@@ -1,0 +1,10 @@
+[package]
+name = "allpaca-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU fallback kernels (AVX2 with scalar path)"
+
+[dependencies]
+allpaca-types.workspace = true
+tracing.workspace = true

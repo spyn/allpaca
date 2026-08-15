@@ -1,0 +1,14 @@
+[package]
+name = "allpaca-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF model parsing and tokenizer extraction"
+
+[dependencies]
+ahash.workspace = true
+allpaca-types.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
