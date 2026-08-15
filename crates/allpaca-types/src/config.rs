@@ -298,7 +298,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toml_then_cli_overrides() {
+    fn compiled_defaults_then_toml_then_cli() {
+        let defaults = Config::compiled_defaults();
+        assert_eq!(defaults.http.port, 8080);
+        assert_eq!(defaults.engine.cpu_threads, 4);
+        assert!(defaults.speculative.enabled);
+        assert!(!defaults.engine.cpu_only);
+
         let toml = r#"
             [engine]
             cpu_threads = 6
@@ -306,17 +312,28 @@ mod tests {
             port = 9000
         "#;
         let mut cfg = Config::from_toml_str(toml).unwrap();
-        assert_eq!(cfg.engine.cpu_threads, 6);
-        assert_eq!(cfg.http.port, 9000);
+        assert_eq!(cfg.engine.cpu_threads, 6, "TOML overrides compiled default");
+        assert_eq!(cfg.http.port, 9000, "TOML overrides compiled default");
+        assert!(
+            cfg.speculative.enabled,
+            "unspecified TOML field keeps compiled default"
+        );
+        assert!(!cfg.engine.cpu_only);
+
         cfg.merge_cli(&CliOverrides {
             port: Some(8081),
             cpu_only: true,
+            speculative: Some(false),
             ..CliOverrides::default()
         });
-        assert_eq!(cfg.http.port, 8081);
+        assert_eq!(cfg.http.port, 8081, "CLI overrides TOML");
+        assert!(!cfg.speculative.enabled, "CLI overrides compiled default");
         assert_eq!(cfg.engine.target_device, DeviceSelector::Cpu);
         assert!(cfg.engine.cpu_only);
-        assert_eq!(cfg.engine.cpu_threads, 6);
+        assert_eq!(
+            cfg.engine.cpu_threads, 6,
+            "CLI must not clobber unspecified TOML values"
+        );
     }
 
     #[test]

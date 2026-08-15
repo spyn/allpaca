@@ -6,4 +6,4 @@ mod writer;
 
 pub use parser::{GgufFile, GgufValue, TensorInfo, GGUF_MAGIC};
 pub use tokenizer::{extract_tokenizer, GgufTokenizer};
-pub use writer::write_gguf;
+pub use writer::{write_gguf, GgufWriteTensor};
