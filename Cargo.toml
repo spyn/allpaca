@@ -5,6 +5,7 @@ members = [
     "crates/allpaca-cpu",
     "crates/allpaca-hip",
     "crates/allpaca-gguf",
+    "crates/allpaca-core",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ description = "Heterogeneous research inference engine"
 
 [workspace.dependencies]
 allpaca-types = { path = "crates/allpaca-types" }
+allpaca-core = { path = "crates/allpaca-core" }
 allpaca-gguf = { path = "crates/allpaca-gguf" }
 allpaca-hip = { path = "crates/allpaca-hip" }
 allpaca-cpu = { path = "crates/allpaca-cpu" }
