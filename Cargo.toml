@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/allpaca-types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Heterogeneous research inference engine"
+
+[workspace.dependencies]
+allpaca-types = { path = "crates/allpaca-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["full"] }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+ahash = "0.8"
+memmap2 = "0.9"
+rand = { version = "0.8", features = ["small_rng"] }
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["json"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures = "0.3"
+async-stream = "0.3"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
