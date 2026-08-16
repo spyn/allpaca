@@ -1,0 +1,46 @@
+mod api;
+mod cli;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use allpaca_core::Engine;
+use allpaca_types::Config;
+use tracing_subscriber::EnvFilter;
+
+use crate::cli::Cli;
+
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("fatal: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("allpaca=info".parse()?))
+        .init();
+
+    let cli = Cli::parse_args();
+    let mut config = if let Some(path) = &cli.config {
+        Config::from_toml_file(path)?
+    } else {
+        Config::compiled_defaults()
+    };
+    config.merge_cli(&cli.to_overrides());
+    config.validate()?;
+
+    let engine = Engine::new(config.clone())?;
+    let state = api::AppState {
+        engine: Arc::new(engine),
+        config: config.clone(),
+    };
+    let app = api::router(state);
+    let addr = SocketAddr::new(config.http.host.parse()?, config.http.port);
+    tracing::info!(%addr, "allpaca-server listening (CPU-only={})", config.engine.cpu_only);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}

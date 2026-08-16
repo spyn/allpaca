@@ -414,10 +414,7 @@ mod tests {
     use crate::writer::{write_gguf, GgufWriteTensor};
     use std::collections::HashMap;
 
-    #[test]
-    fn roundtrip_header_and_f32_tensor() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("allpaca_gguf_roundtrip.gguf");
+    fn sample_meta() -> HashMap<String, GgufValue> {
         let mut meta = HashMap::new();
         meta.insert(
             "general.architecture".into(),
@@ -427,15 +424,44 @@ mod tests {
             "tokenizer.ggml.model".into(),
             GgufValue::String("llama".into()),
         );
-        let tokens = vec![
-            GgufValue::String("<unk>".into()),
-            GgufValue::String("hello".into()),
-        ];
-        meta.insert("tokenizer.ggml.tokens".into(), GgufValue::Array(tokens));
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("hello".into()),
+            ]),
+        );
+        meta
+    }
+
+    fn write_typed_gguf(path: &std::path::Path, ggml_type_id: u32, nbytes: usize) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let name = "quant.weight";
+        buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&4u64.to_le_bytes());
+        buf.extend_from_slice(&ggml_type_id.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        buf.extend(std::iter::repeat_n(0u8, nbytes));
+        std::fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn roundtrip_header_and_f32_tensor() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("allpaca_gguf_roundtrip.gguf");
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
         write_gguf(
             &path,
-            &meta,
+            &sample_meta(),
             &[GgufWriteTensor {
                 name: "token_embd.weight".into(),
                 dims: vec![2, 2],
@@ -445,9 +471,35 @@ mod tests {
         .unwrap();
 
         let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.version, 3);
         assert_eq!(file.architecture(), Some("llama"));
+        assert_eq!(file.tensors.len(), 1);
+        let info = file.tensor("token_embd.weight").expect("tensor info");
+        assert_eq!(info.dims, vec![2, 2]);
+        assert_eq!(info.ggml_type, GgmlType::F32);
         let loaded = file.tensor_f32("token_embd.weight").unwrap();
         assert_eq!(loaded, data);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q4_and_q8_tensor_load_is_fatal() {
+        let dir = std::env::temp_dir();
+        for (name, type_id, expected) in [
+            ("allpaca_gguf_q4.gguf", 2u32, GgmlType::Q4_0),
+            ("allpaca_gguf_q8.gguf", 8u32, GgmlType::Q8_0),
+        ] {
+            let path = dir.join(name);
+            write_typed_gguf(&path, type_id, 32);
+            let file = GgufFile::open(&path).unwrap();
+            let info = file.tensor("quant.weight").expect("header lists tensor");
+            assert_eq!(info.ggml_type, expected);
+            let err = file.tensor_f32("quant.weight").unwrap_err();
+            assert!(
+                err.is_fatal(),
+                "{expected:?} load must be Fatal, got {err:?}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
