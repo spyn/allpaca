@@ -1,0 +1,24 @@
+[package]
+name = "allpaca-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Engine, scheduler, memory tiers, and draft providers"
+
+[features]
+default = []
+hip = ["allpaca-hip/hip"]
+
+[dependencies]
+ahash.workspace = true
+allpaca-cpu.workspace = true
+allpaca-gguf.workspace = true
+allpaca-hip.workspace = true
+allpaca-types.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
+tracing.workspace = true
