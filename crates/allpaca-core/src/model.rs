@@ -1,6 +1,7 @@
 use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
 use crate::forest::TokenForest;
 use allpaca_gguf::GgufFile;
+use allpaca_safetensors::{HfConfig, SafetensorsFile};
 use allpaca_types::{AllpacaError, FatalError};
 
 use crate::kv_tier::KvTierManager;
@@ -168,6 +169,55 @@ impl TinyModel {
                 .meta_str("general.name")
                 .unwrap_or("gguf")
                 .to_string(),
+        })
+    }
+
+    pub fn from_safetensors(file: &SafetensorsFile, hf: &HfConfig) -> Result<Self, AllpacaError> {
+        let n_heads = hf.num_attention_heads.max(1);
+        let n_kv_heads = hf.num_key_value_heads.unwrap_or(n_heads).max(1);
+        let ff_dim = hf.intermediate_size.unwrap_or(hf.hidden_size * 4);
+        let cfg = ModelConfig {
+            vocab_size: hf.vocab_size,
+            dim: hf.hidden_size,
+            n_layers: hf.num_hidden_layers,
+            n_heads,
+            n_kv_heads,
+            ff_dim,
+            eps: hf.rms_norm_eps,
+            rope_theta: hf.rope_theta,
+        };
+        let embed = file.tensor_f32("token_embd.weight")?;
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            layers.push(LayerWeights {
+                attn_norm: file.tensor_f32(&format!("blk.{i}.attn_norm.weight"))?,
+                wq: file.tensor_f32(&format!("blk.{i}.attn_q.weight"))?,
+                wk: file.tensor_f32(&format!("blk.{i}.attn_k.weight"))?,
+                wv: file.tensor_f32(&format!("blk.{i}.attn_v.weight"))?,
+                wo: file.tensor_f32(&format!("blk.{i}.attn_output.weight"))?,
+                ffn_norm: file.tensor_f32(&format!("blk.{i}.ffn_norm.weight"))?,
+                w_gate: file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
+                w_up: file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
+                w_down: file.tensor_f32(&format!("blk.{i}.ffn_down.weight"))?,
+            });
+        }
+        let norm = file.tensor_f32("output_norm.weight")?;
+        let lm_head = match file.tensor_f32("output.weight") {
+            Ok(w) => w,
+            Err(_) => embed.clone(),
+        };
+        let name = hf
+            .architectures
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "safetensors".into());
+        Ok(Self {
+            config: cfg,
+            embed,
+            layers,
+            norm,
+            lm_head,
+            name,
         })
     }
 

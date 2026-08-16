@@ -24,15 +24,28 @@ impl EngineTokenizer {
         }
     }
 
-    pub fn synthetic(vocab_size: usize) -> Result<Self, AllpacaError> {
-        let tokens = synthetic_vocab(vocab_size);
+    pub fn from_vocab(
+        tokens: Vec<String>,
+        bos_id: Option<u32>,
+        eos_id: Option<u32>,
+    ) -> Result<Self, AllpacaError> {
+        if tokens.is_empty() {
+            return Err(AllpacaError::Fatal(FatalError::Tokenizer(
+                "tokenizer vocab is empty".into(),
+            )));
+        }
         let mut vocab = AHashMap::new();
         for (i, tok) in tokens.iter().enumerate() {
             vocab.insert(tok.clone(), i as u32);
         }
+        let unk = tokens
+            .iter()
+            .find(|t| *t == "<unk>" || *t == "[UNK]")
+            .cloned()
+            .unwrap_or_else(|| tokens[0].clone());
         let model = WordLevel::builder()
             .vocab(vocab)
-            .unk_token("<unk>".into())
+            .unk_token(unk)
             .build()
             .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))?;
         let mut inner = Tokenizer::new(model);
@@ -40,10 +53,14 @@ impl EngineTokenizer {
         Ok(Self {
             inner,
             tokens,
-            bos_id: Some(1),
-            eos_id: Some(2),
-            add_bos: true,
+            bos_id,
+            eos_id,
+            add_bos: bos_id.is_some(),
         })
+    }
+
+    pub fn synthetic(vocab_size: usize) -> Result<Self, AllpacaError> {
+        Self::from_vocab(synthetic_vocab(vocab_size), Some(1), Some(2))
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, AllpacaError> {
