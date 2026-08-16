@@ -66,9 +66,14 @@ int allpaca_gemm(const float *a, const float *b, float *c, int32_t m, int32_t n,
 int allpaca_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                     allpaca_stream_t stream);
 
-/* C[m,n] = A[m,k] * dequant(B_q8_0[n,k])^T. B is 36-byte staged Q8_0, not raw GGUF. */
+/* C[m,n] = A[m,k] * dequant(B_q8_0[n,k])^T. Decode default is float A × Q8.
+ * B is 36-byte staged Q8_0, not raw GGUF. */
 int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
+
+/* Integer A×Q8 GEMV (quantize A tiles, int32 MAC). Not the decode default. */
+int allpaca_gemm_nt_q8_0_intdot(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                int32_t k, allpaca_stream_t stream);
 
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
