@@ -192,6 +192,18 @@ extern "C" int allpaca_hip_can_p2p(int32_t src, int32_t dst, int32_t *can) {
     return ALLPACA_OK;
 }
 
+extern "C" int allpaca_hip_enable_peer_access(int32_t src, int32_t dst) {
+    hipError_t err = hipSetDevice(src);
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    err = hipDeviceEnablePeerAccess(dst, 0);
+    if (err != hipSuccess && err != hipErrorPeerAccessAlreadyEnabled) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device) {
     if (!ptr || bytes == 0) {
         return ALLPACA_ERR_INVALID;
@@ -295,18 +307,15 @@ extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, dou
     (void)hipEventCreate(&start);
     (void)hipEventCreate(&stop);
 
-    int can = 0;
-    (void)hipDeviceCanAccessPeer(&can, src, dst);
-    if (can) {
-        (void)hipSetDevice(src);
-        (void)hipDeviceEnablePeerAccess(dst, 0);
-        (void)hipSetDevice(dst);
-        (void)hipDeviceEnablePeerAccess(src, 0);
-        (void)hipSetDevice(src);
-        (void)hipEventRecord(start, nullptr);
-        (void)hipMemcpyPeer(d_dst, dst, d_src, src, bytes);
-        (void)hipEventRecord(stop, nullptr);
-        (void)hipEventSynchronize(stop);
+    /* Enable is attempted even when the raw query is false; policy lives in Rust. */
+    (void)allpaca_hip_enable_peer_access(src, dst);
+    (void)allpaca_hip_enable_peer_access(dst, src);
+    (void)hipSetDevice(src);
+    (void)hipEventRecord(start, nullptr);
+    hipError_t peer_err = hipMemcpyPeer(d_dst, dst, d_src, src, bytes);
+    (void)hipEventRecord(stop, nullptr);
+    (void)hipEventSynchronize(stop);
+    if (peer_err == hipSuccess) {
         float ms = 0.0f;
         (void)hipEventElapsedTime(&ms, start, stop);
         if (ms > 0.0f) {
@@ -412,6 +421,10 @@ extern "C" int allpaca_hip_can_p2p(int32_t, int32_t, int32_t *can) {
     if (can) {
         *can = 0;
     }
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_enable_peer_access(int32_t, int32_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

@@ -10,11 +10,22 @@ pub struct DeviceInventory {
     pub pipeline_mode: PipelineMode,
     pub transfer_path: TransferPath,
     pub transfer_benchmark: Option<BandwidthBenchmark>,
+    pub p2p_capable: bool,
+    pub p2p_enabled: bool,
     pub target_device: i32,
     pub draft_device: i32,
 }
 
 impl DeviceInventory {
+    /// Per-pair P2P after the boot enable + re-query, not a raw pre-enable probe.
+    pub fn can_p2p(&self, src: i32, dst: i32) -> bool {
+        self.devices
+            .iter()
+            .find(|d| d.id == src)
+            .map(|d| d.peers.contains(&dst))
+            .unwrap_or(false)
+    }
+
     pub fn discover(config: &Config) -> Self {
         let mut devices = vec![DeviceInfo::cpu()];
         if !config.engine.cpu_only {
@@ -31,9 +42,12 @@ impl DeviceInventory {
         let (target_device, draft_device) = resolve_devices(config, &placement, &devices);
         let (transfer_path, transfer_benchmark) =
             crate::transfer::select_transfer_path_with_bench(&devices, config.engine.cpu_only);
+        let (p2p_capable, p2p_enabled) = peer_flags(&devices, config.engine.cpu_only);
         tracing::info!(
             ?pipeline_mode,
             ?transfer_path,
+            p2p_capable,
+            p2p_enabled,
             target_device,
             draft_device,
             devices = devices.len(),
@@ -44,6 +58,8 @@ impl DeviceInventory {
             pipeline_mode,
             transfer_path,
             transfer_benchmark,
+            p2p_capable,
+            p2p_enabled,
             target_device,
             draft_device,
         }
@@ -70,6 +86,23 @@ pub fn detect_pipeline_mode(devices: &[DeviceInfo]) -> PipelineMode {
             }
         }
     }
+}
+
+fn peer_flags(devices: &[DeviceInfo], cpu_only: bool) -> (bool, bool) {
+    if cpu_only {
+        return (false, false);
+    }
+    let gpus: Vec<i32> = devices
+        .iter()
+        .filter(|d| d.kind == DeviceKind::HipGpu)
+        .map(|d| d.id)
+        .collect();
+    if gpus.len() < 2 {
+        return (false, false);
+    }
+    let ab = allpaca_hip::probe_peer(gpus[0], gpus[1]);
+    let ba = allpaca_hip::probe_peer(gpus[1], gpus[0]);
+    (ab.capable && ba.capable, ab.enabled && ba.enabled)
 }
 
 fn resolve_devices(

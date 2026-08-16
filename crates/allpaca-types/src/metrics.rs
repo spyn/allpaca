@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 pub struct StatsSnapshot {
     pub pipeline_mode: String,
     pub transfer_path: String,
+    /// True when a GPU pair can access peers after enable + re-query.
+    pub p2p_capable: bool,
+    /// True when `hipDeviceEnablePeerAccess` succeeded in both directions.
+    pub p2p_enabled: bool,
+    /// `"measured"` after a successful enable+peer-copy trial, or `"p2p_unavailable"`.
+    pub p2p_status: String,
+    pub p2p_gbps: f64,
+    pub host_staging_gbps: f64,
+    pub p2p_us: f64,
+    pub host_staging_us: f64,
     pub target_device: i32,
     pub draft_device: i32,
     pub requests_total: u64,

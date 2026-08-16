@@ -185,9 +185,23 @@ impl Engine {
         self.metrics
             .device_memory_bytes
             .store(device_memory_bytes, std::sync::atomic::Ordering::Relaxed);
+        let bench = self.inventory.transfer_benchmark;
+        let p2p_copy_ok = bench.map(|b| b.p2p_copy_ok).unwrap_or(false);
+        let p2p_status = if p2p_copy_ok {
+            "measured"
+        } else {
+            "p2p_unavailable"
+        };
         self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
+            self.inventory.p2p_capable,
+            self.inventory.p2p_enabled,
+            p2p_status,
+            bench.map(|b| b.p2p_gbps).unwrap_or(0.0),
+            bench.map(|b| b.host_staging_gbps).unwrap_or(0.0),
+            bench.map(|b| b.p2p_us).unwrap_or(0.0),
+            bench.map(|b| b.host_staging_us).unwrap_or(0.0),
             self.inventory.target_device,
             self.inventory.draft_device,
             model_id,

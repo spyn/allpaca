@@ -111,16 +111,39 @@ pub enum TransferPath {
     HostStaging,
 }
 
+/// Prefer P2P when enable+copy succeeded and measured P2P bandwidth is not
+/// more than 10% below host-staging bandwidth.
+pub const P2P_MAX_SLOWER_FRACTION: f64 = 0.10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BandwidthBenchmark {
     pub bytes: u64,
     pub p2p_gbps: f64,
     pub host_staging_gbps: f64,
+    #[serde(default)]
+    pub p2p_us: f64,
+    #[serde(default)]
+    pub host_staging_us: f64,
+    #[serde(default)]
+    pub p2p_copy_ok: bool,
 }
 
 impl BandwidthBenchmark {
     pub fn faster_path(&self) -> TransferPath {
-        if self.p2p_gbps > self.host_staging_gbps {
+        self.selected_path()
+    }
+
+    /// `P2p` only when the peer copy succeeded and is not slower than host
+    /// staging by more than [`P2P_MAX_SLOWER_FRACTION`].
+    pub fn selected_path(&self) -> TransferPath {
+        if !self.p2p_copy_ok || self.p2p_gbps <= 0.0 {
+            return TransferPath::HostStaging;
+        }
+        if self.host_staging_gbps <= 0.0 {
+            return TransferPath::P2p;
+        }
+        let floor = self.host_staging_gbps * (1.0 - P2P_MAX_SLOWER_FRACTION);
+        if self.p2p_gbps + f64::EPSILON >= floor {
             TransferPath::P2p
         } else {
             TransferPath::HostStaging
@@ -146,6 +169,42 @@ pub enum KvTierKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p2p_selected_only_when_copy_ok_and_not_much_slower() {
+        let ready = BandwidthBenchmark {
+            bytes: 4 << 20,
+            p2p_gbps: 12.0,
+            host_staging_gbps: 10.0,
+            p2p_us: 10.0,
+            host_staging_us: 12.0,
+            p2p_copy_ok: true,
+        };
+        assert_eq!(ready.selected_path(), TransferPath::P2p);
+
+        let within_margin = BandwidthBenchmark {
+            p2p_gbps: 9.2,
+            host_staging_gbps: 10.0,
+            p2p_copy_ok: true,
+            ..ready
+        };
+        assert_eq!(within_margin.selected_path(), TransferPath::P2p);
+
+        let much_slower = BandwidthBenchmark {
+            p2p_gbps: 5.0,
+            host_staging_gbps: 10.0,
+            p2p_copy_ok: true,
+            ..ready
+        };
+        assert_eq!(much_slower.selected_path(), TransferPath::HostStaging);
+
+        let copy_failed = BandwidthBenchmark {
+            p2p_gbps: 40.0,
+            p2p_copy_ok: false,
+            ..ready
+        };
+        assert_eq!(copy_failed.selected_path(), TransferPath::HostStaging);
+    }
 
     #[test]
     fn parse_device_selector() {

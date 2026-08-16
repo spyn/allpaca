@@ -346,6 +346,6 @@ The scheduler chooses:
 
 ### P2P Constraints
 
-- P2P must be validated at runtime via `hipDeviceCanAccessPeer`
-- Benchmark P2P vs host staging for each transfer size
-- Never assume P2P is faster without measurement
+- P2P must be validated at runtime: query `hipDeviceCanAccessPeer`, enable both directions with `hipDeviceEnablePeerAccess`, then re-query
+- Benchmark enable+peer-copy vs host staging for each transfer size
+- Never assume P2P is faster without measurement; prefer P2P only when it is not more than 10% slower than host staging
