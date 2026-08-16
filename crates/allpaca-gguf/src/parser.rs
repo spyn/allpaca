@@ -256,36 +256,63 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// F32 tensor bytes. Other dtypes return Fatal — dequant is a follow-up.
+    /// Materialize a tensor as F32. Q8_0 is dequantized on CPU; other quants are Fatal.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, AllpacaError> {
         let info = self.tensor(name).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
         })?;
-        if info.ggml_type != GgmlType::F32 {
-            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "tensor {name} is {:?} (only F32 materialization in MVP; TODO dequant)",
-                info.ggml_type
-            ))));
-        }
         let n = info.n_elements() as usize;
         let start = self.tensor_data_offset + info.offset as usize;
-        let bytes = n.saturating_mul(4);
-        if start.saturating_add(bytes) > self.mmap.len() {
-            return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
-                "tensor {name} out of range"
-            ))));
+        match info.ggml_type {
+            GgmlType::F32 => {
+                let bytes = n.saturating_mul(4);
+                if start.saturating_add(bytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let off = start + i * 4;
+                    *slot = f32::from_le_bytes([
+                        self.mmap[off],
+                        self.mmap[off + 1],
+                        self.mmap[off + 2],
+                        self.mmap[off + 3],
+                    ]);
+                }
+                Ok(out)
+            }
+            GgmlType::Q4_0 => {
+                let nbytes = n
+                    .div_ceil(allpaca_cpu::Q4_0_BLOCK_ELEMS)
+                    .saturating_mul(allpaca_cpu::Q4_0_BLOCK_BYTES);
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q4_0 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q4_0(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q8_0 => {
+                let nbytes = n
+                    .div_ceil(allpaca_cpu::Q8_0_BLOCK_ELEMS)
+                    .saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES);
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q8_0 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q8_0(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "tensor {name} is {other:?} (unsupported GGUF quant)"
+            )))),
         }
-        let mut out = vec![0.0f32; n];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let off = start + i * 4;
-            *slot = f32::from_le_bytes([
-                self.mmap[off],
-                self.mmap[off + 1],
-                self.mmap[off + 2],
-                self.mmap[off + 3],
-            ]);
-        }
-        Ok(out)
     }
 
     pub fn meta_str(&self, key: &str) -> Option<&str> {
@@ -434,7 +461,7 @@ mod tests {
         meta
     }
 
-    fn write_typed_gguf(path: &std::path::Path, ggml_type_id: u32, nbytes: usize) {
+    fn write_typed_gguf(path: &std::path::Path, ggml_type_id: u32, payload: &[u8], n_elems: u64) {
         let mut buf = Vec::new();
         buf.extend_from_slice(&GGUF_MAGIC);
         buf.extend_from_slice(&3u32.to_le_bytes());
@@ -444,14 +471,52 @@ mod tests {
         buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&4u64.to_le_bytes());
+        buf.extend_from_slice(&n_elems.to_le_bytes());
         buf.extend_from_slice(&ggml_type_id.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
         while buf.len() % 32 != 0 {
             buf.push(0);
         }
-        buf.extend(std::iter::repeat_n(0u8, nbytes));
+        buf.extend_from_slice(payload);
         std::fs::write(path, buf).unwrap();
+    }
+
+    fn f32_to_f16_bits(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let mant = bits & 0x7f_ffff;
+        if exp == 255 {
+            return sign | 0x7c00 | ((mant >> 13) as u16);
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            return sign | 0x7c00;
+        }
+        if new_exp <= 0 {
+            return sign;
+        }
+        sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+
+    fn encode_q8_0(values: &[i8], scale: f32) -> Vec<u8> {
+        assert_eq!(values.len(), 32);
+        let mut out = Vec::with_capacity(34);
+        out.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        out.extend(values.iter().map(|v| *v as u8));
+        out
+    }
+
+    fn encode_q4_0(qs_minus_8: &[i8], scale: f32) -> Vec<u8> {
+        assert_eq!(qs_minus_8.len(), 32);
+        let mut out = Vec::with_capacity(18);
+        out.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        for i in 0..16 {
+            let lo = (qs_minus_8[i] + 8) as u8 & 0x0f;
+            let hi = (qs_minus_8[i + 16] + 8) as u8 & 0x0f;
+            out.push(lo | (hi << 4));
+        }
+        out
     }
 
     #[test]
@@ -483,23 +548,62 @@ mod tests {
     }
 
     #[test]
-    fn q4_and_q8_tensor_load_is_fatal() {
-        let dir = std::env::temp_dir();
-        for (name, type_id, expected) in [
-            ("allpaca_gguf_q4.gguf", 2u32, GgmlType::Q4_0),
-            ("allpaca_gguf_q8.gguf", 8u32, GgmlType::Q8_0),
-        ] {
-            let path = dir.join(name);
-            write_typed_gguf(&path, type_id, 32);
-            let file = GgufFile::open(&path).unwrap();
-            let info = file.tensor("quant.weight").expect("header lists tensor");
-            assert_eq!(info.ggml_type, expected);
-            let err = file.tensor_f32("quant.weight").unwrap_err();
+    fn q8_0_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q8.gguf");
+        let qs: Vec<i8> = (0..32).map(|i| i as i8).collect();
+        let payload = encode_q8_0(&qs, 1.0);
+        write_typed_gguf(&path, 8, &payload, 32);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::Q8_0);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("Q8_0 must materialize to F32");
+        assert_eq!(loaded.len(), 32);
+        for (i, v) in loaded.iter().enumerate() {
             assert!(
-                err.is_fatal(),
-                "{expected:?} load must be Fatal, got {err:?}"
+                (*v - i as f32).abs() < 1e-2,
+                "Q8_0 dequant mismatch at {i}: {v}"
             );
-            let _ = std::fs::remove_file(path);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q4_0_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q4.gguf");
+        let qs: Vec<i8> = (0..32).map(|i| (i % 9) as i8 - 4).collect();
+        let payload = encode_q4_0(&qs, 0.5);
+        write_typed_gguf(&path, 2, &payload, 32);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::Q4_0);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("Q4_0 must materialize to F32");
+        assert_eq!(loaded.len(), 32);
+        for (i, v) in loaded.iter().enumerate() {
+            let expect = 0.5 * qs[i] as f32;
+            assert!(
+                (*v - expect).abs() < 1e-2,
+                "Q4_0 dequant mismatch at {i}: {v} vs {expect}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unsupported_quant_tensor_load_is_fatal() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q5.gguf");
+        write_typed_gguf(&path, 6, &[0u8; 32], 32);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::Q5_0);
+        let err = file.tensor_f32("quant.weight").unwrap_err();
+        assert!(
+            err.is_fatal(),
+            "unsupported GGUF quant must be Fatal, got {err:?}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -379,6 +379,171 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+pub const Q4_0_BLOCK_ELEMS: usize = 32;
+pub const Q4_0_BLOCK_BYTES: usize = 18;
+pub const Q8_0_BLOCK_ELEMS: usize = 32;
+pub const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// IEEE-754 binary16 → f32.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = u32::from(h & 0x3ff);
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut e = 127 - 14;
+            let mut m = mant;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((u32::from(exp) + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+pub fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7f_ffff;
+    if exp == 255 {
+        return sign | 0x7c00 | ((mant >> 13) as u16);
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return sign | 0x7c00;
+    }
+    if new_exp <= 0 {
+        return sign;
+    }
+    sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+}
+
+pub fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(Q8_0_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * Q8_0_BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * Q8_0_BLOCK_ELEMS;
+        let end = (start + Q8_0_BLOCK_ELEMS).min(data.len());
+        let mut amax = 0.0f32;
+        for v in &data[start..end] {
+            amax = amax.max(v.abs());
+        }
+        let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+        let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let off = b * Q8_0_BLOCK_BYTES;
+        out[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for i in 0..Q8_0_BLOCK_ELEMS {
+            let src = start + i;
+            let q = if src < data.len() {
+                (data[src] * inv).round().clamp(-127.0, 127.0) as i8
+            } else {
+                0
+            };
+            out[off + 2 + i] = q as u8;
+        }
+    }
+    out
+}
+
+pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(Q4_0_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * Q4_0_BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * Q4_0_BLOCK_ELEMS;
+        let end = (start + Q4_0_BLOCK_ELEMS).min(data.len());
+        let mut amax = 0.0f32;
+        for v in &data[start..end] {
+            amax = amax.max(v.abs());
+        }
+        let d = if amax == 0.0 { 0.0 } else { amax / 8.0 };
+        let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let off = b * Q4_0_BLOCK_BYTES;
+        out[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for j in 0..16 {
+            let q_lo = quant_nibble(data, start + j, inv);
+            let q_hi = quant_nibble(data, start + j + 16, inv);
+            out[off + 2 + j] = q_lo | (q_hi << 4);
+        }
+    }
+    out
+}
+
+fn quant_nibble(data: &[f32], idx: usize, inv: f32) -> u8 {
+    if idx >= data.len() {
+        return 8;
+    }
+    ((data[idx] * inv).round() + 8.0).clamp(0.0, 15.0) as u8
+}
+
+/// Dequantize GGUF Q4_0 blocks: `f16 d` + packed nibbles → `d * (q - 8)`.
+pub fn dequant_q4_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q4_0 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q4_0_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q4_0_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q4_0 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q4_0_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        for j in 0..16 {
+            let packed = blocks[off + 2 + j];
+            let i0 = b * Q4_0_BLOCK_ELEMS + j;
+            let i1 = i0 + 16;
+            if i0 < n {
+                out[i0] = d * ((packed & 0x0f) as i8 as f32 - 8.0);
+            }
+            if i1 < n {
+                out[i1] = d * ((packed >> 4) as i8 as f32 - 8.0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q8_0 blocks: `f16 d` + `i8[32]` → `d * q`.
+pub fn dequant_q8_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q8_0 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q8_0_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q8_0_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q8_0 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q8_0_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        for i in 0..Q8_0_BLOCK_ELEMS {
+            let idx = b * Q8_0_BLOCK_ELEMS + i;
+            if idx >= n {
+                break;
+            }
+            out[idx] = d * (blocks[off + 2 + i] as i8 as f32);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
