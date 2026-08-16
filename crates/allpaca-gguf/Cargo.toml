@@ -7,6 +7,7 @@ description = "GGUF model parsing and tokenizer extraction"
 
 [dependencies]
 ahash.workspace = true
+allpaca-cpu.workspace = true
 allpaca-types.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true

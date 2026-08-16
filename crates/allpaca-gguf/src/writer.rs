@@ -4,7 +4,7 @@ use std::path::Path;
 
 use allpaca_types::{AllpacaError, FatalError};
 
-use crate::parser::{GgufValue, GGUF_MAGIC};
+use crate::parser::{GgmlType, GgufValue, GGUF_MAGIC};
 
 pub struct GgufWriteTensor<'a> {
     pub name: String,
@@ -51,6 +51,82 @@ pub fn write_gguf(
         for v in tensor.data {
             buf.extend_from_slice(&v.to_le_bytes());
         }
+    }
+
+    let mut file = std::fs::File::create(path).map_err(FatalError::from)?;
+    file.write_all(&buf).map_err(FatalError::from)?;
+    Ok(())
+}
+
+pub struct GgufWriteQuantTensor<'a> {
+    pub name: String,
+    pub dims: Vec<u64>,
+    pub ggml_type: GgmlType,
+    pub bytes: &'a [u8],
+}
+
+pub fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
+    allpaca_cpu::quantize_q8_0(data)
+}
+
+pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
+    allpaca_cpu::quantize_q4_0(data)
+}
+
+/// Write a GGUF that mixes F32 tensors with quantized blocks (tests / tiny models).
+pub fn write_gguf_quant(
+    path: &Path,
+    metadata: &HashMap<String, GgufValue>,
+    f32_tensors: &[GgufWriteTensor<'_>],
+    quant_tensors: &[GgufWriteQuantTensor<'_>],
+) -> Result<(), AllpacaError> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&GGUF_MAGIC);
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    let n_tensors = (f32_tensors.len() + quant_tensors.len()) as u64;
+    buf.extend_from_slice(&n_tensors.to_le_bytes());
+    buf.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+
+    let mut keys: Vec<&String> = metadata.keys().collect();
+    keys.sort();
+    for key in keys {
+        write_string(&mut buf, key);
+        write_value(&mut buf, &metadata[key])?;
+    }
+
+    let mut offset = 0u64;
+    for tensor in f32_tensors {
+        write_string(&mut buf, &tensor.name);
+        buf.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+        for d in &tensor.dims {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        buf.extend_from_slice(&(GgmlType::F32 as u32).to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+        offset += (tensor.data.len() * 4) as u64;
+    }
+    for tensor in quant_tensors {
+        write_string(&mut buf, &tensor.name);
+        buf.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+        for d in &tensor.dims {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        buf.extend_from_slice(&(tensor.ggml_type as u32).to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+        offset += tensor.bytes.len() as u64;
+    }
+
+    let align = 32usize;
+    while buf.len() % align != 0 {
+        buf.push(0);
+    }
+    for tensor in f32_tensors {
+        for v in tensor.data {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for tensor in quant_tensors {
+        buf.extend_from_slice(tensor.bytes);
     }
 
     let mut file = std::fs::File::create(path).map_err(FatalError::from)?;

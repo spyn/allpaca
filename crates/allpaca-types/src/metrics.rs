@@ -20,5 +20,9 @@ pub struct StatsSnapshot {
     pub ttft_ms_last: u64,
     pub itl_ms_ema: f64,
     pub degraded_events: u64,
+    pub tree_nodes: u64,
+    pub tree_accepted_path_len: u64,
+    pub tree_path_valid: bool,
+    pub accepted_tokens_per_target_eval: f64,
     pub model_id: String,
 }

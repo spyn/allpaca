@@ -65,6 +65,7 @@ name = "allpaca-gguf"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "allpaca-cpu",
  "allpaca-types",
  "memmap2",
  "thiserror",

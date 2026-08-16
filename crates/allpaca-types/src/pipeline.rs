@@ -20,6 +20,7 @@ pub struct FeatureFlags {
     pub dram_tiering: bool,
     pub ngram_speculation: bool,
     pub draft_model_speculation: bool,
+    pub tree_speculation: bool,
     pub json_constraints: bool,
     pub adaptive_draft_depth: bool,
 }
@@ -38,6 +39,7 @@ impl FeatureFlags {
                 dram_tiering: true,
                 ngram_speculation: true,
                 draft_model_speculation: true,
+                tree_speculation: false,
                 json_constraints: true,
                 adaptive_draft_depth: true,
             },
@@ -46,6 +48,7 @@ impl FeatureFlags {
                 dram_tiering: true,
                 ngram_speculation: true,
                 draft_model_speculation: true,
+                tree_speculation: false,
                 json_constraints: true,
                 adaptive_draft_depth: true,
             },
@@ -54,6 +57,7 @@ impl FeatureFlags {
                 dram_tiering: true,
                 ngram_speculation: true,
                 draft_model_speculation: false,
+                tree_speculation: false,
                 json_constraints: true,
                 adaptive_draft_depth: true,
             },
@@ -74,6 +78,9 @@ impl FeatureFlags {
         if let Some(v) = overlay.draft_model_speculation {
             self.draft_model_speculation = v;
         }
+        if let Some(v) = overlay.tree_speculation {
+            self.tree_speculation = v;
+        }
         if let Some(v) = overlay.json_constraints {
             self.json_constraints = v;
         }
@@ -89,6 +96,7 @@ pub struct FeatureFlagOverlay {
     pub dram_tiering: Option<bool>,
     pub ngram_speculation: Option<bool>,
     pub draft_model_speculation: Option<bool>,
+    pub tree_speculation: Option<bool>,
     pub json_constraints: Option<bool>,
     pub adaptive_draft_depth: Option<bool>,
 }
