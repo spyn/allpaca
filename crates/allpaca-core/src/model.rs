@@ -911,6 +911,14 @@ impl TinyModel {
         resident: Option<&ResidentModel>,
         metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(pos, token, error = %e, "HIP draft on-device decode failed; host fallback");
+                }
+            }
+        }
         let cfg = &self.config;
         let dim = cfg.dim;
         let head_dim = cfg.head_dim();
@@ -1008,11 +1016,229 @@ impl TinyModel {
         }
         Ok(())
     }
+
+    /// Sequential draft decode with device-resident hidden state and DenseKv.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_dense_device(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut DenseKv,
+        logits: &mut [f32],
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let head_dim = cfg.head_dim();
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let vocab = cfg.vocab_size;
+        if logits.len() < vocab {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "logits buffer smaller than vocab".into(),
+            )));
+        }
+        hip.bind()?;
+        cache.ensure_device(hip.device, cfg.n_layers, kv_dim, pos + 1)?;
+        if let Some(metrics) = metrics {
+            metrics
+                .draft_kv_bytes_on_device
+                .store(cache.device_bytes(), std::sync::atomic::Ordering::Relaxed);
+        }
+        let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, pos + 1)?;
+        hip.embed_gather(resident.embed(), token, buf.x, dim as i32)?;
+        record_elementwise(metrics);
+
+        for layer_idx in 0..self.layers.len() {
+            hip.rmsnorm_device(
+                buf.x,
+                resident.attn_norm(layer_idx),
+                buf.normed,
+                dim as i32,
+                cfg.eps,
+            )?;
+            record_elementwise(metrics);
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.wq(layer_idx),
+                buf.q,
+                1,
+                dim as i32,
+                dim as i32,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.wk(layer_idx),
+                buf.k,
+                1,
+                kv_dim as i32,
+                dim as i32,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.wv(layer_idx),
+                buf.v,
+                1,
+                kv_dim as i32,
+                dim as i32,
+            )?;
+            hip.rope_device(
+                buf.q,
+                cfg.n_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                cfg.rope_theta,
+            )?;
+            record_elementwise(metrics);
+            hip.rope_device(
+                buf.k,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                cfg.rope_theta,
+            )?;
+            record_elementwise(metrics);
+            cache.write_pos_from_device(layer_idx, pos, buf.k, buf.v)?;
+            let n_kv = pos + 1;
+            hip.attention_device(
+                buf.q,
+                cache.k_ptr(layer_idx),
+                cache.v_ptr(layer_idx),
+                buf.attn,
+                1,
+                n_kv as i32,
+                cfg.n_heads as i32,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                true,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.attn,
+                resident.wo(layer_idx),
+                buf.proj,
+                1,
+                dim as i32,
+                dim as i32,
+            )?;
+            hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            if let Some(metrics) = metrics {
+                metrics
+                    .residual_gpu_ops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            record_elementwise(metrics);
+
+            hip.rmsnorm_device(
+                buf.x,
+                resident.ffn_norm(layer_idx),
+                buf.normed,
+                dim as i32,
+                cfg.eps,
+            )?;
+            record_elementwise(metrics);
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.w_gate(layer_idx),
+                buf.gate,
+                1,
+                cfg.ff_dim as i32,
+                dim as i32,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.w_up(layer_idx),
+                buf.up,
+                1,
+                cfg.ff_dim as i32,
+                dim as i32,
+            )?;
+            hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+            record_elementwise(metrics);
+            allpaca_hip::gemm_nt_device(
+                buf.gate,
+                resident.w_down(layer_idx),
+                buf.proj,
+                1,
+                dim as i32,
+                cfg.ff_dim as i32,
+            )?;
+            hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            if let Some(metrics) = metrics {
+                metrics
+                    .residual_gpu_ops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            record_elementwise(metrics);
+        }
+
+        hip.rmsnorm_device(buf.x, resident.norm(), buf.normed, dim as i32, cfg.eps)?;
+        record_elementwise(metrics);
+        allpaca_hip::gemm_nt_device(
+            buf.normed,
+            resident.lm_head(),
+            buf.logits,
+            1,
+            vocab as i32,
+            dim as i32,
+        )?;
+        hip.publish_logits(buf.logits, &mut logits[..vocab])?;
+        if let Some(metrics) = metrics {
+            metrics
+                .gpu_forwards
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .draft_gpu_forwards
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug, Default, Clone)]
+struct DeviceLayerKv {
+    k: *mut u8,
+    v: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for DeviceLayerKv {}
+unsafe impl Sync for DeviceLayerKv {}
+
+impl std::fmt::Debug for DeviceLayerKv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceLayerKv")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 pub struct DenseKv {
     pub layers: Vec<DenseLayerKv>,
+    device: Option<i32>,
+    device_layers: Vec<DeviceLayerKv>,
+    tokens: usize,
+    capacity: usize,
+    kv_dim: usize,
+}
+
+impl Default for DenseKv {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            device: None,
+            device_layers: Vec::new(),
+            tokens: 0,
+            capacity: 0,
+            kv_dim: 0,
+        }
+    }
+}
+
+impl Drop for DenseKv {
+    fn drop(&mut self) {
+        self.free_device();
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1026,12 +1252,137 @@ impl DenseKv {
         self.layers.resize_with(n, DenseLayerKv::default);
     }
 
+    pub fn device_bytes(&self) -> u64 {
+        self.device_layers.iter().map(|l| (l.bytes * 2) as u64).sum()
+    }
+
+    pub fn reset(&mut self) {
+        self.tokens = 0;
+        for layer in &mut self.layers {
+            layer.k.clear();
+            layer.v.clear();
+        }
+    }
+
+    fn free_device(&mut self) {
+        for layer in self.device_layers.drain(..) {
+            allpaca_hip::device_free(layer.k, layer.bytes);
+            allpaca_hip::device_free(layer.v, layer.bytes);
+        }
+        self.device = None;
+        self.capacity = 0;
+    }
+
+    fn ensure_device(
+        &mut self,
+        device: i32,
+        n_layers: usize,
+        kv_dim: usize,
+        min_tokens: usize,
+    ) -> Result<(), AllpacaError> {
+        allpaca_hip::set_device(device)?;
+        self.ensure_layers(n_layers);
+        let need = min_tokens.max(1);
+        let reuse = self.device == Some(device)
+            && self.kv_dim == kv_dim
+            && self.device_layers.len() == n_layers
+            && self.capacity >= need;
+        if reuse {
+            return Ok(());
+        }
+        let new_cap = need.max(self.capacity.saturating_mul(2)).max(8);
+        let bytes = new_cap * kv_dim * 4;
+        let copy_tokens = if self.device == Some(device) && self.kv_dim == kv_dim {
+            self.tokens
+        } else {
+            0
+        };
+        let copy_bytes = copy_tokens * kv_dim * 4;
+        let mut new_layers: Vec<DeviceLayerKv> = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            let k = match allpaca_hip::device_malloc(bytes, device) {
+                Ok(p) => p,
+                Err(e) => {
+                    for layer in new_layers.drain(..) {
+                        allpaca_hip::device_free(layer.k, layer.bytes);
+                        allpaca_hip::device_free(layer.v, layer.bytes);
+                    }
+                    return Err(e);
+                }
+            };
+            let v = match allpaca_hip::device_malloc(bytes, device) {
+                Ok(p) => p,
+                Err(e) => {
+                    allpaca_hip::device_free(k, bytes);
+                    for layer in new_layers.drain(..) {
+                        allpaca_hip::device_free(layer.k, layer.bytes);
+                        allpaca_hip::device_free(layer.v, layer.bytes);
+                    }
+                    return Err(e);
+                }
+            };
+            if copy_bytes > 0 && i < self.device_layers.len() {
+                allpaca_hip::memcpy(k, self.device_layers[i].k, copy_bytes, allpaca_hip::MEMCPY_D2D)?;
+                allpaca_hip::memcpy(v, self.device_layers[i].v, copy_bytes, allpaca_hip::MEMCPY_D2D)?;
+            }
+            new_layers.push(DeviceLayerKv { k, v, bytes });
+        }
+        self.free_device();
+        self.device_layers = new_layers;
+        self.device = Some(device);
+        self.capacity = new_cap;
+        self.kv_dim = kv_dim;
+        Ok(())
+    }
+
+    fn write_pos_from_device(
+        &mut self,
+        layer: usize,
+        pos: usize,
+        k_dev: *const f32,
+        v_dev: *const f32,
+    ) -> Result<(), AllpacaError> {
+        if layer >= self.device_layers.len() || k_dev.is_null() || v_dev.is_null() {
+            return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                "draft device KV pointer is null".into(),
+            )));
+        }
+        if pos >= self.capacity || self.kv_dim == 0 {
+            return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                "draft device KV capacity exceeded".into(),
+            )));
+        }
+        let kv_bytes = self.kv_dim * 4;
+        let off = pos * kv_bytes;
+        let dest_k = unsafe { self.device_layers[layer].k.add(off) };
+        let dest_v = unsafe { self.device_layers[layer].v.add(off) };
+        allpaca_hip::memcpy(dest_k, k_dev.cast(), kv_bytes, allpaca_hip::MEMCPY_D2D)?;
+        allpaca_hip::memcpy(dest_v, v_dev.cast(), kv_bytes, allpaca_hip::MEMCPY_D2D)?;
+        self.tokens = self.tokens.max(pos + 1);
+        Ok(())
+    }
+
+    fn k_ptr(&self, layer: usize) -> *const f32 {
+        self.device_layers
+            .get(layer)
+            .map(|l| l.k.cast::<f32>() as *const f32)
+            .unwrap_or(std::ptr::null())
+    }
+
+    fn v_ptr(&self, layer: usize) -> *const f32 {
+        self.device_layers
+            .get(layer)
+            .map(|l| l.v.cast::<f32>() as *const f32)
+            .unwrap_or(std::ptr::null())
+    }
+
     pub fn rewind_to(&mut self, tokens: usize, kv_dim: usize) {
         for layer in &mut self.layers {
             let keep = tokens * kv_dim;
             layer.k.truncate(keep);
             layer.v.truncate(keep);
         }
+        self.tokens = tokens;
     }
 }
 

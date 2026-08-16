@@ -126,6 +126,7 @@ impl DraftModelProvider {
         ctx: &[u32],
         max_tokens: usize,
         temperature: f32,
+        cache: &mut DenseKv,
         hip: Option<&HipWorkspace>,
         resident: Option<&ResidentModel>,
         metrics: Option<&Metrics>,
@@ -133,14 +134,14 @@ impl DraftModelProvider {
         if ctx.is_empty() {
             return Ok(Vec::new());
         }
-        let mut cache = DenseKv::default();
+        cache.reset();
         let vocab = self.model.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         for (pos, tok) in ctx.iter().enumerate() {
             self.model.forward_dense_on(
                 *tok,
                 pos,
-                &mut cache,
+                cache,
                 &mut logits,
                 hip,
                 resident,
@@ -168,7 +169,7 @@ impl DraftModelProvider {
             self.model.forward_dense_on(
                 next,
                 window.len() - 1,
-                &mut cache,
+                cache,
                 &mut logits,
                 hip,
                 resident,
@@ -192,7 +193,8 @@ impl DraftProvider for DraftModelProvider {
         max_tokens: usize,
         temperature: f32,
     ) -> Result<Vec<u32>, AllpacaError> {
-        self.propose_on(ctx, max_tokens, temperature, None, None, None)
+        let mut cache = DenseKv::default();
+        self.propose_on(ctx, max_tokens, temperature, &mut cache, None, None, None)
     }
 }
 

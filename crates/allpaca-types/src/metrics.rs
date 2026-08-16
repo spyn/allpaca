@@ -55,7 +55,10 @@ pub struct StatsSnapshot {
     /// Cumulative H2D bytes of weight tensors. Grows at load only, not decode GEMM.
     pub weight_h2d_bytes: u64,
     /// KV page bytes currently in `hipMalloc` (0 when pages are host Vecs).
+    /// Includes draft DenseKv pages when they are device-resident.
     pub kv_bytes_on_device: u64,
+    /// Draft DenseKv bytes in `hipMalloc` on the draft device (0 on 1 GPU / CPU).
+    pub draft_kv_bytes_on_device: u64,
     /// HIP RoPE / RMSNorm / SiLU launches (0 on the CPU fallback path).
     pub elementwise_gpu_ops: u64,
     /// HIP residual-add launches (0 on the CPU fallback path).

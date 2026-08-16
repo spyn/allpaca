@@ -30,6 +30,7 @@ pub struct Metrics {
     pub weight_bytes_on_device: AtomicU64,
     pub weight_h2d_bytes: AtomicU64,
     pub kv_bytes_on_device: AtomicU64,
+    pub draft_kv_bytes_on_device: AtomicU64,
     pub elementwise_gpu_ops: AtomicU64,
     pub residual_gpu_ops: AtomicU64,
     pub activation_h2d_bytes: AtomicU64,
@@ -109,7 +110,9 @@ impl Metrics {
             device_memory_bytes: self.device_memory_bytes.load(Ordering::Relaxed),
             weight_bytes_on_device: self.weight_bytes_on_device.load(Ordering::Relaxed),
             weight_h2d_bytes: self.weight_h2d_bytes.load(Ordering::Relaxed),
-            kv_bytes_on_device: self.kv_bytes_on_device.load(Ordering::Relaxed),
+            kv_bytes_on_device: self.kv_bytes_on_device.load(Ordering::Relaxed)
+                + self.draft_kv_bytes_on_device.load(Ordering::Relaxed),
+            draft_kv_bytes_on_device: self.draft_kv_bytes_on_device.load(Ordering::Relaxed),
             elementwise_gpu_ops: self.elementwise_gpu_ops.load(Ordering::Relaxed),
             residual_gpu_ops: self.residual_gpu_ops.load(Ordering::Relaxed),
             activation_h2d_bytes: self.activation_h2d_bytes.load(Ordering::Relaxed),

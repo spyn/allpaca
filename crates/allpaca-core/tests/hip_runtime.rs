@@ -49,6 +49,7 @@ fn cpu_only_generate_reports_cpu_backend() {
     assert_eq!(stats.weight_bytes_on_device, 0);
     assert_eq!(stats.weight_h2d_bytes, 0);
     assert_eq!(stats.kv_bytes_on_device, 0);
+    assert_eq!(stats.draft_kv_bytes_on_device, 0);
     assert_eq!(stats.elementwise_gpu_ops, 0);
     assert_eq!(stats.residual_gpu_ops, 0);
     assert_eq!(stats.activation_h2d_bytes, 0);
@@ -412,6 +413,84 @@ fn hip_speculative_synthetic() -> Config {
     cfg.features.ngram_speculation = Some(false);
     cfg.features.tree_speculation = Some(false);
     cfg
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn speculative_generate_keeps_draft_kv_on_draft_device() {
+    let engine = Engine::new(hip_speculative_synthetic()).unwrap();
+    if hip_gpus(&engine).len() < 2 {
+        return;
+    }
+    let out = engine.generate("hello", greedy(8)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.draft_kv_bytes_on_device > 0,
+        "draft DenseKv must be hipMalloc on the draft device; stats={stats:?}"
+    );
+    assert!(
+        stats.kv_bytes_on_device >= stats.draft_kv_bytes_on_device,
+        "kv_bytes_on_device must include draft pages; stats={stats:?}"
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn speculative_generate_draft_decode_does_not_h2d_activations() {
+    let engine = Engine::new(hip_speculative_synthetic()).unwrap();
+    if hip_gpus(&engine).len() < 2 {
+        return;
+    }
+    let after_load = engine.stats();
+    let out = engine.generate("hello", greedy(8)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let after = engine.stats();
+    assert_eq!(
+        after.activation_h2d_bytes, after_load.activation_h2d_bytes,
+        "draft decode must stay on device; activation_h2d grew {} -> {}; stats={after:?}",
+        after_load.activation_h2d_bytes, after.activation_h2d_bytes
+    );
+    assert!(
+        after.draft_tokens_copied > 0,
+        "draft token ids may still host-stage; stats={after:?}"
+    );
+    assert_eq!(after.weight_bytes_migrated, 0);
+    assert!(after.draft_gpu_forwards > 0 && after.target_gpu_forwards > 0);
+}
+
+#[test]
+fn cpu_only_speculative_draft_kv_stays_on_host() {
+    let mut cfg = cpu_only_synthetic();
+    cfg.speculative.enabled = true;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    let engine = Engine::new(cfg).unwrap();
+    let out = engine.generate("hello", greedy(8)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cpu");
+    assert_eq!(stats.draft_kv_bytes_on_device, 0);
+    assert_eq!(stats.kv_bytes_on_device, 0);
+    assert_eq!(stats.activation_h2d_bytes, 0);
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn one_gpu_speculative_draft_kv_stays_on_host() {
+    let engine = Engine::new(hip_speculative_synthetic()).unwrap();
+    let gpus = hip_gpus(&engine);
+    if gpus.len() != 1 {
+        return;
+    }
+    let out = engine.generate("hello", greedy(8)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.draft_device < 0,
+        "one GPU must fall back to host draft; stats={stats:?}"
+    );
+    assert_eq!(stats.draft_kv_bytes_on_device, 0);
 }
 
 #[cfg(feature = "hip")]
