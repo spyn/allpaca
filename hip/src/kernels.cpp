@@ -294,70 +294,158 @@ __global__ void gemm_nt_tiled_kernel(const float *a, const float *b, float *c, i
     }
 }
 
-__global__ void attention_kernel(const float *q, const float *k, const float *v, float *out,
-                                 int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
-                                 int causal) {
-    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    const int total = n_q * n_heads;
-    if (idx >= total) {
+__device__ float warp_sum32(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_down(v, off, 32);
+    }
+    return __shfl(v, 0, 32);
+}
+
+/* Decode/prefill: one warp per (query, head). Online softmax, coalesced KV. */
+__global__ void attention_flash_kernel(const float *q, const float *k, const float *v, float *out,
+                                       int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
+                                       int causal) {
+    const int qi = static_cast<int>(blockIdx.x);
+    const int h = static_cast<int>(blockIdx.y);
+    if (qi >= n_q || h >= n_heads) {
         return;
     }
-    const int qi = idx / n_heads;
-    const int h = idx % n_heads;
+    const int lane = static_cast<int>(threadIdx.x);
     const int reps = n_heads / n_kv_heads;
     const int kv_h = h / reps;
     const float scale = rsqrtf(static_cast<float>(head_dim));
-    const float *qh = q + (qi * n_heads + h) * head_dim;
+    const int t_max = causal ? qi + (n_kv > n_q ? n_kv - n_q : 0) : n_kv - 1;
+    const float *qh = q + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
+    float *oh = out + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
 
-    float max_s = -1.0e30f;
-    for (int t = 0; t < n_kv; ++t) {
-        if (causal && t > qi + (n_kv - n_q > 0 ? n_kv - n_q : 0)) {
-            continue;
-        }
-        const float *kh = k + (t * n_kv_heads + kv_h) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            dot += qh[d] * kh[d];
-        }
-        const float s = dot * scale;
-        if (s > max_s) {
-            max_s = s;
-        }
+    constexpr int MAX_DPT = 16;
+    float qreg[MAX_DPT];
+    float acc[MAX_DPT];
+#pragma unroll
+    for (int i = 0; i < MAX_DPT; ++i) {
+        qreg[i] = 0.0f;
+        acc[i] = 0.0f;
     }
 
-    float sum = 0.0f;
-    for (int t = 0; t < n_kv; ++t) {
-        if (causal && t > qi + (n_kv - n_q > 0 ? n_kv - n_q : 0)) {
-            continue;
+    const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
+                      (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
+    const int nvec = vec4 ? head_dim / 4 : head_dim;
+    if (vec4) {
+        int nd = 0;
+        for (int v = lane; v < nvec && nd + 3 < MAX_DPT; v += 32) {
+            const float4 qv = *reinterpret_cast<const float4 *>(qh + v * 4);
+            qreg[nd] = qv.x;
+            qreg[nd + 1] = qv.y;
+            qreg[nd + 2] = qv.z;
+            qreg[nd + 3] = qv.w;
+            nd += 4;
         }
-        const float *kh = k + (t * n_kv_heads + kv_h) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            dot += qh[d] * kh[d];
+    } else {
+        int nd = 0;
+        for (int d = lane; d < head_dim && nd < MAX_DPT; d += 32) {
+            qreg[nd++] = qh[d];
         }
-        sum += expf(dot * scale - max_s);
-    }
-    if (sum == 0.0f) {
-        sum = 1.0f;
     }
 
-    float *oh = out + (qi * n_heads + h) * head_dim;
-    for (int d = 0; d < head_dim; ++d) {
-        oh[d] = 0.0f;
-    }
+    float m = -1.0e30f;
+    float l = 0.0f;
+
     for (int t = 0; t < n_kv; ++t) {
-        if (causal && t > qi + (n_kv - n_q > 0 ? n_kv - n_q : 0)) {
-            continue;
+        const bool valid = t <= t_max;
+        const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+        const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+        float partial = 0.0f;
+        if (vec4) {
+            int i = 0;
+            for (int vec = lane; vec < nvec && i + 3 < MAX_DPT; vec += 32) {
+                float4 kv;
+                if (valid && (reinterpret_cast<uintptr_t>(kh + vec * 4) % 16u) == 0) {
+                    kv = *reinterpret_cast<const float4 *>(kh + vec * 4);
+                } else {
+                    kv.x = (valid && vec * 4 < head_dim) ? kh[vec * 4] : 0.0f;
+                    kv.y = (valid && vec * 4 + 1 < head_dim) ? kh[vec * 4 + 1] : 0.0f;
+                    kv.z = (valid && vec * 4 + 2 < head_dim) ? kh[vec * 4 + 2] : 0.0f;
+                    kv.w = (valid && vec * 4 + 3 < head_dim) ? kh[vec * 4 + 3] : 0.0f;
+                }
+                partial += qreg[i] * kv.x + qreg[i + 1] * kv.y + qreg[i + 2] * kv.z +
+                           qreg[i + 3] * kv.w;
+                i += 4;
+            }
+        } else {
+            int i = 0;
+            for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
+                partial += qreg[i++] * (valid ? kh[d] : 0.0f);
+            }
         }
-        const float *kh = k + (t * n_kv_heads + kv_h) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            dot += qh[d] * kh[d];
+        float s = warp_sum32(partial) * scale;
+        if (!valid) {
+            s = -1.0e30f;
         }
-        const float w = expf(dot * scale - max_s) / sum;
-        const float *vh = v + (t * n_kv_heads + kv_h) * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-            oh[d] += w * vh[d];
+        const float m_new = fmaxf(m, s);
+        const float alpha = expf(m - m_new);
+        const float p = expf(s - m_new);
+        l = l * alpha + p;
+        if (vec4) {
+            int i = 0;
+            for (int vec = lane; vec < nvec && i + 3 < MAX_DPT; vec += 32) {
+                float4 vv;
+                if (valid && (reinterpret_cast<uintptr_t>(vh + vec * 4) % 16u) == 0) {
+                    vv = *reinterpret_cast<const float4 *>(vh + vec * 4);
+                } else {
+                    vv.x = (valid && vec * 4 < head_dim) ? vh[vec * 4] : 0.0f;
+                    vv.y = (valid && vec * 4 + 1 < head_dim) ? vh[vec * 4 + 1] : 0.0f;
+                    vv.z = (valid && vec * 4 + 2 < head_dim) ? vh[vec * 4 + 2] : 0.0f;
+                    vv.w = (valid && vec * 4 + 3 < head_dim) ? vh[vec * 4 + 3] : 0.0f;
+                }
+                acc[i] = acc[i] * alpha + p * vv.x;
+                acc[i + 1] = acc[i + 1] * alpha + p * vv.y;
+                acc[i + 2] = acc[i + 2] * alpha + p * vv.z;
+                acc[i + 3] = acc[i + 3] * alpha + p * vv.w;
+                i += 4;
+            }
+        } else {
+            int i = 0;
+            for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
+                acc[i] = acc[i] * alpha + p * (valid ? vh[d] : 0.0f);
+                i++;
+            }
+        }
+        m = m_new;
+    }
+
+    const float inv = (l == 0.0f) ? 0.0f : 1.0f / l;
+    if (vec4) {
+        int i = 0;
+        for (int vec = lane; vec < nvec && i + 3 < MAX_DPT; vec += 32) {
+            if (vec * 4 + 3 < head_dim && (reinterpret_cast<uintptr_t>(oh + vec * 4) % 16u) == 0) {
+                float4 o;
+                o.x = acc[i] * inv;
+                o.y = acc[i + 1] * inv;
+                o.z = acc[i + 2] * inv;
+                o.w = acc[i + 3] * inv;
+                *reinterpret_cast<float4 *>(oh + vec * 4) = o;
+            } else {
+                if (vec * 4 < head_dim) {
+                    oh[vec * 4] = acc[i] * inv;
+                }
+                if (vec * 4 + 1 < head_dim) {
+                    oh[vec * 4 + 1] = acc[i + 1] * inv;
+                }
+                if (vec * 4 + 2 < head_dim) {
+                    oh[vec * 4 + 2] = acc[i + 2] * inv;
+                }
+                if (vec * 4 + 3 < head_dim) {
+                    oh[vec * 4 + 3] = acc[i + 3] * inv;
+                }
+            }
+            i += 4;
+        }
+    } else {
+        int i = 0;
+        for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
+            oh[d] = acc[i++] * inv;
         }
     }
 }
@@ -674,11 +762,9 @@ extern "C" int allpaca_attention(const float *q, const float *k, const float *v,
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    const int total = n_q * n_heads;
-    const int threads = 64;
-    const int blocks = (total + threads - 1) / threads;
-    hipLaunchKernelGGL(attention_kernel, dim3(static_cast<unsigned>(blocks)),
-                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), q, k, v, out, n_q,
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    hipLaunchKernelGGL(attention_flash_kernel, grid, block, 0, as_stream(stream), q, k, v, out, n_q,
                        n_kv, n_heads, n_kv_heads, head_dim, causal);
     return hip_status(hipGetLastError());
 }

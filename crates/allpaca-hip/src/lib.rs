@@ -2025,4 +2025,128 @@ mod tests {
         device_free(dr, c_bytes);
         result.expect("queued device Q8 GEMV + residual must match CPU");
     }
+
+    #[cfg(feature = "hip")]
+    fn cpu_attention(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        n_q: usize,
+        n_kv: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        causal: bool,
+    ) {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let reps = n_heads / n_kv_heads;
+        let mut scores = vec![0.0f32; n_kv];
+        for qi in 0..n_q {
+            for h in 0..n_heads {
+                let kv_h = h / reps;
+                let q_off = (qi * n_heads + h) * head_dim;
+                for t in 0..n_kv {
+                    if causal && t > qi + n_kv.saturating_sub(n_q) {
+                        scores[t] = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_off = (t * n_kv_heads + kv_h) * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_off + d] * k[k_off + d];
+                    }
+                    scores[t] = dot * scale;
+                }
+                let mut max = f32::NEG_INFINITY;
+                for s in &scores {
+                    if *s > max {
+                        max = *s;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                if sum == 0.0 {
+                    sum = 1.0;
+                }
+                let o_off = q_off;
+                for d in 0..head_dim {
+                    out[o_off + d] = 0.0;
+                }
+                for t in 0..n_kv {
+                    let w = scores[t] / sum;
+                    let v_off = (t * n_kv_heads + kv_h) * head_dim;
+                    for d in 0..head_dim {
+                        out[o_off + d] += w * v[v_off + d];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Public `attention` must match CPU causal / GQA softmax on decode and short prefill.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn attention_matches_cpu_on_decode_and_prefill() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (1, 1, 1, 1, 2, true),
+            (1, 8, 4, 1, 4, true),
+            (1, 16, 2, 2, 8, true),
+            (1, 32, 4, 2, 16, true),
+            (1, 8, 1, 1, 128, true),
+            (4, 4, 2, 2, 4, true),
+            (3, 8, 4, 1, 8, true),
+            (2, 2, 1, 1, 4, false),
+        ];
+        for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
+            shapes.iter().copied().enumerate()
+        {
+            let qn = n_q * n_heads * head_dim;
+            let kn = n_kv * n_kv_heads * head_dim;
+            let mut q = vec![0.0f32; qn];
+            let mut k = vec![0.0f32; kn];
+            let mut v = vec![0.0f32; kn];
+            for (i, x) in q.iter_mut().enumerate() {
+                *x = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, x) in k.iter_mut().enumerate() {
+                *x = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = ((i * 11 + si * 5) % 50) as f32 * 0.02 - 0.5;
+            }
+            let mut cpu = vec![0.0f32; qn];
+            let mut hip = vec![0.0f32; qn];
+            cpu_attention(
+                &q, &k, &v, &mut cpu, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            );
+            attention(
+                &q,
+                &k,
+                &v,
+                &mut hip,
+                n_q as i32,
+                n_kv as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
+                head_dim as i32,
+                causal,
+            )
+            .expect("HIP attention must run when a device is present");
+            for i in 0..qn {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "attention mismatch n_q={n_q} n_kv={n_kv} heads={n_heads}/{n_kv_heads} d={head_dim} causal={causal} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
 }
