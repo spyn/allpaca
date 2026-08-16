@@ -52,7 +52,7 @@
 | **Request** | A generation task with its own KV cache (`KvHandle` / KV Pages) and decode state. Multiple Requests can be active up to `engine.max_active_requests` (compiled default 1). A saturated scheduler returns Transient `RequestBusy` backpressure. |
 | **Telemetry** | Internal metrics (TTFT, ITL, acceptance rate, page migrations) stored in memory, exposed via `/stats` JSON endpoint. Uses `tracing` crate for structured logs. Prometheus/OpenTelemetry export is post-MVP. |
 | **Multimodal** | Vision/audio encoder support. Post-MVP; deferred until text-only asymmetric scheduling is proven. |
-| **Transfer Path** | The mechanism for moving tensors between devices. Engine benchmarks P2P and host-staged paths at boot, picks faster one transparently. Host staging (GPU→DRAM→GPU) is fallback when P2P unavailable or slower. |
+| **Transfer Path** | The mechanism for moving tensors between devices. At boot the engine queries `hipDeviceCanAccessPeer`, enables both directions (`hipDeviceEnablePeerAccess`), re-queries, then benchmarks that enable+peer-copy against host staging (GPU→DRAM→GPU). `P2p` is chosen only when enable+copy succeed and measured P2P is not slower than host staging by more than 10% (`P2P_MAX_SLOWER_FRACTION`). Host staging is the fallback when P2P is unavailable or slower. Never assume P2P is faster. |
 | **Configuration** | Engine settings loaded from TOML file, overridable by CLI flags. Compiled defaults for unspecified values. No env vars or runtime API in MVP. |
 
 ## Crate Structure

@@ -45,6 +45,24 @@ fn cpu_only_generate_reports_cpu_backend() {
     assert_eq!(stats.gpu_forwards, 0);
 }
 
+#[test]
+fn zero_or_one_gpu_does_not_claim_p2p() {
+    let engine = Engine::new(cpu_only_synthetic()).unwrap();
+    let stats = engine.stats();
+    assert!(!stats.p2p_capable, "cpu_only must not claim P2P capability");
+    assert!(!stats.p2p_enabled, "cpu_only must not claim P2P enabled");
+    assert_eq!(stats.transfer_path, "HostStaging");
+    assert_eq!(stats.p2p_status, "p2p_unavailable");
+    let inv = engine.inventory();
+    assert!(
+        inv.devices.iter().all(|d| d.peers.is_empty()),
+        "0–1 GPU inventory must record no P2P peers"
+    );
+    assert!(!inv.can_p2p(0, 1));
+    assert!(!inv.p2p_capable);
+    assert!(!inv.p2p_enabled);
+}
+
 #[cfg(feature = "hip")]
 fn hip_gpus(engine: &Engine) -> Vec<&allpaca_types::DeviceInfo> {
     engine
@@ -53,6 +71,42 @@ fn hip_gpus(engine: &Engine) -> Vec<&allpaca_types::DeviceInfo> {
         .iter()
         .filter(|d| d.kind == DeviceKind::HipGpu)
         .collect()
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn inventory_records_can_p2p_after_enable() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    let gpus = hip_gpus(&engine);
+    if gpus.is_empty() {
+        return;
+    }
+    let inv = engine.inventory();
+    let stats = engine.stats();
+    for a in &gpus {
+        for b in &gpus {
+            if a.id == b.id {
+                assert!(
+                    !inv.can_p2p(a.id, b.id),
+                    "a device is not a P2P peer of itself"
+                );
+                continue;
+            }
+            assert_eq!(
+                inv.can_p2p(a.id, b.id),
+                a.peers.contains(&b.id),
+                "inventory can_p2p must match recorded peers after enable"
+            );
+        }
+    }
+    let any_pair = gpus.iter().any(|d| !d.peers.is_empty());
+    assert_eq!(stats.p2p_capable, any_pair);
+    assert_eq!(inv.p2p_capable, any_pair);
+    if gpus.len() < 2 {
+        assert!(!stats.p2p_capable);
+        assert!(!stats.p2p_enabled);
+        assert!(gpus.iter().all(|d| d.peers.is_empty()));
+    }
 }
 
 #[cfg(feature = "hip")]
@@ -90,6 +144,21 @@ fn transfer_path_is_measured_not_assumed_p2p() {
             engine.inventory().transfer_benchmark.is_some(),
             "two GPUs must record a P2P-vs-host benchmark; P2P is never assumed"
         );
+        assert!(
+            stats.host_staging_gbps > 0.0 || stats.host_staging_us > 0.0,
+            "two-GPU boot must measure host staging"
+        );
+        if stats.p2p_capable && stats.p2p_enabled && stats.p2p_gbps > 0.0 {
+            assert_eq!(stats.p2p_status, "measured");
+            assert!(stats.p2p_us > 0.0);
+        } else {
+            assert_eq!(
+                stats.p2p_status, "p2p_unavailable",
+                "failed enable+copy must not pretend P2P was measured"
+            );
+            assert_eq!(stats.p2p_gbps, 0.0);
+            assert_eq!(stats.transfer_path, "HostStaging");
+        }
     }
 }
 

@@ -38,6 +38,7 @@ mod ffi {
             bandwidth_gbps: *mut f64,
         ) -> i32;
         pub fn allpaca_hip_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
+        pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
         pub fn allpaca_hip_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_hip_host_malloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
@@ -49,7 +50,6 @@ mod ffi {
             kind: i32,
             stream: *mut c_void,
         ) -> i32;
-        #[allow(dead_code)]
         pub fn allpaca_hip_memcpy_peer(
             dst: *mut c_void,
             dst_dev: i32,
@@ -58,6 +58,7 @@ mod ffi {
             bytes: usize,
             stream: *mut c_void,
         ) -> i32;
+        #[allow(dead_code)]
         pub fn allpaca_hip_benchmark(
             src: i32,
             dst: i32,
@@ -152,7 +153,7 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
                 .into_owned();
             let mut peers = Vec::new();
             for other in 0..count {
-                if other != id && can_p2p(id, other) {
+                if other != id && probe_peer(id, other).capable {
                     peers.push(other);
                 }
             }
@@ -189,22 +190,137 @@ pub fn can_p2p(src: i32, dst: i32) -> bool {
     }
 }
 
-/// Runtime P2P vs host-staging measurement. Never assumes P2P is faster.
+/// Result of query → enable → re-query for one direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerAccess {
+    pub capable: bool,
+    pub enabled: bool,
+}
+
+/// Query, enable `src → dst`, then re-query. Policy stays in Rust.
+pub fn enable_peer_access(src: i32, dst: i32) -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_hip_enable_peer_access(src, dst) == ALLPACA_OK }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (src, dst);
+        false
+    }
+}
+
+/// Query, attempt enable, re-query. `capable` is the post-enable answer.
+pub fn probe_peer(src: i32, dst: i32) -> PeerAccess {
+    let queried = can_p2p(src, dst);
+    let enabled = enable_peer_access(src, dst);
+    let capable = can_p2p(src, dst);
+    tracing::debug!(src, dst, queried, enabled, capable, "P2P probe query-enable-requery");
+    PeerAccess { capable, enabled }
+}
+
+pub fn memcpy_peer(
+    dst: *mut u8,
+    dst_dev: i32,
+    src: *const u8,
+    src_dev: i32,
+    bytes: usize,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_hip_memcpy_peer(
+                dst.cast(),
+                dst_dev,
+                src.cast(),
+                src_dev,
+                bytes,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "memcpy_peer")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (dst, dst_dev, src, src_dev, bytes);
+        Err(AllpacaError::Degraded(DegradedError::HostStagingFallback(
+            "HIP peer copy unavailable".into(),
+        )))
+    }
+}
+
+/// Runtime enable + peer-copy vs host-staging measurement. Never assumes P2P is faster.
 pub fn benchmark_transfer(src: i32, dst: i32, bytes: u64) -> Result<BandwidthBenchmark, AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let mut p2p = 0.0f64;
-        let mut host = 0.0f64;
-        let rc = unsafe { ffi::allpaca_hip_benchmark(src, dst, bytes as usize, &mut p2p, &mut host) };
-        if rc != ALLPACA_OK {
+        use std::time::Instant;
+
+        let n = bytes as usize;
+        if n == 0 {
             return Err(AllpacaError::Degraded(DegradedError::HostStagingFallback(
-                format!("HIP transfer benchmark returned {rc}; host staging selected"),
+                "transfer benchmark bytes must be > 0".into(),
+            )));
+        }
+        let d_src = device_malloc(n, src)?;
+        let d_dst = match device_malloc(n, dst) {
+            Ok(p) => p,
+            Err(e) => {
+                device_free(d_src, n);
+                return Err(e);
+            }
+        };
+        let h_pin = match host_malloc(n) {
+            Ok(p) => p,
+            Err(e) => {
+                device_free(d_src, n);
+                device_free(d_dst, n);
+                return Err(e);
+            }
+        };
+
+        let t = Instant::now();
+        let ab = probe_peer(src, dst);
+        let ba = probe_peer(dst, src);
+        let copy_ok = ab.enabled
+            && ba.enabled
+            && ab.capable
+            && ba.capable
+            && memcpy_peer(d_dst, dst, d_src, src, n).is_ok();
+        let p2p_elapsed_us = t.elapsed().as_secs_f64() * 1.0e6;
+        let (p2p_gbps, p2p_us, p2p_copy_ok) = if copy_ok && p2p_elapsed_us > 0.0 {
+            let gbps = (bytes as f64 * 8.0 / 1.0e9) / (p2p_elapsed_us / 1.0e6);
+            (gbps, p2p_elapsed_us, true)
+        } else {
+            (0.0, 0.0, false)
+        };
+
+        let t = Instant::now();
+        let host_ok = memcpy(h_pin, d_src, n, MEMCPY_D2H).is_ok()
+            && memcpy(d_dst, h_pin, n, MEMCPY_H2D).is_ok();
+        let host_elapsed_us = t.elapsed().as_secs_f64() * 1.0e6;
+        let (host_staging_gbps, host_staging_us) = if host_ok && host_elapsed_us > 0.0 {
+            let gbps = (bytes as f64 * 8.0 / 1.0e9) / (host_elapsed_us / 1.0e6);
+            (gbps, host_elapsed_us)
+        } else {
+            (0.0, 0.0)
+        };
+
+        host_free(h_pin);
+        device_free(d_src, n);
+        device_free(d_dst, n);
+
+        if !host_ok && !p2p_copy_ok {
+            return Err(AllpacaError::Degraded(DegradedError::HostStagingFallback(
+                "HIP transfer benchmark failed for both P2P and host staging".into(),
             )));
         }
         Ok(BandwidthBenchmark {
             bytes,
-            p2p_gbps: p2p,
-            host_staging_gbps: host,
+            p2p_gbps,
+            host_staging_gbps,
+            p2p_us,
+            host_staging_us,
+            p2p_copy_ok,
         })
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -687,6 +803,9 @@ mod tests {
         if cfg!(not(feature = "hip")) {
             assert!(enumerate_devices().is_empty());
             assert!(!can_p2p(0, 1));
+            let access = probe_peer(0, 1);
+            assert!(!access.capable);
+            assert!(!access.enabled);
             assert_eq!(device_count(), 0);
         }
     }
