@@ -270,6 +270,23 @@ impl ResidentModel {
         }
     }
 
+    fn gemm_nt(
+        &self,
+        a: *const f32,
+        w: WeightRef,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        match w.kind {
+            WeightKind::F32 => allpaca_hip::gemm_nt_device(a, self.weights.ptr_at(w.off), c, m, n, k),
+            WeightKind::Q8_0 => {
+                allpaca_hip::gemm_nt_q8_0_device(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
+        }
+    }
+
     pub fn embed(&self) -> *const f32 {
         self.weights.ptr_at(self.embed.off)
     }
@@ -854,30 +871,9 @@ impl TinyModel {
                 cfg.eps,
             )?;
             record_elementwise(Some(metrics));
-            allpaca_hip::gemm_nt_device(
-                buf.normed,
-                resident.f32_or_dequant(hip, layer.wq)?,
-                buf.q,
-                1,
-                dim as i32,
-                dim as i32,
-            )?;
-            allpaca_hip::gemm_nt_device(
-                buf.normed,
-                resident.f32_or_dequant(hip, layer.wk)?,
-                buf.k,
-                1,
-                kv_dim as i32,
-                dim as i32,
-            )?;
-            allpaca_hip::gemm_nt_device(
-                buf.normed,
-                resident.f32_or_dequant(hip, layer.wv)?,
-                buf.v,
-                1,
-                kv_dim as i32,
-                dim as i32,
-            )?;
+            resident.gemm_nt(buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
+            resident.gemm_nt(buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
+            resident.gemm_nt(buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
             hip.rope_device(
                 buf.q,
                 cfg.n_heads as i32,
@@ -921,14 +917,7 @@ impl TinyModel {
                 head_dim as i32,
                 true,
             )?;
-            allpaca_hip::gemm_nt_device(
-                buf.attn,
-                resident.f32_or_dequant(hip, layer.wo)?,
-                buf.proj,
-                1,
-                dim as i32,
-                dim as i32,
-            )?;
+            resident.gemm_nt(buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
             hip.residual_add(buf.x, buf.proj, dim as i32)?;
             metrics
                 .residual_gpu_ops
@@ -943,17 +932,17 @@ impl TinyModel {
                 cfg.eps,
             )?;
             record_elementwise(Some(metrics));
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
                 buf.normed,
-                resident.f32_or_dequant(hip, layer.w_gate)?,
+                layer.w_gate,
                 buf.gate,
                 1,
                 cfg.ff_dim as i32,
                 dim as i32,
             )?;
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
                 buf.normed,
-                resident.f32_or_dequant(hip, layer.w_up)?,
+                layer.w_up,
                 buf.up,
                 1,
                 cfg.ff_dim as i32,
@@ -961,9 +950,9 @@ impl TinyModel {
             )?;
             hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
             record_elementwise(Some(metrics));
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
                 buf.gate,
-                resident.f32_or_dequant(hip, layer.w_down)?,
+                layer.w_down,
                 buf.proj,
                 1,
                 dim as i32,
@@ -984,9 +973,9 @@ impl TinyModel {
             cfg.eps,
         )?;
         record_elementwise(Some(metrics));
-        allpaca_hip::gemm_nt_device(
+        resident.gemm_nt(
             buf.normed,
-            resident.f32_or_dequant(hip, resident.lm_head)?,
+            resident.lm_head,
             buf.logits,
             1,
             vocab as i32,

@@ -10,6 +10,8 @@
 
 #if ALLPACA_HAS_HIP
 
+__device__ float allpaca_f16le_to_f32(const uint8_t *p);
+
 static hipStream_t as_stream(allpaca_stream_t stream) {
     return static_cast<hipStream_t>(stream);
 }
@@ -22,30 +24,251 @@ static void clear_last_error() {
     (void)hipGetLastError();
 }
 
-__global__ void gemm_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
-    const int row = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-    const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= m || col >= n) {
-        return;
+/* C[m,n] = A[m,k] * B[k,n]. Shared-memory tiles, coalesced K/N loads. */
+__global__ void gemm_tiled_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 16;
+    constexpr int TX = 16;
+    constexpr int TY = 16;
+    constexpr int TM = BM / TY;
+    constexpr int TN = BN / TX;
+
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BK][BN + 1];
+
+    const int row0 = static_cast<int>(blockIdx.y) * BM;
+    const int col0 = static_cast<int>(blockIdx.x) * BN;
+    const int tx = static_cast<int>(threadIdx.x);
+    const int ty = static_cast<int>(threadIdx.y);
+    const int tid = ty * TX + tx;
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
     }
-    float acc = 0.0f;
-    for (int p = 0; p < k; ++p) {
-        acc += a[row * k + p] * b[p * n + col];
+
+    for (int k0 = 0; k0 < k; k0 += BK) {
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * (TX * TY);
+            const int r = idx / BK;
+            const int p = idx % BK;
+            const int gr = row0 + r;
+            const int gp = k0 + p;
+            As[r][p] = (gr < m && gp < k) ? a[static_cast<size_t>(gr) * k + gp] : 0.0f;
+        }
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * (TX * TY);
+            const int p = idx / BN;
+            const int c = idx % BN;
+            const int gp = k0 + p;
+            const int gc = col0 + c;
+            Bs[p][c] = (gp < k && gc < n) ? b[static_cast<size_t>(gp) * n + gc] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int p = 0; p < BK; ++p) {
+            float av[TM];
+            float bv[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                av[i] = As[ty * TM + i][p];
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                bv[j] = Bs[p][tx * TN + j];
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += av[i] * bv[j];
+                }
+            }
+        }
+        __syncthreads();
     }
-    c[row * n + col] = acc;
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gr = row0 + ty * TM + i;
+        if (gr >= m) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int gc = col0 + tx * TN + j;
+            if (gc < n) {
+                c[static_cast<size_t>(gr) * n + gc] = acc[i][j];
+            }
+        }
+    }
 }
 
-__global__ void gemm_nt_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
-    const int row = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-    const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+/* Decode GEMV: C[m,n] = A[m,k] * B[n,k]^T with m small. One warp per output. */
+__global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
+    constexpr int WARPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * WARPS + warp;
     if (row >= m || col >= n) {
         return;
     }
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const float *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
     float acc = 0.0f;
-    for (int p = 0; p < k; ++p) {
-        acc += a[row * k + p] * b[col * k + p];
+    const int k4 = k & ~3;
+    const bool vec = k4 > 0 && (reinterpret_cast<uintptr_t>(arow) % 16u) == 0 &&
+                     (reinterpret_cast<uintptr_t>(brow) % 16u) == 0;
+    if (vec) {
+        for (int p = lane * 4; p < k4; p += 128) {
+            const float4 av = *reinterpret_cast<const float4 *>(arow + p);
+            const float4 bv = *reinterpret_cast<const float4 *>(brow + p);
+            acc += av.x * bv.x + av.y * bv.y + av.z * bv.z + av.w * bv.w;
+        }
+        for (int p = k4 + lane; p < k; p += 32) {
+            acc += arow[p] * brow[p];
+        }
+    } else {
+        for (int p = lane; p < k; p += 32) {
+            acc += arow[p] * brow[p];
+        }
     }
-    c[row * n + col] = acc;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 32);
+    }
+    if (lane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+/* Decode GEMV against GGUF Q8_0 rows: one warp per output, no F32 materialize. */
+__global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                    int k) {
+    constexpr int WARPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * WARPS + warp;
+    if (row >= m || col >= n) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 34;
+    float acc = 0.0f;
+    for (int blk = 0; blk < nblocks; ++blk) {
+        const uint8_t *bp = brow + static_cast<size_t>(blk) * 34;
+        const float d = allpaca_f16le_to_f32(bp);
+        const int idx = blk * 32 + lane;
+        if (idx < k) {
+            acc += arow[idx] * (d * static_cast<float>(static_cast<int8_t>(bp[2 + lane])));
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 32);
+    }
+    if (lane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+/* C[m,n] = A[m,k] * B[n,k]^T. Shared-memory tiles, coalesced row loads. */
+__global__ void gemm_nt_tiled_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 16;
+    constexpr int TX = 16;
+    constexpr int TY = 16;
+    constexpr int TM = BM / TY;
+    constexpr int TN = BN / TX;
+
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BN][BK + 1];
+
+    const int row0 = static_cast<int>(blockIdx.y) * BM;
+    const int col0 = static_cast<int>(blockIdx.x) * BN;
+    const int tx = static_cast<int>(threadIdx.x);
+    const int ty = static_cast<int>(threadIdx.y);
+    const int tid = ty * TX + tx;
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int k0 = 0; k0 < k; k0 += BK) {
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * (TX * TY);
+            const int r = idx / BK;
+            const int p = idx % BK;
+            const int gr = row0 + r;
+            const int gp = k0 + p;
+            As[r][p] = (gr < m && gp < k) ? a[static_cast<size_t>(gr) * k + gp] : 0.0f;
+        }
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * (TX * TY);
+            const int col = idx / BK;
+            const int p = idx % BK;
+            const int gc = col0 + col;
+            const int gp = k0 + p;
+            Bs[col][p] = (gc < n && gp < k) ? b[static_cast<size_t>(gc) * k + gp] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int p = 0; p < BK; ++p) {
+            float av[TM];
+            float bv[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                av[i] = As[ty * TM + i][p];
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                bv[j] = Bs[tx * TN + j][p];
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += av[i] * bv[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gr = row0 + ty * TM + i;
+        if (gr >= m) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int gc = col0 + tx * TN + j;
+            if (gc < n) {
+                c[static_cast<size_t>(gr) * n + gc] = acc[i][j];
+            }
+        }
+    }
 }
 
 __global__ void attention_kernel(const float *q, const float *k, const float *v, float *out,
@@ -122,9 +345,11 @@ static int launch_gemm(const float *a, const float *b, float *c, int32_t m, int3
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    constexpr int BM = 64;
+    constexpr int BN = 64;
     dim3 block(16, 16);
-    dim3 grid(static_cast<unsigned>((n + 15) / 16), static_cast<unsigned>((m + 15) / 16));
-    hipLaunchKernelGGL(gemm_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>((m + BM - 1) / BM));
+    hipLaunchKernelGGL(gemm_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
@@ -138,9 +363,36 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    dim3 block(16, 16);
-    dim3 grid(static_cast<unsigned>((n + 15) / 16), static_cast<unsigned>((m + 15) / 16));
-    hipLaunchKernelGGL(gemm_nt_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    /* Decode is always M=1; small-M prefill stays on the coalesced GEMV. */
+    if (m <= 8) {
+        constexpr int warps = 8;
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + warps - 1) / warps), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    } else {
+        constexpr int BM = 64;
+        constexpr int BN = 64;
+        dim3 block(16, 16);
+        dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>((m + BM - 1) / BM));
+        hipLaunchKernelGGL(gemm_nt_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    }
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(stream));
+}
+
+static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                               int32_t k, hipStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int warps = 8;
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((n + warps - 1) / warps), static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_q8_0_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
@@ -381,6 +633,11 @@ extern "C" int allpaca_gemm(const float *a, const float *b, float *c, int32_t m,
 extern "C" int allpaca_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n,
                                int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt(a, b, c, m, n, k, as_stream(stream));
+}
+
+extern "C" int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_q8_0(a, b, c, m, n, k, as_stream(stream));
 }
 
 extern "C" int allpaca_attention(const float *q, const float *k, const float *v, float *out,
@@ -706,6 +963,11 @@ extern "C" int allpaca_gemm(const float *, const float *, float *, int32_t, int3
 
 extern "C" int allpaca_gemm_nt(const float *, const float *, float *, int32_t, int32_t, int32_t,
                                allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q8_0(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                    int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

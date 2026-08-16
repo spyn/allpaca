@@ -354,6 +354,25 @@ fn residual_add_runs_on_hip() {
 
 #[cfg(feature = "hip")]
 #[test]
+fn hip_greedy_generate_matches_cpu_on_synthetic() {
+    let cpu = Engine::new(cpu_only_synthetic()).unwrap();
+    let hip = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        return;
+    }
+    let cpu_out = cpu.generate("hello", greedy(4)).unwrap();
+    let hip_out = hip.generate("hello", greedy(4)).unwrap();
+    assert!(!hip_out.token_ids.is_empty());
+    assert_eq!(
+        hip_out.token_ids, cpu_out.token_ids,
+        "HIP greedy tokens must match CPU; hip={:?} cpu={:?}",
+        hip_out.token_ids, cpu_out.token_ids
+    );
+    assert_eq!(hip.stats().backend, "hip");
+}
+
+#[cfg(feature = "hip")]
+#[test]
 fn generate_runs_hip_gemm_and_attention() {
     let engine = Engine::new(hip_auto_synthetic()).unwrap();
     if hip_gpus(&engine).is_empty() {
