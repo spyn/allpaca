@@ -272,6 +272,7 @@ impl ResidentModel {
 
     fn gemm_nt(
         &self,
+        hip: &HipWorkspace,
         a: *const f32,
         w: WeightRef,
         c: *mut f32,
@@ -280,9 +281,9 @@ impl ResidentModel {
         k: i32,
     ) -> Result<(), AllpacaError> {
         match w.kind {
-            WeightKind::F32 => allpaca_hip::gemm_nt_device(a, self.weights.ptr_at(w.off), c, m, n, k),
+            WeightKind::F32 => hip.gemm_nt_dev(a, self.weights.ptr_at(w.off), c, m, n, k),
             WeightKind::Q8_0 => {
-                allpaca_hip::gemm_nt_q8_0_device(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+                hip.gemm_nt_q8_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
         }
     }
@@ -861,6 +862,8 @@ impl TinyModel {
             .max(pos + 1);
         hip.bind()?;
         let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, max_kv)?;
+        hip.begin_decode_profile();
+        let result = (|| {
         match resident.embed.kind {
             WeightKind::F32 => hip.embed_gather(resident.embed(), token, buf.x, dim as i32)?,
             WeightKind::Q8_0 => hip.embed_gather_q8_0(
@@ -882,9 +885,9 @@ impl TinyModel {
                 cfg.eps,
             )?;
             record_elementwise(Some(metrics));
-            resident.gemm_nt(buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
-            resident.gemm_nt(buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
-            resident.gemm_nt(buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
+            resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
+            resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
+            resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
             hip.rope_device(
                 buf.q,
                 cfg.n_heads as i32,
@@ -928,7 +931,7 @@ impl TinyModel {
                 head_dim as i32,
                 true,
             )?;
-            resident.gemm_nt(buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
+            resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
             hip.residual_add(buf.x, buf.proj, dim as i32)?;
             metrics
                 .residual_gpu_ops
@@ -943,7 +946,7 @@ impl TinyModel {
                 cfg.eps,
             )?;
             record_elementwise(Some(metrics));
-            resident.gemm_nt(
+            resident.gemm_nt(hip, 
                 buf.normed,
                 layer.w_gate,
                 buf.gate,
@@ -951,7 +954,7 @@ impl TinyModel {
                 cfg.ff_dim as i32,
                 dim as i32,
             )?;
-            resident.gemm_nt(
+            resident.gemm_nt(hip, 
                 buf.normed,
                 layer.w_up,
                 buf.up,
@@ -961,7 +964,7 @@ impl TinyModel {
             )?;
             hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
             record_elementwise(Some(metrics));
-            resident.gemm_nt(
+            resident.gemm_nt(hip, 
                 buf.gate,
                 layer.w_down,
                 buf.proj,
@@ -984,14 +987,18 @@ impl TinyModel {
             cfg.eps,
         )?;
         record_elementwise(Some(metrics));
-        resident.gemm_nt(
-            buf.normed,
-            resident.lm_head,
-            buf.logits,
-            1,
-            vocab as i32,
-            dim as i32,
-        )?;
+        {
+            let _lm = hip.lm_head_scope();
+            resident.gemm_nt(
+                hip,
+                buf.normed,
+                resident.lm_head,
+                buf.logits,
+                1,
+                vocab as i32,
+                dim as i32,
+            )?;
+        }
         hip.publish_logits(buf.logits, &mut logits[..vocab])?;
         metrics
             .gpu_forwards
@@ -1000,6 +1007,9 @@ impl TinyModel {
             .target_gpu_forwards
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+        })();
+        hip.end_decode_profile();
+        result
     }
 
     /// Packed Token Forest verify: one target eval with an ancestry attention mask.

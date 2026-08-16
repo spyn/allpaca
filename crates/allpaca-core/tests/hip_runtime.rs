@@ -57,6 +57,19 @@ fn cpu_only_generate_reports_cpu_backend() {
 }
 
 #[test]
+fn cpu_only_decode_profile_buckets_are_zero() {
+    let engine = Engine::new(cpu_only_synthetic()).unwrap();
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.q8_gemm_us, 0.0);
+    assert_eq!(stats.attention_us, 0.0);
+    assert_eq!(stats.lm_head_us, 0.0);
+    assert_eq!(stats.other_gpu_us, 0.0);
+    assert_eq!(stats.host_us, 0.0);
+}
+
+#[test]
 fn zero_or_one_gpu_does_not_claim_p2p() {
     let engine = Engine::new(cpu_only_synthetic()).unwrap();
     let stats = engine.stats();
@@ -369,6 +382,77 @@ fn hip_greedy_generate_matches_cpu_on_synthetic() {
         hip_out.token_ids, cpu_out.token_ids
     );
     assert_eq!(hip.stats().backend, "hip");
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_reports_decode_profile_buckets() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert_eq!(
+        stats.q8_gemm_us, 0.0,
+        "synthetic F32 decode has no Q8 GEMM; q8_gemm_us={}",
+        stats.q8_gemm_us
+    );
+    assert!(
+        stats.attention_us > 0.0,
+        "HIP attention must land in attention_us; stats={stats:?}"
+    );
+    assert!(
+        stats.lm_head_us > 0.0,
+        "HIP lm_head GEMV must land in lm_head_us; stats={stats:?}"
+    );
+    assert!(
+        stats.other_gpu_us > 0.0,
+        "layer GEMM / elementwise must land in other_gpu_us; stats={stats:?}"
+    );
+    assert!(
+        stats.host_us > 0.0,
+        "logits D2H / host bookkeeping must land in host_us; stats={stats:?}"
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_decode_profile_buckets_sum_toward_itl() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    let sum = stats.q8_gemm_us
+        + stats.attention_us
+        + stats.lm_head_us
+        + stats.other_gpu_us
+        + stats.host_us;
+    assert!(
+        sum > 0.0,
+        "decode profile buckets must be non-zero on HIP; stats={stats:?}"
+    );
+    let itl_us = stats.itl_ms_ema * 1_000.0;
+    if itl_us >= 500.0 {
+        assert!(
+            sum > itl_us / 10.0 && sum < itl_us * 10.0,
+            "profile sum {sum:.1}us should be order-of-magnitude of ITL {itl_us:.1}us; stats={stats:?}"
+        );
+    } else {
+        let n = out.token_ids.len().max(1) as f64;
+        let per_tok = elapsed_us / n;
+        assert!(
+            sum > per_tok / 20.0 && sum < per_tok * 20.0,
+            "profile sum {sum:.1}us vs wall/token {per_tok:.1}us; stats={stats:?}"
+        );
+    }
 }
 
 #[cfg(feature = "hip")]
@@ -773,6 +857,20 @@ fn hip_generate_real_7b_gguf_when_path_set() {
     );
     let toks = out.token_ids.len().max(1) as f64;
     let tps = toks / elapsed.as_secs_f64().max(1e-6);
+    let profile_sum = stats.q8_gemm_us
+        + stats.attention_us
+        + stats.lm_head_us
+        + stats.other_gpu_us
+        + stats.host_us;
+    assert!(
+        stats.q8_gemm_us > 0.0,
+        "Q8_0 7B/8B decode must time Q8 GEMV; q8_gemm_us={}",
+        stats.q8_gemm_us
+    );
+    assert!(
+        stats.attention_us > 0.0 && stats.lm_head_us > 0.0,
+        "7B/8B decode must time attention and lm_head; stats={stats:?}"
+    );
     eprintln!(
         "7B HIP generate: tokens={} backend={} devices={} ttft_ms={} itl_ms={:.2} tokens/s={:.2} elapsed_ms={} text={:?}",
         out.token_ids.len(),
@@ -783,6 +881,16 @@ fn hip_generate_real_7b_gguf_when_path_set() {
         tps,
         elapsed.as_millis(),
         out.text
+    );
+    eprintln!(
+        "7B HIP decode profile us: q8_gemm={:.1} attention={:.1} lm_head={:.1} other_gpu={:.1} host={:.1} sum={:.1} itl_us={:.1}",
+        stats.q8_gemm_us,
+        stats.attention_us,
+        stats.lm_head_us,
+        stats.other_gpu_us,
+        stats.host_us,
+        profile_sum,
+        stats.itl_ms_ema * 1000.0
     );
 }
 

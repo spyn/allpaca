@@ -71,4 +71,14 @@ pub struct StatsSnapshot {
     pub activation_h2d_bytes: u64,
     /// Cumulative D2H bytes of activations. Decode should grow only by logits.
     pub activation_d2h_bytes: u64,
+    /// Last/EMA HIP decode: Q8_0 GEMM/GEMV time in microseconds (0 on cpu_only).
+    pub q8_gemm_us: f64,
+    /// Last/EMA HIP decode: attention kernel time in microseconds (0 on cpu_only).
+    pub attention_us: f64,
+    /// Last/EMA HIP decode: F32 lm_head GEMM/GEMV time in microseconds (0 on cpu_only).
+    pub lm_head_us: f64,
+    /// Last/EMA HIP decode: other GPU kernels (RoPE, RMSNorm, residual, F32 layer GEMM).
+    pub other_gpu_us: f64,
+    /// Last/EMA HIP decode: host-side time (D2H logits, bookkeeping) in microseconds.
+    pub host_us: f64,
 }

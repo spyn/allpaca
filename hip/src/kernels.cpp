@@ -734,6 +734,47 @@ extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t stream) {
     return hip_status(hipStreamSynchronize(as_stream(stream)));
 }
 
+extern "C" int allpaca_hip_event_create(void **event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    hipEvent_t ev = nullptr;
+    hipError_t err = hipEventCreateWithFlags(&ev, hipEventDefault);
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *event = ev;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_hip_event_destroy(void *event) {
+    if (!event) {
+        return ALLPACA_OK;
+    }
+    return hip_status(hipEventDestroy(static_cast<hipEvent_t>(event)));
+}
+
+extern "C" int allpaca_hip_event_record(void *event, allpaca_stream_t stream) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return hip_status(hipEventRecord(static_cast<hipEvent_t>(event), as_stream(stream)));
+}
+
+extern "C" int allpaca_hip_event_elapsed_us(void *start, void *stop, double *us) {
+    if (!start || !stop || !us) {
+        return ALLPACA_ERR_INVALID;
+    }
+    float ms = 0.0f;
+    hipError_t err = hipEventElapsedTime(&ms, static_cast<hipEvent_t>(start),
+                                         static_cast<hipEvent_t>(stop));
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *us = static_cast<double>(ms) * 1000.0;
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes) {
     if (!used_bytes) {
         return ALLPACA_ERR_INVALID;
@@ -1074,6 +1115,18 @@ extern "C" int allpaca_hip_mem_used(int32_t, uint64_t *) { return ALLPACA_ERR_NO
 extern "C" int allpaca_hip_set_device(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_event_create(void **) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
+extern "C" int allpaca_hip_event_destroy(void *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
+extern "C" int allpaca_hip_event_record(void *, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_event_elapsed_us(void *, void *, double *) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
