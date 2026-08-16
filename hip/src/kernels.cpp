@@ -113,41 +113,47 @@ __global__ void gemm_tiled_kernel(const float *a, const float *b, float *c, int 
     }
 }
 
-/* Decode GEMV: C[m,n] = A[m,k] * B[n,k]^T with m small. One warp per output. */
+/* Decode GEMV: C[m,n] = A[m,k] * B[n,k]^T. Four columns per warp (lm_head-scale n). */
 __global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
     constexpr int WARPS = 8;
+    constexpr int COLS = 4;
+    constexpr int SUB = 8;
     const int row = static_cast<int>(blockIdx.y);
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
-    const int col = static_cast<int>(blockIdx.x) * WARPS + warp;
-    if (row >= m || col >= n) {
+    const int sub = lane / SUB;
+    const int sublane = lane % SUB;
+    const int col = (static_cast<int>(blockIdx.x) * WARPS + warp) * COLS + sub;
+    if (row >= m) {
         return;
     }
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
-    const float *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
     float acc = 0.0f;
-    const int k4 = k & ~3;
-    const bool vec = k4 > 0 && (reinterpret_cast<uintptr_t>(arow) % 16u) == 0 &&
-                     (reinterpret_cast<uintptr_t>(brow) % 16u) == 0;
-    if (vec) {
-        for (int p = lane * 4; p < k4; p += 128) {
-            const float4 av = *reinterpret_cast<const float4 *>(arow + p);
-            const float4 bv = *reinterpret_cast<const float4 *>(brow + p);
-            acc += av.x * bv.x + av.y * bv.y + av.z * bv.z + av.w * bv.w;
-        }
-        for (int p = k4 + lane; p < k; p += 32) {
-            acc += arow[p] * brow[p];
-        }
-    } else {
-        for (int p = lane; p < k; p += 32) {
-            acc += arow[p] * brow[p];
+    if (col < n) {
+        const float *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+        const int k4 = k & ~3;
+        const bool vec = k4 > 0 && (reinterpret_cast<uintptr_t>(arow) % 16u) == 0 &&
+                         (reinterpret_cast<uintptr_t>(brow) % 16u) == 0;
+        if (vec) {
+            for (int p = sublane * 4; p < k4; p += SUB * 4) {
+                const float4 av = *reinterpret_cast<const float4 *>(arow + p);
+                const float4 bv = *reinterpret_cast<const float4 *>(brow + p);
+                acc += av.x * bv.x + av.y * bv.y + av.z * bv.z + av.w * bv.w;
+            }
+            for (int p = k4 + sublane; p < k; p += SUB) {
+                acc += arow[p] * brow[p];
+            }
+        } else {
+            for (int p = sublane; p < k; p += SUB) {
+                acc += arow[p] * brow[p];
+            }
         }
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down(acc, off, 32);
+    for (int off = 4; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 8);
     }
-    if (lane == 0) {
+    if (col < n && sublane == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
     }
 }
@@ -473,8 +479,11 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
     /* Decode is always M=1; small-M prefill stays on the coalesced GEMV. */
     if (m <= 8) {
         constexpr int warps = 8;
+        constexpr int cols = 4;
+        constexpr int cols_per_block = warps * cols;
         dim3 block(256);
-        dim3 grid(static_cast<unsigned>((n + warps - 1) / warps), static_cast<unsigned>(m));
+        dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
+                  static_cast<unsigned>(m));
         hipLaunchKernelGGL(gemv_nt_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     } else {
         constexpr int BM = 64;
