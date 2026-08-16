@@ -58,4 +58,10 @@ pub struct StatsSnapshot {
     pub kv_bytes_on_device: u64,
     /// HIP RoPE / RMSNorm / SiLU launches (0 on the CPU fallback path).
     pub elementwise_gpu_ops: u64,
+    /// HIP residual-add launches (0 on the CPU fallback path).
+    pub residual_gpu_ops: u64,
+    /// Cumulative H2D bytes of activations (hidden, QKV, KV gather). Not weights.
+    pub activation_h2d_bytes: u64,
+    /// Cumulative D2H bytes of activations. Decode should grow only by logits.
+    pub activation_d2h_bytes: u64,
 }

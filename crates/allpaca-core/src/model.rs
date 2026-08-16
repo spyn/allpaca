@@ -110,7 +110,6 @@ impl ResidentModel {
         self.weights.bytes()
     }
 
-    #[allow(dead_code)]
     pub fn embed(&self) -> *const f32 {
         self.weights.ptr_at(self.embed)
     }
@@ -430,6 +429,16 @@ impl TinyModel {
                 "token {token} out of vocab"
             ))));
         }
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            match self.forward_token_device(
+                token, pos, page_ids, kv, metrics, logits, hip, resident,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
+                }
+            }
+        }
         let mut x = self.embed[token as usize * dim..(token as usize + 1) * dim].to_vec();
         let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
         let mut q = vec![0.0f32; dim];
@@ -536,6 +545,196 @@ impl TinyModel {
                 .target_gpu_forwards
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        Ok(())
+    }
+
+    /// Sequential target decode with device-resident hidden state and KV.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_token_device(
+        &self,
+        token: u32,
+        pos: usize,
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        logits: &mut [f32],
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let head_dim = cfg.head_dim();
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let vocab = cfg.vocab_size;
+        if logits.len() < vocab {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "logits buffer smaller than vocab".into(),
+            )));
+        }
+        let page_tokens = page_ids
+            .first()
+            .and_then(|p| p.first())
+            .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
+            .unwrap_or(128);
+        let max_kv = page_ids
+            .iter()
+            .map(|layer| layer.len().saturating_mul(page_tokens))
+            .max()
+            .unwrap_or(pos + 1)
+            .max(pos + 1);
+        hip.bind()?;
+        let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, max_kv)?;
+        hip.embed_gather(resident.embed(), token, buf.x, dim as i32)?;
+        record_elementwise(Some(metrics));
+
+        for (layer_idx, _) in self.layers.iter().enumerate() {
+            hip.rmsnorm_device(
+                buf.x,
+                resident.attn_norm(layer_idx),
+                buf.normed,
+                dim as i32,
+                cfg.eps,
+            )?;
+            record_elementwise(Some(metrics));
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.wq(layer_idx),
+                buf.q,
+                1,
+                dim as i32,
+                dim as i32,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.wk(layer_idx),
+                buf.k,
+                1,
+                kv_dim as i32,
+                dim as i32,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.wv(layer_idx),
+                buf.v,
+                1,
+                kv_dim as i32,
+                dim as i32,
+            )?;
+            hip.rope_device(
+                buf.q,
+                cfg.n_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                cfg.rope_theta,
+            )?;
+            record_elementwise(Some(metrics));
+            hip.rope_device(
+                buf.k,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                cfg.rope_theta,
+            )?;
+            record_elementwise(Some(metrics));
+
+            let page_index = pos / page_tokens;
+            let slot = (pos % page_tokens) as u32;
+            let page_id = page_ids[layer_idx][page_index];
+            kv.write_slot_from_device(page_id, slot, cfg.n_kv_heads, head_dim, buf.k, buf.v)?;
+            kv.touch(page_id, 1.0);
+
+            let n_kv = kv.pack_kv_device(
+                &page_ids[layer_idx],
+                cfg.n_kv_heads,
+                head_dim,
+                buf.packed_k,
+                buf.packed_v,
+                buf.max_kv,
+            )?;
+            hip.attention_device(
+                buf.q,
+                buf.packed_k,
+                buf.packed_v,
+                buf.attn,
+                1,
+                n_kv as i32,
+                cfg.n_heads as i32,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                true,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.attn,
+                resident.wo(layer_idx),
+                buf.proj,
+                1,
+                dim as i32,
+                dim as i32,
+            )?;
+            hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            metrics
+                .residual_gpu_ops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            record_elementwise(Some(metrics));
+
+            hip.rmsnorm_device(
+                buf.x,
+                resident.ffn_norm(layer_idx),
+                buf.normed,
+                dim as i32,
+                cfg.eps,
+            )?;
+            record_elementwise(Some(metrics));
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.w_gate(layer_idx),
+                buf.gate,
+                1,
+                cfg.ff_dim as i32,
+                dim as i32,
+            )?;
+            allpaca_hip::gemm_nt_device(
+                buf.normed,
+                resident.w_up(layer_idx),
+                buf.up,
+                1,
+                cfg.ff_dim as i32,
+                dim as i32,
+            )?;
+            hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+            record_elementwise(Some(metrics));
+            allpaca_hip::gemm_nt_device(
+                buf.gate,
+                resident.w_down(layer_idx),
+                buf.proj,
+                1,
+                dim as i32,
+                cfg.ff_dim as i32,
+            )?;
+            hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            metrics
+                .residual_gpu_ops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            record_elementwise(Some(metrics));
+        }
+
+        hip.rmsnorm_device(buf.x, resident.norm(), buf.normed, dim as i32, cfg.eps)?;
+        record_elementwise(Some(metrics));
+        allpaca_hip::gemm_nt_device(
+            buf.normed,
+            resident.lm_head(),
+            buf.logits,
+            1,
+            vocab as i32,
+            dim as i32,
+        )?;
+        hip.publish_logits(buf.logits, &mut logits[..vocab])?;
+        metrics
+            .gpu_forwards
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .target_gpu_forwards
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
