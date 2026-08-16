@@ -2,6 +2,8 @@
 //! GPU-gated tests skip when `hipGetDeviceCount() == 0`.
 
 use allpaca_core::Engine;
+#[cfg(feature = "hip")]
+use allpaca_core::ModelConfig;
 use allpaca_types::{Config, GenerationParams};
 #[cfg(feature = "hip")]
 use allpaca_types::DeviceKind;
@@ -368,6 +370,9 @@ fn residual_add_runs_on_hip() {
 /// profile-blas 8B Q8_0 `other_gpu` EMA was ~24 ms. Fused hidden-state ops must shrink it.
 #[cfg(feature = "hip")]
 const PROFILE_BLAS_OTHER_GPU_US: f64 = 24_000.0;
+/// int-dot branch 8B Q8_0 `host_us` EMA was ~32 ms (vocab clone / ring / events).
+#[cfg(feature = "hip")]
+const INTDOT_HOST_US: f64 = 32_000.0;
 
 #[cfg(feature = "hip")]
 #[test]
@@ -408,6 +413,40 @@ fn hip_greedy_generate_matches_cpu_on_synthetic() {
         hip_out.token_ids, cpu_out.token_ids
     );
     assert_eq!(hip.stats().backend, "hip");
+}
+
+/// Unconstrained HIP generate must not pay a vocab-sized host tax (string clone /
+/// logits ring) — `host_us` stays small vs a 32k vocab.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_unconstrained_generate_host_us_not_vocab_bound() {
+    let cpu = Engine::new(cpu_only_synthetic()).unwrap();
+    let hip = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        return;
+    }
+    let mut cfg = ModelConfig::tiny();
+    cfg.vocab_size = 32_768;
+    cpu.load_synthetic(cfg.clone()).unwrap();
+    hip.load_synthetic(cfg).unwrap();
+    let cpu_out = cpu.generate("hello", greedy(4)).unwrap();
+    let hip_out = hip.generate("hello", greedy(4)).unwrap();
+    assert_eq!(
+        hip_out.token_ids, cpu_out.token_ids,
+        "HIP greedy tokens must match CPU at large vocab; hip={:?} cpu={:?}",
+        hip_out.token_ids, cpu_out.token_ids
+    );
+    let stats = hip.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(
+        stats.host_us > 0.0,
+        "host_us must stay on the public stats API; stats={stats:?}"
+    );
+    assert!(
+        stats.host_us < 8_000.0,
+        "unconstrained host_us {:.1}us must not clone a 32k vocab each token; stats={stats:?}",
+        stats.host_us
+    );
 }
 
 /// Public Engine contract for this branch: HIP generate still works and
@@ -943,6 +982,11 @@ fn hip_generate_real_7b_gguf_when_path_set() {
     assert!(
         profile_sum > itl_us * 0.8 && profile_sum < itl_us * 1.25,
         "decode profile sum {profile_sum:.1}us must explain ITL {itl_us:.1}us; stats={stats:?}"
+    );
+    assert!(
+        stats.host_us < INTDOT_HOST_US * 0.65,
+        "host_us {:.1} must drop vs int-dot ~32ms; stats={stats:?}",
+        stats.host_us
     );
     eprintln!(
         "7B HIP generate: tokens={} backend={} devices={} ttft_ms={} itl_ms={:.2} tokens/s={:.2} elapsed_ms={} text={:?}",
