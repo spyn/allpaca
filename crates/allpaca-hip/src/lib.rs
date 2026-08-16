@@ -13,6 +13,46 @@ use allpaca_types::{AllpacaError, BandwidthBenchmark, DegradedError, DeviceInfo}
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
 use allpaca_types::DeviceKind;
 
+/// GGUF Q8_0 packed block (f16 scale + 32 qs).
+pub const Q8_PACKED_BLOCK: usize = 34;
+/// Device-staged Q8_0: f32 scale at 0, qs at 4, 36-byte stride (4-byte aligned).
+pub const Q8_STAGED_BLOCK: usize = 36;
+pub const Q8_STAGED_QS: usize = 4;
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = u32::from(h & 0x3ff);
+    let bits = if exp == 0 {
+        sign
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((u32::from(exp) + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Repack GGUF 34-byte Q8_0 blocks into 36-byte device blocks with an F32 scale.
+pub fn stage_q8_0_blocks(packed: &[u8]) -> Result<Vec<u8>, AllpacaError> {
+    if packed.len() % Q8_PACKED_BLOCK != 0 {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 packed length is not a multiple of 34".into(),
+        )));
+    }
+    let n = packed.len() / Q8_PACKED_BLOCK;
+    let mut out = vec![0u8; n * Q8_STAGED_BLOCK];
+    for i in 0..n {
+        let src = i * Q8_PACKED_BLOCK;
+        let dst = i * Q8_STAGED_BLOCK;
+        let h = u16::from_le_bytes([packed[src], packed[src + 1]]);
+        out[dst..dst + 4].copy_from_slice(&f16_bits_to_f32(h).to_le_bytes());
+        out[dst + Q8_STAGED_QS..dst + Q8_STAGED_QS + 32]
+            .copy_from_slice(&packed[src + 2..src + Q8_PACKED_BLOCK]);
+    }
+    Ok(out)
+}
+
 pub const ALLPACA_OK: i32 = 0;
 pub const ALLPACA_ERR_NOT_IMPLEMENTED: i32 = 1;
 pub const ALLPACA_ERR_INVALID: i32 = 2;
@@ -108,6 +148,19 @@ mod ffi {
             n_kv_heads: i32,
             head_dim: i32,
             causal: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_attention_masked(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_q: i32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            mask: *const u8,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_copy_async(
@@ -698,24 +751,25 @@ pub fn gemm_nt_q8_0(
         let a_n = (m as usize) * (k as usize);
         let c_n = (m as usize) * (n as usize);
         let nblocks = (k as usize).div_ceil(32);
-        let b_bytes = (n as usize) * nblocks * 34;
-        if a.len() < a_n || b.len() < b_bytes || c.len() < c_n {
+        let packed_bytes = (n as usize) * nblocks * Q8_PACKED_BLOCK;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "Q8_0 GEMM buffer size mismatch".into(),
             )));
         }
+        let staged = stage_q8_0_blocks(&b[..packed_bytes])?;
         let da = device_malloc(a_n * 4, 0)?;
-        let db = device_malloc(b_bytes, 0)?;
+        let db = device_malloc(staged.len(), 0)?;
         let dc = device_malloc(c_n * 4, 0)?;
         set_device(0)?;
         let result = (|| {
             memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
-            memcpy(db, b.as_ptr(), b_bytes, MEMCPY_H2D)?;
+            memcpy(db, staged.as_ptr(), staged.len(), MEMCPY_H2D)?;
             gemm_nt_q8_0_device(da.cast(), db, dc.cast(), m, n, k)?;
             memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
         })();
         device_free(da, a_n * 4);
-        device_free(db, b_bytes);
+        device_free(db, staged.len());
         device_free(dc, c_n * 4);
         result
     }
@@ -1704,6 +1758,170 @@ impl HipWorkspace {
             )))
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_device_masked(
+        &self,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mask: *const u8,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || k.is_null() || v.is_null() || out.is_null() || mask.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device masked attention".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_attention_masked(
+                    q,
+                    k,
+                    v,
+                    out,
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    mask,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "attention_masked")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (n_q, n_kv, n_heads, n_kv_heads, head_dim);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP attention_masked unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_masked(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mask: &[u8],
+    ) -> Result<(), AllpacaError> {
+        let mask_n = (n_q as usize).saturating_mul(n_kv as usize);
+        if mask.len() < mask_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention mask size mismatch".into(),
+            )));
+        }
+        let mask_bytes = mask_n;
+        let need = q.len() * 4 + k.len() * 4 + v.len() * 4 + out.len() * 4 + mask_bytes;
+        if need > self.scratch_bytes {
+            let dq = device_malloc(q.len() * 4, self.device)?;
+            let dk = match device_malloc(k.len() * 4, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    return Err(e);
+                }
+            };
+            let dv = match device_malloc(v.len() * 4, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    device_free(dk, k.len() * 4);
+                    return Err(e);
+                }
+            };
+            let dout = match device_malloc(out.len() * 4, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    device_free(dk, k.len() * 4);
+                    device_free(dv, v.len() * 4);
+                    return Err(e);
+                }
+            };
+            let dm = match device_malloc(mask_bytes, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    device_free(dk, k.len() * 4);
+                    device_free(dv, v.len() * 4);
+                    device_free(dout, out.len() * 4);
+                    return Err(e);
+                }
+            };
+            let result = (|| {
+                self.bind()?;
+                memcpy(dq, q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
+                memcpy(dk, k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
+                memcpy(dv, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+                memcpy(dm, mask.as_ptr(), mask_bytes, MEMCPY_H2D)?;
+                self.add_h2d(q.len() * 4 + k.len() * 4 + v.len() * 4 + mask_bytes);
+                self.attention_device_masked(
+                    dq.cast(),
+                    dk.cast(),
+                    dv.cast(),
+                    dout.cast(),
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    dm,
+                )?;
+                memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)?;
+                self.add_d2h(out.len() * 4);
+                Ok(())
+            })();
+            device_free(dq, q.len() * 4);
+            device_free(dk, k.len() * 4);
+            device_free(dv, v.len() * 4);
+            device_free(dout, out.len() * 4);
+            device_free(dm, mask_bytes);
+            return result;
+        }
+        self.bind()?;
+        let dq = self.scratch;
+        let dk = unsafe { self.scratch.add(q.len() * 4) };
+        let dv = unsafe { self.scratch.add((q.len() + k.len()) * 4) };
+        let dout = unsafe { self.scratch.add((q.len() + k.len() + v.len()) * 4) };
+        let dm = unsafe { self.scratch.add((q.len() + k.len() + v.len() + out.len()) * 4) };
+        memcpy(dq, q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
+        memcpy(dk, k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
+        memcpy(dv, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+        memcpy(dm, mask.as_ptr(), mask_bytes, MEMCPY_H2D)?;
+        self.add_h2d(q.len() * 4 + k.len() * 4 + v.len() * 4 + mask_bytes);
+        self.attention_device_masked(
+            dq.cast(),
+            dk.cast(),
+            dv.cast(),
+            dout.cast(),
+            n_q,
+            n_kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            dm,
+        )?;
+        memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)?;
+        self.add_d2h(out.len() * 4);
+        Ok(())
+    }
 }
 
 impl Drop for HipWorkspace {
@@ -1726,6 +1944,21 @@ impl Drop for HipWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_q8_0_blocks_keeps_scale_and_qs() {
+        let mut packed = vec![0u8; Q8_PACKED_BLOCK];
+        packed[0] = 0x00;
+        packed[1] = 0x3c; // f16 1.0
+        packed[2] = 5u8;
+        packed[33] = 0xfb; // -5 as i8
+        let staged = stage_q8_0_blocks(&packed).unwrap();
+        assert_eq!(staged.len(), Q8_STAGED_BLOCK);
+        let scale = f32::from_le_bytes(staged[0..4].try_into().unwrap());
+        assert!((scale - 1.0).abs() < 1e-3, "staged scale {scale}");
+        assert_eq!(staged[Q8_STAGED_QS], 5);
+        assert_eq!(staged[Q8_STAGED_QS + 31], 0xfb);
+    }
 
     #[test]
     fn default_build_has_no_hip_devices() {
@@ -1787,6 +2020,8 @@ mod tests {
             (3, 65, 17),
             (16, 64, 32),
             (32, 32, 32),
+            (1, 129, 33),
+            (1, 1024, 64),
         ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let mut a = vec![0.0f32; m * k];
@@ -1956,14 +2191,15 @@ mod tests {
         for (i, v) in residual.iter_mut().enumerate() {
             *v = (i as f32) * 0.1 - 0.3;
         }
-        let mut b_q8 = Vec::new();
+        let mut b_q8_packed = Vec::new();
         for row in 0..n {
-            b_q8.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
+            b_q8_packed.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
         }
+        let b_q8 = stage_q8_0_blocks(&b_q8_packed).expect("stage q8");
         let mut b_deq = vec![0.0f32; n * k];
         let nblocks = k.div_ceil(32);
         for row in 0..n {
-            let blk = &b_q8[row * nblocks * 34..(row + 1) * nblocks * 34];
+            let blk = &b_q8_packed[row * nblocks * 34..(row + 1) * nblocks * 34];
             for bi in 0..nblocks {
                 let off = bi * 34;
                 let h = u16::from_le_bytes([blk[off], blk[off + 1]]);
@@ -2024,5 +2260,129 @@ mod tests {
         device_free(dc, c_bytes);
         device_free(dr, c_bytes);
         result.expect("queued device Q8 GEMV + residual must match CPU");
+    }
+
+    #[cfg(feature = "hip")]
+    fn cpu_attention(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        n_q: usize,
+        n_kv: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        causal: bool,
+    ) {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let reps = n_heads / n_kv_heads;
+        let mut scores = vec![0.0f32; n_kv];
+        for qi in 0..n_q {
+            for h in 0..n_heads {
+                let kv_h = h / reps;
+                let q_off = (qi * n_heads + h) * head_dim;
+                for t in 0..n_kv {
+                    if causal && t > qi + n_kv.saturating_sub(n_q) {
+                        scores[t] = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_off = (t * n_kv_heads + kv_h) * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_off + d] * k[k_off + d];
+                    }
+                    scores[t] = dot * scale;
+                }
+                let mut max = f32::NEG_INFINITY;
+                for s in &scores {
+                    if *s > max {
+                        max = *s;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                if sum == 0.0 {
+                    sum = 1.0;
+                }
+                let o_off = q_off;
+                for d in 0..head_dim {
+                    out[o_off + d] = 0.0;
+                }
+                for t in 0..n_kv {
+                    let w = scores[t] / sum;
+                    let v_off = (t * n_kv_heads + kv_h) * head_dim;
+                    for d in 0..head_dim {
+                        out[o_off + d] += w * v[v_off + d];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Public `attention` must match CPU causal / GQA softmax on decode and short prefill.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn attention_matches_cpu_on_decode_and_prefill() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (1, 1, 1, 1, 2, true),
+            (1, 8, 4, 1, 4, true),
+            (1, 16, 2, 2, 8, true),
+            (1, 32, 4, 2, 16, true),
+            (1, 8, 1, 1, 128, true),
+            (4, 4, 2, 2, 4, true),
+            (3, 8, 4, 1, 8, true),
+            (2, 2, 1, 1, 4, false),
+        ];
+        for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
+            shapes.iter().copied().enumerate()
+        {
+            let qn = n_q * n_heads * head_dim;
+            let kn = n_kv * n_kv_heads * head_dim;
+            let mut q = vec![0.0f32; qn];
+            let mut k = vec![0.0f32; kn];
+            let mut v = vec![0.0f32; kn];
+            for (i, x) in q.iter_mut().enumerate() {
+                *x = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, x) in k.iter_mut().enumerate() {
+                *x = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = ((i * 11 + si * 5) % 50) as f32 * 0.02 - 0.5;
+            }
+            let mut cpu = vec![0.0f32; qn];
+            let mut hip = vec![0.0f32; qn];
+            cpu_attention(
+                &q, &k, &v, &mut cpu, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            );
+            attention(
+                &q,
+                &k,
+                &v,
+                &mut hip,
+                n_q as i32,
+                n_kv as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
+                head_dim as i32,
+                causal,
+            )
+            .expect("HIP attention must run when a device is present");
+            for i in 0..qn {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "attention mismatch n_q={n_q} n_kv={n_kv} heads={n_heads}/{n_kv_heads} d={head_dim} causal={causal} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
     }
 }

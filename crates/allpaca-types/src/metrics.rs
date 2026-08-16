@@ -20,6 +20,8 @@ pub struct StatsSnapshot {
     pub requests_total: u64,
     pub active_requests: u64,
     pub prompt_tokens: u64,
+    /// Prompt prefill chunks completed (`prefill.chunk_tokens` each).
+    pub prefill_chunks: u64,
     pub tokens_generated: u64,
     pub draft_proposed: u64,
     pub draft_accepted: u64,
@@ -33,6 +35,8 @@ pub struct StatsSnapshot {
     pub tree_nodes: u64,
     pub tree_accepted_path_len: u64,
     pub tree_path_valid: bool,
+    /// Packed Token Forest attention launches that ran the ancestry mask on HIP.
+    pub tree_gpu_verifies: u64,
     pub accepted_tokens_per_target_eval: f64,
     pub model_id: String,
     /// `"cpu"` or `"hip"` — which kernel backend ran target forwards.

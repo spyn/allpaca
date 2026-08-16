@@ -425,6 +425,45 @@ fn asymmetric_placement_uses_distinct_devices_when_two_gpus() {
 }
 
 #[cfg(feature = "hip")]
+#[test]
+fn hip_tree_packed_verify_uses_device_mask_and_matches_linear() {
+    let mut linear = hip_auto_synthetic();
+    linear.speculative.enabled = true;
+    linear.features.ngram_speculation = Some(true);
+    linear.features.draft_model_speculation = Some(true);
+    linear.features.tree_speculation = Some(false);
+    linear.speculative.tree.enabled = false;
+    let mut tree = linear.clone();
+    tree.speculative.tree.enabled = true;
+    tree.speculative.tree.max_nodes = 16;
+    tree.features.tree_speculation = Some(true);
+    let linear_e = Engine::new(linear).unwrap();
+    let tree_e = Engine::new(tree).unwrap();
+    if hip_gpus(&tree_e).is_empty() {
+        return;
+    }
+    let params = greedy(8);
+    let base = linear_e.generate("hello", params.clone()).unwrap();
+    let forest = tree_e.generate("hello", params).unwrap();
+    assert_eq!(
+        forest.token_ids, base.token_ids,
+        "packed tree verify must match linear greedy; tree={:?} linear={:?}",
+        forest.token_ids, base.token_ids
+    );
+    let stats = tree_e.stats();
+    assert!(
+        stats.tree_nodes > 0,
+        "tree Feature Flag must build a Token Forest; stats={stats:?}"
+    );
+    assert!(
+        stats.tree_gpu_verifies > 0,
+        "ancestry mask must run on the target GPU; stats={stats:?}"
+    );
+    assert!(stats.tree_path_valid);
+    assert_eq!(linear_e.stats().tree_gpu_verifies, 0);
+}
+
+#[cfg(feature = "hip")]
 fn hip_speculative_synthetic() -> Config {
     let mut cfg = hip_auto_synthetic();
     cfg.speculative.enabled = true;
@@ -624,10 +663,31 @@ fn gated_7b_gguf() -> Option<std::path::PathBuf> {
 
 #[cfg(feature = "hip")]
 fn gated_draft_gguf() -> Option<std::path::PathBuf> {
-    std::env::var("ALLPACA_DRAFT_GGUF")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_file())
+    if let Ok(raw) = std::env::var("ALLPACA_DRAFT_GGUF") {
+        let path = std::path::PathBuf::from(raw);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    const DISCOVERED: &[&str] = &[
+        r"E:\Models\huggingface\models--bartowski--Llama-3.2-1B-Instruct-GGUF",
+        r"E:\Models\huggingface\models--bartowski--Llama-3.2-3B-Instruct-GGUF",
+    ];
+    for root in DISCOVERED {
+        let root = std::path::Path::new(root);
+        if !root.exists() {
+            continue;
+        }
+        if let Ok(walk) = std::fs::read_dir(root) {
+            for entry in walk.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("gguf") && p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(feature = "hip")]

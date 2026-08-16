@@ -69,6 +69,11 @@ int allpaca_attention(const float *q, const float *k, const float *v, float *out
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);
 
+/* Same layout as allpaca_attention. mask is [n_q, n_kv] uint8 (nonzero = attend). */
+int allpaca_attention_masked(const float *q, const float *k, const float *v, float *out,
+                             int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                             int32_t head_dim, const uint8_t *mask, allpaca_stream_t stream);
+
 int allpaca_copy_async(void *dst, const void *src, size_t bytes, allpaca_stream_t stream);
 
 int allpaca_rmsnorm(const float *x, const float *weight, float *out, int32_t n, float eps,

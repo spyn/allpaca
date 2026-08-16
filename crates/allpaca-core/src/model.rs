@@ -386,7 +386,13 @@ fn append_gguf_tensor(
     let n = info.n_elements() as usize;
     let (bytes, kind) = match info.ggml_type {
         allpaca_gguf::GgmlType::F32 => (file.tensor_bytes(name)?.to_vec(), WeightKind::F32),
-        allpaca_gguf::GgmlType::Q8_0 => (file.tensor_bytes(name)?.to_vec(), WeightKind::Q8_0),
+        allpaca_gguf::GgmlType::Q8_0 => {
+            let packed = file.tensor_bytes(name)?;
+            let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
+            })?;
+            (staged, WeightKind::Q8_0)
+        }
         _ => {
             let f32s = file.tensor_f32(name)?;
             let mut bytes = Vec::with_capacity(f32s.len() * 4);
@@ -396,6 +402,11 @@ fn append_gguf_tensor(
             (bytes, WeightKind::F32)
         }
     };
+    if kind == WeightKind::Q8_0 && *off % allpaca_hip::Q8_STAGED_BLOCK != 0 {
+        let pad = allpaca_hip::Q8_STAGED_BLOCK - (*off % allpaca_hip::Q8_STAGED_BLOCK);
+        parts.push(vec![0u8; pad]);
+        *off += pad;
+    }
     let w = WeightRef {
         off: *off,
         n,
@@ -992,7 +1003,7 @@ impl TinyModel {
     }
 
     /// Packed Token Forest verify: one target eval with an ancestry attention mask.
-    /// HIP stays on the sequential `forward_token` path.
+    /// When `hip` is present the ancestry mask runs on the target GPU.
     pub fn forward_forest(
         &self,
         forest: &TokenForest,
@@ -1000,6 +1011,8 @@ impl TinyModel {
         kv: &KvTierManager,
         prompt_len: usize,
         node_logits: &mut [Vec<f32>],
+        hip: Option<&HipWorkspace>,
+        metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
         let n_tree = forest.nodes.len();
         if n_tree == 0 {
@@ -1084,18 +1097,45 @@ impl TinyModel {
                 }
             }
             let mut attn_out = vec![0.0f32; n_tree * dim];
-            attention_with_mask(
-                &qs,
-                &k_all,
-                &v_all,
-                &mut attn_out,
-                n_tree,
-                n_kv,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                head_dim,
-                &mask,
-            )?;
+            let mut gpu_mask = false;
+            if let Some(hip) = hip {
+                let mask_u8: Vec<u8> = mask.iter().map(|b| u8::from(*b)).collect();
+                if hip
+                    .attention_masked(
+                        &qs,
+                        &k_all,
+                        &v_all,
+                        &mut attn_out,
+                        n_tree as i32,
+                        n_kv as i32,
+                        cfg.n_heads as i32,
+                        cfg.n_kv_heads as i32,
+                        head_dim as i32,
+                        &mask_u8,
+                    )
+                    .is_ok()
+                {
+                    gpu_mask = true;
+                    if let Some(m) = metrics {
+                        m.tree_gpu_verifies
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            if !gpu_mask {
+                attention_with_mask(
+                    &qs,
+                    &k_all,
+                    &v_all,
+                    &mut attn_out,
+                    n_tree,
+                    n_kv,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    &mask,
+                )?;
+            }
             for i in 0..n_tree {
                 let mut hidden = vec![0.0f32; dim];
                 matmul_nt(

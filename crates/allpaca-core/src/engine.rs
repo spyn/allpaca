@@ -34,6 +34,7 @@ struct ActiveRequest {
     id: u64,
     tokens: Vec<u32>,
     prompt_len: usize,
+    prefill_pos: usize,
     generated: usize,
     params: GenerationParams,
     pages: Vec<Vec<u64>>,
@@ -128,6 +129,15 @@ impl Drop for RequestHandle {
 
 impl Engine {
     pub fn new(config: Config) -> Result<Self, AllpacaError> {
+        let mut config = config;
+        if config.model.draft_path.is_none() {
+            if let Ok(raw) = std::env::var("ALLPACA_DRAFT_GGUF") {
+                let p = std::path::PathBuf::from(raw);
+                if p.is_file() {
+                    config.model.draft_path = Some(p);
+                }
+            }
+        }
         config.validate()?;
         let inventory = DeviceInventory::discover(&config);
         let mut flags = FeatureFlags::from_mode(inventory.pipeline_mode);
@@ -487,6 +497,7 @@ impl Engine {
                         break reason;
                     }
                 }
+                StepResult::Prefill { .. } => {}
                 StepResult::Finished(reason) => break reason,
             }
         };
@@ -531,6 +542,7 @@ impl Engine {
                             break;
                         }
                     }
+                    Ok(StepResult::Prefill { .. }) => {}
                     Ok(StepResult::Finished(_)) => break,
                     Err(e) => {
                         yield Err(e);
@@ -585,24 +597,6 @@ impl Engine {
             tokens.len() + params.max_tokens,
             &self.metrics,
         )?;
-        let mut pending_logits = vec![0.0f32; vocab];
-        let resident = inner.target_resident.clone();
-        for (pos, tok) in tokens.iter().enumerate() {
-            // TODO: HIP prefill kernel dispatch when target_device is HIP.
-            target.forward_token(
-                *tok,
-                pos,
-                &pages,
-                &mut inner.kv,
-                &self.metrics,
-                &mut pending_logits,
-                self.hip.as_deref(),
-                resident.as_deref(),
-            )?;
-        }
-        inner.ngram.observe(&tokens);
-        let published = inner.ring.publish(&pending_logits)?;
-        inner.ring.release_current();
         let rng = rng_from_params(&params, self.config.engine.determinism_seed);
         let id = inner.next_request_id;
         inner.next_request_id += 1;
@@ -612,11 +606,12 @@ impl Engine {
             ActiveRequest {
                 id,
                 prompt_len,
+                prefill_pos: 0,
                 tokens,
                 generated: 0,
                 params,
                 pages,
-                pending_logits: published,
+                pending_logits: vec![0.0f32; vocab],
                 emit_queue: Vec::new(),
                 json_prefix: String::new(),
                 rng,
@@ -637,6 +632,9 @@ impl Engine {
             prompt_len as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // One chunk only — remaining prompt tokens continue in `step` so a
+        // second Request can admit / decode between chunks.
+        self.prefill_chunk(&mut inner, id)?;
         Ok(RequestHandle {
             id,
             inner: Arc::clone(&self.inner),
@@ -658,6 +656,15 @@ impl Engine {
             if active.generated >= active.params.max_tokens {
                 active.finished = true;
                 return Ok(StepResult::Finished(FinishReason::Length));
+            }
+        }
+        if request(&inner, id)?.prefill_pos < request(&inner, id)?.prompt_len {
+            let (done, total) = self.prefill_chunk(&mut inner, id)?;
+            if done < total {
+                return Ok(StepResult::Prefill {
+                    tokens_done: done,
+                    tokens_total: total,
+                });
             }
         }
 
@@ -813,6 +820,68 @@ impl Engine {
             })
             .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig("empty step".into())))?;
         Ok(StepResult::Token(ev))
+    }
+
+    fn prefill_chunk(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+    ) -> Result<(usize, usize), AllpacaError> {
+        let chunk = self.config.prefill.chunk_tokens.max(1);
+        let (start, total, toks, pages) = {
+            let active = request_mut(inner, id)?;
+            let start = active.prefill_pos;
+            let total = active.prompt_len;
+            if start >= total {
+                return Ok((start, total));
+            }
+            let end = (start + chunk).min(total);
+            (
+                start,
+                total,
+                active.tokens[start..end].to_vec(),
+                active.pages.clone(),
+            )
+        };
+        let target = inner
+            .target
+            .clone()
+            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let resident = inner.target_resident.clone();
+        let mut logits = {
+            let active = request_mut(inner, id)?;
+            std::mem::take(&mut active.pending_logits)
+        };
+        for (i, tok) in toks.iter().enumerate() {
+            target.forward_token(
+                *tok,
+                start + i,
+                &pages,
+                &mut inner.kv,
+                &self.metrics,
+                &mut logits,
+                self.hip.as_deref(),
+                resident.as_deref(),
+            )?;
+        }
+        let end = start + toks.len();
+        {
+            let active = request_mut(inner, id)?;
+            active.prefill_pos = end;
+            active.pending_logits = logits;
+        }
+        self.metrics
+            .prefill_chunks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if end >= total {
+            let tokens = request(inner, id)?.tokens.clone();
+            let logits = request(inner, id)?.pending_logits.clone();
+            inner.ngram.observe(&tokens);
+            let published = inner.ring.publish(&logits)?;
+            inner.ring.release_current();
+            request_mut(inner, id)?.pending_logits = published;
+        }
+        Ok((end, total))
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, EngineInner>, AllpacaError> {
@@ -1025,6 +1094,7 @@ fn verify_forest(
     hip: Option<&HipWorkspace>,
 ) -> Result<Produced, AllpacaError> {
     let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
+    let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
     if !forest.nodes.is_empty() {
         let pages = request(inner, id)?.pages.clone();
         let prompt_len = request(inner, id)?.tokens.len();
@@ -1032,10 +1102,15 @@ fn verify_forest(
             .target
             .clone()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-        let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
-        // Ancestry-masked packed verify (CPU). HIP path stays sequential.
-        target.forward_forest(forest, &pages, &inner.kv, prompt_len, &mut node_logits)?;
-        let _ = node_logits;
+        target.forward_forest(
+            forest,
+            &pages,
+            &inner.kv,
+            prompt_len,
+            &mut node_logits,
+            hip,
+            Some(metrics),
+        )?;
     }
 
     let mut produced = Vec::new();
@@ -1044,7 +1119,15 @@ fn verify_forest(
     while produced.len() < remaining {
         let (mut logits, params) = {
             let active = request(inner, id)?;
-            (active.pending_logits.clone(), active.params.clone())
+            let mut logits = active.pending_logits.clone();
+            if parent >= 0 {
+                if let Some(nl) = node_logits.get(parent as usize) {
+                    if nl.len() == logits.len() {
+                        logits.copy_from_slice(nl);
+                    }
+                }
+            }
+            (logits, active.params.clone())
         };
         let sampled = {
             let active = request_mut(inner, id)?;
@@ -1435,6 +1518,56 @@ mod tests {
         assert_eq!(engine.stats().active_requests, 2);
         drop(first);
         drop(second);
+    }
+
+    #[test]
+    fn chunked_prefill_lets_second_request_admit_and_is_observable() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.prefill.chunk_tokens = 1;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 2,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let long = "hello world hello world hello world hello world";
+        let mut first = engine.begin_request(long, params.clone()).unwrap();
+        let after_first = engine.stats();
+        assert_eq!(
+            after_first.prefill_chunks, 1,
+            "begin_request must release after one prefill chunk; stats={after_first:?}"
+        );
+        let mut second = engine
+            .begin_request("hello", params.clone())
+            .expect("second Request must admit before the first prompt finishes prefill");
+        assert_eq!(engine.stats().active_requests, 2);
+        match engine.step(&mut first).unwrap() {
+            StepResult::Prefill {
+                tokens_done,
+                tokens_total,
+            } => {
+                assert!(tokens_done < tokens_total);
+                assert!(tokens_done >= 2);
+            }
+            other => panic!("long prompt with chunk_tokens=1 must keep prefilling, got {other:?}"),
+        }
+        match engine.step(&mut second).unwrap() {
+            StepResult::Prefill { .. } | StepResult::Token(_) | StepResult::Finished(_) => {}
+        }
+        drop(first);
+        drop(second);
+        let out = engine
+            .generate(long, params)
+            .expect("generate must finish remaining prefill chunks");
+        assert!(!out.token_ids.is_empty());
+        assert!(
+            engine.stats().prefill_chunks > 1,
+            "chunked prefill must be visible on stats; stats={:?}",
+            engine.stats()
+        );
     }
 
     #[test]
@@ -2367,6 +2500,42 @@ mod tests {
             .expect("generate must work on dequantized Q4/Q8 weights");
         assert!(!out.token_ids.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_speculative_generate_from_tiny_written_draft_gguf() {
+        let target = std::env::temp_dir().join("allpaca_target_for_draft.gguf");
+        let draft = std::env::temp_dir().join("allpaca_tiny_draft.gguf");
+        write_tiny_target_gguf(&target);
+        write_tiny_target_gguf(&draft);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(target.clone());
+        cfg.model.draft_path = Some(draft.clone());
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("tiny target+draft GGUF must load");
+        assert_eq!(engine.stats().degraded_events, 0);
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("speculative generate with a written draft GGUF must run");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_file(draft);
     }
 
     #[test]
