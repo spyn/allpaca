@@ -1,5 +1,5 @@
 use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
-use allpaca_hip::HipWorkspace;
+use allpaca_hip::{DeviceWeights, HipWorkspace};
 use crate::forest::TokenForest;
 use allpaca_gguf::GgufFile;
 use allpaca_onnx::OnnxFile;
@@ -44,6 +44,119 @@ impl ModelConfig {
 
     pub fn head_dim(&self) -> usize {
         self.dim / self.n_heads
+    }
+}
+
+const TENSORS_PER_LAYER: usize = 9;
+
+#[derive(Debug, Clone, Copy)]
+struct LayerOff {
+    attn_norm: usize,
+    wq: usize,
+    wk: usize,
+    wv: usize,
+    wo: usize,
+    ffn_norm: usize,
+    w_gate: usize,
+    w_up: usize,
+    w_down: usize,
+}
+
+/// Host-layout map onto a once-uploaded [`DeviceWeights`] blob.
+pub struct ResidentModel {
+    weights: DeviceWeights,
+    embed: usize,
+    layers: Vec<LayerOff>,
+    norm: usize,
+    lm_head: usize,
+}
+
+impl ResidentModel {
+    pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
+        let slices = model.weight_slices();
+        let mut offsets = Vec::with_capacity(slices.len());
+        let mut off = 0usize;
+        for s in &slices {
+            offsets.push(off);
+            off += s.len() * 4;
+        }
+        let weights = DeviceWeights::upload(device, &slices)?;
+        let mut layers = Vec::with_capacity(model.layers.len());
+        let mut idx = 1;
+        for _ in 0..model.layers.len() {
+            layers.push(LayerOff {
+                attn_norm: offsets[idx],
+                wq: offsets[idx + 1],
+                wk: offsets[idx + 2],
+                wv: offsets[idx + 3],
+                wo: offsets[idx + 4],
+                ffn_norm: offsets[idx + 5],
+                w_gate: offsets[idx + 6],
+                w_up: offsets[idx + 7],
+                w_down: offsets[idx + 8],
+            });
+            idx += TENSORS_PER_LAYER;
+        }
+        Ok(Self {
+            weights,
+            embed: offsets[0],
+            layers,
+            norm: offsets[idx],
+            lm_head: offsets[idx + 1],
+        })
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.weights.bytes()
+    }
+
+    #[allow(dead_code)]
+    pub fn embed(&self) -> *const f32 {
+        self.weights.ptr_at(self.embed)
+    }
+
+    pub fn attn_norm(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].attn_norm)
+    }
+
+    pub fn wq(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].wq)
+    }
+
+    pub fn wk(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].wk)
+    }
+
+    pub fn wv(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].wv)
+    }
+
+    pub fn wo(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].wo)
+    }
+
+    pub fn ffn_norm(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].ffn_norm)
+    }
+
+    pub fn w_gate(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].w_gate)
+    }
+
+    pub fn w_up(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].w_up)
+    }
+
+    pub fn w_down(&self, layer: usize) -> *const f32 {
+        self.weights.ptr_at(self.layers[layer].w_down)
+    }
+
+    pub fn norm(&self) -> *const f32 {
+        self.weights.ptr_at(self.norm)
+    }
+
+    pub fn lm_head(&self) -> *const f32 {
+        self.weights.ptr_at(self.lm_head)
     }
 }
 
@@ -267,6 +380,34 @@ impl TinyModel {
         })
     }
 
+    pub fn weight_bytes(&self) -> u64 {
+        let n: usize = self
+            .weight_slices()
+            .iter()
+            .map(|t| t.len())
+            .sum();
+        (n * 4) as u64
+    }
+
+    fn weight_slices(&self) -> Vec<&[f32]> {
+        let mut v = Vec::with_capacity(2 + self.layers.len() * TENSORS_PER_LAYER);
+        v.push(self.embed.as_slice());
+        for layer in &self.layers {
+            v.push(layer.attn_norm.as_slice());
+            v.push(layer.wq.as_slice());
+            v.push(layer.wk.as_slice());
+            v.push(layer.wv.as_slice());
+            v.push(layer.wo.as_slice());
+            v.push(layer.ffn_norm.as_slice());
+            v.push(layer.w_gate.as_slice());
+            v.push(layer.w_up.as_slice());
+            v.push(layer.w_down.as_slice());
+        }
+        v.push(self.norm.as_slice());
+        v.push(self.lm_head.as_slice());
+        v
+    }
+
     /// Decode one token at `pos`, writing K/V into paged tiers. Logits written to `logits`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_token(
@@ -278,6 +419,7 @@ impl TinyModel {
         metrics: &Metrics,
         logits: &mut [f32],
         hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -297,16 +439,20 @@ impl TinyModel {
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            rmsnorm(&x, &layer.attn_norm, cfg.eps, &mut scratch[..dim])?;
-            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wq, &mut q, 1, dim, dim)?;
-            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wk, &mut k, 1, kv_dim, dim)?;
-            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wv, &mut v, 1, kv_dim, dim)?;
-            for h in 0..cfg.n_heads {
-                rope(&mut q[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
-            }
-            for h in 0..cfg.n_kv_heads {
-                rope(&mut k[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
-            }
+            rmsnorm_dispatch(
+                hip,
+                &x,
+                &layer.attn_norm,
+                resident.map(|r| r.attn_norm(layer_idx)),
+                cfg.eps,
+                &mut scratch[..dim],
+                Some(metrics),
+            )?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wq, resident.map(|r| r.wq(layer_idx)), &mut q, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wk, resident.map(|r| r.wk(layer_idx)), &mut k, 1, kv_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wv, resident.map(|r| r.wv(layer_idx)), &mut v, 1, kv_dim, dim)?;
+            rope_dispatch(hip, &mut q, cfg.n_heads, head_dim, pos, cfg.rope_theta, Some(metrics))?;
+            rope_dispatch(hip, &mut k, cfg.n_kv_heads, head_dim, pos, cfg.rope_theta, Some(metrics))?;
 
             let page_tokens = kv
                 .get(page_ids[layer_idx][0])
@@ -333,27 +479,40 @@ impl TinyModel {
                 head_dim,
                 true,
             )?;
-            gemm_nt_dispatch(hip, &attn_out, &layer.wo, &mut hidden, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &attn_out, &layer.wo, resident.map(|r| r.wo(layer_idx)), &mut hidden, 1, dim, dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
 
-            rmsnorm(&x, &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
+            rmsnorm_dispatch(
+                hip,
+                &x,
+                &layer.ffn_norm,
+                resident.map(|r| r.ffn_norm(layer_idx)),
+                cfg.eps,
+                &mut scratch[..dim],
+                Some(metrics),
+            )?;
             let mut gate = vec![0.0f32; cfg.ff_dim];
             let mut up = vec![0.0f32; cfg.ff_dim];
-            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
-            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
-            for i in 0..cfg.ff_dim {
-                gate[i] = silu(gate[i]) * up[i];
-            }
-            gemm_nt_dispatch(hip, &gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_gate, resident.map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_up, resident.map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
+            silu_mul_dispatch(hip, &mut gate, &up, Some(metrics))?;
+            gemm_nt_dispatch(hip, &gate, &layer.w_down, resident.map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
-            let _ = metrics;
         }
 
-        rmsnorm(&x, &self.norm, cfg.eps, &mut scratch[..dim])?;
+        rmsnorm_dispatch(
+            hip,
+            &x,
+            &self.norm,
+            resident.map(|r| r.norm()),
+            cfg.eps,
+            &mut scratch[..dim],
+            Some(metrics),
+        )?;
         if logits.len() < cfg.vocab_size {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
@@ -363,6 +522,7 @@ impl TinyModel {
             hip,
             &scratch[..dim],
             &self.lm_head,
+            resident.map(|r| r.lm_head()),
             &mut logits[..cfg.vocab_size],
             1,
             cfg.vocab_size,
@@ -537,10 +697,11 @@ impl TinyModel {
         cache: &mut DenseKv,
         logits: &mut [f32],
     ) -> Result<(), AllpacaError> {
-        self.forward_dense_on(token, pos, cache, logits, None, None)
+        self.forward_dense_on(token, pos, cache, logits, None, None, None)
     }
 
     /// Draft forward. GEMM/attention run on `hip` when present (resident draft GPU).
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_dense_on(
         &self,
         token: u32,
@@ -548,6 +709,7 @@ impl TinyModel {
         cache: &mut DenseKv,
         logits: &mut [f32],
         hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
         metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
@@ -563,16 +725,20 @@ impl TinyModel {
         let mut attn_out = vec![0.0f32; dim];
         let mut hidden = vec![0.0f32; dim];
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            rmsnorm(&x, &layer.attn_norm, cfg.eps, &mut normed)?;
-            gemm_nt_dispatch(hip, &normed, &layer.wq, &mut q, 1, dim, dim)?;
-            gemm_nt_dispatch(hip, &normed, &layer.wk, &mut k, 1, kv_dim, dim)?;
-            gemm_nt_dispatch(hip, &normed, &layer.wv, &mut v, 1, kv_dim, dim)?;
-            for h in 0..cfg.n_heads {
-                rope(&mut q[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
-            }
-            for h in 0..cfg.n_kv_heads {
-                rope(&mut k[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
-            }
+            rmsnorm_dispatch(
+                hip,
+                &x,
+                &layer.attn_norm,
+                resident.map(|r| r.attn_norm(layer_idx)),
+                cfg.eps,
+                &mut normed,
+                metrics,
+            )?;
+            gemm_nt_dispatch(hip, &normed, &layer.wq, resident.map(|r| r.wq(layer_idx)), &mut q, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.wk, resident.map(|r| r.wk(layer_idx)), &mut k, 1, kv_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.wv, resident.map(|r| r.wv(layer_idx)), &mut v, 1, kv_dim, dim)?;
+            rope_dispatch(hip, &mut q, cfg.n_heads, head_dim, pos, cfg.rope_theta, metrics)?;
+            rope_dispatch(hip, &mut k, cfg.n_kv_heads, head_dim, pos, cfg.rope_theta, metrics)?;
             cache.layers[layer_idx].k.extend_from_slice(&k);
             cache.layers[layer_idx].v.extend_from_slice(&v);
             let n_kv = cache.layers[layer_idx].k.len() / kv_dim;
@@ -589,28 +755,43 @@ impl TinyModel {
                 head_dim,
                 true,
             )?;
-            gemm_nt_dispatch(hip, &attn_out, &layer.wo, &mut hidden, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &attn_out, &layer.wo, resident.map(|r| r.wo(layer_idx)), &mut hidden, 1, dim, dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
-            rmsnorm(&x, &layer.ffn_norm, cfg.eps, &mut normed)?;
+            rmsnorm_dispatch(
+                hip,
+                &x,
+                &layer.ffn_norm,
+                resident.map(|r| r.ffn_norm(layer_idx)),
+                cfg.eps,
+                &mut normed,
+                metrics,
+            )?;
             let mut gate = vec![0.0f32; cfg.ff_dim];
             let mut up = vec![0.0f32; cfg.ff_dim];
-            gemm_nt_dispatch(hip, &normed, &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
-            gemm_nt_dispatch(hip, &normed, &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
-            for i in 0..cfg.ff_dim {
-                gate[i] = silu(gate[i]) * up[i];
-            }
-            gemm_nt_dispatch(hip, &gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.w_gate, resident.map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.w_up, resident.map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
+            silu_mul_dispatch(hip, &mut gate, &up, metrics)?;
+            gemm_nt_dispatch(hip, &gate, &layer.w_down, resident.map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
         }
-        rmsnorm(&x, &self.norm, cfg.eps, &mut normed)?;
+        rmsnorm_dispatch(
+            hip,
+            &x,
+            &self.norm,
+            resident.map(|r| r.norm()),
+            cfg.eps,
+            &mut normed,
+            metrics,
+        )?;
         gemm_nt_dispatch(
             hip,
             &normed,
             &self.lm_head,
+            resident.map(|r| r.lm_head()),
             &mut logits[..cfg.vocab_size],
             1,
             cfg.vocab_size,
@@ -655,15 +836,93 @@ impl DenseKv {
     }
 }
 
+fn record_elementwise(metrics: Option<&Metrics>) {
+    if let Some(metrics) = metrics {
+        metrics
+            .elementwise_gpu_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn rmsnorm_dispatch(
+    hip: Option<&HipWorkspace>,
+    x: &[f32],
+    weight: &[f32],
+    weight_dev: Option<*const f32>,
+    eps: f32,
+    out: &mut [f32],
+    metrics: Option<&Metrics>,
+) -> Result<(), AllpacaError> {
+    if let Some(hip) = hip {
+        if hip.rmsnorm(x, weight, weight_dev, eps, out).is_ok() {
+            record_elementwise(metrics);
+            return Ok(());
+        }
+    }
+    rmsnorm(x, weight, eps, out)
+}
+
+fn rope_dispatch(
+    hip: Option<&HipWorkspace>,
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    theta: f32,
+    metrics: Option<&Metrics>,
+) -> Result<(), AllpacaError> {
+    if let Some(hip) = hip {
+        if hip
+            .rope(x, n_heads as i32, head_dim as i32, pos as i32, theta)
+            .is_ok()
+        {
+            record_elementwise(metrics);
+            return Ok(());
+        }
+    }
+    for h in 0..n_heads {
+        rope(&mut x[h * head_dim..(h + 1) * head_dim], pos, theta)?;
+    }
+    Ok(())
+}
+
+fn silu_mul_dispatch(
+    hip: Option<&HipWorkspace>,
+    gate: &mut [f32],
+    up: &[f32],
+    metrics: Option<&Metrics>,
+) -> Result<(), AllpacaError> {
+    if let Some(hip) = hip {
+        if hip.silu_mul(gate, up).is_ok() {
+            record_elementwise(metrics);
+            return Ok(());
+        }
+    }
+    for i in 0..gate.len() {
+        gate[i] = silu(gate[i]) * up[i];
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn gemm_nt_dispatch(
     hip: Option<&HipWorkspace>,
     a: &[f32],
     b: &[f32],
+    b_dev: Option<*const f32>,
     c: &mut [f32],
     rows: usize,
     n: usize,
     k: usize,
 ) -> Result<(), AllpacaError> {
+    if let (Some(hip), Some(b_dev)) = (hip, b_dev) {
+        if hip
+            .gemm_nt_dev_b(a, b_dev, c, rows as i32, n as i32, k as i32)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
     if let Some(hip) = hip {
         if hip
             .gemm_nt(a, b, c, rows as i32, n as i32, k as i32)

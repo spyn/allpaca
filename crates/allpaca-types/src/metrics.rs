@@ -50,4 +50,12 @@ pub struct StatsSnapshot {
     pub weight_bytes_migrated: u64,
     /// Bytes currently owned by `hipMalloc` (0 on the CPU path).
     pub device_memory_bytes: u64,
+    /// Model weight tensors resident on a HIP device after load (0 on CPU).
+    pub weight_bytes_on_device: u64,
+    /// Cumulative H2D bytes of weight tensors. Grows at load only, not decode GEMM.
+    pub weight_h2d_bytes: u64,
+    /// KV page bytes currently in `hipMalloc` (0 when pages are host Vecs).
+    pub kv_bytes_on_device: u64,
+    /// HIP RoPE / RMSNorm / SiLU launches (0 on the CPU fallback path).
+    pub elementwise_gpu_ops: u64,
 }

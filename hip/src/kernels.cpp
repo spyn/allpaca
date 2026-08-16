@@ -396,6 +396,97 @@ extern "C" int allpaca_attention(const float *q, const float *k, const float *v,
     return hip_status(hipStreamSynchronize(as_stream(stream)));
 }
 
+__global__ void rmsnorm_kernel(const float *x, const float *weight, float *out, int n, float eps) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        ss += x[i] * x[i];
+    }
+    const float inv = rsqrtf(ss / static_cast<float>(n) + eps);
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx < n) {
+        out[idx] = x[idx] * inv * weight[idx];
+    }
+}
+
+__global__ void rope_kernel(float *x, int n_heads, int head_dim, int pos, float theta) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = head_dim / 2;
+    const int total = n_heads * half;
+    if (idx >= total || head_dim % 2 != 0) {
+        return;
+    }
+    const int h = idx / half;
+    const int i = idx % half;
+    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    const float angle = static_cast<float>(pos) * freq;
+    const float s = sinf(angle);
+    const float c = cosf(angle);
+    float *hvec = x + h * head_dim;
+    const float a = hvec[2 * i];
+    const float b = hvec[2 * i + 1];
+    hvec[2 * i] = a * c - b * s;
+    hvec[2 * i + 1] = a * s + b * c;
+}
+
+__global__ void silu_mul_kernel(float *gate, const float *up, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    const float g = gate[idx];
+    gate[idx] = (g / (1.0f + expf(-g))) * up[idx];
+}
+
+extern "C" int allpaca_rmsnorm(const float *x, const float *weight, float *out, int32_t n, float eps,
+                               allpaca_stream_t stream) {
+    if (!x || !weight || !out || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int threads = 64;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(rmsnorm_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, weight, out, n,
+                       eps);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
+extern "C" int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
+                            allpaca_stream_t stream) {
+    if (!x || n_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int total = n_heads * (head_dim / 2);
+    const int threads = 64;
+    const int blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(rope_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n_heads,
+                       head_dim, pos, theta);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
+extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream) {
+    if (!gate || !up || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int threads = 64;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(silu_mul_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
 extern "C" int allpaca_copy_async(void *dst, const void *src, size_t bytes,
                                   allpaca_stream_t stream) {
     if (!dst || !src) {
@@ -473,6 +564,19 @@ extern "C" int allpaca_attention(const float *, const float *, const float *, fl
 }
 
 extern "C" int allpaca_copy_async(void *, const void *, size_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rmsnorm(const float *, const float *, float *, int32_t, float,
+                               allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rope(float *, int32_t, int32_t, int32_t, float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_silu_mul(float *, const float *, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

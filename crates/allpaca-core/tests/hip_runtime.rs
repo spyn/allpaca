@@ -46,6 +46,10 @@ fn cpu_only_generate_reports_cpu_backend() {
     assert_eq!(stats.target_gpu_forwards, 0);
     assert_eq!(stats.draft_gpu_forwards, 0);
     assert_eq!(stats.weight_bytes_migrated, 0);
+    assert_eq!(stats.weight_bytes_on_device, 0);
+    assert_eq!(stats.weight_h2d_bytes, 0);
+    assert_eq!(stats.kv_bytes_on_device, 0);
+    assert_eq!(stats.elementwise_gpu_ops, 0);
 }
 
 #[test]
@@ -167,19 +171,73 @@ fn transfer_path_is_measured_not_assumed_p2p() {
 
 #[cfg(feature = "hip")]
 #[test]
+fn hip_load_residents_weights_on_device() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let stats = engine.stats();
+    assert!(
+        stats.weight_bytes_on_device > 0,
+        "HIP load must upload weights once; weight_bytes_on_device={}",
+        stats.weight_bytes_on_device
+    );
+    assert!(
+        stats.device_memory_bytes >= stats.weight_bytes_on_device,
+        "device_memory_bytes must include resident weights, not just 8MiB scratch; stats={stats:?}"
+    );
+    assert_eq!(
+        stats.weight_h2d_bytes, stats.weight_bytes_on_device,
+        "initial H2D must be the resident weight blob; stats={stats:?}"
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn decode_does_not_h2d_weights() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let after_load = engine.stats();
+    assert!(after_load.weight_h2d_bytes > 0);
+    let h2d = after_load.weight_h2d_bytes;
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let after = engine.stats();
+    assert_eq!(
+        after.weight_h2d_bytes, h2d,
+        "decode GEMM must use device weight pointers; H2D grew {} -> {}; stats={after:?}",
+        h2d, after.weight_h2d_bytes
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
 fn generate_on_hip_uses_real_device_memory() {
     let engine = Engine::new(hip_auto_synthetic()).unwrap();
     if hip_gpus(&engine).is_empty() {
         return;
     }
-    let out = engine.generate("hello", greedy(4)).unwrap();
-    assert!(!out.token_ids.is_empty());
+    let mut handle = engine.begin_request("hello", greedy(4)).unwrap();
+    assert!(matches!(
+        engine.step(&mut handle).unwrap(),
+        allpaca_types::StepResult::Token(_) | allpaca_types::StepResult::Finished(_)
+    ));
     let stats = engine.stats();
     assert!(
         stats.device_memory_bytes > 0,
         "hipMalloc workspace must report device memory used > 0, got {}",
         stats.device_memory_bytes
     );
+    assert!(
+        stats.kv_bytes_on_device > 0,
+        "live Request KV pages must be hipMalloc, not host Vecs labeled VRAM; kv_bytes_on_device={}",
+        stats.kv_bytes_on_device
+    );
+    drop(handle);
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
 }
 
 #[cfg(feature = "hip")]
@@ -198,6 +256,11 @@ fn generate_runs_hip_gemm_and_attention() {
         stats.gpu_forwards > 0,
         "target decode must run HIP kernels, gpu_forwards={}",
         stats.gpu_forwards
+    );
+    assert!(
+        stats.elementwise_gpu_ops > 0,
+        "HIP forward must run RoPE/RMSNorm/SiLU, elementwise_gpu_ops={}",
+        stats.elementwise_gpu_ops
     );
 }
 

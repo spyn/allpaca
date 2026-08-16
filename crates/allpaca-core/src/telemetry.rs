@@ -27,6 +27,10 @@ pub struct Metrics {
     pub draft_tokens_copied: AtomicU64,
     pub weight_bytes_migrated: AtomicU64,
     pub device_memory_bytes: AtomicU64,
+    pub weight_bytes_on_device: AtomicU64,
+    pub weight_h2d_bytes: AtomicU64,
+    pub kv_bytes_on_device: AtomicU64,
+    pub elementwise_gpu_ops: AtomicU64,
 }
 
 impl Metrics {
@@ -100,6 +104,10 @@ impl Metrics {
             draft_tokens_copied: self.draft_tokens_copied.load(Ordering::Relaxed),
             weight_bytes_migrated: self.weight_bytes_migrated.load(Ordering::Relaxed),
             device_memory_bytes: self.device_memory_bytes.load(Ordering::Relaxed),
+            weight_bytes_on_device: self.weight_bytes_on_device.load(Ordering::Relaxed),
+            weight_h2d_bytes: self.weight_h2d_bytes.load(Ordering::Relaxed),
+            kv_bytes_on_device: self.kv_bytes_on_device.load(Ordering::Relaxed),
+            elementwise_gpu_ops: self.elementwise_gpu_ops.load(Ordering::Relaxed),
         }
     }
 

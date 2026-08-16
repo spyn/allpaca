@@ -21,7 +21,7 @@ use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
 use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
-use crate::model::{alloc_pages_for_seq, ensure_pages, ModelConfig, TinyModel};
+use crate::model::{alloc_pages_for_seq, ensure_pages, ModelConfig, ResidentModel, TinyModel};
 use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
 use crate::telemetry::Metrics;
@@ -57,6 +57,8 @@ struct EngineInner {
     active: HashMap<u64, ActiveRequest>,
     next_request_id: u64,
     model_id: String,
+    target_resident: Option<Arc<ResidentModel>>,
+    draft_resident: Option<Arc<ResidentModel>>,
 }
 
 #[derive(Clone)]
@@ -129,14 +131,15 @@ impl Engine {
         flags.overlay(&config.features);
         apply_provider_flags(&mut flags, &config);
         let scheduler = Scheduler::new(inventory.pipeline_mode, flags.clone(), &config.speculative);
-        let kv = KvTierManager::new(
+        let hip = open_hip_workspace(&config, &inventory).map(Arc::new);
+        let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
+        let kv = KvTierManager::with_hip(
             config.kv.vram_bytes,
             config.kv.dram_bytes,
             config.kv.hot_fraction,
+            hip.as_ref().map(|h| h.device),
         );
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);
-        let hip = open_hip_workspace(&config, &inventory).map(Arc::new);
-        let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
         let inner = EngineInner {
             flags,
             scheduler,
@@ -149,6 +152,8 @@ impl Engine {
             active: HashMap::new(),
             next_request_id: 1,
             model_id: config.model.id.clone(),
+            target_resident: None,
+            draft_resident: None,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -180,13 +185,8 @@ impl Engine {
             .ok()
             .and_then(|g| g.target.as_ref().map(|m| m.name.clone()))
             .unwrap_or_else(|| self.config.model.id.clone());
-        let (backend, device_memory_bytes) = if let Some(hip) = &self.hip {
-            let draft_bytes = self
-                .draft_hip
-                .as_ref()
-                .map(|d| d.allocated_bytes())
-                .unwrap_or(0);
-            ("hip".into(), hip.allocated_bytes() + draft_bytes)
+        let (backend, device_memory_bytes) = if self.hip.is_some() {
+            ("hip".into(), allpaca_hip::allocated_bytes())
         } else {
             ("cpu".into(), 0)
         };
@@ -245,6 +245,8 @@ impl Engine {
         }
         inner.tokenizer = Some(tokenizer);
         inner.model_id = "synthetic".into();
+        drop(inner);
+        self.upload_resident_weights()?;
         tracing::info!(vocab = cfg.vocab_size, layers = cfg.n_layers, "loaded synthetic model");
         Ok(())
     }
@@ -278,7 +280,8 @@ impl Engine {
         inner.tokenizer = Some(tokenizer);
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
-        Ok(())
+        drop(inner);
+        self.upload_resident_weights()
     }
 
     pub fn load_onnx(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
@@ -303,7 +306,8 @@ impl Engine {
         inner.tokenizer = Some(tokenizer);
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
-        Ok(())
+        drop(inner);
+        self.upload_resident_weights()
     }
 
     pub fn load_gguf(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
@@ -327,6 +331,60 @@ impl Engine {
         }
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
+        drop(inner);
+        self.upload_resident_weights()
+    }
+
+    fn upload_resident_weights(&self) -> Result<(), AllpacaError> {
+        let mut inner = self.lock()?;
+        let mut weight_bytes = 0u64;
+        let mut h2d = 0u64;
+        let target = inner.target.clone();
+        let draft = inner.draft_model.clone();
+        inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
+            match ResidentModel::upload(&target, hip.device) {
+                Ok(resident) => {
+                    let n = resident.bytes();
+                    weight_bytes += n;
+                    h2d += n;
+                    Some(Arc::new(resident))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "HIP target weight upload failed; GEMM will H2D per op");
+                    self.metrics
+                        .degraded_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        inner.draft_resident = if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
+            match ResidentModel::upload(&draft, hip.device) {
+                Ok(resident) => {
+                    let n = resident.bytes();
+                    weight_bytes += n;
+                    h2d += n;
+                    Some(Arc::new(resident))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "HIP draft weight upload failed; GEMM will H2D per op");
+                    self.metrics
+                        .degraded_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.metrics
+            .weight_bytes_on_device
+            .store(weight_bytes, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .weight_h2d_bytes
+            .store(h2d, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -444,6 +502,7 @@ impl Engine {
             &self.metrics,
         )?;
         let mut pending_logits = vec![0.0f32; vocab];
+        let resident = inner.target_resident.clone();
         for (pos, tok) in tokens.iter().enumerate() {
             // TODO: HIP prefill kernel dispatch when target_device is HIP.
             target.forward_token(
@@ -454,6 +513,7 @@ impl Engine {
                 &self.metrics,
                 &mut pending_logits,
                 self.hip.as_deref(),
+                resident.as_deref(),
             )?;
         }
         inner.ngram.observe(&tokens);
@@ -786,7 +846,15 @@ fn propose_drafts(
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mut provider = DraftModelProvider::new((*model).clone());
-            let draft = provider.propose_on(&ctx, depth, temperature, draft_hip, Some(metrics))?;
+            let resident = inner.draft_resident.clone();
+            let draft = provider.propose_on(
+                &ctx,
+                depth,
+                temperature,
+                draft_hip,
+                resident.as_deref(),
+                Some(metrics),
+            )?;
             if !draft.is_empty() {
                 host_stage_draft_tokens(&draft, draft_hip, metrics);
                 return Ok(draft);
@@ -963,7 +1031,17 @@ fn append_and_forward(
         .target
         .clone()
         .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-    target.forward_token(token, pos, &pages, &mut inner.kv, metrics, &mut logits, hip)?;
+    let resident = inner.target_resident.clone();
+    target.forward_token(
+        token,
+        pos,
+        &pages,
+        &mut inner.kv,
+        metrics,
+        &mut logits,
+        hip,
+        resident.as_deref(),
+    )?;
     let published = inner.ring.publish(&logits)?;
     inner.ring.release_current();
     request_mut(inner, id)?.pending_logits = published;

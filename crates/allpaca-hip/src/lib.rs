@@ -105,6 +105,28 @@ mod ffi {
             bytes: usize,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_rmsnorm(
+            x: *const f32,
+            weight: *const f32,
+            out: *mut f32,
+            n: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_rope(
+            x: *mut f32,
+            n_heads: i32,
+            head_dim: i32,
+            pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_silu_mul(
+            gate: *mut f32,
+            up: *const f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -697,6 +719,58 @@ fn status(rc: i32, op: &str) -> Result<(), AllpacaError> {
     }
 }
 
+/// Packed weight tensors uploaded once via H2D. GEMM must use [`Self::ptr`] — no per-op copy.
+pub struct DeviceWeights {
+    device: i32,
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for DeviceWeights {}
+unsafe impl Sync for DeviceWeights {}
+
+impl DeviceWeights {
+    /// Allocate one device blob and copy `tensors` in order. Records no Engine metrics.
+    pub fn upload(device: i32, tensors: &[&[f32]]) -> Result<Self, AllpacaError> {
+        let bytes: usize = tensors.iter().map(|t| t.len() * 4).sum();
+        if bytes == 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty weight upload".into(),
+            )));
+        }
+        let ptr = device_malloc(bytes, device)?;
+        set_device(device)?;
+        let mut off = 0usize;
+        for t in tensors {
+            let n = t.len() * 4;
+            if let Err(e) = memcpy(unsafe { ptr.add(off) }, t.as_ptr().cast(), n, MEMCPY_H2D) {
+                device_free(ptr, bytes);
+                return Err(e);
+            }
+            off += n;
+        }
+        Ok(Self { device, ptr, bytes })
+    }
+
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes as u64
+    }
+
+    pub fn ptr_at(&self, byte_offset: usize) -> *const f32 {
+        unsafe { self.ptr.add(byte_offset).cast() }
+    }
+}
+
+impl Drop for DeviceWeights {
+    fn drop(&mut self) {
+        device_free(self.ptr, self.bytes);
+    }
+}
+
 /// Persistent device workspace used by the Engine for GEMM / attention / logits.
 pub struct HipWorkspace {
     pub device: i32,
@@ -750,6 +824,56 @@ impl HipWorkspace {
         k: i32,
     ) -> Result<(), AllpacaError> {
         self.gemm_via_scratch(a, b, c, m, n, k, true)
+    }
+
+    /// GEMM NT with a **device** weight pointer `b`. Only activations (`a`) and `c` are copied.
+    pub fn gemm_nt_dev_b(
+        &self,
+        a: &[f32],
+        b: *const f32,
+        c: &mut [f32],
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if m <= 0 || n <= 0 || k <= 0 || b.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid resident GEMM".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        if a.len() < a_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "resident GEMM buffer size mismatch".into(),
+            )));
+        }
+        let need = (a_n + c_n) * 4;
+        if need > self.scratch_bytes {
+            let da = device_malloc(a_n * 4, self.device)?;
+            let dc = match device_malloc(c_n * 4, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(da, a_n * 4);
+                    return Err(e);
+                }
+            };
+            let result = (|| {
+                self.bind()?;
+                memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+                gemm_nt_device(da.cast(), b, dc.cast(), m, n, k)?;
+                memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+            })();
+            device_free(da, a_n * 4);
+            device_free(dc, c_n * 4);
+            return result;
+        }
+        self.bind()?;
+        let da = self.scratch;
+        let dc = unsafe { self.scratch.add(a_n * 4) };
+        memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+        gemm_nt_device(da.cast(), b, dc.cast(), m, n, k)?;
+        memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -868,6 +992,130 @@ impl HipWorkspace {
                 head_dim,
                 causal,
             )
+        }
+    }
+
+    pub fn rmsnorm(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        weight_dev: Option<*const f32>,
+        eps: f32,
+        out: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        if x.len() != out.len() || x.is_empty() || (weight_dev.is_none() && weight.len() != x.len())
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "rmsnorm length mismatch".into(),
+            )));
+        }
+        let n = x.len();
+        let need = n * 4 * if weight_dev.is_some() { 2 } else { 3 };
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "rmsnorm exceeds scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let dx = self.scratch;
+        let dw = unsafe { self.scratch.add(n * 4) };
+        let dout = if weight_dev.is_some() {
+            dw
+        } else {
+            unsafe { self.scratch.add(n * 8) }
+        };
+        memcpy(dx, x.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        let wptr = if let Some(w) = weight_dev {
+            w
+        } else {
+            memcpy(dw, weight.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+            dw.cast()
+        };
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_rmsnorm(dx.cast(), wptr, dout.cast(), n as i32, eps, std::ptr::null_mut())
+            };
+            status(rc, "rmsnorm")?;
+            memcpy(out.as_mut_ptr().cast(), dout, n * 4, MEMCPY_D2H)
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (wptr, dout, eps);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rmsnorm unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn rope(
+        &self,
+        x: &mut [f32],
+        n_heads: i32,
+        head_dim: i32,
+        pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        let n = x.len();
+        if n * 4 > self.scratch_bytes || n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "rope exceeds scratch".into(),
+            )));
+        }
+        self.bind()?;
+        memcpy(self.scratch, x.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_rope(
+                    self.scratch.cast(),
+                    n_heads,
+                    head_dim,
+                    pos,
+                    theta,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "rope")?;
+            memcpy(x.as_mut_ptr().cast(), self.scratch, n * 4, MEMCPY_D2H)
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (pos, theta);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rope unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn silu_mul(&self, gate: &mut [f32], up: &[f32]) -> Result<(), AllpacaError> {
+        if gate.len() != up.len() || gate.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "silu_mul length mismatch".into(),
+            )));
+        }
+        let n = gate.len();
+        if n * 8 > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "silu_mul exceeds scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let dg = self.scratch;
+        let du = unsafe { self.scratch.add(n * 4) };
+        memcpy(dg, gate.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        memcpy(du, up.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_silu_mul(dg.cast(), du.cast(), n as i32, std::ptr::null_mut()) };
+            status(rc, "silu_mul")?;
+            memcpy(gate.as_mut_ptr().cast(), dg, n * 4, MEMCPY_D2H)
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP silu_mul unavailable".into(),
+            )))
         }
     }
 
