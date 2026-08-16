@@ -17,6 +17,10 @@ static int hip_status(hipError_t err) {
     return err == hipSuccess ? ALLPACA_OK : ALLPACA_ERR_DEVICE;
 }
 
+static void clear_last_error() {
+    (void)hipGetLastError();
+}
+
 __global__ void gemm_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
     const int row = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
     const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -116,6 +120,7 @@ static int launch_gemm(const float *a, const float *b, float *c, int32_t m, int3
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
+    clear_last_error();
     dim3 block(16, 16);
     dim3 grid(static_cast<unsigned>((n + 15) / 16), static_cast<unsigned>((m + 15) / 16));
     hipLaunchKernelGGL(gemm_kernel, grid, block, 0, stream, a, b, c, m, n, k);
@@ -131,6 +136,7 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
+    clear_last_error();
     dim3 block(16, 16);
     dim3 grid(static_cast<unsigned>((n + 15) / 16), static_cast<unsigned>((m + 15) / 16));
     hipLaunchKernelGGL(gemm_nt_kernel, grid, block, 0, stream, a, b, c, m, n, k);
@@ -383,6 +389,7 @@ extern "C" int allpaca_attention(const float *q, const float *k, const float *v,
         head_dim <= 0 || (n_heads % n_kv_heads) != 0) {
         return ALLPACA_ERR_INVALID;
     }
+    clear_last_error();
     const int total = n_q * n_heads;
     const int threads = 64;
     const int blocks = (total + threads - 1) / threads;
@@ -442,6 +449,7 @@ extern "C" int allpaca_rmsnorm(const float *x, const float *weight, float *out, 
     if (!x || !weight || !out || n <= 0) {
         return ALLPACA_ERR_INVALID;
     }
+    clear_last_error();
     const int threads = 64;
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(rmsnorm_kernel, dim3(static_cast<unsigned>(blocks)),
@@ -459,6 +467,7 @@ extern "C" int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t
     if (!x || n_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0) {
         return ALLPACA_ERR_INVALID;
     }
+    clear_last_error();
     const int total = n_heads * (head_dim / 2);
     const int threads = 64;
     const int blocks = (total + threads - 1) / threads;
@@ -476,10 +485,62 @@ extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca
     if (!gate || !up || n <= 0) {
         return ALLPACA_ERR_INVALID;
     }
+    clear_last_error();
     const int threads = 64;
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(silu_mul_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
+__global__ void embed_gather_kernel(const float *table, int token, float *out, int dim) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= dim) {
+        return;
+    }
+    out[idx] = table[token * dim + idx];
+}
+
+__global__ void residual_add_kernel(float *x, const float *residual, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    x[idx] += residual[idx];
+}
+
+extern "C" int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
+                                    allpaca_stream_t stream) {
+    if (!table || !out || dim <= 0 || token < 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 64;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(embed_gather_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
+                       dim);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
+extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
+                                    allpaca_stream_t stream) {
+    if (!x || !residual || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 64;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(residual_add_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, residual, n);
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
@@ -577,6 +638,14 @@ extern "C" int allpaca_rope(float *, int32_t, int32_t, int32_t, float, allpaca_s
 }
 
 extern "C" int allpaca_silu_mul(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather(const float *, int32_t, float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_residual_add(float *, const float *, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

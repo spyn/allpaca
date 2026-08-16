@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use allpaca_cpu::copy_async;
 use allpaca_types::{
@@ -78,6 +79,8 @@ pub struct KvTierManager {
     dram: BufferPool,
     hip_pages: HashMap<PageId, HipPageAlloc>,
     hip_device: Option<i32>,
+    activation_h2d_bytes: AtomicU64,
+    activation_d2h_bytes: AtomicU64,
     next_id: u64,
     clock: u64,
     hot_fraction: f32,
@@ -101,6 +104,8 @@ impl KvTierManager {
             dram: BufferPool::new(dram_bytes),
             hip_pages: HashMap::new(),
             hip_device,
+            activation_h2d_bytes: AtomicU64::new(0),
+            activation_d2h_bytes: AtomicU64::new(0),
             next_id: 1,
             clock: 1,
             hot_fraction,
@@ -260,6 +265,8 @@ impl KvTierManager {
                     k_bytes,
                     allpaca_hip::MEMCPY_H2D,
                 )?;
+                self.activation_h2d_bytes
+                    .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
             }
             DeviceBufferKind::CpuVram => {
                 self.vram.slice_mut(k_off, kv_width).copy_from_slice(k);
@@ -312,6 +319,8 @@ impl KvTierManager {
                     n * 4,
                     allpaca_hip::MEMCPY_D2H,
                 )?;
+                self.activation_d2h_bytes
+                    .fetch_add((n * 8) as u64, Ordering::Relaxed);
                 (k, v)
             }
             DeviceBufferKind::CpuVram => (
@@ -324,6 +333,169 @@ impl KvTierManager {
             ),
         };
         Ok((k, v))
+    }
+
+    pub fn activation_h2d_bytes(&self) -> u64 {
+        self.activation_h2d_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn activation_d2h_bytes(&self) -> u64 {
+        self.activation_d2h_bytes.load(Ordering::Relaxed)
+    }
+
+    /// D2D write of a K/V slot from device pointers (no host bounce).
+    pub(crate) fn write_slot_from_device(
+        &mut self,
+        id: PageId,
+        slot: u32,
+        n_kv_heads: usize,
+        head_dim: usize,
+        k_dev: *const f32,
+        v_dev: *const f32,
+    ) -> Result<(), AllpacaError> {
+        if k_dev.is_null() || v_dev.is_null() {
+            return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                "device K/V pointer is null".into(),
+            )));
+        }
+        let page = self.pages.get(&id).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
+        })?;
+        let kv_width = n_kv_heads * head_dim;
+        let k_off = page.location.offset + slot as usize * kv_width;
+        let v_off = page.location.offset
+            + page.capacity_tokens as usize * kv_width
+            + slot as usize * kv_width;
+        let k_bytes = kv_width * 4;
+        match page.location.kind {
+            DeviceBufferKind::Hip => {
+                let alloc = self.hip_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "HIP KV page {id} missing device buffer"
+                    )))
+                })?;
+                let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
+                let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
+                allpaca_hip::memcpy(k_ptr, k_dev.cast(), k_bytes, allpaca_hip::MEMCPY_D2D)?;
+                allpaca_hip::memcpy(v_ptr, v_dev.cast(), k_bytes, allpaca_hip::MEMCPY_D2D)?;
+            }
+            DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
+                let mut k = vec![0.0f32; kv_width];
+                let mut v = vec![0.0f32; kv_width];
+                allpaca_hip::memcpy(
+                    k.as_mut_ptr().cast(),
+                    k_dev.cast(),
+                    k_bytes,
+                    allpaca_hip::MEMCPY_D2H,
+                )?;
+                allpaca_hip::memcpy(
+                    v.as_mut_ptr().cast(),
+                    v_dev.cast(),
+                    k_bytes,
+                    allpaca_hip::MEMCPY_D2H,
+                )?;
+                self.activation_d2h_bytes
+                    .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
+                return self.write_slot(id, slot, n_kv_heads, head_dim, &k, &v);
+            }
+        }
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.filled = page.filled.max(slot + 1);
+        }
+        Ok(())
+    }
+
+    /// Pack filled tokens from `pages` into device K/V buffers (D2D when resident).
+    pub(crate) fn pack_kv_device(
+        &self,
+        pages: &[u64],
+        n_kv_heads: usize,
+        head_dim: usize,
+        dest_k: *mut f32,
+        dest_v: *mut f32,
+        max_kv: usize,
+    ) -> Result<usize, AllpacaError> {
+        if dest_k.is_null() || dest_v.is_null() || max_kv == 0 {
+            return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                "packed device KV destination is empty".into(),
+            )));
+        }
+        let kv_width = n_kv_heads * head_dim;
+        let mut n_kv = 0usize;
+        for id in pages {
+            let page = self.pages.get(id).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
+            })?;
+            let filled = page.filled as usize;
+            if filled == 0 {
+                continue;
+            }
+            if n_kv + filled > max_kv {
+                return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                    "packed device KV exceeds workspace".into(),
+                )));
+            }
+            let n = filled * kv_width;
+            let k_off = page.location.offset;
+            let v_off = page.location.offset + page.capacity_tokens as usize * kv_width;
+            let dk = unsafe { dest_k.add(n_kv * kv_width).cast::<u8>() };
+            let dv = unsafe { dest_v.add(n_kv * kv_width).cast::<u8>() };
+            match page.location.kind {
+                DeviceBufferKind::Hip => {
+                    let alloc = self.hip_pages.get(id).ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                            "HIP KV page {id} missing device buffer"
+                        )))
+                    })?;
+                    allpaca_hip::memcpy(
+                        dk,
+                        unsafe { alloc.ptr.add(k_off * 4) },
+                        n * 4,
+                        allpaca_hip::MEMCPY_D2D,
+                    )?;
+                    allpaca_hip::memcpy(
+                        dv,
+                        unsafe { alloc.ptr.add(v_off * 4) },
+                        n * 4,
+                        allpaca_hip::MEMCPY_D2D,
+                    )?;
+                }
+                DeviceBufferKind::CpuVram => {
+                    allpaca_hip::memcpy(
+                        dk,
+                        self.vram.slice(k_off, n).as_ptr().cast(),
+                        n * 4,
+                        allpaca_hip::MEMCPY_H2D,
+                    )?;
+                    allpaca_hip::memcpy(
+                        dv,
+                        self.vram.slice(v_off, n).as_ptr().cast(),
+                        n * 4,
+                        allpaca_hip::MEMCPY_H2D,
+                    )?;
+                    self.activation_h2d_bytes
+                        .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                }
+                DeviceBufferKind::CpuPinnedDram => {
+                    allpaca_hip::memcpy(
+                        dk,
+                        self.dram.slice(k_off, n).as_ptr().cast(),
+                        n * 4,
+                        allpaca_hip::MEMCPY_H2D,
+                    )?;
+                    allpaca_hip::memcpy(
+                        dv,
+                        self.dram.slice(v_off, n).as_ptr().cast(),
+                        n * 4,
+                        allpaca_hip::MEMCPY_H2D,
+                    )?;
+                    self.activation_h2d_bytes
+                        .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                }
+            }
+            n_kv += filled;
+        }
+        Ok(n_kv)
     }
 
     pub fn migrate_to_dram(&mut self, id: PageId, metrics: &Metrics) -> Result<(), AllpacaError> {

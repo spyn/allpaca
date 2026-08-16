@@ -46,7 +46,7 @@
 | **Auxiliary Accelerator** | A sidecar compute device (Coral TPU, Intel NPU) for non-LLM workloads like classifiers. Post-MVP; trait interface may exist but no implementations ship initially. |
 | **Constraint Mask** | A bitset of allowed tokens produced by the CPU grammar engine, applied to GPU logits before sampling. Enables structured output. |
 | **Structured Output** | Constrained generation (JSON, schemas, grammars). MVP supports JSON mode only via hardcoded grammar. Full `llguidance` integration is post-MVP. |
-| **GPU Backend** | Real HIP kernels (GEMM, attention, RoPE, RMSNorm, SiLU, hipMalloc, H2D/D2H/P2P copy) behind `--features hip` when ROCm is present. Weights are uploaded once to the target GPU (draft weights to the second GPU); decode GEMM uses device weight pointers (`weight_h2d_bytes` grows at load only). KV pages in the VRAM tier are `hipMalloc`, not host Vecs. `Engine::generate` reports `backend = "hip"`, `gpu_forwards`, `weight_bytes_on_device`, `kv_bytes_on_device`, and `elementwise_gpu_ops`. Without the feature, without an SDK, or with 0 devices / `cpu_only`, the CPU fallback is used. CUDA is post-MVP. |
+| **GPU Backend** | Real HIP kernels (GEMM, attention, RoPE, RMSNorm, SiLU, residual add, embed gather, hipMalloc, H2D/D2H/P2P copy) behind `--features hip` when ROCm is present. Weights are uploaded once to the target GPU (draft weights to the second GPU); decode GEMM uses device weight pointers (`weight_h2d_bytes` grows at load only). Sequential target decode keeps hidden state in `hipMalloc` across layers; attention reads resident device KV in-place (packed page view, no D2H gather / H2D QKV). `Engine::generate` reports `backend = "hip"`, `gpu_forwards`, `weight_bytes_on_device`, `kv_bytes_on_device`, `elementwise_gpu_ops`, `residual_gpu_ops`, `activation_h2d_bytes`, and `activation_d2h_bytes`. Decode activation H2D stays flat; D2H is logits-only for CPU sampling. Without the feature, without an SDK, or with 0 devices / `cpu_only`, the CPU fallback is used. CUDA is post-MVP. |
 | **CPU Fallback** | A slow but functional kernel implementation using AVX2 intrinsics. Required for every operation so the engine runs without GPU. |
 | **Tokenizer** | Converts text ↔ tokens. Uses HuggingFace `tokenizers` crate. Vocab comes from GGUF metadata or a SafeTensors/ONNX sidecar JSON; decoupled from weight layout. |
 | **Request** | A generation task with its own KV cache (`KvHandle` / KV Pages) and decode state. Multiple Requests can be active up to `engine.max_active_requests` (compiled default 1). A saturated scheduler returns Transient `RequestBusy` backpressure. |
@@ -103,7 +103,7 @@
 
 ## Sampling
 
-Sampling (temperature, top-k, top-p, grammar masking, RNG) happens on **CPU**. Logits are copied async from GPU to pinned DRAM ring buffer. GPU sampling is a post-MVP optimization.
+Sampling (temperature, top-k, top-p, grammar masking, RNG) happens on **CPU**. On HIP, decode hidden state stays device-resident for the whole sequential target forward; logits are copied once per token from GPU to pinned DRAM for host sampling. GPU sampling is a post-MVP optimization.
 
 ## Server API (MVP)
 

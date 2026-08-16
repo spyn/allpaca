@@ -180,19 +180,41 @@ impl Engine {
     }
 
     pub fn stats(&self) -> StatsSnapshot {
-        let model_id = self
-            .lock()
-            .ok()
-            .and_then(|g| g.target.as_ref().map(|m| m.name.clone()))
-            .unwrap_or_else(|| self.config.model.id.clone());
+        let (model_id, kv_h2d, kv_d2h) = match self.lock() {
+            Ok(g) => (
+                g.target
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| self.config.model.id.clone()),
+                g.kv.activation_h2d_bytes(),
+                g.kv.activation_d2h_bytes(),
+            ),
+            Err(_) => (self.config.model.id.clone(), 0, 0),
+        };
         let (backend, device_memory_bytes) = if self.hip.is_some() {
             ("hip".into(), allpaca_hip::allocated_bytes())
         } else {
             ("cpu".into(), 0)
         };
+        let hip_h2d = self
+            .hip
+            .as_ref()
+            .map(|h| h.activation_h2d_bytes())
+            .unwrap_or(0);
+        let hip_d2h = self
+            .hip
+            .as_ref()
+            .map(|h| h.activation_d2h_bytes())
+            .unwrap_or(0);
         self.metrics
             .device_memory_bytes
             .store(device_memory_bytes, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .activation_h2d_bytes
+            .store(hip_h2d + kv_h2d, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .activation_d2h_bytes
+            .store(hip_d2h + kv_d2h, std::sync::atomic::Ordering::Relaxed);
         let bench = self.inventory.transfer_benchmark;
         let p2p_copy_ok = bench.map(|b| b.p2p_copy_ok).unwrap_or(false);
         let p2p_status = if p2p_copy_ok {

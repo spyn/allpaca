@@ -50,6 +50,9 @@ fn cpu_only_generate_reports_cpu_backend() {
     assert_eq!(stats.weight_h2d_bytes, 0);
     assert_eq!(stats.kv_bytes_on_device, 0);
     assert_eq!(stats.elementwise_gpu_ops, 0);
+    assert_eq!(stats.residual_gpu_ops, 0);
+    assert_eq!(stats.activation_h2d_bytes, 0);
+    assert_eq!(stats.activation_d2h_bytes, 0);
 }
 
 #[test]
@@ -238,6 +241,114 @@ fn generate_on_hip_uses_real_device_memory() {
     drop(handle);
     let out = engine.generate("hello", greedy(4)).unwrap();
     assert!(!out.token_ids.is_empty());
+}
+
+/// Synthetic `ModelConfig::tiny` vocab. Each target forward D2H's one logit row.
+#[cfg(feature = "hip")]
+const SYNTHETIC_VOCAB: u64 = 64;
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_embed_gather_stays_on_device() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let after_load = engine.stats();
+    assert!(after_load.weight_bytes_on_device > 0);
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let after = engine.stats();
+    let embed_row = 32u64 * 4;
+    let embed_h2d = after.gpu_forwards.saturating_mul(embed_row);
+    assert!(
+        after.activation_h2d_bytes.saturating_sub(after_load.activation_h2d_bytes) < embed_h2d
+            || after.activation_h2d_bytes == after_load.activation_h2d_bytes,
+        "embed gather must use the resident weight row, not H2D each token; load={} after={} forwards={} stats={after:?}",
+        after_load.activation_h2d_bytes,
+        after.activation_h2d_bytes,
+        after.gpu_forwards
+    );
+    assert_eq!(after.weight_h2d_bytes, after_load.weight_h2d_bytes);
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn decode_activation_traffic_is_logits_only() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let after_load = engine.stats();
+    assert_eq!(after_load.activation_h2d_bytes, 0);
+    assert_eq!(after_load.activation_d2h_bytes, 0);
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let after = engine.stats();
+    assert_eq!(
+        after.activation_h2d_bytes, after_load.activation_h2d_bytes,
+        "decode hidden/QKV must stay on device; activation_h2d grew {} -> {}; stats={after:?}",
+        after_load.activation_h2d_bytes, after.activation_h2d_bytes
+    );
+    let logits_d2h = after.gpu_forwards.saturating_mul(SYNTHETIC_VOCAB * 4);
+    assert_eq!(
+        after.activation_d2h_bytes, logits_d2h,
+        "D2H must be logits only (vocab*4*forwards={logits_d2h}); stats={after:?}"
+    );
+    let hidden_scale = after.gpu_forwards.saturating_mul(2 * 32 * 4 * 8);
+    assert!(
+        after.activation_d2h_bytes < hidden_scale || hidden_scale == 0,
+        "D2H must not be per-layer hidden traffic; d2h={} hidden_scale={hidden_scale} stats={after:?}",
+        after.activation_d2h_bytes
+    );
+    assert_eq!(after.weight_h2d_bytes, after_load.weight_h2d_bytes);
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn attention_reads_resident_device_kv() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let mut handle = engine.begin_request("hello", greedy(4)).unwrap();
+    assert!(matches!(
+        engine.step(&mut handle).unwrap(),
+        allpaca_types::StepResult::Token(_) | allpaca_types::StepResult::Finished(_)
+    ));
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(
+        stats.kv_bytes_on_device > 0,
+        "attention must read hipMalloc KV pages; kv_bytes_on_device={}",
+        stats.kv_bytes_on_device
+    );
+    assert!(stats.gpu_forwards > 0);
+    assert_eq!(
+        stats.activation_h2d_bytes, 0,
+        "resident KV attention must not H2D QKV; stats={stats:?}"
+    );
+    drop(handle);
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn residual_add_runs_on_hip() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.residual_gpu_ops > 0,
+        "residual add must launch a HIP kernel; residual_gpu_ops={}",
+        stats.residual_gpu_ops
+    );
+    assert!(stats.elementwise_gpu_ops > 0);
 }
 
 #[cfg(feature = "hip")]

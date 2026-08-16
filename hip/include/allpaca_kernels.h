@@ -73,6 +73,11 @@ int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float
 
 int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
 
+int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
+                         allpaca_stream_t stream);
+
+int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

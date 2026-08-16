@@ -7,6 +7,7 @@
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use allpaca_types::{AllpacaError, BandwidthBenchmark, DegradedError, DeviceInfo};
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
@@ -124,6 +125,19 @@ mod ffi {
         pub fn allpaca_silu_mul(
             gate: *mut f32,
             up: *const f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather(
+            table: *const f32,
+            token: i32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_residual_add(
+            x: *mut f32,
+            residual: *const f32,
             n: i32,
             stream: *mut c_void,
         ) -> i32;
@@ -771,6 +785,67 @@ impl Drop for DeviceWeights {
     }
 }
 
+/// Named hipMalloc view used for one sequential `forward_token` on device.
+#[derive(Clone, Copy)]
+pub struct DeviceDecode {
+    pub x: *mut f32,
+    pub normed: *mut f32,
+    pub q: *mut f32,
+    pub k: *mut f32,
+    pub v: *mut f32,
+    pub attn: *mut f32,
+    pub proj: *mut f32,
+    pub gate: *mut f32,
+    pub up: *mut f32,
+    pub logits: *mut f32,
+    pub packed_k: *mut f32,
+    pub packed_v: *mut f32,
+    pub max_kv: usize,
+}
+
+struct DecodeAlloc {
+    ptr: *mut u8,
+    bytes: usize,
+    dim: usize,
+    kv_dim: usize,
+    ff_dim: usize,
+    vocab: usize,
+    max_kv: usize,
+}
+
+unsafe impl Send for DecodeAlloc {}
+unsafe impl Sync for DecodeAlloc {}
+
+impl DecodeAlloc {
+    fn ptrs(&self) -> DeviceDecode {
+        let mut off = 0usize;
+        let mut next = |n: usize| {
+            let p = unsafe { self.ptr.add(off * 4).cast::<f32>() };
+            off += n;
+            p
+        };
+        DeviceDecode {
+            x: next(self.dim),
+            normed: next(self.dim),
+            q: next(self.dim),
+            k: next(self.kv_dim),
+            v: next(self.kv_dim),
+            attn: next(self.dim),
+            proj: next(self.dim),
+            gate: next(self.ff_dim),
+            up: next(self.ff_dim),
+            logits: next(self.vocab),
+            packed_k: next(self.max_kv * self.kv_dim),
+            packed_v: next(self.max_kv * self.kv_dim),
+            max_kv: self.max_kv,
+        }
+    }
+}
+
+fn decode_floats(dim: usize, kv_dim: usize, ff_dim: usize, vocab: usize, max_kv: usize) -> usize {
+    dim * 5 + kv_dim * 2 + ff_dim * 2 + vocab + max_kv * kv_dim * 2
+}
+
 /// Persistent device workspace used by the Engine for GEMM / attention / logits.
 pub struct HipWorkspace {
     pub device: i32,
@@ -778,6 +853,9 @@ pub struct HipWorkspace {
     scratch_bytes: usize,
     pinned_logits: *mut u8,
     pinned_logits_bytes: usize,
+    decode: Mutex<Option<DecodeAlloc>>,
+    activation_h2d: AtomicU64,
+    activation_d2h: AtomicU64,
 }
 
 unsafe impl Send for HipWorkspace {}
@@ -798,6 +876,9 @@ impl HipWorkspace {
             scratch_bytes,
             pinned_logits,
             pinned_logits_bytes,
+            decode: Mutex::new(None),
+            activation_h2d: AtomicU64::new(0),
+            activation_d2h: AtomicU64::new(0),
         })
     }
 
@@ -806,11 +887,82 @@ impl HipWorkspace {
         if !self.pinned_logits.is_null() {
             n += self.pinned_logits_bytes as u64;
         }
+        if let Ok(g) = self.decode.lock() {
+            if let Some(d) = g.as_ref() {
+                n += d.bytes as u64;
+            }
+        }
         n
+    }
+
+    pub fn activation_h2d_bytes(&self) -> u64 {
+        self.activation_h2d.load(Ordering::Relaxed)
+    }
+
+    pub fn activation_d2h_bytes(&self) -> u64 {
+        self.activation_d2h.load(Ordering::Relaxed)
+    }
+
+    fn add_h2d(&self, bytes: usize) {
+        self.activation_h2d
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn add_d2h(&self, bytes: usize) {
+        self.activation_d2h
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn bind(&self) -> Result<(), AllpacaError> {
         set_device(self.device)
+    }
+
+    /// Persistent hidden / QKV / packed-KV buffers. Grows if the model or seq is larger.
+    pub fn ensure_decode(
+        &self,
+        dim: usize,
+        kv_dim: usize,
+        ff_dim: usize,
+        vocab: usize,
+        max_kv: usize,
+    ) -> Result<DeviceDecode, AllpacaError> {
+        let max_kv = max_kv.max(1);
+        let mut guard = self
+            .decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let grow = match guard.as_ref() {
+            None => true,
+            Some(a) => {
+                a.dim < dim
+                    || a.kv_dim < kv_dim
+                    || a.ff_dim < ff_dim
+                    || a.vocab < vocab
+                    || a.max_kv < max_kv
+            }
+        };
+        if grow {
+            if let Some(old) = guard.take() {
+                device_free(old.ptr, old.bytes);
+            }
+            let dim = dim.max(1);
+            let kv_dim = kv_dim.max(1);
+            let ff_dim = ff_dim.max(1);
+            let vocab = vocab.max(1);
+            let floats = decode_floats(dim, kv_dim, ff_dim, vocab, max_kv);
+            let bytes = floats * 4;
+            let ptr = device_malloc(bytes, self.device)?;
+            *guard = Some(DecodeAlloc {
+                ptr,
+                bytes,
+                dim,
+                kv_dim,
+                ff_dim,
+                vocab,
+                max_kv,
+            });
+        }
+        Ok(guard.as_ref().expect("decode alloc").ptrs())
     }
 
     /// GEMM NT using the persistent scratch buffer (H2D / kernel / D2H).
@@ -861,8 +1013,11 @@ impl HipWorkspace {
             let result = (|| {
                 self.bind()?;
                 memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+                self.add_h2d(a_n * 4);
                 gemm_nt_device(da.cast(), b, dc.cast(), m, n, k)?;
-                memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+                memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)?;
+                self.add_d2h(c_n * 4);
+                Ok(())
             })();
             device_free(da, a_n * 4);
             device_free(dc, c_n * 4);
@@ -872,8 +1027,11 @@ impl HipWorkspace {
         let da = self.scratch;
         let dc = unsafe { self.scratch.add(a_n * 4) };
         memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+        self.add_h2d(a_n * 4);
         gemm_nt_device(da.cast(), b, dc.cast(), m, n, k)?;
-        memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)?;
+        self.add_d2h(c_n * 4);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -899,6 +1057,7 @@ impl HipWorkspace {
         let db = unsafe { self.scratch.add(a_n * 4) };
         let dc = unsafe { self.scratch.add((a_n + b_n) * 4) };
         memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+        self.add_h2d(a_n * 4);
         memcpy(db, b.as_ptr().cast(), b_n * 4, MEMCPY_H2D)?;
         if nt {
             gemm_nt_device(da.cast(), db.cast(), dc.cast(), m, n, k)?;
@@ -915,7 +1074,9 @@ impl HipWorkspace {
                 return gemm(a, b, c, m, n, k);
             }
         }
-        memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)?;
+        self.add_d2h(c_n * 4);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -956,6 +1117,7 @@ impl HipWorkspace {
         memcpy(dq, q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
         memcpy(dk, k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
         memcpy(dv, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+        self.add_h2d((q.len() + k.len() + v.len()) * 4);
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
             let rc = unsafe {
@@ -974,7 +1136,9 @@ impl HipWorkspace {
                 )
             };
             status(rc, "attention")?;
-            memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)
+            memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)?;
+            self.add_d2h(out.len() * 4);
+            Ok(())
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1025,6 +1189,7 @@ impl HipWorkspace {
             unsafe { self.scratch.add(n * 8) }
         };
         memcpy(dx, x.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        self.add_h2d(n * 4);
         let wptr = if let Some(w) = weight_dev {
             w
         } else {
@@ -1037,7 +1202,9 @@ impl HipWorkspace {
                 ffi::allpaca_rmsnorm(dx.cast(), wptr, dout.cast(), n as i32, eps, std::ptr::null_mut())
             };
             status(rc, "rmsnorm")?;
-            memcpy(out.as_mut_ptr().cast(), dout, n * 4, MEMCPY_D2H)
+            memcpy(out.as_mut_ptr().cast(), dout, n * 4, MEMCPY_D2H)?;
+            self.add_d2h(n * 4);
+            Ok(())
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1064,6 +1231,7 @@ impl HipWorkspace {
         }
         self.bind()?;
         memcpy(self.scratch, x.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        self.add_h2d(n * 4);
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
             let rc = unsafe {
@@ -1077,7 +1245,9 @@ impl HipWorkspace {
                 )
             };
             status(rc, "rope")?;
-            memcpy(x.as_mut_ptr().cast(), self.scratch, n * 4, MEMCPY_D2H)
+            memcpy(x.as_mut_ptr().cast(), self.scratch, n * 4, MEMCPY_D2H)?;
+            self.add_d2h(n * 4);
+            Ok(())
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1105,11 +1275,14 @@ impl HipWorkspace {
         let du = unsafe { self.scratch.add(n * 4) };
         memcpy(dg, gate.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
         memcpy(du, up.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        self.add_h2d(n * 8);
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
             let rc = unsafe { ffi::allpaca_silu_mul(dg.cast(), du.cast(), n as i32, std::ptr::null_mut()) };
             status(rc, "silu_mul")?;
-            memcpy(gate.as_mut_ptr().cast(), dg, n * 4, MEMCPY_D2H)
+            memcpy(gate.as_mut_ptr().cast(), dg, n * 4, MEMCPY_D2H)?;
+            self.add_d2h(n * 4);
+            Ok(())
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1124,12 +1297,188 @@ impl HipWorkspace {
         let bytes = host.len() * 4;
         if !self.pinned_logits.is_null() && self.pinned_logits_bytes >= bytes {
             memcpy(self.pinned_logits, device_logits.cast(), bytes, MEMCPY_D2H)?;
+            self.add_d2h(bytes);
             unsafe {
                 std::ptr::copy_nonoverlapping(self.pinned_logits.cast::<f32>(), host.as_mut_ptr(), host.len());
             }
             Ok(())
         } else {
-            memcpy(host.as_mut_ptr().cast(), device_logits.cast(), bytes, MEMCPY_D2H)
+            memcpy(host.as_mut_ptr().cast(), device_logits.cast(), bytes, MEMCPY_D2H)?;
+            self.add_d2h(bytes);
+            Ok(())
+        }
+    }
+
+    pub fn embed_gather(
+        &self,
+        table: *const f32,
+        token: u32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed gather".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_embed_gather(table, token as i32, out, dim, std::ptr::null_mut())
+            };
+            status(rc, "embed_gather")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = token;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn residual_add(&self, x: *mut f32, residual: *const f32, n: i32) -> Result<(), AllpacaError> {
+        if x.is_null() || residual.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid residual add".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_residual_add(x, residual, n, std::ptr::null_mut()) };
+            status(rc, "residual_add")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP residual_add unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn rmsnorm_device(
+        &self,
+        x: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        n: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if x.is_null() || weight.is_null() || out.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device rmsnorm".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_rmsnorm(x, weight, out, n, eps, std::ptr::null_mut()) };
+            status(rc, "rmsnorm")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = eps;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rmsnorm unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn rope_device(
+        &self,
+        x: *mut f32,
+        n_heads: i32,
+        head_dim: i32,
+        pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        if x.is_null() || n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device rope".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_rope(x, n_heads, head_dim, pos, theta, std::ptr::null_mut()) };
+            status(rc, "rope")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (pos, theta);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rope unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn silu_mul_device(&self, gate: *mut f32, up: *const f32, n: i32) -> Result<(), AllpacaError> {
+        if gate.is_null() || up.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device silu_mul".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_silu_mul(gate, up, n, std::ptr::null_mut()) };
+            status(rc, "silu_mul")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP silu_mul unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_device(
+        &self,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || k.is_null() || v.is_null() || out.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device attention".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_attention(
+                    q,
+                    k,
+                    v,
+                    out,
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    i32::from(causal),
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "attention")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP attention unavailable".into(),
+            )))
         }
     }
 }
@@ -1138,6 +1487,11 @@ impl Drop for HipWorkspace {
     fn drop(&mut self) {
         device_free(self.scratch, self.scratch_bytes);
         host_free(self.pinned_logits);
+        if let Ok(mut g) = self.decode.lock() {
+            if let Some(d) = g.take() {
+                device_free(d.ptr, d.bytes);
+            }
+        }
     }
 }
 
