@@ -354,12 +354,30 @@ impl Engine {
         let file = GgufFile::open(path)?;
         let tok = extract_tokenizer(&file)?;
         let model = TinyModel::from_gguf(&file)?;
+        if !model.host_weights_ready() && self.hip.is_none() {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "large GGUF requires HIP (host F32 materialize is skipped to avoid OOM)".into(),
+            )));
+        }
+        let mut draft_file = None;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         inner.tokenizer = Some(EngineTokenizer::from_gguf(tok));
         if let Some(draft_path) = &self.config.model.draft_path {
-            match GgufFile::open(draft_path).and_then(|f| TinyModel::from_gguf(&f)) {
-                Ok(draft) => inner.draft_model = Some(Arc::new(draft)),
+            match GgufFile::open(draft_path) {
+                Ok(f) => match TinyModel::from_gguf(&f) {
+                    Ok(draft) => {
+                        inner.draft_model = Some(Arc::new(draft));
+                        draft_file = Some(f);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "draft GGUF failed; disabling draft-model speculation");
+                        inner.flags.draft_model_speculation = false;
+                        self.metrics
+                            .degraded_events
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "draft GGUF failed; disabling draft-model speculation");
                     inner.flags.draft_model_speculation = false;
@@ -372,17 +390,34 @@ impl Engine {
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
-        self.upload_resident_weights()
+        self.upload_resident_from_gguf(Some(&file), draft_file.as_ref())
     }
 
     fn upload_resident_weights(&self) -> Result<(), AllpacaError> {
+        self.upload_resident_from_gguf(None, None)
+    }
+
+    fn upload_resident_from_gguf(
+        &self,
+        target_gguf: Option<&GgufFile>,
+        draft_gguf: Option<&GgufFile>,
+    ) -> Result<(), AllpacaError> {
         let mut inner = self.lock()?;
         let mut weight_bytes = 0u64;
         let mut h2d = 0u64;
         let target = inner.target.clone();
         let draft = inner.draft_model.clone();
         inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
-            match ResidentModel::upload(&target, hip.device) {
+            let uploaded = if target.host_weights_ready() {
+                ResidentModel::upload(&target, hip.device)
+            } else if let Some(file) = target_gguf {
+                ResidentModel::upload_gguf(file, &target.config, hip.device)
+            } else {
+                Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                    "large GGUF missing file handle for HIP upload".into(),
+                )))
+            };
+            match uploaded {
                 Ok(resident) => {
                     let n = resident.bytes();
                     weight_bytes += n;
@@ -401,7 +436,16 @@ impl Engine {
             None
         };
         inner.draft_resident = if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
-            match ResidentModel::upload(&draft, hip.device) {
+            let uploaded = if draft.host_weights_ready() {
+                ResidentModel::upload(&draft, hip.device)
+            } else if let Some(file) = draft_gguf {
+                ResidentModel::upload_gguf(file, &draft.config, hip.device)
+            } else {
+                Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                    "large draft GGUF missing file handle for HIP upload".into(),
+                )))
+            };
+            match uploaded {
                 Ok(resident) => {
                     let n = resident.bytes();
                     weight_bytes += n;
@@ -1936,6 +1980,27 @@ mod tests {
         };
         assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
         let _ = std::fs::remove_file(junk);
+    }
+
+    #[test]
+    fn engine_fatal_on_missing_gguf() {
+        let mut missing = Config::compiled_defaults();
+        missing.merge_cli(&CliOverrides {
+            cpu_only: true,
+            model: Some(std::env::temp_dir().join("allpaca_missing_target.gguf")),
+            ..CliOverrides::default()
+        });
+        assert_eq!(
+            missing.model.path.as_deref(),
+            Some(std::path::Path::new(
+                &std::env::temp_dir().join("allpaca_missing_target.gguf")
+            ))
+        );
+        let err = match Engine::new(missing) {
+            Ok(_) => panic!("missing GGUF must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
     }
 
     #[test]

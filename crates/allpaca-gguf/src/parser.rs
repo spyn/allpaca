@@ -83,6 +83,18 @@ impl GgufValue {
         }
     }
 
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Self::Float32(v) => Some(*v),
+            Self::Float64(v) => Some(*v as f32),
+            Self::Uint32(v) => Some(*v as f32),
+            Self::Uint64(v) => Some(*v as f32),
+            Self::Int32(v) => Some(*v as f32),
+            Self::Int64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Uint32(v) => Some(*v as u64),
@@ -165,6 +177,21 @@ pub struct TensorInfo {
 impl TensorInfo {
     pub fn n_elements(&self) -> u64 {
         self.dims.iter().product()
+    }
+
+    pub fn nbytes(&self) -> usize {
+        let n = self.n_elements() as usize;
+        match self.ggml_type {
+            GgmlType::F32 => n.saturating_mul(4),
+            GgmlType::F16 => n.saturating_mul(2),
+            GgmlType::Q4_0 => n
+                .div_ceil(allpaca_cpu::Q4_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q4_0_BLOCK_BYTES),
+            GgmlType::Q8_0 => n
+                .div_ceil(allpaca_cpu::Q8_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES),
+            _ => n.saturating_mul(4),
+        }
     }
 }
 
@@ -315,12 +342,31 @@ impl GgufFile {
         }
     }
 
+    /// Raw on-disk tensor bytes (quant blocks or IEEE floats).
+    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], AllpacaError> {
+        let info = self.tensor(name).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
+        })?;
+        let start = self.tensor_data_offset + info.offset as usize;
+        let nbytes = info.nbytes();
+        if start.saturating_add(nbytes) > self.mmap.len() {
+            return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                "tensor {name} out of range"
+            ))));
+        }
+        Ok(&self.mmap[start..start + nbytes])
+    }
+
     pub fn meta_str(&self, key: &str) -> Option<&str> {
         self.metadata.get(key).and_then(GgufValue::as_str)
     }
 
     pub fn meta_u32(&self, key: &str) -> Option<u32> {
         self.metadata.get(key).and_then(GgufValue::as_u32)
+    }
+
+    pub fn meta_f32(&self, key: &str) -> Option<f32> {
+        self.metadata.get(key).and_then(GgufValue::as_f32)
     }
 }
 
@@ -544,6 +590,28 @@ mod tests {
         assert_eq!(info.ggml_type, GgmlType::F32);
         let loaded = file.tensor_f32("token_embd.weight").unwrap();
         assert_eq!(loaded, data);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn meta_f32_reads_rope_freq_base() {
+        let path = std::env::temp_dir().join("allpaca_gguf_rope.gguf");
+        let mut meta = HashMap::new();
+        meta.insert(
+            "llama.rope.freq_base".into(),
+            GgufValue::Float32(500_000.0),
+        );
+        meta.insert(
+            "llama.attention.layer_norm_rms_epsilon".into(),
+            GgufValue::Float32(1e-5),
+        );
+        write_gguf(&path, &meta, &[]).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.meta_f32("llama.rope.freq_base"), Some(500_000.0));
+        assert!(
+            file.meta_f32("llama.attention.layer_norm_rms_epsilon")
+                .is_some_and(|e| (e - 1e-5).abs() < 1e-8)
+        );
         let _ = std::fs::remove_file(path);
     }
 

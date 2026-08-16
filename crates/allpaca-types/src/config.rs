@@ -454,4 +454,22 @@ mod tests {
             Some(std::path::Path::new("tokenizer.json"))
         );
     }
+
+    #[test]
+    fn cli_model_flag_points_at_gguf_path() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            model: Some(PathBuf::from("path/to/model.gguf")),
+            draft_model: Some(PathBuf::from("path/to/draft.gguf")),
+            ..CliOverrides::default()
+        });
+        assert_eq!(
+            cfg.model.path.as_deref(),
+            Some(std::path::Path::new("path/to/model.gguf"))
+        );
+        assert_eq!(
+            cfg.model.draft_path.as_deref(),
+            Some(std::path::Path::new("path/to/draft.gguf"))
+        );
+    }
 }
