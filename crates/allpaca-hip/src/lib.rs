@@ -87,6 +87,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_q8_0(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_attention(
             q: *const f32,
             k: *const f32,
@@ -627,6 +636,78 @@ pub fn gemm_nt_device(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt unavailable".into(),
+        )))
+    }
+}
+
+/// Device-pointer NT GEMM with GGUF Q8_0 `b` (`C = A * dequant(B)^T`).
+pub fn gemm_nt_q8_0_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_q8_0(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q8_0")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q8_0 unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer Q8_0 NT GEMM: copies to device, runs the kernel, copies back.
+pub fn gemm_nt_q8_0(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(32);
+        let b_bytes = (n as usize) * nblocks * 34;
+        if a.len() < a_n || b.len() < b_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q8_0 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(b_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), b_bytes, MEMCPY_H2D)?;
+            gemm_nt_q8_0_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, b_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q8_0 unavailable".into(),
         )))
     }
 }
@@ -1652,5 +1733,179 @@ mod tests {
         let devices = enumerate_devices();
         assert!(!devices.is_empty());
         assert!(devices.iter().all(|d| d.id >= 0 && d.kind == allpaca_types::DeviceKind::HipGpu));
+    }
+
+    #[cfg(feature = "hip")]
+    fn cpu_gemm_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        for r in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += a[r * k + p] * b[j * k + p];
+                }
+                c[r * n + j] = acc;
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    fn gemm_close(got: f32, exp: f32) -> bool {
+        let d = (got - exp).abs();
+        d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
+    }
+
+    /// Public `gemm_nt` must match CPU `C[m,n] = A[m,k] * B[n,k]^T` on small random shapes.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_matches_cpu_on_small_random_matrices() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (1, 8, 4),
+            (2, 3, 5),
+            (1, 64, 32),
+            (7, 17, 13),
+            (4, 32, 16),
+            (1, 128, 64),
+            (3, 65, 17),
+            (16, 64, 32),
+            (32, 32, 32),
+        ];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b, &mut cpu, m, n, k);
+            gemm_nt(&a, &b, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    fn f32_to_f16_bits(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let mant = bits & 0x7f_ffff;
+        if exp == 255 {
+            return sign | 0x7c00 | ((mant >> 13) as u16);
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            return sign | 0x7c00;
+        }
+        if new_exp <= 0 {
+            return sign;
+        }
+        sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+
+    #[cfg(feature = "hip")]
+    fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
+        let n_blocks = data.len().div_ceil(32);
+        let mut out = vec![0u8; n_blocks * 34];
+        for b in 0..n_blocks {
+            let start = b * 32;
+            let end = (start + 32).min(data.len());
+            let mut amax = 0.0f32;
+            for v in &data[start..end] {
+                amax = amax.max(v.abs());
+            }
+            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+            let off = b * 34;
+            out[off..off + 2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+            for i in 0..32 {
+                let src = start + i;
+                let q = if src < data.len() {
+                    (data[src] * inv).round().clamp(-127.0, 127.0) as i8
+                } else {
+                    0
+                };
+                out[off + 2 + i] = q as u8;
+            }
+        }
+        out
+    }
+
+    /// Public `gemm_nt_q8_0` must match CPU dequant + NT GEMM on small random shapes.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q8_0_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1, 8, 32), (2, 5, 64), (1, 17, 32), (3, 9, 96)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let mut b_q8 = Vec::new();
+            for row in 0..n {
+                b_q8.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
+            }
+            let mut b_deq = vec![0.0f32; n * k];
+            let nblocks = k.div_ceil(32);
+            for row in 0..n {
+                let blk = &b_q8[row * nblocks * 34..(row + 1) * nblocks * 34];
+                for bi in 0..nblocks {
+                    let off = bi * 34;
+                    let d = {
+                        let h = u16::from_le_bytes([blk[off], blk[off + 1]]);
+                        let sign = u32::from(h & 0x8000) << 16;
+                        let exp = (h >> 10) & 0x1f;
+                        let mant = u32::from(h & 0x3ff);
+                        let bits = if exp == 0 {
+                            sign
+                        } else if exp == 31 {
+                            sign | 0x7f80_0000 | (mant << 13)
+                        } else {
+                            sign | ((u32::from(exp) + (127 - 15)) << 23) | (mant << 13)
+                        };
+                        f32::from_bits(bits)
+                    };
+                    for j in 0..32 {
+                        let idx = bi * 32 + j;
+                        if idx < k {
+                            b_deq[row * k + idx] = d * (blk[off + 2 + j] as i8 as f32);
+                        }
+                    }
+                }
+            }
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_q8_0(&a, &b_q8, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q8_0 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_q8_0 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
     }
 }
