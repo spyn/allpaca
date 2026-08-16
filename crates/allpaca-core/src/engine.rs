@@ -128,6 +128,15 @@ impl Drop for RequestHandle {
 
 impl Engine {
     pub fn new(config: Config) -> Result<Self, AllpacaError> {
+        let mut config = config;
+        if config.model.draft_path.is_none() {
+            if let Ok(raw) = std::env::var("ALLPACA_DRAFT_GGUF") {
+                let p = std::path::PathBuf::from(raw);
+                if p.is_file() {
+                    config.model.draft_path = Some(p);
+                }
+            }
+        }
         config.validate()?;
         let inventory = DeviceInventory::discover(&config);
         let mut flags = FeatureFlags::from_mode(inventory.pipeline_mode);
@@ -2381,6 +2390,42 @@ mod tests {
             .expect("generate must work on dequantized Q4/Q8 weights");
         assert!(!out.token_ids.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_speculative_generate_from_tiny_written_draft_gguf() {
+        let target = std::env::temp_dir().join("allpaca_target_for_draft.gguf");
+        let draft = std::env::temp_dir().join("allpaca_tiny_draft.gguf");
+        write_tiny_target_gguf(&target);
+        write_tiny_target_gguf(&draft);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(target.clone());
+        cfg.model.draft_path = Some(draft.clone());
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("tiny target+draft GGUF must load");
+        assert_eq!(engine.stats().degraded_events, 0);
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("speculative generate with a written draft GGUF must run");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_file(draft);
     }
 
     #[test]

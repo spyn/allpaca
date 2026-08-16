@@ -63,7 +63,7 @@ cargo test -p allpaca-core --features hip --test hip_runtime hip_generate_real_7
 cargo run -p allpaca-server --features hip -- --model %ALLPACA_7B_GGUF%
 ```
 
-Optional speculative draft (second GPU) uses `--draft-model` / `ALLPACA_DRAFT_GGUF`. If that file is absent, tests skip.
+Optional speculative draft (second GPU: target on the fast card, draft on the slow card) uses `--draft-model`, `model.draft_path`, or `ALLPACA_DRAFT_GGUF`. `Engine::new` picks up `ALLPACA_DRAFT_GGUF` when `model.draft_path` is unset and the file exists. If that file is absent, the gated 7B+draft HIP test skips; a tiny written draft GGUF still exercises the Engine path in unit tests. Do not download multi-GB drafts.
 
 CLI flags override the TOML file; the file overrides compiled defaults.
 
