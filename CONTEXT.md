@@ -50,7 +50,7 @@
 | **GPU Backend** | The kernel implementation for a GPU vendor. MVP is HIP (AMD) only. CUDA (NVIDIA) is post-MVP. |
 | **CPU Fallback** | A slow but functional kernel implementation using AVX2 intrinsics. Required for every operation so the engine runs without GPU. |
 | **Tokenizer** | Converts text ↔ tokens. Uses HuggingFace `tokenizers` crate. Vocab extracted from GGUF at model load, decoupled from model format. |
-| **Request** | A single generation task with its own KV cache and decode state. MVP supports one active request; multi-request continuous batching is post-MVP. |
+| **Request** | A generation task with its own KV cache (`KvHandle` / KV Pages) and decode state. Multiple Requests can be active up to `engine.max_active_requests` (compiled default 1). A saturated scheduler returns Transient `RequestBusy` backpressure. |
 | **Telemetry** | Internal metrics (TTFT, ITL, acceptance rate, page migrations) stored in memory, exposed via `/stats` JSON endpoint. Uses `tracing` crate for structured logs. Prometheus/OpenTelemetry export is post-MVP. |
 | **Multimodal** | Vision/audio encoder support. Post-MVP; deferred until text-only asymmetric scheduling is proven. |
 | **Transfer Path** | The mechanism for moving tensors between devices. Engine benchmarks P2P and host-staged paths at boot, picks faster one transparently. Host staging (GPU→DRAM→GPU) is fallback when P2P unavailable or slower. |

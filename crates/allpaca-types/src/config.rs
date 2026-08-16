@@ -118,6 +118,11 @@ impl Config {
                 "speculative.max_depth < min_depth".into(),
             )));
         }
+        if self.engine.max_active_requests == 0 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "engine.max_active_requests must be > 0".into(),
+            )));
+        }
         Ok(())
     }
 }
@@ -133,6 +138,9 @@ pub struct EngineSection {
     /// `None` means auto-detect from the device inventory.
     pub pipeline_mode: Option<PipelineMode>,
     pub determinism_seed: Option<u64>,
+    /// Concurrent Requests the Engine will admit. Default 1 keeps
+    /// `RequestBusy` when a second `begin_request` arrives.
+    pub max_active_requests: usize,
 }
 
 impl Default for EngineSection {
@@ -145,6 +153,7 @@ impl Default for EngineSection {
             cpu_only: false,
             pipeline_mode: None,
             determinism_seed: None,
+            max_active_requests: 1,
         }
     }
 }
@@ -357,6 +366,34 @@ mod tests {
     #[test]
     fn compiled_defaults_validate() {
         Config::compiled_defaults().validate().unwrap();
+    }
+
+    #[test]
+    fn max_active_requests_defaults_to_one_and_is_configurable() {
+        let defaults = Config::compiled_defaults();
+        assert_eq!(
+            defaults.engine.max_active_requests, 1,
+            "compiled default keeps single-Request Engine behavior"
+        );
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [engine]
+            max_active_requests = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.engine.max_active_requests, 4);
+        assert_eq!(
+            cfg.engine.cpu_threads, 4,
+            "max_active_requests is composable, not a Pipeline Mode"
+        );
+
+        let mut bad = Config::compiled_defaults();
+        bad.engine.max_active_requests = 0;
+        let err = bad.validate().unwrap_err();
+        assert_eq!(err.class(), crate::ErrorClass::Fatal);
+        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
     }
 
     #[test]
