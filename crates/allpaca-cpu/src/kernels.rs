@@ -386,6 +386,12 @@ pub const Q8_0_BLOCK_BYTES: usize = 34;
 /// GGUF Q4_K / Q4_K_S / Q4_K_M super-block (256 elems).
 pub const Q4_K_BLOCK_ELEMS: usize = 256;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
+/// GGUF Q5_K super-block (256 elems): d + dmin + scales[12] + qh[32] + qs[128].
+pub const Q5_K_BLOCK_ELEMS: usize = 256;
+pub const Q5_K_BLOCK_BYTES: usize = 176;
+/// GGUF Q6_K super-block (256 elems): ql[128] + qh[64] + scales[16] + d.
+pub const Q6_K_BLOCK_ELEMS: usize = 256;
+pub const Q6_K_BLOCK_BYTES: usize = 210;
 
 /// IEEE-754 binary16 → f32.
 pub fn f16_to_f32(h: u16) -> f32 {
@@ -574,6 +580,173 @@ pub fn quantize_q4_k(data: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Quantize to GGUF Q5_K super-blocks (tests / tiny written models).
+pub fn quantize_q5_k(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(Q5_K_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * Q5_K_BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * Q5_K_BLOCK_ELEMS;
+        let mut scales = [0.0f32; 8];
+        let mut mins = [0.0f32; 8];
+        for j in 0..8 {
+            let g0 = start + j * 32;
+            let mut min_v = f32::MAX;
+            let mut max_v = f32::MIN;
+            for l in 0..32 {
+                let v = data.get(g0 + l).copied().unwrap_or(0.0);
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+            }
+            if min_v == f32::MAX {
+                min_v = 0.0;
+                max_v = 0.0;
+            }
+            scales[j] = (max_v - min_v) / 31.0;
+            mins[j] = -min_v;
+        }
+        let max_scale = scales.iter().copied().fold(0.0f32, f32::max);
+        let max_min = mins.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_min = mins.iter().copied().fold(f32::INFINITY, f32::min);
+        let extremum = if max_min.abs() >= min_min.abs() {
+            max_min
+        } else {
+            min_min
+        };
+        let d = if max_scale > 0.0 {
+            max_scale / 63.0
+        } else {
+            0.0
+        };
+        let dmin = if extremum.abs() > 0.0 {
+            extremum / 63.0
+        } else {
+            0.0
+        };
+        let mut sc_bytes = [0u8; 12];
+        for j in 0..8 {
+            let ls = if d > 0.0 {
+                ((scales[j] / d).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+            let lm = if dmin.abs() > 0.0 {
+                ((mins[j] / dmin).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+            if j < 4 {
+                sc_bytes[j] = ls;
+                sc_bytes[j + 4] = lm;
+            } else {
+                sc_bytes[j + 4] = (ls & 0x0f) | ((lm & 0x0f) << 4);
+                sc_bytes[j - 4] |= (ls >> 4) << 6;
+                sc_bytes[j] |= (lm >> 4) << 6;
+            }
+        }
+        let off = b * Q5_K_BLOCK_BYTES;
+        out[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        out[off + 2..off + 4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        out[off + 4..off + 16].copy_from_slice(&sc_bytes);
+        let mut qs = [0u8; 256];
+        for j in 0..8 {
+            let (sc, m) = q4_k_scale_min(j, &sc_bytes);
+            let dj = d * f32::from(sc);
+            let mj = dmin * f32::from(m);
+            let g0 = start + j * 32;
+            for l in 0..32 {
+                let x = data.get(g0 + l).copied().unwrap_or(0.0);
+                let q = if dj.abs() > 0.0 {
+                    ((x + mj) / dj).round().clamp(0.0, 31.0) as u8
+                } else {
+                    0
+                };
+                qs[j * 32 + l] = q;
+            }
+        }
+        let packed = &mut out[off + 16..off + 176];
+        let (qh, q_out) = packed.split_at_mut(32);
+        for grp in 0..4 {
+            let base = grp * 64;
+            let u1 = 1u8 << (2 * grp);
+            let u2 = 2u8 << (2 * grp);
+            for l in 0..32 {
+                let lo = qs[base + l];
+                let hi = qs[base + 32 + l];
+                q_out[grp * 32 + l] = (lo & 0x0f) | ((hi & 0x0f) << 4);
+                if lo & 0x10 != 0 {
+                    qh[l] |= u1;
+                }
+                if hi & 0x10 != 0 {
+                    qh[l] |= u2;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Quantize to GGUF Q6_K super-blocks (tests / tiny written models).
+pub fn quantize_q6_k(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(Q6_K_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * Q6_K_BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * Q6_K_BLOCK_ELEMS;
+        let mut levels = [0i8; Q6_K_BLOCK_ELEMS];
+        let mut scales = [0.0f32; 16];
+        let mut max_scale = 0.0f32;
+        for ib in 0..16 {
+            let g0 = start + ib * 16;
+            let mut amax = 0.0f32;
+            for l in 0..16 {
+                amax = amax.max(data.get(g0 + l).copied().unwrap_or(0.0).abs());
+            }
+            scales[ib] = amax / 32.0;
+            max_scale = max_scale.max(scales[ib].abs());
+        }
+        let d = if max_scale > 0.0 {
+            max_scale / 127.0
+        } else {
+            0.0
+        };
+        let off = b * Q6_K_BLOCK_BYTES;
+        out[off + 208..off + 210].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for ib in 0..16 {
+            let sc = if d > 0.0 {
+                ((scales[ib] / d).round() as i32).clamp(-128, 127) as i8
+            } else {
+                0
+            };
+            out[off + 192 + ib] = sc as u8;
+            let dj = d * f32::from(sc);
+            let g0 = start + ib * 16;
+            for l in 0..16 {
+                let q = if dj.abs() > 0.0 {
+                    (data.get(g0 + l).copied().unwrap_or(0.0) / dj)
+                        .round()
+                        .clamp(-32.0, 31.0) as i8
+                } else {
+                    0
+                };
+                levels[ib * 16 + l] = q;
+            }
+        }
+        for half in 0..2 {
+            let j = half * 128;
+            for l in 0..32 {
+                let q1 = (i16::from(levels[j + l]) + 32) as u8;
+                let q2 = (i16::from(levels[j + l + 32]) + 32) as u8;
+                let q3 = (i16::from(levels[j + l + 64]) + 32) as u8;
+                let q4 = (i16::from(levels[j + l + 96]) + 32) as u8;
+                out[off + half * 64 + l] = (q1 & 0x0f) | ((q3 & 0x0f) << 4);
+                out[off + half * 64 + 32 + l] = (q2 & 0x0f) | ((q4 & 0x0f) << 4);
+                out[off + 128 + half * 32 + l] =
+                    (q1 >> 4) | ((q2 >> 4) << 2) | ((q3 >> 4) << 4) | ((q4 >> 4) << 6);
+            }
+        }
+    }
+    out
+}
+
 fn quant_nibble(data: &[f32], idx: usize, inv: f32) -> u8 {
     if idx >= data.len() {
         return 8;
@@ -667,6 +840,116 @@ pub fn dequant_q4_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
             q_off += 32;
             y_base += 64;
             is += 2;
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q5_K super-blocks: `y = d*sc*q - dmin*m` (q in 0..31).
+pub fn dequant_q5_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q5_k output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q5_K_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q5_K_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q5_k truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q5_K_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([blocks[off + 2], blocks[off + 3]]));
+        let scales = &blocks[off + 4..off + 16];
+        let qh = &blocks[off + 16..off + 48];
+        let qs = &blocks[off + 48..off + 176];
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+        let mut y_base = b * Q5_K_BLOCK_ELEMS;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for _ in 0..4 {
+            let (sc1, m1) = q4_k_scale_min(is, scales);
+            let (sc2, m2) = q4_k_scale_min(is + 1, scales);
+            let d1 = d * f32::from(sc1);
+            let min1 = dmin * f32::from(m1);
+            let d2 = d * f32::from(sc2);
+            let min2 = dmin * f32::from(m2);
+            for l in 0..32 {
+                let packed = qs[q_off + l];
+                let i0 = y_base + l;
+                let i1 = y_base + 32 + l;
+                if i0 < n {
+                    let q = f32::from(packed & 0x0f) + if qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+                    out[i0] = d1 * q - min1;
+                }
+                if i1 < n {
+                    let q = f32::from(packed >> 4) + if qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+                    out[i1] = d2 * q - min2;
+                }
+            }
+            q_off += 32;
+            y_base += 64;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q6_K super-blocks: `y = d * scale * (q - 32)` (q in 0..63).
+pub fn dequant_q6_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q6_k output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q6_K_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q6_K_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q6_k truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q6_K_BLOCK_BYTES;
+        let ql = &blocks[off..off + 128];
+        let qh = &blocks[off + 128..off + 192];
+        let scales = &blocks[off + 192..off + 208];
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off + 208], blocks[off + 209]]));
+        let mut y_base = b * Q6_K_BLOCK_ELEMS;
+        for half in 0..2 {
+            let ql_h = &ql[half * 64..half * 64 + 64];
+            let qh_h = &qh[half * 32..half * 32 + 32];
+            let sc_h = &scales[half * 8..half * 8 + 8];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = i32::from(ql_h[l] & 0x0f | ((qh_h[l] >> 0) & 3) << 4) - 32;
+                let q2 = i32::from(ql_h[l + 32] & 0x0f | ((qh_h[l] >> 2) & 3) << 4) - 32;
+                let q3 = i32::from((ql_h[l] >> 4) | ((qh_h[l] >> 4) & 3) << 4) - 32;
+                let q4 = i32::from((ql_h[l + 32] >> 4) | ((qh_h[l] >> 6) & 3) << 4) - 32;
+                let i0 = y_base + l;
+                let i1 = y_base + 32 + l;
+                let i2 = y_base + 64 + l;
+                let i3 = y_base + 96 + l;
+                if i0 < n {
+                    out[i0] = d * (sc_h[is] as i8 as f32) * q1 as f32;
+                }
+                if i1 < n {
+                    out[i1] = d * (sc_h[is + 2] as i8 as f32) * q2 as f32;
+                }
+                if i2 < n {
+                    out[i2] = d * (sc_h[is + 4] as i8 as f32) * q3 as f32;
+                }
+                if i3 < n {
+                    out[i3] = d * (sc_h[is + 6] as i8 as f32) * q4 as f32;
+                }
+            }
+            y_base += 128;
         }
     }
     Ok(())

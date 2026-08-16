@@ -148,6 +148,8 @@ pub enum GgmlType {
     Q8_0 = 8,
     Q8_1 = 9,
     Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
     Other = 255,
 }
 
@@ -163,6 +165,8 @@ impl GgmlType {
             8 => Self::Q8_0,
             9 => Self::Q8_1,
             12 => Self::Q4_K,
+            13 => Self::Q5_K,
+            14 => Self::Q6_K,
             _ => Self::Other,
         }
     }
@@ -196,6 +200,12 @@ impl TensorInfo {
             GgmlType::Q4_K => n
                 .div_ceil(allpaca_cpu::Q4_K_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q4_K_BLOCK_BYTES),
+            GgmlType::Q5_K => n
+                .div_ceil(allpaca_cpu::Q5_K_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q5_K_BLOCK_BYTES),
+            GgmlType::Q6_K => n
+                .div_ceil(allpaca_cpu::Q6_K_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES),
             _ => n.saturating_mul(4),
         }
     }
@@ -289,7 +299,7 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// Materialize a tensor as F32. Q4_0 / Q8_0 / Q4_K dequantize on CPU; other quants are Fatal.
+    /// Materialize a tensor as F32. Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K dequantize on CPU; other quants are Fatal.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, AllpacaError> {
         let info = self.tensor(name).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
@@ -353,6 +363,32 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_q4_k(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q5_K => {
+                let nbytes = n
+                    .div_ceil(allpaca_cpu::Q5_K_BLOCK_ELEMS)
+                    .saturating_mul(allpaca_cpu::Q5_K_BLOCK_BYTES);
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q5_K out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q5_k(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q6_K => {
+                let nbytes = n
+                    .div_ceil(allpaca_cpu::Q6_K_BLOCK_ELEMS)
+                    .saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES);
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q6_K out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q6_k(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -714,6 +750,90 @@ mod tests {
             assert!(
                 loaded[i].abs() < 1e-3,
                 "Q4_K tail should be zero at {i}: {}",
+                loaded[i]
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn encode_q6_k_identity_block() -> Vec<u8> {
+        // One Q6_K super-block (256 elems, 210 bytes): d=1, scales[0]=1,
+        // first 16 quants 0..15 so y[i] = i.
+        let mut payload = vec![0u8; 210];
+        for l in 0..16 {
+            let stored = (l as u8) + 32;
+            payload[l] = stored & 0x0f;
+            payload[128 + l] = stored >> 4;
+        }
+        payload[192] = 1;
+        payload[208..210].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn q6_k_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q6k.gguf");
+        let payload = encode_q6_k_identity_block();
+        write_typed_gguf(&path, 14, &payload, 256);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::Q6_K);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("Q6_K must materialize to F32");
+        assert_eq!(loaded.len(), 256);
+        for i in 0..16 {
+            assert!(
+                (loaded[i] - i as f32).abs() < 1e-2,
+                "Q6_K dequant mismatch at {i}: {}",
+                loaded[i]
+            );
+        }
+        for i in 16..256 {
+            assert!(
+                loaded[i].abs() < 1e-3,
+                "Q6_K tail should be zero at {i}: {}",
+                loaded[i]
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn encode_q5_k_identity_block() -> Vec<u8> {
+        // One Q5_K super-block (256 elems, 176 bytes): d=1, dmin=0, first
+        // group scale=1, qs low nibbles 0..15 so y[i] = i % 16.
+        let mut payload = vec![0u8; 176];
+        payload[0..2].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+        payload[4] = 1;
+        for i in 0..32 {
+            payload[48 + i] = (i as u8) & 0x0f;
+        }
+        payload
+    }
+
+    #[test]
+    fn q5_k_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q5k.gguf");
+        let payload = encode_q5_k_identity_block();
+        write_typed_gguf(&path, 13, &payload, 256);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::Q5_K);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("Q5_K must materialize to F32");
+        assert_eq!(loaded.len(), 256);
+        for i in 0..32 {
+            assert!(
+                (loaded[i] - (i % 16) as f32).abs() < 1e-2,
+                "Q5_K dequant mismatch at {i}: {}",
+                loaded[i]
+            );
+        }
+        for i in 32..256 {
+            assert!(
+                loaded[i].abs() < 1e-3,
+                "Q5_K tail should be zero at {i}: {}",
                 loaded[i]
             );
         }
