@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use allpaca_hip::HipWorkspace;
 use allpaca_types::{AllpacaError, GenerationParams};
 
-use crate::model::{DenseKv, TinyModel};
+use crate::model::{DenseKv, ResidentModel, TinyModel};
 use crate::sampling::{argmax, rng_from_params, sample};
 use crate::telemetry::Metrics;
 
@@ -127,6 +127,7 @@ impl DraftModelProvider {
         max_tokens: usize,
         temperature: f32,
         hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
         metrics: Option<&Metrics>,
     ) -> Result<Vec<u32>, AllpacaError> {
         if ctx.is_empty() {
@@ -136,8 +137,15 @@ impl DraftModelProvider {
         let vocab = self.model.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         for (pos, tok) in ctx.iter().enumerate() {
-            self.model
-                .forward_dense_on(*tok, pos, &mut cache, &mut logits, hip, metrics)?;
+            self.model.forward_dense_on(
+                *tok,
+                pos,
+                &mut cache,
+                &mut logits,
+                hip,
+                resident,
+                metrics,
+            )?;
         }
         let mut out = Vec::new();
         let mut window = ctx.to_vec();
@@ -163,6 +171,7 @@ impl DraftModelProvider {
                 &mut cache,
                 &mut logits,
                 hip,
+                resident,
                 metrics,
             )?;
         }
@@ -183,7 +192,7 @@ impl DraftProvider for DraftModelProvider {
         max_tokens: usize,
         temperature: f32,
     ) -> Result<Vec<u32>, AllpacaError> {
-        self.propose_on(ctx, max_tokens, temperature, None, None)
+        self.propose_on(ctx, max_tokens, temperature, None, None, None)
     }
 }
 

@@ -65,6 +65,14 @@ int allpaca_attention(const float *q, const float *k, const float *v, float *out
 
 int allpaca_copy_async(void *dst, const void *src, size_t bytes, allpaca_stream_t stream);
 
+int allpaca_rmsnorm(const float *x, const float *weight, float *out, int32_t n, float eps,
+                    allpaca_stream_t stream);
+
+int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
+                 allpaca_stream_t stream);
+
+int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

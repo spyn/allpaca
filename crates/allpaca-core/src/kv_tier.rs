@@ -8,6 +8,14 @@ use allpaca_types::{
 
 use crate::telemetry::Metrics;
 
+struct HipPageAlloc {
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for HipPageAlloc {}
+unsafe impl Sync for HipPageAlloc {}
+
 struct BufferPool {
     data: Vec<f32>,
     bump: usize,
@@ -63,10 +71,13 @@ impl BufferPool {
 }
 
 /// Two-tier KV manager: VRAM (hot) <-> Pinned DRAM (warm). No NVMe in MVP.
+/// When `hip_device` is set, VRAM pages are real `hipMalloc` buffers.
 pub struct KvTierManager {
     pages: HashMap<PageId, KvPage>,
     vram: BufferPool,
     dram: BufferPool,
+    hip_pages: HashMap<PageId, HipPageAlloc>,
+    hip_device: Option<i32>,
     next_id: u64,
     clock: u64,
     hot_fraction: f32,
@@ -75,10 +86,21 @@ pub struct KvTierManager {
 
 impl KvTierManager {
     pub fn new(vram_bytes: usize, dram_bytes: usize, hot_fraction: f32) -> Self {
+        Self::with_hip(vram_bytes, dram_bytes, hot_fraction, None)
+    }
+
+    pub fn with_hip(
+        vram_bytes: usize,
+        dram_bytes: usize,
+        hot_fraction: f32,
+        hip_device: Option<i32>,
+    ) -> Self {
         Self {
             pages: HashMap::new(),
             vram: BufferPool::new(vram_bytes),
             dram: BufferPool::new(dram_bytes),
+            hip_pages: HashMap::new(),
+            hip_device,
             next_id: 1,
             clock: 1,
             hot_fraction,
@@ -101,18 +123,36 @@ impl KvTierManager {
     ) -> Result<PageId, AllpacaError> {
         let len = Self::page_floats(page_tokens, n_kv_heads, head_dim);
         self.evict_if_needed(len, metrics)?;
-        let (tier, offset, kind) = match self.vram.alloc(len) {
-            Ok(off) => (KvResidency::Vram, off, DeviceBufferKind::CpuVram),
-            Err(_) => {
-                let off = self.dram.alloc(len).map_err(|_| {
-                    AllpacaError::Fatal(FatalError::OutOfMemory(
-                        "VRAM and pinned DRAM KV pools are full".into(),
-                    ))
-                })?;
-                (KvResidency::PinnedDram, off, DeviceBufferKind::CpuPinnedDram)
+        let id = self.next_id;
+        let (tier, offset, kind, device_id) = if let Some(dev) = self.hip_device {
+            let bytes = len * 4;
+            match allpaca_hip::device_malloc(bytes, dev) {
+                Ok(ptr) => {
+                    self.hip_pages.insert(id, HipPageAlloc { ptr, bytes });
+                    (KvResidency::Vram, 0, DeviceBufferKind::Hip, dev)
+                }
+                Err(_) => {
+                    let off = self.dram.alloc(len).map_err(|_| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(
+                            "HIP KV alloc failed and pinned DRAM is full".into(),
+                        ))
+                    })?;
+                    (KvResidency::PinnedDram, off, DeviceBufferKind::CpuPinnedDram, -1)
+                }
+            }
+        } else {
+            match self.vram.alloc(len) {
+                Ok(off) => (KvResidency::Vram, off, DeviceBufferKind::CpuVram, -1),
+                Err(_) => {
+                    let off = self.dram.alloc(len).map_err(|_| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(
+                            "VRAM and pinned DRAM KV pools are full".into(),
+                        ))
+                    })?;
+                    (KvResidency::PinnedDram, off, DeviceBufferKind::CpuPinnedDram, -1)
+                }
             }
         };
-        let id = self.next_id;
         self.next_id += 1;
         self.clock += 1;
         self.pages.insert(
@@ -129,7 +169,7 @@ impl KvTierManager {
                 predicted_reuse: 1.0,
                 location: DeviceBuffer {
                     kind,
-                    device_id: -1,
+                    device_id,
                     offset,
                     len,
                 },
@@ -170,9 +210,14 @@ impl KvTierManager {
             return;
         }
         let loc = page.location.clone();
-        match page.tier {
-            KvResidency::Vram => self.vram.free(loc.offset, loc.len),
-            KvResidency::PinnedDram => self.dram.free(loc.offset, loc.len),
+        match loc.kind {
+            DeviceBufferKind::Hip => {
+                if let Some(alloc) = self.hip_pages.remove(&id) {
+                    allpaca_hip::device_free(alloc.ptr, alloc.bytes);
+                }
+            }
+            DeviceBufferKind::CpuVram => self.vram.free(loc.offset, loc.len),
+            DeviceBufferKind::CpuPinnedDram => self.dram.free(loc.offset, loc.len),
         }
         self.pages.remove(&id);
         self.refresh_metrics(metrics);
@@ -193,12 +238,34 @@ impl KvTierManager {
         let kv_width = n_kv_heads * head_dim;
         let k_off = page.location.offset + slot as usize * kv_width;
         let v_off = page.location.offset + page.capacity_tokens as usize * kv_width + slot as usize * kv_width;
-        match page.tier {
-            KvResidency::Vram => {
+        match page.location.kind {
+            DeviceBufferKind::Hip => {
+                let alloc = self.hip_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "HIP KV page {id} missing device buffer"
+                    )))
+                })?;
+                let k_bytes = kv_width * 4;
+                let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
+                let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
+                allpaca_hip::memcpy(
+                    k_ptr,
+                    k.as_ptr().cast(),
+                    k_bytes,
+                    allpaca_hip::MEMCPY_H2D,
+                )?;
+                allpaca_hip::memcpy(
+                    v_ptr,
+                    v.as_ptr().cast(),
+                    k_bytes,
+                    allpaca_hip::MEMCPY_H2D,
+                )?;
+            }
+            DeviceBufferKind::CpuVram => {
                 self.vram.slice_mut(k_off, kv_width).copy_from_slice(k);
                 self.vram.slice_mut(v_off, kv_width).copy_from_slice(v);
             }
-            KvResidency::PinnedDram => {
+            DeviceBufferKind::CpuPinnedDram => {
                 self.dram.slice_mut(k_off, kv_width).copy_from_slice(k);
                 self.dram.slice_mut(v_off, kv_width).copy_from_slice(v);
             }
@@ -223,13 +290,38 @@ impl KvTierManager {
         let cap = page.capacity_tokens as usize;
         let k_off = page.location.offset;
         let v_off = page.location.offset + cap * kv_width;
-        let k = match page.tier {
-            KvResidency::Vram => self.vram.slice(k_off, filled * kv_width).to_vec(),
-            KvResidency::PinnedDram => self.dram.slice(k_off, filled * kv_width).to_vec(),
-        };
-        let v = match page.tier {
-            KvResidency::Vram => self.vram.slice(v_off, filled * kv_width).to_vec(),
-            KvResidency::PinnedDram => self.dram.slice(v_off, filled * kv_width).to_vec(),
+        let n = filled * kv_width;
+        let (k, v) = match page.location.kind {
+            DeviceBufferKind::Hip => {
+                let alloc = self.hip_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "HIP KV page {id} missing device buffer"
+                    )))
+                })?;
+                let mut k = vec![0.0f32; n];
+                let mut v = vec![0.0f32; n];
+                allpaca_hip::memcpy(
+                    k.as_mut_ptr().cast(),
+                    unsafe { alloc.ptr.add(k_off * 4) },
+                    n * 4,
+                    allpaca_hip::MEMCPY_D2H,
+                )?;
+                allpaca_hip::memcpy(
+                    v.as_mut_ptr().cast(),
+                    unsafe { alloc.ptr.add(v_off * 4) },
+                    n * 4,
+                    allpaca_hip::MEMCPY_D2H,
+                )?;
+                (k, v)
+            }
+            DeviceBufferKind::CpuVram => (
+                self.vram.slice(k_off, n).to_vec(),
+                self.vram.slice(v_off, n).to_vec(),
+            ),
+            DeviceBufferKind::CpuPinnedDram => (
+                self.dram.slice(k_off, n).to_vec(),
+                self.dram.slice(v_off, n).to_vec(),
+            ),
         };
         Ok((k, v))
     }
@@ -243,14 +335,27 @@ impl KvTierManager {
         }
         let len = page.location.len;
         let dst = self.dram.alloc(len)?;
-        copy_f32(
-            self.dram.slice_mut(dst, len),
-            self.vram.slice(page.location.offset, len),
-        )?;
-        self.vram.free(page.location.offset, len);
+        if page.location.kind == DeviceBufferKind::Hip {
+            if let Some(alloc) = self.hip_pages.remove(&id) {
+                allpaca_hip::memcpy(
+                    self.dram.slice_mut(dst, len).as_mut_ptr().cast(),
+                    alloc.ptr,
+                    alloc.bytes,
+                    allpaca_hip::MEMCPY_D2H,
+                )?;
+                allpaca_hip::device_free(alloc.ptr, alloc.bytes);
+            }
+        } else {
+            copy_f32(
+                self.dram.slice_mut(dst, len),
+                self.vram.slice(page.location.offset, len),
+            )?;
+            self.vram.free(page.location.offset, len);
+        }
         if let Some(page) = self.pages.get_mut(&id) {
             page.tier = KvResidency::PinnedDram;
             page.location.kind = DeviceBufferKind::CpuPinnedDram;
+            page.location.device_id = -1;
             page.location.offset = dst;
         }
         metrics
@@ -269,16 +374,35 @@ impl KvTierManager {
         }
         let len = page.location.len;
         self.evict_if_needed(len, metrics)?;
-        let dst = self.vram.alloc(len)?;
-        copy_f32(
-            self.vram.slice_mut(dst, len),
-            self.dram.slice(page.location.offset, len),
-        )?;
-        self.dram.free(page.location.offset, len);
-        if let Some(page) = self.pages.get_mut(&id) {
-            page.tier = KvResidency::Vram;
-            page.location.kind = DeviceBufferKind::CpuVram;
-            page.location.offset = dst;
+        if let Some(dev) = self.hip_device {
+            let bytes = len * 4;
+            let ptr = allpaca_hip::device_malloc(bytes, dev)?;
+            allpaca_hip::memcpy(
+                ptr,
+                self.dram.slice(page.location.offset, len).as_ptr().cast(),
+                bytes,
+                allpaca_hip::MEMCPY_H2D,
+            )?;
+            self.dram.free(page.location.offset, len);
+            self.hip_pages.insert(id, HipPageAlloc { ptr, bytes });
+            if let Some(page) = self.pages.get_mut(&id) {
+                page.tier = KvResidency::Vram;
+                page.location.kind = DeviceBufferKind::Hip;
+                page.location.device_id = dev;
+                page.location.offset = 0;
+            }
+        } else {
+            let dst = self.vram.alloc(len)?;
+            copy_f32(
+                self.vram.slice_mut(dst, len),
+                self.dram.slice(page.location.offset, len),
+            )?;
+            self.dram.free(page.location.offset, len);
+            if let Some(page) = self.pages.get_mut(&id) {
+                page.tier = KvResidency::Vram;
+                page.location.kind = DeviceBufferKind::CpuVram;
+                page.location.offset = dst;
+            }
         }
         metrics
             .page_migrations
@@ -287,9 +411,17 @@ impl KvTierManager {
         Ok(())
     }
 
+    fn vram_live_floats(&self) -> usize {
+        if self.hip_device.is_some() {
+            self.hip_pages.values().map(|p| p.bytes / 4).sum()
+        } else {
+            self.vram.live
+        }
+    }
+
     fn evict_if_needed(&mut self, needed: usize, metrics: &Metrics) -> Result<(), AllpacaError> {
         let hot_cap = ((self.vram_capacity as f32) * self.hot_fraction).max(1.0) as usize;
-        while self.vram.live + needed > hot_cap {
+        while self.vram_live_floats() + needed > hot_cap {
             let victim = self.lowest_vram_page();
             let Some(id) = victim else {
                 break;
@@ -328,6 +460,10 @@ impl KvTierManager {
         metrics
             .dram_pages
             .store(dram, std::sync::atomic::Ordering::Relaxed);
+        let kv_dev: u64 = self.hip_pages.values().map(|p| p.bytes as u64).sum();
+        metrics
+            .kv_bytes_on_device
+            .store(kv_dev, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn counts(&self) -> (u64, u64) {
