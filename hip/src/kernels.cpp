@@ -10,6 +10,7 @@
 
 #if ALLPACA_HAS_HIP
 
+__device__ float allpaca_f16_bits_to_f32(uint16_t h);
 __device__ float allpaca_f16le_to_f32(const uint8_t *p);
 
 static hipStream_t as_stream(allpaca_stream_t stream) {
@@ -151,34 +152,56 @@ __global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, 
     }
 }
 
-/* Decode GEMV against GGUF Q8_0 rows: one warp per output, no F32 materialize. */
+/* Decode GEMV against GGUF Q8_0: 4 outputs per warp, float4 A + uint16 qs. */
 __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                     int k) {
     constexpr int WARPS = 8;
+    constexpr int COLS = 4;
+    constexpr int SUB = 8;
     const int row = static_cast<int>(blockIdx.y);
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
-    const int col = static_cast<int>(blockIdx.x) * WARPS + warp;
-    if (row >= m || col >= n) {
+    const int sub = lane / SUB;
+    const int sublane = lane % SUB;
+    const int col = (static_cast<int>(blockIdx.x) * WARPS + warp) * COLS + sub;
+    if (row >= m) {
         return;
     }
     const int nblocks = (k + 31) / 32;
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
-    const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 34;
+    const size_t row_stride = static_cast<size_t>(nblocks) * 34;
     float acc = 0.0f;
-    for (int blk = 0; blk < nblocks; ++blk) {
-        const uint8_t *bp = brow + static_cast<size_t>(blk) * 34;
-        const float d = allpaca_f16le_to_f32(bp);
-        const int idx = blk * 32 + lane;
-        if (idx < k) {
-            acc += arow[idx] * (d * static_cast<float>(static_cast<int8_t>(bp[2 + lane])));
+    if (col < n) {
+        const uint8_t *brow = b + static_cast<size_t>(col) * row_stride;
+        for (int blk = 0; blk < nblocks; ++blk) {
+            const uint8_t *bp = brow + static_cast<size_t>(blk) * 34;
+            const uint16_t dh = *reinterpret_cast<const uint16_t *>(bp);
+            const float d = allpaca_f16_bits_to_f32(dh);
+            const int k0 = blk * 32 + sublane * 4;
+            const uint8_t *qp = bp + 2 + sublane * 4;
+            const uint16_t qlo = *reinterpret_cast<const uint16_t *>(qp);
+            const uint16_t qhi = *reinterpret_cast<const uint16_t *>(qp + 2);
+            const float q0 = static_cast<float>(static_cast<int8_t>(qlo & 0xff));
+            const float q1 = static_cast<float>(static_cast<int8_t>(qlo >> 8));
+            const float q2 = static_cast<float>(static_cast<int8_t>(qhi & 0xff));
+            const float q3 = static_cast<float>(static_cast<int8_t>(qhi >> 8));
+            float4 av;
+            if (k0 + 3 < k && (reinterpret_cast<uintptr_t>(arow + k0) % 16u) == 0) {
+                av = *reinterpret_cast<const float4 *>(arow + k0);
+            } else {
+                av.x = (k0 < k) ? arow[k0] : 0.0f;
+                av.y = (k0 + 1 < k) ? arow[k0 + 1] : 0.0f;
+                av.z = (k0 + 2 < k) ? arow[k0 + 2] : 0.0f;
+                av.w = (k0 + 3 < k) ? arow[k0 + 3] : 0.0f;
+            }
+            acc += d * (av.x * q0 + av.y * q1 + av.z * q2 + av.w * q3);
         }
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down(acc, off, 32);
+    for (int off = 4; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 8);
     }
-    if (lane == 0) {
+    if (col < n && sublane == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
     }
 }
@@ -350,11 +373,7 @@ static int launch_gemm(const float *a, const float *b, float *c, int32_t m, int3
     dim3 block(16, 16);
     dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>((m + BM - 1) / BM));
     hipLaunchKernelGGL(gemm_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(stream));
+    return hip_status(hipGetLastError());
 }
 
 static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
@@ -376,11 +395,7 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
         dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>((m + BM - 1) / BM));
         hipLaunchKernelGGL(gemm_nt_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     }
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(stream));
+    return hip_status(hipGetLastError());
 }
 
 static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -390,14 +405,13 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     }
     clear_last_error();
     constexpr int warps = 8;
+    constexpr int cols = 4;
+    constexpr int cols_per_block = warps * cols;
     dim3 block(256);
-    dim3 grid(static_cast<unsigned>((n + warps - 1) / warps), static_cast<unsigned>(m));
+    dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
+              static_cast<unsigned>(m));
     hipLaunchKernelGGL(gemv_nt_q8_0_kernel, grid, block, 0, stream, a, b, c, m, n, k);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(stream));
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_hip_device_count(int32_t *count) {
@@ -478,6 +492,10 @@ extern "C" int allpaca_hip_free(void *ptr) {
     if (!ptr) {
         return ALLPACA_OK;
     }
+    hipError_t err = hipStreamSynchronize(nullptr);
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
     return hip_status(hipFree(ptr));
 }
 
@@ -519,7 +537,11 @@ extern "C" int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int3
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
     }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    /* Host-visible D2H is the wait point; H2D/D2D stay queued on the stream. */
+    if (kind == ALLPACA_MEMCPY_D2H) {
+        return hip_status(hipStreamSynchronize(as_stream(stream)));
+    }
+    return ALLPACA_OK;
 }
 
 extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
@@ -607,6 +629,10 @@ extern "C" int allpaca_hip_set_device(int32_t device) {
     return hip_status(hipSetDevice(device));
 }
 
+extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t stream) {
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
 extern "C" int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes) {
     if (!used_bytes) {
         return ALLPACA_ERR_INVALID;
@@ -654,11 +680,7 @@ extern "C" int allpaca_attention(const float *q, const float *k, const float *v,
     hipLaunchKernelGGL(attention_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), q, k, v, out, n_q,
                        n_kv, n_heads, n_kv_heads, head_dim, causal);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
 __global__ void rmsnorm_kernel(const float *x, const float *weight, float *out, int n, float eps) {
@@ -713,11 +735,7 @@ extern "C" int allpaca_rmsnorm(const float *x, const float *weight, float *out, 
     hipLaunchKernelGGL(rmsnorm_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, weight, out, n,
                        eps);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
@@ -732,11 +750,7 @@ extern "C" int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t
     hipLaunchKernelGGL(rope_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n_heads,
                        head_dim, pos, theta);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream) {
@@ -748,11 +762,7 @@ extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(silu_mul_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
 __global__ void embed_gather_kernel(const float *table, int token, float *out, int dim) {
@@ -782,15 +792,10 @@ extern "C" int allpaca_embed_gather(const float *table, int32_t token, float *ou
     hipLaunchKernelGGL(embed_gather_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
                        dim);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
-__device__ float allpaca_f16le_to_f32(const uint8_t *p) {
-    const uint16_t h = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+__device__ float allpaca_f16_bits_to_f32(uint16_t h) {
     const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u) << 16);
     const uint32_t exp = (h >> 10) & 0x1fu;
     const uint32_t mant = h & 0x3ffu;
@@ -813,6 +818,11 @@ __device__ float allpaca_f16le_to_f32(const uint8_t *p) {
     } conv;
     conv.u = bits;
     return conv.f;
+}
+
+__device__ float allpaca_f16le_to_f32(const uint8_t *p) {
+    const uint16_t h = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    return allpaca_f16_bits_to_f32(h);
 }
 
 __global__ void dequant_q8_0_kernel(const uint8_t *blocks, float *out, int n) {
@@ -848,16 +858,16 @@ extern "C" int allpaca_dequant_q8_0(const uint8_t *qblocks, float *out, int32_t 
     if (!qblocks || !out || n <= 0) {
         return ALLPACA_ERR_INVALID;
     }
+    /* Workspace reuse must not overwrite an in-flight consumer of `out`. */
+    if (hipStreamSynchronize(as_stream(stream)) != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
     clear_last_error();
     const int threads = 64;
     const int nblocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(dequant_q8_0_kernel, dim3(static_cast<unsigned>(nblocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), qblocks, out, n);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, int32_t dim,
@@ -871,11 +881,7 @@ extern "C" int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, fl
     hipLaunchKernelGGL(embed_gather_q8_0_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
                        dim);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
@@ -888,11 +894,7 @@ extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(residual_add_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, residual, n);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_copy_async(void *dst, const void *src, size_t bytes,
@@ -955,6 +957,10 @@ extern "C" int allpaca_hip_benchmark(int32_t, int32_t, size_t, double *, double 
 extern "C" int allpaca_hip_mem_used(int32_t, uint64_t *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_set_device(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
+extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
 
 extern "C" int allpaca_gemm(const float *, const float *, float *, int32_t, int32_t, int32_t,
                             allpaca_stream_t) {

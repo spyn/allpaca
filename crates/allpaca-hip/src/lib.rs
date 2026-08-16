@@ -69,6 +69,7 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_hip_mem_used(device: i32, used_bytes: *mut u64) -> i32;
         pub fn allpaca_hip_set_device(device: i32) -> i32;
+        pub fn allpaca_hip_stream_synchronize(stream: *mut c_void) -> i32;
         pub fn allpaca_gemm(
             a: *const f32,
             b: *const f32,
@@ -475,6 +476,21 @@ pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(
         let _ = (dst, src, bytes, kind);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP memcpy unavailable".into(),
+        )))
+    }
+}
+
+/// Wait for queued kernels and copies on the default stream.
+pub fn stream_synchronize() -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_stream_synchronize(std::ptr::null_mut()) };
+        status(rc, "stream_synchronize")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP stream_synchronize unavailable".into(),
         )))
     }
 }
@@ -1851,7 +1867,16 @@ mod tests {
         if device_count() == 0 {
             return;
         }
-        let shapes = [(1, 8, 32), (2, 5, 64), (1, 17, 32), (3, 9, 96)];
+        let shapes = [
+            (1, 8, 32),
+            (2, 5, 64),
+            (1, 17, 32),
+            (3, 9, 96),
+            (1, 1, 33),
+            (1, 4, 33),
+            (2, 7, 33),
+            (1, 33, 64),
+        ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let mut a = vec![0.0f32; m * k];
             let mut b_f = vec![0.0f32; n * k];
@@ -1907,5 +1932,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Queued Q8 GEMV + residual must match CPU after a single D2H (no per-op host wait).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn queued_q8_gemm_and_residual_match_cpu() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 1usize;
+        let n = 7usize;
+        let k = 64usize;
+        let mut a = vec![0.0f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        let mut residual = vec![0.0f32; m * n];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 11) % 40) as f32 * 0.03 - 0.4;
+        }
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i * 19) % 40) as f32 * 0.03 - 0.4;
+        }
+        for (i, v) in residual.iter_mut().enumerate() {
+            *v = (i as f32) * 0.1 - 0.3;
+        }
+        let mut b_q8 = Vec::new();
+        for row in 0..n {
+            b_q8.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
+        }
+        let mut b_deq = vec![0.0f32; n * k];
+        let nblocks = k.div_ceil(32);
+        for row in 0..n {
+            let blk = &b_q8[row * nblocks * 34..(row + 1) * nblocks * 34];
+            for bi in 0..nblocks {
+                let off = bi * 34;
+                let h = u16::from_le_bytes([blk[off], blk[off + 1]]);
+                let sign = u32::from(h & 0x8000) << 16;
+                let exp = (h >> 10) & 0x1f;
+                let mant = u32::from(h & 0x3ff);
+                let bits = if exp == 0 {
+                    sign
+                } else if exp == 31 {
+                    sign | 0x7f80_0000 | (mant << 13)
+                } else {
+                    sign | ((u32::from(exp) + (127 - 15)) << 23) | (mant << 13)
+                };
+                let d = f32::from_bits(bits);
+                for j in 0..32 {
+                    let idx = bi * 32 + j;
+                    if idx < k {
+                        b_deq[row * k + idx] = d * (blk[off + 2 + j] as i8 as f32);
+                    }
+                }
+            }
+        }
+        let mut cpu = vec![0.0f32; m * n];
+        cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+        for i in 0..m * n {
+            cpu[i] += residual[i];
+        }
+
+        let a_bytes = a.len() * 4;
+        let b_bytes = b_q8.len();
+        let c_bytes = cpu.len() * 4;
+        let da = device_malloc(a_bytes, 0).expect("da");
+        let db = device_malloc(b_bytes, 0).expect("db");
+        let dc = device_malloc(c_bytes, 0).expect("dc");
+        let dr = device_malloc(c_bytes, 0).expect("dr");
+        set_device(0).expect("bind");
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_bytes, MEMCPY_H2D)?;
+            memcpy(db, b_q8.as_ptr(), b_bytes, MEMCPY_H2D)?;
+            memcpy(dr, residual.as_ptr().cast(), c_bytes, MEMCPY_H2D)?;
+            gemm_nt_q8_0_device(da.cast(), db, dc.cast(), m as i32, n as i32, k as i32)?;
+            let hip = HipWorkspace::new(0, 4096, 8)?;
+            hip.residual_add(dc.cast(), dr.cast(), (m * n) as i32)?;
+            let mut got = vec![0.0f32; m * n];
+            memcpy(got.as_mut_ptr().cast(), dc, c_bytes, MEMCPY_D2H)?;
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(got[i], cpu[i]),
+                    "queued q8+residual mismatch idx={i} hip={} cpu={}",
+                    got[i],
+                    cpu[i]
+                );
+            }
+            Ok::<(), AllpacaError>(())
+        })();
+        device_free(da, a_bytes);
+        device_free(db, b_bytes);
+        device_free(dc, c_bytes);
+        device_free(dr, c_bytes);
+        result.expect("queued device Q8 GEMV + residual must match CPU");
     }
 }
