@@ -45,30 +45,104 @@ impl ModelConfig {
     pub fn head_dim(&self) -> usize {
         self.dim / self.n_heads
     }
+
+    pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
+        let arch = file.architecture().unwrap_or("llama").to_string();
+        let vocab = file
+            .meta_u32(&format!("{arch}.vocab_size"))
+            .or_else(|| {
+                file.metadata
+                    .get("tokenizer.ggml.tokens")
+                    .and_then(allpaca_gguf::GgufValue::as_string_array)
+                    .map(|t| t.len() as u32)
+            })
+            .ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("missing vocab_size".into()))
+            })? as usize;
+        let dim = file
+            .meta_u32(&format!("{arch}.embedding_length"))
+            .ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("missing embedding_length".into()))
+            })? as usize;
+        let n_layers = file
+            .meta_u32(&format!("{arch}.block_count"))
+            .ok_or_else(|| AllpacaError::Fatal(FatalError::ModelLoad("missing block_count".into())))?
+            as usize;
+        let n_heads = file
+            .meta_u32(&format!("{arch}.attention.head_count"))
+            .unwrap_or(4) as usize;
+        let n_kv_heads = file
+            .meta_u32(&format!("{arch}.attention.head_count_kv"))
+            .unwrap_or(n_heads as u32) as usize;
+        let ff_dim = file
+            .meta_u32(&format!("{arch}.feed_forward_length"))
+            .unwrap_or((dim * 4) as u32) as usize;
+        let eps = file
+            .meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-5);
+        let rope_theta = file
+            .meta_f32(&format!("{arch}.rope.freq_base"))
+            .unwrap_or(10_000.0);
+        Ok(Self {
+            vocab_size: vocab,
+            dim,
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            ff_dim,
+            eps,
+            rope_theta,
+        })
+    }
 }
 
 const TENSORS_PER_LAYER: usize = 9;
+/// Host-materialize F32 only for tiny GGUFs. A 7B/8B Q8 file is ~32GiB as F32.
+const HOST_F32_LIMIT: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeightKind {
+    F32,
+    Q8_0,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WeightRef {
+    off: usize,
+    n: usize,
+    kind: WeightKind,
+}
+
+impl WeightRef {
+    fn f32(off: usize, n: usize) -> Self {
+        Self {
+            off,
+            n,
+            kind: WeightKind::F32,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct LayerOff {
-    attn_norm: usize,
-    wq: usize,
-    wk: usize,
-    wv: usize,
-    wo: usize,
-    ffn_norm: usize,
-    w_gate: usize,
-    w_up: usize,
-    w_down: usize,
+    attn_norm: WeightRef,
+    wq: WeightRef,
+    wk: WeightRef,
+    wv: WeightRef,
+    wo: WeightRef,
+    ffn_norm: WeightRef,
+    w_gate: WeightRef,
+    w_up: WeightRef,
+    w_down: WeightRef,
 }
 
 /// Host-layout map onto a once-uploaded [`DeviceWeights`] blob.
 pub struct ResidentModel {
     weights: DeviceWeights,
-    embed: usize,
+    embed: WeightRef,
     layers: Vec<LayerOff>,
-    norm: usize,
-    lm_head: usize,
+    norm: WeightRef,
+    lm_head: WeightRef,
 }
 
 impl ResidentModel {
@@ -83,26 +157,97 @@ impl ResidentModel {
         let weights = DeviceWeights::upload(device, &slices)?;
         let mut layers = Vec::with_capacity(model.layers.len());
         let mut idx = 1;
-        for _ in 0..model.layers.len() {
+        for layer in &model.layers {
             layers.push(LayerOff {
-                attn_norm: offsets[idx],
-                wq: offsets[idx + 1],
-                wk: offsets[idx + 2],
-                wv: offsets[idx + 3],
-                wo: offsets[idx + 4],
-                ffn_norm: offsets[idx + 5],
-                w_gate: offsets[idx + 6],
-                w_up: offsets[idx + 7],
-                w_down: offsets[idx + 8],
+                attn_norm: WeightRef::f32(offsets[idx], layer.attn_norm.len()),
+                wq: WeightRef::f32(offsets[idx + 1], layer.wq.len()),
+                wk: WeightRef::f32(offsets[idx + 2], layer.wk.len()),
+                wv: WeightRef::f32(offsets[idx + 3], layer.wv.len()),
+                wo: WeightRef::f32(offsets[idx + 4], layer.wo.len()),
+                ffn_norm: WeightRef::f32(offsets[idx + 5], layer.ffn_norm.len()),
+                w_gate: WeightRef::f32(offsets[idx + 6], layer.w_gate.len()),
+                w_up: WeightRef::f32(offsets[idx + 7], layer.w_up.len()),
+                w_down: WeightRef::f32(offsets[idx + 8], layer.w_down.len()),
             });
             idx += TENSORS_PER_LAYER;
         }
         Ok(Self {
             weights,
-            embed: offsets[0],
+            embed: WeightRef::f32(offsets[0], model.embed.len()),
             layers,
-            norm: offsets[idx],
-            lm_head: offsets[idx + 1],
+            norm: WeightRef::f32(offsets[idx], model.norm.len()),
+            lm_head: WeightRef::f32(offsets[idx + 1], model.lm_head.len()),
+        })
+    }
+
+    /// Upload a real GGUF without host-materializing every tensor as F32.
+    /// Q8_0 weights stay quantized on device; `output.weight` is dequantized once
+    /// so the lm_head GEMM can use a resident F32 matrix.
+    pub fn upload_gguf(file: &GgufFile, cfg: &ModelConfig, device: i32) -> Result<Self, AllpacaError> {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut off = 0usize;
+        let embed = append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?;
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            layers.push(LayerOff {
+                attn_norm: append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.attn_norm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+                wq: append_gguf_tensor(file, &format!("blk.{i}.attn_q.weight"), &mut parts, &mut off)?,
+                wk: append_gguf_tensor(file, &format!("blk.{i}.attn_k.weight"), &mut parts, &mut off)?,
+                wv: append_gguf_tensor(file, &format!("blk.{i}.attn_v.weight"), &mut parts, &mut off)?,
+                wo: append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.attn_output.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+                ffn_norm: append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.ffn_norm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+                w_gate: append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.ffn_gate.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+                w_up: append_gguf_tensor(file, &format!("blk.{i}.ffn_up.weight"), &mut parts, &mut off)?,
+                w_down: append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.ffn_down.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+            });
+        }
+        let norm = append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?;
+        let lm_f32 = match file.tensor_f32("output.weight") {
+            Ok(w) => w,
+            Err(_) => file.tensor_f32("token_embd.weight")?,
+        };
+        let mut lm_bytes = Vec::with_capacity(lm_f32.len() * 4);
+        for v in &lm_f32 {
+            lm_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let lm_head = WeightRef::f32(off, lm_f32.len());
+        off += lm_bytes.len();
+        let _ = off;
+        parts.push(lm_bytes);
+
+        let views: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+        let weights = DeviceWeights::upload_bytes(device, &views)?;
+        Ok(Self {
+            weights,
+            embed,
+            layers,
+            norm,
+            lm_head,
         })
     }
 
@@ -110,53 +255,138 @@ impl ResidentModel {
         self.weights.bytes()
     }
 
+    fn f32_or_dequant(
+        &self,
+        hip: &HipWorkspace,
+        w: WeightRef,
+    ) -> Result<*const f32, AllpacaError> {
+        match w.kind {
+            WeightKind::F32 => Ok(self.weights.ptr_at(w.off)),
+            WeightKind::Q8_0 => {
+                let out = hip.ensure_dequant(w.n)?;
+                hip.dequant_q8_0(self.weights.byte_ptr_at(w.off), w.n as i32, out)?;
+                Ok(out as *const f32)
+            }
+        }
+    }
+
     pub fn embed(&self) -> *const f32 {
-        self.weights.ptr_at(self.embed)
+        self.weights.ptr_at(self.embed.off)
     }
 
     pub fn attn_norm(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].attn_norm)
+        self.weights.ptr_at(self.layers[layer].attn_norm.off)
     }
 
     pub fn wq(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].wq)
+        self.weights.ptr_at(self.layers[layer].wq.off)
     }
 
     pub fn wk(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].wk)
+        self.weights.ptr_at(self.layers[layer].wk.off)
     }
 
     pub fn wv(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].wv)
+        self.weights.ptr_at(self.layers[layer].wv.off)
     }
 
     pub fn wo(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].wo)
+        self.weights.ptr_at(self.layers[layer].wo.off)
     }
 
     pub fn ffn_norm(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].ffn_norm)
+        self.weights.ptr_at(self.layers[layer].ffn_norm.off)
     }
 
     pub fn w_gate(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].w_gate)
+        self.weights.ptr_at(self.layers[layer].w_gate.off)
     }
 
     pub fn w_up(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].w_up)
+        self.weights.ptr_at(self.layers[layer].w_up.off)
     }
 
     pub fn w_down(&self, layer: usize) -> *const f32 {
-        self.weights.ptr_at(self.layers[layer].w_down)
+        self.weights.ptr_at(self.layers[layer].w_down.off)
     }
 
     pub fn norm(&self) -> *const f32 {
-        self.weights.ptr_at(self.norm)
+        self.weights.ptr_at(self.norm.off)
     }
 
     pub fn lm_head(&self) -> *const f32 {
-        self.weights.ptr_at(self.lm_head)
+        self.weights.ptr_at(self.lm_head.off)
     }
+}
+
+fn empty_layer() -> LayerWeights {
+    LayerWeights {
+        attn_norm: Vec::new(),
+        wq: Vec::new(),
+        wk: Vec::new(),
+        wv: Vec::new(),
+        wo: Vec::new(),
+        ffn_norm: Vec::new(),
+        w_gate: Vec::new(),
+        w_up: Vec::new(),
+        w_down: Vec::new(),
+    }
+}
+
+fn estimated_gguf_f32_bytes(file: &GgufFile, n_layers: usize) -> u64 {
+    let mut names = vec![
+        "token_embd.weight".to_string(),
+        "output_norm.weight".to_string(),
+        "output.weight".to_string(),
+    ];
+    for i in 0..n_layers {
+        names.push(format!("blk.{i}.attn_norm.weight"));
+        names.push(format!("blk.{i}.attn_q.weight"));
+        names.push(format!("blk.{i}.attn_k.weight"));
+        names.push(format!("blk.{i}.attn_v.weight"));
+        names.push(format!("blk.{i}.attn_output.weight"));
+        names.push(format!("blk.{i}.ffn_norm.weight"));
+        names.push(format!("blk.{i}.ffn_gate.weight"));
+        names.push(format!("blk.{i}.ffn_up.weight"));
+        names.push(format!("blk.{i}.ffn_down.weight"));
+    }
+    names
+        .iter()
+        .filter_map(|n| file.tensor(n))
+        .map(|t| t.n_elements().saturating_mul(4))
+        .sum()
+}
+
+fn append_gguf_tensor(
+    file: &GgufFile,
+    name: &str,
+    parts: &mut Vec<Vec<u8>>,
+    off: &mut usize,
+) -> Result<WeightRef, AllpacaError> {
+    let info = file.tensor(name).ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
+    })?;
+    let n = info.n_elements() as usize;
+    let (bytes, kind) = match info.ggml_type {
+        allpaca_gguf::GgmlType::F32 => (file.tensor_bytes(name)?.to_vec(), WeightKind::F32),
+        allpaca_gguf::GgmlType::Q8_0 => (file.tensor_bytes(name)?.to_vec(), WeightKind::Q8_0),
+        _ => {
+            let f32s = file.tensor_f32(name)?;
+            let mut bytes = Vec::with_capacity(f32s.len() * 4);
+            for v in &f32s {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            (bytes, WeightKind::F32)
+        }
+    };
+    let w = WeightRef {
+        off: *off,
+        n,
+        kind,
+    };
+    *off += bytes.len();
+    parts.push(bytes);
+    Ok(w)
 }
 
 #[derive(Debug, Clone)]
@@ -212,50 +442,53 @@ impl TinyModel {
         }
     }
 
+    pub fn host_weights_ready(&self) -> bool {
+        !self.embed.is_empty()
+    }
+
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
-        let arch = file.architecture().unwrap_or("llama").to_string();
-        let vocab = file
-            .meta_u32(&format!("{arch}.vocab_size"))
-            .or_else(|| {
-                file.metadata
-                    .get("tokenizer.ggml.tokens")
-                    .and_then(allpaca_gguf::GgufValue::as_string_array)
-                    .map(|t| t.len() as u32)
-            })
-            .ok_or_else(|| {
-                AllpacaError::Fatal(FatalError::ModelLoad("missing vocab_size".into()))
-            })? as usize;
-        let dim = file
-            .meta_u32(&format!("{arch}.embedding_length"))
-            .ok_or_else(|| {
-                AllpacaError::Fatal(FatalError::ModelLoad("missing embedding_length".into()))
-            })? as usize;
-        let n_layers = file
-            .meta_u32(&format!("{arch}.block_count"))
-            .ok_or_else(|| AllpacaError::Fatal(FatalError::ModelLoad("missing block_count".into())))?
-            as usize;
-        let n_heads = file
-            .meta_u32(&format!("{arch}.attention.head_count"))
-            .unwrap_or(4) as usize;
-        let n_kv_heads = file
-            .meta_u32(&format!("{arch}.attention.head_count_kv"))
-            .unwrap_or(n_heads as u32) as usize;
-        let ff_dim = file
-            .meta_u32(&format!("{arch}.feed_forward_length"))
-            .unwrap_or((dim * 4) as u32) as usize;
-        let cfg = ModelConfig {
-            vocab_size: vocab,
-            dim,
-            n_layers,
-            n_heads,
-            n_kv_heads,
-            ff_dim,
-            eps: 1e-5,
-            rope_theta: 10_000.0,
-        };
+        let cfg = ModelConfig::from_gguf(file)?;
+        let name = file
+            .meta_str("general.name")
+            .unwrap_or("gguf")
+            .to_string();
+        for i in 0..cfg.n_layers {
+            for suffix in [
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_norm.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ] {
+                let name = format!("blk.{i}.{suffix}");
+                if file.tensor(&name).is_none() {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "missing tensor {name}"
+                    ))));
+                }
+            }
+        }
+        if file.tensor("token_embd.weight").is_none() {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "missing tensor token_embd.weight".into(),
+            )));
+        }
+        if file.tensor("output_norm.weight").is_none() {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "missing tensor output_norm.weight".into(),
+            )));
+        }
+        let host_bytes = estimated_gguf_f32_bytes(file, cfg.n_layers);
+        if host_bytes > HOST_F32_LIMIT {
+            return Ok(Self::skeleton(cfg, name));
+        }
         let embed = file.tensor_f32("token_embd.weight")?;
-        let mut layers = Vec::with_capacity(n_layers);
-        for i in 0..n_layers {
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
             layers.push(LayerWeights {
                 attn_norm: file.tensor_f32(&format!("blk.{i}.attn_norm.weight"))?,
                 wq: file.tensor_f32(&format!("blk.{i}.attn_q.weight"))?,
@@ -279,11 +512,19 @@ impl TinyModel {
             layers,
             norm,
             lm_head,
-            name: file
-                .meta_str("general.name")
-                .unwrap_or("gguf")
-                .to_string(),
+            name,
         })
+    }
+
+    fn skeleton(cfg: ModelConfig, name: impl Into<String>) -> Self {
+        Self {
+            embed: Vec::new(),
+            layers: (0..cfg.n_layers).map(|_| empty_layer()).collect(),
+            norm: Vec::new(),
+            lm_head: Vec::new(),
+            name: name.into(),
+            config: cfg,
+        }
     }
 
     pub fn from_safetensors(file: &SafetensorsFile, hf: &HfConfig) -> Result<Self, AllpacaError> {
@@ -435,9 +676,17 @@ impl TinyModel {
             ) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    if !self.host_weights_ready() {
+                        return Err(e);
+                    }
                     tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                 }
             }
+        }
+        if !self.host_weights_ready() {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "large GGUF has no host F32 weights; HIP decode is required".into(),
+            )));
         }
         let mut x = self.embed[token as usize * dim..(token as usize + 1) * dim].to_vec();
         let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
@@ -584,13 +833,22 @@ impl TinyModel {
             .max(pos + 1);
         hip.bind()?;
         let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, max_kv)?;
-        hip.embed_gather(resident.embed(), token, buf.x, dim as i32)?;
+        match resident.embed.kind {
+            WeightKind::F32 => hip.embed_gather(resident.embed(), token, buf.x, dim as i32)?,
+            WeightKind::Q8_0 => hip.embed_gather_q8_0(
+                resident.weights.byte_ptr_at(resident.embed.off),
+                token,
+                buf.x,
+                dim as i32,
+            )?,
+        }
         record_elementwise(Some(metrics));
 
         for (layer_idx, _) in self.layers.iter().enumerate() {
+            let layer = &resident.layers[layer_idx];
             hip.rmsnorm_device(
                 buf.x,
-                resident.attn_norm(layer_idx),
+                resident.f32_or_dequant(hip, layer.attn_norm)?,
                 buf.normed,
                 dim as i32,
                 cfg.eps,
@@ -598,7 +856,7 @@ impl TinyModel {
             record_elementwise(Some(metrics));
             allpaca_hip::gemm_nt_device(
                 buf.normed,
-                resident.wq(layer_idx),
+                resident.f32_or_dequant(hip, layer.wq)?,
                 buf.q,
                 1,
                 dim as i32,
@@ -606,7 +864,7 @@ impl TinyModel {
             )?;
             allpaca_hip::gemm_nt_device(
                 buf.normed,
-                resident.wk(layer_idx),
+                resident.f32_or_dequant(hip, layer.wk)?,
                 buf.k,
                 1,
                 kv_dim as i32,
@@ -614,7 +872,7 @@ impl TinyModel {
             )?;
             allpaca_hip::gemm_nt_device(
                 buf.normed,
-                resident.wv(layer_idx),
+                resident.f32_or_dequant(hip, layer.wv)?,
                 buf.v,
                 1,
                 kv_dim as i32,
@@ -665,7 +923,7 @@ impl TinyModel {
             )?;
             allpaca_hip::gemm_nt_device(
                 buf.attn,
-                resident.wo(layer_idx),
+                resident.f32_or_dequant(hip, layer.wo)?,
                 buf.proj,
                 1,
                 dim as i32,
@@ -679,7 +937,7 @@ impl TinyModel {
 
             hip.rmsnorm_device(
                 buf.x,
-                resident.ffn_norm(layer_idx),
+                resident.f32_or_dequant(hip, layer.ffn_norm)?,
                 buf.normed,
                 dim as i32,
                 cfg.eps,
@@ -687,7 +945,7 @@ impl TinyModel {
             record_elementwise(Some(metrics));
             allpaca_hip::gemm_nt_device(
                 buf.normed,
-                resident.w_gate(layer_idx),
+                resident.f32_or_dequant(hip, layer.w_gate)?,
                 buf.gate,
                 1,
                 cfg.ff_dim as i32,
@@ -695,7 +953,7 @@ impl TinyModel {
             )?;
             allpaca_hip::gemm_nt_device(
                 buf.normed,
-                resident.w_up(layer_idx),
+                resident.f32_or_dequant(hip, layer.w_up)?,
                 buf.up,
                 1,
                 cfg.ff_dim as i32,
@@ -705,7 +963,7 @@ impl TinyModel {
             record_elementwise(Some(metrics));
             allpaca_hip::gemm_nt_device(
                 buf.gate,
-                resident.w_down(layer_idx),
+                resident.f32_or_dequant(hip, layer.w_down)?,
                 buf.proj,
                 1,
                 dim as i32,
@@ -718,11 +976,17 @@ impl TinyModel {
             record_elementwise(Some(metrics));
         }
 
-        hip.rmsnorm_device(buf.x, resident.norm(), buf.normed, dim as i32, cfg.eps)?;
+        hip.rmsnorm_device(
+            buf.x,
+            resident.f32_or_dequant(hip, resident.norm)?,
+            buf.normed,
+            dim as i32,
+            cfg.eps,
+        )?;
         record_elementwise(Some(metrics));
         allpaca_hip::gemm_nt_device(
             buf.normed,
-            resident.lm_head(),
+            resident.f32_or_dequant(hip, resident.lm_head)?,
             buf.logits,
             1,
             vocab as i32,

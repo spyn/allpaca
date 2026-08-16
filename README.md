@@ -51,11 +51,19 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"synthetic","messages":[{"role":"user","content":"hello"}],"max_tokens":8}'
 ```
 
-Load a GGUF (F32 weights only in this MVP):
+Load a GGUF (`--model` / `model.path`; missing file is Fatal). Tiny F32/Q4_0/Q8_0 files run on CPU. A real Llama-family ~7B/8B GGUF is a **gated HIP** path (Q8_0 stays quantized on device so a 16GB card does not OOM):
 
 ```bash
+# CPU tiny / synthetic GGUF
 cargo run -p allpaca-server -- --config allpaca.toml --model path/to/model.gguf --cpu-only
+
+# Real 7B-class GGUF on HIP (set the path; do not commit weights)
+set ALLPACA_7B_GGUF=E:\path\to\Llama-3-8B-Q8_0.gguf
+cargo test -p allpaca-core --features hip --test hip_runtime hip_generate_real_7b -- --nocapture
+cargo run -p allpaca-server --features hip -- --model %ALLPACA_7B_GGUF%
 ```
+
+Optional speculative draft (second GPU) uses `--draft-model` / `ALLPACA_DRAFT_GGUF`. If that file is absent, tests skip.
 
 CLI flags override the TOML file; the file overrides compiled defaults.
 

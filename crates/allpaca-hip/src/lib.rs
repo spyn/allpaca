@@ -141,6 +141,19 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_dequant_q8_0(
+            blocks: *const u8,
+            out: *mut f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_q8_0(
+            table: *const u8,
+            token: i32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -777,6 +790,31 @@ impl DeviceWeights {
     pub fn ptr_at(&self, byte_offset: usize) -> *const f32 {
         unsafe { self.ptr.add(byte_offset).cast() }
     }
+
+    pub fn byte_ptr_at(&self, byte_offset: usize) -> *const u8 {
+        unsafe { self.ptr.add(byte_offset) }
+    }
+
+    /// Packed native-quant / F32 byte slices uploaded once via H2D.
+    pub fn upload_bytes(device: i32, parts: &[&[u8]]) -> Result<Self, AllpacaError> {
+        let bytes: usize = parts.iter().map(|t| t.len()).sum();
+        if bytes == 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty weight upload".into(),
+            )));
+        }
+        let ptr = device_malloc(bytes, device)?;
+        set_device(device)?;
+        let mut off = 0usize;
+        for t in parts {
+            if let Err(e) = memcpy(unsafe { ptr.add(off) }, t.as_ptr(), t.len(), MEMCPY_H2D) {
+                device_free(ptr, bytes);
+                return Err(e);
+            }
+            off += t.len();
+        }
+        Ok(Self { device, ptr, bytes })
+    }
 }
 
 impl Drop for DeviceWeights {
@@ -847,6 +885,15 @@ fn decode_floats(dim: usize, kv_dim: usize, ff_dim: usize, vocab: usize, max_kv:
 }
 
 /// Persistent device workspace used by the Engine for GEMM / attention / logits.
+struct DequantAlloc {
+    ptr: *mut u8,
+    bytes: usize,
+    n_floats: usize,
+}
+
+unsafe impl Send for DequantAlloc {}
+unsafe impl Sync for DequantAlloc {}
+
 pub struct HipWorkspace {
     pub device: i32,
     scratch: *mut u8,
@@ -854,6 +901,7 @@ pub struct HipWorkspace {
     pinned_logits: *mut u8,
     pinned_logits_bytes: usize,
     decode: Mutex<Option<DecodeAlloc>>,
+    dequant: Mutex<Option<DequantAlloc>>,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
 }
@@ -877,6 +925,7 @@ impl HipWorkspace {
             pinned_logits,
             pinned_logits_bytes,
             decode: Mutex::new(None),
+            dequant: Mutex::new(None),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
         })
@@ -888,6 +937,11 @@ impl HipWorkspace {
             n += self.pinned_logits_bytes as u64;
         }
         if let Ok(g) = self.decode.lock() {
+            if let Some(d) = g.as_ref() {
+                n += d.bytes as u64;
+            }
+        }
+        if let Ok(g) = self.dequant.lock() {
             if let Some(d) = g.as_ref() {
                 n += d.bytes as u64;
             }
@@ -963,6 +1017,78 @@ impl HipWorkspace {
             });
         }
         Ok(guard.as_ref().expect("decode alloc").ptrs())
+    }
+
+    /// Reusable F32 workspace for on-device Q8_0 dequant before GEMM.
+    pub fn ensure_dequant(&self, n_floats: usize) -> Result<*mut f32, AllpacaError> {
+        let n_floats = n_floats.max(1);
+        let mut guard = self.dequant.lock().unwrap_or_else(|e| e.into_inner());
+        let grow = match guard.as_ref() {
+            None => true,
+            Some(a) => a.n_floats < n_floats,
+        };
+        if grow {
+            if let Some(old) = guard.take() {
+                device_free(old.ptr, old.bytes);
+            }
+            let bytes = n_floats * 4;
+            let ptr = device_malloc(bytes, self.device)?;
+            *guard = Some(DequantAlloc {
+                ptr,
+                bytes,
+                n_floats,
+            });
+        }
+        Ok(guard.as_ref().expect("dequant alloc").ptr.cast())
+    }
+
+    pub fn dequant_q8_0(&self, blocks: *const u8, n: i32, out: *mut f32) -> Result<(), AllpacaError> {
+        if blocks.is_null() || out.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid q8_0 dequant".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_dequant_q8_0(blocks, out, n, std::ptr::null_mut()) };
+            status(rc, "dequant_q8_0")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP dequant_q8_0 unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn embed_gather_q8_0(
+        &self,
+        table: *const u8,
+        token: u32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid q8_0 embed gather".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_embed_gather_q8_0(table, token as i32, out, dim, std::ptr::null_mut())
+            };
+            status(rc, "embed_gather_q8_0")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = token;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_q8_0 unavailable".into(),
+            )))
+        }
     }
 
     /// GEMM NT using the persistent scratch buffer (H2D / kernel / D2H).
@@ -1488,6 +1614,11 @@ impl Drop for HipWorkspace {
         device_free(self.scratch, self.scratch_bytes);
         host_free(self.pinned_logits);
         if let Ok(mut g) = self.decode.lock() {
+            if let Some(d) = g.take() {
+                device_free(d.ptr, d.bytes);
+            }
+        }
+        if let Ok(mut g) = self.dequant.lock() {
             if let Some(d) = g.take() {
                 device_free(d.ptr, d.bytes);
             }

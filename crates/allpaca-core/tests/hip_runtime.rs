@@ -581,3 +581,165 @@ fn host_staging_transfer_path_still_uses_both_gpus() {
         );
     }
 }
+
+/// Gated 7B (or Llama-3 8B-class) GGUF. Skips unless `ALLPACA_7B_GGUF` /
+/// `ALLPACA_GGUF` or a discovered local file exists. Never downloads weights.
+#[cfg(feature = "hip")]
+fn gated_7b_gguf() -> Option<std::path::PathBuf> {
+    for key in ["ALLPACA_7B_GGUF", "ALLPACA_GGUF"] {
+        if let Ok(raw) = std::env::var(key) {
+            let path = std::path::PathBuf::from(raw);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    const DISCOVERED: &[&str] = &[
+        r"E:\Models\huggingface\models--bartowski--Llama-3-Groq-8B-Tool-Use-GGUF\snapshots\2d49903869805faad16daab2450fcda3487685b8\Llama-3-Groq-8B-Tool-Use-Q8_0.gguf",
+    ];
+    DISCOVERED
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+#[cfg(feature = "hip")]
+fn gated_draft_gguf() -> Option<std::path::PathBuf> {
+    std::env::var("ALLPACA_DRAFT_GGUF")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
+#[cfg(feature = "hip")]
+fn hip_7b_config(path: std::path::PathBuf) -> Config {
+    let mut cfg = Config::compiled_defaults();
+    cfg.model.path = Some(path);
+    cfg.model.synthetic = false;
+    cfg.engine.cpu_only = false;
+    cfg.engine.gpu_backend = "auto".into();
+    cfg.engine.determinism_seed = Some(7);
+    cfg.speculative.enabled = false;
+    cfg.kv.vram_bytes = 256 * 1024 * 1024;
+    cfg.kv.dram_bytes = 256 * 1024 * 1024;
+    cfg.kv.page_tokens = 128;
+    cfg
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_loads_real_7b_gguf_when_path_set() {
+    let Some(path) = gated_7b_gguf() else {
+        eprintln!("skip hip_loads_real_7b_gguf_when_path_set: set ALLPACA_7B_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_loads_real_7b_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let engine = Engine::new(hip_7b_config(path)).expect("7B GGUF load must not be Fatal");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_loads_real_7b_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(
+        stats.weight_bytes_on_device > 0,
+        "7B HIP load must upload weights; stats={stats:?}"
+    );
+    assert_eq!(
+        stats.weight_h2d_bytes, stats.weight_bytes_on_device,
+        "load-only H2D must match resident weights; stats={stats:?}"
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_real_7b_gguf_when_path_set() {
+    let Some(path) = gated_7b_gguf() else {
+        eprintln!("skip hip_generate_real_7b_gguf_when_path_set: set ALLPACA_7B_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_generate_real_7b_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let engine = Engine::new(hip_7b_config(path)).expect("7B GGUF load must not be Fatal");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_generate_real_7b_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let after_load = engine.stats();
+    let h2d = after_load.weight_h2d_bytes;
+    const N: usize = 8;
+    let started = std::time::Instant::now();
+    let out = engine
+        .generate("hello", greedy(N))
+        .expect("7B HIP generate must not panic or OOM");
+    let elapsed = started.elapsed();
+    assert!(
+        out.token_ids.len() >= N || out.finish_reason != allpaca_types::FinishReason::Length,
+        "expected at least {N} tokens or an early stop, got {} ids finish={:?}",
+        out.token_ids.len(),
+        out.finish_reason
+    );
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert_eq!(
+        stats.weight_h2d_bytes, h2d,
+        "decode must not H2D weights; load={h2d} after={} stats={stats:?}",
+        stats.weight_h2d_bytes
+    );
+    let toks = out.token_ids.len().max(1) as f64;
+    let tps = toks / elapsed.as_secs_f64().max(1e-6);
+    eprintln!(
+        "7B HIP generate: tokens={} backend={} devices={} ttft_ms={} itl_ms={:.2} tokens/s={:.2} elapsed_ms={} text={:?}",
+        out.token_ids.len(),
+        stats.backend,
+        hip_gpus(&engine).len(),
+        stats.ttft_ms_last,
+        stats.itl_ms_ema,
+        tps,
+        elapsed.as_millis(),
+        out.text
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_speculative_7b_with_draft_gguf_when_path_set() {
+    let Some(target) = gated_7b_gguf() else {
+        eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: set ALLPACA_7B_GGUF");
+        return;
+    };
+    let Some(draft) = gated_draft_gguf() else {
+        eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: set ALLPACA_DRAFT_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() < 2 {
+        eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: need 2 HIP devices");
+        return;
+    }
+    let mut cfg = hip_7b_config(target);
+    cfg.model.draft_path = Some(draft);
+    cfg.speculative.enabled = true;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    cfg.features.tree_speculation = Some(false);
+    let engine = Engine::new(cfg).expect("7B+draft GGUF load must not be Fatal");
+    if hip_gpus(&engine).len() < 2 {
+        eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: need 2 HIP devices");
+        return;
+    }
+    let out = engine
+        .generate("hello", greedy(8))
+        .expect("speculative 7B generate must run");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.target_gpu_forwards > 0 && stats.draft_gpu_forwards > 0,
+        "both forward counters must increment; stats={stats:?}"
+    );
+}

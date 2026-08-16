@@ -78,6 +78,11 @@ int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t 
 
 int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
 
+int allpaca_dequant_q8_0(const uint8_t *blocks, float *out, int32_t n, allpaca_stream_t stream);
+
+int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, int32_t dim,
+                              allpaca_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

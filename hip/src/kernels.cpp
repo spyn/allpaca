@@ -1,4 +1,5 @@
 #include "../include/allpaca_kernels.h"
+#include <stdint.h>
 
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
@@ -531,6 +532,95 @@ extern "C" int allpaca_embed_gather(const float *table, int32_t token, float *ou
     return hip_status(hipStreamSynchronize(as_stream(stream)));
 }
 
+__device__ float allpaca_f16le_to_f32(const uint8_t *p) {
+    const uint16_t h = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u) << 16);
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t mant = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            float f = (static_cast<float>(mant) / 1024.0f) * (1.0f / 16384.0f);
+            return (h & 0x8000u) ? -f : f;
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    union {
+        uint32_t u;
+        float f;
+    } conv;
+    conv.u = bits;
+    return conv.f;
+}
+
+__global__ void dequant_q8_0_kernel(const uint8_t *blocks, float *out, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) {
+        return;
+    }
+    const int b = i / 32;
+    const int j = i % 32;
+    const uint8_t *blk = blocks + static_cast<size_t>(b) * 34;
+    const float d = allpaca_f16le_to_f32(blk);
+    out[i] = d * static_cast<float>(static_cast<int8_t>(blk[2 + j]));
+}
+
+__global__ void embed_gather_q8_0_kernel(const uint8_t *table, int token, float *out, int dim) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= dim) {
+        return;
+    }
+    const int blocks_per_row = (dim + 31) / 32;
+    const int b = i / 32;
+    const int j = i % 32;
+    const uint8_t *blk =
+        table + (static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row) +
+                 static_cast<size_t>(b)) *
+                    34;
+    const float d = allpaca_f16le_to_f32(blk);
+    out[i] = d * static_cast<float>(static_cast<int8_t>(blk[2 + j]));
+}
+
+extern "C" int allpaca_dequant_q8_0(const uint8_t *qblocks, float *out, int32_t n,
+                                    allpaca_stream_t stream) {
+    if (!qblocks || !out || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 64;
+    const int nblocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(dequant_q8_0_kernel, dim3(static_cast<unsigned>(nblocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), qblocks, out, n);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
+extern "C" int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, int32_t dim,
+                                         allpaca_stream_t stream) {
+    if (!table || !out || dim <= 0 || token < 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 64;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(embed_gather_q8_0_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
+                       dim);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
 extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
                                     allpaca_stream_t stream) {
     if (!x || !residual || n <= 0) {
@@ -646,6 +736,15 @@ extern "C" int allpaca_embed_gather(const float *, int32_t, float *, int32_t, al
 }
 
 extern "C" int allpaca_residual_add(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_dequant_q8_0(const uint8_t *, float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather_q8_0(const uint8_t *, int32_t, float *, int32_t,
+                                         allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
