@@ -79,6 +79,7 @@ dependencies = [
 name = "allpaca-hip"
 version = "0.1.0"
 dependencies = [
+ "allpaca-cpu",
  "allpaca-types",
  "tracing",
 ]

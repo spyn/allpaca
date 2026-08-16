@@ -822,6 +822,165 @@ fn host_staging_transfer_path_still_uses_both_gpus() {
     }
 }
 
+#[cfg(feature = "hip")]
+fn write_tiny_q4k_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{
+        quantize_q4_k, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor,
+    };
+    use std::collections::HashMap;
+
+    let dim = 8usize;
+    let vocab = 4usize;
+    let ff = 16usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let embd_q = quantize_q4_k(&vec![0.01f32; vocab * dim]);
+    let q_q = quantize_q4_k(&vec![0.01f32; dim * dim]);
+    let k_q = quantize_q4_k(&vec![0.01f32; 2 * dim]);
+    let v_q = quantize_q4_k(&vec![0.01f32; 2 * dim]);
+    let o_q = quantize_q4_k(&vec![0.01f32; dim * dim]);
+    let gate_q = quantize_q4_k(&vec![0.01f32; ff * dim]);
+    let up_q = quantize_q4_k(&vec![0.01f32; ff * dim]);
+    let down_q = quantize_q4_k(&vec![0.01f32; dim * ff]);
+    let attn_norm = vec![1.0f32; dim];
+    let ffn_norm = vec![1.0f32; dim];
+    let output_norm = vec![1.0f32; dim];
+    write_gguf_quant(
+        path,
+        &meta,
+        &[
+            GgufWriteTensor {
+                name: "blk.0.attn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &attn_norm,
+            },
+            GgufWriteTensor {
+                name: "blk.0.ffn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &ffn_norm,
+            },
+            GgufWriteTensor {
+                name: "output_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &output_norm,
+            },
+        ],
+        &[
+            GgufWriteQuantTensor {
+                name: "token_embd.weight".into(),
+                dims: vec![vocab as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &embd_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_q.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &q_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_k.weight".into(),
+                dims: vec![2, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &k_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_v.weight".into(),
+                dims: vec![2, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &v_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_output.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &o_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_gate.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &gate_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &up_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_down.weight".into(),
+                dims: vec![dim as u64, ff as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &down_q,
+            },
+        ],
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_from_tiny_q4k_gguf() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_generate_from_tiny_q4k_gguf: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_hip_tiny_q4k.gguf");
+    write_tiny_q4k_gguf(&path);
+    let mut cfg = hip_7b_config(path.clone());
+    cfg.kv.page_tokens = 8;
+    cfg.kv.vram_bytes = 16 * 1024 * 1024;
+    cfg.kv.dram_bytes = 16 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("tiny Q4_K GGUF must load on HIP");
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("skip hip_generate_from_tiny_q4k_gguf: no HIP device");
+        return;
+    }
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("tiny Q4_K HIP generate must produce tokens");
+    assert!(!out.token_ids.is_empty());
+    assert_eq!(engine.stats().backend, "hip");
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "hip")]
+fn large_gguf_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Gated 7B (or Llama-3 8B-class) GGUF. Skips unless `ALLPACA_7B_GGUF` /
 /// `ALLPACA_GGUF` or a discovered local file exists. Never downloads weights.
 #[cfg(feature = "hip")]
@@ -841,6 +1000,38 @@ fn gated_7b_gguf() -> Option<std::path::PathBuf> {
         .iter()
         .map(std::path::PathBuf::from)
         .find(|p| p.is_file())
+}
+
+/// Gated Q4_K GGUF. Uses `ALLPACA_Q4K_GGUF`, or `ALLPACA_7B_GGUF` only when that
+/// file is actually Q4_K (the Groq Q8_0 bench path is unchanged).
+#[cfg(feature = "hip")]
+fn gated_q4k_gguf() -> Option<std::path::PathBuf> {
+    if let Ok(raw) = std::env::var("ALLPACA_Q4K_GGUF") {
+        let path = std::path::PathBuf::from(raw);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    gated_7b_gguf().filter(|p| gguf_is_supported_q4k(p))
+}
+
+#[cfg(feature = "hip")]
+fn gguf_is_supported_q4k(path: &std::path::Path) -> bool {
+    let Ok(file) = allpaca_gguf::GgufFile::open(path) else {
+        return false;
+    };
+    let mut saw_q4k = false;
+    for t in &file.tensors {
+        match t.ggml_type {
+            allpaca_gguf::GgmlType::Q4_K => saw_q4k = true,
+            allpaca_gguf::GgmlType::F32
+            | allpaca_gguf::GgmlType::F16
+            | allpaca_gguf::GgmlType::Q4_0
+            | allpaca_gguf::GgmlType::Q8_0 => {}
+            _ => return false,
+        }
+    }
+    saw_q4k
 }
 
 #[cfg(feature = "hip")]
@@ -890,6 +1081,7 @@ fn hip_7b_config(path: std::path::PathBuf) -> Config {
 #[cfg(feature = "hip")]
 #[test]
 fn hip_loads_real_7b_gguf_when_path_set() {
+    let _guard = large_gguf_lock();
     let Some(path) = gated_7b_gguf() else {
         eprintln!("skip hip_loads_real_7b_gguf_when_path_set: set ALLPACA_7B_GGUF");
         return;
@@ -918,6 +1110,7 @@ fn hip_loads_real_7b_gguf_when_path_set() {
 #[cfg(feature = "hip")]
 #[test]
 fn hip_generate_real_7b_gguf_when_path_set() {
+    let _guard = large_gguf_lock();
     let Some(path) = gated_7b_gguf() else {
         eprintln!("skip hip_generate_real_7b_gguf_when_path_set: set ALLPACA_7B_GGUF");
         return;
@@ -1014,6 +1207,7 @@ fn hip_generate_real_7b_gguf_when_path_set() {
 #[cfg(feature = "hip")]
 #[test]
 fn hip_speculative_7b_with_draft_gguf_when_path_set() {
+    let _guard = large_gguf_lock();
     let Some(target) = gated_7b_gguf() else {
         eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: set ALLPACA_7B_GGUF");
         return;
@@ -1045,5 +1239,43 @@ fn hip_speculative_7b_with_draft_gguf_when_path_set() {
     assert!(
         stats.target_gpu_forwards > 0 && stats.draft_gpu_forwards > 0,
         "both forward counters must increment; stats={stats:?}"
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_real_q4k_gguf_when_path_set() {
+    let _guard = large_gguf_lock();
+    let Some(path) = gated_q4k_gguf() else {
+        eprintln!("skip hip_generate_real_q4k_gguf_when_path_set: set ALLPACA_Q4K_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_generate_real_q4k_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let engine = Engine::new(hip_7b_config(path)).expect("Q4_K GGUF load must not be Fatal");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_generate_real_q4k_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let after_load = engine.stats();
+    let h2d = after_load.weight_h2d_bytes;
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("Q4_K HIP generate must not panic or OOM");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert_eq!(
+        stats.weight_h2d_bytes, h2d,
+        "decode must not H2D weights; load={h2d} after={}",
+        stats.weight_h2d_bytes
+    );
+    eprintln!(
+        "Q4_K HIP generate: tokens={} backend={} text={:?}",
+        out.token_ids.len(),
+        stats.backend,
+        out.text
     );
 }

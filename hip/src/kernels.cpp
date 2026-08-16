@@ -640,6 +640,78 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     return hip_status(hipGetLastError());
 }
 
+__device__ void q4k_scale_min(int j, const uint8_t *scales, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0x0F) | static_cast<uint8_t>((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4) | static_cast<uint8_t>((scales[j] >> 6) << 4);
+    }
+}
+
+/* One thread per output column. Native 144-byte Q4_K super-blocks along K. */
+__global__ void gemv_nt_q4_k_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                    int k) {
+    const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    if (col >= n || row >= m) {
+        return;
+    }
+    const int nblocks = (k + 255) / 256;
+    const uint8_t *row_blocks = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 144;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    float acc = 0.f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * 144;
+        const float d = allpaca_f16le_to_f32(blk);
+        const float dmin = allpaca_f16le_to_f32(blk + 2);
+        const uint8_t *scales = blk + 4;
+        const uint8_t *qs = blk + 16;
+        const int k0 = ib * 256;
+        int q_off = 0;
+        int is = 0;
+        for (int g = 0; g < 4; ++g) {
+            uint8_t sc1 = 0;
+            uint8_t m1 = 0;
+            uint8_t sc2 = 0;
+            uint8_t m2 = 0;
+            q4k_scale_min(is, scales, &sc1, &m1);
+            q4k_scale_min(is + 1, scales, &sc2, &m2);
+            const float d1 = d * static_cast<float>(sc1);
+            const float min1 = dmin * static_cast<float>(m1);
+            const float d2 = d * static_cast<float>(sc2);
+            const float min2 = dmin * static_cast<float>(m2);
+            for (int l = 0; l < 32; ++l) {
+                const int i0 = k0 + g * 64 + l;
+                const int i1 = i0 + 32;
+                const uint8_t packed = qs[q_off + l];
+                if (i0 < k) {
+                    acc += arow[i0] * (d1 * static_cast<float>(packed & 0x0F) - min1);
+                }
+                if (i1 < k) {
+                    acc += arow[i1] * (d2 * static_cast<float>(packed >> 4) - min2);
+                }
+            }
+            q_off += 32;
+            is += 2;
+        }
+    }
+    c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+}
+
+extern "C" int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_q4_k_kernel, grid, block, 0, as_stream(stream), a, b, c, m, n, k);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_hip_device_count(int32_t *count) {
     if (!count) {
         return ALLPACA_ERR_INVALID;
@@ -1349,6 +1421,11 @@ extern "C" int allpaca_gemm_nt_q8_0(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_gemm_nt_q8_0_intdot(const float *, const uint8_t *, float *, int32_t, int32_t,
                                            int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q4_k(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                    int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

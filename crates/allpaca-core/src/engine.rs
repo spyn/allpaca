@@ -2511,6 +2511,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn write_tiny_q4k_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{
+            quantize_q4_k, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
+            GgufWriteTensor,
+        };
+        use std::collections::HashMap;
+
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+        meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+        meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+        meta.insert(
+            "llama.feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hello".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+        let embd_q = quantize_q4_k(&vec![0.01f32; vocab * dim]);
+        let q_q = quantize_q4_k(&vec![0.01f32; dim * dim]);
+        let k_q = quantize_q4_k(&vec![0.01f32; 2 * dim]);
+        let v_q = quantize_q4_k(&vec![0.01f32; 2 * dim]);
+        let o_q = quantize_q4_k(&vec![0.01f32; dim * dim]);
+        let gate_q = quantize_q4_k(&vec![0.01f32; ff * dim]);
+        let up_q = quantize_q4_k(&vec![0.01f32; ff * dim]);
+        let down_q = quantize_q4_k(&vec![0.01f32; dim * ff]);
+        let attn_norm = vec![1.0f32; dim];
+        let ffn_norm = vec![1.0f32; dim];
+        let output_norm = vec![1.0f32; dim];
+
+        let f32_tensors = [
+            GgufWriteTensor {
+                name: "blk.0.attn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &attn_norm,
+            },
+            GgufWriteTensor {
+                name: "blk.0.ffn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &ffn_norm,
+            },
+            GgufWriteTensor {
+                name: "output_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &output_norm,
+            },
+        ];
+        let quant_tensors = [
+            GgufWriteQuantTensor {
+                name: "token_embd.weight".into(),
+                dims: vec![vocab as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &embd_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_q.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &q_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_k.weight".into(),
+                dims: vec![2, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &k_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_v.weight".into(),
+                dims: vec![2, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &v_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_output.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &o_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_gate.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &gate_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &up_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_down.weight".into(),
+                dims: vec![dim as u64, ff as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &down_q,
+            },
+        ];
+        write_gguf_quant(path, &meta, &f32_tensors, &quant_tensors).unwrap();
+    }
+
+    #[test]
+    fn engine_generate_from_q4k_gguf() {
+        let path = std::env::temp_dir().join("allpaca_target_q4k.gguf");
+        write_tiny_q4k_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("Q4_K GGUF must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("generate must work on dequantized Q4_K weights");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn engine_generate_from_q4_q8_gguf() {
         let path = std::env::temp_dir().join("allpaca_target_q4q8.gguf");

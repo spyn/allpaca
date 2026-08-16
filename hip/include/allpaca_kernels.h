@@ -76,6 +76,10 @@ int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, 
 int allpaca_gemm_nt_q8_0_intdot(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_q4_k[n,k])^T. B is native GGUF Q4_K super-blocks. */
+int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                         int32_t k, allpaca_stream_t stream);
+
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);

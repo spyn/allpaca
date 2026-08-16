@@ -137,6 +137,7 @@ impl GgufValue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
@@ -146,6 +147,7 @@ pub enum GgmlType {
     Q5_1 = 7,
     Q8_0 = 8,
     Q8_1 = 9,
+    Q4_K = 12,
     Other = 255,
 }
 
@@ -160,6 +162,7 @@ impl GgmlType {
             7 => Self::Q5_1,
             8 => Self::Q8_0,
             9 => Self::Q8_1,
+            12 => Self::Q4_K,
             _ => Self::Other,
         }
     }
@@ -190,6 +193,9 @@ impl TensorInfo {
             GgmlType::Q8_0 => n
                 .div_ceil(allpaca_cpu::Q8_0_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES),
+            GgmlType::Q4_K => n
+                .div_ceil(allpaca_cpu::Q4_K_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q4_K_BLOCK_BYTES),
             _ => n.saturating_mul(4),
         }
     }
@@ -283,7 +289,7 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// Materialize a tensor as F32. Q8_0 is dequantized on CPU; other quants are Fatal.
+    /// Materialize a tensor as F32. Q4_0 / Q8_0 / Q4_K dequantize on CPU; other quants are Fatal.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, AllpacaError> {
         let info = self.tensor(name).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
@@ -334,6 +340,19 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_q8_0(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q4_K => {
+                let nbytes = n
+                    .div_ceil(allpaca_cpu::Q4_K_BLOCK_ELEMS)
+                    .saturating_mul(allpaca_cpu::Q4_K_BLOCK_BYTES);
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q4_K out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q4_k(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -655,6 +674,47 @@ mod tests {
             assert!(
                 (*v - expect).abs() < 1e-2,
                 "Q4_0 dequant mismatch at {i}: {v} vs {expect}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn encode_q4_k_identity_block() -> Vec<u8> {
+        // One Q4_K super-block (256 elems, 144 bytes): d=1, dmin=0, first
+        // group scale=1, qs low nibbles 0..15 repeating so y[i] = i % 16.
+        let mut payload = vec![0u8; 144];
+        payload[0..2].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+        payload[4] = 1;
+        for i in 0..32 {
+            payload[16 + i] = (i as u8) & 0x0f;
+        }
+        payload
+    }
+
+    #[test]
+    fn q4_k_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q4k.gguf");
+        let payload = encode_q4_k_identity_block();
+        write_typed_gguf(&path, 12, &payload, 256);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::Q4_K);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("Q4_K must materialize to F32");
+        assert_eq!(loaded.len(), 256);
+        for i in 0..32 {
+            assert!(
+                (loaded[i] - (i % 16) as f32).abs() < 1e-2,
+                "Q4_K dequant mismatch at {i}: {}",
+                loaded[i]
+            );
+        }
+        for i in 32..256 {
+            assert!(
+                loaded[i].abs() < 1e-3,
+                "Q4_K tail should be zero at {i}: {}",
+                loaded[i]
             );
         }
         let _ = std::fs::remove_file(path);
