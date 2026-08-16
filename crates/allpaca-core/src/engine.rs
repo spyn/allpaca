@@ -21,7 +21,9 @@ use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
 use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
-use crate::model::{alloc_pages_for_seq, ensure_pages, ModelConfig, ResidentModel, TinyModel};
+use crate::model::{
+    alloc_pages_for_seq, ensure_pages, DenseKv, ModelConfig, ResidentModel, TinyModel,
+};
 use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
 use crate::telemetry::Metrics;
@@ -59,6 +61,7 @@ struct EngineInner {
     model_id: String,
     target_resident: Option<Arc<ResidentModel>>,
     draft_resident: Option<Arc<ResidentModel>>,
+    draft_kv: DenseKv,
 }
 
 #[derive(Clone)]
@@ -154,6 +157,7 @@ impl Engine {
             model_id: config.model.id.clone(),
             target_resident: None,
             draft_resident: None,
+            draft_kv: DenseKv::default(),
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -180,7 +184,7 @@ impl Engine {
     }
 
     pub fn stats(&self) -> StatsSnapshot {
-        let (model_id, kv_h2d, kv_d2h) = match self.lock() {
+        let (model_id, kv_h2d, kv_d2h, draft_kv_bytes) = match self.lock() {
             Ok(g) => (
                 g.target
                     .as_ref()
@@ -188,8 +192,9 @@ impl Engine {
                     .unwrap_or_else(|| self.config.model.id.clone()),
                 g.kv.activation_h2d_bytes(),
                 g.kv.activation_d2h_bytes(),
+                g.draft_kv.device_bytes(),
             ),
-            Err(_) => (self.config.model.id.clone(), 0, 0),
+            Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
         let (backend, device_memory_bytes) = if self.hip.is_some() {
             ("hip".into(), allpaca_hip::allocated_bytes())
@@ -206,15 +211,28 @@ impl Engine {
             .as_ref()
             .map(|h| h.activation_d2h_bytes())
             .unwrap_or(0);
+        let draft_h2d = self
+            .draft_hip
+            .as_ref()
+            .map(|h| h.activation_h2d_bytes())
+            .unwrap_or(0);
+        let draft_d2h = self
+            .draft_hip
+            .as_ref()
+            .map(|h| h.activation_d2h_bytes())
+            .unwrap_or(0);
         self.metrics
             .device_memory_bytes
             .store(device_memory_bytes, std::sync::atomic::Ordering::Relaxed);
         self.metrics
+            .draft_kv_bytes_on_device
+            .store(draft_kv_bytes, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
             .activation_h2d_bytes
-            .store(hip_h2d + kv_h2d, std::sync::atomic::Ordering::Relaxed);
+            .store(hip_h2d + kv_h2d + draft_h2d, std::sync::atomic::Ordering::Relaxed);
         self.metrics
             .activation_d2h_bytes
-            .store(hip_d2h + kv_d2h, std::sync::atomic::Ordering::Relaxed);
+            .store(hip_d2h + kv_d2h + draft_d2h, std::sync::atomic::Ordering::Relaxed);
         let bench = self.inventory.transfer_benchmark;
         let p2p_copy_ok = bench.map(|b| b.p2p_copy_ok).unwrap_or(false);
         let p2p_status = if p2p_copy_ok {
@@ -873,6 +891,7 @@ fn propose_drafts(
                 &ctx,
                 depth,
                 temperature,
+                &mut inner.draft_kv,
                 draft_hip,
                 resident.as_deref(),
                 Some(metrics),
