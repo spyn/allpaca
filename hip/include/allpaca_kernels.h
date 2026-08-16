@@ -94,6 +94,14 @@ int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t 
 
 int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
 
+/* x += residual, then RMSNorm(x) -> out. One launch for the decode epilogue. */
+int allpaca_residual_rmsnorm(float *x, const float *residual, const float *weight, float *out,
+                             int32_t n, float eps, allpaca_stream_t stream);
+
+/* RoPE on Q and K in one launch. */
+int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads, int32_t head_dim,
+                    int32_t pos, float theta, allpaca_stream_t stream);
+
 int allpaca_dequant_q8_0(const uint8_t *blocks, float *out, int32_t n, allpaca_stream_t stream);
 
 int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, int32_t dim,
