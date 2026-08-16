@@ -52,6 +52,11 @@ pub struct TokenEvent {
 pub enum StepResult {
     Token(TokenEvent),
     Finished(FinishReason),
+    /// Prompt prefill advanced by `prefill.chunk_tokens`; decode has not started.
+    Prefill {
+        tokens_done: usize,
+        tokens_total: usize,
+    },
 }
 
 /// AVX2-friendly allowed-token bitset (64-token words).

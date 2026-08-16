@@ -20,6 +20,8 @@ pub struct StatsSnapshot {
     pub requests_total: u64,
     pub active_requests: u64,
     pub prompt_tokens: u64,
+    /// Prompt prefill chunks completed (`prefill.chunk_tokens` each).
+    pub prefill_chunks: u64,
     pub tokens_generated: u64,
     pub draft_proposed: u64,
     pub draft_accepted: u64,

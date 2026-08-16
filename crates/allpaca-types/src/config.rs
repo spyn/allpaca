@@ -12,6 +12,7 @@ use crate::pipeline::{FeatureFlagOverlay, PipelineMode};
 pub struct Config {
     pub engine: EngineSection,
     pub speculative: SpeculativeSection,
+    pub prefill: PrefillSection,
     pub kv: KvSection,
     pub sampling: SamplingSection,
     pub structured_output: StructuredOutputSection,
@@ -31,6 +32,7 @@ impl Config {
         Self {
             engine: EngineSection::default(),
             speculative: SpeculativeSection::default(),
+            prefill: PrefillSection::default(),
             kv: KvSection::default(),
             sampling: SamplingSection::default(),
             structured_output: StructuredOutputSection::default(),
@@ -123,7 +125,26 @@ impl Config {
                 "engine.max_active_requests must be > 0".into(),
             )));
         }
+        if self.prefill.chunk_tokens == 0 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "prefill.chunk_tokens must be > 0".into(),
+            )));
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefillSection {
+    /// Prompt tokens processed per Engine lock hold. A second Request can
+    /// admit or decode between chunks when `engine.max_active_requests >= 2`.
+    pub chunk_tokens: usize,
+}
+
+impl Default for PrefillSection {
+    fn default() -> Self {
+        Self { chunk_tokens: 512 }
     }
 }
 
@@ -375,6 +396,34 @@ mod tests {
     #[test]
     fn compiled_defaults_validate() {
         Config::compiled_defaults().validate().unwrap();
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_defaults_to_512_and_is_configurable() {
+        let defaults = Config::compiled_defaults();
+        assert_eq!(
+            defaults.prefill.chunk_tokens, 512,
+            "compiled default matches PRD prefill.chunk_tokens"
+        );
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [prefill]
+            chunk_tokens = 64
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.prefill.chunk_tokens, 64);
+        assert_eq!(
+            cfg.engine.max_active_requests, 1,
+            "prefill is composable, not a Pipeline Mode"
+        );
+
+        let mut bad = Config::compiled_defaults();
+        bad.prefill.chunk_tokens = 0;
+        let err = bad.validate().unwrap_err();
+        assert_eq!(err.class(), crate::ErrorClass::Fatal);
+        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
     }
 
     #[test]
