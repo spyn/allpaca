@@ -344,6 +344,10 @@ extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, dou
     return ALLPACA_OK;
 }
 
+extern "C" int allpaca_hip_set_device(int32_t device) {
+    return hip_status(hipSetDevice(device));
+}
+
 extern "C" int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes) {
     if (!used_bytes) {
         return ALLPACA_ERR_INVALID;
@@ -450,6 +454,8 @@ extern "C" int allpaca_hip_benchmark(int32_t, int32_t, size_t, double *, double 
 }
 
 extern "C" int allpaca_hip_mem_used(int32_t, uint64_t *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
+extern "C" int allpaca_hip_set_device(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_gemm(const float *, const float *, float *, int32_t, int32_t, int32_t,
                             allpaca_stream_t) {

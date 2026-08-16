@@ -43,6 +43,9 @@ fn cpu_only_generate_reports_cpu_backend() {
     let stats = engine.stats();
     assert_eq!(stats.backend, "cpu");
     assert_eq!(stats.gpu_forwards, 0);
+    assert_eq!(stats.target_gpu_forwards, 0);
+    assert_eq!(stats.draft_gpu_forwards, 0);
+    assert_eq!(stats.weight_bytes_migrated, 0);
 }
 
 #[test]
@@ -218,7 +221,110 @@ fn asymmetric_placement_uses_distinct_devices_when_two_gpus() {
             inv.target_device >= 0,
             "single GPU still runs generate on HIP"
         );
+        assert!(
+            inv.draft_device < 0,
+            "one GPU must fall back to CPU draft (no second resident device)"
+        );
         let out = engine.generate("hello", greedy(2)).unwrap();
         assert!(!out.token_ids.is_empty());
+    }
+}
+
+#[cfg(feature = "hip")]
+fn hip_speculative_synthetic() -> Config {
+    let mut cfg = hip_auto_synthetic();
+    cfg.speculative.enabled = true;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    cfg.features.tree_speculation = Some(false);
+    cfg
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn speculative_generate_runs_draft_and_target_on_distinct_gpus() {
+    let engine = Engine::new(hip_speculative_synthetic()).unwrap();
+    let gpus = hip_gpus(&engine);
+    if gpus.len() < 2 {
+        return;
+    }
+    let inv = engine.inventory();
+    assert_ne!(
+        inv.target_device, inv.draft_device,
+        "target stays on the fast GPU; draft stays on the slow GPU"
+    );
+    assert!(inv.target_device >= 0 && inv.draft_device >= 0);
+    let out = engine.generate("hello", greedy(8)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.target_device, inv.target_device);
+    assert_eq!(stats.draft_device, inv.draft_device);
+    assert!(
+        stats.target_gpu_forwards > 0,
+        "target verify must run HIP on the target device; stats={stats:?}"
+    );
+    assert!(
+        stats.draft_gpu_forwards > 0,
+        "draft propose must run HIP on the draft device; stats={stats:?}"
+    );
+    assert!(
+        stats.gpu_forwards >= stats.target_gpu_forwards + stats.draft_gpu_forwards,
+        "gpu_forwards must count both resident models; stats={stats:?}"
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn speculative_generate_host_stages_tokens_not_weights() {
+    let engine = Engine::new(hip_speculative_synthetic()).unwrap();
+    if hip_gpus(&engine).len() < 2 {
+        return;
+    }
+    let out = engine.generate("hello", greedy(8)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(
+        stats.weight_bytes_migrated, 0,
+        "resident speculation must not copy weights between GPUs; stats={stats:?}"
+    );
+    assert!(
+        stats.draft_tokens_copied > 0,
+        "draft token ids must cross via host staging; stats={stats:?}"
+    );
+    assert!(
+        stats.host_staging_bytes > 0,
+        "host-staged draft traffic must be recorded; stats={stats:?}"
+    );
+    const TOKEN_SCALE_BOUND: u64 = 64 * 1024;
+    assert!(
+        stats.host_staging_bytes < TOKEN_SCALE_BOUND,
+        "host staging must stay token/logit scale, not weight scale; bytes={} stats={stats:?}",
+        stats.host_staging_bytes
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn host_staging_transfer_path_still_uses_both_gpus() {
+    let engine = Engine::new(hip_speculative_synthetic()).unwrap();
+    if hip_gpus(&engine).len() < 2 {
+        return;
+    }
+    let stats_boot = engine.stats();
+    assert!(
+        stats_boot.transfer_path == "HostStaging" || stats_boot.transfer_path == "P2p",
+        "unexpected transfer_path {}",
+        stats_boot.transfer_path
+    );
+    let out = engine.generate("hello", greedy(8)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_ne!(stats.target_device, stats.draft_device);
+    assert!(stats.target_gpu_forwards > 0 && stats.draft_gpu_forwards > 0);
+    if stats.transfer_path == "HostStaging" {
+        assert!(
+            !stats.p2p_capable || !stats.p2p_enabled || stats.p2p_gbps == 0.0,
+            "HostStaging is valid when P2P is unavailable or slower; stats={stats:?}"
+        );
     }
 }

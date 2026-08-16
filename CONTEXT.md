@@ -40,7 +40,7 @@
 | **Kernel ABI** | A flat C interface (`extern "C"`) exposing GPU/CPU compute primitives. C++/HIP/CUDA implements the kernels; Rust calls them. No logic in kernels beyond numerics. |
 | **Draft Provider** | A pluggable source of speculative token candidates. MVP includes NGramProvider (CPU trie) and DraftModelProvider (secondary GPU model). Tree speculation is Phase 2. |
 | **Target Model** | The authoritative model that verifies draft tokens. Runs on the fastest available GPU. |
-| **Draft Model** | A smaller/faster model that proposes candidate tokens for speculative decoding. Runs on secondary GPU or CPU. |
+| **Draft Model** | A smaller/faster model that proposes candidate tokens for speculative decoding. Weights and draft KV stay resident on the secondary GPU (slow device) when two HIP GPUs exist; CPU fallback on 1 GPU / `cpu_only`. Only draft token ids (and short logits) cross to the target path — never full weights or KV. |
 | **KV Tier** | A memory region where KV cache pages can reside. MVP supports two tiers: VRAM (hot) and Pinned DRAM (warm). NVMe cold tier is post-MVP. |
 | **KV Page** | A fixed-size block of KV cache data that can migrate between tiers. Unit of residency tracking and prefetch. |
 | **Auxiliary Accelerator** | A sidecar compute device (Coral TPU, Intel NPU) for non-LLM workloads like classifiers. Post-MVP; trait interface may exist but no implementations ship initially. |
@@ -52,7 +52,7 @@
 | **Request** | A generation task with its own KV cache (`KvHandle` / KV Pages) and decode state. Multiple Requests can be active up to `engine.max_active_requests` (compiled default 1). A saturated scheduler returns Transient `RequestBusy` backpressure. |
 | **Telemetry** | Internal metrics (TTFT, ITL, acceptance rate, page migrations) stored in memory, exposed via `/stats` JSON endpoint. Uses `tracing` crate for structured logs. Prometheus/OpenTelemetry export is post-MVP. |
 | **Multimodal** | Vision/audio encoder support. Post-MVP; deferred until text-only asymmetric scheduling is proven. |
-| **Transfer Path** | The mechanism for moving tensors between devices. At boot the engine queries `hipDeviceCanAccessPeer`, enables both directions (`hipDeviceEnablePeerAccess`), re-queries, then benchmarks that enable+peer-copy against host staging (GPU→DRAM→GPU). `P2p` is chosen only when enable+copy succeed and measured P2P is not slower than host staging by more than 10% (`P2P_MAX_SLOWER_FRACTION`). Host staging is the fallback when P2P is unavailable or slower. Never assume P2P is faster. |
+| **Transfer Path** | The mechanism for moving tensors between devices. At boot the engine queries `hipDeviceCanAccessPeer`, enables both directions (`hipDeviceEnablePeerAccess`), re-queries, then benchmarks that enable+peer-copy against host staging (GPU→DRAM→GPU). `P2p` is chosen only when enable+copy succeed and measured P2P is not slower than host staging by more than 10% (`P2P_MAX_SLOWER_FRACTION`). Host staging is the fallback when P2P is unavailable or slower. Never assume P2P is faster. Speculative generate does **not** require P2P: target stays on the fast GPU, draft stays on the slow GPU, and only token-scale payloads are host-staged (`host_staging_bytes` / `draft_tokens_copied`; `weight_bytes_migrated` stays 0). |
 | **Configuration** | Engine settings loaded from TOML file, overridable by CLI flags. Compiled defaults for unspecified values. No env vars or runtime API in MVP. |
 
 ## Crate Structure

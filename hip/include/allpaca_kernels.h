@@ -50,6 +50,8 @@ int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, double *p2p_gb
 
 int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes);
 
+int allpaca_hip_set_device(int32_t device);
+
 int allpaca_gemm(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                  allpaca_stream_t stream);
 

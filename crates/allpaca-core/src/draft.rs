@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
+use allpaca_hip::HipWorkspace;
 use allpaca_types::{AllpacaError, GenerationParams};
 
 use crate::model::{DenseKv, TinyModel};
 use crate::sampling::{argmax, rng_from_params, sample};
+use crate::telemetry::Metrics;
 
 pub trait DraftProvider {
     fn name(&self) -> &'static str;
@@ -109,7 +111,7 @@ impl DraftProvider for NGramProvider {
     }
 }
 
-/// Secondary model draft path (CPU). HIP placement is a scheduler concern.
+/// Secondary model draft path. HIP GEMM/attention run on the resident draft GPU.
 pub struct DraftModelProvider {
     model: TinyModel,
 }
@@ -118,20 +120,14 @@ impl DraftModelProvider {
     pub fn new(model: TinyModel) -> Self {
         Self { model }
     }
-}
 
-impl DraftProvider for DraftModelProvider {
-    fn name(&self) -> &'static str {
-        "draft_model"
-    }
-
-    fn observe(&mut self, _tokens: &[u32]) {}
-
-    fn propose(
+    pub fn propose_on(
         &mut self,
         ctx: &[u32],
         max_tokens: usize,
         temperature: f32,
+        hip: Option<&HipWorkspace>,
+        metrics: Option<&Metrics>,
     ) -> Result<Vec<u32>, AllpacaError> {
         if ctx.is_empty() {
             return Ok(Vec::new());
@@ -140,7 +136,8 @@ impl DraftProvider for DraftModelProvider {
         let vocab = self.model.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         for (pos, tok) in ctx.iter().enumerate() {
-            self.model.forward_dense(*tok, pos, &mut cache, &mut logits)?;
+            self.model
+                .forward_dense_on(*tok, pos, &mut cache, &mut logits, hip, metrics)?;
         }
         let mut out = Vec::new();
         let mut window = ctx.to_vec();
@@ -160,10 +157,33 @@ impl DraftProvider for DraftModelProvider {
             };
             out.push(next);
             window.push(next);
-            self.model
-                .forward_dense(next, window.len() - 1, &mut cache, &mut logits)?;
+            self.model.forward_dense_on(
+                next,
+                window.len() - 1,
+                &mut cache,
+                &mut logits,
+                hip,
+                metrics,
+            )?;
         }
         Ok(out)
+    }
+}
+
+impl DraftProvider for DraftModelProvider {
+    fn name(&self) -> &'static str {
+        "draft_model"
+    }
+
+    fn observe(&mut self, _tokens: &[u32]) {}
+
+    fn propose(
+        &mut self,
+        ctx: &[u32],
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<Vec<u32>, AllpacaError> {
+        self.propose_on(ctx, max_tokens, temperature, None, None)
     }
 }
 
