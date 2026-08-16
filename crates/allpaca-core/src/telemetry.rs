@@ -134,9 +134,9 @@ impl Metrics {
         }
     }
 
-    pub fn record_itl_ms(&self, ms: u64) {
+    pub fn record_itl_ms(&self, ms: f64) {
+        let sample = (ms.max(0.0) * 100.0).round() as u64;
         let prev = self.itl_ms_ema_x100.load(Ordering::Relaxed);
-        let sample = ms.saturating_mul(100);
         let next = if prev == 0 {
             sample
         } else {
