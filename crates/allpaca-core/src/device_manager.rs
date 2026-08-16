@@ -1,13 +1,15 @@
-use allpaca_types::{Config, DeviceInfo, DeviceKind, DeviceSelector, PipelineMode, TransferPath};
+use allpaca_types::{
+    BandwidthBenchmark, Config, DeviceInfo, DeviceKind, DeviceSelector, PipelineMode, TransferPath,
+};
 
 use crate::scheduler::Scheduler;
-use crate::transfer::select_transfer_path;
 
 #[derive(Debug, Clone)]
 pub struct DeviceInventory {
     pub devices: Vec<DeviceInfo>,
     pub pipeline_mode: PipelineMode,
     pub transfer_path: TransferPath,
+    pub transfer_benchmark: Option<BandwidthBenchmark>,
     pub target_device: i32,
     pub draft_device: i32,
 }
@@ -27,7 +29,8 @@ impl DeviceInventory {
         let scheduler = Scheduler::new(pipeline_mode, flags, &config.speculative);
         let placement = scheduler.placement(&devices);
         let (target_device, draft_device) = resolve_devices(config, &placement, &devices);
-        let transfer_path = select_transfer_path(&devices, config.engine.cpu_only);
+        let (transfer_path, transfer_benchmark) =
+            crate::transfer::select_transfer_path_with_bench(&devices, config.engine.cpu_only);
         tracing::info!(
             ?pipeline_mode,
             ?transfer_path,
@@ -40,6 +43,7 @@ impl DeviceInventory {
             devices,
             pipeline_mode,
             transfer_path,
+            transfer_benchmark,
             target_device,
             draft_device,
         }

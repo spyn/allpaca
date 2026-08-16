@@ -26,6 +26,7 @@ use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
 use crate::telemetry::Metrics;
 use crate::tokenizer::EngineTokenizer;
+use allpaca_hip::HipWorkspace;
 
 struct ActiveRequest {
     id: u64,
@@ -64,6 +65,7 @@ pub struct Engine {
     config: Config,
     inventory: DeviceInventory,
     metrics: Arc<Metrics>,
+    hip: Option<Arc<HipWorkspace>>,
 }
 
 pub struct RequestHandle {
@@ -132,6 +134,7 @@ impl Engine {
             config.kv.hot_fraction,
         );
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);
+        let hip = open_hip_workspace(&config, &inventory).map(Arc::new);
         let inner = EngineInner {
             flags,
             scheduler,
@@ -150,6 +153,7 @@ impl Engine {
             config: config.clone(),
             inventory,
             metrics: Arc::new(Metrics::default()),
+            hip,
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -173,12 +177,21 @@ impl Engine {
             .ok()
             .and_then(|g| g.target.as_ref().map(|m| m.name.clone()))
             .unwrap_or_else(|| self.config.model.id.clone());
+        let (backend, device_memory_bytes) = if let Some(hip) = &self.hip {
+            ("hip".into(), hip.allocated_bytes())
+        } else {
+            ("cpu".into(), 0)
+        };
+        self.metrics
+            .device_memory_bytes
+            .store(device_memory_bytes, std::sync::atomic::Ordering::Relaxed);
         self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
             self.inventory.target_device,
             self.inventory.draft_device,
             model_id,
+            backend,
         )
     }
 
@@ -418,6 +431,7 @@ impl Engine {
                 &mut inner.kv,
                 &self.metrics,
                 &mut pending_logits,
+                self.hip.as_deref(),
             )?;
         }
         inner.ngram.observe(&tokens);
@@ -542,14 +556,14 @@ impl Engine {
             self.metrics
                 .tree_nodes
                 .fetch_add(forest.nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics)?
+            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref())?
         } else {
             let drafts = if speculate && depth > 0 {
                 propose_drafts(&mut inner, id, depth, temperature)?
             } else {
                 Vec::new()
             };
-            verify_and_sample(&mut inner, id, drafts, mask.as_ref(), remaining, &self.metrics)?
+            verify_and_sample(&mut inner, id, drafts, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref())?
         };
         let accepted = produced.accepted;
         let proposed = produced.proposed;
@@ -635,6 +649,37 @@ impl Engine {
     }
 }
 
+fn open_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<HipWorkspace> {
+    if config.engine.cpu_only || config.engine.gpu_backend == "cpu" {
+        return None;
+    }
+    if !allpaca_hip::runtime_linked() {
+        return None;
+    }
+    let gpus: Vec<_> = inventory.devices.iter().filter(|d| d.is_gpu()).collect();
+    if gpus.is_empty() {
+        return None;
+    }
+    if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "hip" {
+        return None;
+    }
+    let device = if inventory.target_device >= 0 {
+        inventory.target_device
+    } else {
+        gpus[0].id
+    };
+    match HipWorkspace::new(device, 8 * 1024 * 1024, 256) {
+        Ok(ws) => {
+            tracing::info!(device, bytes = ws.allocated_bytes(), "HIP workspace allocated");
+            Some(ws)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "HIP workspace failed; CPU fallback");
+            None
+        }
+    }
+}
+
 fn apply_provider_flags(flags: &mut FeatureFlags, config: &Config) {
     if config.features.tree_speculation.is_none() {
         flags.tree_speculation = config.speculative.enabled && config.speculative.tree.enabled;
@@ -703,6 +748,7 @@ fn verify_and_sample(
     mask: Option<&allpaca_types::TokenMask>,
     remaining: usize,
     metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
 ) -> Result<Produced, AllpacaError> {
     let drafts_len = drafts.len() as u64;
     let mut produced = Vec::new();
@@ -723,7 +769,7 @@ fn verify_and_sample(
             accepted += 1;
             draft_iter.next();
         }
-        append_and_forward(inner, id, sampled, metrics)?;
+        append_and_forward(inner, id, sampled, metrics, hip)?;
         if is_stop(sampled, &params) || !matched || draft_iter.peek().is_none() {
             break;
         }
@@ -742,6 +788,7 @@ fn verify_forest(
     mask: Option<&allpaca_types::TokenMask>,
     remaining: usize,
     metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
 ) -> Result<Produced, AllpacaError> {
     let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
     if !forest.nodes.is_empty() {
@@ -775,7 +822,7 @@ fn verify_forest(
             accepted_tokens.push(sampled);
             parent = idx as i32;
         }
-        append_and_forward(inner, id, sampled, metrics)?;
+        append_and_forward(inner, id, sampled, metrics, hip)?;
         if is_stop(sampled, &params) || child.is_none() || forest.children(parent).next().is_none()
         {
             break;
@@ -803,6 +850,7 @@ fn append_and_forward(
     id: u64,
     token: u32,
     metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
     let page_tokens = request(inner, id)?
@@ -834,7 +882,7 @@ fn append_and_forward(
         .target
         .clone()
         .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-    target.forward_token(token, pos, &pages, &mut inner.kv, metrics, &mut logits)?;
+    target.forward_token(token, pos, &pages, &mut inner.kv, metrics, &mut logits, hip)?;
     let published = inner.ring.publish(&logits)?;
     inner.ring.release_current();
     request_mut(inner, id)?.pending_logits = published;

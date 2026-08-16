@@ -46,7 +46,7 @@
 | **Auxiliary Accelerator** | A sidecar compute device (Coral TPU, Intel NPU) for non-LLM workloads like classifiers. Post-MVP; trait interface may exist but no implementations ship initially. |
 | **Constraint Mask** | A bitset of allowed tokens produced by the CPU grammar engine, applied to GPU logits before sampling. Enables structured output. |
 | **Structured Output** | Constrained generation (JSON, schemas, grammars). MVP supports JSON mode only via hardcoded grammar. Full `llguidance` integration is post-MVP. |
-| **GPU Backend** | The kernel implementation for a GPU vendor. MVP is HIP (AMD) only. CUDA (NVIDIA) is post-MVP. |
+| **GPU Backend** | Real HIP kernels (GEMM, attention, hipMalloc, H2D/D2H/P2P copy) behind `--features hip` when ROCm is present. `Engine::generate` runs target forwards on HIP devices and reports `backend = "hip"` / `gpu_forwards`. Without the feature, without an SDK, or with 0 devices / `cpu_only`, the CPU fallback is used. CUDA is post-MVP. |
 | **CPU Fallback** | A slow but functional kernel implementation using AVX2 intrinsics. Required for every operation so the engine runs without GPU. |
 | **Tokenizer** | Converts text ↔ tokens. Uses HuggingFace `tokenizers` crate. Vocab comes from GGUF metadata or a SafeTensors/ONNX sidecar JSON; decoupled from weight layout. |
 | **Request** | A generation task with its own KV cache (`KvHandle` / KV Pages) and decode state. Multiple Requests can be active up to `engine.max_active_requests` (compiled default 1). A saturated scheduler returns Transient `RequestBusy` backpressure. |

@@ -11,13 +11,27 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Optional HIP bindings (needs ROCm + a built `liballpaca_kernels`):
+Optional HIP path (AMD GPU; `generate()` uses HIP GEMM + attention):
 
 ```bash
-cmake -S hip -B hip/build
-cmake --build hip/build
-cargo build -p allpaca-server --features hip
+# Needs the HIP/ROCm SDK. On Windows the crate probes
+# HIP_PATH, ROCM_PATH, and C:\Program Files\AMD\ROCm\*.
+# MSVC (vcvars64) is required so hipcc can find the C++ STL.
+# Without an SDK, `--features hip` still compiles (stub; GPU tests skip).
+
+cargo test --workspace --features hip
+cargo run -p allpaca-server --features hip -- --synthetic --port 8080
 ```
+
+Windows example (ROCm 7.1 + RX 9070 / 9060 XT):
+
+```bat
+set HIP_PATH=C:\Program Files\AMD\ROCm\7.1
+set ROCM_PATH=C:\Program Files\AMD\ROCm\7.1
+cargo test --workspace --features hip
+```
+
+Kernels live in `hip/` (CMake + hipcc). `allpaca-hip/build.rs` compiles them when the SDK is found. GPU-gated tests are `#[cfg(feature = "hip")]` and return if `hipGetDeviceCount() == 0`.
 
 ## Run (CPU-only)
 

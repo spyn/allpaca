@@ -1,4 +1,5 @@
 use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
+use allpaca_hip::HipWorkspace;
 use crate::forest::TokenForest;
 use allpaca_gguf::GgufFile;
 use allpaca_onnx::OnnxFile;
@@ -267,6 +268,7 @@ impl TinyModel {
     }
 
     /// Decode one token at `pos`, writing K/V into paged tiers. Logits written to `logits`.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_token(
         &self,
         token: u32,
@@ -275,6 +277,7 @@ impl TinyModel {
         kv: &mut KvTierManager,
         metrics: &Metrics,
         logits: &mut [f32],
+        hip: Option<&HipWorkspace>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -295,10 +298,9 @@ impl TinyModel {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             rmsnorm(&x, &layer.attn_norm, cfg.eps, &mut scratch[..dim])?;
-            // TODO: HIP gemm at this call site when a HIP stream is selected.
-            matmul_nt(&scratch[..dim], &layer.wq, &mut q, 1, dim, dim)?;
-            matmul_nt(&scratch[..dim], &layer.wk, &mut k, 1, kv_dim, dim)?;
-            matmul_nt(&scratch[..dim], &layer.wv, &mut v, 1, kv_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wq, &mut q, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wk, &mut k, 1, kv_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.wv, &mut v, 1, kv_dim, dim)?;
             for h in 0..cfg.n_heads {
                 rope(&mut q[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
             }
@@ -318,8 +320,8 @@ impl TinyModel {
 
             let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
             let n_kv = k_all.len() / kv_dim;
-            // TODO: HIP attention kernel when the target device is HIP.
-            attention(
+            attention_dispatch(
+                hip,
                 &q,
                 &k_all,
                 &v_all,
@@ -331,7 +333,7 @@ impl TinyModel {
                 head_dim,
                 true,
             )?;
-            matmul_nt(&attn_out, &layer.wo, &mut hidden, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &attn_out, &layer.wo, &mut hidden, 1, dim, dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
@@ -339,12 +341,12 @@ impl TinyModel {
             rmsnorm(&x, &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
             let mut gate = vec![0.0f32; cfg.ff_dim];
             let mut up = vec![0.0f32; cfg.ff_dim];
-            matmul_nt(&scratch[..dim], &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
-            matmul_nt(&scratch[..dim], &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
             for i in 0..cfg.ff_dim {
                 gate[i] = silu(gate[i]) * up[i];
             }
-            matmul_nt(&gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
+            gemm_nt_dispatch(hip, &gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
@@ -357,7 +359,8 @@ impl TinyModel {
                 "logits buffer smaller than vocab".into(),
             )));
         }
-        matmul_nt(
+        gemm_nt_dispatch(
+            hip,
             &scratch[..dim],
             &self.lm_head,
             &mut logits[..cfg.vocab_size],
@@ -365,6 +368,11 @@ impl TinyModel {
             cfg.vocab_size,
             dim,
         )?;
+        if hip.is_some() {
+            metrics
+                .gpu_forwards
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -610,6 +618,62 @@ impl DenseKv {
             layer.v.truncate(keep);
         }
     }
+}
+
+fn gemm_nt_dispatch(
+    hip: Option<&HipWorkspace>,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    rows: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), AllpacaError> {
+    if let Some(hip) = hip {
+        if hip
+            .gemm_nt(a, b, c, rows as i32, n as i32, k as i32)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    matmul_nt(a, b, c, rows, n, k)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_dispatch(
+    hip: Option<&HipWorkspace>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+) -> Result<(), AllpacaError> {
+    if let Some(hip) = hip {
+        if hip
+            .attention(
+                q,
+                k,
+                v,
+                out,
+                n_q as i32,
+                n_kv as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
+                head_dim as i32,
+                causal,
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)
 }
 
 fn gather_kv(

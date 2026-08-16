@@ -141,6 +141,8 @@ pub struct EngineSection {
     /// Concurrent Requests the Engine will admit. Default 1 keeps
     /// `RequestBusy` when a second `begin_request` arrives.
     pub max_active_requests: usize,
+    /// `"auto"` (HIP when the `hip` feature sees devices), `"hip"`, or `"cpu"`.
+    pub gpu_backend: String,
 }
 
 impl Default for EngineSection {
@@ -154,6 +156,7 @@ impl Default for EngineSection {
             pipeline_mode: None,
             determinism_seed: None,
             max_active_requests: 1,
+            gpu_backend: "auto".into(),
         }
     }
 }
