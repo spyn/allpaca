@@ -4,6 +4,7 @@
 
 # HIP build
 /hip/build
+/hip/build-test
 
 # ---> C++
 # Prerequisites

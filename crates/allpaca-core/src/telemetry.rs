@@ -20,6 +20,8 @@ pub struct Metrics {
     pub tree_accepted_path_len: AtomicU64,
     pub tree_path_invalid: AtomicU64,
     pub target_evals: AtomicU64,
+    pub gpu_forwards: AtomicU64,
+    pub device_memory_bytes: AtomicU64,
 }
 
 impl Metrics {
@@ -30,6 +32,7 @@ impl Metrics {
         target_device: i32,
         draft_device: i32,
         model_id: String,
+        backend: String,
     ) -> StatsSnapshot {
         let proposed = self.draft_proposed.load(Ordering::Relaxed);
         let accepted = self.draft_accepted.load(Ordering::Relaxed);
@@ -69,6 +72,9 @@ impl Metrics {
                 && self.tree_path_invalid.load(Ordering::Relaxed) == 0,
             accepted_tokens_per_target_eval,
             model_id,
+            backend,
+            gpu_forwards: self.gpu_forwards.load(Ordering::Relaxed),
+            device_memory_bytes: self.device_memory_bytes.load(Ordering::Relaxed),
         }
     }
 

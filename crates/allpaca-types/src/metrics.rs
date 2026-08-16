@@ -25,4 +25,9 @@ pub struct StatsSnapshot {
     pub tree_path_valid: bool,
     pub accepted_tokens_per_target_eval: f64,
     pub model_id: String,
+    /// `"cpu"` or `"hip"` — which kernel backend ran target forwards.
+    pub backend: String,
+    pub gpu_forwards: u64,
+    /// Bytes currently owned by `hipMalloc` (0 on the CPU path).
+    pub device_memory_bytes: u64,
 }

@@ -22,4 +22,4 @@ pub use model::{LayerWeights, ModelConfig, TinyModel};
 pub use scheduler::Scheduler;
 pub use telemetry::Metrics;
 pub use tokenizer::EngineTokenizer;
-pub use transfer::select_transfer_path;
+pub use transfer::{select_transfer_path, select_transfer_path_with_bench};
