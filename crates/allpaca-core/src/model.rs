@@ -389,10 +389,20 @@ fn append_gguf_tensor(
         allpaca_gguf::GgmlType::F32 => (file.tensor_bytes(name)?.to_vec(), WeightKind::F32),
         allpaca_gguf::GgmlType::Q8_0 => {
             let packed = file.tensor_bytes(name)?;
-            let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
-                AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
-            })?;
-            (staged, WeightKind::Q8_0)
+            if n <= 65_536 {
+                let mut f32s = vec![0.0f32; n];
+                allpaca_cpu::dequant_q8_0(packed, n, &mut f32s)?;
+                let mut bytes = Vec::with_capacity(n * 4);
+                for v in f32s {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (bytes, WeightKind::F32)
+            } else {
+                let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
+                    AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
+                })?;
+                (staged, WeightKind::Q8_0)
+            }
         }
         _ => {
             let f32s = file.tensor_f32(name)?;
@@ -877,27 +887,23 @@ impl TinyModel {
 
         for (layer_idx, _) in self.layers.iter().enumerate() {
             let layer = &resident.layers[layer_idx];
-            hip.rmsnorm_device(
-                buf.x,
-                resident.f32_or_dequant(hip, layer.attn_norm)?,
-                buf.normed,
-                dim as i32,
-                cfg.eps,
-            )?;
-            record_elementwise(Some(metrics));
+            if layer_idx == 0 {
+                hip.rmsnorm_device(
+                    buf.x,
+                    resident.f32_or_dequant(hip, layer.attn_norm)?,
+                    buf.normed,
+                    dim as i32,
+                    cfg.eps,
+                )?;
+                record_elementwise(Some(metrics));
+            }
             resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
             resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
             resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
-            hip.rope_device(
+            hip.rope_qk_device(
                 buf.q,
-                cfg.n_heads as i32,
-                head_dim as i32,
-                pos as i32,
-                cfg.rope_theta,
-            )?;
-            record_elementwise(Some(metrics));
-            hip.rope_device(
                 buf.k,
+                cfg.n_heads as i32,
                 cfg.n_kv_heads as i32,
                 head_dim as i32,
                 pos as i32,
@@ -911,7 +917,7 @@ impl TinyModel {
             kv.write_slot_from_device(page_id, slot, cfg.n_kv_heads, head_dim, buf.k, buf.v)?;
             kv.touch(page_id, 1.0);
 
-            let n_kv = kv.pack_kv_device(
+            let (packed_k, packed_v, n_kv) = kv.kv_device_views(
                 &page_ids[layer_idx],
                 cfg.n_kv_heads,
                 head_dim,
@@ -921,8 +927,8 @@ impl TinyModel {
             )?;
             hip.attention_device(
                 buf.q,
-                buf.packed_k,
-                buf.packed_v,
+                packed_k,
+                packed_v,
                 buf.attn,
                 1,
                 n_kv as i32,
@@ -932,19 +938,17 @@ impl TinyModel {
                 true,
             )?;
             resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
-            hip.residual_add(buf.x, buf.proj, dim as i32)?;
-            metrics
-                .residual_gpu_ops
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            record_elementwise(Some(metrics));
-
-            hip.rmsnorm_device(
+            hip.residual_rmsnorm(
                 buf.x,
+                buf.proj,
                 resident.f32_or_dequant(hip, layer.ffn_norm)?,
                 buf.normed,
                 dim as i32,
                 cfg.eps,
             )?;
+            metrics
+                .residual_gpu_ops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             record_elementwise(Some(metrics));
             resident.gemm_nt(hip, 
                 buf.normed,
@@ -972,7 +976,18 @@ impl TinyModel {
                 dim as i32,
                 cfg.ff_dim as i32,
             )?;
-            hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            if layer_idx + 1 < resident.layers.len() {
+                hip.residual_rmsnorm(
+                    buf.x,
+                    buf.proj,
+                    resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
+                    buf.normed,
+                    dim as i32,
+                    cfg.eps,
+                )?;
+            } else {
+                hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            }
             metrics
                 .residual_gpu_ops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1354,14 +1369,16 @@ impl TinyModel {
         record_elementwise(metrics);
 
         for layer_idx in 0..self.layers.len() {
-            hip.rmsnorm_device(
-                buf.x,
-                resident.attn_norm(layer_idx),
-                buf.normed,
-                dim as i32,
-                cfg.eps,
-            )?;
-            record_elementwise(metrics);
+            if layer_idx == 0 {
+                hip.rmsnorm_device(
+                    buf.x,
+                    resident.attn_norm(layer_idx),
+                    buf.normed,
+                    dim as i32,
+                    cfg.eps,
+                )?;
+                record_elementwise(metrics);
+            }
             allpaca_hip::gemm_nt_device(
                 buf.normed,
                 resident.wq(layer_idx),
@@ -1386,16 +1403,10 @@ impl TinyModel {
                 kv_dim as i32,
                 dim as i32,
             )?;
-            hip.rope_device(
+            hip.rope_qk_device(
                 buf.q,
-                cfg.n_heads as i32,
-                head_dim as i32,
-                pos as i32,
-                cfg.rope_theta,
-            )?;
-            record_elementwise(metrics);
-            hip.rope_device(
                 buf.k,
+                cfg.n_heads as i32,
                 cfg.n_kv_heads as i32,
                 head_dim as i32,
                 pos as i32,
@@ -1424,21 +1435,19 @@ impl TinyModel {
                 dim as i32,
                 dim as i32,
             )?;
-            hip.residual_add(buf.x, buf.proj, dim as i32)?;
-            if let Some(metrics) = metrics {
-                metrics
-                    .residual_gpu_ops
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            record_elementwise(metrics);
-
-            hip.rmsnorm_device(
+            hip.residual_rmsnorm(
                 buf.x,
+                buf.proj,
                 resident.ffn_norm(layer_idx),
                 buf.normed,
                 dim as i32,
                 cfg.eps,
             )?;
+            if let Some(metrics) = metrics {
+                metrics
+                    .residual_gpu_ops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             record_elementwise(metrics);
             allpaca_hip::gemm_nt_device(
                 buf.normed,
@@ -1466,7 +1475,18 @@ impl TinyModel {
                 dim as i32,
                 cfg.ff_dim as i32,
             )?;
-            hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            if layer_idx + 1 < self.layers.len() {
+                hip.residual_rmsnorm(
+                    buf.x,
+                    buf.proj,
+                    resident.attn_norm(layer_idx + 1),
+                    buf.normed,
+                    dim as i32,
+                    cfg.eps,
+                )?;
+            } else {
+                hip.residual_add(buf.x, buf.proj, dim as i32)?;
+            }
             if let Some(metrics) = metrics {
                 metrics
                     .residual_gpu_ops

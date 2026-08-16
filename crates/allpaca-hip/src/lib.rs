@@ -306,6 +306,25 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_residual_rmsnorm(
+            x: *mut f32,
+            residual: *const f32,
+            weight: *const f32,
+            out: *mut f32,
+            n: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_rope_qk(
+            q: *mut f32,
+            k: *mut f32,
+            n_q_heads: i32,
+            n_k_heads: i32,
+            head_dim: i32,
+            pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_dequant_q8_0(
             blocks: *const u8,
             out: *mut f32,
@@ -1893,6 +1912,47 @@ impl HipWorkspace {
         }
     }
 
+    pub fn residual_rmsnorm(
+        &self,
+        x: *mut f32,
+        residual: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        n: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if x.is_null() || residual.is_null() || weight.is_null() || out.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid residual_rmsnorm".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_residual_rmsnorm(
+                        x,
+                        residual,
+                        weight,
+                        out,
+                        n,
+                        eps,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "residual_rmsnorm")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = eps;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP residual_rmsnorm unavailable".into(),
+            )))
+        }
+    }
+
     pub fn rmsnorm_device(
         &self,
         x: *const f32,
@@ -1919,6 +1979,49 @@ impl HipWorkspace {
             let _ = eps;
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP rmsnorm unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn rope_qk_device(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        n_q_heads: i32,
+        n_k_heads: i32,
+        head_dim: i32,
+        pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || k.is_null() || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device rope_qk".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_rope_qk(
+                        q,
+                        k,
+                        n_q_heads,
+                        n_k_heads,
+                        head_dim,
+                        pos,
+                        theta,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "rope_qk")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (pos, theta);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rope_qk unavailable".into(),
             )))
         }
     }
@@ -2379,6 +2482,10 @@ mod tests {
             (1, 4, 33),
             (2, 7, 33),
             (1, 33, 64),
+            (1, 64, 128),
+            (1, 128, 256),
+            (1, 96, 33),
+            (2, 40, 64),
         ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let mut a = vec![0.0f32; m * k];

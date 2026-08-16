@@ -405,6 +405,43 @@ impl KvTierManager {
         Ok(())
     }
 
+    /// Device K/V views for attention. A single resident HIP page is used in-place
+    /// (no D2D pack). Multiple or host pages still pack into `dest_k` / `dest_v`.
+    pub(crate) fn kv_device_views(
+        &self,
+        pages: &[u64],
+        n_kv_heads: usize,
+        head_dim: usize,
+        dest_k: *mut f32,
+        dest_v: *mut f32,
+        max_kv: usize,
+    ) -> Result<(*const f32, *const f32, usize), AllpacaError> {
+        if pages.len() == 1 {
+            let id = pages[0];
+            if let Some(page) = self.pages.get(&id) {
+                let filled = page.filled as usize;
+                if filled > 0
+                    && filled <= max_kv
+                    && page.location.kind == DeviceBufferKind::Hip
+                {
+                    let alloc = self.hip_pages.get(&id).ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                            "HIP KV page {id} missing device buffer"
+                        )))
+                    })?;
+                    let kv_width = n_kv_heads * head_dim;
+                    let k_off = page.location.offset;
+                    let v_off = page.location.offset + page.capacity_tokens as usize * kv_width;
+                    let k = unsafe { alloc.ptr.add(k_off * 4).cast::<f32>() };
+                    let v = unsafe { alloc.ptr.add(v_off * 4).cast::<f32>() };
+                    return Ok((k, v, filled));
+                }
+            }
+        }
+        let n_kv = self.pack_kv_device(pages, n_kv_heads, head_dim, dest_k, dest_v, max_kv)?;
+        Ok((dest_k as *const f32, dest_v as *const f32, n_kv))
+    }
+
     /// Pack filled tokens from `pages` into device K/V buffers (D2D when resident).
     pub(crate) fn pack_kv_device(
         &self,

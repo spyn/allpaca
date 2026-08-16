@@ -162,12 +162,15 @@ __global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, 
 constexpr int Q8_STAGED_STRIDE = 36;
 constexpr int Q8_STAGED_QS = 4;
 
-/* Decode GEMV against staged Q8_0: 4 outputs per warp, float4 A + aligned qs. */
+/* Decode Q8 GEMV: 8 cols/warp, 16 warps, shared A tiles (no per-column A reload). */
 __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                     int k) {
-    constexpr int WARPS = 8;
-    constexpr int COLS = 4;
-    constexpr int SUB = 8;
+    constexpr int WARPS = 16;
+    constexpr int COLS = 8;
+    constexpr int SUB = 4;
+    constexpr int TILE = 8;
+    __shared__ float As[TILE * 32];
+
     const int row = static_cast<int>(blockIdx.y);
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
@@ -180,34 +183,46 @@ __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, 
     const int nblocks = (k + 31) / 32;
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
     const size_t row_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
+    const uint8_t *brow = (col < n) ? b + static_cast<size_t>(col) * row_stride : nullptr;
     float acc = 0.0f;
-    if (col < n) {
-        const uint8_t *brow = b + static_cast<size_t>(col) * row_stride;
-        for (int blk = 0; blk < nblocks; ++blk) {
-            const uint8_t *bp = brow + static_cast<size_t>(blk) * Q8_STAGED_STRIDE;
-            const float d = *reinterpret_cast<const float *>(bp);
-            const int k0 = blk * 32 + sublane * 4;
-            const uint8_t *qp = bp + Q8_STAGED_QS + sublane * 4;
-            const uint32_t q4 = *reinterpret_cast<const uint32_t *>(qp);
-            const float q0 = static_cast<float>(static_cast<int8_t>(q4 & 0xff));
-            const float q1 = static_cast<float>(static_cast<int8_t>((q4 >> 8) & 0xff));
-            const float q2 = static_cast<float>(static_cast<int8_t>((q4 >> 16) & 0xff));
-            const float q3 = static_cast<float>(static_cast<int8_t>((q4 >> 24) & 0xff));
-            float4 av;
-            if (k0 + 3 < k && (reinterpret_cast<uintptr_t>(arow + k0) % 16u) == 0) {
-                av = *reinterpret_cast<const float4 *>(arow + k0);
-            } else {
-                av.x = (k0 < k) ? arow[k0] : 0.0f;
-                av.y = (k0 + 1 < k) ? arow[k0 + 1] : 0.0f;
-                av.z = (k0 + 2 < k) ? arow[k0 + 2] : 0.0f;
-                av.w = (k0 + 3 < k) ? arow[k0 + 3] : 0.0f;
-            }
-            acc += d * (av.x * q0 + av.y * q1 + av.z * q2 + av.w * q3);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    for (int blk0 = 0; blk0 < nblocks; blk0 += TILE) {
+        const int ntile = (blk0 + TILE <= nblocks) ? TILE : (nblocks - blk0);
+        const int a0 = blk0 * 32;
+        const int nfloat = ntile * 32;
+        for (int i = tid; i < nfloat; i += static_cast<int>(blockDim.x)) {
+            const int gi = a0 + i;
+            As[i] = (gi < k) ? arow[gi] : 0.0f;
         }
+        __syncthreads();
+
+        if (brow) {
+            for (int t = 0; t < ntile; ++t) {
+                const uint8_t *bp = brow + static_cast<size_t>(blk0 + t) * Q8_STAGED_STRIDE;
+                const float d = *reinterpret_cast<const float *>(bp);
+                const int qbase = sublane * 8;
+                const uint8_t *qp = bp + Q8_STAGED_QS + qbase;
+                const uint32_t qlo = *reinterpret_cast<const uint32_t *>(qp);
+                const uint32_t qhi = *reinterpret_cast<const uint32_t *>(qp + 4);
+                const float *as = As + t * 32 + qbase;
+                float dot = as[0] * static_cast<float>(static_cast<int8_t>(qlo & 0xff));
+                dot += as[1] * static_cast<float>(static_cast<int8_t>((qlo >> 8) & 0xff));
+                dot += as[2] * static_cast<float>(static_cast<int8_t>((qlo >> 16) & 0xff));
+                dot += as[3] * static_cast<float>(static_cast<int8_t>((qlo >> 24) & 0xff));
+                dot += as[4] * static_cast<float>(static_cast<int8_t>(qhi & 0xff));
+                dot += as[5] * static_cast<float>(static_cast<int8_t>((qhi >> 8) & 0xff));
+                dot += as[6] * static_cast<float>(static_cast<int8_t>((qhi >> 16) & 0xff));
+                dot += as[7] * static_cast<float>(static_cast<int8_t>((qhi >> 24) & 0xff));
+                acc += d * dot;
+            }
+        }
+        __syncthreads();
     }
+
 #pragma unroll
-    for (int off = 4; off > 0; off >>= 1) {
-        acc += __shfl_down(acc, off, 8);
+    for (int off = 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 4);
     }
     if (col < n && sublane == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
@@ -505,10 +520,10 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    constexpr int warps = 8;
-    constexpr int cols = 4;
+    constexpr int warps = 16;
+    constexpr int cols = 8;
     constexpr int cols_per_block = warps * cols;
-    dim3 block(256);
+    dim3 block(512);
     dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
               static_cast<unsigned>(m));
     hipLaunchKernelGGL(gemv_nt_q8_0_kernel, grid, block, 0, stream, a, b, c, m, n, k);
@@ -839,16 +854,58 @@ extern "C" int allpaca_attention_masked(const float *q, const float *k, const fl
     return hip_status(hipGetLastError());
 }
 
+__device__ float block_reduce_sum(float v, float *red) {
+    red[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = static_cast<int>(blockDim.x) / 2; s > 0; s >>= 1) {
+        if (static_cast<int>(threadIdx.x) < s) {
+            red[threadIdx.x] += red[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    return red[0];
+}
+
+/* Single-block RMSNorm: one reduction, then scale. Decode n is hidden dim. */
 __global__ void rmsnorm_kernel(const float *x, const float *weight, float *out, int n, float eps) {
-    float ss = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        ss += x[i] * x[i];
+    __shared__ float red[256];
+    float local = 0.0f;
+    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
+        const float v = x[i];
+        local += v * v;
     }
+    const float ss = block_reduce_sum(local, red);
     const float inv = rsqrtf(ss / static_cast<float>(n) + eps);
-    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (idx < n) {
-        out[idx] = x[idx] * inv * weight[idx];
+    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
+        out[i] = x[i] * inv * weight[i];
     }
+}
+
+__global__ void residual_rmsnorm_kernel(float *x, const float *residual, const float *weight,
+                                        float *out, int n, float eps) {
+    __shared__ float red[256];
+    float local = 0.0f;
+    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
+        const float v = x[i] + residual[i];
+        x[i] = v;
+        local += v * v;
+    }
+    const float ss = block_reduce_sum(local, red);
+    const float inv = rsqrtf(ss / static_cast<float>(n) + eps);
+    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
+        out[i] = x[i] * inv * weight[i];
+    }
+}
+
+__device__ void rope_pair(float *hvec, int i, int half, int pos, float theta) {
+    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    const float angle = static_cast<float>(pos) * freq;
+    const float s = sinf(angle);
+    const float c = cosf(angle);
+    const float a = hvec[2 * i];
+    const float b = hvec[2 * i + 1];
+    hvec[2 * i] = a * c - b * s;
+    hvec[2 * i + 1] = a * s + b * c;
 }
 
 __global__ void rope_kernel(float *x, int n_heads, int head_dim, int pos, float theta) {
@@ -858,17 +915,24 @@ __global__ void rope_kernel(float *x, int n_heads, int head_dim, int pos, float 
     if (idx >= total || head_dim % 2 != 0) {
         return;
     }
-    const int h = idx / half;
-    const int i = idx % half;
-    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
-    const float angle = static_cast<float>(pos) * freq;
-    const float s = sinf(angle);
-    const float c = cosf(angle);
-    float *hvec = x + h * head_dim;
-    const float a = hvec[2 * i];
-    const float b = hvec[2 * i + 1];
-    hvec[2 * i] = a * c - b * s;
-    hvec[2 * i + 1] = a * s + b * c;
+    rope_pair(x + (idx / half) * head_dim, idx % half, half, pos, theta);
+}
+
+__global__ void rope_qk_kernel(float *q, float *k, int n_q_heads, int n_k_heads, int head_dim,
+                               int pos, float theta) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = head_dim / 2;
+    const int q_pairs = n_q_heads * half;
+    const int total = q_pairs + n_k_heads * half;
+    if (idx >= total || head_dim % 2 != 0) {
+        return;
+    }
+    if (idx < q_pairs) {
+        rope_pair(q + (idx / half) * head_dim, idx % half, half, pos, theta);
+    } else {
+        const int j = idx - q_pairs;
+        rope_pair(k + (j / half) * head_dim, j % half, half, pos, theta);
+    }
 }
 
 __global__ void silu_mul_kernel(float *gate, const float *up, int n) {
@@ -886,11 +950,34 @@ extern "C" int allpaca_rmsnorm(const float *x, const float *weight, float *out, 
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    const int threads = 64;
-    const int blocks = (n + threads - 1) / threads;
-    hipLaunchKernelGGL(rmsnorm_kernel, dim3(static_cast<unsigned>(blocks)),
-                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, weight, out, n,
+    hipLaunchKernelGGL(rmsnorm_kernel, dim3(1), dim3(256), 0, as_stream(stream), x, weight, out, n,
                        eps);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_residual_rmsnorm(float *x, const float *residual, const float *weight,
+                                        float *out, int32_t n, float eps, allpaca_stream_t stream) {
+    if (!x || !residual || !weight || !out || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(residual_rmsnorm_kernel, dim3(1), dim3(256), 0, as_stream(stream), x, residual,
+                       weight, out, n, eps);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                               int32_t head_dim, int32_t pos, float theta, allpaca_stream_t stream) {
+    if (!q || !k || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int total = (n_q_heads + n_k_heads) * (head_dim / 2);
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(rope_qk_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), q, k, n_q_heads,
+                       n_k_heads, head_dim, pos, theta);
     return hip_status(hipGetLastError());
 }
 
@@ -901,7 +988,7 @@ extern "C" int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t
     }
     clear_last_error();
     const int total = n_heads * (head_dim / 2);
-    const int threads = 64;
+    const int threads = 256;
     const int blocks = (total + threads - 1) / threads;
     hipLaunchKernelGGL(rope_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n_heads,
@@ -914,7 +1001,7 @@ extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    const int threads = 64;
+    const int threads = 256;
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(silu_mul_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
@@ -943,7 +1030,7 @@ extern "C" int allpaca_embed_gather(const float *table, int32_t token, float *ou
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    const int threads = 64;
+    const int threads = 256;
     const int blocks = (dim + threads - 1) / threads;
     hipLaunchKernelGGL(embed_gather_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
@@ -1014,12 +1101,9 @@ extern "C" int allpaca_dequant_q8_0(const uint8_t *qblocks, float *out, int32_t 
     if (!qblocks || !out || n <= 0) {
         return ALLPACA_ERR_INVALID;
     }
-    /* Workspace reuse must not overwrite an in-flight consumer of `out`. */
-    if (hipStreamSynchronize(as_stream(stream)) != hipSuccess) {
-        return ALLPACA_ERR_DEVICE;
-    }
+    /* Same-stream order keeps workspace reuse after in-flight readers. */
     clear_last_error();
-    const int threads = 64;
+    const int threads = 256;
     const int nblocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(dequant_q8_0_kernel, dim3(static_cast<unsigned>(nblocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), qblocks, out, n);
@@ -1032,7 +1116,7 @@ extern "C" int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, fl
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    const int threads = 64;
+    const int threads = 256;
     const int blocks = (dim + threads - 1) / threads;
     hipLaunchKernelGGL(embed_gather_q8_0_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
@@ -1046,7 +1130,7 @@ extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    const int threads = 64;
+    const int threads = 256;
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(residual_add_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, residual, n);
@@ -1178,6 +1262,16 @@ extern "C" int allpaca_embed_gather(const float *, int32_t, float *, int32_t, al
 }
 
 extern "C" int allpaca_residual_add(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_residual_rmsnorm(float *, const float *, const float *, float *, int32_t,
+                                        float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rope_qk(float *, float *, int32_t, int32_t, int32_t, int32_t, float,
+                               allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

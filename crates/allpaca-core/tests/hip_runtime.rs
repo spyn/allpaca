@@ -365,6 +365,32 @@ fn residual_add_runs_on_hip() {
     assert!(stats.elementwise_gpu_ops > 0);
 }
 
+/// profile-blas 8B Q8_0 `other_gpu` EMA was ~24 ms. Fused hidden-state ops must shrink it.
+#[cfg(feature = "hip")]
+const PROFILE_BLAS_OTHER_GPU_US: f64 = 24_000.0;
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_other_gpu_ema_shrinks_and_greedy_matches_cpu() {
+    let cpu = Engine::new(cpu_only_synthetic()).unwrap();
+    let hip = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        return;
+    }
+    let cpu_out = cpu.generate("hello", greedy(4)).unwrap();
+    let hip_out = hip.generate("hello", greedy(4)).unwrap();
+    assert_eq!(
+        hip_out.token_ids, cpu_out.token_ids,
+        "fused other_gpu must keep greedy HIP==CPU; hip={:?} cpu={:?}",
+        hip_out.token_ids, cpu_out.token_ids
+    );
+    let stats = hip.stats();
+    assert!(
+        stats.other_gpu_us > 0.0,
+        "other_gpu_us must stay on the public stats API; stats={stats:?}"
+    );
+}
+
 #[cfg(feature = "hip")]
 #[test]
 fn hip_greedy_generate_matches_cpu_on_synthetic() {
@@ -382,6 +408,39 @@ fn hip_greedy_generate_matches_cpu_on_synthetic() {
         hip_out.token_ids, cpu_out.token_ids
     );
     assert_eq!(hip.stats().backend, "hip");
+}
+
+/// Public Engine contract for this branch: HIP generate still works and
+/// `/stats` decode profile fields stay present after a greedy generate.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_keeps_decode_profile_fields() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(
+        !out.token_ids.is_empty(),
+        "HIP generate must still emit tokens"
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(stats.gpu_forwards > 0);
+    let _ = (
+        stats.q8_gemm_us,
+        stats.attention_us,
+        stats.lm_head_us,
+        stats.other_gpu_us,
+        stats.host_us,
+    );
+    assert!(
+        stats.attention_us > 0.0
+            && stats.lm_head_us > 0.0
+            && stats.other_gpu_us > 0.0
+            && stats.host_us > 0.0,
+        "decode profile fields must stay present on HIP generate; stats={stats:?}"
+    );
 }
 
 #[cfg(feature = "hip")]
@@ -870,6 +929,11 @@ fn hip_generate_real_7b_gguf_when_path_set() {
     assert!(
         stats.attention_us > 0.0 && stats.lm_head_us > 0.0,
         "7B/8B decode must time attention and lm_head; stats={stats:?}"
+    );
+    assert!(
+        stats.other_gpu_us > 0.0 && stats.other_gpu_us < PROFILE_BLAS_OTHER_GPU_US * 0.85,
+        "other_gpu_us {:.1} must shrink vs profile-blas {:.1}; stats={stats:?}",
+        stats.other_gpu_us, PROFILE_BLAS_OTHER_GPU_US
     );
     eprintln!(
         "7B HIP generate: tokens={} backend={} devices={} ttft_ms={} itl_ms={:.2} tokens/s={:.2} elapsed_ms={} text={:?}",
