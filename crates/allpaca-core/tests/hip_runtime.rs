@@ -384,6 +384,39 @@ fn hip_greedy_generate_matches_cpu_on_synthetic() {
     assert_eq!(hip.stats().backend, "hip");
 }
 
+/// Public Engine contract for this branch: HIP generate still works and
+/// `/stats` decode profile fields stay present after a greedy generate.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_keeps_decode_profile_fields() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(
+        !out.token_ids.is_empty(),
+        "HIP generate must still emit tokens"
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(stats.gpu_forwards > 0);
+    let _ = (
+        stats.q8_gemm_us,
+        stats.attention_us,
+        stats.lm_head_us,
+        stats.other_gpu_us,
+        stats.host_us,
+    );
+    assert!(
+        stats.attention_us > 0.0
+            && stats.lm_head_us > 0.0
+            && stats.other_gpu_us > 0.0
+            && stats.host_us > 0.0,
+        "decode profile fields must stay present on HIP generate; stats={stats:?}"
+    );
+}
+
 #[cfg(feature = "hip")]
 #[test]
 fn hip_generate_reports_decode_profile_buckets() {
