@@ -397,9 +397,22 @@ fn append_gguf_tensor(
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
                 (bytes, WeightKind::F32)
-            } else {
+            } else if name == "token_embd.weight" {
                 let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
                     AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
+                })?;
+                (staged, WeightKind::Q8_0)
+            } else {
+                let k = *info.dims.first().unwrap_or(&1) as usize;
+                if k == 0 || n % k != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "Q8_0 GEMV {name} dims {:?} do not tile n={n}",
+                        info.dims
+                    ))));
+                }
+                let n_rows = n / k;
+                let staged = allpaca_hip::stage_q8_0_gemv(packed, n_rows, k).map_err(|e| {
+                    AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 GEMV stage {name}: {e}")))
                 })?;
                 (staged, WeightKind::Q8_0)
             }
