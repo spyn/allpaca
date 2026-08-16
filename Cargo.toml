@@ -6,6 +6,7 @@ members = [
     "crates/allpaca-hip",
     "crates/allpaca-gguf",
     "crates/allpaca-safetensors",
+    "crates/allpaca-onnx",
     "crates/allpaca-core",
     "crates/allpaca-server",
     "tools/bench",
@@ -22,6 +23,7 @@ allpaca-types = { path = "crates/allpaca-types" }
 allpaca-core = { path = "crates/allpaca-core" }
 allpaca-gguf = { path = "crates/allpaca-gguf" }
 allpaca-safetensors = { path = "crates/allpaca-safetensors" }
+allpaca-onnx = { path = "crates/allpaca-onnx" }
 allpaca-hip = { path = "crates/allpaca-hip" }
 allpaca-cpu = { path = "crates/allpaca-cpu" }
 serde = { version = "1", features = ["derive"] }

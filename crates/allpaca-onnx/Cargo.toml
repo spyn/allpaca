@@ -1,0 +1,9 @@
+[package]
+name = "allpaca-onnx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ONNX weight-export loading (initializer import, not a general runtime)"
+
+[dependencies]
+allpaca-types.workspace = true

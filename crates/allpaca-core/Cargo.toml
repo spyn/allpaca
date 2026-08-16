@@ -14,6 +14,7 @@ ahash.workspace = true
 allpaca-cpu.workspace = true
 allpaca-gguf.workspace = true
 allpaca-safetensors.workspace = true
+allpaca-onnx.workspace = true
 allpaca-hip.workspace = true
 allpaca-types.workspace = true
 async-stream.workspace = true
