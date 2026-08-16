@@ -19,6 +19,7 @@ pub struct Metrics {
     pub tree_nodes: AtomicU64,
     pub tree_accepted_path_len: AtomicU64,
     pub tree_path_invalid: AtomicU64,
+    pub tree_gpu_verifies: AtomicU64,
     pub target_evals: AtomicU64,
     pub gpu_forwards: AtomicU64,
     pub target_gpu_forwards: AtomicU64,
@@ -98,6 +99,7 @@ impl Metrics {
             tree_accepted_path_len: self.tree_accepted_path_len.load(Ordering::Relaxed),
             tree_path_valid: self.tree_nodes.load(Ordering::Relaxed) > 0
                 && self.tree_path_invalid.load(Ordering::Relaxed) == 0,
+            tree_gpu_verifies: self.tree_gpu_verifies.load(Ordering::Relaxed),
             accepted_tokens_per_target_eval,
             model_id,
             backend,

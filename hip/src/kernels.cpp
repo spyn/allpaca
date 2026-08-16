@@ -313,7 +313,7 @@ __device__ float warp_sum32(float v) {
 /* Decode/prefill: one warp per (query, head). Online softmax, coalesced KV. */
 __global__ void attention_flash_kernel(const float *q, const float *k, const float *v, float *out,
                                        int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
-                                       int causal) {
+                                       int causal, const uint8_t *mask) {
     const int qi = static_cast<int>(blockIdx.x);
     const int h = static_cast<int>(blockIdx.y);
     if (qi >= n_q || h >= n_heads) {
@@ -361,7 +361,9 @@ __global__ void attention_flash_kernel(const float *q, const float *k, const flo
     float l = 0.0f;
 
     for (int t = 0; t < n_kv; ++t) {
-        const bool valid = t <= t_max;
+        const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
+                                       static_cast<size_t>(t)] != 0
+                                : t <= t_max;
         const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         float partial = 0.0f;
@@ -776,7 +778,23 @@ extern "C" int allpaca_attention(const float *q, const float *k, const float *v,
     dim3 block(32);
     dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
     hipLaunchKernelGGL(attention_flash_kernel, grid, block, 0, as_stream(stream), q, k, v, out, n_q,
-                       n_kv, n_heads, n_kv_heads, head_dim, causal);
+                       n_kv, n_heads, n_kv_heads, head_dim, causal, static_cast<const uint8_t *>(nullptr));
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_attention_masked(const float *q, const float *k, const float *v, float *out,
+                                        int32_t n_q, int32_t n_kv, int32_t n_heads,
+                                        int32_t n_kv_heads, int32_t head_dim, const uint8_t *mask,
+                                        allpaca_stream_t stream) {
+    if (!q || !k || !v || !out || !mask || n_q <= 0 || n_kv <= 0 || n_heads <= 0 ||
+        n_kv_heads <= 0 || head_dim <= 0 || (n_heads % n_kv_heads) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    hipLaunchKernelGGL(attention_flash_kernel, grid, block, 0, as_stream(stream), q, k, v, out, n_q,
+                       n_kv, n_heads, n_kv_heads, head_dim, 0, mask);
     return hip_status(hipGetLastError());
 }
 
@@ -1076,6 +1094,12 @@ extern "C" int allpaca_gemm_nt_q8_0(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_attention(const float *, const float *, const float *, float *, int32_t,
                                  int32_t, int32_t, int32_t, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_attention_masked(const float *, const float *, const float *, float *,
+                                        int32_t, int32_t, int32_t, int32_t, int32_t, const uint8_t *,
+                                        allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

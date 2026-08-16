@@ -1003,7 +1003,7 @@ impl TinyModel {
     }
 
     /// Packed Token Forest verify: one target eval with an ancestry attention mask.
-    /// HIP stays on the sequential `forward_token` path.
+    /// When `hip` is present the ancestry mask runs on the target GPU.
     pub fn forward_forest(
         &self,
         forest: &TokenForest,
@@ -1011,6 +1011,8 @@ impl TinyModel {
         kv: &KvTierManager,
         prompt_len: usize,
         node_logits: &mut [Vec<f32>],
+        hip: Option<&HipWorkspace>,
+        metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
         let n_tree = forest.nodes.len();
         if n_tree == 0 {
@@ -1095,18 +1097,45 @@ impl TinyModel {
                 }
             }
             let mut attn_out = vec![0.0f32; n_tree * dim];
-            attention_with_mask(
-                &qs,
-                &k_all,
-                &v_all,
-                &mut attn_out,
-                n_tree,
-                n_kv,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                head_dim,
-                &mask,
-            )?;
+            let mut gpu_mask = false;
+            if let Some(hip) = hip {
+                let mask_u8: Vec<u8> = mask.iter().map(|b| u8::from(*b)).collect();
+                if hip
+                    .attention_masked(
+                        &qs,
+                        &k_all,
+                        &v_all,
+                        &mut attn_out,
+                        n_tree as i32,
+                        n_kv as i32,
+                        cfg.n_heads as i32,
+                        cfg.n_kv_heads as i32,
+                        head_dim as i32,
+                        &mask_u8,
+                    )
+                    .is_ok()
+                {
+                    gpu_mask = true;
+                    if let Some(m) = metrics {
+                        m.tree_gpu_verifies
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            if !gpu_mask {
+                attention_with_mask(
+                    &qs,
+                    &k_all,
+                    &v_all,
+                    &mut attn_out,
+                    n_tree,
+                    n_kv,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    &mask,
+                )?;
+            }
             for i in 0..n_tree {
                 let mut hidden = vec![0.0f32; dim];
                 matmul_nt(

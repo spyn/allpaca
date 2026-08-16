@@ -150,6 +150,19 @@ mod ffi {
             causal: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_attention_masked(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_q: i32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            mask: *const u8,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_copy_async(
             dst: *mut c_void,
             src: *const c_void,
@@ -1744,6 +1757,170 @@ impl HipWorkspace {
                 "HIP attention unavailable".into(),
             )))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_device_masked(
+        &self,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mask: *const u8,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || k.is_null() || v.is_null() || out.is_null() || mask.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device masked attention".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_attention_masked(
+                    q,
+                    k,
+                    v,
+                    out,
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    mask,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "attention_masked")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (n_q, n_kv, n_heads, n_kv_heads, head_dim);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP attention_masked unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_masked(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mask: &[u8],
+    ) -> Result<(), AllpacaError> {
+        let mask_n = (n_q as usize).saturating_mul(n_kv as usize);
+        if mask.len() < mask_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention mask size mismatch".into(),
+            )));
+        }
+        let mask_bytes = mask_n;
+        let need = q.len() * 4 + k.len() * 4 + v.len() * 4 + out.len() * 4 + mask_bytes;
+        if need > self.scratch_bytes {
+            let dq = device_malloc(q.len() * 4, self.device)?;
+            let dk = match device_malloc(k.len() * 4, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    return Err(e);
+                }
+            };
+            let dv = match device_malloc(v.len() * 4, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    device_free(dk, k.len() * 4);
+                    return Err(e);
+                }
+            };
+            let dout = match device_malloc(out.len() * 4, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    device_free(dk, k.len() * 4);
+                    device_free(dv, v.len() * 4);
+                    return Err(e);
+                }
+            };
+            let dm = match device_malloc(mask_bytes, self.device) {
+                Ok(p) => p,
+                Err(e) => {
+                    device_free(dq, q.len() * 4);
+                    device_free(dk, k.len() * 4);
+                    device_free(dv, v.len() * 4);
+                    device_free(dout, out.len() * 4);
+                    return Err(e);
+                }
+            };
+            let result = (|| {
+                self.bind()?;
+                memcpy(dq, q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
+                memcpy(dk, k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
+                memcpy(dv, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+                memcpy(dm, mask.as_ptr(), mask_bytes, MEMCPY_H2D)?;
+                self.add_h2d(q.len() * 4 + k.len() * 4 + v.len() * 4 + mask_bytes);
+                self.attention_device_masked(
+                    dq.cast(),
+                    dk.cast(),
+                    dv.cast(),
+                    dout.cast(),
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    dm,
+                )?;
+                memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)?;
+                self.add_d2h(out.len() * 4);
+                Ok(())
+            })();
+            device_free(dq, q.len() * 4);
+            device_free(dk, k.len() * 4);
+            device_free(dv, v.len() * 4);
+            device_free(dout, out.len() * 4);
+            device_free(dm, mask_bytes);
+            return result;
+        }
+        self.bind()?;
+        let dq = self.scratch;
+        let dk = unsafe { self.scratch.add(q.len() * 4) };
+        let dv = unsafe { self.scratch.add((q.len() + k.len()) * 4) };
+        let dout = unsafe { self.scratch.add((q.len() + k.len() + v.len()) * 4) };
+        let dm = unsafe { self.scratch.add((q.len() + k.len() + v.len() + out.len()) * 4) };
+        memcpy(dq, q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
+        memcpy(dk, k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
+        memcpy(dv, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+        memcpy(dm, mask.as_ptr(), mask_bytes, MEMCPY_H2D)?;
+        self.add_h2d(q.len() * 4 + k.len() * 4 + v.len() * 4 + mask_bytes);
+        self.attention_device_masked(
+            dq.cast(),
+            dk.cast(),
+            dv.cast(),
+            dout.cast(),
+            n_q,
+            n_kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            dm,
+        )?;
+        memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)?;
+        self.add_d2h(out.len() * 4);
+        Ok(())
     }
 }
 

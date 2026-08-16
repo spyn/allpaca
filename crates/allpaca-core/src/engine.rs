@@ -1025,6 +1025,7 @@ fn verify_forest(
     hip: Option<&HipWorkspace>,
 ) -> Result<Produced, AllpacaError> {
     let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
+    let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
     if !forest.nodes.is_empty() {
         let pages = request(inner, id)?.pages.clone();
         let prompt_len = request(inner, id)?.tokens.len();
@@ -1032,10 +1033,15 @@ fn verify_forest(
             .target
             .clone()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-        let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
-        // Ancestry-masked packed verify (CPU). HIP path stays sequential.
-        target.forward_forest(forest, &pages, &inner.kv, prompt_len, &mut node_logits)?;
-        let _ = node_logits;
+        target.forward_forest(
+            forest,
+            &pages,
+            &inner.kv,
+            prompt_len,
+            &mut node_logits,
+            hip,
+            Some(metrics),
+        )?;
     }
 
     let mut produced = Vec::new();
@@ -1044,7 +1050,15 @@ fn verify_forest(
     while produced.len() < remaining {
         let (mut logits, params) = {
             let active = request(inner, id)?;
-            (active.pending_logits.clone(), active.params.clone())
+            let mut logits = active.pending_logits.clone();
+            if parent >= 0 {
+                if let Some(nl) = node_logits.get(parent as usize) {
+                    if nl.len() == logits.len() {
+                        logits.copy_from_slice(nl);
+                    }
+                }
+            }
+            (logits, active.params.clone())
         };
         let sampled = {
             let active = request_mut(inner, id)?;
