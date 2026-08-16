@@ -42,6 +42,8 @@ dependencies = [
  "allpaca-cpu",
  "allpaca-gguf",
  "allpaca-hip",
+ "allpaca-onnx",
+ "allpaca-safetensors",
  "allpaca-types",
  "async-stream",
  "futures",
@@ -79,6 +81,22 @@ version = "0.1.0"
 dependencies = [
  "allpaca-types",
  "tracing",
+]
+
+[[package]]
+name = "allpaca-onnx"
+version = "0.1.0"
+dependencies = [
+ "allpaca-types",
+]
+
+[[package]]
+name = "allpaca-safetensors"
+version = "0.1.0"
+dependencies = [
+ "allpaca-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

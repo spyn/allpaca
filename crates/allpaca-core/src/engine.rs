@@ -3,6 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use allpaca_gguf::{extract_tokenizer, GgufFile};
+use allpaca_onnx::OnnxFile;
+use allpaca_safetensors::{
+    load_hf_config, load_vocab_sidecar, resolve_sidecar, SafetensorsFile,
+};
 use allpaca_types::{
     AllpacaError, Config, DraftProviderKind, FatalError, FeatureFlags, FinishReason,
     GenerationOutput, GenerationParams, KvHandle, StatsSnapshot, StepResult, TokenEvent,
@@ -150,7 +154,7 @@ impl Engine {
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
         } else if let Some(path) = &config.model.path {
-            engine.load_gguf(path)?;
+            engine.load_model_path(path)?;
         }
         Ok(engine)
     }
@@ -207,6 +211,63 @@ impl Engine {
         inner.tokenizer = Some(tokenizer);
         inner.model_id = "synthetic".into();
         tracing::info!(vocab = cfg.vocab_size, layers = cfg.n_layers, "loaded synthetic model");
+        Ok(())
+    }
+
+    fn load_model_path(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("safetensors") => self.load_safetensors(path),
+            Some("onnx") => self.load_onnx(path),
+            _ => self.load_gguf(path),
+        }
+    }
+
+    pub fn load_safetensors(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
+        let file = SafetensorsFile::open(path)?;
+        let config_path = resolve_sidecar(
+            self.config.model.config_path.as_deref(),
+            path,
+            "config.json",
+        );
+        let tokenizer_path = resolve_sidecar(
+            self.config.model.tokenizer_path.as_deref(),
+            path,
+            "tokenizer.json",
+        );
+        let hf = load_hf_config(&config_path)?;
+        let vocab = load_vocab_sidecar(&tokenizer_path)?;
+        let model = TinyModel::from_safetensors(&file, &hf)?;
+        let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
+        let mut inner = self.lock()?;
+        inner.ring.resize_vocab(model.config.vocab_size);
+        inner.tokenizer = Some(tokenizer);
+        inner.model_id = model.name.clone();
+        inner.target = Some(Arc::new(model));
+        Ok(())
+    }
+
+    pub fn load_onnx(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
+        let file = OnnxFile::open(path)?;
+        file.ensure_weight_export()?;
+        let config_path = resolve_sidecar(
+            self.config.model.config_path.as_deref(),
+            path,
+            "config.json",
+        );
+        let tokenizer_path = resolve_sidecar(
+            self.config.model.tokenizer_path.as_deref(),
+            path,
+            "tokenizer.json",
+        );
+        let hf = load_hf_config(&config_path)?;
+        let vocab = load_vocab_sidecar(&tokenizer_path)?;
+        let model = TinyModel::from_onnx(&file, &hf)?;
+        let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
+        let mut inner = self.lock()?;
+        inner.ring.resize_vocab(model.config.vocab_size);
+        inner.tokenizer = Some(tokenizer);
+        inner.model_id = model.name.clone();
+        inner.target = Some(Arc::new(model));
         Ok(())
     }
 
@@ -1630,6 +1691,343 @@ mod tests {
     }
 
     #[test]
+    fn engine_fatal_on_missing_or_invalid_safetensors() {
+        let mut missing = Config::compiled_defaults();
+        missing.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        missing.model.path = Some(std::env::temp_dir().join("allpaca_missing.safetensors"));
+        let err = match Engine::new(missing) {
+            Ok(_) => panic!("missing SafeTensors must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        assert!(
+            !matches!(err, AllpacaError::Fatal(FatalError::CorruptGguf(_))),
+            "a .safetensors path must not be treated as GGUF: {err}"
+        );
+
+        let junk = std::env::temp_dir().join("allpaca_corrupt.safetensors");
+        std::fs::write(&junk, b"not a safetensors file").unwrap();
+        let mut corrupt = Config::compiled_defaults();
+        corrupt.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        corrupt.model.path = Some(junk.clone());
+        let err = match Engine::new(corrupt) {
+            Ok(_) => panic!("invalid SafeTensors must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        assert!(
+            !matches!(err, AllpacaError::Fatal(FatalError::CorruptGguf(_))),
+            "invalid SafeTensors must not surface as corrupt GGUF: {err}"
+        );
+        let _ = std::fs::remove_file(junk);
+    }
+
+    #[test]
+    fn engine_fatal_on_missing_or_invalid_onnx() {
+        let mut missing = Config::compiled_defaults();
+        missing.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        missing.model.path = Some(std::env::temp_dir().join("allpaca_missing.onnx"));
+        let err = match Engine::new(missing) {
+            Ok(_) => panic!("missing ONNX must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        assert!(
+            !matches!(err, AllpacaError::Fatal(FatalError::CorruptGguf(_))),
+            "a .onnx path must not be treated as GGUF: {err}"
+        );
+
+        let junk = std::env::temp_dir().join("allpaca_corrupt.onnx");
+        std::fs::write(&junk, b"not an onnx file").unwrap();
+        let mut corrupt = Config::compiled_defaults();
+        corrupt.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        corrupt.model.path = Some(junk.clone());
+        let err = match Engine::new(corrupt) {
+            Ok(_) => panic!("invalid ONNX must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        assert!(
+            !matches!(err, AllpacaError::Fatal(FatalError::CorruptGguf(_))),
+            "invalid ONNX must not surface as corrupt GGUF: {err}"
+        );
+        let _ = std::fs::remove_file(junk);
+    }
+
+    fn write_tiny_safetensors_checkpoint(dir: &std::path::Path) -> std::path::PathBuf {
+        use allpaca_safetensors::{write_safetensors, SafetensorsDtype, SafetensorsWriteTensor};
+
+        std::fs::create_dir_all(dir).unwrap();
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let kv_dim = 2usize;
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"architectures":["LlamaForCausalLM"],"vocab_size":{vocab},"hidden_size":{dim},"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":1,"intermediate_size":{ff},"rms_norm_eps":1e-5,"rope_theta":10000.0}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            r#"{"tokens":["<unk>","<s>","</s>","hello"],"bos_id":1,"eos_id":2}"#,
+        )
+        .unwrap();
+
+        let embd = vec![0.01f32; vocab * dim];
+        let ones = vec![1.0f32; dim];
+        let q = vec![0.01f32; dim * dim];
+        let k = vec![0.01f32; kv_dim * dim];
+        let v = vec![0.01f32; kv_dim * dim];
+        let o = vec![0.01f32; dim * dim];
+        let gate = vec![0.01f32; ff * dim];
+        let up = vec![0.01f32; ff * dim];
+        let down = vec![0.01f32; dim * ff];
+        let path = dir.join("model.safetensors");
+        let owned = [
+            ("token_embd.weight", vec![vocab as u64, dim as u64], &embd, SafetensorsDtype::F32),
+            ("blk.0.attn_norm.weight", vec![dim as u64], &ones, SafetensorsDtype::F32),
+            ("blk.0.attn_q.weight", vec![dim as u64, dim as u64], &q, SafetensorsDtype::F32),
+            ("blk.0.attn_k.weight", vec![kv_dim as u64, dim as u64], &k, SafetensorsDtype::F32),
+            ("blk.0.attn_v.weight", vec![kv_dim as u64, dim as u64], &v, SafetensorsDtype::F32),
+            ("blk.0.attn_output.weight", vec![dim as u64, dim as u64], &o, SafetensorsDtype::F32),
+            ("blk.0.ffn_norm.weight", vec![dim as u64], &ones, SafetensorsDtype::F32),
+            ("blk.0.ffn_gate.weight", vec![ff as u64, dim as u64], &gate, SafetensorsDtype::F32),
+            ("blk.0.ffn_up.weight", vec![ff as u64, dim as u64], &up, SafetensorsDtype::F32),
+            ("blk.0.ffn_down.weight", vec![dim as u64, ff as u64], &down, SafetensorsDtype::F32),
+            ("output_norm.weight", vec![dim as u64], &ones, SafetensorsDtype::F32),
+        ];
+        let views: Vec<SafetensorsWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data, dtype)| SafetensorsWriteTensor {
+                name: (*name).into(),
+                dims: dims.clone(),
+                dtype: *dtype,
+                data,
+            })
+            .collect();
+        write_safetensors(&path, &views).unwrap();
+        path
+    }
+
+    #[test]
+    fn engine_generate_from_tiny_safetensors() {
+        let dir = std::env::temp_dir().join("allpaca_tiny_safetensors_ckpt");
+        let path = write_tiny_safetensors_checkpoint(&dir);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("SafeTensors checkpoint must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("generate must work on SafeTensors weights");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn write_tiny_onnx_checkpoint(dir: &std::path::Path) -> std::path::PathBuf {
+        use allpaca_onnx::{write_onnx_weights, OnnxWriteTensor};
+
+        std::fs::create_dir_all(dir).unwrap();
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let kv_dim = 2usize;
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"architectures":["LlamaForCausalLM"],"vocab_size":{vocab},"hidden_size":{dim},"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":1,"intermediate_size":{ff},"rms_norm_eps":1e-5,"rope_theta":10000.0}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            r#"{"tokens":["<unk>","<s>","</s>","hello"],"bos_id":1,"eos_id":2}"#,
+        )
+        .unwrap();
+        let embd = vec![0.01f32; vocab * dim];
+        let ones = vec![1.0f32; dim];
+        let q = vec![0.01f32; dim * dim];
+        let k = vec![0.01f32; kv_dim * dim];
+        let v = vec![0.01f32; kv_dim * dim];
+        let o = vec![0.01f32; dim * dim];
+        let gate = vec![0.01f32; ff * dim];
+        let up = vec![0.01f32; ff * dim];
+        let down = vec![0.01f32; dim * ff];
+        let path = dir.join("model.onnx");
+        let owned = [
+            ("token_embd.weight", vec![vocab as i64, dim as i64], &embd),
+            ("blk.0.attn_norm.weight", vec![dim as i64], &ones),
+            ("blk.0.attn_q.weight", vec![dim as i64, dim as i64], &q),
+            ("blk.0.attn_k.weight", vec![kv_dim as i64, dim as i64], &k),
+            ("blk.0.attn_v.weight", vec![kv_dim as i64, dim as i64], &v),
+            ("blk.0.attn_output.weight", vec![dim as i64, dim as i64], &o),
+            ("blk.0.ffn_norm.weight", vec![dim as i64], &ones),
+            ("blk.0.ffn_gate.weight", vec![ff as i64, dim as i64], &gate),
+            ("blk.0.ffn_up.weight", vec![ff as i64, dim as i64], &up),
+            ("blk.0.ffn_down.weight", vec![dim as i64, ff as i64], &down),
+            ("output_norm.weight", vec![dim as i64], &ones),
+        ];
+        let views: Vec<OnnxWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| OnnxWriteTensor {
+                name: (*name).into(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        write_onnx_weights(&path, "tiny-llama", &views, &[]).unwrap();
+        path
+    }
+
+    #[test]
+    fn engine_generate_from_tiny_onnx() {
+        let dir = std::env::temp_dir().join("allpaca_tiny_onnx_ckpt");
+        let path = write_tiny_onnx_checkpoint(&dir);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("ONNX weight-export must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("generate must work on ONNX initializer weights");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn engine_fatal_on_unsupported_onnx_graph() {
+        use allpaca_onnx::{write_onnx_weights, OnnxWriteNode, OnnxWriteTensor};
+
+        let dir = std::env::temp_dir().join("allpaca_onnx_bad_op");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"vocab_size":4,"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":4,"intermediate_size":16}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            r#"{"tokens":["<unk>","<s>","</s>","hello"],"bos_id":1,"eos_id":2}"#,
+        )
+        .unwrap();
+        let w = [1.0f32, 2.0];
+        let path = dir.join("model.onnx");
+        write_onnx_weights(
+            &path,
+            "conv-net",
+            &[OnnxWriteTensor {
+                name: "w".into(),
+                dims: vec![2],
+                data: &w,
+            }],
+            &[OnnxWriteNode {
+                op_type: "Conv".into(),
+                name: "conv0".into(),
+            }],
+        )
+        .unwrap();
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path);
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("unsupported ONNX graph must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Conv") && !msg.to_lowercase().contains("panic"),
+            "Fatal error must name the unsupported op: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn engine_fatal_on_unsupported_safetensors_dtype() {
+        let dir = std::env::temp_dir().join("allpaca_st_bad_dtype");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"vocab_size":4,"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":4,"intermediate_size":16}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            r#"{"tokens":["<unk>","<s>","</s>","hello"],"bos_id":1,"eos_id":2}"#,
+        )
+        .unwrap();
+        let header = r#"{"token_embd.weight":{"dtype":"I32","shape":[4,8],"data_offsets":[0,128]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 128]);
+        let path = dir.join("model.safetensors");
+        std::fs::write(&path, bytes).unwrap();
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path);
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("unsupported SafeTensors dtype must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("I32") && msg.to_lowercase().contains("unsupported"),
+            "Fatal error must name the unsupported dtype: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn engine_generate_from_q4_q8_gguf() {
         let path = std::env::temp_dir().join("allpaca_target_q4q8.gguf");
         write_tiny_quant_gguf(&path);
@@ -1687,6 +2085,35 @@ mod tests {
             .expect("Degraded draft failure must continue on the Target Model");
         assert!(!out.token_ids.is_empty());
         let _ = std::fs::remove_file(target);
+    }
+
+    #[test]
+    fn engine_generate_from_gguf_still_works_alongside_safetensors() {
+        let path = std::env::temp_dir().join("allpaca_gguf_regression.gguf");
+        write_tiny_target_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("GGUF path must still load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("GGUF generate must still work");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -271,6 +271,10 @@ impl Default for StructuredOutputSection {
 pub struct ModelSection {
     pub path: Option<PathBuf>,
     pub draft_path: Option<PathBuf>,
+    /// HuggingFace-style `config.json` sidecar (SafeTensors / ONNX).
+    pub config_path: Option<PathBuf>,
+    /// Tokenizer sidecar JSON (vocab or HuggingFace `tokenizer.json`).
+    pub tokenizer_path: Option<PathBuf>,
     pub synthetic: bool,
     pub id: String,
 }
@@ -280,6 +284,8 @@ impl Default for ModelSection {
         Self {
             path: None,
             draft_path: None,
+            config_path: None,
+            tokenizer_path: None,
             synthetic: false,
             id: "allpaca".into(),
         }
@@ -419,5 +425,30 @@ mod tests {
         assert!(cfg.speculative.tree.enabled);
         assert_eq!(cfg.speculative.tree.max_nodes, 16);
         assert!(cfg.speculative.enabled, "tree is composable, not a Pipeline Mode");
+    }
+
+    #[test]
+    fn model_section_accepts_safetensors_sidecar_paths() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [model]
+            path = "weights.safetensors"
+            config_path = "config.json"
+            tokenizer_path = "tokenizer.json"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model.path.as_deref(),
+            Some(std::path::Path::new("weights.safetensors"))
+        );
+        assert_eq!(
+            cfg.model.config_path.as_deref(),
+            Some(std::path::Path::new("config.json"))
+        );
+        assert_eq!(
+            cfg.model.tokenizer_path.as_deref(),
+            Some(std::path::Path::new("tokenizer.json"))
+        );
     }
 }
