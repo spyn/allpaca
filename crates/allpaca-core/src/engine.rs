@@ -243,6 +243,24 @@ impl Engine {
         self.metrics
             .activation_d2h_bytes
             .store(hip_d2h + kv_d2h + draft_d2h, std::sync::atomic::Ordering::Relaxed);
+        if let Some(hip) = &self.hip {
+            let p = hip.decode_profile();
+            self.metrics
+                .q8_gemm_ns
+                .store((p.q8_gemm_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .attention_ns
+                .store((p.attention_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .lm_head_ns
+                .store((p.lm_head_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .other_gpu_ns
+                .store((p.other_gpu_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .host_ns
+                .store((p.host_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let bench = self.inventory.transfer_benchmark;
         let p2p_copy_ok = bench.map(|b| b.p2p_copy_ok).unwrap_or(false);
         let p2p_status = if p2p_copy_ok {

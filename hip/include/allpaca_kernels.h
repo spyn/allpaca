@@ -54,6 +54,11 @@ int allpaca_hip_set_device(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);
 
+int allpaca_hip_event_create(void **event);
+int allpaca_hip_event_destroy(void *event);
+int allpaca_hip_event_record(void *event, allpaca_stream_t stream);
+int allpaca_hip_event_elapsed_us(void *start, void *stop, double *us);
+
 int allpaca_gemm(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                  allpaca_stream_t stream);
 

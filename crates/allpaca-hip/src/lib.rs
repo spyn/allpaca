@@ -65,6 +65,100 @@ pub const MEMCPY_DEFAULT: i32 = 3;
 
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// HIP decode timing buckets (microseconds) for the last/EMA target forward.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DecodeProfile {
+    pub q8_gemm_us: f64,
+    pub attention_us: f64,
+    pub lm_head_us: f64,
+    pub other_gpu_us: f64,
+    pub host_us: f64,
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum DecodeOp {
+    Q8Gemm = 0,
+    Attention = 1,
+    LmHead = 2,
+    OtherGpu = 3,
+}
+
+struct ProfileState {
+    #[allow(dead_code)]
+    pairs: Vec<[*mut std::ffi::c_void; 2]>,
+    ops: Vec<u8>,
+    used: usize,
+    wall_start: Option<std::time::Instant>,
+    ema_ns: [u64; 5],
+}
+
+impl Default for ProfileState {
+    fn default() -> Self {
+        Self {
+            pairs: Vec::new(),
+            ops: Vec::new(),
+            used: 0,
+            wall_start: None,
+            ema_ns: [0; 5],
+        }
+    }
+}
+
+impl Drop for ProfileState {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            for pair in &self.pairs {
+                unsafe {
+                    ffi::allpaca_hip_event_destroy(pair[0]);
+                    ffi::allpaca_hip_event_destroy(pair[1]);
+                }
+            }
+        }
+    }
+}
+
+unsafe impl Send for ProfileState {}
+
+fn ema_ns(prev: u64, sample: u64) -> u64 {
+    if prev == 0 {
+        sample
+    } else {
+        (prev * 8 + sample * 2) / 10
+    }
+}
+
+#[cfg(all(feature = "hip", allpaca_hip_runtime))]
+fn event_create() -> Result<*mut std::ffi::c_void, AllpacaError> {
+    let mut ev = std::ptr::null_mut();
+    let rc = unsafe { ffi::allpaca_hip_event_create(&mut ev) };
+    status(rc, "event_create")?;
+    if ev.is_null() {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP event_create returned null".into(),
+        )));
+    }
+    Ok(ev)
+}
+
+#[cfg(all(feature = "hip", allpaca_hip_runtime))]
+fn event_record(ev: *mut std::ffi::c_void) -> Result<(), AllpacaError> {
+    let rc = unsafe { ffi::allpaca_hip_event_record(ev, std::ptr::null_mut()) };
+    status(rc, "event_record")
+}
+
+#[cfg(all(feature = "hip", allpaca_hip_runtime))]
+fn event_elapsed_ns(start: *mut std::ffi::c_void, stop: *mut std::ffi::c_void) -> u64 {
+    let mut us = 0.0f64;
+    let rc = unsafe { ffi::allpaca_hip_event_elapsed_us(start, stop, &mut us) };
+    if rc != ALLPACA_OK || us <= 0.0 {
+        0
+    } else {
+        (us * 1_000.0).round() as u64
+    }
+}
+
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
 mod ffi {
     use std::os::raw::c_void;
@@ -110,6 +204,14 @@ mod ffi {
         pub fn allpaca_hip_mem_used(device: i32, used_bytes: *mut u64) -> i32;
         pub fn allpaca_hip_set_device(device: i32) -> i32;
         pub fn allpaca_hip_stream_synchronize(stream: *mut c_void) -> i32;
+        pub fn allpaca_hip_event_create(event: *mut *mut c_void) -> i32;
+        pub fn allpaca_hip_event_destroy(event: *mut c_void) -> i32;
+        pub fn allpaca_hip_event_record(event: *mut c_void, stream: *mut c_void) -> i32;
+        pub fn allpaca_hip_event_elapsed_us(
+            start: *mut c_void,
+            stop: *mut c_void,
+            us: *mut f64,
+        ) -> i32;
         pub fn allpaca_gemm(
             a: *const f32,
             b: *const f32,
@@ -1036,6 +1138,16 @@ fn decode_floats(dim: usize, kv_dim: usize, ff_dim: usize, vocab: usize, max_kv:
 }
 
 /// Persistent device workspace used by the Engine for GEMM / attention / logits.
+pub struct LmHeadScope<'a> {
+    flag: &'a AtomicU64,
+}
+
+impl Drop for LmHeadScope<'_> {
+    fn drop(&mut self) {
+        self.flag.store(0, Ordering::Relaxed);
+    }
+}
+
 struct DequantAlloc {
     ptr: *mut u8,
     bytes: usize,
@@ -1055,6 +1167,9 @@ pub struct HipWorkspace {
     dequant: Mutex<Option<DequantAlloc>>,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
+    profiling: AtomicU64,
+    lm_head: AtomicU64,
+    profile: Mutex<ProfileState>,
 }
 
 unsafe impl Send for HipWorkspace {}
@@ -1079,6 +1194,9 @@ impl HipWorkspace {
             dequant: Mutex::new(None),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
+            profiling: AtomicU64::new(0),
+            lm_head: AtomicU64::new(0),
+            profile: Mutex::new(ProfileState::default()),
         })
     }
 
@@ -1106,6 +1224,138 @@ impl HipWorkspace {
 
     pub fn activation_d2h_bytes(&self) -> u64 {
         self.activation_d2h.load(Ordering::Relaxed)
+    }
+
+    /// Start a HIP decode sample. Kernel ABI calls until [`end_decode_profile`] are timed.
+    pub fn begin_decode_profile(&self) {
+        self.profiling.store(1, Ordering::Relaxed);
+        self.lm_head.store(0, Ordering::Relaxed);
+        let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+        g.used = 0;
+        g.ops.clear();
+        g.wall_start = Some(std::time::Instant::now());
+    }
+
+    /// Classify the next F32 GEMM ABI calls as lm_head until the guard drops.
+    pub fn lm_head_scope(&self) -> LmHeadScope<'_> {
+        self.lm_head.store(1, Ordering::Relaxed);
+        LmHeadScope { flag: &self.lm_head }
+    }
+
+    /// Last/EMA decode buckets in microseconds.
+    pub fn decode_profile(&self) -> DecodeProfile {
+        let g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+        DecodeProfile {
+            q8_gemm_us: g.ema_ns[0] as f64 / 1_000.0,
+            attention_us: g.ema_ns[1] as f64 / 1_000.0,
+            lm_head_us: g.ema_ns[2] as f64 / 1_000.0,
+            other_gpu_us: g.ema_ns[3] as f64 / 1_000.0,
+            host_us: g.ema_ns[4] as f64 / 1_000.0,
+        }
+    }
+
+    /// Finish the sample after the stream wait (logits D2H) so HIP events are complete.
+    pub fn end_decode_profile(&self) {
+        self.profiling.store(0, Ordering::Relaxed);
+        self.lm_head.store(0, Ordering::Relaxed);
+        let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+        let wall_ns = g
+            .wall_start
+            .take()
+            .map(|t| t.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        let mut buckets = [0u64; 5];
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            for i in 0..g.used.min(g.ops.len()).min(g.pairs.len()) {
+                let op = g.ops[i] as usize;
+                if op >= 4 {
+                    continue;
+                }
+                buckets[op] += event_elapsed_ns(g.pairs[i][0], g.pairs[i][1]);
+            }
+        }
+        let gpu_ns = buckets[0] + buckets[1] + buckets[2] + buckets[3];
+        buckets[4] = wall_ns.saturating_sub(gpu_ns);
+        for i in 0..5 {
+            g.ema_ns[i] = ema_ns(g.ema_ns[i], buckets[i]);
+        }
+        g.used = 0;
+        g.ops.clear();
+    }
+
+    fn timed_gpu<T>(
+        &self,
+        op: DecodeOp,
+        f: impl FnOnce() -> Result<T, AllpacaError>,
+    ) -> Result<T, AllpacaError> {
+        if self.profiling.load(Ordering::Relaxed) == 0 {
+            return f();
+        }
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let pair = {
+                let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+                if g.used >= g.pairs.len() {
+                    match (event_create(), event_create()) {
+                        (Ok(a), Ok(b)) => g.pairs.push([a, b]),
+                        (Ok(a), Err(e)) => {
+                            unsafe { ffi::allpaca_hip_event_destroy(a) };
+                            return Err(e);
+                        }
+                        (Err(e), Ok(b)) => {
+                            unsafe { ffi::allpaca_hip_event_destroy(b) };
+                            return Err(e);
+                        }
+                        (Err(e), Err(_)) => return Err(e),
+                    }
+                }
+                g.pairs[g.used]
+            };
+            let _ = event_record(pair[0]);
+            let result = f();
+            let _ = event_record(pair[1]);
+            {
+                let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+                g.ops.push(op as u8);
+                g.used += 1;
+            }
+            result
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = op;
+            f()
+        }
+    }
+
+    pub fn gemm_nt_dev(
+        &self,
+        a: *const f32,
+        b: *const f32,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::OtherGpu
+        };
+        self.timed_gpu(op, || gemm_nt_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_q8_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        self.timed_gpu(DecodeOp::Q8Gemm, || gemm_nt_q8_0_device(a, b, c, m, n, k))
     }
 
     fn add_h2d(&self, bytes: usize) {
@@ -1202,8 +1452,10 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_dequant_q8_0(blocks, out, n, std::ptr::null_mut()) };
-            status(rc, "dequant_q8_0")
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_dequant_q8_0(blocks, out, n, std::ptr::null_mut()) };
+                status(rc, "dequant_q8_0")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1228,10 +1480,12 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe {
-                ffi::allpaca_embed_gather_q8_0(table, token as i32, out, dim, std::ptr::null_mut())
-            };
-            status(rc, "embed_gather_q8_0")
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_q8_0(table, token as i32, out, dim, std::ptr::null_mut())
+                };
+                status(rc, "embed_gather_q8_0")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1601,10 +1855,12 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe {
-                ffi::allpaca_embed_gather(table, token as i32, out, dim, std::ptr::null_mut())
-            };
-            status(rc, "embed_gather")
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather(table, token as i32, out, dim, std::ptr::null_mut())
+                };
+                status(rc, "embed_gather")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1624,8 +1880,10 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_residual_add(x, residual, n, std::ptr::null_mut()) };
-            status(rc, "residual_add")
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_residual_add(x, residual, n, std::ptr::null_mut()) };
+                status(rc, "residual_add")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1651,8 +1909,10 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_rmsnorm(x, weight, out, n, eps, std::ptr::null_mut()) };
-            status(rc, "rmsnorm")
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_rmsnorm(x, weight, out, n, eps, std::ptr::null_mut()) };
+                status(rc, "rmsnorm")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1679,8 +1939,10 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_rope(x, n_heads, head_dim, pos, theta, std::ptr::null_mut()) };
-            status(rc, "rope")
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_rope(x, n_heads, head_dim, pos, theta, std::ptr::null_mut()) };
+                status(rc, "rope")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1700,8 +1962,10 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_silu_mul(gate, up, n, std::ptr::null_mut()) };
-            status(rc, "silu_mul")
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_silu_mul(gate, up, n, std::ptr::null_mut()) };
+                status(rc, "silu_mul")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1733,22 +1997,24 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe {
-                ffi::allpaca_attention(
-                    q,
-                    k,
-                    v,
-                    out,
-                    n_q,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    i32::from(causal),
-                    std::ptr::null_mut(),
-                )
-            };
-            status(rc, "attention")
+            self.timed_gpu(DecodeOp::Attention, || {
+                let rc = unsafe {
+                    ffi::allpaca_attention(
+                        q,
+                        k,
+                        v,
+                        out,
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "attention")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
@@ -1781,22 +2047,24 @@ impl HipWorkspace {
         self.bind()?;
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe {
-                ffi::allpaca_attention_masked(
-                    q,
-                    k,
-                    v,
-                    out,
-                    n_q,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    mask,
-                    std::ptr::null_mut(),
-                )
-            };
-            status(rc, "attention_masked")
+            self.timed_gpu(DecodeOp::Attention, || {
+                let rc = unsafe {
+                    ffi::allpaca_attention_masked(
+                        q,
+                        k,
+                        v,
+                        out,
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        mask,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "attention_masked")
+            })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
