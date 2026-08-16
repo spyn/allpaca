@@ -168,7 +168,7 @@ __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, 
     constexpr int WARPS = 16;
     constexpr int COLS = 8;
     constexpr int SUB = 4;
-    constexpr int TILE = 4;
+    constexpr int TILE = 8;
     __shared__ float As[TILE * 32];
 
     const int row = static_cast<int>(blockIdx.y);

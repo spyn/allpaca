@@ -917,7 +917,7 @@ impl TinyModel {
             kv.write_slot_from_device(page_id, slot, cfg.n_kv_heads, head_dim, buf.k, buf.v)?;
             kv.touch(page_id, 1.0);
 
-            let n_kv = kv.pack_kv_device(
+            let (packed_k, packed_v, n_kv) = kv.kv_device_views(
                 &page_ids[layer_idx],
                 cfg.n_kv_heads,
                 head_dim,
@@ -927,8 +927,8 @@ impl TinyModel {
             )?;
             hip.attention_device(
                 buf.q,
-                buf.packed_k,
-                buf.packed_v,
+                packed_k,
+                packed_v,
                 buf.attn,
                 1,
                 n_kv as i32,
