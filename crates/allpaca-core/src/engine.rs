@@ -257,9 +257,18 @@ impl Engine {
             self.metrics
                 .other_gpu_ns
                 .store((p.other_gpu_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+            let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
+            let itl_us = self.metrics.itl_ms_ema_x100.load(std::sync::atomic::Ordering::Relaxed)
+                as f64
+                * 10.0;
+            let host_us = if itl_us > gpu_us {
+                itl_us - gpu_us
+            } else {
+                p.host_us
+            };
             self.metrics
                 .host_ns
-                .store((p.host_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+                .store((host_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let bench = self.inventory.transfer_benchmark;
         let p2p_copy_ok = bench.map(|b| b.p2p_copy_ok).unwrap_or(false);
@@ -807,7 +816,7 @@ impl Engine {
                         .store(ttft, std::sync::atomic::Ordering::Relaxed);
                     active.first_emitted = true;
                 } else {
-                    let itl = now.duration_since(active.last_token_at).as_millis() as u64;
+                    let itl = now.duration_since(active.last_token_at).as_secs_f64() * 1_000.0;
                     self.metrics.record_itl_ms(itl);
                 }
                 active.last_token_at = now;

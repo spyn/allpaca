@@ -53,6 +53,23 @@ pub fn stage_q8_0_blocks(packed: &[u8]) -> Result<Vec<u8>, AllpacaError> {
     Ok(out)
 }
 
+/// Repack GGUF Q8_0 into 36-byte column-major GEMV blocks (F32 scale + aligned qs).
+pub fn stage_q8_0_gemv(packed: &[u8], n: usize, k: usize) -> Result<Vec<u8>, AllpacaError> {
+    if n == 0 || k == 0 {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 GEMV stage needs n>0 and k>0".into(),
+        )));
+    }
+    let nblocks = k.div_ceil(32);
+    let packed_need = n.saturating_mul(nblocks).saturating_mul(Q8_PACKED_BLOCK);
+    if packed.len() < packed_need {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 GEMV packed length is short for n,k".into(),
+        )));
+    }
+    stage_q8_0_blocks(&packed[..packed_need])
+}
+
 pub const ALLPACA_OK: i32 = 0;
 pub const ALLPACA_ERR_NOT_IMPLEMENTED: i32 = 1;
 pub const ALLPACA_ERR_INVALID: i32 = 2;
@@ -878,7 +895,7 @@ pub fn gemm_nt_q8_0(
                 "Q8_0 GEMM buffer size mismatch".into(),
             )));
         }
-        let staged = stage_q8_0_blocks(&b[..packed_bytes])?;
+        let staged = stage_q8_0_gemv(&b[..packed_bytes], n as usize, k as usize)?;
         let da = device_malloc(a_n * 4, 0)?;
         let db = device_malloc(staged.len(), 0)?;
         let dc = device_malloc(c_n * 4, 0)?;
@@ -2331,6 +2348,60 @@ mod tests {
         assert_eq!(staged[Q8_STAGED_QS + 31], 0xfb);
     }
 
+    fn pack_q8_block(scale_f16: u16, qs0: u8) -> Vec<u8> {
+        let mut packed = vec![0u8; Q8_PACKED_BLOCK];
+        packed[0..2].copy_from_slice(&scale_f16.to_le_bytes());
+        packed[2] = qs0;
+        packed
+    }
+
+    /// GEMV staging is 36-byte column-major: F32 scale then 32 qs, N rows of K-blocks.
+    #[test]
+    fn stage_q8_0_gemv_uses_36_byte_column_major() {
+        let mut packed = Vec::new();
+        for col in 0..8u8 {
+            let mut blk = pack_q8_block(0x3c00, col + 1);
+            blk[33] = 0x80 + col;
+            packed.extend_from_slice(&blk);
+        }
+        let staged = stage_q8_0_gemv(&packed, 8, 32).unwrap();
+        assert_eq!(staged.len(), 8 * Q8_STAGED_BLOCK);
+        for c in 0..8 {
+            let dst = c * Q8_STAGED_BLOCK;
+            let scale = f32::from_le_bytes(staged[dst..dst + 4].try_into().unwrap());
+            assert!((scale - 1.0).abs() < 1e-3, "scale col {c} = {scale}");
+            assert_eq!(staged[dst + Q8_STAGED_QS], c as u8 + 1);
+            assert_eq!(staged[dst + Q8_STAGED_QS + 31], 0x80 + c as u8);
+        }
+    }
+
+    /// One column's K-blocks stay consecutive 36-byte strides (not interleaved with other cols).
+    #[test]
+    fn stage_q8_0_gemv_keeps_k_blocks_consecutive_per_column() {
+        let n = 9usize;
+        let k = 64usize;
+        let nblocks = 2usize;
+        let mut packed = vec![0u8; n * nblocks * Q8_PACKED_BLOCK];
+        for col in 0..n {
+            for blk in 0..nblocks {
+                let src = (col * nblocks + blk) * Q8_PACKED_BLOCK;
+                packed[src..src + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                packed[src + 2] = (col as u8) + 1;
+                packed[src + 3] = blk as u8 + 10;
+            }
+        }
+        let staged = stage_q8_0_gemv(&packed, n, k).unwrap();
+        assert_eq!(staged.len(), n * nblocks * Q8_STAGED_BLOCK);
+        for blk in 0..nblocks {
+            let dst = blk * Q8_STAGED_BLOCK;
+            assert_eq!(staged[dst + Q8_STAGED_QS], 1);
+            assert_eq!(staged[dst + Q8_STAGED_QS + 1], blk as u8 + 10);
+        }
+        let col8 = 8 * nblocks * Q8_STAGED_BLOCK;
+        assert_eq!(staged[col8 + Q8_STAGED_QS], 9);
+        assert_eq!(staged[col8 + Q8_STAGED_QS + 1], 10);
+    }
+
     #[test]
     fn default_build_has_no_hip_devices() {
         if cfg!(not(feature = "hip")) {
@@ -2570,7 +2641,7 @@ mod tests {
         for row in 0..n {
             b_q8_packed.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
         }
-        let b_q8 = stage_q8_0_blocks(&b_q8_packed).expect("stage q8");
+        let b_q8 = stage_q8_0_gemv(&b_q8_packed, n, k).expect("stage q8 gemv");
         let mut b_deq = vec![0.0f32; n * k];
         let nblocks = k.div_ceil(32);
         for row in 0..n {

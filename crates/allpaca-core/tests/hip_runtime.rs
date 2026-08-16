@@ -935,6 +935,15 @@ fn hip_generate_real_7b_gguf_when_path_set() {
         "other_gpu_us {:.1} must shrink vs profile-blas {:.1}; stats={stats:?}",
         stats.other_gpu_us, PROFILE_BLAS_OTHER_GPU_US
     );
+    let itl_us = stats.itl_ms_ema * 1_000.0;
+    assert!(
+        itl_us > 10_000.0,
+        "8B decode ITL should be tens of ms; itl_us={itl_us:.1} stats={stats:?}"
+    );
+    assert!(
+        profile_sum > itl_us * 0.8 && profile_sum < itl_us * 1.25,
+        "decode profile sum {profile_sum:.1}us must explain ITL {itl_us:.1}us; stats={stats:?}"
+    );
     eprintln!(
         "7B HIP generate: tokens={} backend={} devices={} ttft_ms={} itl_ms={:.2} tokens/s={:.2} elapsed_ms={} text={:?}",
         out.token_ids.len(),
