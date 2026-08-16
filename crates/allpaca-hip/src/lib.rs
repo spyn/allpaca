@@ -67,6 +67,7 @@ mod ffi {
             host_gbps: *mut f64,
         ) -> i32;
         pub fn allpaca_hip_mem_used(device: i32, used_bytes: *mut u64) -> i32;
+        pub fn allpaca_hip_set_device(device: i32) -> i32;
         pub fn allpaca_gemm(
             a: *const f32,
             b: *const f32,
@@ -420,6 +421,22 @@ pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(
     }
 }
 
+/// Bind subsequent kernels / memcpy to `device`.
+pub fn set_device(device: i32) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_set_device(device) };
+        status(rc, "set_device")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = device;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP set_device unavailable".into(),
+        )))
+    }
+}
+
 /// Bytes currently tracked from [`device_malloc`].
 pub fn allocated_bytes() -> u64 {
     ALLOCATED_BYTES.load(Ordering::Relaxed)
@@ -450,7 +467,7 @@ pub fn gemm(
     n: i32,
     k: i32,
 ) -> Result<(), AllpacaError> {
-    gemm_kind(a, b, c, m, n, k, false)
+    gemm_kind(a, b, c, m, n, k, false, 0)
 }
 
 /// Host-pointer NT GEMM: `C[m,n] = A[m,k] * B[n,k]^T`.
@@ -462,9 +479,10 @@ pub fn gemm_nt(
     n: i32,
     k: i32,
 ) -> Result<(), AllpacaError> {
-    gemm_kind(a, b, c, m, n, k, true)
+    gemm_kind(a, b, c, m, n, k, true, 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gemm_kind(
     a: &[f32],
     b: &[f32],
@@ -473,6 +491,7 @@ fn gemm_kind(
     n: i32,
     k: i32,
     nt: bool,
+    device: i32,
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -493,9 +512,10 @@ fn gemm_kind(
                 "GEMM buffer size mismatch".into(),
             )));
         }
-        let da = device_malloc(a_bytes, 0)?;
-        let db = device_malloc(b_bytes, 0)?;
-        let dc = device_malloc(c_bytes, 0)?;
+        let da = device_malloc(a_bytes, device)?;
+        let db = device_malloc(b_bytes, device)?;
+        let dc = device_malloc(c_bytes, device)?;
+        set_device(device)?;
         let result = (|| {
             memcpy(da, a.as_ptr().cast(), a_bytes, MEMCPY_H2D)?;
             memcpy(db, b.as_ptr().cast(), b_bytes, MEMCPY_H2D)?;
@@ -532,7 +552,7 @@ fn gemm_kind(
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
-        let _ = (a, b, c, m, n, k, nt);
+        let _ = (a, b, c, m, n, k, nt, device);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm unavailable; use CPU fallback".into(),
         )))
@@ -575,16 +595,36 @@ pub fn attention(
     head_dim: i32,
     causal: bool,
 ) -> Result<(), AllpacaError> {
+    attention_on(
+        0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_on(
+    device: i32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: i32,
+    n_kv: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    causal: bool,
+) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
         let q_bytes = q.len() * 4;
         let k_bytes = k.len() * 4;
         let v_bytes = v.len() * 4;
         let o_bytes = out.len() * 4;
-        let dq = device_malloc(q_bytes, 0)?;
-        let dk = device_malloc(k_bytes, 0)?;
-        let dv = device_malloc(v_bytes, 0)?;
-        let dout = device_malloc(o_bytes, 0)?;
+        let dq = device_malloc(q_bytes, device)?;
+        let dk = device_malloc(k_bytes, device)?;
+        let dv = device_malloc(v_bytes, device)?;
+        let dout = device_malloc(o_bytes, device)?;
+        set_device(device)?;
         let result = (|| {
             memcpy(dq, q.as_ptr().cast(), q_bytes, MEMCPY_H2D)?;
             memcpy(dk, k.as_ptr().cast(), k_bytes, MEMCPY_H2D)?;
@@ -616,7 +656,7 @@ pub fn attention(
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
         let _ = (
-            q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            device, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
         );
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP attention unavailable; use CPU fallback".into(),
@@ -695,6 +735,10 @@ impl HipWorkspace {
         n
     }
 
+    pub fn bind(&self) -> Result<(), AllpacaError> {
+        set_device(self.device)
+    }
+
     /// GEMM NT using the persistent scratch buffer (H2D / kernel / D2H).
     pub fn gemm_nt(
         &self,
@@ -724,12 +768,9 @@ impl HipWorkspace {
         let c_n = (m as usize) * (n as usize);
         let need = (a_n + b_n + c_n) * 4;
         if need > self.scratch_bytes {
-            return if nt {
-                gemm_nt(a, b, c, m, n, k)
-            } else {
-                gemm(a, b, c, m, n, k)
-            };
+            return gemm_kind(a, b, c, m, n, k, nt, self.device);
         }
+        self.bind()?;
         let da = self.scratch;
         let db = unsafe { self.scratch.add(a_n * 4) };
         let dc = unsafe { self.scratch.add((a_n + b_n) * 4) };
@@ -767,9 +808,67 @@ impl HipWorkspace {
         head_dim: i32,
         causal: bool,
     ) -> Result<(), AllpacaError> {
-        attention(
-            q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
-        )
+        let need = (q.len() + k.len() + v.len() + out.len()) * 4;
+        if need > self.scratch_bytes {
+            return attention_on(
+                self.device,
+                q,
+                k,
+                v,
+                out,
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
+            );
+        }
+        self.bind()?;
+        let dq = self.scratch;
+        let dk = unsafe { self.scratch.add(q.len() * 4) };
+        let dv = unsafe { self.scratch.add((q.len() + k.len()) * 4) };
+        let dout = unsafe { self.scratch.add((q.len() + k.len() + v.len()) * 4) };
+        memcpy(dq, q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
+        memcpy(dk, k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
+        memcpy(dv, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_attention(
+                    dq.cast(),
+                    dk.cast(),
+                    dv.cast(),
+                    dout.cast(),
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    i32::from(causal),
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "attention")?;
+            memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = dout;
+            attention_on(
+                self.device,
+                q,
+                k,
+                v,
+                out,
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
+            )
+        }
     }
 
     /// Copy device logits into the pinned host ring slot when one exists.

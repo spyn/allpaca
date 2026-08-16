@@ -372,6 +372,9 @@ impl TinyModel {
             metrics
                 .gpu_forwards
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .target_gpu_forwards
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
@@ -534,6 +537,19 @@ impl TinyModel {
         cache: &mut DenseKv,
         logits: &mut [f32],
     ) -> Result<(), AllpacaError> {
+        self.forward_dense_on(token, pos, cache, logits, None, None)
+    }
+
+    /// Draft forward. GEMM/attention run on `hip` when present (resident draft GPU).
+    pub fn forward_dense_on(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut DenseKv,
+        logits: &mut [f32],
+        hip: Option<&HipWorkspace>,
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
         let head_dim = cfg.head_dim();
@@ -548,9 +564,9 @@ impl TinyModel {
         let mut hidden = vec![0.0f32; dim];
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             rmsnorm(&x, &layer.attn_norm, cfg.eps, &mut normed)?;
-            matmul_nt(&normed, &layer.wq, &mut q, 1, dim, dim)?;
-            matmul_nt(&normed, &layer.wk, &mut k, 1, kv_dim, dim)?;
-            matmul_nt(&normed, &layer.wv, &mut v, 1, kv_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.wq, &mut q, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.wk, &mut k, 1, kv_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.wv, &mut v, 1, kv_dim, dim)?;
             for h in 0..cfg.n_heads {
                 rope(&mut q[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
             }
@@ -560,7 +576,8 @@ impl TinyModel {
             cache.layers[layer_idx].k.extend_from_slice(&k);
             cache.layers[layer_idx].v.extend_from_slice(&v);
             let n_kv = cache.layers[layer_idx].k.len() / kv_dim;
-            attention(
+            attention_dispatch(
+                hip,
                 &q,
                 &cache.layers[layer_idx].k,
                 &cache.layers[layer_idx].v,
@@ -572,25 +589,43 @@ impl TinyModel {
                 head_dim,
                 true,
             )?;
-            matmul_nt(&attn_out, &layer.wo, &mut hidden, 1, dim, dim)?;
+            gemm_nt_dispatch(hip, &attn_out, &layer.wo, &mut hidden, 1, dim, dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
             rmsnorm(&x, &layer.ffn_norm, cfg.eps, &mut normed)?;
             let mut gate = vec![0.0f32; cfg.ff_dim];
             let mut up = vec![0.0f32; cfg.ff_dim];
-            matmul_nt(&normed, &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
-            matmul_nt(&normed, &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
             for i in 0..cfg.ff_dim {
                 gate[i] = silu(gate[i]) * up[i];
             }
-            matmul_nt(&gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
+            gemm_nt_dispatch(hip, &gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
         }
         rmsnorm(&x, &self.norm, cfg.eps, &mut normed)?;
-        matmul_nt(&normed, &self.lm_head, &mut logits[..cfg.vocab_size], 1, cfg.vocab_size, dim)?;
+        gemm_nt_dispatch(
+            hip,
+            &normed,
+            &self.lm_head,
+            &mut logits[..cfg.vocab_size],
+            1,
+            cfg.vocab_size,
+            dim,
+        )?;
+        if hip.is_some() {
+            if let Some(metrics) = metrics {
+                metrics
+                    .gpu_forwards
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .draft_gpu_forwards
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         Ok(())
     }
 }

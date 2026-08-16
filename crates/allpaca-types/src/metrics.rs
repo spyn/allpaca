@@ -38,6 +38,16 @@ pub struct StatsSnapshot {
     /// `"cpu"` or `"hip"` — which kernel backend ran target forwards.
     pub backend: String,
     pub gpu_forwards: u64,
+    /// HIP forwards of the target model (fast GPU).
+    pub target_gpu_forwards: u64,
+    /// HIP forwards of the draft model (slow GPU when two devices exist).
+    pub draft_gpu_forwards: u64,
+    /// Host-staged bytes that crossed the device boundary (token ids / short logits).
+    pub host_staging_bytes: u64,
+    /// Draft token ids copied off the draft device via host staging (or P2P).
+    pub draft_tokens_copied: u64,
+    /// Full weight tensors moved between GPUs. Must stay 0 for resident speculation.
+    pub weight_bytes_migrated: u64,
     /// Bytes currently owned by `hipMalloc` (0 on the CPU path).
     pub device_memory_bytes: u64,
 }

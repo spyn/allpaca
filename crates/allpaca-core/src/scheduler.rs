@@ -66,11 +66,9 @@ impl Scheduler {
             .map(|d| d.id)
             .unwrap_or(-1);
         let target = gpus.first().map(|d| d.id).unwrap_or(cpu);
-        let draft = if self.flags.asymmetric_drafting {
-            gpus.get(1).map(|d| d.id).unwrap_or(cpu)
-        } else {
-            gpus.first().map(|d| d.id).unwrap_or(cpu)
-        };
+        // Resident draft: second GPU when present. P2P is not required.
+        // One GPU / CPU-only falls back to CPU draft (id == cpu).
+        let draft = gpus.get(1).map(|d| d.id).unwrap_or(cpu);
         Placement {
             target_device: target,
             draft_device: draft,

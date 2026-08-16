@@ -66,6 +66,7 @@ pub struct Engine {
     inventory: DeviceInventory,
     metrics: Arc<Metrics>,
     hip: Option<Arc<HipWorkspace>>,
+    draft_hip: Option<Arc<HipWorkspace>>,
 }
 
 pub struct RequestHandle {
@@ -135,6 +136,7 @@ impl Engine {
         );
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);
         let hip = open_hip_workspace(&config, &inventory).map(Arc::new);
+        let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
         let inner = EngineInner {
             flags,
             scheduler,
@@ -154,6 +156,7 @@ impl Engine {
             inventory,
             metrics: Arc::new(Metrics::default()),
             hip,
+            draft_hip,
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -178,7 +181,12 @@ impl Engine {
             .and_then(|g| g.target.as_ref().map(|m| m.name.clone()))
             .unwrap_or_else(|| self.config.model.id.clone());
         let (backend, device_memory_bytes) = if let Some(hip) = &self.hip {
-            ("hip".into(), hip.allocated_bytes())
+            let draft_bytes = self
+                .draft_hip
+                .as_ref()
+                .map(|d| d.allocated_bytes())
+                .unwrap_or(0);
+            ("hip".into(), hip.allocated_bytes() + draft_bytes)
         } else {
             ("cpu".into(), 0)
         };
@@ -573,7 +581,14 @@ impl Engine {
             verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref())?
         } else {
             let drafts = if speculate && depth > 0 {
-                propose_drafts(&mut inner, id, depth, temperature)?
+                propose_drafts(
+                    &mut inner,
+                    id,
+                    depth,
+                    temperature,
+                    self.draft_hip.as_deref(),
+                    &self.metrics,
+                )?
             } else {
                 Vec::new()
             };
@@ -694,6 +709,38 @@ fn open_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<Hi
     }
 }
 
+/// Resident draft workspace on the slow GPU. Absent on 1 GPU / CPU (degraded).
+fn open_draft_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<HipWorkspace> {
+    if config.engine.cpu_only || config.engine.gpu_backend == "cpu" {
+        return None;
+    }
+    if !allpaca_hip::runtime_linked() {
+        return None;
+    }
+    if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "hip" {
+        return None;
+    }
+    let draft = inventory.draft_device;
+    let target = inventory.target_device;
+    if draft < 0 || draft == target {
+        return None;
+    }
+    match HipWorkspace::new(draft, 8 * 1024 * 1024, 256) {
+        Ok(ws) => {
+            tracing::info!(
+                device = draft,
+                bytes = ws.allocated_bytes(),
+                "HIP draft workspace allocated (resident; P2P not required)"
+            );
+            Some(ws)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "HIP draft workspace failed; CPU draft fallback");
+            None
+        }
+    }
+}
+
 fn apply_provider_flags(flags: &mut FeatureFlags, config: &Config) {
     if config.features.tree_speculation.is_none() {
         flags.tree_speculation = config.speculative.enabled && config.speculative.tree.enabled;
@@ -732,13 +779,16 @@ fn propose_drafts(
     id: u64,
     depth: usize,
     temperature: f32,
+    draft_hip: Option<&HipWorkspace>,
+    metrics: &Metrics,
 ) -> Result<Vec<u32>, AllpacaError> {
     let ctx = request(inner, id)?.tokens.clone();
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mut provider = DraftModelProvider::new((*model).clone());
-            let draft = provider.propose(&ctx, depth, temperature)?;
+            let draft = provider.propose_on(&ctx, depth, temperature, draft_hip, Some(metrics))?;
             if !draft.is_empty() {
+                host_stage_draft_tokens(&draft, draft_hip, metrics);
                 return Ok(draft);
             }
         }
@@ -747,6 +797,23 @@ fn propose_drafts(
         return inner.ngram.propose(&ctx, depth, temperature);
     }
     Ok(Vec::new())
+}
+
+/// Tokens (and only tokens) cross the device boundary via host. Weights stay put.
+fn host_stage_draft_tokens(tokens: &[u32], draft_hip: Option<&HipWorkspace>, metrics: &Metrics) {
+    if tokens.is_empty() {
+        return;
+    }
+    let bytes = std::mem::size_of_val(tokens) as u64;
+    metrics
+        .draft_tokens_copied
+        .fetch_add(tokens.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .host_staging_bytes
+        .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    if let Some(hip) = draft_hip {
+        let _ = hip.bind();
+    }
 }
 
 struct Produced {

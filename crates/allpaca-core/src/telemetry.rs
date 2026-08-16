@@ -21,10 +21,16 @@ pub struct Metrics {
     pub tree_path_invalid: AtomicU64,
     pub target_evals: AtomicU64,
     pub gpu_forwards: AtomicU64,
+    pub target_gpu_forwards: AtomicU64,
+    pub draft_gpu_forwards: AtomicU64,
+    pub host_staging_bytes: AtomicU64,
+    pub draft_tokens_copied: AtomicU64,
+    pub weight_bytes_migrated: AtomicU64,
     pub device_memory_bytes: AtomicU64,
 }
 
 impl Metrics {
+    #[allow(clippy::too_many_arguments)]
     pub fn snapshot(
         &self,
         pipeline_mode: &str,
@@ -88,6 +94,11 @@ impl Metrics {
             model_id,
             backend,
             gpu_forwards: self.gpu_forwards.load(Ordering::Relaxed),
+            target_gpu_forwards: self.target_gpu_forwards.load(Ordering::Relaxed),
+            draft_gpu_forwards: self.draft_gpu_forwards.load(Ordering::Relaxed),
+            host_staging_bytes: self.host_staging_bytes.load(Ordering::Relaxed),
+            draft_tokens_copied: self.draft_tokens_copied.load(Ordering::Relaxed),
+            weight_bytes_migrated: self.weight_bytes_migrated.load(Ordering::Relaxed),
             device_memory_bytes: self.device_memory_bytes.load(Ordering::Relaxed),
         }
     }
