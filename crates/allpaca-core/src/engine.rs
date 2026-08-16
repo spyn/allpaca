@@ -686,7 +686,7 @@ mod tests {
     use super::*;
     use allpaca_types::CliOverrides;
 
-    fn test_engine() -> Engine {
+    fn test_config() -> Config {
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             synthetic: true,
@@ -698,7 +698,11 @@ mod tests {
         cfg.kv.page_tokens = 8;
         cfg.kv.vram_bytes = 8 * 1024;
         cfg.kv.dram_bytes = 64 * 1024;
-        Engine::new(cfg).unwrap()
+        cfg
+    }
+
+    fn test_engine() -> Engine {
+        Engine::new(test_config()).unwrap()
     }
 
     #[test]
@@ -716,8 +720,40 @@ mod tests {
             )
             .unwrap();
         assert!(!out.token_ids.is_empty());
+        assert_eq!(out.completion_tokens, out.token_ids.len());
         assert!(out.completion_tokens <= 8);
         assert!(out.prompt_tokens >= 1);
+        assert!(matches!(
+            out.finish_reason,
+            FinishReason::Length | FinishReason::Stop
+        ));
+    }
+
+    #[tokio::test]
+    async fn generate_stream_emits_tokens() {
+        use futures::StreamExt;
+
+        let engine = test_engine();
+        let mut stream = std::pin::pin!(engine.generate_stream(
+            "hello".into(),
+            GenerationParams {
+                max_tokens: 6,
+                temperature: 0.0,
+                seed: Some(7),
+                ..GenerationParams::default()
+            },
+        ));
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            let ev = item.expect("stream token");
+            events.push(ev.clone());
+            if ev.finish_reason.is_some() {
+                break;
+            }
+        }
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| e.token_id < 64));
+        assert!(events.last().and_then(|e| e.finish_reason).is_some());
     }
 
     #[test]
@@ -731,11 +767,8 @@ mod tests {
         };
         let mut handle = engine.begin_request("hello", params.clone()).unwrap();
         let mut n = 0;
-        loop {
-            match engine.step(&mut handle).unwrap() {
-                StepResult::Token(_) => n += 1,
-                StepResult::Finished(_) => break,
-            }
+        while let StepResult::Token(_) = engine.step(&mut handle).unwrap() {
+            n += 1;
             if n > 8 {
                 break;
             }
@@ -751,19 +784,317 @@ mod tests {
             temperature: 0.0,
             ..GenerationParams::default()
         };
-        let _first = engine.begin_request("hello", params.clone()).unwrap();
-        let err = engine.begin_request("world", params).unwrap_err();
-        assert!(matches!(err, AllpacaError::Transient(TransientError::RequestBusy)));
+        let first = engine.begin_request("hello", params.clone()).unwrap();
+        let err = engine.begin_request("world", params.clone()).unwrap_err();
+        assert!(matches!(
+            err,
+            AllpacaError::Transient(TransientError::RequestBusy)
+        ));
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Transient);
+        drop(first);
+        engine
+            .begin_request("world", params)
+            .expect("lock released after Request handle drop");
     }
 
     #[test]
-    fn json_mode_does_not_panic() {
+    fn generate_spills_kv_pages_to_pinned_dram() {
+        let mut cfg = test_config();
+        cfg.kv.page_tokens = 2;
+        cfg.kv.vram_bytes = 1024;
+        cfg.kv.dram_bytes = 256 * 1024;
+        cfg.kv.hot_fraction = 0.35;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 16,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let mut handle = engine.begin_request("hello", params).unwrap();
+        let mut tokens = 0usize;
+        while let StepResult::Token(ev) = engine.step(&mut handle).unwrap() {
+            tokens += 1;
+            if ev.finish_reason.is_some() {
+                break;
+            }
+        }
+        assert!(tokens >= 1);
+        let stats = engine.stats();
+        assert!(
+            stats.dram_pages > 0 || stats.page_migrations > 0,
+            "KV Pages must move VRAM → Pinned DRAM under pressure; stats={stats:?}"
+        );
+        drop(handle);
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty(), "generate still works after KV spill");
+    }
+
+    #[test]
+    fn target_decides_tokens_with_speculation() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+
+        let mut with_spec = test_config();
+        with_spec.features.draft_model_speculation = Some(true);
+        with_spec.features.ngram_speculation = Some(true);
+        let speculated = Engine::new(with_spec).unwrap();
+        let with_out = speculated.generate("hello", params.clone()).unwrap();
+        assert!(
+            speculated.stats().draft_proposed > 0,
+            "Draft Provider must propose under speculation"
+        );
+
+        let mut no_spec = test_config();
+        no_spec.merge_cli(&CliOverrides {
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        let baseline = Engine::new(no_spec).unwrap();
+        let without_out = baseline.generate("hello", params).unwrap();
+        assert_eq!(
+            with_out.token_ids, without_out.token_ids,
+            "Target Model must decide tokens; Draft Provider only proposes"
+        );
+    }
+
+    fn is_special_token(piece: &str) -> bool {
+        piece.starts_with('<') && piece.ends_with('>')
+    }
+
+    /// Public-API oracle: a prefix is JSON-legal if it is valid JSON or a
+    /// truncated value (object/array/string/number/literal) with no junk.
+    fn json_prefix_legal(s: &str) -> bool {
+        if s.is_empty() {
+            return true;
+        }
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut chars = s.chars().peekable();
+        let mut started = false;
+        while let Some(c) = chars.next() {
+            if in_string {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match c {
+                    '\\' => escape = true,
+                    '"' => in_string = false,
+                    ch if ch.is_control() => return false,
+                    _ => {}
+                }
+                continue;
+            }
+            if c.is_whitespace() {
+                continue;
+            }
+            started = true;
+            match c {
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return false;
+                    }
+                }
+                '"' => in_string = true,
+                ':' | ',' => {
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                't' => {
+                    let rest: String = std::iter::once('t').chain(chars.clone()).take(4).collect();
+                    if !"true".starts_with(&rest) && rest != "true"[..rest.len().min(4)] {
+                        return false;
+                    }
+                    for _ in 0..rest.len().saturating_sub(1).min(3) {
+                        chars.next();
+                    }
+                }
+                'f' => {
+                    let rest: String = std::iter::once('f').chain(chars.clone()).take(5).collect();
+                    if !"false".starts_with(&rest) {
+                        return false;
+                    }
+                    for _ in 0..rest.len().saturating_sub(1).min(4) {
+                        chars.next();
+                    }
+                }
+                'n' => {
+                    let rest: String = std::iter::once('n').chain(chars.clone()).take(4).collect();
+                    if !"null".starts_with(&rest) {
+                        return false;
+                    }
+                    for _ in 0..rest.len().saturating_sub(1).min(3) {
+                        chars.next();
+                    }
+                }
+                '-' | '0'..='9' => {
+                    while matches!(chars.peek(), Some('0'..='9' | '.' | 'e' | 'E' | '+' | '-')) {
+                        chars.next();
+                    }
+                }
+                _ => return false,
+            }
+        }
+        started || s.chars().all(char::is_whitespace)
+    }
+
+    fn write_tiny_target_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        use std::collections::HashMap;
+
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+        meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+        meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+        meta.insert(
+            "llama.feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hello".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+        let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![0.01; vocab * dim]),
+            ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
+            ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
+            ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
+            ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
+            ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
+            ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
+            ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![0.01; dim * ff]),
+            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        ];
+        let views: Vec<GgufWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
+    #[test]
+    fn engine_fatal_without_model_or_valid_config() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        let engine = Engine::new(cfg).unwrap();
+        let err = engine
+            .generate("hello", GenerationParams::default())
+            .unwrap_err();
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+
+        let mut bad = Config::compiled_defaults();
+        bad.kv.page_tokens = 0;
+        let err = match Engine::new(bad) {
+            Ok(_) => panic!("invalid config must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
+
+        let junk = std::env::temp_dir().join("allpaca_corrupt.gguf");
+        std::fs::write(&junk, b"not a gguf").unwrap();
+        let mut corrupt = Config::compiled_defaults();
+        corrupt.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        corrupt.model.path = Some(junk.clone());
+        let err = match Engine::new(corrupt) {
+            Ok(_) => panic!("corrupt GGUF must be Fatal"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        let _ = std::fs::remove_file(junk);
+    }
+
+    #[test]
+    fn engine_degraded_when_draft_gguf_missing() {
+        let target = std::env::temp_dir().join("allpaca_target_tiny.gguf");
+        write_tiny_target_gguf(&target);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(target.clone());
+        cfg.model.draft_path = Some(std::env::temp_dir().join("allpaca_missing_draft.gguf"));
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("target GGUF loads; missing draft is Degraded");
+        assert!(engine.stats().degraded_events > 0);
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("Degraded draft failure must continue on the Target Model");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[test]
+    fn json_mode_emits_only_legal_tokens() {
         let engine = test_engine();
         let out = engine
             .generate(
                 "hello",
                 GenerationParams {
-                    max_tokens: 6,
+                    max_tokens: 12,
                     temperature: 0.0,
                     json_mode: true,
                     seed: Some(3),
@@ -772,5 +1103,30 @@ mod tests {
             )
             .unwrap();
         assert!(!out.token_ids.is_empty());
+        let tok = EngineTokenizer::synthetic(64).unwrap();
+        let mut prefix = String::new();
+        for id in &out.token_ids {
+            let piece = tok.decode_one(*id);
+            if is_special_token(&piece) {
+                continue;
+            }
+            prefix.push_str(&piece);
+            assert!(
+                json_prefix_legal(&prefix),
+                "Constraint Mask allowed illegal JSON after {prefix:?} (+{piece:?})"
+            );
+        }
+        assert!(
+            prefix.starts_with('{')
+                || prefix.starts_with('[')
+                || prefix.starts_with('"')
+                || prefix.starts_with('-')
+                || prefix.starts_with(|c: char| c.is_ascii_digit())
+                || prefix.starts_with("true")
+                || prefix.starts_with("false")
+                || prefix.starts_with("null")
+                || prefix.is_empty(),
+            "JSON mode must start with a JSON value, got {prefix:?}"
+        );
     }
 }

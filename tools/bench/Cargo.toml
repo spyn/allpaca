@@ -1,0 +1,11 @@
+[package]
+name = "allpaca-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lightweight CPU-path bench harness"
+
+[dependencies]
+allpaca-core.workspace = true
+allpaca-types.workspace = true
+clap.workspace = true

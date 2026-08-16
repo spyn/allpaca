@@ -1,0 +1,28 @@
+[package]
+name = "allpaca-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAI-compatible HTTP server wrapper around the Engine"
+
+[features]
+default = []
+hip = ["allpaca-core/hip"]
+
+[dependencies]
+allpaca-core.workspace = true
+allpaca-types.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower.workspace = true

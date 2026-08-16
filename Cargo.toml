@@ -6,6 +6,8 @@ members = [
     "crates/allpaca-hip",
     "crates/allpaca-gguf",
     "crates/allpaca-core",
+    "crates/allpaca-server",
+    "tools/bench",
 ]
 
 [workspace.package]

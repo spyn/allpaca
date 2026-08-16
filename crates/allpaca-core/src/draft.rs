@@ -148,6 +148,7 @@ impl DraftProvider for DraftModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ModelConfig, TinyModel};
 
     #[test]
     fn ngram_repeats_seen_continuation() {
@@ -155,5 +156,15 @@ mod tests {
         p.observe(&[1, 2, 3, 1, 2, 3]);
         let draft = p.propose(&[1, 2], 2, 0.0).unwrap();
         assert_eq!(draft.first().copied(), Some(3));
+        assert!(!draft.is_empty());
+    }
+
+    #[test]
+    fn draft_model_proposes_tokens() {
+        let model = TinyModel::synthetic(ModelConfig::draft_tiny(), 1, "draft");
+        let mut p = DraftModelProvider::new(model);
+        let draft = p.propose(&[1, 2], 3, 0.0).unwrap();
+        assert_eq!(draft.len(), 3);
+        assert!(draft.iter().all(|t| *t < 64));
     }
 }
