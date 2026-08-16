@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "crates/allpaca-types",
+    "crates/allpaca-cpu",
+    "crates/allpaca-hip",
+    "crates/allpaca-gguf",
 ]
 
 [workspace.package]
@@ -12,6 +15,9 @@ description = "Heterogeneous research inference engine"
 
 [workspace.dependencies]
 allpaca-types = { path = "crates/allpaca-types" }
+allpaca-gguf = { path = "crates/allpaca-gguf" }
+allpaca-hip = { path = "crates/allpaca-hip" }
+allpaca-cpu = { path = "crates/allpaca-cpu" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
