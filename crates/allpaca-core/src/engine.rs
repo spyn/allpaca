@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use allpaca_gguf::{extract_tokenizer, GgufFile};
 use allpaca_types::{
     AllpacaError, Config, DraftProviderKind, FatalError, FeatureFlags, FinishReason,
-    GenerationOutput, GenerationParams, StatsSnapshot, StepResult, TokenEvent, TransientError,
+    GenerationOutput, GenerationParams, KvHandle, StatsSnapshot, StepResult, TokenEvent,
+    TransientError,
 };
 use futures::Stream;
 use rand::rngs::StdRng;
@@ -47,7 +49,7 @@ struct EngineInner {
     target: Option<Arc<TinyModel>>,
     draft_model: Option<Arc<TinyModel>>,
     ngram: NGramProvider,
-    active: Option<ActiveRequest>,
+    active: HashMap<u64, ActiveRequest>,
     next_request_id: u64,
     model_id: String,
 }
@@ -66,6 +68,28 @@ pub struct RequestHandle {
     metrics: Arc<Metrics>,
 }
 
+impl RequestHandle {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn kv_handle(&self) -> Result<KvHandle, AllpacaError> {
+        let guard = self.inner.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("engine mutex poisoned".into()))
+        })?;
+        let active = guard
+            .active
+            .get(&self.id)
+            .ok_or(AllpacaError::Transient(TransientError::RequestBusy))?;
+        Ok(KvHandle {
+            request_id: active.id,
+            epoch: 0,
+            token_count: active.tokens.len(),
+            pages: active.pages.iter().flatten().copied().collect(),
+        })
+    }
+}
+
 impl std::fmt::Debug for RequestHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestHandle").field("id", &self.id).finish()
@@ -75,17 +99,16 @@ impl std::fmt::Debug for RequestHandle {
 impl Drop for RequestHandle {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.inner.lock() {
-            if guard.active.as_ref().map(|a| a.id) == Some(self.id) {
-                if let Some(active) = guard.active.take() {
-                    for layer in active.pages {
-                        for page in layer {
-                            guard.kv.release(page, &self.metrics);
-                        }
+            if let Some(active) = guard.active.remove(&self.id) {
+                for layer in active.pages {
+                    for page in layer {
+                        guard.kv.release(page, &self.metrics);
                     }
                 }
-                self.metrics
-                    .active_requests
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.metrics.active_requests.store(
+                    guard.active.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
     }
@@ -114,7 +137,7 @@ impl Engine {
             target: None,
             draft_model: None,
             ngram: NGramProvider::new(config.speculative.ngram_n),
-            active: None,
+            active: HashMap::new(),
             next_request_id: 1,
             model_id: config.model.id.clone(),
         };
@@ -289,7 +312,7 @@ impl Engine {
             params.max_tokens = 1;
         }
         let mut inner = self.lock()?;
-        if inner.active.is_some() {
+        if inner.active.len() >= self.config.engine.max_active_requests {
             return Err(AllpacaError::Transient(TransientError::RequestBusy));
         }
         let tokenizer = inner
@@ -342,30 +365,35 @@ impl Engine {
         let rng = rng_from_params(&params, self.config.engine.determinism_seed);
         let id = inner.next_request_id;
         inner.next_request_id += 1;
-        inner.active = Some(ActiveRequest {
+        let prompt_len = tokens.len();
+        inner.active.insert(
             id,
-            prompt_len: tokens.len(),
-            tokens,
-            generated: 0,
-            params,
-            pages,
-            pending_logits: published,
-            emit_queue: Vec::new(),
-            json_prefix: String::new(),
-            rng,
-            started: Instant::now(),
-            last_token_at: Instant::now(),
-            first_emitted: false,
-            finished: false,
-        });
+            ActiveRequest {
+                id,
+                prompt_len,
+                tokens,
+                generated: 0,
+                params,
+                pages,
+                pending_logits: published,
+                emit_queue: Vec::new(),
+                json_prefix: String::new(),
+                rng,
+                started: Instant::now(),
+                last_token_at: Instant::now(),
+                first_emitted: false,
+                finished: false,
+            },
+        );
         self.metrics
             .requests_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.metrics
-            .active_requests
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics.active_requests.store(
+            inner.active.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.metrics.prompt_tokens.fetch_add(
-            inner.active.as_ref().map(|a| a.prompt_len as u64).unwrap_or(0),
+            prompt_len as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
         Ok(RequestHandle {
@@ -377,14 +405,9 @@ impl Engine {
 
     pub fn step(&self, handle: &mut RequestHandle) -> Result<StepResult, AllpacaError> {
         let mut inner = self.lock()?;
+        let id = handle.id;
         {
-            let active = inner
-                .active
-                .as_mut()
-                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-            if active.id != handle.id {
-                return Err(AllpacaError::Transient(TransientError::RequestBusy));
-            }
+            let active = request_mut(&mut inner, id)?;
             if !active.emit_queue.is_empty() {
                 return Ok(StepResult::Token(active.emit_queue.remove(0)));
             }
@@ -407,7 +430,7 @@ impl Engine {
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation || inner.flags.draft_model_speculation);
         let (json_mode, json_prefix, temperature, remaining, depth) = {
-            let active = inner.active.as_ref().unwrap();
+            let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
             let depth = inner.scheduler.draft_depth.min(remaining.saturating_sub(1));
             (
@@ -441,11 +464,7 @@ impl Engine {
             .target_evals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let produced = if use_tree {
-            let ctx = inner
-                .active
-                .as_ref()
-                .map(|a| a.tokens.clone())
-                .unwrap_or_default();
+            let ctx = request(&inner, id)?.tokens.clone();
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
             let draft = if inner.flags.draft_model_speculation {
                 inner.draft_model.as_deref()
@@ -462,14 +481,14 @@ impl Engine {
             self.metrics
                 .tree_nodes
                 .fetch_add(forest.nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            verify_forest(&mut inner, &forest, mask.as_ref(), remaining, &self.metrics)?
+            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics)?
         } else {
             let drafts = if speculate && depth > 0 {
-                propose_drafts(&mut inner, depth, temperature)?
+                propose_drafts(&mut inner, id, depth, temperature)?
             } else {
                 Vec::new()
             };
-            verify_and_sample(&mut inner, drafts, mask.as_ref(), remaining, &self.metrics)?
+            verify_and_sample(&mut inner, id, drafts, mask.as_ref(), remaining, &self.metrics)?
         };
         let accepted = produced.accepted;
         let proposed = produced.proposed;
@@ -489,7 +508,7 @@ impl Engine {
                 .map(|t| t.decode_one(tok))
                 .unwrap_or_default();
             let (stop, maxed, first) = {
-                let active = inner.active.as_ref().unwrap();
+                let active = request(&inner, id)?;
                 (
                     is_stop(tok, &active.params),
                     active.generated + 1 >= active.params.max_tokens && i == last_idx,
@@ -504,7 +523,7 @@ impl Engine {
                 None
             };
             let now = Instant::now();
-            if let Some(active) = inner.active.as_mut() {
+            if let Some(active) = inner.active.get_mut(&id) {
                 if !is_special(&piece) {
                     active.json_prefix.push_str(&piece);
                 }
@@ -536,7 +555,7 @@ impl Engine {
 
         let ev = inner
             .active
-            .as_mut()
+            .get_mut(&id)
             .and_then(|a| {
                 if a.emit_queue.is_empty() {
                     None
@@ -574,16 +593,27 @@ fn apply_provider_flags(flags: &mut FeatureFlags, config: &Config) {
     }
 }
 
+fn request(inner: &EngineInner, id: u64) -> Result<&ActiveRequest, AllpacaError> {
+    inner
+        .active
+        .get(&id)
+        .ok_or(AllpacaError::Transient(TransientError::RequestBusy))
+}
+
+fn request_mut(inner: &mut EngineInner, id: u64) -> Result<&mut ActiveRequest, AllpacaError> {
+    inner
+        .active
+        .get_mut(&id)
+        .ok_or(AllpacaError::Transient(TransientError::RequestBusy))
+}
+
 fn propose_drafts(
     inner: &mut EngineInner,
+    id: u64,
     depth: usize,
     temperature: f32,
 ) -> Result<Vec<u32>, AllpacaError> {
-    let ctx = inner
-        .active
-        .as_ref()
-        .map(|a| a.tokens.clone())
-        .unwrap_or_default();
+    let ctx = request(inner, id)?.tokens.clone();
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mut provider = DraftModelProvider::new((*model).clone());
@@ -607,6 +637,7 @@ struct Produced {
 
 fn verify_and_sample(
     inner: &mut EngineInner,
+    id: u64,
     drafts: Vec<u32>,
     mask: Option<&allpaca_types::TokenMask>,
     remaining: usize,
@@ -618,14 +649,11 @@ fn verify_and_sample(
     let mut draft_iter = drafts.into_iter().peekable();
     while produced.len() < remaining {
         let (mut logits, params) = {
-            let active = inner
-                .active
-                .as_ref()
-                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+            let active = request(inner, id)?;
             (active.pending_logits.clone(), active.params.clone())
         };
         let sampled = {
-            let active = inner.active.as_mut().unwrap();
+            let active = request_mut(inner, id)?;
             sample(&mut logits, mask, &params, &mut active.rng)
         };
         produced.push(sampled);
@@ -634,7 +662,7 @@ fn verify_and_sample(
             accepted += 1;
             draft_iter.next();
         }
-        append_and_forward(inner, sampled, metrics)?;
+        append_and_forward(inner, id, sampled, metrics)?;
         if is_stop(sampled, &params) || !matched || draft_iter.peek().is_none() {
             break;
         }
@@ -648,6 +676,7 @@ fn verify_and_sample(
 
 fn verify_forest(
     inner: &mut EngineInner,
+    id: u64,
     forest: &TokenForest,
     mask: Option<&allpaca_types::TokenMask>,
     remaining: usize,
@@ -655,12 +684,8 @@ fn verify_forest(
 ) -> Result<Produced, AllpacaError> {
     let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
     if !forest.nodes.is_empty() {
-        let pages = inner
-            .active
-            .as_ref()
-            .map(|a| a.pages.clone())
-            .unwrap_or_default();
-        let prompt_len = inner.active.as_ref().map(|a| a.tokens.len()).unwrap_or(0);
+        let pages = request(inner, id)?.pages.clone();
+        let prompt_len = request(inner, id)?.tokens.len();
         let target = inner
             .target
             .clone()
@@ -676,14 +701,11 @@ fn verify_forest(
     let mut parent = -1i32;
     while produced.len() < remaining {
         let (mut logits, params) = {
-            let active = inner
-                .active
-                .as_ref()
-                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+            let active = request(inner, id)?;
             (active.pending_logits.clone(), active.params.clone())
         };
         let sampled = {
-            let active = inner.active.as_mut().unwrap();
+            let active = request_mut(inner, id)?;
             sample(&mut logits, mask, &params, &mut active.rng)
         };
         produced.push(sampled);
@@ -692,7 +714,7 @@ fn verify_forest(
             accepted_tokens.push(sampled);
             parent = idx as i32;
         }
-        append_and_forward(inner, sampled, metrics)?;
+        append_and_forward(inner, id, sampled, metrics)?;
         if is_stop(sampled, &params) || child.is_none() || forest.children(parent).next().is_none()
         {
             break;
@@ -717,21 +739,16 @@ fn verify_forest(
 
 fn append_and_forward(
     inner: &mut EngineInner,
+    id: u64,
     token: u32,
     metrics: &Metrics,
 ) -> Result<(), AllpacaError> {
-    let pos = inner
-        .active
-        .as_ref()
-        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
-        .tokens
-        .len();
-    let page_tokens = inner
-        .active
-        .as_ref()
-        .and_then(|a| a.pages.first())
+    let pos = request(inner, id)?.tokens.len();
+    let page_tokens = request(inner, id)?
+        .pages
+        .first()
         .and_then(|layer| layer.first())
-        .and_then(|id| inner.kv.get(*id))
+        .and_then(|page_id| inner.kv.get(*page_id))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);
     let cfg = inner
@@ -740,17 +757,18 @@ fn append_and_forward(
         .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
         .config
         .clone();
-    let mut pages = inner.active.as_ref().unwrap().pages.clone();
+    let mut pages = request(inner, id)?.pages.clone();
     ensure_pages(&mut inner.kv, &cfg, page_tokens, &mut pages, pos, metrics)?;
-    if let Some(active) = inner.active.as_mut() {
+    {
+        let active = request_mut(inner, id)?;
         active.pages = pages;
         active.tokens.push(token);
     }
-    let ctx = inner.active.as_ref().unwrap().tokens.clone();
+    let ctx = request(inner, id)?.tokens.clone();
     inner.ngram.observe(&ctx);
     let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
     let mut logits = vec![0.0f32; vocab];
-    let pages = inner.active.as_ref().unwrap().pages.clone();
+    let pages = request(inner, id)?.pages.clone();
     let target = inner
         .target
         .clone()
@@ -758,9 +776,7 @@ fn append_and_forward(
     target.forward_token(token, pos, &pages, &mut inner.kv, metrics, &mut logits)?;
     let published = inner.ring.publish(&logits)?;
     inner.ring.release_current();
-    if let Some(active) = inner.active.as_mut() {
-        active.pending_logits = published;
-    }
+    request_mut(inner, id)?.pending_logits = published;
     Ok(())
 }
 
@@ -779,10 +795,8 @@ fn handle_prompt_len(
     let guard = inner.lock().map_err(|_| {
         AllpacaError::Fatal(FatalError::InvalidConfig("engine mutex poisoned".into()))
     })?;
-    if let Some(active) = guard.active.as_ref() {
-        if active.id == handle.id {
-            return Ok(active.prompt_len);
-        }
+    if let Some(active) = guard.active.get(&handle.id) {
+        return Ok(active.prompt_len);
     }
     Ok(0)
 }
@@ -880,6 +894,194 @@ mod tests {
             }
         }
         assert!(n >= 1);
+    }
+
+    #[test]
+    fn exceeding_cap_is_transient_and_drop_frees_slot() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            ..GenerationParams::default()
+        };
+        let first = engine.begin_request("hello", params.clone()).unwrap();
+        let second = engine.begin_request("world", params.clone()).unwrap();
+        let err = engine.begin_request("third", params.clone()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AllpacaError::Transient(TransientError::RequestBusy)
+                    | AllpacaError::Transient(TransientError::Backpressure(_))
+            ),
+            "saturated scheduler must be Transient, got {err:?}"
+        );
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Transient);
+        drop(first);
+        engine
+            .begin_request("third", params.clone())
+            .expect("dropping a Request must free a scheduler slot");
+        drop(second);
+        let out = engine
+            .generate("hello", params)
+            .expect("completed generate must free its slot");
+        assert!(!out.token_ids.is_empty());
+    }
+
+    #[test]
+    fn each_request_keeps_its_own_kv_pages() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.kv.page_tokens = 2;
+        cfg.kv.vram_bytes = 1024;
+        cfg.kv.dram_bytes = 256 * 1024;
+        cfg.kv.hot_fraction = 0.35;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let mut first = engine.begin_request("hello", params.clone()).unwrap();
+        let mut second = engine.begin_request("world", params).unwrap();
+        assert!(matches!(engine.step(&mut first).unwrap(), StepResult::Token(_)));
+        assert!(matches!(engine.step(&mut second).unwrap(), StepResult::Token(_)));
+
+        let kv_a = first.kv_handle().expect("first Request KvHandle");
+        let kv_b = second.kv_handle().expect("second Request KvHandle");
+        assert_ne!(kv_a.request_id, kv_b.request_id);
+        assert!(!kv_a.pages.is_empty());
+        assert!(!kv_b.pages.is_empty());
+        for page in &kv_a.pages {
+            assert!(
+                !kv_b.pages.contains(page),
+                "Requests must not share KV Pages; a={kv_a:?} b={kv_b:?}"
+            );
+        }
+
+        let pages_both = engine.stats().vram_pages + engine.stats().dram_pages;
+        assert!(pages_both > 0);
+        drop(first);
+        let pages_after = engine.stats().vram_pages + engine.stats().dram_pages;
+        assert!(
+            pages_after > 0,
+            "finishing one Request must not wipe the other's KV; stats={:?}",
+            engine.stats()
+        );
+        assert!(
+            pages_after < pages_both,
+            "dropped Request must release its KV Pages; before={pages_both} after={pages_after}"
+        );
+        assert!(matches!(
+            engine.step(&mut second).unwrap(),
+            StepResult::Token(_) | StepResult::Finished(_)
+        ));
+        let stats = engine.stats();
+        assert!(
+            stats.dram_pages > 0 || stats.page_migrations > 0 || stats.vram_pages > 0,
+            "KV spilling/stats must still work with two Requests; stats={stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_streams_progress_independently() {
+        use futures::StreamExt;
+
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let mut a = std::pin::pin!(engine.generate_stream("hello".into(), params.clone()));
+        let mut b = std::pin::pin!(engine.generate_stream("world".into(), params));
+        let ev_a = a
+            .next()
+            .await
+            .expect("stream a")
+            .expect("first Request stream must not be RequestBusy");
+        let ev_b = b
+            .next()
+            .await
+            .expect("stream b")
+            .expect("second Request stream must not be RequestBusy");
+        assert!(ev_a.token_id < 64);
+        assert!(ev_b.token_id < 64);
+        let mut n_a = 1usize;
+        let mut n_b = 1usize;
+        while let Some(item) = a.next().await {
+            item.expect("stream a token");
+            n_a += 1;
+        }
+        while let Some(item) = b.next().await {
+            item.expect("stream b token");
+            n_b += 1;
+        }
+        assert!(n_a >= 1);
+        assert!(n_b >= 1);
+    }
+
+    #[test]
+    fn two_concurrent_generate_progress_independently() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let a = {
+            let engine = engine.clone();
+            let params = params.clone();
+            std::thread::spawn(move || engine.generate("hello", params))
+        };
+        let b = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.generate("world", params))
+        };
+        let out_a = a
+            .join()
+            .expect("thread a")
+            .expect("first Request must not be RequestBusy");
+        let out_b = b
+            .join()
+            .expect("thread b")
+            .expect("second Request must not be RequestBusy");
+        assert!(!out_a.token_ids.is_empty());
+        assert!(!out_b.token_ids.is_empty());
+        assert!(out_a.prompt_tokens >= 1);
+        assert!(out_b.prompt_tokens >= 1);
+        assert_ne!(
+            out_a.token_ids, out_b.token_ids,
+            "different prompts must produce independently progressing Requests"
+        );
+    }
+
+    #[test]
+    fn two_begin_request_succeed_when_max_active_requests_is_two() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            ..GenerationParams::default()
+        };
+        let first = engine.begin_request("hello", params.clone()).unwrap();
+        let second = engine
+            .begin_request("world", params)
+            .expect("second Request must be admitted when under the cap");
+        assert_eq!(engine.stats().active_requests, 2);
+        drop(first);
+        drop(second);
     }
 
     #[test]

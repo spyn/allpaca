@@ -342,6 +342,67 @@ mod tests {
         assert_eq!(json["model_id"], "synthetic");
     }
 
+    fn multi_request_state() -> AppState {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(1),
+            ..CliOverrides::default()
+        });
+        cfg.engine.max_active_requests = 2;
+        AppState {
+            engine: Arc::new(Engine::new(cfg.clone()).unwrap()),
+            config: cfg,
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_chat_completions_do_not_500() {
+        let app = router(multi_request_state());
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (res_a, res_b) = tokio::join!(
+            app.clone().oneshot(make_req()),
+            app.oneshot(make_req()),
+        );
+        let res_a = res_a.expect("request a");
+        let res_b = res_b.expect("request b");
+        assert_ne!(
+            res_a.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "overlapping chat must not 500"
+        );
+        assert_ne!(
+            res_b.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "overlapping chat must not 500"
+        );
+        assert_eq!(res_a.status(), StatusCode::OK);
+        assert_eq!(res_b.status(), StatusCode::OK);
+        let bytes_a = res_a.into_body().collect().await.unwrap().to_bytes();
+        let bytes_b = res_b.into_body().collect().await.unwrap().to_bytes();
+        let json_a: serde_json::Value = serde_json::from_slice(&bytes_a).unwrap();
+        let json_b: serde_json::Value = serde_json::from_slice(&bytes_b).unwrap();
+        assert_eq!(json_a["object"], "chat.completion");
+        assert_eq!(json_b["object"], "chat.completion");
+        assert!(json_a["usage"]["completion_tokens"].as_u64().unwrap() >= 1);
+        assert!(json_b["usage"]["completion_tokens"].as_u64().unwrap() >= 1);
+    }
+
     #[tokio::test]
     async fn chat_completion_non_stream() {
         let app = router(test_state());
