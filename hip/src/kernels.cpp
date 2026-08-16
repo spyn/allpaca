@@ -162,12 +162,15 @@ __global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, 
 constexpr int Q8_STAGED_STRIDE = 36;
 constexpr int Q8_STAGED_QS = 4;
 
-/* Decode GEMV against staged Q8_0: 4 outputs per warp, float4 A + aligned qs. */
+/* Decode Q8 GEMV: 8 cols/warp, 16 warps, shared A tiles (no per-column A reload). */
 __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                     int k) {
-    constexpr int WARPS = 8;
-    constexpr int COLS = 4;
-    constexpr int SUB = 8;
+    constexpr int WARPS = 16;
+    constexpr int COLS = 8;
+    constexpr int SUB = 4;
+    constexpr int TILE = 4;
+    __shared__ float As[TILE * 32];
+
     const int row = static_cast<int>(blockIdx.y);
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
@@ -180,34 +183,46 @@ __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, 
     const int nblocks = (k + 31) / 32;
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
     const size_t row_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
+    const uint8_t *brow = (col < n) ? b + static_cast<size_t>(col) * row_stride : nullptr;
     float acc = 0.0f;
-    if (col < n) {
-        const uint8_t *brow = b + static_cast<size_t>(col) * row_stride;
-        for (int blk = 0; blk < nblocks; ++blk) {
-            const uint8_t *bp = brow + static_cast<size_t>(blk) * Q8_STAGED_STRIDE;
-            const float d = *reinterpret_cast<const float *>(bp);
-            const int k0 = blk * 32 + sublane * 4;
-            const uint8_t *qp = bp + Q8_STAGED_QS + sublane * 4;
-            const uint32_t q4 = *reinterpret_cast<const uint32_t *>(qp);
-            const float q0 = static_cast<float>(static_cast<int8_t>(q4 & 0xff));
-            const float q1 = static_cast<float>(static_cast<int8_t>((q4 >> 8) & 0xff));
-            const float q2 = static_cast<float>(static_cast<int8_t>((q4 >> 16) & 0xff));
-            const float q3 = static_cast<float>(static_cast<int8_t>((q4 >> 24) & 0xff));
-            float4 av;
-            if (k0 + 3 < k && (reinterpret_cast<uintptr_t>(arow + k0) % 16u) == 0) {
-                av = *reinterpret_cast<const float4 *>(arow + k0);
-            } else {
-                av.x = (k0 < k) ? arow[k0] : 0.0f;
-                av.y = (k0 + 1 < k) ? arow[k0 + 1] : 0.0f;
-                av.z = (k0 + 2 < k) ? arow[k0 + 2] : 0.0f;
-                av.w = (k0 + 3 < k) ? arow[k0 + 3] : 0.0f;
-            }
-            acc += d * (av.x * q0 + av.y * q1 + av.z * q2 + av.w * q3);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    for (int blk0 = 0; blk0 < nblocks; blk0 += TILE) {
+        const int ntile = (blk0 + TILE <= nblocks) ? TILE : (nblocks - blk0);
+        const int a0 = blk0 * 32;
+        const int nfloat = ntile * 32;
+        for (int i = tid; i < nfloat; i += static_cast<int>(blockDim.x)) {
+            const int gi = a0 + i;
+            As[i] = (gi < k) ? arow[gi] : 0.0f;
         }
+        __syncthreads();
+
+        if (brow) {
+            for (int t = 0; t < ntile; ++t) {
+                const uint8_t *bp = brow + static_cast<size_t>(blk0 + t) * Q8_STAGED_STRIDE;
+                const float d = *reinterpret_cast<const float *>(bp);
+                const int qbase = sublane * 8;
+                const uint8_t *qp = bp + Q8_STAGED_QS + qbase;
+                const uint32_t qlo = *reinterpret_cast<const uint32_t *>(qp);
+                const uint32_t qhi = *reinterpret_cast<const uint32_t *>(qp + 4);
+                const float *as = As + t * 32 + qbase;
+                float dot = as[0] * static_cast<float>(static_cast<int8_t>(qlo & 0xff));
+                dot += as[1] * static_cast<float>(static_cast<int8_t>((qlo >> 8) & 0xff));
+                dot += as[2] * static_cast<float>(static_cast<int8_t>((qlo >> 16) & 0xff));
+                dot += as[3] * static_cast<float>(static_cast<int8_t>((qlo >> 24) & 0xff));
+                dot += as[4] * static_cast<float>(static_cast<int8_t>(qhi & 0xff));
+                dot += as[5] * static_cast<float>(static_cast<int8_t>((qhi >> 8) & 0xff));
+                dot += as[6] * static_cast<float>(static_cast<int8_t>((qhi >> 16) & 0xff));
+                dot += as[7] * static_cast<float>(static_cast<int8_t>((qhi >> 24) & 0xff));
+                acc += d * dot;
+            }
+        }
+        __syncthreads();
     }
+
 #pragma unroll
-    for (int off = 4; off > 0; off >>= 1) {
-        acc += __shfl_down(acc, off, 8);
+    for (int off = 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 4);
     }
     if (col < n && sublane == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
@@ -505,10 +520,10 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    constexpr int warps = 8;
-    constexpr int cols = 4;
+    constexpr int warps = 16;
+    constexpr int cols = 8;
     constexpr int cols_per_block = warps * cols;
-    dim3 block(256);
+    dim3 block(512);
     dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
               static_cast<unsigned>(m));
     hipLaunchKernelGGL(gemv_nt_q8_0_kernel, grid, block, 0, stream, a, b, c, m, n, k);

@@ -2379,6 +2379,10 @@ mod tests {
             (1, 4, 33),
             (2, 7, 33),
             (1, 33, 64),
+            (1, 64, 128),
+            (1, 128, 256),
+            (1, 96, 33),
+            (2, 40, 64),
         ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let mut a = vec![0.0f32; m * k];
