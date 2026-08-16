@@ -695,12 +695,6 @@ impl Engine {
             }
         }
 
-        let vocab_tokens = inner
-            .tokenizer
-            .as_ref()
-            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
-            .tokens
-            .clone();
         let json_constraints = inner.flags.json_constraints;
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation || inner.flags.draft_model_speculation);
@@ -720,6 +714,12 @@ impl Engine {
         };
 
         let mask = if json_mode {
+            let vocab_tokens = inner
+                .tokenizer
+                .as_ref()
+                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
+                .tokens
+                .clone();
             let constraint = JsonConstraint::new(vocab_tokens);
             let mut m = constraint.mask(&json_prefix);
             if !m.any() {
@@ -892,6 +892,9 @@ impl Engine {
             )?;
         }
         let end = start + toks.len();
+        if let Some(hip) = self.hip.as_deref() {
+            hip.wait_logits_d2h(&mut logits)?;
+        }
         {
             let active = request_mut(inner, id)?;
             active.prefill_pos = end;
@@ -900,13 +903,9 @@ impl Engine {
         self.metrics
             .prefill_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if end >= total {
+        if end >= total && inner.flags.ngram_speculation {
             let tokens = request(inner, id)?.tokens.clone();
-            let logits = request(inner, id)?.pending_logits.clone();
             inner.ngram.observe(&tokens);
-            let published = inner.ring.publish(&logits)?;
-            inner.ring.release_current();
-            request_mut(inner, id)?.pending_logits = published;
         }
         Ok((end, total))
     }
@@ -1085,13 +1084,18 @@ fn verify_and_sample(
     let mut accepted = 0u64;
     let mut draft_iter = drafts.into_iter().peekable();
     while produced.len() < remaining {
-        let (mut logits, params) = {
-            let active = request(inner, id)?;
-            (active.pending_logits.clone(), active.params.clone())
-        };
+        if let Some(hip) = hip {
+            let active = request_mut(inner, id)?;
+            hip.wait_logits_d2h(&mut active.pending_logits)?;
+        }
         let sampled = {
             let active = request_mut(inner, id)?;
-            sample(&mut logits, mask, &params, &mut active.rng)
+            sample(
+                &mut active.pending_logits,
+                mask,
+                &active.params,
+                &mut active.rng,
+            )
         };
         produced.push(sampled);
         let matched = draft_iter.peek().copied() == Some(sampled);
@@ -1100,7 +1104,8 @@ fn verify_and_sample(
             draft_iter.next();
         }
         append_and_forward(inner, id, sampled, metrics, hip)?;
-        if is_stop(sampled, &params) || !matched || draft_iter.peek().is_none() {
+        let stop = is_stop(sampled, &request(inner, id)?.params);
+        if stop || !matched || draft_iter.peek().is_none() {
             break;
         }
     }
@@ -1144,21 +1149,26 @@ fn verify_forest(
     let mut accepted_tokens = Vec::new();
     let mut parent = -1i32;
     while produced.len() < remaining {
-        let (mut logits, params) = {
-            let active = request(inner, id)?;
-            let mut logits = active.pending_logits.clone();
-            if parent >= 0 {
-                if let Some(nl) = node_logits.get(parent as usize) {
-                    if nl.len() == logits.len() {
-                        logits.copy_from_slice(nl);
-                    }
+        if let Some(hip) = hip {
+            let active = request_mut(inner, id)?;
+            hip.wait_logits_d2h(&mut active.pending_logits)?;
+        }
+        if parent >= 0 {
+            if let Some(nl) = node_logits.get(parent as usize) {
+                let active = request_mut(inner, id)?;
+                if nl.len() == active.pending_logits.len() {
+                    active.pending_logits.copy_from_slice(nl);
                 }
             }
-            (logits, active.params.clone())
-        };
+        }
         let sampled = {
             let active = request_mut(inner, id)?;
-            sample(&mut logits, mask, &params, &mut active.rng)
+            sample(
+                &mut active.pending_logits,
+                mask,
+                &active.params,
+                &mut active.rng,
+            )
         };
         produced.push(sampled);
         let child = forest.children(parent).find(|&i| forest.nodes[i].token_id as u32 == sampled);
@@ -1167,7 +1177,8 @@ fn verify_forest(
             parent = idx as i32;
         }
         append_and_forward(inner, id, sampled, metrics, hip)?;
-        if is_stop(sampled, &params) || child.is_none() || forest.children(parent).next().is_none()
+        let stop = is_stop(sampled, &request(inner, id)?.params);
+        if stop || child.is_none() || forest.children(parent).next().is_none()
         {
             break;
         }
@@ -1204,28 +1215,30 @@ fn append_and_forward(
         .and_then(|page_id| inner.kv.get(*page_id))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);
-    let cfg = inner
+    let target = inner
         .target
-        .as_ref()
-        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
-        .config
-        .clone();
+        .clone()
+        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
     let mut pages = request(inner, id)?.pages.clone();
-    ensure_pages(&mut inner.kv, &cfg, page_tokens, &mut pages, pos, metrics)?;
+    ensure_pages(
+        &mut inner.kv,
+        &target.config,
+        page_tokens,
+        &mut pages,
+        pos,
+        metrics,
+    )?;
     {
         let active = request_mut(inner, id)?;
         active.pages = pages;
         active.tokens.push(token);
     }
-    let ctx = request(inner, id)?.tokens.clone();
-    inner.ngram.observe(&ctx);
-    let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
-    let mut logits = vec![0.0f32; vocab];
+    if inner.flags.ngram_speculation {
+        let ctx = request(inner, id)?.tokens.clone();
+        inner.ngram.observe(&ctx);
+    }
+    let mut logits = std::mem::take(&mut request_mut(inner, id)?.pending_logits);
     let pages = request(inner, id)?.pages.clone();
-    let target = inner
-        .target
-        .clone()
-        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
     let resident = inner.target_resident.clone();
     target.forward_token(
         token,
@@ -1237,9 +1250,7 @@ fn append_and_forward(
         hip,
         resident.as_deref(),
     )?;
-    let published = inner.ring.publish(&logits)?;
-    inner.ring.release_current();
-    request_mut(inner, id)?.pending_logits = published;
+    request_mut(inner, id)?.pending_logits = logits;
     Ok(())
 }
 

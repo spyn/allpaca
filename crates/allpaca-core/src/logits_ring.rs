@@ -1,6 +1,7 @@
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use allpaca_cpu::copy_async;
 use allpaca_types::{AllpacaError, TransientError};
 
 const FREE: u32 = 0;
@@ -83,16 +84,7 @@ fn write_slot(slot: &mut LogitSlot, logits: &[f32]) -> Result<Vec<f32>, AllpacaE
         slot.data.resize(logits.len(), 0.0);
         slot.bytes.resize(logits.len() * 4, 0);
     }
-    let mut src = vec![0u8; logits.len() * 4];
-    for (i, v) in logits.iter().enumerate() {
-        src[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    copy_async(&mut slot.bytes[..src.len()], &src)?;
-    for i in 0..logits.len() {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&slot.bytes[i * 4..i * 4 + 4]);
-        slot.data[i] = f32::from_le_bytes(b);
-    }
+    slot.data[..logits.len()].copy_from_slice(logits);
     slot.state.store(READY, Ordering::SeqCst);
     slot.state.store(CPU_READING, Ordering::SeqCst);
     Ok(slot.data[..logits.len()].to_vec())

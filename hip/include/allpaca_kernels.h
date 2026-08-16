@@ -17,6 +17,7 @@ extern "C" {
 #define ALLPACA_MEMCPY_D2H 1
 #define ALLPACA_MEMCPY_D2D 2
 #define ALLPACA_MEMCPY_DEFAULT 3
+#define ALLPACA_MEMCPY_D2H_ASYNC 4
 
 typedef void *allpaca_stream_t;
 

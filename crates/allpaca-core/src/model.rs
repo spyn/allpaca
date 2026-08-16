@@ -910,9 +910,18 @@ impl TinyModel {
                 )?;
                 record_elementwise(Some(metrics));
             }
-            resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
-            resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
-            resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
+            if layer.wq.kind == WeightKind::Q8_0 {
+                hip.profile_q8(|| {
+                    resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
+                    resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
+                    resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
+                    Ok(())
+                })?;
+            } else {
+                resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
+                resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
+                resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
+            }
             hip.rope_qk_device(
                 buf.q,
                 buf.k,
@@ -950,7 +959,13 @@ impl TinyModel {
                 head_dim as i32,
                 true,
             )?;
-            resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
+            if layer.wo.kind == WeightKind::Q8_0 {
+                hip.profile_q8(|| {
+                    resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)
+                })?;
+            } else {
+                resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
+            }
             hip.residual_rmsnorm(
                 buf.x,
                 buf.proj,
@@ -963,32 +978,73 @@ impl TinyModel {
                 .residual_gpu_ops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             record_elementwise(Some(metrics));
-            resident.gemm_nt(hip, 
-                buf.normed,
-                layer.w_gate,
-                buf.gate,
-                1,
-                cfg.ff_dim as i32,
-                dim as i32,
-            )?;
-            resident.gemm_nt(hip, 
-                buf.normed,
-                layer.w_up,
-                buf.up,
-                1,
-                cfg.ff_dim as i32,
-                dim as i32,
-            )?;
+            if layer.w_gate.kind == WeightKind::Q8_0 {
+                hip.profile_q8(|| {
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_gate,
+                        buf.gate,
+                        1,
+                        cfg.ff_dim as i32,
+                        dim as i32,
+                    )?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_up,
+                        buf.up,
+                        1,
+                        cfg.ff_dim as i32,
+                        dim as i32,
+                    )?;
+                    Ok(())
+                })?;
+            } else {
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    layer.w_gate,
+                    buf.gate,
+                    1,
+                    cfg.ff_dim as i32,
+                    dim as i32,
+                )?;
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    layer.w_up,
+                    buf.up,
+                    1,
+                    cfg.ff_dim as i32,
+                    dim as i32,
+                )?;
+            }
             hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
             record_elementwise(Some(metrics));
-            resident.gemm_nt(hip, 
-                buf.gate,
-                layer.w_down,
-                buf.proj,
-                1,
-                dim as i32,
-                cfg.ff_dim as i32,
-            )?;
+            if layer.w_down.kind == WeightKind::Q8_0 {
+                hip.profile_q8(|| {
+                    resident.gemm_nt(
+                        hip,
+                        buf.gate,
+                        layer.w_down,
+                        buf.proj,
+                        1,
+                        dim as i32,
+                        cfg.ff_dim as i32,
+                    )
+                })?;
+            } else {
+                resident.gemm_nt(
+                    hip,
+                    buf.gate,
+                    layer.w_down,
+                    buf.proj,
+                    1,
+                    dim as i32,
+                    cfg.ff_dim as i32,
+                )?;
+            }
             if layer_idx + 1 < resident.layers.len() {
                 hip.residual_rmsnorm(
                     buf.x,
@@ -1027,7 +1083,7 @@ impl TinyModel {
                 dim as i32,
             )?;
         }
-        hip.publish_logits(buf.logits, &mut logits[..vocab])?;
+        hip.start_logits_d2h(buf.logits, vocab)?;
         metrics
             .gpu_forwards
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

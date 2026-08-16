@@ -79,6 +79,7 @@ pub const MEMCPY_H2D: i32 = 0;
 pub const MEMCPY_D2H: i32 = 1;
 pub const MEMCPY_D2D: i32 = 2;
 pub const MEMCPY_DEFAULT: i32 = 3;
+pub const MEMCPY_D2H_ASYNC: i32 = 4;
 
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -106,6 +107,7 @@ struct ProfileState {
     pairs: Vec<[*mut std::ffi::c_void; 2]>,
     ops: Vec<u8>,
     used: usize,
+    full: bool,
     wall_start: Option<std::time::Instant>,
     ema_ns: [u64; 5],
 }
@@ -116,6 +118,7 @@ impl Default for ProfileState {
             pairs: Vec::new(),
             ops: Vec::new(),
             used: 0,
+            full: false,
             wall_start: None,
             ema_ns: [0; 5],
         }
@@ -1250,18 +1253,26 @@ struct DequantAlloc {
 unsafe impl Send for DequantAlloc {}
 unsafe impl Sync for DequantAlloc {}
 
+struct PinnedLogits {
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for PinnedLogits {}
+
 pub struct HipWorkspace {
     pub device: i32,
     scratch: *mut u8,
     scratch_bytes: usize,
-    pinned_logits: *mut u8,
-    pinned_logits_bytes: usize,
+    pinned: Mutex<PinnedLogits>,
     decode: Mutex<Option<DecodeAlloc>>,
     dequant: Mutex<Option<DequantAlloc>>,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
     profiling: AtomicU64,
     lm_head: AtomicU64,
+    profile_span: AtomicU64,
+    logits_inflight: AtomicU64,
     profile: Mutex<ProfileState>,
 }
 
@@ -1272,8 +1283,8 @@ impl HipWorkspace {
     pub fn new(device: i32, scratch_bytes: usize, vocab: usize) -> Result<Self, AllpacaError> {
         let scratch_bytes = scratch_bytes.max(4096);
         let scratch = device_malloc(scratch_bytes, device)?;
-        let pinned_logits_bytes = vocab.max(1) * 4;
-        let pinned_logits = match host_malloc(pinned_logits_bytes) {
+        let pinned_bytes = vocab.max(1) * 4;
+        let pinned_ptr = match host_malloc(pinned_bytes) {
             Ok(p) => p,
             Err(_) => std::ptr::null_mut(),
         };
@@ -1281,22 +1292,28 @@ impl HipWorkspace {
             device,
             scratch,
             scratch_bytes,
-            pinned_logits,
-            pinned_logits_bytes,
+            pinned: Mutex::new(PinnedLogits {
+                ptr: pinned_ptr,
+                bytes: if pinned_ptr.is_null() { 0 } else { pinned_bytes },
+            }),
             decode: Mutex::new(None),
             dequant: Mutex::new(None),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
             profiling: AtomicU64::new(0),
             lm_head: AtomicU64::new(0),
+            profile_span: AtomicU64::new(0),
+            logits_inflight: AtomicU64::new(0),
             profile: Mutex::new(ProfileState::default()),
         })
     }
 
     pub fn allocated_bytes(&self) -> u64 {
         let mut n = self.scratch_bytes as u64;
-        if !self.pinned_logits.is_null() {
-            n += self.pinned_logits_bytes as u64;
+        if let Ok(g) = self.pinned.lock() {
+            if !g.ptr.is_null() {
+                n += g.bytes as u64;
+            }
         }
         if let Ok(g) = self.decode.lock() {
             if let Some(d) = g.as_ref() {
@@ -1323,9 +1340,11 @@ impl HipWorkspace {
     pub fn begin_decode_profile(&self) {
         self.profiling.store(1, Ordering::Relaxed);
         self.lm_head.store(0, Ordering::Relaxed);
+        self.profile_span.store(0, Ordering::Relaxed);
         let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
         g.used = 0;
         g.ops.clear();
+        g.full = true;
         g.wall_start = Some(std::time::Instant::now());
     }
 
@@ -1333,6 +1352,20 @@ impl HipWorkspace {
     pub fn lm_head_scope(&self) -> LmHeadScope<'_> {
         self.lm_head.store(1, Ordering::Relaxed);
         LmHeadScope { flag: &self.lm_head }
+    }
+
+    /// Time consecutive Q8 GEMVs as one profile span (fewer HIP event queries).
+    pub fn profile_q8<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, AllpacaError>,
+    ) -> Result<T, AllpacaError> {
+        if self.profiling.load(Ordering::Relaxed) == 0 {
+            return f();
+        }
+        self.profile_span.store(1, Ordering::Relaxed);
+        let result = self.time_op(DecodeOp::Q8Gemm, f);
+        self.profile_span.store(0, Ordering::Relaxed);
+        result
     }
 
     /// Last/EMA decode buckets in microseconds.
@@ -1347,37 +1380,56 @@ impl HipWorkspace {
         }
     }
 
-    /// Finish the sample after the stream wait (logits D2H) so HIP events are complete.
+    /// Finish the sample after the last kernel so HIP events are complete.
     pub fn end_decode_profile(&self) {
         self.profiling.store(0, Ordering::Relaxed);
         self.lm_head.store(0, Ordering::Relaxed);
+        self.profile_span.store(0, Ordering::Relaxed);
         let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
         let wall_ns = g
             .wall_start
             .take()
             .map(|t| t.elapsed().as_nanos() as u64)
             .unwrap_or(0);
-        let mut buckets = [0u64; 5];
-        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
-        {
-            for i in 0..g.used.min(g.ops.len()).min(g.pairs.len()) {
-                let op = g.ops[i] as usize;
-                if op >= 4 {
-                    continue;
+        if g.full {
+            let mut buckets = [0u64; 5];
+            #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+            {
+                let _ = stream_synchronize();
+                for i in 0..g.used.min(g.ops.len()).min(g.pairs.len()) {
+                    let op = g.ops[i] as usize;
+                    if op >= 4 {
+                        continue;
+                    }
+                    buckets[op] += event_elapsed_ns(g.pairs[i][0], g.pairs[i][1]);
                 }
-                buckets[op] += event_elapsed_ns(g.pairs[i][0], g.pairs[i][1]);
             }
-        }
-        let gpu_ns = buckets[0] + buckets[1] + buckets[2] + buckets[3];
-        buckets[4] = wall_ns.saturating_sub(gpu_ns);
-        for i in 0..5 {
-            g.ema_ns[i] = ema_ns(g.ema_ns[i], buckets[i]);
+            let gpu_ns = buckets[0] + buckets[1] + buckets[2] + buckets[3];
+            buckets[4] = wall_ns.saturating_sub(gpu_ns);
+            for i in 0..5 {
+                g.ema_ns[i] = ema_ns(g.ema_ns[i], buckets[i]);
+            }
+        } else {
+            let gpu_ns = g.ema_ns[0] + g.ema_ns[1] + g.ema_ns[2] + g.ema_ns[3];
+            g.ema_ns[4] = ema_ns(g.ema_ns[4], wall_ns.saturating_sub(gpu_ns));
         }
         g.used = 0;
         g.ops.clear();
+        g.full = false;
     }
 
     fn timed_gpu<T>(
+        &self,
+        op: DecodeOp,
+        f: impl FnOnce() -> Result<T, AllpacaError>,
+    ) -> Result<T, AllpacaError> {
+        if self.profile_span.load(Ordering::Relaxed) != 0 {
+            return f();
+        }
+        self.time_op(op, f)
+    }
+
+    fn time_op<T>(
         &self,
         op: DecodeOp,
         f: impl FnOnce() -> Result<T, AllpacaError>,
@@ -1510,7 +1562,33 @@ impl HipWorkspace {
                 max_kv,
             });
         }
-        Ok(guard.as_ref().expect("decode alloc").ptrs())
+        let vocab = guard.as_ref().map(|a| a.vocab).unwrap_or(vocab);
+        drop(guard);
+        let _ = self.ensure_pinned_logits(vocab);
+        Ok(self
+            .decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .expect("decode alloc")
+            .ptrs())
+    }
+
+    fn ensure_pinned_logits(&self, n_floats: usize) -> Result<*mut u8, AllpacaError> {
+        let need = n_floats.max(1) * 4;
+        let mut g = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.ptr.is_null() && g.bytes >= need {
+            return Ok(g.ptr);
+        }
+        if !g.ptr.is_null() {
+            host_free(g.ptr);
+            g.ptr = std::ptr::null_mut();
+            g.bytes = 0;
+        }
+        let ptr = host_malloc(need)?;
+        g.ptr = ptr;
+        g.bytes = need;
+        Ok(ptr)
     }
 
     /// Reusable F32 workspace for on-device Q8_0 dequant before GEMM.
@@ -1918,19 +1996,43 @@ impl HipWorkspace {
 
     /// Copy device logits into the pinned host ring slot when one exists.
     pub fn publish_logits(&self, device_logits: *const f32, host: &mut [f32]) -> Result<(), AllpacaError> {
-        let bytes = host.len() * 4;
-        if !self.pinned_logits.is_null() && self.pinned_logits_bytes >= bytes {
-            memcpy(self.pinned_logits, device_logits.cast(), bytes, MEMCPY_D2H)?;
-            self.add_d2h(bytes);
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.pinned_logits.cast::<f32>(), host.as_mut_ptr(), host.len());
-            }
-            Ok(())
-        } else {
-            memcpy(host.as_mut_ptr().cast(), device_logits.cast(), bytes, MEMCPY_D2H)?;
-            self.add_d2h(bytes);
-            Ok(())
+        self.start_logits_d2h(device_logits, host.len())?;
+        self.wait_logits_d2h(host)
+    }
+
+    /// Queue logits D2H into pinned host memory (no stream wait).
+    pub fn start_logits_d2h(&self, device_logits: *const f32, n: usize) -> Result<(), AllpacaError> {
+        if device_logits.is_null() || n == 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid logits D2H".into(),
+            )));
         }
+        let bytes = n * 4;
+        let pinned = self.ensure_pinned_logits(n)?;
+        memcpy(pinned, device_logits.cast(), bytes, MEMCPY_D2H_ASYNC)?;
+        self.logits_inflight.store(n as u64, Ordering::Relaxed);
+        self.add_d2h(bytes);
+        Ok(())
+    }
+
+    /// Wait for a queued logits D2H and copy pinned bytes into `host`.
+    pub fn wait_logits_d2h(&self, host: &mut [f32]) -> Result<(), AllpacaError> {
+        let n = self.logits_inflight.swap(0, Ordering::Relaxed) as usize;
+        if n == 0 {
+            return Ok(());
+        }
+        stream_synchronize()?;
+        let g = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
+        if g.ptr.is_null() || g.bytes < n * 4 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "pinned logits missing after D2H".into(),
+            )));
+        }
+        let copy_n = n.min(host.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(g.ptr.cast::<f32>(), host.as_mut_ptr(), copy_n);
+        }
+        Ok(())
     }
 
     pub fn embed_gather(
@@ -2372,7 +2474,11 @@ impl HipWorkspace {
 impl Drop for HipWorkspace {
     fn drop(&mut self) {
         device_free(self.scratch, self.scratch_bytes);
-        host_free(self.pinned_logits);
+        if let Ok(mut g) = self.pinned.lock() {
+            host_free(g.ptr);
+            g.ptr = std::ptr::null_mut();
+            g.bytes = 0;
+        }
         if let Ok(mut g) = self.decode.lock() {
             if let Some(d) = g.take() {
                 device_free(d.ptr, d.bytes);
