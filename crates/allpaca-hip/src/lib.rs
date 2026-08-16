@@ -13,6 +13,46 @@ use allpaca_types::{AllpacaError, BandwidthBenchmark, DegradedError, DeviceInfo}
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
 use allpaca_types::DeviceKind;
 
+/// GGUF Q8_0 packed block (f16 scale + 32 qs).
+pub const Q8_PACKED_BLOCK: usize = 34;
+/// Device-staged Q8_0: f32 scale at 0, qs at 4, 36-byte stride (4-byte aligned).
+pub const Q8_STAGED_BLOCK: usize = 36;
+pub const Q8_STAGED_QS: usize = 4;
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = u32::from(h & 0x3ff);
+    let bits = if exp == 0 {
+        sign
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((u32::from(exp) + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Repack GGUF 34-byte Q8_0 blocks into 36-byte device blocks with an F32 scale.
+pub fn stage_q8_0_blocks(packed: &[u8]) -> Result<Vec<u8>, AllpacaError> {
+    if packed.len() % Q8_PACKED_BLOCK != 0 {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 packed length is not a multiple of 34".into(),
+        )));
+    }
+    let n = packed.len() / Q8_PACKED_BLOCK;
+    let mut out = vec![0u8; n * Q8_STAGED_BLOCK];
+    for i in 0..n {
+        let src = i * Q8_PACKED_BLOCK;
+        let dst = i * Q8_STAGED_BLOCK;
+        let h = u16::from_le_bytes([packed[src], packed[src + 1]]);
+        out[dst..dst + 4].copy_from_slice(&f16_bits_to_f32(h).to_le_bytes());
+        out[dst + Q8_STAGED_QS..dst + Q8_STAGED_QS + 32]
+            .copy_from_slice(&packed[src + 2..src + Q8_PACKED_BLOCK]);
+    }
+    Ok(out)
+}
+
 pub const ALLPACA_OK: i32 = 0;
 pub const ALLPACA_ERR_NOT_IMPLEMENTED: i32 = 1;
 pub const ALLPACA_ERR_INVALID: i32 = 2;
@@ -698,24 +738,25 @@ pub fn gemm_nt_q8_0(
         let a_n = (m as usize) * (k as usize);
         let c_n = (m as usize) * (n as usize);
         let nblocks = (k as usize).div_ceil(32);
-        let b_bytes = (n as usize) * nblocks * 34;
-        if a.len() < a_n || b.len() < b_bytes || c.len() < c_n {
+        let packed_bytes = (n as usize) * nblocks * Q8_PACKED_BLOCK;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "Q8_0 GEMM buffer size mismatch".into(),
             )));
         }
+        let staged = stage_q8_0_blocks(&b[..packed_bytes])?;
         let da = device_malloc(a_n * 4, 0)?;
-        let db = device_malloc(b_bytes, 0)?;
+        let db = device_malloc(staged.len(), 0)?;
         let dc = device_malloc(c_n * 4, 0)?;
         set_device(0)?;
         let result = (|| {
             memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
-            memcpy(db, b.as_ptr(), b_bytes, MEMCPY_H2D)?;
+            memcpy(db, staged.as_ptr(), staged.len(), MEMCPY_H2D)?;
             gemm_nt_q8_0_device(da.cast(), db, dc.cast(), m, n, k)?;
             memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
         })();
         device_free(da, a_n * 4);
-        device_free(db, b_bytes);
+        device_free(db, staged.len());
         device_free(dc, c_n * 4);
         result
     }
@@ -1728,6 +1769,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stage_q8_0_blocks_keeps_scale_and_qs() {
+        let mut packed = vec![0u8; Q8_PACKED_BLOCK];
+        packed[0] = 0x00;
+        packed[1] = 0x3c; // f16 1.0
+        packed[2] = 5u8;
+        packed[33] = 0xfb; // -5 as i8
+        let staged = stage_q8_0_blocks(&packed).unwrap();
+        assert_eq!(staged.len(), Q8_STAGED_BLOCK);
+        let scale = f32::from_le_bytes(staged[0..4].try_into().unwrap());
+        assert!((scale - 1.0).abs() < 1e-3, "staged scale {scale}");
+        assert_eq!(staged[Q8_STAGED_QS], 5);
+        assert_eq!(staged[Q8_STAGED_QS + 31], 0xfb);
+    }
+
+    #[test]
     fn default_build_has_no_hip_devices() {
         if cfg!(not(feature = "hip")) {
             assert!(enumerate_devices().is_empty());
@@ -1958,14 +2014,15 @@ mod tests {
         for (i, v) in residual.iter_mut().enumerate() {
             *v = (i as f32) * 0.1 - 0.3;
         }
-        let mut b_q8 = Vec::new();
+        let mut b_q8_packed = Vec::new();
         for row in 0..n {
-            b_q8.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
+            b_q8_packed.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
         }
+        let b_q8 = stage_q8_0_blocks(&b_q8_packed).expect("stage q8");
         let mut b_deq = vec![0.0f32; n * k];
         let nblocks = k.div_ceil(32);
         for row in 0..n {
-            let blk = &b_q8[row * nblocks * 34..(row + 1) * nblocks * 34];
+            let blk = &b_q8_packed[row * nblocks * 34..(row + 1) * nblocks * 34];
             for bi in 0..nblocks {
                 let off = bi * 34;
                 let h = u16::from_le_bytes([blk[off], blk[off + 1]]);

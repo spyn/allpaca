@@ -158,7 +158,11 @@ __global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, 
     }
 }
 
-/* Decode GEMV against GGUF Q8_0: 4 outputs per warp, float4 A + uint16 qs. */
+/* Staged Q8_0: 36-byte blocks, f32 scale at 0, qs[32] at 4 (4-byte aligned). */
+constexpr int Q8_STAGED_STRIDE = 36;
+constexpr int Q8_STAGED_QS = 4;
+
+/* Decode GEMV against staged Q8_0: 4 outputs per warp, float4 A + aligned qs. */
 __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                     int k) {
     constexpr int WARPS = 8;
@@ -175,22 +179,20 @@ __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, 
     }
     const int nblocks = (k + 31) / 32;
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
-    const size_t row_stride = static_cast<size_t>(nblocks) * 34;
+    const size_t row_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
     float acc = 0.0f;
     if (col < n) {
         const uint8_t *brow = b + static_cast<size_t>(col) * row_stride;
         for (int blk = 0; blk < nblocks; ++blk) {
-            const uint8_t *bp = brow + static_cast<size_t>(blk) * 34;
-            const uint16_t dh = *reinterpret_cast<const uint16_t *>(bp);
-            const float d = allpaca_f16_bits_to_f32(dh);
+            const uint8_t *bp = brow + static_cast<size_t>(blk) * Q8_STAGED_STRIDE;
+            const float d = *reinterpret_cast<const float *>(bp);
             const int k0 = blk * 32 + sublane * 4;
-            const uint8_t *qp = bp + 2 + sublane * 4;
-            const uint16_t qlo = *reinterpret_cast<const uint16_t *>(qp);
-            const uint16_t qhi = *reinterpret_cast<const uint16_t *>(qp + 2);
-            const float q0 = static_cast<float>(static_cast<int8_t>(qlo & 0xff));
-            const float q1 = static_cast<float>(static_cast<int8_t>(qlo >> 8));
-            const float q2 = static_cast<float>(static_cast<int8_t>(qhi & 0xff));
-            const float q3 = static_cast<float>(static_cast<int8_t>(qhi >> 8));
+            const uint8_t *qp = bp + Q8_STAGED_QS + sublane * 4;
+            const uint32_t q4 = *reinterpret_cast<const uint32_t *>(qp);
+            const float q0 = static_cast<float>(static_cast<int8_t>(q4 & 0xff));
+            const float q1 = static_cast<float>(static_cast<int8_t>((q4 >> 8) & 0xff));
+            const float q2 = static_cast<float>(static_cast<int8_t>((q4 >> 16) & 0xff));
+            const float q3 = static_cast<float>(static_cast<int8_t>((q4 >> 24) & 0xff));
             float4 av;
             if (k0 + 3 < k && (reinterpret_cast<uintptr_t>(arow + k0) % 16u) == 0) {
                 av = *reinterpret_cast<const float4 *>(arow + k0);
@@ -927,9 +929,9 @@ __global__ void dequant_q8_0_kernel(const uint8_t *blocks, float *out, int n) {
     }
     const int b = i / 32;
     const int j = i % 32;
-    const uint8_t *blk = blocks + static_cast<size_t>(b) * 34;
-    const float d = allpaca_f16le_to_f32(blk);
-    out[i] = d * static_cast<float>(static_cast<int8_t>(blk[2 + j]));
+    const uint8_t *blk = blocks + static_cast<size_t>(b) * Q8_STAGED_STRIDE;
+    const float d = *reinterpret_cast<const float *>(blk);
+    out[i] = d * static_cast<float>(static_cast<int8_t>(blk[Q8_STAGED_QS + j]));
 }
 
 __global__ void embed_gather_q8_0_kernel(const uint8_t *table, int token, float *out, int dim) {
@@ -943,9 +945,9 @@ __global__ void embed_gather_q8_0_kernel(const uint8_t *table, int token, float 
     const uint8_t *blk =
         table + (static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row) +
                  static_cast<size_t>(b)) *
-                    34;
-    const float d = allpaca_f16le_to_f32(blk);
-    out[i] = d * static_cast<float>(static_cast<int8_t>(blk[2 + j]));
+                    Q8_STAGED_STRIDE;
+    const float d = *reinterpret_cast<const float *>(blk);
+    out[i] = d * static_cast<float>(static_cast<int8_t>(blk[Q8_STAGED_QS + j]));
 }
 
 extern "C" int allpaca_dequant_q8_0(const uint8_t *qblocks, float *out, int32_t n,

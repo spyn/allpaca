@@ -386,7 +386,13 @@ fn append_gguf_tensor(
     let n = info.n_elements() as usize;
     let (bytes, kind) = match info.ggml_type {
         allpaca_gguf::GgmlType::F32 => (file.tensor_bytes(name)?.to_vec(), WeightKind::F32),
-        allpaca_gguf::GgmlType::Q8_0 => (file.tensor_bytes(name)?.to_vec(), WeightKind::Q8_0),
+        allpaca_gguf::GgmlType::Q8_0 => {
+            let packed = file.tensor_bytes(name)?;
+            let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
+            })?;
+            (staged, WeightKind::Q8_0)
+        }
         _ => {
             let f32s = file.tensor_f32(name)?;
             let mut bytes = Vec::with_capacity(f32s.len() * 4);
@@ -396,6 +402,11 @@ fn append_gguf_tensor(
             (bytes, WeightKind::F32)
         }
     };
+    if kind == WeightKind::Q8_0 && *off % allpaca_hip::Q8_STAGED_BLOCK != 0 {
+        let pad = allpaca_hip::Q8_STAGED_BLOCK - (*off % allpaca_hip::Q8_STAGED_BLOCK);
+        parts.push(vec![0u8; pad]);
+        *off += pad;
+    }
     let w = WeightRef {
         off: *off,
         n,
