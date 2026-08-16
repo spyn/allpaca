@@ -158,6 +158,22 @@ pub enum DraftProviderKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TreeSection {
+    pub enabled: bool,
+    pub max_nodes: usize,
+}
+
+impl Default for TreeSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_nodes: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SpeculativeSection {
     pub enabled: bool,
     pub providers: Vec<DraftProviderKind>,
@@ -165,6 +181,7 @@ pub struct SpeculativeSection {
     pub min_depth: usize,
     pub adaptive: bool,
     pub ngram_n: usize,
+    pub tree: TreeSection,
 }
 
 impl Default for SpeculativeSection {
@@ -176,6 +193,7 @@ impl Default for SpeculativeSection {
             min_depth: 2,
             adaptive: true,
             ngram_n: 3,
+            tree: TreeSection::default(),
         }
     }
 }
@@ -339,5 +357,30 @@ mod tests {
     #[test]
     fn compiled_defaults_validate() {
         Config::compiled_defaults().validate().unwrap();
+    }
+
+    #[test]
+    fn tree_speculation_is_off_by_default_and_enabled_via_toml() {
+        let defaults = Config::compiled_defaults();
+        assert!(
+            !defaults.speculative.tree.enabled,
+            "Token Forest Feature Flag defaults off"
+        );
+        assert!(
+            defaults.speculative.tree.max_nodes > 0,
+            "compiled max_nodes must be a conservative positive budget"
+        );
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [speculative.tree]
+            enabled = true
+            max_nodes = 16
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.speculative.tree.enabled);
+        assert_eq!(cfg.speculative.tree.max_nodes, 16);
+        assert!(cfg.speculative.enabled, "tree is composable, not a Pipeline Mode");
     }
 }

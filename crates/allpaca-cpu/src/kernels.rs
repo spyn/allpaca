@@ -219,6 +219,77 @@ pub fn attention(
     Ok(())
 }
 
+/// Attention with an explicit [n_q, n_kv] ancestry/causal mask (`true` = attend).
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attention_with_mask(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    mask: &[bool],
+) -> Result<(), AllpacaError> {
+    if n_heads == 0 || n_kv_heads == 0 || !n_heads.is_multiple_of(n_kv_heads) {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "invalid attention head configuration".into(),
+        )));
+    }
+    let q_need = n_q * n_heads * head_dim;
+    let kv_need = n_kv * n_kv_heads * head_dim;
+    if q.len() < q_need
+        || k.len() < kv_need
+        || v.len() < kv_need
+        || out.len() < q_need
+        || mask.len() < n_q * n_kv
+    {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "attention mask buffer size mismatch".into(),
+        )));
+    }
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let reps = n_heads / n_kv_heads;
+    let mut scores = vec![0.0f32; n_kv];
+    for qi in 0..n_q {
+        for h in 0..n_heads {
+            let kv_h = h / reps;
+            let q_off = (qi * n_heads + h) * head_dim;
+            let qh = &q[q_off..q_off + head_dim];
+            for t in 0..n_kv {
+                if !mask[qi * n_kv + t] {
+                    scores[t] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let k_off = (t * n_kv_heads + kv_h) * head_dim;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += qh[d] * k[k_off + d];
+                }
+                scores[t] = dot * scale;
+            }
+            softmax_in_place(&mut scores);
+            let o_off = (qi * n_heads + h) * head_dim;
+            for d in 0..head_dim {
+                out[o_off + d] = 0.0;
+            }
+            for t in 0..n_kv {
+                let w = scores[t];
+                if w == 0.0 {
+                    continue;
+                }
+                let v_off = (t * n_kv_heads + kv_h) * head_dim;
+                for d in 0..head_dim {
+                    out[o_off + d] += w * v[v_off + d];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn copy_async(dst: &mut [u8], src: &[u8]) -> Result<(), AllpacaError> {
     if dst.len() < src.len() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(

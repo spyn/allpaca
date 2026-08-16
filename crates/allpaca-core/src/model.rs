@@ -1,4 +1,5 @@
-use allpaca_cpu::{attention, matmul_nt, rmsnorm, rope, silu};
+use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
+use crate::forest::TokenForest;
 use allpaca_gguf::GgufFile;
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -269,6 +270,156 @@ impl TinyModel {
             cfg.vocab_size,
             dim,
         )?;
+        Ok(())
+    }
+
+    /// Packed Token Forest verify: one target eval with an ancestry attention mask.
+    /// HIP stays on the sequential `forward_token` path.
+    pub fn forward_forest(
+        &self,
+        forest: &TokenForest,
+        page_ids: &[Vec<u64>],
+        kv: &KvTierManager,
+        prompt_len: usize,
+        node_logits: &mut [Vec<f32>],
+    ) -> Result<(), AllpacaError> {
+        let n_tree = forest.nodes.len();
+        if n_tree == 0 {
+            return Ok(());
+        }
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let head_dim = cfg.head_dim();
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let vocab = cfg.vocab_size;
+        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(n_tree);
+        for n in &forest.nodes {
+            let tok = n.token_id as usize;
+            if tok >= cfg.vocab_size {
+                return Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
+                    "token {tok} out of vocab"
+                ))));
+            }
+            xs.push(self.embed[tok * dim..(tok + 1) * dim].to_vec());
+        }
+        let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
+        let ancestry = forest.ancestry_mask();
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let (prompt_k, prompt_v) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+            let n_prompt = prompt_k.len().checked_div(kv_dim).unwrap_or(0);
+            let n_kv = n_prompt + n_tree;
+            let mut qs = vec![0.0f32; n_tree * dim];
+            let mut ks = vec![0.0f32; n_tree * kv_dim];
+            let mut vs = vec![0.0f32; n_tree * kv_dim];
+            for (i, x) in xs.iter().enumerate() {
+                rmsnorm(x, &layer.attn_norm, cfg.eps, &mut scratch[..dim])?;
+                matmul_nt(
+                    &scratch[..dim],
+                    &layer.wq,
+                    &mut qs[i * dim..(i + 1) * dim],
+                    1,
+                    dim,
+                    dim,
+                )?;
+                matmul_nt(
+                    &scratch[..dim],
+                    &layer.wk,
+                    &mut ks[i * kv_dim..(i + 1) * kv_dim],
+                    1,
+                    kv_dim,
+                    dim,
+                )?;
+                matmul_nt(
+                    &scratch[..dim],
+                    &layer.wv,
+                    &mut vs[i * kv_dim..(i + 1) * kv_dim],
+                    1,
+                    kv_dim,
+                    dim,
+                )?;
+                let pos = prompt_len + forest.nodes[i].depth as usize - 1;
+                for h in 0..cfg.n_heads {
+                    rope(&mut qs[i * dim + h * head_dim..i * dim + (h + 1) * head_dim], pos, cfg.rope_theta)?;
+                }
+                for h in 0..cfg.n_kv_heads {
+                    rope(
+                        &mut ks[i * kv_dim + h * head_dim..i * kv_dim + (h + 1) * head_dim],
+                        pos,
+                        cfg.rope_theta,
+                    )?;
+                }
+            }
+            let mut k_all = prompt_k;
+            k_all.extend_from_slice(&ks);
+            let mut v_all = prompt_v;
+            v_all.extend_from_slice(&vs);
+            let mut mask = vec![false; n_tree * n_kv];
+            for i in 0..n_tree {
+                for t in 0..n_prompt {
+                    mask[i * n_kv + t] = true;
+                }
+                for j in 0..n_tree {
+                    if ancestry[i * n_tree + j] {
+                        mask[i * n_kv + n_prompt + j] = true;
+                    }
+                }
+            }
+            let mut attn_out = vec![0.0f32; n_tree * dim];
+            attention_with_mask(
+                &qs,
+                &k_all,
+                &v_all,
+                &mut attn_out,
+                n_tree,
+                n_kv,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                head_dim,
+                &mask,
+            )?;
+            for i in 0..n_tree {
+                let mut hidden = vec![0.0f32; dim];
+                matmul_nt(
+                    &attn_out[i * dim..(i + 1) * dim],
+                    &layer.wo,
+                    &mut hidden,
+                    1,
+                    dim,
+                    dim,
+                )?;
+                for d in 0..dim {
+                    xs[i][d] += hidden[d];
+                }
+                rmsnorm(&xs[i], &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
+                let mut gate = vec![0.0f32; cfg.ff_dim];
+                let mut up = vec![0.0f32; cfg.ff_dim];
+                matmul_nt(&scratch[..dim], &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
+                matmul_nt(&scratch[..dim], &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
+                for g in 0..cfg.ff_dim {
+                    gate[g] = silu(gate[g]) * up[g];
+                }
+                matmul_nt(&gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
+                for d in 0..dim {
+                    xs[i][d] += hidden[d];
+                }
+            }
+        }
+
+        for (i, x) in xs.iter().enumerate() {
+            rmsnorm(x, &self.norm, cfg.eps, &mut scratch[..dim])?;
+            if node_logits[i].len() < vocab {
+                node_logits[i].resize(vocab, 0.0);
+            }
+            matmul_nt(
+                &scratch[..dim],
+                &self.lm_head,
+                &mut node_logits[i][..vocab],
+                1,
+                vocab,
+                dim,
+            )?;
+        }
         Ok(())
     }
 

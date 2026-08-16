@@ -31,18 +31,40 @@ impl NGramProvider {
     }
 
     fn best_next(&self, ctx: &[u32]) -> Option<u32> {
+        self.top_next(ctx, 1).into_iter().next().map(|(tok, _)| tok)
+    }
+
+    pub(crate) fn top_next(&self, ctx: &[u32], k: usize) -> Vec<(u32, f32)> {
+        if k == 0 || ctx.is_empty() {
+            return Vec::new();
+        }
         let max_ctx = self.n - 1;
         let start = ctx.len().saturating_sub(max_ctx);
         for prefix_len in (1..=ctx.len() - start).rev() {
             let key = ctx[ctx.len() - prefix_len..].to_vec();
             if let Some(nexts) = self.counts.get(&key) {
-                return nexts
+                let total: f32 = nexts.values().map(|c| *c as f32).sum();
+                let mut ranked: Vec<(u32, f32)> = nexts
                     .iter()
-                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
-                    .map(|(tok, _)| *tok);
+                    .map(|(tok, c)| {
+                        let p = if total > 0.0 {
+                            *c as f32 / total
+                        } else {
+                            0.0
+                        };
+                        (*tok, p.ln())
+                    })
+                    .collect();
+                ranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                ranked.truncate(k);
+                return ranked;
             }
         }
-        None
+        Vec::new()
     }
 }
 

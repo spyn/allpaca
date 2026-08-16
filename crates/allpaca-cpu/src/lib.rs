@@ -3,5 +3,6 @@
 mod kernels;
 
 pub use kernels::{
-    attention, copy_async, gemm, matmul, matmul_nt, rmsnorm, rope, silu, softmax, CpuBackend,
+    attention, attention_with_mask, copy_async, gemm, matmul, matmul_nt, rmsnorm, rope, silu,
+    softmax, CpuBackend,
 };

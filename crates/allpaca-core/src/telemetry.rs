@@ -16,6 +16,10 @@ pub struct Metrics {
     pub ttft_ms_last: AtomicU64,
     pub itl_ms_ema_x100: AtomicU64,
     pub degraded_events: AtomicU64,
+    pub tree_nodes: AtomicU64,
+    pub tree_accepted_path_len: AtomicU64,
+    pub tree_path_invalid: AtomicU64,
+    pub target_evals: AtomicU64,
 }
 
 impl Metrics {
@@ -33,6 +37,13 @@ impl Metrics {
             0.0
         } else {
             accepted as f64 / proposed as f64
+        };
+        let target_evals = self.target_evals.load(Ordering::Relaxed);
+        let generated = self.tokens_generated.load(Ordering::Relaxed);
+        let accepted_tokens_per_target_eval = if target_evals == 0 {
+            0.0
+        } else {
+            generated as f64 / target_evals as f64
         };
         StatsSnapshot {
             pipeline_mode: pipeline_mode.to_string(),
@@ -52,6 +63,11 @@ impl Metrics {
             ttft_ms_last: self.ttft_ms_last.load(Ordering::Relaxed),
             itl_ms_ema: self.itl_ms_ema_x100.load(Ordering::Relaxed) as f64 / 100.0,
             degraded_events: self.degraded_events.load(Ordering::Relaxed),
+            tree_nodes: self.tree_nodes.load(Ordering::Relaxed),
+            tree_accepted_path_len: self.tree_accepted_path_len.load(Ordering::Relaxed),
+            tree_path_valid: self.tree_nodes.load(Ordering::Relaxed) > 0
+                && self.tree_path_invalid.load(Ordering::Relaxed) == 0,
+            accepted_tokens_per_target_eval,
             model_id,
         }
     }

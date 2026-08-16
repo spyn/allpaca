@@ -12,6 +12,7 @@ use rand::rngs::StdRng;
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
+use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::model::{alloc_pages_for_seq, ensure_pages, ModelConfig, TinyModel};
@@ -435,14 +436,43 @@ impl Engine {
             None
         };
 
-        let drafts = if speculate && depth > 0 {
-            propose_drafts(&mut inner, depth, temperature)?
+        let use_tree = speculate && inner.flags.tree_speculation && depth > 0;
+        self.metrics
+            .target_evals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let produced = if use_tree {
+            let ctx = inner
+                .active
+                .as_ref()
+                .map(|a| a.tokens.clone())
+                .unwrap_or_default();
+            let max_nodes = self.config.speculative.tree.max_nodes.max(1);
+            let draft = if inner.flags.draft_model_speculation {
+                inner.draft_model.as_deref()
+            } else {
+                None
+            };
+            let forest = build_token_forest(
+                &inner.ngram,
+                draft,
+                &ctx,
+                max_nodes,
+                depth.max(1),
+            )?;
+            self.metrics
+                .tree_nodes
+                .fetch_add(forest.nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            verify_forest(&mut inner, &forest, mask.as_ref(), remaining, &self.metrics)?
         } else {
-            Vec::new()
+            let drafts = if speculate && depth > 0 {
+                propose_drafts(&mut inner, depth, temperature)?
+            } else {
+                Vec::new()
+            };
+            verify_and_sample(&mut inner, drafts, mask.as_ref(), remaining, &self.metrics)?
         };
-        let proposed = drafts.len() as u64;
-        let produced = verify_and_sample(&mut inner, drafts, mask.as_ref(), remaining, &self.metrics)?;
         let accepted = produced.accepted;
+        let proposed = produced.proposed;
         inner.scheduler.record_acceptance(accepted, proposed);
         self.metrics
             .draft_proposed
@@ -526,9 +556,13 @@ impl Engine {
 }
 
 fn apply_provider_flags(flags: &mut FeatureFlags, config: &Config) {
+    if config.features.tree_speculation.is_none() {
+        flags.tree_speculation = config.speculative.enabled && config.speculative.tree.enabled;
+    }
     if !config.speculative.enabled {
         flags.ngram_speculation = false;
         flags.draft_model_speculation = false;
+        flags.tree_speculation = false;
         return;
     }
     let providers = &config.speculative.providers;
@@ -568,6 +602,7 @@ fn propose_drafts(
 struct Produced {
     tokens: Vec<u32>,
     accepted: u64,
+    proposed: u64,
 }
 
 fn verify_and_sample(
@@ -577,6 +612,7 @@ fn verify_and_sample(
     remaining: usize,
     metrics: &Metrics,
 ) -> Result<Produced, AllpacaError> {
+    let drafts_len = drafts.len() as u64;
     let mut produced = Vec::new();
     let mut accepted = 0u64;
     let mut draft_iter = drafts.into_iter().peekable();
@@ -606,6 +642,76 @@ fn verify_and_sample(
     Ok(Produced {
         tokens: produced,
         accepted,
+        proposed: drafts_len,
+    })
+}
+
+fn verify_forest(
+    inner: &mut EngineInner,
+    forest: &TokenForest,
+    mask: Option<&allpaca_types::TokenMask>,
+    remaining: usize,
+    metrics: &Metrics,
+) -> Result<Produced, AllpacaError> {
+    let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
+    if !forest.nodes.is_empty() {
+        let pages = inner
+            .active
+            .as_ref()
+            .map(|a| a.pages.clone())
+            .unwrap_or_default();
+        let prompt_len = inner.active.as_ref().map(|a| a.tokens.len()).unwrap_or(0);
+        let target = inner
+            .target
+            .clone()
+            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
+        // Ancestry-masked packed verify (CPU). HIP path stays sequential.
+        target.forward_forest(forest, &pages, &inner.kv, prompt_len, &mut node_logits)?;
+        let _ = node_logits;
+    }
+
+    let mut produced = Vec::new();
+    let mut accepted_tokens = Vec::new();
+    let mut parent = -1i32;
+    while produced.len() < remaining {
+        let (mut logits, params) = {
+            let active = inner
+                .active
+                .as_ref()
+                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+            (active.pending_logits.clone(), active.params.clone())
+        };
+        let sampled = {
+            let active = inner.active.as_mut().unwrap();
+            sample(&mut logits, mask, &params, &mut active.rng)
+        };
+        produced.push(sampled);
+        let child = forest.children(parent).find(|&i| forest.nodes[i].token_id as u32 == sampled);
+        if let Some(idx) = child {
+            accepted_tokens.push(sampled);
+            parent = idx as i32;
+        }
+        append_and_forward(inner, sampled, metrics)?;
+        if is_stop(sampled, &params) || child.is_none() || forest.children(parent).next().is_none()
+        {
+            break;
+        }
+    }
+    let path_valid = forest.is_valid_path(&accepted_tokens);
+    if !path_valid {
+        metrics
+            .tree_path_invalid
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    metrics.tree_accepted_path_len.fetch_add(
+        accepted_tokens.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(Produced {
+        tokens: produced,
+        accepted: accepted_tokens.len() as u64,
+        proposed: forest.nodes.len() as u64,
     })
 }
 
@@ -839,6 +945,141 @@ mod tests {
             )
             .unwrap();
         assert!(!out.token_ids.is_empty(), "generate still works after KV spill");
+    }
+
+    #[test]
+    fn disabling_tree_falls_back_to_linear_draft() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+
+        let mut cfg = test_config();
+        cfg.speculative.tree.enabled = true;
+        cfg.features.tree_speculation = Some(false);
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(true);
+        let engine = Engine::new(cfg).expect("disabling Token Forest must not be Fatal");
+        let out = engine.generate("hello", params).expect("linear Draft Provider fallback");
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert_eq!(
+            stats.tree_nodes, 0,
+            "disabled tree Feature Flag must not build a Token Forest; stats={stats:?}"
+        );
+        assert!(
+            stats.draft_proposed > 0,
+            "Engine must fall back to linear NGram/DraftModel providers; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn tree_accepted_prefix_is_valid_forest_path() {
+        let mut cfg = test_config();
+        cfg.speculative.tree.enabled = true;
+        cfg.speculative.tree.max_nodes = 16;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(true);
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.tree_nodes > 0,
+            "Token Forest must be built when the Feature Flag is on"
+        );
+        assert!(
+            stats.tree_path_valid,
+            "accepted prefix must be a valid ancestry path; stats={stats:?}"
+        );
+        assert!(
+            stats.tree_accepted_path_len <= stats.tree_nodes,
+            "accepted path cannot be longer than the forest; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn tree_speculation_proposes_multiple_branches() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+
+        let mut linear_cfg = test_config();
+        linear_cfg.speculative.tree.enabled = false;
+        linear_cfg.features.draft_model_speculation = Some(true);
+        linear_cfg.features.ngram_speculation = Some(true);
+        let linear = Engine::new(linear_cfg).unwrap();
+        linear.generate("hello", params.clone()).unwrap();
+        let linear_stats = linear.stats();
+
+        let mut tree_cfg = test_config();
+        tree_cfg.speculative.tree.enabled = true;
+        tree_cfg.speculative.tree.max_nodes = 16;
+        tree_cfg.features.draft_model_speculation = Some(true);
+        tree_cfg.features.ngram_speculation = Some(true);
+        let tree = Engine::new(tree_cfg).unwrap();
+        tree.generate("hello", params).unwrap();
+        let tree_stats = tree.stats();
+
+        assert!(
+            tree_stats.tree_nodes > 1,
+            "Token Forest must propose multiple candidate nodes; stats={tree_stats:?}"
+        );
+        assert!(
+            tree_stats.tree_nodes > linear_stats.draft_proposed
+                || tree_stats.draft_proposed > linear_stats.draft_proposed
+                || tree_stats.accepted_tokens_per_target_eval
+                    > linear_stats.accepted_tokens_per_target_eval,
+            "tree must expose more candidates than linear-only; tree={tree_stats:?} linear={linear_stats:?}"
+        );
+    }
+
+    #[test]
+    fn tree_speculation_generate_matches_greedy_without_tree() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+
+        let mut with_tree = test_config();
+        with_tree.speculative.tree.enabled = true;
+        with_tree.speculative.tree.max_nodes = 16;
+        with_tree.features.draft_model_speculation = Some(true);
+        with_tree.features.ngram_speculation = Some(true);
+        let tree_engine = Engine::new(with_tree).unwrap();
+        let tree_out = tree_engine.generate("hello", params.clone()).unwrap();
+        assert!(
+            !tree_out.token_ids.is_empty(),
+            "tree-enabled generate must still produce tokens"
+        );
+
+        let mut no_tree = test_config();
+        no_tree.speculative.tree.enabled = false;
+        no_tree.features.draft_model_speculation = Some(true);
+        no_tree.features.ngram_speculation = Some(true);
+        let baseline = Engine::new(no_tree).unwrap();
+        let base_out = baseline.generate("hello", params).unwrap();
+        assert_eq!(
+            tree_out.token_ids, base_out.token_ids,
+            "Target Model must decide tokens when Token Forest is enabled"
+        );
     }
 
     #[test]
