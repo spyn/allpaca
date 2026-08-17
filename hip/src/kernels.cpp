@@ -162,9 +162,34 @@ __global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, 
 constexpr int Q8_STAGED_STRIDE = 36;
 constexpr int Q8_STAGED_QS = 4;
 
-/* Decode Q8 GEMV: 8 cols/warp, 16 warps, shared A tiles (no per-column A reload). */
-__global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
-                                    int k) {
+#ifndef ALLPACA_Q8_GEMV_INTDOT
+/* Decode default stays float A × Q8: int-dot was not faster (weight-load bound). */
+#define ALLPACA_Q8_GEMV_INTDOT 0
+#endif
+
+__device__ inline int32_t i8dot4(uint32_t a, uint32_t b, int32_t c) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    union {
+        uint32_t u;
+        char4 c4;
+    } ua, ub;
+    ua.u = a;
+    ub.u = b;
+    return amd_mixed_dot(ua.c4, ub.c4, c, false);
+#else
+    int32_t acc = c;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        acc += static_cast<int32_t>(static_cast<int8_t>((a >> (8 * i)) & 0xff)) *
+               static_cast<int32_t>(static_cast<int8_t>((b >> (8 * i)) & 0xff));
+    }
+    return acc;
+#endif
+}
+
+/* Float A × Q8 weight (fallback if integer MAC is slower). */
+__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                        int k) {
     constexpr int WARPS = 16;
     constexpr int COLS = 8;
     constexpr int SUB = 4;
@@ -215,6 +240,87 @@ __global__ void gemv_nt_q8_0_kernel(const float *a, const uint8_t *b, float *c, 
                 dot += as[6] * static_cast<float>(static_cast<int8_t>((qhi >> 16) & 0xff));
                 dot += as[7] * static_cast<float>(static_cast<int8_t>((qhi >> 24) & 0xff));
                 acc += d * dot;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int off = 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 4);
+    }
+    if (col < n && sublane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+/* Decode Q8 GEMV: quantize A tiles to int8, int32 MAC with Q8 weights (ggml vec_dot_q8 idea). */
+__global__ void gemv_nt_q8_0_intdot_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                           int k) {
+    constexpr int WARPS = 16;
+    constexpr int COLS = 8;
+    constexpr int SUB = 4;
+    constexpr int TILE = 8;
+    __shared__ float As[TILE * 32];
+    __shared__ int8_t Aq[TILE * 32];
+    __shared__ float Ad[TILE];
+
+    const int row = static_cast<int>(blockIdx.y);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int sub = lane / SUB;
+    const int sublane = lane % SUB;
+    const int col = (static_cast<int>(blockIdx.x) * WARPS + warp) * COLS + sub;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const size_t row_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
+    const uint8_t *brow = (col < n) ? b + static_cast<size_t>(col) * row_stride : nullptr;
+    float acc = 0.0f;
+    const int tid = static_cast<int>(threadIdx.x);
+
+    for (int blk0 = 0; blk0 < nblocks; blk0 += TILE) {
+        const int ntile = (blk0 + TILE <= nblocks) ? TILE : (nblocks - blk0);
+        const int a0 = blk0 * 32;
+        const int nfloat = ntile * 32;
+        for (int i = tid; i < nfloat; i += static_cast<int>(blockDim.x)) {
+            const int gi = a0 + i;
+            As[i] = (gi < k) ? arow[gi] : 0.0f;
+        }
+        __syncthreads();
+
+        if (warp < ntile) {
+            const float v = As[warp * 32 + lane];
+            float amax = fabsf(v);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+            }
+            const float d = (amax == 0.0f) ? 0.0f : amax / 127.0f;
+            const float inv = (d == 0.0f) ? 0.0f : 1.0f / d;
+            int q = static_cast<int>(roundf(v * inv));
+            q = q > 127 ? 127 : (q < -127 ? -127 : q);
+            Aq[warp * 32 + lane] = static_cast<int8_t>(q);
+            if (lane == 0) {
+                Ad[warp] = d;
+            }
+        }
+        __syncthreads();
+
+        if (brow) {
+            for (int t = 0; t < ntile; ++t) {
+                const uint8_t *bp = brow + static_cast<size_t>(blk0 + t) * Q8_STAGED_STRIDE;
+                const float dw = *reinterpret_cast<const float *>(bp);
+                const int qbase = sublane * 8;
+                const uint8_t *qp = bp + Q8_STAGED_QS + qbase;
+                const uint32_t qlo = *reinterpret_cast<const uint32_t *>(qp);
+                const uint32_t qhi = *reinterpret_cast<const uint32_t *>(qp + 4);
+                const uint32_t alo = *reinterpret_cast<const uint32_t *>(Aq + t * 32 + qbase);
+                const uint32_t ahi = *reinterpret_cast<const uint32_t *>(Aq + t * 32 + qbase + 4);
+                const int32_t sumi = i8dot4(alo, qlo, i8dot4(ahi, qhi, 0));
+                acc += Ad[t] * dw * static_cast<float>(sumi);
             }
         }
         __syncthreads();
@@ -515,7 +621,7 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
 }
 
 static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
-                               int32_t k, hipStream_t stream) {
+                               int32_t k, hipStream_t stream, int intdot) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
@@ -526,7 +632,11 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     dim3 block(512);
     dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
               static_cast<unsigned>(m));
-    hipLaunchKernelGGL(gemv_nt_q8_0_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    if (intdot) {
+        hipLaunchKernelGGL(gemv_nt_q8_0_intdot_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    } else {
+        hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    }
     return hip_status(hipGetLastError());
 }
 
@@ -820,7 +930,12 @@ extern "C" int allpaca_gemm_nt(const float *a, const float *b, float *c, int32_t
 
 extern "C" int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                     int32_t k, allpaca_stream_t stream) {
-    return launch_gemm_nt_q8_0(a, b, c, m, n, k, as_stream(stream));
+    return launch_gemm_nt_q8_0(a, b, c, m, n, k, as_stream(stream), ALLPACA_Q8_GEMV_INTDOT);
+}
+
+extern "C" int allpaca_gemm_nt_q8_0_intdot(const float *a, const uint8_t *b, float *c, int32_t m,
+                                           int32_t n, int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_q8_0(a, b, c, m, n, k, as_stream(stream), 1);
 }
 
 extern "C" int allpaca_attention(const float *q, const float *k, const float *v, float *out,
@@ -1226,6 +1341,11 @@ extern "C" int allpaca_gemm_nt(const float *, const float *, float *, int32_t, i
 
 extern "C" int allpaca_gemm_nt_q8_0(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q8_0_intdot(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                           int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
