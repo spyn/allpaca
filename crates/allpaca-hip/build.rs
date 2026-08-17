@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HIP_PATH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rustc-check-cfg=cfg(allpaca_hip_runtime)");
+    println!("cargo:rustc-check-cfg=cfg(allpaca_rocblas)");
 
     if env::var("CARGO_FEATURE_HIP").is_err() {
         return;
@@ -38,6 +39,10 @@ fn main() {
     println!("cargo:rustc-link-lib=amdhip64");
     if cfg!(windows) {
         println!("cargo:rustc-link-lib=dylib=amdhip64");
+    }
+    if rocblas_lib_exists(&hip_root) {
+        println!("cargo:rustc-link-lib=rocblas");
+        println!("cargo:rustc-cfg=allpaca_rocblas");
     }
     println!("cargo:rustc-cfg=allpaca_hip_runtime");
 }
@@ -81,6 +86,12 @@ fn find_hip_root() -> Option<PathBuf> {
     None
 }
 
+fn rocblas_lib_exists(hip_root: &Path) -> bool {
+    hip_root.join("lib/rocblas.lib").is_file()
+        || hip_root.join("lib/librocblas.so").is_file()
+        || hip_root.join("lib/librocblas.a").is_file()
+}
+
 fn hip_looks_valid(root: &Path) -> bool {
     root.join("include/hip/hip_runtime.h").is_file()
         && (root.join("bin/hipcc.exe").is_file() || root.join("bin/hipcc").is_file())
@@ -107,16 +118,21 @@ fn try_hipcc(hip_root: &Path, out: &Path) -> Result<(), String> {
     let src = manifest_hip_dir().join("src/kernels.cpp");
     let obj = out.join(if cfg!(windows) { "kernels.obj" } else { "kernels.o" });
     let include = manifest_hip_dir().join("include");
+    let mut extra = String::new();
+    if rocblas_lib_exists(hip_root) {
+        extra.push_str(" -DALLPACA_HAS_ROCBLAS");
+    }
     let output = if cfg!(windows) {
         let vcvars = find_vcvars64().ok_or_else(|| "vcvars64.bat not found (need MSVC for hipcc)".to_string())?;
         let bat = out.join("build_kernels.bat");
         let script = format!(
-            "@echo off\r\ncall \"{vc}\"\r\n\"{hipcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\" --offload-arch=gfx1201 --offload-arch=gfx1200 --offload-arch=gfx1100\r\n",
+            "@echo off\r\ncall \"{vc}\"\r\n\"{hipcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\"{extra} --offload-arch=gfx1201 --offload-arch=gfx1200 --offload-arch=gfx1100\r\n",
             vc = vcvars.display(),
             hipcc = hipcc.display(),
             src = src.display(),
             obj = obj.display(),
             inc = include.display(),
+            extra = extra,
         );
         std::fs::write(&bat, script).map_err(|e| format!("write bat: {e}"))?;
         Command::new("cmd")
@@ -126,8 +142,8 @@ fn try_hipcc(hip_root: &Path, out: &Path) -> Result<(), String> {
             .output()
             .map_err(|e| format!("spawn hipcc via vcvars: {e}"))?
     } else {
-        Command::new(&hipcc)
-            .arg("-c")
+        let mut cmd = Command::new(&hipcc);
+        cmd.arg("-c")
             .arg(&src)
             .arg("-o")
             .arg(&obj)
@@ -137,8 +153,11 @@ fn try_hipcc(hip_root: &Path, out: &Path) -> Result<(), String> {
             .arg("--offload-arch=gfx1201")
             .arg("--offload-arch=gfx1200")
             .arg("--offload-arch=gfx1100")
-            .env("HIP_PATH", hip_root)
-            .output()
+            .env("HIP_PATH", hip_root);
+        if rocblas_lib_exists(hip_root) {
+            cmd.arg("-DALLPACA_HAS_ROCBLAS");
+        }
+        cmd.output()
             .map_err(|e| format!("spawn hipcc: {e}"))?
     };
     if !output.status.success() {

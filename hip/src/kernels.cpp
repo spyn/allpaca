@@ -10,6 +10,11 @@
 
 #if ALLPACA_HAS_HIP
 
+#ifdef ALLPACA_HAS_ROCBLAS
+#include <mutex>
+#include <rocblas/rocblas.h>
+#endif
+
 __device__ float allpaca_f16_bits_to_f32(uint16_t h);
 __device__ float allpaca_f16le_to_f32(const uint8_t *p);
 
@@ -595,12 +600,49 @@ static int launch_gemm(const float *a, const float *b, float *c, int32_t m, int3
     return hip_status(hipGetLastError());
 }
 
+#ifdef ALLPACA_HAS_ROCBLAS
+/* Row-major C[m,n] = A[m,k] * B[n,k]^T via column-major rocBLAS (swap A/B, N/M). */
+static int launch_gemm_nt_rocblas(const float *a, const float *b, float *c, int32_t m, int32_t n,
+                                  int32_t k, hipStream_t stream) {
+    static std::mutex mu;
+    static rocblas_handle handle = nullptr;
+    static bool tried = false;
+    std::lock_guard<std::mutex> lock(mu);
+    if (!tried) {
+        tried = true;
+        if (rocblas_create_handle(&handle) != rocblas_status_success) {
+            handle = nullptr;
+        }
+    }
+    if (!handle) {
+        return ALLPACA_ERR_NOT_IMPLEMENTED;
+    }
+    if (rocblas_set_stream(handle, stream) != rocblas_status_success) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    rocblas_status st = rocblas_sgemm(handle, rocblas_operation_transpose, rocblas_operation_none, n,
+                                      m, k, &alpha, b, k, a, k, &beta, c, n);
+    return st == rocblas_status_success ? ALLPACA_OK : ALLPACA_ERR_DEVICE;
+}
+#endif
+
 static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                           hipStream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+#ifdef ALLPACA_HAS_ROCBLAS
+    /* Decode is M=1; rocBLAS lost on skinny GEMV, so only wide/prefill GEMM uses it. */
+    if (m > 8) {
+        int rc = launch_gemm_nt_rocblas(a, b, c, m, n, k, stream);
+        if (rc == ALLPACA_OK) {
+            return ALLPACA_OK;
+        }
+    }
+#endif
     /* Decode is always M=1; small-M prefill stays on the coalesced GEMV. */
     if (m <= 8) {
         constexpr int warps = 8;

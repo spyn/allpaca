@@ -2786,6 +2786,35 @@ mod tests {
     }
 
     #[test]
+    fn engine_generate_from_f16_gguf() {
+        let path = std::env::temp_dir().join("allpaca_target_f16.gguf");
+        write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::F16, allpaca_gguf::quantize_f16);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("F16 GGUF must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("generate must work on F16 weights");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn engine_generate_from_q6k_gguf() {
         let path = std::env::temp_dir().join("allpaca_target_q6k.gguf");
         write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::Q6_K, allpaca_gguf::quantize_q6_k);

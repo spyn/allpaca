@@ -299,7 +299,7 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// Materialize a tensor as F32. Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K dequantize on CPU; other quants are Fatal.
+    /// Materialize a tensor as F32. F16 / Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K convert on CPU; other quants are Fatal.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, AllpacaError> {
         let info = self.tensor(name).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
@@ -323,6 +323,21 @@ impl GgufFile {
                         self.mmap[off + 2],
                         self.mmap[off + 3],
                     ]);
+                }
+                Ok(out)
+            }
+            GgmlType::F16 => {
+                let bytes = n.saturating_mul(2);
+                if start.saturating_add(bytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} F16 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let off = start + i * 2;
+                    let h = u16::from_le_bytes([self.mmap[off], self.mmap[off + 1]]);
+                    *slot = allpaca_cpu::f16_to_f32(h);
                 }
                 Ok(out)
             }
@@ -667,6 +682,31 @@ mod tests {
             file.meta_f32("llama.attention.layer_norm_rms_epsilon")
                 .is_some_and(|e| (e - 1e-5).abs() < 1e-8)
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn f16_tensor_load_materializes_to_f32() {
+        let path = std::env::temp_dir().join("allpaca_gguf_f16.gguf");
+        let values = [1.0f32, -2.0, 0.5, 3.25];
+        let mut payload = Vec::with_capacity(values.len() * 2);
+        for v in values {
+            payload.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+        }
+        write_typed_gguf(&path, 1, &payload, values.len() as u64);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::F16);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("F16 must materialize to F32");
+        assert_eq!(loaded.len(), values.len());
+        for (i, (got, exp)) in loaded.iter().zip(values).enumerate() {
+            assert!(
+                (*got - exp).abs() < 1e-3,
+                "F16 mismatch at {i}: {got} vs {exp}"
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 

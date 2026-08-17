@@ -1260,6 +1260,33 @@ fn hip_generate_from_tiny_q6k_gguf() {
 
 #[cfg(feature = "hip")]
 #[test]
+fn hip_generate_from_tiny_f16_gguf() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_generate_from_tiny_f16_gguf: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_hip_tiny_f16.gguf");
+    write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::F16, allpaca_gguf::quantize_f16);
+    let mut cfg = hip_7b_config(path.clone());
+    cfg.kv.page_tokens = 8;
+    cfg.kv.vram_bytes = 16 * 1024 * 1024;
+    cfg.kv.dram_bytes = 16 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("tiny F16 GGUF must load on HIP");
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("skip hip_generate_from_tiny_f16_gguf: no HIP device");
+        return;
+    }
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("tiny F16 HIP generate must produce tokens");
+    assert!(!out.token_ids.is_empty());
+    assert_eq!(engine.stats().backend, "hip");
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "hip")]
+#[test]
 fn hip_generate_from_tiny_q4k_q6k_gguf() {
     if allpaca_hip::device_count() == 0 {
         eprintln!("skip hip_generate_from_tiny_q4k_q6k_gguf: no HIP device");
