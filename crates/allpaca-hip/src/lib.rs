@@ -860,6 +860,13 @@ pub fn gemm_nt_device(
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
         let rc = unsafe { ffi::allpaca_gemm_nt(a, b, c, m, n, k, std::ptr::null_mut()) };
+        #[cfg(allpaca_hipblaslt)]
+        if rc == ALLPACA_OK {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!("F32 gemm_nt: hipBLASLt linked; first successful launch");
+            });
+        }
         status(rc, "gemm_nt")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2724,6 +2731,7 @@ mod tests {
             (64, 128, 64),
             (1, 129, 33),
             (1, 1024, 64),
+            (1, 2048, 2048),
         ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let mut a = vec![0.0f32; m * k];
@@ -2746,6 +2754,14 @@ mod tests {
                     hip[i],
                     cpu[i]
                 );
+            }
+            if m == 64 && n == 128 && k == 64 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..20 {
+                    gemm_nt(&a, &b, &mut hip, m as i32, n as i32, k as i32)
+                        .expect("HIP gemm_nt 64x128x64 timing");
+                }
+                eprintln!("gemm_nt 64x128x64 x20 {:?}", t0.elapsed());
             }
         }
     }

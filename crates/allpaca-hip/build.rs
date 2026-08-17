@@ -15,6 +15,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rustc-check-cfg=cfg(allpaca_hip_runtime)");
     println!("cargo:rustc-check-cfg=cfg(allpaca_rocblas)");
+    println!("cargo:rustc-check-cfg=cfg(allpaca_hipblaslt)");
 
     if env::var("CARGO_FEATURE_HIP").is_err() {
         return;
@@ -28,7 +29,16 @@ fn main() {
     };
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    if let Err(e) = build_kernels(&hip_root, &out) {
+    let mut hipblaslt = hipblaslt_present(&hip_root);
+    if hipblaslt && cfg!(windows) {
+        if let Err(e) = generate_hipblaslt_import_lib(&hip_root, &out) {
+            println!(
+                "cargo:warning=hipBLASLt MSVC import lib failed ({e}); compiling without hipBLASLt"
+            );
+            hipblaslt = false;
+        }
+    }
+    if let Err(e) = build_kernels(&hip_root, &out, hipblaslt) {
         println!("cargo:warning=HIP kernel build failed ({e}); hip feature is stub-only.");
         return;
     }
@@ -43,6 +53,10 @@ fn main() {
     if rocblas_lib_exists(&hip_root) {
         println!("cargo:rustc-link-lib=rocblas");
         println!("cargo:rustc-cfg=allpaca_rocblas");
+    }
+    if hipblaslt {
+        println!("cargo:rustc-link-lib=hipblaslt");
+        println!("cargo:rustc-cfg=allpaca_hipblaslt");
     }
     println!("cargo:rustc-cfg=allpaca_hip_runtime");
 }
@@ -92,13 +106,115 @@ fn rocblas_lib_exists(hip_root: &Path) -> bool {
         || hip_root.join("lib/librocblas.a").is_file()
 }
 
+fn hipblaslt_present(hip_root: &Path) -> bool {
+    let hdr = hip_root.join("include/hipblaslt/hipblaslt.h");
+    if !hdr.is_file() {
+        return false;
+    }
+    hip_root.join("bin/libhipblaslt.dll").is_file()
+        || hip_root.join("bin/hipblaslt.dll").is_file()
+        || hip_root.join("lib/libhipblaslt.so").is_file()
+        || hip_root.join("lib/hipblaslt.lib").is_file()
+}
+
+fn find_msvc_tool(name: &str) -> Option<PathBuf> {
+    let pf86 = env::var_os("ProgramFiles(x86)")?;
+    let vswhere = PathBuf::from(pf86).join(r"Microsoft Visual Studio\Installer\vswhere.exe");
+    if !vswhere.is_file() {
+        return None;
+    }
+    let out = Command::new(&vswhere)
+        .args(["-latest", "-find", &format!(r"**\Hostx64\x64\{name}")])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    let p = PathBuf::from(path);
+    p.is_file().then_some(p)
+}
+
+/// MinGW `libhipblaslt.dll.a` is not an MSVC import lib. Build one from the DLL.
+fn generate_hipblaslt_import_lib(hip_root: &Path, out: &Path) -> Result<(), String> {
+    if hip_root.join("lib/hipblaslt.lib").is_file() {
+        return Ok(());
+    }
+    let lib_out = out.join("hipblaslt.lib");
+    if lib_out.is_file() {
+        return Ok(());
+    }
+    let dll = if hip_root.join("bin/libhipblaslt.dll").is_file() {
+        hip_root.join("bin/libhipblaslt.dll")
+    } else {
+        hip_root.join("bin/hipblaslt.dll")
+    };
+    if !dll.is_file() {
+        return Err("hipBLASLt DLL not found".into());
+    }
+    println!("cargo:rerun-if-changed={}", dll.display());
+    let dumpbin = find_msvc_tool("dumpbin.exe").ok_or_else(|| "dumpbin.exe not found".to_string())?;
+    let libexe = find_msvc_tool("lib.exe").ok_or_else(|| "lib.exe not found".to_string())?;
+    let output = Command::new(&dumpbin)
+        .arg("/EXPORTS")
+        .arg(&dll)
+        .output()
+        .map_err(|e| format!("dumpbin: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "dumpbin /EXPORTS failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut names: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t.contains('?') || t.contains('@') {
+            continue;
+        }
+        let Some(name) = t.split_whitespace().last() else {
+            continue;
+        };
+        if name.starts_with("hipblasLt") && name.chars().all(|c| c.is_ascii_alphanumeric()) {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Err("no undecorated hipblasLt exports".into());
+    }
+    let def_path = out.join("hipblaslt.def");
+    let mut def = String::from("LIBRARY libhipblaslt.dll\r\nEXPORTS\r\n");
+    for n in &names {
+        def.push_str(n);
+        def.push_str("\r\n");
+    }
+    std::fs::write(&def_path, def).map_err(|e| format!("write def: {e}"))?;
+    let st = Command::new(&libexe)
+        .arg(format!("/DEF:{}", def_path.display()))
+        .arg(format!("/OUT:{}", lib_out.display()))
+        .arg("/MACHINE:X64")
+        .status()
+        .map_err(|e| format!("lib.exe: {e}"))?;
+    if !st.success() || !lib_out.is_file() {
+        return Err("lib.exe failed to write hipblaslt.lib".into());
+    }
+    Ok(())
+}
+
 fn hip_looks_valid(root: &Path) -> bool {
     root.join("include/hip/hip_runtime.h").is_file()
         && (root.join("bin/hipcc.exe").is_file() || root.join("bin/hipcc").is_file())
 }
 
-fn build_kernels(hip_root: &Path, out: &Path) -> Result<(), String> {
-    match try_hipcc(hip_root, out) {
+fn build_kernels(hip_root: &Path, out: &Path, hipblaslt: bool) -> Result<(), String> {
+    match try_hipcc(hip_root, out, hipblaslt) {
         Ok(()) => return Ok(()),
         Err(e) => println!("cargo:warning=hipcc path failed: {e}"),
     }
@@ -113,7 +229,7 @@ fn hipcc_bin(hip_root: &Path) -> PathBuf {
     }
 }
 
-fn try_hipcc(hip_root: &Path, out: &Path) -> Result<(), String> {
+fn try_hipcc(hip_root: &Path, out: &Path, hipblaslt: bool) -> Result<(), String> {
     let hipcc = hipcc_bin(hip_root);
     let src = manifest_hip_dir().join("src/kernels.cpp");
     let obj = out.join(if cfg!(windows) { "kernels.obj" } else { "kernels.o" });
@@ -121,6 +237,9 @@ fn try_hipcc(hip_root: &Path, out: &Path) -> Result<(), String> {
     let mut extra = String::new();
     if rocblas_lib_exists(hip_root) {
         extra.push_str(" -DALLPACA_HAS_ROCBLAS");
+    }
+    if hipblaslt {
+        extra.push_str(" -DALLPACA_HAS_HIPBLASLT");
     }
     let output = if cfg!(windows) {
         let vcvars = find_vcvars64().ok_or_else(|| "vcvars64.bat not found (need MSVC for hipcc)".to_string())?;
@@ -156,6 +275,9 @@ fn try_hipcc(hip_root: &Path, out: &Path) -> Result<(), String> {
             .env("HIP_PATH", hip_root);
         if rocblas_lib_exists(hip_root) {
             cmd.arg("-DALLPACA_HAS_ROCBLAS");
+        }
+        if hipblaslt {
+            cmd.arg("-DALLPACA_HAS_HIPBLASLT");
         }
         cmd.output()
             .map_err(|e| format!("spawn hipcc: {e}"))?

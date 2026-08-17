@@ -10,9 +10,17 @@
 
 #if ALLPACA_HAS_HIP
 
-#ifdef ALLPACA_HAS_ROCBLAS
+#if defined(ALLPACA_HAS_ROCBLAS) || defined(ALLPACA_HAS_HIPBLASLT)
 #include <mutex>
+#endif
+#ifdef ALLPACA_HAS_ROCBLAS
 #include <rocblas/rocblas.h>
+#endif
+#ifdef ALLPACA_HAS_HIPBLASLT
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <hipblaslt/hipblaslt.h>
 #endif
 
 __device__ float allpaca_f16_bits_to_f32(uint16_t h);
@@ -628,12 +636,265 @@ static int launch_gemm_nt_rocblas(const float *a, const float *b, float *c, int3
 }
 #endif
 
+#ifdef ALLPACA_HAS_HIPBLASLT
+static void ensure_hipblaslt_tensile_path() {
+    const char *cur = std::getenv("HIPBLASLT_TENSILE_LIBPATH");
+    if (cur && cur[0]) {
+        return;
+    }
+    const char *hip = std::getenv("HIP_PATH");
+    if (!hip || !hip[0]) {
+        hip = std::getenv("ROCM_PATH");
+    }
+    if (!hip || !hip[0]) {
+        return;
+    }
+    size_t n = std::strlen(hip);
+    while (n > 0 && (hip[n - 1] == '\\' || hip[n - 1] == '/')) {
+        n--;
+    }
+    char path[1024];
+#ifdef _WIN32
+    const char *fmt = "%.*s\\bin\\hipblaslt\\library";
+#else
+    const char *fmt = "%.*s/bin/hipblaslt/library";
+#endif
+    if (std::snprintf(path, sizeof(path), fmt, static_cast<int>(n), hip) < 0) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s("HIPBLASLT_TENSILE_LIBPATH", path);
+#else
+    setenv("HIPBLASLT_TENSILE_LIBPATH", path, 0);
+#endif
+}
+
+struct HipblasLtDescs {
+    hipblasLtMatrixLayout_t a = nullptr;
+    hipblasLtMatrixLayout_t b = nullptr;
+    hipblasLtMatrixLayout_t c = nullptr;
+    hipblasLtMatmulDesc_t desc = nullptr;
+    hipblasLtMatmulPreference_t pref = nullptr;
+    ~HipblasLtDescs() {
+        if (a) {
+            hipblasLtMatrixLayoutDestroy(a);
+        }
+        if (b) {
+            hipblasLtMatrixLayoutDestroy(b);
+        }
+        if (c) {
+            hipblasLtMatrixLayoutDestroy(c);
+        }
+        if (desc) {
+            hipblasLtMatmulDescDestroy(desc);
+        }
+        if (pref) {
+            hipblasLtMatmulPreferenceDestroy(pref);
+        }
+    }
+};
+
+/* Column-major swap matching rocBLAS: C_col[n,m] = B[n,k]^T * A[m,k].
+ * Row-major ORDER_ROW found algos on gfx1201 but mismatched CPU (e.g. 1x8x4). */
+static int lt_make_col_rocblas(HipblasLtDescs *d, int32_t m, int32_t n, int32_t k) {
+    if (hipblasLtMatrixLayoutCreate(&d->a, HIP_R_32F, static_cast<uint64_t>(k),
+                                    static_cast<uint64_t>(n), k) != HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (hipblasLtMatrixLayoutCreate(&d->b, HIP_R_32F, static_cast<uint64_t>(k),
+                                    static_cast<uint64_t>(m), k) != HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (hipblasLtMatrixLayoutCreate(&d->c, HIP_R_32F, static_cast<uint64_t>(n),
+                                    static_cast<uint64_t>(m), n) != HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (hipblasLtMatmulDescCreate(&d->desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) !=
+        HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    hipblasOperation_t transA = HIPBLAS_OP_T;
+    hipblasOperation_t transB = HIPBLAS_OP_N;
+    if (hipblasLtMatmulDescSetAttribute(d->desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transA,
+                                        sizeof(transA)) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescSetAttribute(d->desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transB,
+                                        sizeof(transB)) != HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return ALLPACA_OK;
+}
+
+struct HipblasLtDev {
+    hipblasLtHandle_t handle = nullptr;
+    bool tried = false;
+    void *workspace = nullptr;
+    size_t workspace_bytes = 0;
+    int32_t cache_m = 0;
+    int32_t cache_n = 0;
+    int32_t cache_k = 0;
+    int cache_status = 0;
+    hipblasLtMatmulAlgo_t algo{};
+    size_t algo_ws = 0;
+};
+
+static int lt_grow_workspace(HipblasLtDev *st, size_t need, hipStream_t stream) {
+    if (need == 0) {
+        return ALLPACA_OK;
+    }
+    if (need <= st->workspace_bytes && st->workspace) {
+        return ALLPACA_OK;
+    }
+    if (st->workspace) {
+        (void)hipStreamSynchronize(stream);
+        (void)hipFree(st->workspace);
+        st->workspace = nullptr;
+        st->workspace_bytes = 0;
+    }
+    size_t bytes = (need + 15u) & ~size_t{15};
+    if (hipMalloc(&st->workspace, bytes) != hipSuccess) {
+        st->workspace = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    st->workspace_bytes = bytes;
+    return ALLPACA_OK;
+}
+
+static int lt_run(HipblasLtDev *st, const float *a, const float *b, float *c, int32_t m, int32_t n,
+                  int32_t k, hipStream_t stream, int *out_algos) {
+    HipblasLtDescs d;
+    int rc = lt_make_col_rocblas(&d, m, n, k);
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    if (hipblasLtMatmulPreferenceCreate(&d.pref) != HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    const uint64_t max_ws = 64ull * 1024ull * 1024ull;
+    if (hipblasLtMatmulPreferenceSetAttribute(d.pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &max_ws, sizeof(max_ws)) != HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    hipblasLtMatmulAlgo_t algo{};
+    size_t ws = 0;
+    bool have_algo = st->cache_status == 1 && st->cache_m == m && st->cache_n == n && st->cache_k == k;
+    if (have_algo) {
+        algo = st->algo;
+        ws = st->algo_ws;
+        if (out_algos) {
+            *out_algos = 1;
+        }
+    } else {
+        hipblasLtMatmulHeuristicResult_t heur[8];
+        int returned = 0;
+        hipblasStatus_t hs = hipblasLtMatmulAlgoGetHeuristic(st->handle, d.desc, d.a, d.b, d.c, d.c,
+                                                             d.pref, 8, heur, &returned);
+        if (out_algos) {
+            *out_algos = returned;
+        }
+        if (hs != HIPBLAS_STATUS_SUCCESS || returned <= 0) {
+            return ALLPACA_ERR_NOT_IMPLEMENTED;
+        }
+        bool picked = false;
+        for (int i = 0; i < returned; i++) {
+            if (heur[i].state != HIPBLAS_STATUS_SUCCESS) {
+                continue;
+            }
+            algo = heur[i].algo;
+            ws = heur[i].workspaceSize;
+            picked = true;
+            break;
+        }
+        if (!picked) {
+            return ALLPACA_ERR_NOT_IMPLEMENTED;
+        }
+    }
+    if (lt_grow_workspace(st, ws, stream) != ALLPACA_OK) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    hipblasStatus_t ms =
+        hipblasLtMatmul(st->handle, d.desc, &alpha, b, d.a, a, d.b, &beta, c, d.c, c, d.c, &algo,
+                        st->workspace, st->workspace_bytes, stream);
+    if (ms != HIPBLAS_STATUS_SUCCESS) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    st->cache_m = m;
+    st->cache_n = n;
+    st->cache_k = k;
+    st->cache_status = 1;
+    st->algo = algo;
+    st->algo_ws = ws;
+    return ALLPACA_OK;
+}
+
+static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, hipStream_t stream) {
+    static std::mutex mu;
+    static HipblasLtDev devs[16];
+    static bool tensile_set = false;
+    static bool logged_ok = false;
+    static bool logged_miss = false;
+    std::lock_guard<std::mutex> lock(mu);
+    if (!tensile_set) {
+        tensile_set = true;
+        ensure_hipblaslt_tensile_path();
+    }
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= 16) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    HipblasLtDev &st = devs[device];
+    if (!st.tried) {
+        st.tried = true;
+        if (hipblasLtCreate(&st.handle) != HIPBLAS_STATUS_SUCCESS) {
+            st.handle = nullptr;
+        }
+    }
+    if (!st.handle) {
+        return ALLPACA_ERR_NOT_IMPLEMENTED;
+    }
+    if (st.cache_status == 2 && st.cache_m == m && st.cache_n == n && st.cache_k == k) {
+        return ALLPACA_ERR_NOT_IMPLEMENTED;
+    }
+    int algos = 0;
+    int rc = lt_run(&st, a, b, c, m, n, k, stream, &algos);
+    if (rc == ALLPACA_OK) {
+        if (!logged_ok) {
+            logged_ok = true;
+            std::fprintf(stderr, "allpaca: hipBLASLt F32 GEMM ok algos=%d m=%d n=%d k=%d ws=%zu\n",
+                         algos, m, n, k, st.algo_ws);
+        }
+        return ALLPACA_OK;
+    }
+    st.cache_m = m;
+    st.cache_n = n;
+    st.cache_k = k;
+    st.cache_status = 2;
+    if (!logged_miss) {
+        logged_miss = true;
+        std::fprintf(stderr, "allpaca: hipBLASLt F32 GEMM miss m=%d n=%d k=%d algos=%d\n", m, n, k,
+                     algos);
+    }
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+#endif
+
 static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                           hipStream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+#ifdef ALLPACA_HAS_HIPBLASLT
+    /* M=1 lm_head: hipBLASLt was ~378 ms vs ~0.5 ms custom GEMV. Keep Lt for wide/prefill only. */
+    if (m > 8) {
+        int rc = launch_gemm_nt_hipblaslt(a, b, c, m, n, k, stream);
+        if (rc == ALLPACA_OK) {
+            return ALLPACA_OK;
+        }
+    }
+#endif
 #ifdef ALLPACA_HAS_ROCBLAS
     /* Decode is M=1; rocBLAS lost on skinny GEMV, so only wide/prefill GEMM uses it. */
     if (m > 8) {
