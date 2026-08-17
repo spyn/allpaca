@@ -752,6 +752,9 @@ extern "C" int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int3
     case ALLPACA_MEMCPY_D2H:
         mk = hipMemcpyDeviceToHost;
         break;
+    case ALLPACA_MEMCPY_D2H_ASYNC:
+        mk = hipMemcpyDeviceToHost;
+        break;
     case ALLPACA_MEMCPY_D2D:
         mk = hipMemcpyDeviceToDevice;
         break;
@@ -763,7 +766,7 @@ extern "C" int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int3
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
     }
-    /* Host-visible D2H is the wait point; H2D/D2D stay queued on the stream. */
+    /* Host-visible D2H is the wait point; async D2H / H2D / D2D stay queued. */
     if (kind == ALLPACA_MEMCPY_D2H) {
         return hip_status(hipStreamSynchronize(as_stream(stream)));
     }
