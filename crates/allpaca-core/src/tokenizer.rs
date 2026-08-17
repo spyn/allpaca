@@ -80,15 +80,21 @@ impl EngineTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String, AllpacaError> {
-        self.inner
-            .decode(ids, true)
-            .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))
+        let mut out = String::new();
+        for &id in ids {
+            let piece = self.decode_one(id);
+            if is_special_piece(&piece) {
+                continue;
+            }
+            out.push_str(&piece);
+        }
+        Ok(out)
     }
 
     pub fn decode_one(&self, id: u32) -> String {
         self.tokens
             .get(id as usize)
-            .cloned()
+            .map(|piece| normalize_piece(piece))
             .unwrap_or_else(|| format!("<{id}>"))
     }
 
@@ -131,6 +137,38 @@ pub fn synthetic_vocab(vocab_size: usize) -> Vec<String> {
     tokens
 }
 
+/// GPT-2 / Llama-3 BPE space marker (U+0120 LATIN CAPITAL LETTER G WITH DOT ABOVE).
+const GPT2_SPACE: char = '\u{0120}';
+/// SentencePiece / Llama-2 underline space marker (U+2581).
+const SPM_SPACE: char = '\u{2581}';
+
+fn normalize_piece(piece: &str) -> String {
+    if let Some(byte) = parse_hex_byte_token(piece) {
+        return byte_to_string(byte);
+    }
+    piece.replace(GPT2_SPACE, " ").replace(SPM_SPACE, " ")
+}
+
+fn parse_hex_byte_token(piece: &str) -> Option<u8> {
+    let rest = piece.strip_prefix("<0x")?.strip_suffix('>')?;
+    if rest.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(rest, 16).ok()
+}
+
+fn byte_to_string(byte: u8) -> String {
+    if byte.is_ascii() {
+        (byte as char).to_string()
+    } else {
+        String::from_utf8_lossy(&[byte]).into_owned()
+    }
+}
+
+fn is_special_piece(piece: &str) -> bool {
+    piece.starts_with('<') && piece.ends_with('>')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +179,26 @@ mod tests {
         let ids = tok.encode("hello").unwrap();
         assert!(ids.contains(&3));
         assert_eq!(tok.decode_one(3), "hello");
+    }
+
+    #[test]
+    fn decode_one_maps_gpt2_and_sentencepiece_space_markers() {
+        let tok = EngineTokenizer::from_vocab(
+            vec![
+                "<unk>".into(),
+                "hello".into(),
+                "Ġworld".into(),
+                "▁foo".into(),
+                "<0x0A>".into(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tok.decode_one(1), "hello");
+        assert_eq!(tok.decode_one(2), " world");
+        assert_eq!(tok.decode_one(3), " foo");
+        assert_eq!(tok.decode_one(4), "\n");
+        assert_eq!(tok.decode(&[0, 1, 2, 3]).unwrap(), "hello world foo");
     }
 }
