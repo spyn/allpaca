@@ -1617,29 +1617,98 @@ fn gguf_is_supported_q4k(path: &std::path::Path) -> bool {
 fn gated_draft_gguf() -> Option<std::path::PathBuf> {
     if let Ok(raw) = std::env::var("ALLPACA_DRAFT_GGUF") {
         let path = std::path::PathBuf::from(raw);
-        if path.is_file() {
+        if path.is_file() && looks_like_gguf(&path) {
             return Some(path);
         }
     }
     const DISCOVERED: &[&str] = &[
         r"E:\Models\huggingface\models--bartowski--Llama-3.2-1B-Instruct-GGUF",
         r"E:\Models\huggingface\models--bartowski--Llama-3.2-3B-Instruct-GGUF",
+        r"E:\Models\huggingface\models--ggml-org--Qwen2.5-Coder-0.5B-Q8_0-GGUF",
     ];
     for root in DISCOVERED {
-        let root = std::path::Path::new(root);
-        if !root.exists() {
-            continue;
+        if let Some(p) = find_gguf_under(std::path::Path::new(root)) {
+            return Some(p);
         }
-        if let Ok(walk) = std::fs::read_dir(root) {
-            for entry in walk.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("gguf") && p.is_file() {
+    }
+    None
+}
+
+#[cfg(feature = "hip")]
+fn looks_like_gguf(path: &std::path::Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        return path.is_file();
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut f, &mut magic).is_ok() && magic == allpaca_gguf::GGUF_MAGIC
+}
+
+/// HF hub cache may store the file as `snapshots/<rev>/*.gguf` or as a hash under `blobs/`.
+#[cfg(feature = "hip")]
+fn find_gguf_under(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    if root.is_file() {
+        return looks_like_gguf(root).then(|| root.to_path_buf());
+    }
+    if !root.is_dir() {
+        return None;
+    }
+    let snapshots = root.join("snapshots");
+    if snapshots.is_dir() {
+        if let Ok(commits) = std::fs::read_dir(&snapshots) {
+            for commit in commits.flatten() {
+                let dir = commit.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                if let Ok(files) = std::fs::read_dir(&dir) {
+                    for f in files.flatten() {
+                        let p = f.path();
+                        if p.extension().and_then(|e| e.to_str()) == Some("gguf") && p.is_file() {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let blobs = root.join("blobs");
+    if blobs.is_dir() {
+        if let Ok(files) = std::fs::read_dir(&blobs) {
+            for f in files.flatten() {
+                let p = f.path();
+                if p.is_file() && looks_like_gguf(&p) {
                     return Some(p);
                 }
             }
         }
     }
+    if let Ok(files) = std::fs::read_dir(root) {
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("gguf") && p.is_file() {
+                return Some(p);
+            }
+        }
+    }
     None
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn discovers_qwen_coder_05b_gguf_in_hf_cache_when_present() {
+    let root = std::path::Path::new(
+        r"E:\Models\huggingface\models--ggml-org--Qwen2.5-Coder-0.5B-Q8_0-GGUF",
+    );
+    if !root.exists() {
+        eprintln!("skip discovers_qwen_coder_05b_gguf_in_hf_cache_when_present: cache dir missing");
+        return;
+    }
+    let found = find_gguf_under(root).expect("Qwen 0.5B HF cache must contain a GGUF blob or snapshots/*.gguf");
+    assert!(found.is_file(), "discovered path must be a file: {}", found.display());
+    eprintln!("discovered draft GGUF {}", found.display());
 }
 
 #[cfg(feature = "hip")]
@@ -1858,9 +1927,10 @@ fn hip_speculative_7b_with_draft_gguf_when_path_set() {
         return;
     };
     let Some(draft) = gated_draft_gguf() else {
-        eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: set ALLPACA_DRAFT_GGUF");
+        eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: set ALLPACA_DRAFT_GGUF or place a small GGUF in the discovered HF cache dirs");
         return;
     };
+    eprintln!("speculative 7B draft path={}", draft.display());
     if allpaca_hip::device_count() < 2 {
         eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: need 2 HIP devices");
         return;
