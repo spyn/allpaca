@@ -201,4 +201,78 @@ mod tests {
         assert_eq!(tok.decode_one(4), "\n");
         assert_eq!(tok.decode(&[0, 1, 2, 3]).unwrap(), "hello world foo");
     }
+
+    #[test]
+    fn encode_hello_world_on_gpt2_merges_is_bytelevel_bpe_not_unk() {
+        use allpaca_gguf::{write_gguf, GgufFile, GgufValue};
+        use std::collections::HashMap;
+
+        let path = std::env::temp_dir().join("allpaca_engine_gpt2_tok.gguf");
+        let g = "\u{0120}";
+        let mut meta = HashMap::new();
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("gpt2".into()),
+        );
+        let tokens: Vec<String> = vec![
+            "<unk>".into(),
+            "<s>".into(),
+            "</s>".into(),
+            "H".into(),
+            "e".into(),
+            "l".into(),
+            "o".into(),
+            "w".into(),
+            "r".into(),
+            "d".into(),
+            g.into(),
+            "He".into(),
+            "Hel".into(),
+            "Hell".into(),
+            "Hello".into(),
+            format!("{g}w"),
+            format!("{g}wo"),
+            format!("{g}wor"),
+            format!("{g}worl"),
+            format!("{g}world"),
+        ];
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(tokens.into_iter().map(GgufValue::String).collect()),
+        );
+        let merges: Vec<String> = vec![
+            "H e".into(),
+            "He l".into(),
+            "Hel l".into(),
+            "Hell o".into(),
+            format!("{g} w"),
+            format!("{g}w o"),
+            format!("{g}wo r"),
+            format!("{g}wor l"),
+            format!("{g}worl d"),
+        ];
+        meta.insert(
+            "tokenizer.ggml.merges".into(),
+            GgufValue::Array(merges.into_iter().map(GgufValue::String).collect()),
+        );
+        meta.insert(
+            "tokenizer.ggml.unknown_token_id".into(),
+            GgufValue::Uint32(0),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.add_bos_token".into(), GgufValue::Bool(false));
+        write_gguf(&path, &meta, &[]).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let gguf_tok = allpaca_gguf::extract_tokenizer(&file).unwrap();
+        let tok = EngineTokenizer::from_gguf(gguf_tok);
+        let ids = tok.encode("Hello world").unwrap();
+        assert_eq!(
+            ids,
+            vec![14, 19],
+            "EngineTokenizer gpt2 encode must be Hello + Ġworld BPE ids, got {ids:?}"
+        );
+        assert_ne!(ids, vec![14, 0], "not a whitespace split of raw world");
+        assert_eq!(tok.decode(&ids).unwrap(), "Hello world");
+        let _ = std::fs::remove_file(path);
+    }
 }

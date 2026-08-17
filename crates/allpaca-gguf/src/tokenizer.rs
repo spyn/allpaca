@@ -3,6 +3,7 @@ use allpaca_types::{AllpacaError, FatalError};
 use tokenizers::models::bpe::BPE;
 use tokenizers::models::unigram::Unigram;
 use tokenizers::models::wordlevel::WordLevel;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
 use tokenizers::tokenizer::Tokenizer;
 
@@ -130,15 +131,13 @@ fn build_bpe(
     merges: Option<&[String]>,
     unk_id: Option<u32>,
 ) -> Result<Tokenizer, AllpacaError> {
-    let Some(merges) = merges.filter(|m| !m.is_empty()) else {
-        return build_wordlevel(tokens, unk_id);
-    };
     let vocab: AHashMap<String, u32> = tokens
         .iter()
         .enumerate()
         .map(|(i, t)| (t.clone(), i as u32))
         .collect();
     let merge_pairs: Vec<(String, String)> = merges
+        .unwrap_or(&[])
         .iter()
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
@@ -151,12 +150,22 @@ fn build_bpe(
         .unk_token(unk)
         .build()
     {
-        Ok(model) => Ok(Tokenizer::new(model)),
+        Ok(model) => Ok(byte_level_bpe(model)),
         Err(e) => {
             tracing::warn!(error = %e, "BPE tokenizer build failed; falling back to WordLevel");
             build_wordlevel(tokens, unk_id)
         }
     }
+}
+
+fn byte_level_bpe(model: BPE) -> Tokenizer {
+    let mut tokenizer = Tokenizer::new(model);
+    // Llama-3 / GPT-2: ByteLevel maps space to Ġ then BPE. add_prefix_space
+    // is false so "Hello world" is Hello + Ġworld, not ĠHello.
+    let byte_level = ByteLevel::new(false, true, true);
+    tokenizer.with_pre_tokenizer(Some(byte_level.clone()));
+    tokenizer.with_decoder(Some(byte_level));
+    tokenizer
 }
 
 #[cfg(test)]
@@ -191,6 +200,82 @@ mod tests {
         let tok = extract_tokenizer(&file).unwrap();
         let ids = tok.inner.encode("hello world", false).unwrap();
         assert_eq!(ids.get_ids(), &[1, 2]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn gpt2_hello_world_meta() -> HashMap<String, GgufValue> {
+        let g = "\u{0120}";
+        let mut meta = HashMap::new();
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("gpt2".into()),
+        );
+        let tokens: Vec<String> = vec![
+            "<unk>".into(),
+            "<s>".into(),
+            "</s>".into(),
+            "H".into(),
+            "e".into(),
+            "l".into(),
+            "o".into(),
+            "w".into(),
+            "r".into(),
+            "d".into(),
+            g.into(),
+            "He".into(),
+            "Hel".into(),
+            "Hell".into(),
+            "Hello".into(),
+            format!("{g}w"),
+            format!("{g}wo"),
+            format!("{g}wor"),
+            format!("{g}worl"),
+            format!("{g}world"),
+        ];
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(tokens.into_iter().map(GgufValue::String).collect()),
+        );
+        let merges: Vec<String> = vec![
+            "H e".into(),
+            "He l".into(),
+            "Hel l".into(),
+            "Hell o".into(),
+            format!("{g} w"),
+            format!("{g}w o"),
+            format!("{g}wo r"),
+            format!("{g}wor l"),
+            format!("{g}worl d"),
+        ];
+        meta.insert(
+            "tokenizer.ggml.merges".into(),
+            GgufValue::Array(merges.into_iter().map(GgufValue::String).collect()),
+        );
+        meta.insert(
+            "tokenizer.ggml.unknown_token_id".into(),
+            GgufValue::Uint32(0),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.add_bos_token".into(), GgufValue::Bool(false));
+        meta
+    }
+
+    #[test]
+    fn gpt2_bpe_encodes_hello_world_as_bytelevel_pieces_not_unk() {
+        let path = std::env::temp_dir().join("allpaca_gpt2_tok.gguf");
+        write_gguf(&path, &gpt2_hello_world_meta(), &[]).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let tok = extract_tokenizer(&file).unwrap();
+        assert_eq!(tok.model_kind, "gpt2");
+        let encoded = tok.inner.encode("Hello world", false).unwrap();
+        let ids = encoded.get_ids();
+        assert_eq!(
+            ids,
+            &[14, 19],
+            "ByteLevel BPE must emit Hello + Ġworld, not unk/whitespace; tokens={:?} ids={ids:?}",
+            encoded.get_tokens()
+        );
+        assert_ne!(ids, &[14, 0], "must not be WordLevel split of raw 'world'");
         let _ = std::fs::remove_file(path);
     }
 }
