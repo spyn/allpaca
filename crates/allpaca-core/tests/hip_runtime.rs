@@ -415,6 +415,56 @@ fn hip_greedy_generate_matches_cpu_on_synthetic() {
     assert_eq!(hip.stats().backend, "hip");
 }
 
+fn long_hello_prompt() -> String {
+    "hello ".repeat(16)
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_long_prompt_prefills_without_per_token_forwards() {
+    let cpu = Engine::new(cpu_only_synthetic()).unwrap();
+    let hip = Engine::new(hip_auto_synthetic()).unwrap();
+    let prompt = long_hello_prompt();
+    let cpu_out = cpu.generate(&prompt, greedy(4)).unwrap();
+    assert!(
+        cpu_out.prompt_tokens >= 16,
+        "need a prompt of at least 16 tokens, got {}",
+        cpu_out.prompt_tokens
+    );
+    assert!(!cpu_out.token_ids.is_empty());
+    if hip_gpus(&hip).is_empty() {
+        return;
+    }
+    let hip_out = hip.generate(&prompt, greedy(4)).unwrap();
+    assert!(!hip_out.token_ids.is_empty());
+    let stats = hip.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(
+        stats.gpu_forwards < hip_out.prompt_tokens as u64,
+        "a prompt longer than 8 tokens must not run N decode-sized GEMMs; gpu_forwards={} prompt_tokens={} stats={stats:?}",
+        stats.gpu_forwards,
+        hip_out.prompt_tokens
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_greedy_long_prompt_matches_cpu_on_synthetic() {
+    let cpu = Engine::new(cpu_only_synthetic()).unwrap();
+    let hip = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        return;
+    }
+    let prompt = long_hello_prompt();
+    let cpu_out = cpu.generate(&prompt, greedy(4)).unwrap();
+    let hip_out = hip.generate(&prompt, greedy(4)).unwrap();
+    assert_eq!(
+        hip_out.token_ids, cpu_out.token_ids,
+        "batched HIP prefill must match per-token CPU greedy; hip={:?} cpu={:?}",
+        hip_out.token_ids, cpu_out.token_ids
+    );
+}
+
 /// Unconstrained HIP generate must not pay a vocab-sized host tax (string clone /
 /// logits ring) — `host_us` stays small vs a 32k vocab.
 #[cfg(feature = "hip")]
@@ -1100,6 +1150,67 @@ fn write_tiny_uniform_kquant_gguf(
 }
 
 #[cfg(feature = "hip")]
+fn write_tiny_f32_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 8usize;
+    let vocab = 4usize;
+    let ff = 16usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+        ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![0.01; vocab * dim]),
+        ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
+        ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
+        ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
+        ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
+        ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
+        ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
+        ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![0.01; dim * ff]),
+        ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+    ];
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).unwrap();
+}
+
+#[cfg(feature = "hip")]
 fn write_tiny_q4k_q6k_gguf(path: &std::path::Path) {
     use allpaca_gguf::{
         quantize_q4_k, quantize_q6_k, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
@@ -1283,6 +1394,84 @@ fn hip_generate_from_tiny_f16_gguf() {
     assert!(!out.token_ids.is_empty());
     assert_eq!(engine.stats().backend, "hip");
     let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "hip")]
+fn tiny_written_cfg(path: std::path::PathBuf, cpu_only: bool) -> Config {
+    let mut cfg = hip_7b_config(path);
+    cfg.engine.cpu_only = cpu_only;
+    if cpu_only {
+        cfg.engine.gpu_backend = "cpu".into();
+    }
+    cfg.kv.page_tokens = 32;
+    cfg.kv.vram_bytes = 16 * 1024 * 1024;
+    cfg.kv.dram_bytes = 16 * 1024 * 1024;
+    cfg
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_greedy_long_prompt_matches_cpu_on_tiny_written_ggufs() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_greedy_long_prompt_matches_cpu_on_tiny_written_ggufs: no HIP device");
+        return;
+    }
+    let prompt = long_hello_prompt();
+    let cases: [(&str, Box<dyn Fn(&std::path::Path)>); 3] = [
+        ("f32", Box::new(write_tiny_f32_gguf)),
+        (
+            "f16",
+            Box::new(|p| {
+                write_tiny_uniform_kquant_gguf(p, allpaca_gguf::GgmlType::F16, allpaca_gguf::quantize_f16)
+            }),
+        ),
+        (
+            "q8",
+            Box::new(|p| {
+                write_tiny_uniform_kquant_gguf(
+                    p,
+                    allpaca_gguf::GgmlType::Q8_0,
+                    allpaca_gguf::quantize_q8_0,
+                )
+            }),
+        ),
+    ];
+    for (label, write) in cases {
+        let path = std::env::temp_dir().join(format!("allpaca_hip_tiny_prefill_{label}.gguf"));
+        write(&path);
+        let cpu = Engine::new(tiny_written_cfg(path.clone(), true)).expect("tiny CPU load");
+        let hip = Engine::new(tiny_written_cfg(path.clone(), false)).expect("tiny HIP load");
+        if hip_gpus(&hip).is_empty() {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("skip {label}: no HIP device");
+            continue;
+        }
+        let cpu_out = cpu
+            .generate(&prompt, greedy(4))
+            .unwrap_or_else(|e| panic!("{label} CPU generate: {e}"));
+        let hip_out = hip
+            .generate(&prompt, greedy(4))
+            .unwrap_or_else(|e| panic!("{label} HIP generate: {e}"));
+        assert!(
+            cpu_out.prompt_tokens >= 16,
+            "{label} prompt_tokens={}",
+            cpu_out.prompt_tokens
+        );
+        assert_eq!(
+            hip_out.token_ids, cpu_out.token_ids,
+            "{label} batched HIP greedy must match CPU; hip={:?} cpu={:?}",
+            hip_out.token_ids, cpu_out.token_ids
+        );
+        let stats = hip.stats();
+        assert_eq!(stats.backend, "hip");
+        assert!(
+            stats.gpu_forwards < hip_out.prompt_tokens as u64,
+            "{label} must batch prefill; gpu_forwards={} prompt_tokens={}",
+            stats.gpu_forwards,
+            hip_out.prompt_tokens
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(feature = "hip")]
@@ -1591,6 +1780,72 @@ fn hip_generate_real_7b_gguf_when_path_set() {
         stats.host_us,
         profile_sum,
         stats.itl_ms_ema * 1000.0
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_long_prompt_real_7b_gguf_when_path_set() {
+    let _guard = large_gguf_lock();
+    let Some(path) = gated_7b_gguf() else {
+        eprintln!("skip hip_generate_long_prompt_real_7b_gguf_when_path_set: set ALLPACA_7B_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_generate_long_prompt_real_7b_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let engine = Engine::new(hip_7b_config(path)).expect("7B GGUF load must not be Fatal");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_generate_long_prompt_real_7b_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let prompt = "hello world. ".repeat(80);
+    const N: usize = 4;
+    let started = std::time::Instant::now();
+    let out = engine
+        .generate(&prompt, greedy(N))
+        .expect("7B HIP long-prompt generate must not panic or OOM");
+    let elapsed = started.elapsed();
+    assert!(!out.token_ids.is_empty());
+    assert!(
+        out.prompt_tokens >= 64,
+        "long prompt must encode at least 64 tokens, got {}",
+        out.prompt_tokens
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(
+        stats.ttft_ms_last > 0,
+        "TTFT must be recorded; stats={stats:?}"
+    );
+    assert!(
+        stats.gpu_forwards < out.prompt_tokens as u64,
+        "batched prefill must not run one forward per prompt token; gpu_forwards={} prompt_tokens={} stats={stats:?}",
+        stats.gpu_forwards,
+        out.prompt_tokens
+    );
+    let toks = out.token_ids.len().max(1) as f64;
+    let tps = toks / elapsed.as_secs_f64().max(1e-6);
+    eprintln!(
+        "7B HIP long prompt: prompt_tokens={} gen={} backend={} ttft_ms={} itl_ms={:.2} tokens/s={:.2} elapsed_ms={} gpu_forwards={} text={:?}",
+        out.prompt_tokens,
+        out.token_ids.len(),
+        stats.backend,
+        stats.ttft_ms_last,
+        stats.itl_ms_ema,
+        tps,
+        elapsed.as_millis(),
+        stats.gpu_forwards,
+        out.text
+    );
+    eprintln!(
+        "7B HIP long-prompt profile us: q8_gemm={:.1} attention={:.1} lm_head={:.1} other_gpu={:.1} host={:.1}",
+        stats.q8_gemm_us,
+        stats.attention_us,
+        stats.lm_head_us,
+        stats.other_gpu_us,
+        stats.host_us
     );
 }
 

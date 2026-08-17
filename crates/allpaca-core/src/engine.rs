@@ -879,19 +879,19 @@ impl Engine {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.pending_logits)
         };
-        for (i, tok) in toks.iter().enumerate() {
-            target.forward_token(
-                *tok,
-                start + i,
-                &pages,
-                &mut inner.kv,
-                &self.metrics,
-                &mut logits,
-                self.hip.as_deref(),
-                resident.as_deref(),
-            )?;
-        }
         let end = start + toks.len();
+        let write_logits = end >= total;
+        target.forward_tokens(
+            &toks,
+            start,
+            &pages,
+            &mut inner.kv,
+            &self.metrics,
+            &mut logits,
+            self.hip.as_deref(),
+            resident.as_deref(),
+            write_logits,
+        )?;
         if let Some(hip) = self.hip.as_deref() {
             hip.wait_logits_d2h(&mut logits)?;
         }
@@ -1321,6 +1321,29 @@ mod tests {
             out.finish_reason,
             FinishReason::Length | FinishReason::Stop
         ));
+    }
+
+    #[test]
+    fn generate_with_prompt_longer_than_eight_tokens_still_produces_tokens() {
+        let engine = test_engine();
+        let prompt = "hello ".repeat(16);
+        let out = engine
+            .generate(
+                &prompt,
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            out.prompt_tokens >= 16,
+            "need a prompt of at least 16 tokens, got {}",
+            out.prompt_tokens
+        );
+        assert!(!out.token_ids.is_empty());
     }
 
     #[tokio::test]

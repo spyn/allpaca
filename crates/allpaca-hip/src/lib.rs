@@ -1281,6 +1281,24 @@ pub struct DeviceDecode {
     pub max_kv: usize,
 }
 
+impl DeviceDecode {
+    pub fn x_row(&self, i: usize, dim: usize) -> *mut f32 {
+        unsafe { self.x.add(i * dim) }
+    }
+
+    pub fn q_row(&self, i: usize, dim: usize) -> *mut f32 {
+        unsafe { self.q.add(i * dim) }
+    }
+
+    pub fn k_row(&self, i: usize, kv_dim: usize) -> *mut f32 {
+        unsafe { self.k.add(i * kv_dim) }
+    }
+
+    pub fn v_row(&self, i: usize, kv_dim: usize) -> *mut f32 {
+        unsafe { self.v.add(i * kv_dim) }
+    }
+}
+
 struct DecodeAlloc {
     ptr: *mut u8,
     bytes: usize,
@@ -1289,6 +1307,7 @@ struct DecodeAlloc {
     ff_dim: usize,
     vocab: usize,
     max_kv: usize,
+    batch: usize,
 }
 
 unsafe impl Send for DecodeAlloc {}
@@ -1302,16 +1321,17 @@ impl DecodeAlloc {
             off += n;
             p
         };
+        let b = self.batch.max(1);
         DeviceDecode {
-            x: next(self.dim),
-            normed: next(self.dim),
-            q: next(self.dim),
-            k: next(self.kv_dim),
-            v: next(self.kv_dim),
-            attn: next(self.dim),
-            proj: next(self.dim),
-            gate: next(self.ff_dim),
-            up: next(self.ff_dim),
+            x: next(self.dim * b),
+            normed: next(self.dim * b),
+            q: next(self.dim * b),
+            k: next(self.kv_dim * b),
+            v: next(self.kv_dim * b),
+            attn: next(self.dim * b),
+            proj: next(self.dim * b),
+            gate: next(self.ff_dim * b),
+            up: next(self.ff_dim * b),
             logits: next(self.vocab),
             packed_k: next(self.max_kv * self.kv_dim),
             packed_v: next(self.max_kv * self.kv_dim),
@@ -1320,8 +1340,16 @@ impl DecodeAlloc {
     }
 }
 
-fn decode_floats(dim: usize, kv_dim: usize, ff_dim: usize, vocab: usize, max_kv: usize) -> usize {
-    dim * 5 + kv_dim * 2 + ff_dim * 2 + vocab + max_kv * kv_dim * 2
+fn decode_floats(
+    dim: usize,
+    kv_dim: usize,
+    ff_dim: usize,
+    vocab: usize,
+    max_kv: usize,
+    batch: usize,
+) -> usize {
+    let b = batch.max(1);
+    b * (dim * 5 + kv_dim * 2 + ff_dim * 2) + vocab + max_kv * kv_dim * 2
 }
 
 /// Persistent device workspace used by the Engine for GEMM / attention / logits.
@@ -1629,7 +1657,21 @@ impl HipWorkspace {
         vocab: usize,
         max_kv: usize,
     ) -> Result<DeviceDecode, AllpacaError> {
+        self.ensure_decode_batch(dim, kv_dim, ff_dim, vocab, max_kv, 1)
+    }
+
+    /// Same workspace as [`ensure_decode`], sized for `batch` token rows (prefill M=N).
+    pub fn ensure_decode_batch(
+        &self,
+        dim: usize,
+        kv_dim: usize,
+        ff_dim: usize,
+        vocab: usize,
+        max_kv: usize,
+        batch: usize,
+    ) -> Result<DeviceDecode, AllpacaError> {
         let max_kv = max_kv.max(1);
+        let batch = batch.max(1);
         let mut guard = self
             .decode
             .lock()
@@ -1642,6 +1684,7 @@ impl HipWorkspace {
                     || a.ff_dim < ff_dim
                     || a.vocab < vocab
                     || a.max_kv < max_kv
+                    || a.batch < batch
             }
         };
         if grow {
@@ -1652,7 +1695,7 @@ impl HipWorkspace {
             let kv_dim = kv_dim.max(1);
             let ff_dim = ff_dim.max(1);
             let vocab = vocab.max(1);
-            let floats = decode_floats(dim, kv_dim, ff_dim, vocab, max_kv);
+            let floats = decode_floats(dim, kv_dim, ff_dim, vocab, max_kv, batch);
             let bytes = floats * 4;
             let ptr = device_malloc(bytes, self.device)?;
             *guard = Some(DecodeAlloc {
@@ -1663,6 +1706,7 @@ impl HipWorkspace {
                 ff_dim,
                 vocab,
                 max_kv,
+                batch,
             });
         }
         let vocab = guard.as_ref().map(|a| a.vocab).unwrap_or(vocab);

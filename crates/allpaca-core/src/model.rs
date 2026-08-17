@@ -878,6 +878,85 @@ impl TinyModel {
         Ok(())
     }
 
+    /// Prefill a token chunk. HIP runs one forward with M=N (hipBLASLt when N>8 on F32).
+    /// Decode stays on [`forward_token`]. CPU loops per token. Last-chunk logits are
+    /// written for the last position only when `write_logits` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tokens(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        logits: &mut [f32],
+        hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
+        write_logits: bool,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if tokens.len() == 1 {
+            return self.forward_token(
+                tokens[0],
+                start_pos,
+                page_ids,
+                kv,
+                metrics,
+                logits,
+                hip,
+                resident,
+            );
+        }
+        for tok in tokens {
+            if *tok as usize >= self.config.vocab_size {
+                return Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
+                    "token {tok} out of vocab"
+                ))));
+            }
+        }
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            match self.forward_tokens_device(
+                tokens,
+                start_pos,
+                page_ids,
+                kv,
+                metrics,
+                logits,
+                hip,
+                resident,
+                write_logits,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !self.host_weights_ready() {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        start_pos,
+                        n = tokens.len(),
+                        error = %e,
+                        "HIP batched prefill failed; per-token host fallback"
+                    );
+                }
+            }
+        }
+        for (i, tok) in tokens.iter().enumerate() {
+            self.forward_token(
+                *tok,
+                start_pos + i,
+                page_ids,
+                kv,
+                metrics,
+                logits,
+                hip,
+                resident,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Sequential target decode with device-resident hidden state and KV.
     #[allow(clippy::too_many_arguments)]
     fn forward_token_device(
@@ -1125,6 +1204,302 @@ impl TinyModel {
             .target_gpu_forwards
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+        })();
+        hip.end_decode_profile();
+        result
+    }
+
+    /// Batched HIP prefill: one GEMM with m = N per weight, attention n_q = N.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_tokens_device(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        logits: &mut [f32],
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        write_logits: bool,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let head_dim = cfg.head_dim();
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let vocab = cfg.vocab_size;
+        let n_tok = tokens.len();
+        if write_logits && logits.len() < vocab {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "logits buffer smaller than vocab".into(),
+            )));
+        }
+        let page_tokens = page_ids
+            .first()
+            .and_then(|p| p.first())
+            .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
+            .unwrap_or(128);
+        let seq_end = start_pos + n_tok;
+        let max_kv = page_ids
+            .iter()
+            .map(|layer| layer.len().saturating_mul(page_tokens))
+            .max()
+            .unwrap_or(seq_end)
+            .max(seq_end);
+        hip.bind()?;
+        let buf = hip.ensure_decode_batch(dim, kv_dim, cfg.ff_dim, vocab, max_kv, n_tok)?;
+        hip.begin_decode_profile();
+        let result = (|| {
+            for (i, tok) in tokens.iter().enumerate() {
+                let dst = buf.x_row(i, dim);
+                match resident.embed.kind {
+                    WeightKind::F32 => hip.embed_gather(resident.embed(), *tok, dst, dim as i32)?,
+                    WeightKind::Q8_0 => hip.embed_gather_q8_0(
+                        resident.weights.byte_ptr_at(resident.embed.off),
+                        *tok,
+                        dst,
+                        dim as i32,
+                    )?,
+                    WeightKind::Q4_K => {
+                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                            "Q4_K embed must be F32 at load".into(),
+                        )))
+                    }
+                }
+            }
+            record_elementwise(Some(metrics));
+
+            let m = n_tok as i32;
+            for (layer_idx, _) in self.layers.iter().enumerate() {
+                let layer = &resident.layers[layer_idx];
+                if layer_idx == 0 {
+                    rmsnorm_device_rows(
+                        hip,
+                        buf.x,
+                        resident.f32_or_dequant(hip, layer.attn_norm)?,
+                        buf.normed,
+                        n_tok,
+                        dim,
+                        cfg.eps,
+                    )?;
+                    record_elementwise(Some(metrics));
+                }
+                if layer.wq.kind == WeightKind::Q8_0 {
+                    hip.profile_q8(|| {
+                        resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, m, dim as i32, dim as i32)?;
+                        resident.gemm_nt(
+                            hip,
+                            buf.normed,
+                            layer.wk,
+                            buf.k,
+                            m,
+                            kv_dim as i32,
+                            dim as i32,
+                        )?;
+                        resident.gemm_nt(
+                            hip,
+                            buf.normed,
+                            layer.wv,
+                            buf.v,
+                            m,
+                            kv_dim as i32,
+                            dim as i32,
+                        )?;
+                        Ok(())
+                    })?;
+                } else {
+                    resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, m, dim as i32, dim as i32)?;
+                    resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, m, kv_dim as i32, dim as i32)?;
+                    resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, m, kv_dim as i32, dim as i32)?;
+                }
+                for i in 0..n_tok {
+                    hip.rope_qk_device(
+                        buf.q_row(i, dim),
+                        buf.k_row(i, kv_dim),
+                        cfg.n_heads as i32,
+                        cfg.n_kv_heads as i32,
+                        head_dim as i32,
+                        (start_pos + i) as i32,
+                        cfg.rope_theta,
+                    )?;
+                }
+                record_elementwise(Some(metrics));
+
+                for i in 0..n_tok {
+                    let pos = start_pos + i;
+                    let page_index = pos / page_tokens;
+                    let slot = (pos % page_tokens) as u32;
+                    let page_id = page_ids[layer_idx][page_index];
+                    kv.write_slot_from_device(
+                        page_id,
+                        slot,
+                        cfg.n_kv_heads,
+                        head_dim,
+                        buf.k_row(i, kv_dim),
+                        buf.v_row(i, kv_dim),
+                    )?;
+                    kv.touch(page_id, 1.0);
+                }
+
+                let (packed_k, packed_v, n_kv) = kv.kv_device_views(
+                    &page_ids[layer_idx],
+                    cfg.n_kv_heads,
+                    head_dim,
+                    buf.packed_k,
+                    buf.packed_v,
+                    buf.max_kv,
+                )?;
+                hip.attention_device(
+                    buf.q,
+                    packed_k,
+                    packed_v,
+                    buf.attn,
+                    m,
+                    n_kv as i32,
+                    cfg.n_heads as i32,
+                    cfg.n_kv_heads as i32,
+                    head_dim as i32,
+                    true,
+                )?;
+                if layer.wo.kind == WeightKind::Q8_0 {
+                    hip.profile_q8(|| {
+                        resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, m, dim as i32, dim as i32)
+                    })?;
+                } else {
+                    resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, m, dim as i32, dim as i32)?;
+                }
+                hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+                metrics
+                    .residual_gpu_ops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                record_elementwise(Some(metrics));
+                rmsnorm_device_rows(
+                    hip,
+                    buf.x,
+                    resident.f32_or_dequant(hip, layer.ffn_norm)?,
+                    buf.normed,
+                    n_tok,
+                    dim,
+                    cfg.eps,
+                )?;
+                record_elementwise(Some(metrics));
+                if layer.w_gate.kind == WeightKind::Q8_0 {
+                    hip.profile_q8(|| {
+                        resident.gemm_nt(
+                            hip,
+                            buf.normed,
+                            layer.w_gate,
+                            buf.gate,
+                            m,
+                            cfg.ff_dim as i32,
+                            dim as i32,
+                        )?;
+                        resident.gemm_nt(
+                            hip,
+                            buf.normed,
+                            layer.w_up,
+                            buf.up,
+                            m,
+                            cfg.ff_dim as i32,
+                            dim as i32,
+                        )?;
+                        Ok(())
+                    })?;
+                } else {
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_gate,
+                        buf.gate,
+                        m,
+                        cfg.ff_dim as i32,
+                        dim as i32,
+                    )?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_up,
+                        buf.up,
+                        m,
+                        cfg.ff_dim as i32,
+                        dim as i32,
+                    )?;
+                }
+                hip.silu_mul_device(buf.gate, buf.up, (n_tok * cfg.ff_dim) as i32)?;
+                record_elementwise(Some(metrics));
+                if layer.w_down.kind == WeightKind::Q8_0 {
+                    hip.profile_q8(|| {
+                        resident.gemm_nt(
+                            hip,
+                            buf.gate,
+                            layer.w_down,
+                            buf.proj,
+                            m,
+                            dim as i32,
+                            cfg.ff_dim as i32,
+                        )
+                    })?;
+                } else {
+                    resident.gemm_nt(
+                        hip,
+                        buf.gate,
+                        layer.w_down,
+                        buf.proj,
+                        m,
+                        dim as i32,
+                        cfg.ff_dim as i32,
+                    )?;
+                }
+                hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+                metrics
+                    .residual_gpu_ops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                record_elementwise(Some(metrics));
+                if layer_idx + 1 < resident.layers.len() {
+                    rmsnorm_device_rows(
+                        hip,
+                        buf.x,
+                        resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
+                        buf.normed,
+                        n_tok,
+                        dim,
+                        cfg.eps,
+                    )?;
+                    record_elementwise(Some(metrics));
+                }
+            }
+
+            if write_logits {
+                let x_last = buf.x_row(n_tok - 1, dim);
+                hip.rmsnorm_device(
+                    x_last,
+                    resident.f32_or_dequant(hip, resident.norm)?,
+                    buf.normed,
+                    dim as i32,
+                    cfg.eps,
+                )?;
+                record_elementwise(Some(metrics));
+                {
+                    let _lm = hip.lm_head_scope();
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        resident.lm_head,
+                        buf.logits,
+                        1,
+                        vocab as i32,
+                        dim as i32,
+                    )?;
+                }
+                hip.start_logits_d2h(buf.logits, vocab)?;
+            }
+            metrics
+                .gpu_forwards
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .target_gpu_forwards
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         })();
         hip.end_decode_profile();
         result
@@ -1818,6 +2193,23 @@ fn record_elementwise(metrics: Option<&Metrics>) {
             .elementwise_gpu_ops
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+fn rmsnorm_device_rows(
+    hip: &HipWorkspace,
+    x: *const f32,
+    weight: *const f32,
+    out: *mut f32,
+    n_tok: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<(), AllpacaError> {
+    for i in 0..n_tok {
+        let xi = unsafe { x.add(i * dim) };
+        let oi = unsafe { out.add(i * dim) };
+        hip.rmsnorm_device(xi, weight, oi, dim as i32, eps)?;
+    }
+    Ok(())
 }
 
 fn rmsnorm_dispatch(
