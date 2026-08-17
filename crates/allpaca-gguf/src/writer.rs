@@ -73,6 +73,10 @@ pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
     allpaca_cpu::quantize_q4_0(data)
 }
 
+pub fn quantize_q4_k(data: &[f32]) -> Vec<u8> {
+    allpaca_cpu::quantize_q4_k(data)
+}
+
 /// Write a GGUF that mixes F32 tensors with quantized blocks (tests / tiny models).
 pub fn write_gguf_quant(
     path: &Path,

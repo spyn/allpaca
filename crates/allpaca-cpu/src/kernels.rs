@@ -383,6 +383,9 @@ pub const Q4_0_BLOCK_ELEMS: usize = 32;
 pub const Q4_0_BLOCK_BYTES: usize = 18;
 pub const Q8_0_BLOCK_ELEMS: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
+/// GGUF Q4_K / Q4_K_S / Q4_K_M super-block (256 elems).
+pub const Q4_K_BLOCK_ELEMS: usize = 256;
+pub const Q4_K_BLOCK_BYTES: usize = 144;
 
 /// IEEE-754 binary16 → f32.
 pub fn f16_to_f32(h: u16) -> f32 {
@@ -477,6 +480,100 @@ pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Quantize to GGUF Q4_K super-blocks (tests / tiny written models).
+pub fn quantize_q4_k(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(Q4_K_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * Q4_K_BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * Q4_K_BLOCK_ELEMS;
+        let mut scales = [0.0f32; 8];
+        let mut mins = [0.0f32; 8];
+        for j in 0..8 {
+            let g0 = start + j * 32;
+            let mut min_v = f32::MAX;
+            let mut max_v = f32::MIN;
+            for l in 0..32 {
+                let v = data.get(g0 + l).copied().unwrap_or(0.0);
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+            }
+            if min_v == f32::MAX {
+                min_v = 0.0;
+                max_v = 0.0;
+            }
+            scales[j] = (max_v - min_v) / 15.0;
+            mins[j] = -min_v;
+        }
+        let max_scale = scales.iter().copied().fold(0.0f32, f32::max);
+        let max_min = mins.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_min = mins.iter().copied().fold(f32::INFINITY, f32::min);
+        let extremum = if max_min.abs() >= min_min.abs() {
+            max_min
+        } else {
+            min_min
+        };
+        let d = if max_scale > 0.0 {
+            max_scale / 63.0
+        } else {
+            0.0
+        };
+        let dmin = if extremum.abs() > 0.0 {
+            extremum / 63.0
+        } else {
+            0.0
+        };
+        let mut sc_bytes = [0u8; 12];
+        for j in 0..8 {
+            let ls = if d > 0.0 {
+                ((scales[j] / d).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+            let lm = if dmin.abs() > 0.0 {
+                ((mins[j] / dmin).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+            if j < 4 {
+                sc_bytes[j] = ls;
+                sc_bytes[j + 4] = lm;
+            } else {
+                sc_bytes[j + 4] = (ls & 0x0f) | ((lm & 0x0f) << 4);
+                sc_bytes[j - 4] |= (ls >> 4) << 6;
+                sc_bytes[j] |= (lm >> 4) << 6;
+            }
+        }
+        let off = b * Q4_K_BLOCK_BYTES;
+        out[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        out[off + 2..off + 4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        out[off + 4..off + 16].copy_from_slice(&sc_bytes);
+        let mut qs = [0u8; 256];
+        for j in 0..8 {
+            let (sc, m) = q4_k_scale_min(j, &sc_bytes);
+            let dj = d * f32::from(sc);
+            let mj = dmin * f32::from(m);
+            let g0 = start + j * 32;
+            for l in 0..32 {
+                let x = data.get(g0 + l).copied().unwrap_or(0.0);
+                let q = if dj.abs() > 0.0 {
+                    ((x + mj) / dj).round().clamp(0.0, 15.0) as u8
+                } else {
+                    0
+                };
+                qs[j * 32 + l] = q;
+            }
+        }
+        let q_out = &mut out[off + 16..off + 144];
+        for grp in 0..4 {
+            let base = grp * 64;
+            for l in 0..32 {
+                q_out[grp * 32 + l] = qs[base + l] | (qs[base + 32 + l] << 4);
+            }
+        }
+    }
+    out
+}
+
 fn quant_nibble(data: &[f32], idx: usize, inv: f32) -> u8 {
     if idx >= data.len() {
         return 8;
@@ -511,6 +608,65 @@ pub fn dequant_q4_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
             if i1 < n {
                 out[i1] = d * ((packed >> 4) as i8 as f32 - 8.0);
             }
+        }
+    }
+    Ok(())
+}
+
+fn q4_k_scale_min(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        let sc = (scales[j + 4] & 0x0f) | ((scales[j - 4] >> 6) << 4);
+        let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (sc, m)
+    }
+}
+
+/// Dequantize GGUF Q4_K super-blocks: `y = d*sc*q - dmin*m` (q in 0..15).
+pub fn dequant_q4_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q4_k output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q4_K_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q4_K_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q4_k truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q4_K_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([blocks[off + 2], blocks[off + 3]]));
+        let scales = &blocks[off + 4..off + 16];
+        let qs = &blocks[off + 16..off + 144];
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+        let mut y_base = b * Q4_K_BLOCK_ELEMS;
+        for _ in 0..4 {
+            let (sc1, m1) = q4_k_scale_min(is, scales);
+            let (sc2, m2) = q4_k_scale_min(is + 1, scales);
+            let d1 = d * f32::from(sc1);
+            let min1 = dmin * f32::from(m1);
+            let d2 = d * f32::from(sc2);
+            let min2 = dmin * f32::from(m2);
+            for l in 0..32 {
+                let packed = qs[q_off + l];
+                let i0 = y_base + l;
+                let i1 = y_base + 32 + l;
+                if i0 < n {
+                    out[i0] = d1 * f32::from(packed & 0x0f) - min1;
+                }
+                if i1 < n {
+                    out[i1] = d2 * f32::from(packed >> 4) - min2;
+                }
+            }
+            q_off += 32;
+            y_base += 64;
+            is += 2;
         }
     }
     Ok(())

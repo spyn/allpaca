@@ -12,3 +12,6 @@ hip = []
 [dependencies]
 allpaca-types.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+allpaca-cpu.workspace = true
