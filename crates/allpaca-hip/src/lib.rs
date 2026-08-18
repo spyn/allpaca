@@ -320,6 +320,15 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_rmsnorm_rows(
+            x: *const f32,
+            weight: *const f32,
+            out: *mut f32,
+            rows: i32,
+            n: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_rope(
             x: *mut f32,
             n_heads: i32,
@@ -341,6 +350,14 @@ mod ffi {
             dim: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_embed_gather_rows(
+            table: *const f32,
+            tokens: *const i32,
+            out: *mut f32,
+            n_tok: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_residual_add(
             x: *mut f32,
             residual: *const f32,
@@ -356,6 +373,7 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        #[allow(dead_code)]
         pub fn allpaca_rope_qk(
             q: *mut f32,
             k: *mut f32,
@@ -363,6 +381,17 @@ mod ffi {
             n_k_heads: i32,
             head_dim: i32,
             pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_rope_qk_rows(
+            q: *mut f32,
+            k: *mut f32,
+            n_tok: i32,
+            n_q_heads: i32,
+            n_k_heads: i32,
+            head_dim: i32,
+            start_pos: i32,
             theta: f32,
             stream: *mut c_void,
         ) -> i32;
@@ -376,6 +405,14 @@ mod ffi {
             table: *const u8,
             token: i32,
             out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_q8_0_rows(
+            table: *const u8,
+            tokens: *const i32,
+            out: *mut f32,
+            n_tok: i32,
             dim: i32,
             stream: *mut c_void,
         ) -> i32;
@@ -1067,6 +1104,254 @@ fn gemm_nt_q8_0_host(
         let _ = (a, b, c, m, n, k, kernel);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q8_0 unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer batched RMSNorm: `out[rows, n] = RMSNorm(x[rows, n], weight[n])`.
+pub fn rmsnorm_rows(
+    x: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    rows: i32,
+    n: i32,
+    eps: f32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if rows <= 0 || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rmsnorm_rows shape".into(),
+            )));
+        }
+        let rows_n = (rows as usize).saturating_mul(n as usize);
+        if x.len() < rows_n || out.len() < rows_n || weight.len() < n as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "rmsnorm_rows buffer size mismatch".into(),
+            )));
+        }
+        let x_bytes = rows_n * 4;
+        let w_bytes = (n as usize) * 4;
+        let dx = device_malloc(x_bytes, 0)?;
+        let dw = device_malloc(w_bytes, 0)?;
+        let dout = device_malloc(x_bytes, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(dx, x.as_ptr().cast(), x_bytes, MEMCPY_H2D)?;
+            memcpy(dw, weight.as_ptr().cast(), w_bytes, MEMCPY_H2D)?;
+            let rc = unsafe {
+                ffi::allpaca_rmsnorm_rows(
+                    dx.cast(),
+                    dw.cast(),
+                    dout.cast(),
+                    rows,
+                    n,
+                    eps,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "rmsnorm_rows")?;
+            memcpy(out.as_mut_ptr().cast(), dout, x_bytes, MEMCPY_D2H)
+        })();
+        device_free(dx, x_bytes);
+        device_free(dw, w_bytes);
+        device_free(dout, x_bytes);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, weight, out, rows, n, eps);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP rmsnorm_rows unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer batched Q/K RoPE: in-place on `q[n_tok, n_q*head_dim]` and `k[n_tok, n_k*head_dim]`.
+pub fn rope_qk_rows(
+    q: &mut [f32],
+    k: &mut [f32],
+    n_tok: i32,
+    n_q_heads: i32,
+    n_k_heads: i32,
+    head_dim: i32,
+    start_pos: i32,
+    theta: f32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if n_tok <= 0 || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 || head_dim % 2 != 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rope_qk_rows shape".into(),
+            )));
+        }
+        let q_n = (n_tok as usize)
+            .saturating_mul(n_q_heads as usize)
+            .saturating_mul(head_dim as usize);
+        let k_n = (n_tok as usize)
+            .saturating_mul(n_k_heads as usize)
+            .saturating_mul(head_dim as usize);
+        if q.len() < q_n || k.len() < k_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "rope_qk_rows buffer size mismatch".into(),
+            )));
+        }
+        let q_bytes = q_n * 4;
+        let k_bytes = k_n * 4;
+        let dq = device_malloc(q_bytes, 0)?;
+        let dk = device_malloc(k_bytes, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(dq, q.as_ptr().cast(), q_bytes, MEMCPY_H2D)?;
+            memcpy(dk, k.as_ptr().cast(), k_bytes, MEMCPY_H2D)?;
+            let rc = unsafe {
+                ffi::allpaca_rope_qk_rows(
+                    dq.cast(),
+                    dk.cast(),
+                    n_tok,
+                    n_q_heads,
+                    n_k_heads,
+                    head_dim,
+                    start_pos,
+                    theta,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "rope_qk_rows")?;
+            memcpy(q.as_mut_ptr().cast(), dq, q_bytes, MEMCPY_D2H)?;
+            memcpy(k.as_mut_ptr().cast(), dk, k_bytes, MEMCPY_D2H)
+        })();
+        device_free(dq, q_bytes);
+        device_free(dk, k_bytes);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (q, k, n_tok, n_q_heads, n_k_heads, head_dim, start_pos, theta);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP rope_qk_rows unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer batched F32 embed gather: `out[n_tok, dim] = table[tokens[i]]`.
+pub fn embed_gather_rows(
+    table: &[f32],
+    tokens: &[u32],
+    out: &mut [f32],
+    dim: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if dim <= 0 || tokens.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed_gather_rows shape".into(),
+            )));
+        }
+        let n_tok = tokens.len();
+        let dim_u = dim as usize;
+        let max_tok = *tokens.iter().max().unwrap_or(&0) as usize;
+        if table.len() < (max_tok + 1).saturating_mul(dim_u) || out.len() < n_tok * dim_u {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed_gather_rows buffer size mismatch".into(),
+            )));
+        }
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let t_bytes = table.len() * 4;
+        let id_bytes = ids.len() * 4;
+        let o_bytes = n_tok * dim_u * 4;
+        let dt = device_malloc(t_bytes, 0)?;
+        let di = device_malloc(id_bytes, 0)?;
+        let dout = device_malloc(o_bytes, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(dt, table.as_ptr().cast(), t_bytes, MEMCPY_H2D)?;
+            memcpy(di, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+            let rc = unsafe {
+                ffi::allpaca_embed_gather_rows(
+                    dt.cast(),
+                    di.cast(),
+                    dout.cast(),
+                    n_tok as i32,
+                    dim,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "embed_gather_rows")?;
+            memcpy(out.as_mut_ptr().cast(), dout, o_bytes, MEMCPY_D2H)
+        })();
+        device_free(dt, t_bytes);
+        device_free(di, id_bytes);
+        device_free(dout, o_bytes);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (table, tokens, out, dim);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP embed_gather_rows unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer batched Q8 embed gather. `table` is packed 34-byte GGUF Q8_0 rows.
+pub fn embed_gather_q8_0_rows(
+    table: &[u8],
+    tokens: &[u32],
+    out: &mut [f32],
+    dim: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if dim <= 0 || tokens.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed_gather_q8_0_rows shape".into(),
+            )));
+        }
+        let n_tok = tokens.len();
+        let dim_u = dim as usize;
+        let max_tok = *tokens.iter().max().unwrap_or(&0) as usize;
+        let nblocks = dim_u.div_ceil(32);
+        let packed_need = (max_tok + 1).saturating_mul(nblocks).saturating_mul(Q8_PACKED_BLOCK);
+        if table.len() < packed_need || out.len() < n_tok * dim_u {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed_gather_q8_0_rows buffer size mismatch".into(),
+            )));
+        }
+        let staged = stage_q8_0_blocks(&table[..packed_need])?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let id_bytes = ids.len() * 4;
+        let o_bytes = n_tok * dim_u * 4;
+        let dt = device_malloc(staged.len(), 0)?;
+        let di = device_malloc(id_bytes, 0)?;
+        let dout = device_malloc(o_bytes, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(dt, staged.as_ptr(), staged.len(), MEMCPY_H2D)?;
+            memcpy(di, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+            let rc = unsafe {
+                ffi::allpaca_embed_gather_q8_0_rows(
+                    dt,
+                    di.cast(),
+                    dout.cast(),
+                    n_tok as i32,
+                    dim,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "embed_gather_q8_0_rows")?;
+            memcpy(out.as_mut_ptr().cast(), dout, o_bytes, MEMCPY_D2H)
+        })();
+        device_free(dt, staged.len());
+        device_free(di, id_bytes);
+        device_free(dout, o_bytes);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (table, tokens, out, dim);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP embed_gather_q8_0_rows unavailable".into(),
         )))
     }
 }
@@ -2213,6 +2498,102 @@ impl HipWorkspace {
         }
     }
 
+    pub fn embed_gather_rows(
+        &self,
+        table: *const f32,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed gather".into(),
+            )));
+        }
+        let id_bytes = tokens.len() * 4;
+        if id_bytes > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed gather tokens exceed scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        memcpy(self.scratch, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_rows(
+                        table,
+                        self.scratch.cast(),
+                        out,
+                        tokens.len() as i32,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn embed_gather_q8_0_rows(
+        &self,
+        table: *const u8,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid q8_0 embed gather".into(),
+            )));
+        }
+        let id_bytes = tokens.len() * 4;
+        if id_bytes > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed gather tokens exceed scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        memcpy(self.scratch, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_q8_0_rows(
+                        table,
+                        self.scratch.cast(),
+                        out,
+                        tokens.len() as i32,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_q8_0_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_q8_0 unavailable".into(),
+            )))
+        }
+    }
+
     pub fn residual_add(&self, x: *mut f32, residual: *const f32, n: i32) -> Result<(), AllpacaError> {
         if x.is_null() || residual.is_null() || n <= 0 {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -2284,7 +2665,22 @@ impl HipWorkspace {
         n: i32,
         eps: f32,
     ) -> Result<(), AllpacaError> {
-        if x.is_null() || weight.is_null() || out.is_null() || n <= 0 {
+        self.rmsnorm_device_rows(x, weight, out, 1, n, eps)
+    }
+
+    pub fn rmsnorm_device_rows(
+        &self,
+        x: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if x.is_null() || weight.is_null() || out.is_null() || rows < 0 || n <= 0 {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "invalid device rmsnorm".into(),
             )));
@@ -2293,8 +2689,10 @@ impl HipWorkspace {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
             self.timed_gpu(DecodeOp::OtherGpu, || {
-                let rc = unsafe { ffi::allpaca_rmsnorm(x, weight, out, n, eps, std::ptr::null_mut()) };
-                status(rc, "rmsnorm")
+                let rc = unsafe {
+                    ffi::allpaca_rmsnorm_rows(x, weight, out, rows, n, eps, std::ptr::null_mut())
+                };
+                status(rc, "rmsnorm_rows")
             })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2316,7 +2714,25 @@ impl HipWorkspace {
         pos: i32,
         theta: f32,
     ) -> Result<(), AllpacaError> {
-        if q.is_null() || k.is_null() || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 {
+        self.rope_qk_device_rows(q, k, 1, n_q_heads, n_k_heads, head_dim, pos, theta)
+    }
+
+    pub fn rope_qk_device_rows(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        n_tok: i32,
+        n_q_heads: i32,
+        n_k_heads: i32,
+        head_dim: i32,
+        start_pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        if n_tok == 0 {
+            return Ok(());
+        }
+        if q.is_null() || k.is_null() || n_tok < 0 || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0
+        {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "invalid device rope_qk".into(),
             )));
@@ -2326,23 +2742,24 @@ impl HipWorkspace {
         {
             self.timed_gpu(DecodeOp::OtherGpu, || {
                 let rc = unsafe {
-                    ffi::allpaca_rope_qk(
+                    ffi::allpaca_rope_qk_rows(
                         q,
                         k,
+                        n_tok,
                         n_q_heads,
                         n_k_heads,
                         head_dim,
-                        pos,
+                        start_pos,
                         theta,
                         std::ptr::null_mut(),
                     )
                 };
-                status(rc, "rope_qk")
+                status(rc, "rope_qk_rows")
             })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (pos, theta);
+            let _ = (start_pos, theta);
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP rope_qk unavailable".into(),
             )))
@@ -3061,6 +3478,33 @@ mod tests {
         }
     }
 
+    /// Prefill-wide Q8 NT GEMM (M>8) must match CPU dequant + NT GEMM.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q8_0_wide_m_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(16, 64, 128), (9, 17, 64), (32, 33, 96)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, b_q8, _) = fill_q8_gemm_case(si + 40, m, n, k);
+            let b_deq = dequant_q8_matrix(&b_q8, n, k);
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_q8_0(&a, &b_q8, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q8_0 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_q8_0 wide mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
     /// Int-dot GEMV vs float GEMV: small max abs error on random vectors.
     #[cfg(feature = "hip")]
     #[test]
@@ -3287,6 +3731,180 @@ mod tests {
                     cpu[i]
                 );
             }
+        }
+    }
+
+    /// Prefill-shaped batched RMSNorm must match per-row CPU RMSNorm.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rmsnorm_rows_matches_cpu_per_row() {
+        if device_count() == 0 {
+            return;
+        }
+        let eps = 1e-6f32;
+        let shapes = [(16, 32), (9, 8), (1, 64)];
+        for (si, (rows, n)) in shapes.iter().copied().enumerate() {
+            let mut x = vec![0.0f32; rows * n];
+            let mut weight = vec![0.0f32; n];
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in weight.iter_mut().enumerate() {
+                *v = 0.5 + ((i * 13 + si) % 20) as f32 * 0.05;
+            }
+            let mut cpu = vec![0.0f32; rows * n];
+            for r in 0..rows {
+                allpaca_cpu::rmsnorm(
+                    &x[r * n..(r + 1) * n],
+                    &weight,
+                    eps,
+                    &mut cpu[r * n..(r + 1) * n],
+                )
+                .expect("CPU rmsnorm");
+            }
+            let mut hip = vec![0.0f32; rows * n];
+            rmsnorm_rows(&x, &weight, &mut hip, rows as i32, n as i32, eps)
+                .expect("HIP rmsnorm_rows must run when a device is present");
+            for i in 0..rows * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "rmsnorm_rows mismatch rows={rows} n={n} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// Prefill-shaped batched Q/K RoPE must match per-token CPU RoPE.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rope_qk_rows_matches_cpu_per_token() {
+        if device_count() == 0 {
+            return;
+        }
+        let theta = 10_000.0f32;
+        let shapes = [(16, 4, 2, 8, 3), (9, 2, 2, 4, 0), (1, 4, 1, 16, 7)];
+        for (si, (n_tok, n_q, n_k, head_dim, start_pos)) in shapes.iter().copied().enumerate() {
+            let q_stride = n_q * head_dim;
+            let k_stride = n_k * head_dim;
+            let mut q = vec![0.0f32; n_tok * q_stride];
+            let mut k = vec![0.0f32; n_tok * k_stride];
+            for (i, v) in q.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in k.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let mut cpu_q = q.clone();
+            let mut cpu_k = k.clone();
+            for t in 0..n_tok {
+                let pos = start_pos + t;
+                for h in 0..n_q {
+                    let s = t * q_stride + h * head_dim;
+                    allpaca_cpu::rope(&mut cpu_q[s..s + head_dim], pos, theta).expect("CPU q rope");
+                }
+                for h in 0..n_k {
+                    let s = t * k_stride + h * head_dim;
+                    allpaca_cpu::rope(&mut cpu_k[s..s + head_dim], pos, theta).expect("CPU k rope");
+                }
+            }
+            rope_qk_rows(
+                &mut q,
+                &mut k,
+                n_tok as i32,
+                n_q as i32,
+                n_k as i32,
+                head_dim as i32,
+                start_pos as i32,
+                theta,
+            )
+            .expect("HIP rope_qk_rows must run when a device is present");
+            for i in 0..q.len() {
+                assert!(
+                    gemm_close(q[i], cpu_q[i]),
+                    "rope_qk_rows Q mismatch n_tok={n_tok} idx={i} hip={} cpu={}",
+                    q[i],
+                    cpu_q[i]
+                );
+            }
+            for i in 0..k.len() {
+                assert!(
+                    gemm_close(k[i], cpu_k[i]),
+                    "rope_qk_rows K mismatch n_tok={n_tok} idx={i} hip={} cpu={}",
+                    k[i],
+                    cpu_k[i]
+                );
+            }
+        }
+    }
+
+    /// Prefill-shaped batched F32 embed gather must match table rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn embed_gather_rows_matches_table_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        let vocab = 8usize;
+        let dim = 16usize;
+        let tokens = [0u32, 3, 7, 1, 3, 2];
+        let mut table = vec![0.0f32; vocab * dim];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        let mut cpu = vec![0.0f32; tokens.len() * dim];
+        for (r, &tok) in tokens.iter().enumerate() {
+            let s = tok as usize * dim;
+            cpu[r * dim..(r + 1) * dim].copy_from_slice(&table[s..s + dim]);
+        }
+        let mut hip = vec![0.0f32; tokens.len() * dim];
+        embed_gather_rows(&table, &tokens, &mut hip, dim as i32)
+            .expect("HIP embed_gather_rows must run when a device is present");
+        for i in 0..cpu.len() {
+            assert!(
+                gemm_close(hip[i], cpu[i]),
+                "embed_gather_rows mismatch idx={i} hip={} cpu={}",
+                hip[i],
+                cpu[i]
+            );
+        }
+    }
+
+    /// Prefill-shaped batched Q8 embed gather must match dequantized table rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn embed_gather_q8_0_rows_matches_dequant_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        let vocab = 8usize;
+        let dim = 32usize;
+        let tokens = [0u32, 3, 7, 1, 3, 2];
+        let mut table = vec![0.0f32; vocab * dim];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        let mut packed = Vec::new();
+        for row in 0..vocab {
+            packed.extend(quantize_q8_0(&table[row * dim..(row + 1) * dim]));
+        }
+        let b_deq = dequant_q8_matrix(&packed, vocab, dim);
+        let mut cpu = vec![0.0f32; tokens.len() * dim];
+        for (r, &tok) in tokens.iter().enumerate() {
+            let s = tok as usize * dim;
+            cpu[r * dim..(r + 1) * dim].copy_from_slice(&b_deq[s..s + dim]);
+        }
+        let mut hip = vec![0.0f32; tokens.len() * dim];
+        embed_gather_q8_0_rows(&packed, &tokens, &mut hip, dim as i32)
+            .expect("HIP embed_gather_q8_0_rows must run when a device is present");
+        for i in 0..cpu.len() {
+            assert!(
+                gemm_close(hip[i], cpu[i]),
+                "embed_gather_q8_0_rows mismatch idx={i} hip={} cpu={}",
+                hip[i],
+                cpu[i]
+            );
         }
     }
 }

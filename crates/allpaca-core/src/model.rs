@@ -1250,21 +1250,18 @@ impl TinyModel {
         let buf = hip.ensure_decode_batch(dim, kv_dim, cfg.ff_dim, vocab, max_kv, n_tok)?;
         hip.begin_decode_profile();
         let result = (|| {
-            for (i, tok) in tokens.iter().enumerate() {
-                let dst = buf.x_row(i, dim);
-                match resident.embed.kind {
-                    WeightKind::F32 => hip.embed_gather(resident.embed(), *tok, dst, dim as i32)?,
-                    WeightKind::Q8_0 => hip.embed_gather_q8_0(
-                        resident.weights.byte_ptr_at(resident.embed.off),
-                        *tok,
-                        dst,
-                        dim as i32,
-                    )?,
-                    WeightKind::Q4_K => {
-                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                            "Q4_K embed must be F32 at load".into(),
-                        )))
-                    }
+            match resident.embed.kind {
+                WeightKind::F32 => hip.embed_gather_rows(resident.embed(), tokens, buf.x, dim as i32)?,
+                WeightKind::Q8_0 => hip.embed_gather_q8_0_rows(
+                    resident.weights.byte_ptr_at(resident.embed.off),
+                    tokens,
+                    buf.x,
+                    dim as i32,
+                )?,
+                WeightKind::Q4_K => {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                        "Q4_K embed must be F32 at load".into(),
+                    )))
                 }
             }
             record_elementwise(Some(metrics));
@@ -1312,34 +1309,28 @@ impl TinyModel {
                     resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, m, kv_dim as i32, dim as i32)?;
                     resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, m, kv_dim as i32, dim as i32)?;
                 }
-                for i in 0..n_tok {
-                    hip.rope_qk_device(
-                        buf.q_row(i, dim),
-                        buf.k_row(i, kv_dim),
-                        cfg.n_heads as i32,
-                        cfg.n_kv_heads as i32,
-                        head_dim as i32,
-                        (start_pos + i) as i32,
-                        cfg.rope_theta,
-                    )?;
-                }
+                hip.rope_qk_device_rows(
+                    buf.q,
+                    buf.k,
+                    n_tok as i32,
+                    cfg.n_heads as i32,
+                    cfg.n_kv_heads as i32,
+                    head_dim as i32,
+                    start_pos as i32,
+                    cfg.rope_theta,
+                )?;
                 record_elementwise(Some(metrics));
 
-                for i in 0..n_tok {
-                    let pos = start_pos + i;
-                    let page_index = pos / page_tokens;
-                    let slot = (pos % page_tokens) as u32;
-                    let page_id = page_ids[layer_idx][page_index];
-                    kv.write_slot_from_device(
-                        page_id,
-                        slot,
-                        cfg.n_kv_heads,
-                        head_dim,
-                        buf.k_row(i, kv_dim),
-                        buf.v_row(i, kv_dim),
-                    )?;
-                    kv.touch(page_id, 1.0);
-                }
+                kv.write_slots_from_device(
+                    &page_ids[layer_idx],
+                    start_pos,
+                    n_tok,
+                    page_tokens,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    buf.k,
+                    buf.v,
+                )?;
 
                 let (packed_k, packed_v, n_kv) = kv.kv_device_views(
                     &page_ids[layer_idx],
@@ -2204,12 +2195,7 @@ fn rmsnorm_device_rows(
     dim: usize,
     eps: f32,
 ) -> Result<(), AllpacaError> {
-    for i in 0..n_tok {
-        let xi = unsafe { x.add(i * dim) };
-        let oi = unsafe { out.add(i * dim) };
-        hip.rmsnorm_device(xi, weight, oi, dim as i32, eps)?;
-    }
-    Ok(())
+    hip.rmsnorm_device_rows(x, weight, out, n_tok as i32, dim as i32, eps)
 }
 
 fn rmsnorm_dispatch(

@@ -68,7 +68,7 @@ int allpaca_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t
                     allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q8_0[n,k])^T. Decode default is float A × Q8.
- * B is 36-byte staged Q8_0, not raw GGUF. */
+ * B is 36-byte staged Q8_0, not raw GGUF. M>8 uses a tiled kernel. */
 int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
 
@@ -94,6 +94,10 @@ int allpaca_copy_async(void *dst, const void *src, size_t bytes, allpaca_stream_
 int allpaca_rmsnorm(const float *x, const float *weight, float *out, int32_t n, float eps,
                     allpaca_stream_t stream);
 
+/* out[rows, n] = RMSNorm(x[rows, n], weight[n]). One launch; one block per row. */
+int allpaca_rmsnorm_rows(const float *x, const float *weight, float *out, int32_t rows, int32_t n,
+                         float eps, allpaca_stream_t stream);
+
 int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
                  allpaca_stream_t stream);
 
@@ -102,20 +106,31 @@ int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t s
 int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
                          allpaca_stream_t stream);
 
+/* out[n_tok, dim] = table[tokens[i]]. Decode stays on allpaca_embed_gather. */
+int allpaca_embed_gather_rows(const float *table, const int32_t *tokens, float *out, int32_t n_tok,
+                              int32_t dim, allpaca_stream_t stream);
+
 int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
 
 /* x += residual, then RMSNorm(x) -> out. One launch for the decode epilogue. */
 int allpaca_residual_rmsnorm(float *x, const float *residual, const float *weight, float *out,
                              int32_t n, float eps, allpaca_stream_t stream);
 
-/* RoPE on Q and K in one launch. */
+/* RoPE on Q and K in one launch. Decode uses n_tok=1 via allpaca_rope_qk. */
 int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads, int32_t head_dim,
                     int32_t pos, float theta, allpaca_stream_t stream);
+
+/* Prefill: Q/K are [n_tok, heads*head_dim]; position is start_pos + token. One launch. */
+int allpaca_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads, int32_t n_k_heads,
+                         int32_t head_dim, int32_t start_pos, float theta, allpaca_stream_t stream);
 
 int allpaca_dequant_q8_0(const uint8_t *blocks, float *out, int32_t n, allpaca_stream_t stream);
 
 int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, int32_t dim,
                               allpaca_stream_t stream);
+
+int allpaca_embed_gather_q8_0_rows(const uint8_t *table, const int32_t *tokens, float *out,
+                                   int32_t n_tok, int32_t dim, allpaca_stream_t stream);
 
 #ifdef __cplusplus
 }

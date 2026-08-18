@@ -405,6 +405,92 @@ impl KvTierManager {
         Ok(())
     }
 
+    /// D2D write of packed K/V rows `[n_tok, kv_width]`, one copy per page run.
+    pub(crate) fn write_slots_from_device(
+        &mut self,
+        page_ids: &[PageId],
+        start_pos: usize,
+        n_tok: usize,
+        page_tokens: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        k_dev: *const f32,
+        v_dev: *const f32,
+    ) -> Result<(), AllpacaError> {
+        if n_tok == 0 {
+            return Ok(());
+        }
+        if page_tokens == 0 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "KV page_tokens must be > 0".into(),
+            )));
+        }
+        if k_dev.is_null() || v_dev.is_null() {
+            return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                "device K/V pointer is null".into(),
+            )));
+        }
+        let kv_width = n_kv_heads * head_dim;
+        let mut i = 0;
+        while i < n_tok {
+            let pos = start_pos + i;
+            let page_index = pos / page_tokens;
+            let slot = pos % page_tokens;
+            let page_id = *page_ids.get(page_index).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                    "KV page index {page_index} out of range"
+                )))
+            })?;
+            let run = (n_tok - i).min(page_tokens - slot);
+            let (kind, offset, cap) = {
+                let page = self.pages.get(&page_id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {page_id}")))
+                })?;
+                (
+                    page.location.kind,
+                    page.location.offset,
+                    page.capacity_tokens as usize,
+                )
+            };
+            match kind {
+                DeviceBufferKind::Hip => {
+                    let k_off = offset + slot * kv_width;
+                    let v_off = offset + cap * kv_width + slot * kv_width;
+                    let alloc = self.hip_pages.get(&page_id).ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                            "HIP KV page {page_id} missing device buffer"
+                        )))
+                    })?;
+                    let run_bytes = run * kv_width * 4;
+                    let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
+                    let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
+                    let k_src = unsafe { k_dev.add(i * kv_width) };
+                    let v_src = unsafe { v_dev.add(i * kv_width) };
+                    allpaca_hip::memcpy(k_ptr, k_src.cast(), run_bytes, allpaca_hip::MEMCPY_D2D)?;
+                    allpaca_hip::memcpy(v_ptr, v_src.cast(), run_bytes, allpaca_hip::MEMCPY_D2D)?;
+                    if let Some(page) = self.pages.get_mut(&page_id) {
+                        page.filled = page.filled.max((slot + run) as u32);
+                    }
+                }
+                DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
+                    for t in 0..run {
+                        self.write_slot_from_device(
+                            page_id,
+                            (slot + t) as u32,
+                            n_kv_heads,
+                            head_dim,
+                            unsafe { k_dev.add((i + t) * kv_width) },
+                            unsafe { v_dev.add((i + t) * kv_width) },
+                        )?;
+                    }
+                }
+            }
+            self.touch(page_id, 1.0);
+            i += run;
+        }
+        Ok(())
+    }
+
     /// Device K/V views for attention. A single resident HIP page is used in-place
     /// (no D2D pack). Multiple or host pages still pack into `dest_k` / `dest_v`.
     pub(crate) fn kv_device_views(
@@ -721,5 +807,88 @@ mod tests {
         let (vram, dram) = kv.counts();
         assert!(dram > 0, "expected DRAM spill, vram={vram} dram={dram}");
         assert!(metrics.page_migrations.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// Packed device K/V rows written as page runs must match per-slot HIP copies.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn write_slots_from_device_matches_per_slot_on_hip() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let metrics = Metrics::default();
+        let mut batched = KvTierManager::with_hip(1 << 20, 1 << 20, 0.9, Some(0));
+        let mut per_slot = KvTierManager::with_hip(1 << 20, 1 << 20, 0.9, Some(0));
+        let page_tokens = 8u32;
+        let n_kv_heads = 2usize;
+        let head_dim = 4usize;
+        let kv_width = n_kv_heads * head_dim;
+        let start_pos = 6usize;
+        let n_tok = 4usize;
+        let n_pages = 2u32;
+        let mut batch_ids = Vec::new();
+        let mut slot_ids = Vec::new();
+        for i in 0..n_pages {
+            batch_ids.push(
+                batched
+                    .alloc_page(0, i, page_tokens, n_kv_heads, head_dim, &metrics)
+                    .unwrap(),
+            );
+            slot_ids.push(
+                per_slot
+                    .alloc_page(0, i, page_tokens, n_kv_heads, head_dim, &metrics)
+                    .unwrap(),
+            );
+        }
+        let mut k = vec![0.0f32; n_tok * kv_width];
+        let mut v = vec![0.0f32; n_tok * kv_width];
+        for (i, x) in k.iter_mut().enumerate() {
+            *x = i as f32 * 0.01;
+        }
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = 1.0 + i as f32 * 0.01;
+        }
+        let k_bytes = k.len() * 4;
+        let v_bytes = v.len() * 4;
+        allpaca_hip::set_device(0).unwrap();
+        let dk = allpaca_hip::device_malloc(k_bytes, 0).unwrap();
+        let dv = allpaca_hip::device_malloc(v_bytes, 0).unwrap();
+        allpaca_hip::memcpy(dk, k.as_ptr().cast(), k_bytes, allpaca_hip::MEMCPY_H2D).unwrap();
+        allpaca_hip::memcpy(dv, v.as_ptr().cast(), v_bytes, allpaca_hip::MEMCPY_H2D).unwrap();
+        batched
+            .write_slots_from_device(
+                &batch_ids,
+                start_pos,
+                n_tok,
+                page_tokens as usize,
+                n_kv_heads,
+                head_dim,
+                dk.cast(),
+                dv.cast(),
+            )
+            .expect("batched KV write");
+        for i in 0..n_tok {
+            let pos = start_pos + i;
+            let page_index = pos / page_tokens as usize;
+            let slot = (pos % page_tokens as usize) as u32;
+            per_slot
+                .write_slot_from_device(
+                    slot_ids[page_index],
+                    slot,
+                    n_kv_heads,
+                    head_dim,
+                    unsafe { dk.cast::<f32>().add(i * kv_width) },
+                    unsafe { dv.cast::<f32>().add(i * kv_width) },
+                )
+                .expect("per-slot KV write");
+        }
+        allpaca_hip::device_free(dk, k_bytes);
+        allpaca_hip::device_free(dv, v_bytes);
+        for (a, b) in batch_ids.iter().zip(slot_ids.iter()) {
+            let (bk, bv) = batched.read_kv(*a, n_kv_heads, head_dim).unwrap();
+            let (sk, sv) = per_slot.read_kv(*b, n_kv_heads, head_dim).unwrap();
+            assert_eq!(bk, sk, "K page mismatch batched vs per-slot");
+            assert_eq!(bv, sv, "V page mismatch batched vs per-slot");
+        }
     }
 }
