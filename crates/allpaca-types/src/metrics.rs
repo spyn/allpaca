@@ -37,6 +37,8 @@ pub struct StatsSnapshot {
     pub tree_path_valid: bool,
     /// Packed Token Forest attention launches that ran the ancestry mask on HIP.
     pub tree_gpu_verifies: u64,
+    /// Linear draft-span verifies that ran one Target Model forward over the proposed tokens.
+    pub linear_packed_verifies: u64,
     pub accepted_tokens_per_target_eval: f64,
     pub model_id: String,
     /// `"cpu"` or `"hip"` — which kernel backend ran target forwards.

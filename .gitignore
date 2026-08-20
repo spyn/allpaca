@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# Local GGUF weights (not in git)
+/models/*.gguf
+
 # HIP build
 /hip/build
 /hip/build-test

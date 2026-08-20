@@ -104,6 +104,7 @@ const HOST_F32_LIMIT: u64 = 128 * 1024 * 1024;
 #[allow(non_camel_case_types)]
 enum WeightKind {
     F32,
+    F16,
     Q8_0,
     Q4_K,
 }
@@ -183,8 +184,9 @@ impl ResidentModel {
     }
 
     /// Upload a real GGUF without host-materializing every tensor as F32.
-    /// Q8_0 weights stay quantized on device; `output.weight` is dequantized once
-    /// so the lm_head GEMM can use a resident F32 matrix.
+    /// Q8_0 / large F16 GEMM weights stay packed; `output.weight` and large
+    /// `token_embd.weight` use the same path (F16 lm_head/embed stay F16).
+    /// Tied models reuse embed.
     pub fn upload_gguf(file: &GgufFile, cfg: &ModelConfig, device: i32) -> Result<Self, AllpacaError> {
         let mut parts: Vec<Vec<u8>> = Vec::new();
         let mut off = 0usize;
@@ -229,18 +231,11 @@ impl ResidentModel {
             });
         }
         let norm = append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?;
-        let lm_f32 = match file.tensor_f32("output.weight") {
-            Ok(w) => w,
-            Err(_) => file.tensor_f32("token_embd.weight")?,
+        let lm_head = if file.tensor("output.weight").is_some() {
+            append_gguf_tensor(file, "output.weight", &mut parts, &mut off)?
+        } else {
+            embed
         };
-        let mut lm_bytes = Vec::with_capacity(lm_f32.len() * 4);
-        for v in &lm_f32 {
-            lm_bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        let lm_head = WeightRef::f32(off, lm_f32.len());
-        off += lm_bytes.len();
-        let _ = off;
-        parts.push(lm_bytes);
 
         let views: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
         let weights = DeviceWeights::upload_bytes(device, &views)?;
@@ -269,8 +264,8 @@ impl ResidentModel {
                 hip.dequant_q8_0(self.weights.byte_ptr_at(w.off), w.n as i32, out)?;
                 Ok(out as *const f32)
             }
-            WeightKind::Q4_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q4_K norm/embed must be F32 at load".into(),
+            WeightKind::F16 | WeightKind::Q4_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "F16/Q4_K norm must be F32 at load".into(),
             ))),
         }
     }
@@ -287,12 +282,74 @@ impl ResidentModel {
     ) -> Result<(), AllpacaError> {
         match w.kind {
             WeightKind::F32 => hip.gemm_nt_dev(a, self.weights.ptr_at(w.off), c, m, n, k),
+            WeightKind::F16 => hip.gemm_nt_f16_dev(
+                a,
+                self.weights.byte_ptr_at(w.off) as *const u16,
+                c,
+                m,
+                n,
+                k,
+            ),
             WeightKind::Q8_0 => {
                 hip.gemm_nt_q8_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
             WeightKind::Q4_K => {
                 hip.gemm_nt_q4_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+        }
+    }
+
+    fn embed_gather(
+        &self,
+        hip: &HipWorkspace,
+        token: u32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        match self.embed.kind {
+            WeightKind::F32 => hip.embed_gather(self.embed(), token, out, dim),
+            WeightKind::F16 => hip.embed_gather_f16(
+                self.weights.byte_ptr_at(self.embed.off) as *const u16,
+                token,
+                out,
+                dim,
+            ),
+            WeightKind::Q8_0 => hip.embed_gather_q8_0(
+                self.weights.byte_ptr_at(self.embed.off),
+                token,
+                out,
+                dim,
+            ),
+            WeightKind::Q4_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "Q4_K embed must be F32 at load".into(),
+            ))),
+        }
+    }
+
+    fn embed_gather_rows(
+        &self,
+        hip: &HipWorkspace,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        match self.embed.kind {
+            WeightKind::F32 => hip.embed_gather_rows(self.embed(), tokens, out, dim),
+            WeightKind::F16 => hip.embed_gather_f16_rows(
+                self.weights.byte_ptr_at(self.embed.off) as *const u16,
+                tokens,
+                out,
+                dim,
+            ),
+            WeightKind::Q8_0 => hip.embed_gather_q8_0_rows(
+                self.weights.byte_ptr_at(self.embed.off),
+                tokens,
+                out,
+                dim,
+            ),
+            WeightKind::Q4_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "Q4_K embed must be F32 at load".into(),
+            ))),
         }
     }
 
@@ -395,6 +452,19 @@ fn append_gguf_tensor(
     let n = info.n_elements() as usize;
     let (bytes, kind) = match info.ggml_type {
         allpaca_gguf::GgmlType::F32 => (file.tensor_bytes(name)?.to_vec(), WeightKind::F32),
+        allpaca_gguf::GgmlType::F16 => {
+            let packed = file.tensor_bytes(name)?;
+            if n <= 65_536 {
+                let f32s = file.tensor_f32(name)?;
+                let mut bytes = Vec::with_capacity(f32s.len() * 4);
+                for v in &f32s {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (bytes, WeightKind::F32)
+            } else {
+                (packed.to_vec(), WeightKind::F16)
+            }
+        }
         allpaca_gguf::GgmlType::Q4_K => {
             let packed = file.tensor_bytes(name)?;
             if n <= 65_536 || name == "token_embd.weight" {
@@ -457,6 +527,11 @@ fn append_gguf_tensor(
     };
     if kind == WeightKind::Q8_0 && *off % allpaca_hip::Q8_STAGED_BLOCK != 0 {
         let pad = allpaca_hip::Q8_STAGED_BLOCK - (*off % allpaca_hip::Q8_STAGED_BLOCK);
+        parts.push(vec![0u8; pad]);
+        *off += pad;
+    }
+    if kind == WeightKind::F16 && *off % 16 != 0 {
+        let pad = 16 - (*off % 16);
         parts.push(vec![0u8; pad]);
         *off += pad;
     }
@@ -880,7 +955,8 @@ impl TinyModel {
 
     /// Prefill a token chunk. HIP runs one forward with M=N (hipBLASLt when N>8 on F32).
     /// Decode stays on [`forward_token`]. CPU loops per token. Last-chunk logits are
-    /// written for the last position only when `write_logits` is set.
+    /// written for the last position only when `write_logits` is set. Packed linear
+    /// verify passes `row_logits` of length `tokens.len() * vocab` to keep every row.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_tokens(
         &self,
@@ -893,12 +969,13 @@ impl TinyModel {
         hip: Option<&HipWorkspace>,
         resident: Option<&ResidentModel>,
         write_logits: bool,
+        mut row_logits: Option<&mut [f32]>,
     ) -> Result<(), AllpacaError> {
         if tokens.is_empty() {
             return Ok(());
         }
         if tokens.len() == 1 {
-            return self.forward_token(
+            self.forward_token(
                 tokens[0],
                 start_pos,
                 page_ids,
@@ -907,7 +984,14 @@ impl TinyModel {
                 logits,
                 hip,
                 resident,
-            );
+            )?;
+            if let Some(rows) = row_logits {
+                let vocab = self.config.vocab_size;
+                if rows.len() >= vocab {
+                    rows[..vocab].copy_from_slice(&logits[..vocab]);
+                }
+            }
+            return Ok(());
         }
         for tok in tokens {
             if *tok as usize >= self.config.vocab_size {
@@ -927,6 +1011,7 @@ impl TinyModel {
                 hip,
                 resident,
                 write_logits,
+                row_logits.as_deref_mut(),
             ) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -942,6 +1027,7 @@ impl TinyModel {
                 }
             }
         }
+        let vocab = self.config.vocab_size;
         for (i, tok) in tokens.iter().enumerate() {
             self.forward_token(
                 *tok,
@@ -953,6 +1039,12 @@ impl TinyModel {
                 hip,
                 resident,
             )?;
+            if let Some(rows) = row_logits.as_mut() {
+                let off = i * vocab;
+                if rows.len() >= off + vocab {
+                    rows[off..off + vocab].copy_from_slice(&logits[..vocab]);
+                }
+            }
         }
         Ok(())
     }
@@ -995,20 +1087,7 @@ impl TinyModel {
         let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, max_kv)?;
         hip.begin_decode_profile();
         let result = (|| {
-        match resident.embed.kind {
-            WeightKind::F32 => hip.embed_gather(resident.embed(), token, buf.x, dim as i32)?,
-            WeightKind::Q8_0 => hip.embed_gather_q8_0(
-                resident.weights.byte_ptr_at(resident.embed.off),
-                token,
-                buf.x,
-                dim as i32,
-            )?,
-            WeightKind::Q4_K => {
-                return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                    "Q4_K embed must be F32 at load".into(),
-                )))
-            }
-        }
+        resident.embed_gather(hip, token, buf.x, dim as i32)?;
         record_elementwise(Some(metrics));
 
         for (layer_idx, _) in self.layers.iter().enumerate() {
@@ -1222,6 +1301,7 @@ impl TinyModel {
         hip: &HipWorkspace,
         resident: &ResidentModel,
         write_logits: bool,
+        row_logits: Option<&mut [f32]>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -1233,6 +1313,13 @@ impl TinyModel {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
             )));
+        }
+        if let Some(rows) = row_logits.as_ref() {
+            if rows.len() < n_tok.saturating_mul(vocab) {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "row logits buffer smaller than n_tok * vocab".into(),
+                )));
+            }
         }
         let page_tokens = page_ids
             .first()
@@ -1247,23 +1334,18 @@ impl TinyModel {
             .unwrap_or(seq_end)
             .max(seq_end);
         hip.bind()?;
-        let buf = hip.ensure_decode_batch(dim, kv_dim, cfg.ff_dim, vocab, max_kv, n_tok)?;
+        let buf = hip.ensure_decode_batch(
+            dim,
+            kv_dim,
+            cfg.ff_dim,
+            vocab,
+            max_kv,
+            n_tok,
+            if row_logits.is_some() { n_tok } else { 1 },
+        )?;
         hip.begin_decode_profile();
         let result = (|| {
-            match resident.embed.kind {
-                WeightKind::F32 => hip.embed_gather_rows(resident.embed(), tokens, buf.x, dim as i32)?,
-                WeightKind::Q8_0 => hip.embed_gather_q8_0_rows(
-                    resident.weights.byte_ptr_at(resident.embed.off),
-                    tokens,
-                    buf.x,
-                    dim as i32,
-                )?,
-                WeightKind::Q4_K => {
-                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                        "Q4_K embed must be F32 at load".into(),
-                    )))
-                }
-            }
+            resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
             record_elementwise(Some(metrics));
 
             let m = n_tok as i32;
@@ -1460,7 +1542,31 @@ impl TinyModel {
                 }
             }
 
-            if write_logits {
+            if row_logits.is_some() {
+                rmsnorm_device_rows(
+                    hip,
+                    buf.x,
+                    resident.f32_or_dequant(hip, resident.norm)?,
+                    buf.normed,
+                    n_tok,
+                    dim,
+                    cfg.eps,
+                )?;
+                record_elementwise(Some(metrics));
+                {
+                    let _lm = hip.lm_head_scope();
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        resident.lm_head,
+                        buf.logits,
+                        n_tok as i32,
+                        vocab as i32,
+                        dim as i32,
+                    )?;
+                }
+                hip.start_logits_d2h(buf.logits, n_tok * vocab)?;
+            } else if write_logits {
                 let x_last = buf.x_row(n_tok - 1, dim);
                 hip.rmsnorm_device(
                     x_last,
@@ -1698,6 +1804,7 @@ impl TinyModel {
         resident: Option<&ResidentModel>,
         metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
+        cache.forwards = cache.forwards.saturating_add(1);
         if let (Some(hip), Some(resident)) = (hip, resident) {
             match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
                 Ok(()) => return Ok(()),
@@ -1834,39 +1941,37 @@ impl TinyModel {
                 .store(cache.device_bytes(), std::sync::atomic::Ordering::Relaxed);
         }
         let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, pos + 1)?;
-        hip.embed_gather(resident.embed(), token, buf.x, dim as i32)?;
+        resident.embed_gather(hip, token, buf.x, dim as i32)?;
         record_elementwise(metrics);
 
+        // Same dtype dispatch as target decode (`resident.gemm_nt`). F32 GEMV on
+        // packed F16/Q8 reads past the weight allocation and hangs the draft GPU.
         for layer_idx in 0..self.layers.len() {
+            let layer = &resident.layers[layer_idx];
             if layer_idx == 0 {
                 hip.rmsnorm_device(
                     buf.x,
-                    resident.attn_norm(layer_idx),
+                    resident.f32_or_dequant(hip, layer.attn_norm)?,
                     buf.normed,
                     dim as i32,
                     cfg.eps,
                 )?;
                 record_elementwise(metrics);
             }
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
+            resident.gemm_nt(
+                hip,
                 buf.normed,
-                resident.wq(layer_idx),
-                buf.q,
-                1,
-                dim as i32,
-                dim as i32,
-            )?;
-            allpaca_hip::gemm_nt_device(
-                buf.normed,
-                resident.wk(layer_idx),
+                layer.wk,
                 buf.k,
                 1,
                 kv_dim as i32,
                 dim as i32,
             )?;
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
+                hip,
                 buf.normed,
-                resident.wv(layer_idx),
+                layer.wv,
                 buf.v,
                 1,
                 kv_dim as i32,
@@ -1896,9 +2001,10 @@ impl TinyModel {
                 head_dim as i32,
                 true,
             )?;
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
+                hip,
                 buf.attn,
-                resident.wo(layer_idx),
+                layer.wo,
                 buf.proj,
                 1,
                 dim as i32,
@@ -1907,7 +2013,7 @@ impl TinyModel {
             hip.residual_rmsnorm(
                 buf.x,
                 buf.proj,
-                resident.ffn_norm(layer_idx),
+                resident.f32_or_dequant(hip, layer.ffn_norm)?,
                 buf.normed,
                 dim as i32,
                 cfg.eps,
@@ -1918,17 +2024,19 @@ impl TinyModel {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             record_elementwise(metrics);
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
+                hip,
                 buf.normed,
-                resident.w_gate(layer_idx),
+                layer.w_gate,
                 buf.gate,
                 1,
                 cfg.ff_dim as i32,
                 dim as i32,
             )?;
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
+                hip,
                 buf.normed,
-                resident.w_up(layer_idx),
+                layer.w_up,
                 buf.up,
                 1,
                 cfg.ff_dim as i32,
@@ -1936,19 +2044,20 @@ impl TinyModel {
             )?;
             hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
             record_elementwise(metrics);
-            allpaca_hip::gemm_nt_device(
+            resident.gemm_nt(
+                hip,
                 buf.gate,
-                resident.w_down(layer_idx),
+                layer.w_down,
                 buf.proj,
                 1,
                 dim as i32,
                 cfg.ff_dim as i32,
             )?;
-            if layer_idx + 1 < self.layers.len() {
+            if layer_idx + 1 < resident.layers.len() {
                 hip.residual_rmsnorm(
                     buf.x,
                     buf.proj,
-                    resident.attn_norm(layer_idx + 1),
+                    resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
                     buf.normed,
                     dim as i32,
                     cfg.eps,
@@ -1964,16 +2073,26 @@ impl TinyModel {
             record_elementwise(metrics);
         }
 
-        hip.rmsnorm_device(buf.x, resident.norm(), buf.normed, dim as i32, cfg.eps)?;
-        record_elementwise(metrics);
-        allpaca_hip::gemm_nt_device(
+        hip.rmsnorm_device(
+            buf.x,
+            resident.f32_or_dequant(hip, resident.norm)?,
             buf.normed,
-            resident.lm_head(),
-            buf.logits,
-            1,
-            vocab as i32,
             dim as i32,
+            cfg.eps,
         )?;
+        record_elementwise(metrics);
+        {
+            let _lm = hip.lm_head_scope();
+            resident.gemm_nt(
+                hip,
+                buf.normed,
+                resident.lm_head,
+                buf.logits,
+                1,
+                vocab as i32,
+                dim as i32,
+            )?;
+        }
         hip.publish_logits(buf.logits, &mut logits[..vocab])?;
         if let Some(metrics) = metrics {
             metrics
@@ -2012,6 +2131,9 @@ pub struct DenseKv {
     tokens: usize,
     capacity: usize,
     kv_dim: usize,
+    seq: Vec<u32>,
+    /// Draft decode steps on this cache (CPU or HIP). Locks prefix reuse.
+    pub(crate) forwards: u64,
 }
 
 impl Default for DenseKv {
@@ -2023,6 +2145,8 @@ impl Default for DenseKv {
             tokens: 0,
             capacity: 0,
             kv_dim: 0,
+            seq: Vec::new(),
+            forwards: 0,
         }
     }
 }
@@ -2050,10 +2174,28 @@ impl DenseKv {
 
     pub fn reset(&mut self) {
         self.tokens = 0;
+        self.seq.clear();
         for layer in &mut self.layers {
             layer.k.clear();
             layer.v.clear();
         }
+    }
+
+    pub(crate) fn prefix_len(&self, ctx: &[u32]) -> usize {
+        self.seq
+            .iter()
+            .zip(ctx)
+            .take_while(|(a, b)| *a == *b)
+            .count()
+    }
+
+    pub(crate) fn truncate(&mut self, n: usize, kv_dim: usize) {
+        self.rewind_to(n, kv_dim);
+        self.seq.truncate(n);
+    }
+
+    pub(crate) fn record(&mut self, token: u32) {
+        self.seq.push(token);
     }
 
     fn free_device(&mut self) {

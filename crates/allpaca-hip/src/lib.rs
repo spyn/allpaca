@@ -280,6 +280,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_f16(
+            a: *const f32,
+            b: *const u16,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_attention(
             q: *const f32,
             k: *const f32,
@@ -352,6 +361,21 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_embed_gather_rows(
             table: *const f32,
+            tokens: *const i32,
+            out: *mut f32,
+            n_tok: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_f16(
+            table: *const u16,
+            token: i32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_f16_rows(
+            table: *const u16,
             tokens: *const i32,
             out: *mut f32,
             n_tok: i32,
@@ -962,6 +986,29 @@ pub fn gemm_nt_q8_0_intdot_device(
     }
 }
 
+/// Device-pointer NT GEMM with packed IEEE F16 `b` (`C = A * dequant(B)^T`).
+pub fn gemm_nt_f16_device(
+    a: *const f32,
+    b: *const u16,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_f16(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_f16")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_f16 unavailable".into(),
+        )))
+    }
+}
+
 /// Device-pointer NT GEMM with native GGUF Q4_K `b` (`C = A * dequant(B)^T`).
 pub fn gemm_nt_q4_k_device(
     a: *const f32,
@@ -981,6 +1028,54 @@ pub fn gemm_nt_q4_k_device(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q4_k unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer F16 NT GEMM: copies packed IEEE F16 `b`, runs the kernel, copies back.
+pub fn gemm_nt_f16(
+    a: &[f32],
+    b: &[u16],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let b_n = (n as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        if a.len() < a_n || b.len() < b_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "F16 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(b_n * 2, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr().cast(), b_n * 2, MEMCPY_H2D)?;
+            gemm_nt_f16_device(da.cast(), db.cast(), dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, b_n * 2);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_f16 unavailable".into(),
         )))
     }
 }
@@ -1294,6 +1389,66 @@ pub fn embed_gather_rows(
     }
 }
 
+/// Host-pointer batched F16 embed gather. `table` is packed IEEE F16 rows.
+pub fn embed_gather_f16_rows(
+    table: &[u16],
+    tokens: &[u32],
+    out: &mut [f32],
+    dim: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if dim <= 0 || tokens.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed_gather_f16_rows shape".into(),
+            )));
+        }
+        let n_tok = tokens.len();
+        let dim_u = dim as usize;
+        let max_tok = *tokens.iter().max().unwrap_or(&0) as usize;
+        if table.len() < (max_tok + 1).saturating_mul(dim_u) || out.len() < n_tok * dim_u {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed_gather_f16_rows buffer size mismatch".into(),
+            )));
+        }
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let t_bytes = table.len() * 2;
+        let id_bytes = ids.len() * 4;
+        let o_bytes = n_tok * dim_u * 4;
+        let dt = device_malloc(t_bytes, 0)?;
+        let di = device_malloc(id_bytes, 0)?;
+        let dout = device_malloc(o_bytes, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(dt, table.as_ptr().cast(), t_bytes, MEMCPY_H2D)?;
+            memcpy(di, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+            let rc = unsafe {
+                ffi::allpaca_embed_gather_f16_rows(
+                    dt.cast(),
+                    di.cast(),
+                    dout.cast(),
+                    n_tok as i32,
+                    dim,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "embed_gather_f16_rows")?;
+            memcpy(out.as_mut_ptr().cast(), dout, o_bytes, MEMCPY_D2H)
+        })();
+        device_free(dt, t_bytes);
+        device_free(di, id_bytes);
+        device_free(dout, o_bytes);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (table, tokens, out, dim);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP embed_gather_f16_rows unavailable".into(),
+        )))
+    }
+}
+
 /// Host-pointer batched Q8 embed gather. `table` is packed 34-byte GGUF Q8_0 rows.
 pub fn embed_gather_q8_0_rows(
     table: &[u8],
@@ -1593,6 +1748,7 @@ struct DecodeAlloc {
     vocab: usize,
     max_kv: usize,
     batch: usize,
+    logits_rows: usize,
 }
 
 unsafe impl Send for DecodeAlloc {}
@@ -1607,6 +1763,7 @@ impl DecodeAlloc {
             p
         };
         let b = self.batch.max(1);
+        let logits_rows = self.logits_rows.max(1);
         DeviceDecode {
             x: next(self.dim * b),
             normed: next(self.dim * b),
@@ -1617,7 +1774,7 @@ impl DecodeAlloc {
             proj: next(self.dim * b),
             gate: next(self.ff_dim * b),
             up: next(self.ff_dim * b),
-            logits: next(self.vocab),
+            logits: next(self.vocab * logits_rows),
             packed_k: next(self.max_kv * self.kv_dim),
             packed_v: next(self.max_kv * self.kv_dim),
             max_kv: self.max_kv,
@@ -1632,9 +1789,11 @@ fn decode_floats(
     vocab: usize,
     max_kv: usize,
     batch: usize,
+    logits_rows: usize,
 ) -> usize {
     let b = batch.max(1);
-    b * (dim * 5 + kv_dim * 2 + ff_dim * 2) + vocab + max_kv * kv_dim * 2
+    let rows = logits_rows.max(1);
+    b * (dim * 5 + kv_dim * 2 + ff_dim * 2) + vocab * rows + max_kv * kv_dim * 2
 }
 
 /// Persistent device workspace used by the Engine for GEMM / attention / logits.
@@ -1752,7 +1911,7 @@ impl HipWorkspace {
         g.wall_start = Some(std::time::Instant::now());
     }
 
-    /// Classify the next F32 GEMM ABI calls as lm_head until the guard drops.
+    /// Classify the next F32/F16 GEMM ABI calls as lm_head until the guard drops.
     pub fn lm_head_scope(&self) -> LmHeadScope<'_> {
         self.lm_head.store(1, Ordering::Relaxed);
         LmHeadScope { flag: &self.lm_head }
@@ -1919,6 +2078,23 @@ impl HipWorkspace {
         self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q4_k_device(a, b, c, m, n, k))
     }
 
+    pub fn gemm_nt_f16_dev(
+        &self,
+        a: *const f32,
+        b: *const u16,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::OtherGpu
+        };
+        self.timed_gpu(op, || gemm_nt_f16_device(a, b, c, m, n, k))
+    }
+
     fn add_h2d(&self, bytes: usize) {
         self.activation_h2d
             .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -1942,10 +2118,11 @@ impl HipWorkspace {
         vocab: usize,
         max_kv: usize,
     ) -> Result<DeviceDecode, AllpacaError> {
-        self.ensure_decode_batch(dim, kv_dim, ff_dim, vocab, max_kv, 1)
+        self.ensure_decode_batch(dim, kv_dim, ff_dim, vocab, max_kv, 1, 1)
     }
 
     /// Same workspace as [`ensure_decode`], sized for `batch` token rows (prefill M=N).
+    /// `logits_rows` is 1 for last-token prefill logits, or `batch` for packed linear verify.
     pub fn ensure_decode_batch(
         &self,
         dim: usize,
@@ -1954,9 +2131,11 @@ impl HipWorkspace {
         vocab: usize,
         max_kv: usize,
         batch: usize,
+        logits_rows: usize,
     ) -> Result<DeviceDecode, AllpacaError> {
         let max_kv = max_kv.max(1);
         let batch = batch.max(1);
+        let logits_rows = logits_rows.max(1);
         let mut guard = self
             .decode
             .lock()
@@ -1970,6 +2149,7 @@ impl HipWorkspace {
                     || a.vocab < vocab
                     || a.max_kv < max_kv
                     || a.batch < batch
+                    || a.logits_rows < logits_rows
             }
         };
         if grow {
@@ -1980,7 +2160,7 @@ impl HipWorkspace {
             let kv_dim = kv_dim.max(1);
             let ff_dim = ff_dim.max(1);
             let vocab = vocab.max(1);
-            let floats = decode_floats(dim, kv_dim, ff_dim, vocab, max_kv, batch);
+            let floats = decode_floats(dim, kv_dim, ff_dim, vocab, max_kv, batch, logits_rows);
             let bytes = floats * 4;
             let ptr = device_malloc(bytes, self.device)?;
             *guard = Some(DecodeAlloc {
@@ -1992,11 +2172,13 @@ impl HipWorkspace {
                 vocab,
                 max_kv,
                 batch,
+                logits_rows,
             });
         }
         let vocab = guard.as_ref().map(|a| a.vocab).unwrap_or(vocab);
+        let pinned_rows = guard.as_ref().map(|a| a.logits_rows).unwrap_or(logits_rows);
         drop(guard);
-        let _ = self.ensure_pinned_logits(vocab);
+        let _ = self.ensure_pinned_logits(vocab.saturating_mul(pinned_rows));
         Ok(self
             .decode
             .lock()
@@ -2498,6 +2680,37 @@ impl HipWorkspace {
         }
     }
 
+    pub fn embed_gather_f16(
+        &self,
+        table: *const u16,
+        token: u32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed gather".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_f16(table, token as i32, out, dim, std::ptr::null_mut())
+                };
+                status(rc, "embed_gather_f16")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = token;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_f16 unavailable".into(),
+            )))
+        }
+    }
+
     pub fn embed_gather_rows(
         &self,
         table: *const f32,
@@ -2542,6 +2755,54 @@ impl HipWorkspace {
         {
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP embed_gather unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn embed_gather_f16_rows(
+        &self,
+        table: *const u16,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed gather".into(),
+            )));
+        }
+        let id_bytes = tokens.len() * 4;
+        if id_bytes > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed gather tokens exceed scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        memcpy(self.scratch, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_f16_rows(
+                        table,
+                        self.scratch.cast(),
+                        out,
+                        tokens.len() as i32,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_f16_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_f16 unavailable".into(),
             )))
         }
     }
@@ -3478,6 +3739,177 @@ mod tests {
         }
     }
 
+    /// Public `gemm_nt_f16` must match CPU F16-dequant + NT GEMM on decode shapes (M≤8).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_f16_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (1, 8, 4),
+            (1, 64, 32),
+            (1, 129, 33),
+            (2, 3, 5),
+            (7, 17, 13),
+            (8, 32, 16),
+            (1, 128, 64),
+        ];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+            let b_deq: Vec<f32> = b_f16.iter().copied().map(super::f16_bits_to_f32).collect();
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_f16(&a, &b_f16, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_f16 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_f16 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// Prefill-wide F16 NT GEMM (M>8) must match CPU F16-dequant + NT GEMM.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_f16_wide_m_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(16, 64, 128), (9, 17, 64), (32, 33, 96)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 43) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 11) % 50) as f32 * 0.02 - 0.5;
+            }
+            let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+            let b_deq: Vec<f32> = b_f16.iter().copied().map(super::f16_bits_to_f32).collect();
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_f16(&a, &b_f16, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_f16 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_f16 wide mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// F16 decode GEMV at lm_head-ish n must stay in the same ballpark as F32 GEMV.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_f16_wide_n_decode_is_not_orders_slower_than_f32() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 1usize;
+        let n = 32_768usize;
+        let k = 2_048usize;
+        let a = vec![0.1f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i % 17) as f32) * 0.01;
+        }
+        let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+        let a_b = a.len() * 4;
+        let b32_b = b_f.len() * 4;
+        let b16_b = b_f16.len() * 2;
+        let c_b = n * 4;
+        set_device(0).unwrap();
+        let da = device_malloc(a_b, 0).unwrap();
+        let db32 = device_malloc(b32_b, 0).unwrap();
+        let db16 = device_malloc(b16_b, 0).unwrap();
+        let dc = device_malloc(c_b, 0).unwrap();
+        memcpy(da, a.as_ptr().cast(), a_b, MEMCPY_H2D).unwrap();
+        memcpy(db32, b_f.as_ptr().cast(), b32_b, MEMCPY_H2D).unwrap();
+        memcpy(db16, b_f16.as_ptr().cast(), b16_b, MEMCPY_H2D).unwrap();
+        gemm_nt_device(da.cast(), db32.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        gemm_nt_f16_device(da.cast(), db16.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        stream_synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 {
+            gemm_nt_device(da.cast(), db32.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        }
+        stream_synchronize().unwrap();
+        let f32_ms = t0.elapsed().as_secs_f64() * 1_000.0 / 10.0;
+        let t1 = std::time::Instant::now();
+        for _ in 0..10 {
+            gemm_nt_f16_device(da.cast(), db16.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+        }
+        stream_synchronize().unwrap();
+        let f16_ms = t1.elapsed().as_secs_f64() * 1_000.0 / 10.0;
+        device_free(da, a_b);
+        device_free(db32, b32_b);
+        device_free(db16, b16_b);
+        device_free(dc, c_b);
+        eprintln!("device GEMV 1x{n}x{k} f32={f32_ms:.2}ms f16={f16_ms:.2}ms");
+        assert!(
+            f16_ms < f32_ms * 8.0 + 2.0,
+            "F16 GEMV {f16_ms:.2}ms vs F32 {f32_ms:.2}ms on 1x{n}x{k}"
+        );
+    }
+
+    /// Draft GPU is device 1. F16 GEMV must run there, not only on the 9070.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_f16_runs_on_every_hip_device() {
+        let n = device_count();
+        if n == 0 {
+            return;
+        }
+        let m = 1i32;
+        let cols = 64i32;
+        let k = 128i32;
+        let a = vec![0.25f32; k as usize];
+        let b: Vec<u16> = (0..cols * k)
+            .map(|i| allpaca_cpu::f32_to_f16(((i % 9) as f32) * 0.05))
+            .collect();
+        let mut c = vec![0.0f32; cols as usize];
+        for id in 0..n {
+            let t0 = std::time::Instant::now();
+            set_device(id).expect("set_device");
+            let da = device_malloc(a.len() * 4, id).expect("A");
+            let db = device_malloc(b.len() * 2, id).expect("B");
+            let dc = device_malloc(c.len() * 4, id).expect("C");
+            memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, b.as_ptr().cast(), b.len() * 2, MEMCPY_H2D).unwrap();
+            gemm_nt_f16_device(da.cast(), db.cast(), dc.cast(), m, cols, k)
+                .unwrap_or_else(|e| panic!("F16 GEMV on device {id}: {e}"));
+            stream_synchronize().unwrap_or_else(|e| panic!("sync device {id}: {e}"));
+            memcpy(c.as_mut_ptr().cast(), dc, c.len() * 4, MEMCPY_D2H).unwrap();
+            device_free(da, a.len() * 4);
+            device_free(db, b.len() * 2);
+            device_free(dc, c.len() * 4);
+            eprintln!(
+                "f16 gemv device {id} ok in {:?}",
+                t0.elapsed()
+            );
+        }
+    }
+
     /// Prefill-wide Q8 NT GEMM (M>8) must match CPU dequant + NT GEMM.
     #[cfg(feature = "hip")]
     #[test]
@@ -3865,6 +4297,45 @@ mod tests {
             assert!(
                 gemm_close(hip[i], cpu[i]),
                 "embed_gather_rows mismatch idx={i} hip={} cpu={}",
+                hip[i],
+                cpu[i]
+            );
+        }
+    }
+
+    /// Prefill-shaped batched F16 embed gather must match dequantized table rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn embed_gather_f16_rows_matches_table_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        let vocab = 8usize;
+        let dim = 16usize;
+        let tokens = [0u32, 3, 7, 1, 3, 2];
+        let mut table_f = vec![0.0f32; vocab * dim];
+        for (i, v) in table_f.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        let table: Vec<u16> = table_f
+            .iter()
+            .copied()
+            .map(allpaca_cpu::f32_to_f16)
+            .collect();
+        let mut cpu = vec![0.0f32; tokens.len() * dim];
+        for (r, &tok) in tokens.iter().enumerate() {
+            let s = tok as usize * dim;
+            for i in 0..dim {
+                cpu[r * dim + i] = super::f16_bits_to_f32(table[s + i]);
+            }
+        }
+        let mut hip = vec![0.0f32; tokens.len() * dim];
+        embed_gather_f16_rows(&table, &tokens, &mut hip, dim as i32)
+            .expect("HIP embed_gather_f16_rows must run when a device is present");
+        for i in 0..cpu.len() {
+            assert!(
+                gemm_close(hip[i], cpu[i]),
+                "embed_gather_f16_rows mismatch idx={i} hip={} cpu={}",
                 hip[i],
                 cpu[i]
             );

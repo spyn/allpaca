@@ -134,10 +134,18 @@ impl DraftModelProvider {
         if ctx.is_empty() {
             return Ok(Vec::new());
         }
-        cache.reset();
+        let kv_dim = self.model.config.n_kv_heads * self.model.config.head_dim();
+        let common = cache.prefix_len(ctx);
+        let start = if common == ctx.len() {
+            cache.truncate(common.saturating_sub(1), kv_dim);
+            common.saturating_sub(1)
+        } else {
+            cache.truncate(common, kv_dim);
+            common
+        };
         let vocab = self.model.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
-        for (pos, tok) in ctx.iter().enumerate() {
+        for (pos, tok) in ctx.iter().enumerate().skip(start) {
             self.model.forward_dense_on(
                 *tok,
                 pos,
@@ -147,6 +155,7 @@ impl DraftModelProvider {
                 resident,
                 metrics,
             )?;
+            cache.record(*tok);
         }
         let mut out = Vec::new();
         let mut window = ctx.to_vec();
@@ -175,6 +184,7 @@ impl DraftModelProvider {
                 resident,
                 metrics,
             )?;
+            cache.record(next);
         }
         Ok(out)
     }
@@ -219,5 +229,32 @@ mod tests {
         let draft = p.propose(&[1, 2], 3, 0.0).unwrap();
         assert_eq!(draft.len(), 3);
         assert!(draft.iter().all(|t| *t < 64));
+    }
+
+    #[test]
+    fn draft_model_reuses_kv_prefix_instead_of_replaying_context() {
+        let model = TinyModel::synthetic(ModelConfig::draft_tiny(), 1, "draft");
+        let mut p = DraftModelProvider::new(model);
+        let mut cache = DenseKv::default();
+        let first = p
+            .propose_on(&[1, 2], 3, 0.0, &mut cache, None, None, None)
+            .unwrap();
+        assert_eq!(first.len(), 3);
+        let after_first = cache.forwards;
+        assert_eq!(
+            after_first, 5,
+            "first propose forwards the 2-token ctx then 3 drafts"
+        );
+        let ctx2 = vec![1, 2, first[0]];
+        let second = p
+            .propose_on(&ctx2, 3, 0.0, &mut cache, None, None, None)
+            .unwrap();
+        assert_eq!(second.len(), 3);
+        let added = cache.forwards - after_first;
+        assert_eq!(
+            added, 4,
+            "prefix hit refreshes the last ctx token then runs 3 drafts; replay would be {}; added={added}",
+            ctx2.len() + 3
+        );
     }
 }

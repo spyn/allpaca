@@ -491,6 +491,32 @@ impl KvTierManager {
         Ok(())
     }
 
+    /// Keep KV `filled` equal to `seq_len` tokens across `pages` (one vec per layer).
+    /// Packed linear verify writes a speculative span, then rewinds the rejected suffix.
+    pub(crate) fn rewind_filled(
+        &mut self,
+        pages: &[Vec<PageId>],
+        seq_len: usize,
+        page_tokens: usize,
+    ) {
+        if page_tokens == 0 {
+            return;
+        }
+        for layer in pages {
+            for (i, id) in layer.iter().enumerate() {
+                let start = i * page_tokens;
+                let filled = if seq_len <= start {
+                    0
+                } else {
+                    (seq_len - start).min(page_tokens) as u32
+                };
+                if let Some(page) = self.pages.get_mut(id) {
+                    page.filled = filled;
+                }
+            }
+        }
+    }
+
     /// Device K/V views for attention. A single resident HIP page is used in-place
     /// (no D2D pack). Multiple or host pages still pack into `dest_k` / `dest_v`.
     pub(crate) fn kv_device_views(
@@ -795,6 +821,23 @@ fn copy_f32(dst: &mut [f32], src: &[f32]) -> Result<(), AllpacaError> {
 mod tests {
     use super::*;
     use crate::telemetry::Metrics;
+
+    #[test]
+    fn rewind_filled_drops_tail_slots() {
+        let metrics = Metrics::default();
+        let mut kv = KvTierManager::new(4096, 4096, 0.4);
+        let id = kv.alloc_page(0, 0, 8, 1, 4, &metrics).unwrap();
+        let kv_width = 4usize;
+        let zero = vec![0.0f32; kv_width];
+        for slot in 0..4u32 {
+            kv.write_slot(id, slot, 1, 4, &zero, &zero).unwrap();
+        }
+        let (k, _) = kv.read_kv(id, 1, 4).unwrap();
+        assert_eq!(k.len(), 16);
+        kv.rewind_filled(&[vec![id]], 2, 8);
+        let (k, _) = kv.read_kv(id, 1, 4).unwrap();
+        assert_eq!(k.len(), 8, "seq_len=2 must leave two KV slots");
+    }
 
     #[test]
     fn spills_to_dram_when_vram_hot_set_full() {

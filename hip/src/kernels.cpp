@@ -171,6 +171,64 @@ __global__ void gemv_nt_kernel(const float *a, const float *b, float *c, int m, 
     }
 }
 
+/* Decode F16 GEMV: C[m,n] = A[m,k] * dequant(B_f16[n,k])^T. Eight columns per warp. */
+__global__ void gemv_nt_f16_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
+                                  int k) {
+    constexpr int WARPS = 16;
+    constexpr int COLS = 8;
+    constexpr int SUB = 4;
+    const int row = static_cast<int>(blockIdx.y);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int sub = lane / SUB;
+    const int sublane = lane % SUB;
+    const int col = (static_cast<int>(blockIdx.x) * WARPS + warp) * COLS + sub;
+    if (row >= m) {
+        return;
+    }
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    float acc = 0.0f;
+    if (col < n) {
+        const uint16_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+        const int k8 = k & ~7;
+        const bool vec = k8 > 0 && (reinterpret_cast<uintptr_t>(arow) % 16u) == 0 &&
+                         (reinterpret_cast<uintptr_t>(brow) % 16u) == 0;
+        if (vec) {
+            for (int p = sublane * 8; p < k8; p += SUB * 8) {
+                const float4 av0 = *reinterpret_cast<const float4 *>(arow + p);
+                const float4 av1 = *reinterpret_cast<const float4 *>(arow + p + 4);
+                const uint4 hv = *reinterpret_cast<const uint4 *>(brow + p);
+                const uint16_t h0 = static_cast<uint16_t>(hv.x);
+                const uint16_t h1 = static_cast<uint16_t>(hv.x >> 16);
+                const uint16_t h2 = static_cast<uint16_t>(hv.y);
+                const uint16_t h3 = static_cast<uint16_t>(hv.y >> 16);
+                const uint16_t h4 = static_cast<uint16_t>(hv.z);
+                const uint16_t h5 = static_cast<uint16_t>(hv.z >> 16);
+                const uint16_t h6 = static_cast<uint16_t>(hv.w);
+                const uint16_t h7 = static_cast<uint16_t>(hv.w >> 16);
+                acc += av0.x * allpaca_f16_bits_to_f32(h0) + av0.y * allpaca_f16_bits_to_f32(h1) +
+                       av0.z * allpaca_f16_bits_to_f32(h2) + av0.w * allpaca_f16_bits_to_f32(h3) +
+                       av1.x * allpaca_f16_bits_to_f32(h4) + av1.y * allpaca_f16_bits_to_f32(h5) +
+                       av1.z * allpaca_f16_bits_to_f32(h6) + av1.w * allpaca_f16_bits_to_f32(h7);
+            }
+            for (int p = k8 + sublane; p < k; p += SUB) {
+                acc += arow[p] * allpaca_f16_bits_to_f32(brow[p]);
+            }
+        } else {
+            for (int p = sublane; p < k; p += SUB) {
+                acc += arow[p] * allpaca_f16_bits_to_f32(brow[p]);
+            }
+        }
+    }
+#pragma unroll
+    for (int off = 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 4);
+    }
+    if (col < n && sublane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
 /* Staged Q8_0: 36-byte blocks, f32 scale at 0, qs[32] at 4 (4-byte aligned). */
 constexpr int Q8_STAGED_STRIDE = 36;
 constexpr int Q8_STAGED_QS = 4;
@@ -491,6 +549,98 @@ __global__ void gemm_nt_tiled_kernel(const float *a, const float *b, float *c, i
             const int gc = col0 + col;
             const int gp = k0 + p;
             Bs[col][p] = (gc < n && gp < k) ? b[static_cast<size_t>(gc) * k + gp] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int p = 0; p < BK; ++p) {
+            float av[TM];
+            float bv[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                av[i] = As[ty * TM + i][p];
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                bv[j] = Bs[tx * TN + j][p];
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += av[i] * bv[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gr = row0 + ty * TM + i;
+        if (gr >= m) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int gc = col0 + tx * TN + j;
+            if (gc < n) {
+                c[static_cast<size_t>(gr) * n + gc] = acc[i][j];
+            }
+        }
+    }
+}
+
+/* Prefill F16 NT GEMM: convert B tiles to shared F32 so F16 weights reuse across A rows.
+ * Decode (M<=8) stays on gemv_nt_f16_kernel. */
+__global__ void gemm_nt_f16_tiled_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
+                                         int k) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 16;
+    constexpr int TX = 16;
+    constexpr int TY = 16;
+    constexpr int TM = BM / TY;
+    constexpr int TN = BN / TX;
+
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BN][BK + 1];
+
+    const int row0 = static_cast<int>(blockIdx.y) * BM;
+    const int col0 = static_cast<int>(blockIdx.x) * BN;
+    const int tx = static_cast<int>(threadIdx.x);
+    const int ty = static_cast<int>(threadIdx.y);
+    const int tid = ty * TX + tx;
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int k0 = 0; k0 < k; k0 += BK) {
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * (TX * TY);
+            const int r = idx / BK;
+            const int p = idx % BK;
+            const int gr = row0 + r;
+            const int gp = k0 + p;
+            As[r][p] = (gr < m && gp < k) ? a[static_cast<size_t>(gr) * k + gp] : 0.0f;
+        }
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * (TX * TY);
+            const int col = idx / BK;
+            const int p = idx % BK;
+            const int gc = col0 + col;
+            const int gp = k0 + p;
+            Bs[col][p] = (gc < n && gp < k)
+                             ? allpaca_f16_bits_to_f32(b[static_cast<size_t>(gc) * k + gp])
+                             : 0.0f;
         }
         __syncthreads();
 
@@ -1020,6 +1170,32 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
     return hip_status(hipGetLastError());
 }
 
+static int launch_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                              int32_t k, hipStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    /* Decode M<=8 stays on GEMV. Prefill M>8 reuses F16 B tiles across A rows. */
+    if (m > 8) {
+        constexpr int BM = 64;
+        constexpr int BN = 64;
+        dim3 block(16, 16);
+        dim3 grid(static_cast<unsigned>((n + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+        hipLaunchKernelGGL(gemm_nt_f16_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        return hip_status(hipGetLastError());
+    }
+    constexpr int warps = 16;
+    constexpr int cols = 8;
+    constexpr int cols_per_block = warps * cols;
+    dim3 block(512);
+    dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
+              static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_f16_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    return hip_status(hipGetLastError());
+}
+
 static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                int32_t k, hipStream_t stream, int intdot) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
@@ -1418,6 +1594,11 @@ extern "C" int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, 
     return launch_gemm_nt_q8_0(a, b, c, m, n, k, as_stream(stream), ALLPACA_Q8_GEMV_INTDOT);
 }
 
+extern "C" int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                                  int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_f16(a, b, c, m, n, k, as_stream(stream));
+}
+
 extern "C" int allpaca_gemm_nt_q8_0_intdot(const float *a, const uint8_t *b, float *c, int32_t m,
                                            int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_q8_0(a, b, c, m, n, k, as_stream(stream), 1);
@@ -1714,6 +1895,56 @@ __device__ float allpaca_f16le_to_f32(const uint8_t *p) {
     return allpaca_f16_bits_to_f32(h);
 }
 
+__global__ void embed_gather_f16_kernel(const uint16_t *table, int token, float *out, int dim) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= dim) {
+        return;
+    }
+    out[idx] = allpaca_f16_bits_to_f32(table[static_cast<size_t>(token) * static_cast<size_t>(dim) +
+                                            static_cast<size_t>(idx)]);
+}
+
+__global__ void embed_gather_f16_rows_kernel(const uint16_t *table, const int32_t *tokens, float *out,
+                                             int n_tok, int dim) {
+    const int row = static_cast<int>(blockIdx.y);
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= n_tok || idx >= dim) {
+        return;
+    }
+    const int token = tokens[row];
+    out[static_cast<size_t>(row) * static_cast<size_t>(dim) + idx] = allpaca_f16_bits_to_f32(
+        table[static_cast<size_t>(token) * static_cast<size_t>(dim) + static_cast<size_t>(idx)]);
+}
+
+extern "C" int allpaca_embed_gather_f16(const uint16_t *table, int32_t token, float *out, int32_t dim,
+                                        allpaca_stream_t stream) {
+    if (!table || !out || dim <= 0 || token < 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(embed_gather_f16_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
+                       dim);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_embed_gather_f16_rows(const uint16_t *table, const int32_t *tokens, float *out,
+                                             int32_t n_tok, int32_t dim, allpaca_stream_t stream) {
+    if (!table || !tokens || !out || n_tok <= 0 || dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(embed_gather_f16_rows_kernel,
+                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(n_tok)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, tokens, out,
+                       n_tok, dim);
+    return hip_status(hipGetLastError());
+}
+
 __global__ void dequant_q8_0_kernel(const uint8_t *blocks, float *out, int n) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) {
@@ -1920,6 +2151,11 @@ extern "C" int allpaca_gemm_nt_q4_k(const float *, const uint8_t *, float *, int
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gemm_nt_f16(const float *, const uint16_t *, float *, int32_t, int32_t,
+                                  int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_attention(const float *, const float *, const float *, float *, int32_t,
                                  int32_t, int32_t, int32_t, int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -1959,6 +2195,16 @@ extern "C" int allpaca_embed_gather(const float *, int32_t, float *, int32_t, al
 
 extern "C" int allpaca_embed_gather_rows(const float *, const int32_t *, float *, int32_t, int32_t,
                                          allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather_f16(const uint16_t *, int32_t, float *, int32_t,
+                                        allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather_f16_rows(const uint16_t *, const int32_t *, float *, int32_t,
+                                             int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

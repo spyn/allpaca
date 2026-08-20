@@ -6,7 +6,7 @@ use allpaca_core::Engine;
 use allpaca_core::ModelConfig;
 use allpaca_types::{Config, GenerationParams};
 #[cfg(feature = "hip")]
-use allpaca_types::DeviceKind;
+use allpaca_types::{DeviceKind, DeviceSelector};
 
 fn cpu_only_synthetic() -> Config {
     let mut cfg = Config::compiled_defaults();
@@ -160,6 +160,29 @@ fn transfer_path_is_measured_not_assumed_p2p() {
         return;
     }
     let stats = engine.stats();
+    eprintln!(
+        "transfer_path={} p2p_capable={} p2p_enabled={} p2p_status={} p2p_gbps={:.3} host_staging_gbps={:.3} p2p_us={:.1} host_us={:.1} target_device={} draft_device={}",
+        stats.transfer_path,
+        stats.p2p_capable,
+        stats.p2p_enabled,
+        stats.p2p_status,
+        stats.p2p_gbps,
+        stats.host_staging_gbps,
+        stats.p2p_us,
+        stats.host_staging_us,
+        stats.target_device,
+        stats.draft_device
+    );
+    for d in hip_gpus(&engine) {
+        eprintln!(
+            "gpu id={} name={} mem_gb={:.2} bw_gbps={:.1} peers={:?}",
+            d.id,
+            d.name,
+            d.memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            d.bandwidth_gbps,
+            d.peers
+        );
+    }
     assert!(
         stats.transfer_path == "HostStaging" || stats.transfer_path == "P2p",
         "unexpected transfer_path {}",
@@ -695,6 +718,53 @@ fn hip_tree_packed_verify_uses_device_mask_and_matches_linear() {
     assert_eq!(linear_e.stats().tree_gpu_verifies, 0);
 }
 
+/// Linear draft verify must run one Target Model forward over the proposed span,
+/// not one decode per draft token.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_speculative_linear_verify_packs_draft_span() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_speculative_linear_verify_packs_draft_span: no HIP device");
+        return;
+    }
+    let target = std::env::temp_dir().join("allpaca_hip_pack_verify_tgt.gguf");
+    let draft = std::env::temp_dir().join("allpaca_hip_pack_verify_dft.gguf");
+    write_packed_f16_gguf(&target);
+    write_packed_f16_gguf(&draft);
+    let mut cfg = hip_7b_config(target.clone());
+    cfg.model.draft_path = Some(draft.clone());
+    cfg.speculative.enabled = true;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    cfg.features.tree_speculation = Some(false);
+    cfg.speculative.min_depth = 2;
+    cfg.speculative.max_depth = 4;
+    cfg.kv.page_tokens = 8;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    cfg.kv.dram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("packed F16 target+draft must load");
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&draft);
+        eprintln!("skip hip_speculative_linear_verify_packs_draft_span: no HIP device");
+        return;
+    }
+    let out = engine.generate("hello", greedy(8)).expect("packed linear verify generate");
+    assert!(!out.token_ids.is_empty());
+    let n = out.token_ids.len() as u64;
+    let stats = engine.stats();
+    assert!(
+        stats.linear_packed_verifies > 0,
+        "identical F16 target+draft must pack the linear span; gen={n} stats={stats:?}"
+    );
+    assert!(
+        stats.target_gpu_forwards < n.saturating_add(stats.prefill_chunks),
+        "packed verify must do fewer target forwards than generated tokens plus prefill; gen={n} stats={stats:?}"
+    );
+    let _ = std::fs::remove_file(target);
+    let _ = std::fs::remove_file(draft);
+}
+
 #[cfg(feature = "hip")]
 fn hip_speculative_synthetic() -> Config {
     let mut cfg = hip_auto_synthetic();
@@ -813,6 +883,25 @@ fn speculative_generate_runs_draft_and_target_on_distinct_gpus() {
     assert!(
         stats.gpu_forwards >= stats.target_gpu_forwards + stats.draft_gpu_forwards,
         "gpu_forwards must count both resident models; stats={stats:?}"
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn speculative_synthetic_draft_forwards_stay_linear_in_generated_tokens() {
+    let engine = Engine::new(hip_speculative_synthetic()).unwrap();
+    if hip_gpus(&engine).len() < 2 {
+        return;
+    }
+    let gen = 24usize;
+    let out = engine.generate("hello", greedy(gen)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let n = out.token_ids.len() as u64;
+    let stats = engine.stats();
+    // Prefix reuse: ~prompt + steps*(1 refresh + depth). Replay would be ~O(n²).
+    assert!(
+        stats.draft_gpu_forwards > 0 && stats.draft_gpu_forwards < n.saturating_mul(16).max(32),
+        "draft GPU forwards must stay linear in generated tokens; gen={n} stats={stats:?}"
     );
 }
 
@@ -1149,6 +1238,140 @@ fn write_tiny_uniform_kquant_gguf(
     .unwrap();
 }
 
+/// F16 GGUF with GEMM tensors larger than the n≤65536 F32 materialize cutoff.
+#[cfg(feature = "hip")]
+fn write_packed_f16_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{write_gguf_quant, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 288usize;
+    let vocab = 4usize;
+    let n_heads = 8usize;
+    let n_kv_heads = 2usize;
+    let kv_dim = dim / n_heads * n_kv_heads;
+    let ff = 768usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert(
+        "llama.attention.head_count".into(),
+        GgufValue::Uint32(n_heads as u32),
+    );
+    meta.insert(
+        "llama.attention.head_count_kv".into(),
+        GgufValue::Uint32(n_kv_heads as u32),
+    );
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let quantize = allpaca_gguf::quantize_f16;
+    let ggml_type = allpaca_gguf::GgmlType::F16;
+    let embd_q = quantize(&vec![0.01f32; vocab * dim]);
+    let q_q = quantize(&vec![0.01f32; dim * dim]);
+    let k_q = quantize(&vec![0.01f32; kv_dim * dim]);
+    let v_q = quantize(&vec![0.01f32; kv_dim * dim]);
+    let o_q = quantize(&vec![0.01f32; dim * dim]);
+    let gate_q = quantize(&vec![0.01f32; ff * dim]);
+    let up_q = quantize(&vec![0.01f32; ff * dim]);
+    let down_q = quantize(&vec![0.01f32; dim * ff]);
+    let attn_norm = vec![1.0f32; dim];
+    let ffn_norm = vec![1.0f32; dim];
+    let output_norm = vec![1.0f32; dim];
+    write_gguf_quant(
+        path,
+        &meta,
+        &[
+            GgufWriteTensor {
+                name: "blk.0.attn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &attn_norm,
+            },
+            GgufWriteTensor {
+                name: "blk.0.ffn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &ffn_norm,
+            },
+            GgufWriteTensor {
+                name: "output_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &output_norm,
+            },
+        ],
+        &[
+            GgufWriteQuantTensor {
+                name: "token_embd.weight".into(),
+                dims: vec![vocab as u64, dim as u64],
+                ggml_type,
+                bytes: &embd_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_q.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type,
+                bytes: &q_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_k.weight".into(),
+                dims: vec![kv_dim as u64, dim as u64],
+                ggml_type,
+                bytes: &k_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_v.weight".into(),
+                dims: vec![kv_dim as u64, dim as u64],
+                ggml_type,
+                bytes: &v_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_output.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type,
+                bytes: &o_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_gate.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type,
+                bytes: &gate_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type,
+                bytes: &up_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_down.weight".into(),
+                dims: vec![dim as u64, ff as u64],
+                ggml_type,
+                bytes: &down_q,
+            },
+        ],
+    )
+    .unwrap();
+}
+
 #[cfg(feature = "hip")]
 fn write_tiny_f32_gguf(path: &std::path::Path) {
     use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
@@ -1396,6 +1619,88 @@ fn hip_generate_from_tiny_f16_gguf() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Large F16 GEMM tensors stay packed (not F32) and still generate on HIP.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_packed_f16_gguf_stays_half_width_and_generates() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_packed_f16_gguf_stays_half_width_and_generates: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_hip_packed_f16.gguf");
+    write_packed_f16_gguf(&path);
+    let mut cfg = hip_7b_config(path.clone());
+    cfg.kv.page_tokens = 8;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    cfg.kv.dram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("packed F16 GGUF must load on HIP");
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("skip hip_packed_f16_gguf_stays_half_width_and_generates: no HIP device");
+        return;
+    }
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert!(
+        stats.weight_bytes_on_device > 0 && stats.weight_bytes_on_device < 2_400_000,
+        "packed F16 must stay well under F32 materialize (~3.5MiB); stats={stats:?}"
+    );
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("packed F16 HIP generate must produce tokens");
+    assert!(!out.token_ids.is_empty());
+    let _ = std::fs::remove_file(path);
+}
+
+/// Packed F16 as the Draft Model must use F16 GEMV on the slow GPU. Target
+/// decode already dispatched by WeightKind; the draft dense path used to run
+/// F32 GEMV over half-width weights and hang on a real F16 draft (3B lm_head).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_packed_f16_draft_speculates_on_second_gpu() {
+    if allpaca_hip::device_count() < 2 {
+        eprintln!("skip hip_packed_f16_draft_speculates_on_second_gpu: need 2 HIP devices");
+        return;
+    }
+    let target = std::env::temp_dir().join("allpaca_hip_packed_f16_spec_tgt.gguf");
+    let draft = std::env::temp_dir().join("allpaca_hip_packed_f16_spec_dft.gguf");
+    write_packed_f16_gguf(&target);
+    write_packed_f16_gguf(&draft);
+    let mut cfg = hip_7b_config(target.clone());
+    cfg.model.draft_path = Some(draft.clone());
+    cfg.speculative.enabled = true;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    cfg.features.tree_speculation = Some(false);
+    cfg.kv.page_tokens = 8;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    cfg.kv.dram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("packed F16 target+draft must load");
+    if hip_gpus(&engine).len() < 2 {
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&draft);
+        eprintln!("skip hip_packed_f16_draft_speculates_on_second_gpu: need 2 HIP devices");
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine_t = engine.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(engine_t.generate("hello", greedy(2)));
+    });
+    let out = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("packed F16 draft generate hung — draft path must dispatch F16 GEMV")
+        .expect("packed F16 draft generate must run");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.draft_gpu_forwards > 0,
+        "draft GPU must run packed F16 forwards; stats={stats:?}"
+    );
+    let _ = std::fs::remove_file(target);
+    let _ = std::fs::remove_file(draft);
+}
+
 #[cfg(feature = "hip")]
 fn tiny_written_cfg(path: std::path::PathBuf, cpu_only: bool) -> Config {
     let mut cfg = hip_7b_config(path);
@@ -1621,6 +1926,9 @@ fn gated_draft_gguf() -> Option<std::path::PathBuf> {
             return Some(path);
         }
     }
+    if let Some(p) = local_llama32_draft_gguf() {
+        return Some(p);
+    }
     const DISCOVERED: &[&str] = &[
         r"E:\Models\huggingface\models--bartowski--Llama-3.2-1B-Instruct-GGUF",
         r"E:\Models\huggingface\models--bartowski--Llama-3.2-3B-Instruct-GGUF",
@@ -1709,6 +2017,448 @@ fn discovers_qwen_coder_05b_gguf_in_hf_cache_when_present() {
     let found = find_gguf_under(root).expect("Qwen 0.5B HF cache must contain a GGUF blob or snapshots/*.gguf");
     assert!(found.is_file(), "discovered path must be a file: {}", found.display());
     eprintln!("discovered draft GGUF {}", found.display());
+}
+
+#[cfg(feature = "hip")]
+fn local_models_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models")
+}
+
+/// Repo `models/` Llama-3.2 drafts beat the Qwen HF blob (same-family vocab).
+#[cfg(feature = "hip")]
+fn local_llama32_draft_gguf() -> Option<std::path::PathBuf> {
+    let dir = local_models_dir();
+    const NAMES: &[&str] = &[
+        "Llama-3.2-1B-Instruct-f16.gguf",
+        "Llama-3.2-3B-Instruct-f16.gguf",
+        "Llama-3.2-1B-Instruct-Q8_0.gguf",
+        "Llama-3.2-3B-Instruct-Q8_0.gguf",
+    ];
+    for name in NAMES {
+        let p = dir.join(name);
+        if p.is_file() && looks_like_gguf(&p) {
+            return Some(p);
+        }
+    }
+    find_gguf_under(&dir).filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("Llama-3.2"))
+    })
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn gated_draft_prefers_local_llama32_3b_f16_over_qwen() {
+    let p = local_models_dir().join("Llama-3.2-3B-Instruct-f16.gguf");
+    if !p.is_file() {
+        eprintln!(
+            "skip gated_draft_prefers_local_llama32_3b_f16_over_qwen: missing {}",
+            p.display()
+        );
+        return;
+    }
+    let found = gated_draft_gguf().expect("local Llama-3.2-3B F16 must be discoverable");
+    assert_eq!(
+        found.canonicalize().unwrap_or(found.clone()),
+        p.canonicalize().unwrap_or(p.clone()),
+        "same-family Llama draft must win over Qwen; found={}",
+        found.display()
+    );
+}
+
+/// Local Llama-3.2-3B F16 must stay packed (~6–8GiB), not F32 (~12GiB).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_local_llama32_f16_stays_packed_on_load() {
+    let _guard = large_gguf_lock();
+    let p = local_models_dir().join("Llama-3.2-3B-Instruct-f16.gguf");
+    if !p.is_file() {
+        eprintln!(
+            "skip hip_local_llama32_f16_stays_packed_on_load: missing {}",
+            p.display()
+        );
+        return;
+    }
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_local_llama32_f16_stays_packed_on_load: no HIP device");
+        return;
+    }
+    let mut cfg = hip_7b_config(p);
+    cfg.kv.vram_bytes = 512 * 1024 * 1024;
+    cfg.kv.dram_bytes = 512 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("Llama-3.2-3B F16 must load on HIP");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_local_llama32_f16_stays_packed_on_load: no HIP device");
+        return;
+    }
+    let stats = engine.stats();
+    eprintln!(
+        "llama32-3b-f16 packed weight_bytes_on_device={}",
+        stats.weight_bytes_on_device
+    );
+    assert_eq!(stats.backend, "hip");
+    assert!(
+        stats.weight_bytes_on_device > 5_000_000_000
+            && stats.weight_bytes_on_device < 6_500_000_000,
+        "F16 GEMM, lm_head, and token_embd must stay packed (F32 embed is ~6.7GiB); stats={stats:?}"
+    );
+    let out = engine
+        .generate("hello", greedy(2))
+        .expect("Llama-3.2-3B packed F16 must decode");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    eprintln!(
+        "llama32-3b-f16 gen={:?} itl_ms_ema={:.2} lm_head_us={:.0} other_gpu_us={:.0}",
+        out.text, stats.itl_ms_ema, stats.lm_head_us, stats.other_gpu_us
+    );
+}
+
+/// Soak the slow GPU as Target Model. Skips unless `ALLPACA_OVERNIGHT=1`.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
+    if std::env::var("ALLPACA_OVERNIGHT").ok().as_deref() != Some("1") {
+        eprintln!("skip hip_overnight_llama32_f16_on_second_gpu_when_env_set: set ALLPACA_OVERNIGHT=1");
+        return;
+    }
+    let _guard = large_gguf_lock();
+    let p = local_models_dir().join("Llama-3.2-3B-Instruct-f16.gguf");
+    if !p.is_file() {
+        eprintln!(
+            "skip hip_overnight_llama32_f16_on_second_gpu_when_env_set: missing {}",
+            p.display()
+        );
+        return;
+    }
+    if allpaca_hip::device_count() < 2 {
+        eprintln!("skip hip_overnight_llama32_f16_on_second_gpu_when_env_set: need 2 HIP devices");
+        return;
+    }
+    let soak_9060 = std::env::var("ALLPACA_OVERNIGHT_9060").ok().as_deref() == Some("1");
+    let tokens = std::env::var("ALLPACA_OVERNIGHT_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let rounds = std::env::var("ALLPACA_OVERNIGHT_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+
+    let Some(target) = gated_7b_gguf() else {
+        eprintln!("overnight skip speculative: no 8B GGUF");
+        return;
+    };
+    let Some(draft) = gated_draft_gguf() else {
+        eprintln!("overnight skip speculative: no draft GGUF");
+        return;
+    };
+    let spec_tokens = std::env::var("ALLPACA_OVERNIGHT_SPEC_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let spec_rounds = std::env::var("ALLPACA_OVERNIGHT_SPEC_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let mut spec_cfg = hip_7b_config(target.clone());
+    spec_cfg.model.draft_path = Some(draft.clone());
+    spec_cfg.speculative.enabled = true;
+    spec_cfg.features.draft_model_speculation = Some(true);
+    spec_cfg.features.ngram_speculation = Some(false);
+    spec_cfg.features.tree_speculation = Some(false);
+    spec_cfg.kv.vram_bytes = 512 * 1024 * 1024;
+    spec_cfg.kv.dram_bytes = 512 * 1024 * 1024;
+    eprintln!("overnight spec (clean boot) Engine::new starting spec_tokens={spec_tokens} spec_rounds={spec_rounds}");
+    let spec = Engine::new(spec_cfg).expect("overnight 8B+3B load");
+    let stats = spec.stats();
+    eprintln!(
+        "overnight spec load target_device={} draft_device={} weight_bytes={} transfer_path={} p2p_status={}",
+        stats.target_device,
+        stats.draft_device,
+        stats.weight_bytes_on_device,
+        stats.transfer_path,
+        stats.p2p_status
+    );
+    for round in 0..spec_rounds {
+        eprintln!(
+            "overnight spec round={}/{} generate starting",
+            round + 1,
+            spec_rounds
+        );
+        let before = spec.stats();
+        let t0 = std::time::Instant::now();
+        let out = generate_or_timeout(
+            &spec,
+            "hello",
+            spec_tokens,
+            std::time::Duration::from_secs(180),
+        );
+        let stats = spec.stats();
+        let secs = t0.elapsed().as_secs_f64();
+        let tps = out.token_ids.len() as f64 / secs.max(1e-6);
+        let draft_delta = stats.draft_gpu_forwards.saturating_sub(before.draft_gpu_forwards);
+        eprintln!(
+            "overnight spec round={}/{} gen={} tps={:.2} itl_ms={:.2} acceptance={:.3} target_fwd={} draft_fwd={} draft_fwd_delta={} host_staging_bytes={} weight_bytes_migrated={} text_prefix={:?}",
+            round + 1,
+            spec_rounds,
+            out.token_ids.len(),
+            tps,
+            stats.itl_ms_ema,
+            stats.acceptance_rate,
+            stats.target_gpu_forwards,
+            stats.draft_gpu_forwards,
+            draft_delta,
+            stats.host_staging_bytes,
+            stats.weight_bytes_migrated,
+            out.text.chars().take(40).collect::<String>()
+        );
+        assert!(
+            draft_delta > 0 && draft_delta < (spec_tokens as u64).saturating_mul(16).max(64),
+            "overnight spec round {} must reuse draft KV; gen={} draft_fwd_delta={} stats={stats:?}",
+            round + 1,
+            out.token_ids.len(),
+            draft_delta
+        );
+    }
+    drop(spec);
+
+    if !soak_9060 {
+        eprintln!("overnight skip 9060 soak: set ALLPACA_OVERNIGHT_9060=1");
+        return;
+    }
+    let mut cfg = hip_7b_config(p);
+    cfg.engine.target_device = DeviceSelector::Hip(1);
+    cfg.engine.draft_device = DeviceSelector::Cpu;
+    cfg.kv.vram_bytes = 512 * 1024 * 1024;
+    cfg.kv.dram_bytes = 512 * 1024 * 1024;
+    eprintln!("overnight 9060 Engine::new starting tokens={tokens} rounds={rounds}");
+    let engine = Engine::new(cfg).expect("Llama-3.2-3B F16 must load on HIP:1");
+    let stats = engine.stats();
+    eprintln!(
+        "overnight 9060 load backend={} target_device={} draft_device={} weight_bytes={} transfer_path={} p2p_status={}",
+        stats.backend,
+        stats.target_device,
+        stats.draft_device,
+        stats.weight_bytes_on_device,
+        stats.transfer_path,
+        stats.p2p_status
+    );
+    assert_eq!(stats.target_device, 1, "overnight soak must run on the second HIP device");
+    for round in 0..rounds {
+        let t0 = std::time::Instant::now();
+        let out = engine
+            .generate("hello", greedy(tokens))
+            .expect("overnight 9060 generate");
+        let stats = engine.stats();
+        let secs = t0.elapsed().as_secs_f64();
+        let tps = out.token_ids.len() as f64 / secs.max(1e-6);
+        eprintln!(
+            "overnight 9060 round={}/{} gen={} tps={:.2} itl_ms={:.2} lm_head_us={:.0} other_gpu_us={:.0} q8_gemm_us={:.0} attention_us={:.0} text_prefix={:?}",
+            round + 1,
+            rounds,
+            out.token_ids.len(),
+            tps,
+            stats.itl_ms_ema,
+            stats.lm_head_us,
+            stats.other_gpu_us,
+            stats.q8_gemm_us,
+            stats.attention_us,
+            out.text.chars().take(40).collect::<String>()
+        );
+    }
+    drop(engine);
+
+    let Some(target) = gated_7b_gguf() else {
+        eprintln!("overnight skip speculative: no 8B GGUF");
+        return;
+    };
+    let Some(draft) = gated_draft_gguf() else {
+        eprintln!("overnight skip speculative: no draft GGUF");
+        return;
+    };
+    let spec_tokens = std::env::var("ALLPACA_OVERNIGHT_SPEC_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let spec_rounds = std::env::var("ALLPACA_OVERNIGHT_SPEC_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let mut spec_cfg = hip_7b_config(target);
+    spec_cfg.model.draft_path = Some(draft);
+    spec_cfg.speculative.enabled = true;
+    spec_cfg.features.draft_model_speculation = Some(true);
+    spec_cfg.features.ngram_speculation = Some(false);
+    spec_cfg.features.tree_speculation = Some(false);
+    spec_cfg.kv.vram_bytes = 512 * 1024 * 1024;
+    spec_cfg.kv.dram_bytes = 512 * 1024 * 1024;
+    eprintln!("overnight spec (post-9060) Engine::new starting spec_tokens={spec_tokens} spec_rounds={spec_rounds}");
+    let spec = Engine::new(spec_cfg).expect("overnight 8B+3B load");
+    let stats = spec.stats();
+    eprintln!(
+        "overnight spec load target_device={} draft_device={} weight_bytes={} transfer_path={} p2p_status={} host_staging_bytes={}",
+        stats.target_device,
+        stats.draft_device,
+        stats.weight_bytes_on_device,
+        stats.transfer_path,
+        stats.p2p_status,
+        stats.host_staging_bytes
+    );
+    for round in 0..spec_rounds {
+        eprintln!(
+            "overnight spec round={}/{} generate starting",
+            round + 1,
+            spec_rounds
+        );
+        let before = spec.stats();
+        let t0 = std::time::Instant::now();
+        let out = generate_or_timeout(
+            &spec,
+            "hello",
+            spec_tokens,
+            std::time::Duration::from_secs(180),
+        );
+        let stats = spec.stats();
+        let secs = t0.elapsed().as_secs_f64();
+        let tps = out.token_ids.len() as f64 / secs.max(1e-6);
+        let draft_delta = stats.draft_gpu_forwards.saturating_sub(before.draft_gpu_forwards);
+        eprintln!(
+            "overnight spec round={}/{} gen={} tps={:.2} itl_ms={:.2} acceptance={:.3} target_fwd={} draft_fwd={} draft_fwd_delta={} host_staging_bytes={} weight_bytes_migrated={} text_prefix={:?}",
+            round + 1,
+            spec_rounds,
+            out.token_ids.len(),
+            tps,
+            stats.itl_ms_ema,
+            stats.acceptance_rate,
+            stats.target_gpu_forwards,
+            stats.draft_gpu_forwards,
+            draft_delta,
+            stats.host_staging_bytes,
+            stats.weight_bytes_migrated,
+            out.text.chars().take(40).collect::<String>()
+        );
+        assert!(
+            draft_delta > 0 && draft_delta < (spec_tokens as u64).saturating_mul(16).max(64),
+            "post-9060 spec round {} must reuse draft KV; gen={} draft_fwd_delta={} stats={stats:?}",
+            round + 1,
+            out.token_ids.len(),
+            draft_delta
+        );
+    }
+}
+
+/// 8B-only greedy on the Target Model GPU (RX 9070 / HIP:0). Dual-GPU spec waits.
+/// Requires `ALLPACA_OVERNIGHT=1` and `ALLPACA_OVERNIGHT_9070=1`. Skips when more
+/// than one HIP device is visible so boot P2P probe cannot touch the 9060;
+/// run with `HIP_VISIBLE_DEVICES=0`.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_overnight_8b_greedy_on_target_gpu_when_env_set() {
+    if std::env::var("ALLPACA_OVERNIGHT").ok().as_deref() != Some("1") {
+        eprintln!("skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: set ALLPACA_OVERNIGHT=1");
+        return;
+    }
+    if std::env::var("ALLPACA_OVERNIGHT_9070").ok().as_deref() != Some("1") {
+        eprintln!("skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: set ALLPACA_OVERNIGHT_9070=1");
+        return;
+    }
+    let _guard = large_gguf_lock();
+    let Some(path) = gated_7b_gguf() else {
+        eprintln!("skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: no 8B GGUF");
+        return;
+    };
+    let n_dev = allpaca_hip::device_count();
+    if n_dev == 0 {
+        eprintln!("skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: no HIP device");
+        return;
+    }
+    if n_dev > 1 {
+        eprintln!(
+            "skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: {n_dev} HIP devices visible; set HIP_VISIBLE_DEVICES=0 so the 9060 is not P2P-probed"
+        );
+        return;
+    }
+    let tokens = std::env::var("ALLPACA_OVERNIGHT_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let rounds = std::env::var("ALLPACA_OVERNIGHT_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let mut cfg = hip_7b_config(path);
+    cfg.engine.target_device = DeviceSelector::Hip(0);
+    cfg.engine.draft_device = DeviceSelector::Cpu;
+    cfg.speculative.enabled = false;
+    cfg.features.draft_model_speculation = Some(false);
+    cfg.kv.vram_bytes = 512 * 1024 * 1024;
+    cfg.kv.dram_bytes = 512 * 1024 * 1024;
+    eprintln!("overnight 9070 Engine::new starting tokens={tokens} rounds={rounds}");
+    let engine = Engine::new(cfg).expect("8B GGUF must load on HIP:0");
+    let stats = engine.stats();
+    eprintln!(
+        "overnight 9070 load backend={} target_device={} draft_device={} weight_bytes={} gpu_count={}",
+        stats.backend,
+        stats.target_device,
+        stats.draft_device,
+        stats.weight_bytes_on_device,
+        hip_gpus(&engine).len()
+    );
+    assert_eq!(stats.backend, "hip");
+    assert_eq!(
+        stats.target_device, 0,
+        "9070 soak must run on the only visible HIP device"
+    );
+    assert_eq!(stats.draft_device, -1, "9070 soak must not place a Draft Model");
+    let timeout = std::time::Duration::from_secs((tokens as u64).saturating_mul(3).max(180));
+    for round in 0..rounds {
+        eprintln!(
+            "overnight 9070 round={}/{} generate starting",
+            round + 1,
+            rounds
+        );
+        let before = engine.stats();
+        let t0 = std::time::Instant::now();
+        let out = generate_or_timeout(&engine, "hello", tokens, timeout);
+        let stats = engine.stats();
+        let secs = t0.elapsed().as_secs_f64();
+        let tps = out.token_ids.len() as f64 / secs.max(1e-6);
+        let target_delta = stats
+            .target_gpu_forwards
+            .saturating_sub(before.target_gpu_forwards);
+        eprintln!(
+            "overnight 9070 round={}/{} gen={} tps={:.2} itl_ms={:.2} target_fwd={} target_fwd_delta={} draft_fwd={} q8_gemm_us={:.0} attention_us={:.0} lm_head_us={:.0} other_gpu_us={:.0} host_us={:.0} text_prefix={:?}",
+            round + 1,
+            rounds,
+            out.token_ids.len(),
+            tps,
+            stats.itl_ms_ema,
+            stats.target_gpu_forwards,
+            target_delta,
+            stats.draft_gpu_forwards,
+            stats.q8_gemm_us,
+            stats.attention_us,
+            stats.lm_head_us,
+            stats.other_gpu_us,
+            stats.host_us,
+            out.text.chars().take(40).collect::<String>()
+        );
+        assert!(
+            !out.token_ids.is_empty(),
+            "overnight 9070 round {} must emit tokens",
+            round + 1
+        );
+        assert_eq!(
+            stats.draft_gpu_forwards, 0,
+            "9070-only soak must not run a Draft Model; stats={stats:?}"
+        );
+        assert!(
+            target_delta > 0,
+            "overnight 9070 round {} must forward the Target Model; stats={stats:?}",
+            round + 1
+        );
+    }
 }
 
 #[cfg(feature = "hip")]
@@ -1930,6 +2680,7 @@ fn hip_speculative_7b_with_draft_gguf_when_path_set() {
         eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: set ALLPACA_DRAFT_GGUF or place a small GGUF in the discovered HF cache dirs");
         return;
     };
+    eprintln!("speculative 7B target path={}", target.display());
     eprintln!("speculative 7B draft path={}", draft.display());
     if allpaca_hip::device_count() < 2 {
         eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: need 2 HIP devices");
@@ -1941,11 +2692,20 @@ fn hip_speculative_7b_with_draft_gguf_when_path_set() {
     cfg.features.draft_model_speculation = Some(true);
     cfg.features.ngram_speculation = Some(false);
     cfg.features.tree_speculation = Some(false);
+    let t0 = std::time::Instant::now();
+    eprintln!("speculative 7B Engine::new starting");
     let engine = Engine::new(cfg).expect("7B+draft GGUF load must not be Fatal");
+    eprintln!(
+        "speculative 7B Engine::new done in {:.1}s weight_bytes={}",
+        t0.elapsed().as_secs_f64(),
+        engine.stats().weight_bytes_on_device
+    );
     if hip_gpus(&engine).len() < 2 {
         eprintln!("skip hip_speculative_7b_with_draft_gguf_when_path_set: need 2 HIP devices");
         return;
     }
+    eprintln!("speculative 7B generate starting");
+    let t1 = std::time::Instant::now();
     let out = engine
         .generate("hello", greedy(8))
         .expect("speculative 7B generate must run");
@@ -1954,6 +2714,101 @@ fn hip_speculative_7b_with_draft_gguf_when_path_set() {
     assert!(
         stats.target_gpu_forwards > 0 && stats.draft_gpu_forwards > 0,
         "both forward counters must increment; stats={stats:?}"
+    );
+    eprintln!(
+        "speculative 7B: gen={} acceptance={:.3} target_fwd={} draft_fwd={} itl_ms={:.2} generate_s={:.1} text={:?} transfer_path={} p2p_status={} p2p_gbps={:.3} host_staging_bytes={} weight_bytes_migrated={} target_device={} draft_device={}",
+        out.token_ids.len(),
+        stats.acceptance_rate,
+        stats.target_gpu_forwards,
+        stats.draft_gpu_forwards,
+        stats.itl_ms_ema,
+        t1.elapsed().as_secs_f64(),
+        out.text,
+        stats.transfer_path,
+        stats.p2p_status,
+        stats.p2p_gbps,
+        stats.host_staging_bytes,
+        stats.weight_bytes_migrated,
+        stats.target_device,
+        stats.draft_device
+    );
+}
+
+#[cfg(feature = "hip")]
+fn generate_or_timeout(
+    engine: &Engine,
+    prompt: &str,
+    n: usize,
+    timeout: std::time::Duration,
+) -> allpaca_types::GenerationOutput {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = engine.clone();
+    let prompt = prompt.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(engine.generate(&prompt, greedy(n)));
+    });
+    rx.recv_timeout(timeout)
+        .unwrap_or_else(|_| panic!("generate({n}) hung after {timeout:?}"))
+        .expect("generate must run")
+}
+
+/// 64-token speculative decode must finish on a clean boot (the overnight soak
+/// hung here before draft KV prefix reuse).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_speculative_7b_64_tokens_finishes_before_timeout() {
+    let _guard = large_gguf_lock();
+    let Some(target) = gated_7b_gguf() else {
+        eprintln!("skip hip_speculative_7b_64_tokens_finishes_before_timeout: set ALLPACA_7B_GGUF");
+        return;
+    };
+    let Some(draft) = gated_draft_gguf() else {
+        eprintln!("skip hip_speculative_7b_64_tokens_finishes_before_timeout: no draft GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() < 2 {
+        eprintln!("skip hip_speculative_7b_64_tokens_finishes_before_timeout: need 2 HIP devices");
+        return;
+    }
+    let mut cfg = hip_7b_config(target);
+    cfg.model.draft_path = Some(draft);
+    cfg.speculative.enabled = true;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    cfg.features.tree_speculation = Some(false);
+    cfg.kv.vram_bytes = 512 * 1024 * 1024;
+    cfg.kv.dram_bytes = 512 * 1024 * 1024;
+    eprintln!("speculative 7B-64 Engine::new starting");
+    let engine = Engine::new(cfg).expect("7B+draft GGUF load must not be Fatal");
+    if hip_gpus(&engine).len() < 2 {
+        eprintln!("skip hip_speculative_7b_64_tokens_finishes_before_timeout: need 2 HIP devices");
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let out = generate_or_timeout(
+        &engine,
+        "hello",
+        64,
+        std::time::Duration::from_secs(180),
+    );
+    assert!(!out.token_ids.is_empty());
+    let n = out.token_ids.len() as u64;
+    let stats = engine.stats();
+    let secs = t0.elapsed().as_secs_f64();
+    let tps = n as f64 / secs.max(1e-6);
+    eprintln!(
+        "speculative 7B-64: gen={n} tps={:.2} itl_ms={:.2} acceptance={:.3} target_fwd={} draft_fwd={} generate_s={:.1} text_prefix={:?}",
+        tps,
+        stats.itl_ms_ema,
+        stats.acceptance_rate,
+        stats.target_gpu_forwards,
+        stats.draft_gpu_forwards,
+        secs,
+        out.text.chars().take(48).collect::<String>()
+    );
+    assert!(
+        stats.draft_gpu_forwards > 0 && stats.draft_gpu_forwards < n.saturating_mul(16).max(64),
+        "64-token spec must reuse draft KV; gen={n} stats={stats:?}"
     );
 }
 

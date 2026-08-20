@@ -445,10 +445,10 @@ impl Engine {
         let target = inner.target.clone();
         let draft = inner.draft_model.clone();
         inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
-            let uploaded = if target.host_weights_ready() {
-                ResidentModel::upload(&target, hip.device)
-            } else if let Some(file) = target_gguf {
+            let uploaded = if let Some(file) = target_gguf {
                 ResidentModel::upload_gguf(file, &target.config, hip.device)
+            } else if target.host_weights_ready() {
+                ResidentModel::upload(&target, hip.device)
             } else {
                 Err(AllpacaError::Fatal(FatalError::ModelLoad(
                     "large GGUF missing file handle for HIP upload".into(),
@@ -473,10 +473,11 @@ impl Engine {
             None
         };
         inner.draft_resident = if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
-            let uploaded = if draft.host_weights_ready() {
-                ResidentModel::upload(&draft, hip.device)
-            } else if let Some(file) = draft_gguf {
+            tracing::info!(device = hip.device, "HIP draft weight upload start");
+            let uploaded = if let Some(file) = draft_gguf {
                 ResidentModel::upload_gguf(file, &draft.config, hip.device)
+            } else if draft.host_weights_ready() {
+                ResidentModel::upload(&draft, hip.device)
             } else {
                 Err(AllpacaError::Fatal(FatalError::ModelLoad(
                     "large draft GGUF missing file handle for HIP upload".into(),
@@ -891,6 +892,7 @@ impl Engine {
             self.hip.as_deref(),
             resident.as_deref(),
             write_logits,
+            None,
         )?;
         if let Some(hip) = self.hip.as_deref() {
             hip.wait_logits_d2h(&mut logits)?;
@@ -1080,9 +1082,54 @@ fn verify_and_sample(
     hip: Option<&HipWorkspace>,
 ) -> Result<Produced, AllpacaError> {
     let drafts_len = drafts.len() as u64;
-    let mut produced = Vec::new();
-    let mut accepted = 0u64;
+    if remaining == 0 {
+        return Ok(Produced {
+            tokens: Vec::new(),
+            accepted: 0,
+            proposed: drafts_len,
+        });
+    }
+    if let Some(hip) = hip {
+        let active = request_mut(inner, id)?;
+        hip.wait_logits_d2h(&mut active.pending_logits)?;
+    }
+    let sampled = {
+        let active = request_mut(inner, id)?;
+        sample(
+            &mut active.pending_logits,
+            mask,
+            &active.params,
+            &mut active.rng,
+        )
+    };
+    let first_match = drafts.first().copied() == Some(sampled);
+    let stop = is_stop(sampled, &request(inner, id)?.params);
+    if first_match && drafts.len() >= 2 && !stop && remaining > 1 {
+        return packed_linear_verify(
+            inner,
+            id,
+            drafts,
+            sampled,
+            mask,
+            remaining,
+            metrics,
+            hip,
+        );
+    }
+    let mut produced = vec![sampled];
+    let mut accepted = u64::from(first_match);
     let mut draft_iter = drafts.into_iter().peekable();
+    if first_match {
+        draft_iter.next();
+    }
+    append_and_forward(inner, id, sampled, metrics, hip)?;
+    if stop || !first_match || draft_iter.peek().is_none() {
+        return Ok(Produced {
+            tokens: produced,
+            accepted,
+            proposed: drafts_len,
+        });
+    }
     while produced.len() < remaining {
         if let Some(hip) = hip {
             let active = request_mut(inner, id)?;
@@ -1108,6 +1155,119 @@ fn verify_and_sample(
         if stop || !matched || draft_iter.peek().is_none() {
             break;
         }
+    }
+    Ok(Produced {
+        tokens: produced,
+        accepted,
+        proposed: drafts_len,
+    })
+}
+
+fn packed_linear_verify(
+    inner: &mut EngineInner,
+    id: u64,
+    span: Vec<u32>,
+    first: u32,
+    mask: Option<&allpaca_types::TokenMask>,
+    remaining: usize,
+    metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
+) -> Result<Produced, AllpacaError> {
+    let drafts_len = span.len() as u64;
+    let vocab = request(inner, id)?.pending_logits.len();
+    let start_pos = request(inner, id)?.tokens.len();
+    let page_tokens = request(inner, id)?
+        .pages
+        .first()
+        .and_then(|layer| layer.first())
+        .and_then(|page_id| inner.kv.get(*page_id))
+        .map(|p| p.capacity_tokens)
+        .unwrap_or(128);
+    let last_pos = start_pos + span.len() - 1;
+    let target = inner
+        .target
+        .clone()
+        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+    let mut pages = request(inner, id)?.pages.clone();
+    ensure_pages(
+        &mut inner.kv,
+        &target.config,
+        page_tokens,
+        &mut pages,
+        last_pos,
+        metrics,
+    )?;
+    request_mut(inner, id)?.pages = pages;
+    let mut last_logits = std::mem::take(&mut request_mut(inner, id)?.pending_logits);
+    let mut row_logits = vec![0.0f32; span.len() * vocab];
+    let pages = request(inner, id)?.pages.clone();
+    let resident = inner.target_resident.clone();
+    target.forward_tokens(
+        &span,
+        start_pos,
+        &pages,
+        &mut inner.kv,
+        metrics,
+        &mut last_logits,
+        hip,
+        resident.as_deref(),
+        true,
+        Some(&mut row_logits),
+    )?;
+    if let Some(hip) = hip {
+        hip.wait_logits_d2h(&mut row_logits)?;
+    }
+    request_mut(inner, id)?.pending_logits = last_logits;
+    metrics
+        .linear_packed_verifies
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let mut produced = vec![first];
+    let mut accepted = 1u64;
+    let mut keep = 1usize;
+    let params_stop = request(inner, id)?.params.clone();
+    for i in 0..span.len().saturating_sub(1) {
+        if produced.len() >= remaining {
+            break;
+        }
+        if is_stop(produced[produced.len() - 1], &params_stop) {
+            break;
+        }
+        let off = i * vocab;
+        let row = &mut row_logits[off..off + vocab];
+        let next = {
+            let active = request_mut(inner, id)?;
+            sample(row, mask, &active.params, &mut active.rng)
+        };
+        produced.push(next);
+        if next == span[i + 1] {
+            accepted += 1;
+            keep = i + 2;
+        } else {
+            break;
+        }
+    }
+
+    let pages = request(inner, id)?.pages.clone();
+    inner
+        .kv
+        .rewind_filled(&pages, start_pos + keep, page_tokens as usize);
+    {
+        let active = request_mut(inner, id)?;
+        active.tokens.extend_from_slice(&span[..keep]);
+        active.pages = pages;
+    }
+    if inner.flags.ngram_speculation {
+        let ctx = request(inner, id)?.tokens.clone();
+        inner.ngram.observe(&ctx);
+    }
+
+    if produced.len() > keep {
+        append_and_forward(inner, id, produced[keep], metrics, hip)?;
+    } else {
+        let off = keep.saturating_sub(1) * vocab;
+        let pending = row_logits[off..off + vocab].to_vec();
+        request_mut(inner, id)?.pending_logits = pending;
     }
     Ok(Produced {
         tokens: produced,
@@ -3080,6 +3240,76 @@ mod tests {
             .expect("generate must work on dequantized Q4/Q8 weights");
         assert!(!out.token_ids.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_speculative_linear_verify_packs_draft_span() {
+        let target = std::env::temp_dir().join("allpaca_pack_verify_tgt.gguf");
+        let draft = std::env::temp_dir().join("allpaca_pack_verify_dft.gguf");
+        write_tiny_target_gguf(&target);
+        write_tiny_target_gguf(&draft);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(target.clone());
+        cfg.model.draft_path = Some(draft.clone());
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 4;
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("identical tiny target+draft must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("packed linear verify generate must run");
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.linear_packed_verifies > 0,
+            "greedy identical target+draft must pack the linear draft span; gen={} acceptance={:.3} stats={stats:?}",
+            out.token_ids.len(),
+            stats.acceptance_rate
+        );
+        let mut plain = Config::compiled_defaults();
+        plain.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        plain.model.path = Some(target.clone());
+        plain.kv.page_tokens = 8;
+        let plain_engine = Engine::new(plain).expect("plain target must load");
+        let plain_out = plain_engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("plain generate must run");
+        assert_eq!(
+            out.token_ids, plain_out.token_ids,
+            "packed linear verify must match greedy Target Model tokens"
+        );
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_file(draft);
     }
 
     #[test]

@@ -80,6 +80,11 @@ int allpaca_gemm_nt_q8_0_intdot(const float *a, const uint8_t *b, float *c, int3
 int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_f16[n,k])^T. B is packed IEEE F16, row-major [n,k].
+ * Decode (M<=8) is custom GEMV; M>8 uses a tiled kernel. */
+int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                        int32_t k, allpaca_stream_t stream);
+
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);
@@ -109,6 +114,12 @@ int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t 
 /* out[n_tok, dim] = table[tokens[i]]. Decode stays on allpaca_embed_gather. */
 int allpaca_embed_gather_rows(const float *table, const int32_t *tokens, float *out, int32_t n_tok,
                               int32_t dim, allpaca_stream_t stream);
+
+int allpaca_embed_gather_f16(const uint16_t *table, int32_t token, float *out, int32_t dim,
+                             allpaca_stream_t stream);
+
+int allpaca_embed_gather_f16_rows(const uint16_t *table, const int32_t *tokens, float *out,
+                                  int32_t n_tok, int32_t dim, allpaca_stream_t stream);
 
 int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
 
