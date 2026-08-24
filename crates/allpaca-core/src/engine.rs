@@ -1662,6 +1662,7 @@ fn append_and_forward(
         &mut logits,
         hip,
         resident.as_deref(),
+        false,
     )?;
     request_mut(inner, id)?.pending_logits = logits;
     Ok(())
@@ -1813,6 +1814,48 @@ mod tests {
         assert!(
             stats.expert_lru_fills > 0,
             "Fill policy must admit misses into the LRU"
+        );
+    }
+
+    #[test]
+    fn moe_prefill_admits_full_layer_and_matches_resident() {
+        let expert_bytes = 64 * 32 * 3 * 4;
+        let mut resident_cfg = test_config();
+        resident_cfg.model.synthetic = false;
+        resident_cfg.speculative.enabled = false;
+        let resident = Engine::new(resident_cfg).unwrap();
+        resident.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let prompt = "hello ".repeat(16);
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let full = resident.generate(&prompt, params.clone()).unwrap();
+
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.cache_bytes = expert_bytes * 4;
+        cfg.weights.miss_policy = MissPolicy::Fill;
+        let buffered = Engine::new(cfg).unwrap();
+        buffered.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let part = buffered.generate(&prompt, params).unwrap();
+        assert_eq!(
+            part.token_ids, full.token_ids,
+            "GPU residency is a speed dial: greedy tokens must match"
+        );
+        let stats = buffered.stats();
+        assert!(
+            stats.expert_slots >= 4,
+            "one full expert layer must fit; slots={}",
+            stats.expert_slots
+        );
+        assert!(
+            stats.expert_lru_fills >= 4,
+            "prefill must admit a whole layer, not only top-k; fills={}",
+            stats.expert_lru_fills
         );
     }
 

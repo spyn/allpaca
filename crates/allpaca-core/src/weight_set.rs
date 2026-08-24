@@ -561,6 +561,34 @@ impl ExpertLru {
         self.cpu_runs
             .fetch_add(plan.cpu.len() as u64, Ordering::Relaxed);
     }
+
+    /// True when `n_layers` full expert sets fit in the LRU (prefill double-buffer).
+    pub fn holds_layers(&self, n_experts: usize, n_layers: usize) -> bool {
+        n_experts > 0 && n_layers > 0 && self.n_slots >= n_experts.saturating_mul(n_layers)
+    }
+
+    /// Admit every expert of `layer`. Prefill uses this instead of on-demand `q*`.
+    pub fn admit_layer(&self, layer: u32, experts: &[LayerFfn]) -> Result<(), AllpacaError> {
+        let mut fills = 0u64;
+        let mut hits = 0u64;
+        for (e, host) in experts.iter().enumerate() {
+            let id = ExpertId {
+                layer,
+                expert: e as u32,
+            };
+            let already = self.plan(&[id]).hits.len() == 1;
+            self.admit(id, host)?;
+            if already {
+                hits += 1;
+            } else {
+                fills += 1;
+            }
+        }
+        self.hits.fetch_add(hits, Ordering::Relaxed);
+        self.misses.fetch_add(fills, Ordering::Relaxed);
+        self.fills.fetch_add(fills, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -671,5 +699,51 @@ mod tests {
         let plan = lru.plan(&[ExpertId { layer: 1, expert: 2 }]);
         assert!(plan.fill.is_empty());
         assert_eq!(plan.cpu.len(), 1);
+    }
+
+    #[test]
+    fn prefill_admits_a_full_layer_when_slots_fit() {
+        let lru = ExpertLru::new(4, MissPolicy::Fill);
+        assert!(lru.holds_layers(4, 1));
+        assert!(!lru.holds_layers(4, 2));
+        let experts = vec![LayerFfn::default(); 4];
+        lru.admit_layer(0, &experts).unwrap();
+        let needed: Vec<_> = (0..4)
+            .map(|e| ExpertId {
+                layer: 0,
+                expert: e,
+            })
+            .collect();
+        let plan = lru.plan(&needed);
+        assert_eq!(plan.hits.len(), 4);
+        assert!(plan.fill.is_empty());
+        assert!(lru.fills() >= 4);
+    }
+
+    #[test]
+    fn double_buffer_keeps_current_and_next_layer() {
+        let lru = ExpertLru::new(8, MissPolicy::Fill);
+        assert!(lru.holds_layers(4, 2));
+        let experts = vec![LayerFfn::default(); 4];
+        lru.admit_layer(0, &experts).unwrap();
+        lru.admit_layer(1, &experts).unwrap();
+        assert_eq!(
+            lru.plan(&[ExpertId {
+                layer: 0,
+                expert: 2
+            }])
+            .hits
+            .len(),
+            1
+        );
+        assert_eq!(
+            lru.plan(&[ExpertId {
+                layer: 1,
+                expert: 3
+            }])
+            .hits
+            .len(),
+            1
+        );
     }
 }

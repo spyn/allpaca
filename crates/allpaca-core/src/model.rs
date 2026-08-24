@@ -956,10 +956,14 @@ impl TinyModel {
         hip: Option<&HipWorkspace>,
         resident: Option<&ResidentModel>,
         metrics: Option<&Metrics>,
+        prefill: bool,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
         if cfg.n_experts > 0 {
+            if prefill {
+                self.prefetch_moe_layers(layer_idx)?;
+            }
             rmsnorm(x, &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
             let moe_out = self.moe_hidden(layer_idx, layer, &scratch[..dim])?;
             for i in 0..dim {
@@ -1071,6 +1075,28 @@ impl TinyModel {
             }
         }
         Ok(acc)
+    }
+
+    fn prefetch_moe_layers(&self, layer_idx: usize) -> Result<(), AllpacaError> {
+        let Some(lru) = &self.expert_lru else {
+            return Ok(());
+        };
+        let n_exp = self.config.n_experts;
+        if n_exp == 0 || !lru.holds_layers(n_exp, 1) {
+            return Ok(());
+        }
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "MoE prefetch missing layer {layer_idx}"
+            )))
+        })?;
+        lru.admit_layer(layer_idx as u32, &layer.experts)?;
+        if lru.holds_layers(n_exp, 2) {
+            if let Some(next) = self.layers.get(layer_idx + 1) {
+                lru.admit_layer((layer_idx + 1) as u32, &next.experts)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
@@ -1305,6 +1331,7 @@ impl TinyModel {
         logits: &mut [f32],
         hip: Option<&HipWorkspace>,
         resident: Option<&ResidentModel>,
+        prefill: bool,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -1398,6 +1425,7 @@ impl TinyModel {
                 hip,
                 resident,
                 Some(metrics),
+                prefill,
             )?;
         }
 
@@ -1467,6 +1495,7 @@ impl TinyModel {
                 logits,
                 hip,
                 resident,
+                false,
             )?;
             if let Some(rows) = row_logits {
                 let vocab = self.config.vocab_size;
@@ -1523,6 +1552,7 @@ impl TinyModel {
                 logits,
                 hip,
                 resident,
+                true,
             )?;
             if let Some(rows) = row_logits.as_mut() {
                 let off = i * vocab;
@@ -2256,6 +2286,7 @@ impl TinyModel {
                     None,
                     None,
                     metrics,
+                    false,
                 )?;
             }
         }
@@ -2367,6 +2398,7 @@ impl TinyModel {
                 hip,
                 resident,
                 metrics,
+                false,
             )?;
         }
         rmsnorm_dispatch(
