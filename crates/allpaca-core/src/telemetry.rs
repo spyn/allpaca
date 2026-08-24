@@ -22,6 +22,7 @@ pub struct Metrics {
     pub tree_path_invalid: AtomicU64,
     pub tree_gpu_verifies: AtomicU64,
     pub linear_packed_verifies: AtomicU64,
+    pub draft_ahead_hits: AtomicU64,
     pub target_evals: AtomicU64,
     pub gpu_forwards: AtomicU64,
     pub target_gpu_forwards: AtomicU64,
@@ -43,6 +44,10 @@ pub struct Metrics {
     pub lm_head_ns: AtomicU64,
     pub other_gpu_ns: AtomicU64,
     pub host_ns: AtomicU64,
+    pub weight_pinned_layers: AtomicU64,
+    pub weight_ring_slots: AtomicU64,
+    pub weight_ring_binds: AtomicU64,
+    pub weight_ring_hits: AtomicU64,
 }
 
 impl Metrics {
@@ -109,6 +114,7 @@ impl Metrics {
                 && self.tree_path_invalid.load(Ordering::Relaxed) == 0,
             tree_gpu_verifies: self.tree_gpu_verifies.load(Ordering::Relaxed),
             linear_packed_verifies: self.linear_packed_verifies.load(Ordering::Relaxed),
+            draft_ahead_hits: self.draft_ahead_hits.load(Ordering::Relaxed),
             accepted_tokens_per_target_eval,
             model_id,
             backend,
@@ -133,6 +139,10 @@ impl Metrics {
             lm_head_us: self.lm_head_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             other_gpu_us: self.other_gpu_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             host_us: self.host_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            weight_pinned_layers: self.weight_pinned_layers.load(Ordering::Relaxed),
+            weight_ring_slots: self.weight_ring_slots.load(Ordering::Relaxed),
+            weight_ring_binds: self.weight_ring_binds.load(Ordering::Relaxed),
+            weight_ring_hits: self.weight_ring_hits.load(Ordering::Relaxed),
         }
     }
 

@@ -5,9 +5,12 @@ use allpaca_gguf::GgufFile;
 use allpaca_onnx::OnnxFile;
 use allpaca_safetensors::{HfConfig, SafetensorsFile};
 use allpaca_types::{AllpacaError, FatalError};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
+use crate::weight_set::{FfnRefs, LayerFfn, WeightWorkingSet};
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -139,9 +142,76 @@ struct LayerOff {
     w_down: WeightRef,
 }
 
+struct FfnRingState {
+    bound: Vec<Option<usize>>,
+    cursor: usize,
+}
+
+struct FfnRing {
+    base: usize,
+    slot_bytes: usize,
+    state: Mutex<FfnRingState>,
+}
+
+enum DeviceFfn<'a> {
+    Resident {
+        ffn_norm: WeightRef,
+        w_gate: WeightRef,
+        w_up: WeightRef,
+        w_down: WeightRef,
+    },
+    Bound {
+        _guard: std::sync::MutexGuard<'a, FfnRingState>,
+        ffn_norm: WeightRef,
+        w_gate: WeightRef,
+        w_up: WeightRef,
+        w_down: WeightRef,
+    },
+}
+
+impl DeviceFfn<'_> {
+    fn ffn_norm(&self) -> WeightRef {
+        match self {
+            Self::Resident { ffn_norm, .. } | Self::Bound { ffn_norm, .. } => *ffn_norm,
+        }
+    }
+    fn w_gate(&self) -> WeightRef {
+        match self {
+            Self::Resident { w_gate, .. } | Self::Bound { w_gate, .. } => *w_gate,
+        }
+    }
+    fn w_up(&self) -> WeightRef {
+        match self {
+            Self::Resident { w_up, .. } | Self::Bound { w_up, .. } => *w_up,
+        }
+    }
+    fn w_down(&self) -> WeightRef {
+        match self {
+            Self::Resident { w_down, .. } | Self::Bound { w_down, .. } => *w_down,
+        }
+    }
+}
+
+fn slot_ffn_refs(base: usize, slot_bytes: usize, slot: usize, host: &LayerFfn) -> [WeightRef; 4] {
+    let mut off = base + slot * slot_bytes;
+    let mut next = |n: usize| {
+        let r = WeightRef::f32(off, n);
+        off += n * 4;
+        r
+    };
+    [
+        next(host.ffn_norm.len()),
+        next(host.w_gate.len()),
+        next(host.w_up.len()),
+        next(host.w_down.len()),
+    ]
+}
+
 /// Host-layout map onto a once-uploaded [`DeviceWeights`] blob.
 pub struct ResidentModel {
     weights: DeviceWeights,
+    packed_h2d: u64,
+    ffn_ring: Option<FfnRing>,
     embed: WeightRef,
     layers: Vec<LayerOff>,
     norm: WeightRef,
@@ -150,36 +220,80 @@ pub struct ResidentModel {
 
 impl ResidentModel {
     pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
-        let slices = model.weight_slices();
-        let mut offsets = Vec::with_capacity(slices.len());
+        let mut slices: Vec<&[f32]> = Vec::new();
         let mut off = 0usize;
-        for s in &slices {
-            offsets.push(off);
-            off += s.len() * 4;
+        fn push<'a>(slices: &mut Vec<&'a [f32]>, off: &mut usize, s: &'a [f32]) -> WeightRef {
+            let o = *off;
+            slices.push(s);
+            *off += s.len() * 4;
+            WeightRef::f32(o, s.len())
         }
-        let weights = DeviceWeights::upload(device, &slices)?;
+        let embed = push(&mut slices, &mut off, model.embed.as_slice());
         let mut layers = Vec::with_capacity(model.layers.len());
-        let mut idx = 1;
         for layer in &model.layers {
+            let attn_norm = push(&mut slices, &mut off, layer.attn_norm.as_slice());
+            let wq = push(&mut slices, &mut off, layer.wq.as_slice());
+            let wk = push(&mut slices, &mut off, layer.wk.as_slice());
+            let wv = push(&mut slices, &mut off, layer.wv.as_slice());
+            let wo = push(&mut slices, &mut off, layer.wo.as_slice());
+            let (ffn_norm, w_gate, w_up, w_down) = if layer.w_gate.is_empty() {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                )
+            } else {
+                (
+                    push(&mut slices, &mut off, layer.ffn_norm.as_slice()),
+                    push(&mut slices, &mut off, layer.w_gate.as_slice()),
+                    push(&mut slices, &mut off, layer.w_up.as_slice()),
+                    push(&mut slices, &mut off, layer.w_down.as_slice()),
+                )
+            };
             layers.push(LayerOff {
-                attn_norm: WeightRef::f32(offsets[idx], layer.attn_norm.len()),
-                wq: WeightRef::f32(offsets[idx + 1], layer.wq.len()),
-                wk: WeightRef::f32(offsets[idx + 2], layer.wk.len()),
-                wv: WeightRef::f32(offsets[idx + 3], layer.wv.len()),
-                wo: WeightRef::f32(offsets[idx + 4], layer.wo.len()),
-                ffn_norm: WeightRef::f32(offsets[idx + 5], layer.ffn_norm.len()),
-                w_gate: WeightRef::f32(offsets[idx + 6], layer.w_gate.len()),
-                w_up: WeightRef::f32(offsets[idx + 7], layer.w_up.len()),
-                w_down: WeightRef::f32(offsets[idx + 8], layer.w_down.len()),
+                attn_norm,
+                wq,
+                wk,
+                wv,
+                wo,
+                ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
             });
-            idx += TENSORS_PER_LAYER;
         }
+        let norm = push(&mut slices, &mut off, model.norm.as_slice());
+        let lm_head = push(&mut slices, &mut off, model.lm_head.as_slice());
+        let packed = off;
+        let (ring_slots, slot_bytes) = model
+            .working_set
+            .as_ref()
+            .filter(|w| w.streams())
+            .map(|w| (w.plan.ring_slots.max(1), w.plan.slot_bytes))
+            .unwrap_or((0, 0));
+        let tail = ring_slots.saturating_mul(slot_bytes);
+        let weights = DeviceWeights::upload_f32_with_tail(device, &slices, tail)?;
+        let ffn_ring = if tail > 0 {
+            Some(FfnRing {
+                base: packed,
+                slot_bytes,
+                state: Mutex::new(FfnRingState {
+                    bound: vec![None; ring_slots],
+                    cursor: 0,
+                }),
+            })
+        } else {
+            None
+        };
         Ok(Self {
+            packed_h2d: packed as u64,
             weights,
-            embed: WeightRef::f32(offsets[0], model.embed.len()),
+            ffn_ring,
+            embed,
             layers,
-            norm: WeightRef::f32(offsets[idx], model.norm.len()),
-            lm_head: WeightRef::f32(offsets[idx + 1], model.lm_head.len()),
+            norm,
+            lm_head,
         })
     }
 
@@ -240,6 +354,8 @@ impl ResidentModel {
         let views: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
         let weights = DeviceWeights::upload_bytes(device, &views)?;
         Ok(Self {
+            packed_h2d: weights.bytes(),
+            ffn_ring: None,
             weights,
             embed,
             layers,
@@ -250,6 +366,99 @@ impl ResidentModel {
 
     pub fn bytes(&self) -> u64 {
         self.weights.bytes()
+    }
+
+    pub fn packed_h2d_bytes(&self) -> u64 {
+        self.packed_h2d
+    }
+
+    fn bind_ffn<'a>(
+        &'a self,
+        layer_idx: usize,
+        host: Option<&LayerFfn>,
+        working_set: Option<&WeightWorkingSet>,
+        metrics: Option<&Metrics>,
+    ) -> Result<DeviceFfn<'a>, AllpacaError> {
+        let layer = &self.layers[layer_idx];
+        if layer.w_gate.n > 0 {
+            return Ok(DeviceFfn::Resident {
+                ffn_norm: layer.ffn_norm,
+                w_gate: layer.w_gate,
+                w_up: layer.w_up,
+                w_down: layer.w_down,
+            });
+        }
+        let ring = self.ffn_ring.as_ref().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(
+                "streamed FFN layer has no device ring".into(),
+            ))
+        })?;
+        let host = host.ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "streamed FFN layer {layer_idx} missing host pool"
+            )))
+        })?;
+        let packed = host.bytes();
+        if packed > ring.slot_bytes {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "FFN layer {layer_idx} is {packed} bytes, ring slot is {}",
+                ring.slot_bytes
+            ))));
+        }
+        let mut state = ring.state.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(
+                "device FFN ring mutex poisoned".into(),
+            ))
+        })?;
+        let n_slots = state.bound.len();
+        if let Some(slot) = state.bound.iter().position(|&b| b == Some(layer_idx)) {
+            if let Some(ws) = working_set {
+                ws.note_bind(true);
+            }
+            let [ffn_norm, w_gate, w_up, w_down] =
+                slot_ffn_refs(ring.base, ring.slot_bytes, slot, host);
+            return Ok(DeviceFfn::Bound {
+                _guard: state,
+                ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
+            });
+        }
+        let slot = state
+            .bound
+            .iter()
+            .position(|b| b.is_none())
+            .unwrap_or_else(|| {
+                let s = state.cursor % n_slots.max(1);
+                state.cursor = state.cursor.wrapping_add(1);
+                s
+            });
+        let mut copy_off = ring.base + slot * ring.slot_bytes;
+        for part in [&host.ffn_norm, &host.w_gate, &host.w_up, &host.w_down] {
+            let n = part.len() * 4;
+            let bytes = unsafe { std::slice::from_raw_parts(part.as_ptr().cast::<u8>(), n) };
+            self.weights.copy_h2d(copy_off, bytes)?;
+            copy_off += n;
+        }
+        state.bound[slot] = Some(layer_idx);
+        if let Some(ws) = working_set {
+            ws.note_bind(false);
+        }
+        if let Some(metrics) = metrics {
+            metrics
+                .weight_h2d_bytes
+                .fetch_add(packed as u64, Ordering::Relaxed);
+        }
+        let [ffn_norm, w_gate, w_up, w_down] =
+            slot_ffn_refs(ring.base, ring.slot_bytes, slot, host);
+        Ok(DeviceFfn::Bound {
+            _guard: state,
+            ffn_norm,
+            w_gate,
+            w_up,
+            w_down,
+        })
     }
 
     fn f32_or_dequant(
@@ -566,6 +775,7 @@ pub struct TinyModel {
     pub norm: Vec<f32>,
     pub lm_head: Vec<f32>,
     pub name: String,
+    pub working_set: Option<Arc<WeightWorkingSet>>,
 }
 
 impl TinyModel {
@@ -595,11 +805,49 @@ impl TinyModel {
             lm_head: rng.vec(vocab * dim),
             name: name.into(),
             config: cfg,
+            working_set: None,
         }
     }
 
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
+    }
+
+    fn ffn<'a>(
+        &'a self,
+        layer_idx: usize,
+        layer: &'a LayerWeights,
+    ) -> Result<FfnRefs<'a>, AllpacaError> {
+        if let Some(ws) = &self.working_set {
+            if !ws.is_pinned(layer_idx) {
+                return Ok(FfnRefs::Bound(ws.bind(layer_idx)?));
+            }
+        }
+        Ok(FfnRefs::Resident(layer))
+    }
+
+    fn device_ffn<'a>(
+        &'a self,
+        resident: &'a ResidentModel,
+        layer_idx: usize,
+        metrics: Option<&Metrics>,
+    ) -> Result<DeviceFfn<'a>, AllpacaError> {
+        let host = self
+            .working_set
+            .as_ref()
+            .and_then(|ws| ws.host_ffn(layer_idx));
+        resident.bind_ffn(
+            layer_idx,
+            host,
+            self.working_set.as_deref(),
+            metrics,
+        )
+    }
+
+    fn streamed_ffn(&self, layer_idx: usize) -> bool {
+        self.working_set
+            .as_ref()
+            .is_some_and(|ws| !ws.is_pinned(layer_idx))
     }
 
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
@@ -669,6 +917,7 @@ impl TinyModel {
             norm,
             lm_head,
             name,
+            working_set: None,
         })
     }
 
@@ -680,6 +929,7 @@ impl TinyModel {
             lm_head: Vec::new(),
             name: name.into(),
             config: cfg,
+            working_set: None,
         }
     }
 
@@ -729,6 +979,7 @@ impl TinyModel {
             norm,
             lm_head,
             name,
+            working_set: None,
         })
     }
 
@@ -773,6 +1024,7 @@ impl TinyModel {
             norm,
             lm_head,
             name: "onnx".into(),
+            working_set: None,
         })
     }
 
@@ -898,21 +1150,23 @@ impl TinyModel {
                 x[i] += hidden[i];
             }
 
+            let ffn = self.ffn(layer_idx, layer)?;
+            let ffn_dev = !self.streamed_ffn(layer_idx);
             rmsnorm_dispatch(
                 hip,
                 &x,
-                &layer.ffn_norm,
-                resident.map(|r| r.ffn_norm(layer_idx)),
+                ffn.ffn_norm(),
+                resident.filter(|_| ffn_dev).map(|r| r.ffn_norm(layer_idx)),
                 cfg.eps,
                 &mut scratch[..dim],
                 Some(metrics),
             )?;
             let mut gate = vec![0.0f32; cfg.ff_dim];
             let mut up = vec![0.0f32; cfg.ff_dim];
-            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_gate, resident.map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
-            gemm_nt_dispatch(hip, &scratch[..dim], &layer.w_up, resident.map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], ffn.w_gate(), resident.filter(|_| ffn_dev).map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &scratch[..dim], ffn.w_up(), resident.filter(|_| ffn_dev).map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
             silu_mul_dispatch(hip, &mut gate, &up, Some(metrics))?;
-            gemm_nt_dispatch(hip, &gate, &layer.w_down, resident.map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
+            gemm_nt_dispatch(hip, &gate, ffn.w_down(), resident.filter(|_| ffn_dev).map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
@@ -1158,10 +1412,15 @@ impl TinyModel {
             } else {
                 resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
             }
+            let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
+            let ffn_norm = ffn.ffn_norm();
+            let w_gate = ffn.w_gate();
+            let w_up = ffn.w_up();
+            let w_down = ffn.w_down();
             hip.residual_rmsnorm(
                 buf.x,
                 buf.proj,
-                resident.f32_or_dequant(hip, layer.ffn_norm)?,
+                resident.f32_or_dequant(hip, ffn_norm)?,
                 buf.normed,
                 dim as i32,
                 cfg.eps,
@@ -1170,12 +1429,12 @@ impl TinyModel {
                 .residual_gpu_ops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             record_elementwise(Some(metrics));
-            if layer.w_gate.kind == WeightKind::Q8_0 {
+            if w_gate.kind == WeightKind::Q8_0 {
                 hip.profile_q8(|| {
                     resident.gemm_nt(
                         hip,
                         buf.normed,
-                        layer.w_gate,
+                        w_gate,
                         buf.gate,
                         1,
                         cfg.ff_dim as i32,
@@ -1184,7 +1443,7 @@ impl TinyModel {
                     resident.gemm_nt(
                         hip,
                         buf.normed,
-                        layer.w_up,
+                        w_up,
                         buf.up,
                         1,
                         cfg.ff_dim as i32,
@@ -1196,7 +1455,7 @@ impl TinyModel {
                 resident.gemm_nt(
                     hip,
                     buf.normed,
-                    layer.w_gate,
+                    w_gate,
                     buf.gate,
                     1,
                     cfg.ff_dim as i32,
@@ -1205,7 +1464,7 @@ impl TinyModel {
                 resident.gemm_nt(
                     hip,
                     buf.normed,
-                    layer.w_up,
+                    w_up,
                     buf.up,
                     1,
                     cfg.ff_dim as i32,
@@ -1214,12 +1473,12 @@ impl TinyModel {
             }
             hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
             record_elementwise(Some(metrics));
-            if layer.w_down.kind == WeightKind::Q8_0 {
+            if w_down.kind == WeightKind::Q8_0 {
                 hip.profile_q8(|| {
                     resident.gemm_nt(
                         hip,
                         buf.gate,
-                        layer.w_down,
+                        w_down,
                         buf.proj,
                         1,
                         dim as i32,
@@ -1230,13 +1489,14 @@ impl TinyModel {
                 resident.gemm_nt(
                     hip,
                     buf.gate,
-                    layer.w_down,
+                    w_down,
                     buf.proj,
                     1,
                     dim as i32,
                     cfg.ff_dim as i32,
                 )?;
             }
+            drop(ffn);
             if layer_idx + 1 < resident.layers.len() {
                 hip.residual_rmsnorm(
                     buf.x,
@@ -1446,22 +1706,27 @@ impl TinyModel {
                     .residual_gpu_ops
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 record_elementwise(Some(metrics));
+                let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
+                let ffn_norm = ffn.ffn_norm();
+                let w_gate = ffn.w_gate();
+                let w_up = ffn.w_up();
+                let w_down = ffn.w_down();
                 rmsnorm_device_rows(
                     hip,
                     buf.x,
-                    resident.f32_or_dequant(hip, layer.ffn_norm)?,
+                    resident.f32_or_dequant(hip, ffn_norm)?,
                     buf.normed,
                     n_tok,
                     dim,
                     cfg.eps,
                 )?;
                 record_elementwise(Some(metrics));
-                if layer.w_gate.kind == WeightKind::Q8_0 {
+                if w_gate.kind == WeightKind::Q8_0 {
                     hip.profile_q8(|| {
                         resident.gemm_nt(
                             hip,
                             buf.normed,
-                            layer.w_gate,
+                            w_gate,
                             buf.gate,
                             m,
                             cfg.ff_dim as i32,
@@ -1470,7 +1735,7 @@ impl TinyModel {
                         resident.gemm_nt(
                             hip,
                             buf.normed,
-                            layer.w_up,
+                            w_up,
                             buf.up,
                             m,
                             cfg.ff_dim as i32,
@@ -1482,7 +1747,7 @@ impl TinyModel {
                     resident.gemm_nt(
                         hip,
                         buf.normed,
-                        layer.w_gate,
+                        w_gate,
                         buf.gate,
                         m,
                         cfg.ff_dim as i32,
@@ -1491,7 +1756,7 @@ impl TinyModel {
                     resident.gemm_nt(
                         hip,
                         buf.normed,
-                        layer.w_up,
+                        w_up,
                         buf.up,
                         m,
                         cfg.ff_dim as i32,
@@ -1500,12 +1765,12 @@ impl TinyModel {
                 }
                 hip.silu_mul_device(buf.gate, buf.up, (n_tok * cfg.ff_dim) as i32)?;
                 record_elementwise(Some(metrics));
-                if layer.w_down.kind == WeightKind::Q8_0 {
+                if w_down.kind == WeightKind::Q8_0 {
                     hip.profile_q8(|| {
                         resident.gemm_nt(
                             hip,
                             buf.gate,
-                            layer.w_down,
+                            w_down,
                             buf.proj,
                             m,
                             dim as i32,
@@ -1516,13 +1781,14 @@ impl TinyModel {
                     resident.gemm_nt(
                         hip,
                         buf.gate,
-                        layer.w_down,
+                        w_down,
                         buf.proj,
                         m,
                         dim as i32,
                         cfg.ff_dim as i32,
                     )?;
                 }
+                drop(ffn);
                 hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
                 metrics
                     .residual_gpu_ops
@@ -1736,6 +2002,7 @@ impl TinyModel {
                     &mask,
                 )?;
             }
+            let ffn = self.ffn(layer_idx, layer)?;
             for i in 0..n_tree {
                 let mut hidden = vec![0.0f32; dim];
                 matmul_nt(
@@ -1749,15 +2016,15 @@ impl TinyModel {
                 for d in 0..dim {
                     xs[i][d] += hidden[d];
                 }
-                rmsnorm(&xs[i], &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
+                rmsnorm(&xs[i], ffn.ffn_norm(), cfg.eps, &mut scratch[..dim])?;
                 let mut gate = vec![0.0f32; cfg.ff_dim];
                 let mut up = vec![0.0f32; cfg.ff_dim];
-                matmul_nt(&scratch[..dim], &layer.w_gate, &mut gate, 1, cfg.ff_dim, dim)?;
-                matmul_nt(&scratch[..dim], &layer.w_up, &mut up, 1, cfg.ff_dim, dim)?;
+                matmul_nt(&scratch[..dim], ffn.w_gate(), &mut gate, 1, cfg.ff_dim, dim)?;
+                matmul_nt(&scratch[..dim], ffn.w_up(), &mut up, 1, cfg.ff_dim, dim)?;
                 for g in 0..cfg.ff_dim {
                     gate[g] = silu(gate[g]) * up[g];
                 }
-                matmul_nt(&gate, &layer.w_down, &mut hidden, 1, dim, cfg.ff_dim)?;
+                matmul_nt(&gate, ffn.w_down(), &mut hidden, 1, dim, cfg.ff_dim)?;
                 for d in 0..dim {
                     xs[i][d] += hidden[d];
                 }
@@ -1860,21 +2127,23 @@ impl TinyModel {
             for i in 0..dim {
                 x[i] += hidden[i];
             }
+            let ffn = self.ffn(layer_idx, layer)?;
+            let ffn_dev = !self.streamed_ffn(layer_idx);
             rmsnorm_dispatch(
                 hip,
                 &x,
-                &layer.ffn_norm,
-                resident.map(|r| r.ffn_norm(layer_idx)),
+                ffn.ffn_norm(),
+                resident.filter(|_| ffn_dev).map(|r| r.ffn_norm(layer_idx)),
                 cfg.eps,
                 &mut normed,
                 metrics,
             )?;
             let mut gate = vec![0.0f32; cfg.ff_dim];
             let mut up = vec![0.0f32; cfg.ff_dim];
-            gemm_nt_dispatch(hip, &normed, &layer.w_gate, resident.map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
-            gemm_nt_dispatch(hip, &normed, &layer.w_up, resident.map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, ffn.w_gate(), resident.filter(|_| ffn_dev).map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
+            gemm_nt_dispatch(hip, &normed, ffn.w_up(), resident.filter(|_| ffn_dev).map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
             silu_mul_dispatch(hip, &mut gate, &up, metrics)?;
-            gemm_nt_dispatch(hip, &gate, &layer.w_down, resident.map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
+            gemm_nt_dispatch(hip, &gate, ffn.w_down(), resident.filter(|_| ffn_dev).map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }
@@ -2010,10 +2279,15 @@ impl TinyModel {
                 dim as i32,
                 dim as i32,
             )?;
+            let ffn = self.device_ffn(resident, layer_idx, metrics)?;
+            let ffn_norm = ffn.ffn_norm();
+            let w_gate = ffn.w_gate();
+            let w_up = ffn.w_up();
+            let w_down = ffn.w_down();
             hip.residual_rmsnorm(
                 buf.x,
                 buf.proj,
-                resident.f32_or_dequant(hip, layer.ffn_norm)?,
+                resident.f32_or_dequant(hip, ffn_norm)?,
                 buf.normed,
                 dim as i32,
                 cfg.eps,
@@ -2027,7 +2301,7 @@ impl TinyModel {
             resident.gemm_nt(
                 hip,
                 buf.normed,
-                layer.w_gate,
+                w_gate,
                 buf.gate,
                 1,
                 cfg.ff_dim as i32,
@@ -2036,7 +2310,7 @@ impl TinyModel {
             resident.gemm_nt(
                 hip,
                 buf.normed,
-                layer.w_up,
+                w_up,
                 buf.up,
                 1,
                 cfg.ff_dim as i32,
@@ -2047,12 +2321,13 @@ impl TinyModel {
             resident.gemm_nt(
                 hip,
                 buf.gate,
-                layer.w_down,
+                w_down,
                 buf.proj,
                 1,
                 dim as i32,
                 cfg.ff_dim as i32,
             )?;
+            drop(ffn);
             if layer_idx + 1 < resident.layers.len() {
                 hip.residual_rmsnorm(
                     buf.x,

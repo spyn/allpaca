@@ -28,6 +28,7 @@ use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
 use crate::telemetry::Metrics;
 use crate::tokenizer::EngineTokenizer;
+use crate::weight_set::{DenseTrunkPlan, WeightWorkingSet};
 use allpaca_hip::HipWorkspace;
 
 struct ActiveRequest {
@@ -63,6 +64,12 @@ struct EngineInner {
     target_resident: Option<Arc<ResidentModel>>,
     draft_resident: Option<Arc<ResidentModel>>,
     draft_kv: DenseKv,
+    draft_ahead: Option<DraftAhead>,
+}
+
+struct DraftAhead {
+    ctx: Vec<u32>,
+    tokens: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -168,6 +175,7 @@ impl Engine {
             target_resident: None,
             draft_resident: None,
             draft_kv: DenseKv::default(),
+            draft_ahead: None,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -195,7 +203,16 @@ impl Engine {
 
     pub fn stats(&self) -> StatsSnapshot {
         let (model_id, kv_h2d, kv_d2h, draft_kv_bytes) = match self.lock() {
-            Ok(g) => (
+            Ok(g) => {
+                if let Some(ws) = g.target.as_ref().and_then(|m| m.working_set.as_ref()) {
+                    self.metrics
+                        .weight_ring_binds
+                        .store(ws.ring_binds(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .weight_ring_hits
+                        .store(ws.ring_hits(), std::sync::atomic::Ordering::Relaxed);
+                }
+                (
                 g.target
                     .as_ref()
                     .map(|m| m.name.clone())
@@ -203,7 +220,8 @@ impl Engine {
                 g.kv.activation_h2d_bytes(),
                 g.kv.activation_d2h_bytes(),
                 g.draft_kv.device_bytes(),
-            ),
+                )
+            }
             Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
         let (backend, device_memory_bytes) = if self.hip.is_some() {
@@ -312,13 +330,17 @@ impl Engine {
         let seed = self.config.engine.determinism_seed.unwrap_or(42);
         let tokenizer = EngineTokenizer::synthetic(cfg.vocab_size)?;
         inner.ring.resize_vocab(cfg.vocab_size);
-        inner.target = Some(Arc::new(TinyModel::synthetic(cfg.clone(), seed, "synthetic")));
+        let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
+        self.apply_weight_working_set(&mut target);
+        inner.target = Some(Arc::new(target));
         if inner.flags.draft_model_speculation {
-            inner.draft_model = Some(Arc::new(TinyModel::synthetic(
+            let mut draft = TinyModel::synthetic(
                 ModelConfig::draft_tiny(),
                 seed.wrapping_add(1),
                 "synthetic-draft",
-            )));
+            );
+            self.apply_weight_working_set(&mut draft);
+            inner.draft_model = Some(Arc::new(draft));
         }
         inner.tokenizer = Some(tokenizer);
         inner.model_id = "synthetic".into();
@@ -326,6 +348,24 @@ impl Engine {
         self.upload_resident_weights()?;
         tracing::info!(vocab = cfg.vocab_size, layers = cfg.n_layers, "loaded synthetic model");
         Ok(())
+    }
+
+    fn apply_weight_working_set(&self, model: &mut TinyModel) {
+        let cfg = &self.config.weights;
+        if cfg.trunk_bytes == 0 || !model.host_weights_ready() {
+            return;
+        }
+        let sizes: Vec<usize> = model.layers.iter().map(|l| l.ffn_bytes()).collect();
+        if sizes.iter().all(|&b| b == 0) {
+            return;
+        }
+        let requested = cfg.ring_slots.max(1);
+        let plan = DenseTrunkPlan::plan(&sizes, cfg.trunk_bytes, requested);
+        WeightWorkingSet::record_plan(&self.metrics, &plan);
+        if !plan.streams() {
+            return;
+        }
+        model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan));
     }
 
     fn load_model_path(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
@@ -350,7 +390,8 @@ impl Engine {
         );
         let hf = load_hf_config(&config_path)?;
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
-        let model = TinyModel::from_safetensors(&file, &hf)?;
+        let mut model = TinyModel::from_safetensors(&file, &hf)?;
+        self.apply_weight_working_set(&mut model);
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -376,7 +417,8 @@ impl Engine {
         );
         let hf = load_hf_config(&config_path)?;
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
-        let model = TinyModel::from_onnx(&file, &hf)?;
+        let mut model = TinyModel::from_onnx(&file, &hf)?;
+        self.apply_weight_working_set(&mut model);
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -390,12 +432,13 @@ impl Engine {
     pub fn load_gguf(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
         let file = GgufFile::open(path)?;
         let tok = extract_tokenizer(&file)?;
-        let model = TinyModel::from_gguf(&file)?;
+        let mut model = TinyModel::from_gguf(&file)?;
         if !model.host_weights_ready() && self.hip.is_none() {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "large GGUF requires HIP (host F32 materialize is skipped to avoid OOM)".into(),
             )));
         }
+        self.apply_weight_working_set(&mut model);
         let mut draft_file = None;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -458,7 +501,7 @@ impl Engine {
                 Ok(resident) => {
                     let n = resident.bytes();
                     weight_bytes += n;
-                    h2d += n;
+                    h2d += resident.packed_h2d_bytes();
                     Some(Arc::new(resident))
                 }
                 Err(e) => {
@@ -487,7 +530,7 @@ impl Engine {
                 Ok(resident) => {
                     let n = resident.bytes();
                     weight_bytes += n;
-                    h2d += n;
+                    h2d += resident.packed_h2d_bytes();
                     Some(Arc::new(resident))
                 }
                 Err(e) => {
@@ -628,6 +671,8 @@ impl Engine {
         let rng = rng_from_params(&params, self.config.engine.determinism_seed);
         let id = inner.next_request_id;
         inner.next_request_id += 1;
+        inner.draft_ahead = None;
+        inner.draft_kv.reset();
         let prompt_len = tokens.len();
         inner.active.insert(
             id,
@@ -771,7 +816,18 @@ impl Engine {
             } else {
                 Vec::new()
             };
-            verify_and_sample(&mut inner, id, drafts, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref())?
+            verify_and_sample(
+                    &mut inner,
+                    id,
+                    drafts,
+                    mask.as_ref(),
+                    remaining,
+                    &self.metrics,
+                    self.hip.as_deref(),
+                    self.draft_hip.as_deref(),
+                    depth,
+                    temperature,
+                )?
         };
         let accepted = produced.accepted;
         let proposed = produced.proposed;
@@ -1024,6 +1080,15 @@ fn propose_drafts(
     metrics: &Metrics,
 ) -> Result<Vec<u32>, AllpacaError> {
     let ctx = request(inner, id)?.tokens.clone();
+    if let Some(ahead) = inner.draft_ahead.take() {
+        if ahead.ctx == ctx && !ahead.tokens.is_empty() {
+            metrics
+                .draft_ahead_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            host_stage_draft_tokens(&ahead.tokens, draft_hip, metrics);
+            return Ok(ahead.tokens);
+        }
+    }
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mut provider = DraftModelProvider::new((*model).clone());
@@ -1080,6 +1145,9 @@ fn verify_and_sample(
     remaining: usize,
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
+    draft_hip: Option<&HipWorkspace>,
+    depth: usize,
+    temperature: f32,
 ) -> Result<Produced, AllpacaError> {
     let drafts_len = drafts.len() as u64;
     if remaining == 0 {
@@ -1114,6 +1182,9 @@ fn verify_and_sample(
             remaining,
             metrics,
             hip,
+            draft_hip,
+            depth,
+            temperature,
         );
     }
     let mut produced = vec![sampled];
@@ -1124,11 +1195,19 @@ fn verify_and_sample(
     }
     append_and_forward(inner, id, sampled, metrics, hip)?;
     if stop || !first_match || draft_iter.peek().is_none() {
-        return Ok(Produced {
-            tokens: produced,
-            accepted,
-            proposed: drafts_len,
-        });
+        return finish_linear_verify(
+            inner,
+            id,
+            Produced {
+                tokens: produced,
+                accepted,
+                proposed: drafts_len,
+            },
+            depth,
+            temperature,
+            draft_hip,
+            metrics,
+        );
     }
     while produced.len() < remaining {
         if let Some(hip) = hip {
@@ -1156,14 +1235,148 @@ fn verify_and_sample(
             break;
         }
     }
-    Ok(Produced {
-        tokens: produced,
-        accepted,
-        proposed: drafts_len,
-    })
+    finish_linear_verify(
+        inner,
+        id,
+        Produced {
+            tokens: produced,
+            accepted,
+            proposed: drafts_len,
+        },
+        depth,
+        temperature,
+        draft_hip,
+        metrics,
+    )
+}
+
+fn finish_linear_verify(
+    inner: &mut EngineInner,
+    id: u64,
+    produced: Produced,
+    depth: usize,
+    temperature: f32,
+    draft_hip: Option<&HipWorkspace>,
+    metrics: &Metrics,
+) -> Result<Produced, AllpacaError> {
+    if !produced.tokens.is_empty() {
+        let ctx = request(inner, id)?.tokens.clone();
+        store_draft_ahead_from_ctx(inner, &ctx, depth, temperature, draft_hip, metrics)?;
+    }
+    Ok(produced)
 }
 
 fn packed_linear_verify(
+    inner: &mut EngineInner,
+    id: u64,
+    span: Vec<u32>,
+    first: u32,
+    mask: Option<&allpaca_types::TokenMask>,
+    remaining: usize,
+    metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
+    draft_hip: Option<&HipWorkspace>,
+    depth: usize,
+    temperature: f32,
+) -> Result<Produced, AllpacaError> {
+    let span_len = span.len();
+    let next_ctx = {
+        let mut ctx = request(inner, id)?.tokens.clone();
+        ctx.extend_from_slice(&span);
+        ctx
+    };
+    let can_ahead = depth > 0
+        && inner.flags.draft_model_speculation
+        && inner.draft_model.is_some();
+    if !can_ahead {
+        return packed_linear_verify_span(inner, id, span, first, mask, remaining, metrics, hip);
+    }
+    let mut draft_kv = std::mem::take(&mut inner.draft_kv);
+    let model = inner.draft_model.clone().expect("draft-ahead needs a Draft Model");
+    let resident = inner.draft_resident.clone();
+    let next_ctx_worker = next_ctx.clone();
+    std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            if let Some(h) = draft_hip {
+                let _ = h.bind();
+            }
+            let mut provider = DraftModelProvider::new((*model).clone());
+            let tokens = provider.propose_on(
+                &next_ctx_worker,
+                depth,
+                temperature,
+                &mut draft_kv,
+                draft_hip,
+                resident.as_deref(),
+                Some(metrics),
+            );
+            (draft_kv, tokens)
+        });
+        let produced = packed_linear_verify_span(
+            inner, id, span, first, mask, remaining, metrics, hip,
+        );
+        let (kv, ahead) = worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        inner.draft_kv = kv;
+        let produced = produced?;
+        let ahead = ahead?;
+        let actual_ctx = request(inner, id)?.tokens.clone();
+        let full_accept = produced.accepted == produced.proposed
+            && produced.proposed == span_len as u64
+            && actual_ctx == next_ctx;
+        if full_accept && !ahead.is_empty() {
+            inner.draft_ahead = Some(DraftAhead {
+                ctx: next_ctx,
+                tokens: ahead,
+            });
+        } else {
+            store_draft_ahead_from_ctx(
+                inner,
+                &actual_ctx,
+                depth,
+                temperature,
+                draft_hip,
+                metrics,
+            )?;
+        }
+        Ok(produced)
+    })
+}
+
+fn store_draft_ahead_from_ctx(
+    inner: &mut EngineInner,
+    ctx: &[u32],
+    depth: usize,
+    temperature: f32,
+    draft_hip: Option<&HipWorkspace>,
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    if depth == 0 || ctx.is_empty() {
+        return Ok(());
+    }
+    let Some(model) = inner.draft_model.clone() else {
+        return Ok(());
+    };
+    let mut provider = DraftModelProvider::new((*model).clone());
+    let resident = inner.draft_resident.clone();
+    let tokens = provider.propose_on(
+        ctx,
+        depth,
+        temperature,
+        &mut inner.draft_kv,
+        draft_hip,
+        resident.as_deref(),
+        Some(metrics),
+    )?;
+    if !tokens.is_empty() {
+        inner.draft_ahead = Some(DraftAhead {
+            ctx: ctx.to_vec(),
+            tokens,
+        });
+    }
+    Ok(())
+}
+
+fn packed_linear_verify_span(
     inner: &mut EngineInner,
     id: u64,
     span: Vec<u32>,
@@ -1481,6 +1694,44 @@ mod tests {
             out.finish_reason,
             FinishReason::Length | FinishReason::Stop
         ));
+    }
+
+    #[test]
+    fn streamed_ffn_greedy_tokens_match_fully_resident() {
+        let mut resident_cfg = test_config();
+        resident_cfg.speculative.enabled = false;
+        let resident = Engine::new(resident_cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let full = resident.generate("hello", params.clone()).unwrap();
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.weights.trunk_bytes = 64;
+        cfg.weights.ring_slots = 1;
+        let streamed = Engine::new(cfg).unwrap();
+        let part = streamed.generate("hello", params).unwrap();
+        assert_eq!(
+            part.token_ids, full.token_ids,
+            "GPU residency is a speed dial: greedy tokens must match"
+        );
+        let stats = streamed.stats();
+        assert!(
+            stats.weight_ring_slots >= 1,
+            "tiny trunk budget must grant a ring"
+        );
+        assert!(
+            stats.weight_ring_binds > 0,
+            "streamed FFN must actually bind through the ring"
+        );
+        assert!(
+            stats.weight_pinned_layers < 2,
+            "tiny budget should not pin both synthetic layers"
+        );
     }
 
     #[test]
@@ -2109,6 +2360,10 @@ mod tests {
     }
 
     fn write_tiny_target_gguf(path: &std::path::Path) {
+        write_tiny_llama_gguf(path, 0.01, 0.01);
+    }
+
+    fn write_tiny_llama_gguf(path: &std::path::Path, w: f32, ffn_down: f32) {
         use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
         use std::collections::HashMap;
 
@@ -2145,16 +2400,16 @@ mod tests {
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
         meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
         let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
-            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![0.01; vocab * dim]),
+            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
             ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-            ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
-            ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
-            ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
-            ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
+            ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
+            ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
+            ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
+            ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
             ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-            ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
-            ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
-            ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![0.01; dim * ff]),
+            ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![w; ff * dim]),
+            ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![w; ff * dim]),
+            ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![ffn_down; dim * ff]),
             ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
         ];
         let views: Vec<GgufWriteTensor<'_>> = owned
@@ -3283,6 +3538,11 @@ mod tests {
             out.token_ids.len(),
             stats.acceptance_rate
         );
+        assert!(
+            stats.draft_ahead_hits > 0,
+            "full-accept packed verify must overlap the next Draft Model propose; gen={} stats={stats:?}",
+            out.token_ids.len()
+        );
         let mut plain = Config::compiled_defaults();
         plain.merge_cli(&CliOverrides {
             cpu_only: true,
@@ -3307,6 +3567,80 @@ mod tests {
         assert_eq!(
             out.token_ids, plain_out.token_ids,
             "packed linear verify must match greedy Target Model tokens"
+        );
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_file(draft);
+    }
+
+    #[test]
+    fn engine_speculative_reuses_draft_ahead_after_partial_accept() {
+        let target = std::env::temp_dir().join("allpaca_pack_partial_tgt.gguf");
+        let draft = std::env::temp_dir().join("allpaca_pack_partial_dft.gguf");
+        write_tiny_llama_gguf(&target, 0.01, 0.01);
+        write_tiny_llama_gguf(&draft, 0.01, 2.0);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(target.clone());
+        cfg.model.draft_path = Some(draft.clone());
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 4;
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("mismatched tiny target+draft must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 16,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("partial-accept packed verify must generate");
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.linear_packed_verifies > 0,
+            "first draft token must match often enough to pack; stats={stats:?}"
+        );
+        assert!(
+            stats.draft_ahead_hits > 0,
+            "packed verify must queue the next Draft span even when later tokens diverge; gen={} acceptance={:.3} stats={stats:?}",
+            out.token_ids.len(),
+            stats.acceptance_rate
+        );
+        let mut plain = Config::compiled_defaults();
+        plain.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        plain.model.path = Some(target.clone());
+        plain.kv.page_tokens = 8;
+        let plain_engine = Engine::new(plain).expect("plain target must load");
+        let plain_out = plain_engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 16,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("plain generate must run");
+        assert_eq!(
+            out.token_ids, plain_out.token_ids,
+            "partial-accept verify must keep Target Model tokens"
         );
         let _ = std::fs::remove_file(target);
         let _ = std::fs::remove_file(draft);

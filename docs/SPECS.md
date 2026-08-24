@@ -18,7 +18,7 @@ The engine must refuse to assume direct GPU P2P until capability and benchmark v
 
 ### TR-04 — Memory Accounting
 
-All VRAM, DRAM and NVMe residency must be tracked per request and per page.
+All VRAM, DRAM and NVMe residency must be tracked per request, per KV page, and per weight/expert slot.
 
 ### TR-05 — Backpressure
 
@@ -31,6 +31,10 @@ Export OpenTelemetry/Prometheus-compatible counters for latency, queue depth, ac
 ### TR-07 — Fault Handling
 
 If a side accelerator fails, inference falls back to a CPU/GPU implementation without terminating the request unless policy forbids fallback.
+
+### TR-08 — Weight Working Set Correctness
+
+When weights do not fit in VRAM, greedy tokens must match the fully-resident path at every `trunk_gb` / `cache_gb` budget. GPU residency is a speed dial. Host (or NVMe) is the source of truth. Weight slots are not KV pages.
 
 ## Core Data Structures
 
@@ -220,6 +224,45 @@ VRAM <-> DRAM <-> NVMe
 priority = predicted_reuse * recency_weight * layer_weight - transfer_cost
 ```
 
+## Weight Working Set
+
+Orthogonal to KV. Do not share `KvTierManager`.
+
+```cpp
+enum class WeightKind { AlwaysHot, StreamFfn, RoutedExpert };
+
+enum class SlotState { Empty, Inflight, Resident };
+
+struct ExpertId { uint32_t layer; uint32_t expert; };  // logical l*E+e
+
+struct WeightSlot {
+    SlotState state;
+    ExpertId key;           // or layer index for dense ring
+    DeviceBuffer location;  // VRAM or pinned DRAM
+    uint64_t last_access;
+    bool pinned;            // prefix layers / pinned experts
+};
+
+// q* miss split (FreeToken): profiled on this machine, not from spec sheets.
+// q_fill = max(1, round(m * B_pcie / B_host_expert))
+struct BandwidthProfile {
+    double b_pcie_gbps;          // B_P: pinned expert H2D
+    double b_host_expert_gbps;   // B_H: CPU expert kernel
+};
+```
+
+### Dense policy (cyclic layer walk)
+
+Pin prefix of layers 0..k. Remaining layers cycle through 1–2 ring slots. Prefetch L+1 while computing L. Not LRU.
+
+### MoE policy (sparse decode)
+
+Host pool holds every expert. GPU LRU holds complete `(layer, expert)` slots. Prefill double-buffers full layers. Residual decode misses split by `q*`. CPU and GPU partial sums merge exactly.
+
+### Packed layout
+
+Layer-major trunk (dense) or FTW-style banks with leading dim `l*E+e` (MoE). Aligned for direct I/O. Pin host memory after fill, not before.
+
 ## Token Forest Specification
 
 ### Node Structure
@@ -340,9 +383,9 @@ The scheduler chooses:
 
 | Tier | Latency | Bandwidth | Capacity | Use Case |
 |------|---------|-----------|----------|----------|
-| VRAM | ~100ns | 320-640 GB/s | 16 GB | Hot KV, active weights |
-| Pinned DRAM | ~100ns | 50-100 GB/s | 64+ GB | Warm KV, prompt cache |
-| NVMe | ~10μs | 5-7 GB/s | TB-scale | Cold KV, weight persistence |
+| VRAM | ~100ns | 320-640 GB/s | 16 GB | Hot KV, always-hot weights, expert LRU slots |
+| Pinned DRAM | ~100ns | 50-100 GB/s | 64+ GB | Warm KV, dense ring, host expert pool |
+| NVMe | ~10μs | 5-7 GB/s | TB-scale | Cold KV, packed trunk / expert banks |
 
 ### P2P Constraints
 

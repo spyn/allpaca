@@ -14,6 +14,7 @@ pub struct Config {
     pub speculative: SpeculativeSection,
     pub prefill: PrefillSection,
     pub kv: KvSection,
+    pub weights: WeightsSection,
     pub sampling: SamplingSection,
     pub structured_output: StructuredOutputSection,
     pub model: ModelSection,
@@ -34,6 +35,7 @@ impl Config {
             speculative: SpeculativeSection::default(),
             prefill: PrefillSection::default(),
             kv: KvSection::default(),
+            weights: WeightsSection::default(),
             sampling: SamplingSection::default(),
             structured_output: StructuredOutputSection::default(),
             model: ModelSection::default(),
@@ -128,6 +130,11 @@ impl Config {
         if self.prefill.chunk_tokens == 0 {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "prefill.chunk_tokens must be > 0".into(),
+            )));
+        }
+        if self.weights.ring_slots > 2 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "weights.ring_slots must be 0..=2".into(),
             )));
         }
         Ok(())
@@ -248,6 +255,45 @@ impl Default for KvSection {
             hot_fraction: 0.75,
             vram_bytes: 4 * 1024 * 1024,
             dram_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// How residual MoE expert misses are served (FreeToken `q*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissPolicy {
+    Qstar,
+    Fill,
+    Cpu,
+}
+
+impl Default for MissPolicy {
+    fn default() -> Self {
+        Self::Qstar
+    }
+}
+
+/// Dense pin-prefix + ring, and (later) MoE expert LRU. `trunk_bytes == 0` is full resident.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WeightsSection {
+    /// Budget for pinned FFN prefix plus ring slots. 0 = unlimited (current HIP contract).
+    pub trunk_bytes: usize,
+    /// GPU expert-LRU budget. 0 until MoE lands.
+    pub cache_bytes: usize,
+    /// Requested ring slots (1 or 2). 0 means 1. Second slot only if it fits `trunk_bytes`.
+    pub ring_slots: usize,
+    pub miss_policy: MissPolicy,
+}
+
+impl Default for WeightsSection {
+    fn default() -> Self {
+        Self {
+            trunk_bytes: 0,
+            cache_bytes: 0,
+            ring_slots: 2,
+            miss_policy: MissPolicy::Qstar,
         }
     }
 }
@@ -396,6 +442,36 @@ mod tests {
     #[test]
     fn compiled_defaults_validate() {
         Config::compiled_defaults().validate().unwrap();
+    }
+
+    #[test]
+    fn weights_trunk_bytes_defaults_to_unlimited_and_is_configurable() {
+        let defaults = Config::compiled_defaults();
+        assert_eq!(defaults.weights.trunk_bytes, 0);
+        assert_eq!(defaults.weights.ring_slots, 2);
+        assert_eq!(defaults.weights.miss_policy, MissPolicy::Qstar);
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [weights]
+            trunk_bytes = 4096
+            ring_slots = 1
+            miss_policy = "fill"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.weights.trunk_bytes, 4096);
+        assert_eq!(cfg.weights.ring_slots, 1);
+        assert_eq!(cfg.weights.miss_policy, MissPolicy::Fill);
+        assert_eq!(
+            cfg.kv.page_tokens, 128,
+            "weights is composable, not a Pipeline Mode"
+        );
+
+        let mut bad = Config::compiled_defaults();
+        bad.weights.ring_slots = 3;
+        let err = bad.validate().unwrap_err();
+        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
     }
 
     #[test]

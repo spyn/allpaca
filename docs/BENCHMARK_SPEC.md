@@ -44,7 +44,7 @@ Compare device-side sampling against pinned host sampling.
 VRAM + DRAM paging.
 
 ### B6 — Host + NVMe cold tier
-Add NVMe and prefetch/eviction.
+Add NVMe and prefetch/eviction for KV.
 
 ### B7 — Multimodal split
 9060 XT handles vision/audio encoder while 9070 handles the language model.
@@ -54,6 +54,9 @@ Measure grammar/JSON overhead with and without pipelined CPU masks.
 
 ### B9 — Model-specific early exit
 Only compatible LayerSkip/self-speculative checkpoints.
+
+### B10 — Weight working set
+Dense pin-prefix + ring vs full VRAM residency. MoE LRU + `q*` vs static placement and vs fill-only / CPU-only miss policies. Greedy tokens must match.
 
 ## Workload matrix
 
@@ -102,6 +105,12 @@ CPU-side constraint work can be hidden under target-model compute for large enou
 ### H6 — 9060 XT modality split
 Keeping vision/audio on the 9060 XT will improve target-model stability under concurrent multimodal requests.
 
+### H7 — Dense pin-prefix beats LRU
+On a cyclic layer walk, a pinned prefix plus ring has a deterministic hit rate; LRU of the same budget has hit rate ~0.
+
+### H8 — `q*` beats fill-only and CPU-only
+On a dual-channel desktop, splitting decode expert misses by measured `B_P/B_H` beats sending every miss over PCIe or executing every miss on CPU, without changing tokens.
+
 ## Telemetry schema
 
 ```json
@@ -122,6 +131,14 @@ Keeping vision/audio on the 9060 XT will improve target-model stability under co
     "dram_pages": 0,
     "nvme_pages": 0,
     "prefetch_hit": 0.0
+  },
+  "weights": {
+    "pinned_layers": 0,
+    "ring_hits": 0,
+    "expert_hits": 0,
+    "expert_misses": 0,
+    "qstar_fills": 0,
+    "cpu_experts": 0
   }
 }
 ```

@@ -1637,26 +1637,60 @@ unsafe impl Send for DeviceWeights {}
 unsafe impl Sync for DeviceWeights {}
 
 impl DeviceWeights {
-    /// Allocate one device blob and copy `tensors` in order. Records no Engine metrics.
-    pub fn upload(device: i32, tensors: &[&[f32]]) -> Result<Self, AllpacaError> {
-        let bytes: usize = tensors.iter().map(|t| t.len() * 4).sum();
+    pub fn alloc(device: i32, bytes: usize) -> Result<Self, AllpacaError> {
         if bytes == 0 {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "empty weight upload".into(),
             )));
         }
         let ptr = device_malloc(bytes, device)?;
-        set_device(device)?;
+        Ok(Self { device, ptr, bytes })
+    }
+
+    /// Copy host bytes into this blob at `offset`. Caller must keep the region unused by GEMM.
+    pub fn copy_h2d(&self, offset: usize, src: &[u8]) -> Result<(), AllpacaError> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        if offset.saturating_add(src.len()) > self.bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!(
+                    "weight H2D overflow: off={offset} n={} cap={}",
+                    src.len(),
+                    self.bytes
+                ),
+            )));
+        }
+        set_device(self.device)?;
+        memcpy(
+            unsafe { self.ptr.add(offset) },
+            src.as_ptr(),
+            src.len(),
+            MEMCPY_H2D,
+        )
+    }
+
+    /// Allocate one device blob and copy `tensors` in order. Records no Engine metrics.
+    pub fn upload(device: i32, tensors: &[&[f32]]) -> Result<Self, AllpacaError> {
+        Self::upload_f32_with_tail(device, tensors, 0)
+    }
+
+    /// Like [`upload`], with extra uninitialized bytes at the end (FFN ring slots).
+    pub fn upload_f32_with_tail(
+        device: i32,
+        tensors: &[&[f32]],
+        tail_bytes: usize,
+    ) -> Result<Self, AllpacaError> {
+        let packed: usize = tensors.iter().map(|t| t.len() * 4).sum();
+        let this = Self::alloc(device, packed.saturating_add(tail_bytes))?;
         let mut off = 0usize;
         for t in tensors {
             let n = t.len() * 4;
-            if let Err(e) = memcpy(unsafe { ptr.add(off) }, t.as_ptr().cast(), n, MEMCPY_H2D) {
-                device_free(ptr, bytes);
-                return Err(e);
-            }
+            let bytes = unsafe { std::slice::from_raw_parts(t.as_ptr().cast::<u8>(), n) };
+            this.copy_h2d(off, bytes)?;
             off += n;
         }
-        Ok(Self { device, ptr, bytes })
+        Ok(this)
     }
 
     pub fn device(&self) -> i32 {

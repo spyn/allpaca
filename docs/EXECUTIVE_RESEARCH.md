@@ -66,8 +66,9 @@ The Rust control plane must query GPU symmetry on boot.
 | Prefill/decode disaggregation | Productized in vLLM ecosystems | Implement local asymmetric variant | High |
 | CPU/GPU overlap + async sampling | Common pattern | Make first-class scheduler primitive | High |
 | Early exit | Research/model-dependent | Only for trained early-exit models | Medium/Low |
-| Host RAM weight/expert staging | Established in offload systems | Implement page cache + async prefetch | High |
-| NVMe KV/weight tier | Research/throughput-oriented systems | Optional cold tier | Medium |
+| Host RAM weight/expert staging | Productized: kimi-k3-in-c (pin-prefix+ring), FreeToken (LRU+`q*`) | Separate working-set manager; policy follows access pattern | High |
+| NVMe KV/weight tier | kimi packed trunk + FreeToken FTW/direct I/O | Optional cold backing store under the host pool | Medium |
+| Bandwidth-adaptive CPU/GPU miss split | FreeToken 2026 (`q* ≈ m B_P/B_H`) | Profile on the box; HIP streams, not CUDA graphs | High |
 | "GPU directly to L3" logits | Not a normal PCIe GPU facility | Reject literal design; replace with ring-buffer DMA | Not applicable |
 | GPU P2P DMA | Supported by HIP when topology permits | Detect and exploit | High |
 | GPU memory pooling as transparent 32 GB | Not transparent | Explicit device-local allocators | High |
@@ -116,6 +117,8 @@ Therefore the runtime should expose an `EarlyExitPolicy`, but only enable it whe
 
 FlexGen demonstrated explicit allocation across GPU, CPU and disk, with overlap-aware scheduling. More recent work has characterized NVMe traffic for model and KV offload. This supports an explicit **three-tier page cache**, but NVMe should be treated as a cold-capacity extension rather than pretending it behaves like VRAM. [FlexGen](https://github.com/tomaarsen/FlexGen), [CHEOPS 2025 study](https://research.ibm.com/publications/an-io-characterizing-study-of-offloading-llm-models-and-kv-caches-to-nvme-ssd).
 
+Weight working sets are not KV pages. See §11.
+
 ### 6. CXL is highly relevant architecturally, but not for this motherboard as a software toggle
 
 Recent research such as LIA and CXL-enabled KV-cache systems shows real gains from CXL memory and cooperative CPU/accelerator execution. CXL.cache/CXL.mem provide coherent protocols for suitable hardware. That does **not** imply the current Radeon/AM4 desktop can turn system DDR into transparent coherent GPU HBM or address CPU L3 as a DMA buffer. [LIA](https://deepmind.google/research/publications/81986/), [Linux CXL protocol documentation](https://www.kernel.org/doc/html/latest/driver-api/cxl/devices/device-types.html).
@@ -136,6 +139,20 @@ The Edge TPU executes compiled TensorFlow Lite models and only supports a docume
 
 AMD lists the RX 9070 at 16 GB, 256-bit, up to 640 GB/s and 64 MB Infinity Cache; the RX 9060 XT 16 GB is 128-bit, up to 320 GB/s and 32 MB Infinity Cache. The engine should therefore prefer **9070 = target / main decoder** and **9060 XT = draft / vision / auxiliary work**, unless a benchmark demonstrates a better split. [RX 9070](https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070.html), [RX 9060 XT 16 GB](https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9060xt.html).
 
+### 11. Two 2026 systems close the "model larger than VRAM" gap; copy policy, not runtimes
+
+**kimi-k3-in-c** ([FareedKhan-dev/kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c)) runs Kimi K3 (2.78T) on CPU by streaming a packed dense trunk and LRU-caching routed experts. The dense trunk is a cyclic scan: LRU hit rate is zero; a pinned prefix plus a ring is the correct structure. Experts are sparse: LRU plus `EMPTY|INFLIGHT|key` slots and disk-offset-ordered batch prefetch. Direct I/O beats the OS page cache on that cyclic walk. RAM is only a speed dial; tokens are byte-identical from 8 GB to 224 GB.
+
+**FreeToken** ([arXiv:2608.16157](https://arxiv.org/abs/2608.16157), [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), Apache-2.0, CUDA/Python) is the closest analogue to this engine's thesis: treat GPU, CPU, host RAM and interconnect as one elastic platform, and serve MoE models whose expert pool exceeds VRAM. Three policies matter:
+
+1. Prefill: full-layer double buffering (stream layer *l+1* while computing *l*), because prefill destroys MoE sparsity.
+2. Decode: global LRU of complete `(layer, expert)` slots following the router, then a closed-form miss split `q* ≈ m B_P / B_H` between PCIe cache-fill and in-place CPU execution. Partial sums merge exactly. Static placement (llama.cpp) and prefill-frozen hot sets (KTransformers) miss more of the same traces at equal capacity.
+3. Elastic VRAM: rebuild expert slots vs KV pages at a scheduler safe point without reloading the host pool. Load into final host layout, pin after fill. Semantic recurrent-state checkpoints at tool/thinking/turn boundaries keep agent TTFT tails under client timeouts.
+
+Allpaca differentiators to keep: thick Rust + HIP, two Radeons with asymmetric draft/target, existing VRAM↔DRAM KV. FreeToken is NVIDIA CUDA-graph + single GPU + CPU; do not take CUDA host-function capture as a HIP requirement. Do not vendor their kernels into a GPL tree — rewrite on the kernel ABI.
+
+The implementation notes live in `docs/OPPORTUNITY_DESIGN.md` §8.
+
 ## Recommended MVP order
 
 1. **Rust Control Plane:** Build the hardware discovery engine (Detect CPU, GPUs, memory buses, and NPUs).
@@ -146,8 +163,8 @@ AMD lists the RX 9070 at 16 GB, 256-bit, up to 640 GB/s and 64 MB Infinity Cache
 6. Token Forest + tree verification.
 7. Prefill/decode separation inside one machine.
 8. Pinned host-memory ring buffers and async sampling/masking.
-9. Host RAM model/expert page cache.
-10. Hierarchical KV cache: VRAM -> pinned/regular DDR -> NVMe.
+9. Weight working set: packed layout, dense pin-prefix + ring, host expert pool + GPU LRU + `q*` miss split.
+10. Hierarchical KV cache: VRAM -> pinned/regular DDR -> NVMe (orthogonal to §9).
 11. Multimodal placement.
 12. Structured output scheduler.
 13. Early-exit/self-speculation only for compatible checkpoints.

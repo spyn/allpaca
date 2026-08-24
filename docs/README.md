@@ -32,6 +32,8 @@ The engine should be a **heterogeneous scheduler + memory-fabric runtime** rathe
 - AMD RX 9060 XT 16 GB specs: https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9060xt.html
 - llama.cpp speculative decoding: https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md
 - vLLM disaggregated prefill: https://github.com/vllm-project/vllm/blob/main/docs/features/disagg_prefill.md
+- FreeToken (edge MoE, `q*` miss split, FTW layout): https://arxiv.org/abs/2608.16157 — https://github.com/FlashML-org/FreeToken
+- kimi-k3-in-c (packed trunk, pin-prefix + ring, expert LRU): https://github.com/FareedKhan-dev/kimi-k3-in-c
 - SpecInfer: https://arxiv.org/abs/2305.09781
 - Medusa: https://arxiv.org/abs/2401.10774
 - LayerSkip: https://arxiv.org/abs/2404.16710

@@ -13,6 +13,7 @@ mod scheduler;
 mod telemetry;
 mod tokenizer;
 mod transfer;
+mod weight_set;
 
 pub use device_manager::{detect_pipeline_mode, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
@@ -23,3 +24,4 @@ pub use scheduler::Scheduler;
 pub use telemetry::Metrics;
 pub use tokenizer::EngineTokenizer;
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};
+pub use weight_set::{qstar_fill_count, DenseTrunkPlan, WeightWorkingSet};

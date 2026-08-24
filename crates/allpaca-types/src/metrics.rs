@@ -39,6 +39,9 @@ pub struct StatsSnapshot {
     pub tree_gpu_verifies: u64,
     /// Linear draft-span verifies that ran one Target Model forward over the proposed tokens.
     pub linear_packed_verifies: u64,
+    /// Next-span Draft Model proposes that were reused after overlapping packed verify.
+    #[serde(default)]
+    pub draft_ahead_hits: u64,
     pub accepted_tokens_per_target_eval: f64,
     pub model_id: String,
     /// `"cpu"` or `"hip"` — which kernel backend ran target forwards.
@@ -83,4 +86,16 @@ pub struct StatsSnapshot {
     pub other_gpu_us: f64,
     /// Last/EMA HIP decode: host-side time (D2H logits, bookkeeping) in microseconds.
     pub host_us: f64,
+    /// Dense FFN layers pinned in the weight working set (0 = full resident / unset).
+    #[serde(default)]
+    pub weight_pinned_layers: u64,
+    /// Ring slots granted for streamed FFN (0 when fully pinned).
+    #[serde(default)]
+    pub weight_ring_slots: u64,
+    /// Bind attempts on streamed FFN layers.
+    #[serde(default)]
+    pub weight_ring_binds: u64,
+    /// Binds served from a ring slot without copying from the host pool.
+    #[serde(default)]
+    pub weight_ring_hits: u64,
 }

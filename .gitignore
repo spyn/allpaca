@@ -4,6 +4,7 @@
 
 # Local GGUF weights (not in git)
 /models/*.gguf
+/models/.cache/
 
 # HIP build
 /hip/build

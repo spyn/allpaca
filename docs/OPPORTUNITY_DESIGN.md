@@ -237,27 +237,98 @@ Score a page by:
 
 Do not synchronously page fault during a decode token if it can be avoided. Prefetch one or more pages ahead based on the attention window and reuse model.
 
-## 8. MoE expert residency
+## 8. Weight working set (dense + MoE)
 
-For MoE models, model each expert as a cacheable page group.
+Weights and KV are different reuse patterns. Do **not** put either cache in `KvTierManager`.
+
+- KV pages: decode-hot, random-ish reuse, already VRAM ↔ pinned DRAM (NVMe cold is post-MVP).
+- Dense layers: walked 0…N-1 every token. That is a cyclic scan.
+- Routed experts: sparse, overlapping across consecutive tokens. That is an LRU working set.
+
+Host (or NVMe) is the source of truth whenever the full model does not fit. GPU residency is a speed dial. Same tokens at every budget; only the clock changes.
+
+Two 2026 systems already solve halves of this. Steal the policies, not their runtimes (kimi-k3-in-c is CPU-only C99; FreeToken is CUDA/Python on NVIDIA). Allpaca stays thick-Rust + HIP.
+
+### 8.1 Dense trunk — pin prefix + ring (from kimi-k3-in-c)
+
+A cyclic layer walk is the pathological case for LRU: by the time layer 0 comes around again it is the least-recently-used slot, so hit rate is exactly zero. Pin the first *k* layers that fit the VRAM/DRAM budget. Stream the rest through 1–2 ring slots. Prefetch layer *L+1* into the spare slot while *L* GEMMs.
 
 ```cpp
-struct ExpertStats {
-    uint64_t hits;
-    uint64_t misses;
-    float ema_prob;
+// Slot size = largest *unpinned* layer, not the largest layer in the file.
+// Two ring slots only if they fit the printed budget (second slot is a request).
+struct DenseTrunkPlan {
+    int pinned_prefix;     // layers [0, pinned_prefix)
+    size_t ring_slots;     // 1 or 2
+    size_t slot_bytes;     // align_up(max remaining layer, DIRECT_ALIGN)
 };
 
-std::vector<int> choose_prefetch_experts(
-    const RouterPrediction& rp,
-    const Cache& cache,
-    size_t budget_bytes) {
-    // Rank by predicted probability / bytes and prefetch top experts.
-    return {};
-}
+// GPU shape: NVMe -> pinned DRAM ring -> H2D into a device slot.
+// Overlap k3_trunk_prefetch(L+1) with compute(L).
 ```
 
-The win comes from predicting likely experts early enough to overlap DMA with current-layer compute.
+Repack GGUF/safetensors into a layer-major file (one aligned sequential read per layer) before streaming. Refuse to pack a layer whose tensors are not a contiguous run — a gap would drag unrelated bytes. This is the custom tiered-memory-optimized format already named in CONTEXT.
+
+Always-hot vs streamable (two budgets, like `--trunk-gb` / `--cache-gb`):
+
+- always-hot on VRAM: embed, norms, attention, lm_head, shared experts
+- streamable: dense FFN (and routed experts, §8.2)
+
+Do not LRU this path. Do not treat GGUF mmap as the cache; a cyclic scan thrashes the OS page cache. Prefer aligned direct I/O into hugepage/pinned arenas. Slot states need `EMPTY | INFLIGHT | key` so a prefetch cannot alias a live buffer. Sum trunk + model + cache + KV + scratch against `MemAvailable` and free VRAM *before* allocating; quote measured peak RSS, not the plan.
+
+### 8.2 Routed experts — host pool + GPU LRU + q* (from FreeToken)
+
+FreeToken ([paper](https://arxiv.org/abs/2608.16157), [code](https://github.com/FlashML-org/FreeToken)) is the closest analogue: edge-native MoE serving that treats GPU, CPU, host RAM and PCIe as one elastic platform. Non-expert weights stay GPU-resident. The complete expert pool stays in host memory. Remaining VRAM is a single LRU of **complete** `(layer, expert)` slots shared across all MoE layers.
+
+Prefill activates almost the whole expert set. Do not fetch those experts on demand. Double-buffer at **full-layer** granularity: while the GPU computes layer *l*, a transfer stream loads *all* experts of *l+1*. When two full layers do not fit, fall back to on-demand rather than oversubscribe VRAM. Surviving prefill slots seed decode.
+
+Decode routing has short-range locality. A global LRU following the router beats static load-time placement (llama.cpp) and prefill-frozen hot sets (KTransformers) at equal capacity. Caching cannot eliminate misses. Serve residual misses with a measured-bandwidth split, not "always DMA" or "always CPU":
+
+```
+B_P = measured pinned expert H2D bandwidth
+B_H = measured CPU expert-kernel bandwidth (same host DRAM)
+q*  ≈ m * B_P / B_H     // of m unique misses, fill q*, execute the rest in place on CPU
+```
+
+Always fill at least one miss so the cache keeps warming. CPU and GPU partial sums merge exactly — no router change, no expert substitution, no precision drop. Profile `B_P` and `B_H` on the deployed machine the same way we already benchmark P2P vs host staging. An RX 9070 desktop and a dual-channel laptop will not share a ratio.
+
+On HIP, keep the split in the Rust control plane with streams/events. Do not require CUDA-graph host-function capture (NVIDIA-specific). Device-side victim selection in one pass is worth a later kernel if host sync shows up in the decode profile.
+
+Elastic VRAM: at a scheduler safe point, rebuild the expert-slot pool vs KV pages under a new budget without restarting or reloading the host pool. GPU memory affects speed, never correctness.
+
+Bootstrap: read experts into their **final host layout**, then pin. Pinning empty buffers first faults in and zeroes gigabytes you are about to overwrite. First request may run with a cold cache.
+
+FTW-style banks (flattened `l*E+e` as the leading dimension, one identity for GPU and CPU kernels) are the MoE half of the packed format.
+
+If `hipHostRegister` / DMA pin fails on a platform, fall back to CPU MoE: only activations, routing metadata and aggregated outputs cross the PCI boundary.
+
+Router-prediction prefetch (`choose_prefetch_experts`) is optional on top of LRU+q*. It is not the miss policy. Trace-replay cache sizing (kimi's `sim_cache.py`) is how `--cache-gb` gets picked, not guessed.
+
+### 8.3 Semantic anchors (FreeToken, when hybrid attention exists)
+
+Agent harnesses edit context at special-token boundaries (thinking blocks, tool calls, turns). Checkpoint recurrent state (KDA / DeltaNet / SWA) at those anchors, LRU-evict independently of the KV pool, and re-prefill only the new suffix. Full-attention KV can keep the existing radix/prefix reuse. Not needed for the current dense GGUF path; needed the moment a Kimi-K3 / Qwen3.6-style hybrid checkpoint is in scope.
+
+### 8.4 What not to copy
+
+- kimi-k3-in-c CPU-only MXFP4 kernels, or 26 s/token as a product posture. Allpaca's HIP contract is the opposite until streaming is on: `decode_does_not_h2d_weights`.
+- FreeToken's Python/CUDA stack, CUDA graphs, or NVIDIA-only kernels. Allpaca is GPL-3.0 Rust/HIP; steal policy, rewrite on our ABI.
+- LRU on the dense trunk.
+- Stuffing weight blobs into `KvTierManager`.
+- Trusting mmap as the working-set cache.
+- Static expert placement chosen at load time.
+
+### 8.5 Allpaca mapping
+
+Today: `ResidentModel::upload_gguf` copies the whole packed blob into `DeviceWeights`. mmap is how the file is opened, not a cache. If that upload fails, GEMM degrades to per-op H2D — that is not a working set.
+
+Ship in this order:
+
+1. Packed layer-major (or FTW-bank) layout + pin-prefix + 1–2 host/device ring slots for dense FFN that does not fit VRAM. Byte-identical vs full-resident at every budget.
+2. Host-truth expert pool + GPU LRU slots + `q*` miss split, with full-layer prefill double-buffering.
+3. NVMe as the layer/expert backing store under the host pool (P1). Direct I/O, not page-cache.
+4. Elastic VRAM split (expert slots vs KV pages) at scheduler safe points.
+5. Semantic recurrent-state anchors when a hybrid-attention MoE is loaded.
+
+Keep asymmetric draft/target on two HIP GPUs. FreeToken is single-GPU + CPU; that is complementary, not a replacement. Draft weights can stay fully resident on the slow GPU while the target streams.
 
 ## 9. Model-specific early exit
 

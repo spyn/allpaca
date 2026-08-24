@@ -26,13 +26,14 @@ The product should **not** try to reproduce every capability of vLLM, SGLang or 
 - Separate prefill and decode scheduling.
 - Implement pinned host ring buffers for asynchronous CPU work.
 - Implement VRAM -> DRAM KV tiering.
-- Implement model/expert page residency and prefetch.
+- Implement model/expert page residency and prefetch (dense pin-prefix + ring; MoE host-pool + GPU LRU; measured `q*` miss split). Weights are a working set, not KV pages.
 - Provide structured-output/grammar scheduling.
 - Provide detailed telemetry and benchmark output.
 
 ### P1 goals
 
-- NVMe cold KV/weight tier.
+- NVMe cold KV/weight tier (direct I/O under the host-resident pool; not OS page cache).
+- Elastic VRAM split between KV pages and expert/weight slots at scheduler safe points.
 - Multimodal device placement.
 - Model-aware early exit and self-speculation.
 - BitNet/ternary backend.
@@ -65,6 +66,9 @@ As an operator, the engine automatically adjusts draft depth based on acceptance
 
 ### US-03 — long-context serving
 As an operator, I can configure a tiered KV cache so that older pages move to host DRAM and cold pages can be persisted on NVMe.
+
+### US-07 — models larger than VRAM
+As an operator, I can run a dense or MoE checkpoint whose weights exceed GPU memory. Always-hot tensors stay on the target GPU; streamable FFN/experts move through a pinned DRAM ring (and later NVMe). Output tokens match the fully-resident path. More RAM/VRAM only changes speed.
 
 ### US-04 — tree verification
 As a researcher, I can enable a token forest and compare linear vs tree speculative verification using the same target model.
@@ -103,6 +107,13 @@ As an application developer, I can keep vision/audio encoders resident on the 90
           +------v------+         +------v-------+
           | DRAM KV Tier|         | NVMe Cold Tier|
           +-------------+         +--------------+
+
+          +--------------------------------------+
+          | Weight working set (not KV)          |
+          | VRAM pin-prefix / expert LRU slots   |
+          | DRAM ring + host expert pool         |
+          | NVMe packed trunk / FTW banks        |
+          +--------------------------------------+
 
              Optional sidecar
                   |
@@ -235,7 +246,7 @@ The engine must refuse to assume direct GPU P2P until capability and benchmark v
 
 ### TR-04 — Memory accounting
 
-All VRAM, DRAM and NVMe residency must be tracked per request and per page.
+All VRAM, DRAM and NVMe residency must be tracked per request, per KV page, and per weight/expert slot.
 
 ### TR-05 — Backpressure
 
@@ -305,9 +316,14 @@ Deliverables:
 - DRAM page cache,
 - prefetch thread,
 - eviction policy,
-- optional NVMe tier.
+- optional NVMe KV tier,
+- packed layer-major / expert-bank layout,
+- dense pin-prefix + 1–2 ring slots (cyclic layers; not LRU),
+- host-truth expert pool + GPU LRU slots + `q*` miss split (profiled `B_P`, `B_H`),
+- full-layer prefill double-buffering for MoE,
+- byte-identical tokens vs full-resident at every memory budget.
 
-Exit gate: context capacity increase and no catastrophic tail latency for configured hot-set workloads.
+Exit gate: context capacity increase and no catastrophic tail latency for configured hot-set workloads; a model that does not fit VRAM generates the same greedy tokens as the resident path.
 
 ### Phase 5 — multimodal and side accelerators
 
@@ -371,6 +387,16 @@ kv:
   cold: nvme
   prefetch_distance: 4
 
+weights:
+  always_hot: [embed, attn, norm, lm_head, shared_expert]
+  stream: [ffn, routed_expert]
+  trunk_gb: 8          # pinned prefix + ring (dense / shared)
+  cache_gb: 8          # GPU expert LRU + host pool budget
+  ring_slots: 2        # granted only if they fit trunk_gb
+  miss_policy: qstar   # qstar | fill | cpu
+  packed_layout: auto  # auto | gguf | trunk | ftw
+  pin_after_fill: true
+
 sampling:
   mode: async_host
   pinned_ring_slots: 8
@@ -396,10 +422,11 @@ Required dashboards:
 2. GPU utilization and memory by device.
 3. Speculative acceptance waterfall.
 4. KV tier occupancy and migration.
-5. P2P/host transfer bandwidth.
-6. Scheduler queue depth.
-7. CPU core affinity and utilization.
-8. Structured-output overhead.
+5. Weight working-set occupancy (pinned layers, ring hits, expert LRU hits/misses, `q*` fill vs CPU).
+6. P2P/host transfer bandwidth (`B_P`) and CPU expert bandwidth (`B_H`).
+7. Scheduler queue depth.
+8. CPU core affinity and utilization.
+9. Structured-output overhead.
 
 ## 12. Risks and mitigations
 
@@ -408,7 +435,10 @@ Required dashboards:
 | P2P topology is slower than host staging | Runtime benchmark + policy fallback |
 | Draft model contention | Adaptive disabling / queue-aware policy |
 | Tree verification overhead dominates | Branch budget and acceptance-aware pruning |
-| NVMe paging destroys latency | NVMe limited to cold tier; prefetch only |
+| NVMe paging destroys latency | NVMe limited to cold tier; prefetch only; dense trunk uses pin-prefix not LRU |
+| LRU on cyclic dense layers | Pin prefix + ring; LRU only for sparse experts |
+| Weight cache in KvTierManager | Separate working-set manager; host pool is source of truth |
+| CUDA-graph host callbacks on HIP | Keep `q*` in Rust; streams/events; device-side victims later if sync shows up |
 | Early exit degrades quality | Compatible-checkpoint gating + verification |
 | Coral unsupported ops | Compile validation and CPU fallback |
 | ROCm kernel instability | Kernel capability registry and fallback implementation |
@@ -423,6 +453,7 @@ The MVP is successful when it can demonstrate, on the reference platform:
 - measurable speculative acceptance telemetry;
 - measurable end-to-end benefit from at least one adaptive speculative policy;
 - context capacity beyond VRAM-only limits using DRAM KV tiering;
+- a weights-over-VRAM path whose greedy tokens match the fully-resident path;
 - no host-staging surprise where P2P is expected;
 - structured generation overlapping with GPU compute;
 - reproducible benchmarks with automated reports;
@@ -431,8 +462,10 @@ The MVP is successful when it can demonstrate, on the reference platform:
 ## 14. Research principles
 
 1. **Never call a capacity tier a performance tier.** DRAM/NVMe extend capacity but do not become VRAM.
-2. **Measure topology before optimizing transport.** PCIe tree placement can dominate.
-3. **Optimize end-to-end latency, not isolated kernel throughput.**
-4. **Treat speculative decoding as a control problem.** Acceptance, cost and queue pressure must jointly determine policy.
-5. **Keep hardware research behind stable interfaces.** PIM/CXL/photonic ideas should not leak into core transformer code.
-6. **Prefer reversible experiments.** Every optimization should have an A/B switch and telemetry.
+2. **GPU weight residency is a speed dial, not a correctness gate.** Host (or NVMe) is source of truth when the model does not fit.
+3. **Match cache policy to access pattern.** Cyclic dense layers: pin prefix + ring. Sparse experts: LRU + measured miss split. Never LRU a cyclic scan.
+4. **Measure topology before optimizing transport.** PCIe tree placement can dominate. Profile `B_P` and `B_H` on the machine, as with P2P vs host staging.
+5. **Optimize end-to-end latency, not isolated kernel throughput.**
+6. **Treat speculative decoding as a control problem.** Acceptance, cost and queue pressure must jointly determine policy.
+7. **Keep hardware research behind stable interfaces.** PIM/CXL/photonic ideas should not leak into core transformer code.
+8. **Prefer reversible experiments.** Every optimization should have an A/B switch and telemetry.
