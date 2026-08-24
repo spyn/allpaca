@@ -2889,6 +2889,63 @@ impl HipWorkspace {
         }
     }
 
+    pub fn copy_d2h_f32(&self, src: *const f32, dst: &mut [f32]) -> Result<(), AllpacaError> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        if src.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid D2H copy".into(),
+            )));
+        }
+        self.bind()?;
+        let bytes = dst.len() * 4;
+        memcpy(dst.as_mut_ptr().cast(), src.cast(), bytes, MEMCPY_D2H)?;
+        self.add_d2h(bytes);
+        Ok(())
+    }
+
+    pub fn copy_h2d_f32(&self, dst: *mut f32, src: &[f32]) -> Result<(), AllpacaError> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        if dst.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid H2D copy".into(),
+            )));
+        }
+        self.bind()?;
+        let bytes = src.len() * 4;
+        memcpy(dst.cast(), src.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        self.add_h2d(bytes);
+        Ok(())
+    }
+
+    pub fn copy_d2d_f32(&self, dst: *mut f32, src: *const f32, n: usize) -> Result<(), AllpacaError> {
+        if n == 0 {
+            return Ok(());
+        }
+        if dst.is_null() || src.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid D2D copy".into(),
+            )));
+        }
+        self.bind()?;
+        memcpy(dst.cast(), src.cast(), n * 4, MEMCPY_D2D)
+    }
+
+    pub fn scale_f32(&self, ptr: *mut f32, n: usize, scale: f32) -> Result<(), AllpacaError> {
+        if n == 0 || ptr.is_null() {
+            return Ok(());
+        }
+        let mut tmp = vec![0.0f32; n];
+        self.copy_d2h_f32(ptr, &mut tmp)?;
+        for v in &mut tmp {
+            *v *= scale;
+        }
+        self.copy_h2d_f32(ptr, &tmp)
+    }
+
     pub fn residual_add(&self, x: *mut f32, residual: *const f32, n: i32) -> Result<(), AllpacaError> {
         if x.is_null() || residual.is_null() || n <= 0 {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(

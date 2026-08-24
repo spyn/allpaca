@@ -6,7 +6,7 @@ use allpaca_core::Engine;
 use allpaca_core::ModelConfig;
 use allpaca_types::{Config, GenerationParams};
 #[cfg(feature = "hip")]
-use allpaca_types::{DeviceKind, DeviceSelector};
+use allpaca_types::{DeviceKind, DeviceSelector, MissPolicy};
 
 fn cpu_only_synthetic() -> Config {
     let mut cfg = Config::compiled_defaults();
@@ -300,6 +300,69 @@ fn streamed_ffn_hip_greedy_tokens_match_fully_resident() {
     assert!(
         after.weight_ring_binds > 0,
         "streamed FFN must bind through the ring"
+    );
+}
+
+#[cfg(feature = "hip")]
+fn hip_moe_resident() -> Config {
+    let mut cfg = hip_auto_synthetic();
+    cfg.model.synthetic = false;
+    cfg
+}
+
+#[cfg(feature = "hip")]
+fn hip_moe_streamed() -> Config {
+    let mut cfg = hip_moe_resident();
+    cfg.weights.cache_bytes = 64;
+    cfg.weights.miss_policy = MissPolicy::Fill;
+    cfg
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn streamed_moe_hip_greedy_tokens_match_fully_resident() {
+    let resident = Engine::new(hip_moe_resident()).unwrap();
+    if hip_gpus(&resident).is_empty() {
+        return;
+    }
+    resident
+        .load_synthetic(ModelConfig::tiny_moe())
+        .unwrap();
+    let full = resident.generate("hello", greedy(8)).unwrap();
+
+    let streamed = Engine::new(hip_moe_streamed()).unwrap();
+    if hip_gpus(&streamed).is_empty() {
+        return;
+    }
+    streamed
+        .load_synthetic(ModelConfig::tiny_moe())
+        .unwrap();
+    let after_load = streamed.stats();
+    assert!(
+        after_load.expert_slots >= 1,
+        "tiny cache_bytes must grant at least one expert slot"
+    );
+    assert!(
+        after_load.weight_bytes_on_device > after_load.weight_h2d_bytes,
+        "expert-slot VRAM is reserved at load; packed H2D skips experts; stats={after_load:?}"
+    );
+    let part = streamed.generate("hello", greedy(8)).unwrap();
+    assert_eq!(
+        part.token_ids, full.token_ids,
+        "GPU residency is a speed dial: greedy tokens must match"
+    );
+    let after = streamed.stats();
+    assert!(
+        after.weight_h2d_bytes > after_load.weight_h2d_bytes,
+        "expert-slot fills must H2D during generate"
+    );
+    assert!(
+        after.gpu_forwards > 0,
+        "MoE decode must stay on the HIP path, not silently fall back to host"
+    );
+    assert!(
+        after.expert_lru_fills > 0,
+        "Fill policy must admit misses into the LRU"
     );
 }
 

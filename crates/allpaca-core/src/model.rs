@@ -1,5 +1,5 @@
 use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
-use allpaca_hip::{DeviceWeights, HipWorkspace};
+use allpaca_hip::{DeviceDecode, DeviceWeights, HipWorkspace};
 use crate::forest::TokenForest;
 use allpaca_gguf::GgufFile;
 use allpaca_onnx::OnnxFile;
@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
-use crate::weight_set::{ExpertId, ExpertLru, FfnRefs, LayerFfn, WeightWorkingSet};
+use crate::weight_set::{
+    align_up, ExpertId, ExpertLru, FfnRefs, LayerFfn, MissPlan, WeightWorkingSet, DIRECT_ALIGN,
+};
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -154,6 +156,8 @@ struct LayerOff {
     w_gate: WeightRef,
     w_up: WeightRef,
     w_down: WeightRef,
+    #[allow(dead_code)]
+    w_router: WeightRef,
 }
 
 struct FfnRingState {
@@ -206,6 +210,64 @@ impl DeviceFfn<'_> {
     }
 }
 
+struct ExpertRingState {
+    bound: Vec<Option<ExpertId>>,
+    used_at: Vec<u64>,
+    clock: u64,
+}
+
+struct ExpertRing {
+    base: usize,
+    slot_bytes: usize,
+    state: Mutex<ExpertRingState>,
+}
+
+enum DeviceExpert<'a> {
+    Resident {
+        w_gate: WeightRef,
+        w_up: WeightRef,
+        w_down: WeightRef,
+    },
+    Bound {
+        _guard: std::sync::MutexGuard<'a, ExpertRingState>,
+        w_gate: WeightRef,
+        w_up: WeightRef,
+        w_down: WeightRef,
+    },
+}
+
+impl DeviceExpert<'_> {
+    fn w_gate(&self) -> WeightRef {
+        match self {
+            Self::Resident { w_gate, .. } | Self::Bound { w_gate, .. } => *w_gate,
+        }
+    }
+    fn w_up(&self) -> WeightRef {
+        match self {
+            Self::Resident { w_up, .. } | Self::Bound { w_up, .. } => *w_up,
+        }
+    }
+    fn w_down(&self) -> WeightRef {
+        match self {
+            Self::Resident { w_down, .. } | Self::Bound { w_down, .. } => *w_down,
+        }
+    }
+}
+
+fn slot_expert_refs(base: usize, slot_bytes: usize, slot: usize, host: &LayerFfn) -> [WeightRef; 3] {
+    let mut off = base + slot * slot_bytes + host.ffn_norm.len() * 4;
+    let mut next = |n: usize| {
+        let r = WeightRef::f32(off, n);
+        off += n * 4;
+        r
+    };
+    [
+        next(host.w_gate.len()),
+        next(host.w_up.len()),
+        next(host.w_down.len()),
+    ]
+}
+
 fn slot_ffn_refs(base: usize, slot_bytes: usize, slot: usize, host: &LayerFfn) -> [WeightRef; 4] {
     let mut off = base + slot * slot_bytes;
     let mut next = |n: usize| {
@@ -226,6 +288,8 @@ pub struct ResidentModel {
     weights: DeviceWeights,
     packed_h2d: u64,
     ffn_ring: Option<FfnRing>,
+    expert_offs: Vec<Vec<[WeightRef; 3]>>,
+    expert_ring: Option<ExpertRing>,
     embed: WeightRef,
     layers: Vec<LayerOff>,
     norm: WeightRef,
@@ -244,27 +308,47 @@ impl ResidentModel {
         }
         let embed = push(&mut slices, &mut off, model.embed.as_slice());
         let mut layers = Vec::with_capacity(model.layers.len());
+        let mut expert_offs = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let attn_norm = push(&mut slices, &mut off, layer.attn_norm.as_slice());
             let wq = push(&mut slices, &mut off, layer.wq.as_slice());
             let wk = push(&mut slices, &mut off, layer.wk.as_slice());
             let wv = push(&mut slices, &mut off, layer.wv.as_slice());
             let wo = push(&mut slices, &mut off, layer.wo.as_slice());
-            let (ffn_norm, w_gate, w_up, w_down) = if layer.w_gate.is_empty() {
+            let ffn_norm = if layer.ffn_norm.is_empty() {
+                WeightRef::f32(0, 0)
+            } else {
+                push(&mut slices, &mut off, layer.ffn_norm.as_slice())
+            };
+            let (w_gate, w_up, w_down) = if layer.w_gate.is_empty() {
                 (
-                    WeightRef::f32(0, 0),
                     WeightRef::f32(0, 0),
                     WeightRef::f32(0, 0),
                     WeightRef::f32(0, 0),
                 )
             } else {
                 (
-                    push(&mut slices, &mut off, layer.ffn_norm.as_slice()),
                     push(&mut slices, &mut off, layer.w_gate.as_slice()),
                     push(&mut slices, &mut off, layer.w_up.as_slice()),
                     push(&mut slices, &mut off, layer.w_down.as_slice()),
                 )
             };
+            let w_router = if layer.w_router.is_empty() {
+                WeightRef::f32(0, 0)
+            } else {
+                push(&mut slices, &mut off, layer.w_router.as_slice())
+            };
+            let mut packed_ex = Vec::with_capacity(layer.experts.len());
+            if model.expert_lru.is_none() {
+                for expert in &layer.experts {
+                    packed_ex.push([
+                        push(&mut slices, &mut off, expert.w_gate.as_slice()),
+                        push(&mut slices, &mut off, expert.w_up.as_slice()),
+                        push(&mut slices, &mut off, expert.w_down.as_slice()),
+                    ]);
+                }
+            }
+            expert_offs.push(packed_ex);
             layers.push(LayerOff {
                 attn_norm,
                 wq,
@@ -275,6 +359,7 @@ impl ResidentModel {
                 w_gate,
                 w_up,
                 w_down,
+                w_router,
             });
         }
         let norm = push(&mut slices, &mut off, model.norm.as_slice());
@@ -286,9 +371,26 @@ impl ResidentModel {
             .filter(|w| w.streams())
             .map(|w| (w.plan.ring_slots.max(1), w.plan.slot_bytes))
             .unwrap_or((0, 0));
-        let tail = ring_slots.saturating_mul(slot_bytes);
+        let ffn_tail = ring_slots.saturating_mul(slot_bytes);
+        let (expert_slots, expert_slot_bytes) = if let Some(lru) = &model.expert_lru {
+            let eb = model
+                .layers
+                .iter()
+                .find_map(|l| l.experts.first())
+                .map(|e| e.bytes())
+                .unwrap_or(0);
+            if eb == 0 {
+                (0, 0)
+            } else {
+                (lru.n_slots(), align_up(eb, DIRECT_ALIGN))
+            }
+        } else {
+            (0, 0)
+        };
+        let expert_tail = expert_slots.saturating_mul(expert_slot_bytes);
+        let tail = ffn_tail.saturating_add(expert_tail);
         let weights = DeviceWeights::upload_f32_with_tail(device, &slices, tail)?;
-        let ffn_ring = if tail > 0 {
+        let ffn_ring = if ffn_tail > 0 {
             Some(FfnRing {
                 base: packed,
                 slot_bytes,
@@ -300,10 +402,25 @@ impl ResidentModel {
         } else {
             None
         };
+        let expert_ring = if expert_tail > 0 {
+            Some(ExpertRing {
+                base: packed + ffn_tail,
+                slot_bytes: expert_slot_bytes,
+                state: Mutex::new(ExpertRingState {
+                    bound: vec![None; expert_slots],
+                    used_at: vec![0; expert_slots],
+                    clock: 0,
+                }),
+            })
+        } else {
+            None
+        };
         Ok(Self {
             packed_h2d: packed as u64,
             weights,
             ffn_ring,
+            expert_offs,
+            expert_ring,
             embed,
             layers,
             norm,
@@ -356,6 +473,7 @@ impl ResidentModel {
                     &mut parts,
                     &mut off,
                 )?,
+                w_router: WeightRef::f32(0, 0),
             });
         }
         let norm = append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?;
@@ -370,6 +488,8 @@ impl ResidentModel {
         Ok(Self {
             packed_h2d: weights.bytes(),
             ffn_ring: None,
+            expert_offs: Vec::new(),
+            expert_ring: None,
             weights,
             embed,
             layers,
@@ -469,6 +589,87 @@ impl ResidentModel {
         Ok(DeviceFfn::Bound {
             _guard: state,
             ffn_norm,
+            w_gate,
+            w_up,
+            w_down,
+        })
+    }
+
+    fn bind_expert<'a>(
+        &'a self,
+        id: ExpertId,
+        host: &LayerFfn,
+        metrics: Option<&Metrics>,
+    ) -> Result<DeviceExpert<'a>, AllpacaError> {
+        if let Some(refs) = self
+            .expert_offs
+            .get(id.layer as usize)
+            .and_then(|layer| layer.get(id.expert as usize))
+        {
+            return Ok(DeviceExpert::Resident {
+                w_gate: refs[0],
+                w_up: refs[1],
+                w_down: refs[2],
+            });
+        }
+        let ring = self.expert_ring.as_ref().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(
+                "streamed expert has no device slot ring".into(),
+            ))
+        })?;
+        let packed = host.bytes();
+        if packed > ring.slot_bytes {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "expert ({}, {}) is {packed} bytes, slot is {}",
+                id.layer, id.expert, ring.slot_bytes
+            ))));
+        }
+        let mut state = ring.state.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(
+                "device expert ring mutex poisoned".into(),
+            ))
+        })?;
+        state.clock = state.clock.saturating_add(1);
+        if let Some(slot) = state.bound.iter().position(|&b| b == Some(id)) {
+            state.used_at[slot] = state.clock;
+            let [w_gate, w_up, w_down] = slot_expert_refs(ring.base, ring.slot_bytes, slot, host);
+            return Ok(DeviceExpert::Bound {
+                _guard: state,
+                w_gate,
+                w_up,
+                w_down,
+            });
+        }
+        let victim = state
+            .bound
+            .iter()
+            .position(|b| b.is_none())
+            .unwrap_or_else(|| {
+                state
+                    .used_at
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, t)| *t)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+        let mut copy_off = ring.base + victim * ring.slot_bytes;
+        for part in [&host.ffn_norm, &host.w_gate, &host.w_up, &host.w_down] {
+            let n = part.len() * 4;
+            let bytes = unsafe { std::slice::from_raw_parts(part.as_ptr().cast::<u8>(), n) };
+            self.weights.copy_h2d(copy_off, bytes)?;
+            copy_off += n;
+        }
+        state.bound[victim] = Some(id);
+        state.used_at[victim] = state.clock;
+        if let Some(metrics) = metrics {
+            metrics
+                .weight_h2d_bytes
+                .fetch_add(packed as u64, Ordering::Relaxed);
+        }
+        let [w_gate, w_up, w_down] = slot_expert_refs(ring.base, ring.slot_bytes, victim, host);
+        Ok(DeviceExpert::Bound {
+            _guard: state,
             w_gate,
             w_up,
             w_down,
@@ -1099,6 +1300,203 @@ impl TinyModel {
         Ok(())
     }
 
+    fn warm_moe_slots(
+        &self,
+        layer_idx: usize,
+        resident: &ResidentModel,
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
+        let Some(lru) = &self.expert_lru else {
+            return Ok(());
+        };
+        let n_exp = self.config.n_experts;
+        if n_exp == 0 || !lru.holds_layers(n_exp, 1) {
+            return Ok(());
+        }
+        let bind_layer = |idx: usize| -> Result<(), AllpacaError> {
+            let layer = self.layers.get(idx).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "MoE slot warm missing layer {idx}"
+                )))
+            })?;
+            for (e, host) in layer.experts.iter().enumerate() {
+                let _bound = resident.bind_expert(
+                    ExpertId {
+                        layer: idx as u32,
+                        expert: e as u32,
+                    },
+                    host,
+                    metrics,
+                )?;
+            }
+            Ok(())
+        };
+        bind_layer(layer_idx)?;
+        if lru.holds_layers(n_exp, 2) && layer_idx + 1 < self.layers.len() {
+            bind_layer(layer_idx + 1)?;
+        }
+        Ok(())
+    }
+
+    fn device_expert_gemm(
+        &self,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        buf: DeviceDecode,
+        w_gate: WeightRef,
+        w_up: WeightRef,
+        w_down: WeightRef,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        resident.gemm_nt(
+            hip,
+            buf.normed,
+            w_gate,
+            buf.gate,
+            1,
+            cfg.ff_dim as i32,
+            dim as i32,
+        )?;
+        resident.gemm_nt(
+            hip,
+            buf.normed,
+            w_up,
+            buf.up,
+            1,
+            cfg.ff_dim as i32,
+            dim as i32,
+        )?;
+        hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+        resident.gemm_nt(
+            hip,
+            buf.gate,
+            w_down,
+            buf.proj,
+            1,
+            dim as i32,
+            cfg.ff_dim as i32,
+        )?;
+        Ok(())
+    }
+
+    fn device_moe(
+        &self,
+        layer_idx: usize,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        buf: DeviceDecode,
+        metrics: &Metrics,
+        prefill: bool,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        if prefill {
+            self.prefetch_moe_layers(layer_idx)?;
+            self.warm_moe_slots(layer_idx, resident, Some(metrics))?;
+        }
+        let host_layer = self.layers.get(layer_idx).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "MoE missing host layer {layer_idx}"
+            )))
+        })?;
+        let off = resident.layers.get(layer_idx).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "MoE missing device layer {layer_idx}"
+            )))
+        })?;
+        if off.ffn_norm.n == 0 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "MoE layer missing packed ffn_norm".into(),
+            )));
+        }
+        hip.residual_rmsnorm(
+            buf.x,
+            buf.proj,
+            resident.f32_or_dequant(hip, off.ffn_norm)?,
+            buf.normed,
+            dim as i32,
+            cfg.eps,
+        )?;
+        metrics
+            .residual_gpu_ops
+            .fetch_add(1, Ordering::Relaxed);
+        record_elementwise(Some(metrics));
+        let mut x_norm = vec![0.0f32; dim];
+        hip.copy_d2h_f32(buf.normed, &mut x_norm)?;
+        let n_exp = cfg.n_experts.max(1);
+        let n_act = cfg.n_active.max(1).min(n_exp);
+        let routed = topk_route(&x_norm, &host_layer.w_router, n_exp, n_act);
+        let ids: Vec<ExpertId> = routed
+            .iter()
+            .map(|&(e, _)| ExpertId {
+                layer: layer_idx as u32,
+                expert: e as u32,
+            })
+            .collect();
+        let plan = if let Some(lru) = &self.expert_lru {
+            let plan = lru.plan(&ids);
+            lru.note_plan(&plan);
+            for id in &plan.fill {
+                let host = host_layer.experts.get(id.expert as usize).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "missing expert {}",
+                        id.expert
+                    )))
+                })?;
+                lru.admit(*id, host)?;
+            }
+            plan
+        } else {
+            MissPlan {
+                hits: ids,
+                fill: Vec::new(),
+                cpu: Vec::new(),
+            }
+        };
+        hip.copy_h2d_f32(buf.attn, &vec![0.0f32; dim])?;
+        let mut scratch = vec![0.0f32; dim];
+        for &(e, w) in &routed {
+            let id = ExpertId {
+                layer: layer_idx as u32,
+                expert: e as u32,
+            };
+            let host = host_layer.experts.get(e).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!("missing expert {e}")))
+            })?;
+            if plan.cpu.iter().any(|&c| c == id) {
+                let ffn = if let Some(lru) = &self.expert_lru {
+                    lru.materialize(id, host)?
+                } else {
+                    host.clone()
+                };
+                expert_mlp(&x_norm, &ffn, cfg.ff_dim, dim, &mut scratch)?;
+                for v in &mut scratch {
+                    *v *= w;
+                }
+                hip.copy_h2d_f32(buf.proj, &scratch)?;
+                hip.residual_add(buf.attn, buf.proj, dim as i32)?;
+                continue;
+            }
+            {
+                let expert = resident.bind_expert(id, host, Some(metrics))?;
+                self.device_expert_gemm(
+                    hip,
+                    resident,
+                    buf,
+                    expert.w_gate(),
+                    expert.w_up(),
+                    expert.w_down(),
+                )?;
+            }
+            hip.scale_f32(buf.proj, dim, w)?;
+            hip.residual_add(buf.attn, buf.proj, dim as i32)?;
+        }
+        hip.copy_d2d_f32(buf.proj, buf.attn, dim)?;
+        record_elementwise(Some(metrics));
+        Ok(())
+    }
+
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
         let cfg = ModelConfig::from_gguf(file)?;
         let name = file
@@ -1342,18 +1740,16 @@ impl TinyModel {
                 "token {token} out of vocab"
             ))));
         }
-        if self.config.n_experts == 0 {
-            if let (Some(hip), Some(resident)) = (hip, resident) {
-                match self.forward_token_device(
-                    token, pos, page_ids, kv, metrics, logits, hip, resident,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        if !self.host_weights_ready() {
-                            return Err(e);
-                        }
-                        tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            match self.forward_token_device(
+                token, pos, page_ids, kv, metrics, logits, hip, resident, prefill,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !self.host_weights_ready() {
+                        return Err(e);
                     }
+                    tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                 }
             }
         }
@@ -1576,6 +1972,7 @@ impl TinyModel {
         logits: &mut [f32],
         hip: &HipWorkspace,
         resident: &ResidentModel,
+        prefill: bool,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -1673,6 +2070,9 @@ impl TinyModel {
             } else {
                 resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
             }
+            if self.config.n_experts > 0 {
+                self.device_moe(layer_idx, hip, resident, buf, metrics, prefill)?;
+            } else {
             let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
             let ffn_norm = ffn.ffn_norm();
             let w_gate = ffn.w_gate();
@@ -1758,6 +2158,7 @@ impl TinyModel {
                 )?;
             }
             drop(ffn);
+            }
             if layer_idx + 1 < resident.layers.len() {
                 hip.residual_rmsnorm(
                     buf.x,
