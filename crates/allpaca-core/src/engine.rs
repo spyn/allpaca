@@ -28,7 +28,7 @@ use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
 use crate::telemetry::Metrics;
 use crate::tokenizer::EngineTokenizer;
-use crate::weight_set::{DenseTrunkPlan, WeightWorkingSet};
+use crate::weight_set::{expert_lru_slots, DenseTrunkPlan, ExpertLru, WeightWorkingSet};
 use allpaca_hip::HipWorkspace;
 
 struct ActiveRequest {
@@ -212,6 +212,20 @@ impl Engine {
                         .weight_ring_hits
                         .store(ws.ring_hits(), std::sync::atomic::Ordering::Relaxed);
                 }
+                if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
+                    self.metrics
+                        .expert_lru_hits
+                        .store(lru.hits(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .expert_lru_misses
+                        .store(lru.misses(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .expert_lru_fills
+                        .store(lru.fills(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .expert_cpu_runs
+                        .store(lru.cpu_runs(), std::sync::atomic::Ordering::Relaxed);
+                }
                 (
                 g.target
                     .as_ref()
@@ -332,6 +346,7 @@ impl Engine {
         inner.ring.resize_vocab(cfg.vocab_size);
         let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
         self.apply_weight_working_set(&mut target);
+        self.apply_expert_lru(&mut target);
         inner.target = Some(Arc::new(target));
         if inner.flags.draft_model_speculation {
             let mut draft = TinyModel::synthetic(
@@ -340,6 +355,7 @@ impl Engine {
                 "synthetic-draft",
             );
             self.apply_weight_working_set(&mut draft);
+            self.apply_expert_lru(&mut draft);
             inner.draft_model = Some(Arc::new(draft));
         }
         inner.tokenizer = Some(tokenizer);
@@ -368,6 +384,27 @@ impl Engine {
         model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan));
     }
 
+    fn apply_expert_lru(&self, model: &mut TinyModel) {
+        if model.config.n_experts == 0 || !model.host_weights_ready() {
+            return;
+        }
+        let expert_bytes = model
+            .layers
+            .first()
+            .and_then(|l| l.experts.first())
+            .map(|e| e.bytes())
+            .unwrap_or(0);
+        let n_slots = expert_lru_slots(expert_bytes, self.config.weights.cache_bytes);
+        ExpertLru::record_slots(&self.metrics, n_slots);
+        if n_slots == 0 {
+            return;
+        }
+        model.expert_lru = Some(ExpertLru::new(
+            n_slots,
+            self.config.weights.miss_policy,
+        ));
+    }
+
     fn load_model_path(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
         match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => self.load_safetensors(path),
@@ -392,6 +429,7 @@ impl Engine {
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model);
+        self.apply_expert_lru(&mut model);
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -419,6 +457,7 @@ impl Engine {
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model);
+        self.apply_expert_lru(&mut model);
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -439,6 +478,7 @@ impl Engine {
             )));
         }
         self.apply_weight_working_set(&mut model);
+        self.apply_expert_lru(&mut model);
         let mut draft_file = None;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -1651,7 +1691,7 @@ fn handle_prompt_len(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use allpaca_types::CliOverrides;
+    use allpaca_types::{CliOverrides, MissPolicy};
 
     fn test_config() -> Config {
         let mut cfg = Config::compiled_defaults();
@@ -1731,6 +1771,48 @@ mod tests {
         assert!(
             stats.weight_pinned_layers < 2,
             "tiny budget should not pin both synthetic layers"
+        );
+    }
+
+    #[test]
+    fn moe_lru_greedy_tokens_match_fully_resident() {
+        let mut resident_cfg = test_config();
+        resident_cfg.model.synthetic = false;
+        resident_cfg.speculative.enabled = false;
+        let resident = Engine::new(resident_cfg).unwrap();
+        resident.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let full = resident.generate("hello", params.clone()).unwrap();
+
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.cache_bytes = 64;
+        cfg.weights.miss_policy = MissPolicy::Fill;
+        let streamed = Engine::new(cfg).unwrap();
+        streamed.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let part = streamed.generate("hello", params).unwrap();
+        assert_eq!(
+            part.token_ids, full.token_ids,
+            "GPU residency is a speed dial: greedy tokens must match"
+        );
+        let stats = streamed.stats();
+        assert!(
+            stats.expert_slots >= 1,
+            "tiny cache_bytes must grant at least one expert slot"
+        );
+        assert!(
+            stats.expert_lru_misses > 0,
+            "a one-slot LRU over 4 experts must miss"
+        );
+        assert!(
+            stats.expert_lru_fills > 0,
+            "Fill policy must admit misses into the LRU"
         );
     }
 

@@ -24,4 +24,6 @@ pub use scheduler::Scheduler;
 pub use telemetry::Metrics;
 pub use tokenizer::EngineTokenizer;
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};
-pub use weight_set::{qstar_fill_count, DenseTrunkPlan, WeightWorkingSet};
+pub use weight_set::{
+    expert_lru_slots, qstar_fill_count, DenseTrunkPlan, ExpertId, ExpertLru, WeightWorkingSet,
+};

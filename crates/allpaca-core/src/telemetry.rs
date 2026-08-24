@@ -48,6 +48,11 @@ pub struct Metrics {
     pub weight_ring_slots: AtomicU64,
     pub weight_ring_binds: AtomicU64,
     pub weight_ring_hits: AtomicU64,
+    pub expert_slots: AtomicU64,
+    pub expert_lru_hits: AtomicU64,
+    pub expert_lru_misses: AtomicU64,
+    pub expert_lru_fills: AtomicU64,
+    pub expert_cpu_runs: AtomicU64,
 }
 
 impl Metrics {
@@ -143,6 +148,11 @@ impl Metrics {
             weight_ring_slots: self.weight_ring_slots.load(Ordering::Relaxed),
             weight_ring_binds: self.weight_ring_binds.load(Ordering::Relaxed),
             weight_ring_hits: self.weight_ring_hits.load(Ordering::Relaxed),
+            expert_slots: self.expert_slots.load(Ordering::Relaxed),
+            expert_lru_hits: self.expert_lru_hits.load(Ordering::Relaxed),
+            expert_lru_misses: self.expert_lru_misses.load(Ordering::Relaxed),
+            expert_lru_fills: self.expert_lru_fills.load(Ordering::Relaxed),
+            expert_cpu_runs: self.expert_cpu_runs.load(Ordering::Relaxed),
         }
     }
 

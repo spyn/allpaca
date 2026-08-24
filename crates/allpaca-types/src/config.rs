@@ -280,7 +280,7 @@ impl Default for MissPolicy {
 pub struct WeightsSection {
     /// Budget for pinned FFN prefix plus ring slots. 0 = unlimited (current HIP contract).
     pub trunk_bytes: usize,
-    /// GPU expert-LRU budget. 0 until MoE lands.
+    /// GPU/hot expert-LRU budget. 0 = no expert slots (host pool only).
     pub cache_bytes: usize,
     /// Requested ring slots (1 or 2). 0 means 1. Second slot only if it fits `trunk_bytes`.
     pub ring_slots: usize,

@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use allpaca_types::{AllpacaError, FatalError};
+use allpaca_types::{AllpacaError, FatalError, MissPolicy};
 
 use crate::model::LayerWeights;
 use crate::telemetry::Metrics;
@@ -360,6 +360,209 @@ impl WeightWorkingSet {
     }
 }
 
+/// Complete `(layer, expert)` identity. FTW bank index is `layer * n_experts + expert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExpertId {
+    pub layer: u32,
+    pub expert: u32,
+}
+
+impl ExpertId {
+    pub fn bank(self, n_experts: u32) -> u32 {
+        self.layer.saturating_mul(n_experts).saturating_add(self.expert)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissPlan {
+    pub hits: Vec<ExpertId>,
+    pub fill: Vec<ExpertId>,
+    pub cpu: Vec<ExpertId>,
+}
+
+/// How many LRU slots `cache_bytes` buys. `cache_bytes == 0` means no GPU/hot cache.
+pub fn expert_lru_slots(expert_bytes: usize, cache_bytes: usize) -> usize {
+    if cache_bytes == 0 || expert_bytes == 0 {
+        0
+    } else {
+        (cache_bytes / expert_bytes).max(1)
+    }
+}
+
+fn unique_in_order(ids: &[ExpertId]) -> Vec<ExpertId> {
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+struct ExpertLruInner {
+    bound: Vec<Option<ExpertId>>,
+    used_at: Vec<u64>,
+    slots: Vec<LayerFfn>,
+    clock: u64,
+}
+
+/// Host pool is source of truth. These slots are the GPU (or hot DRAM) LRU.
+pub struct ExpertLru {
+    n_slots: usize,
+    policy: MissPolicy,
+    b_pcie: f64,
+    b_host: f64,
+    inner: Mutex<ExpertLruInner>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    fills: AtomicU64,
+    cpu_runs: AtomicU64,
+}
+
+impl std::fmt::Debug for ExpertLru {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertLru")
+            .field("n_slots", &self.n_slots)
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+impl ExpertLru {
+    pub fn new(n_slots: usize, policy: MissPolicy) -> Arc<Self> {
+        Self::with_bandwidth(n_slots, policy, 0.0, 0.0)
+    }
+
+    pub fn with_bandwidth(
+        n_slots: usize,
+        policy: MissPolicy,
+        b_pcie: f64,
+        b_host: f64,
+    ) -> Arc<Self> {
+        let n = n_slots.max(1);
+        Arc::new(Self {
+            n_slots: n,
+            policy,
+            b_pcie,
+            b_host,
+            inner: Mutex::new(ExpertLruInner {
+                bound: vec![None; n],
+                used_at: vec![0; n],
+                slots: vec![LayerFfn::default(); n],
+                clock: 0,
+            }),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            fills: AtomicU64::new(0),
+            cpu_runs: AtomicU64::new(0),
+        })
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.n_slots
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+    pub fn fills(&self) -> u64 {
+        self.fills.load(Ordering::Relaxed)
+    }
+    pub fn cpu_runs(&self) -> u64 {
+        self.cpu_runs.load(Ordering::Relaxed)
+    }
+
+    pub fn record_slots(metrics: &Metrics, n_slots: usize) {
+        metrics
+            .expert_slots
+            .store(n_slots as u64, Ordering::Relaxed);
+    }
+
+    pub fn plan(&self, needed: &[ExpertId]) -> MissPlan {
+        let unique = unique_in_order(needed);
+        let inner = self.inner.lock().ok();
+        let mut hits = Vec::new();
+        let mut misses = Vec::new();
+        if let Some(inner) = inner.as_ref() {
+            for &id in &unique {
+                if inner.bound.iter().any(|&b| b == Some(id)) {
+                    hits.push(id);
+                } else {
+                    misses.push(id);
+                }
+            }
+        } else {
+            misses = unique;
+        }
+        let q = match self.policy {
+            MissPolicy::Fill => misses.len(),
+            MissPolicy::Cpu => 0,
+            MissPolicy::Qstar => qstar_fill_count(misses.len(), self.b_pcie, self.b_host),
+        };
+        let fill = misses.iter().copied().take(q).collect();
+        let cpu = misses.iter().copied().skip(q).collect();
+        MissPlan { hits, fill, cpu }
+    }
+
+    pub fn admit(&self, id: ExpertId, host: &LayerFfn) -> Result<(), AllpacaError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(
+                "expert LRU mutex poisoned".into(),
+            ))
+        })?;
+        inner.clock = inner.clock.saturating_add(1);
+        if let Some(slot) = inner.bound.iter().position(|&b| b == Some(id)) {
+            inner.used_at[slot] = inner.clock;
+            return Ok(());
+        }
+        let victim = inner
+            .bound
+            .iter()
+            .position(|b| b.is_none())
+            .unwrap_or_else(|| {
+                inner
+                    .used_at
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, t)| *t)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+        inner.slots[victim] = host.clone();
+        inner.bound[victim] = Some(id);
+        inner.used_at[victim] = inner.clock;
+        Ok(())
+    }
+
+    pub fn materialize(&self, id: ExpertId, pool: &LayerFfn) -> Result<LayerFfn, AllpacaError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(
+                "expert LRU mutex poisoned".into(),
+            ))
+        })?;
+        inner.clock = inner.clock.saturating_add(1);
+        if let Some(slot) = inner.bound.iter().position(|&b| b == Some(id)) {
+            inner.used_at[slot] = inner.clock;
+            return Ok(inner.slots[slot].clone());
+        }
+        Ok(pool.clone())
+    }
+
+    pub fn note_plan(&self, plan: &MissPlan) {
+        self.hits
+            .fetch_add(plan.hits.len() as u64, Ordering::Relaxed);
+        let miss_n = (plan.fill.len() + plan.cpu.len()) as u64;
+        self.misses.fetch_add(miss_n, Ordering::Relaxed);
+        self.fills
+            .fetch_add(plan.fill.len() as u64, Ordering::Relaxed);
+        self.cpu_runs
+            .fetch_add(plan.cpu.len() as u64, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +620,56 @@ mod tests {
         assert_eq!(qstar_fill_count(8, 11.8, 47.5), 2);
         assert_eq!(qstar_fill_count(4, 1.0, 100.0), 1, "always keep warming");
         assert_eq!(qstar_fill_count(0, 50.0, 80.0), 0);
+    }
+
+    #[test]
+    fn expert_lru_slots_zero_budget_means_no_cache() {
+        assert_eq!(expert_lru_slots(24_704, 0), 0);
+        assert_eq!(expert_lru_slots(24_704, 64), 1);
+        assert_eq!(expert_lru_slots(100, 250), 2);
+    }
+
+    #[test]
+    fn expert_lru_hits_repeating_ids_not_a_cyclic_layer_walk() {
+        let lru = ExpertLru::new(2, MissPolicy::Fill);
+        let dummy = LayerFfn::default();
+        let a = ExpertId { layer: 0, expert: 1 };
+        let b = ExpertId { layer: 0, expert: 3 };
+        for id in [a, b, a, b, a] {
+            let plan = lru.plan(&[id]);
+            for f in &plan.fill {
+                lru.admit(*f, &dummy).unwrap();
+            }
+            lru.note_plan(&plan);
+        }
+        assert!(lru.hits() >= 3, "short-range expert reuse must hit LRU");
+        assert!(lru.misses() >= 2);
+    }
+
+    #[test]
+    fn qstar_splits_unique_misses_fill_then_cpu() {
+        let lru = ExpertLru::with_bandwidth(1, MissPolicy::Qstar, 1.0, 100.0);
+        let dummy = LayerFfn::default();
+        let misses = [
+            ExpertId { layer: 0, expert: 0 },
+            ExpertId { layer: 0, expert: 1 },
+            ExpertId { layer: 0, expert: 2 },
+            ExpertId { layer: 0, expert: 3 },
+        ];
+        let plan = lru.plan(&misses);
+        assert_eq!(plan.hits.len(), 0);
+        assert_eq!(plan.fill.len(), 1, "q* always fills at least one");
+        assert_eq!(plan.cpu.len(), 3);
+        lru.admit(plan.fill[0], &dummy).unwrap();
+        let again = lru.plan(&misses);
+        assert_eq!(again.hits, vec![plan.fill[0]]);
+    }
+
+    #[test]
+    fn cpu_miss_policy_never_admits() {
+        let lru = ExpertLru::new(2, MissPolicy::Cpu);
+        let plan = lru.plan(&[ExpertId { layer: 1, expert: 2 }]);
+        assert!(plan.fill.is_empty());
+        assert_eq!(plan.cpu.len(), 1);
     }
 }

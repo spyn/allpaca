@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
-use crate::weight_set::{FfnRefs, LayerFfn, WeightWorkingSet};
+use crate::weight_set::{ExpertId, ExpertLru, FfnRefs, LayerFfn, WeightWorkingSet};
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -20,6 +20,8 @@ pub struct ModelConfig {
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub ff_dim: usize,
+    pub n_experts: usize,
+    pub n_active: usize,
     pub eps: f32,
     pub rope_theta: f32,
 }
@@ -33,8 +35,18 @@ impl ModelConfig {
             n_heads: 4,
             n_kv_heads: 2,
             ff_dim: 64,
+            n_experts: 0,
+            n_active: 0,
             eps: 1e-5,
             rope_theta: 10_000.0,
+        }
+    }
+
+    pub fn tiny_moe() -> Self {
+        Self {
+            n_experts: 4,
+            n_active: 2,
+            ..Self::tiny()
         }
     }
 
@@ -93,6 +105,8 @@ impl ModelConfig {
             n_heads,
             n_kv_heads,
             ff_dim,
+            n_experts: 0,
+            n_active: 0,
             eps,
             rope_theta,
         })
@@ -611,6 +625,55 @@ impl ResidentModel {
     }
 }
 
+fn expert_mlp(
+    x: &[f32],
+    ffn: &LayerFfn,
+    ff_dim: usize,
+    dim: usize,
+    out: &mut [f32],
+) -> Result<(), AllpacaError> {
+    let mut gate = vec![0.0f32; ff_dim];
+    let mut up = vec![0.0f32; ff_dim];
+    matmul_nt(x, &ffn.w_gate, &mut gate, 1, ff_dim, dim)?;
+    matmul_nt(x, &ffn.w_up, &mut up, 1, ff_dim, dim)?;
+    for i in 0..ff_dim {
+        gate[i] = silu(gate[i]) * up[i];
+    }
+    matmul_nt(&gate, &ffn.w_down, out, 1, dim, ff_dim)
+}
+
+fn topk_route(x: &[f32], w_router: &[f32], n_experts: usize, n_active: usize) -> Vec<(usize, f32)> {
+    let dim = x.len();
+    let mut logits = vec![0.0f32; n_experts];
+    for e in 0..n_experts {
+        let row = &w_router[e * dim..(e + 1) * dim];
+        let mut s = 0.0f32;
+        for i in 0..dim {
+            s += x[i] * row[i];
+        }
+        logits[e] = s;
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut weights: Vec<f32> = logits
+        .iter()
+        .map(|v| (*v - max).exp())
+        .collect();
+    let sum: f32 = weights.iter().sum::<f32>().max(1e-9);
+    for w in &mut weights {
+        *w /= sum;
+    }
+    let mut idx: Vec<usize> = (0..n_experts).collect();
+    idx.sort_by(|&a, &b| {
+        weights[b]
+            .partial_cmp(&weights[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    idx.truncate(n_active.max(1).min(n_experts));
+    let part: f32 = idx.iter().map(|&i| weights[i]).sum::<f32>().max(1e-9);
+    idx.into_iter().map(|i| (i, weights[i] / part)).collect()
+}
+
 fn empty_layer() -> LayerWeights {
     LayerWeights {
         attn_norm: Vec::new(),
@@ -622,6 +685,8 @@ fn empty_layer() -> LayerWeights {
         w_gate: Vec::new(),
         w_up: Vec::new(),
         w_down: Vec::new(),
+        w_router: Vec::new(),
+        experts: Vec::new(),
     }
 }
 
@@ -765,6 +830,8 @@ pub struct LayerWeights {
     pub w_gate: Vec<f32>,
     pub w_up: Vec<f32>,
     pub w_down: Vec<f32>,
+    pub w_router: Vec<f32>,
+    pub experts: Vec<LayerFfn>,
 }
 
 #[derive(Debug, Clone)]
@@ -776,6 +843,7 @@ pub struct TinyModel {
     pub lm_head: Vec<f32>,
     pub name: String,
     pub working_set: Option<Arc<WeightWorkingSet>>,
+    pub expert_lru: Option<Arc<ExpertLru>>,
 }
 
 impl TinyModel {
@@ -786,6 +854,31 @@ impl TinyModel {
         let kv_dim = cfg.n_kv_heads * cfg.head_dim();
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
+            let (w_gate, w_up, w_down, w_router, experts) = if cfg.n_experts > 0 {
+                let experts = (0..cfg.n_experts)
+                    .map(|_| LayerFfn {
+                        ffn_norm: Vec::new(),
+                        w_gate: rng.vec(cfg.ff_dim * dim),
+                        w_up: rng.vec(cfg.ff_dim * dim),
+                        w_down: rng.vec(dim * cfg.ff_dim),
+                    })
+                    .collect();
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    rng.vec(cfg.n_experts * dim),
+                    experts,
+                )
+            } else {
+                (
+                    rng.vec(cfg.ff_dim * dim),
+                    rng.vec(cfg.ff_dim * dim),
+                    rng.vec(dim * cfg.ff_dim),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
             layers.push(LayerWeights {
                 attn_norm: ones(dim),
                 wq: rng.vec(dim * dim),
@@ -793,9 +886,11 @@ impl TinyModel {
                 wv: rng.vec(kv_dim * dim),
                 wo: rng.vec(dim * dim),
                 ffn_norm: ones(dim),
-                w_gate: rng.vec(cfg.ff_dim * dim),
-                w_up: rng.vec(cfg.ff_dim * dim),
-                w_down: rng.vec(dim * cfg.ff_dim),
+                w_gate,
+                w_up,
+                w_down,
+                w_router,
+                experts,
             });
         }
         Self {
@@ -806,6 +901,7 @@ impl TinyModel {
             name: name.into(),
             config: cfg,
             working_set: None,
+            expert_lru: None,
         }
     }
 
@@ -848,6 +944,133 @@ impl TinyModel {
         self.working_set
             .as_ref()
             .is_some_and(|ws| !ws.is_pinned(layer_idx))
+    }
+
+    fn apply_ffn(
+        &self,
+        layer_idx: usize,
+        layer: &LayerWeights,
+        x: &mut [f32],
+        scratch: &mut [f32],
+        hidden: &mut [f32],
+        hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        if cfg.n_experts > 0 {
+            rmsnorm(x, &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
+            let moe_out = self.moe_hidden(layer_idx, layer, &scratch[..dim])?;
+            for i in 0..dim {
+                x[i] += moe_out[i];
+            }
+            return Ok(());
+        }
+        let ffn = self.ffn(layer_idx, layer)?;
+        let ffn_dev = !self.streamed_ffn(layer_idx);
+        rmsnorm_dispatch(
+            hip,
+            x,
+            ffn.ffn_norm(),
+            resident.filter(|_| ffn_dev).map(|r| r.ffn_norm(layer_idx)),
+            cfg.eps,
+            &mut scratch[..dim],
+            metrics,
+        )?;
+        let mut gate = vec![0.0f32; cfg.ff_dim];
+        let mut up = vec![0.0f32; cfg.ff_dim];
+        gemm_nt_dispatch(
+            hip,
+            &scratch[..dim],
+            ffn.w_gate(),
+            resident.filter(|_| ffn_dev).map(|r| r.w_gate(layer_idx)),
+            &mut gate,
+            1,
+            cfg.ff_dim,
+            dim,
+        )?;
+        gemm_nt_dispatch(
+            hip,
+            &scratch[..dim],
+            ffn.w_up(),
+            resident.filter(|_| ffn_dev).map(|r| r.w_up(layer_idx)),
+            &mut up,
+            1,
+            cfg.ff_dim,
+            dim,
+        )?;
+        silu_mul_dispatch(hip, &mut gate, &up, metrics)?;
+        gemm_nt_dispatch(
+            hip,
+            &gate,
+            ffn.w_down(),
+            resident.filter(|_| ffn_dev).map(|r| r.w_down(layer_idx)),
+            hidden,
+            1,
+            dim,
+            cfg.ff_dim,
+        )?;
+        for i in 0..dim {
+            x[i] += hidden[i];
+        }
+        Ok(())
+    }
+
+    fn moe_hidden(
+        &self,
+        layer_idx: usize,
+        layer: &LayerWeights,
+        x_norm: &[f32],
+    ) -> Result<Vec<f32>, AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let n_exp = cfg.n_experts.max(1);
+        let n_act = cfg.n_active.max(1).min(n_exp);
+        let routed = topk_route(x_norm, &layer.w_router, n_exp, n_act);
+        let ids: Vec<ExpertId> = routed
+            .iter()
+            .map(|&(e, _)| ExpertId {
+                layer: layer_idx as u32,
+                expert: e as u32,
+            })
+            .collect();
+        if let Some(lru) = &self.expert_lru {
+            let plan = lru.plan(&ids);
+            lru.note_plan(&plan);
+            for id in &plan.fill {
+                let host = layer.experts.get(id.expert as usize).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "missing expert {}",
+                        id.expert
+                    )))
+                })?;
+                lru.admit(*id, host)?;
+            }
+        }
+        let mut acc = vec![0.0f32; dim];
+        let mut scratch_h = vec![0.0f32; dim];
+        for &(e, w) in &routed {
+            let host = layer.experts.get(e).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!("missing expert {e}")))
+            })?;
+            let ffn = if let Some(lru) = &self.expert_lru {
+                lru.materialize(
+                    ExpertId {
+                        layer: layer_idx as u32,
+                        expert: e as u32,
+                    },
+                    host,
+                )?
+            } else {
+                host.clone()
+            };
+            expert_mlp(x_norm, &ffn, cfg.ff_dim, dim, &mut scratch_h)?;
+            for i in 0..dim {
+                acc[i] += w * scratch_h[i];
+            }
+        }
+        Ok(acc)
     }
 
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
@@ -903,6 +1126,8 @@ impl TinyModel {
                 w_gate: file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
                 w_up: file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
                 w_down: file.tensor_f32(&format!("blk.{i}.ffn_down.weight"))?,
+                w_router: Vec::new(),
+                experts: Vec::new(),
             });
         }
         let norm = file.tensor_f32("output_norm.weight")?;
@@ -918,6 +1143,7 @@ impl TinyModel {
             lm_head,
             name,
             working_set: None,
+            expert_lru: None,
         })
     }
 
@@ -930,6 +1156,7 @@ impl TinyModel {
             name: name.into(),
             config: cfg,
             working_set: None,
+            expert_lru: None,
         }
     }
 
@@ -944,6 +1171,8 @@ impl TinyModel {
             n_heads,
             n_kv_heads,
             ff_dim,
+            n_experts: 0,
+            n_active: 0,
             eps: hf.rms_norm_eps,
             rope_theta: hf.rope_theta,
         };
@@ -960,6 +1189,8 @@ impl TinyModel {
                 w_gate: file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
                 w_up: file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
                 w_down: file.tensor_f32(&format!("blk.{i}.ffn_down.weight"))?,
+                w_router: Vec::new(),
+                experts: Vec::new(),
             });
         }
         let norm = file.tensor_f32("output_norm.weight")?;
@@ -980,6 +1211,7 @@ impl TinyModel {
             lm_head,
             name,
             working_set: None,
+            expert_lru: None,
         })
     }
 
@@ -994,6 +1226,8 @@ impl TinyModel {
             n_heads,
             n_kv_heads,
             ff_dim,
+            n_experts: 0,
+            n_active: 0,
             eps: hf.rms_norm_eps,
             rope_theta: hf.rope_theta,
         };
@@ -1010,6 +1244,8 @@ impl TinyModel {
                 w_gate: file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
                 w_up: file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
                 w_down: file.tensor_f32(&format!("blk.{i}.ffn_down.weight"))?,
+                w_router: Vec::new(),
+                experts: Vec::new(),
             });
         }
         let norm = file.tensor_f32("output_norm.weight")?;
@@ -1025,6 +1261,7 @@ impl TinyModel {
             lm_head,
             name: "onnx".into(),
             working_set: None,
+            expert_lru: None,
         })
     }
 
@@ -1078,16 +1315,18 @@ impl TinyModel {
                 "token {token} out of vocab"
             ))));
         }
-        if let (Some(hip), Some(resident)) = (hip, resident) {
-            match self.forward_token_device(
-                token, pos, page_ids, kv, metrics, logits, hip, resident,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if !self.host_weights_ready() {
-                        return Err(e);
+        if self.config.n_experts == 0 {
+            if let (Some(hip), Some(resident)) = (hip, resident) {
+                match self.forward_token_device(
+                    token, pos, page_ids, kv, metrics, logits, hip, resident,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if !self.host_weights_ready() {
+                            return Err(e);
+                        }
+                        tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                     }
-                    tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                 }
             }
         }
@@ -1150,26 +1389,16 @@ impl TinyModel {
                 x[i] += hidden[i];
             }
 
-            let ffn = self.ffn(layer_idx, layer)?;
-            let ffn_dev = !self.streamed_ffn(layer_idx);
-            rmsnorm_dispatch(
+            self.apply_ffn(
+                layer_idx,
+                layer,
+                &mut x,
+                &mut scratch,
+                &mut hidden,
                 hip,
-                &x,
-                ffn.ffn_norm(),
-                resident.filter(|_| ffn_dev).map(|r| r.ffn_norm(layer_idx)),
-                cfg.eps,
-                &mut scratch[..dim],
+                resident,
                 Some(metrics),
             )?;
-            let mut gate = vec![0.0f32; cfg.ff_dim];
-            let mut up = vec![0.0f32; cfg.ff_dim];
-            gemm_nt_dispatch(hip, &scratch[..dim], ffn.w_gate(), resident.filter(|_| ffn_dev).map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
-            gemm_nt_dispatch(hip, &scratch[..dim], ffn.w_up(), resident.filter(|_| ffn_dev).map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
-            silu_mul_dispatch(hip, &mut gate, &up, Some(metrics))?;
-            gemm_nt_dispatch(hip, &gate, ffn.w_down(), resident.filter(|_| ffn_dev).map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
-            for i in 0..dim {
-                x[i] += hidden[i];
-            }
         }
 
         rmsnorm_dispatch(
@@ -1254,7 +1483,8 @@ impl TinyModel {
                 ))));
             }
         }
-        if let (Some(hip), Some(resident)) = (hip, resident) {
+        if self.config.n_experts == 0 {
+            if let (Some(hip), Some(resident)) = (hip, resident) {
             match self.forward_tokens_device(
                 tokens,
                 start_pos,
@@ -1279,6 +1509,7 @@ impl TinyModel {
                         "HIP batched prefill failed; per-token host fallback"
                     );
                 }
+            }
             }
         }
         let vocab = self.config.vocab_size;
@@ -2002,7 +2233,7 @@ impl TinyModel {
                     &mask,
                 )?;
             }
-            let ffn = self.ffn(layer_idx, layer)?;
+            let ffn_scratch = &mut scratch;
             for i in 0..n_tree {
                 let mut hidden = vec![0.0f32; dim];
                 matmul_nt(
@@ -2016,18 +2247,16 @@ impl TinyModel {
                 for d in 0..dim {
                     xs[i][d] += hidden[d];
                 }
-                rmsnorm(&xs[i], ffn.ffn_norm(), cfg.eps, &mut scratch[..dim])?;
-                let mut gate = vec![0.0f32; cfg.ff_dim];
-                let mut up = vec![0.0f32; cfg.ff_dim];
-                matmul_nt(&scratch[..dim], ffn.w_gate(), &mut gate, 1, cfg.ff_dim, dim)?;
-                matmul_nt(&scratch[..dim], ffn.w_up(), &mut up, 1, cfg.ff_dim, dim)?;
-                for g in 0..cfg.ff_dim {
-                    gate[g] = silu(gate[g]) * up[g];
-                }
-                matmul_nt(&gate, ffn.w_down(), &mut hidden, 1, dim, cfg.ff_dim)?;
-                for d in 0..dim {
-                    xs[i][d] += hidden[d];
-                }
+                self.apply_ffn(
+                    layer_idx,
+                    layer,
+                    &mut xs[i],
+                    ffn_scratch,
+                    &mut hidden,
+                    None,
+                    None,
+                    metrics,
+                )?;
             }
         }
 
@@ -2072,11 +2301,13 @@ impl TinyModel {
         metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
         cache.forwards = cache.forwards.saturating_add(1);
-        if let (Some(hip), Some(resident)) = (hip, resident) {
-            match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    tracing::warn!(pos, token, error = %e, "HIP draft on-device decode failed; host fallback");
+        if self.config.n_experts == 0 {
+            if let (Some(hip), Some(resident)) = (hip, resident) {
+                match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        tracing::warn!(pos, token, error = %e, "HIP draft on-device decode failed; host fallback");
+                    }
                 }
             }
         }
@@ -2127,26 +2358,16 @@ impl TinyModel {
             for i in 0..dim {
                 x[i] += hidden[i];
             }
-            let ffn = self.ffn(layer_idx, layer)?;
-            let ffn_dev = !self.streamed_ffn(layer_idx);
-            rmsnorm_dispatch(
-                hip,
-                &x,
-                ffn.ffn_norm(),
-                resident.filter(|_| ffn_dev).map(|r| r.ffn_norm(layer_idx)),
-                cfg.eps,
+            self.apply_ffn(
+                layer_idx,
+                layer,
+                &mut x,
                 &mut normed,
+                &mut hidden,
+                hip,
+                resident,
                 metrics,
             )?;
-            let mut gate = vec![0.0f32; cfg.ff_dim];
-            let mut up = vec![0.0f32; cfg.ff_dim];
-            gemm_nt_dispatch(hip, &normed, ffn.w_gate(), resident.filter(|_| ffn_dev).map(|r| r.w_gate(layer_idx)), &mut gate, 1, cfg.ff_dim, dim)?;
-            gemm_nt_dispatch(hip, &normed, ffn.w_up(), resident.filter(|_| ffn_dev).map(|r| r.w_up(layer_idx)), &mut up, 1, cfg.ff_dim, dim)?;
-            silu_mul_dispatch(hip, &mut gate, &up, metrics)?;
-            gemm_nt_dispatch(hip, &gate, ffn.w_down(), resident.filter(|_| ffn_dev).map(|r| r.w_down(layer_idx)), &mut hidden, 1, dim, cfg.ff_dim)?;
-            for i in 0..dim {
-                x[i] += hidden[i];
-            }
         }
         rmsnorm_dispatch(
             hip,

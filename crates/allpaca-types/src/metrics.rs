@@ -98,4 +98,15 @@ pub struct StatsSnapshot {
     /// Binds served from a ring slot without copying from the host pool.
     #[serde(default)]
     pub weight_ring_hits: u64,
+    /// GPU/hot expert LRU slots (0 = host pool only).
+    #[serde(default)]
+    pub expert_slots: u64,
+    #[serde(default)]
+    pub expert_lru_hits: u64,
+    #[serde(default)]
+    pub expert_lru_misses: u64,
+    #[serde(default)]
+    pub expert_lru_fills: u64,
+    #[serde(default)]
+    pub expert_cpu_runs: u64,
 }
