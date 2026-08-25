@@ -28,7 +28,11 @@ use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
 use crate::telemetry::Metrics;
 use crate::tokenizer::EngineTokenizer;
-use crate::weight_set::{expert_lru_slots, DenseTrunkPlan, ExpertLru, WeightWorkingSet};
+use crate::packed::{temp_pack_path, PackedStore, HostExpertPool};
+use crate::weight_set::{
+    expert_lru_slots, host_pool_slots, DenseTrunkPlan, ExpertId, ExpertLru, LayerFfn,
+    WeightWorkingSet,
+};
 use allpaca_hip::HipWorkspace;
 
 struct ActiveRequest {
@@ -212,6 +216,21 @@ impl Engine {
                         .weight_ring_hits
                         .store(ws.ring_hits(), std::sync::atomic::Ordering::Relaxed);
                 }
+                if let Some(pool) = g.target.as_ref().and_then(|m| m.expert_host.as_ref()) {
+                    self.metrics
+                        .expert_host_slots
+                        .store(pool.n_slots() as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .nvme_reads
+                        .store(pool.nvme_reads(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .nvme_bytes
+                        .store(pool.nvme_bytes(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.nvme_direct.store(
+                        u64::from(pool.is_direct()),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
                     self.metrics
                         .expert_lru_hits
@@ -346,7 +365,7 @@ impl Engine {
         inner.ring.resize_vocab(cfg.vocab_size);
         let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
         self.apply_weight_working_set(&mut target);
-        self.apply_expert_lru(&mut target);
+        self.apply_expert_lru(&mut target)?;
         inner.target = Some(Arc::new(target));
         if inner.flags.draft_model_speculation {
             let mut draft = TinyModel::synthetic(
@@ -355,7 +374,7 @@ impl Engine {
                 "synthetic-draft",
             );
             self.apply_weight_working_set(&mut draft);
-            self.apply_expert_lru(&mut draft);
+            self.apply_expert_lru(&mut draft)?;
             inner.draft_model = Some(Arc::new(draft));
         }
         inner.tokenizer = Some(tokenizer);
@@ -384,9 +403,9 @@ impl Engine {
         model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan));
     }
 
-    fn apply_expert_lru(&self, model: &mut TinyModel) {
+    fn apply_expert_lru(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
         if model.config.n_experts == 0 || !model.host_weights_ready() {
-            return;
+            return Ok(());
         }
         let expert_bytes = model
             .layers
@@ -394,15 +413,78 @@ impl Engine {
             .and_then(|l| l.experts.first())
             .map(|e| e.bytes())
             .unwrap_or(0);
+        if expert_bytes == 0 {
+            return Ok(());
+        }
+        let sample = model.layers.first().and_then(|l| l.experts.first());
+        let b_host = sample
+            .map(|e| {
+                crate::model::measure_expert_host_bandwidth(
+                    e,
+                    model.config.ff_dim,
+                    model.config.dim,
+                )
+            })
+            .unwrap_or(0.0);
+        let b_pcie = self
+            .hip
+            .as_ref()
+            .and_then(|hip| {
+                allpaca_hip::benchmark_h2d_bytes_per_sec(hip.device, expert_bytes).ok()
+            })
+            .unwrap_or(0.0);
+        self.metrics
+            .expert_host_bps
+            .store(b_host as u64, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .expert_pcie_bps
+            .store(b_pcie as u64, std::sync::atomic::Ordering::Relaxed);
+
+        let pool_bytes = expert_bytes
+            .saturating_mul(model.layers.len())
+            .saturating_mul(model.config.n_experts);
+        let host_bytes = self.config.weights.host_bytes;
+        if host_bytes > 0 && pool_bytes > host_bytes {
+            let n_host = host_pool_slots(expert_bytes, host_bytes);
+            let path = temp_pack_path();
+            let pairs: Vec<(ExpertId, &LayerFfn)> = model
+                .layers
+                .iter()
+                .enumerate()
+                .flat_map(|(li, layer)| {
+                    layer.experts.iter().enumerate().map(move |(ei, expert)| {
+                        (
+                            ExpertId {
+                                layer: li as u32,
+                                expert: ei as u32,
+                            },
+                            expert,
+                        )
+                    })
+                })
+                .collect();
+            let store = PackedStore::pack(&path, pairs)?;
+            for layer in &mut model.layers {
+                for expert in &mut layer.experts {
+                    *expert = LayerFfn::default();
+                }
+            }
+            HostExpertPool::record_slots(&self.metrics, n_host);
+            model.expert_host = Some(HostExpertPool::new(store, n_host));
+        }
+
         let n_slots = expert_lru_slots(expert_bytes, self.config.weights.cache_bytes);
         ExpertLru::record_slots(&self.metrics, n_slots);
         if n_slots == 0 {
-            return;
+            return Ok(());
         }
-        model.expert_lru = Some(ExpertLru::new(
+        model.expert_lru = Some(ExpertLru::with_bandwidth(
             n_slots,
             self.config.weights.miss_policy,
+            b_pcie,
+            b_host,
         ));
+        Ok(())
     }
 
     fn load_model_path(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
@@ -429,7 +511,7 @@ impl Engine {
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model);
-        self.apply_expert_lru(&mut model);
+        self.apply_expert_lru(&mut model)?;
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -457,7 +539,7 @@ impl Engine {
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model);
-        self.apply_expert_lru(&mut model);
+        self.apply_expert_lru(&mut model)?;
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -478,7 +560,7 @@ impl Engine {
             )));
         }
         self.apply_weight_working_set(&mut model);
-        self.apply_expert_lru(&mut model);
+        self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -528,7 +610,9 @@ impl Engine {
         let target = inner.target.clone();
         let draft = inner.draft_model.clone();
         inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
-            let uploaded = if let Some(file) = target_gguf {
+            let uploaded = if target.config.n_experts > 0 && target.host_weights_ready() {
+                ResidentModel::upload(&target, hip.device)
+            } else if let Some(file) = target_gguf {
                 ResidentModel::upload_gguf(file, &target.config, hip.device)
             } else if target.host_weights_ready() {
                 ResidentModel::upload(&target, hip.device)
@@ -557,7 +641,9 @@ impl Engine {
         };
         inner.draft_resident = if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
             tracing::info!(device = hip.device, "HIP draft weight upload start");
-            let uploaded = if let Some(file) = draft_gguf {
+            let uploaded = if draft.config.n_experts > 0 && draft.host_weights_ready() {
+                ResidentModel::upload(&draft, hip.device)
+            } else if let Some(file) = draft_gguf {
                 ResidentModel::upload_gguf(file, &draft.config, hip.device)
             } else if draft.host_weights_ready() {
                 ResidentModel::upload(&draft, hip.device)
@@ -1818,6 +1904,86 @@ mod tests {
     }
 
     #[test]
+    fn moe_nvme_host_pool_greedy_tokens_match_fully_resident() {
+        let mut resident_cfg = test_config();
+        resident_cfg.model.synthetic = false;
+        resident_cfg.speculative.enabled = false;
+        let resident = Engine::new(resident_cfg).unwrap();
+        resident.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let full = resident.generate("hello", params.clone()).unwrap();
+
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.host_bytes = 64;
+        cfg.weights.cache_bytes = 0;
+        let streamed = Engine::new(cfg).unwrap();
+        streamed.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let part = streamed.generate("hello", params).unwrap();
+        assert_eq!(
+            part.token_ids, full.token_ids,
+            "NVMe host pool is a speed dial: greedy tokens must match"
+        );
+        let stats = streamed.stats();
+        assert!(
+            stats.expert_host_slots >= 1,
+            "tiny host_bytes must grant at least one DRAM slot; stats={stats:?}"
+        );
+        assert!(
+            stats.nvme_reads > 0,
+            "experts that miss the DRAM pool must page from the packed file; stats={stats:?}"
+        );
+        #[cfg(windows)]
+        assert!(
+            stats.nvme_direct,
+            "packed expert reads must use FILE_FLAG_NO_BUFFERING, not the page cache; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn qstar_records_measured_host_bandwidth() {
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.cache_bytes = 64;
+        cfg.weights.miss_policy = MissPolicy::Qstar;
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let stats = engine.stats();
+        assert!(
+            stats.expert_host_bps > 0,
+            "q* must measure CPU expert bandwidth; stats={stats:?}"
+        );
+        assert_eq!(
+            stats.expert_pcie_bps, 0,
+            "cpu_only has no PCIe expert H2D"
+        );
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let after = engine.stats();
+        assert!(
+            after.expert_cpu_runs > 0,
+            "measured q* with no PCIe must CPU-run residual misses; stats={after:?}"
+        );
+    }
+
+    #[test]
     fn moe_prefill_admits_full_layer_and_matches_resident() {
         let expert_bytes = 64 * 32 * 3 * 4;
         let mut resident_cfg = test_config();
@@ -2535,6 +2701,95 @@ mod tests {
             ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![w; ff * dim]),
             ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![w; ff * dim]),
             ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![ffn_down; dim * ff]),
+            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        ];
+        let views: Vec<GgufWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
+    fn write_tiny_moe_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        use std::collections::HashMap;
+
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let n_exp = 4usize;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+        meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+        meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+        meta.insert(
+            "llama.feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert("llama.expert_count".into(), GgufValue::Uint32(n_exp as u32));
+        meta.insert("llama.expert_used_count".into(), GgufValue::Uint32(2));
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hello".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+        let w = 0.01f32;
+        let mut gate_exps = Vec::new();
+        let mut up_exps = Vec::new();
+        let mut down_exps = Vec::new();
+        for _ in 0..n_exp {
+            gate_exps.extend(std::iter::repeat(w).take(ff * dim));
+            up_exps.extend(std::iter::repeat(w).take(ff * dim));
+            down_exps.extend(std::iter::repeat(w).take(dim * ff));
+        }
+        let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
+            ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
+            ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
+            ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
+            ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
+            ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "blk.0.ffn_gate_inp.weight".into(),
+                vec![n_exp as u64, dim as u64],
+                vec![w; n_exp * dim],
+            ),
+            (
+                "blk.0.ffn_gate_exps.weight".into(),
+                vec![n_exp as u64, ff as u64, dim as u64],
+                gate_exps,
+            ),
+            (
+                "blk.0.ffn_up_exps.weight".into(),
+                vec![n_exp as u64, ff as u64, dim as u64],
+                up_exps,
+            ),
+            (
+                "blk.0.ffn_down_exps.weight".into(),
+                vec![n_exp as u64, dim as u64, ff as u64],
+                down_exps,
+            ),
             ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
         ];
         let views: Vec<GgufWriteTensor<'_>> = owned
@@ -3864,6 +4119,42 @@ mod tests {
             )
             .expect("GGUF generate must still work");
         assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_generate_from_moe_gguf_loads_stacked_experts() {
+        let path = std::env::temp_dir().join("allpaca_moe_gguf.gguf");
+        write_tiny_moe_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.kv.page_tokens = 8;
+        cfg.weights.cache_bytes = 64;
+        cfg.weights.miss_policy = MissPolicy::Fill;
+        let engine = Engine::new(cfg).expect("Mixtral-style GGUF must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("MoE GGUF generate must work");
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.expert_slots >= 1,
+            "cache_bytes on a Mixtral-style GGUF must grant expert slots; stats={stats:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

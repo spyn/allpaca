@@ -123,6 +123,8 @@ int allpaca_embed_gather_f16_rows(const uint16_t *table, const int32_t *tokens, 
 
 int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
 
+int allpaca_scale_f32(float *x, int32_t n, float scale, allpaca_stream_t stream);
+
 /* x += residual, then RMSNorm(x) -> out. One launch for the decode epilogue. */
 int allpaca_residual_rmsnorm(float *x, const float *residual, const float *weight, float *out,
                              int32_t n, float eps, allpaca_stream_t stream);

@@ -1836,6 +1836,14 @@ __global__ void residual_add_kernel(float *x, const float *residual, int n) {
     x[idx] += residual[idx];
 }
 
+__global__ void scale_f32_kernel(float *x, float scale, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    x[idx] *= scale;
+}
+
 extern "C" int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
                                     allpaca_stream_t stream) {
     if (!table || !out || dim <= 0 || token < 0) {
@@ -2049,6 +2057,18 @@ extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
     return hip_status(hipGetLastError());
 }
 
+extern "C" int allpaca_scale_f32(float *x, int32_t n, float scale, allpaca_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(scale_f32_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, scale, n);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_copy_async(void *dst, const void *src, size_t bytes,
                                   allpaca_stream_t stream) {
     if (!dst || !src) {
@@ -2209,6 +2229,10 @@ extern "C" int allpaca_embed_gather_f16_rows(const uint16_t *, const int32_t *, 
 }
 
 extern "C" int allpaca_residual_add(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scale_f32(float *, int32_t, float, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

@@ -285,6 +285,9 @@ pub struct WeightsSection {
     /// Requested ring slots (1 or 2). 0 means 1. Second slot only if it fits `trunk_bytes`.
     pub ring_slots: usize,
     pub miss_policy: MissPolicy,
+    /// DRAM budget for the expert host pool. 0 = unlimited (experts stay in RAM).
+    /// When the pool exceeds this, experts pack to an aligned file and page in via Direct I/O.
+    pub host_bytes: usize,
 }
 
 impl Default for WeightsSection {
@@ -294,6 +297,7 @@ impl Default for WeightsSection {
             cache_bytes: 0,
             ring_slots: 2,
             miss_policy: MissPolicy::Qstar,
+            host_bytes: 0,
         }
     }
 }
@@ -450,6 +454,7 @@ mod tests {
         assert_eq!(defaults.weights.trunk_bytes, 0);
         assert_eq!(defaults.weights.ring_slots, 2);
         assert_eq!(defaults.weights.miss_policy, MissPolicy::Qstar);
+        assert_eq!(defaults.weights.host_bytes, 0);
 
         let cfg = Config::from_toml_str(
             r#"
@@ -457,12 +462,14 @@ mod tests {
             trunk_bytes = 4096
             ring_slots = 1
             miss_policy = "fill"
+            host_bytes = 128
             "#,
         )
         .unwrap();
         assert_eq!(cfg.weights.trunk_bytes, 4096);
         assert_eq!(cfg.weights.ring_slots, 1);
         assert_eq!(cfg.weights.miss_policy, MissPolicy::Fill);
+        assert_eq!(cfg.weights.host_bytes, 128);
         assert_eq!(
             cfg.kv.page_tokens, 128,
             "weights is composable, not a Pipeline Mode"

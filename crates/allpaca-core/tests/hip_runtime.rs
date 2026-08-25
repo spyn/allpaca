@@ -343,6 +343,14 @@ fn streamed_moe_hip_greedy_tokens_match_fully_resident() {
         "tiny cache_bytes must grant at least one expert slot"
     );
     assert!(
+        after_load.expert_host_bps > 0,
+        "q* must measure CPU expert bandwidth on HIP load; stats={after_load:?}"
+    );
+    assert!(
+        after_load.expert_pcie_bps > 0,
+        "q* must measure expert H2D bandwidth on HIP load; stats={after_load:?}"
+    );
+    assert!(
         after_load.weight_bytes_on_device > after_load.weight_h2d_bytes,
         "expert-slot VRAM is reserved at load; packed H2D skips experts; stats={after_load:?}"
     );
@@ -364,6 +372,46 @@ fn streamed_moe_hip_greedy_tokens_match_fully_resident() {
         after.expert_lru_fills > 0,
         "Fill policy must admit misses into the LRU"
     );
+    let dim = 32u64;
+    let n_layers = 2u64;
+    let logits = SYNTHETIC_VOCAB.saturating_mul(4);
+    let route = n_layers.saturating_mul(dim).saturating_mul(4).saturating_mul(2);
+    let bound = after.gpu_forwards.saturating_mul(logits.saturating_add(route));
+    assert!(
+        after.activation_d2h_bytes <= bound,
+        "MoE residual scale must stay on device; d2h={} bound={} stats={after:?}",
+        after.activation_d2h_bytes,
+        bound
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn moe_gguf_hip_generate_uses_expert_slots() {
+    let path = std::env::temp_dir().join("allpaca_hip_moe.gguf");
+    write_tiny_moe_gguf(&path);
+    let mut cfg = hip_auto_synthetic();
+    cfg.model.synthetic = false;
+    cfg.model.path = Some(path.clone());
+    cfg.weights.cache_bytes = 64;
+    cfg.weights.miss_policy = MissPolicy::Fill;
+    let engine = Engine::new(cfg).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let out = engine.generate("hello", greedy(4)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.expert_slots >= 1,
+        "Mixtral-style GGUF must grant expert slots; stats={stats:?}"
+    );
+    assert!(
+        stats.gpu_forwards > 0,
+        "MoE GGUF must stay on HIP; stats={stats:?}"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[cfg(feature = "hip")]
@@ -1532,6 +1580,96 @@ fn write_tiny_f32_gguf(path: &std::path::Path) {
         ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
         ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
         ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![0.01; dim * ff]),
+        ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+    ];
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).unwrap();
+}
+
+#[cfg(feature = "hip")]
+fn write_tiny_moe_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 8usize;
+    let vocab = 4usize;
+    let ff = 16usize;
+    let n_exp = 4usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert("llama.expert_count".into(), GgufValue::Uint32(n_exp as u32));
+    meta.insert("llama.expert_used_count".into(), GgufValue::Uint32(2));
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let w = 0.01f32;
+    let mut gate_exps = Vec::new();
+    let mut up_exps = Vec::new();
+    let mut down_exps = Vec::new();
+    for _ in 0..n_exp {
+        gate_exps.extend(std::iter::repeat_n(w, ff * dim));
+        up_exps.extend(std::iter::repeat_n(w, ff * dim));
+        down_exps.extend(std::iter::repeat_n(w, dim * ff));
+    }
+    let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+        ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
+        ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
+        ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
+        ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
+        ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
+        ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        (
+            "blk.0.ffn_gate_inp.weight".into(),
+            vec![n_exp as u64, dim as u64],
+            vec![w; n_exp * dim],
+        ),
+        (
+            "blk.0.ffn_gate_exps.weight".into(),
+            vec![n_exp as u64, ff as u64, dim as u64],
+            gate_exps,
+        ),
+        (
+            "blk.0.ffn_up_exps.weight".into(),
+            vec![n_exp as u64, ff as u64, dim as u64],
+            up_exps,
+        ),
+        (
+            "blk.0.ffn_down_exps.weight".into(),
+            vec![n_exp as u64, dim as u64, ff as u64],
+            down_exps,
+        ),
         ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
     ];
     let views: Vec<GgufWriteTensor<'_>> = owned

@@ -11,6 +11,7 @@ mod model;
 mod sampling;
 mod scheduler;
 mod telemetry;
+mod packed;
 mod tokenizer;
 mod transfer;
 mod weight_set;
@@ -24,6 +25,8 @@ pub use scheduler::Scheduler;
 pub use telemetry::Metrics;
 pub use tokenizer::EngineTokenizer;
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};
+pub use packed::{HostExpertPool, PackedStore};
 pub use weight_set::{
-    expert_lru_slots, qstar_fill_count, DenseTrunkPlan, ExpertId, ExpertLru, WeightWorkingSet,
+    expert_lru_slots, host_pool_slots, qstar_fill_count, DenseTrunkPlan, ExpertId, ExpertLru,
+    WeightWorkingSet,
 };

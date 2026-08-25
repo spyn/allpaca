@@ -32,7 +32,7 @@ pub fn qstar_fill_count(misses: usize, b_pcie: f64, b_host: f64) -> usize {
     let ratio = if b_pcie.is_finite() && b_pcie > 0.0 {
         (b_pcie / b_host).clamp(0.0, 1.0)
     } else {
-        1.0
+        0.0
     };
     let q = ((misses as f64) * ratio).round() as usize;
     q.clamp(1, misses)
@@ -183,6 +183,44 @@ impl LayerFfn {
             }
         }
         out
+    }
+
+    pub fn unpack_bytes(
+        bytes: &[u8],
+        n_norm: usize,
+        n_gate: usize,
+        n_up: usize,
+        n_down: usize,
+    ) -> Result<Self, AllpacaError> {
+        let need = n_norm
+            .saturating_add(n_gate)
+            .saturating_add(n_up)
+            .saturating_add(n_down)
+            .saturating_mul(4);
+        if bytes.len() < need {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "packed expert truncated: have {} want {need}",
+                bytes.len()
+            ))));
+        }
+        let mut off = 0usize;
+        let mut take = |n: usize| -> Result<Vec<f32>, AllpacaError> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let chunk: [u8; 4] = bytes[off..off + 4].try_into().map_err(|_| {
+                    AllpacaError::Fatal(FatalError::ModelLoad("packed expert slice".into()))
+                })?;
+                v.push(f32::from_le_bytes(chunk));
+                off += 4;
+            }
+            Ok(v)
+        };
+        Ok(Self {
+            ffn_norm: take(n_norm)?,
+            w_gate: take(n_gate)?,
+            w_up: take(n_up)?,
+            w_down: take(n_down)?,
+        })
     }
 }
 
@@ -387,6 +425,11 @@ pub fn expert_lru_slots(expert_bytes: usize, cache_bytes: usize) -> usize {
     } else {
         (cache_bytes / expert_bytes).max(1)
     }
+}
+
+/// How many DRAM slots `host_bytes` buys. `host_bytes == 0` means unlimited RAM (no NVMe).
+pub fn host_pool_slots(expert_bytes: usize, host_bytes: usize) -> usize {
+    expert_lru_slots(expert_bytes, host_bytes)
 }
 
 fn unique_in_order(ids: &[ExpertId]) -> Vec<ExpertId> {
@@ -647,6 +690,7 @@ mod tests {
         assert_eq!(qstar_fill_count(8, 52.7, 77.3), 5);
         assert_eq!(qstar_fill_count(8, 11.8, 47.5), 2);
         assert_eq!(qstar_fill_count(4, 1.0, 100.0), 1, "always keep warming");
+        assert_eq!(qstar_fill_count(8, 0.0, 50.0), 1, "unmeasured PCIe fills one, rest CPU");
         assert_eq!(qstar_fill_count(0, 50.0, 80.0), 0);
     }
 

@@ -53,6 +53,12 @@ pub struct Metrics {
     pub expert_lru_misses: AtomicU64,
     pub expert_lru_fills: AtomicU64,
     pub expert_cpu_runs: AtomicU64,
+    pub expert_pcie_bps: AtomicU64,
+    pub expert_host_bps: AtomicU64,
+    pub expert_host_slots: AtomicU64,
+    pub nvme_reads: AtomicU64,
+    pub nvme_bytes: AtomicU64,
+    pub nvme_direct: AtomicU64,
 }
 
 impl Metrics {
@@ -153,6 +159,12 @@ impl Metrics {
             expert_lru_misses: self.expert_lru_misses.load(Ordering::Relaxed),
             expert_lru_fills: self.expert_lru_fills.load(Ordering::Relaxed),
             expert_cpu_runs: self.expert_cpu_runs.load(Ordering::Relaxed),
+            expert_pcie_bps: self.expert_pcie_bps.load(Ordering::Relaxed),
+            expert_host_bps: self.expert_host_bps.load(Ordering::Relaxed),
+            expert_host_slots: self.expert_host_slots.load(Ordering::Relaxed),
+            nvme_reads: self.nvme_reads.load(Ordering::Relaxed),
+            nvme_bytes: self.nvme_bytes.load(Ordering::Relaxed),
+            nvme_direct: self.nvme_direct.load(Ordering::Relaxed) != 0,
         }
     }
 

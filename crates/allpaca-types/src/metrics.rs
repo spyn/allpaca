@@ -109,4 +109,22 @@ pub struct StatsSnapshot {
     pub expert_lru_fills: u64,
     #[serde(default)]
     pub expert_cpu_runs: u64,
+    /// Measured expert H2D bandwidth (bytes/s) used by `q*`. 0 = unmeasured.
+    #[serde(default)]
+    pub expert_pcie_bps: u64,
+    /// Measured CPU expert-kernel bandwidth (bytes/s) used by `q*`. 0 = unmeasured.
+    #[serde(default)]
+    pub expert_host_bps: u64,
+    /// DRAM slots in the NVMe-backed expert host pool (0 = full RAM pool).
+    #[serde(default)]
+    pub expert_host_slots: u64,
+    /// Direct I/O (or buffered fallback) reads from the packed expert file.
+    #[serde(default)]
+    pub nvme_reads: u64,
+    /// Bytes read from the packed expert file (aligned slot size, not payload).
+    #[serde(default)]
+    pub nvme_bytes: u64,
+    /// True when packed expert reads used Direct I/O rather than the page cache.
+    #[serde(default)]
+    pub nvme_direct: bool,
 }

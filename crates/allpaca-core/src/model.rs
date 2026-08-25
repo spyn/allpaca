@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
+use crate::packed::HostExpertPool;
 use crate::weight_set::{
     align_up, ExpertId, ExpertLru, FfnRefs, LayerFfn, MissPlan, WeightWorkingSet, DIRECT_ALIGN,
 };
@@ -107,8 +108,12 @@ impl ModelConfig {
             n_heads,
             n_kv_heads,
             ff_dim,
-            n_experts: 0,
-            n_active: 0,
+            n_experts: file
+                .meta_u32(&format!("{arch}.expert_count"))
+                .unwrap_or(0) as usize,
+            n_active: file
+                .meta_u32(&format!("{arch}.expert_used_count"))
+                .unwrap_or(0) as usize,
             eps,
             rope_theta,
         })
@@ -339,7 +344,7 @@ impl ResidentModel {
                 push(&mut slices, &mut off, layer.w_router.as_slice())
             };
             let mut packed_ex = Vec::with_capacity(layer.experts.len());
-            if model.expert_lru.is_none() {
+            if model.expert_lru.is_none() && model.expert_host.is_none() {
                 for expert in &layer.experts {
                     packed_ex.push([
                         push(&mut slices, &mut off, expert.w_gate.as_slice()),
@@ -372,20 +377,17 @@ impl ResidentModel {
             .map(|w| (w.plan.ring_slots.max(1), w.plan.slot_bytes))
             .unwrap_or((0, 0));
         let ffn_tail = ring_slots.saturating_mul(slot_bytes);
-        let (expert_slots, expert_slot_bytes) = if let Some(lru) = &model.expert_lru {
-            let eb = model
-                .layers
-                .iter()
-                .find_map(|l| l.experts.first())
-                .map(|e| e.bytes())
-                .unwrap_or(0);
+        let (expert_slots, expert_slot_bytes) = {
+            let eb = model.expert_slot_bytes();
             if eb == 0 {
                 (0, 0)
-            } else {
+            } else if let Some(lru) = &model.expert_lru {
                 (lru.n_slots(), align_up(eb, DIRECT_ALIGN))
+            } else if model.expert_host.is_some() {
+                (1, align_up(eb, DIRECT_ALIGN))
+            } else {
+                (0, 0)
             }
-        } else {
-            (0, 0)
         };
         let expert_tail = expert_slots.saturating_mul(expert_slot_bytes);
         let tail = ffn_tail.saturating_add(expert_tail);
@@ -437,43 +439,79 @@ impl ResidentModel {
         let mut off = 0usize;
         let embed = append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
+        let mut expert_offs = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
+            let attn_norm = append_gguf_tensor(
+                file,
+                &format!("blk.{i}.attn_norm.weight"),
+                &mut parts,
+                &mut off,
+            )?;
+            let wq = append_gguf_tensor(file, &format!("blk.{i}.attn_q.weight"), &mut parts, &mut off)?;
+            let wk = append_gguf_tensor(file, &format!("blk.{i}.attn_k.weight"), &mut parts, &mut off)?;
+            let wv = append_gguf_tensor(file, &format!("blk.{i}.attn_v.weight"), &mut parts, &mut off)?;
+            let wo = append_gguf_tensor(
+                file,
+                &format!("blk.{i}.attn_output.weight"),
+                &mut parts,
+                &mut off,
+            )?;
+            let ffn_norm = append_gguf_tensor(
+                file,
+                &format!("blk.{i}.ffn_norm.weight"),
+                &mut parts,
+                &mut off,
+            )?;
+            let (w_gate, w_up, w_down, w_router, packed_ex) = if cfg.n_experts > 0 {
+                let w_router = if file.tensor(&format!("blk.{i}.ffn_gate_inp.weight")).is_some() {
+                    append_gguf_tensor(
+                        file,
+                        &format!("blk.{i}.ffn_gate_inp.weight"),
+                        &mut parts,
+                        &mut off,
+                    )?
+                } else {
+                    append_gguf_tensor(
+                        file,
+                        &format!("blk.{i}.ffn_router.weight"),
+                        &mut parts,
+                        &mut off,
+                    )?
+                };
+                let packed_ex = append_gguf_experts(file, i, cfg.n_experts, &mut parts, &mut off)?;
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    w_router,
+                    packed_ex,
+                )
+            } else {
+                (
+                    append_gguf_tensor(file, &format!("blk.{i}.ffn_gate.weight"), &mut parts, &mut off)?,
+                    append_gguf_tensor(file, &format!("blk.{i}.ffn_up.weight"), &mut parts, &mut off)?,
+                    append_gguf_tensor(
+                        file,
+                        &format!("blk.{i}.ffn_down.weight"),
+                        &mut parts,
+                        &mut off,
+                    )?,
+                    WeightRef::f32(0, 0),
+                    Vec::new(),
+                )
+            };
+            expert_offs.push(packed_ex);
             layers.push(LayerOff {
-                attn_norm: append_gguf_tensor(
-                    file,
-                    &format!("blk.{i}.attn_norm.weight"),
-                    &mut parts,
-                    &mut off,
-                )?,
-                wq: append_gguf_tensor(file, &format!("blk.{i}.attn_q.weight"), &mut parts, &mut off)?,
-                wk: append_gguf_tensor(file, &format!("blk.{i}.attn_k.weight"), &mut parts, &mut off)?,
-                wv: append_gguf_tensor(file, &format!("blk.{i}.attn_v.weight"), &mut parts, &mut off)?,
-                wo: append_gguf_tensor(
-                    file,
-                    &format!("blk.{i}.attn_output.weight"),
-                    &mut parts,
-                    &mut off,
-                )?,
-                ffn_norm: append_gguf_tensor(
-                    file,
-                    &format!("blk.{i}.ffn_norm.weight"),
-                    &mut parts,
-                    &mut off,
-                )?,
-                w_gate: append_gguf_tensor(
-                    file,
-                    &format!("blk.{i}.ffn_gate.weight"),
-                    &mut parts,
-                    &mut off,
-                )?,
-                w_up: append_gguf_tensor(file, &format!("blk.{i}.ffn_up.weight"), &mut parts, &mut off)?,
-                w_down: append_gguf_tensor(
-                    file,
-                    &format!("blk.{i}.ffn_down.weight"),
-                    &mut parts,
-                    &mut off,
-                )?,
-                w_router: WeightRef::f32(0, 0),
+                attn_norm,
+                wq,
+                wk,
+                wv,
+                wo,
+                ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
+                w_router,
             });
         }
         let norm = append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?;
@@ -488,7 +526,7 @@ impl ResidentModel {
         Ok(Self {
             packed_h2d: weights.bytes(),
             ffn_ring: None,
-            expert_offs: Vec::new(),
+            expert_offs,
             expert_ring: None,
             weights,
             embed,
@@ -843,6 +881,27 @@ fn expert_mlp(
     matmul_nt(&gate, &ffn.w_down, out, 1, dim, ff_dim)
 }
 
+pub(crate) fn measure_expert_host_bandwidth(
+    ffn: &LayerFfn,
+    ff_dim: usize,
+    dim: usize,
+) -> f64 {
+    use std::time::Instant;
+    if ffn.bytes() == 0 || dim == 0 || ff_dim == 0 {
+        return 0.0;
+    }
+    let x = vec![0.01f32; dim];
+    let mut out = vec![0.0f32; dim];
+    let _ = expert_mlp(&x, ffn, ff_dim, dim, &mut out);
+    let iters = 8usize;
+    let t = Instant::now();
+    for _ in 0..iters {
+        let _ = expert_mlp(&x, ffn, ff_dim, dim, &mut out);
+    }
+    let secs = t.elapsed().as_secs_f64().max(1e-9);
+    (ffn.bytes() as f64 * iters as f64) / secs
+}
+
 fn topk_route(x: &[f32], w_router: &[f32], n_experts: usize, n_active: usize) -> Vec<(usize, f32)> {
     let dim = x.len();
     let mut logits = vec![0.0f32; n_experts];
@@ -891,28 +950,111 @@ fn empty_layer() -> LayerWeights {
     }
 }
 
-fn estimated_gguf_f32_bytes(file: &GgufFile, n_layers: usize) -> u64 {
+fn estimated_gguf_f32_bytes(file: &GgufFile, cfg: &ModelConfig) -> u64 {
     let mut names = vec![
         "token_embd.weight".to_string(),
         "output_norm.weight".to_string(),
         "output.weight".to_string(),
     ];
-    for i in 0..n_layers {
+    for i in 0..cfg.n_layers {
         names.push(format!("blk.{i}.attn_norm.weight"));
         names.push(format!("blk.{i}.attn_q.weight"));
         names.push(format!("blk.{i}.attn_k.weight"));
         names.push(format!("blk.{i}.attn_v.weight"));
         names.push(format!("blk.{i}.attn_output.weight"));
         names.push(format!("blk.{i}.ffn_norm.weight"));
-        names.push(format!("blk.{i}.ffn_gate.weight"));
-        names.push(format!("blk.{i}.ffn_up.weight"));
-        names.push(format!("blk.{i}.ffn_down.weight"));
+        if cfg.n_experts > 0 {
+            names.push(format!("blk.{i}.ffn_gate_inp.weight"));
+            names.push(format!("blk.{i}.ffn_gate_exps.weight"));
+            names.push(format!("blk.{i}.ffn_up_exps.weight"));
+            names.push(format!("blk.{i}.ffn_down_exps.weight"));
+            for e in 0..cfg.n_experts {
+                names.push(format!("blk.{i}.ffn_gate.{e}.weight"));
+                names.push(format!("blk.{i}.ffn_up.{e}.weight"));
+                names.push(format!("blk.{i}.ffn_down.{e}.weight"));
+            }
+        } else {
+            names.push(format!("blk.{i}.ffn_gate.weight"));
+            names.push(format!("blk.{i}.ffn_up.weight"));
+            names.push(format!("blk.{i}.ffn_down.weight"));
+        }
     }
     names
         .iter()
         .filter_map(|n| file.tensor(n))
         .map(|t| t.n_elements().saturating_mul(4))
         .sum()
+}
+
+fn require_gguf_tensor(file: &GgufFile, name: &str) -> Result<(), AllpacaError> {
+    if file.tensor(name).is_none() {
+        Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "missing tensor {name}"
+        ))))
+    } else {
+        Ok(())
+    }
+}
+
+fn split_expert_rows(data: Vec<f32>, n_experts: usize, what: &str) -> Result<Vec<Vec<f32>>, AllpacaError> {
+    if n_experts == 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "{what} has no experts"
+        ))));
+    }
+    if data.len() % n_experts != 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "{what} len {} is not divisible by {n_experts} experts",
+            data.len()
+        ))));
+    }
+    let chunk = data.len() / n_experts;
+    Ok(data.chunks(chunk).map(|c| c.to_vec()).collect())
+}
+
+fn load_gguf_moe_layer(
+    file: &GgufFile,
+    layer: usize,
+    n_experts: usize,
+) -> Result<(Vec<f32>, Vec<LayerFfn>), AllpacaError> {
+    let router_name = format!("blk.{layer}.ffn_gate_inp.weight");
+    let w_router = file.tensor_f32(&router_name).or_else(|_| {
+        file.tensor_f32(&format!("blk.{layer}.ffn_router.weight"))
+    })?;
+    let stacked_gate = format!("blk.{layer}.ffn_gate_exps.weight");
+    let experts = if file.tensor(&stacked_gate).is_some() {
+        let gates = split_expert_rows(file.tensor_f32(&stacked_gate)?, n_experts, &stacked_gate)?;
+        let ups = split_expert_rows(
+            file.tensor_f32(&format!("blk.{layer}.ffn_up_exps.weight"))?,
+            n_experts,
+            "ffn_up_exps",
+        )?;
+        let downs = split_expert_rows(
+            file.tensor_f32(&format!("blk.{layer}.ffn_down_exps.weight"))?,
+            n_experts,
+            "ffn_down_exps",
+        )?;
+        (0..n_experts)
+            .map(|e| LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate: gates[e].clone(),
+                w_up: ups[e].clone(),
+                w_down: downs[e].clone(),
+            })
+            .collect()
+    } else {
+        let mut experts = Vec::with_capacity(n_experts);
+        for e in 0..n_experts {
+            experts.push(LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate: file.tensor_f32(&format!("blk.{layer}.ffn_gate.{e}.weight"))?,
+                w_up: file.tensor_f32(&format!("blk.{layer}.ffn_up.{e}.weight"))?,
+                w_down: file.tensor_f32(&format!("blk.{layer}.ffn_down.{e}.weight"))?,
+            });
+        }
+        experts
+    };
+    Ok((w_router, experts))
 }
 
 fn append_gguf_tensor(
@@ -1020,6 +1162,86 @@ fn append_gguf_tensor(
     Ok(w)
 }
 
+fn split_packed_experts(
+    w: WeightRef,
+    n_experts: usize,
+    what: &str,
+) -> Result<Vec<WeightRef>, AllpacaError> {
+    if n_experts == 0 || w.n % n_experts != 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "{what} n={} is not divisible by {n_experts} experts",
+            w.n
+        ))));
+    }
+    let n_per = w.n / n_experts;
+    let stride = match w.kind {
+        WeightKind::F32 => n_per.saturating_mul(4),
+        WeightKind::F16 => n_per.saturating_mul(2),
+        _ => {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "{what} packed quant experts cannot be sliced; use host F32"
+            ))))
+        }
+    };
+    Ok((0..n_experts)
+        .map(|e| WeightRef {
+            off: w.off + e * stride,
+            n: n_per,
+            kind: w.kind,
+        })
+        .collect())
+}
+
+fn append_gguf_experts(
+    file: &GgufFile,
+    layer: usize,
+    n_experts: usize,
+    parts: &mut Vec<Vec<u8>>,
+    off: &mut usize,
+) -> Result<Vec<[WeightRef; 3]>, AllpacaError> {
+    let stacked = format!("blk.{layer}.ffn_gate_exps.weight");
+    if file.tensor(&stacked).is_some() {
+        let gate = append_gguf_tensor(file, &stacked, parts, off)?;
+        let up = append_gguf_tensor(
+            file,
+            &format!("blk.{layer}.ffn_up_exps.weight"),
+            parts,
+            off,
+        )?;
+        let down = append_gguf_tensor(
+            file,
+            &format!("blk.{layer}.ffn_down_exps.weight"),
+            parts,
+            off,
+        )?;
+        let gates = split_packed_experts(gate, n_experts, "ffn_gate_exps")?;
+        let ups = split_packed_experts(up, n_experts, "ffn_up_exps")?;
+        let downs = split_packed_experts(down, n_experts, "ffn_down_exps")?;
+        return Ok((0..n_experts)
+            .map(|e| [gates[e], ups[e], downs[e]])
+            .collect());
+    }
+    let mut out = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        out.push([
+            append_gguf_tensor(
+                file,
+                &format!("blk.{layer}.ffn_gate.{e}.weight"),
+                parts,
+                off,
+            )?,
+            append_gguf_tensor(file, &format!("blk.{layer}.ffn_up.{e}.weight"), parts, off)?,
+            append_gguf_tensor(
+                file,
+                &format!("blk.{layer}.ffn_down.{e}.weight"),
+                parts,
+                off,
+            )?,
+        ]);
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone)]
 pub struct LayerWeights {
     pub attn_norm: Vec<f32>,
@@ -1045,6 +1267,7 @@ pub struct TinyModel {
     pub name: String,
     pub working_set: Option<Arc<WeightWorkingSet>>,
     pub expert_lru: Option<Arc<ExpertLru>>,
+    pub expert_host: Option<Arc<HostExpertPool>>,
 }
 
 impl TinyModel {
@@ -1103,11 +1326,57 @@ impl TinyModel {
             config: cfg,
             working_set: None,
             expert_lru: None,
+            expert_host: None,
         }
     }
 
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
+    }
+
+    fn expert_slot_bytes(&self) -> usize {
+        if let Some(pool) = &self.expert_host {
+            return pool.expert_bytes();
+        }
+        self.layers
+            .iter()
+            .find_map(|l| l.experts.first())
+            .map(|e| e.bytes())
+            .unwrap_or(0)
+    }
+
+    fn host_expert(&self, layer_idx: usize, expert: usize) -> Result<LayerFfn, AllpacaError> {
+        let id = ExpertId {
+            layer: layer_idx as u32,
+            expert: expert as u32,
+        };
+        if let Some(pool) = &self.expert_host {
+            return pool.get(id);
+        }
+        self.layers
+            .get(layer_idx)
+            .and_then(|l| l.experts.get(expert))
+            .cloned()
+            .ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "missing expert {expert} on layer {layer_idx}"
+                )))
+            })
+    }
+
+    fn host_experts_layer(&self, layer_idx: usize) -> Result<Vec<LayerFfn>, AllpacaError> {
+        let n_exp = self.config.n_experts;
+        if let Some(pool) = &self.expert_host {
+            return pool.get_layer(layer_idx as u32, n_exp);
+        }
+        self.layers
+            .get(layer_idx)
+            .map(|l| l.experts.clone())
+            .ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "MoE missing host layer {layer_idx}"
+                )))
+            })
     }
 
     fn ffn<'a>(
@@ -1244,31 +1513,24 @@ impl TinyModel {
             let plan = lru.plan(&ids);
             lru.note_plan(&plan);
             for id in &plan.fill {
-                let host = layer.experts.get(id.expert as usize).ok_or_else(|| {
-                    AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                        "missing expert {}",
-                        id.expert
-                    )))
-                })?;
-                lru.admit(*id, host)?;
+                let host = self.host_expert(layer_idx, id.expert as usize)?;
+                lru.admit(*id, &host)?;
             }
         }
         let mut acc = vec![0.0f32; dim];
         let mut scratch_h = vec![0.0f32; dim];
         for &(e, w) in &routed {
-            let host = layer.experts.get(e).ok_or_else(|| {
-                AllpacaError::Fatal(FatalError::ModelLoad(format!("missing expert {e}")))
-            })?;
+            let host = self.host_expert(layer_idx, e)?;
             let ffn = if let Some(lru) = &self.expert_lru {
                 lru.materialize(
                     ExpertId {
                         layer: layer_idx as u32,
                         expert: e as u32,
                     },
-                    host,
+                    &host,
                 )?
             } else {
-                host.clone()
+                host
             };
             expert_mlp(x_norm, &ffn, cfg.ff_dim, dim, &mut scratch_h)?;
             for i in 0..dim {
@@ -1286,15 +1548,12 @@ impl TinyModel {
         if n_exp == 0 || !lru.holds_layers(n_exp, 1) {
             return Ok(());
         }
-        let layer = self.layers.get(layer_idx).ok_or_else(|| {
-            AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "MoE prefetch missing layer {layer_idx}"
-            )))
-        })?;
-        lru.admit_layer(layer_idx as u32, &layer.experts)?;
+        let experts = self.host_experts_layer(layer_idx)?;
+        lru.admit_layer(layer_idx as u32, &experts)?;
         if lru.holds_layers(n_exp, 2) {
-            if let Some(next) = self.layers.get(layer_idx + 1) {
-                lru.admit_layer((layer_idx + 1) as u32, &next.experts)?;
+            if layer_idx + 1 < self.layers.len() {
+                let next = self.host_experts_layer(layer_idx + 1)?;
+                lru.admit_layer((layer_idx + 1) as u32, &next)?;
             }
         }
         Ok(())
@@ -1314,12 +1573,8 @@ impl TinyModel {
             return Ok(());
         }
         let bind_layer = |idx: usize| -> Result<(), AllpacaError> {
-            let layer = self.layers.get(idx).ok_or_else(|| {
-                AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                    "MoE slot warm missing layer {idx}"
-                )))
-            })?;
-            for (e, host) in layer.experts.iter().enumerate() {
+            let experts = self.host_experts_layer(idx)?;
+            for (e, host) in experts.iter().enumerate() {
                 let _bound = resident.bind_expert(
                     ExpertId {
                         layer: idx as u32,
@@ -1438,13 +1693,8 @@ impl TinyModel {
             let plan = lru.plan(&ids);
             lru.note_plan(&plan);
             for id in &plan.fill {
-                let host = host_layer.experts.get(id.expert as usize).ok_or_else(|| {
-                    AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                        "missing expert {}",
-                        id.expert
-                    )))
-                })?;
-                lru.admit(*id, host)?;
+                let host = self.host_expert(layer_idx, id.expert as usize)?;
+                lru.admit(*id, &host)?;
             }
             plan
         } else {
@@ -1461,14 +1711,12 @@ impl TinyModel {
                 layer: layer_idx as u32,
                 expert: e as u32,
             };
-            let host = host_layer.experts.get(e).ok_or_else(|| {
-                AllpacaError::Fatal(FatalError::ModelLoad(format!("missing expert {e}")))
-            })?;
+            let host = self.host_expert(layer_idx, e)?;
             if plan.cpu.iter().any(|&c| c == id) {
                 let ffn = if let Some(lru) = &self.expert_lru {
-                    lru.materialize(id, host)?
+                    lru.materialize(id, &host)?
                 } else {
-                    host.clone()
+                    host
                 };
                 expert_mlp(&x_norm, &ffn, cfg.ff_dim, dim, &mut scratch)?;
                 for v in &mut scratch {
@@ -1479,7 +1727,7 @@ impl TinyModel {
                 continue;
             }
             {
-                let expert = resident.bind_expert(id, host, Some(metrics))?;
+                let expert = resident.bind_expert(id, &host, Some(metrics))?;
                 self.device_expert_gemm(
                     hip,
                     resident,
@@ -1511,15 +1759,26 @@ impl TinyModel {
                 "attn_v.weight",
                 "attn_output.weight",
                 "ffn_norm.weight",
-                "ffn_gate.weight",
-                "ffn_up.weight",
-                "ffn_down.weight",
             ] {
-                let name = format!("blk.{i}.{suffix}");
-                if file.tensor(&name).is_none() {
-                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                        "missing tensor {name}"
-                    ))));
+                require_gguf_tensor(file, &format!("blk.{i}.{suffix}"))?;
+            }
+            if cfg.n_experts > 0 {
+                if file.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some() {
+                    require_gguf_tensor(file, &format!("blk.{i}.ffn_gate_inp.weight"))?;
+                    require_gguf_tensor(file, &format!("blk.{i}.ffn_up_exps.weight"))?;
+                    require_gguf_tensor(file, &format!("blk.{i}.ffn_down_exps.weight"))?;
+                } else {
+                    require_gguf_tensor(file, &format!("blk.{i}.ffn_gate_inp.weight"))
+                        .or_else(|_| require_gguf_tensor(file, &format!("blk.{i}.ffn_router.weight")))?;
+                    for e in 0..cfg.n_experts {
+                        require_gguf_tensor(file, &format!("blk.{i}.ffn_gate.{e}.weight"))?;
+                        require_gguf_tensor(file, &format!("blk.{i}.ffn_up.{e}.weight"))?;
+                        require_gguf_tensor(file, &format!("blk.{i}.ffn_down.{e}.weight"))?;
+                    }
+                }
+            } else {
+                for suffix in ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"] {
+                    require_gguf_tensor(file, &format!("blk.{i}.{suffix}"))?;
                 }
             }
         }
@@ -1533,13 +1792,25 @@ impl TinyModel {
                 "missing tensor output_norm.weight".into(),
             )));
         }
-        let host_bytes = estimated_gguf_f32_bytes(file, cfg.n_layers);
+        let host_bytes = estimated_gguf_f32_bytes(file, &cfg);
         if host_bytes > HOST_F32_LIMIT {
             return Ok(Self::skeleton(cfg, name));
         }
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
+            let (w_gate, w_up, w_down, w_router, experts) = if cfg.n_experts > 0 {
+                let (w_router, experts) = load_gguf_moe_layer(file, i, cfg.n_experts)?;
+                (Vec::new(), Vec::new(), Vec::new(), w_router, experts)
+            } else {
+                (
+                    file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
+                    file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
+                    file.tensor_f32(&format!("blk.{i}.ffn_down.weight"))?,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
             layers.push(LayerWeights {
                 attn_norm: file.tensor_f32(&format!("blk.{i}.attn_norm.weight"))?,
                 wq: file.tensor_f32(&format!("blk.{i}.attn_q.weight"))?,
@@ -1547,11 +1818,11 @@ impl TinyModel {
                 wv: file.tensor_f32(&format!("blk.{i}.attn_v.weight"))?,
                 wo: file.tensor_f32(&format!("blk.{i}.attn_output.weight"))?,
                 ffn_norm: file.tensor_f32(&format!("blk.{i}.ffn_norm.weight"))?,
-                w_gate: file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
-                w_up: file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
-                w_down: file.tensor_f32(&format!("blk.{i}.ffn_down.weight"))?,
-                w_router: Vec::new(),
-                experts: Vec::new(),
+                w_gate,
+                w_up,
+                w_down,
+                w_router,
+                experts,
             });
         }
         let norm = file.tensor_f32("output_norm.weight")?;
@@ -1568,6 +1839,7 @@ impl TinyModel {
             name,
             working_set: None,
             expert_lru: None,
+            expert_host: None,
         })
     }
 
@@ -1581,6 +1853,7 @@ impl TinyModel {
             config: cfg,
             working_set: None,
             expert_lru: None,
+            expert_host: None,
         }
     }
 
@@ -1636,6 +1909,7 @@ impl TinyModel {
             name,
             working_set: None,
             expert_lru: None,
+            expert_host: None,
         })
     }
 
@@ -1686,6 +1960,7 @@ impl TinyModel {
             name: "onnx".into(),
             working_set: None,
             expert_lru: None,
+            expert_host: None,
         })
     }
 

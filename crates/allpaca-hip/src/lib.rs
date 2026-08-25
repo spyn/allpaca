@@ -388,6 +388,12 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_scale_f32(
+            x: *mut f32,
+            n: i32,
+            scale: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_residual_rmsnorm(
             x: *mut f32,
             residual: *const f32,
@@ -665,6 +671,32 @@ pub fn benchmark_transfer(src: i32, dst: i32, bytes: u64) -> Result<BandwidthBen
         Err(AllpacaError::Degraded(DegradedError::HostStagingFallback(
             "HIP feature disabled or SDK missing; P2P not measured".into(),
         )))
+    }
+}
+
+/// Expert-slot H2D probe. Returns bytes/s, or 0 when HIP is stubbed.
+pub fn benchmark_h2d_bytes_per_sec(device: i32, bytes: usize) -> Result<f64, AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        use std::time::Instant;
+        if bytes == 0 {
+            return Ok(0.0);
+        }
+        let blob = DeviceWeights::alloc(device, bytes)?;
+        let src = vec![1u8; bytes];
+        blob.copy_h2d(0, &src)?;
+        let iters = 4usize;
+        let t = Instant::now();
+        for _ in 0..iters {
+            blob.copy_h2d(0, &src)?;
+        }
+        let secs = t.elapsed().as_secs_f64().max(1e-9);
+        Ok((bytes as f64 * iters as f64) / secs)
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (device, bytes);
+        Ok(0.0)
     }
 }
 
@@ -2938,12 +2970,23 @@ impl HipWorkspace {
         if n == 0 || ptr.is_null() {
             return Ok(());
         }
-        let mut tmp = vec![0.0f32; n];
-        self.copy_d2h_f32(ptr, &mut tmp)?;
-        for v in &mut tmp {
-            *v *= scale;
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_scale_f32(ptr, n as i32, scale, std::ptr::null_mut())
+                };
+                status(rc, "scale_f32")
+            })
         }
-        self.copy_h2d_f32(ptr, &tmp)
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = scale;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP scale_f32 unavailable".into(),
+            )))
+        }
     }
 
     pub fn residual_add(&self, x: *mut f32, residual: *const f32, n: i32) -> Result<(), AllpacaError> {
