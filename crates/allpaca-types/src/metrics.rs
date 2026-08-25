@@ -127,4 +127,10 @@ pub struct StatsSnapshot {
     /// True when packed expert reads used Direct I/O rather than the page cache.
     #[serde(default)]
     pub nvme_direct: bool,
+    /// Semantic-anchor restores (recurrent state, not KV LRU).
+    #[serde(default)]
+    pub anchor_hits: u64,
+    /// Prompt tokens skipped because a surviving anchor restored the prefix.
+    #[serde(default)]
+    pub anchor_skip_tokens: u64,
 }

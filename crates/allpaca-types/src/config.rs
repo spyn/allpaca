@@ -15,6 +15,7 @@ pub struct Config {
     pub prefill: PrefillSection,
     pub kv: KvSection,
     pub weights: WeightsSection,
+    pub anchors: AnchorsSection,
     pub sampling: SamplingSection,
     pub structured_output: StructuredOutputSection,
     pub model: ModelSection,
@@ -36,6 +37,7 @@ impl Config {
             prefill: PrefillSection::default(),
             kv: KvSection::default(),
             weights: WeightsSection::default(),
+            anchors: AnchorsSection::default(),
             sampling: SamplingSection::default(),
             structured_output: StructuredOutputSection::default(),
             model: ModelSection::default(),
@@ -298,6 +300,25 @@ impl Default for WeightsSection {
             ring_slots: 2,
             miss_policy: MissPolicy::Qstar,
             host_bytes: 0,
+        }
+    }
+}
+
+/// Recurrent-state checkpoints at special-token boundaries. Independent of KV.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnchorsSection {
+    /// LRU slots for recurrent snapshots. 0 = disabled.
+    pub slots: usize,
+    /// Token ids treated as thinking / tool / turn boundaries.
+    pub token_ids: Vec<u32>,
+}
+
+impl Default for AnchorsSection {
+    fn default() -> Self {
+        Self {
+            slots: 0,
+            token_ids: Vec::new(),
         }
     }
 }

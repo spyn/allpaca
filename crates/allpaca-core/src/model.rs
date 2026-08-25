@@ -8,6 +8,7 @@ use allpaca_types::{AllpacaError, FatalError};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use crate::anchors::RecurrentState;
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
 use crate::packed::HostExpertPool;
@@ -27,6 +28,8 @@ pub struct ModelConfig {
     pub n_active: usize,
     pub eps: f32,
     pub rope_theta: f32,
+    /// Synthetic recurrent mix (semantic-anchor tracer). Not a KDA/FLA kernel.
+    pub recurrent: bool,
 }
 
 impl ModelConfig {
@@ -42,6 +45,7 @@ impl ModelConfig {
             n_active: 0,
             eps: 1e-5,
             rope_theta: 10_000.0,
+            recurrent: false,
         }
     }
 
@@ -49,6 +53,13 @@ impl ModelConfig {
         Self {
             n_experts: 4,
             n_active: 2,
+            ..Self::tiny()
+        }
+    }
+
+    pub fn tiny_hybrid() -> Self {
+        Self {
+            recurrent: true,
             ..Self::tiny()
         }
     }
@@ -116,6 +127,7 @@ impl ModelConfig {
                 .unwrap_or(0) as usize,
             eps,
             rope_theta,
+            recurrent: false,
         })
     }
 }
@@ -1334,7 +1346,7 @@ impl TinyModel {
         !self.embed.is_empty()
     }
 
-    fn expert_slot_bytes(&self) -> usize {
+    pub(crate) fn expert_slot_bytes(&self) -> usize {
         if let Some(pool) = &self.expert_host {
             return pool.expert_bytes();
         }
@@ -1872,6 +1884,7 @@ impl TinyModel {
             n_active: 0,
             eps: hf.rms_norm_eps,
             rope_theta: hf.rope_theta,
+            recurrent: false,
         };
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -1928,6 +1941,7 @@ impl TinyModel {
             n_active: 0,
             eps: hf.rms_norm_eps,
             rope_theta: hf.rope_theta,
+            recurrent: false,
         };
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -2005,6 +2019,7 @@ impl TinyModel {
         hip: Option<&HipWorkspace>,
         resident: Option<&ResidentModel>,
         prefill: bool,
+        mut recurrent: Option<&mut RecurrentState>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -2015,16 +2030,18 @@ impl TinyModel {
                 "token {token} out of vocab"
             ))));
         }
-        if let (Some(hip), Some(resident)) = (hip, resident) {
-            match self.forward_token_device(
-                token, pos, page_ids, kv, metrics, logits, hip, resident, prefill,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if !self.host_weights_ready() {
-                        return Err(e);
+        if recurrent.is_none() {
+            if let (Some(hip), Some(resident)) = (hip, resident) {
+                match self.forward_token_device(
+                    token, pos, page_ids, kv, metrics, logits, hip, resident, prefill,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if !self.host_weights_ready() {
+                            return Err(e);
+                        }
+                        tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                     }
-                    tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                 }
             }
         }
@@ -2098,6 +2115,9 @@ impl TinyModel {
                 Some(metrics),
                 prefill,
             )?;
+            if let Some(state) = recurrent.as_deref_mut() {
+                state.mix_layer(layer_idx, &mut x);
+            }
         }
 
         rmsnorm_dispatch(
@@ -2152,6 +2172,7 @@ impl TinyModel {
         resident: Option<&ResidentModel>,
         write_logits: bool,
         mut row_logits: Option<&mut [f32]>,
+        mut recurrent: Option<&mut RecurrentState>,
     ) -> Result<(), AllpacaError> {
         if tokens.is_empty() {
             return Ok(());
@@ -2167,6 +2188,7 @@ impl TinyModel {
                 hip,
                 resident,
                 false,
+                recurrent,
             )?;
             if let Some(rows) = row_logits {
                 let vocab = self.config.vocab_size;
@@ -2183,7 +2205,7 @@ impl TinyModel {
                 ))));
             }
         }
-        if self.config.n_experts == 0 {
+        if recurrent.is_none() && self.config.n_experts == 0 {
             if let (Some(hip), Some(resident)) = (hip, resident) {
             match self.forward_tokens_device(
                 tokens,
@@ -2224,6 +2246,7 @@ impl TinyModel {
                 hip,
                 resident,
                 true,
+                recurrent.as_deref_mut(),
             )?;
             if let Some(rows) = row_logits.as_mut() {
                 let off = i * vocab;
@@ -3670,7 +3693,7 @@ fn attention_dispatch(
     attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)
 }
 
-fn gather_kv(
+pub(crate) fn gather_kv(
     kv: &KvTierManager,
     pages: &[u64],
     n_kv_heads: usize,

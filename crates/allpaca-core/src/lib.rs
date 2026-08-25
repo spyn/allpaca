@@ -1,5 +1,6 @@
 //! Allpaca Engine: scheduling, memory tiers, draft providers, and decode.
 
+mod anchors;
 mod constraint;
 mod device_manager;
 mod draft;

@@ -740,6 +740,24 @@ impl KvTierManager {
         }
     }
 
+    /// Shrink or grow the VRAM KV budget. Excess hot pages spill to DRAM.
+    /// Does not touch the weight host pool.
+    pub fn set_vram_bytes(
+        &mut self,
+        vram_bytes: usize,
+        metrics: &Metrics,
+    ) -> Result<(), AllpacaError> {
+        self.vram_capacity = (vram_bytes / 4).max(1);
+        self.evict_if_needed(0, metrics)?;
+        while self.vram_live_floats() > self.vram_capacity {
+            let Some(id) = self.lowest_vram_page() else {
+                break;
+            };
+            self.migrate_to_dram(id, metrics)?;
+        }
+        Ok(())
+    }
+
     fn evict_if_needed(&mut self, needed: usize, metrics: &Metrics) -> Result<(), AllpacaError> {
         let hot_cap = ((self.vram_capacity as f32) * self.hot_fraction).max(1.0) as usize;
         while self.vram_live_floats() + needed > hot_cap {
@@ -850,6 +868,26 @@ mod tests {
         let (vram, dram) = kv.counts();
         assert!(dram > 0, "expected DRAM spill, vram={vram} dram={dram}");
         assert!(metrics.page_migrations.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn shrinking_vram_budget_spills_hot_pages_to_dram() {
+        let metrics = Metrics::default();
+        let mut kv = KvTierManager::new(4096, 16 * 1024, 1.0);
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(kv.alloc_page(0, i, 4, 1, 4, &metrics).unwrap());
+        }
+        let (vram_before, dram_before) = kv.counts();
+        assert!(vram_before >= 4, "pages must start in VRAM; vram={vram_before}");
+        assert_eq!(dram_before, 0);
+        kv.set_vram_bytes(128, &metrics).unwrap();
+        let (vram_after, dram_after) = kv.counts();
+        assert!(
+            dram_after > 0,
+            "elastic shrink must spill KV to DRAM; vram={vram_after} dram={dram_after}"
+        );
+        assert!(vram_after < vram_before);
     }
 
     /// Packed device K/V rows written as page runs must match per-slot HIP copies.

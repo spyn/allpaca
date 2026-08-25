@@ -15,6 +15,7 @@ use allpaca_types::{
 use futures::Stream;
 use rand::rngs::StdRng;
 
+use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
@@ -51,6 +52,7 @@ struct ActiveRequest {
     last_token_at: Instant,
     first_emitted: bool,
     finished: bool,
+    recurrent: Option<RecurrentState>,
 }
 
 struct EngineInner {
@@ -69,6 +71,7 @@ struct EngineInner {
     draft_resident: Option<Arc<ResidentModel>>,
     draft_kv: DenseKv,
     draft_ahead: Option<DraftAhead>,
+    anchors: AnchorCache,
 }
 
 struct DraftAhead {
@@ -180,6 +183,7 @@ impl Engine {
             draft_resident: None,
             draft_kv: DenseKv::default(),
             draft_ahead: None,
+            anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -245,6 +249,13 @@ impl Engine {
                         .expert_cpu_runs
                         .store(lru.cpu_runs(), std::sync::atomic::Ordering::Relaxed);
                 }
+                self.metrics
+                    .anchor_hits
+                    .store(g.anchors.hits(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics.anchor_skip_tokens.store(
+                    g.anchors.skip_tokens(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 (
                 g.target
                     .as_ref()
@@ -794,6 +805,22 @@ impl Engine {
             tokens.len() + params.max_tokens,
             &self.metrics,
         )?;
+        let mut recurrent = if target.config.recurrent {
+            Some(RecurrentState::zeros(
+                target.config.n_layers,
+                target.config.dim,
+            ))
+        } else {
+            None
+        };
+        let mut prefill_pos = 0;
+        if let Some((state, rows, n)) = inner.anchors.lookup(&tokens) {
+            restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
+            if let Some(dst) = recurrent.as_mut() {
+                *dst = state;
+            }
+            prefill_pos = n;
+        }
         let rng = rng_from_params(&params, self.config.engine.determinism_seed);
         let id = inner.next_request_id;
         inner.next_request_id += 1;
@@ -805,7 +832,7 @@ impl Engine {
             ActiveRequest {
                 id,
                 prompt_len,
-                prefill_pos: 0,
+                prefill_pos,
                 tokens,
                 generated: 0,
                 params,
@@ -818,6 +845,7 @@ impl Engine {
                 last_token_at: Instant::now(),
                 first_emitted: false,
                 finished: false,
+                recurrent,
             },
         );
         self.metrics
@@ -1064,18 +1092,54 @@ impl Engine {
         };
         let end = start + toks.len();
         let write_logits = end >= total;
-        target.forward_tokens(
-            &toks,
-            start,
-            &pages,
-            &mut inner.kv,
-            &self.metrics,
-            &mut logits,
-            self.hip.as_deref(),
-            resident.as_deref(),
-            write_logits,
-            None,
-        )?;
+        let mut recurrent = {
+            let active = request_mut(inner, id)?;
+            std::mem::take(&mut active.recurrent)
+        };
+        if inner.anchors.enabled() {
+            for (i, tok) in toks.iter().enumerate() {
+                let pos = start + i;
+                target.forward_token(
+                    *tok,
+                    pos,
+                    &pages,
+                    &mut inner.kv,
+                    &self.metrics,
+                    &mut logits,
+                    self.hip.as_deref(),
+                    resident.as_deref(),
+                    true,
+                    recurrent.as_mut(),
+                )?;
+                if inner.anchors.is_anchor(*tok) {
+                    if let Some(state) = recurrent.as_ref() {
+                        let prefix = request(inner, id)?.tokens[..=pos].to_vec();
+                        let pages = request(inner, id)?.pages.clone();
+                        inner.anchors.capture(
+                            &prefix,
+                            state,
+                            &inner.kv,
+                            &pages,
+                            &target.config,
+                        )?;
+                    }
+                }
+            }
+        } else {
+            target.forward_tokens(
+                &toks,
+                start,
+                &pages,
+                &mut inner.kv,
+                &self.metrics,
+                &mut logits,
+                self.hip.as_deref(),
+                resident.as_deref(),
+                write_logits,
+                None,
+                recurrent.as_mut(),
+            )?;
+        }
         if let Some(hip) = self.hip.as_deref() {
             hip.wait_logits_d2h(&mut logits)?;
         }
@@ -1083,6 +1147,7 @@ impl Engine {
             let active = request_mut(inner, id)?;
             active.prefill_pos = end;
             active.pending_logits = logits;
+            active.recurrent = recurrent;
         }
         self.metrics
             .prefill_chunks
@@ -1098,6 +1163,56 @@ impl Engine {
         self.inner.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("engine mutex poisoned".into()))
         })
+    }
+
+    /// Rebuild expert LRU slots vs KV VRAM at a scheduler safe point.
+    /// Host (or NVMe) pool is not reloaded. GPU residency is a speed dial.
+    pub fn rebalance_vram(
+        &self,
+        cache_bytes: usize,
+        vram_bytes: usize,
+    ) -> Result<(), AllpacaError> {
+        {
+            let mut inner = self.lock()?;
+            if let Some(model) = inner.target.as_mut() {
+                let model = Arc::get_mut(model).ok_or_else(|| {
+                    AllpacaError::Transient(TransientError::RequestBusy)
+                })?;
+                self.rebuild_expert_slots(model, cache_bytes);
+            }
+            inner.kv.set_vram_bytes(vram_bytes, &self.metrics)?;
+        }
+        if self.hip.is_some() {
+            self.upload_resident_weights()?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_expert_slots(&self, model: &mut TinyModel, cache_bytes: usize) {
+        if model.config.n_experts == 0 {
+            return;
+        }
+        let expert_bytes = model.expert_slot_bytes();
+        let n_slots = expert_lru_slots(expert_bytes, cache_bytes);
+        ExpertLru::record_slots(&self.metrics, n_slots);
+        if n_slots == 0 {
+            model.expert_lru = None;
+            return;
+        }
+        let b_pcie = self
+            .metrics
+            .expert_pcie_bps
+            .load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let b_host = self
+            .metrics
+            .expert_host_bps
+            .load(std::sync::atomic::Ordering::Relaxed) as f64;
+        model.expert_lru = Some(ExpertLru::with_bandwidth(
+            n_slots,
+            self.config.weights.miss_policy,
+            b_pcie,
+            b_host,
+        ));
     }
 }
 
@@ -1541,6 +1656,7 @@ fn packed_linear_verify_span(
     let mut row_logits = vec![0.0f32; span.len() * vocab];
     let pages = request(inner, id)?.pages.clone();
     let resident = inner.target_resident.clone();
+    let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     target.forward_tokens(
         &span,
         start_pos,
@@ -1552,11 +1668,13 @@ fn packed_linear_verify_span(
         resident.as_deref(),
         true,
         Some(&mut row_logits),
+        recurrent.as_mut(),
     )?;
     if let Some(hip) = hip {
         hip.wait_logits_d2h(&mut row_logits)?;
     }
     request_mut(inner, id)?.pending_logits = last_logits;
+    request_mut(inner, id)?.recurrent = recurrent;
     metrics
         .linear_packed_verifies
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1739,6 +1857,7 @@ fn append_and_forward(
     let mut logits = std::mem::take(&mut request_mut(inner, id)?.pending_logits);
     let pages = request(inner, id)?.pages.clone();
     let resident = inner.target_resident.clone();
+    let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     target.forward_token(
         token,
         pos,
@@ -1749,8 +1868,10 @@ fn append_and_forward(
         hip,
         resident.as_deref(),
         false,
+        recurrent.as_mut(),
     )?;
     request_mut(inner, id)?.pending_logits = logits;
+    request_mut(inner, id)?.recurrent = recurrent;
     Ok(())
 }
 
@@ -1943,6 +2064,112 @@ mod tests {
         assert!(
             stats.nvme_direct,
             "packed expert reads must use FILE_FLAG_NO_BUFFERING, not the page cache; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn elastic_vram_rebalance_keeps_tokens_and_host_pool() {
+        let mut resident_cfg = test_config();
+        resident_cfg.model.synthetic = false;
+        resident_cfg.speculative.enabled = false;
+        let resident = Engine::new(resident_cfg).unwrap();
+        resident.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let full = resident.generate("hello", params.clone()).unwrap();
+
+        let expert_bytes = 64 * 32 * 3 * 4;
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.host_bytes = 64;
+        cfg.weights.cache_bytes = expert_bytes * 4;
+        cfg.kv.vram_bytes = 8 * 1024;
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let first = engine.generate("hello", params.clone()).unwrap();
+        assert_eq!(first.token_ids, full.token_ids);
+        let before = engine.stats();
+        assert!(
+            before.expert_slots >= 4,
+            "wide cache_bytes must grant several expert slots; stats={before:?}"
+        );
+        assert!(
+            before.nvme_reads > 0,
+            "host_bytes overflow must page from NVMe; stats={before:?}"
+        );
+        let host_reads = before.nvme_reads;
+
+        engine
+            .rebalance_vram(64, 1024)
+            .expect("safe-point rebalance must succeed with no in-flight forward");
+        let mid = engine.stats();
+        assert_eq!(
+            mid.nvme_reads, host_reads,
+            "rebalance must not reload the host/NVMe pool; stats={mid:?}"
+        );
+        assert_eq!(
+            mid.expert_slots, 1,
+            "shrinking cache_bytes must rebuild a one-slot LRU; stats={mid:?}"
+        );
+
+        let second = engine.generate("hello", params).unwrap();
+        assert_eq!(
+            second.token_ids, full.token_ids,
+            "elastic VRAM is a speed dial: greedy tokens must match"
+        );
+    }
+
+    #[test]
+    fn semantic_anchor_skips_prefix_and_matches_full_prefill() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let mut full_cfg = test_config();
+        full_cfg.model.synthetic = false;
+        full_cfg.speculative.enabled = false;
+        let full_engine = Engine::new(full_cfg).unwrap();
+        full_engine
+            .load_synthetic(ModelConfig::tiny_hybrid())
+            .unwrap();
+        let full = full_engine
+            .generate("hello true", params.clone())
+            .unwrap();
+
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.anchors.slots = 4;
+        cfg.anchors.token_ids = vec![3];
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(ModelConfig::tiny_hybrid()).unwrap();
+        let _warm = engine.generate("hello world", params.clone()).unwrap();
+        let after_warm = engine.stats();
+        assert_eq!(
+            after_warm.anchor_hits, 0,
+            "first prompt has no prior checkpoint; stats={after_warm:?}"
+        );
+
+        let part = engine.generate("hello true", params).unwrap();
+        assert_eq!(
+            part.token_ids, full.token_ids,
+            "restoring the deepest surviving anchor must match a full prefill"
+        );
+        let stats = engine.stats();
+        assert!(
+            stats.anchor_hits >= 1,
+            "edited prompt must hit the hello-boundary checkpoint; stats={stats:?}"
+        );
+        assert!(
+            stats.anchor_skip_tokens >= 2,
+            "bos+hello must be skipped; stats={stats:?}"
         );
     }
 

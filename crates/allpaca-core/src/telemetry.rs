@@ -59,6 +59,8 @@ pub struct Metrics {
     pub nvme_reads: AtomicU64,
     pub nvme_bytes: AtomicU64,
     pub nvme_direct: AtomicU64,
+    pub anchor_hits: AtomicU64,
+    pub anchor_skip_tokens: AtomicU64,
 }
 
 impl Metrics {
@@ -165,6 +167,8 @@ impl Metrics {
             nvme_reads: self.nvme_reads.load(Ordering::Relaxed),
             nvme_bytes: self.nvme_bytes.load(Ordering::Relaxed),
             nvme_direct: self.nvme_direct.load(Ordering::Relaxed) != 0,
+            anchor_hits: self.anchor_hits.load(Ordering::Relaxed),
+            anchor_skip_tokens: self.anchor_skip_tokens.load(Ordering::Relaxed),
         }
     }
 
