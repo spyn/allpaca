@@ -44,3 +44,4 @@ futures = "0.3"
 async-stream = "0.3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+llguidance = "1.8"

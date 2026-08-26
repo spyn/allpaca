@@ -38,9 +38,20 @@ pub struct ChatMessage {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct JsonSchemaSpec {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub schema: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ResponseFormat {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaSpec>,
+    #[serde(default)]
+    pub grammar: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,16 +132,28 @@ fn prompt_from_messages(messages: &[ChatMessage]) -> String {
 }
 
 fn params_from_request(req: &ChatCompletionRequest, config: &Config) -> GenerationParams {
+    let format = req.response_format.as_ref();
+    let json_mode = format
+        .map(|f| f.kind == "json_object")
+        .unwrap_or(config.structured_output.json_mode);
+    let json_schema = format.and_then(|f| {
+        if f.kind == "json_schema" {
+            f.json_schema
+                .as_ref()
+                .and_then(|spec| serde_json::to_string(&spec.schema).ok())
+        } else {
+            None
+        }
+    });
+    let grammar = format.and_then(|f| f.grammar.clone());
     GenerationParams {
         max_tokens: req.max_tokens.unwrap_or(32),
         temperature: req.temperature.unwrap_or(config.sampling.temperature),
         top_k: req.top_k.unwrap_or(config.sampling.top_k),
         top_p: req.top_p.unwrap_or(config.sampling.top_p),
-        json_mode: req
-            .response_format
-            .as_ref()
-            .map(|f| f.kind == "json_object")
-            .unwrap_or(config.structured_output.json_mode),
+        json_mode,
+        json_schema,
+        grammar,
         seed: req.seed.or(config.engine.determinism_seed),
         stop_token_ids: Vec::new(),
     }

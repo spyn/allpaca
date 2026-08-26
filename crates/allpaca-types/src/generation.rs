@@ -7,6 +7,12 @@ pub struct GenerationParams {
     pub top_k: usize,
     pub top_p: f32,
     pub json_mode: bool,
+    /// JSON Schema text compiled by llguidance. Takes precedence over `json_mode`.
+    #[serde(default)]
+    pub json_schema: Option<String>,
+    /// Lark grammar compiled by llguidance.
+    #[serde(default)]
+    pub grammar: Option<String>,
     pub seed: Option<u64>,
     pub stop_token_ids: Vec<u32>,
 }
@@ -19,6 +25,8 @@ impl Default for GenerationParams {
             top_k: 40,
             top_p: 0.95,
             json_mode: false,
+            json_schema: None,
+            grammar: None,
             seed: None,
             stop_token_ids: Vec::new(),
         }

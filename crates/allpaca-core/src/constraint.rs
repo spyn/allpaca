@@ -1,6 +1,7 @@
 use allpaca_types::TokenMask;
 
-/// Hardcoded JSON grammar (MVP). Full llguidance is post-MVP.
+/// Hardcoded JSON grammar for `json_mode` without a schema.
+/// Schema and Lark requests go through `grammar` / llguidance.
 #[derive(Debug, Clone)]
 pub struct JsonConstraint {
     vocab: Vec<String>,

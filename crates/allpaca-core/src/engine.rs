@@ -47,6 +47,7 @@ struct ActiveRequest {
     pending_logits: Vec<f32>,
     emit_queue: Vec<TokenEvent>,
     json_prefix: String,
+    grammar: Option<llguidance::Matcher>,
     rng: StdRng,
     started: Instant,
     last_token_at: Instant,
@@ -72,6 +73,7 @@ struct EngineInner {
     draft_kv: DenseKv,
     draft_ahead: Option<DraftAhead>,
     anchors: AnchorCache,
+    grammar_factory: Option<llguidance::ParserFactory>,
 }
 
 struct DraftAhead {
@@ -185,6 +187,7 @@ impl Engine {
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
+            grammar_factory: None,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -417,7 +420,7 @@ impl Engine {
             self.apply_expert_lru(&mut draft)?;
             inner.draft_model = Some(Arc::new(draft));
         }
-        inner.tokenizer = Some(tokenizer);
+        set_tokenizer(&mut inner, tokenizer);
         inner.model_id = "synthetic".into();
         drop(inner);
         self.upload_resident_weights()?;
@@ -556,7 +559,7 @@ impl Engine {
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
-        inner.tokenizer = Some(tokenizer);
+        set_tokenizer(&mut inner, tokenizer);
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
@@ -584,7 +587,7 @@ impl Engine {
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
-        inner.tokenizer = Some(tokenizer);
+        set_tokenizer(&mut inner, tokenizer);
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
@@ -605,7 +608,7 @@ impl Engine {
         let mut draft_file = None;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
-        inner.tokenizer = Some(EngineTokenizer::from_gguf(tok));
+        set_tokenizer(&mut inner, EngineTokenizer::from_gguf(tok));
         if let Some(draft_path) = &self.config.model.draft_path {
             match GgufFile::open(draft_path) {
                 Ok(f) => match TinyModel::from_gguf(&f) {
@@ -852,6 +855,28 @@ impl Engine {
             prefill_pos = n;
         }
         let rng = rng_from_params(&params, self.config.engine.determinism_seed);
+        let grammar = if self.config.structured_output.enabled
+            && inner.flags.json_constraints
+            && (params.json_schema.is_some() || params.grammar.is_some())
+        {
+            if inner.grammar_factory.is_none() {
+                let factory = {
+                    let tok = inner
+                        .tokenizer
+                        .as_ref()
+                        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+                    crate::grammar::factory_from_tokenizer(tok)?
+                };
+                inner.grammar_factory = Some(factory);
+            }
+            Some(crate::grammar::matcher_from_factory(
+                inner.grammar_factory.as_ref().unwrap(),
+                params.json_schema.as_deref(),
+                params.grammar.as_deref(),
+            )?)
+        } else {
+            None
+        };
         let id = inner.next_request_id;
         inner.next_request_id += 1;
         inner.draft_ahead = None;
@@ -870,6 +895,7 @@ impl Engine {
                 pending_logits: vec![0.0f32; vocab],
                 emit_queue: Vec::new(),
                 json_prefix: String::new(),
+                grammar,
                 rng,
                 started: Instant::now(),
                 last_token_at: Instant::now(),
@@ -926,24 +952,26 @@ impl Engine {
         }
 
         let json_constraints = inner.flags.json_constraints;
+        let structured = json_constraints && self.config.structured_output.enabled;
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation || inner.flags.draft_model_speculation);
-        let (json_mode, json_prefix, temperature, remaining, depth) = {
+        let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
             let depth = inner.scheduler.draft_depth.min(remaining.saturating_sub(1));
             (
-                active.params.json_mode
-                    && json_constraints
-                    && self.config.structured_output.enabled,
+                active.params.json_mode && structured && active.grammar.is_none(),
                 active.json_prefix.clone(),
                 active.params.temperature,
                 remaining,
                 depth,
+                active.grammar.is_some(),
             )
         };
 
-        let mask = if json_mode {
+        let mask = if has_grammar {
+            grammar_mask(&mut inner, id, &self.metrics)?
+        } else if json_mode {
             let vocab_tokens = inner
                 .tokenizer
                 .as_ref()
@@ -1047,6 +1075,16 @@ impl Engine {
             };
             let now = Instant::now();
             if let Some(active) = inner.active.get_mut(&id) {
+                if let Some(ref mut g) = active.grammar {
+                    if !g.is_stopped() {
+                        if let Err(e) = g.consume_token(tok) {
+                            tracing::warn!(token = tok, error = %e, "grammar consume_token failed");
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 if !is_special(&piece) {
                     active.json_prefix.push_str(&piece);
                 }
@@ -1340,6 +1378,47 @@ fn request_mut(inner: &mut EngineInner, id: u64) -> Result<&mut ActiveRequest, A
         .active
         .get_mut(&id)
         .ok_or(AllpacaError::Transient(TransientError::RequestBusy))
+}
+
+fn set_tokenizer(inner: &mut EngineInner, tokenizer: EngineTokenizer) {
+    inner.tokenizer = Some(tokenizer);
+    inner.grammar_factory = None;
+}
+
+fn grammar_mask(
+    inner: &mut EngineInner,
+    id: u64,
+    metrics: &Metrics,
+) -> Result<Option<allpaca_types::TokenMask>, AllpacaError> {
+    let vocab = inner
+        .tokenizer
+        .as_ref()
+        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
+        .vocab_size();
+    let active = request_mut(inner, id)?;
+    let Some(matcher) = active.grammar.as_mut() else {
+        return Ok(None);
+    };
+    match matcher.compute_mask_or_eos() {
+        Ok(vob) => {
+            let mut mask = crate::grammar::vob_to_mask(&vob, vocab);
+            if !mask.any() {
+                tracing::warn!("grammar constraint mask empty; allowing all tokens (degraded)");
+                metrics
+                    .degraded_events
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                mask = allpaca_types::TokenMask::allow_all(vocab);
+            }
+            Ok(Some(mask))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "grammar mask failed; allowing all tokens (degraded)");
+            metrics
+                .degraded_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(allpaca_types::TokenMask::allow_all(vocab)))
+        }
+    }
 }
 
 fn propose_drafts(
@@ -4495,6 +4574,61 @@ mod tests {
                 || prefix.starts_with("null")
                 || prefix.is_empty(),
             "JSON mode must start with a JSON value, got {prefix:?}"
+        );
+    }
+
+    #[test]
+    fn json_schema_emits_only_schema_valid_object() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let schema = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 16,
+                    temperature: 0.0,
+                    json_schema: Some(schema.into()),
+                    seed: Some(3),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.text.is_empty(), "schema generate must emit text");
+        let value: serde_json::Value =
+            serde_json::from_str(&out.text).unwrap_or_else(|e| panic!("schema output must parse as JSON: {e}; text={:?}", out.text));
+        let obj = value
+            .as_object()
+            .unwrap_or_else(|| panic!("schema output must be an object, got {value}"));
+        assert_eq!(obj.len(), 1, "additionalProperties:false, got {value}");
+        assert!(
+            obj.get("ok").is_some_and(|v| v.is_boolean()),
+            "required boolean field ok, got {value}"
+        );
+    }
+
+    #[test]
+    fn lark_grammar_emits_only_true_or_false() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    grammar: Some(r#"start: "true" | "false""#.into()),
+                    seed: Some(3),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        let text = out.text.trim();
+        assert!(
+            text == "true" || text == "false",
+            "lark grammar must force true|false, got {text:?}"
         );
     }
 }

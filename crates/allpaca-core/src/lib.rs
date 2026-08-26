@@ -2,6 +2,7 @@
 
 mod anchors;
 mod constraint;
+mod grammar;
 mod device_manager;
 mod draft;
 mod engine;
