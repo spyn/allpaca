@@ -92,6 +92,7 @@ impl Metrics {
         draft_device: i32,
         model_id: String,
         backend: String,
+        draft_depth: u64,
     ) -> StatsSnapshot {
         let proposed = self.draft_proposed.load(Ordering::Relaxed);
         let accepted = self.draft_accepted.load(Ordering::Relaxed);
@@ -191,6 +192,7 @@ impl Metrics {
             poll_decode_picks: self.poll_decode_picks.load(Ordering::Relaxed),
             poll_wait_ms_ema: self.poll_wait_ms_ema_x100.load(Ordering::Relaxed) as f64 / 100.0,
             async_mask_hits: self.async_mask_hits.load(Ordering::Relaxed),
+            draft_depth,
         }
     }
 
