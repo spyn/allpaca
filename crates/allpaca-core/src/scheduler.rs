@@ -2,6 +2,7 @@ use allpaca_types::{
     DeviceInfo, DeviceKind, FeatureFlags, Placement, PipelineMode, SpeculativeSection, TaskCost,
     KvTierKind,
 };
+use std::time::Instant;
 
 /// Heuristic scheduler. Modes only seed [`FeatureFlags`]; flags stay composable.
 pub struct Scheduler {
@@ -76,6 +77,37 @@ impl Scheduler {
             warm_kv: KvTierKind::Dram,
         }
     }
+
+    /// Continuous batching: among runnable Requests, pick the longest-waiting.
+    /// Ties break round-robin after `after_id`, then lowest id.
+    pub fn pick_runnable(
+        &self,
+        candidates: &[(u64, Instant)],
+        after_id: Option<u64>,
+    ) -> Option<u64> {
+        pick_runnable(candidates, after_id)
+    }
+}
+
+/// Among runnable Requests, pick the one waiting longest since last progress.
+/// Ties break by round-robin after `after_id` (exclusive), then by lowest id.
+pub fn pick_runnable(candidates: &[(u64, Instant)], after_id: Option<u64>) -> Option<u64> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let min_t = candidates.iter().map(|(_, t)| *t).min()?;
+    let mut tied: Vec<u64> = candidates
+        .iter()
+        .filter(|(_, t)| *t == min_t)
+        .map(|(id, _)| *id)
+        .collect();
+    tied.sort_unstable();
+    if let Some(after) = after_id {
+        if let Some(&id) = tied.iter().find(|&&id| id > after) {
+            return Some(id);
+        }
+    }
+    tied.first().copied()
 }
 
 /// Acceptance-aware adaptive speculation (CODE_EXAMPLES example 6).
@@ -102,5 +134,19 @@ mod tests {
         assert_eq!(next_draft_depth(9, 10, 4, 2, 12), 6);
         assert_eq!(next_draft_depth(1, 10, 4, 2, 12), 2);
         assert_eq!(next_draft_depth(0, 0, 4, 2, 12), 2);
+    }
+
+    #[test]
+    fn pick_runnable_prefers_oldest_wait_then_round_robin() {
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(1);
+        let candidates = [(1u64, t0), (2u64, t0), (3u64, t1)];
+        assert_eq!(pick_runnable(&candidates, None), Some(1));
+        assert_eq!(pick_runnable(&candidates, Some(1)), Some(2));
+        assert_eq!(
+            pick_runnable(&candidates, Some(2)),
+            Some(1),
+            "wrap round-robin among equal waiters"
+        );
     }
 }

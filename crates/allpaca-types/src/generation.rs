@@ -67,6 +67,13 @@ pub enum StepResult {
     },
 }
 
+/// One continuous-batching tick: which Request advanced and what it produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PollEvent {
+    pub request_id: u64,
+    pub result: StepResult,
+}
+
 /// AVX2-friendly allowed-token bitset (64-token words).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenMask {

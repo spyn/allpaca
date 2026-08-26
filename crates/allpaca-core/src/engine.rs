@@ -74,6 +74,8 @@ struct EngineInner {
     draft_ahead: Option<DraftAhead>,
     anchors: AnchorCache,
     grammar_factory: Option<llguidance::ParserFactory>,
+    /// Round-robin cursor for continuous-batching ties.
+    last_poll_id: Option<u64>,
 }
 
 struct DraftAhead {
@@ -188,6 +190,7 @@ impl Engine {
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
             grammar_factory: None,
+            last_poll_id: None,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -926,8 +929,40 @@ impl Engine {
     }
 
     pub fn step(&self, handle: &mut RequestHandle) -> Result<StepResult, AllpacaError> {
+        self.step_id(handle.id)
+    }
+
+    /// Advance the longest-waiting runnable Request. `None` when nothing is runnable
+    /// (idle, or only finished Requests remain until their handles are dropped).
+    pub fn poll(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
+        let id = {
+            let inner = self.lock()?;
+            let candidates: Vec<(u64, Instant)> = inner
+                .active
+                .iter()
+                .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty()))
+                .map(|(id, r)| (*id, r.last_token_at))
+                .collect();
+            inner
+                .scheduler
+                .pick_runnable(&candidates, inner.last_poll_id)
+        };
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        {
+            let mut inner = self.lock()?;
+            inner.last_poll_id = Some(id);
+        }
+        let result = self.step_id(id)?;
+        Ok(Some(allpaca_types::PollEvent {
+            request_id: id,
+            result,
+        }))
+    }
+
+    fn step_id(&self, id: u64) -> Result<StepResult, AllpacaError> {
         let mut inner = self.lock()?;
-        let id = handle.id;
         {
             let active = request_mut(&mut inner, id)?;
             if !active.emit_queue.is_empty() {
@@ -944,6 +979,9 @@ impl Engine {
         if request(&inner, id)?.prefill_pos < request(&inner, id)?.prompt_len {
             let (done, total) = self.prefill_chunk(&mut inner, id)?;
             if done < total {
+                if let Some(active) = inner.active.get_mut(&id) {
+                    active.last_token_at = Instant::now();
+                }
                 return Ok(StepResult::Prefill {
                     tokens_done: done,
                     tokens_total: total,
@@ -2602,6 +2640,136 @@ mod tests {
             out_a.token_ids, out_b.token_ids,
             "different prompts must produce independently progressing Requests"
         );
+    }
+
+    #[test]
+    fn poll_interleaves_two_decode_requests() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let a = engine.begin_request("hello", params.clone()).unwrap();
+        let b = engine.begin_request("world", params).unwrap();
+        let id_a = a.id();
+        let id_b = b.id();
+
+        let mut progress_a = 0usize;
+        let mut progress_b = 0usize;
+        let mut switches = 0usize;
+        let mut last: Option<u64> = None;
+        let mut done_a = false;
+        let mut done_b = false;
+        for _ in 0..64 {
+            let Some(ev) = engine.poll().expect("poll") else {
+                break;
+            };
+            if last.map(|l| l != ev.request_id).unwrap_or(false) {
+                switches += 1;
+            }
+            last = Some(ev.request_id);
+            match ev.result {
+                StepResult::Token(tok) => {
+                    if ev.request_id == id_a {
+                        progress_a += 1;
+                        if tok.finish_reason.is_some() {
+                            done_a = true;
+                        }
+                    } else if ev.request_id == id_b {
+                        progress_b += 1;
+                        if tok.finish_reason.is_some() {
+                            done_b = true;
+                        }
+                    }
+                }
+                StepResult::Prefill { .. } => {
+                    if ev.request_id == id_a {
+                        progress_a += 1;
+                    } else if ev.request_id == id_b {
+                        progress_b += 1;
+                    }
+                }
+                StepResult::Finished(_) => {
+                    if ev.request_id == id_a {
+                        done_a = true;
+                    } else if ev.request_id == id_b {
+                        done_b = true;
+                    }
+                }
+            }
+            if done_a && done_b {
+                break;
+            }
+        }
+        assert!(
+            progress_a >= 1 && progress_b >= 1,
+            "poll must advance both Requests; a={progress_a} b={progress_b}"
+        );
+        assert!(
+            switches >= 1,
+            "poll must interleave Requests instead of draining one; switches={switches}"
+        );
+        assert!(done_a && done_b, "both Requests must finish under poll-only driving");
+        drop(a);
+        drop(b);
+    }
+
+    #[test]
+    fn poll_lets_decode_progress_while_peer_prefills() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.prefill.chunk_tokens = 1;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 3,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let long = "hello world hello world hello world hello world";
+        let long_req = engine.begin_request(long, params.clone()).unwrap();
+        let short = engine.begin_request("hello", params).unwrap();
+        let id_long = long_req.id();
+        let id_short = short.id();
+
+        let mut short_tokens = 0usize;
+        let mut long_prefill_after_short_token = false;
+        for _ in 0..96 {
+            let Some(ev) = engine.poll().expect("poll") else {
+                break;
+            };
+            match &ev.result {
+                StepResult::Token(_) if ev.request_id == id_short => {
+                    short_tokens += 1;
+                }
+                StepResult::Prefill {
+                    tokens_done,
+                    tokens_total,
+                } if ev.request_id == id_long && *tokens_done < *tokens_total => {
+                    if short_tokens >= 1 {
+                        long_prefill_after_short_token = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            short_tokens >= 1,
+            "decode Request must emit tokens under poll while a peer is still prefilling"
+        );
+        assert!(
+            long_prefill_after_short_token,
+            "long Request must still be mid-prefill after the decode Request produced a token"
+        );
+        drop(long_req);
+        drop(short);
     }
 
     #[test]
