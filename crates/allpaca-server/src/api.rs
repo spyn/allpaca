@@ -190,6 +190,46 @@ async fn chat_completions(
         return stream_completion(state, prompt, params, model, id, created).into_response();
     }
 
+    if state.config.engine.max_active_requests > 1 {
+        let mut stream = Box::pin(state.engine.generate_stream(prompt.clone(), params));
+        let mut text = String::new();
+        let mut completion_tokens = 0usize;
+        let mut finish = FinishReason::Stop;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(ev) => {
+                    text.push_str(&ev.text);
+                    completion_tokens += 1;
+                    if let Some(reason) = ev.finish_reason {
+                        finish = reason;
+                        break;
+                    }
+                }
+                Err(e) => return error_response(e),
+            }
+        }
+        return Json(ChatCompletionResponse {
+            id,
+            object: "chat.completion",
+            created,
+            model,
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessageOut {
+                    role: "assistant",
+                    content: text,
+                },
+                finish_reason: Some(finish_name(finish).into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens,
+                total_tokens: completion_tokens,
+            },
+        })
+        .into_response();
+    }
+
     let engine = Arc::clone(&state.engine);
     match tokio::task::spawn_blocking(move || engine.generate(&prompt, params)).await {
         Ok(Ok(out)) => Json(ChatCompletionResponse {
@@ -230,10 +270,11 @@ fn stream_completion(
     created: u64,
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(16);
-    let rt = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut stream = Box::pin(state.engine.generate_stream(prompt, params));
-        rt.block_on(async {
+    let use_async_poll = state.config.engine.max_active_requests > 1;
+    let engine = Arc::clone(&state.engine);
+    if use_async_poll {
+        tokio::spawn(async move {
+            let mut stream = Box::pin(engine.generate_stream(prompt, params));
             let first = serde_json::json!({
                 "id": id,
                 "object": "chat.completion.chunk",
@@ -271,7 +312,50 @@ fn stream_completion(
             }
             let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
         });
-    });
+    } else {
+        let rt = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let mut stream = Box::pin(state.engine.generate_stream(prompt, params));
+            rt.block_on(async {
+                let first = serde_json::json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                });
+                let _ = tx
+                    .send(Ok(Event::default().data(first.to_string())))
+                    .await;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(ev) => {
+                            let chunk = serde_json::json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": ev.text},
+                                    "finish_reason": ev.finish_reason.map(finish_name)
+                                }]
+                            });
+                            if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let err = serde_json::json!({"error": {"message": e.to_string()}});
+                            let _ = tx.send(Ok(Event::default().data(err.to_string()))).await;
+                            break;
+                        }
+                    }
+                }
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+            });
+        });
+    }
     Sse::new(async_stream::stream! {
         let mut rx = rx;
         while let Some(item) = rx.recv().await {
@@ -511,6 +595,60 @@ mod tests {
         assert_eq!(json_b["object"], "chat.completion");
         assert!(json_a["usage"]["completion_tokens"].as_u64().unwrap() >= 1);
         assert!(json_b["usage"]["completion_tokens"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_stream_completions_drive_poll_when_max_active_two() {
+        let state = multi_request_state();
+        let app = router(state.clone());
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (res_a, res_b) = tokio::join!(
+            app.clone().oneshot(make_req()),
+            app.oneshot(make_req()),
+        );
+        let res_a = res_a.expect("a");
+        let res_b = res_b.expect("b");
+        assert_eq!(res_a.status(), StatusCode::OK);
+        assert_eq!(res_b.status(), StatusCode::OK);
+        let body_a = res_a.into_body().collect().await.unwrap().to_bytes();
+        let body_b = res_b.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body_a).contains("[DONE]"));
+        assert!(String::from_utf8_lossy(&body_b).contains("[DONE]"));
+        let stats = state.engine.stats();
+        assert!(
+            stats.poll_ticks > 0,
+            "overlapping SSE must use fair poll; stats={stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_exposes_draft_depth_field() {
+        let app = router(test_state());
+        let res = app
+            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json.get("draft_depth").is_some(),
+            "GET /stats must expose draft_depth; json={json}"
+        );
     }
 
     #[tokio::test]
