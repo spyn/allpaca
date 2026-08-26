@@ -1050,61 +1050,69 @@ impl Engine {
     /// Advance the longest-waiting runnable Request. `None` when nothing is runnable
     /// (idle, or only finished Requests remain until their handles are dropped).
     pub fn poll(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
-        let (id, waited_ms, is_prefill) = {
-            let inner = self.lock()?;
-            let candidates: Vec<(u64, Instant)> = inner
-                .active
-                .iter()
-                .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty()))
-                .map(|(id, r)| (*id, r.last_token_at))
-                .collect();
-            let id = inner
-                .scheduler
-                .pick_runnable(&candidates, inner.last_poll_id);
-            let Some(id) = id else {
-                return Ok(None);
+        loop {
+            let (id, waited_ms, is_prefill) = {
+                let inner = self.lock()?;
+                let candidates: Vec<(u64, Instant)> = inner
+                    .active
+                    .iter()
+                    .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty()))
+                    .map(|(id, r)| (*id, r.last_token_at))
+                    .collect();
+                let id = inner
+                    .scheduler
+                    .pick_runnable(&candidates, inner.last_poll_id);
+                let Some(id) = id else {
+                    return Ok(None);
+                };
+                let active = inner.active.get(&id).unwrap();
+                let waited_ms = active.last_token_at.elapsed().as_secs_f64() * 1000.0;
+                let is_prefill =
+                    active.prefill_pos < active.prompt_len && active.emit_queue.is_empty();
+                (id, waited_ms, is_prefill)
             };
-            let active = inner.active.get(&id).unwrap();
-            let waited_ms = active.last_token_at.elapsed().as_secs_f64() * 1000.0;
-            let is_prefill = active.prefill_pos < active.prompt_len && active.emit_queue.is_empty();
-            (id, waited_ms, is_prefill)
-        };
-        {
-            let mut inner = self.lock()?;
-            inner.last_poll_id = Some(id);
-        }
-        self.metrics
-            .poll_ticks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if is_prefill {
+            {
+                let mut inner = self.lock()?;
+                inner.last_poll_id = Some(id);
+            }
             self.metrics
-                .poll_prefill_picks
+                .poll_ticks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.metrics
-                .poll_decode_picks
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if is_prefill {
+                self.metrics
+                    .poll_prefill_picks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.metrics
+                    .poll_decode_picks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let prev = self
+                .metrics
+                .poll_wait_ms_ema_x100
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 100.0;
+            let ema = if prev <= 0.0 {
+                waited_ms
+            } else {
+                prev * 0.9 + waited_ms * 0.1
+            };
+            self.metrics.poll_wait_ms_ema_x100.store(
+                (ema * 100.0) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            match self.step_id(id) {
+                Ok(result) => {
+                    return Ok(Some(allpaca_types::PollEvent {
+                        request_id: id,
+                        result,
+                    }));
+                }
+                // Peer Drop removed the Request between pick and step.
+                Err(AllpacaError::Transient(TransientError::RequestBusy)) => continue,
+                Err(e) => return Err(e),
+            }
         }
-        // EMA wait time (x100 for AtomicU64).
-        let prev = self
-            .metrics
-            .poll_wait_ms_ema_x100
-            .load(std::sync::atomic::Ordering::Relaxed) as f64
-            / 100.0;
-        let ema = if prev <= 0.0 {
-            waited_ms
-        } else {
-            prev * 0.9 + waited_ms * 0.1
-        };
-        self.metrics.poll_wait_ms_ema_x100.store(
-            (ema * 100.0) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let result = self.step_id(id)?;
-        Ok(Some(allpaca_types::PollEvent {
-            request_id: id,
-            result,
-        }))
     }
 
     fn step_id(&self, id: u64) -> Result<StepResult, AllpacaError> {
