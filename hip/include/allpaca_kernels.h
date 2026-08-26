@@ -63,9 +63,14 @@ int allpaca_hip_event_elapsed_us(void *start, void *stop, double *us);
 int allpaca_gemm(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                  allpaca_stream_t stream);
 
-/* C[m,n] = A[m,k] * B[n,k]^T  (row-major). Device pointers. */
+/* C[m,n] = A[m,k] * B[n,k]^T  (row-major). Device pointers.
+ * Decode (M<=8) uses cache-aware A-tile GEMV (§12). */
 int allpaca_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                     allpaca_stream_t stream);
+
+/* Untiled warp GEMV baseline for §12 before/after tracers. */
+int allpaca_gemm_nt_untiled(const float *a, const float *b, float *c, int32_t m, int32_t n,
+                            int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q8_0[n,k])^T. Decode default is float A × Q8.
  * B is 36-byte staged Q8_0, not raw GGUF. M>8 uses a tiled kernel. */
@@ -86,9 +91,13 @@ int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, float *c, int
                                  int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_f16[n,k])^T. B is packed IEEE F16, row-major [n,k].
- * Decode (M<=8) is custom GEMV; M>8 uses a tiled kernel. */
+ * Decode (M<=8) uses cache-aware A-tile GEMV (§12); M>8 uses a tiled prefill kernel. */
 int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                         int32_t k, allpaca_stream_t stream);
+
+/* Untiled F16 GEMV baseline for §12 before/after tracers. */
+int allpaca_gemm_nt_f16_untiled(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                                int32_t k, allpaca_stream_t stream);
 
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,

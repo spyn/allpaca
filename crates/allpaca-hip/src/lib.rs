@@ -253,6 +253,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_untiled(
+            a: *const f32,
+            b: *const f32,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_q8_0(
             a: *const f32,
             b: *const u8,
@@ -290,6 +299,15 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gemm_nt_f16(
+            a: *const f32,
+            b: *const u16,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_f16_untiled(
             a: *const f32,
             b: *const u16,
             c: *mut f32,
@@ -980,6 +998,29 @@ pub fn gemm_nt_device(
     }
 }
 
+/// Untiled F32 GEMV baseline (§12 before/after).
+pub fn gemm_nt_untiled_device(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_untiled(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_untiled")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_untiled unavailable".into(),
+        )))
+    }
+}
+
 /// Device-pointer NT GEMM with GGUF Q8_0 `b` (`C = A * dequant(B)^T`).
 /// Decode uses float A × Q8; integer A×Q8 is [`gemm_nt_q8_0_intdot_device`].
 pub fn gemm_nt_q8_0_device(
@@ -1046,6 +1087,30 @@ pub fn gemm_nt_f16_device(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_f16 unavailable".into(),
+        )))
+    }
+}
+
+/// Untiled F16 GEMV baseline (§12 before/after).
+pub fn gemm_nt_f16_untiled_device(
+    a: *const f32,
+    b: *const u16,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc =
+            unsafe { ffi::allpaca_gemm_nt_f16_untiled(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_f16_untiled")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_f16_untiled unavailable".into(),
         )))
     }
 }
@@ -3952,6 +4017,141 @@ mod tests {
             before_us > 0 && after_us > 0,
             "before/after tracers must record positive times"
         );
+    }
+
+    /// §12: tiled F16 GEMV matches untiled; before/after wall times recorded.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn f16_tiled_gemv_matches_untiled_and_records_before_after() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 1usize;
+        let n = 128usize;
+        let k = 4096usize;
+        let a = vec![0.1f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i % 17) as f32) * 0.01;
+        }
+        let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+        let a_bytes = a.len() * 4;
+        let b_bytes = b_f16.len() * 2;
+        let c_bytes = m * n * 4;
+        let da = device_malloc(a_bytes, 0).unwrap();
+        let db = device_malloc(b_bytes, 0).unwrap();
+        let dc = device_malloc(c_bytes, 0).unwrap();
+        set_device(0).unwrap();
+        memcpy(da, a.as_ptr().cast(), a_bytes, MEMCPY_H2D).unwrap();
+        memcpy(db, b_f16.as_ptr().cast(), b_bytes, MEMCPY_H2D).unwrap();
+        let mut tiled = vec![0.0f32; m * n];
+        let mut untiled = vec![0.0f32; m * n];
+        gemm_nt_f16_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        memcpy(tiled.as_mut_ptr().cast(), dc, c_bytes, MEMCPY_D2H).unwrap();
+        gemm_nt_f16_untiled_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+            .unwrap();
+        memcpy(untiled.as_mut_ptr().cast(), dc, c_bytes, MEMCPY_D2H).unwrap();
+        for i in 0..m * n {
+            assert!(
+                gemm_close(tiled[i], untiled[i]),
+                "F16 tiled vs untiled idx={i} tiled={} untiled={}",
+                tiled[i],
+                untiled[i]
+            );
+        }
+        let warm = 3usize;
+        let reps = 20usize;
+        for _ in 0..warm {
+            gemm_nt_f16_untiled_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+            gemm_nt_f16_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_f16_untiled_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+        }
+        let before_us = t0.elapsed().as_micros();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_f16_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+        }
+        let after_us = t1.elapsed().as_micros();
+        eprintln!(
+            "§12 F16 GEMV 1x{n}x{k} x{reps}: untiled(before)={before_us}us tiled(after)={after_us}us"
+        );
+        device_free(da, a_bytes);
+        device_free(db, b_bytes);
+        device_free(dc, c_bytes);
+        assert!(before_us > 0 && after_us > 0);
+    }
+
+    /// §12: tiled F32 lm_head GEMV matches untiled; before/after wall times recorded.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn f32_lm_head_tiled_gemv_matches_untiled_and_records_before_after() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 1usize;
+        let n = 4096usize;
+        let k = 4096usize;
+        let a = vec![0.1f32; m * k];
+        let mut b = vec![0.0f32; n * k];
+        for (i, v) in b.iter_mut().enumerate() {
+            *v = ((i % 19) as f32) * 0.01;
+        }
+        let a_bytes = a.len() * 4;
+        let b_bytes = b.len() * 4;
+        let c_bytes = m * n * 4;
+        let da = device_malloc(a_bytes, 0).unwrap();
+        let db = device_malloc(b_bytes, 0).unwrap();
+        let dc = device_malloc(c_bytes, 0).unwrap();
+        set_device(0).unwrap();
+        memcpy(da, a.as_ptr().cast(), a_bytes, MEMCPY_H2D).unwrap();
+        memcpy(db, b.as_ptr().cast(), b_bytes, MEMCPY_H2D).unwrap();
+        let mut tiled = vec![0.0f32; m * n];
+        let mut untiled = vec![0.0f32; m * n];
+        gemm_nt_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        memcpy(tiled.as_mut_ptr().cast(), dc, c_bytes, MEMCPY_D2H).unwrap();
+        gemm_nt_untiled_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+            .unwrap();
+        memcpy(untiled.as_mut_ptr().cast(), dc, c_bytes, MEMCPY_D2H).unwrap();
+        for i in 0..m * n {
+            assert!(
+                gemm_close(tiled[i], untiled[i]),
+                "F32 tiled vs untiled idx={i} tiled={} untiled={}",
+                tiled[i],
+                untiled[i]
+            );
+        }
+        let warm = 3usize;
+        let reps = 20usize;
+        for _ in 0..warm {
+            gemm_nt_untiled_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+            gemm_nt_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_untiled_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+        }
+        let before_us = t0.elapsed().as_micros();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_device(da.cast(), db.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        }
+        let after_us = t1.elapsed().as_micros();
+        eprintln!(
+            "§12 F32 lm_head GEMV 1x{n}x{k} x{reps}: untiled(before)={before_us}us tiled(after)={after_us}us"
+        );
+        device_free(da, a_bytes);
+        device_free(db, b_bytes);
+        device_free(dc, c_bytes);
+        assert!(before_us > 0 && after_us > 0);
     }
 
     /// Public `gemm_nt_q8_0` must match CPU dequant + NT GEMM on small random shapes.
