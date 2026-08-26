@@ -171,8 +171,21 @@ pub struct EngineSection {
     /// Concurrent Requests the Engine will admit. Default 1 keeps
     /// `RequestBusy` when a second `begin_request` arrives.
     pub max_active_requests: usize,
+    /// How `Engine::poll` chooses among runnable Requests.
+    pub poll_schedule: PollSchedule,
     /// `"auto"` (HIP when the `hip` feature sees devices), `"hip"`, or `"cpu"`.
     pub gpu_backend: String,
+}
+
+/// Continuous-batching poll selection policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PollSchedule {
+    /// Longest-waiting Request wins (prefill and decode treated equally).
+    #[default]
+    Fair,
+    /// Prefer decode/emitted Requests over in-flight prefill when both are runnable.
+    DecodePriority,
 }
 
 impl Default for EngineSection {
@@ -186,6 +199,7 @@ impl Default for EngineSection {
             pipeline_mode: None,
             determinism_seed: None,
             max_active_requests: 1,
+            poll_schedule: PollSchedule::Fair,
             gpu_backend: "auto".into(),
         }
     }

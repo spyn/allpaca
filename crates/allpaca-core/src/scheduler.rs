@@ -1,6 +1,6 @@
 use allpaca_types::{
-    DeviceInfo, DeviceKind, FeatureFlags, Placement, PipelineMode, SpeculativeSection, TaskCost,
-    KvTierKind,
+    DeviceInfo, DeviceKind, FeatureFlags, Placement, PipelineMode, PollSchedule, SpeculativeSection,
+    TaskCost, KvTierKind,
 };
 use std::time::Instant;
 
@@ -82,11 +82,38 @@ impl Scheduler {
     /// Ties break round-robin after `after_id`, then lowest id.
     pub fn pick_runnable(
         &self,
-        candidates: &[(u64, Instant)],
+        candidates: &[(u64, Instant, bool)],
         after_id: Option<u64>,
+        schedule: PollSchedule,
     ) -> Option<u64> {
-        pick_runnable(candidates, after_id)
+        pick_runnable_phased(candidates, after_id, schedule)
     }
+}
+
+/// Among runnable Requests, pick the one waiting longest since last progress.
+/// When `schedule` is [`PollSchedule::DecodePriority`], decode/emitted Requests
+/// win over prefilling peers regardless of wait time.
+pub fn pick_runnable_phased(
+    candidates: &[(u64, Instant, bool)],
+    after_id: Option<u64>,
+    schedule: PollSchedule,
+) -> Option<u64> {
+    let narrowed: Vec<(u64, Instant)> = match schedule {
+        PollSchedule::Fair => candidates.iter().map(|(id, t, _)| (*id, *t)).collect(),
+        PollSchedule::DecodePriority => {
+            let decode: Vec<(u64, Instant)> = candidates
+                .iter()
+                .filter(|(_, _, prefill)| !prefill)
+                .map(|(id, t, _)| (*id, *t))
+                .collect();
+            if decode.is_empty() {
+                candidates.iter().map(|(id, t, _)| (*id, *t)).collect()
+            } else {
+                decode
+            }
+        }
+    };
+    pick_runnable(&narrowed, after_id)
 }
 
 /// Among runnable Requests, pick the one waiting longest since last progress.
@@ -147,6 +174,23 @@ mod tests {
             pick_runnable(&candidates, Some(2)),
             Some(1),
             "wrap round-robin among equal waiters"
+        );
+    }
+
+    #[test]
+    fn decode_priority_prefers_decode_over_older_prefill() {
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let phased = [(1u64, t0, true), (2u64, t1, false)];
+        assert_eq!(
+            pick_runnable_phased(&phased, None, PollSchedule::Fair),
+            Some(1),
+            "fair picks oldest waiter even when prefilling"
+        );
+        assert_eq!(
+            pick_runnable_phased(&phased, None, PollSchedule::DecodePriority),
+            Some(2),
+            "decode priority must pick decoding Request over older prefill"
         );
     }
 }

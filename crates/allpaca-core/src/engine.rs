@@ -378,6 +378,11 @@ impl Engine {
         } else {
             "p2p_unavailable"
         };
+        let draft_depth = self
+            .lock()
+            .ok()
+            .map(|g| g.scheduler.draft_depth as u64)
+            .unwrap_or(0);
         self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
@@ -392,6 +397,7 @@ impl Engine {
             self.inventory.draft_device,
             model_id,
             backend,
+            draft_depth,
         )
     }
 
@@ -1053,15 +1059,20 @@ impl Engine {
         loop {
             let (id, waited_ms, is_prefill) = {
                 let inner = self.lock()?;
-                let candidates: Vec<(u64, Instant)> = inner
+                let schedule = self.config.engine.poll_schedule;
+                let candidates: Vec<(u64, Instant, bool)> = inner
                     .active
                     .iter()
                     .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty()))
-                    .map(|(id, r)| (*id, r.last_token_at))
+                    .map(|(id, r)| {
+                        let prefill =
+                            r.prefill_pos < r.prompt_len && r.emit_queue.is_empty();
+                        (*id, r.last_token_at, prefill)
+                    })
                     .collect();
                 let id = inner
                     .scheduler
-                    .pick_runnable(&candidates, inner.last_poll_id);
+                    .pick_runnable(&candidates, inner.last_poll_id, schedule);
                 let Some(id) = id else {
                     return Ok(None);
                 };
@@ -3013,6 +3024,73 @@ mod tests {
     }
 
     #[test]
+    fn decode_priority_poll_prefers_decoding_over_older_prefill() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.engine.poll_schedule = allpaca_types::PollSchedule::DecodePriority;
+        cfg.prefill.chunk_tokens = 1;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let long = "hello world hello world hello world hello world";
+        let _long = engine.begin_request(long, params.clone()).unwrap();
+        let short = engine.begin_request("hi", params).unwrap();
+        let id_short = short.id();
+
+        let mut short_tokens = 0usize;
+        for _ in 0..32 {
+            let Some(ev) = engine.poll().expect("poll") else {
+                break;
+            };
+            if ev.request_id == id_short && matches!(ev.result, StepResult::Token(_)) {
+                short_tokens += 1;
+            }
+            if short_tokens >= 2 {
+                break;
+            }
+        }
+        assert!(
+            short_tokens >= 2,
+            "decode_priority must let short Request decode; got {short_tokens}"
+        );
+    }
+
+    #[test]
+    fn adaptive_draft_depth_observable_on_stats() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = true;
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 12;
+        cfg.features.adaptive_draft_depth = Some(true);
+        let engine = Engine::new(cfg).unwrap();
+        let initial = engine.stats().draft_depth;
+        assert!(initial >= 2, "initial draft depth from min_depth; stats={initial}");
+        {
+            let mut inner = engine.lock().unwrap();
+            inner.scheduler.record_acceptance(9, 10);
+        }
+        let raised = engine.stats().draft_depth;
+        assert!(
+            raised > initial,
+            "high acceptance must raise draft_depth; before={initial} after={raised}"
+        );
+        {
+            let mut inner = engine.lock().unwrap();
+            inner.scheduler.record_acceptance(1, 10);
+        }
+        let lowered = engine.stats().draft_depth;
+        assert!(
+            lowered < raised,
+            "low acceptance must shrink draft_depth; raised={raised} lowered={lowered}"
+        );
+    }
+
+    #[test]
     fn two_begin_request_succeed_when_max_active_requests_is_two() {
         let mut cfg = test_config();
         cfg.engine.max_active_requests = 2;
@@ -3179,6 +3257,34 @@ mod tests {
         assert!(
             stats.kv_nvme_pages > 0 || stats.kv_nvme_reads > 0,
             "tight DRAM must page KV to NVMe; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn stats_snapshot_includes_nvme_kv_fields() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.kv.page_tokens = 2;
+        cfg.kv.vram_bytes = 256;
+        cfg.kv.dram_bytes = 256;
+        cfg.kv.hot_fraction = 0.4;
+        cfg.kv.nvme_bytes = 1024 * 1024;
+        let engine = Engine::new(cfg).unwrap();
+        let _ = engine
+            .generate(
+                "hello world hello world hello world hello true",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        let stats = engine.stats();
+        assert!(
+            stats.kv_nvme_reads > 0 || stats.kv_nvme_pages > 0,
+            "NVMe cold KV must be observable on stats; stats={stats:?}"
         );
     }
 
