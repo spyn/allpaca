@@ -160,4 +160,7 @@ pub struct StatsSnapshot {
     /// EMA of wait-ms before a poll pick (longest-waiting fairness).
     #[serde(default)]
     pub poll_wait_ms_ema: f64,
+    /// Grammar masks served from a completed background prefetch.
+    #[serde(default)]
+    pub async_mask_hits: u64,
 }

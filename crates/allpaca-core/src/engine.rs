@@ -48,6 +48,8 @@ struct ActiveRequest {
     emit_queue: Vec<TokenEvent>,
     /// StepResults parked by a peer thread's fair `poll` demux.
     parked: VecDeque<StepResult>,
+    /// Prefetched grammar mask from a background thread (`structured_output.async`).
+    async_mask_rx: Option<std::sync::mpsc::Receiver<Result<allpaca_types::TokenMask, String>>>,
     json_prefix: String,
     grammar: Option<llguidance::Matcher>,
     rng: StdRng,
@@ -1002,6 +1004,7 @@ impl Engine {
                 pending_logits: vec![0.0f32; vocab],
                 emit_queue: Vec::new(),
                 parked: VecDeque::new(),
+                async_mask_rx: None,
                 json_prefix: String::new(),
                 grammar,
                 rng,
@@ -1012,6 +1015,13 @@ impl Engine {
                 recurrent,
             },
         );
+        if self.config.structured_output.async_masks {
+            if let Some(active) = inner.active.get_mut(&id) {
+                if active.grammar.is_some() {
+                    kick_async_mask(active, vocab);
+                }
+            }
+        }
         self.metrics
             .requests_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1248,6 +1258,12 @@ impl Engine {
                 None
             };
             let now = Instant::now();
+            let vocab = inner
+                .tokenizer
+                .as_ref()
+                .map(|t| t.vocab_size())
+                .unwrap_or(0);
+            let async_masks = self.config.structured_output.async_masks;
             if let Some(active) = inner.active.get_mut(&id) {
                 if let Some(ref mut g) = active.grammar {
                     if !g.is_stopped() {
@@ -1256,6 +1272,8 @@ impl Engine {
                             self.metrics
                                 .degraded_events
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else if async_masks {
+                            kick_async_mask(active, vocab);
                         }
                     }
                 }
@@ -1570,6 +1588,29 @@ fn grammar_mask(
         .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
         .vocab_size();
     let active = request_mut(inner, id)?;
+    if let Some(rx) = active.async_mask_rx.take() {
+        match rx.recv() {
+            Ok(Ok(mut mask)) => {
+                metrics
+                    .async_mask_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !mask.any() {
+                    tracing::warn!("async grammar mask empty; allowing all tokens (degraded)");
+                    metrics
+                        .degraded_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    mask = allpaca_types::TokenMask::allow_all(vocab);
+                }
+                return Ok(Some(mask));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "async grammar mask failed; falling back to sync");
+            }
+            Err(_) => {
+                tracing::warn!("async grammar mask worker dropped; falling back to sync");
+            }
+        }
+    }
     let Some(matcher) = active.grammar.as_mut() else {
         return Ok(None);
     };
@@ -1593,6 +1634,25 @@ fn grammar_mask(
             Ok(Some(allpaca_types::TokenMask::allow_all(vocab)))
         }
     }
+}
+
+fn kick_async_mask(active: &mut ActiveRequest, vocab: usize) {
+    let Some(matcher) = active.grammar.as_ref() else {
+        return;
+    };
+    if matcher.is_stopped() {
+        return;
+    }
+    let mut matcher = matcher.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    active.async_mask_rx = Some(rx);
+    std::thread::spawn(move || {
+        let result = match matcher.compute_mask_or_eos() {
+            Ok(vob) => Ok(crate::grammar::vob_to_mask(&vob, vocab)),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
 }
 
 fn propose_drafts(
@@ -4914,6 +4974,34 @@ mod tests {
                 || prefix.starts_with("null")
                 || prefix.is_empty(),
             "JSON mode must start with a JSON value, got {prefix:?}"
+        );
+    }
+
+    #[test]
+    fn async_schema_mask_hits_and_stays_valid() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.structured_output.async_masks = true;
+        let engine = Engine::new(cfg).unwrap();
+        let schema = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 16,
+                    temperature: 0.0,
+                    json_schema: Some(schema.into()),
+                    seed: Some(3),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out.text).unwrap();
+        assert!(value.get("ok").is_some_and(|v| v.is_boolean()));
+        let stats = engine.stats();
+        assert!(
+            stats.async_mask_hits > 0,
+            "structured_output.async must serve at least one prefetched mask; stats={stats:?}"
         );
     }
 

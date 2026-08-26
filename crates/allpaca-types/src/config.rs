@@ -356,6 +356,9 @@ impl Default for SamplingSection {
 pub struct StructuredOutputSection {
     pub enabled: bool,
     pub json_mode: bool,
+    /// Prefetch the next grammar mask on a background thread (`async` in TOML).
+    #[serde(default, rename = "async")]
+    pub async_masks: bool,
 }
 
 impl Default for StructuredOutputSection {
@@ -363,6 +366,7 @@ impl Default for StructuredOutputSection {
         Self {
             enabled: true,
             json_mode: false,
+            async_masks: false,
         }
     }
 }
