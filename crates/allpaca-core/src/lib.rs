@@ -6,6 +6,7 @@ mod device_manager;
 mod draft;
 mod engine;
 mod forest;
+mod kv_nvme;
 mod kv_tier;
 mod logits_ring;
 mod model;

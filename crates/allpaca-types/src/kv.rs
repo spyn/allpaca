@@ -6,6 +6,7 @@ pub type PageId = u64;
 pub enum KvResidency {
     Vram,
     PinnedDram,
+    Nvme,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +14,7 @@ pub enum DeviceBufferKind {
     CpuVram,
     CpuPinnedDram,
     Hip,
+    Nvme,
 }
 
 /// Location of a KV page's bytes. HIP pointers stay opaque to the control plane.

@@ -61,6 +61,11 @@ pub struct Metrics {
     pub nvme_direct: AtomicU64,
     pub anchor_hits: AtomicU64,
     pub anchor_skip_tokens: AtomicU64,
+    pub kv_nvme_pages: AtomicU64,
+    pub kv_nvme_reads: AtomicU64,
+    pub kv_nvme_bytes: AtomicU64,
+    pub kv_nvme_direct: AtomicU64,
+    pub kv_nvme_prefetches: AtomicU64,
 }
 
 impl Metrics {
@@ -169,6 +174,11 @@ impl Metrics {
             nvme_direct: self.nvme_direct.load(Ordering::Relaxed) != 0,
             anchor_hits: self.anchor_hits.load(Ordering::Relaxed),
             anchor_skip_tokens: self.anchor_skip_tokens.load(Ordering::Relaxed),
+            kv_nvme_pages: self.kv_nvme_pages.load(Ordering::Relaxed),
+            kv_nvme_reads: self.kv_nvme_reads.load(Ordering::Relaxed),
+            kv_nvme_bytes: self.kv_nvme_bytes.load(Ordering::Relaxed),
+            kv_nvme_direct: self.kv_nvme_direct.load(Ordering::Relaxed) != 0,
+            kv_nvme_prefetches: self.kv_nvme_prefetches.load(Ordering::Relaxed),
         }
     }
 

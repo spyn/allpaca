@@ -133,4 +133,19 @@ pub struct StatsSnapshot {
     /// Prompt tokens skipped because a surviving anchor restored the prefix.
     #[serde(default)]
     pub anchor_skip_tokens: u64,
+    /// KV pages currently resident on the NVMe cold tier.
+    #[serde(default)]
+    pub kv_nvme_pages: u64,
+    /// Direct I/O (or buffered fallback) reads of spilled KV pages.
+    #[serde(default)]
+    pub kv_nvme_reads: u64,
+    /// Bytes moved to/from the KV swap file (aligned slot size).
+    #[serde(default)]
+    pub kv_nvme_bytes: u64,
+    /// True when KV cold-tier I/O used Direct I/O rather than the page cache.
+    #[serde(default)]
+    pub kv_nvme_direct: bool,
+    /// NVMe → DRAM restores of the next page_index (prefetch, not a decode fault).
+    #[serde(default)]
+    pub kv_nvme_prefetches: u64,
 }

@@ -160,12 +160,13 @@ impl Engine {
         let scheduler = Scheduler::new(inventory.pipeline_mode, flags.clone(), &config.speculative);
         let hip = open_hip_workspace(&config, &inventory).map(Arc::new);
         let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
-        let kv = KvTierManager::with_hip(
+        let mut kv = KvTierManager::with_hip(
             config.kv.vram_bytes,
             config.kv.dram_bytes,
             config.kv.hot_fraction,
             hip.as_ref().map(|h| h.device),
         );
+        kv.open_nvme(config.kv.nvme_bytes, config.kv.nvme_path.as_deref())?;
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);
         let inner = EngineInner {
             flags,
@@ -254,6 +255,23 @@ impl Engine {
                     .store(g.anchors.hits(), std::sync::atomic::Ordering::Relaxed);
                 self.metrics.anchor_skip_tokens.store(
                     g.anchors.skip_tokens(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics
+                    .kv_nvme_pages
+                    .store(g.kv.nvme_count(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .kv_nvme_reads
+                    .store(g.kv.nvme_reads(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .kv_nvme_bytes
+                    .store(g.kv.nvme_bytes(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics.kv_nvme_direct.store(
+                    u64::from(g.kv.nvme_direct()),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.kv_nvme_prefetches.store(
+                    g.kv.nvme_prefetches(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 (
@@ -2623,6 +2641,42 @@ mod tests {
             )
             .unwrap();
         assert!(!out.token_ids.is_empty(), "generate still works after KV spill");
+    }
+
+    #[test]
+    fn generate_with_nvme_kv_matches_resident() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let prompt = "hello world hello world hello world hello true";
+
+        let mut full_cfg = test_config();
+        full_cfg.speculative.enabled = false;
+        full_cfg.kv.page_tokens = 2;
+        let full = Engine::new(full_cfg).unwrap();
+        let full_out = full.generate(prompt, params.clone()).unwrap();
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.kv.page_tokens = 2;
+        cfg.kv.vram_bytes = 256;
+        cfg.kv.dram_bytes = 256;
+        cfg.kv.hot_fraction = 0.4;
+        cfg.kv.nvme_bytes = 1024 * 1024;
+        let engine = Engine::new(cfg).unwrap();
+        let part = engine.generate(prompt, params).unwrap();
+        assert_eq!(
+            part.token_ids, full_out.token_ids,
+            "NVMe cold KV is capacity, not a different model"
+        );
+        let stats = engine.stats();
+        assert!(
+            stats.kv_nvme_pages > 0 || stats.kv_nvme_reads > 0,
+            "tight DRAM must page KV to NVMe; stats={stats:?}"
+        );
     }
 
     #[test]

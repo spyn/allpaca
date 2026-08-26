@@ -7,6 +7,7 @@ use allpaca_types::{
     TransientError,
 };
 
+use crate::kv_nvme::{temp_kv_nvme_path, NvmeKvStore};
 use crate::telemetry::Metrics;
 
 struct HipPageAlloc {
@@ -71,16 +72,19 @@ impl BufferPool {
     }
 }
 
-/// Two-tier KV manager: VRAM (hot) <-> Pinned DRAM (warm). No NVMe in MVP.
-/// When `hip_device` is set, VRAM pages are real `hipMalloc` buffers.
+/// Three-tier KV manager: VRAM (hot) <-> Pinned DRAM (warm) <-> NVMe (cold).
+/// NVMe is off until [`Self::open_nvme`]. When `hip_device` is set, VRAM pages
+/// are real `hipMalloc` buffers.
 pub struct KvTierManager {
     pages: HashMap<PageId, KvPage>,
     vram: BufferPool,
     dram: BufferPool,
+    nvme: Option<NvmeKvStore>,
     hip_pages: HashMap<PageId, HipPageAlloc>,
     hip_device: Option<i32>,
     activation_h2d_bytes: AtomicU64,
     activation_d2h_bytes: AtomicU64,
+    nvme_prefetches: AtomicU64,
     next_id: u64,
     clock: u64,
     hot_fraction: f32,
@@ -102,15 +106,35 @@ impl KvTierManager {
             pages: HashMap::new(),
             vram: BufferPool::new(vram_bytes),
             dram: BufferPool::new(dram_bytes),
+            nvme: None,
             hip_pages: HashMap::new(),
             hip_device,
             activation_h2d_bytes: AtomicU64::new(0),
             activation_d2h_bytes: AtomicU64::new(0),
+            nvme_prefetches: AtomicU64::new(0),
             next_id: 1,
             clock: 1,
             hot_fraction,
             vram_capacity: (vram_bytes / 4).max(1),
         }
+    }
+
+    /// Enable the NVMe cold tier. `path = None` uses a temp file removed on drop.
+    pub fn open_nvme(
+        &mut self,
+        nvme_bytes: usize,
+        path: Option<&std::path::Path>,
+    ) -> Result<(), AllpacaError> {
+        if nvme_bytes == 0 {
+            self.nvme = None;
+            return Ok(());
+        }
+        let (store_path, remove) = match path {
+            Some(p) => (p.to_path_buf(), false),
+            None => (temp_kv_nvme_path(), true),
+        };
+        self.nvme = Some(NvmeKvStore::open(&store_path, nvme_bytes, remove)?);
+        Ok(())
     }
 
     pub fn page_floats(page_tokens: u32, n_kv_heads: usize, head_dim: usize) -> usize {
@@ -137,7 +161,7 @@ impl KvTierManager {
                     (KvResidency::Vram, 0, DeviceBufferKind::Hip, dev)
                 }
                 Err(_) => {
-                    let off = self.dram.alloc(len).map_err(|_| {
+                    let off = self.dram_alloc(len, metrics).map_err(|_| {
                         AllpacaError::Fatal(FatalError::OutOfMemory(
                             "HIP KV alloc failed and pinned DRAM is full".into(),
                         ))
@@ -149,7 +173,7 @@ impl KvTierManager {
             match self.vram.alloc(len) {
                 Ok(off) => (KvResidency::Vram, off, DeviceBufferKind::CpuVram, -1),
                 Err(_) => {
-                    let off = self.dram.alloc(len).map_err(|_| {
+                    let off = self.dram_alloc(len, metrics).map_err(|_| {
                         AllpacaError::Fatal(FatalError::OutOfMemory(
                             "VRAM and pinned DRAM KV pools are full".into(),
                         ))
@@ -223,6 +247,11 @@ impl KvTierManager {
             }
             DeviceBufferKind::CpuVram => self.vram.free(loc.offset, loc.len),
             DeviceBufferKind::CpuPinnedDram => self.dram.free(loc.offset, loc.len),
+            DeviceBufferKind::Nvme => {
+                if let Some(store) = self.nvme.as_ref() {
+                    store.free_page(id);
+                }
+            }
         }
         self.pages.remove(&id);
         self.refresh_metrics(metrics);
@@ -237,6 +266,7 @@ impl KvTierManager {
         k: &[f32],
         v: &[f32],
     ) -> Result<(), AllpacaError> {
+        self.ensure_dram(id)?;
         let page = self.pages.get(&id).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
         })?;
@@ -276,10 +306,16 @@ impl KvTierManager {
                 self.dram.slice_mut(k_off, kv_width).copy_from_slice(k);
                 self.dram.slice_mut(v_off, kv_width).copy_from_slice(v);
             }
+            DeviceBufferKind::Nvme => {
+                return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                    "NVMe KV page must be restored to DRAM before write".into(),
+                )));
+            }
         }
         if let Some(page) = self.pages.get_mut(&id) {
             page.filled = page.filled.max(slot + 1);
         }
+        self.prefetch_next(id);
         Ok(())
     }
 
@@ -331,6 +367,22 @@ impl KvTierManager {
                 self.dram.slice(k_off, n).to_vec(),
                 self.dram.slice(v_off, n).to_vec(),
             ),
+            DeviceBufferKind::Nvme => {
+                let store = self.nvme.as_ref().ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "NVMe KV page with no cold-tier store".into(),
+                    ))
+                })?;
+                let data = store.read_page(page.location.offset, page.location.len)?;
+                let v0 = cap * kv_width;
+                let k = data.get(..n).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory("NVMe KV K slice".into()))
+                })?;
+                let v = data.get(v0..v0 + n).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory("NVMe KV V slice".into()))
+                })?;
+                (k.to_vec(), v.to_vec())
+            }
         };
         Ok((k, v))
     }
@@ -358,6 +410,7 @@ impl KvTierManager {
                 "device K/V pointer is null".into(),
             )));
         }
+        self.ensure_dram(id)?;
         let page = self.pages.get(&id).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
         })?;
@@ -398,10 +451,16 @@ impl KvTierManager {
                     .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
                 return self.write_slot(id, slot, n_kv_heads, head_dim, &k, &v);
             }
+            DeviceBufferKind::Nvme => {
+                return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                    "NVMe KV page must be restored to DRAM before device write".into(),
+                )));
+            }
         }
         if let Some(page) = self.pages.get_mut(&id) {
             page.filled = page.filled.max(slot + 1);
         }
+        self.prefetch_next(id);
         Ok(())
     }
 
@@ -441,6 +500,7 @@ impl KvTierManager {
                     "KV page index {page_index} out of range"
                 )))
             })?;
+            self.ensure_dram(page_id)?;
             let run = (n_tok - i).min(page_tokens - slot);
             let (kind, offset, cap) = {
                 let page = self.pages.get(&page_id).ok_or_else(|| {
@@ -484,8 +544,14 @@ impl KvTierManager {
                         )?;
                     }
                 }
+                DeviceBufferKind::Nvme => {
+                    return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "NVMe KV page must be restored to DRAM before device write".into(),
+                    )));
+                }
             }
             self.touch(page_id, 1.0);
+            self.prefetch_next(page_id);
             i += run;
         }
         Ok(())
@@ -641,6 +707,25 @@ impl KvTierManager {
                     self.activation_h2d_bytes
                         .fetch_add((n * 8) as u64, Ordering::Relaxed);
                 }
+                DeviceBufferKind::Nvme => {
+                    let store = self.nvme.as_ref().ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(
+                            "NVMe KV page with no cold-tier store".into(),
+                        ))
+                    })?;
+                    let data = store.read_page(page.location.offset, page.location.len)?;
+                    let v0 = page.capacity_tokens as usize * kv_width;
+                    let k = data.get(..n).ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory("NVMe KV K pack".into()))
+                    })?;
+                    let v = data.get(v0..v0 + n).ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory("NVMe KV V pack".into()))
+                    })?;
+                    allpaca_hip::memcpy(dk, k.as_ptr().cast(), n * 4, allpaca_hip::MEMCPY_H2D)?;
+                    allpaca_hip::memcpy(dv, v.as_ptr().cast(), n * 4, allpaca_hip::MEMCPY_H2D)?;
+                    self.activation_h2d_bytes
+                        .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                }
             }
             n_kv += filled;
         }
@@ -655,23 +740,41 @@ impl KvTierManager {
             return Ok(());
         }
         let len = page.location.len;
-        let dst = self.dram.alloc(len)?;
-        if page.location.kind == DeviceBufferKind::Hip {
-            if let Some(alloc) = self.hip_pages.remove(&id) {
-                allpaca_hip::memcpy(
-                    self.dram.slice_mut(dst, len).as_mut_ptr().cast(),
-                    alloc.ptr,
-                    alloc.bytes,
-                    allpaca_hip::MEMCPY_D2H,
-                )?;
-                allpaca_hip::device_free(alloc.ptr, alloc.bytes);
+        let dst = self.dram_alloc(len, metrics)?;
+        match page.location.kind {
+            DeviceBufferKind::Hip => {
+                if let Some(alloc) = self.hip_pages.remove(&id) {
+                    allpaca_hip::memcpy(
+                        self.dram.slice_mut(dst, len).as_mut_ptr().cast(),
+                        alloc.ptr,
+                        alloc.bytes,
+                        allpaca_hip::MEMCPY_D2H,
+                    )?;
+                    allpaca_hip::device_free(alloc.ptr, alloc.bytes);
+                }
             }
-        } else {
-            copy_f32(
-                self.dram.slice_mut(dst, len),
-                self.vram.slice(page.location.offset, len),
-            )?;
-            self.vram.free(page.location.offset, len);
+            DeviceBufferKind::CpuVram => {
+                copy_f32(
+                    self.dram.slice_mut(dst, len),
+                    self.vram.slice(page.location.offset, len),
+                )?;
+                self.vram.free(page.location.offset, len);
+            }
+            DeviceBufferKind::Nvme => {
+                let data = {
+                    let store = self.nvme.as_ref().ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(
+                            "NVMe KV page with no cold-tier store".into(),
+                        ))
+                    })?;
+                    store.read_page(page.location.offset, len)?
+                };
+                self.dram.slice_mut(dst, len).copy_from_slice(&data);
+                if let Some(store) = self.nvme.as_ref() {
+                    store.free_page(id);
+                }
+            }
+            DeviceBufferKind::CpuPinnedDram => {}
         }
         if let Some(page) = self.pages.get_mut(&id) {
             page.tier = KvResidency::PinnedDram;
@@ -693,6 +796,12 @@ impl KvTierManager {
         if page.tier == KvResidency::Vram {
             return Ok(());
         }
+        if page.tier == KvResidency::Nvme {
+            self.migrate_to_dram(id, metrics)?;
+        }
+        let page = self.pages.get(&id).cloned().ok_or_else(|| {
+            AllpacaError::Transient(TransientError::PageMigration(format!("missing {id}")))
+        })?;
         let len = page.location.len;
         self.evict_if_needed(len, metrics)?;
         if let Some(dev) = self.hip_device {
@@ -730,6 +839,101 @@ impl KvTierManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.refresh_metrics(metrics);
         Ok(())
+    }
+
+    fn migrate_to_nvme(&mut self, id: PageId, metrics: &Metrics) -> Result<(), AllpacaError> {
+        let page = self.pages.get(&id).cloned().ok_or_else(|| {
+            AllpacaError::Transient(TransientError::PageMigration(format!("missing {id}")))
+        })?;
+        if page.tier == KvResidency::Nvme {
+            return Ok(());
+        }
+        if page.tier == KvResidency::Vram {
+            self.migrate_to_dram(id, metrics)?;
+        }
+        let page = self.pages.get(&id).cloned().ok_or_else(|| {
+            AllpacaError::Transient(TransientError::PageMigration(format!("missing {id}")))
+        })?;
+        let len = page.location.len;
+        let data = self.dram.slice(page.location.offset, len).to_vec();
+        let slot = {
+            let store = self.nvme.as_ref().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::OutOfMemory(
+                    "NVMe KV cold tier is not open".into(),
+                ))
+            })?;
+            store.write_page(id, &data)?
+        };
+        self.dram.free(page.location.offset, len);
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.tier = KvResidency::Nvme;
+            page.location.kind = DeviceBufferKind::Nvme;
+            page.location.device_id = -1;
+            page.location.offset = slot;
+        }
+        metrics
+            .page_migrations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_metrics(metrics);
+        Ok(())
+    }
+
+    fn dram_alloc(&mut self, len: usize, metrics: &Metrics) -> Result<usize, AllpacaError> {
+        loop {
+            match self.dram.alloc(len) {
+                Ok(off) => return Ok(off),
+                Err(e) => {
+                    if self.nvme.is_none() {
+                        return Err(e);
+                    }
+                    let Some(victim) = self.lowest_dram_page() else {
+                        return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                            "pinned DRAM is full and no DRAM page can spill to NVMe".into(),
+                        )));
+                    };
+                    self.migrate_to_nvme(victim, metrics)?;
+                }
+            }
+        }
+    }
+
+    fn ensure_dram(&mut self, id: PageId) -> Result<(), AllpacaError> {
+        let tier = self.pages.get(&id).map(|p| p.tier);
+        if tier != Some(KvResidency::Nvme) {
+            return Ok(());
+        }
+        let metrics = Metrics::default();
+        self.migrate_to_dram(id, &metrics)
+    }
+
+    fn prefetch_next(&mut self, id: PageId) {
+        let Some(page) = self.pages.get(&id).cloned() else {
+            return;
+        };
+        let want = page.page_index.saturating_add(1);
+        let Some(next_id) = self.pages.values().find(|p| {
+            p.layer == page.layer
+                && p.page_index == want
+                && p.tier == KvResidency::Nvme
+                && p.id != id
+        }).map(|p| p.id) else {
+            return;
+        };
+        if self.migrate_to_dram(next_id, &Metrics::default()).is_ok() {
+            self.nvme_prefetches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn lowest_dram_page(&self) -> Option<PageId> {
+        self.pages
+            .values()
+            .filter(|p| p.tier == KvResidency::PinnedDram)
+            .min_by(|a, b| {
+                a.priority(self.clock, 1.0, 0.4)
+                    .partial_cmp(&b.priority(self.clock, 1.0, 0.4))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| p.id)
     }
 
     fn vram_live_floats(&self) -> usize {
@@ -799,6 +1003,26 @@ impl KvTierManager {
         metrics
             .dram_pages
             .store(dram, std::sync::atomic::Ordering::Relaxed);
+        let nvme = self.nvme_count();
+        metrics
+            .kv_nvme_pages
+            .store(nvme, std::sync::atomic::Ordering::Relaxed);
+        if let Some(store) = self.nvme.as_ref() {
+            metrics
+                .kv_nvme_reads
+                .store(store.reads(), std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .kv_nvme_bytes
+                .store(store.bytes(), std::sync::atomic::Ordering::Relaxed);
+            metrics.kv_nvme_direct.store(
+                u64::from(store.is_direct()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        metrics.kv_nvme_prefetches.store(
+            self.nvme_prefetches.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let kv_dev: u64 = self.hip_pages.values().map(|p| p.bytes as u64).sum();
         metrics
             .kv_bytes_on_device
@@ -817,6 +1041,29 @@ impl KvTierManager {
             .filter(|p| p.tier == KvResidency::PinnedDram)
             .count() as u64;
         (vram, dram)
+    }
+
+    pub fn nvme_count(&self) -> u64 {
+        self.pages
+            .values()
+            .filter(|p| p.tier == KvResidency::Nvme)
+            .count() as u64
+    }
+
+    pub fn nvme_reads(&self) -> u64 {
+        self.nvme.as_ref().map(|s| s.reads()).unwrap_or(0)
+    }
+
+    pub fn nvme_bytes(&self) -> u64 {
+        self.nvme.as_ref().map(|s| s.bytes()).unwrap_or(0)
+    }
+
+    pub fn nvme_direct(&self) -> bool {
+        self.nvme.as_ref().map(|s| s.is_direct()).unwrap_or(false)
+    }
+
+    pub fn nvme_prefetches(&self) -> u64 {
+        self.nvme_prefetches.load(Ordering::Relaxed)
     }
 }
 
@@ -888,6 +1135,43 @@ mod tests {
             "elastic shrink must spill KV to DRAM; vram={vram_after} dram={dram_after}"
         );
         assert!(vram_after < vram_before);
+    }
+
+    #[test]
+    fn spills_to_nvme_when_dram_full_and_restores_bytes() {
+        let metrics = Metrics::default();
+        let mut kv = KvTierManager::new(256, 256, 0.4);
+        kv.open_nvme(256 * 1024, None).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..12u32 {
+            ids.push(kv.alloc_page(0, i, 2, 1, 4, &metrics).unwrap());
+        }
+        let marker = vec![1.5f32, 2.5, 3.5, 4.5];
+        kv.write_slot(ids[0], 0, 1, 4, &marker, &marker).unwrap();
+        for i in 12..24u32 {
+            ids.push(kv.alloc_page(0, i, 2, 1, 4, &metrics).unwrap());
+        }
+        assert!(
+            kv.nvme_count() > 0,
+            "DRAM overflow must spill to NVMe; counts={:?} nvme={}",
+            kv.counts(),
+            kv.nvme_count()
+        );
+        let (k, v) = kv.read_kv(ids[0], 1, 4).unwrap();
+        assert_eq!(&k[..4], marker.as_slice(), "cold-tier read must keep K bytes");
+        assert_eq!(&v[..4], marker.as_slice(), "cold-tier read must keep V bytes");
+        kv.write_slot(ids[0], 1, 1, 4, &marker, &marker).unwrap();
+        let (k, _) = kv.read_kv(ids[0], 1, 4).unwrap();
+        assert_eq!(
+            k.len(),
+            8,
+            "write after NVMe restore must keep both slots; filled len={}",
+            k.len()
+        );
+        assert!(
+            kv.nvme_reads() >= 1,
+            "spilled pages must be read from the swap file"
+        );
     }
 
     /// Packed device K/V rows written as page runs must match per-slot HIP copies.

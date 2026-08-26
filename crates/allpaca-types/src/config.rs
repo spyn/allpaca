@@ -248,6 +248,10 @@ pub struct KvSection {
     /// Simulated VRAM budget on the CPU backend (bytes of f32 KV storage).
     pub vram_bytes: usize,
     pub dram_bytes: usize,
+    /// Cold KV swap file budget. 0 = disabled (VRAM ↔ DRAM only).
+    pub nvme_bytes: usize,
+    /// Swap file path. None = a process-local temp file removed on drop.
+    pub nvme_path: Option<PathBuf>,
 }
 
 impl Default for KvSection {
@@ -257,6 +261,8 @@ impl Default for KvSection {
             hot_fraction: 0.75,
             vram_bytes: 4 * 1024 * 1024,
             dram_bytes: 32 * 1024 * 1024,
+            nvme_bytes: 0,
+            nvme_path: None,
         }
     }
 }
