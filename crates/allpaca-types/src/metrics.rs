@@ -148,4 +148,16 @@ pub struct StatsSnapshot {
     /// NVMe → DRAM restores of the next page_index (prefetch, not a decode fault).
     #[serde(default)]
     pub kv_nvme_prefetches: u64,
+    /// Continuous-batching `Engine::poll` ticks.
+    #[serde(default)]
+    pub poll_ticks: u64,
+    /// Poll picks while the Request was still prefilling.
+    #[serde(default)]
+    pub poll_prefill_picks: u64,
+    /// Poll picks while the Request was decoding (or emitting).
+    #[serde(default)]
+    pub poll_decode_picks: u64,
+    /// EMA of wait-ms before a poll pick (longest-waiting fairness).
+    #[serde(default)]
+    pub poll_wait_ms_ema: f64,
 }

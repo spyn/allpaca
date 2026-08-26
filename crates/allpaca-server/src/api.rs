@@ -381,6 +381,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_chat_completions_drive_poll_when_max_active_two() {
+        let state = multi_request_state();
+        let app = router(state.clone());
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (res_a, res_b) = tokio::join!(
+            app.clone().oneshot(make_req()),
+            app.oneshot(make_req()),
+        );
+        assert_eq!(res_a.expect("a").status(), StatusCode::OK);
+        assert_eq!(res_b.expect("b").status(), StatusCode::OK);
+        let stats = state.engine.stats();
+        assert!(
+            stats.poll_ticks > 0,
+            "HTTP chat with max_active_requests=2 must use Engine::poll; stats={stats:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn overlapping_chat_completions_do_not_500() {
         let app = router(multi_request_state());
         let body = serde_json::json!({

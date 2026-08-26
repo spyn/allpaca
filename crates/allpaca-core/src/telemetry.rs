@@ -66,6 +66,11 @@ pub struct Metrics {
     pub kv_nvme_bytes: AtomicU64,
     pub kv_nvme_direct: AtomicU64,
     pub kv_nvme_prefetches: AtomicU64,
+    /// Continuous-batching `Engine::poll` invocations.
+    pub poll_ticks: AtomicU64,
+    pub poll_prefill_picks: AtomicU64,
+    pub poll_decode_picks: AtomicU64,
+    pub poll_wait_ms_ema_x100: AtomicU64,
 }
 
 impl Metrics {
@@ -179,6 +184,10 @@ impl Metrics {
             kv_nvme_bytes: self.kv_nvme_bytes.load(Ordering::Relaxed),
             kv_nvme_direct: self.kv_nvme_direct.load(Ordering::Relaxed) != 0,
             kv_nvme_prefetches: self.kv_nvme_prefetches.load(Ordering::Relaxed),
+            poll_ticks: self.poll_ticks.load(Ordering::Relaxed),
+            poll_prefill_picks: self.poll_prefill_picks.load(Ordering::Relaxed),
+            poll_decode_picks: self.poll_decode_picks.load(Ordering::Relaxed),
+            poll_wait_ms_ema: self.poll_wait_ms_ema_x100.load(Ordering::Relaxed) as f64 / 100.0,
         }
     }
 

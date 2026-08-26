@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -46,6 +46,8 @@ struct ActiveRequest {
     pages: Vec<Vec<u64>>,
     pending_logits: Vec<f32>,
     emit_queue: Vec<TokenEvent>,
+    /// StepResults parked by a peer thread's fair `poll` demux.
+    parked: VecDeque<StepResult>,
     json_prefix: String,
     grammar: Option<llguidance::Matcher>,
     rng: StdRng,
@@ -733,18 +735,10 @@ impl Engine {
     ) -> Result<GenerationOutput, AllpacaError> {
         let mut handle = self.begin_request(prompt, params)?;
         let mut token_ids = Vec::new();
-        let finish = loop {
-            match self.step(&mut handle)? {
-                StepResult::Token(ev) => {
-                    token_ids.push(ev.token_id);
-                    if let Some(reason) = ev.finish_reason {
-                        break reason;
-                    }
-                }
-                StepResult::Prefill { .. } => {}
-                StepResult::Finished(reason) => break reason,
-            }
-        };
+        let finish = self.drive_request(&mut handle, |ev| {
+            token_ids.push(ev.token_id);
+            ev.finish_reason
+        })?;
         let text = {
             let inner = self.lock()?;
             inner
@@ -769,6 +763,7 @@ impl Engine {
         params: GenerationParams,
     ) -> impl Stream<Item = Result<TokenEvent, AllpacaError>> + Send {
         let engine = self.clone();
+        let use_fair = engine.config.engine.max_active_requests > 1;
         async_stream::stream! {
             let mut handle = match engine.begin_request(&prompt, params) {
                 Ok(h) => h,
@@ -777,24 +772,133 @@ impl Engine {
                     return;
                 }
             };
-            loop {
-                match engine.step(&mut handle) {
-                    Ok(StepResult::Token(ev)) => {
-                        let done = ev.finish_reason.is_some();
-                        yield Ok(ev);
-                        if done {
+            if use_fair {
+                loop {
+                    match engine.next_fair(&mut handle) {
+                        Ok(None) => break,
+                        Ok(Some(ev)) => {
+                            let done = ev.finish_reason.is_some();
+                            yield Ok(ev);
+                            if done {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(e);
                             break;
                         }
                     }
-                    Ok(StepResult::Prefill { .. }) => {}
-                    Ok(StepResult::Finished(_)) => break,
-                    Err(e) => {
-                        yield Err(e);
-                        break;
+                }
+            } else {
+                loop {
+                    match engine.step(&mut handle) {
+                        Ok(StepResult::Token(ev)) => {
+                            let done = ev.finish_reason.is_some();
+                            yield Ok(ev);
+                            if done {
+                                break;
+                            }
+                        }
+                        Ok(StepResult::Prefill { .. }) => {}
+                        Ok(StepResult::Finished(_)) => break,
+                        Err(e) => {
+                            yield Err(e);
+                            break;
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Drive one Request to completion. When `max_active_requests > 1`, uses
+    /// `poll` and parks foreign events so concurrent callers share fair scheduling.
+    fn drive_request(
+        &self,
+        handle: &mut RequestHandle,
+        mut on_token: impl FnMut(TokenEvent) -> Option<FinishReason>,
+    ) -> Result<FinishReason, AllpacaError> {
+        if self.config.engine.max_active_requests <= 1 {
+            loop {
+                match self.step(handle)? {
+                    StepResult::Token(ev) => {
+                        if let Some(reason) = on_token(ev) {
+                            return Ok(reason);
+                        }
+                    }
+                    StepResult::Prefill { .. } => {}
+                    StepResult::Finished(reason) => return Ok(reason),
+                }
+            }
+        }
+        loop {
+            match self.next_fair(handle)? {
+                None => {
+                    return Ok(FinishReason::Stop);
+                }
+                Some(ev) => {
+                    if let Some(reason) = on_token(ev) {
+                        return Ok(reason);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One fair tick for `handle`: drain parked results, else `poll` (parking peers).
+    fn next_fair(&self, handle: &mut RequestHandle) -> Result<Option<TokenEvent>, AllpacaError> {
+        let id = handle.id;
+        loop {
+            if let Some(parked) = self.take_parked(id)? {
+                match parked {
+                    StepResult::Token(ev) => return Ok(Some(ev)),
+                    StepResult::Prefill { .. } => continue,
+                    StepResult::Finished(_) => return Ok(None),
+                }
+            }
+            match self.poll()? {
+                None => {
+                    // Idle: if we are finished, stop; else retry (peer may unblock).
+                    let finished = {
+                        let inner = self.lock()?;
+                        inner
+                            .active
+                            .get(&id)
+                            .map(|r| r.finished && r.emit_queue.is_empty() && r.parked.is_empty())
+                            .unwrap_or(true)
+                    };
+                    if finished {
+                        return Ok(None);
+                    }
+                    std::thread::yield_now();
+                    continue;
+                }
+                Some(ev) if ev.request_id == id => match ev.result {
+                    StepResult::Token(tok) => return Ok(Some(tok)),
+                    StepResult::Prefill { .. } => continue,
+                    StepResult::Finished(_) => return Ok(None),
+                },
+                Some(ev) => {
+                    self.park_result(ev.request_id, ev.result)?;
+                }
+            }
+        }
+    }
+
+    fn take_parked(&self, id: u64) -> Result<Option<StepResult>, AllpacaError> {
+        let mut inner = self.lock()?;
+        Ok(inner
+            .active
+            .get_mut(&id)
+            .and_then(|r| r.parked.pop_front()))
+    }
+
+    fn park_result(&self, id: u64, result: StepResult) -> Result<(), AllpacaError> {
+        let mut inner = self.lock()?;
+        if let Some(active) = inner.active.get_mut(&id) {
+            active.parked.push_back(result);
+        }
+        Ok(())
     }
 
     pub fn begin_request(
@@ -897,6 +1001,7 @@ impl Engine {
                 pages,
                 pending_logits: vec![0.0f32; vocab],
                 emit_queue: Vec::new(),
+                parked: VecDeque::new(),
                 json_prefix: String::new(),
                 grammar,
                 rng,
@@ -935,25 +1040,56 @@ impl Engine {
     /// Advance the longest-waiting runnable Request. `None` when nothing is runnable
     /// (idle, or only finished Requests remain until their handles are dropped).
     pub fn poll(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
-        let id = {
+        let (id, waited_ms, is_prefill) = {
             let inner = self.lock()?;
             let candidates: Vec<(u64, Instant)> = inner
                 .active
                 .iter()
-                .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty()))
+                .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty()))
                 .map(|(id, r)| (*id, r.last_token_at))
                 .collect();
-            inner
+            let id = inner
                 .scheduler
-                .pick_runnable(&candidates, inner.last_poll_id)
-        };
-        let Some(id) = id else {
-            return Ok(None);
+                .pick_runnable(&candidates, inner.last_poll_id);
+            let Some(id) = id else {
+                return Ok(None);
+            };
+            let active = inner.active.get(&id).unwrap();
+            let waited_ms = active.last_token_at.elapsed().as_secs_f64() * 1000.0;
+            let is_prefill = active.prefill_pos < active.prompt_len && active.emit_queue.is_empty();
+            (id, waited_ms, is_prefill)
         };
         {
             let mut inner = self.lock()?;
             inner.last_poll_id = Some(id);
         }
+        self.metrics
+            .poll_ticks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if is_prefill {
+            self.metrics
+                .poll_prefill_picks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.metrics
+                .poll_decode_picks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // EMA wait time (x100 for AtomicU64).
+        let prev = self
+            .metrics
+            .poll_wait_ms_ema_x100
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 100.0;
+        let ema = if prev <= 0.0 {
+            waited_ms
+        } else {
+            prev * 0.9 + waited_ms * 0.1
+        };
+        self.metrics.poll_wait_ms_ema_x100.store(
+            (ema * 100.0) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let result = self.step_id(id)?;
         Ok(Some(allpaca_types::PollEvent {
             request_id: id,
@@ -2639,6 +2775,42 @@ mod tests {
         assert_ne!(
             out_a.token_ids, out_b.token_ids,
             "different prompts must produce independently progressing Requests"
+        );
+    }
+
+    #[test]
+    fn concurrent_generate_uses_poll_when_max_active_above_one() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let a = {
+            let engine = engine.clone();
+            let params = params.clone();
+            std::thread::spawn(move || engine.generate("hello", params))
+        };
+        let b = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.generate("world", params))
+        };
+        let out_a = a.join().unwrap().unwrap();
+        let out_b = b.join().unwrap().unwrap();
+        assert!(!out_a.token_ids.is_empty());
+        assert!(!out_b.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.poll_ticks > 0,
+            "max_active_requests>1 must drive generate via poll; stats={stats:?}"
+        );
+        assert!(
+            stats.poll_decode_picks > 0,
+            "fair generate must record decode picks; stats={stats:?}"
         );
     }
 
