@@ -413,6 +413,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_exposes_continuous_batching_fields_after_overlapping_chat() {
+        let state = multi_request_state();
+        let app = router(state);
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (res_a, res_b) = tokio::join!(
+            app.clone().oneshot(make_req()),
+            app.clone().oneshot(make_req()),
+        );
+        assert_eq!(res_a.expect("a").status(), StatusCode::OK);
+        assert_eq!(res_b.expect("b").status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["poll_ticks"].as_u64().unwrap_or(0) > 0,
+            "GET /stats must report poll_ticks after multi-request chat; json={json}"
+        );
+        assert!(
+            json["poll_decode_picks"].as_u64().unwrap_or(0) > 0,
+            "GET /stats must report decode picks; json={json}"
+        );
+        assert!(
+            json.get("poll_prefill_picks").is_some(),
+            "GET /stats must expose poll_prefill_picks; json={json}"
+        );
+        assert!(
+            json.get("poll_wait_ms_ema").is_some(),
+            "GET /stats must expose poll_wait_ms_ema; json={json}"
+        );
+        assert!(
+            json.get("active_requests").is_some(),
+            "GET /stats must expose queue depth as active_requests; json={json}"
+        );
+    }
+
+    #[tokio::test]
     async fn overlapping_chat_completions_do_not_500() {
         let app = router(multi_request_state());
         let body = serde_json::json!({
