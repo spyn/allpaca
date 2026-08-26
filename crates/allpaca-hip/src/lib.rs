@@ -280,6 +280,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_q4_k_untiled(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_f16(
             a: *const f32,
             b: *const u16,
@@ -1064,6 +1073,30 @@ pub fn gemm_nt_q4_k_device(
     }
 }
 
+/// Untiled Q4_K GEMV baseline (§12 before/after).
+pub fn gemm_nt_q4_k_untiled_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc =
+            unsafe { ffi::allpaca_gemm_nt_q4_k_untiled(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q4_k_untiled")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q4_k_untiled unavailable".into(),
+        )))
+    }
+}
+
 /// Host-pointer F16 NT GEMM: copies packed IEEE F16 `b`, runs the kernel, copies back.
 pub fn gemm_nt_f16(
     a: &[f32],
@@ -1121,6 +1154,30 @@ pub fn gemm_nt_q4_k(
     n: i32,
     k: i32,
 ) -> Result<(), AllpacaError> {
+    gemm_nt_q4_k_host(a, b, c, m, n, k, gemm_nt_q4_k_device)
+}
+
+/// Untiled Q4_K host GEMV for §12 before/after tracers.
+pub fn gemm_nt_q4_k_untiled(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    gemm_nt_q4_k_host(a, b, c, m, n, k, gemm_nt_q4_k_untiled_device)
+}
+
+fn gemm_nt_q4_k_host(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+    kernel: fn(*const f32, *const u8, *mut f32, i32, i32, i32) -> Result<(), AllpacaError>,
+) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
         if m <= 0 || n <= 0 || k <= 0 {
@@ -1144,7 +1201,7 @@ pub fn gemm_nt_q4_k(
         let result = (|| {
             memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
             memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
-            gemm_nt_q4_k_device(da.cast(), db, dc.cast(), m, n, k)?;
+            kernel(da.cast(), db, dc.cast(), m, n, k)?;
             memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
         })();
         device_free(da, a_n * 4);
@@ -1154,7 +1211,7 @@ pub fn gemm_nt_q4_k(
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
-        let _ = (a, b, c, m, n, k);
+        let _ = (a, b, c, m, n, k, kernel);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q4_k unavailable".into(),
         )))
@@ -3845,6 +3902,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §12: tiled Q4_K GEMV matches untiled baseline; before/after wall times recorded.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q4_k_tiled_gemv_matches_untiled_and_records_before_after() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 1usize;
+        let n = 128usize;
+        let k = 4096usize;
+        let (a, b_q, _) = fill_q4k_gemm_case(42, m, n, k);
+        let mut tiled = vec![0.0f32; m * n];
+        let mut untiled = vec![0.0f32; m * n];
+        gemm_nt_q4_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32)
+            .expect("tiled Q4_K");
+        gemm_nt_q4_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32)
+            .expect("untiled Q4_K");
+        for i in 0..m * n {
+            assert!(
+                gemm_close(tiled[i], untiled[i]),
+                "tiled vs untiled mismatch idx={i} tiled={} untiled={}",
+                tiled[i],
+                untiled[i]
+            );
+        }
+        let warm = 3usize;
+        let reps = 20usize;
+        for _ in 0..warm {
+            gemm_nt_q4_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32).unwrap();
+            gemm_nt_q4_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_q4_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let before_us = t0.elapsed().as_micros();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_q4_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let after_us = t1.elapsed().as_micros();
+        eprintln!(
+            "§12 Q4_K GEMV 1x{n}x{k} x{reps}: untiled(before)={before_us}us tiled(after)={after_us}us"
+        );
+        assert!(
+            before_us > 0 && after_us > 0,
+            "before/after tracers must record positive times"
+        );
     }
 
     /// Public `gemm_nt_q8_0` must match CPU dequant + NT GEMM on small random shapes.

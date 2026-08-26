@@ -1236,9 +1236,10 @@ __device__ void q4k_scale_min(int j, const uint8_t *scales, uint8_t *sc, uint8_t
     }
 }
 
-/* One thread per output column. Native 144-byte Q4_K super-blocks along K. */
-__global__ void gemv_nt_q4_k_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
-                                    int k) {
+/* One thread per output column. Native 144-byte Q4_K super-blocks along K.
+ * Baseline: each column re-reads A from global (no LDS tile). */
+__global__ void gemv_nt_q4_k_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                            int n, int k) {
     const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int row = static_cast<int>(blockIdx.y);
     if (col >= n || row >= m) {
@@ -1286,16 +1287,93 @@ __global__ void gemv_nt_q4_k_kernel(const float *a, const uint8_t *b, float *c, 
     c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
 }
 
-extern "C" int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
-                                    int32_t k, allpaca_stream_t stream) {
+/* Cache-aware decode tile (§12): one 256-float A super-block in LDS, reused by COLS columns. */
+__global__ void gemv_nt_q4_k_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                          int k) {
+    constexpr int COLS = 64;
+    __shared__ float As[256];
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 255) / 256;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const uint8_t *brow =
+        (tid < COLS && col < n)
+            ? b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 144
+            : nullptr;
+    float acc = 0.f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const int k0 = ib * 256;
+        As[tid] = (k0 + tid < k) ? arow[k0 + tid] : 0.f;
+        __syncthreads();
+        if (brow) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * 144;
+            const float d = allpaca_f16le_to_f32(blk);
+            const float dmin = allpaca_f16le_to_f32(blk + 2);
+            const uint8_t *scales = blk + 4;
+            const uint8_t *qs = blk + 16;
+            int q_off = 0;
+            int is = 0;
+            for (int g = 0; g < 4; ++g) {
+                uint8_t sc1 = 0;
+                uint8_t m1 = 0;
+                uint8_t sc2 = 0;
+                uint8_t m2 = 0;
+                q4k_scale_min(is, scales, &sc1, &m1);
+                q4k_scale_min(is + 1, scales, &sc2, &m2);
+                const float d1 = d * static_cast<float>(sc1);
+                const float min1 = dmin * static_cast<float>(m1);
+                const float d2 = d * static_cast<float>(sc2);
+                const float min2 = dmin * static_cast<float>(m2);
+                for (int l = 0; l < 32; ++l) {
+                    const int i0 = g * 64 + l;
+                    const int i1 = i0 + 32;
+                    const uint8_t packed = qs[q_off + l];
+                    acc += As[i0] * (d1 * static_cast<float>(packed & 0x0F) - min1);
+                    acc += As[i1] * (d2 * static_cast<float>(packed >> 4) - min2);
+                }
+                q_off += 32;
+                is += 2;
+            }
+        }
+        __syncthreads();
+    }
+    if (brow) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+static int launch_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                               int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    dim3 block(256);
-    dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
-    hipLaunchKernelGGL(gemv_nt_q4_k_kernel, grid, block, 0, as_stream(stream), a, b, c, m, n, k);
+    if (tiled) {
+        constexpr int COLS = 64;
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_q4_k_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    } else {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_q4_k_untiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    }
     return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_q4_k(a, b, c, m, n, k, as_stream(stream), 1);
+}
+
+/* Untiled baseline for §12 before/after tracers. */
+extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m,
+                                            int32_t n, int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_q4_k(a, b, c, m, n, k, as_stream(stream), 0);
 }
 
 extern "C" int allpaca_hip_device_count(int32_t *count) {
@@ -2168,6 +2246,11 @@ extern "C" int allpaca_gemm_nt_q8_0_intdot(const float *, const uint8_t *, float
 
 extern "C" int allpaca_gemm_nt_q4_k(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *, const uint8_t *, float *, int32_t,
+                                            int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

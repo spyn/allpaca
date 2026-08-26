@@ -76,9 +76,14 @@ int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, 
 int allpaca_gemm_nt_q8_0_intdot(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, allpaca_stream_t stream);
 
-/* C[m,n] = A[m,k] * dequant(B_q4_k[n,k])^T. B is native GGUF Q4_K super-blocks. */
+/* C[m,n] = A[m,k] * dequant(B_q4_k[n,k])^T. B is native GGUF Q4_K super-blocks.
+ * Default is cache-aware A-tile GEMV (§12). */
 int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
+
+/* Untiled one-thread-per-column Q4_K GEMV (before §12 tile). Tracer / A-B only. */
+int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                 int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_f16[n,k])^T. B is packed IEEE F16, row-major [n,k].
  * Decode (M<=8) is custom GEMV; M>8 uses a tiled kernel. */
