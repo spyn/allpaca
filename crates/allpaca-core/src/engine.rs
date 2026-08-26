@@ -3777,6 +3777,32 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_hybrid_gguf_load_fatals_with_named_reason() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf",
+        );
+        if !path.exists() {
+            return;
+        }
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path);
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("Nemotron hybrid/FP4 must not load for generate"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nemotron_h_moe") && msg.contains("SSM") && msg.contains("100"),
+            "named Fatal must cite arch, SSM, and ggml_type_id 100; got {msg}"
+        );
+    }
+
+    #[test]
     fn engine_fatal_on_missing_or_invalid_safetensors() {
         let mut missing = Config::compiled_defaults();
         missing.merge_cli(&CliOverrides {

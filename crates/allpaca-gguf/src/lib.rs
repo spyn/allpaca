@@ -4,7 +4,7 @@ mod parser;
 mod tokenizer;
 mod writer;
 
-pub use parser::{GgmlType, GgufFile, GgufValue, TensorInfo, GGUF_MAGIC};
+pub use parser::{GgmlType, GgufCompatReport, GgufFile, GgufValue, TensorInfo, GGUF_MAGIC};
 pub use tokenizer::{extract_tokenizer, GgufTokenizer};
 pub use writer::{
     quantize_f16, quantize_q4_0, quantize_q4_k, quantize_q5_k, quantize_q6_k, quantize_q8_0,

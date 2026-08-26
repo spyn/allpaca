@@ -1759,6 +1759,10 @@ impl TinyModel {
     }
 
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
+        let report = file.compat_report();
+        if let Some(reason) = report.reject_reason {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
+        }
         let cfg = ModelConfig::from_gguf(file)?;
         let name = file
             .meta_str("general.name")

@@ -211,6 +211,19 @@ impl TensorInfo {
     }
 }
 
+/// Header-only GGUF probe: architecture, layer mix, and quant type ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GgufCompatReport {
+    pub architecture: String,
+    pub n_layers: usize,
+    pub ssm_layers: usize,
+    pub attention_layers: usize,
+    pub moe_layers: usize,
+    pub ggml_type_ids: Vec<u32>,
+    /// Named Fatal message when this file cannot be loaded for generate.
+    pub reject_reason: Option<String>,
+}
+
 pub struct GgufFile {
     mmap: Mmap,
     pub version: u32,
@@ -297,6 +310,108 @@ impl GgufFile {
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
+    }
+
+    /// Probe arch / layer mix / ggml type ids without loading weights.
+    /// `reject_reason` is set when Allpaca cannot run the file (hybrid SSM, unknown quant, …).
+    pub fn compat_report(&self) -> GgufCompatReport {
+        let architecture = self
+            .architecture()
+            .unwrap_or("unknown")
+            .to_string();
+        let n_layers = self
+            .meta_u32(&format!("{architecture}.block_count"))
+            .or_else(|| self.meta_u32("llama.block_count"))
+            .unwrap_or_else(|| {
+                self.tensors
+                    .iter()
+                    .filter_map(|t| {
+                        let mut parts = t.name.split('.');
+                        if parts.next() != Some("blk") {
+                            return None;
+                        }
+                        parts.next()?.parse::<u32>().ok()
+                    })
+                    .max()
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            }) as usize;
+        let mut ssm_layers = 0usize;
+        let mut attention_layers = 0usize;
+        let mut moe_layers = 0usize;
+        for i in 0..n_layers {
+            let ssm = self.tensor(&format!("blk.{i}.ssm_in.weight")).is_some()
+                || self.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some();
+            let attn = self.tensor(&format!("blk.{i}.attn_q.weight")).is_some();
+            let moe = self.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some()
+                || self.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some()
+                || self.tensor(&format!("blk.{i}.ffn_gate.0.weight")).is_some();
+            if ssm {
+                ssm_layers += 1;
+            }
+            if attn {
+                attention_layers += 1;
+            }
+            if moe {
+                moe_layers += 1;
+            }
+        }
+        let mut ggml_type_ids: Vec<u32> = self.tensors.iter().map(|t| t.ggml_type_id).collect();
+        ggml_type_ids.sort_unstable();
+        ggml_type_ids.dedup();
+
+        const SUPPORTED_GGML: &[u32] = &[
+            GgmlType::F32 as u32,
+            GgmlType::F16 as u32,
+            GgmlType::Q4_0 as u32,
+            GgmlType::Q8_0 as u32,
+            GgmlType::Q4_K as u32,
+            GgmlType::Q5_K as u32,
+            GgmlType::Q6_K as u32,
+        ];
+        let unsupported_types: Vec<u32> = ggml_type_ids
+            .iter()
+            .copied()
+            .filter(|id| !SUPPORTED_GGML.contains(id))
+            .collect();
+
+        let mut reasons = Vec::new();
+        if ssm_layers > 0 {
+            reasons.push(format!(
+                "hybrid SSM/Mamba ({ssm_layers} layers; no Allpaca SSM kernel)"
+            ));
+        }
+        if !unsupported_types.is_empty() {
+            reasons.push(format!(
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K)"
+            ));
+        }
+        let llama_family = matches!(
+            architecture.as_str(),
+            "llama" | "mistral" | "mixtral" | "qwen2" | "qwen2moe" | "phi3" | "minicpm"
+        );
+        if !llama_family && ssm_layers == 0 && attention_layers == 0 && n_layers > 0 {
+            reasons.push(format!(
+                "architecture '{architecture}' is outside the Llama-layout loader"
+            ));
+        }
+        let reject_reason = if reasons.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "unsupported GGUF architecture '{architecture}': {}; layer mix attn={attention_layers} ssm={ssm_layers} moe={moe_layers}; ggml_type_ids={ggml_type_ids:?}",
+                reasons.join("; ")
+            ))
+        };
+        GgufCompatReport {
+            architecture,
+            n_layers,
+            ssm_layers,
+            attention_layers,
+            moe_layers,
+            ggml_type_ids,
+            reject_reason,
+        }
     }
 
     /// Materialize a tensor as F32. F16 / Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K convert on CPU; other quants are Fatal.
@@ -893,5 +1008,76 @@ mod tests {
             "unsupported GGUF quant must be Fatal, got {err:?}"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compat_report_names_hybrid_ssm_and_unknown_quant() {
+        let path = std::env::temp_dir().join("allpaca_gguf_hybrid_probe.gguf");
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("nemotron_h_moe".into()),
+        );
+        meta.insert(
+            "nemotron_h_moe.block_count".into(),
+            GgufValue::Uint32(1),
+        );
+        let ssm = vec![0.0f32; 4];
+        write_gguf(
+            &path,
+            &meta,
+            &[GgufWriteTensor {
+                name: "blk.0.ssm_in.weight".into(),
+                dims: vec![4, 1],
+                data: &ssm,
+            }],
+        )
+        .unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let report = file.compat_report();
+        assert_eq!(report.architecture, "nemotron_h_moe");
+        assert_eq!(report.n_layers, 1);
+        assert_eq!(report.ssm_layers, 1);
+        let reason = report
+            .reject_reason
+            .expect("hybrid SSM must be rejected by name");
+        assert!(
+            reason.contains("nemotron_h_moe") && reason.contains("SSM"),
+            "named reject must cite arch + SSM; got {reason}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nemotron_rocmfp4_gguf_probe_fatals_with_named_reason() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf");
+        if !path.exists() {
+            return;
+        }
+        let file = GgufFile::open(&path).expect("mmap Nemotron header");
+        let report = file.compat_report();
+        assert_eq!(report.architecture, "nemotron_h_moe");
+        assert_eq!(report.n_layers, 52);
+        assert!(report.ssm_layers > 0, "expected SSM layers; {report:?}");
+        assert!(
+            report.attention_layers > 0,
+            "expected attention layers; {report:?}"
+        );
+        assert!(report.moe_layers > 0, "expected MoE layers; {report:?}");
+        assert!(
+            report.ggml_type_ids.contains(&100),
+            "ROCmFP4 uses ggml_type_id=100; ids={:?}",
+            report.ggml_type_ids
+        );
+        let reason = report
+            .reject_reason
+            .expect("Nemotron hybrid must reject by name");
+        assert!(
+            reason.contains("nemotron_h_moe")
+                && reason.contains("SSM")
+                && reason.contains("100"),
+            "Fatal reason must name arch, SSM, and type 100; got {reason}"
+        );
     }
 }
