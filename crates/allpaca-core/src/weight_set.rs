@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use allpaca_types::{AllpacaError, FatalError, MissPolicy};
 
 use crate::model::LayerWeights;
+use crate::packed::{temp_pack_path, PackedStore};
 use crate::telemetry::Metrics;
 
 /// Alignment for ring slots (O_DIRECT-style). Prefix layers keep exact sizes.
@@ -291,6 +292,7 @@ impl FfnRefs<'_> {
 pub struct WeightWorkingSet {
     pub plan: DenseTrunkPlan,
     pool: Vec<LayerFfn>,
+    store: Option<PackedStore>,
     ring: Mutex<RingState>,
     binds: AtomicU64,
     hits: AtomicU64,
@@ -300,34 +302,56 @@ impl std::fmt::Debug for WeightWorkingSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WeightWorkingSet")
             .field("plan", &self.plan)
+            .field("packed", &self.store.is_some())
             .finish()
     }
 }
 
 impl WeightWorkingSet {
-    pub fn detach_unpinned(model_layers: &mut [LayerWeights], plan: DenseTrunkPlan) -> Arc<Self> {
+    pub fn detach_unpinned(
+        model_layers: &mut [LayerWeights],
+        plan: DenseTrunkPlan,
+    ) -> Result<Arc<Self>, AllpacaError> {
         let n = model_layers.len();
         let mut pool = Vec::with_capacity(n);
+        let mut packed = Vec::new();
         for (i, layer) in model_layers.iter_mut().enumerate() {
             if i < plan.pinned_prefix {
                 pool.push(LayerFfn::default());
             } else {
-                pool.push(LayerFfn::take_from(layer));
+                let ffn = LayerFfn::take_from(layer);
+                packed.push((
+                    ExpertId {
+                        layer: i as u32,
+                        expert: 0,
+                    },
+                    ffn,
+                ));
+                pool.push(LayerFfn::default());
             }
         }
+        let store = if packed.is_empty() {
+            None
+        } else {
+            Some(PackedStore::pack(
+                &temp_pack_path(),
+                packed.iter().map(|(id, ffn)| (*id, ffn)),
+            )?)
+        };
         let nring = plan.ring_slots.max(1);
         let ring = RingState {
             slots: (0..nring).map(|_| LayerFfn::default()).collect(),
             bound: vec![None; nring],
             cursor: 0,
         };
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             plan,
             pool,
+            store,
             ring: Mutex::new(ring),
             binds: AtomicU64::new(0),
             hits: AtomicU64::new(0),
-        })
+        }))
     }
 
     pub fn is_pinned(&self, layer: usize) -> bool {
@@ -357,6 +381,51 @@ impl WeightWorkingSet {
         self.pool.get(layer).filter(|f| !f.w_gate.is_empty())
     }
 
+    pub fn nvme_reads(&self) -> u64 {
+        self.store.as_ref().map(|s| s.reads()).unwrap_or(0)
+    }
+
+    pub fn nvme_bytes(&self) -> u64 {
+        self.store.as_ref().map(|s| s.bytes_read()).unwrap_or(0)
+    }
+
+    pub fn nvme_direct(&self) -> bool {
+        self.store.as_ref().map(|s| s.is_direct()).unwrap_or(false)
+    }
+
+    pub fn load_layer(&self, layer: usize) -> Result<LayerFfn, AllpacaError> {
+        if let Ok(ring) = self.ring.lock() {
+            if let Some(slot) = ring.bound.iter().position(|&b| b == Some(layer)) {
+                return Ok(ring.slots[slot].clone());
+            }
+        }
+        if let Some(store) = &self.store {
+            return store.read_expert(ExpertId {
+                layer: layer as u32,
+                expert: 0,
+            });
+        }
+        self.pool.get(layer).cloned().filter(|f| !f.w_gate.is_empty()).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "FFN layer {layer} missing from weight working set"
+            )))
+        })
+    }
+
+    fn fill_from_source(&self, layer: usize) -> Result<LayerFfn, AllpacaError> {
+        if let Some(store) = &self.store {
+            return store.read_expert(ExpertId {
+                layer: layer as u32,
+                expert: 0,
+            });
+        }
+        self.pool.get(layer).cloned().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "FFN layer {layer} missing from weight working set"
+            )))
+        })
+    }
+
     pub fn bind(&self, layer: usize) -> Result<BoundFfn<'_>, AllpacaError> {
         let mut ring = self.ring.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig(
@@ -378,13 +447,20 @@ impl WeightWorkingSet {
                 ring.cursor = ring.cursor.wrapping_add(1);
                 s
             });
-        let src = self.pool.get(layer).ok_or_else(|| {
-            AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "FFN layer {layer} missing from weight working set"
-            )))
-        })?;
-        ring.slots[slot] = src.clone();
+        ring.slots[slot] = self.fill_from_source(layer)?;
         ring.bound[slot] = Some(layer);
+        if n >= 2 {
+            let next = layer + 1;
+            if next < self.plan.n_layers && !self.is_pinned(next) {
+                let other = (slot + 1) % n;
+                if ring.bound[other] != Some(next) {
+                    if let Ok(ffn) = self.fill_from_source(next) {
+                        ring.slots[other] = ffn;
+                        ring.bound[other] = Some(next);
+                    }
+                }
+            }
+        }
         Ok(BoundFfn { guard: ring, slot })
     }
 
@@ -682,6 +758,70 @@ mod tests {
         assert_eq!(plan.ring_slots, 2);
         let plan_tight = DenseTrunkPlan::plan(&layers, one + 10, 2);
         assert_eq!(plan_tight.ring_slots, 1);
+    }
+
+    fn ffn_layer(gate: f32) -> crate::model::LayerWeights {
+        crate::model::LayerWeights {
+            attn_norm: vec![],
+            wq: vec![],
+            wk: vec![],
+            wv: vec![],
+            wo: vec![],
+            ffn_norm: vec![1.0],
+            w_gate: vec![gate],
+            w_up: vec![gate + 1.0],
+            w_down: vec![gate + 2.0],
+            w_router: vec![],
+            experts: vec![],
+        }
+    }
+
+    #[test]
+    fn unpinned_layers_page_from_packed_trunk() {
+        let mut layers = vec![ffn_layer(1.0), ffn_layer(10.0), ffn_layer(20.0)];
+        let plan = DenseTrunkPlan {
+            n_layers: 3,
+            pinned_prefix: 0,
+            ring_slots: 1,
+            slot_bytes: DIRECT_ALIGN,
+        };
+        let ws = WeightWorkingSet::detach_unpinned(&mut layers, plan).unwrap();
+        assert!(ws.host_ffn(0).is_none(), "unpinned FFN must leave RAM");
+        let a = ws.bind(0).unwrap();
+        assert_eq!(a.w_gate(), &[1.0]);
+        drop(a);
+        let b = ws.bind(1).unwrap();
+        assert_eq!(b.w_down(), &[12.0]);
+        drop(b);
+        assert!(
+            ws.nvme_reads() >= 2,
+            "one ring slot over two layers must miss to the packed trunk"
+        );
+    }
+
+    #[test]
+    fn spare_ring_slot_prefetches_next_layer() {
+        let mut layers = vec![ffn_layer(1.0), ffn_layer(10.0), ffn_layer(20.0)];
+        let plan = DenseTrunkPlan {
+            n_layers: 3,
+            pinned_prefix: 0,
+            ring_slots: 2,
+            slot_bytes: DIRECT_ALIGN,
+        };
+        let ws = WeightWorkingSet::detach_unpinned(&mut layers, plan).unwrap();
+        let _ = ws.bind(0).unwrap();
+        let reads_after_bind0 = ws.nvme_reads();
+        let b = ws.bind(1).unwrap();
+        assert_eq!(b.w_gate(), &[10.0]);
+        assert!(
+            ws.ring_hits() >= 1,
+            "prefetch of L+1 into the spare slot must hit on the next bind"
+        );
+        assert_eq!(
+            ws.nvme_reads(),
+            reads_after_bind0,
+            "hit must not re-read the packed trunk"
+        );
     }
 
     #[test]

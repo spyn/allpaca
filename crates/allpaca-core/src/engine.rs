@@ -235,6 +235,17 @@ impl Engine {
                         u64::from(pool.is_direct()),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                } else if let Some(ws) = g.target.as_ref().and_then(|m| m.working_set.as_ref()) {
+                    self.metrics
+                        .nvme_reads
+                        .store(ws.nvme_reads(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .nvme_bytes
+                        .store(ws.nvme_bytes(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.nvme_direct.store(
+                        u64::from(ws.nvme_direct()),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
                     self.metrics
@@ -393,7 +404,7 @@ impl Engine {
         let tokenizer = EngineTokenizer::synthetic(cfg.vocab_size)?;
         inner.ring.resize_vocab(cfg.vocab_size);
         let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
-        self.apply_weight_working_set(&mut target);
+        self.apply_weight_working_set(&mut target)?;
         self.apply_expert_lru(&mut target)?;
         inner.target = Some(Arc::new(target));
         if inner.flags.draft_model_speculation {
@@ -402,7 +413,7 @@ impl Engine {
                 seed.wrapping_add(1),
                 "synthetic-draft",
             );
-            self.apply_weight_working_set(&mut draft);
+            self.apply_weight_working_set(&mut draft)?;
             self.apply_expert_lru(&mut draft)?;
             inner.draft_model = Some(Arc::new(draft));
         }
@@ -414,22 +425,23 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_weight_working_set(&self, model: &mut TinyModel) {
+    fn apply_weight_working_set(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
         let cfg = &self.config.weights;
         if cfg.trunk_bytes == 0 || !model.host_weights_ready() {
-            return;
+            return Ok(());
         }
         let sizes: Vec<usize> = model.layers.iter().map(|l| l.ffn_bytes()).collect();
         if sizes.iter().all(|&b| b == 0) {
-            return;
+            return Ok(());
         }
         let requested = cfg.ring_slots.max(1);
         let plan = DenseTrunkPlan::plan(&sizes, cfg.trunk_bytes, requested);
         WeightWorkingSet::record_plan(&self.metrics, &plan);
         if !plan.streams() {
-            return;
+            return Ok(());
         }
-        model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan));
+        model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan)?);
+        Ok(())
     }
 
     fn apply_expert_lru(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
@@ -539,7 +551,7 @@ impl Engine {
         let hf = load_hf_config(&config_path)?;
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
-        self.apply_weight_working_set(&mut model);
+        self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
@@ -567,7 +579,7 @@ impl Engine {
         let hf = load_hf_config(&config_path)?;
         let vocab = load_vocab_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_onnx(&file, &hf)?;
-        self.apply_weight_working_set(&mut model);
+        self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
@@ -588,7 +600,7 @@ impl Engine {
                 "large GGUF requires HIP (host F32 materialize is skipped to avoid OOM)".into(),
             )));
         }
-        self.apply_weight_working_set(&mut model);
+        self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut inner = self.lock()?;
@@ -1993,6 +2005,10 @@ mod tests {
         assert!(
             stats.weight_ring_binds > 0,
             "streamed FFN must actually bind through the ring"
+        );
+        assert!(
+            stats.nvme_reads > 0,
+            "unpinned FFN must page from the packed trunk, not stay in RAM; stats={stats:?}"
         );
         assert!(
             stats.weight_pinned_layers < 2,

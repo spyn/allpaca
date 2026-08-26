@@ -301,6 +301,10 @@ fn streamed_ffn_hip_greedy_tokens_match_fully_resident() {
         after.weight_ring_binds > 0,
         "streamed FFN must bind through the ring"
     );
+    assert!(
+        after.nvme_reads > 0,
+        "unpinned FFN must H2D from the packed trunk; stats={after:?}"
+    );
 }
 
 #[cfg(feature = "hip")]

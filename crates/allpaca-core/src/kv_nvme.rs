@@ -125,6 +125,7 @@ impl NvmeKvStore {
         self.reads.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
     }

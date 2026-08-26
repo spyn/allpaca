@@ -1410,13 +1410,14 @@ impl TinyModel {
         layer_idx: usize,
         metrics: Option<&Metrics>,
     ) -> Result<DeviceFfn<'a>, AllpacaError> {
-        let host = self
-            .working_set
-            .as_ref()
-            .and_then(|ws| ws.host_ffn(layer_idx));
+        let host = match self.working_set.as_ref() {
+            Some(ws) if !ws.is_pinned(layer_idx) => Some(ws.load_layer(layer_idx)?),
+            Some(ws) => ws.host_ffn(layer_idx).cloned(),
+            None => None,
+        };
         resident.bind_ffn(
             layer_idx,
-            host,
+            host.as_ref(),
             self.working_set.as_deref(),
             metrics,
         )

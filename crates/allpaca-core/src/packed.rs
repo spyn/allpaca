@@ -1,7 +1,7 @@
-//! Packed expert banks on NVMe. Direct I/O into a bounded DRAM host pool.
+//! Packed layer-major trunk and expert banks on NVMe. Direct I/O into a bounded DRAM ring/pool.
 //!
-//! Not KV. Host (or this file) is source of truth when the expert set does not
-//! fit RAM; GPU LRU slots remain a speed dial.
+//! Not KV. Host (or this file) is source of truth when the working set does not
+//! fit RAM; GPU residency remains a speed dial.
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::HashMap;
