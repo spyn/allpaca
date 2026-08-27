@@ -4234,11 +4234,98 @@ mod tests {
     }
 
     #[test]
-    fn nemotron_hybrid_gguf_load_fatals_with_named_reason() {
+    fn nemotron_hybrid_fatal_reason_stable_synthetic_and_real() {
+        // Probe path (always): synthetic hybrid SSM GGUF must Fatal with a stable
+        // named reason — no silent skip when the real ROCmFP4 file is absent.
+        {
+            use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+            let path = std::env::temp_dir().join(format!(
+                "allpaca_nemotron_hybrid_probe-{}-{}.gguf",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut meta = std::collections::HashMap::new();
+            meta.insert(
+                "general.architecture".into(),
+                GgufValue::String("nemotron_h_moe".into()),
+            );
+            meta.insert(
+                "nemotron_h_moe.block_count".into(),
+                GgufValue::Uint32(1),
+            );
+            meta.insert(
+                "tokenizer.ggml.model".into(),
+                GgufValue::String("wordlevel".into()),
+            );
+            meta.insert(
+                "tokenizer.ggml.tokens".into(),
+                GgufValue::Array(vec![
+                    GgufValue::String("<unk>".into()),
+                    GgufValue::String("<s>".into()),
+                    GgufValue::String("</s>".into()),
+                    GgufValue::String("hi".into()),
+                ]),
+            );
+            meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+            meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+            let ssm = vec![0.0f32; 4];
+            write_gguf(
+                &path,
+                &meta,
+                &[GgufWriteTensor {
+                    name: "blk.0.ssm_in.weight".into(),
+                    dims: vec![4, 1],
+                    data: &ssm,
+                }],
+            )
+            .unwrap();
+            let nvme_path = std::env::temp_dir().join(format!(
+                "allpaca-nemotron-nvme-{}-{}.bin",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                cpu_only: true,
+                ..CliOverrides::default()
+            });
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(path.clone());
+            // MoE + NVMe cold tier (GEM hybrid serving posture).
+            cfg.weights.cache_bytes = 1 << 20;
+            cfg.weights.host_bytes = 1 << 20;
+            cfg.kv.nvme_bytes = 1 << 20;
+            cfg.kv.nvme_path = Some(nvme_path.clone());
+            let err = match Engine::new(cfg) {
+                Ok(_) => panic!("synthetic nemotron_h_moe SSM must Fatal"),
+                Err(e) => e,
+            };
+            assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("nemotron_h_moe") && msg.contains("SSM"),
+                "Fatal reason must stay stable (arch+SSM); got {msg}"
+            );
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&nvme_path);
+        }
+
+        // Real GGUF under MoE+NVMe: clear Fatal (SSM + ggml_type 100) — not a green
+        // generate path until SSM/FP4 land. Named skip if the file is absent.
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
             "../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf",
         );
         if !path.exists() {
+            eprintln!(
+                "skip nemotron real GGUF: place ROCmFP4 at {}; synthetic probe already asserted",
+                path.display()
+            );
             return;
         }
         let mut cfg = Config::compiled_defaults();
@@ -4246,7 +4333,16 @@ mod tests {
             cpu_only: true,
             ..CliOverrides::default()
         });
+        cfg.model.synthetic = false;
         cfg.model.path = Some(path);
+        cfg.weights.cache_bytes = 64 << 20;
+        cfg.weights.host_bytes = 64 << 20;
+        cfg.kv.nvme_bytes = 64 << 20;
+        cfg.kv.nvme_path = Some(std::env::temp_dir().join(format!(
+            "allpaca-nemotron-real-nvme-{}.bin",
+            std::process::id()
+        )));
+        let nvme = cfg.kv.nvme_path.clone();
         let err = match Engine::new(cfg) {
             Ok(_) => panic!("Nemotron hybrid/FP4 must not load for generate"),
             Err(e) => e,
@@ -4257,6 +4353,9 @@ mod tests {
             msg.contains("nemotron_h_moe") && msg.contains("SSM") && msg.contains("100"),
             "named Fatal must cite arch, SSM, and ggml_type_id 100; got {msg}"
         );
+        if let Some(p) = nvme {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

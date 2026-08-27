@@ -1087,6 +1087,10 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf");
         if !path.exists() {
+            eprintln!(
+                "skip nemotron_rocmfp4_gguf_probe: missing {}; see compat_report_names_hybrid_ssm",
+                path.display()
+            );
             return;
         }
         let file = GgufFile::open(&path).expect("mmap Nemotron header");
