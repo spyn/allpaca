@@ -211,6 +211,24 @@ impl TensorInfo {
     }
 }
 
+/// Per-block role in a hybrid GGUF (SSM / attention / MoE FFN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridLayerKind {
+    Ssm,
+    Attention,
+    DenseFfn,
+    /// Layer has MoE expert tensors (may also be Attention or Ssm for the sequence block).
+    Moe,
+}
+
+/// One layer in a hybrid map: sequence block kind plus whether MoE FFN is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HybridLayerInfo {
+    pub index: usize,
+    pub block: HybridLayerKind,
+    pub moe: bool,
+}
+
 /// Header-only GGUF probe: architecture, layer mix, and quant type ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgufCompatReport {
@@ -219,6 +237,8 @@ pub struct GgufCompatReport {
     pub ssm_layers: usize,
     pub attention_layers: usize,
     pub moe_layers: usize,
+    /// Per-layer map (`attn` / `ssm` / dense); `moe` is a separate flag per layer.
+    pub layers: Vec<HybridLayerInfo>,
     pub ggml_type_ids: Vec<u32>,
     /// Named Fatal message when this file cannot be loaded for generate.
     pub reject_reason: Option<String>,
@@ -339,6 +359,7 @@ impl GgufFile {
         let mut ssm_layers = 0usize;
         let mut attention_layers = 0usize;
         let mut moe_layers = 0usize;
+        let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let ssm = self.tensor(&format!("blk.{i}.ssm_in.weight")).is_some()
                 || self.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some();
@@ -355,6 +376,18 @@ impl GgufFile {
             if moe {
                 moe_layers += 1;
             }
+            let block = if ssm {
+                HybridLayerKind::Ssm
+            } else if attn {
+                HybridLayerKind::Attention
+            } else {
+                HybridLayerKind::DenseFfn
+            };
+            layers.push(HybridLayerInfo {
+                index: i,
+                block,
+                moe,
+            });
         }
         let mut ggml_type_ids: Vec<u32> = self.tensors.iter().map(|t| t.ggml_type_id).collect();
         ggml_type_ids.sort_unstable();
@@ -409,6 +442,7 @@ impl GgufFile {
             ssm_layers,
             attention_layers,
             moe_layers,
+            layers,
             ggml_type_ids,
             reject_reason,
         }
@@ -1078,6 +1112,26 @@ mod tests {
                 && reason.contains("SSM")
                 && reason.contains("100"),
             "Fatal reason must name arch, SSM, and type 100; got {reason}"
+        );
+        assert_eq!(report.layers.len(), 52);
+        assert!(
+            report
+                .layers
+                .iter()
+                .any(|l| l.block == HybridLayerKind::Ssm),
+            "layer map must tag SSM blocks; {:?}",
+            report.layers.iter().take(8).collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .layers
+                .iter()
+                .any(|l| l.block == HybridLayerKind::Attention),
+            "layer map must tag attention blocks"
+        );
+        assert!(
+            report.layers.iter().any(|l| l.moe),
+            "layer map must flag MoE FFN layers"
         );
     }
 }
