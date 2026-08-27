@@ -18,7 +18,9 @@ use rand::rngs::StdRng;
 use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
-use crate::direct_storage::{probe_direct_storage, DirectStorageProbe};
+use crate::direct_storage::{
+    probe_direct_storage, DirectStorageBridge, DirectStorageProbe, DirectStorageQueue,
+};
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
 use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
@@ -89,6 +91,8 @@ struct EngineInner {
     last_poll_id: Option<u64>,
     /// Consecutive prefill picks under `PrefillBudget` schedule.
     consecutive_prefill_picks: usize,
+    /// Next poll prefers this request (cross-req micro-batch partner).
+    prefer_next: Option<u64>,
 }
 
 struct DraftAhead {
@@ -104,6 +108,9 @@ pub struct Engine {
     metrics: Arc<Metrics>,
     hip: Option<Arc<HipWorkspace>>,
     draft_hip: Option<Arc<HipWorkspace>>,
+    /// Shared DirectStorage enqueue ledger (file-coordinate + staged H2D).
+    ds_queue: Arc<DirectStorageQueue>,
+    ds_probe: DirectStorageProbe,
 }
 
 pub struct RequestHandle {
@@ -185,6 +192,8 @@ impl Engine {
         );
         kv.open_nvme(config.kv.nvme_bytes, config.kv.nvme_path.as_deref())?;
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);
+        let ds_probe = probe_direct_storage();
+        let ds_queue = Arc::new(DirectStorageQueue::new());
         let inner = EngineInner {
             flags,
             scheduler,
@@ -202,11 +211,12 @@ impl Engine {
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
-            kv_radix: KvRadixForest::new(),
-            ds_probe: probe_direct_storage(),
+            kv_radix: KvRadixForest::with_max_nodes(4096),
+            ds_probe: ds_probe.clone(),
             grammar_factory: None,
             last_poll_id: None,
             consecutive_prefill_picks: 0,
+            prefer_next: None,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -215,6 +225,8 @@ impl Engine {
             metrics: Arc::new(Metrics::default()),
             hip,
             draft_hip,
+            ds_queue,
+            ds_probe,
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -298,8 +310,22 @@ impl Engine {
                     g.kv_radix.skip_tokens(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                self.metrics.radix_evictions.store(
+                    g.kv_radix.evictions(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 self.metrics.ds_available.store(
                     u64::from(g.ds_probe.available),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                // File-coordinate DMA intents + staged fills from the shared queue.
+                let q = &self.ds_queue;
+                self.metrics.ds_enqueued.store(
+                    q.enqueued() + q.staged(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.ds_bytes.store(
+                    q.bytes() + q.staged_bytes(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 self.metrics
@@ -551,7 +577,11 @@ impl Engine {
                 }
             }
             HostExpertPool::record_slots(&self.metrics, n_host);
-            model.expert_host = Some(HostExpertPool::new(store, n_host));
+            let ds = DirectStorageBridge {
+                probe: self.ds_probe.clone(),
+                queue: Arc::clone(&self.ds_queue),
+            };
+            model.expert_host = Some(HostExpertPool::with_direct_storage(store, n_host, ds));
         }
 
         let n_slots = expert_lru_slots(expert_bytes, self.config.weights.cache_bytes);
@@ -559,11 +589,15 @@ impl Engine {
         if n_slots == 0 {
             return Ok(());
         }
-        model.expert_lru = Some(ExpertLru::with_bandwidth(
+        let (t_dma, t_dispatch) = crate::model::measure_qstar_fixed_costs(expert_bytes);
+        model.expert_lru = Some(ExpertLru::with_overhead(
             n_slots,
             self.config.weights.miss_policy,
             b_pcie,
             b_host,
+            t_dma,
+            t_dispatch,
+            expert_bytes as f64,
         ));
         Ok(())
     }
@@ -1093,10 +1127,13 @@ impl Engine {
 
     /// Advance the longest-waiting runnable Request. `None` when nothing is runnable
     /// (idle, or only finished Requests remain until their handles are dropped).
+    ///
+    /// Under concurrency (`≥2` runnable), also advances a stagger partner in the
+    /// same tick (true cross-request micro-batch at poll granularity).
     pub fn poll(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
         loop {
-            let (id, waited_ms, is_prefill) = {
-                let inner = self.lock()?;
+            let (id, waited_ms, is_prefill, stagger_partner) = {
+                let mut inner = self.lock()?;
                 let schedule = self.config.engine.poll_schedule;
                 let max_pref = self.config.engine.max_consecutive_prefill_picks;
                 let streak = inner.consecutive_prefill_picks;
@@ -1110,11 +1147,12 @@ impl Engine {
                         (*id, r.last_token_at, prefill)
                     })
                     .collect();
-                // GEM: record cross-request GPU/CPU stagger intent under concurrency.
+                let mut stagger_partner: Option<u64> = None;
                 if candidates.len() >= 2 {
                     let hints: Vec<ActiveLayerHint> = candidates
                         .iter()
-                        .map(|(rid, _, pref)| ActiveLayerHint {
+                        .enumerate()
+                        .map(|(i, (rid, _, pref))| ActiveLayerHint {
                             request_id: *rid,
                             phase: if *pref {
                                 StaggerPhase::Prefill
@@ -1122,11 +1160,12 @@ impl Engine {
                                 StaggerPhase::Decode
                             },
                             layer: 0,
-                            cpu_expert_pending: inner
-                                .target
-                                .as_ref()
-                                .and_then(|m| m.expert_lru.as_ref())
-                                .is_some_and(|lru| lru.cpu_runs() > 0),
+                            cpu_expert_pending: i > 0
+                                || inner
+                                    .target
+                                    .as_ref()
+                                    .and_then(|m| m.expert_lru.as_ref())
+                                    .is_some_and(|lru| lru.cpu_runs() > 0),
                         })
                         .collect();
                     let plan = plan_micro_batch(&hints);
@@ -1134,27 +1173,58 @@ impl Engine {
                         self.metrics
                             .micro_batch_plans
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(c) = plan.cpu {
+                            stagger_partner = Some(c.request_id);
+                        }
                     }
                 }
-                let id = inner.scheduler.pick_runnable(
-                    &candidates,
-                    inner.last_poll_id,
-                    schedule,
-                    streak,
-                    max_pref,
-                );
+                let preferred = inner
+                    .prefer_next
+                    .take()
+                    .filter(|pid| candidates.iter().any(|(cid, _, _)| cid == pid));
+                if preferred.is_some() {
+                    self.metrics
+                        .micro_batch_dual_steps
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let id = preferred.or_else(|| {
+                    inner.scheduler.pick_runnable(
+                        &candidates,
+                        inner.last_poll_id,
+                        schedule,
+                        streak,
+                        max_pref,
+                    )
+                });
                 let Some(id) = id else {
                     return Ok(None);
                 };
+                if let Some(partner) = stagger_partner {
+                    if partner != id {
+                        // Drop the lock before step; stash preference for next tick.
+                        // (Set below after we re-lock.)
+                        stagger_partner = Some(partner);
+                    } else {
+                        stagger_partner = candidates
+                            .iter()
+                            .map(|(cid, _, _)| *cid)
+                            .find(|cid| *cid != id);
+                    }
+                }
                 let active = inner.active.get(&id).unwrap();
                 let waited_ms = active.last_token_at.elapsed().as_secs_f64() * 1000.0;
                 let is_prefill =
                     active.prefill_pos < active.prompt_len && active.emit_queue.is_empty();
-                (id, waited_ms, is_prefill)
+                (id, waited_ms, is_prefill, stagger_partner)
             };
             {
                 let mut inner = self.lock()?;
                 inner.last_poll_id = Some(id);
+                if let Some(partner) = stagger_partner {
+                    if partner != id {
+                        inner.prefer_next = Some(partner);
+                    }
+                }
                 if is_prefill {
                     inner.consecutive_prefill_picks =
                         inner.consecutive_prefill_picks.saturating_add(1);
@@ -1561,11 +1631,15 @@ impl Engine {
             .metrics
             .expert_host_bps
             .load(std::sync::atomic::Ordering::Relaxed) as f64;
-        model.expert_lru = Some(ExpertLru::with_bandwidth(
+        let (t_dma, t_dispatch) = crate::model::measure_qstar_fixed_costs(expert_bytes);
+        model.expert_lru = Some(ExpertLru::with_overhead(
             n_slots,
             self.config.weights.miss_policy,
             b_pcie,
             b_host,
+            t_dma,
+            t_dispatch,
+            expert_bytes as f64,
         ));
     }
 }
@@ -3075,6 +3149,15 @@ mod tests {
             "poll must interleave Requests instead of draining one; switches={switches}"
         );
         assert!(done_a && done_b, "both Requests must finish under poll-only driving");
+        let stats = engine.stats();
+        assert!(
+            stats.micro_batch_plans >= 1,
+            "concurrent poll must plan stagger; stats={stats:?}"
+        );
+        assert!(
+            stats.micro_batch_dual_steps >= 1,
+            "concurrent poll must honor stagger prefer-next; stats={stats:?}"
+        );
         drop(a);
         drop(b);
     }

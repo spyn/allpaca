@@ -718,11 +718,6 @@ impl ResidentModel {
             metrics
                 .weight_h2d_bytes
                 .fetch_add(packed as u64, Ordering::Relaxed);
-            // GEM DirectStorage-shaped staging: count expert H2D as queued DMA work.
-            metrics.ds_enqueued.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .ds_bytes
-                .fetch_add(packed as u64, Ordering::Relaxed);
         }
         let [w_gate, w_up, w_down] = slot_expert_refs(ring.base, ring.slot_bytes, victim, host);
         Ok(DeviceExpert::Bound {
@@ -931,6 +926,31 @@ pub(crate) fn measure_expert_host_bandwidth(
     }
     let secs = t.elapsed().as_secs_f64().max(1e-9);
     (ffn.bytes() as f64 * iters as f64) / secs
+}
+
+/// Profile fixed costs for overhead-aware `q*` (DMA setup + CPU dispatch).
+pub(crate) fn measure_qstar_fixed_costs(expert_bytes: usize) -> (f64, f64) {
+    use std::time::Instant;
+    let n = expert_bytes.max(64);
+    let src = vec![0u8; n];
+    let mut dst = vec![0u8; n];
+    // Warm.
+    dst.copy_from_slice(&src);
+    let iters = 32usize;
+    let t = Instant::now();
+    for _ in 0..iters {
+        dst.copy_from_slice(&src);
+    }
+    let t_dma = t.elapsed().as_secs_f64() / iters as f64;
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        std::thread::scope(|s| {
+            s.spawn(|| ());
+        });
+    }
+    let t_dispatch = t.elapsed().as_secs_f64() / iters as f64;
+    (t_dma, t_dispatch)
 }
 
 fn topk_route(x: &[f32], w_router: &[f32], n_experts: usize, n_active: usize) -> Vec<(usize, f32)> {

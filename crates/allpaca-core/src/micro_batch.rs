@@ -4,8 +4,8 @@
 //! layer of the same request. Better utilization: GPU runs request A at layer
 //! `l+1` while CPU finishes cache-missed experts of request B at layer `l`.
 //!
-//! Vertical: `plan_micro_batch` runs on each multi-request `poll`, and MoE
-//! forwards run CPU expert MLPs in parallel with the GPU expert loop.
+//! Vertical: `plan_micro_batch` on multi-request `poll`, prefer-next affinity
+//! for the stagger partner on the following tick, and MoE CPU‖GPU expert loops.
 
 /// Request progress phase for stagger planning (mirrors engine poll phases).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

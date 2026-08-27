@@ -159,6 +159,12 @@ pub struct StatsSnapshot {
     /// Cross-request GPU/CPU stagger plans recorded under concurrency.
     #[serde(default)]
     pub micro_batch_plans: u64,
+    /// Poll ticks that honored a cross-request stagger preference.
+    #[serde(default)]
+    pub micro_batch_dual_steps: u64,
+    /// Radix forest nodes evicted to stay under the node cap.
+    #[serde(default)]
+    pub radix_evictions: u64,
     /// KV pages currently resident on the NVMe cold tier.
     #[serde(default)]
     pub kv_nvme_pages: u64,

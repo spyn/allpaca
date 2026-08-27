@@ -4,13 +4,13 @@
 //! DirectStorage (Windows) / GDS (Linux) can DMA into device memory and skip
 //! the host bounce for large expert fills.
 //!
-//! Vertical: capability probe at engine start (`ds_available` on `/stats`) plus
-//! DS-shaped accounting on expert ring H2D (`ds_enqueued` / `ds_bytes`).
-//! `DirectStorageQueue::try_enqueue` records intent when the probe is hot;
-//! real NVMe→VRAM DMA still needs the platform SDK.
+//! Vertical: capability probe + file-coordinate enqueue from packed expert NVMe
+//! reads (`ds_enqueued` / `ds_bytes`). Real NVMe→VRAM DMA still needs the SDK;
+//! when the probe is hot we record DMA intents with path/offset/length.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Result of probing host DirectStorage / GDS availability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,11 +31,21 @@ pub enum DirectStorageBackend {
     LinuxGds,
 }
 
+/// Probe + queue shared with the NVMe expert host pool.
+#[derive(Debug, Clone)]
+pub struct DirectStorageBridge {
+    pub probe: DirectStorageProbe,
+    pub queue: Arc<DirectStorageQueue>,
+}
+
 /// Records intended NVMe→device transfers (probe-gated) without issuing DMA yet.
 #[derive(Debug, Default)]
 pub struct DirectStorageQueue {
     enqueued: AtomicU64,
     bytes: AtomicU64,
+    /// Host-staged fills counted when DS is unavailable (or after H2D).
+    staged: AtomicU64,
+    staged_bytes: AtomicU64,
 }
 
 impl DirectStorageQueue {
@@ -49,6 +59,14 @@ impl DirectStorageQueue {
 
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn staged(&self) -> u64 {
+        self.staged.load(Ordering::Relaxed)
+    }
+
+    pub fn staged_bytes(&self) -> u64 {
+        self.staged_bytes.load(Ordering::Relaxed)
     }
 
     /// Record a would-be DMA of `bytes` from `path` @ `offset` into device memory.
@@ -67,6 +85,28 @@ impl DirectStorageQueue {
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         true
+    }
+
+    /// Host-staged NVMe→RAM→VRAM fill (no DS DMA).
+    pub fn record_staged_h2d(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.staged.fetch_add(1, Ordering::Relaxed);
+        self.staged_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Prefer DMA intent when probe is hot; otherwise record staged.
+    pub fn enqueue_or_stage(
+        &self,
+        probe: &DirectStorageProbe,
+        path: &Path,
+        offset: u64,
+        bytes: usize,
+    ) {
+        if !self.try_enqueue(probe, path, offset, bytes) {
+            self.record_staged_h2d(bytes);
+        }
     }
 }
 
@@ -146,7 +186,6 @@ fn probe_linux_gds() -> DirectStorageProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn probe_returns_structured_backend() {
@@ -179,5 +218,19 @@ mod tests {
         assert!(q.try_enqueue(&on, &PathBuf::from("experts.bin"), 0, 8192));
         assert_eq!(q.enqueued(), 1);
         assert_eq!(q.bytes(), 8192);
+    }
+
+    #[test]
+    fn enqueue_or_stage_falls_back_to_staged() {
+        let q = DirectStorageQueue::new();
+        let off = DirectStorageProbe {
+            available: false,
+            backend: DirectStorageBackend::HostStaging,
+            detail: "off".into(),
+        };
+        q.enqueue_or_stage(&off, Path::new("experts.bin"), 4096, 8192);
+        assert_eq!(q.enqueued(), 0);
+        assert_eq!(q.staged(), 1);
+        assert_eq!(q.staged_bytes(), 8192);
     }
 }

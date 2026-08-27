@@ -24,19 +24,50 @@ pub fn align_up(n: usize, align: usize) -> usize {
 /// How many of `misses` unique experts to fill over PCIe; the rest run on CPU.
 /// Always fills at least one miss so the cache keeps warming.
 pub fn qstar_fill_count(misses: usize, b_pcie: f64, b_host: f64) -> usize {
+    qstar_fill_count_with_overhead(misses, b_pcie, b_host, 0.0, 0.0, 0.0)
+}
+
+/// Overhead-aware `q*`: balance PCIe fill vs CPU with fixed DMA / dispatch costs.
+///
+/// Solves for `k` minimizing `max(t_pcie(k), t_cpu(n-k))` where
+/// `t_pcie = k * bytes/B_p + t_dma` and `t_cpu = (n-k) * bytes/B_h + t_dispatch`.
+pub fn qstar_fill_count_with_overhead(
+    misses: usize,
+    b_pcie: f64,
+    b_host: f64,
+    t_dma_s: f64,
+    t_dispatch_s: f64,
+    expert_bytes: f64,
+) -> usize {
     if misses == 0 {
         return 0;
     }
     if !b_host.is_finite() || b_host <= 0.0 {
         return misses;
     }
-    let ratio = if b_pcie.is_finite() && b_pcie > 0.0 {
-        (b_pcie / b_host).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let q = ((misses as f64) * ratio).round() as usize;
-    q.clamp(1, misses)
+    if expert_bytes <= 0.0 || (!b_pcie.is_finite() || b_pcie <= 0.0) {
+        // Fall back to bandwidth-ratio when PCIe unmeasured / zero-size.
+        let ratio = if b_pcie.is_finite() && b_pcie > 0.0 {
+            (b_pcie / b_host).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let q = ((misses as f64) * ratio).round() as usize;
+        return q.clamp(1, misses);
+    }
+    let mut best_k = 1usize;
+    let mut best_cost = f64::INFINITY;
+    for k in 1..=misses {
+        let cpu_n = misses - k;
+        let t_pcie = (k as f64) * (expert_bytes / b_pcie) + t_dma_s.max(0.0);
+        let t_cpu = (cpu_n as f64) * (expert_bytes / b_host) + t_dispatch_s.max(0.0);
+        let cost = t_pcie.max(t_cpu);
+        if cost < best_cost {
+            best_cost = cost;
+            best_k = k;
+        }
+    }
+    best_k
 }
 
 /// Hits an LRU cache of `n_slots` records over `cycles` walks of `0..n_layers`.
@@ -531,6 +562,11 @@ pub struct ExpertLru {
     policy: MissPolicy,
     b_pcie: f64,
     b_host: f64,
+    /// Fixed DMA setup cost (seconds) folded into overhead-aware `q*`.
+    t_dma_s: f64,
+    /// Fixed CPU dispatch cost (seconds) folded into overhead-aware `q*`.
+    t_dispatch_s: f64,
+    expert_bytes: f64,
     inner: Mutex<ExpertLruInner>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -558,12 +594,27 @@ impl ExpertLru {
         b_pcie: f64,
         b_host: f64,
     ) -> Arc<Self> {
+        Self::with_overhead(n_slots, policy, b_pcie, b_host, 0.0, 0.0, 0.0)
+    }
+
+    pub fn with_overhead(
+        n_slots: usize,
+        policy: MissPolicy,
+        b_pcie: f64,
+        b_host: f64,
+        t_dma_s: f64,
+        t_dispatch_s: f64,
+        expert_bytes: f64,
+    ) -> Arc<Self> {
         let n = n_slots.max(1);
         Arc::new(Self {
             n_slots: n,
             policy,
             b_pcie,
             b_host,
+            t_dma_s,
+            t_dispatch_s,
+            expert_bytes,
             inner: Mutex::new(ExpertLruInner {
                 bound: vec![None; n],
                 used_at: vec![0; n],
@@ -619,7 +670,14 @@ impl ExpertLru {
         let q = match self.policy {
             MissPolicy::Fill => misses.len(),
             MissPolicy::Cpu => 0,
-            MissPolicy::Qstar => qstar_fill_count(misses.len(), self.b_pcie, self.b_host),
+            MissPolicy::Qstar => qstar_fill_count_with_overhead(
+                misses.len(),
+                self.b_pcie,
+                self.b_host,
+                self.t_dma_s,
+                self.t_dispatch_s,
+                self.expert_bytes,
+            ),
         };
         let fill = misses.iter().copied().take(q).collect();
         let cpu = misses.iter().copied().skip(q).collect();
@@ -832,6 +890,23 @@ mod tests {
         assert_eq!(qstar_fill_count(4, 1.0, 100.0), 1, "always keep warming");
         assert_eq!(qstar_fill_count(8, 0.0, 50.0), 1, "unmeasured PCIe fills one, rest CPU");
         assert_eq!(qstar_fill_count(0, 50.0, 80.0), 0);
+    }
+
+    #[test]
+    fn qstar_overhead_shifts_fill_when_dma_setup_dominates() {
+        // Cheap PCIe bandwidth but huge DMA setup → prefer fewer PCIe fills.
+        let with = qstar_fill_count_with_overhead(8, 100.0, 50.0, 1e-3, 0.0, 1e6);
+        let bare = qstar_fill_count(8, 100.0, 50.0);
+        assert!(
+            with <= bare,
+            "DMA setup should not increase PCIe fills; with={with} bare={bare}"
+        );
+        // Huge CPU dispatch → prefer more PCIe fills.
+        let heavy_cpu = qstar_fill_count_with_overhead(8, 50.0, 50.0, 0.0, 1e-3, 1e6);
+        assert!(
+            heavy_cpu >= bare / 2,
+            "CPU dispatch overhead should keep PCIe filling; heavy={heavy_cpu}"
+        );
     }
 
     #[test]

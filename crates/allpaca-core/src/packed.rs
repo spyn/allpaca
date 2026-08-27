@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use allpaca_types::{AllpacaError, FatalError};
 
+use crate::direct_storage::DirectStorageBridge;
 use crate::numa::NumaTopology;
 use crate::telemetry::Metrics;
 use crate::weight_set::{align_up, ExpertId, LayerFfn, DIRECT_ALIGN};
@@ -208,6 +209,21 @@ impl PackedStore {
     pub fn bytes_read(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
     }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+
+    /// File coordinates for a DirectStorage-shaped DMA of this expert slot.
+    pub fn slot_coords(&self, id: ExpertId) -> Option<(PathBuf, u64, usize)> {
+        let slot = *self.index.get(&id)?;
+        let offset = (slot as u64).saturating_mul(self.slot_bytes as u64);
+        Some((self.path.clone(), offset, self.slot_bytes))
+    }
 }
 
 impl Drop for PackedStore {
@@ -301,6 +317,8 @@ pub struct HostExpertPool {
     misses: AtomicU64,
     /// GEM NUMA spike: preferred node for each expert id (placement intent).
     numa: NumaTopology,
+    /// Optional DirectStorage bridge for file-coordinate enqueue on NVMe misses.
+    ds: Option<DirectStorageBridge>,
 }
 
 impl std::fmt::Debug for HostExpertPool {
@@ -319,6 +337,15 @@ impl HostExpertPool {
     }
 
     pub fn with_numa(store: PackedStore, n_slots: usize, numa: NumaTopology) -> Arc<Self> {
+        Self::with_numa_ds(store, n_slots, numa, None)
+    }
+
+    pub fn with_numa_ds(
+        store: PackedStore,
+        n_slots: usize,
+        numa: NumaTopology,
+        ds: Option<DirectStorageBridge>,
+    ) -> Arc<Self> {
         let n = n_slots.max(1);
         Arc::new(Self {
             store,
@@ -332,7 +359,16 @@ impl HostExpertPool {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             numa,
+            ds,
         })
+    }
+
+    pub fn with_direct_storage(
+        store: PackedStore,
+        n_slots: usize,
+        ds: DirectStorageBridge,
+    ) -> Arc<Self> {
+        Self::with_numa_ds(store, n_slots, NumaTopology::probe(), Some(ds))
     }
 
     pub fn n_slots(&self) -> usize {
@@ -409,6 +445,12 @@ impl HostExpertPool {
                     .unwrap_or(0)
             });
         let raw = self.store.read_expert(id)?;
+        if let Some(ds) = &self.ds {
+            if let Some((path, offset, bytes)) = self.store.slot_coords(id) {
+                ds.queue
+                    .enqueue_or_stage(&ds.probe, &path, offset, bytes);
+            }
+        }
         let node = self.numa.preferred_node(id);
         let ffn = self.numa.clone_ffn_on_node(node, &raw);
         inner.slots[victim] = ffn.clone();
@@ -550,6 +592,60 @@ mod tests {
             pool.nvme_reads() >= 2,
             "one DRAM slot over two experts must miss to NVMe"
         );
+    }
+
+    #[test]
+    fn host_pool_enqueues_ds_coords_on_nvme_miss() {
+        use crate::direct_storage::{
+            DirectStorageBackend, DirectStorageBridge, DirectStorageProbe, DirectStorageQueue,
+        };
+        let a = LayerFfn {
+            w_gate: vec![1.0],
+            w_up: vec![2.0],
+            w_down: vec![3.0],
+            ..LayerFfn::default()
+        };
+        let path = unique_path();
+        let store = PackedStore::pack(
+            &path,
+            [(
+                ExpertId {
+                    layer: 0,
+                    expert: 0,
+                },
+                &a,
+            )],
+        )
+        .unwrap();
+        let coords = store
+            .slot_coords(ExpertId {
+                layer: 0,
+                expert: 0,
+            })
+            .expect("coords");
+        assert_eq!(coords.0, path);
+        assert_eq!(coords.1, 0);
+        assert!(coords.2 >= DIRECT_ALIGN);
+
+        let queue = Arc::new(DirectStorageQueue::new());
+        let bridge = DirectStorageBridge {
+            probe: DirectStorageProbe {
+                available: false,
+                backend: DirectStorageBackend::HostStaging,
+                detail: "test".into(),
+            },
+            queue: Arc::clone(&queue),
+        };
+        let pool = HostExpertPool::with_direct_storage(store, 1, bridge);
+        let _ = pool
+            .get(ExpertId {
+                layer: 0,
+                expert: 0,
+            })
+            .unwrap();
+        assert_eq!(queue.enqueued(), 0);
+        assert_eq!(queue.staged(), 1);
+        assert!(queue.staged_bytes() >= DIRECT_ALIGN as u64);
     }
 
     #[test]
