@@ -1540,6 +1540,88 @@ extern "C" int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, 
     return hip_status(hipGetLastError());
 }
 
+/* Fused Q5_K GEMV: 176-byte super-blocks (qh + qs), A tile in LDS. */
+__global__ void gemv_nt_q5_k_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                          int k) {
+    constexpr int COLS = 64;
+    __shared__ float As[256];
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 255) / 256;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const uint8_t *brow =
+        (tid < COLS && col < n)
+            ? b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 176
+            : nullptr;
+    float acc = 0.f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const int k0 = ib * 256;
+        As[tid] = (k0 + tid < k) ? arow[k0 + tid] : 0.f;
+        __syncthreads();
+        if (brow) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * 176;
+            const float d = allpaca_f16le_to_f32(blk);
+            const float dmin = allpaca_f16le_to_f32(blk + 2);
+            const uint8_t *scales = blk + 4;
+            const uint8_t *qh = blk + 16;
+            const uint8_t *qs = blk + 48;
+            int q_off = 0;
+            int is = 0;
+            uint8_t u1 = 1;
+            uint8_t u2 = 2;
+            for (int g = 0; g < 4; ++g) {
+                uint8_t sc1 = 0;
+                uint8_t m1 = 0;
+                uint8_t sc2 = 0;
+                uint8_t m2 = 0;
+                q4k_scale_min(is, scales, &sc1, &m1);
+                q4k_scale_min(is + 1, scales, &sc2, &m2);
+                const float d1 = d * static_cast<float>(sc1);
+                const float min1 = dmin * static_cast<float>(m1);
+                const float d2 = d * static_cast<float>(sc2);
+                const float min2 = dmin * static_cast<float>(m2);
+                for (int l = 0; l < 32; ++l) {
+                    const int i0 = g * 64 + l;
+                    const int i1 = i0 + 32;
+                    const uint8_t packed = qs[q_off + l];
+                    const float qlo =
+                        static_cast<float>(packed & 0x0F) + ((qh[l] & u1) ? 16.f : 0.f);
+                    const float qhi =
+                        static_cast<float>(packed >> 4) + ((qh[l] & u2) ? 16.f : 0.f);
+                    acc += As[i0] * (d1 * qlo - min1);
+                    acc += As[i1] * (d2 * qhi - min2);
+                }
+                q_off += 32;
+                is += 2;
+                u1 = static_cast<uint8_t>(u1 << 2);
+                u2 = static_cast<uint8_t>(u2 << 2);
+            }
+        }
+        __syncthreads();
+    }
+    if (brow) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+extern "C" int allpaca_gemm_nt_q5_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int COLS = 64;
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_q5_k_tiled_kernel, grid, block, 0, as_stream(stream), a, b, c, m, n,
+                       k);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_hip_device_count(int32_t *count) {
     if (!count) {
         return ALLPACA_ERR_INVALID;
@@ -2434,6 +2516,11 @@ extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *, const uint8_t *, floa
 }
 
 extern "C" int allpaca_gemm_nt_q6_k(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                    int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q5_k(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
