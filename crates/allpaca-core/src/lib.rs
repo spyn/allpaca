@@ -8,6 +8,7 @@ mod draft;
 mod engine;
 mod forest;
 mod kv_nvme;
+mod kv_radix;
 mod kv_tier;
 mod logits_ring;
 mod model;
