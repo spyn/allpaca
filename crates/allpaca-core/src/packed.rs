@@ -447,8 +447,15 @@ impl HostExpertPool {
         let raw = self.store.read_expert(id)?;
         if let Some(ds) = &self.ds {
             if let Some((path, offset, bytes)) = self.store.slot_coords(id) {
-                ds.queue
-                    .enqueue_or_stage(&ds.probe, &path, offset, bytes);
+                // DMA intent only when the SDK probe is hot — never invent GPU DMA.
+                let _ = ds.queue.try_enqueue(&ds.probe, &path, offset, bytes);
+                // Real host path already performed by `read_expert` (Direct I/O when
+                // possible). Record pinned vs buffered bounce for H2D stats.
+                if self.store.is_direct() {
+                    ds.queue.record_pinned_h2d(bytes);
+                } else {
+                    ds.queue.record_staged_h2d(bytes);
+                }
             }
         }
         let node = self.numa.preferred_node(id);
@@ -633,6 +640,7 @@ mod tests {
                 available: false,
                 backend: DirectStorageBackend::HostStaging,
                 detail: "test".into(),
+                factory_resolved: false,
             },
             queue: Arc::clone(&queue),
         };
@@ -644,8 +652,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(queue.enqueued(), 0);
-        assert_eq!(queue.staged(), 1);
-        assert!(queue.staged_bytes() >= DIRECT_ALIGN as u64);
+        // Direct I/O → pinned; buffered fallback → staged. Either is a real host path.
+        assert!(
+            queue.pinned() + queue.staged() >= 1,
+            "pinned={} staged={}",
+            queue.pinned(),
+            queue.staged()
+        );
+        assert!(queue.pinned_bytes() + queue.staged_bytes() >= DIRECT_ALIGN as u64);
     }
 
     #[test]

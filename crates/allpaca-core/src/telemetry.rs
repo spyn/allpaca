@@ -68,6 +68,8 @@ pub struct Metrics {
     pub radix_skip_tokens: AtomicU64,
     pub ds_enqueued: AtomicU64,
     pub ds_bytes: AtomicU64,
+    pub ds_pinned: AtomicU64,
+    pub ds_pinned_bytes: AtomicU64,
     pub ds_available: AtomicU64,
     pub micro_batch_plans: AtomicU64,
     /// Poll ticks that honored a cross-request stagger preference.
@@ -201,6 +203,8 @@ impl Metrics {
             radix_skip_tokens: self.radix_skip_tokens.load(Ordering::Relaxed),
             ds_enqueued: self.ds_enqueued.load(Ordering::Relaxed),
             ds_bytes: self.ds_bytes.load(Ordering::Relaxed),
+            ds_pinned: self.ds_pinned.load(Ordering::Relaxed),
+            ds_pinned_bytes: self.ds_pinned_bytes.load(Ordering::Relaxed),
             ds_available: self.ds_available.load(Ordering::Relaxed) != 0,
             micro_batch_plans: self.micro_batch_plans.load(Ordering::Relaxed),
             micro_batch_dual_steps: self.micro_batch_dual_steps.load(Ordering::Relaxed),

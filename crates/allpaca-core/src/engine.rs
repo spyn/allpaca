@@ -318,14 +318,21 @@ impl Engine {
                     u64::from(g.ds_probe.available),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                // File-coordinate DMA intents + staged fills from the shared queue.
+                // DMA intents + host-staged/pinned H2D from the shared queue.
                 let q = &self.ds_queue;
                 self.metrics.ds_enqueued.store(
-                    q.enqueued() + q.staged(),
+                    q.enqueued() + q.staged() + q.pinned(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 self.metrics.ds_bytes.store(
-                    q.bytes() + q.staged_bytes(),
+                    q.bytes() + q.staged_bytes() + q.pinned_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics
+                    .ds_pinned
+                    .store(q.pinned(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics.ds_pinned_bytes.store(
+                    q.pinned_bytes(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 self.metrics
@@ -2720,6 +2727,7 @@ mod tests {
         // Probe always runs; availability is host-dependent.
         let _ = stats.ds_available;
         assert_eq!(stats.ds_enqueued, 0, "no expert H2D yet; stats={stats:?}");
+        assert_eq!(stats.ds_pinned, 0, "no pinned staging yet; stats={stats:?}");
     }
 
     #[test]

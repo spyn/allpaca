@@ -148,11 +148,16 @@ pub struct StatsSnapshot {
     /// Prompt tokens skipped via radix LCP restore.
     #[serde(default)]
     pub radix_skip_tokens: u64,
-    /// DirectStorage (or staged H2D) transfers enqueued.
+    /// DirectStorage DMA intents + host-staged/pinned H2D transfers.
     #[serde(default)]
     pub ds_enqueued: u64,
     #[serde(default)]
     pub ds_bytes: u64,
+    /// Aligned Direct I/O fills into pinned-shaped host memory (H2D source).
+    #[serde(default)]
+    pub ds_pinned: u64,
+    #[serde(default)]
+    pub ds_pinned_bytes: u64,
     /// True when DirectStorage/GDS probe succeeded at engine start.
     #[serde(default)]
     pub ds_available: bool,
