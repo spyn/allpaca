@@ -6,6 +6,11 @@
 /models/*.gguf
 /models/.cache/
 
+# Cursor / graphify local artifacts
+.cursor/
+.cursor-plugin/
+graphify-out/
+
 # HIP build
 /hip/build
 /hip/build-test

@@ -2,6 +2,7 @@
 
 mod anchors;
 mod constraint;
+mod direct_storage;
 mod grammar;
 mod device_manager;
 mod draft;
@@ -11,6 +12,7 @@ mod kv_nvme;
 mod kv_radix;
 mod kv_tier;
 mod logits_ring;
+mod micro_batch;
 mod model;
 mod numa;
 mod sampling;
