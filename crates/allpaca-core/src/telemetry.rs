@@ -72,7 +72,7 @@ pub struct Metrics {
     pub ds_pinned_bytes: AtomicU64,
     pub ds_available: AtomicU64,
     pub micro_batch_plans: AtomicU64,
-    /// Poll ticks that honored a cross-request stagger preference.
+    /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     pub micro_batch_dual_steps: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub kv_nvme_pages: AtomicU64,

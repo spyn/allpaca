@@ -1136,7 +1136,8 @@ impl Engine {
     /// (idle, or only finished Requests remain until their handles are dropped).
     ///
     /// Under concurrency (`≥2` runnable), also advances a stagger partner in the
-    /// same tick (true cross-request micro-batch at poll granularity).
+    /// same tick. The partner's `StepResult` is **parked** so it still surfaces as
+    /// a later `PollEvent` (prior silent dual-step broke interleave observability).
     pub fn poll(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
         loop {
             let (id, waited_ms, is_prefill, stagger_partner) = {
@@ -1149,8 +1150,9 @@ impl Engine {
                     .iter()
                     .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty()))
                     .map(|(id, r)| {
-                        let prefill =
-                            r.prefill_pos < r.prompt_len && r.emit_queue.is_empty();
+                        let prefill = r.prefill_pos < r.prompt_len
+                            && r.emit_queue.is_empty()
+                            && r.parked.is_empty();
                         (*id, r.last_token_at, prefill)
                     })
                     .collect();
@@ -1185,15 +1187,11 @@ impl Engine {
                         }
                     }
                 }
+                // Soft affinity from a prior failed same-tick partner step.
                 let preferred = inner
                     .prefer_next
                     .take()
                     .filter(|pid| candidates.iter().any(|(cid, _, _)| cid == pid));
-                if preferred.is_some() {
-                    self.metrics
-                        .micro_batch_dual_steps
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
                 let id = preferred.or_else(|| {
                     inner.scheduler.pick_runnable(
                         &candidates,
@@ -1207,11 +1205,7 @@ impl Engine {
                     return Ok(None);
                 };
                 if let Some(partner) = stagger_partner {
-                    if partner != id {
-                        // Drop the lock before step; stash preference for next tick.
-                        // (Set below after we re-lock.)
-                        stagger_partner = Some(partner);
-                    } else {
+                    if partner == id {
                         stagger_partner = candidates
                             .iter()
                             .map(|(cid, _, _)| *cid)
@@ -1220,18 +1214,14 @@ impl Engine {
                 }
                 let active = inner.active.get(&id).unwrap();
                 let waited_ms = active.last_token_at.elapsed().as_secs_f64() * 1000.0;
-                let is_prefill =
-                    active.prefill_pos < active.prompt_len && active.emit_queue.is_empty();
+                let is_prefill = active.prefill_pos < active.prompt_len
+                    && active.emit_queue.is_empty()
+                    && active.parked.is_empty();
                 (id, waited_ms, is_prefill, stagger_partner)
             };
             {
                 let mut inner = self.lock()?;
                 inner.last_poll_id = Some(id);
-                if let Some(partner) = stagger_partner {
-                    if partner != id {
-                        inner.prefer_next = Some(partner);
-                    }
-                }
                 if is_prefill {
                     inner.consecutive_prefill_picks =
                         inner.consecutive_prefill_picks.saturating_add(1);
@@ -1265,17 +1255,33 @@ impl Engine {
                 (ema * 100.0) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            match self.step_id(id) {
-                Ok(result) => {
-                    return Ok(Some(allpaca_types::PollEvent {
-                        request_id: id,
-                        result,
-                    }));
-                }
+            let primary = match self.step_id(id) {
+                Ok(result) => result,
                 // Peer Drop removed the Request between pick and step.
                 Err(AllpacaError::Transient(TransientError::RequestBusy)) => continue,
                 Err(e) => return Err(e),
+            };
+            // Same-tick partner: co-progress then park so the result remains a
+            // PollEvent when that request is next picked (observability intact).
+            if let Some(partner) = stagger_partner.filter(|&p| p != id) {
+                match self.step_id(partner) {
+                    Ok(partner_result) => {
+                        self.park_result(partner, partner_result)?;
+                        self.metrics
+                            .micro_batch_dual_steps
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(AllpacaError::Transient(TransientError::RequestBusy)) => {
+                        let mut inner = self.lock()?;
+                        inner.prefer_next = Some(partner);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
+            return Ok(Some(allpaca_types::PollEvent {
+                request_id: id,
+                result: primary,
+            }));
         }
     }
 
@@ -1283,6 +1289,10 @@ impl Engine {
         let mut inner = self.lock()?;
         {
             let active = request_mut(&mut inner, id)?;
+            // Drain same-tick micro-batch parks before fresh work.
+            if let Some(parked) = active.parked.pop_front() {
+                return Ok(parked);
+            }
             if !active.emit_queue.is_empty() {
                 return Ok(StepResult::Token(active.emit_queue.remove(0)));
             }
@@ -3164,7 +3174,7 @@ mod tests {
         );
         assert!(
             stats.micro_batch_dual_steps >= 1,
-            "concurrent poll must honor stagger prefer-next; stats={stats:?}"
+            "concurrent poll must same-tick dual-step partner; stats={stats:?}"
         );
         drop(a);
         drop(b);

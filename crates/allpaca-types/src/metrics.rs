@@ -164,7 +164,7 @@ pub struct StatsSnapshot {
     /// Cross-request GPU/CPU stagger plans recorded under concurrency.
     #[serde(default)]
     pub micro_batch_plans: u64,
-    /// Poll ticks that honored a cross-request stagger preference.
+    /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     #[serde(default)]
     pub micro_batch_dual_steps: u64,
     /// Radix forest nodes evicted to stay under the node cap.
