@@ -11,6 +11,7 @@ mod kv_nvme;
 mod kv_tier;
 mod logits_ring;
 mod model;
+mod numa;
 mod sampling;
 mod scheduler;
 mod telemetry;

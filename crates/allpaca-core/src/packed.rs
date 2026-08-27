@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use allpaca_types::{AllpacaError, FatalError};
 
+use crate::numa::NumaTopology;
 use crate::telemetry::Metrics;
 use crate::weight_set::{align_up, ExpertId, LayerFfn, DIRECT_ALIGN};
 
@@ -298,6 +299,8 @@ pub struct HostExpertPool {
     inner: Mutex<HostPoolInner>,
     hits: AtomicU64,
     misses: AtomicU64,
+    /// GEM NUMA spike: preferred node for each expert id (placement intent).
+    numa: NumaTopology,
 }
 
 impl std::fmt::Debug for HostExpertPool {
@@ -305,12 +308,17 @@ impl std::fmt::Debug for HostExpertPool {
         f.debug_struct("HostExpertPool")
             .field("n_slots", &self.n_slots)
             .field("direct", &self.store.direct)
+            .field("numa_nodes", &self.numa.n_nodes)
             .finish()
     }
 }
 
 impl HostExpertPool {
     pub fn new(store: PackedStore, n_slots: usize) -> Arc<Self> {
+        Self::with_numa(store, n_slots, NumaTopology::probe())
+    }
+
+    pub fn with_numa(store: PackedStore, n_slots: usize, numa: NumaTopology) -> Arc<Self> {
         let n = n_slots.max(1);
         Arc::new(Self {
             store,
@@ -323,11 +331,21 @@ impl HostExpertPool {
             }),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            numa,
         })
     }
 
     pub fn n_slots(&self) -> usize {
         self.n_slots
+    }
+
+    /// Preferred NUMA node for this expert (spike: assignment only, no pin yet).
+    pub fn preferred_numa_node(&self, id: ExpertId) -> usize {
+        self.numa.preferred_node(id)
+    }
+
+    pub fn numa_nodes(&self) -> usize {
+        self.numa.n_nodes
     }
 
     pub fn hits(&self) -> u64 {
@@ -510,5 +528,33 @@ mod tests {
             pool.nvme_reads() >= 2,
             "one DRAM slot over two experts must miss to NVMe"
         );
+    }
+
+    #[test]
+    fn host_pool_exposes_numa_preferred_node_for_experts() {
+        let ffn = sample_ffn();
+        let path = unique_path();
+        let store = PackedStore::pack(
+            &path,
+            [(
+                ExpertId {
+                    layer: 0,
+                    expert: 0,
+                },
+                &ffn,
+            )],
+        )
+        .unwrap();
+        let pool = HostExpertPool::with_numa(store, 1, NumaTopology::with_nodes(2));
+        assert_eq!(pool.numa_nodes(), 2);
+        let n0 = pool.preferred_numa_node(ExpertId {
+            layer: 0,
+            expert: 0,
+        });
+        let n1 = pool.preferred_numa_node(ExpertId {
+            layer: 0,
+            expert: 1,
+        });
+        assert_ne!(n0, n1, "interleaved experts land on different nodes");
     }
 }
