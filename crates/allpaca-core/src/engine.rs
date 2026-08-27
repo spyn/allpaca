@@ -211,7 +211,7 @@ impl Engine {
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
-            kv_radix: KvRadixForest::with_max_nodes(4096),
+            kv_radix: KvRadixForest::with_limits(4096, 64 << 20),
             ds_probe: ds_probe.clone(),
             grammar_factory: None,
             last_poll_id: None,
@@ -312,6 +312,10 @@ impl Engine {
                 );
                 self.metrics.radix_evictions.store(
                     g.kv_radix.evictions(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.radix_bytes.store(
+                    g.kv_radix.checkpoint_bytes() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 self.metrics.ds_available.store(

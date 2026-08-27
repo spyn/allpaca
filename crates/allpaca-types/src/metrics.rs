@@ -167,9 +167,12 @@ pub struct StatsSnapshot {
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     #[serde(default)]
     pub micro_batch_dual_steps: u64,
-    /// Radix forest nodes evicted to stay under the node cap.
+    /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,
+    /// Approximate checkpoint bytes currently held in the radix forest.
+    #[serde(default)]
+    pub radix_bytes: u64,
     /// KV pages currently resident on the NVMe cold tier.
     #[serde(default)]
     pub kv_nvme_pages: u64,

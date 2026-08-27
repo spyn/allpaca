@@ -75,6 +75,7 @@ pub struct Metrics {
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     pub micro_batch_dual_steps: AtomicU64,
     pub radix_evictions: AtomicU64,
+    pub radix_bytes: AtomicU64,
     pub kv_nvme_pages: AtomicU64,
     pub kv_nvme_reads: AtomicU64,
     pub kv_nvme_bytes: AtomicU64,
@@ -209,6 +210,7 @@ impl Metrics {
             micro_batch_plans: self.micro_batch_plans.load(Ordering::Relaxed),
             micro_batch_dual_steps: self.micro_batch_dual_steps.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
+            radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             kv_nvme_pages: self.kv_nvme_pages.load(Ordering::Relaxed),
             kv_nvme_reads: self.kv_nvme_reads.load(Ordering::Relaxed),
             kv_nvme_bytes: self.kv_nvme_bytes.load(Ordering::Relaxed),
