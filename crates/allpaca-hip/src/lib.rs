@@ -21,6 +21,9 @@ pub const Q8_STAGED_QS: usize = 4;
 /// GGUF Q4_K super-block (f16 d + f16 dmin + 12 scale bytes + 128 qs).
 pub const Q4_K_BLOCK_ELEMS: usize = 256;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
+/// GGUF Q6_K super-block (128 ql + 64 qh + 16 scales + f16 d).
+pub const Q6_K_BLOCK_ELEMS: usize = 256;
+pub const Q6_K_BLOCK_BYTES: usize = 210;
 
 fn f16_bits_to_f32(h: u16) -> f32 {
     let sign = u32::from(h & 0x8000) << 16;
@@ -290,6 +293,15 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gemm_nt_q4_k_untiled(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_q6_k(
             a: *const f32,
             b: *const u8,
             c: *mut f32,
@@ -1162,6 +1174,29 @@ pub fn gemm_nt_q4_k_untiled_device(
     }
 }
 
+/// Device-pointer NT GEMM with native GGUF Q6_K `b` (`C = A * dequant(B)^T`).
+pub fn gemm_nt_q6_k_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_q6_k(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q6_k")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q6_k unavailable".into(),
+        )))
+    }
+}
+
 /// Host-pointer F16 NT GEMM: copies packed IEEE F16 `b`, runs the kernel, copies back.
 pub fn gemm_nt_f16(
     a: &[f32],
@@ -1232,6 +1267,55 @@ pub fn gemm_nt_q4_k_untiled(
     k: i32,
 ) -> Result<(), AllpacaError> {
     gemm_nt_q4_k_host(a, b, c, m, n, k, gemm_nt_q4_k_untiled_device)
+}
+
+/// Host-pointer Q6_K NT GEMM: copies native GGUF blocks, runs the fused kernel, copies back.
+pub fn gemm_nt_q6_k(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(Q6_K_BLOCK_ELEMS);
+        let packed_bytes = (n as usize) * nblocks * Q6_K_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q6_K GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            gemm_nt_q6_k_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q6_k unavailable".into(),
+        )))
+    }
 }
 
 fn gemm_nt_q4_k_host(
@@ -2264,6 +2348,18 @@ impl HipWorkspace {
         k: i32,
     ) -> Result<(), AllpacaError> {
         self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q4_k_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_q6_k_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q6_k_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_f16_dev(
@@ -3962,6 +4058,63 @@ mod tests {
                 assert!(
                     gemm_close(hip[i], cpu[i]),
                     "gemm_nt_q4_k mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    fn fill_q6k_gemm_case(si: usize, m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+        let mut a = vec![0.0f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+        }
+        let mut b_q = Vec::new();
+        for row in 0..n {
+            b_q.extend(allpaca_cpu::quantize_q6_k(&b_f[row * k..(row + 1) * k]));
+        }
+        (a, b_q, b_f)
+    }
+
+    #[cfg(feature = "hip")]
+    fn dequant_q6k_matrix(b_q: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let nblocks = k.div_ceil(Q6_K_BLOCK_ELEMS);
+        let mut out = vec![0.0f32; n * k];
+        for row in 0..n {
+            let blk = &b_q[row * nblocks * Q6_K_BLOCK_BYTES..(row + 1) * nblocks * Q6_K_BLOCK_BYTES];
+            let mut tmp = vec![0.0f32; nblocks * Q6_K_BLOCK_ELEMS];
+            allpaca_cpu::dequant_q6_k(blk, nblocks * Q6_K_BLOCK_ELEMS, &mut tmp).unwrap();
+            out[row * k..(row + 1) * k].copy_from_slice(&tmp[..k]);
+        }
+        out
+    }
+
+    /// GEM mixed-quant: fused Q6_K GEMV must match CPU dequant + NT GEMM.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q6_k_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1, 4, 256), (1, 8, 256), (2, 3, 256), (1, 4, 512)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, b_q, _) = fill_q6k_gemm_case(si, m, n, k);
+            let b_deq = dequant_q6k_matrix(&b_q, n, k);
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_q6_k(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q6_k must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_q6_k mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
                     hip[i],
                     cpu[i]
                 );

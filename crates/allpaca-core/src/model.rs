@@ -143,6 +143,7 @@ enum WeightKind {
     F16,
     Q8_0,
     Q4_K,
+    Q6_K,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -738,9 +739,11 @@ impl ResidentModel {
                 hip.dequant_q8_0(self.weights.byte_ptr_at(w.off), w.n as i32, out)?;
                 Ok(out as *const f32)
             }
-            WeightKind::F16 | WeightKind::Q4_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "F16/Q4_K norm must be F32 at load".into(),
-            ))),
+            WeightKind::F16 | WeightKind::Q4_K | WeightKind::Q6_K => {
+                Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                    "F16/Q4_K/Q6_K norm must be F32 at load".into(),
+                )))
+            }
         }
     }
 
@@ -770,6 +773,9 @@ impl ResidentModel {
             WeightKind::Q4_K => {
                 hip.gemm_nt_q4_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::Q6_K => {
+                hip.gemm_nt_q6_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
         }
     }
 
@@ -794,8 +800,8 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q4_K embed must be F32 at load".into(),
+            WeightKind::Q4_K | WeightKind::Q6_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "Q4_K/Q6_K embed must be F32 at load".into(),
             ))),
         }
     }
@@ -821,8 +827,8 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q4_K embed must be F32 at load".into(),
+            WeightKind::Q4_K | WeightKind::Q6_K => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "Q4_K/Q6_K embed must be F32 at load".into(),
             ))),
         }
     }
@@ -1113,6 +1119,27 @@ fn append_gguf_tensor(
                     ))));
                 }
                 (packed.to_vec(), WeightKind::Q4_K)
+            }
+        }
+        allpaca_gguf::GgmlType::Q6_K => {
+            let packed = file.tensor_bytes(name)?;
+            if n <= 65_536 || name == "token_embd.weight" {
+                let mut f32s = vec![0.0f32; n];
+                allpaca_cpu::dequant_q6_k(packed, n, &mut f32s)?;
+                let mut bytes = Vec::with_capacity(n * 4);
+                for v in f32s {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (bytes, WeightKind::F32)
+            } else {
+                let k = *info.dims.first().unwrap_or(&1) as usize;
+                if k == 0 || n % k != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "Q6_K GEMV {name} dims {:?} do not tile n={n}",
+                        info.dims
+                    ))));
+                }
+                (packed.to_vec(), WeightKind::Q6_K)
             }
         }
         allpaca_gguf::GgmlType::Q8_0 => {

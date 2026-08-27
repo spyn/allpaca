@@ -90,6 +90,10 @@ int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, 
 int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_q6_k[n,k])^T. Native 210-byte Q6_K super-blocks (GEM mixed-quant). */
+int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                         int32_t k, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * dequant(B_f16[n,k])^T. B is packed IEEE F16, row-major [n,k].
  * Decode (M<=8) uses cache-aware A-tile GEMV (§12); M>8 uses a tiled prefill kernel. */
 int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,

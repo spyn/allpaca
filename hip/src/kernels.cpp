@@ -1461,6 +1461,85 @@ extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, fl
     return launch_gemm_nt_q4_k(a, b, c, m, n, k, as_stream(stream), 0);
 }
 
+/* Fused Q6_K GEMV (GEM mixed-precision): 210-byte super-blocks, A tile in LDS. */
+__global__ void gemv_nt_q6_k_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                          int k) {
+    constexpr int COLS = 64;
+    constexpr int TILE = 256;
+    __shared__ float As[TILE];
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 255) / 256;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const uint8_t *brow =
+        (tid < COLS && col < n)
+            ? b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 210
+            : nullptr;
+    float acc = 0.f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const int k0 = ib * 256;
+        As[tid] = (k0 + tid < k) ? arow[k0 + tid] : 0.f;
+        __syncthreads();
+        if (brow) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * 210;
+            const uint8_t *ql = blk;
+            const uint8_t *qh = blk + 128;
+            const uint8_t *scales = blk + 192;
+            const float d = allpaca_f16le_to_f32(blk + 208);
+            for (int half = 0; half < 2; ++half) {
+                const uint8_t *ql_h = ql + half * 64;
+                const uint8_t *qh_h = qh + half * 32;
+                const uint8_t *sc_h = scales + half * 8;
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16;
+                    const int q1 =
+                        static_cast<int>(ql_h[l] & 0x0f | ((qh_h[l] >> 0) & 3) << 4) - 32;
+                    const int q2 =
+                        static_cast<int>(ql_h[l + 32] & 0x0f | ((qh_h[l] >> 2) & 3) << 4) - 32;
+                    const int q3 =
+                        static_cast<int>((ql_h[l] >> 4) | ((qh_h[l] >> 4) & 3) << 4) - 32;
+                    const int q4 =
+                        static_cast<int>((ql_h[l + 32] >> 4) | ((qh_h[l] >> 6) & 3) << 4) - 32;
+                    const int i0 = half * 128 + l;
+                    const int i1 = half * 128 + 32 + l;
+                    const int i2 = half * 128 + 64 + l;
+                    const int i3 = half * 128 + 96 + l;
+                    acc += As[i0] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is])) *
+                                     static_cast<float>(q1));
+                    acc += As[i1] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is + 2])) *
+                                     static_cast<float>(q2));
+                    acc += As[i2] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is + 4])) *
+                                     static_cast<float>(q3));
+                    acc += As[i3] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is + 6])) *
+                                     static_cast<float>(q4));
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (brow) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+extern "C" int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int COLS = 64;
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_q6_k_tiled_kernel, grid, block, 0, as_stream(stream), a, b, c, m, n,
+                       k);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_hip_device_count(int32_t *count) {
     if (!count) {
         return ALLPACA_ERR_INVALID;
@@ -2351,6 +2430,11 @@ extern "C" int allpaca_gemm_nt_q4_k(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *, const uint8_t *, float *, int32_t,
                                             int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q6_k(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                    int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
