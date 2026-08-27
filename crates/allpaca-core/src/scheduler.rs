@@ -39,6 +39,17 @@ impl Scheduler {
     }
 
     pub fn record_acceptance(&mut self, accepted: u64, proposed: u64) {
+        self.record_acceptance_with_pressure(accepted, proposed, 0);
+    }
+
+    /// Acceptance-aware depth, optionally shrunk under concurrent Request pressure
+    /// (GEM research / US-02: target queue pressure).
+    pub fn record_acceptance_with_pressure(
+        &mut self,
+        accepted: u64,
+        proposed: u64,
+        active_requests: usize,
+    ) {
         self.accepted += accepted;
         self.proposed += proposed;
         if !self.flags.adaptive_draft_depth {
@@ -51,6 +62,12 @@ impl Scheduler {
             self.min_depth,
             self.max_depth,
         );
+        if active_requests > 1 {
+            self.draft_depth = self
+                .draft_depth
+                .saturating_sub(active_requests.saturating_sub(1))
+                .max(self.min_depth);
+        }
     }
 
     pub fn placement(&self, devices: &[DeviceInfo]) -> Placement {
@@ -85,21 +102,46 @@ impl Scheduler {
         candidates: &[(u64, Instant, bool)],
         after_id: Option<u64>,
         schedule: PollSchedule,
+        consecutive_prefill: usize,
+        max_consecutive_prefill: usize,
     ) -> Option<u64> {
-        pick_runnable_phased(candidates, after_id, schedule)
+        pick_runnable_phased(
+            candidates,
+            after_id,
+            schedule,
+            consecutive_prefill,
+            max_consecutive_prefill,
+        )
     }
 }
 
 /// Among runnable Requests, pick the one waiting longest since last progress.
 /// When `schedule` is [`PollSchedule::DecodePriority`], decode/emitted Requests
 /// win over prefilling peers regardless of wait time.
+/// When `schedule` is [`PollSchedule::PrefillBudget`] and the consecutive prefill
+/// streak has hit the cap, force a decode pick if any decode peer is runnable.
 pub fn pick_runnable_phased(
     candidates: &[(u64, Instant, bool)],
     after_id: Option<u64>,
     schedule: PollSchedule,
+    consecutive_prefill: usize,
+    max_consecutive_prefill: usize,
 ) -> Option<u64> {
-    let narrowed: Vec<(u64, Instant)> = match schedule {
-        PollSchedule::Fair => candidates.iter().map(|(id, t, _)| (*id, *t)).collect(),
+    let force_decode = matches!(schedule, PollSchedule::PrefillBudget)
+        && max_consecutive_prefill > 0
+        && consecutive_prefill >= max_consecutive_prefill
+        && candidates.iter().any(|(_, _, prefill)| !prefill);
+    let effective = if force_decode {
+        PollSchedule::DecodePriority
+    } else if matches!(schedule, PollSchedule::PrefillBudget) {
+        PollSchedule::Fair
+    } else {
+        schedule
+    };
+    let narrowed: Vec<(u64, Instant)> = match effective {
+        PollSchedule::Fair | PollSchedule::PrefillBudget => {
+            candidates.iter().map(|(id, t, _)| (*id, *t)).collect()
+        }
         PollSchedule::DecodePriority => {
             let decode: Vec<(u64, Instant)> = candidates
                 .iter()
@@ -183,14 +225,31 @@ mod tests {
         let t1 = t0 + std::time::Duration::from_millis(5);
         let phased = [(1u64, t0, true), (2u64, t1, false)];
         assert_eq!(
-            pick_runnable_phased(&phased, None, PollSchedule::Fair),
+            pick_runnable_phased(&phased, None, PollSchedule::Fair, 0, 0),
             Some(1),
             "fair picks oldest waiter even when prefilling"
         );
         assert_eq!(
-            pick_runnable_phased(&phased, None, PollSchedule::DecodePriority),
+            pick_runnable_phased(&phased, None, PollSchedule::DecodePriority, 0, 0),
             Some(2),
             "decode priority must pick decoding Request over older prefill"
+        );
+    }
+
+    #[test]
+    fn prefill_budget_forces_decode_after_streak() {
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let phased = [(1u64, t0, true), (2u64, t1, false)];
+        assert_eq!(
+            pick_runnable_phased(&phased, None, PollSchedule::PrefillBudget, 0, 2),
+            Some(1),
+            "under budget, fair pick still wins"
+        );
+        assert_eq!(
+            pick_runnable_phased(&phased, None, PollSchedule::PrefillBudget, 2, 2),
+            Some(2),
+            "at budget cap, decode must win"
         );
     }
 }

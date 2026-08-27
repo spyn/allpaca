@@ -173,6 +173,9 @@ pub struct EngineSection {
     pub max_active_requests: usize,
     /// How `Engine::poll` chooses among runnable Requests.
     pub poll_schedule: PollSchedule,
+    /// When `poll_schedule = prefill_budget`, max consecutive prefill picks before a
+    /// decode Request must be served (0 = unlimited). Ignored for other schedules.
+    pub max_consecutive_prefill_picks: usize,
     /// `"auto"` (HIP when the `hip` feature sees devices), `"hip"`, or `"cpu"`.
     pub gpu_backend: String,
 }
@@ -186,6 +189,9 @@ pub enum PollSchedule {
     Fair,
     /// Prefer decode/emitted Requests over in-flight prefill when both are runnable.
     DecodePriority,
+    /// Fair among decode; allow at most `max_consecutive_prefill_picks` prefills in a row
+    /// when a decode Request is also runnable (0 = unlimited, same as Fair).
+    PrefillBudget,
 }
 
 impl Default for EngineSection {
@@ -200,6 +206,7 @@ impl Default for EngineSection {
             determinism_seed: None,
             max_active_requests: 1,
             poll_schedule: PollSchedule::Fair,
+            max_consecutive_prefill_picks: 0,
             gpu_backend: "auto".into(),
         }
     }

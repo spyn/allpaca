@@ -80,6 +80,8 @@ struct EngineInner {
     grammar_factory: Option<llguidance::ParserFactory>,
     /// Round-robin cursor for continuous-batching ties.
     last_poll_id: Option<u64>,
+    /// Consecutive prefill picks under `PrefillBudget` schedule.
+    consecutive_prefill_picks: usize,
 }
 
 struct DraftAhead {
@@ -195,6 +197,7 @@ impl Engine {
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
             grammar_factory: None,
             last_poll_id: None,
+            consecutive_prefill_picks: 0,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -1060,6 +1063,8 @@ impl Engine {
             let (id, waited_ms, is_prefill) = {
                 let inner = self.lock()?;
                 let schedule = self.config.engine.poll_schedule;
+                let max_pref = self.config.engine.max_consecutive_prefill_picks;
+                let streak = inner.consecutive_prefill_picks;
                 let candidates: Vec<(u64, Instant, bool)> = inner
                     .active
                     .iter()
@@ -1070,9 +1075,13 @@ impl Engine {
                         (*id, r.last_token_at, prefill)
                     })
                     .collect();
-                let id = inner
-                    .scheduler
-                    .pick_runnable(&candidates, inner.last_poll_id, schedule);
+                let id = inner.scheduler.pick_runnable(
+                    &candidates,
+                    inner.last_poll_id,
+                    schedule,
+                    streak,
+                    max_pref,
+                );
                 let Some(id) = id else {
                     return Ok(None);
                 };
@@ -1085,6 +1094,12 @@ impl Engine {
             {
                 let mut inner = self.lock()?;
                 inner.last_poll_id = Some(id);
+                if is_prefill {
+                    inner.consecutive_prefill_picks =
+                        inner.consecutive_prefill_picks.saturating_add(1);
+                } else {
+                    inner.consecutive_prefill_picks = 0;
+                }
             }
             self.metrics
                 .poll_ticks
@@ -1246,7 +1261,10 @@ impl Engine {
         };
         let accepted = produced.accepted;
         let proposed = produced.proposed;
-        inner.scheduler.record_acceptance(accepted, proposed);
+        let active_n = inner.active.len();
+        inner
+            .scheduler
+            .record_acceptance_with_pressure(accepted, proposed, active_n);
         self.metrics
             .draft_proposed
             .fetch_add(proposed, std::sync::atomic::Ordering::Relaxed);
@@ -3061,6 +3079,109 @@ mod tests {
     }
 
     #[test]
+    fn prefill_budget_forces_decode_under_mixed_load() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.engine.poll_schedule = allpaca_types::PollSchedule::PrefillBudget;
+        cfg.engine.max_consecutive_prefill_picks = 1;
+        cfg.prefill.chunk_tokens = 1;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let long = "hello world hello world hello world hello world";
+        let _long = engine.begin_request(long, params.clone()).unwrap();
+        let short = engine.begin_request("hi", params).unwrap();
+        let id_short = short.id();
+        let mut short_tokens = 0usize;
+        let mut saw_prefill = false;
+        for _ in 0..48 {
+            let Some(ev) = engine.poll().expect("poll") else {
+                break;
+            };
+            match &ev.result {
+                StepResult::Prefill { .. } => saw_prefill = true,
+                StepResult::Token(_) if ev.request_id == id_short => {
+                    short_tokens += 1;
+                    if short_tokens >= 1 && saw_prefill {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            short_tokens >= 1 && saw_prefill,
+            "prefill_budget must still serve decode after a prefill streak; tokens={short_tokens} saw_prefill={saw_prefill}"
+        );
+    }
+
+    #[test]
+    fn queue_pressure_shrinks_draft_depth() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = true;
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 12;
+        cfg.features.adaptive_draft_depth = Some(true);
+        let engine = Engine::new(cfg).unwrap();
+        {
+            let mut inner = engine.lock().unwrap();
+            inner.scheduler.record_acceptance(9, 10);
+            let raised = inner.scheduler.draft_depth;
+            assert!(raised > 2);
+            // Neutral acceptance keeps depth; queue pressure alone must shrink.
+            inner
+                .scheduler
+                .record_acceptance_with_pressure(5, 10, 3);
+            assert!(
+                inner.scheduler.draft_depth < raised,
+                "active_requests>1 must shrink depth; raised={raised} now={}",
+                inner.scheduler.draft_depth
+            );
+            assert!(inner.scheduler.draft_depth >= 2);
+        }
+    }
+
+    #[test]
+    fn adaptive_draft_depth_moves_during_generate() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = true;
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 12;
+        cfg.features.adaptive_draft_depth = Some(true);
+        cfg.features.ngram_speculation = Some(true);
+        let engine = Engine::new(cfg).unwrap();
+        let initial = engine.stats().draft_depth;
+        // Repeating prompt trains the ngram; long decode should propose and adapt.
+        let prompt = "hello world hello world hello world hello world";
+        let out = engine
+            .generate(
+                prompt,
+                GenerationParams {
+                    max_tokens: 24,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.draft_proposed > 0,
+            "live generate must propose drafts; stats={stats:?}"
+        );
+        assert!(
+            stats.draft_depth != initial || stats.acceptance_rate > 0.0,
+            "adaptive path must move depth or record acceptance; initial={initial} stats={stats:?}"
+        );
+    }
+
+    #[test]
     fn adaptive_draft_depth_observable_on_stats() {
         let mut cfg = test_config();
         cfg.speculative.enabled = true;
@@ -3387,6 +3508,44 @@ mod tests {
                 || tree_stats.accepted_tokens_per_target_eval
                     > linear_stats.accepted_tokens_per_target_eval,
             "tree must expose more candidates than linear-only; tree={tree_stats:?} linear={linear_stats:?}"
+        );
+    }
+
+    /// Operator soak: turn on `speculative.tree` and watch `tree_*` on `/stats`.
+    #[test]
+    fn tree_speculation_soak_exposes_stats_for_operators() {
+        let mut cfg = test_config();
+        cfg.speculative.tree.enabled = true;
+        cfg.speculative.tree.max_nodes = 16;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(true);
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello world hello",
+                GenerationParams {
+                    max_tokens: 12,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.tree_nodes > 1,
+            "enable speculative.tree for forest soak; missing tree_nodes: {stats:?}"
+        );
+        assert!(
+            stats.tree_path_valid
+                || stats.tree_accepted_path_len > 0
+                || stats.tokens_generated > 0,
+            "tree soak must finish with path/tokens; stats={stats:?}"
+        );
+        assert!(
+            stats.draft_proposed > 0 || stats.accepted_tokens_per_target_eval >= 1.0,
+            "operator /stats must show draft activity under tree; {stats:?}"
         );
     }
 
