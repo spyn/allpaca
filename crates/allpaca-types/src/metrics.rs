@@ -142,6 +142,23 @@ pub struct StatsSnapshot {
     /// Prompt tokens skipped because a surviving anchor restored the prefix.
     #[serde(default)]
     pub anchor_skip_tokens: u64,
+    /// Radix-prefix KV restores (mid-prompt edit LCP).
+    #[serde(default)]
+    pub radix_hits: u64,
+    /// Prompt tokens skipped via radix LCP restore.
+    #[serde(default)]
+    pub radix_skip_tokens: u64,
+    /// DirectStorage (or staged H2D) transfers enqueued.
+    #[serde(default)]
+    pub ds_enqueued: u64,
+    #[serde(default)]
+    pub ds_bytes: u64,
+    /// True when DirectStorage/GDS probe succeeded at engine start.
+    #[serde(default)]
+    pub ds_available: bool,
+    /// Cross-request GPU/CPU stagger plans recorded under concurrency.
+    #[serde(default)]
+    pub micro_batch_plans: u64,
     /// KV pages currently resident on the NVMe cold tier.
     #[serde(default)]
     pub kv_nvme_pages: u64,

@@ -39,8 +39,8 @@ impl RecurrentState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct KvRow {
-    k: Vec<f32>,
-    v: Vec<f32>,
+    pub(crate) k: Vec<f32>,
+    pub(crate) v: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,7 +214,7 @@ pub fn restore_kv(
     Ok(())
 }
 
-fn snapshot_kv(
+pub(crate) fn snapshot_kv(
     kv: &KvTierManager,
     pages: &[Vec<u64>],
     cfg: &ModelConfig,

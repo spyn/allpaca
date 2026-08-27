@@ -18,10 +18,13 @@ use rand::rngs::StdRng;
 use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
+use crate::direct_storage::{probe_direct_storage, DirectStorageProbe};
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
 use crate::forest::{build_token_forest, TokenForest};
+use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
+use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, StaggerPhase};
 use crate::model::{
     alloc_pages_for_seq, ensure_pages, DenseKv, ModelConfig, ResidentModel, TinyModel,
 };
@@ -77,6 +80,10 @@ struct EngineInner {
     draft_kv: DenseKv,
     draft_ahead: Option<DraftAhead>,
     anchors: AnchorCache,
+    /// GEM radix prefix KV reuse (arbitrary mid-prompt edits).
+    kv_radix: KvRadixForest,
+    /// DirectStorage / GDS capability probe at engine start.
+    ds_probe: DirectStorageProbe,
     grammar_factory: Option<llguidance::ParserFactory>,
     /// Round-robin cursor for continuous-batching ties.
     last_poll_id: Option<u64>,
@@ -195,6 +202,8 @@ impl Engine {
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
+            kv_radix: KvRadixForest::new(),
+            ds_probe: probe_direct_storage(),
             grammar_factory: None,
             last_poll_id: None,
             consecutive_prefill_picks: 0,
@@ -280,6 +289,17 @@ impl Engine {
                     .store(g.anchors.hits(), std::sync::atomic::Ordering::Relaxed);
                 self.metrics.anchor_skip_tokens.store(
                     g.anchors.skip_tokens(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics
+                    .radix_hits
+                    .store(g.kv_radix.hits(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics.radix_skip_tokens.store(
+                    g.kv_radix.skip_tokens(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.ds_available.store(
+                    u64::from(g.ds_probe.available),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 self.metrics
@@ -973,6 +993,20 @@ impl Engine {
             }
             prefill_pos = n;
         }
+        if let Some((n, cp)) = inner
+            .kv_radix
+            .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
+        {
+            if n > prefill_pos {
+                restore_kv(&mut inner.kv, &pages, &cp.kv, &target.config)?;
+                if let Some(dst) = recurrent.as_mut() {
+                    *dst = cp.recurrent;
+                } else if target.config.recurrent {
+                    recurrent = Some(cp.recurrent);
+                }
+                prefill_pos = n;
+            }
+        }
         let rng = rng_from_params(&params, self.config.engine.determinism_seed);
         let grammar = if self.config.structured_output.enabled
             && inner.flags.json_constraints
@@ -1076,6 +1110,32 @@ impl Engine {
                         (*id, r.last_token_at, prefill)
                     })
                     .collect();
+                // GEM: record cross-request GPU/CPU stagger intent under concurrency.
+                if candidates.len() >= 2 {
+                    let hints: Vec<ActiveLayerHint> = candidates
+                        .iter()
+                        .map(|(rid, _, pref)| ActiveLayerHint {
+                            request_id: *rid,
+                            phase: if *pref {
+                                StaggerPhase::Prefill
+                            } else {
+                                StaggerPhase::Decode
+                            },
+                            layer: 0,
+                            cpu_expert_pending: inner
+                                .target
+                                .as_ref()
+                                .and_then(|m| m.expert_lru.as_ref())
+                                .is_some_and(|lru| lru.cpu_runs() > 0),
+                        })
+                        .collect();
+                    let plan = plan_micro_batch(&hints);
+                    if plan.gpu.is_some() && plan.cpu.is_some() {
+                        self.metrics
+                            .micro_batch_plans
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 let id = inner.scheduler.pick_runnable(
                     &candidates,
                     inner.last_poll_id,
@@ -1394,49 +1454,45 @@ impl Engine {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.recurrent)
         };
-        if inner.anchors.enabled() {
-            for (i, tok) in toks.iter().enumerate() {
-                let pos = start + i;
-                target.forward_token(
-                    *tok,
-                    pos,
-                    &pages,
-                    &mut inner.kv,
-                    &self.metrics,
-                    &mut logits,
-                    self.hip.as_deref(),
-                    resident.as_deref(),
-                    true,
-                    recurrent.as_mut(),
-                )?;
-                if inner.anchors.is_anchor(*tok) {
-                    if let Some(state) = recurrent.as_ref() {
-                        let prefix = request(inner, id)?.tokens[..=pos].to_vec();
-                        let pages = request(inner, id)?.pages.clone();
-                        inner.anchors.capture(
-                            &prefix,
-                            state,
-                            &inner.kv,
-                            &pages,
-                            &target.config,
-                        )?;
-                    }
-                }
-            }
-        } else {
-            target.forward_tokens(
-                &toks,
-                start,
+        // Per-token prefill so radix (and anchors) get correct mid-prefix checkpoints.
+        for (i, tok) in toks.iter().enumerate() {
+            let pos = start + i;
+            let last = pos + 1 >= total;
+            target.forward_token(
+                *tok,
+                pos,
                 &pages,
                 &mut inner.kv,
                 &self.metrics,
                 &mut logits,
                 self.hip.as_deref(),
                 resident.as_deref(),
-                write_logits,
-                None,
+                last || write_logits,
                 recurrent.as_mut(),
             )?;
+            let prefix = request(inner, id)?.tokens[..=pos].to_vec();
+            let pages_now = request(inner, id)?.pages.clone();
+            let state_ref = recurrent
+                .clone()
+                .unwrap_or_else(|| RecurrentState::zeros(target.config.n_layers, target.config.dim));
+            inner.kv_radix.capture(
+                &prefix,
+                &state_ref,
+                &inner.kv,
+                &pages_now,
+                &target.config,
+            )?;
+            if inner.anchors.enabled() && inner.anchors.is_anchor(*tok) {
+                if let Some(state) = recurrent.as_ref() {
+                    inner.anchors.capture(
+                        &prefix,
+                        state,
+                        &inner.kv,
+                        &pages_now,
+                        &target.config,
+                    )?;
+                }
+            }
         }
         if let Some(hip) = self.hip.as_deref() {
             hip.wait_logits_d2h(&mut logits)?;
@@ -2556,6 +2612,40 @@ mod tests {
             stats.anchor_skip_tokens >= 2,
             "bos+hello must be skipped; stats={stats:?}"
         );
+    }
+
+    #[test]
+    fn radix_prefix_skips_shared_tokens_after_mid_edit() {
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let _warm = engine.generate("hello world", params.clone()).unwrap();
+
+        let _edited = engine.generate("hello there", params).unwrap();
+        let stats = engine.stats();
+        assert!(
+            stats.radix_hits >= 1,
+            "edited prompt must restore LCP via radix; stats={stats:?}"
+        );
+        assert!(
+            stats.radix_skip_tokens >= 1,
+            "at least one shared token must be skipped; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn ds_probe_surfaces_on_stats() {
+        let engine = Engine::new(test_config()).unwrap();
+        let stats = engine.stats();
+        // Probe always runs; availability is host-dependent.
+        let _ = stats.ds_available;
+        assert_eq!(stats.ds_enqueued, 0, "no expert H2D yet; stats={stats:?}");
     }
 
     #[test]

@@ -1,10 +1,11 @@
-//! Cross-request layer-staggered micro-batching spike (GEM).
+//! Cross-request layer-staggered micro-batching (GEM).
 //!
 //! Under concurrency, FreeToken-style co-execution binds CPU and GPU to the same
 //! layer of the same request. Better utilization: GPU runs request A at layer
 //! `l+1` while CPU finishes cache-missed experts of request B at layer `l`.
 //!
-//! Spike scope: plan struct + picker. Engine wire-up is the next vertical.
+//! Vertical: `plan_micro_batch` runs on each multi-request `poll`, and MoE
+//! forwards run CPU expert MLPs in parallel with the GPU expert loop.
 
 /// Request progress phase for stagger planning (mirrors engine poll phases).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

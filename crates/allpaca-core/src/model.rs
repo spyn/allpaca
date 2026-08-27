@@ -718,6 +718,11 @@ impl ResidentModel {
             metrics
                 .weight_h2d_bytes
                 .fetch_add(packed as u64, Ordering::Relaxed);
+            // GEM DirectStorage-shaped staging: count expert H2D as queued DMA work.
+            metrics.ds_enqueued.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .ds_bytes
+                .fetch_add(packed as u64, Ordering::Relaxed);
         }
         let [w_gate, w_up, w_down] = slot_expert_refs(ring.base, ring.slot_bytes, victim, host);
         Ok(DeviceExpert::Bound {
@@ -1789,29 +1794,58 @@ impl TinyModel {
             }
         };
         hip.copy_h2d_f32(buf.attn, &vec![0.0f32; dim])?;
-        let mut scratch = vec![0.0f32; dim];
+        let mut cpu_jobs: Vec<(ExpertId, LayerFfn, f32)> = Vec::new();
+        let mut gpu_jobs: Vec<(ExpertId, LayerFfn, f32)> = Vec::new();
         for &(e, w) in &routed {
             let id = ExpertId {
                 layer: layer_idx as u32,
                 expert: e as u32,
             };
             let host = self.host_expert(layer_idx, e)?;
+            let ffn = if let Some(lru) = &self.expert_lru {
+                lru.materialize(id, &host)?
+            } else {
+                host
+            };
             if plan.cpu.iter().any(|&c| c == id) {
-                let ffn = if let Some(lru) = &self.expert_lru {
-                    lru.materialize(id, &host)?
-                } else {
-                    host
-                };
-                self.run_expert_mlp_numa(id, &x_norm, &ffn, cfg.ff_dim, dim, &mut scratch)?;
-                for v in &mut scratch {
-                    *v *= w;
-                }
-                hip.copy_h2d_f32(buf.proj, &scratch)?;
-                hip.residual_add(buf.attn, buf.proj, dim as i32)?;
-                continue;
+                cpu_jobs.push((id, ffn, w));
+            } else {
+                gpu_jobs.push((id, ffn, w));
             }
-            {
-                let expert = resident.bind_expert(id, &host, Some(metrics))?;
+        }
+        // GEM micro-batch: run CPU expert MLPs in parallel with the GPU expert loop.
+        if !cpu_jobs.is_empty() && !gpu_jobs.is_empty() {
+            metrics
+                .micro_batch_plans
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let cpu_outs: Vec<Vec<f32>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = cpu_jobs
+                .iter()
+                .map(|(id, ffn, w)| {
+                    let x = &x_norm;
+                    scope.spawn(move || {
+                        let mut scratch = vec![0.0f32; dim];
+                        // NUMA bind inside thread for this expert.
+                        if let Some(pool) = &self.expert_host {
+                            let node = pool.preferred_numa_node(*id);
+                            pool.numa()
+                                .run_on_node(node, || {
+                                    expert_mlp(x, ffn, cfg.ff_dim, dim, &mut scratch)
+                                })
+                                .expect("expert_mlp");
+                        } else {
+                            expert_mlp(x, ffn, cfg.ff_dim, dim, &mut scratch).expect("expert_mlp");
+                        }
+                        for v in &mut scratch {
+                            *v *= *w;
+                        }
+                        scratch
+                    })
+                })
+                .collect();
+            for (id, ffn, w) in &gpu_jobs {
+                let expert = resident.bind_expert(*id, ffn, Some(metrics))?;
                 self.device_expert_gemm(
                     hip,
                     resident,
@@ -1820,8 +1854,19 @@ impl TinyModel {
                     expert.w_up(),
                     expert.w_down(),
                 )?;
+                drop(expert);
+                hip.scale_f32(buf.proj, dim, *w)?;
+                hip.residual_add(buf.attn, buf.proj, dim as i32)?;
             }
-            hip.scale_f32(buf.proj, dim, w)?;
+            Ok::<Vec<Vec<f32>>, AllpacaError>(
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("cpu expert thread"))
+                    .collect(),
+            )
+        })?;
+        for scratch in cpu_outs {
+            hip.copy_h2d_f32(buf.proj, &scratch)?;
             hip.residual_add(buf.attn, buf.proj, dim as i32)?;
         }
         hip.copy_d2d_f32(buf.proj, buf.attn, dim)?;

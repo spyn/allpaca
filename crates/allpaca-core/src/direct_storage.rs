@@ -1,10 +1,13 @@
-//! DirectStorage / GPU-direct NVMe spike (GEM).
+//! DirectStorage / GPU-direct NVMe path (GEM).
 //!
 //! Today expert and KV cold tiers bounce NVMe → host RAM → PCIe → VRAM.
 //! DirectStorage (Windows) / GDS (Linux) can DMA into device memory and skip
 //! the host bounce for large expert fills.
 //!
-//! Spike scope: capability probe + enqueue API shape. No real DS queue yet.
+//! Vertical: capability probe at engine start (`ds_available` on `/stats`) plus
+//! DS-shaped accounting on expert ring H2D (`ds_enqueued` / `ds_bytes`).
+//! `DirectStorageQueue::try_enqueue` records intent when the probe is hot;
+//! real NVMe→VRAM DMA still needs the platform SDK.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +31,7 @@ pub enum DirectStorageBackend {
     LinuxGds,
 }
 
-/// Spike queue: records intended NVMe→device transfers without issuing them.
+/// Records intended NVMe→device transfers (probe-gated) without issuing DMA yet.
 #[derive(Debug, Default)]
 pub struct DirectStorageQueue {
     enqueued: AtomicU64,
