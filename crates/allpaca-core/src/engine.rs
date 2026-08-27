@@ -238,6 +238,7 @@ impl Engine {
                     self.metrics
                         .expert_host_slots
                         .store(pool.n_slots() as u64, std::sync::atomic::Ordering::Relaxed);
+                    HostExpertPool::record_numa(&self.metrics, pool.numa());
                     self.metrics
                         .nvme_reads
                         .store(pool.nvme_reads(), std::sync::atomic::Ordering::Relaxed);

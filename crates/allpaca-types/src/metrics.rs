@@ -118,6 +118,15 @@ pub struct StatsSnapshot {
     /// DRAM slots in the NVMe-backed expert host pool (0 = full RAM pool).
     #[serde(default)]
     pub expert_host_slots: u64,
+    /// Host NUMA nodes visible to expert placement.
+    #[serde(default)]
+    pub expert_numa_nodes: u64,
+    /// Successful CPU thread binds to an expert's preferred NUMA node.
+    #[serde(default)]
+    pub expert_numa_binds: u64,
+    /// Expert weight clones first-touched onto a preferred NUMA node.
+    #[serde(default)]
+    pub expert_numa_pins: u64,
     /// Direct I/O (or buffered fallback) reads from the packed expert file.
     #[serde(default)]
     pub nvme_reads: u64,

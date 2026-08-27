@@ -348,6 +348,10 @@ impl HostExpertPool {
         self.numa.n_nodes
     }
 
+    pub fn numa_pins(&self) -> u64 {
+        self.numa.pins()
+    }
+
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
@@ -404,7 +408,9 @@ impl HostExpertPool {
                     .map(|(i, _)| i)
                     .unwrap_or(0)
             });
-        let ffn = self.store.read_expert(id)?;
+        let raw = self.store.read_expert(id)?;
+        let node = self.numa.preferred_node(id);
+        let ffn = self.numa.clone_ffn_on_node(node, &raw);
         inner.slots[victim] = ffn.clone();
         inner.bound[victim] = Some(id);
         inner.used_at[victim] = inner.clock;
@@ -420,6 +426,22 @@ impl HostExpertPool {
             })?);
         }
         Ok(out)
+    }
+
+    pub fn numa(&self) -> &NumaTopology {
+        &self.numa
+    }
+
+    pub fn record_numa(metrics: &Metrics, topo: &NumaTopology) {
+        metrics
+            .expert_numa_nodes
+            .store(topo.n_nodes as u64, Ordering::Relaxed);
+        metrics
+            .expert_numa_binds
+            .store(topo.binds_ok(), Ordering::Relaxed);
+        metrics
+            .expert_numa_pins
+            .store(topo.pins(), Ordering::Relaxed);
     }
 }
 
@@ -556,5 +578,15 @@ mod tests {
             expert: 1,
         });
         assert_ne!(n0, n1, "interleaved experts land on different nodes");
+        let _ = pool
+            .get(ExpertId {
+                layer: 0,
+                expert: 0,
+            })
+            .unwrap();
+        assert!(
+            pool.numa_pins() >= 1,
+            "miss fill must first-touch pin onto preferred node"
+        );
     }
 }

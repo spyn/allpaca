@@ -1432,6 +1432,23 @@ impl TinyModel {
             })
     }
 
+    /// Bind CPU expert MLP to the preferred NUMA node when a host pool is present.
+    fn run_expert_mlp_numa(
+        &self,
+        id: ExpertId,
+        x_norm: &[f32],
+        ffn: &LayerFfn,
+        ff_dim: usize,
+        dim: usize,
+        out: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        if let Some(pool) = &self.expert_host {
+            let node = pool.preferred_numa_node(id);
+            return pool.numa().run_on_node(node, || expert_mlp(x_norm, ffn, ff_dim, dim, out));
+        }
+        expert_mlp(x_norm, ffn, ff_dim, dim, out)
+    }
+
     fn host_experts_layer(&self, layer_idx: usize) -> Result<Vec<LayerFfn>, AllpacaError> {
         let n_exp = self.config.n_experts;
         if let Some(pool) = &self.expert_host {
@@ -1590,18 +1607,16 @@ impl TinyModel {
         let mut scratch_h = vec![0.0f32; dim];
         for &(e, w) in &routed {
             let host = self.host_expert(layer_idx, e)?;
+            let id = ExpertId {
+                layer: layer_idx as u32,
+                expert: e as u32,
+            };
             let ffn = if let Some(lru) = &self.expert_lru {
-                lru.materialize(
-                    ExpertId {
-                        layer: layer_idx as u32,
-                        expert: e as u32,
-                    },
-                    &host,
-                )?
+                lru.materialize(id, &host)?
             } else {
                 host
             };
-            expert_mlp(x_norm, &ffn, cfg.ff_dim, dim, &mut scratch_h)?;
+            self.run_expert_mlp_numa(id, x_norm, &ffn, cfg.ff_dim, dim, &mut scratch_h)?;
             for i in 0..dim {
                 acc[i] += w * scratch_h[i];
             }
@@ -1787,7 +1802,7 @@ impl TinyModel {
                 } else {
                     host
                 };
-                expert_mlp(&x_norm, &ffn, cfg.ff_dim, dim, &mut scratch)?;
+                self.run_expert_mlp_numa(id, &x_norm, &ffn, cfg.ff_dim, dim, &mut scratch)?;
                 for v in &mut scratch {
                     *v *= w;
                 }
