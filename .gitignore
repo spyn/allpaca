@@ -1,5 +1,7 @@
 # Rust
 /target
+/target-overnight/
+test-out*.txt
 **/*.rs.bk
 
 # Local GGUF weights (not in git)
