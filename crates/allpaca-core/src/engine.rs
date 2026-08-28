@@ -321,6 +321,10 @@ impl Engine {
                     g.kv_radix.checkpoint_bytes() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                self.metrics.gemv_tile_cols.store(
+                    allpaca_hip::last_gemv_tile_cols(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 self.metrics.ds_available.store(
                     u64::from(g.ds_probe.available),
                     std::sync::atomic::Ordering::Relaxed,
@@ -1680,6 +1684,59 @@ impl Engine {
         Ok(())
     }
 
+    /// Safe-point: trim cold radix checkpoints and grow the expert LRU pool from
+    /// the freed budget (OPPORTUNITY §8.2 elastic VRAM). No-op when Requests are
+    /// in flight.
+    pub fn rebalance_experts_elastic(&self) -> Result<(), AllpacaError> {
+        let (freed, new_cache, new_vram) = {
+            let mut inner = self.lock()?;
+            if !inner.active.is_empty() {
+                return Err(AllpacaError::Transient(TransientError::RequestBusy));
+            }
+            let before = inner.kv_radix.checkpoint_bytes();
+            // Soft pressure: trim cold half so expert LRU can expand.
+            let target = before / 2;
+            let freed = if before > target {
+                inner.kv_radix.trim_to_bytes(target)
+            } else {
+                0
+            };
+            let expert_bytes = inner
+                .target
+                .as_ref()
+                .map(|m| m.expert_slot_bytes())
+                .unwrap_or(0);
+            let base_cache = self.config.weights.cache_bytes;
+            let new_cache = base_cache.saturating_add(freed);
+            // Give expert pool headroom by shrinking KV VRAM when we reclaimed radix.
+            let cur_vram = self.config.kv.vram_bytes;
+            let new_vram = if freed > 0 && expert_bytes > 0 {
+                cur_vram.saturating_sub(freed.min(cur_vram / 4))
+            } else {
+                cur_vram
+            };
+            if let Some(model) = inner.target.as_mut() {
+                if let Some(model) = Arc::get_mut(model) {
+                    self.rebuild_expert_slots(model, new_cache);
+                }
+            }
+            if new_vram != cur_vram {
+                inner.kv.set_vram_bytes(new_vram, &self.metrics)?;
+            }
+            (freed, new_cache, new_vram)
+        };
+        if freed > 0 || new_cache > self.config.weights.cache_bytes {
+            self.metrics
+                .vram_rebalances
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = new_vram;
+        if self.hip.is_some() {
+            self.upload_resident_weights()?;
+        }
+        Ok(())
+    }
+
     fn rebuild_expert_slots(&self, model: &mut TinyModel, cache_bytes: usize) {
         if model.config.n_experts == 0 {
             return;
@@ -2708,6 +2765,54 @@ mod tests {
         assert_eq!(
             second.token_ids, full.token_ids,
             "elastic VRAM is a speed dial: greedy tokens must match"
+        );
+    }
+
+    #[test]
+    fn elastic_rebalance_trims_radix_and_grows_expert_slots() {
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.host_bytes = 64;
+        cfg.weights.cache_bytes = 64; // one expert slot initially
+        cfg.kv.vram_bytes = 8 * 1024;
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let params = GenerationParams {
+            max_tokens: 2,
+            temperature: 0.0,
+            seed: Some(3),
+            ..GenerationParams::default()
+        };
+        // Fill radix with several prompt prefixes.
+        for prompt in ["hello", "hello world", "hello there", "goodbye friend"] {
+            let _ = engine.generate(prompt, params.clone()).unwrap();
+        }
+        let before = engine.stats();
+        assert!(
+            before.radix_bytes > 0,
+            "prefills must seed radix checkpoints; stats={before:?}"
+        );
+        let slots_before = before.expert_slots;
+
+        engine
+            .rebalance_experts_elastic()
+            .expect("safe-point elastic rebalance");
+        let after = engine.stats();
+        assert!(
+            after.vram_rebalances >= 1,
+            "elastic rebalance must record; stats={after:?}"
+        );
+        assert!(
+            after.radix_bytes < before.radix_bytes,
+            "radix must shrink; before={} after={}",
+            before.radix_bytes,
+            after.radix_bytes
+        );
+        assert!(
+            after.expert_slots >= slots_before,
+            "expert pool must not shrink; before={slots_before} after={}",
+            after.expert_slots
         );
     }
 

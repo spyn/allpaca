@@ -119,6 +119,23 @@ impl KvRadixForest {
         self.checkpoint_bytes
     }
 
+    #[allow(dead_code)]
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Evict cold checkpoints until `checkpoint_bytes <= target`. Returns bytes freed.
+    pub fn trim_to_bytes(&mut self, target: usize) -> usize {
+        let before = self.checkpoint_bytes;
+        while self.checkpoint_bytes > target {
+            if !self.evict_one_leaf(true) {
+                break;
+            }
+            self.evictions += 1;
+        }
+        before.saturating_sub(self.checkpoint_bytes)
+    }
+
     fn touch(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock
@@ -482,5 +499,22 @@ mod tests {
         forest.insert_checkpoint(&[1], fat_cp(8));
         let b = forest.checkpoint_bytes();
         assert!(b < a, "replace must shrink tracked bytes: a={a} b={b}");
+    }
+
+    #[test]
+    fn trim_to_bytes_frees_cold_checkpoints() {
+        let mut forest = KvRadixForest::with_limits(0, 0);
+        forest.insert_checkpoint(&[1], fat_cp(64));
+        forest.insert_checkpoint(&[2], fat_cp(64));
+        forest.insert_checkpoint(&[3], fat_cp(64));
+        let before = forest.checkpoint_bytes();
+        assert!(before > 200, "before={before}");
+        let freed = forest.trim_to_bytes(before / 3);
+        assert!(freed > 0, "freed={freed}");
+        assert!(
+            forest.checkpoint_bytes() <= before / 3 + 64,
+            "after={}",
+            forest.checkpoint_bytes()
+        );
     }
 }
