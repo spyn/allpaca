@@ -167,6 +167,14 @@ pub struct StatsSnapshot {
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     #[serde(default)]
     pub micro_batch_dual_steps: u64,
+    /// MoE prefill: next-layer expert H2D overlapped with current layer GPU work.
+    #[serde(default)]
+    pub expert_prefill_overlaps: u64,
+    /// Expert miss fills merged into one contiguous DMA (decode micro-batch union).
+    #[serde(default)]
+    pub expert_bulk_fills: u64,
+    #[serde(default)]
+    pub expert_bulk_bytes: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,

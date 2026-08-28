@@ -74,6 +74,11 @@ pub struct Metrics {
     pub micro_batch_plans: AtomicU64,
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     pub micro_batch_dual_steps: AtomicU64,
+    /// MoE prefill: next-layer expert H2D queued while current layer computes.
+    pub expert_prefill_overlaps: AtomicU64,
+    /// Decode/micro-batch: expert miss fills merged into one contiguous DMA.
+    pub expert_bulk_fills: AtomicU64,
+    pub expert_bulk_bytes: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub kv_nvme_pages: AtomicU64,
@@ -209,6 +214,9 @@ impl Metrics {
             ds_available: self.ds_available.load(Ordering::Relaxed) != 0,
             micro_batch_plans: self.micro_batch_plans.load(Ordering::Relaxed),
             micro_batch_dual_steps: self.micro_batch_dual_steps.load(Ordering::Relaxed),
+            expert_prefill_overlaps: self.expert_prefill_overlaps.load(Ordering::Relaxed),
+            expert_bulk_fills: self.expert_bulk_fills.load(Ordering::Relaxed),
+            expert_bulk_bytes: self.expert_bulk_bytes.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             kv_nvme_pages: self.kv_nvme_pages.load(Ordering::Relaxed),

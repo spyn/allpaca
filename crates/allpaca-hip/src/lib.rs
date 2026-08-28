@@ -1937,6 +1937,34 @@ pub fn copy_async(dst: &mut [u8], src: &[u8]) -> Result<(), AllpacaError> {
     }
 }
 
+pub fn memcpy_async(
+    dst: *mut u8,
+    src: *const u8,
+    bytes: usize,
+    kind: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_hip_memcpy(
+                dst.cast(),
+                src.cast(),
+                bytes,
+                kind,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "memcpy_async")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (dst, src, bytes, kind);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP memcpy_async unavailable; use CPU fallback".into(),
+        )))
+    }
+}
+
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
 fn status(rc: i32, op: &str) -> Result<(), AllpacaError> {
     if rc == ALLPACA_OK {
@@ -1985,6 +2013,29 @@ impl DeviceWeights {
         }
         set_device(self.device)?;
         memcpy(
+            unsafe { self.ptr.add(offset) },
+            src.as_ptr(),
+            src.len(),
+            MEMCPY_H2D,
+        )
+    }
+
+    /// Queue H2D on the default stream (overlap with GPU kernels on same stream).
+    pub fn copy_h2d_async(&self, offset: usize, src: &[u8]) -> Result<(), AllpacaError> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        if offset.saturating_add(src.len()) > self.bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!(
+                    "weight async H2D overflow: off={offset} n={} cap={}",
+                    src.len(),
+                    self.bytes
+                ),
+            )));
+        }
+        set_device(self.device)?;
+        memcpy_async(
             unsafe { self.ptr.add(offset) },
             src.as_ptr(),
             src.len(),

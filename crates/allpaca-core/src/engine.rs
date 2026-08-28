@@ -26,6 +26,7 @@ use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
+use crate::expert_batch::MicroBatchExpertUnion;
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, StaggerPhase};
 use crate::model::{
     alloc_pages_for_seq, ensure_pages, DenseKv, ModelConfig, ResidentModel, TinyModel,
@@ -111,6 +112,7 @@ pub struct Engine {
     /// Shared DirectStorage enqueue ledger (file-coordinate + staged H2D).
     ds_queue: Arc<DirectStorageQueue>,
     ds_probe: DirectStorageProbe,
+    micro_batch: Arc<MicroBatchExpertUnion>,
 }
 
 pub struct RequestHandle {
@@ -227,6 +229,7 @@ impl Engine {
             draft_hip,
             ds_queue,
             ds_probe,
+            micro_batch: Arc::new(MicroBatchExpertUnion::new()),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -535,13 +538,24 @@ impl Engine {
             return Ok(());
         }
         let sample = model.layers.first().and_then(|l| l.experts.first());
+        let sample_id = ExpertId { layer: 0, expert: 0 };
         let b_host = sample
             .map(|e| {
-                crate::model::measure_expert_host_bandwidth(
-                    e,
-                    model.config.ff_dim,
-                    model.config.dim,
-                )
+                if let Some(pool) = &model.expert_host {
+                    crate::model::measure_expert_host_bandwidth_numa(
+                        e,
+                        model.config.ff_dim,
+                        model.config.dim,
+                        pool.numa(),
+                        sample_id,
+                    )
+                } else {
+                    crate::model::measure_expert_host_bandwidth(
+                        e,
+                        model.config.ff_dim,
+                        model.config.dim,
+                    )
+                }
             })
             .unwrap_or(0.0);
         let b_pcie = self
@@ -610,6 +624,9 @@ impl Engine {
             t_dispatch,
             expert_bytes as f64,
         ));
+        if let Some(pool) = &model.expert_host {
+            HostExpertPool::record_numa(&self.metrics, pool.numa());
+        }
         Ok(())
     }
 
@@ -1259,15 +1276,34 @@ impl Engine {
                 (ema * 100.0) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            let dual_partner = stagger_partner.filter(|&p| p != id);
+            if dual_partner.is_some() {
+                self.micro_batch.begin_dual_step(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0),
+                );
+            }
             let primary = match self.step_id(id) {
                 Ok(result) => result,
                 // Peer Drop removed the Request between pick and step.
-                Err(AllpacaError::Transient(TransientError::RequestBusy)) => continue,
-                Err(e) => return Err(e),
+                Err(AllpacaError::Transient(TransientError::RequestBusy)) => {
+                    if dual_partner.is_some() {
+                        self.micro_batch.end_dual_step();
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    if dual_partner.is_some() {
+                        self.micro_batch.end_dual_step();
+                    }
+                    return Err(e);
+                }
             };
             // Same-tick partner: co-progress then park so the result remains a
             // PollEvent when that request is next picked (observability intact).
-            if let Some(partner) = stagger_partner.filter(|&p| p != id) {
+            if let Some(partner) = dual_partner {
                 match self.step_id(partner) {
                     Ok(partner_result) => {
                         self.park_result(partner, partner_result)?;
@@ -1279,8 +1315,12 @@ impl Engine {
                         let mut inner = self.lock()?;
                         inner.prefer_next = Some(partner);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        self.micro_batch.end_dual_step();
+                        return Err(e);
+                    }
                 }
+                self.micro_batch.end_dual_step();
             }
             return Ok(Some(allpaca_types::PollEvent {
                 request_id: id,
@@ -1366,6 +1406,11 @@ impl Engine {
         self.metrics
             .target_evals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let micro_batch = if self.micro_batch.dual_active() {
+            Some(self.micro_batch.as_ref())
+        } else {
+            None
+        };
         let produced = if use_tree {
             let ctx = request(&inner, id)?.tokens.clone();
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
@@ -1384,7 +1429,7 @@ impl Engine {
             self.metrics
                 .tree_nodes
                 .fetch_add(forest.nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref())?
+            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref(), micro_batch)?
         } else {
             let drafts = if speculate && depth > 0 {
                 propose_drafts(
@@ -1409,6 +1454,7 @@ impl Engine {
                     self.draft_hip.as_deref(),
                     depth,
                     temperature,
+                    micro_batch,
                 )?
         };
         let accepted = produced.accepted;
@@ -1560,6 +1606,7 @@ impl Engine {
                 resident.as_deref(),
                 last || write_logits,
                 recurrent.as_mut(),
+                None,
             )?;
             let prefix = request(inner, id)?.tokens[..=pos].to_vec();
             let pages_now = request(inner, id)?.pages.clone();
@@ -1921,6 +1968,7 @@ fn verify_and_sample(
     draft_hip: Option<&HipWorkspace>,
     depth: usize,
     temperature: f32,
+    micro_batch: Option<&MicroBatchExpertUnion>,
 ) -> Result<Produced, AllpacaError> {
     let drafts_len = drafts.len() as u64;
     if remaining == 0 {
@@ -1966,7 +2014,7 @@ fn verify_and_sample(
     if first_match {
         draft_iter.next();
     }
-    append_and_forward(inner, id, sampled, metrics, hip)?;
+    append_and_forward(inner, id, sampled, metrics, hip, micro_batch)?;
     if stop || !first_match || draft_iter.peek().is_none() {
         return finish_linear_verify(
             inner,
@@ -2002,7 +2050,7 @@ fn verify_and_sample(
             accepted += 1;
             draft_iter.next();
         }
-        append_and_forward(inner, id, sampled, metrics, hip)?;
+        append_and_forward(inner, id, sampled, metrics, hip, micro_batch)?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || !matched || draft_iter.peek().is_none() {
             break;
@@ -2252,7 +2300,7 @@ fn packed_linear_verify_span(
     }
 
     if produced.len() > keep {
-        append_and_forward(inner, id, produced[keep], metrics, hip)?;
+        append_and_forward(inner, id, produced[keep], metrics, hip, None)?;
     } else {
         let off = keep.saturating_sub(1) * vocab;
         let pending = row_logits[off..off + vocab].to_vec();
@@ -2273,6 +2321,7 @@ fn verify_forest(
     remaining: usize,
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
+    micro_batch: Option<&MicroBatchExpertUnion>,
 ) -> Result<Produced, AllpacaError> {
     let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
     let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
@@ -2325,7 +2374,7 @@ fn verify_forest(
             accepted_tokens.push(sampled);
             parent = idx as i32;
         }
-        append_and_forward(inner, id, sampled, metrics, hip)?;
+        append_and_forward(inner, id, sampled, metrics, hip, micro_batch)?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || child.is_none() || forest.children(parent).next().is_none()
         {
@@ -2355,6 +2404,7 @@ fn append_and_forward(
     token: u32,
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
+    micro_batch: Option<&MicroBatchExpertUnion>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
     let page_tokens = request(inner, id)?
@@ -2401,6 +2451,7 @@ fn append_and_forward(
         resident.as_deref(),
         false,
         recurrent.as_mut(),
+        micro_batch,
     )?;
     request_mut(inner, id)?.pending_logits = logits;
     request_mut(inner, id)?.recurrent = recurrent;
@@ -2820,6 +2871,60 @@ mod tests {
             stats.expert_lru_fills >= 4,
             "prefill must admit a whole layer, not only top-k; fills={}",
             stats.expert_lru_fills
+        );
+    }
+
+    #[test]
+    fn moe_prefill_double_buffer_hits_on_live_path() {
+        let expert_bytes = 64 * 32 * 3 * 4;
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.cache_bytes = expert_bytes * 8;
+        cfg.weights.miss_policy = MissPolicy::Fill;
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        let prompt = "hello ".repeat(16);
+        let _ = engine
+            .generate(
+                &prompt,
+                GenerationParams {
+                    max_tokens: 2,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        let stats = engine.stats();
+        assert!(
+            stats.expert_slots >= 8,
+            "two full layers must fit; slots={}",
+            stats.expert_slots
+        );
+        assert!(
+            stats.expert_lru_hits > stats.expert_lru_fills / 4,
+            "double-buffered prefill must hit admitted experts; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn numa_host_bandwidth_uses_cross_node_floor() {
+        use crate::numa::NumaTopology;
+        use crate::weight_set::{ExpertId, LayerFfn};
+        let topo = NumaTopology::with_nodes(2);
+        let ffn = LayerFfn {
+            w_gate: vec![1.0; 32],
+            w_up: vec![1.0; 32],
+            w_down: vec![1.0; 32],
+            ..LayerFfn::default()
+        };
+        let id = ExpertId { layer: 0, expert: 1 };
+        let b = crate::model::measure_expert_host_bandwidth_numa(&ffn, 32, 64, &topo, id);
+        assert!(b > 0.0, "NUMA-aware host measure must be positive");
+        assert!(
+            topo.binds_ok() + topo.binds_skip() >= 2,
+            "local + remote probes must attempt binds"
         );
     }
 

@@ -3,6 +3,7 @@
 mod anchors;
 mod constraint;
 mod direct_storage;
+mod expert_batch;
 mod grammar;
 mod device_manager;
 mod draft;
