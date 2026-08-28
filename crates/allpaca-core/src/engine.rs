@@ -1018,18 +1018,13 @@ impl Engine {
                     StepResult::Finished(_) => return Ok(None),
                 }
             }
+            // Finished locally: do not spin parking a peer's entire decode.
+            if self.request_fully_done(id)? {
+                return Ok(None);
+            }
             match self.poll()? {
                 None => {
-                    // Idle: if we are finished, stop; else retry (peer may unblock).
-                    let finished = {
-                        let inner = self.lock()?;
-                        inner
-                            .active
-                            .get(&id)
-                            .map(|r| r.finished && r.emit_queue.is_empty() && r.parked.is_empty())
-                            .unwrap_or(true)
-                    };
-                    if finished {
+                    if self.request_fully_done(id)? {
                         return Ok(None);
                     }
                     std::thread::yield_now();
@@ -1045,6 +1040,15 @@ impl Engine {
                 }
             }
         }
+    }
+
+    fn request_fully_done(&self, id: u64) -> Result<bool, AllpacaError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .active
+            .get(&id)
+            .map(|r| r.finished && r.emit_queue.is_empty() && r.parked.is_empty())
+            .unwrap_or(true))
     }
 
     fn take_parked(&self, id: u64) -> Result<Option<StepResult>, AllpacaError> {
@@ -1308,24 +1312,29 @@ impl Engine {
                         max_pref,
                     )
                 });
-                let Some(id) = id else {
-                    let _ = self.maybe_auto_elastic_rebalance();
-                    return Ok(None);
-                };
-                if let Some(partner) = stagger_partner {
-                    if partner == id {
-                        stagger_partner = candidates
-                            .iter()
-                            .map(|(cid, _, _)| *cid)
-                            .find(|cid| *cid != id);
+                if let Some(id) = id {
+                    if let Some(partner) = stagger_partner {
+                        if partner == id {
+                            stagger_partner = candidates
+                                .iter()
+                                .map(|(cid, _, _)| *cid)
+                                .find(|cid| *cid != id);
+                        }
                     }
+                    let active = inner.active.get(&id).unwrap();
+                    let waited_ms = active.last_token_at.elapsed().as_secs_f64() * 1000.0;
+                    let is_prefill = active.prefill_pos < active.prompt_len
+                        && active.emit_queue.is_empty()
+                        && active.parked.is_empty();
+                    (Some(id), waited_ms, is_prefill, stagger_partner)
+                } else {
+                    // Drop the mutex before rebalance (it re-locks).
+                    (None, 0.0, false, None)
                 }
-                let active = inner.active.get(&id).unwrap();
-                let waited_ms = active.last_token_at.elapsed().as_secs_f64() * 1000.0;
-                let is_prefill = active.prefill_pos < active.prompt_len
-                    && active.emit_queue.is_empty()
-                    && active.parked.is_empty();
-                (id, waited_ms, is_prefill, stagger_partner)
+            };
+            let Some(id) = id else {
+                let _ = self.maybe_auto_elastic_rebalance();
+                return Ok(None);
             };
             {
                 let mut inner = self.lock()?;
@@ -3277,7 +3286,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.model.synthetic = false;
         cfg.speculative.enabled = false;
-        cfg.weights.host_bytes = 64;
+        // Keep experts host-resident so this tracer is not an NVMe soak.
+        cfg.weights.host_bytes = 0;
         cfg.weights.cache_bytes = 64;
         let engine = Engine::new(cfg).unwrap();
         engine.load_synthetic(ModelConfig::tiny_moe()).unwrap();
