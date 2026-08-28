@@ -90,13 +90,22 @@ int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, 
 int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
 
-/* C[m,n] = A[m,k] * dequant(B_q6_k[n,k])^T. Native 210-byte Q6_K super-blocks (GEM mixed-quant). */
+/* C[m,n] = A[m,k] * dequant(B_q6_k[n,k])^T. Native 210-byte Q6_K super-blocks (GEM mixed-quant).
+ * Default tile cols from §12 picker; use _cols / _untiled for tracers. */
 int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
+int allpaca_gemm_nt_q6_k_cols(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                              int32_t k, int32_t cols, allpaca_stream_t stream);
+int allpaca_gemm_nt_q6_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                 int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
 int allpaca_gemm_nt_q5_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
+int allpaca_gemm_nt_q5_k_cols(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                              int32_t k, int32_t cols, allpaca_stream_t stream);
+int allpaca_gemm_nt_q5_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                 int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_f16[n,k])^T. B is packed IEEE F16, row-major [n,k].
  * Decode (M<=8) uses cache-aware A-tile GEMV (§12); M>8 uses a tiled prefill kernel. */

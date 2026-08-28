@@ -1461,10 +1461,11 @@ extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, fl
     return launch_gemm_nt_q4_k(a, b, c, m, n, k, as_stream(stream), 0);
 }
 
-/* Fused Q6_K GEMV (GEM mixed-precision): 210-byte super-blocks, A tile in LDS. */
+/* Fused Q6_K GEMV (GEM mixed-precision): 210-byte super-blocks, A tile in LDS.
+ * COLS is the §12 cache-aware column tile (32/64/128). */
+template <int COLS>
 __global__ void gemv_nt_q6_k_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                           int k) {
-    constexpr int COLS = 64;
     constexpr int TILE = 256;
     __shared__ float As[TILE];
     const int row = static_cast<int>(blockIdx.y);
@@ -1526,24 +1527,114 @@ __global__ void gemv_nt_q6_k_tiled_kernel(const float *a, const uint8_t *b, floa
     }
 }
 
-extern "C" int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
-                                    int32_t k, allpaca_stream_t stream) {
+__global__ void gemv_nt_q6_k_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                            int n, int k) {
+    const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    if (col >= n || row >= m) {
+        return;
+    }
+    const int nblocks = (k + 255) / 256;
+    const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 210;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    float acc = 0.f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const uint8_t *blk = brow + static_cast<size_t>(ib) * 210;
+        const uint8_t *ql = blk;
+        const uint8_t *qh = blk + 128;
+        const uint8_t *scales = blk + 192;
+        const float d = allpaca_f16le_to_f32(blk + 208);
+        const int k0 = ib * 256;
+        for (int half = 0; half < 2; ++half) {
+            const uint8_t *ql_h = ql + half * 64;
+            const uint8_t *qh_h = qh + half * 32;
+            const uint8_t *sc_h = scales + half * 8;
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int q1 =
+                    static_cast<int>(ql_h[l] & 0x0f | ((qh_h[l] >> 0) & 3) << 4) - 32;
+                const int q2 =
+                    static_cast<int>(ql_h[l + 32] & 0x0f | ((qh_h[l] >> 2) & 3) << 4) - 32;
+                const int q3 =
+                    static_cast<int>((ql_h[l] >> 4) | ((qh_h[l] >> 4) & 3) << 4) - 32;
+                const int q4 =
+                    static_cast<int>((ql_h[l + 32] >> 4) | ((qh_h[l] >> 6) & 3) << 4) - 32;
+                const int i0 = k0 + half * 128 + l;
+                const int i1 = k0 + half * 128 + 32 + l;
+                const int i2 = k0 + half * 128 + 64 + l;
+                const int i3 = k0 + half * 128 + 96 + l;
+                if (i0 < k) {
+                    acc += arow[i0] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is])) *
+                                       static_cast<float>(q1));
+                }
+                if (i1 < k) {
+                    acc += arow[i1] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is + 2])) *
+                                       static_cast<float>(q2));
+                }
+                if (i2 < k) {
+                    acc += arow[i2] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is + 4])) *
+                                       static_cast<float>(q3));
+                }
+                if (i3 < k) {
+                    acc += arow[i3] * (d * static_cast<float>(static_cast<int8_t>(sc_h[is + 6])) *
+                                       static_cast<float>(q4));
+                }
+            }
+        }
+    }
+    c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+}
+
+static int launch_gemm_nt_q6_k_cols(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, int32_t cols, hipStream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    constexpr int COLS = 64;
+    int use = cols;
+    if (use != 32 && use != 64 && use != 128) {
+        use = 64;
+    }
     dim3 block(256);
-    dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
-    hipLaunchKernelGGL(gemv_nt_q6_k_tiled_kernel, grid, block, 0, as_stream(stream), a, b, c, m, n,
-                       k);
+    dim3 grid(static_cast<unsigned>((n + use - 1) / use), static_cast<unsigned>(m));
+    if (use == 32) {
+        hipLaunchKernelGGL(gemv_nt_q6_k_tiled_kernel<32>, grid, block, 0, stream, a, b, c, m, n, k);
+    } else if (use == 128) {
+        hipLaunchKernelGGL(gemv_nt_q6_k_tiled_kernel<128>, grid, block, 0, stream, a, b, c, m, n, k);
+    } else {
+        hipLaunchKernelGGL(gemv_nt_q6_k_tiled_kernel<64>, grid, block, 0, stream, a, b, c, m, n, k);
+    }
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_q6_k_cols(a, b, c, m, n, k, 64, as_stream(stream));
+}
+
+extern "C" int allpaca_gemm_nt_q6_k_cols(const float *a, const uint8_t *b, float *c, int32_t m,
+                                         int32_t n, int32_t k, int32_t cols,
+                                         allpaca_stream_t stream) {
+    return launch_gemm_nt_q6_k_cols(a, b, c, m, n, k, cols, as_stream(stream));
+}
+
+extern "C" int allpaca_gemm_nt_q6_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m,
+                                            int32_t n, int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_q6_k_untiled_kernel, grid, block, 0, as_stream(stream), a, b, c, m,
+                       n, k);
     return hip_status(hipGetLastError());
 }
 
 /* Fused Q5_K GEMV: 176-byte super-blocks (qh + qs), A tile in LDS. */
+template <int COLS>
 __global__ void gemv_nt_q5_k_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                           int k) {
-    constexpr int COLS = 64;
     __shared__ float As[256];
     const int row = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x);
@@ -1608,17 +1699,107 @@ __global__ void gemv_nt_q5_k_tiled_kernel(const float *a, const uint8_t *b, floa
     }
 }
 
-extern "C" int allpaca_gemm_nt_q5_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
-                                    int32_t k, allpaca_stream_t stream) {
+__global__ void gemv_nt_q5_k_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                            int n, int k) {
+    const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    if (col >= n || row >= m) {
+        return;
+    }
+    const int nblocks = (k + 255) / 256;
+    const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 176;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    float acc = 0.f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const uint8_t *blk = brow + static_cast<size_t>(ib) * 176;
+        const float d = allpaca_f16le_to_f32(blk);
+        const float dmin = allpaca_f16le_to_f32(blk + 2);
+        const uint8_t *scales = blk + 4;
+        const uint8_t *qh = blk + 16;
+        const uint8_t *qs = blk + 48;
+        const int k0 = ib * 256;
+        int q_off = 0;
+        int is = 0;
+        uint8_t u1 = 1;
+        uint8_t u2 = 2;
+        for (int g = 0; g < 4; ++g) {
+            uint8_t sc1 = 0;
+            uint8_t m1 = 0;
+            uint8_t sc2 = 0;
+            uint8_t m2 = 0;
+            q4k_scale_min(is, scales, &sc1, &m1);
+            q4k_scale_min(is + 1, scales, &sc2, &m2);
+            const float d1 = d * static_cast<float>(sc1);
+            const float min1 = dmin * static_cast<float>(m1);
+            const float d2 = d * static_cast<float>(sc2);
+            const float min2 = dmin * static_cast<float>(m2);
+            for (int l = 0; l < 32; ++l) {
+                const int i0 = k0 + g * 64 + l;
+                const int i1 = i0 + 32;
+                const uint8_t packed = qs[q_off + l];
+                const float qlo =
+                    static_cast<float>(packed & 0x0F) + ((qh[l] & u1) ? 16.f : 0.f);
+                const float qhi =
+                    static_cast<float>(packed >> 4) + ((qh[l] & u2) ? 16.f : 0.f);
+                if (i0 < k) {
+                    acc += arow[i0] * (d1 * qlo - min1);
+                }
+                if (i1 < k) {
+                    acc += arow[i1] * (d2 * qhi - min2);
+                }
+            }
+            q_off += 32;
+            is += 2;
+            u1 = static_cast<uint8_t>(u1 << 2);
+            u2 = static_cast<uint8_t>(u2 << 2);
+        }
+    }
+    c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+}
+
+static int launch_gemm_nt_q5_k_cols(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, int32_t cols, hipStream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    constexpr int COLS = 64;
+    int use = cols;
+    if (use != 32 && use != 64 && use != 128) {
+        use = 64;
+    }
     dim3 block(256);
-    dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
-    hipLaunchKernelGGL(gemv_nt_q5_k_tiled_kernel, grid, block, 0, as_stream(stream), a, b, c, m, n,
-                       k);
+    dim3 grid(static_cast<unsigned>((n + use - 1) / use), static_cast<unsigned>(m));
+    if (use == 32) {
+        hipLaunchKernelGGL(gemv_nt_q5_k_tiled_kernel<32>, grid, block, 0, stream, a, b, c, m, n, k);
+    } else if (use == 128) {
+        hipLaunchKernelGGL(gemv_nt_q5_k_tiled_kernel<128>, grid, block, 0, stream, a, b, c, m, n, k);
+    } else {
+        hipLaunchKernelGGL(gemv_nt_q5_k_tiled_kernel<64>, grid, block, 0, stream, a, b, c, m, n, k);
+    }
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_gemm_nt_q5_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_q5_k_cols(a, b, c, m, n, k, 64, as_stream(stream));
+}
+
+extern "C" int allpaca_gemm_nt_q5_k_cols(const float *a, const uint8_t *b, float *c, int32_t m,
+                                         int32_t n, int32_t k, int32_t cols,
+                                         allpaca_stream_t stream) {
+    return launch_gemm_nt_q5_k_cols(a, b, c, m, n, k, cols, as_stream(stream));
+}
+
+extern "C" int allpaca_gemm_nt_q5_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m,
+                                            int32_t n, int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_q5_k_untiled_kernel, grid, block, 0, as_stream(stream), a, b, c, m,
+                       n, k);
     return hip_status(hipGetLastError());
 }
 
@@ -2520,8 +2701,28 @@ extern "C" int allpaca_gemm_nt_q6_k(const float *, const uint8_t *, float *, int
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gemm_nt_q6_k_cols(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                         int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q6_k_untiled(const float *, const uint8_t *, float *, int32_t,
+                                            int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_gemm_nt_q5_k(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q5_k_cols(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                         int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q5_k_untiled(const float *, const uint8_t *, float *, int32_t,
+                                            int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

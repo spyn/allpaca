@@ -181,6 +181,12 @@ pub struct StatsSnapshot {
     /// Approximate checkpoint bytes currently held in the radix forest.
     #[serde(default)]
     pub radix_bytes: u64,
+    /// Last §12 MoE GEMV column tile (32/64/128) chosen for Q5_K/Q6_K.
+    #[serde(default)]
+    pub gemv_tile_cols: u64,
+    /// Elastic KV→expert VRAM rebalances at scheduler safe points.
+    #[serde(default)]
+    pub vram_rebalances: u64,
     /// KV pages currently resident on the NVMe cold tier.
     #[serde(default)]
     pub kv_nvme_pages: u64,

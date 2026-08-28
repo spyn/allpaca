@@ -4,6 +4,12 @@
 //! (`HIP_PATH` / `ROCM_PATH` / common install locations). Without an SDK the
 //! crate still compiles; [`device_count`] returns 0 and GPU tests skip.
 
+mod gemv_tile;
+
+pub use gemv_tile::{
+    gemv_tile_working_bytes, infinity_cache_from_l2, select_gemv_tile_cols,
+};
+
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -313,7 +319,45 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_q6_k_cols(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            cols: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_q6_k_untiled(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_q5_k(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_q5_k_cols(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            cols: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_q5_k_untiled(
             a: *const f32,
             b: *const u8,
             c: *mut f32,
@@ -1187,6 +1231,7 @@ pub fn gemm_nt_q4_k_untiled_device(
 }
 
 /// Device-pointer NT GEMM with native GGUF Q6_K `b` (`C = A * dequant(B)^T`).
+/// Picks §12 tile cols from Infinity Cache budget.
 pub fn gemm_nt_q6_k_device(
     a: *const f32,
     b: *const u8,
@@ -1197,7 +1242,11 @@ pub fn gemm_nt_q6_k_device(
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_gemm_nt_q6_k(a, b, c, m, n, k, std::ptr::null_mut()) };
+        let cols = select_gemv_tile_cols(n, k, infinity_cache_budget(), Q6_K_BLOCK_BYTES);
+        record_gemv_tile_cols(cols);
+        let rc = unsafe {
+            ffi::allpaca_gemm_nt_q6_k_cols(a, b, c, m, n, k, cols, std::ptr::null_mut())
+        };
         status(rc, "gemm_nt_q6_k")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -1205,6 +1254,30 @@ pub fn gemm_nt_q6_k_device(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q6_k unavailable".into(),
+        )))
+    }
+}
+
+/// Untiled Q6_K GEMV baseline (§12 before/after).
+pub fn gemm_nt_q6_k_untiled_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc =
+            unsafe { ffi::allpaca_gemm_nt_q6_k_untiled(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q6_k_untiled")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q6_k_untiled unavailable".into(),
         )))
     }
 }
@@ -1220,7 +1293,11 @@ pub fn gemm_nt_q5_k_device(
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_gemm_nt_q5_k(a, b, c, m, n, k, std::ptr::null_mut()) };
+        let cols = select_gemv_tile_cols(n, k, infinity_cache_budget(), Q5_K_BLOCK_BYTES);
+        record_gemv_tile_cols(cols);
+        let rc = unsafe {
+            ffi::allpaca_gemm_nt_q5_k_cols(a, b, c, m, n, k, cols, std::ptr::null_mut())
+        };
         status(rc, "gemm_nt_q5_k")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -1230,6 +1307,67 @@ pub fn gemm_nt_q5_k_device(
             "HIP gemm_nt_q5_k unavailable".into(),
         )))
     }
+}
+
+/// Untiled Q5_K GEMV baseline (§12 before/after).
+pub fn gemm_nt_q5_k_untiled_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc =
+            unsafe { ffi::allpaca_gemm_nt_q5_k_untiled(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q5_k_untiled")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q5_k_untiled unavailable".into(),
+        )))
+    }
+}
+
+static LAST_GEMV_TILE_COLS: AtomicU64 = AtomicU64::new(64);
+static INFINITY_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[allow(dead_code)] // used from HIP-runtime gemm paths; stub builds keep picker API live
+fn record_gemv_tile_cols(cols: i32) {
+    LAST_GEMV_TILE_COLS.store(cols.max(0) as u64, Ordering::Relaxed);
+}
+
+/// Last §12 GEMV column tile chosen by [`select_gemv_tile_cols`].
+pub fn last_gemv_tile_cols() -> u64 {
+    LAST_GEMV_TILE_COLS.load(Ordering::Relaxed)
+}
+
+#[allow(dead_code)] // HIP-runtime gemm paths; also exercised via set_infinity_cache_budget
+fn infinity_cache_budget() -> usize {
+    let cached = INFINITY_CACHE_BYTES.load(Ordering::Relaxed) as usize;
+    if cached > 0 {
+        return cached;
+    }
+    if let Ok(raw) = std::env::var("ALLPACA_INFINITY_CACHE_MB") {
+        if let Ok(mb) = raw.parse::<usize>() {
+            let bytes = mb.saturating_mul(1 << 20);
+            INFINITY_CACHE_BYTES.store(bytes as u64, Ordering::Relaxed);
+            return bytes;
+        }
+    }
+    // Default RDNA4-class budget when a GPU is present; 0 keeps COLS=64 via picker.
+    let bytes = if device_count() > 0 { 64usize << 20 } else { 0 };
+    INFINITY_CACHE_BYTES.store(bytes as u64, Ordering::Relaxed);
+    bytes
+}
+
+/// Override Infinity Cache budget used by the §12 tile picker (tests / ops).
+pub fn set_infinity_cache_budget(bytes: usize) {
+    INFINITY_CACHE_BYTES.store(bytes as u64, Ordering::Relaxed);
 }
 
 /// Host-pointer F16 NT GEMM: copies packed IEEE F16 `b`, runs the kernel, copies back.
@@ -1353,6 +1491,55 @@ pub fn gemm_nt_q6_k(
     }
 }
 
+/// Untiled Q6_K host GEMV for §12 before/after tracers.
+pub fn gemm_nt_q6_k_untiled(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(Q6_K_BLOCK_ELEMS);
+        let packed_bytes = (n as usize) * nblocks * Q6_K_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q6_K GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            gemm_nt_q6_k_untiled_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q6_k_untiled unavailable".into(),
+        )))
+    }
+}
+
 /// Host-pointer Q5_K NT GEMM: copies native GGUF blocks, runs the fused kernel, copies back.
 pub fn gemm_nt_q5_k(
     a: &[f32],
@@ -1398,6 +1585,55 @@ pub fn gemm_nt_q5_k(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q5_k unavailable".into(),
+        )))
+    }
+}
+
+/// Untiled Q5_K host GEMV for §12 before/after tracers.
+pub fn gemm_nt_q5_k_untiled(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(Q5_K_BLOCK_ELEMS);
+        let packed_bytes = (n as usize) * nblocks * Q5_K_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q5_K GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            gemm_nt_q5_k_untiled_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q5_k_untiled unavailable".into(),
         )))
     }
 }
@@ -4374,6 +4610,107 @@ mod tests {
             before_us > 0 && after_us > 0,
             "before/after tracers must record positive times"
         );
+    }
+
+    /// §12: tiled Q5_K GEMV matches untiled; tile picker records cols.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q5_k_tiled_gemv_matches_untiled_and_records_tile_cols() {
+        if device_count() == 0 {
+            return;
+        }
+        set_infinity_cache_budget(64 << 20);
+        let m = 1usize;
+        let n = 128usize;
+        let k = 4096usize;
+        let (a, b_q, _) = fill_q5k_gemm_case(7, m, n, k);
+        let mut tiled = vec![0.0f32; m * n];
+        let mut untiled = vec![0.0f32; m * n];
+        gemm_nt_q5_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).expect("tiled Q5_K");
+        gemm_nt_q5_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32)
+            .expect("untiled Q5_K");
+        for i in 0..m * n {
+            assert!(
+                gemm_close(tiled[i], untiled[i]),
+                "Q5_K tiled vs untiled idx={i} tiled={} untiled={}",
+                tiled[i],
+                untiled[i]
+            );
+        }
+        assert!(
+            last_gemv_tile_cols() >= 32,
+            "§12 picker must record a tile; cols={}",
+            last_gemv_tile_cols()
+        );
+        let warm = 2usize;
+        let reps = 10usize;
+        for _ in 0..warm {
+            gemm_nt_q5_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32).unwrap();
+            gemm_nt_q5_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_q5_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let before_us = t0.elapsed().as_micros();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_q5_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let after_us = t1.elapsed().as_micros();
+        eprintln!(
+            "§12 Q5_K GEMV 1x{n}x{k} x{reps} cols={}: untiled={before_us}us tiled={after_us}us",
+            last_gemv_tile_cols()
+        );
+        assert!(before_us > 0 && after_us > 0);
+    }
+
+    /// §12: tiled Q6_K GEMV matches untiled baseline.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q6_k_tiled_gemv_matches_untiled_and_records_before_after() {
+        if device_count() == 0 {
+            return;
+        }
+        set_infinity_cache_budget(64 << 20);
+        let m = 1usize;
+        let n = 128usize;
+        let k = 4096usize;
+        let (a, b_q, _) = fill_q6k_gemm_case(11, m, n, k);
+        let mut tiled = vec![0.0f32; m * n];
+        let mut untiled = vec![0.0f32; m * n];
+        gemm_nt_q6_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).expect("tiled Q6_K");
+        gemm_nt_q6_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32)
+            .expect("untiled Q6_K");
+        for i in 0..m * n {
+            assert!(
+                gemm_close(tiled[i], untiled[i]),
+                "Q6_K tiled vs untiled idx={i} tiled={} untiled={}",
+                tiled[i],
+                untiled[i]
+            );
+        }
+        let warm = 2usize;
+        let reps = 10usize;
+        for _ in 0..warm {
+            gemm_nt_q6_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32).unwrap();
+            gemm_nt_q6_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_q6_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let before_us = t0.elapsed().as_micros();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            gemm_nt_q6_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).unwrap();
+        }
+        let after_us = t1.elapsed().as_micros();
+        eprintln!(
+            "§12 Q6_K GEMV 1x{n}x{k} x{reps} cols={}: untiled={before_us}us tiled={after_us}us",
+            last_gemv_tile_cols()
+        );
+        assert!(before_us > 0 && after_us > 0);
     }
 
     /// §12: tiled F16 GEMV matches untiled; before/after wall times recorded.
