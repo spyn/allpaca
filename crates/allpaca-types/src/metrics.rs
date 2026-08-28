@@ -158,6 +158,11 @@ pub struct StatsSnapshot {
     pub ds_pinned: u64,
     #[serde(default)]
     pub ds_pinned_bytes: u64,
+    /// NVMe→host→VRAM fills with a bound expert device slot.
+    #[serde(default)]
+    pub ds_gpu_dma: u64,
+    #[serde(default)]
+    pub ds_gpu_dma_bytes: u64,
     /// True when DirectStorage/GDS probe succeeded at engine start.
     #[serde(default)]
     pub ds_available: bool,
@@ -175,6 +180,12 @@ pub struct StatsSnapshot {
     pub expert_bulk_fills: u64,
     #[serde(default)]
     pub expert_bulk_bytes: u64,
+    /// Draft-span expert union bulk prefetches before packed verify.
+    #[serde(default)]
+    pub draft_expert_prefetches: u64,
+    /// Cross-request layer-stagger CPU expert steps.
+    #[serde(default)]
+    pub layer_stagger_steps: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,

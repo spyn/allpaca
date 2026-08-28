@@ -70,6 +70,9 @@ pub struct Metrics {
     pub ds_bytes: AtomicU64,
     pub ds_pinned: AtomicU64,
     pub ds_pinned_bytes: AtomicU64,
+    /// NVMe→host→VRAM expert fills with bound device slots.
+    pub ds_gpu_dma: AtomicU64,
+    pub ds_gpu_dma_bytes: AtomicU64,
     pub ds_available: AtomicU64,
     pub micro_batch_plans: AtomicU64,
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
@@ -79,6 +82,10 @@ pub struct Metrics {
     /// Decode/micro-batch: expert miss fills merged into one contiguous DMA.
     pub expert_bulk_fills: AtomicU64,
     pub expert_bulk_bytes: AtomicU64,
+    /// Draft-span expert union prefetches before packed verify.
+    pub draft_expert_prefetches: AtomicU64,
+    /// Cross-request layer-stagger CPU expert steps during GPU forward.
+    pub layer_stagger_steps: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
@@ -213,12 +220,16 @@ impl Metrics {
             ds_bytes: self.ds_bytes.load(Ordering::Relaxed),
             ds_pinned: self.ds_pinned.load(Ordering::Relaxed),
             ds_pinned_bytes: self.ds_pinned_bytes.load(Ordering::Relaxed),
+            ds_gpu_dma: self.ds_gpu_dma.load(Ordering::Relaxed),
+            ds_gpu_dma_bytes: self.ds_gpu_dma_bytes.load(Ordering::Relaxed),
             ds_available: self.ds_available.load(Ordering::Relaxed) != 0,
             micro_batch_plans: self.micro_batch_plans.load(Ordering::Relaxed),
             micro_batch_dual_steps: self.micro_batch_dual_steps.load(Ordering::Relaxed),
             expert_prefill_overlaps: self.expert_prefill_overlaps.load(Ordering::Relaxed),
             expert_bulk_fills: self.expert_bulk_fills.load(Ordering::Relaxed),
             expert_bulk_bytes: self.expert_bulk_bytes.load(Ordering::Relaxed),
+            draft_expert_prefetches: self.draft_expert_prefetches.load(Ordering::Relaxed),
+            layer_stagger_steps: self.layer_stagger_steps.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),

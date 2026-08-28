@@ -4,6 +4,8 @@
 //! width (32 / 64 / 128) so the A-tile + concurrent B columns stay in a
 //! working set the L2/Infinity Cache can absorb.
 
+use std::sync::OnceLock;
+
 /// Working-set estimate for one A super-block tile reused across `cols` columns.
 /// A tile is 256 f32; each Q5_K/Q6_K column touches one 176/210-byte block per K-chunk.
 pub fn gemv_tile_working_bytes(cols: i32, block_bytes: usize) -> usize {
@@ -13,13 +15,49 @@ pub fn gemv_tile_working_bytes(cols: i32, block_bytes: usize) -> usize {
     a_tile.saturating_add(b_chunk)
 }
 
+static PROFILED_GEMV_COLS: OnceLock<i32> = OnceLock::new();
+
+/// Measure COLS candidates (microseconds per call); pick the fastest that fits budget.
+pub fn profile_gemv_tile_cols(
+    bench_cols: impl Fn(i32) -> Option<u64>,
+    infinity_cache_bytes: usize,
+    block_bytes: usize,
+) -> i32 {
+    let budget = if infinity_cache_bytes == 0 {
+        infinity_cache_bytes
+    } else {
+        infinity_cache_bytes / 8
+    };
+    let mut best_cols = 64i32;
+    let mut best_us = u64::MAX;
+    for cols in [128i32, 64, 32] {
+        if budget > 0 && gemv_tile_working_bytes(cols, block_bytes) > budget {
+            continue;
+        }
+        if let Some(us) = bench_cols(cols) {
+            if us < best_us {
+                best_us = us;
+                best_cols = cols;
+            }
+        }
+    }
+    let _ = PROFILED_GEMV_COLS.set(best_cols);
+    best_cols
+}
+
+/// Cached profile winner when [`profile_gemv_tile_cols`] has run.
+pub fn profiled_gemv_tile_cols() -> Option<i32> {
+    PROFILED_GEMV_COLS.get().copied()
+}
+
 /// Pick GEMV column tile for MoE expert decode on AMD RDNA.
 ///
-/// Heuristic (OPPORTUNITY §12): prefer the widest tile whose working set fits in
-/// ~1/8 of the reported Infinity/L2 cache budget so many concurrent GEMVs leave
-/// headroom. Falls back to 64 (current default) when cache size is unknown.
+/// Uses a measured profile when present; otherwise heuristic (OPPORTUNITY §12).
 pub fn select_gemv_tile_cols(n: i32, k: i32, infinity_cache_bytes: usize, block_bytes: usize) -> i32 {
     let _ = (n, k);
+    if let Some(cols) = profiled_gemv_tile_cols() {
+        return cols;
+    }
     let budget = if infinity_cache_bytes == 0 {
         // Unknown device: keep the shipped default.
         return 64;
@@ -74,5 +112,24 @@ mod tests {
         assert_eq!(infinity_cache_from_l2(0), 0);
         assert_eq!(infinity_cache_from_l2(4 << 20), 32 << 20);
         assert_eq!(infinity_cache_from_l2(16 << 20), 64 << 20);
+    }
+
+    #[test]
+    fn profile_picks_fastest_within_budget() {
+        let cols = profile_gemv_tile_cols(
+            |c| {
+                Some(match c {
+                    128 => 100,
+                    64 => 40,
+                    32 => 50,
+                    _ => 999,
+                })
+            },
+            64 << 20,
+            176,
+        );
+        assert_eq!(cols, 64);
+        assert_eq!(profiled_gemv_tile_cols(), Some(64));
+        assert_eq!(select_gemv_tile_cols(1, 4096, 64 << 20, 176), 64);
     }
 }

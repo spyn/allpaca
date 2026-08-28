@@ -7,7 +7,8 @@
 mod gemv_tile;
 
 pub use gemv_tile::{
-    gemv_tile_working_bytes, infinity_cache_from_l2, select_gemv_tile_cols,
+    gemv_tile_working_bytes, infinity_cache_from_l2, profile_gemv_tile_cols,
+    profiled_gemv_tile_cols, select_gemv_tile_cols,
 };
 
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]

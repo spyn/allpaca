@@ -11,10 +11,12 @@
 //! 3. Real host path: aligned Direct I/O into a pinned-shaped buffer, then
 //!    record `ds_pinned_*` as the H2D source (overlapped host→device still
 //!    needs HIP; we do not claim NVMe→VRAM DMA completed).
+//! 4. When a device destination is bound, stage aligned host read then H2D
+//!    into the expert ring slot (`ds_gpu_dma_*` — deepest path without COM).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -62,6 +64,9 @@ pub struct DirectStorageQueue {
     /// Aligned Direct I/O into pinned-shaped host memory (H2D source).
     pinned: AtomicU64,
     pinned_bytes: AtomicU64,
+    /// NVMe→host→VRAM fills with a bound device destination.
+    gpu_dma: AtomicU64,
+    gpu_dma_bytes: AtomicU64,
 }
 
 impl DirectStorageQueue {
@@ -91,6 +96,14 @@ impl DirectStorageQueue {
 
     pub fn pinned_bytes(&self) -> u64 {
         self.pinned_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn gpu_dma(&self) -> u64 {
+        self.gpu_dma.load(Ordering::Relaxed)
+    }
+
+    pub fn gpu_dma_bytes(&self) -> u64 {
+        self.gpu_dma_bytes.load(Ordering::Relaxed)
     }
 
     /// Record a would-be DMA of `bytes` from `path` @ `offset` into device memory.
@@ -163,6 +176,28 @@ impl DirectStorageQueue {
             self.record_staged_h2d(aligned);
         }
         Ok(out)
+    }
+
+    /// Deepest feasible path: aligned NVMe/host read into pinned memory, then
+    /// H2D into a bound expert ring slot. Records `gpu_dma_*` when successful.
+    pub fn fill_to_device(
+        &self,
+        probe: &DirectStorageProbe,
+        path: &Path,
+        offset: u64,
+        bytes: usize,
+        copy_h2d: impl FnOnce(&[u8]) -> Result<(), AllpacaError>,
+    ) -> Result<bool, AllpacaError> {
+        if !probe.available || bytes == 0 {
+            return Ok(false);
+        }
+        let _ = self.try_enqueue(probe, path, offset, bytes);
+        let host = self.stage_aligned_read(path, offset, bytes)?;
+        copy_h2d(&host)?;
+        self.gpu_dma.fetch_add(1, Ordering::Relaxed);
+        self.gpu_dma_bytes
+            .fetch_add(host.len() as u64, Ordering::Relaxed);
+        Ok(true)
     }
 }
 
@@ -338,6 +373,7 @@ fn probe_linux_gds() -> DirectStorageProbe {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     #[test]
     fn probe_returns_structured_backend() {

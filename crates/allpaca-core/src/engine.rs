@@ -27,9 +27,10 @@ use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::expert_batch::MicroBatchExpertUnion;
-use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, StaggerPhase};
+use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
-    alloc_pages_for_seq, ensure_pages, DenseKv, ModelConfig, ResidentModel, TinyModel,
+    alloc_pages_for_seq, ensure_pages, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
+    TinyModel,
 };
 use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
@@ -64,6 +65,10 @@ struct ActiveRequest {
     first_emitted: bool,
     finished: bool,
     recurrent: Option<RecurrentState>,
+    /// Decode steps completed (for layer-stagger micro-batch hints).
+    decode_step: u64,
+    /// Last MoE router input (FFN RMSNorm) from the most recent decode forward.
+    moe_norm: Vec<f32>,
 }
 
 struct EngineInner {
@@ -94,11 +99,23 @@ struct EngineInner {
     consecutive_prefill_picks: usize,
     /// Next poll prefers this request (cross-req micro-batch partner).
     prefer_next: Option<u64>,
+    /// Consecutive decode steps with expert LRU misses (elastic pressure).
+    elastic_miss_streak: u32,
+    /// Run [`Engine::rebalance_experts_elastic`] on next idle safe point.
+    elastic_rebalance_pending: bool,
+    /// Prior expert LRU miss counter for streak detection.
+    elastic_last_misses: u64,
 }
 
 struct DraftAhead {
     ctx: Vec<u32>,
     tokens: Vec<u32>,
+}
+
+struct DecodePollHooks<'a> {
+    layer_stagger: Option<&'a LayerStagger>,
+    ds_probe: &'a DirectStorageProbe,
+    ds_queue: &'a DirectStorageQueue,
 }
 
 #[derive(Clone)]
@@ -113,6 +130,7 @@ pub struct Engine {
     ds_queue: Arc<DirectStorageQueue>,
     ds_probe: DirectStorageProbe,
     micro_batch: Arc<MicroBatchExpertUnion>,
+    layer_stagger: Arc<LayerStagger>,
 }
 
 pub struct RequestHandle {
@@ -162,6 +180,10 @@ impl Drop for RequestHandle {
                     guard.active.len() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+            }
+            // Safe point: last client gone while elastic pressure was recorded.
+            if guard.active.is_empty() && guard.elastic_rebalance_pending {
+                guard.elastic_rebalance_pending = true;
             }
         }
     }
@@ -219,6 +241,9 @@ impl Engine {
             last_poll_id: None,
             consecutive_prefill_picks: 0,
             prefer_next: None,
+            elastic_miss_streak: 0,
+            elastic_rebalance_pending: false,
+            elastic_last_misses: 0,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -230,6 +255,7 @@ impl Engine {
             ds_queue,
             ds_probe,
             micro_batch: Arc::new(MicroBatchExpertUnion::new()),
+            layer_stagger: Arc::new(LayerStagger::new()),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -344,6 +370,14 @@ impl Engine {
                     .store(q.pinned(), std::sync::atomic::Ordering::Relaxed);
                 self.metrics.ds_pinned_bytes.store(
                     q.pinned_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.ds_gpu_dma.store(
+                    q.gpu_dma(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.ds_gpu_dma_bytes.store(
+                    q.gpu_dma_bytes(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 self.metrics
@@ -1101,6 +1135,11 @@ impl Engine {
         inner.draft_ahead = None;
         inner.draft_kv.reset();
         let prompt_len = tokens.len();
+        let dim = inner
+            .target
+            .as_ref()
+            .map(|m| m.config.dim)
+            .unwrap_or(0);
         inner.active.insert(
             id,
             ActiveRequest {
@@ -1123,6 +1162,8 @@ impl Engine {
                 first_emitted: false,
                 finished: false,
                 recurrent,
+                decode_step: 0,
+                moe_norm: vec![0.0f32; dim],
             },
         );
         if self.config.structured_output.async_masks {
@@ -1183,23 +1224,34 @@ impl Engine {
                     .collect();
                 let mut stagger_partner: Option<u64> = None;
                 if candidates.len() >= 2 {
+                    let n_layers = inner
+                        .target
+                        .as_ref()
+                        .map(|m| m.layers.len())
+                        .unwrap_or(1)
+                        .max(1);
                     let hints: Vec<ActiveLayerHint> = candidates
                         .iter()
-                        .enumerate()
-                        .map(|(i, (rid, _, pref))| ActiveLayerHint {
-                            request_id: *rid,
-                            phase: if *pref {
-                                StaggerPhase::Prefill
-                            } else {
-                                StaggerPhase::Decode
-                            },
-                            layer: 0,
-                            cpu_expert_pending: i > 0
-                                || inner
+                        .map(|(rid, _, pref)| {
+                            let decode_layer = inner
+                                .active
+                                .get(rid)
+                                .map(|r| (r.decode_step as usize) % n_layers)
+                                .unwrap_or(0);
+                            ActiveLayerHint {
+                                request_id: *rid,
+                                phase: if *pref {
+                                    StaggerPhase::Prefill
+                                } else {
+                                    StaggerPhase::Decode
+                                },
+                                layer: if *pref { 0 } else { decode_layer },
+                                cpu_expert_pending: inner
                                     .target
                                     .as_ref()
                                     .and_then(|m| m.expert_lru.as_ref())
                                     .is_some_and(|lru| lru.cpu_runs() > 0),
+                            }
                         })
                         .collect();
                     let plan = plan_micro_batch(&hints);
@@ -1227,6 +1279,7 @@ impl Engine {
                     )
                 });
                 let Some(id) = id else {
+                    let _ = self.maybe_auto_elastic_rebalance();
                     return Ok(None);
                 };
                 if let Some(partner) = stagger_partner {
@@ -1289,18 +1342,79 @@ impl Engine {
                         .unwrap_or(0),
                 );
             }
+            if let Some(partner) = dual_partner {
+                let stagger_plan = {
+                    let inner = self.lock()?;
+                    let n_layers = inner
+                        .target
+                        .as_ref()
+                        .map(|m| m.layers.len())
+                        .unwrap_or(1)
+                        .max(1);
+                    let hints: Vec<ActiveLayerHint> = inner
+                        .active
+                        .iter()
+                        .filter(|(rid, r)| {
+                            (**rid == id || **rid == partner)
+                                && !(r.finished
+                                    && r.emit_queue.is_empty()
+                                    && r.parked.is_empty())
+                        })
+                        .map(|(rid, r)| {
+                            let prefill = r.prefill_pos < r.prompt_len
+                                && r.emit_queue.is_empty()
+                                && r.parked.is_empty();
+                            let decode_layer = (r.decode_step as usize) % n_layers;
+                            ActiveLayerHint {
+                                request_id: *rid,
+                                phase: if prefill {
+                                    StaggerPhase::Prefill
+                                } else {
+                                    StaggerPhase::Decode
+                                },
+                                layer: if prefill { 0 } else { decode_layer },
+                                cpu_expert_pending: inner
+                                    .target
+                                    .as_ref()
+                                    .and_then(|m| m.expert_lru.as_ref())
+                                    .is_some_and(|lru| lru.cpu_runs() > 0),
+                            }
+                        })
+                        .collect();
+                    plan_micro_batch(&hints)
+                };
+                if let (Some(gpu), Some(cpu)) = (stagger_plan.gpu, stagger_plan.cpu) {
+                    let partner_norm = {
+                        let inner = self.lock()?;
+                        inner
+                            .active
+                            .get(&cpu.request_id)
+                            .map(|r| r.moe_norm.clone())
+                            .unwrap_or_default()
+                    };
+                    self.layer_stagger.begin(
+                        gpu.request_id,
+                        gpu.layer,
+                        cpu.request_id,
+                        cpu.layer,
+                        &partner_norm,
+                    );
+                }
+            }
             let primary = match self.step_id(id) {
                 Ok(result) => result,
                 // Peer Drop removed the Request between pick and step.
                 Err(AllpacaError::Transient(TransientError::RequestBusy)) => {
                     if dual_partner.is_some() {
                         self.micro_batch.end_dual_step();
+                        self.layer_stagger.end();
                     }
                     continue;
                 }
                 Err(e) => {
                     if dual_partner.is_some() {
                         self.micro_batch.end_dual_step();
+                        self.layer_stagger.end();
                     }
                     return Err(e);
                 }
@@ -1326,6 +1440,8 @@ impl Engine {
                 }
                 self.micro_batch.end_dual_step();
             }
+            self.layer_stagger.end();
+            self.note_elastic_pressure_after_decode()?;
             return Ok(Some(allpaca_types::PollEvent {
                 request_id: id,
                 result: primary,
@@ -1415,6 +1531,11 @@ impl Engine {
         } else {
             None
         };
+        let hooks = DecodePollHooks {
+            layer_stagger: Some(self.layer_stagger.as_ref()),
+            ds_probe: &self.ds_probe,
+            ds_queue: &self.ds_queue,
+        };
         let produced = if use_tree {
             let ctx = request(&inner, id)?.tokens.clone();
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
@@ -1433,7 +1554,7 @@ impl Engine {
             self.metrics
                 .tree_nodes
                 .fetch_add(forest.nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref(), micro_batch)?
+            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref(), micro_batch, &hooks)?
         } else {
             let drafts = if speculate && depth > 0 {
                 propose_drafts(
@@ -1459,6 +1580,7 @@ impl Engine {
                     depth,
                     temperature,
                     micro_batch,
+                    &hooks,
                 )?
         };
         let accepted = produced.accepted;
@@ -1611,6 +1733,7 @@ impl Engine {
                 last || write_logits,
                 recurrent.as_mut(),
                 None,
+                None,
             )?;
             let prefix = request(inner, id)?.tokens[..=pos].to_vec();
             let pages_now = request(inner, id)?.pages.clone();
@@ -1733,6 +1856,53 @@ impl Engine {
         let _ = new_vram;
         if self.hip.is_some() {
             self.upload_resident_weights()?;
+        }
+        Ok(())
+    }
+
+    /// Auto safe-point rebalance when radix + expert miss pressure was recorded.
+    fn maybe_auto_elastic_rebalance(&self) -> Result<(), AllpacaError> {
+        let pending = {
+            let mut inner = self.lock()?;
+            if !inner.active.is_empty() || !inner.elastic_rebalance_pending {
+                return Ok(());
+            }
+            inner.elastic_rebalance_pending = false;
+            true
+        };
+        if pending {
+            let _ = self.rebalance_experts_elastic();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn test_mark_elastic_pending(&self) {
+        if let Ok(mut inner) = self.lock() {
+            inner.elastic_rebalance_pending = true;
+        }
+    }
+
+    fn note_elastic_pressure_after_decode(&self) -> Result<(), AllpacaError> {
+        let mut inner = self.lock()?;
+        let Some(model) = inner.target.as_ref() else {
+            return Ok(());
+        };
+        let Some(lru) = model.expert_lru.as_ref() else {
+            return Ok(());
+        };
+        let misses = lru.misses();
+        if misses > inner.elastic_last_misses {
+            inner.elastic_miss_streak = inner.elastic_miss_streak.saturating_add(1);
+        } else {
+            inner.elastic_miss_streak = 0;
+        }
+        inner.elastic_last_misses = misses;
+        let max_bytes = inner.kv_radix.max_bytes();
+        let radix_bytes = inner.kv_radix.checkpoint_bytes();
+        let radix_hot = max_bytes > 0 && radix_bytes > max_bytes * 3 / 4;
+        if radix_hot && inner.elastic_miss_streak >= 4 {
+            inner.elastic_rebalance_pending = true;
         }
         Ok(())
     }
@@ -2014,6 +2184,66 @@ struct Produced {
     proposed: u64,
 }
 
+fn prefetch_draft_expert_union(
+    inner: &EngineInner,
+    span: &[u32],
+    metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
+    hooks: &DecodePollHooks<'_>,
+) -> Result<(), AllpacaError> {
+    let target = inner
+        .target
+        .as_ref()
+        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+    let Some(resident) = inner.target_resident.as_ref() else {
+        return Ok(());
+    };
+    if target.config.n_experts == 0 || span.len() < 2 {
+        return Ok(());
+    }
+    let ids = target.routed_experts_for_verify_span(span);
+    if ids.len() < 2 {
+        return Ok(());
+    }
+    let Some(lru) = target.expert_lru.as_ref() else {
+        return Ok(());
+    };
+    let plan = lru.plan(&ids);
+    if plan.fill.is_empty() {
+        return Ok(());
+    }
+    let mut pairs = Vec::new();
+    for id in &plan.fill {
+        let host = target.host_expert(id.layer as usize, id.expert as usize)?;
+        pairs.push((*id, host));
+    }
+    let side = DeviceDecodeSide {
+        request_id: 0,
+        moe_norm: None,
+        layer_stagger: hooks.layer_stagger,
+        ds_probe: Some(hooks.ds_probe),
+        ds_queue: Some(hooks.ds_queue),
+    };
+    let mut nvme = |id: ExpertId, dev_off: usize, slot_bytes: usize| {
+        target.try_nvme_expert_fill(id, dev_off, slot_bytes, Some(&side), resident)
+    };
+    resident.bulk_fill_experts(
+        &pairs,
+        Some(metrics),
+        None,
+        false,
+        Some(&mut nvme),
+    )?;
+    for (id, host) in &pairs {
+        lru.admit(*id, host)?;
+    }
+    metrics
+        .draft_expert_prefetches
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = hip;
+    Ok(())
+}
+
 fn verify_and_sample(
     inner: &mut EngineInner,
     id: u64,
@@ -2026,6 +2256,7 @@ fn verify_and_sample(
     depth: usize,
     temperature: f32,
     micro_batch: Option<&MicroBatchExpertUnion>,
+    hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
     let drafts_len = drafts.len() as u64;
     if remaining == 0 {
@@ -2051,6 +2282,7 @@ fn verify_and_sample(
     let first_match = drafts.first().copied() == Some(sampled);
     let stop = is_stop(sampled, &request(inner, id)?.params);
     if first_match && drafts.len() >= 2 && !stop && remaining > 1 {
+        prefetch_draft_expert_union(inner, &drafts, metrics, hip, hooks)?;
         return packed_linear_verify(
             inner,
             id,
@@ -2063,6 +2295,7 @@ fn verify_and_sample(
             draft_hip,
             depth,
             temperature,
+            hooks,
         );
     }
     let mut produced = vec![sampled];
@@ -2071,7 +2304,17 @@ fn verify_and_sample(
     if first_match {
         draft_iter.next();
     }
-    append_and_forward(inner, id, sampled, metrics, hip, micro_batch)?;
+    append_and_forward(
+        inner,
+        id,
+        sampled,
+        metrics,
+        hip,
+        micro_batch,
+        hooks.layer_stagger,
+        Some(hooks.ds_probe),
+        Some(hooks.ds_queue),
+    )?;
     if stop || !first_match || draft_iter.peek().is_none() {
         return finish_linear_verify(
             inner,
@@ -2107,7 +2350,17 @@ fn verify_and_sample(
             accepted += 1;
             draft_iter.next();
         }
-        append_and_forward(inner, id, sampled, metrics, hip, micro_batch)?;
+        append_and_forward(
+        inner,
+        id,
+        sampled,
+        metrics,
+        hip,
+        micro_batch,
+        hooks.layer_stagger,
+        Some(hooks.ds_probe),
+        Some(hooks.ds_queue),
+    )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || !matched || draft_iter.peek().is_none() {
             break;
@@ -2156,6 +2409,7 @@ fn packed_linear_verify(
     draft_hip: Option<&HipWorkspace>,
     depth: usize,
     temperature: f32,
+    hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
     let span_len = span.len();
     let next_ctx = {
@@ -2167,7 +2421,9 @@ fn packed_linear_verify(
         && inner.flags.draft_model_speculation
         && inner.draft_model.is_some();
     if !can_ahead {
-        return packed_linear_verify_span(inner, id, span, first, mask, remaining, metrics, hip);
+        return packed_linear_verify_span(
+            inner, id, span, first, mask, remaining, metrics, hip, hooks,
+        );
     }
     let mut draft_kv = std::mem::take(&mut inner.draft_kv);
     let model = inner.draft_model.clone().expect("draft-ahead needs a Draft Model");
@@ -2191,7 +2447,7 @@ fn packed_linear_verify(
             (draft_kv, tokens)
         });
         let produced = packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip,
+            inner, id, span, first, mask, remaining, metrics, hip, hooks,
         );
         let (kv, ahead) = worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
         inner.draft_kv = kv;
@@ -2263,7 +2519,9 @@ fn packed_linear_verify_span(
     remaining: usize,
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
+    hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
+    prefetch_draft_expert_union(inner, &span, metrics, hip, hooks)?;
     let drafts_len = span.len() as u64;
     let vocab = request(inner, id)?.pending_logits.len();
     let start_pos = request(inner, id)?.tokens.len();
@@ -2357,7 +2615,17 @@ fn packed_linear_verify_span(
     }
 
     if produced.len() > keep {
-        append_and_forward(inner, id, produced[keep], metrics, hip, None)?;
+        append_and_forward(
+            inner,
+            id,
+            produced[keep],
+            metrics,
+            hip,
+            None,
+            hooks.layer_stagger,
+            Some(hooks.ds_probe),
+            Some(hooks.ds_queue),
+        )?;
     } else {
         let off = keep.saturating_sub(1) * vocab;
         let pending = row_logits[off..off + vocab].to_vec();
@@ -2379,6 +2647,7 @@ fn verify_forest(
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
     micro_batch: Option<&MicroBatchExpertUnion>,
+    hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
     let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
     let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
@@ -2431,7 +2700,17 @@ fn verify_forest(
             accepted_tokens.push(sampled);
             parent = idx as i32;
         }
-        append_and_forward(inner, id, sampled, metrics, hip, micro_batch)?;
+        append_and_forward(
+        inner,
+        id,
+        sampled,
+        metrics,
+        hip,
+        micro_batch,
+        hooks.layer_stagger,
+        Some(hooks.ds_probe),
+        Some(hooks.ds_queue),
+    )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || child.is_none() || forest.children(parent).next().is_none()
         {
@@ -2462,6 +2741,9 @@ fn append_and_forward(
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
     micro_batch: Option<&MicroBatchExpertUnion>,
+    layer_stagger: Option<&LayerStagger>,
+    ds_probe: Option<&DirectStorageProbe>,
+    ds_queue: Option<&DirectStorageQueue>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
     let page_tokens = request(inner, id)?
@@ -2497,6 +2779,14 @@ fn append_and_forward(
     let pages = request(inner, id)?.pages.clone();
     let resident = inner.target_resident.clone();
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
+    let mut moe_norm = std::mem::take(&mut request_mut(inner, id)?.moe_norm);
+    let mut side = DeviceDecodeSide {
+        request_id: id,
+        moe_norm: Some(&mut moe_norm),
+        layer_stagger,
+        ds_probe,
+        ds_queue,
+    };
     target.forward_token(
         token,
         pos,
@@ -2509,9 +2799,14 @@ fn append_and_forward(
         false,
         recurrent.as_mut(),
         micro_batch,
+        Some(&mut side),
     )?;
     request_mut(inner, id)?.pending_logits = logits;
     request_mut(inner, id)?.recurrent = recurrent;
+    request_mut(inner, id)?.moe_norm = moe_norm;
+    if let Some(active) = inner.active.get_mut(&id) {
+        active.decode_step = active.decode_step.saturating_add(1);
+    }
     Ok(())
 }
 
@@ -2813,6 +3108,37 @@ mod tests {
             after.expert_slots >= slots_before,
             "expert pool must not shrink; before={slots_before} after={}",
             after.expert_slots
+        );
+    }
+
+    #[test]
+    fn auto_elastic_rebalance_on_idle_poll() {
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.host_bytes = 64;
+        cfg.weights.cache_bytes = 64;
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        for prompt in ["hello", "hello world", "hello there"] {
+            let _ = engine
+                .generate(
+                    prompt,
+                    GenerationParams {
+                        max_tokens: 1,
+                        temperature: 0.0,
+                        seed: Some(1),
+                        ..GenerationParams::default()
+                    },
+                )
+                .unwrap();
+        }
+        let before = engine.stats().vram_rebalances;
+        engine.test_mark_elastic_pending();
+        assert!(engine.poll().unwrap().is_none());
+        assert!(
+            engine.stats().vram_rebalances > before,
+            "idle poll must run auto elastic rebalance"
         );
     }
 

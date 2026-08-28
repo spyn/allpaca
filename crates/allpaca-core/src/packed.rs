@@ -400,6 +400,14 @@ impl HostExpertPool {
         self.store.expert_bytes()
     }
 
+    pub fn slot_coords(&self, id: ExpertId) -> Option<(PathBuf, u64, usize)> {
+        self.store.slot_coords(id)
+    }
+
+    pub fn direct_storage(&self) -> Option<&DirectStorageBridge> {
+        self.ds.as_ref()
+    }
+
     pub fn is_direct(&self) -> bool {
         self.store.is_direct()
     }

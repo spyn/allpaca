@@ -7,6 +7,8 @@
 //! Vertical: `plan_micro_batch` on multi-request `poll`, same-tick partner
 //! `step` with parked `PollEvent` observability (prefer-next is fallback only).
 
+use std::sync::Mutex;
+
 /// Request progress phase for stagger planning (mirrors engine poll phases).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaggerPhase {
@@ -38,7 +40,72 @@ pub struct ActiveLayerHint {
     pub cpu_expert_pending: bool,
 }
 
+/// Active cross-request layer stagger for the current dual poll tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaggerActive {
+    pub gpu_request: u64,
+    pub gpu_layer: usize,
+    pub cpu_request: u64,
+    pub cpu_layer: usize,
+}
+
+/// Per-poll layer stagger context shared with MoE forward.
+#[derive(Default)]
+pub struct LayerStagger {
+    inner: Mutex<Option<StaggerActive>>,
+    /// Snapshot of the CPU partner's MoE router input at `cpu_layer`.
+    partner_norm: Mutex<Vec<f32>>,
+}
+
+impl LayerStagger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn begin(
+        &self,
+        gpu_request: u64,
+        gpu_layer: usize,
+        cpu_request: u64,
+        cpu_layer: usize,
+        partner_norm: &[f32],
+    ) {
+        if let Ok(mut g) = self.inner.lock() {
+            *g = Some(StaggerActive {
+                gpu_request,
+                gpu_layer,
+                cpu_request,
+                cpu_layer,
+            });
+        }
+        if let Ok(mut n) = self.partner_norm.lock() {
+            *n = partner_norm.to_vec();
+        }
+    }
+
+    pub fn end(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            *g = None;
+        }
+        if let Ok(mut n) = self.partner_norm.lock() {
+            n.clear();
+        }
+    }
+
+    pub fn active(&self) -> Option<StaggerActive> {
+        self.inner.lock().ok().and_then(|g| *g)
+    }
+
+    pub fn partner_norm(&self) -> Vec<f32> {
+        self.partner_norm
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// Pick a GPU slot and a CPU slot from distinct requests when possible.
+/// CPU partner is pinned one layer behind the GPU slot when both are decoding.
 pub fn plan_micro_batch(active: &[ActiveLayerHint]) -> MicroBatchPlan {
     let gpu = active
         .iter()
@@ -52,10 +119,16 @@ pub fn plan_micro_batch(active: &[ActiveLayerHint]) -> MicroBatchPlan {
         .iter()
         .filter(|h| h.cpu_expert_pending)
         .find(|h| gpu.is_none_or(|g| g.request_id != h.request_id))
-        .map(|h| StaggerSlot {
-            request_id: h.request_id,
-            layer: h.layer,
-            on_gpu: false,
+        .map(|h| {
+            let layer = gpu
+                .filter(|_g| matches!(h.phase, StaggerPhase::Decode))
+                .map(|g| g.layer.saturating_sub(1))
+                .unwrap_or(h.layer);
+            StaggerSlot {
+                request_id: h.request_id,
+                layer,
+                on_gpu: false,
+            }
         });
     MicroBatchPlan { gpu, cpu }
 }
@@ -83,6 +156,7 @@ mod tests {
         let plan = plan_micro_batch(&hints);
         assert_eq!(plan.gpu.map(|g| g.request_id), Some(1));
         assert_eq!(plan.cpu.map(|c| c.request_id), Some(2));
+        assert_eq!(plan.cpu.map(|c| c.layer), Some(3), "cpu one layer behind gpu");
         assert_ne!(
             plan.gpu.map(|g| g.request_id),
             plan.cpu.map(|c| c.request_id)
@@ -100,5 +174,16 @@ mod tests {
         let plan = plan_micro_batch(&hints);
         assert_eq!(plan.gpu.map(|g| g.request_id), Some(7));
         assert!(plan.cpu.is_none(), "same-request CPU pair is not staggered");
+    }
+
+    #[test]
+    fn layer_stagger_tracks_active_tick() {
+        let s = LayerStagger::new();
+        s.begin(1, 5, 2, 4, &[1.0, 2.0]);
+        let a = s.active().unwrap();
+        assert_eq!(a.gpu_request, 1);
+        assert_eq!(a.cpu_layer, 4);
+        s.end();
+        assert!(s.active().is_none());
     }
 }

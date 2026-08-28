@@ -9,13 +9,24 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::anchors::RecurrentState;
+use crate::direct_storage::{DirectStorageProbe, DirectStorageQueue};
 use crate::kv_tier::KvTierManager;
+use crate::micro_batch::LayerStagger;
 use crate::telemetry::Metrics;
 use crate::packed::HostExpertPool;
 use crate::expert_batch::MicroBatchExpertUnion;
 use crate::weight_set::{
     align_up, ExpertId, ExpertLru, FfnRefs, LayerFfn, MissPlan, WeightWorkingSet, DIRECT_ALIGN,
 };
+
+/// Optional decode-side hooks (layer stagger, elastic norm snapshot, NVMe→VRAM).
+pub struct DeviceDecodeSide<'a> {
+    pub request_id: u64,
+    pub moe_norm: Option<&'a mut Vec<f32>>,
+    pub layer_stagger: Option<&'a LayerStagger>,
+    pub ds_probe: Option<&'a DirectStorageProbe>,
+    pub ds_queue: Option<&'a DirectStorageQueue>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -482,13 +493,21 @@ impl ResidentModel {
         buf
     }
 
+    pub(crate) fn copy_expert_h2d(&self, dev_off: usize, host: &[u8]) -> Result<(), AllpacaError> {
+        self.weights.copy_h2d(dev_off, host)
+    }
+
     /// Contiguous bulk H2D for several experts (one DMA when slots are adjacent).
+    /// When `nvme_direct` is set, tries NVMe→VRAM bind per expert before host pack.
     pub(crate) fn bulk_fill_experts(
         &self,
         pairs: &[(ExpertId, LayerFfn)],
         metrics: Option<&Metrics>,
         prefill_map: Option<(u32, u32)>,
         async_copy: bool,
+        mut nvme_direct: Option<
+            &mut dyn FnMut(ExpertId, usize, usize) -> Result<bool, AllpacaError>,
+        >,
     ) -> Result<u64, AllpacaError> {
         if pairs.is_empty() {
             return Ok(0);
@@ -503,6 +522,7 @@ impl ResidentModel {
             state.bound.len()
         };
         let mut slots: Vec<usize> = Vec::with_capacity(pairs.len());
+        let mut nvme_filled: Vec<bool> = Vec::with_capacity(pairs.len());
         let mut staging: Vec<u8> = Vec::with_capacity(pairs.len() * ring.slot_bytes);
         {
             let mut state = ring.state.lock().map_err(|_| {
@@ -559,45 +579,71 @@ impl ResidentModel {
                 state.bound[slot] = Some(*id);
                 state.used_at[slot] = state.clock;
                 slots.push(slot);
-                staging.extend_from_slice(&Self::pack_expert_slot(host, ring.slot_bytes));
-            }
-        }
-        let first = *slots.iter().min().unwrap_or(&0);
-        let contiguous = slots.windows(2).all(|w| w[1] == w[0] + 1);
-        let bytes = staging.len() as u64;
-        let dev_off = ring.base + first * ring.slot_bytes;
-        if contiguous && pairs.len() > 1 {
-            if async_copy {
-                self.weights.copy_h2d_async(dev_off, &staging)?;
-            } else {
-                self.weights.copy_h2d(dev_off, &staging)?;
-            }
-        } else {
-            for (i, slot) in slots.iter().enumerate() {
-                let off = i * ring.slot_bytes;
-                let chunk = &staging[off..off + ring.slot_bytes];
                 let dev = ring.base + slot * ring.slot_bytes;
-                if async_copy {
-                    self.weights.copy_h2d_async(dev, chunk)?;
-                } else {
-                    self.weights.copy_h2d(dev, chunk)?;
+                let direct = nvme_direct
+                    .as_mut()
+                    .map(|f| f(*id, dev, ring.slot_bytes))
+                    .transpose()?
+                    .unwrap_or(false);
+                nvme_filled.push(direct);
+                if !direct {
+                    staging.extend_from_slice(&Self::pack_expert_slot(host, ring.slot_bytes));
                 }
             }
         }
+        let host_slots: Vec<usize> = slots
+            .iter()
+            .copied()
+            .zip(nvme_filled.iter().copied())
+            .filter_map(|(s, d)| (!d).then_some(s))
+            .collect();
+        if !host_slots.is_empty() {
+            let first = *host_slots.iter().min().unwrap_or(&0);
+            let contiguous = host_slots.windows(2).all(|w| w[1] == w[0] + 1)
+                && host_slots.len() > 1;
+            if contiguous {
+                let dev_off = ring.base + first * ring.slot_bytes;
+                if async_copy {
+                    self.weights.copy_h2d_async(dev_off, &staging)?;
+                } else {
+                    self.weights.copy_h2d(dev_off, &staging)?;
+                }
+            } else {
+                let mut staging_off = 0usize;
+                for slot in &host_slots {
+                    let chunk = &staging[staging_off..staging_off + ring.slot_bytes];
+                    let dev = ring.base + slot * ring.slot_bytes;
+                    if async_copy {
+                        self.weights.copy_h2d_async(dev, chunk)?;
+                    } else {
+                        self.weights.copy_h2d(dev, chunk)?;
+                    }
+                    staging_off += ring.slot_bytes;
+                }
+            }
+        }
+        let bytes = staging.len() as u64;
+        let nvme_bytes: u64 = nvme_filled
+            .iter()
+            .zip(pairs.iter())
+            .filter(|(d, _)| **d)
+            .map(|(_, (_, h))| h.bytes() as u64)
+            .sum();
+        let total_bytes = bytes + nvme_bytes;
         if let Some(metrics) = metrics {
             metrics
                 .weight_h2d_bytes
-                .fetch_add(bytes, Ordering::Relaxed);
+                .fetch_add(total_bytes, Ordering::Relaxed);
             if pairs.len() > 1 {
                 metrics
                     .expert_bulk_fills
                     .fetch_add(1, Ordering::Relaxed);
                 metrics
                     .expert_bulk_bytes
-                    .fetch_add(bytes, Ordering::Relaxed);
+                    .fetch_add(total_bytes, Ordering::Relaxed);
             }
         }
-        Ok(bytes)
+        Ok(total_bytes)
     }
 
     pub(crate) fn prefill_layer_gpu_ready(&self, layer: u32) -> bool {
@@ -653,6 +699,7 @@ impl ResidentModel {
             metrics,
             Some((layer, n_exp)),
             true,
+            None,
         )?;
         if let Ok(mut p) = self.prefill_pipe.lock() {
             p.inflight = Some(layer);
@@ -688,7 +735,7 @@ impl ResidentModel {
                 )
             })
             .collect();
-        self.bulk_fill_experts(&pairs, metrics, Some((layer, n_exp)), false)?;
+        self.bulk_fill_experts(&pairs, metrics, Some((layer, n_exp)), false, None)?;
         allpaca_hip::stream_synchronize()?;
         if let Ok(mut p) = self.prefill_pipe.lock() {
             p.ready |= 1u64 << layer.min(63);
@@ -1716,7 +1763,7 @@ impl TinyModel {
             .unwrap_or(0)
     }
 
-    fn host_expert(&self, layer_idx: usize, expert: usize) -> Result<LayerFfn, AllpacaError> {
+    pub(crate) fn host_expert(&self, layer_idx: usize, expert: usize) -> Result<LayerFfn, AllpacaError> {
         let id = ExpertId {
             layer: layer_idx as u32,
             expert: expert as u32,
@@ -1978,6 +2025,65 @@ impl TinyModel {
         Ok(())
     }
 
+    pub(crate) fn try_nvme_expert_fill(
+        &self,
+        id: ExpertId,
+        dev_off: usize,
+        slot_bytes: usize,
+        side: Option<&DeviceDecodeSide<'_>>,
+        weights: &ResidentModel,
+    ) -> Result<bool, AllpacaError> {
+        let Some(side) = side else {
+            return Ok(false);
+        };
+        let (probe, queue) = match (side.ds_probe, side.ds_queue) {
+            (Some(p), Some(q)) => (p, q),
+            _ => return Ok(false),
+        };
+        let pool = match &self.expert_host {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+        let Some((path, offset, bytes)) = pool.slot_coords(id) else {
+            return Ok(false);
+        };
+        let bytes = bytes.min(slot_bytes);
+        queue.fill_to_device(probe, &path, offset, bytes, |host| {
+            weights.copy_expert_h2d(dev_off, host)
+        })
+    }
+
+    /// Router-only union of experts a draft verify span may touch (prefetch).
+    pub fn routed_experts_for_verify_span(&self, span: &[u32]) -> Vec<ExpertId> {
+        if self.config.n_experts == 0 || span.is_empty() {
+            return Vec::new();
+        }
+        let dim = self.config.dim;
+        let n_exp = self.config.n_experts.max(1);
+        let n_act = self.config.n_active.max(1).min(n_exp);
+        let mut union = std::collections::HashSet::new();
+        for &tok in span {
+            if tok as usize >= self.config.vocab_size {
+                continue;
+            }
+            let x = &self.embed[tok as usize * dim..(tok as usize + 1) * dim];
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if layer.w_router.is_empty() {
+                    continue;
+                }
+                for (e, _) in topk_route(x, &layer.w_router, n_exp, n_act) {
+                    union.insert(ExpertId {
+                        layer: layer_idx as u32,
+                        expert: e as u32,
+                    });
+                }
+            }
+        }
+        let mut out: Vec<_> = union.into_iter().collect();
+        out.sort_by_key(|id| (id.layer, id.expert));
+        out
+    }
+
     fn device_expert_gemm(
         &self,
         hip: &HipWorkspace,
@@ -2020,6 +2126,54 @@ impl TinyModel {
         Ok(())
     }
 
+    fn run_stagger_partner_cpu(
+        &self,
+        layer_idx: usize,
+        x_norm: &[f32],
+        metrics: &Metrics,
+    ) -> Result<(), AllpacaError> {
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "stagger missing host layer {layer_idx}"
+            )))
+        })?;
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let n_exp = cfg.n_experts.max(1);
+        let n_act = cfg.n_active.max(1).min(n_exp);
+        let routed = topk_route(x_norm, &layer.w_router, n_exp, n_act);
+        if routed.is_empty() {
+            return Ok(());
+        }
+        let mut scratch = vec![0.0f32; dim];
+        for &(e, w) in &routed {
+            let id = ExpertId {
+                layer: layer_idx as u32,
+                expert: e as u32,
+            };
+            let host = self.host_expert(layer_idx, e)?;
+            let ffn = if let Some(lru) = &self.expert_lru {
+                let plan = lru.plan(&[id]);
+                if !plan.fill.is_empty() {
+                    lru.admit(id, &host)?;
+                }
+                lru.materialize(id, &host)?
+            } else {
+                host
+            };
+            if let Some(lru) = &self.expert_lru {
+                if lru.plan(&[id]).cpu.iter().any(|&c| c == id) {
+                    self.run_expert_mlp_numa(id, x_norm, &ffn, cfg.ff_dim, dim, &mut scratch, None)?;
+                    metrics
+                        .expert_cpu_runs
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = w;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn device_moe(
         &self,
         layer_idx: usize,
@@ -2029,6 +2183,7 @@ impl TinyModel {
         metrics: &Metrics,
         prefill: bool,
         micro_batch: Option<&MicroBatchExpertUnion>,
+        mut side: Option<&mut DeviceDecodeSide<'_>>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -2065,6 +2220,37 @@ impl TinyModel {
         record_elementwise(Some(metrics));
         let mut x_norm = vec![0.0f32; dim];
         hip.copy_d2h_f32(buf.normed, &mut x_norm)?;
+        let ds_probe = side.as_ref().and_then(|s| s.ds_probe);
+        let ds_queue = side.as_ref().and_then(|s| s.ds_queue);
+        let nvme_side = side.as_ref().map(|s| DeviceDecodeSide {
+            request_id: s.request_id,
+            moe_norm: None,
+            layer_stagger: s.layer_stagger,
+            ds_probe,
+            ds_queue,
+        });
+        if let Some(s) = side.as_mut() {
+            if let Some(norm) = s.moe_norm.as_mut() {
+                if norm.len() == dim {
+                    norm.copy_from_slice(&x_norm);
+                }
+            }
+            if let Some(st) = s.layer_stagger.and_then(|ls| ls.active()) {
+                if st.gpu_request == s.request_id && layer_idx == st.gpu_layer {
+                    let partner_norm = s.layer_stagger.unwrap().partner_norm();
+                    if partner_norm.len() == dim {
+                        metrics
+                            .layer_stagger_steps
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = self.run_stagger_partner_cpu(
+                            st.cpu_layer,
+                            &partner_norm,
+                            metrics,
+                        );
+                    }
+                }
+            }
+        }
         let n_exp = cfg.n_experts.max(1);
         let n_act = cfg.n_active.max(1).min(n_exp);
         let routed = topk_route(&x_norm, &host_layer.w_router, n_exp, n_act);
@@ -2091,14 +2277,30 @@ impl TinyModel {
             };
             let union_plan = lru.plan(&route_ids);
             lru.note_plan(&union_plan);
-            if !union_plan.fill.is_empty() {
+                if !union_plan.fill.is_empty() {
                 let mut pairs: Vec<(ExpertId, LayerFfn)> = Vec::new();
                 for id in &union_plan.fill {
                     let host = self.host_expert(id.layer as usize, id.expert as usize)?;
                     pairs.push((*id, host));
                 }
-                if pairs.len() > 1 {
-                    resident.bulk_fill_experts(&pairs, Some(metrics), None, false)?;
+                if !pairs.is_empty() {
+                    let nvme_side = nvme_side.as_ref();
+                    let mut nvme = |id: ExpertId, dev_off: usize, slot_bytes: usize| {
+                        self.try_nvme_expert_fill(
+                            id,
+                            dev_off,
+                            slot_bytes,
+                            nvme_side,
+                            resident,
+                        )
+                    };
+                    resident.bulk_fill_experts(
+                        &pairs,
+                        Some(metrics),
+                        None,
+                        false,
+                        Some(&mut nvme),
+                    )?;
                 }
                 for (id, host) in &pairs {
                     lru.admit(*id, host)?;
@@ -2461,6 +2663,7 @@ impl TinyModel {
         prefill: bool,
         mut recurrent: Option<&mut RecurrentState>,
         micro_batch: Option<&MicroBatchExpertUnion>,
+        side: Option<&mut DeviceDecodeSide<'_>>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -2475,7 +2678,7 @@ impl TinyModel {
             if let (Some(hip), Some(resident)) = (hip, resident) {
                 match self.forward_token_device(
                     token, pos, page_ids, kv, metrics, logits, hip, resident, prefill,
-                    micro_batch,
+                    micro_batch, side,
                 ) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
@@ -2632,6 +2835,7 @@ impl TinyModel {
                 false,
                 recurrent,
                 None,
+                None,
             )?;
             if let Some(rows) = row_logits {
                 let vocab = self.config.vocab_size;
@@ -2691,6 +2895,7 @@ impl TinyModel {
                 true,
                 recurrent.as_deref_mut(),
                 None,
+                None,
             )?;
             if let Some(rows) = row_logits.as_mut() {
                 let off = i * vocab;
@@ -2716,6 +2921,7 @@ impl TinyModel {
         resident: &ResidentModel,
         prefill: bool,
         micro_batch: Option<&MicroBatchExpertUnion>,
+        mut side: Option<&mut DeviceDecodeSide<'_>>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -2839,15 +3045,29 @@ impl TinyModel {
                 resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
             }
             if self.config.n_experts > 0 {
-                self.device_moe(
-                    layer_idx,
-                    hip,
-                    resident,
-                    buf,
-                    metrics,
-                    prefill,
-                    micro_batch,
-                )?;
+                if let Some(s) = side.as_mut() {
+                    self.device_moe(
+                        layer_idx,
+                        hip,
+                        resident,
+                        buf,
+                        metrics,
+                        prefill,
+                        micro_batch,
+                        Some(s),
+                    )?;
+                } else {
+                    self.device_moe(
+                        layer_idx,
+                        hip,
+                        resident,
+                        buf,
+                        metrics,
+                        prefill,
+                        micro_batch,
+                        None,
+                    )?;
+                }
             } else {
             let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
             let ffn_norm = ffn.ffn_norm();
