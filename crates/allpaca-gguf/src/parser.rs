@@ -150,6 +150,8 @@ pub enum GgmlType {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    /// AMD ROCmFP4 dual-scale (ggml_type_id=100): host bytes loadable; F32 dequant not yet.
+    RocmFp4 = 100,
     Other = 255,
 }
 
@@ -167,6 +169,7 @@ impl GgmlType {
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
+            100 => Self::RocmFp4,
             _ => Self::Other,
         }
     }
@@ -206,6 +209,9 @@ impl TensorInfo {
             GgmlType::Q6_K => n
                 .div_ceil(allpaca_cpu::Q6_K_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES),
+            GgmlType::RocmFp4 => n
+                .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES),
             _ => n.saturating_mul(4),
         }
     }
@@ -414,9 +420,20 @@ impl GgufFile {
                 "hybrid SSM/Mamba ({ssm_layers} layers; no Allpaca SSM kernel)"
             ));
         }
-        if !unsupported_types.is_empty() {
+        if unsupported_types.contains(&100) {
+            reasons.push(
+                "ROCmFP4 (ggml_type_id=100): host packed buffer OK; F32 dequant / HIP GEMV not implemented (roadmap: CPU dequant → fused GEMV)"
+                    .into(),
+            );
+        }
+        let other_unsupported: Vec<u32> = unsupported_types
+            .iter()
+            .copied()
+            .filter(|id| *id != 100)
+            .collect();
+        if !other_unsupported.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K)"
+                "unsupported ggml_type_id={other_unsupported:?} (need F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K)"
             ));
         }
         let llama_family = matches!(
@@ -555,10 +572,27 @@ impl GgufFile {
                 allpaca_cpu::dequant_q6_k(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
+            GgmlType::RocmFp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "tensor {name} is ROCmFP4 (ggml_type_id=100): packed host bytes via tensor_bytes; F32 dequant not implemented"
+            )))),
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
                 "tensor {name} is {other:?} (unsupported GGUF quant)"
             )))),
         }
+    }
+
+    /// Copy ROCmFP4 (ggml_type_id=100) packed blocks into a host buffer (no dequant).
+    pub fn tensor_rocmfp4_host(&self, name: &str) -> Result<Vec<u8>, AllpacaError> {
+        let info = self.tensor(name).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
+        })?;
+        if info.ggml_type != GgmlType::RocmFp4 && info.ggml_type_id != 100 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "tensor {name} is {:?}/id={} not ROCmFP4(100)",
+                info.ggml_type, info.ggml_type_id
+            ))));
+        }
+        Ok(self.tensor_bytes(name)?.to_vec())
     }
 
     /// Raw on-disk tensor bytes (quant blocks or IEEE floats).
@@ -1030,6 +1064,31 @@ mod tests {
     }
 
     #[test]
+    fn rocmfp4_type_100_loads_host_bytes_and_refuses_f32_dequant() {
+        let path = std::env::temp_dir().join("allpaca_gguf_rocmfp4.gguf");
+        // One ROCmFP4 block: 32 elems → 18 bytes.
+        let mut payload = vec![0u8; allpaca_cpu::ROCMFP4_BLOCK_BYTES];
+        payload[0] = 0xA5;
+        payload[17] = 0x5A;
+        write_typed_gguf(&path, 100, &payload, 32);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::RocmFp4);
+        assert_eq!(info.ggml_type_id, 100);
+        assert_eq!(info.nbytes(), allpaca_cpu::ROCMFP4_BLOCK_BYTES);
+        let host = file.tensor_rocmfp4_host("quant.weight").unwrap();
+        assert_eq!(host, payload);
+        let err = file.tensor_f32("quant.weight").unwrap_err();
+        assert!(err.is_fatal(), "ROCmFP4 F32 path must be Fatal, got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ROCmFP4") && msg.contains("100") && msg.contains("dequant"),
+            "named refuse must cite ROCmFP4/100/dequant; got {msg}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn unsupported_quant_tensor_load_is_fatal() {
         let path = std::env::temp_dir().join("allpaca_gguf_q5.gguf");
         write_typed_gguf(&path, 6, &[0u8; 32], 32);
@@ -1114,8 +1173,9 @@ mod tests {
         assert!(
             reason.contains("nemotron_h_moe")
                 && reason.contains("SSM")
-                && reason.contains("100"),
-            "Fatal reason must name arch, SSM, and type 100; got {reason}"
+                && reason.contains("100")
+                && reason.contains("ROCmFP4"),
+            "Fatal reason must name arch, SSM, type 100, and ROCmFP4; got {reason}"
         );
         assert_eq!(report.layers.len(), 52);
         assert!(

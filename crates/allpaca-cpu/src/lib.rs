@@ -8,4 +8,5 @@ pub use kernels::{
     quantize_q5_k, quantize_q6_k, quantize_q8_0, rmsnorm, rope, silu, softmax, CpuBackend,
     Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS, Q5_K_BLOCK_BYTES,
     Q5_K_BLOCK_ELEMS, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
+    ROCMFP4_BLOCK_BYTES, ROCMFP4_BLOCK_ELEMS,
 };

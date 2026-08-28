@@ -381,6 +381,9 @@ pub fn silu(x: f32) -> f32 {
 
 pub const Q4_0_BLOCK_ELEMS: usize = 32;
 pub const Q4_0_BLOCK_BYTES: usize = 18;
+/// ggml_type_id=100 ROCmFP4 dual-scale: 18 bytes / 32 elems (4.5 bpw).
+pub const ROCMFP4_BLOCK_ELEMS: usize = 32;
+pub const ROCMFP4_BLOCK_BYTES: usize = 18;
 pub const Q8_0_BLOCK_ELEMS: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
 /// GGUF Q4_K / Q4_K_S / Q4_K_M super-block (256 elems).
