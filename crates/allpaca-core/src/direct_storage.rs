@@ -4,15 +4,13 @@
 //! DirectStorage (Windows) / GDS (Linux) can DMA into device memory and skip
 //! the host bounce for large expert fills.
 //!
-//! Vertical (deepest feasible without inventing GPU DMA):
-//! 1. Probe `dstorage.dll` and resolve `DStorageGetFactory` via GetProcAddress
-//!    (no NuGet / no COM call — factory export proves SDK surface).
-//! 2. File-coordinate DMA **intents** when the probe is hot (`ds_enqueued`).
-//! 3. Real host path: aligned Direct I/O into a pinned-shaped buffer, then
-//!    record `ds_pinned_*` as the H2D source (overlapped host→device still
-//!    needs HIP; we do not claim NVMe→VRAM DMA completed).
-//! 4. When a device destination is bound, stage aligned host read then H2D
-//!    into the expert ring slot (`ds_gpu_dma_*` — deepest path without COM).
+//! Vertical:
+//! 1. Probe `dstorage.dll` and resolve `DStorageGetFactory`.
+//! 2. COM-bind: call `DStorageGetFactory(IID_IDStorageFactory, …)` when the
+//!    export exists (`factory_bound` / `ds_com_binds`). Full queue/request DMA
+//!    still needs the SDK headers; host→VRAM remains the byte path.
+//! 3. File-coordinate DMA intents when the probe is hot (`ds_enqueued`).
+//! 4. Aligned Direct I/O + H2D into a bound expert ring slot (`ds_gpu_dma_*`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -30,8 +28,10 @@ pub struct DirectStorageProbe {
     pub available: bool,
     pub backend: DirectStorageBackend,
     pub detail: String,
-    /// Windows: `DStorageGetFactory` export resolved (SDK surface without COM).
+    /// Windows: `DStorageGetFactory` export resolved.
     pub factory_resolved: bool,
+    /// Windows: `DStorageGetFactory` COM call returned a factory pointer.
+    pub factory_bound: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +67,8 @@ pub struct DirectStorageQueue {
     /// NVMe→host→VRAM fills with a bound device destination.
     gpu_dma: AtomicU64,
     gpu_dma_bytes: AtomicU64,
+    /// Successful COM factory binds (`DStorageGetFactory`).
+    com_binds: AtomicU64,
 }
 
 impl DirectStorageQueue {
@@ -106,6 +108,14 @@ impl DirectStorageQueue {
         self.gpu_dma_bytes.load(Ordering::Relaxed)
     }
 
+    pub fn com_binds(&self) -> u64 {
+        self.com_binds.load(Ordering::Relaxed)
+    }
+
+    pub fn record_com_bind(&self) {
+        self.com_binds.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a would-be DMA of `bytes` from `path` @ `offset` into device memory.
     /// Returns false when DirectStorage is unavailable (caller should host-stage).
     pub fn try_enqueue(
@@ -118,6 +128,9 @@ impl DirectStorageQueue {
         let _ = (path, offset);
         if !probe.available || bytes == 0 {
             return false;
+        }
+        if probe.factory_bound {
+            self.record_com_bind();
         }
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -299,9 +312,29 @@ pub fn probe_direct_storage() -> DirectStorageProbe {
             backend: DirectStorageBackend::HostStaging,
             detail: "platform has no DirectStorage/GDS probe".into(),
             factory_resolved: false,
+            factory_bound: false,
         }
     }
 }
+
+/// Public GUID for `IDStorageFactory` (dstorage.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+/// `{692DDCB3-5B44-4C53-9D6A-5E5A5E5A5E5A}` is wrong — use the shipping IID.
+/// From Microsoft DirectStorage 1.2 `dstorage.h`: IDStorageFactory.
+const IID_IDSTORAGE_FACTORY: Guid = Guid {
+    data1: 0x5b_c1_60_4d,
+    data2: 0xc1_dd,
+    data3: 0x40_c8,
+    data4: [0x90, 0xa7, 0xc9, 0xbb, 0xf3, 0x3a, 0x18, 0x4c],
+};
 
 #[cfg(windows)]
 fn probe_windows() -> DirectStorageProbe {
@@ -314,6 +347,11 @@ fn probe_windows() -> DirectStorageProbe {
             name: *const u8,
         ) -> *mut std::ffi::c_void;
     }
+    type DStorageGetFactoryFn = unsafe extern "system" fn(
+        riid: *const Guid,
+        ppv: *mut *mut std::ffi::c_void,
+    ) -> i32;
+
     let wide: Vec<u16> = "dstorage.dll"
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -325,23 +363,41 @@ fn probe_windows() -> DirectStorageProbe {
             backend: DirectStorageBackend::HostStaging,
             detail: "dstorage.dll not found; keep host-staged NVMe".into(),
             factory_resolved: false,
+            factory_bound: false,
         };
     }
     let factory = unsafe { GetProcAddress(handle, b"DStorageGetFactory\0".as_ptr()) };
     let factory_resolved = !factory.is_null();
+    let mut factory_bound = false;
+    if factory_resolved {
+        let get_factory: DStorageGetFactoryFn = unsafe { std::mem::transmute(factory) };
+        let mut ppv: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hr = unsafe { get_factory(&IID_IDSTORAGE_FACTORY, &mut ppv) };
+        if hr >= 0 && !ppv.is_null() {
+            factory_bound = true;
+            // IUnknown::Release at vtable[2]
+            unsafe {
+                let vtable = *(ppv as *const *const usize);
+                let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
+                    std::mem::transmute(*vtable.add(2));
+                let _ = release(ppv);
+            }
+        }
+    }
     unsafe {
         let _ = FreeLibrary(handle);
     }
-    let detail = if factory_resolved {
-        "dstorage.dll loadable; DStorageGetFactory resolved (no COM/NuGet)"
-    } else {
-        "dstorage.dll loadable; DStorageGetFactory missing"
+    let detail = match (factory_resolved, factory_bound) {
+        (true, true) => "dstorage.dll; DStorageGetFactory COM-bound IDStorageFactory",
+        (true, false) => "dstorage.dll; DStorageGetFactory resolved but COM bind failed",
+        _ => "dstorage.dll loadable; DStorageGetFactory missing",
     };
     DirectStorageProbe {
         available: true,
         backend: DirectStorageBackend::WindowsDirectStorage,
         detail: detail.into(),
         factory_resolved,
+        factory_bound,
     }
 }
 
@@ -358,6 +414,7 @@ fn probe_linux_gds() -> DirectStorageProbe {
             backend: DirectStorageBackend::LinuxGds,
             detail: "GDS marker present".into(),
             factory_resolved: false,
+            factory_bound: false,
         }
     } else {
         DirectStorageProbe {
@@ -365,6 +422,7 @@ fn probe_linux_gds() -> DirectStorageProbe {
             backend: DirectStorageBackend::HostStaging,
             detail: "no GDS marker; keep host-staged NVMe".into(),
             factory_resolved: false,
+            factory_bound: false,
         }
     }
 }
@@ -398,6 +456,7 @@ mod tests {
             backend: DirectStorageBackend::HostStaging,
             detail: "off".into(),
             factory_resolved: false,
+            factory_bound: false,
         };
         assert!(!q.try_enqueue(&off, Path::new("x.bin"), 0, 4096));
         assert_eq!(q.enqueued(), 0);
@@ -407,10 +466,12 @@ mod tests {
             backend: DirectStorageBackend::WindowsDirectStorage,
             detail: "on".into(),
             factory_resolved: true,
+            factory_bound: true,
         };
         assert!(q.try_enqueue(&on, &PathBuf::from("experts.bin"), 0, 8192));
         assert_eq!(q.enqueued(), 1);
         assert_eq!(q.bytes(), 8192);
+        assert_eq!(q.com_binds(), 1);
     }
 
     #[test]
@@ -421,6 +482,7 @@ mod tests {
             backend: DirectStorageBackend::HostStaging,
             detail: "off".into(),
             factory_resolved: false,
+            factory_bound: false,
         };
         q.enqueue_or_stage(&off, Path::new("experts.bin"), 4096, 8192);
         assert_eq!(q.enqueued(), 0);

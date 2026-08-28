@@ -22,7 +22,7 @@ use crate::direct_storage::{
     probe_direct_storage, DirectStorageBridge, DirectStorageProbe, DirectStorageQueue,
 };
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
-use crate::early_exit::gate_unsupported;
+use crate::early_exit::{gate_unsupported, EarlyExitSpec};
 use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
@@ -379,6 +379,10 @@ impl Engine {
                 );
                 self.metrics.ds_gpu_dma_bytes.store(
                     q.gpu_dma_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.ds_com_binds.store(
+                    q.com_binds(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 self.metrics
@@ -1940,6 +1944,23 @@ impl Engine {
         Ok(())
     }
 
+    /// Enable a synthetic early-exit manifest for tracer tests.
+    #[cfg(test)]
+    fn test_enable_early_exit_manifest(&self, exit_layers: Vec<usize>) {
+        if let Ok(mut inner) = self.lock() {
+            if let Some(model) = inner.target.as_mut() {
+                if let Some(model) = Arc::get_mut(model) {
+                    model.early_exit = EarlyExitSpec {
+                        supported: true,
+                        exit_layers,
+                        min_confidence: self.config.early_exit.min_confidence,
+                        min_calibration_margin: self.config.early_exit.min_calibration_margin,
+                    };
+                }
+            }
+        }
+    }
+
     fn note_elastic_pressure_after_decode(&self) -> Result<(), AllpacaError> {
         let mut inner = self.lock()?;
         let Some(model) = inner.target.as_ref() else {
@@ -2912,6 +2933,35 @@ mod tests {
 
     fn test_engine() -> Engine {
         Engine::new(test_config()).unwrap()
+    }
+
+    #[test]
+    fn early_exit_self_speculate_records_accepts() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.early_exit.enabled = true;
+        cfg.early_exit.min_confidence = 0.51;
+        cfg.early_exit.min_calibration_margin = 0.0;
+        let engine = Engine::new(cfg).unwrap();
+        // Gate fired on load (unsupported); enable manifest for decode.
+        engine.test_enable_early_exit_manifest(vec![0]);
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.early_exit_accepts >= 1,
+            "supported exit layer must self-speculate; stats={stats:?}"
+        );
     }
 
     #[test]

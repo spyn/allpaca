@@ -18,6 +18,10 @@ use crate::numa::NumaTopology;
 use crate::telemetry::Metrics;
 use crate::weight_set::{align_up, ExpertId, LayerFfn, DIRECT_ALIGN};
 
+/// Layer-major / FTW bank magic (8 bytes) + versioned header in the first aligned block.
+pub const PACKED_MAGIC: &[u8; 8] = b"ALLPFTW1";
+const PACKED_VERSION: u32 = 1;
+
 #[cfg(windows)]
 const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 
@@ -69,6 +73,8 @@ pub struct PackedStore {
     path: PathBuf,
     file: Mutex<Option<File>>,
     slot_bytes: usize,
+    /// Bytes before the first data slot (aligned header, or 0 for legacy packs).
+    header_bytes: usize,
     entries: Vec<PackedSlotMeta>,
     index: HashMap<ExpertId, usize>,
     expert_bytes: usize,
@@ -118,12 +124,19 @@ impl PackedStore {
             )));
         }
         let slot_bytes = align_up(max_payload.max(1), DIRECT_ALIGN);
+        let header_bytes = DIRECT_ALIGN;
         {
             let mut out = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(path)?;
+            let mut header = vec![0u8; header_bytes];
+            header[..8].copy_from_slice(PACKED_MAGIC);
+            header[8..12].copy_from_slice(&PACKED_VERSION.to_le_bytes());
+            header[12..16].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+            header[16..20].copy_from_slice(&(slot_bytes as u32).to_le_bytes());
+            out.write_all(&header)?;
             for blob in &blobs {
                 let mut slot = vec![0u8; slot_bytes];
                 slot[..blob.len()].copy_from_slice(blob);
@@ -140,6 +153,7 @@ impl PackedStore {
             path: path.to_path_buf(),
             file: Mutex::new(Some(file)),
             slot_bytes,
+            header_bytes,
             entries,
             index,
             expert_bytes,
@@ -148,6 +162,39 @@ impl PackedStore {
             bytes: AtomicU64::new(0),
             remove_on_drop: true,
         })
+    }
+
+    /// Pack dense FFN layers as layer-major banks (`expert = 0`). Same on-disk
+    /// format as [`Self::pack`]; name documents the dense-trunk use case.
+    pub fn pack_layer_major<'a, I>(path: &Path, layers: I) -> Result<Self, AllpacaError>
+    where
+        I: IntoIterator<Item = (usize, &'a LayerFfn)>,
+    {
+        Self::pack(
+            path,
+            layers.into_iter().map(|(layer, ffn)| {
+                (
+                    ExpertId {
+                        layer: layer as u32,
+                        expert: 0,
+                    },
+                    ffn,
+                )
+            }),
+        )
+    }
+
+    pub fn is_layer_major(&self) -> bool {
+        !self.entries.is_empty() && self.entries.iter().all(|e| e.id.expert == 0)
+    }
+
+    pub fn magic_ok(&self) -> bool {
+        self.header_bytes > 0
+    }
+
+    fn slot_file_offset(&self, slot: usize) -> u64 {
+        (self.header_bytes as u64)
+            .saturating_add((slot as u64).saturating_mul(self.slot_bytes as u64))
     }
 
     pub fn read_expert(&self, id: ExpertId) -> Result<LayerFfn, AllpacaError> {
@@ -168,7 +215,7 @@ impl PackedStore {
             let file = guard.as_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("packed store file closed".into()))
             })?;
-            let off = (slot as u64).saturating_mul(self.slot_bytes as u64);
+            let off = self.slot_file_offset(slot);
             file.seek(SeekFrom::Start(off))?;
             let dest = buf.as_mut();
             let mut filled = 0usize;
@@ -221,8 +268,7 @@ impl PackedStore {
     /// File coordinates for a DirectStorage-shaped DMA of this expert slot.
     pub fn slot_coords(&self, id: ExpertId) -> Option<(PathBuf, u64, usize)> {
         let slot = *self.index.get(&id)?;
-        let offset = (slot as u64).saturating_mul(self.slot_bytes as u64);
-        Some((self.path.clone(), offset, self.slot_bytes))
+        Some((self.path.clone(), self.slot_file_offset(slot), self.slot_bytes))
     }
 }
 
@@ -551,6 +597,35 @@ mod tests {
         assert_eq!(got.w_down, ffn.w_down);
         assert!(store.reads() >= 1);
         assert_eq!(store.bytes_read(), DIRECT_ALIGN as u64);
+        assert!(store.magic_ok());
+    }
+
+    #[test]
+    fn pack_layer_major_roundtrip_and_header() {
+        let l0 = sample_ffn();
+        let l1 = LayerFfn {
+            w_gate: vec![4.0, 5.0],
+            w_up: vec![6.0, 7.0],
+            w_down: vec![8.0, 9.0],
+            ffn_norm: vec![1.0, 1.0],
+        };
+        let path = unique_path();
+        let store = PackedStore::pack_layer_major(&path, [(0, &l0), (1, &l1)]).unwrap();
+        assert!(store.is_layer_major());
+        assert!(store.magic_ok());
+        let mut hdr = [0u8; 8];
+        {
+            let mut f = File::open(&path).unwrap();
+            f.read_exact(&mut hdr).unwrap();
+        }
+        assert_eq!(&hdr, PACKED_MAGIC);
+        let got = store
+            .read_expert(ExpertId {
+                layer: 1,
+                expert: 0,
+            })
+            .unwrap();
+        assert_eq!(got.w_gate, l1.w_gate);
     }
 
     #[test]
@@ -639,7 +714,7 @@ mod tests {
             })
             .expect("coords");
         assert_eq!(coords.0, path);
-        assert_eq!(coords.1, 0);
+        assert_eq!(coords.1, DIRECT_ALIGN as u64, "data starts after FTW header");
         assert!(coords.2 >= DIRECT_ALIGN);
 
         let queue = Arc::new(DirectStorageQueue::new());
@@ -649,6 +724,7 @@ mod tests {
                 backend: DirectStorageBackend::HostStaging,
                 detail: "test".into(),
                 factory_resolved: false,
+                factory_bound: false,
             },
             queue: Arc::clone(&queue),
         };

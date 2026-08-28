@@ -163,6 +163,9 @@ pub struct StatsSnapshot {
     pub ds_gpu_dma: u64,
     #[serde(default)]
     pub ds_gpu_dma_bytes: u64,
+    /// COM `DStorageGetFactory` binds that succeeded.
+    #[serde(default)]
+    pub ds_com_binds: u64,
     /// True when DirectStorage/GDS probe succeeded at engine start.
     #[serde(default)]
     pub ds_available: bool,

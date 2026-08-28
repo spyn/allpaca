@@ -73,6 +73,7 @@ pub struct Metrics {
     /// NVMe→host→VRAM expert fills with bound device slots.
     pub ds_gpu_dma: AtomicU64,
     pub ds_gpu_dma_bytes: AtomicU64,
+    pub ds_com_binds: AtomicU64,
     pub ds_available: AtomicU64,
     pub micro_batch_plans: AtomicU64,
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
@@ -228,6 +229,7 @@ impl Metrics {
             ds_pinned_bytes: self.ds_pinned_bytes.load(Ordering::Relaxed),
             ds_gpu_dma: self.ds_gpu_dma.load(Ordering::Relaxed),
             ds_gpu_dma_bytes: self.ds_gpu_dma_bytes.load(Ordering::Relaxed),
+            ds_com_binds: self.ds_com_binds.load(Ordering::Relaxed),
             ds_available: self.ds_available.load(Ordering::Relaxed) != 0,
             micro_batch_plans: self.micro_batch_plans.load(Ordering::Relaxed),
             micro_batch_dual_steps: self.micro_batch_dual_steps.load(Ordering::Relaxed),

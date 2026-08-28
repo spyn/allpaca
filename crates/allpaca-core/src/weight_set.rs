@@ -364,9 +364,11 @@ impl WeightWorkingSet {
         let store = if packed.is_empty() {
             None
         } else {
-            Some(PackedStore::pack(
+            Some(PackedStore::pack_layer_major(
                 &temp_pack_path(),
-                packed.iter().map(|(id, ffn)| (*id, ffn)),
+                packed
+                    .iter()
+                    .map(|(id, ffn)| (id.layer as usize, ffn)),
             )?)
         };
         let nring = plan.ring_slots.max(1);

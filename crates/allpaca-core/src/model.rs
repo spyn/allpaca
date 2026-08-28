@@ -2778,6 +2778,43 @@ impl TinyModel {
             if let Some(state) = recurrent.as_deref_mut() {
                 state.mix_layer(layer_idx, &mut x);
             }
+            // Self-speculative early exit: provisional lm_head; skip remaining layers
+            // when confidence + margin clear the manifest gate.
+            if crate::early_exit::is_exit_layer(&self.early_exit, layer_idx)
+                && layer_idx + 1 < self.layers.len()
+            {
+                if logits.len() < cfg.vocab_size {
+                    return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                        "logits buffer smaller than vocab".into(),
+                    )));
+                }
+                rmsnorm_dispatch(
+                    hip,
+                    &x,
+                    &self.norm,
+                    resident.map(|r| r.norm()),
+                    cfg.eps,
+                    &mut scratch[..dim],
+                    Some(metrics),
+                )?;
+                gemm_nt_dispatch(
+                    hip,
+                    &scratch[..dim],
+                    &self.lm_head,
+                    resident.map(|r| r.lm_head()),
+                    &mut logits[..cfg.vocab_size],
+                    1,
+                    cfg.vocab_size,
+                    dim,
+                )?;
+                let pred = crate::early_exit::prediction_from_logits(&logits[..cfg.vocab_size]);
+                if crate::early_exit::accept_exit(&pred, &self.early_exit) {
+                    metrics
+                        .early_exit_accepts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
         }
 
         rmsnorm_dispatch(

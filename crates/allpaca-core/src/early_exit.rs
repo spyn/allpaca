@@ -1,7 +1,8 @@
 //! Model-aware early exit (OPPORTUNITY §9 / SPECS).
 //!
-//! Only enable when the checkpoint declares exit heads + calibration. Mid-graph
-//! abort is not implemented yet — this module gates policy and records telemetry.
+//! Only enable when the checkpoint declares exit heads + calibration. Prefer
+//! self-speculative accept (confidence from logits) over a destructive mid-graph
+//! abort when correctness is strict.
 
 /// Manifest / runtime early-exit capability (SPECS `EarlyExitSpec`).
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +41,54 @@ pub fn accept_exit(p: &ExitPrediction, s: &EarlyExitSpec) -> bool {
 /// True when config asks for early exit but the loaded model cannot provide it.
 pub fn gate_unsupported(enabled: bool, spec: &EarlyExitSpec) -> bool {
     enabled && !spec.supported
+}
+
+/// Softmax top-1 confidence and top-1−top-2 margin from raw logits.
+pub fn prediction_from_logits(logits: &[f32]) -> ExitPrediction {
+    if logits.is_empty() {
+        return ExitPrediction {
+            confidence: 0.0,
+            margin: 0.0,
+        };
+    }
+    let mut best = f32::NEG_INFINITY;
+    let mut second = f32::NEG_INFINITY;
+    for &v in logits {
+        if v > best {
+            second = best;
+            best = v;
+        } else if v > second {
+            second = v;
+        }
+    }
+    // Numerically stable 2-class softmax between top-1 and top-2.
+    let m = if second.is_finite() {
+        best.max(second)
+    } else {
+        best
+    };
+    let e1 = (best - m).exp();
+    let e2 = if second.is_finite() {
+        (second - m).exp()
+    } else {
+        0.0
+    };
+    let z = e1 + e2;
+    let confidence = if z > 0.0 { e1 / z } else { 0.0 };
+    let margin = if second.is_finite() {
+        confidence - e2 / z
+    } else {
+        confidence
+    };
+    ExitPrediction {
+        confidence,
+        margin: margin.max(0.0),
+    }
+}
+
+/// Whether `layer_idx` is an allowed early-exit point for this spec.
+pub fn is_exit_layer(spec: &EarlyExitSpec, layer_idx: usize) -> bool {
+    spec.supported && spec.exit_layers.iter().any(|&l| l == layer_idx)
 }
 
 #[cfg(test)]
@@ -82,6 +131,22 @@ mod tests {
                 exit_layers: vec![8],
                 ..EarlyExitSpec::default()
             }
+        ));
+    }
+
+    #[test]
+    fn prediction_from_logits_prefers_clear_winner() {
+        let sharp = prediction_from_logits(&[1.0, 10.0, 0.5]);
+        let flat = prediction_from_logits(&[1.0, 1.1, 1.05]);
+        assert!(sharp.confidence > flat.confidence);
+        assert!(sharp.margin > flat.margin);
+        assert!(is_exit_layer(
+            &EarlyExitSpec {
+                supported: true,
+                exit_layers: vec![1],
+                ..EarlyExitSpec::default()
+            },
+            1
         ));
     }
 }
