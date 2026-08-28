@@ -1,5 +1,15 @@
 //! CPU Mamba-2 / selective-SSM stub for hybrid schedules (not production kernels).
 
+#[derive(Debug, Clone)]
+pub struct SsmLayerWeights {
+    pub d_state: usize,
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub c: Vec<f32>,
+    pub d_skip: Vec<f32>,
+    pub dt_bias: f32,
+}
+
 /// Softplus: ln(1 + e^x), stable for moderate x.
 #[inline]
 pub fn softplus(x: f32) -> f32 {

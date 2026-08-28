@@ -415,11 +415,8 @@ impl GgufFile {
             .collect();
 
         let mut reasons = Vec::new();
-        if ssm_layers > 0 {
-            reasons.push(format!(
-                "hybrid SSM/Mamba ({ssm_layers} layers; no Allpaca SSM kernel)"
-            ));
-        }
+        // SSM layers are runnable via the CPU selective-SSM stub when weights are
+        // F32/F16/Q* (type 100 ROCmFP4 still blocks below).
         if unsupported_types.contains(&100) {
             reasons.push(
                 "ROCmFP4 (ggml_type_id=100): host packed buffer OK; F32 dequant / HIP GEMV not implemented (roadmap: CPU dequant → fused GEMV)"
@@ -1104,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn compat_report_names_hybrid_ssm_and_unknown_quant() {
+    fn compat_report_allows_f32_hybrid_ssm_stub() {
         let path = std::env::temp_dir().join("allpaca_gguf_hybrid_probe.gguf");
         let mut meta = HashMap::new();
         meta.insert(
@@ -1131,12 +1128,10 @@ mod tests {
         assert_eq!(report.architecture, "nemotron_h_moe");
         assert_eq!(report.n_layers, 1);
         assert_eq!(report.ssm_layers, 1);
-        let reason = report
-            .reject_reason
-            .expect("hybrid SSM must be rejected by name");
         assert!(
-            reason.contains("nemotron_h_moe") && reason.contains("SSM"),
-            "named reject must cite arch + SSM; got {reason}"
+            report.reject_reason.is_none(),
+            "F32 hybrid SSM must be stub-runnable; got {:?}",
+            report.reject_reason
         );
         let _ = std::fs::remove_file(path);
     }
@@ -1147,7 +1142,7 @@ mod tests {
             .join("../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf");
         if !path.exists() {
             eprintln!(
-                "skip nemotron_rocmfp4_gguf_probe: missing {}; see compat_report_names_hybrid_ssm",
+                "skip nemotron_rocmfp4_gguf_probe: missing {}; see compat_report_allows_f32_hybrid_ssm_stub",
                 path.display()
             );
             return;
@@ -1169,13 +1164,12 @@ mod tests {
         );
         let reason = report
             .reject_reason
-            .expect("Nemotron hybrid must reject by name");
+            .expect("Nemotron ROCmFP4 must reject by name");
         assert!(
             reason.contains("nemotron_h_moe")
-                && reason.contains("SSM")
                 && reason.contains("100")
                 && reason.contains("ROCmFP4"),
-            "Fatal reason must name arch, SSM, type 100, and ROCmFP4; got {reason}"
+            "Fatal reason must name arch, type 100, and ROCmFP4; got {reason}"
         );
         assert_eq!(report.layers.len(), 52);
         assert!(

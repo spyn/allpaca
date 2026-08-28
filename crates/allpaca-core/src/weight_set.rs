@@ -822,6 +822,8 @@ mod tests {
 
     fn ffn_layer(gate: f32) -> crate::model::LayerWeights {
         crate::model::LayerWeights {
+            block: allpaca_gguf::HybridLayerKind::Attention,
+            ssm: None,
             attn_norm: vec![],
             wq: vec![],
             wk: vec![],

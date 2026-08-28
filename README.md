@@ -94,5 +94,5 @@ See compiled defaults in `allpaca-types` (`Config::compiled_defaults`) and CONTE
 
 - **DirectStorage**: probe `dstorage.dll` + resolve `DStorageGetFactory`; DMA intents when hot; real path is aligned Direct I/O → `ds_pinned_*` (no fake NVMe→VRAM DMA).
 - **Micro-batch**: same-tick partner `step` in `poll`; partner `StepResult` parked so both requests stay visible in `PollEvent`s.
-- **Nemotron hybrid**: synthetic + real ROCmFP4 under MoE+NVMe assert stable Fatal (`nemotron_h_moe` / SSM / type 100) until SSM/FP4 land.
+- **Nemotron hybrid**: synthetic F32 `nemotron_h_moe` (SSM stub + attention) generates greedily; real ROCmFP4 (`ggml_type_id=100`) loads packed host bytes but Fatals with a named dequant roadmap until CPU/HIP FP4 lands.
 - **Radix**: node cap 4096 + 64 MiB checkpoint byte budget with LRU cold eviction; stats `radix_evictions` / `radix_bytes`.

@@ -15,12 +15,25 @@ use crate::model::ModelConfig;
 #[derive(Debug, Clone)]
 pub struct RecurrentState {
     pub layers: Vec<Vec<f32>>,
+    /// Per-layer selective-SSM hidden (`d_model * d_state`); empty when unused.
+    pub ssm_h: Vec<Vec<f32>>,
 }
 
 impl RecurrentState {
     pub fn zeros(n_layers: usize, dim: usize) -> Self {
         Self {
             layers: vec![vec![0.0; dim]; n_layers],
+            ssm_h: vec![Vec::new(); n_layers],
+        }
+    }
+
+    pub fn ensure_ssm(&mut self, layer: usize, dim: usize, d_state: usize) {
+        if self.ssm_h.len() <= layer {
+            self.ssm_h.resize(layer + 1, Vec::new());
+        }
+        let need = dim.saturating_mul(d_state);
+        if self.ssm_h[layer].len() != need {
+            self.ssm_h[layer] = vec![0.0; need];
         }
     }
 

@@ -4994,55 +4994,155 @@ mod tests {
         assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
     }
 
+    fn write_tiny_nemotron_hybrid_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        use std::collections::HashMap;
+
+        // Layer 0: SSM stub; layer 1: attention + dense FFN.
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let d_state = 2usize;
+        let w = 0.01f32;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("nemotron_h_moe".into()),
+        );
+        meta.insert(
+            "nemotron_h_moe.vocab_size".into(),
+            GgufValue::Uint32(vocab as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.block_count".into(),
+            GgufValue::Uint32(2),
+        );
+        meta.insert(
+            "nemotron_h_moe.attention.head_count".into(),
+            GgufValue::Uint32(4),
+        );
+        meta.insert(
+            "nemotron_h_moe.attention.head_count_kv".into(),
+            GgufValue::Uint32(1),
+        );
+        meta.insert(
+            "nemotron_h_moe.feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hi".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+        let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            (
+                "token_embd.weight".into(),
+                vec![vocab as u64, dim as u64],
+                vec![w; vocab * dim],
+            ),
+            (
+                "blk.0.attn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.0.ssm_in.weight".into(),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ),
+            ("blk.0.ssm_a".into(), vec![1, d_state as u64], vec![-1.0; d_state]),
+            ("blk.0.ssm_d".into(), vec![1, dim as u64], vec![0.25; dim]),
+            ("blk.0.ssm_dt.bias".into(), vec![d_state as u64], vec![0.0; d_state]),
+            (
+                "blk.1.attn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.1.attn_q.weight".into(),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ),
+            (
+                "blk.1.attn_k.weight".into(),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ),
+            (
+                "blk.1.attn_v.weight".into(),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ),
+            (
+                "blk.1.attn_output.weight".into(),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ),
+            (
+                "blk.1.ffn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.1.ffn_gate.weight".into(),
+                vec![ff as u64, dim as u64],
+                vec![w; ff * dim],
+            ),
+            (
+                "blk.1.ffn_up.weight".into(),
+                vec![ff as u64, dim as u64],
+                vec![w; ff * dim],
+            ),
+            (
+                "blk.1.ffn_down.weight".into(),
+                vec![dim as u64, ff as u64],
+                vec![w; dim * ff],
+            ),
+            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "output.weight".into(),
+                vec![vocab as u64, dim as u64],
+                vec![w; vocab * dim],
+            ),
+        ];
+        let views: Vec<GgufWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
     #[test]
-    fn nemotron_hybrid_fatal_reason_stable_synthetic_and_real() {
-        // Probe path (always): synthetic hybrid SSM GGUF must Fatal with a stable
-        // named reason — no silent skip when the real ROCmFP4 file is absent.
+    fn nemotron_hybrid_synthetic_generates_and_real_fp4_named_refuse() {
+        // Synthetic F32 hybrid (SSM + attention) must generate greedily past Fatal.
         {
-            use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
             let path = std::env::temp_dir().join(format!(
-                "allpaca_nemotron_hybrid_probe-{}-{}.gguf",
+                "allpaca_nemotron_hybrid_green-{}-{}.gguf",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
             ));
-            let mut meta = std::collections::HashMap::new();
-            meta.insert(
-                "general.architecture".into(),
-                GgufValue::String("nemotron_h_moe".into()),
-            );
-            meta.insert(
-                "nemotron_h_moe.block_count".into(),
-                GgufValue::Uint32(1),
-            );
-            meta.insert(
-                "tokenizer.ggml.model".into(),
-                GgufValue::String("wordlevel".into()),
-            );
-            meta.insert(
-                "tokenizer.ggml.tokens".into(),
-                GgufValue::Array(vec![
-                    GgufValue::String("<unk>".into()),
-                    GgufValue::String("<s>".into()),
-                    GgufValue::String("</s>".into()),
-                    GgufValue::String("hi".into()),
-                ]),
-            );
-            meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
-            meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
-            let ssm = vec![0.0f32; 4];
-            write_gguf(
-                &path,
-                &meta,
-                &[GgufWriteTensor {
-                    name: "blk.0.ssm_in.weight".into(),
-                    dims: vec![4, 1],
-                    data: &ssm,
-                }],
-            )
-            .unwrap();
+            write_tiny_nemotron_hybrid_gguf(&path);
             let nvme_path = std::env::temp_dir().join(format!(
                 "allpaca-nemotron-nvme-{}-{}.bin",
                 std::process::id(),
@@ -5058,33 +5158,53 @@ mod tests {
             });
             cfg.model.synthetic = false;
             cfg.model.path = Some(path.clone());
-            // MoE + NVMe cold tier (GEM hybrid serving posture).
+            cfg.speculative.enabled = false;
             cfg.weights.cache_bytes = 1 << 20;
             cfg.weights.host_bytes = 1 << 20;
             cfg.kv.nvme_bytes = 1 << 20;
             cfg.kv.nvme_path = Some(nvme_path.clone());
-            let err = match Engine::new(cfg) {
-                Ok(_) => panic!("synthetic nemotron_h_moe SSM must Fatal"),
-                Err(e) => e,
-            };
-            assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
-            let msg = err.to_string();
+            let engine = Engine::new(cfg).expect("synthetic nemotron_h_moe F32 hybrid must load");
+            let out = engine
+                .generate(
+                    "hi",
+                    GenerationParams {
+                        max_tokens: 4,
+                        temperature: 0.0,
+                        seed: Some(7),
+                        ..GenerationParams::default()
+                    },
+                )
+                .expect("synthetic hybrid generate");
             assert!(
-                msg.contains("nemotron_h_moe") && msg.contains("SSM"),
-                "Fatal reason must stay stable (arch+SSM); got {msg}"
+                !out.token_ids.is_empty(),
+                "must emit tokens; got {out:?}"
+            );
+            let again = engine
+                .generate(
+                    "hi",
+                    GenerationParams {
+                        max_tokens: 4,
+                        temperature: 0.0,
+                        seed: Some(7),
+                        ..GenerationParams::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                out.token_ids, again.token_ids,
+                "greedy hybrid path must be deterministic"
             );
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(&nvme_path);
         }
 
-        // Real GGUF under MoE+NVMe: clear Fatal (SSM + ggml_type 100) — not a green
-        // generate path until SSM/FP4 land. Named skip if the file is absent.
+        // Real ROCmFP4: named refuse (type 100 dequant) or skip if absent.
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
             "../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf",
         );
         if !path.exists() {
             eprintln!(
-                "skip nemotron real GGUF: place ROCmFP4 at {}; synthetic probe already asserted",
+                "skip nemotron real GGUF: place ROCmFP4 at {}; synthetic generate already asserted",
                 path.display()
             );
             return;
@@ -5100,19 +5220,19 @@ mod tests {
         cfg.weights.host_bytes = 64 << 20;
         cfg.kv.nvme_bytes = 64 << 20;
         cfg.kv.nvme_path = Some(std::env::temp_dir().join(format!(
-            "allpaca-nemotron-real-nvme-{}.bin",
+            "allpaca-nemotron-real-nvme-{}",
             std::process::id()
         )));
         let nvme = cfg.kv.nvme_path.clone();
         let err = match Engine::new(cfg) {
-            Ok(_) => panic!("Nemotron hybrid/FP4 must not load for generate"),
+            Ok(_) => panic!("Nemotron ROCmFP4 must not load for generate until dequant lands"),
             Err(e) => e,
         };
         assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
         let msg = err.to_string();
         assert!(
-            msg.contains("nemotron_h_moe") && msg.contains("SSM") && msg.contains("100"),
-            "named Fatal must cite arch, SSM, and ggml_type_id 100; got {msg}"
+            msg.contains("nemotron_h_moe") && msg.contains("100") && msg.contains("ROCmFP4"),
+            "named Fatal must cite arch, ggml_type_id 100, and ROCmFP4; got {msg}"
         );
         if let Some(p) = nvme {
             let _ = std::fs::remove_file(p);
