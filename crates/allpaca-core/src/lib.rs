@@ -3,6 +3,7 @@
 mod anchors;
 mod constraint;
 mod direct_storage;
+mod early_exit;
 mod expert_batch;
 mod grammar;
 mod device_manager;
@@ -26,6 +27,7 @@ mod weight_set;
 
 pub use device_manager::{detect_pipeline_mode, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
+pub use early_exit::{accept_exit, EarlyExitSpec, ExitPrediction};
 pub use engine::{Engine, RequestHandle};
 pub use kv_tier::KvTierManager;
 pub use model::{LayerWeights, ModelConfig, TinyModel};

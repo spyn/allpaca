@@ -22,6 +22,7 @@ use crate::direct_storage::{
     probe_direct_storage, DirectStorageBridge, DirectStorageProbe, DirectStorageQueue,
 };
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
+use crate::early_exit::gate_unsupported;
 use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
@@ -539,7 +540,33 @@ impl Engine {
         inner.model_id = "synthetic".into();
         drop(inner);
         self.upload_resident_weights()?;
+        self.note_early_exit_gate()?;
         tracing::info!(vocab = cfg.vocab_size, layers = cfg.n_layers, "loaded synthetic model");
+        Ok(())
+    }
+
+    /// Record Degraded gate when early_exit is enabled but the model has no manifest.
+    fn note_early_exit_gate(&self) -> Result<(), AllpacaError> {
+        let enabled = self.config.early_exit.enabled;
+        let spec = {
+            let inner = self.lock()?;
+            inner
+                .target
+                .as_ref()
+                .map(|m| m.early_exit.clone())
+                .unwrap_or_default()
+        };
+        if gate_unsupported(enabled, &spec) {
+            self.metrics
+                .early_exit_gated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .degraded_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "early_exit.enabled but model has no supported exit-head manifest; gating"
+            );
+        }
         Ok(())
     }
 
@@ -700,7 +727,8 @@ impl Engine {
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
-        self.upload_resident_weights()
+        self.upload_resident_weights()?;
+        self.note_early_exit_gate()
     }
 
     pub fn load_onnx(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
@@ -728,7 +756,8 @@ impl Engine {
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
-        self.upload_resident_weights()
+        self.upload_resident_weights()?;
+        self.note_early_exit_gate()
     }
 
     pub fn load_gguf(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
@@ -773,7 +802,8 @@ impl Engine {
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
-        self.upload_resident_from_gguf(Some(&file), draft_file.as_ref())
+        self.upload_resident_from_gguf(Some(&file), draft_file.as_ref())?;
+        self.note_early_exit_gate()
     }
 
     fn upload_resident_weights(&self) -> Result<(), AllpacaError> {
@@ -1807,9 +1837,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Safe-point: trim cold radix checkpoints and grow the expert LRU pool from
-    /// the freed budget (OPPORTUNITY §8.2 elastic VRAM). No-op when Requests are
-    /// in flight.
+    /// Safe-point: trim cold radix checkpoints and cold VRAM KV pages, then grow
+    /// the expert LRU pool from the freed budget (OPPORTUNITY §8.2 elastic VRAM).
+    /// No-op when Requests are in flight.
     pub fn rebalance_experts_elastic(&self) -> Result<(), AllpacaError> {
         let (freed, new_cache, new_vram) = {
             let mut inner = self.lock()?;
@@ -1819,7 +1849,7 @@ impl Engine {
             let before = inner.kv_radix.checkpoint_bytes();
             // Soft pressure: trim cold half so expert LRU can expand.
             let target = before / 2;
-            let freed = if before > target {
+            let mut freed = if before > target {
                 inner.kv_radix.trim_to_bytes(target)
             } else {
                 0
@@ -1829,9 +1859,16 @@ impl Engine {
                 .as_ref()
                 .map(|m| m.expert_slot_bytes())
                 .unwrap_or(0);
+            // Attention-trim: spill cold VRAM KV → DRAM for more expert slots.
+            if expert_bytes > 0 {
+                let want = expert_bytes.max(256);
+                freed = freed.saturating_add(
+                    inner.kv.trim_cold_vram_bytes(want, &self.metrics)?,
+                );
+            }
             let base_cache = self.config.weights.cache_bytes;
             let new_cache = base_cache.saturating_add(freed);
-            // Give expert pool headroom by shrinking KV VRAM when we reclaimed radix.
+            // Give expert pool headroom by shrinking KV VRAM when we reclaimed.
             let cur_vram = self.config.kv.vram_bytes;
             let new_vram = if freed > 0 && expert_bytes > 0 {
                 cur_vram.saturating_sub(freed.min(cur_vram / 4))
@@ -1883,6 +1920,17 @@ impl Engine {
         }
     }
 
+    /// Seed orphan VRAM KV pages for elastic attention-trim tests (no active Request).
+    #[cfg(test)]
+    fn test_seed_vram_kv_pages(&self, n: u32) -> Result<(), AllpacaError> {
+        let mut inner = self.lock()?;
+        let page_tokens = self.config.kv.page_tokens;
+        for i in 0..n {
+            let _ = inner.kv.alloc_page(0, i, page_tokens, 1, 4, &self.metrics)?;
+        }
+        Ok(())
+    }
+
     fn note_elastic_pressure_after_decode(&self) -> Result<(), AllpacaError> {
         let mut inner = self.lock()?;
         let Some(model) = inner.target.as_ref() else {
@@ -1901,7 +1949,9 @@ impl Engine {
         let max_bytes = inner.kv_radix.max_bytes();
         let radix_bytes = inner.kv_radix.checkpoint_bytes();
         let radix_hot = max_bytes > 0 && radix_bytes > max_bytes * 3 / 4;
-        if radix_hot && inner.elastic_miss_streak >= 4 {
+        let (vram_pages, _) = inner.kv.counts();
+        let kv_hot = vram_pages >= 2;
+        if (radix_hot || kv_hot) && inner.elastic_miss_streak >= 4 {
             inner.elastic_rebalance_pending = true;
         }
         Ok(())
@@ -2856,6 +2906,36 @@ mod tests {
     }
 
     #[test]
+    fn early_exit_gates_when_model_lacks_manifest() {
+        let mut cfg = test_config();
+        cfg.early_exit.enabled = true;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let stats = engine.stats();
+        assert!(
+            stats.early_exit_gated >= 1,
+            "unsupported synthetic must gate early_exit; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "gate must count as Degraded; stats={stats:?}"
+        );
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 2,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty(), "gate must not block generate");
+        assert_eq!(engine.stats().early_exit_accepts, 0);
+    }
+
+    #[test]
     fn generate_produces_tokens() {
         let engine = test_engine();
         let out = engine
@@ -2918,6 +2998,41 @@ mod tests {
         assert!(
             stats.weight_pinned_layers < 2,
             "tiny budget should not pin both synthetic layers"
+        );
+    }
+
+    #[test]
+    fn dense_ring_double_buffer_hits_on_live_path() {
+        // tiny FFN ≈ 24 KiB/layer; two ring slots fit, neither layer pins.
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.weights.trunk_bytes = 64 * 1024;
+        cfg.weights.ring_slots = 2;
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 6,
+                    temperature: 0.0,
+                    seed: Some(9),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.weight_ring_slots >= 2,
+            "double-buffer plan must grant two ring slots; stats={stats:?}"
+        );
+        assert!(
+            stats.weight_ring_binds > 0,
+            "streamed dense FFN must bind; stats={stats:?}"
+        );
+        assert!(
+            stats.weight_ring_hits > 0,
+            "spare-slot L+1 prefetch must produce ring hits on cyclic walk; stats={stats:?}"
         );
     }
 
@@ -3108,6 +3223,52 @@ mod tests {
             after.expert_slots >= slots_before,
             "expert pool must not shrink; before={slots_before} after={}",
             after.expert_slots
+        );
+    }
+
+    #[test]
+    fn elastic_attention_trim_spills_kv_and_grows_experts() {
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.speculative.enabled = false;
+        cfg.weights.host_bytes = 64;
+        cfg.weights.cache_bytes = 64; // one expert slot initially
+        cfg.kv.vram_bytes = 8 * 1024;
+        cfg.kv.dram_bytes = 64 * 1024;
+        cfg.kv.page_tokens = 4;
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(ModelConfig::tiny_moe()).unwrap();
+        // Request drop releases KV; seed orphan pages so idle rebalance can trim.
+        engine.test_seed_vram_kv_pages(4).unwrap();
+        let before = engine.stats();
+        assert!(
+            before.vram_pages >= 2,
+            "seeded VRAM KV must be visible; stats={before:?}"
+        );
+        let slots_before = before.expert_slots;
+        let dram_before = before.dram_pages;
+
+        engine
+            .rebalance_experts_elastic()
+            .expect("safe-point attention-trim elastic");
+        let after = engine.stats();
+        assert!(
+            after.kv_attention_trims >= 1,
+            "attention-trim must record cold KV spills; stats={after:?}"
+        );
+        assert!(
+            after.dram_pages > dram_before,
+            "trimmed pages must land in DRAM; before={dram_before} after={}",
+            after.dram_pages
+        );
+        assert!(
+            after.expert_slots >= slots_before,
+            "trimmed KV budget must not shrink experts; before={slots_before} after={}",
+            after.expert_slots
+        );
+        assert!(
+            after.vram_rebalances >= 1,
+            "elastic must record; stats={after:?}"
         );
     }
 

@@ -1,5 +1,6 @@
 use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
 use allpaca_hip::{DeviceDecode, DeviceWeights, HipWorkspace};
+use crate::early_exit::EarlyExitSpec;
 use crate::forest::TokenForest;
 use allpaca_gguf::GgufFile;
 use allpaca_onnx::OnnxFile;
@@ -1686,6 +1687,8 @@ pub struct TinyModel {
     pub working_set: Option<Arc<WeightWorkingSet>>,
     pub expert_lru: Option<Arc<ExpertLru>>,
     pub expert_host: Option<Arc<HostExpertPool>>,
+    /// Manifest early-exit capability (unsupported for synthetic / most GGUF).
+    pub early_exit: EarlyExitSpec,
 }
 
 impl TinyModel {
@@ -1745,6 +1748,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            early_exit: EarlyExitSpec::default(),
         }
     }
 
@@ -1838,8 +1842,15 @@ impl TinyModel {
         layer_idx: usize,
         metrics: Option<&Metrics>,
     ) -> Result<DeviceFfn<'a>, AllpacaError> {
+        // Warm the host ring (and spare-slot L+1 prefetch) before H2D — same
+        // policy as CPU `ffn()` → `WeightWorkingSet::bind`.
         let host = match self.working_set.as_ref() {
-            Some(ws) if !ws.is_pinned(layer_idx) => Some(ws.load_layer(layer_idx)?),
+            Some(ws) if !ws.is_pinned(layer_idx) => {
+                {
+                    let _warm = ws.bind(layer_idx)?;
+                }
+                Some(ws.load_layer(layer_idx)?)
+            }
             Some(ws) => ws.host_ffn(layer_idx).cloned(),
             None => None,
         };
@@ -2494,6 +2505,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            early_exit: EarlyExitSpec::default(),
         })
     }
 
@@ -2508,6 +2520,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            early_exit: EarlyExitSpec::default(),
         }
     }
 
@@ -2565,6 +2578,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            early_exit: EarlyExitSpec::default(),
         })
     }
 
@@ -2617,6 +2631,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            early_exit: EarlyExitSpec::default(),
         })
     }
 

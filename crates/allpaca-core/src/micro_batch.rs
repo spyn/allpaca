@@ -129,6 +129,20 @@ pub fn plan_micro_batch(active: &[ActiveLayerHint]) -> MicroBatchPlan {
                 layer,
                 on_gpu: false,
             }
+        })
+        .or_else(|| {
+            gpu.and_then(|g| {
+                active
+                    .iter()
+                    .find(|h| {
+                        matches!(h.phase, StaggerPhase::Decode) && h.request_id != g.request_id
+                    })
+                    .map(|h| StaggerSlot {
+                        request_id: h.request_id,
+                        layer: g.layer.saturating_sub(1),
+                        on_gpu: false,
+                    })
+            })
         });
     MicroBatchPlan { gpu, cpu }
 }
@@ -161,6 +175,28 @@ mod tests {
             plan.gpu.map(|g| g.request_id),
             plan.cpu.map(|c| c.request_id)
         );
+    }
+
+    #[test]
+    fn stagger_pairs_two_decode_requests_without_cpu_expert_pending() {
+        let hints = [
+            ActiveLayerHint {
+                request_id: 1,
+                phase: StaggerPhase::Decode,
+                layer: 2,
+                cpu_expert_pending: false,
+            },
+            ActiveLayerHint {
+                request_id: 2,
+                phase: StaggerPhase::Decode,
+                layer: 1,
+                cpu_expert_pending: false,
+            },
+        ];
+        let plan = plan_micro_batch(&hints);
+        assert_eq!(plan.gpu.map(|g| g.request_id), Some(1));
+        assert_eq!(plan.cpu.map(|c| c.request_id), Some(2));
+        assert_eq!(plan.cpu.map(|c| c.layer), Some(1));
     }
 
     #[test]

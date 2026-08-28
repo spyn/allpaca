@@ -16,6 +16,7 @@ pub struct Config {
     pub kv: KvSection,
     pub weights: WeightsSection,
     pub anchors: AnchorsSection,
+    pub early_exit: EarlyExitSection,
     pub sampling: SamplingSection,
     pub structured_output: StructuredOutputSection,
     pub model: ModelSection,
@@ -38,6 +39,7 @@ impl Config {
             kv: KvSection::default(),
             weights: WeightsSection::default(),
             anchors: AnchorsSection::default(),
+            early_exit: EarlyExitSection::default(),
             sampling: SamplingSection::default(),
             structured_output: StructuredOutputSection::default(),
             model: ModelSection::default(),
@@ -346,6 +348,26 @@ impl Default for AnchorsSection {
         Self {
             slots: 0,
             token_ids: Vec::new(),
+        }
+    }
+}
+
+/// Model-aware early exit (SPECS). Off until a checkpoint declares exit heads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EarlyExitSection {
+    /// Request early-exit policy. Gated when the model lacks a valid manifest.
+    pub enabled: bool,
+    pub min_confidence: f32,
+    pub min_calibration_margin: f32,
+}
+
+impl Default for EarlyExitSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_confidence: 0.9,
+            min_calibration_margin: 0.05,
         }
     }
 }

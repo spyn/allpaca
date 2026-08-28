@@ -962,6 +962,41 @@ impl KvTierManager {
         Ok(())
     }
 
+    /// Spill lowest-priority VRAM KV pages to DRAM until `want_bytes` are freed
+    /// (attention-trim / H2O-style cold shrink for expert VRAM headroom).
+    /// Returns bytes actually migrated. Capacity is left unchanged — this is a
+    /// soft trim of live residency, not a permanent budget cut.
+    pub fn trim_cold_vram_bytes(
+        &mut self,
+        want_bytes: usize,
+        metrics: &Metrics,
+    ) -> Result<usize, AllpacaError> {
+        if want_bytes == 0 {
+            return Ok(0);
+        }
+        let mut freed = 0usize;
+        while freed < want_bytes {
+            let Some(id) = self.lowest_vram_page() else {
+                break;
+            };
+            let page_bytes = self
+                .pages
+                .get(&id)
+                .map(|p| p.location.len.saturating_mul(4))
+                .unwrap_or(0);
+            if page_bytes == 0 {
+                break;
+            }
+            self.migrate_to_dram(id, metrics)?;
+            freed = freed.saturating_add(page_bytes);
+            metrics
+                .kv_attention_trims
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.refresh_metrics(metrics);
+        Ok(freed)
+    }
+
     fn evict_if_needed(&mut self, needed: usize, metrics: &Metrics) -> Result<(), AllpacaError> {
         let hot_cap = ((self.vram_capacity as f32) * self.hot_fraction).max(1.0) as usize;
         while self.vram_live_floats() + needed > hot_cap {
@@ -1135,6 +1170,30 @@ mod tests {
             "elastic shrink must spill KV to DRAM; vram={vram_after} dram={dram_after}"
         );
         assert!(vram_after < vram_before);
+    }
+
+    #[test]
+    fn attention_trim_spills_cold_vram_without_changing_capacity() {
+        let metrics = Metrics::default();
+        let mut kv = KvTierManager::new(4096, 16 * 1024, 1.0);
+        for i in 0..4 {
+            kv.alloc_page(0, i, 4, 1, 4, &metrics).unwrap();
+        }
+        let (vram_before, _) = kv.counts();
+        assert!(vram_before >= 4);
+        let cap_before = kv.vram_capacity;
+        let freed = kv.trim_cold_vram_bytes(128, &metrics).unwrap();
+        assert!(freed >= 128, "must free at least one page; freed={freed}");
+        let (vram_after, dram_after) = kv.counts();
+        assert!(dram_after > 0, "trim must spill to DRAM");
+        assert!(vram_after < vram_before);
+        assert_eq!(kv.vram_capacity, cap_before, "soft trim leaves capacity");
+        assert!(
+            metrics
+                .kv_attention_trims
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
     }
 
     #[test]

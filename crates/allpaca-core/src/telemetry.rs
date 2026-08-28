@@ -90,6 +90,12 @@ pub struct Metrics {
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
     pub vram_rebalances: AtomicU64,
+    /// Soft attention-trim spills of cold VRAM KV pages to DRAM.
+    pub kv_attention_trims: AtomicU64,
+    /// Config requested early exit but the loaded model has no supported manifest.
+    pub early_exit_gated: AtomicU64,
+    /// Accepted early exits (reserved; exit heads not wired yet).
+    pub early_exit_accepts: AtomicU64,
     pub kv_nvme_pages: AtomicU64,
     pub kv_nvme_reads: AtomicU64,
     pub kv_nvme_bytes: AtomicU64,
@@ -234,6 +240,9 @@ impl Metrics {
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
             vram_rebalances: self.vram_rebalances.load(Ordering::Relaxed),
+            kv_attention_trims: self.kv_attention_trims.load(Ordering::Relaxed),
+            early_exit_gated: self.early_exit_gated.load(Ordering::Relaxed),
+            early_exit_accepts: self.early_exit_accepts.load(Ordering::Relaxed),
             kv_nvme_pages: self.kv_nvme_pages.load(Ordering::Relaxed),
             kv_nvme_reads: self.kv_nvme_reads.load(Ordering::Relaxed),
             kv_nvme_bytes: self.kv_nvme_bytes.load(Ordering::Relaxed),

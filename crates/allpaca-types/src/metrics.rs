@@ -198,6 +198,15 @@ pub struct StatsSnapshot {
     /// Elastic KV→expert VRAM rebalances at scheduler safe points.
     #[serde(default)]
     pub vram_rebalances: u64,
+    /// Soft attention-trim: cold VRAM KV pages spilled to DRAM for expert headroom.
+    #[serde(default)]
+    pub kv_attention_trims: u64,
+    /// Early-exit enabled in config but model lacks a supported manifest (gated).
+    #[serde(default)]
+    pub early_exit_gated: u64,
+    /// Accepted early exits (0 until exit heads are wired).
+    #[serde(default)]
+    pub early_exit_accepts: u64,
     /// KV pages currently resident on the NVMe cold tier.
     #[serde(default)]
     pub kv_nvme_pages: u64,

@@ -375,7 +375,7 @@ impl HostExpertPool {
         self.n_slots
     }
 
-    /// Preferred NUMA node for this expert (spike: assignment only, no pin yet).
+    /// Preferred NUMA node for this expert (placement + first-touch on `get`).
     pub fn preferred_numa_node(&self, id: ExpertId) -> usize {
         self.numa.preferred_node(id)
     }

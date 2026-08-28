@@ -1,6 +1,7 @@
 # Rust
 /target
 /target-overnight/
+/target-*/
 test-out*.txt
 **/*.rs.bk
 
