@@ -19,6 +19,7 @@ mod model;
 mod numa;
 mod sampling;
 mod scheduler;
+mod ssm;
 mod telemetry;
 mod packed;
 mod tokenizer;
