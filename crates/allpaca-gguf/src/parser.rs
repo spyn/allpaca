@@ -368,8 +368,10 @@ impl GgufFile {
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let ssm = self.tensor(&format!("blk.{i}.ssm_in.weight")).is_some()
-                || self.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some();
-            let attn = self.tensor(&format!("blk.{i}.attn_q.weight")).is_some();
+                || self.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some()
+                || self.tensor(&format!("blk.{i}.ssm_out.weight")).is_some();
+            let attn = self.tensor(&format!("blk.{i}.attn_q.weight")).is_some()
+                || self.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some();
             let moe = self.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some()
                 || self.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some()
                 || self.tensor(&format!("blk.{i}.ffn_gate.0.weight")).is_some();
@@ -425,7 +427,15 @@ impl GgufFile {
         }
         let llama_family = matches!(
             architecture.as_str(),
-            "llama" | "mistral" | "mixtral" | "qwen2" | "qwen2moe" | "phi3" | "minicpm"
+            "llama"
+                | "mistral"
+                | "mixtral"
+                | "qwen2"
+                | "qwen2moe"
+                | "qwen35"
+                | "phi3"
+                | "minicpm"
+                | "nemotron_h_moe"
         );
         if !llama_family && ssm_layers == 0 && attention_layers == 0 && n_layers > 0 {
             reasons.push(format!(

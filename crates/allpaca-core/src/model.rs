@@ -2,7 +2,7 @@ use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu
 use allpaca_hip::{DeviceDecode, DeviceWeights, HipWorkspace};
 use crate::early_exit::EarlyExitSpec;
 use crate::forest::TokenForest;
-use allpaca_gguf::{GgufFile, HybridLayerInfo, HybridLayerKind};
+use allpaca_gguf::{GgufCompatReport, GgufFile, HybridLayerInfo, HybridLayerKind};
 use crate::ssm::{selective_step, SsmLayerWeights};
 use allpaca_onnx::OnnxFile;
 use allpaca_safetensors::{HfConfig, SafetensorsFile};
@@ -1454,20 +1454,21 @@ fn load_gguf_ssm_layer(file: &GgufFile, layer: usize, dim: usize) -> Result<SsmL
     } else {
         0.0
     };
-    let b = vec![0.5f32; d_state];
-    let c = {
-        let mut c = vec![0.0f32; d_state];
-        if !c.is_empty() {
-            c[0] = 1.0;
-        }
-        c
+    // Prefer GGUF B/C (or Qwen35 ssm_alpha / ssm_beta row means) over hardcoded stubs.
+    let b = load_ssm_bc_vector(file, layer, d_state, true)?;
+    let c = load_ssm_bc_vector(file, layer, d_state, false)?;
+    let conv1d = if file.tensor(&format!("blk.{layer}.ssm_conv1d.weight")).is_some() {
+        Some(file.tensor_f32(&format!("blk.{layer}.ssm_conv1d.weight"))?)
+    } else {
+        None
     };
-    // Touch ssm_in so load fails loudly if type-100 slips past compat.
     if file.tensor(&format!("blk.{layer}.ssm_in.weight")).is_some() {
         let _ = file.tensor_bytes(&format!("blk.{layer}.ssm_in.weight"))?;
-    } else if file.tensor(&format!("blk.{layer}.ssm_conv1d.weight")).is_none() {
+    } else if file.tensor(&format!("blk.{layer}.ssm_conv1d.weight")).is_none()
+        && file.tensor(&format!("blk.{layer}.ssm_out.weight")).is_none()
+    {
         return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-            "SSM layer {layer} missing ssm_in/ssm_conv1d"
+            "SSM layer {layer} missing ssm_in/ssm_conv1d/ssm_out"
         ))));
     }
     Ok(SsmLayerWeights {
@@ -1477,7 +1478,105 @@ fn load_gguf_ssm_layer(file: &GgufFile, layer: usize, dim: usize) -> Result<SsmL
         c,
         d_skip,
         dt_bias,
+        conv1d,
     })
+}
+
+/// Load `ssm_b` / `ssm_c`, or reduce `ssm_alpha` / `ssm_beta` weight rows to a
+/// length-`d_state` vector (mean across the model dim). Falls back to stub values.
+fn load_ssm_bc_vector(
+    file: &GgufFile,
+    layer: usize,
+    d_state: usize,
+    is_b: bool,
+) -> Result<Vec<f32>, AllpacaError> {
+    let (legacy, qwen) = if is_b {
+        (
+            format!("blk.{layer}.ssm_b"),
+            format!("blk.{layer}.ssm_alpha.weight"),
+        )
+    } else {
+        (
+            format!("blk.{layer}.ssm_c"),
+            format!("blk.{layer}.ssm_beta.weight"),
+        )
+    };
+    if file.tensor(&legacy).is_some() {
+        let mut v = file.tensor_f32(&legacy)?;
+        if v.len() < d_state {
+            v.resize(d_state, v.last().copied().unwrap_or(0.5));
+        } else {
+            v.truncate(d_state);
+        }
+        return Ok(v);
+    }
+    if file.tensor(&qwen).is_some() {
+        let info = file.tensor(&qwen).unwrap();
+        let w = file.tensor_f32(&qwen)?;
+        if info.dims.len() >= 2 {
+            let ne0 = info.dims[0] as usize;
+            let ne1 = info.dims[1] as usize;
+            if ne1 == d_state && w.len() == ne0.saturating_mul(ne1) {
+                // GGUF innermost-first: column j is w[i + j*ne0].
+                let mut out = vec![0.0f32; d_state];
+                for j in 0..d_state {
+                    let mut acc = 0.0f32;
+                    for i in 0..ne0 {
+                        acc += w[i + j * ne0];
+                    }
+                    out[j] = acc / ne0.max(1) as f32;
+                }
+                return Ok(out);
+            }
+            if ne0 == d_state && w.len() == ne0.saturating_mul(ne1) {
+                let mut out = vec![0.0f32; d_state];
+                for j in 0..d_state {
+                    let mut acc = 0.0f32;
+                    for i in 0..ne1 {
+                        acc += w[j + i * ne0];
+                    }
+                    out[j] = acc / ne1.max(1) as f32;
+                }
+                return Ok(out);
+            }
+        }
+        if w.len() >= d_state && w.len() % d_state == 0 {
+            let rows = w.len() / d_state;
+            let mut out = vec![0.0f32; d_state];
+            for j in 0..d_state {
+                let mut acc = 0.0f32;
+                for r in 0..rows {
+                    acc += w[r * d_state + j];
+                }
+                out[j] = acc / rows as f32;
+            }
+            return Ok(out);
+        }
+    }
+    if is_b {
+        Ok(vec![0.5f32; d_state])
+    } else {
+        let mut c = vec![0.0f32; d_state];
+        if !c.is_empty() {
+            c[0] = 1.0;
+        }
+        Ok(c)
+    }
+}
+
+fn gguf_ffn_norm(file: &GgufFile, layer: usize) -> Result<Vec<f32>, AllpacaError> {
+    if file.tensor(&format!("blk.{layer}.ffn_norm.weight")).is_some() {
+        file.tensor_f32(&format!("blk.{layer}.ffn_norm.weight"))
+    } else if file
+        .tensor(&format!("blk.{layer}.post_attention_norm.weight"))
+        .is_some()
+    {
+        file.tensor_f32(&format!("blk.{layer}.post_attention_norm.weight"))
+    } else {
+        Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "missing ffn_norm/post_attention_norm on blk.{layer}"
+        ))))
+    }
 }
 
 fn estimated_gguf_f32_bytes(file: &GgufFile, cfg: &ModelConfig) -> u64 {
@@ -2608,10 +2707,15 @@ impl TinyModel {
                 HybridLayerKind::Ssm => {
                     if file.tensor(&format!("blk.{i}.ssm_in.weight")).is_none()
                         && file.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_none()
+                        && file.tensor(&format!("blk.{i}.ssm_out.weight")).is_none()
                     {
                         return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
                             "missing SSM tensors on blk.{i}"
                         ))));
+                    }
+                    if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
+                        require_gguf_tensor(file, &format!("blk.{i}.ffn_up.weight"))?;
+                        require_gguf_tensor(file, &format!("blk.{i}.ffn_down.weight"))?;
                     }
                 }
                 HybridLayerKind::Attention => {
@@ -2621,16 +2725,32 @@ impl TinyModel {
                         "attn_k.weight",
                         "attn_v.weight",
                         "attn_output.weight",
-                        "ffn_norm.weight",
                         "ffn_gate.weight",
                         "ffn_up.weight",
                         "ffn_down.weight",
                     ] {
                         require_gguf_tensor(file, &format!("blk.{i}.{suffix}"))?;
                     }
+                    if file.tensor(&format!("blk.{i}.ffn_norm.weight")).is_none()
+                        && file
+                            .tensor(&format!("blk.{i}.post_attention_norm.weight"))
+                            .is_none()
+                    {
+                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "missing ffn_norm/post_attention_norm on blk.{i}"
+                        ))));
+                    }
                 }
                 HybridLayerKind::DenseFfn | HybridLayerKind::Moe => {
-                    require_gguf_tensor(file, &format!("blk.{i}.ffn_norm.weight"))?;
+                    if file.tensor(&format!("blk.{i}.ffn_norm.weight")).is_none()
+                        && file
+                            .tensor(&format!("blk.{i}.post_attention_norm.weight"))
+                            .is_none()
+                    {
+                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "missing ffn_norm/post_attention_norm on blk.{i}"
+                        ))));
+                    }
                     if info.moe || cfg.n_experts > 0 {
                         if file.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some() {
                             require_gguf_tensor(file, &format!("blk.{i}.ffn_gate_inp.weight"))?;
@@ -2663,7 +2783,7 @@ impl TinyModel {
         }
         let host_bytes = estimated_gguf_f32_bytes(file, &cfg);
         if host_bytes > HOST_F32_LIMIT {
-            return Ok(Self::skeleton(cfg, name));
+            return Ok(Self::skeleton_hybrid(cfg, name, &report));
         }
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -2684,6 +2804,17 @@ impl TinyModel {
                     } else {
                         ones(cfg.dim)
                     };
+                    let (w_gate, w_up, w_down, ffn_norm) =
+                        if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
+                            (
+                                file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
+                                file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
+                                file.tensor_f32(&format!("blk.{i}.ffn_down.weight"))?,
+                                gguf_ffn_norm(file, i).unwrap_or_else(|_| ones(cfg.dim)),
+                            )
+                        } else {
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                        };
                     LayerWeights {
                         block: HybridLayerKind::Ssm,
                         ssm: Some(load_gguf_ssm_layer(file, i, cfg.dim)?),
@@ -2692,10 +2823,10 @@ impl TinyModel {
                         wk: Vec::new(),
                         wv: Vec::new(),
                         wo: Vec::new(),
-                        ffn_norm: Vec::new(),
-                        w_gate: Vec::new(),
-                        w_up: Vec::new(),
-                        w_down: Vec::new(),
+                        ffn_norm,
+                        w_gate,
+                        w_up,
+                        w_down,
                         w_router: Vec::new(),
                         experts: Vec::new(),
                     }
@@ -2723,7 +2854,7 @@ impl TinyModel {
                         wk: Vec::new(),
                         wv: Vec::new(),
                         wo: Vec::new(),
-                        ffn_norm: file.tensor_f32(&format!("blk.{i}.ffn_norm.weight"))?,
+                        ffn_norm: gguf_ffn_norm(file, i)?,
                         w_gate,
                         w_up,
                         w_down,
@@ -2752,7 +2883,7 @@ impl TinyModel {
                         wk: file.tensor_f32(&format!("blk.{i}.attn_k.weight"))?,
                         wv: file.tensor_f32(&format!("blk.{i}.attn_v.weight"))?,
                         wo: file.tensor_f32(&format!("blk.{i}.attn_output.weight"))?,
-                        ffn_norm: file.tensor_f32(&format!("blk.{i}.ffn_norm.weight"))?,
+                        ffn_norm: gguf_ffn_norm(file, i)?,
                         w_gate,
                         w_up,
                         w_down,
@@ -2782,10 +2913,50 @@ impl TinyModel {
         })
     }
 
+    #[allow(dead_code)]
     fn skeleton(cfg: ModelConfig, name: impl Into<String>) -> Self {
+        Self::skeleton_hybrid(cfg, name, &GgufCompatReport {
+            architecture: String::new(),
+            n_layers: 0,
+            ssm_layers: 0,
+            attention_layers: 0,
+            moe_layers: 0,
+            layers: Vec::new(),
+            ggml_type_ids: Vec::new(),
+            reject_reason: None,
+        })
+    }
+
+    fn skeleton_hybrid(
+        cfg: ModelConfig,
+        name: impl Into<String>,
+        report: &allpaca_gguf::GgufCompatReport,
+    ) -> Self {
+        let layers = (0..cfg.n_layers)
+            .map(|i| {
+                let info = report.layers.get(i);
+                let block = info
+                    .map(|l| l.block)
+                    .unwrap_or(HybridLayerKind::Attention);
+                let mut layer = empty_layer();
+                layer.block = block;
+                if block == HybridLayerKind::Ssm {
+                    layer.ssm = Some(SsmLayerWeights {
+                        d_state: 2,
+                        a: vec![-1.0, -1.5],
+                        b: vec![0.5, 0.5],
+                        c: vec![1.0, 0.0],
+                        d_skip: vec![1.0; cfg.dim],
+                        dt_bias: 0.0,
+                        conv1d: None,
+                    });
+                }
+                layer
+            })
+            .collect();
         Self {
             embed: Vec::new(),
-            layers: (0..cfg.n_layers).map(|_| empty_layer()).collect(),
+            layers,
             norm: Vec::new(),
             lm_head: Vec::new(),
             name: name.into(),
@@ -3038,6 +3209,19 @@ impl TinyModel {
                     );
                     for i in 0..dim {
                         x[i] += hidden[i];
+                    }
+                    if !layer.w_gate.is_empty() || !layer.experts.is_empty() {
+                        self.apply_ffn(
+                            layer_idx,
+                            layer,
+                            &mut x,
+                            &mut scratch,
+                            &mut hidden,
+                            hip,
+                            resident,
+                            Some(metrics),
+                            prefill,
+                        )?;
                     }
                 } else {
                     // DenseFfn / MoE-only block: FFN residual, no attention.

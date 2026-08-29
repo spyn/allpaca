@@ -2129,6 +2129,17 @@ fn gated_7b_gguf() -> Option<std::path::PathBuf> {
             }
         }
     }
+    // Prefer local repo models for metal soaks before hardcoded external paths.
+    let local = local_models_dir();
+    for name in [
+        "Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "Llama-3.2-1B-Instruct-Q8_0.gguf",
+    ] {
+        let p = local.join(name);
+        if p.is_file() && looks_like_gguf(&p) {
+            return Some(p);
+        }
+    }
     const DISCOVERED: &[&str] = &[
         r"E:\Models\huggingface\models--bartowski--Llama-3-Groq-8B-Tool-Use-GGUF\snapshots\2d49903869805faad16daab2450fcda3487685b8\Llama-3-Groq-8B-Tool-Use-Q8_0.gguf",
     ];
@@ -2136,6 +2147,31 @@ fn gated_7b_gguf() -> Option<std::path::PathBuf> {
         .iter()
         .map(std::path::PathBuf::from)
         .find(|p| p.is_file())
+}
+
+/// Gated ROCmFP4 GGUF (Qwen35 / Nemotron). Env overrides discovery under `models/`.
+#[cfg(feature = "hip")]
+fn gated_rocmfp4_gguf() -> Option<std::path::PathBuf> {
+    for key in ["ALLPACA_ROCMFP4_GGUF", "ALLPACA_QWEN_GGUF"] {
+        if let Ok(raw) = std::env::var(key) {
+            let path = std::path::PathBuf::from(raw);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    let dir = local_models_dir();
+    let qwen = dir
+        .join("Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF")
+        .join("Qwen3.8-27B-Q4_0_ROCMFP4_COHERENT.gguf");
+    if qwen.is_file() {
+        return Some(qwen);
+    }
+    let nemo = dir.join("NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf");
+    if nemo.is_file() {
+        return Some(nemo);
+    }
+    None
 }
 
 /// Gated Q4_K GGUF. Uses `ALLPACA_Q4K_GGUF`, or `ALLPACA_7B_GGUF` only when that
@@ -3208,12 +3244,12 @@ fn hip_generate_real_7b_gguf_when_path_set() {
         + stats.host_us;
     assert!(
         stats.q8_gemm_us > 0.0,
-        "Q8_0 7B/8B decode must time Q8 GEMV; q8_gemm_us={}",
+        "Q8_0 decode must time Q8 GEMV; q8_gemm_us={}",
         stats.q8_gemm_us
     );
     assert!(
         stats.attention_us > 0.0 && stats.lm_head_us > 0.0,
-        "7B/8B decode must time attention and lm_head; stats={stats:?}"
+        "decode must time attention and lm_head; stats={stats:?}"
     );
     assert!(
         stats.other_gpu_us > 0.0 && stats.other_gpu_us < PROFILE_BLAS_OTHER_GPU_US * 0.85,
@@ -3552,6 +3588,69 @@ fn hip_generate_real_mixed_kquant_gguf_when_path_set() {
         path.display(),
         out.token_ids.len(),
         stats.backend,
+        out.text
+    );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rocmfp4_qwen_probe_and_optional_generate() {
+    let _guard = large_gguf_lock();
+    let Some(path) = gated_rocmfp4_gguf() else {
+        eprintln!("skip hip_rocmfp4_qwen_probe: place Qwen/Nemotron ROCmFP4 under models/");
+        return;
+    };
+    let file = allpaca_gguf::GgufFile::open(&path).expect("mmap ROCmFP4 GGUF");
+    let report = file.compat_report();
+    assert!(
+        report.ggml_type_ids.contains(&100),
+        "expected type 100; ids={:?}",
+        report.ggml_type_ids
+    );
+    assert!(
+        report.reject_reason.is_none(),
+        "ROCmFP4 must not gate loader; got {:?}",
+        report.reject_reason
+    );
+    eprintln!(
+        "ROCmFP4 probe: path={} arch={} layers={} ssm={} attn={} types={:?}",
+        path.display(),
+        report.architecture,
+        report.n_layers,
+        report.ssm_layers,
+        report.attention_layers,
+        report.ggml_type_ids
+    );
+    // Full 27B/30B generate is opt-in (VRAM + load time).
+    if std::env::var("ALLPACA_QWEN").ok().as_deref() != Some("1")
+        && std::env::var("ALLPACA_NEMOTRON").ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "skip ROCmFP4 HIP generate: set ALLPACA_QWEN=1 or ALLPACA_NEMOTRON=1 for {}",
+            path.display()
+        );
+        return;
+    }
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip ROCmFP4 HIP generate: no HIP device");
+        return;
+    }
+    let engine = Engine::new(hip_7b_config(path.clone())).expect("ROCmFP4 Engine::new");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip ROCmFP4 HIP generate: engine has no HIP device");
+        return;
+    }
+    let out = generate_or_timeout(&engine, "hello", 4, overnight_timeout(4, 120));
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    eprintln!(
+        "ROCmFP4 HIP generate: path={} tokens={} backend={} q8_us={} attn_us={} other_us={} text={:?}",
+        path.display(),
+        out.token_ids.len(),
+        stats.backend,
+        stats.q8_gemm_us,
+        stats.attention_us,
+        stats.other_gpu_us,
         out.text
     );
 }

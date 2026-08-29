@@ -3083,7 +3083,13 @@ impl HipWorkspace {
         n: i32,
         k: i32,
     ) -> Result<(), AllpacaError> {
-        self.timed_gpu(DecodeOp::Q8Gemm, || gemm_nt_q8_0_device(a, b, c, m, n, k))
+        // Vocab GEMV under lm_head_scope must land in lm_head_us, not q8_gemm_us.
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::Q8Gemm
+        };
+        self.timed_gpu(op, || gemm_nt_q8_0_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q4_k_dev(
@@ -3095,7 +3101,12 @@ impl HipWorkspace {
         n: i32,
         k: i32,
     ) -> Result<(), AllpacaError> {
-        self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q4_k_device(a, b, c, m, n, k))
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::OtherGpu
+        };
+        self.timed_gpu(op, || gemm_nt_q4_k_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_rocmfp4_dev(
@@ -3107,9 +3118,13 @@ impl HipWorkspace {
         n: i32,
         k: i32,
     ) -> Result<(), AllpacaError> {
-        self.timed_gpu(DecodeOp::OtherGpu, || {
-            gemm_nt_rocmfp4_device(a, b, c, m, n, k)
-        })
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            // Treat packed ROCmFP4 body GEMVs like Q8 for §12 decode accounting.
+            DecodeOp::Q8Gemm
+        };
+        self.timed_gpu(op, || gemm_nt_rocmfp4_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q6_k_dev(

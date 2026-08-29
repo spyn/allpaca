@@ -8,6 +8,8 @@ pub struct SsmLayerWeights {
     pub c: Vec<f32>,
     pub d_skip: Vec<f32>,
     pub dt_bias: f32,
+    /// Optional depthwise conv1d weights (`ssm_conv1d.weight`), host F32.
+    pub conv1d: Option<Vec<f32>>,
 }
 
 /// Softplus: ln(1 + e^x), stable for moderate x.

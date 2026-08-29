@@ -6,7 +6,7 @@ test-out*.txt
 **/*.rs.bk
 
 # Local GGUF weights (not in git)
-/models/*.gguf
+models/**/*.gguf
 /models/.cache/
 
 # Cursor / graphify local artifacts

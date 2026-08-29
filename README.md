@@ -126,6 +126,8 @@ Gated HIP soaks (when weights are present locally):
 | `ALLPACA_DRAFT_GGUF` | Speculative draft GGUF |
 | `ALLPACA_Q4K_GGUF` / `ALLPACA_Q4KM_GGUF` | Q4_K / mixed Q4_K_M |
 | `ALLPACA_NEMOTRON=1` | Opt-in 30B ROCmFP4 Nemotron generate |
+| `ALLPACA_QWEN=1` | Opt-in Qwen35 ROCmFP4 generate (`models/Qwen3.8-27B-…`) |
+| `ALLPACA_ROCMFP4_GGUF` / `ALLPACA_QWEN_GGUF` | Explicit ROCmFP4 GGUF path (probe always discovers under `models/`) |
 | `ALLPACA_DEMO=1` | Asymmetric draft vs greedy tok/s |
 | `ALLPACA_OVERNIGHT=1` | Long draft soak |
 

@@ -520,4 +520,44 @@ mod tests {
         assert_eq!(q.enqueued(), 0, "no DMA intent without probe");
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn fill_to_device_records_gpu_dma_via_h2d_callback() {
+        let path = PathBuf::from(format!(
+            "{}\\allpaca-ds-fill-{}-{}.bin",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let payload = vec![0xCDu8; DIRECT_ALIGN];
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&payload).unwrap();
+            f.sync_all().unwrap();
+        }
+        let q = DirectStorageQueue::new();
+        let probe = DirectStorageProbe {
+            available: true,
+            backend: DirectStorageBackend::WindowsDirectStorage,
+            detail: "test".into(),
+            factory_resolved: true,
+            factory_bound: true,
+        };
+        let mut dest = vec![0u8; DIRECT_ALIGN];
+        let ok = q
+            .fill_to_device(&probe, &path, 0, DIRECT_ALIGN, |src| {
+                dest.copy_from_slice(src);
+                Ok(())
+            })
+            .unwrap();
+        assert!(ok);
+        assert_eq!(dest, payload);
+        assert!(q.gpu_dma() >= 1, "gpu_dma={}", q.gpu_dma());
+        assert!(q.gpu_dma_bytes() >= DIRECT_ALIGN as u64);
+        assert!(q.enqueued() >= 1);
+        let _ = std::fs::remove_file(&path);
+    }
 }
