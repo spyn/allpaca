@@ -234,6 +234,55 @@ fn hip_load_residents_weights_on_device() {
     );
 }
 
+/// `/stats` must carry driver-measured board VRAM and a GPU busy fraction
+/// (BENCHMARK_SPEC `gpu.vram` / `gpu.util`), and the sampler must stay off the
+/// decode path: generating tokens must not add one sample per token.
+#[cfg(feature = "hip")]
+#[test]
+fn stats_carry_driver_vram_and_gpu_util_sampled_off_decode() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        return;
+    }
+    let s = engine.stats();
+    assert!(
+        s.gpu_samples >= 1,
+        "stats must trigger a sample on the HIP path; stats={s:?}"
+    );
+    assert!(
+        s.gpu_vram_total_bytes > 0,
+        "driver must report total VRAM; stats={s:?}"
+    );
+    assert!(
+        s.gpu_vram_used_bytes >= s.device_memory_bytes,
+        "board usage must cover what this process allocated; used={} owned={}",
+        s.gpu_vram_used_bytes,
+        s.device_memory_bytes
+    );
+    assert!(
+        s.gpu_vram_used_bytes <= s.gpu_vram_total_bytes,
+        "used must not exceed total; stats={s:?}"
+    );
+    assert!(
+        (0.0..=1.0).contains(&s.gpu_util),
+        "gpu_util must be a fraction; got {}",
+        s.gpu_util
+    );
+
+    // 10 Hz rate limit: a burst of decode plus /stats calls must not sample
+    // per token. Anything near `tokens` here means the driver call leaked into
+    // the hot path.
+    let before = engine.stats().gpu_samples;
+    let tokens = 16;
+    let out = engine.generate("hello", greedy(tokens)).unwrap();
+    assert!(!out.token_ids.is_empty());
+    let after = engine.stats().gpu_samples;
+    assert!(
+        after - before <= 4,
+        "sampler must stay rate-limited across {tokens} tokens; grew {before} -> {after}"
+    );
+}
+
 #[cfg(feature = "hip")]
 #[test]
 fn decode_does_not_h2d_weights() {

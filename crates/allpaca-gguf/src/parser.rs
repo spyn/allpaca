@@ -407,6 +407,7 @@ impl GgufFile {
             GgmlType::Q4_K as u32,
             GgmlType::Q5_K as u32,
             GgmlType::Q6_K as u32,
+            GgmlType::RocmFp4 as u32,
         ];
         let unsupported_types: Vec<u32> = ggml_type_ids
             .iter()
@@ -416,21 +417,10 @@ impl GgufFile {
 
         let mut reasons = Vec::new();
         // SSM layers are runnable via the CPU selective-SSM stub when weights are
-        // F32/F16/Q* (type 100 ROCmFP4 still blocks below).
-        if unsupported_types.contains(&100) {
-            reasons.push(
-                "ROCmFP4 (ggml_type_id=100): host packed buffer OK; F32 dequant / HIP GEMV not implemented (roadmap: CPU dequant → fused GEMV)"
-                    .into(),
-            );
-        }
-        let other_unsupported: Vec<u32> = unsupported_types
-            .iter()
-            .copied()
-            .filter(|id| *id != 100)
-            .collect();
-        if !other_unsupported.is_empty() {
+        // F32/F16/Q*/ROCmFP4.
+        if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={other_unsupported:?} (need F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K/ROCmFP4)"
             ));
         }
         let llama_family = matches!(
@@ -569,9 +559,19 @@ impl GgufFile {
                 allpaca_cpu::dequant_q6_k(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
-            GgmlType::RocmFp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "tensor {name} is ROCmFP4 (ggml_type_id=100): packed host bytes via tensor_bytes; F32 dequant not implemented"
-            )))),
+            GgmlType::RocmFp4 => {
+                let nbytes = n
+                    .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
+                    .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES);
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} ROCmFP4 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_rocmfp4(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
                 "tensor {name} is {other:?} (unsupported GGUF quant)"
             )))),
@@ -1061,12 +1061,12 @@ mod tests {
     }
 
     #[test]
-    fn rocmfp4_type_100_loads_host_bytes_and_refuses_f32_dequant() {
+    fn rocmfp4_type_100_loads_host_bytes_and_dequants_to_f32() {
         let path = std::env::temp_dir().join("allpaca_gguf_rocmfp4.gguf");
         // One ROCmFP4 block: 32 elems → 18 bytes.
-        let mut payload = vec![0u8; allpaca_cpu::ROCMFP4_BLOCK_BYTES];
-        payload[0] = 0xA5;
-        payload[17] = 0x5A;
+        let values: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.25).collect();
+        let payload = allpaca_cpu::quantize_rocmfp4(&values);
+        assert_eq!(payload.len(), allpaca_cpu::ROCMFP4_BLOCK_BYTES);
         write_typed_gguf(&path, 100, &payload, 32);
         let file = GgufFile::open(&path).unwrap();
         let info = file.tensor("quant.weight").expect("header lists tensor");
@@ -1075,14 +1075,14 @@ mod tests {
         assert_eq!(info.nbytes(), allpaca_cpu::ROCMFP4_BLOCK_BYTES);
         let host = file.tensor_rocmfp4_host("quant.weight").unwrap();
         assert_eq!(host, payload);
-        let err = file.tensor_f32("quant.weight").unwrap_err();
-        assert!(err.is_fatal(), "ROCmFP4 F32 path must be Fatal, got {err:?}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("ROCmFP4") && msg.contains("100") && msg.contains("dequant"),
-            "named refuse must cite ROCmFP4/100/dequant; got {msg}"
-        );
-        let _ = std::fs::remove_file(path);
+        let loaded = file.tensor_f32("quant.weight").unwrap();
+        assert_eq!(loaded.len(), 32);
+        for (i, (&want, &got)) in values.iter().zip(loaded.iter()).enumerate() {
+            assert!(
+                (want - got).abs() <= 0.8,
+                "ROCmFP4 dequant lane {i}: want {want} got {got}"
+            );
+        }
     }
 
     #[test]
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn nemotron_rocmfp4_gguf_probe_fatals_with_named_reason() {
+    fn nemotron_rocmfp4_gguf_probe_dequants_type_100() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf");
         if !path.exists() {
@@ -1162,15 +1162,43 @@ mod tests {
             "ROCmFP4 uses ggml_type_id=100; ids={:?}",
             report.ggml_type_ids
         );
-        let reason = report
-            .reject_reason
-            .expect("Nemotron ROCmFP4 must reject by name");
         assert!(
-            reason.contains("nemotron_h_moe")
-                && reason.contains("100")
-                && reason.contains("ROCmFP4"),
-            "Fatal reason must name arch, type 100, and ROCmFP4; got {reason}"
+            report.reject_reason.is_none(),
+            "ROCmFP4 must no longer reject; got {:?}",
+            report.reject_reason
         );
+
+        // Smallest type-100 tensor must dequant to finite, non-degenerate weights.
+        let smallest = file
+            .tensors
+            .iter()
+            .filter(|t| t.ggml_type_id == 100)
+            .min_by_key(|t| t.n_elements())
+            .expect("Nemotron carries ROCmFP4 tensors")
+            .clone();
+        let values = file
+            .tensor_f32(&smallest.name)
+            .expect("ROCmFP4 tensor must dequant");
+        assert_eq!(values.len(), smallest.n_elements() as usize);
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "ROCmFP4 dequant produced non-finite values in {}",
+            smallest.name
+        );
+        let max_abs = values.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(
+            max_abs > 0.0 && max_abs < 100.0,
+            "ROCmFP4 {} max|w|={max_abs} is outside a plausible weight range",
+            smallest.name
+        );
+        let nonzero = values.iter().filter(|v| **v != 0.0).count();
+        assert!(
+            nonzero * 4 > values.len(),
+            "ROCmFP4 {} decoded mostly zeros ({nonzero}/{}), layout is likely wrong",
+            smallest.name,
+            values.len()
+        );
+
         assert_eq!(report.layers.len(), 52);
         assert!(
             report

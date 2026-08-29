@@ -34,6 +34,9 @@ pub const Q6_K_BLOCK_BYTES: usize = 210;
 /// GGUF Q5_K super-block (f16 d + f16 dmin + 12 scales + 32 qh + 128 qs).
 pub const Q5_K_BLOCK_ELEMS: usize = 256;
 pub const Q5_K_BLOCK_BYTES: usize = 176;
+/// ROCmFP4 block (ggml_type_id=100): 16 packed nibble bytes + 2 UE4M3 scales.
+pub const ROCMFP4_BLOCK_ELEMS: usize = 32;
+pub const ROCMFP4_BLOCK_BYTES: usize = 18;
 
 fn f16_bits_to_f32(h: u16) -> f32 {
     let sign = u32::from(h & 0x8000) << 16;
@@ -238,8 +241,25 @@ mod ffi {
             host_gbps: *mut f64,
         ) -> i32;
         pub fn allpaca_hip_mem_used(device: i32, used_bytes: *mut u64) -> i32;
+        pub fn allpaca_hip_mem_info(
+            device: i32,
+            free_bytes: *mut u64,
+            total_bytes: *mut u64,
+        ) -> i32;
         pub fn allpaca_hip_set_device(device: i32) -> i32;
+        pub fn allpaca_hip_memcpy_batch(
+            dsts: *mut *mut c_void,
+            srcs: *mut *mut c_void,
+            sizes: *mut usize,
+            count: usize,
+            kind: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_hip_has_memcpy_batch() -> i32;
         pub fn allpaca_hip_stream_synchronize(stream: *mut c_void) -> i32;
+        pub fn allpaca_hip_stream_create(stream: *mut *mut c_void) -> i32;
+        pub fn allpaca_hip_stream_destroy(stream: *mut c_void) -> i32;
+        pub fn allpaca_hip_stream_wait_event(stream: *mut c_void, event: *mut c_void) -> i32;
         pub fn allpaca_hip_event_create(event: *mut *mut c_void) -> i32;
         pub fn allpaca_hip_event_destroy(event: *mut c_void) -> i32;
         pub fn allpaca_hip_event_record(event: *mut c_void, stream: *mut c_void) -> i32;
@@ -303,6 +323,24 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gemm_nt_q4_k_untiled(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_rocmfp4(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_rocmfp4_untiled(
             a: *const f32,
             b: *const u8,
             c: *mut f32,
@@ -884,6 +922,65 @@ pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(
     }
 }
 
+/// One batched DMA for `copies` (dst, src, bytes) of a single `kind` on `stream`.
+///
+/// Collapses N FFI round-trips into one and lets ROCm 7.1+ issue them as a
+/// single `hipMemcpyBatchAsync`. Ordering matches the per-copy loop it replaces.
+///
+/// # Safety
+/// Every `dst` must be a live device allocation of at least `bytes`, and every
+/// `src` a live host allocation of at least `bytes`, until the stream drains.
+pub unsafe fn memcpy_batch_on(
+    copies: &[(*mut u8, *const u8, usize)],
+    kind: i32,
+    stream: *mut std::ffi::c_void,
+) -> Result<(), AllpacaError> {
+    if copies.is_empty() {
+        return Ok(());
+    }
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let mut dsts: Vec<*mut std::ffi::c_void> =
+            copies.iter().map(|(d, _, _)| d.cast()).collect();
+        let mut srcs: Vec<*mut std::ffi::c_void> = copies
+            .iter()
+            .map(|(_, s, _)| s.cast_mut().cast())
+            .collect();
+        let mut sizes: Vec<usize> = copies.iter().map(|(_, _, n)| *n).collect();
+        let rc = unsafe {
+            ffi::allpaca_hip_memcpy_batch(
+                dsts.as_mut_ptr(),
+                srcs.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                copies.len(),
+                kind,
+                stream,
+            )
+        };
+        status(rc, "memcpy_batch")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (copies, kind, stream);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP memcpy_batch unavailable".into(),
+        )))
+    }
+}
+
+/// True when the loaded runtime exports `hipMemcpyBatchAsync` (ROCm 7.1+).
+/// A false here still batches at the ABI, just via per-copy async underneath.
+pub fn has_memcpy_batch() -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_hip_has_memcpy_batch() != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        false
+    }
+}
+
 /// Wait for queued kernels and copies on the default stream.
 pub fn stream_synchronize() -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
@@ -896,6 +993,101 @@ pub fn stream_synchronize() -> Result<(), AllpacaError> {
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP stream_synchronize unavailable".into(),
         )))
+    }
+}
+
+/// Wait for queued work on `stream` (null is the default compute stream).
+///
+/// # Safety
+/// `stream` must be null or a stream this process still owns.
+pub unsafe fn stream_synchronize_on(stream: *mut std::ffi::c_void) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_stream_synchronize(stream) };
+        status(rc, "stream_synchronize_on")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = stream;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP stream_synchronize unavailable".into(),
+        )))
+    }
+}
+
+/// A non-blocking side stream for expert H2D, so weight copies overlap compute
+/// on the null stream instead of serializing behind it. Joined with an event,
+/// never a host-side sync (ADR 0001: scheduling stays in Rust, waits stay on GPU).
+pub struct H2dStream {
+    stream: *mut std::ffi::c_void,
+    #[allow(dead_code)] // Only read under the HIP runtime cfg.
+    event: *mut std::ffi::c_void,
+}
+
+// The handles are only touched through the C ABI, which is internally synchronized.
+unsafe impl Send for H2dStream {}
+unsafe impl Sync for H2dStream {}
+
+impl H2dStream {
+    pub fn new() -> Result<Self, AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let mut stream: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { ffi::allpaca_hip_stream_create(&mut stream) };
+            status(rc, "stream_create")?;
+            let event = match event_create() {
+                Ok(e) => e,
+                Err(e) => {
+                    unsafe { ffi::allpaca_hip_stream_destroy(stream) };
+                    return Err(e);
+                }
+            };
+            Ok(Self { stream, event })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP stream_create unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn raw(&self) -> *mut std::ffi::c_void {
+        self.stream
+    }
+
+    /// Record the copy event on this stream, then make the compute stream wait
+    /// for it. The host does not block.
+    pub fn join_compute(&self) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_hip_event_record(self.event, self.stream) };
+            status(rc, "h2d_event_record")?;
+            let rc =
+                unsafe { ffi::allpaca_hip_stream_wait_event(std::ptr::null_mut(), self.event) };
+            status(rc, "h2d_stream_wait_event")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP stream_wait_event unavailable".into(),
+            )))
+        }
+    }
+
+    /// Block the host until every queued copy on this stream has landed.
+    pub fn synchronize(&self) -> Result<(), AllpacaError> {
+        unsafe { stream_synchronize_on(self.stream) }
+    }
+}
+
+impl Drop for H2dStream {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        unsafe {
+            let _ = ffi::allpaca_hip_event_destroy(self.event);
+            let _ = ffi::allpaca_hip_stream_destroy(self.stream);
+        }
     }
 }
 
@@ -932,6 +1124,30 @@ pub fn device_memory_used(device: i32) -> Result<u64, AllpacaError> {
         let _ = device;
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP mem_used unavailable".into(),
+        )))
+    }
+}
+
+/// Driver-measured `(free, total)` VRAM bytes for `device`.
+///
+/// [`allocated_bytes`] only counts what this process asked for; this counts the
+/// whole board, so the scheduler sees pressure from the compositor and other
+/// apps before it grows the expert pool. Cheap, but it is a driver call: sample
+/// it at a few Hz off the decode path, never per token.
+pub fn device_memory_info(device: i32) -> Result<(u64, u64), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let mut free = 0u64;
+        let mut total = 0u64;
+        let rc = unsafe { ffi::allpaca_hip_mem_info(device, &mut free, &mut total) };
+        status(rc, "mem_info")?;
+        Ok((free, total))
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = device;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP mem_info unavailable".into(),
         )))
     }
 }
@@ -1231,6 +1447,53 @@ pub fn gemm_nt_q4_k_untiled_device(
     }
 }
 
+/// Device-pointer NT GEMM with native ROCmFP4 `b` (`C = A * dequant(B)^T`).
+pub fn gemm_nt_rocmfp4_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_rocmfp4(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_rocmfp4")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_rocmfp4 unavailable".into(),
+        )))
+    }
+}
+
+/// Untiled ROCmFP4 GEMV baseline (§12 before/after).
+pub fn gemm_nt_rocmfp4_untiled_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc =
+            unsafe { ffi::allpaca_gemm_nt_rocmfp4_untiled(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_rocmfp4_untiled")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_rocmfp4_untiled unavailable".into(),
+        )))
+    }
+}
+
 /// Device-pointer NT GEMM with native GGUF Q6_K `b` (`C = A * dequant(B)^T`).
 /// Picks §12 tile cols from Infinity Cache budget.
 pub fn gemm_nt_q6_k_device(
@@ -1441,6 +1704,79 @@ pub fn gemm_nt_q4_k_untiled(
     k: i32,
 ) -> Result<(), AllpacaError> {
     gemm_nt_q4_k_host(a, b, c, m, n, k, gemm_nt_q4_k_untiled_device)
+}
+
+/// Host-pointer ROCmFP4 NT GEMM: copies native blocks, runs the fused kernel, copies back.
+pub fn gemm_nt_rocmfp4(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    gemm_nt_rocmfp4_host(a, b, c, m, n, k, gemm_nt_rocmfp4_device)
+}
+
+/// Untiled ROCmFP4 host GEMV for §12 before/after tracers.
+pub fn gemm_nt_rocmfp4_untiled(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    gemm_nt_rocmfp4_host(a, b, c, m, n, k, gemm_nt_rocmfp4_untiled_device)
+}
+
+fn gemm_nt_rocmfp4_host(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+    kernel: fn(*const f32, *const u8, *mut f32, i32, i32, i32) -> Result<(), AllpacaError>,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(ROCMFP4_BLOCK_ELEMS);
+        let packed_bytes = (n as usize) * nblocks * ROCMFP4_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "ROCmFP4 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            kernel(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k, kernel);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_rocmfp4 unavailable".into(),
+        )))
+    }
 }
 
 /// Host-pointer Q6_K NT GEMM: copies native GGUF blocks, runs the fused kernel, copies back.
@@ -2280,6 +2616,46 @@ impl DeviceWeights {
         )
     }
 
+    /// One batched H2D for several disjoint `(offset, bytes)` regions of this
+    /// blob. Replaces a per-slot `copy_h2d_async` loop when expert ring slots
+    /// are not adjacent. `stream` null runs on the default compute stream.
+    ///
+    /// # Safety
+    /// `chunks` must stay alive and unmodified until `stream` drains.
+    pub unsafe fn copy_h2d_batch_on(
+        &self,
+        chunks: &[(usize, &[u8])],
+        stream: *mut std::ffi::c_void,
+    ) -> Result<(), AllpacaError> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        for (offset, src) in chunks {
+            if offset.saturating_add(src.len()) > self.bytes {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    format!(
+                        "weight batch H2D overflow: off={offset} n={} cap={}",
+                        src.len(),
+                        self.bytes
+                    ),
+                )));
+            }
+        }
+        set_device(self.device)?;
+        let copies: Vec<(*mut u8, *const u8, usize)> = chunks
+            .iter()
+            .filter(|(_, src)| !src.is_empty())
+            .map(|(offset, src)| {
+                (
+                    unsafe { self.ptr.add(*offset) },
+                    src.as_ptr(),
+                    src.len(),
+                )
+            })
+            .collect();
+        unsafe { memcpy_batch_on(&copies, MEMCPY_H2D, stream) }
+    }
+
     /// Allocate one device blob and copy `tensors` in order. Records no Engine metrics.
     pub fn upload(device: i32, tensors: &[&[f32]]) -> Result<Self, AllpacaError> {
         Self::upload_f32_with_tail(device, tensors, 0)
@@ -2720,6 +3096,20 @@ impl HipWorkspace {
         k: i32,
     ) -> Result<(), AllpacaError> {
         self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q4_k_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_rocmfp4_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        self.timed_gpu(DecodeOp::OtherGpu, || {
+            gemm_nt_rocmfp4_device(a, b, c, m, n, k)
+        })
     }
 
     pub fn gemm_nt_q6_k_dev(
@@ -4446,6 +4836,237 @@ mod tests {
                     cpu[i]
                 );
             }
+        }
+    }
+
+    /// Scattered slot writes through the batch ABI must land exactly where the
+    /// per-copy path would put them, on the default stream and on a side stream.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn memcpy_batch_writes_scattered_slots_on_either_stream() {
+        if device_count() == 0 {
+            return;
+        }
+        const SLOT: usize = 512;
+        const SLOTS: usize = 6;
+        let blob = DeviceWeights::alloc(0, SLOT * SLOTS).expect("device blob");
+        // Zero the blob so an overrun into an untouched slot is visible.
+        blob.copy_h2d(0, &vec![0u8; SLOT * SLOTS]).expect("zero blob");
+        // Non-adjacent destinations: slots 4, 1, 3 in that order.
+        let order = [4usize, 1, 3];
+        let chunks: Vec<Vec<u8>> = order
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| vec![(0xA0 + i * 7 + slot) as u8; SLOT])
+            .collect();
+        let regions: Vec<(usize, &[u8])> = order
+            .iter()
+            .zip(chunks.iter())
+            .map(|(slot, c)| (slot * SLOT, c.as_slice()))
+            .collect();
+
+        let h2d = H2dStream::new().expect("side stream");
+        for stream in [std::ptr::null_mut(), h2d.raw()] {
+            unsafe { blob.copy_h2d_batch_on(&regions, stream) }.expect("batched H2D");
+            if stream.is_null() {
+                stream_synchronize().expect("default stream sync");
+            } else {
+                h2d.synchronize().expect("side stream sync");
+            }
+            let mut back = vec![0u8; SLOT * SLOTS];
+            memcpy(back.as_mut_ptr(), blob.byte_ptr_at(0), back.len(), MEMCPY_D2H)
+                .expect("read back");
+            for (i, slot) in order.iter().enumerate() {
+                let got = &back[slot * SLOT..(slot + 1) * SLOT];
+                assert_eq!(
+                    got,
+                    chunks[i].as_slice(),
+                    "slot {slot} content differs (side_stream={})",
+                    !stream.is_null()
+                );
+            }
+            // Untouched slots must stay zero: the batch must not overrun.
+            for slot in 0..SLOTS {
+                if order.contains(&slot) {
+                    continue;
+                }
+                assert!(
+                    back[slot * SLOT..(slot + 1) * SLOT].iter().all(|b| *b == 0),
+                    "batch overran into slot {slot}"
+                );
+            }
+        }
+        eprintln!(
+            "memcpy_batch: hipMemcpyBatchAsync available = {}",
+            has_memcpy_batch()
+        );
+    }
+
+    /// Driver VRAM must be self-consistent and must react to a real allocation.
+    /// This is the signal `rebalance_vram` grows the expert pool against, so a
+    /// stale or process-local number would be worse than none.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mem_info_reports_board_free_that_shrinks_on_allocation() {
+        if device_count() == 0 {
+            return;
+        }
+        let (free_before, total) = device_memory_info(0).expect("mem_info");
+        assert!(total > 0, "total VRAM must be known");
+        assert!(free_before <= total, "free {free_before} > total {total}");
+
+        const CHUNK: usize = 256 << 20;
+        if free_before as usize <= CHUNK * 2 {
+            return; // Board is already too full to measure a delta safely.
+        }
+        let hog = DeviceWeights::alloc(0, CHUNK).expect("device alloc");
+        let (free_after, total_after) = device_memory_info(0).expect("mem_info after alloc");
+        assert_eq!(total_after, total, "total VRAM must not move");
+        assert!(
+            free_after < free_before,
+            "free VRAM must drop after a {CHUNK}B alloc: {free_before} -> {free_after}"
+        );
+        drop(hog);
+
+        // `used` is the same reading; the two entry points must not disagree.
+        let used = device_memory_used(0).expect("mem_used");
+        let (free_now, total_now) = device_memory_info(0).expect("mem_info");
+        assert_eq!(total_now, total_now.max(used), "used must fit in total");
+        let derived = total_now - free_now;
+        let skew = derived.abs_diff(used);
+        assert!(
+            skew <= 64 << 20,
+            "mem_used {used} and total-free {derived} disagree by {skew}"
+        );
+    }
+
+    /// The sampler runs on threads that are about to launch kernels, so the
+    /// driver read has to be cheap once its context exists. Prints the first
+    /// call separately because that one pays for context creation.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mem_info_is_cheap_after_the_first_call() {
+        if device_count() == 0 {
+            return;
+        }
+        for dev in 0..device_count() {
+            let t0 = std::time::Instant::now();
+            let ok = device_memory_info(dev).is_ok();
+            let first = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            for _ in 0..100 {
+                let _ = device_memory_info(dev);
+            }
+            let per_call = t1.elapsed() / 100;
+            eprintln!("mem_info dev{dev}: ok={ok} first={first:?} steady={per_call:?}");
+            assert!(
+                per_call < std::time::Duration::from_millis(1),
+                "dev{dev} steady-state mem_info {per_call:?} is too slow to sample at 10 Hz"
+            );
+        }
+    }
+
+    /// An out-of-range region must be refused before any copy is issued.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn memcpy_batch_rejects_region_past_end_of_blob() {
+        if device_count() == 0 {
+            return;
+        }
+        let blob = DeviceWeights::alloc(0, 256).expect("device blob");
+        let src = vec![1u8; 128];
+        let bad = [(0usize, src.as_slice()), (200usize, src.as_slice())];
+        let err = unsafe { blob.copy_h2d_batch_on(&bad, std::ptr::null_mut()) }
+            .expect_err("region past end must be refused");
+        assert!(err.to_string().contains("overflow"), "got {err}");
+    }
+
+    #[cfg(feature = "hip")]
+    fn fill_rocmfp4_gemm_case(si: usize, m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<u8>) {
+        let mut a = vec![0.0f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+        }
+        let mut b_q = Vec::new();
+        for row in 0..n {
+            b_q.extend(allpaca_cpu::quantize_rocmfp4(&b_f[row * k..(row + 1) * k]));
+        }
+        (a, b_q)
+    }
+
+    #[cfg(feature = "hip")]
+    fn dequant_rocmfp4_matrix(b_q: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let nblocks = k.div_ceil(ROCMFP4_BLOCK_ELEMS);
+        let row_bytes = nblocks * ROCMFP4_BLOCK_BYTES;
+        let mut out = vec![0.0f32; n * k];
+        for row in 0..n {
+            let blk = &b_q[row * row_bytes..(row + 1) * row_bytes];
+            let mut tmp = vec![0.0f32; nblocks * ROCMFP4_BLOCK_ELEMS];
+            allpaca_cpu::dequant_rocmfp4(blk, nblocks * ROCMFP4_BLOCK_ELEMS, &mut tmp).unwrap();
+            out[row * k..(row + 1) * k].copy_from_slice(&tmp[..k]);
+        }
+        out
+    }
+
+    /// The fused ROCmFP4 GEMV must match CPU dequant + NT GEMM. Shapes cross the
+    /// 64-column tile and the 256-float LDS slab so both kernel edges are hit.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_rocmfp4_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (1, 4, 32),
+            (1, 8, 256),
+            (2, 3, 128),
+            (1, 70, 512),
+            (1, 4, 288),
+        ];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, b_q) = fill_rocmfp4_gemm_case(si, m, n, k);
+            let b_deq = dequant_rocmfp4_matrix(&b_q, n, k);
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_rocmfp4(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_rocmfp4 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_rocmfp4 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// The §12 tiled ROCmFP4 GEMV must agree with the untiled baseline.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rocmfp4_tiled_gemv_matches_untiled() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, n, k) = (1usize, 96usize, 512usize);
+        let (a, b_q) = fill_rocmfp4_gemm_case(5, m, n, k);
+        let mut tiled = vec![0.0f32; m * n];
+        let mut untiled = vec![0.0f32; m * n];
+        gemm_nt_rocmfp4(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).expect("tiled ROCmFP4");
+        gemm_nt_rocmfp4_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32)
+            .expect("untiled ROCmFP4");
+        for i in 0..m * n {
+            assert!(
+                gemm_close(tiled[i], untiled[i]),
+                "ROCmFP4 tiled/untiled mismatch idx={i} tiled={} untiled={}",
+                tiled[i],
+                untiled[i]
+            );
         }
     }
 

@@ -143,6 +143,21 @@ On a dual-channel desktop, splitting decode expert misses by measured `B_P/B_H` 
 }
 ```
 
+### `gpu.util` / `gpu.vram` sources
+
+`GET /stats` fills these as flat fields on `StatsSnapshot`:
+
+| Schema field | `/stats` field | Source |
+|---|---|---|
+| `gpu.<target>.vram` | `gpu_vram_used_bytes`, `gpu_vram_total_bytes` | `hipMemGetInfo` via `allpaca_hip_mem_info` — whole board, so other GPU clients count |
+| `gpu.<draft>.vram` | `draft_gpu_vram_used_bytes`, `draft_gpu_vram_total_bytes` | same, draft device only when it differs from the target |
+| `gpu.<target>.util` | `gpu_util` | share of decode wall time in allpaca kernels, from the HIP event decode profile |
+
+AMD SMI is not used: ROCm does not ship `amdsmi` on Windows, and the per-GPU
+power and busy counters it would add are not scheduler inputs. `gpu_samples`
+counts completed samples; the sampler is rate-limited to 10 Hz and runs only at
+scheduler safe points and on `/stats`, never per token.
+
 ## Reporting
 
 Every benchmark run must produce:

@@ -162,6 +162,7 @@ enum WeightKind {
     Q4_K,
     Q5_K,
     Q6_K,
+    RocmFp4,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -339,6 +340,13 @@ pub struct ResidentModel {
     expert_offs: Vec<Vec<[WeightRef; 3]>>,
     expert_ring: Option<ExpertRing>,
     prefill_pipe: Mutex<PrefillGpuPipe>,
+    /// Side stream for expert H2D so next-layer fills overlap current-layer
+    /// compute. `None` when the runtime cannot create one; fills then queue on
+    /// the default stream exactly as before.
+    h2d: Option<allpaca_hip::H2dStream>,
+    /// Staging buffers for copies still in flight on `h2d`. Held until the
+    /// stream is drained so the DMA source cannot be freed underneath it.
+    h2d_pending: Mutex<Vec<Vec<u8>>>,
     embed: WeightRef,
     layers: Vec<LayerOff>,
     norm: WeightRef,
@@ -468,6 +476,8 @@ impl ResidentModel {
             expert_offs,
             expert_ring,
             prefill_pipe: Mutex::new(PrefillGpuPipe::default()),
+            h2d: allpaca_hip::H2dStream::new().ok(),
+            h2d_pending: Mutex::new(Vec::new()),
             embed,
             layers,
             norm,
@@ -502,6 +512,67 @@ impl ResidentModel {
         self.weights.copy_h2d(dev_off, host)
     }
 
+    /// Queue expert-slot H2D as one batched DMA on the side stream so it
+    /// overlaps compute on the default stream. `staging` is retained until
+    /// [`drain_expert_h2d`] confirms the copies landed. Without a side stream
+    /// this degrades to per-region async copies on the default stream, which
+    /// order implicitly against compute exactly as before.
+    fn queue_expert_h2d(
+        &self,
+        staging: Vec<u8>,
+        regions: &[(usize, usize, usize)],
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
+        let Some(h2d) = self.h2d.as_ref() else {
+            for (dev, start, len) in regions {
+                self.weights
+                    .copy_h2d_async(*dev, &staging[*start..*start + *len])?;
+            }
+            return Ok(());
+        };
+        {
+            let chunks: Vec<(usize, &[u8])> = regions
+                .iter()
+                .map(|(dev, start, len)| (*dev, &staging[*start..*start + *len]))
+                .collect();
+            // Safety: `staging` outlives the copies because it moves into
+            // `h2d_pending` below (or the stream is drained before it drops).
+            unsafe { self.weights.copy_h2d_batch_on(&chunks, h2d.raw())? };
+        }
+        match self.h2d_pending.lock() {
+            Ok(mut pending) => pending.push(staging),
+            Err(_) => h2d.synchronize()?,
+        }
+        if let Some(metrics) = metrics {
+            metrics
+                .expert_h2d_batched_copies
+                .fetch_add(regions.len() as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Order the default compute stream behind the queued expert copies, then
+    /// wait for them so the staging buffers can be released.
+    fn drain_expert_h2d(&self) -> Result<(), AllpacaError> {
+        let Some(h2d) = self.h2d.as_ref() else {
+            return Ok(());
+        };
+        let idle = self
+            .h2d_pending
+            .lock()
+            .map(|p| p.is_empty())
+            .unwrap_or(false);
+        if idle {
+            return Ok(());
+        }
+        h2d.join_compute()?;
+        h2d.synchronize()?;
+        if let Ok(mut pending) = self.h2d_pending.lock() {
+            pending.clear();
+        }
+        Ok(())
+    }
+
     /// Contiguous bulk H2D for several experts (one DMA when slots are adjacent).
     /// When `nvme_direct` is set, tries NVMe→VRAM bind per expert before host pack.
     pub(crate) fn bulk_fill_experts(
@@ -516,6 +587,12 @@ impl ResidentModel {
     ) -> Result<u64, AllpacaError> {
         if pairs.is_empty() {
             return Ok(0);
+        }
+        if !async_copy {
+            // A blocking fill may reuse a ring slot an async fill is still
+            // writing; the side stream and the default stream do not order
+            // against each other on their own.
+            self.drain_expert_h2d()?;
         }
         let ring = self.expert_ring()?;
         let n_slots = {
@@ -602,32 +679,36 @@ impl ResidentModel {
             .zip(nvme_filled.iter().copied())
             .filter_map(|(s, d)| (!d).then_some(s))
             .collect();
+        let bytes = staging.len() as u64;
         if !host_slots.is_empty() {
             let first = *host_slots.iter().min().unwrap_or(&0);
             let contiguous = host_slots.windows(2).all(|w| w[1] == w[0] + 1)
                 && host_slots.len() > 1;
-            if contiguous {
-                let dev_off = ring.base + first * ring.slot_bytes;
-                if async_copy {
-                    self.weights.copy_h2d_async(dev_off, &staging)?;
-                } else {
-                    self.weights.copy_h2d(dev_off, &staging)?;
-                }
+            // (device offset, staging offset, length) per copy. Adjacent slots
+            // collapse to one region; scattered slots become one batched DMA.
+            let regions: Vec<(usize, usize, usize)> = if contiguous {
+                vec![(ring.base + first * ring.slot_bytes, 0, staging.len())]
             } else {
-                let mut staging_off = 0usize;
-                for slot in &host_slots {
-                    let chunk = &staging[staging_off..staging_off + ring.slot_bytes];
-                    let dev = ring.base + slot * ring.slot_bytes;
-                    if async_copy {
-                        self.weights.copy_h2d_async(dev, chunk)?;
-                    } else {
-                        self.weights.copy_h2d(dev, chunk)?;
-                    }
-                    staging_off += ring.slot_bytes;
+                host_slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, slot)| {
+                        (
+                            ring.base + slot * ring.slot_bytes,
+                            i * ring.slot_bytes,
+                            ring.slot_bytes,
+                        )
+                    })
+                    .collect()
+            };
+            if async_copy {
+                self.queue_expert_h2d(staging, &regions, metrics)?;
+            } else {
+                for (dev, start, len) in &regions {
+                    self.weights.copy_h2d(*dev, &staging[*start..*start + *len])?;
                 }
             }
         }
-        let bytes = staging.len() as u64;
         let nvme_bytes: u64 = nvme_filled
             .iter()
             .zip(pairs.iter())
@@ -664,6 +745,10 @@ impl ResidentModel {
             .lock()
             .map(|p| p.inflight == Some(layer))
             .unwrap_or(false);
+        // Unconditional: a kickoff for a later layer moves `inflight`, and the
+        // staging behind an earlier one must still be drained before its slots
+        // are read.
+        self.drain_expert_h2d()?;
         if wait {
             allpaca_hip::stream_synchronize()?;
             if let Ok(mut p) = self.prefill_pipe.lock() {
@@ -740,6 +825,7 @@ impl ResidentModel {
                 )
             })
             .collect();
+        self.drain_expert_h2d()?;
         self.bulk_fill_experts(&pairs, metrics, Some((layer, n_exp)), false, None)?;
         allpaca_hip::stream_synchronize()?;
         if let Ok(mut p) = self.prefill_pipe.lock() {
@@ -850,6 +936,8 @@ impl ResidentModel {
             expert_offs,
             expert_ring: None,
             prefill_pipe: Mutex::new(PrefillGpuPipe::default()),
+            h2d: allpaca_hip::H2dStream::new().ok(),
+            h2d_pending: Mutex::new(Vec::new()),
             weights,
             embed,
             layers,
@@ -1048,11 +1136,13 @@ impl ResidentModel {
                 hip.dequant_q8_0(self.weights.byte_ptr_at(w.off), w.n as i32, out)?;
                 Ok(out as *const f32)
             }
-            WeightKind::F16 | WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K => {
-                Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                    "F16/Q4_K/Q5_K/Q6_K norm must be F32 at load".into(),
-                )))
-            }
+            WeightKind::F16
+            | WeightKind::Q4_K
+            | WeightKind::Q5_K
+            | WeightKind::Q6_K
+            | WeightKind::RocmFp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "F16/Q4_K/Q5_K/Q6_K/ROCmFP4 norm must be F32 at load".into(),
+            ))),
         }
     }
 
@@ -1088,6 +1178,9 @@ impl ResidentModel {
             WeightKind::Q6_K => {
                 hip.gemm_nt_q6_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::RocmFp4 => {
+                hip.gemm_nt_rocmfp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
         }
     }
 
@@ -1112,9 +1205,9 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K => {
+            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K | WeightKind::RocmFp4 => {
                 Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                    "Q4_K/Q5_K/Q6_K embed must be F32 at load".into(),
+                    "Q4_K/Q5_K/Q6_K/ROCmFP4 embed must be F32 at load".into(),
                 )))
             }
         }
@@ -1141,9 +1234,9 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K => {
+            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K | WeightKind::RocmFp4 => {
                 Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                    "Q4_K/Q5_K/Q6_K embed must be F32 at load".into(),
+                    "Q4_K/Q5_K/Q6_K/ROCmFP4 embed must be F32 at load".into(),
                 )))
             }
         }
@@ -1538,6 +1631,27 @@ fn append_gguf_tensor(
                     ))));
                 }
                 (packed.to_vec(), WeightKind::Q4_K)
+            }
+        }
+        allpaca_gguf::GgmlType::RocmFp4 => {
+            let packed = file.tensor_bytes(name)?;
+            if n <= 65_536 || name == "token_embd.weight" {
+                let mut f32s = vec![0.0f32; n];
+                allpaca_cpu::dequant_rocmfp4(packed, n, &mut f32s)?;
+                let mut bytes = Vec::with_capacity(n * 4);
+                for v in f32s {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (bytes, WeightKind::F32)
+            } else {
+                let k = *info.dims.first().unwrap_or(&1) as usize;
+                if k == 0 || n % k != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "ROCmFP4 GEMV {name} dims {:?} do not tile n={n}",
+                        info.dims
+                    ))));
+                }
+                (packed.to_vec(), WeightKind::RocmFp4)
             }
         }
         allpaca_gguf::GgmlType::Q5_K => {

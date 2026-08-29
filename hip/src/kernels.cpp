@@ -1461,6 +1461,144 @@ extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, fl
     return launch_gemm_nt_q4_k(a, b, c, m, n, k, as_stream(stream), 0);
 }
 
+/* ROCmFP4 (ggml_type_id=100) signed codebook at half-scale: E2M1-derived with
+ * the top magnitude retuned 12 -> 10. Index is the raw 4-bit code. */
+__constant__ const int8_t k_rocmfp4_codebook[16] = {
+    0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+};
+
+/* Unsigned finite E4M3 scale byte -> half-scale multiplier. 0x7f / 0xff are
+ * NaN in this encoding and decode to 0, matching the CPU reference. */
+__device__ inline float rocmfp4_scale(uint8_t e) {
+    if (e == 0 || e == 0x7f || e == 0xff) {
+        return 0.f;
+    }
+    const uint32_t exp = static_cast<uint32_t>((e >> 3) & 0x0F);
+    const uint32_t man = static_cast<uint32_t>(e & 0x07);
+    if (exp == 0) {
+        return static_cast<float>(man) * (1.f / 1024.f);
+    }
+    const uint32_t bits = ((exp + 119u) << 23) | (man << 20);
+    float out;
+    __builtin_memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+/* One thread per output column. Native 18-byte ROCmFP4 blocks along K.
+ * Baseline: each column re-reads A from global (no LDS tile). */
+__global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                               int n, int k) {
+    const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    if (col >= n || row >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const uint8_t *row_blocks = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    float acc = 0.f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * 18;
+        const float d0 = rocmfp4_scale(blk[16]);
+        const float d1 = rocmfp4_scale(blk[17]);
+        const int k0 = ib * 32;
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t packed = blk[j];
+            const int i0 = k0 + j;
+            const int i1 = i0 + 16;
+            if (i0 < k) {
+                acc += arow[i0] * static_cast<float>(k_rocmfp4_codebook[packed & 0x0F]) * d0;
+            }
+            if (i1 < k) {
+                acc += arow[i1] * static_cast<float>(k_rocmfp4_codebook[packed >> 4]) * d1;
+            }
+        }
+    }
+    c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+}
+
+/* Cache-aware decode tile (§12): a 256-float A slab in LDS, reused by COLS
+ * columns. Each slab covers 8 ROCmFP4 blocks so the LDS shape matches the
+ * Q4_K/Q6_K kernels and one __syncthreads pair amortizes over 8 blocks. */
+__global__ void gemv_nt_rocmfp4_tiled_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                             int n, int k) {
+    constexpr int COLS = 64;
+    constexpr int TILE = 256;
+    constexpr int BLOCKS_PER_TILE = TILE / 32;
+    __shared__ float As[TILE];
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const int ntiles = (k + TILE - 1) / TILE;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const uint8_t *brow =
+        (tid < COLS && col < n)
+            ? b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18
+            : nullptr;
+    float acc = 0.f;
+    for (int it = 0; it < ntiles; ++it) {
+        const int k0 = it * TILE;
+        As[tid] = (k0 + tid < k) ? arow[k0 + tid] : 0.f;
+        __syncthreads();
+        if (brow) {
+            for (int t = 0; t < BLOCKS_PER_TILE; ++t) {
+                const int ib = it * BLOCKS_PER_TILE + t;
+                if (ib >= nblocks) {
+                    break;
+                }
+                const uint8_t *blk = brow + static_cast<size_t>(ib) * 18;
+                const float d0 = rocmfp4_scale(blk[16]);
+                const float d1 = rocmfp4_scale(blk[17]);
+                const int base = t * 32;
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t packed = blk[j];
+                    acc += As[base + j] * static_cast<float>(k_rocmfp4_codebook[packed & 0x0F]) * d0;
+                    acc += As[base + 16 + j] * static_cast<float>(k_rocmfp4_codebook[packed >> 4]) *
+                           d1;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (brow) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                  int32_t k, hipStream_t stream, int tiled) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    if (tiled) {
+        constexpr int COLS = 64;
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_rocmfp4_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    } else {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_rocmfp4_untiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    }
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, int32_t m,
+                                       int32_t n, int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 1);
+}
+
+/* Untiled baseline for §12 before/after tracers. */
+extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m,
+                                               int32_t n, int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 0);
+}
+
 /* Fused Q6_K GEMV (GEM mixed-precision): 210-byte super-blocks, A tile in LDS.
  * COLS is the §12 cache-aware column tile (32/64/128). */
 template <int COLS>
@@ -1902,29 +2040,89 @@ extern "C" int allpaca_hip_host_free(void *ptr) {
     return hip_status(hipHostFree(ptr));
 }
 
+static hipMemcpyKind to_hip_memcpy_kind(int32_t kind) {
+    switch (kind) {
+    case ALLPACA_MEMCPY_H2D:
+        return hipMemcpyHostToDevice;
+    case ALLPACA_MEMCPY_D2H:
+    case ALLPACA_MEMCPY_D2H_ASYNC:
+        return hipMemcpyDeviceToHost;
+    case ALLPACA_MEMCPY_D2D:
+        return hipMemcpyDeviceToDevice;
+    default:
+        return hipMemcpyDefault;
+    }
+}
+
+/* hipMemcpyBatchAsync shipped in ROCm 7.1, but some SDK headers (Windows 7.1)
+ * do not declare it even though the runtime exports it. Resolve it from the
+ * loaded runtime rather than declaring the prototype, so a missing symbol
+ * degrades to per-copy async instead of breaking the build. `attrs`,
+ * `attrsIdxs` and `numAttrs` are documented as unsupported by HIP, so the
+ * attribute pointer is always null and its layout never matters here. */
+typedef hipError_t (*allpaca_memcpy_batch_fn)(void **dsts, void **srcs, size_t *sizes, size_t count,
+                                              void *attrs, size_t *attrsIdxs, size_t numAttrs,
+                                              size_t *failIdx, hipStream_t stream);
+
+static allpaca_memcpy_batch_fn memcpy_batch_fn() {
+    static allpaca_memcpy_batch_fn fn = []() -> allpaca_memcpy_batch_fn {
+        void *sym = nullptr;
+        hipDriverProcAddressQueryResult status{};
+        if (hipGetProcAddress("hipMemcpyBatchAsync", &sym, HIP_VERSION, 0, &status) == hipSuccess &&
+            sym) {
+            return reinterpret_cast<allpaca_memcpy_batch_fn>(sym);
+        }
+        return nullptr;
+    }();
+    return fn;
+}
+
+extern "C" int allpaca_hip_has_memcpy_batch(void) { return memcpy_batch_fn() ? 1 : 0; }
+
+extern "C" int allpaca_hip_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count,
+                                        int32_t kind, allpaca_stream_t stream) {
+    if (!dsts || !srcs || !sizes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (count == 0) {
+        return ALLPACA_OK;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!dsts[i] || !srcs[i]) {
+            return ALLPACA_ERR_INVALID;
+        }
+    }
+    clear_last_error();
+    hipStream_t s = as_stream(stream);
+    allpaca_memcpy_batch_fn batch = memcpy_batch_fn();
+    if (batch) {
+        size_t fail_idx = 0;
+        hipError_t err = batch(dsts, srcs, sizes, count, nullptr, nullptr, 0, &fail_idx, s);
+        if (err != hipSuccess) {
+            return ALLPACA_ERR_DEVICE;
+        }
+    } else {
+        const hipMemcpyKind mk = to_hip_memcpy_kind(kind);
+        for (size_t i = 0; i < count; ++i) {
+            hipError_t err = hipMemcpyAsync(dsts[i], srcs[i], sizes[i], mk, s);
+            if (err != hipSuccess) {
+                return ALLPACA_ERR_DEVICE;
+            }
+        }
+    }
+    /* Host-visible D2H is the wait point; async D2H / H2D / D2D stay queued. */
+    if (kind == ALLPACA_MEMCPY_D2H) {
+        return hip_status(hipStreamSynchronize(s));
+    }
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                                  allpaca_stream_t stream) {
     if (!dst || !src) {
         return ALLPACA_ERR_INVALID;
     }
-    hipMemcpyKind mk = hipMemcpyDefault;
-    switch (kind) {
-    case ALLPACA_MEMCPY_H2D:
-        mk = hipMemcpyHostToDevice;
-        break;
-    case ALLPACA_MEMCPY_D2H:
-        mk = hipMemcpyDeviceToHost;
-        break;
-    case ALLPACA_MEMCPY_D2H_ASYNC:
-        mk = hipMemcpyDeviceToHost;
-        break;
-    case ALLPACA_MEMCPY_D2D:
-        mk = hipMemcpyDeviceToDevice;
-        break;
-    default:
-        mk = hipMemcpyDefault;
-        break;
-    }
+    const hipMemcpyKind mk = to_hip_memcpy_kind(kind);
     hipError_t err = hipMemcpyAsync(dst, src, bytes, mk, as_stream(stream));
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
@@ -2025,6 +2223,36 @@ extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t stream) {
     return hip_status(hipStreamSynchronize(as_stream(stream)));
 }
 
+extern "C" int allpaca_hip_stream_create(allpaca_stream_t *stream) {
+    if (!stream) {
+        return ALLPACA_ERR_INVALID;
+    }
+    hipStream_t s = nullptr;
+    /* Non-blocking so this stream never implicitly serializes with the null
+     * compute stream; the join is an explicit event wait. */
+    hipError_t err = hipStreamCreateWithFlags(&s, hipStreamNonBlocking);
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *stream = s;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_hip_stream_destroy(allpaca_stream_t stream) {
+    if (!stream) {
+        return ALLPACA_OK;
+    }
+    return hip_status(hipStreamDestroy(static_cast<hipStream_t>(stream)));
+}
+
+extern "C" int allpaca_hip_stream_wait_event(allpaca_stream_t stream, void *event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return hip_status(
+        hipStreamWaitEvent(as_stream(stream), static_cast<hipEvent_t>(event), 0));
+}
+
 extern "C" int allpaca_hip_event_create(void **event) {
     if (!event) {
         return ALLPACA_ERR_INVALID;
@@ -2081,6 +2309,43 @@ extern "C" int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes) {
         return ALLPACA_ERR_DEVICE;
     }
     *used_bytes = static_cast<uint64_t>(total_b - free_b);
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_hip_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes) {
+    if (!free_bytes || !total_bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    // hipMemGetInfo reports whichever device is current, so a different one has
+    // to be bound first and then restored: the caller is the telemetry sampler
+    // running on a decode thread that goes straight back to launching kernels,
+    // and leaving it bound to the draft device would silently redirect target
+    // work. hipSetDevice takes a driver-wide lock, so the common case -- the
+    // device is already current -- skips the rebinding entirely rather than
+    // contending with every other thread's launches.
+    int prev = 0;
+    hipError_t err = hipGetDevice(&prev);
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    const bool rebind = prev != device;
+    if (rebind) {
+        err = hipSetDevice(device);
+        if (err != hipSuccess) {
+            return ALLPACA_ERR_DEVICE;
+        }
+    }
+    size_t free_b = 0;
+    size_t total_b = 0;
+    err = hipMemGetInfo(&free_b, &total_b);
+    if (rebind && hipSetDevice(prev) != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *free_bytes = static_cast<uint64_t>(free_b);
+    *total_bytes = static_cast<uint64_t>(total_b);
     return ALLPACA_OK;
 }
 
@@ -2632,6 +2897,13 @@ extern "C" int allpaca_hip_memcpy(void *, const void *, size_t, int32_t, allpaca
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_hip_memcpy_batch(void **, void **, size_t *, size_t, int32_t,
+                                        allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_has_memcpy_batch(void) { return 0; }
+
 extern "C" int allpaca_hip_memcpy_peer(void *, int32_t, const void *, int32_t, size_t,
                                       allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -2643,9 +2915,25 @@ extern "C" int allpaca_hip_benchmark(int32_t, int32_t, size_t, double *, double 
 
 extern "C" int allpaca_hip_mem_used(int32_t, uint64_t *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
+extern "C" int allpaca_hip_mem_info(int32_t, uint64_t *, uint64_t *) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_hip_set_device(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_stream_create(allpaca_stream_t *) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_stream_destroy(allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_stream_wait_event(allpaca_stream_t, void *) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
@@ -2693,6 +2981,16 @@ extern "C" int allpaca_gemm_nt_q4_k(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_gemm_nt_q4_k_untiled(const float *, const uint8_t *, float *, int32_t,
                                             int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_rocmfp4(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                       int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *, const uint8_t *, float *, int32_t,
+                                               int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

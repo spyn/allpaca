@@ -569,6 +569,11 @@ pub struct ExpertLru {
     /// Fixed CPU dispatch cost (seconds) folded into overhead-aware `q*`.
     t_dispatch_s: f64,
     expert_bytes: f64,
+    /// Target-GPU busy fraction (x1e4) from the off-decode-path sampler.
+    /// `b_pcie` is measured against an idle board; when the GPU is saturated the
+    /// expert H2D shares copy/queue time with compute, so `q*` must plan on the
+    /// derated bandwidth or it will over-commit to filling. 0 = unsampled.
+    gpu_busy_x1e4: AtomicU64,
     inner: Mutex<ExpertLruInner>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -617,6 +622,7 @@ impl ExpertLru {
             t_dma_s,
             t_dispatch_s,
             expert_bytes,
+            gpu_busy_x1e4: AtomicU64::new(0),
             inner: Mutex::new(ExpertLruInner {
                 bound: vec![None; n],
                 used_at: vec![0; n],
@@ -647,6 +653,27 @@ impl ExpertLru {
         self.cpu_runs.load(Ordering::Relaxed)
     }
 
+    /// Feed the measured target-GPU busy fraction (0.0..=1.0) to `q*`.
+    /// Called by the engine's sampler at a few Hz, never from decode.
+    pub fn set_gpu_busy(&self, frac: f64) {
+        let frac = if frac.is_finite() { frac } else { 0.0 };
+        self.gpu_busy_x1e4.store(
+            (frac.clamp(0.0, 1.0) * 10_000.0).round() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Fill bandwidth `q*` should plan against: idle `b_pcie` derated by GPU
+    /// busy. Floored at 10% so a momentarily pegged GPU cannot stop the cache
+    /// warming altogether.
+    fn effective_b_pcie(&self) -> f64 {
+        let busy = self.gpu_busy_x1e4.load(Ordering::Relaxed) as f64 / 10_000.0;
+        if busy <= 0.0 {
+            return self.b_pcie;
+        }
+        self.b_pcie * (1.0 - busy).clamp(0.1, 1.0)
+    }
+
     pub fn record_slots(metrics: &Metrics, n_slots: usize) {
         metrics
             .expert_slots
@@ -674,7 +701,7 @@ impl ExpertLru {
             MissPolicy::Cpu => 0,
             MissPolicy::Qstar => qstar_fill_count_with_overhead(
                 misses.len(),
-                self.b_pcie,
+                self.effective_b_pcie(),
                 self.b_host,
                 self.t_dma_s,
                 self.t_dispatch_s,
@@ -954,6 +981,49 @@ mod tests {
         lru.admit(plan.fill[0], &dummy).unwrap();
         let again = lru.plan(&misses);
         assert_eq!(again.hits, vec![plan.fill[0]]);
+    }
+
+    /// A busy target GPU derates the fill bandwidth `q*` plans against, moving
+    /// experts to CPU. Idle must reproduce the pre-sampler split exactly, and a
+    /// pegged GPU must still fill one expert so the cache keeps warming.
+    #[test]
+    fn qstar_shifts_to_cpu_when_sampled_gpu_is_busy() {
+        let misses: Vec<ExpertId> = (0..8)
+            .map(|expert| ExpertId { layer: 0, expert })
+            .collect();
+        let bytes = 1 << 20;
+        let build = || {
+            ExpertLru::with_overhead(1, MissPolicy::Qstar, 8.0e9, 4.0e9, 0.0, 0.0, bytes as f64)
+        };
+
+        let idle = build();
+        let idle_fill = idle.plan(&misses).fill.len();
+        idle.set_gpu_busy(0.0);
+        assert_eq!(
+            idle.plan(&misses).fill.len(),
+            idle_fill,
+            "an unsampled or idle GPU must not change the q* split"
+        );
+
+        let busy = build();
+        busy.set_gpu_busy(0.75);
+        let busy_fill = busy.plan(&misses).fill.len();
+        assert!(
+            busy_fill < idle_fill,
+            "busy GPU must fill fewer over PCIe: idle={idle_fill} busy={busy_fill}"
+        );
+
+        let pegged = build();
+        pegged.set_gpu_busy(1.0);
+        assert!(
+            pegged.plan(&misses).fill.len() >= 1,
+            "the derate floor must keep the cache warming"
+        );
+
+        // Garbage from a degenerate profile must not reach the q* solver.
+        let nan = build();
+        nan.set_gpu_busy(f64::NAN);
+        assert_eq!(nan.plan(&misses).fill.len(), idle_fill);
     }
 
     #[test]

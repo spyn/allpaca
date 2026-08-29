@@ -43,6 +43,16 @@ int allpaca_hip_host_free(void *ptr);
 int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                        allpaca_stream_t stream);
 
+/* Batch of `count` 1D copies, all of the same `kind`, on one stream.
+ * Uses hipMemcpyBatchAsync when the loaded runtime exports it (ROCm 7.1+),
+ * otherwise falls back to per-copy hipMemcpyAsync on the same stream. The
+ * observable ordering is identical either way. */
+int allpaca_hip_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count, int32_t kind,
+                             allpaca_stream_t stream);
+
+/* Non-zero when the runtime exports hipMemcpyBatchAsync (telemetry / tests). */
+int allpaca_hip_has_memcpy_batch(void);
+
 int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
                             size_t bytes, allpaca_stream_t stream);
 
@@ -51,9 +61,22 @@ int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, double *p2p_gb
 
 int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes);
 
+/* Driver-measured VRAM for `device`. Unlike the engine's own allocation
+ * counter this includes other processes (compositor, browser), which is what
+ * the scheduler needs before it grows the expert pool. */
+int allpaca_hip_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes);
+
 int allpaca_hip_set_device(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);
+
+/* Non-blocking side stream (expert H2D) so copies overlap the null compute
+ * stream instead of serializing behind it. */
+int allpaca_hip_stream_create(allpaca_stream_t *stream);
+int allpaca_hip_stream_destroy(allpaca_stream_t stream);
+
+/* Make `stream` wait for `event` without blocking the host (cross-stream join). */
+int allpaca_hip_stream_wait_event(allpaca_stream_t stream, void *event);
 
 int allpaca_hip_event_create(void **event);
 int allpaca_hip_event_destroy(void *event);
@@ -89,6 +112,16 @@ int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, 
 /* Untiled one-thread-per-column Q4_K GEMV (before §12 tile). Tracer / A-B only. */
 int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
+
+/* C[m,n] = A[m,k] * dequant(B_rocmfp4[n,k])^T. B is native 18-byte ROCmFP4
+ * blocks (ggml_type_id=100): qs[16] then two unsigned-E4M3 half-block scales.
+ * Default is the cache-aware A-tile GEMV (§12). */
+int allpaca_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                            int32_t k, allpaca_stream_t stream);
+
+/* Untiled one-thread-per-column ROCmFP4 GEMV (before §12 tile). Tracer / A-B only. */
+int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q6_k[n,k])^T. Native 210-byte Q6_K super-blocks (GEM mixed-quant).
  * Default tile cols from §12 picker; use _cols / _untiled for tracers. */

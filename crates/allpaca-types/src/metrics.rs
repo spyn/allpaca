@@ -183,6 +183,9 @@ pub struct StatsSnapshot {
     pub expert_bulk_fills: u64,
     #[serde(default)]
     pub expert_bulk_bytes: u64,
+    /// Slot copies issued through the batched H2D ABI on the side stream.
+    #[serde(default)]
+    pub expert_h2d_batched_copies: u64,
     /// Draft-span expert union bulk prefetches before packed verify.
     #[serde(default)]
     pub draft_expert_prefetches: u64,
@@ -201,6 +204,29 @@ pub struct StatsSnapshot {
     /// Elastic KV→expert VRAM rebalances at scheduler safe points.
     #[serde(default)]
     pub vram_rebalances: u64,
+    /// Driver-measured VRAM in use on the target device, whole board (BENCHMARK_SPEC
+    /// `gpu.vram`). Unlike `device_memory_bytes` this counts other processes too.
+    /// 0 until the off-decode-path sampler has run at least once.
+    #[serde(default)]
+    pub gpu_vram_used_bytes: u64,
+    /// Total VRAM on the target device; 0 when unsampled.
+    #[serde(default)]
+    pub gpu_vram_total_bytes: u64,
+    /// Driver-measured VRAM in use on the draft device (0 on 1 GPU / CPU).
+    #[serde(default)]
+    pub draft_gpu_vram_used_bytes: u64,
+    /// Total VRAM on the draft device (0 on 1 GPU / CPU).
+    #[serde(default)]
+    pub draft_gpu_vram_total_bytes: u64,
+    /// Fraction of wall time the target GPU spent in allpaca kernels between the
+    /// last two samples (BENCHMARK_SPEC `gpu.util`, 0.0..1.0). Derived from the
+    /// HIP decode-profile timers, not from AMD SMI, which ROCm does not ship on
+    /// Windows. 0.0 until two samples exist.
+    #[serde(default)]
+    pub gpu_util: f64,
+    /// Completed GPU samples. Proves the sampler ran and bounds its rate.
+    #[serde(default)]
+    pub gpu_samples: u64,
     /// Soft attention-trim: cold VRAM KV pages spilled to DRAM for expert headroom.
     #[serde(default)]
     pub kv_attention_trims: u64,

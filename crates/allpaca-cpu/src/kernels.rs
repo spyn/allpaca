@@ -382,8 +382,12 @@ pub fn silu(x: f32) -> f32 {
 pub const Q4_0_BLOCK_ELEMS: usize = 32;
 pub const Q4_0_BLOCK_BYTES: usize = 18;
 /// ggml_type_id=100 ROCmFP4 dual-scale: 18 bytes / 32 elems (4.5 bpw).
+/// Block layout is `qs[16]` then `e[2]`: nibble `j` low → element `j` (scale
+/// `e[0]`), nibble `j` high → element `j + 16` (scale `e[1]`).
 pub const ROCMFP4_BLOCK_ELEMS: usize = 32;
 pub const ROCMFP4_BLOCK_BYTES: usize = 18;
+/// Signed E2M1-derived codebook at half-scale, top magnitude retuned 12 → 10.
+pub const ROCMFP4_CODEBOOK: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10];
 pub const Q8_0_BLOCK_ELEMS: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
 /// GGUF Q4_K / Q4_K_S / Q4_K_M super-block (256 elems).
@@ -848,6 +852,167 @@ pub fn dequant_q4_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
     Ok(())
 }
 
+/// Decode a ROCmFP4 unsigned-E4M3 scale byte to the half-scale multiplier the
+/// codebook is expressed in. `0x7f`/`0xff` are NaN in this encoding, not scales.
+pub fn rocmfp4_scale(e: u8) -> f32 {
+    if e == 0 || e == 0x7f || e == 0xff {
+        return 0.0;
+    }
+    let exp = u32::from((e >> 3) & 0x0f);
+    let man = u32::from(e & 0x07);
+    if exp == 0 {
+        return man as f32 * (1.0 / 1024.0);
+    }
+    f32::from_bits(((exp + 119) << 23) | (man << 20))
+}
+
+/// A scale byte is valid when it is finite and unsigned (`<= 0x7e`).
+pub fn rocmfp4_scale_is_valid(e: u8) -> bool {
+    e <= 0x7e
+}
+
+/// Dequantize ROCmFP4 (ggml_type_id=100) blocks: `y = codebook[q] * scale(e)`.
+pub fn dequant_rocmfp4(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_rocmfp4 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(ROCMFP4_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(ROCMFP4_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_rocmfp4 truncated blocks".into(),
+        )));
+    }
+    let half = ROCMFP4_BLOCK_ELEMS / 2;
+    for b in 0..n_blocks {
+        let off = b * ROCMFP4_BLOCK_BYTES;
+        let qs = &blocks[off..off + half];
+        let d0 = rocmfp4_scale(blocks[off + half]);
+        let d1 = rocmfp4_scale(blocks[off + half + 1]);
+        let base = b * ROCMFP4_BLOCK_ELEMS;
+        for (j, &packed) in qs.iter().enumerate() {
+            let i0 = base + j;
+            let i1 = i0 + half;
+            if i0 < n {
+                out[i0] = f32::from(ROCMFP4_CODEBOOK[usize::from(packed & 0x0f)]) * d0;
+            }
+            if i1 < n {
+                out[i1] = f32::from(ROCMFP4_CODEBOOK[usize::from(packed >> 4)]) * d1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Nearest codebook index for `x` under `1 / scale_half`. Ties keep the lower
+/// magnitude, matching the reference encoder.
+fn rocmfp4_best_index(x: f32, inv_scale_half: f32) -> u8 {
+    if !x.is_finite() {
+        return 0;
+    }
+    let a = (x * inv_scale_half).abs();
+    if a <= 0.5 {
+        return 0;
+    }
+    let neg = x < 0.0;
+    let pos = if a <= 1.5 {
+        1
+    } else if a <= 2.5 {
+        2
+    } else if a <= 3.5 {
+        3
+    } else if a <= 5.0 {
+        4
+    } else if a <= 7.0 {
+        5
+    } else if a <= 9.0 {
+        6
+    } else {
+        7
+    };
+    if neg {
+        pos + 8
+    } else {
+        pos
+    }
+}
+
+/// Exhaustive finite-E4M3 scale search minimizing reconstruction MSE over one
+/// 16-element half block. Ties keep the lower scale byte.
+fn rocmfp4_choose_scale(values: &[f32]) -> u8 {
+    let mut max_abs = 0.0f32;
+    for v in values {
+        max_abs = max_abs.max(v.abs());
+    }
+    if !(max_abs > 0.0) || !max_abs.is_finite() {
+        return 0;
+    }
+    let mut best_e = 0u8;
+    let mut best_err = f32::MAX;
+    for e in 1u8..=126 {
+        let scale_half = rocmfp4_scale(e);
+        if !(scale_half > 0.0) {
+            continue;
+        }
+        let inv = 1.0 / scale_half;
+        let mut err = 0.0f32;
+        for &x in values {
+            let q = rocmfp4_best_index(x, inv);
+            let y = f32::from(ROCMFP4_CODEBOOK[usize::from(q)]) * scale_half;
+            let d = x - y;
+            err += d * d;
+            if err > best_err {
+                break;
+            }
+        }
+        if err < best_err {
+            best_err = err;
+            best_e = e;
+        }
+    }
+    best_e
+}
+
+/// Quantize to ROCmFP4 blocks (tests / tiny written models).
+pub fn quantize_rocmfp4(data: &[f32]) -> Vec<u8> {
+    let half = ROCMFP4_BLOCK_ELEMS / 2;
+    let n_blocks = data.len().div_ceil(ROCMFP4_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * ROCMFP4_BLOCK_BYTES];
+    let mut lo = [0.0f32; 16];
+    let mut hi = [0.0f32; 16];
+    for b in 0..n_blocks {
+        let start = b * ROCMFP4_BLOCK_ELEMS;
+        for j in 0..half {
+            lo[j] = data.get(start + j).copied().unwrap_or(0.0);
+            hi[j] = data.get(start + half + j).copied().unwrap_or(0.0);
+        }
+        let e0 = rocmfp4_choose_scale(&lo);
+        let e1 = rocmfp4_choose_scale(&hi);
+        let inv0 = inv_half_scale(e0);
+        let inv1 = inv_half_scale(e1);
+        let off = b * ROCMFP4_BLOCK_BYTES;
+        for j in 0..half {
+            let q0 = rocmfp4_best_index(lo[j], inv0);
+            let q1 = rocmfp4_best_index(hi[j], inv1);
+            out[off + j] = q0 | (q1 << 4);
+        }
+        out[off + half] = e0;
+        out[off + half + 1] = e1;
+    }
+    out
+}
+
+fn inv_half_scale(e: u8) -> f32 {
+    let s = rocmfp4_scale(e);
+    if s > 0.0 {
+        1.0 / s
+    } else {
+        0.0
+    }
+}
+
 /// Dequantize GGUF Q5_K super-blocks: `y = d*sc*q - dmin*m` (q in 0..31).
 pub fn dequant_q5_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
     if out.len() < n {
@@ -1038,5 +1203,78 @@ mod tests {
         attention(&q, &k, &v, &mut out, 1, 2, 1, 1, 2, false).unwrap();
         let sum = out[0] + out[1];
         assert!(sum.is_finite());
+    }
+
+    /// Scale bytes decode as unsigned finite E4M3 at half-scale, so codebook
+    /// level 10 reconstructs 5.0 raw units at scale byte 0x38 (1.0).
+    #[test]
+    fn rocmfp4_scale_decodes_ue4m3_half() {
+        assert_eq!(rocmfp4_scale(0), 0.0);
+        assert_eq!(rocmfp4_scale(0x7f), 0.0);
+        assert_eq!(rocmfp4_scale(0xff), 0.0);
+        assert!(!rocmfp4_scale_is_valid(0x7f));
+        assert!(rocmfp4_scale_is_valid(0x7e));
+        assert!((rocmfp4_scale(0x40) - 1.0).abs() < 1e-6);
+        assert!((rocmfp4_scale(0x38) - 0.5).abs() < 1e-6);
+        assert!((rocmfp4_scale(0x44) - 1.5).abs() < 1e-6);
+        // exp == 0 is the subnormal ramp: man / 1024.
+        assert!((rocmfp4_scale(1) - 1.0 / 1024.0).abs() < 1e-9);
+    }
+
+    /// One hand-built block must decode with `qs` first and the two scale
+    /// bytes last, low nibble → lane j, high nibble → lane j+16.
+    #[test]
+    fn rocmfp4_block_layout_is_qs_then_two_scales() {
+        let mut block = vec![0u8; ROCMFP4_BLOCK_BYTES];
+        // lane 0 → code 7 (+10), lane 16 → code 15 (-10).
+        block[0] = 0x07 | (0x0f << 4);
+        block[16] = 0x40; // scale 1.0 for lanes 0..15
+        block[17] = 0x38; // scale 0.5 for lanes 16..31
+        let mut out = vec![0.0f32; ROCMFP4_BLOCK_ELEMS];
+        dequant_rocmfp4(&block, ROCMFP4_BLOCK_ELEMS, &mut out).unwrap();
+        assert!((out[0] - 10.0).abs() < 1e-6, "lane 0 = {}", out[0]);
+        assert!((out[16] + 5.0).abs() < 1e-6, "lane 16 = {}", out[16]);
+        assert_eq!(out[1], 0.0);
+    }
+
+    /// Values that sit exactly on codebook levels must round-trip exactly.
+    #[test]
+    fn rocmfp4_round_trips_exact_codebook_levels() {
+        let mut data = vec![0.0f32; ROCMFP4_BLOCK_ELEMS];
+        for (i, slot) in data.iter_mut().enumerate() {
+            let level = f32::from(ROCMFP4_CODEBOOK[i % 16]);
+            *slot = level;
+        }
+        let packed = quantize_rocmfp4(&data);
+        assert_eq!(packed.len(), ROCMFP4_BLOCK_BYTES);
+        let mut out = vec![0.0f32; ROCMFP4_BLOCK_ELEMS];
+        dequant_rocmfp4(&packed, ROCMFP4_BLOCK_ELEMS, &mut out).unwrap();
+        for (i, (&want, &got)) in data.iter().zip(out.iter()).enumerate() {
+            assert!((want - got).abs() < 1e-4, "lane {i}: want {want} got {got}");
+        }
+    }
+
+    /// A smooth ramp must survive the scale search within 4-bit resolution.
+    #[test]
+    fn rocmfp4_round_trip_ramp_within_quant_error() {
+        let n = ROCMFP4_BLOCK_ELEMS * 4;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 - 64.0) * 0.031).collect();
+        let packed = quantize_rocmfp4(&data);
+        let mut out = vec![0.0f32; n];
+        dequant_rocmfp4(&packed, n, &mut out).unwrap();
+        let max_abs = data.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        for (i, (&want, &got)) in data.iter().zip(out.iter()).enumerate() {
+            assert!(
+                (want - got).abs() <= max_abs * 0.2,
+                "lane {i}: want {want} got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn rocmfp4_rejects_truncated_blocks() {
+        let short = vec![0u8; ROCMFP4_BLOCK_BYTES - 1];
+        let mut out = vec![0.0f32; ROCMFP4_BLOCK_ELEMS];
+        assert!(dequant_rocmfp4(&short, ROCMFP4_BLOCK_ELEMS, &mut out).is_err());
     }
 }

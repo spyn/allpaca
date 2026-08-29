@@ -1,6 +1,57 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use allpaca_types::StatsSnapshot;
+
+/// Default GPU sample rate. The plan's window is 1–10 Hz; 10 Hz reacts inside a
+/// handful of tokens while keeping the driver round-trip far off the hot path.
+pub const GPU_SAMPLE_INTERVAL_MS: u64 = 100;
+
+/// Rate limiter for telemetry that costs a driver round-trip.
+///
+/// `hipMemGetInfo` is cheap but not free, and decode calls its neighbours
+/// thousands of times a second, so VRAM pressure is sampled on a clock instead:
+/// scheduler safe points and `/stats` ask whether a sample is [`due`], and at
+/// most one caller per window wins.
+///
+/// [`due`]: GpuSampler::due
+#[derive(Debug)]
+pub struct GpuSampler {
+    origin: Instant,
+    /// Milliseconds since `origin` of the last sample, biased by 1 so that 0
+    /// unambiguously means "never sampled" and the first call always wins.
+    last_ms_plus_one: AtomicU64,
+    min_interval_ms: u64,
+}
+
+impl Default for GpuSampler {
+    fn default() -> Self {
+        Self::new(GPU_SAMPLE_INTERVAL_MS)
+    }
+}
+
+impl GpuSampler {
+    pub fn new(min_interval_ms: u64) -> Self {
+        Self {
+            origin: Instant::now(),
+            last_ms_plus_one: AtomicU64::new(0),
+            min_interval_ms,
+        }
+    }
+
+    /// True for exactly one caller once `min_interval_ms` has passed. Losers of
+    /// the race get `false` and keep the stale sample rather than block.
+    pub fn due(&self) -> bool {
+        let now = self.origin.elapsed().as_millis() as u64;
+        let prev = self.last_ms_plus_one.load(Ordering::Relaxed);
+        if prev != 0 && now.saturating_sub(prev - 1) < self.min_interval_ms {
+            return false;
+        }
+        self.last_ms_plus_one
+            .compare_exchange(prev, now + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -83,6 +134,8 @@ pub struct Metrics {
     /// Decode/micro-batch: expert miss fills merged into one contiguous DMA.
     pub expert_bulk_fills: AtomicU64,
     pub expert_bulk_bytes: AtomicU64,
+    /// Slot copies issued through the batched H2D ABI on the side stream.
+    pub expert_h2d_batched_copies: AtomicU64,
     /// Draft-span expert union prefetches before packed verify.
     pub draft_expert_prefetches: AtomicU64,
     /// Cross-request layer-stagger CPU expert steps during GPU forward.
@@ -91,6 +144,16 @@ pub struct Metrics {
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
     pub vram_rebalances: AtomicU64,
+    /// Driver-measured whole-board VRAM, refreshed by [`GpuSampler`] off the
+    /// decode path. `device_memory_bytes` is this process only; these include
+    /// every other GPU client, which is what VRAM rebalancing must respect.
+    pub gpu_vram_used_bytes: AtomicU64,
+    pub gpu_vram_total_bytes: AtomicU64,
+    pub draft_gpu_vram_used_bytes: AtomicU64,
+    pub draft_gpu_vram_total_bytes: AtomicU64,
+    /// Target-GPU busy fraction over the last sample window, scaled by 1e4.
+    pub gpu_util_x1e4: AtomicU64,
+    pub gpu_samples: AtomicU64,
     /// Soft attention-trim spills of cold VRAM KV pages to DRAM.
     pub kv_attention_trims: AtomicU64,
     /// Config requested early exit but the loaded model has no supported manifest.
@@ -236,12 +299,19 @@ impl Metrics {
             expert_prefill_overlaps: self.expert_prefill_overlaps.load(Ordering::Relaxed),
             expert_bulk_fills: self.expert_bulk_fills.load(Ordering::Relaxed),
             expert_bulk_bytes: self.expert_bulk_bytes.load(Ordering::Relaxed),
+            expert_h2d_batched_copies: self.expert_h2d_batched_copies.load(Ordering::Relaxed),
             draft_expert_prefetches: self.draft_expert_prefetches.load(Ordering::Relaxed),
             layer_stagger_steps: self.layer_stagger_steps.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
             vram_rebalances: self.vram_rebalances.load(Ordering::Relaxed),
+            gpu_vram_used_bytes: self.gpu_vram_used_bytes.load(Ordering::Relaxed),
+            gpu_vram_total_bytes: self.gpu_vram_total_bytes.load(Ordering::Relaxed),
+            draft_gpu_vram_used_bytes: self.draft_gpu_vram_used_bytes.load(Ordering::Relaxed),
+            draft_gpu_vram_total_bytes: self.draft_gpu_vram_total_bytes.load(Ordering::Relaxed),
+            gpu_util: self.gpu_util_x1e4.load(Ordering::Relaxed) as f64 / 10_000.0,
+            gpu_samples: self.gpu_samples.load(Ordering::Relaxed),
             kv_attention_trims: self.kv_attention_trims.load(Ordering::Relaxed),
             early_exit_gated: self.early_exit_gated.load(Ordering::Relaxed),
             early_exit_accepts: self.early_exit_accepts.load(Ordering::Relaxed),
@@ -268,5 +338,88 @@ impl Metrics {
             (prev * 8 + sample * 2) / 10
         };
         self.itl_ms_ema_x100.store(next, Ordering::Relaxed);
+    }
+
+    /// Store one GPU sample. `util` is the share of decode wall time spent in
+    /// allpaca kernels on the target device, clamped to 0.0..=1.0.
+    pub fn record_gpu_sample(
+        &self,
+        vram_used: u64,
+        vram_total: u64,
+        draft_vram_used: u64,
+        draft_vram_total: u64,
+        util: f64,
+    ) {
+        self.gpu_vram_used_bytes.store(vram_used, Ordering::Relaxed);
+        self.gpu_vram_total_bytes
+            .store(vram_total, Ordering::Relaxed);
+        self.draft_gpu_vram_used_bytes
+            .store(draft_vram_used, Ordering::Relaxed);
+        self.draft_gpu_vram_total_bytes
+            .store(draft_vram_total, Ordering::Relaxed);
+        let util = if util.is_finite() { util } else { 0.0 };
+        self.gpu_util_x1e4
+            .store((util.clamp(0.0, 1.0) * 10_000.0).round() as u64, Ordering::Relaxed);
+        self.gpu_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Target-GPU busy fraction from the last sample, 0.0..=1.0.
+    pub fn gpu_util(&self) -> f64 {
+        self.gpu_util_x1e4.load(Ordering::Relaxed) as f64 / 10_000.0
+    }
+
+    /// Free VRAM on the target device from the last sample, or `None` when the
+    /// sampler has not run (CPU path, or HIP without a driver reading).
+    pub fn gpu_vram_free_bytes(&self) -> Option<u64> {
+        let total = self.gpu_vram_total_bytes.load(Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        Some(total.saturating_sub(self.gpu_vram_used_bytes.load(Ordering::Relaxed)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One sample per window, and never two in the same window even under
+    /// concurrent safe points, so decode cannot be taxed by a burst of callers.
+    #[test]
+    fn sampler_admits_one_caller_per_window() {
+        let s = GpuSampler::new(50);
+        assert!(s.due(), "first call must always sample");
+        assert!(!s.due(), "second call inside the window must be refused");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(s.due(), "window elapsed, one caller must win again");
+        assert!(!s.due());
+    }
+
+    /// A zero interval still serializes callers but never blocks them.
+    #[test]
+    fn sampler_with_zero_interval_always_admits() {
+        let s = GpuSampler::new(0);
+        for _ in 0..4 {
+            assert!(s.due());
+        }
+    }
+
+    /// Util is stored lossily as x1e4 and must survive the round trip clamped,
+    /// including the garbage a divide-by-zero profile can produce.
+    #[test]
+    fn gpu_sample_clamps_util_and_reports_free_vram() {
+        let m = Metrics::default();
+        assert_eq!(m.gpu_vram_free_bytes(), None, "unsampled must be None");
+
+        m.record_gpu_sample(3 << 30, 16 << 30, 1 << 30, 8 << 30, 0.375);
+        assert!((m.gpu_util() - 0.375).abs() < 1e-4);
+        assert_eq!(m.gpu_vram_free_bytes(), Some(13 << 30));
+        assert_eq!(m.gpu_samples.load(Ordering::Relaxed), 1);
+
+        m.record_gpu_sample(0, 16 << 30, 0, 0, f64::NAN);
+        assert_eq!(m.gpu_util(), 0.0, "NaN util must not poison the metric");
+        m.record_gpu_sample(0, 16 << 30, 0, 0, 4.2);
+        assert_eq!(m.gpu_util(), 1.0, "util must clamp to 1.0");
+        assert_eq!(m.gpu_samples.load(Ordering::Relaxed), 3);
     }
 }

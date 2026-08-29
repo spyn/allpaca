@@ -35,7 +35,7 @@ use crate::model::{
 };
 use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
-use crate::telemetry::Metrics;
+use crate::telemetry::{GpuSampler, Metrics};
 use crate::tokenizer::EngineTokenizer;
 use crate::packed::{temp_pack_path, PackedStore, HostExpertPool};
 use crate::weight_set::{
@@ -132,6 +132,9 @@ pub struct Engine {
     ds_probe: DirectStorageProbe,
     micro_batch: Arc<MicroBatchExpertUnion>,
     layer_stagger: Arc<LayerStagger>,
+    /// Clock for driver VRAM / GPU-busy sampling. Shared across clones so the
+    /// rate limit is per engine, not per handle.
+    gpu_sampler: Arc<GpuSampler>,
 }
 
 pub struct RequestHandle {
@@ -257,6 +260,7 @@ impl Engine {
             ds_probe,
             micro_batch: Arc::new(MicroBatchExpertUnion::new()),
             layer_stagger: Arc::new(LayerStagger::new()),
+            gpu_sampler: Arc::new(GpuSampler::default()),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -274,7 +278,59 @@ impl Engine {
         &self.metrics
     }
 
+    /// Refresh driver VRAM and GPU busy into [`Metrics`], at most once per
+    /// [`GpuSampler`] window, and hand the busy fraction to `q*`.
+    ///
+    /// `hipMemGetInfo` is a driver round-trip, so this belongs to scheduler
+    /// safe points and `/stats` only. Decode must never call it. AMD SMI would
+    /// add per-GPU power here; ROCm does not ship it on Windows, and the busy
+    /// fraction below is measured from HIP events anyway.
+    fn sample_gpu(&self) {
+        let Some(hip) = self.hip.as_ref() else {
+            return;
+        };
+        if !self.gpu_sampler.due() {
+            return;
+        }
+        let read = |dev: i32| {
+            allpaca_hip::device_memory_info(dev)
+                .map(|(free, total)| (total.saturating_sub(free), total))
+                .unwrap_or((0, 0))
+        };
+        let target_dev = self.inventory.target_device.max(0);
+        let (used, total) = read(target_dev);
+        // Reading a second device forces a rebind, and a rebind costs a
+        // driver-wide lock that decode threads are contending for. Skip it
+        // until the draft GPU has actually run something worth watching.
+        let draft_dev = self.inventory.draft_device;
+        let draft_live = self
+            .metrics
+            .draft_gpu_forwards
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
+        let (draft_used, draft_total) =
+            if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
+                read(draft_dev)
+            } else {
+                (0, 0)
+            };
+        // Share of decode wall time the GPU spent in allpaca kernels. The
+        // profile is an EMA of the last decode steps, so no differencing.
+        let p = hip.decode_profile();
+        let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
+        let wall_us = gpu_us + p.host_us;
+        let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
+        self.metrics
+            .record_gpu_sample(used, total, draft_used, draft_total, util);
+        if let Ok(g) = self.lock() {
+            if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
+                lru.set_gpu_busy(util);
+            }
+        }
+    }
+
     pub fn stats(&self) -> StatsSnapshot {
+        self.sample_gpu();
         let (model_id, kv_h2d, kv_d2h, draft_kv_bytes) = match self.lock() {
             Ok(g) => {
                 if let Some(ws) = g.target.as_ref().and_then(|m| m.working_set.as_ref()) {
@@ -1827,13 +1883,45 @@ impl Engine {
         })
     }
 
+    /// Shrink a requested `(expert cache, KV VRAM)` pair to what the board can
+    /// actually hold, scaling both by the same factor so their ratio survives.
+    ///
+    /// Headroom is measured free VRAM plus what this process already owns, less
+    /// a reserve, because the compositor and other GPU clients move underneath
+    /// us. Returns the request unchanged when the sampler has no reading, so
+    /// the CPU path and unsampled HIP behave exactly as before.
+    fn clamp_to_measured_vram(&self, cache_bytes: usize, vram_bytes: usize) -> (usize, usize) {
+        /// Leave the driver room for context, command buffers and the desktop.
+        const RESERVE_BYTES: u64 = 512 << 20;
+        let Some(free) = self.metrics.gpu_vram_free_bytes() else {
+            return (cache_bytes, vram_bytes);
+        };
+        let owned = allpaca_hip::allocated_bytes();
+        let headroom = free.saturating_add(owned).saturating_sub(RESERVE_BYTES);
+        let want = (cache_bytes as u64).saturating_add(vram_bytes as u64);
+        if want <= headroom || want == 0 {
+            return (cache_bytes, vram_bytes);
+        }
+        let scale = headroom as f64 / want as f64;
+        (
+            (cache_bytes as f64 * scale) as usize,
+            (vram_bytes as f64 * scale) as usize,
+        )
+    }
+
     /// Rebuild expert LRU slots vs KV VRAM at a scheduler safe point.
     /// Host (or NVMe) pool is not reloaded. GPU residency is a speed dial.
+    ///
+    /// The request is capped by measured board pressure: the expert pool is a
+    /// speed dial, and overshooting it into an OOM costs far more than the
+    /// slots would have won.
     pub fn rebalance_vram(
         &self,
         cache_bytes: usize,
         vram_bytes: usize,
     ) -> Result<(), AllpacaError> {
+        self.sample_gpu();
+        let (cache_bytes, vram_bytes) = self.clamp_to_measured_vram(cache_bytes, vram_bytes);
         {
             let mut inner = self.lock()?;
             if let Some(model) = inner.target.as_mut() {
@@ -1854,6 +1942,7 @@ impl Engine {
     /// the expert LRU pool from the freed budget (OPPORTUNITY §8.2 elastic VRAM).
     /// No-op when Requests are in flight.
     pub fn rebalance_experts_elastic(&self) -> Result<(), AllpacaError> {
+        self.sample_gpu();
         let (freed, new_cache, new_vram) = {
             let mut inner = self.lock()?;
             if !inner.active.is_empty() {
@@ -1888,6 +1977,8 @@ impl Engine {
             } else {
                 cur_vram
             };
+            // Reclaimed budget is only spendable if the board still has it.
+            let (new_cache, new_vram) = self.clamp_to_measured_vram(new_cache, new_vram);
             if let Some(model) = inner.target.as_mut() {
                 if let Some(model) = Arc::get_mut(model) {
                     self.rebuild_expert_slots(model, new_cache);
@@ -1912,6 +2003,10 @@ impl Engine {
 
     /// Auto safe-point rebalance when radix + expert miss pressure was recorded.
     fn maybe_auto_elastic_rebalance(&self) -> Result<(), AllpacaError> {
+        // Every tick reaches here, but the sampler's own clock keeps the driver
+        // call at 10 Hz, so VRAM and `q*`'s busy input stay fresh without
+        // anyone polling `/stats`.
+        self.sample_gpu();
         let pending = {
             let mut inner = self.lock()?;
             if !inner.active.is_empty() || !inner.elastic_rebalance_pending {
@@ -3282,6 +3377,62 @@ mod tests {
             after.expert_slots >= slots_before,
             "expert pool must not shrink; before={slots_before} after={}",
             after.expert_slots
+        );
+    }
+
+    /// Without a HIP device there is nothing to read, so the sampler must stay
+    /// silent and every budget must pass through untouched. A CPU-only run that
+    /// silently shrank its expert pool would be a nasty regression.
+    #[test]
+    fn unsampled_vram_leaves_budgets_and_stats_untouched() {
+        let mut cfg = test_config();
+        cfg.model.synthetic = true;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let s = engine.stats();
+        assert_eq!(s.gpu_samples, 0, "CPU path must not sample; stats={s:?}");
+        assert_eq!(s.gpu_vram_total_bytes, 0);
+        assert_eq!(s.gpu_util, 0.0);
+        assert_eq!(
+            engine.clamp_to_measured_vram(1 << 40, 1 << 40),
+            (1 << 40, 1 << 40),
+            "an unsampled board must not clamp, however large the request"
+        );
+    }
+
+    /// Once a reading exists, an over-budget request scales down but keeps its
+    /// expert-cache to KV ratio, and a request inside headroom is left alone.
+    #[test]
+    fn measured_vram_scales_over_budget_request_and_keeps_ratio() {
+        let mut cfg = test_config();
+        cfg.model.synthetic = true;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        // 4 GiB board, 3 GiB already in use by anyone.
+        engine
+            .metrics
+            .record_gpu_sample(3 << 30, 4 << 30, 0, 0, 0.5);
+
+        let (cache, kv) = engine.clamp_to_measured_vram(256 << 20, 256 << 20);
+        assert!(
+            cache + kv <= 1 << 30,
+            "must fit measured headroom; got cache={cache} kv={kv}"
+        );
+        assert_eq!(cache, kv, "equal halves must stay equal after scaling");
+
+        let (cache, kv) = engine.clamp_to_measured_vram(2 << 30, 1 << 30);
+        assert!(cache + kv < 3 << 30, "over-budget request must shrink");
+        let ratio = cache as f64 / kv.max(1) as f64;
+        assert!(
+            (ratio - 2.0).abs() < 0.05,
+            "2:1 cache:kv ratio must survive scaling; got {ratio}"
+        );
+
+        let small = (4 << 20, 4 << 20);
+        assert_eq!(
+            engine.clamp_to_measured_vram(small.0, small.1),
+            small,
+            "a request inside headroom must pass through"
         );
     }
 
@@ -5131,7 +5282,7 @@ mod tests {
     }
 
     #[test]
-    fn nemotron_hybrid_synthetic_generates_and_real_fp4_named_refuse() {
+    fn nemotron_hybrid_synthetic_generates_and_real_fp4_loads() {
         // Synthetic F32 hybrid (SSM + attention) must generate greedily past Fatal.
         {
             let path = std::env::temp_dir().join(format!(
@@ -5198,7 +5349,9 @@ mod tests {
             let _ = std::fs::remove_file(&nvme_path);
         }
 
-        // Real ROCmFP4: named refuse (type 100 dequant) or skip if absent.
+        // Real ROCmFP4: type 100 no longer gates the loader. The header check is
+        // cheap enough to always run; the 30B load/generate is opt-in because it
+        // materializes an 18 GiB checkpoint.
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
             "../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf",
         );
@@ -5209,6 +5362,27 @@ mod tests {
             );
             return;
         }
+        let report = allpaca_gguf::GgufFile::open(&path)
+            .expect("mmap Nemotron header")
+            .compat_report();
+        assert!(
+            report.ggml_type_ids.contains(&100),
+            "expected ROCmFP4 tensors; ids={:?}",
+            report.ggml_type_ids
+        );
+        assert!(
+            report.reject_reason.is_none(),
+            "ROCmFP4 (ggml_type_id=100) must no longer gate the loader; got {:?}",
+            report.reject_reason
+        );
+
+        if std::env::var("ALLPACA_NEMOTRON").ok().as_deref() != Some("1") {
+            eprintln!(
+                "skip nemotron real ROCmFP4 generate: set ALLPACA_NEMOTRON=1 (loads {} GiB)",
+                18
+            );
+            return;
+        }
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             cpu_only: true,
@@ -5216,6 +5390,7 @@ mod tests {
         });
         cfg.model.synthetic = false;
         cfg.model.path = Some(path);
+        cfg.speculative.enabled = false;
         cfg.weights.cache_bytes = 64 << 20;
         cfg.weights.host_bytes = 64 << 20;
         cfg.kv.nvme_bytes = 64 << 20;
@@ -5224,16 +5399,19 @@ mod tests {
             std::process::id()
         )));
         let nvme = cfg.kv.nvme_path.clone();
-        let err = match Engine::new(cfg) {
-            Ok(_) => panic!("Nemotron ROCmFP4 must not load for generate until dequant lands"),
-            Err(e) => e,
-        };
-        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
-        let msg = err.to_string();
-        assert!(
-            msg.contains("nemotron_h_moe") && msg.contains("100") && msg.contains("ROCmFP4"),
-            "named Fatal must cite arch, ggml_type_id 100, and ROCmFP4; got {msg}"
-        );
+        let engine = Engine::new(cfg).expect("Nemotron ROCmFP4 must load once dequant lands");
+        let out = engine
+            .generate(
+                "hi",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("Nemotron ROCmFP4 generate");
+        assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
         if let Some(p) = nvme {
             let _ = std::fs::remove_file(p);
         }
