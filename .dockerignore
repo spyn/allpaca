@@ -1,0 +1,12 @@
+.git
+.gitignore
+target
+target-*
+graphify-out
+models
+*.gguf
+*.safetensors
+.cursor
+agent-transcripts
+**/*.pdb
+**/*.ilk

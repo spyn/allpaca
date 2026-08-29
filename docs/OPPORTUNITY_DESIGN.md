@@ -310,7 +310,7 @@ Agent harnesses edit context at special-token boundaries (thinking blocks, tool 
 ### 8.4 What not to copy
 
 - kimi-k3-in-c CPU-only MXFP4 kernels, or 26 s/token as a product posture. Allpaca's HIP contract is the opposite until streaming is on: `decode_does_not_h2d_weights`.
-- FreeToken's Python/CUDA stack, CUDA graphs, or NVIDIA-only kernels. Allpaca is GPL-3.0 Rust/HIP; steal policy, rewrite on our ABI.
+- FreeToken's Python/CUDA stack, CUDA graphs, or NVIDIA-only kernels. Allpaca is MIT Rust/HIP; steal policy, rewrite on our ABI.
 - LRU on the dense trunk.
 - Stuffing weight blobs into `KvTierManager`.
 - Trusting mmap as the working-set cache.
