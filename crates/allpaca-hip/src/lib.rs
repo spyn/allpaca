@@ -486,6 +486,28 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_deinterleave_q_gate(
+            q_full: *const f32,
+            q: *mut f32,
+            gate: *mut f32,
+            n_heads: i32,
+            head_dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_sigmoid_mul(
+            x: *mut f32,
+            gate: *const f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_rmsnorm_heads(
+            x: *mut f32,
+            weight: *const f32,
+            n_heads: i32,
+            head_dim: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_embed_gather(
             table: *const f32,
             token: i32,
@@ -537,6 +559,46 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gated_delta_step(
+            q: *mut f32,
+            k: *mut f32,
+            v: *const f32,
+            decay: *const f32,
+            beta: *const f32,
+            state: *mut f32,
+            out: *mut f32,
+            n_v_heads: i32,
+            head_v: i32,
+            head_k: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gdn_conv1d_step(
+            x: *const f32,
+            kernel: *const f32,
+            conv_state: *mut f32,
+            out: *mut f32,
+            qkv_dim: i32,
+            conv_kernel: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_expand_k_heads(
+            src: *const f32,
+            dst: *mut f32,
+            n_k: i32,
+            n_v: i32,
+            head_k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gdn_decay_beta(
+            alpha: *const f32,
+            dt_bias: *const f32,
+            a: *const f32,
+            decay: *mut f32,
+            beta: *mut f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         #[allow(dead_code)]
         pub fn allpaca_rope_qk(
             q: *mut f32,
@@ -559,6 +621,18 @@ mod ffi {
             theta: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_rope_imrope_qk(
+            q: *mut f32,
+            k: *mut f32,
+            n_q_heads: i32,
+            n_k_heads: i32,
+            head_dim: i32,
+            n_rot: i32,
+            pos: i32,
+            theta: f32,
+            sections: *const i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_dequant_q8_0(
             blocks: *const u8,
             out: *mut f32,
@@ -573,6 +647,21 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_embed_gather_q8_0_rows(
+            table: *const u8,
+            tokens: *const i32,
+            out: *mut f32,
+            n_tok: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_rocmfp4(
+            table: *const u8,
+            token: i32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_rocmfp4_rows(
             table: *const u8,
             tokens: *const i32,
             out: *mut f32,
@@ -2406,6 +2495,69 @@ pub fn embed_gather_q8_0_rows(
     }
 }
 
+/// Host-pointer batched ROCmFP4 embed gather. `table` is native 18-byte blocks.
+pub fn embed_gather_rocmfp4_rows(
+    table: &[u8],
+    tokens: &[u32],
+    out: &mut [f32],
+    dim: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if dim <= 0 || tokens.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed_gather_rocmfp4_rows shape".into(),
+            )));
+        }
+        let n_tok = tokens.len();
+        let dim_u = dim as usize;
+        let max_tok = *tokens.iter().max().unwrap_or(&0) as usize;
+        let nblocks = dim_u.div_ceil(32);
+        let packed_need = (max_tok + 1)
+            .saturating_mul(nblocks)
+            .saturating_mul(ROCMFP4_BLOCK_BYTES);
+        if table.len() < packed_need || out.len() < n_tok * dim_u {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed_gather_rocmfp4_rows buffer size mismatch".into(),
+            )));
+        }
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let id_bytes = ids.len() * 4;
+        let o_bytes = n_tok * dim_u * 4;
+        let dt = device_malloc(packed_need, 0)?;
+        let di = device_malloc(id_bytes, 0)?;
+        let dout = device_malloc(o_bytes, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(dt, table.as_ptr(), packed_need, MEMCPY_H2D)?;
+            memcpy(di, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+            let rc = unsafe {
+                ffi::allpaca_embed_gather_rocmfp4_rows(
+                    dt,
+                    di.cast(),
+                    dout.cast(),
+                    n_tok as i32,
+                    dim,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "embed_gather_rocmfp4_rows")?;
+            memcpy(out.as_mut_ptr().cast(), dout, o_bytes, MEMCPY_D2H)
+        })();
+        device_free(dt, packed_need);
+        device_free(di, id_bytes);
+        device_free(dout, o_bytes);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (table, tokens, out, dim);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP embed_gather_rocmfp4_rows unavailable".into(),
+        )))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     q: &[f32],
@@ -2843,6 +2995,14 @@ struct PinnedLogits {
 
 unsafe impl Send for PinnedLogits {}
 
+/// Per-request / per-layer GDN recurrent state kept on device between tokens.
+struct GdnLayerResident {
+    state: DeviceWeights,
+    state_n: usize,
+    seeded: bool,
+    dirty: bool,
+}
+
 pub struct HipWorkspace {
     pub device: i32,
     scratch: *mut u8,
@@ -2850,6 +3010,7 @@ pub struct HipWorkspace {
     pinned: Mutex<PinnedLogits>,
     decode: Mutex<Option<DecodeAlloc>>,
     dequant: Mutex<Option<DequantAlloc>>,
+    gdn: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
     profiling: AtomicU64,
@@ -2881,6 +3042,7 @@ impl HipWorkspace {
             }),
             decode: Mutex::new(None),
             dequant: Mutex::new(None),
+            gdn: Mutex::new(std::collections::HashMap::new()),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
             profiling: AtomicU64::new(0),
@@ -2906,6 +3068,11 @@ impl HipWorkspace {
         if let Ok(g) = self.dequant.lock() {
             if let Some(d) = g.as_ref() {
                 n += d.bytes as u64;
+            }
+        }
+        if let Ok(g) = self.gdn.lock() {
+            for layer in g.values() {
+                n += layer.state.bytes();
             }
         }
         n
@@ -3354,6 +3521,43 @@ impl HipWorkspace {
         }
     }
 
+    pub fn embed_gather_rocmfp4(
+        &self,
+        table: *const u8,
+        token: u32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rocmfp4 embed gather".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_rocmfp4(
+                        table,
+                        token as i32,
+                        out,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_rocmfp4")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = token;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_rocmfp4 unavailable".into(),
+            )))
+        }
+    }
+
     /// GEMM NT using the persistent scratch buffer (H2D / kernel / D2H).
     pub fn gemm_nt(
         &self,
@@ -3694,6 +3898,7 @@ impl HipWorkspace {
                 "invalid logits D2H".into(),
             )));
         }
+        self.bind()?;
         let bytes = n * 4;
         let pinned = self.ensure_pinned_logits(n)?;
         memcpy(pinned, device_logits.cast(), bytes, MEMCPY_D2H_ASYNC)?;
@@ -3704,11 +3909,13 @@ impl HipWorkspace {
 
     /// Wait for a queued logits D2H and copy pinned bytes into `host`.
     pub fn wait_logits_d2h(&self, host: &mut [f32]) -> Result<(), AllpacaError> {
-        let n = self.logits_inflight.swap(0, Ordering::Relaxed) as usize;
+        let n = self.logits_inflight.load(Ordering::Relaxed) as usize;
         if n == 0 {
             return Ok(());
         }
+        self.bind()?;
         stream_synchronize()?;
+        self.logits_inflight.store(0, Ordering::Relaxed);
         let g = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
         if g.ptr.is_null() || g.bytes < n * 4 {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -3928,6 +4135,54 @@ impl HipWorkspace {
         }
     }
 
+    pub fn embed_gather_rocmfp4_rows(
+        &self,
+        table: *const u8,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rocmfp4 embed gather".into(),
+            )));
+        }
+        let id_bytes = tokens.len() * 4;
+        if id_bytes > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed gather tokens exceed scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        memcpy(self.scratch, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_rocmfp4_rows(
+                        table,
+                        self.scratch.cast(),
+                        out,
+                        tokens.len() as i32,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_rocmfp4_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_rocmfp4 unavailable".into(),
+            )))
+        }
+    }
+
     pub fn copy_d2h_f32(&self, src: *const f32, dst: &mut [f32]) -> Result<(), AllpacaError> {
         if dst.is_empty() {
             return Ok(());
@@ -4059,6 +4314,496 @@ impl HipWorkspace {
         }
     }
 
+    /// Qwen3.5 Gated DeltaNet one-token step on device (matches host `deltanet`).
+    pub fn gated_delta_step(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        v: *const f32,
+        decay: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        n_v_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null()
+            || k.is_null()
+            || v.is_null()
+            || decay.is_null()
+            || beta.is_null()
+            || state.is_null()
+            || out.is_null()
+            || n_v_heads <= 0
+            || head_v <= 0
+            || head_k <= 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gated_delta_step".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_gated_delta_step(
+                        q,
+                        k,
+                        v,
+                        decay,
+                        beta,
+                        state,
+                        out,
+                        n_v_heads,
+                        head_v,
+                        head_k,
+                        eps,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "gated_delta_step")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = eps;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gated_delta_step unavailable".into(),
+            )))
+        }
+    }
+
+    /// Host-buffer GDN step: H2D into scratch, device kernel, D2H. Same math as
+    /// [`Self::gated_delta_step`] / host `deltanet::gated_delta_step_eps`.
+    pub fn gated_delta_step_host(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        out: &mut [f32],
+        n_v_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        let n_v = n_v_heads as usize;
+        let hv = head_v as usize;
+        let hk = head_k as usize;
+        if n_v == 0
+            || hv == 0
+            || hk == 0
+            || q.len() != n_v * hk
+            || k.len() != n_v * hk
+            || v.len() != n_v * hv
+            || decay.len() != n_v
+            || beta.len() != n_v
+            || state.len() != n_v * hv * hk
+            || out.len() != n_v * hv
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gated_delta_step_host length mismatch".into(),
+            )));
+        }
+        let need = (q.len() + k.len() + v.len() + decay.len() + beta.len() + state.len() + out.len())
+            * 4;
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("gated_delta_step_host need {need} scratch={}", self.scratch_bytes),
+            )));
+        }
+        self.bind()?;
+        let mut off = 0usize;
+        let dq = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dq.cast(), q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
+        off += q.len() * 4;
+        let dk = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dk.cast(), k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
+        off += k.len() * 4;
+        let dv = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dv.cast(), v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+        off += v.len() * 4;
+        let ddecay = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(ddecay.cast(), decay.as_ptr().cast(), decay.len() * 4, MEMCPY_H2D)?;
+        off += decay.len() * 4;
+        let dbeta = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dbeta.cast(), beta.as_ptr().cast(), beta.len() * 4, MEMCPY_H2D)?;
+        off += beta.len() * 4;
+        let dstate = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dstate.cast(), state.as_ptr().cast(), state.len() * 4, MEMCPY_H2D)?;
+        off += state.len() * 4;
+        let dout = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dout.cast(), out.as_ptr().cast(), out.len() * 4, MEMCPY_H2D)?;
+        self.add_h2d(need);
+        self.gated_delta_step(
+            dq, dk, dv, ddecay, dbeta, dstate, dout, n_v_heads, head_v, head_k, eps,
+        )?;
+        memcpy(q.as_mut_ptr().cast(), dq.cast(), q.len() * 4, MEMCPY_D2H)?;
+        memcpy(k.as_mut_ptr().cast(), dk.cast(), k.len() * 4, MEMCPY_D2H)?;
+        memcpy(state.as_mut_ptr().cast(), dstate.cast(), state.len() * 4, MEMCPY_D2H)?;
+        memcpy(out.as_mut_ptr().cast(), dout.cast(), out.len() * 4, MEMCPY_D2H)?;
+        self.add_d2h((q.len() + k.len() + state.len() + out.len()) * 4);
+        Ok(())
+    }
+
+    /// Drop all resident GDN state for a finished / restored request.
+    pub fn gdn_clear_request(&self, request_id: u64) {
+        if let Ok(mut g) = self.gdn.lock() {
+            g.retain(|&(rid, _), _| rid != request_id);
+        }
+    }
+
+    /// Force re-seed from host on next step (after recurrent restore).
+    pub fn gdn_invalidate_request(&self, request_id: u64) {
+        if let Ok(mut g) = self.gdn.lock() {
+            for ((rid, _), layer) in g.iter_mut() {
+                if *rid == request_id {
+                    layer.seeded = false;
+                    layer.dirty = false;
+                }
+            }
+        }
+    }
+
+    /// Pull dirty per-layer GDN state into host `states[layer]` (anchor/radix capture).
+    pub fn gdn_sync_request_to_host(
+        &self,
+        request_id: u64,
+        states: &mut [Vec<f32>],
+    ) -> Result<(), AllpacaError> {
+        let mut g = self.gdn.lock().map_err(|_| {
+            AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+                "gdn mutex poisoned".into(),
+            ))
+        })?;
+        self.bind()?;
+        for ((rid, layer), slot) in g.iter_mut() {
+            if *rid != request_id || !slot.dirty {
+                continue;
+            }
+            if *layer >= states.len() {
+                continue;
+            }
+            let host = &mut states[*layer];
+            if host.len() != slot.state_n {
+                *host = vec![0.0; slot.state_n];
+            }
+            memcpy(
+                host.as_mut_ptr().cast(),
+                slot.state.ptr_at(0).cast(),
+                slot.state_n * 4,
+                MEMCPY_D2H,
+            )?;
+            self.add_d2h(slot.state_n * 4);
+            slot.dirty = false;
+        }
+        Ok(())
+    }
+
+    /// GDN step with request-local device-resident state (no per-token state H2D/D2H).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_step_resident(
+        &self,
+        request_id: u64,
+        layer: usize,
+        host_state: &mut [f32],
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        out: &mut [f32],
+        n_v_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        let n_v = n_v_heads as usize;
+        let hv = head_v as usize;
+        let hk = head_k as usize;
+        if n_v == 0
+            || hv == 0
+            || hk == 0
+            || q.len() != n_v * hk
+            || k.len() != n_v * hk
+            || v.len() != n_v * hv
+            || decay.len() != n_v
+            || beta.len() != n_v
+            || host_state.len() != n_v * hv * hk
+            || out.len() != n_v * hv
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gated_delta_step_resident length mismatch".into(),
+            )));
+        }
+        let need = (q.len() + k.len() + v.len() + decay.len() + beta.len() + out.len()) * 4;
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!(
+                    "gated_delta_step_resident need {need} scratch={}",
+                    self.scratch_bytes
+                ),
+            )));
+        }
+        self.bind()?;
+        let key = (request_id, layer);
+        let (dstate, need_seed) = {
+            let mut g = self.gdn.lock().map_err(|_| {
+                AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+                    "gdn mutex poisoned".into(),
+                ))
+            })?;
+            if g.get(&key).is_none_or(|s| s.state_n != host_state.len()) {
+                let blob = DeviceWeights::alloc(self.device, host_state.len() * 4)?;
+                g.insert(
+                    key,
+                    GdnLayerResident {
+                        state: blob,
+                        state_n: host_state.len(),
+                        seeded: false,
+                        dirty: false,
+                    },
+                );
+            }
+            let slot = g.get_mut(&key).expect("gdn layer present");
+            (slot.state.ptr_at(0) as *mut f32, !slot.seeded)
+        };
+        if need_seed {
+            self.copy_h2d_f32(dstate, host_state)?;
+            if let Ok(mut g) = self.gdn.lock() {
+                if let Some(slot) = g.get_mut(&key) {
+                    slot.seeded = true;
+                }
+            }
+        }
+
+        let mut off = 0usize;
+        let dq = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dq.cast(), q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D)?;
+        off += q.len() * 4;
+        let dk = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dk.cast(), k.as_ptr().cast(), k.len() * 4, MEMCPY_H2D)?;
+        off += k.len() * 4;
+        let dv = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dv.cast(), v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D)?;
+        off += v.len() * 4;
+        let ddecay = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(ddecay.cast(), decay.as_ptr().cast(), decay.len() * 4, MEMCPY_H2D)?;
+        off += decay.len() * 4;
+        let dbeta = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dbeta.cast(), beta.as_ptr().cast(), beta.len() * 4, MEMCPY_H2D)?;
+        off += beta.len() * 4;
+        let dout = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dout.cast(), out.as_ptr().cast(), out.len() * 4, MEMCPY_H2D)?;
+        self.add_h2d(need);
+
+        self.gated_delta_step(
+            dq, dk, dv, ddecay, dbeta, dstate, dout, n_v_heads, head_v, head_k, eps,
+        )?;
+
+        memcpy(q.as_mut_ptr().cast(), dq.cast(), q.len() * 4, MEMCPY_D2H)?;
+        memcpy(k.as_mut_ptr().cast(), dk.cast(), k.len() * 4, MEMCPY_D2H)?;
+        memcpy(out.as_mut_ptr().cast(), dout.cast(), out.len() * 4, MEMCPY_D2H)?;
+        self.add_d2h((q.len() + k.len() + out.len()) * 4);
+
+        if let Ok(mut g) = self.gdn.lock() {
+            if let Some(slot) = g.get_mut(&(request_id, layer)) {
+                slot.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn gdn_conv1d_step_host(
+        &self,
+        x: &[f32],
+        kernel: &[f32],
+        conv_state: &mut [f32],
+        out: &mut [f32],
+        conv_kernel: i32,
+    ) -> Result<(), AllpacaError> {
+        let qkv = x.len();
+        let k = conv_kernel as usize;
+        if k == 0
+            || out.len() != qkv
+            || kernel.len() != k.saturating_mul(qkv)
+            || conv_state.len() != k.saturating_sub(1).saturating_mul(qkv)
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gdn_conv1d_step_host length mismatch".into(),
+            )));
+        }
+        let need = (qkv + kernel.len() + conv_state.len() + out.len()) * 4;
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("gdn_conv1d need {need} scratch={}", self.scratch_bytes),
+            )));
+        }
+        self.bind()?;
+        let mut off = 0usize;
+        let dx = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dx.cast(), x.as_ptr().cast(), qkv * 4, MEMCPY_H2D)?;
+        off += qkv * 4;
+        let dk = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dk.cast(), kernel.as_ptr().cast(), kernel.len() * 4, MEMCPY_H2D)?;
+        off += kernel.len() * 4;
+        let ds = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(ds.cast(), conv_state.as_ptr().cast(), conv_state.len() * 4, MEMCPY_H2D)?;
+        off += conv_state.len() * 4;
+        let dout = unsafe { self.scratch.add(off).cast::<f32>() };
+        self.add_h2d((qkv + kernel.len() + conv_state.len()) * 4);
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_gdn_conv1d_step(
+                        dx,
+                        dk,
+                        ds,
+                        dout,
+                        qkv as i32,
+                        conv_kernel,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "gdn_conv1d_step")
+            })?;
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gdn_conv1d unavailable".into(),
+            )));
+        }
+        memcpy(out.as_mut_ptr().cast(), dout.cast(), qkv * 4, MEMCPY_D2H)?;
+        memcpy(
+            conv_state.as_mut_ptr().cast(),
+            ds.cast(),
+            conv_state.len() * 4,
+            MEMCPY_D2H,
+        )?;
+        self.add_d2h((qkv + conv_state.len()) * 4);
+        Ok(())
+    }
+
+    pub fn expand_k_heads_host(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        n_k: i32,
+        n_v: i32,
+        head_k: i32,
+    ) -> Result<(), AllpacaError> {
+        let nk = n_k as usize;
+        let nv = n_v as usize;
+        let hk = head_k as usize;
+        if nk == 0 || nv == 0 || hk == 0 || nv % nk != 0 || src.len() != nk * hk || dst.len() != nv * hk
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "expand_k_heads_host length mismatch".into(),
+            )));
+        }
+        let need = (src.len() + dst.len()) * 4;
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("expand_k need {need}"),
+            )));
+        }
+        self.bind()?;
+        let ds = self.scratch.cast::<f32>();
+        let dd = unsafe { self.scratch.add(src.len() * 4).cast::<f32>() };
+        memcpy(ds.cast(), src.as_ptr().cast(), src.len() * 4, MEMCPY_H2D)?;
+        self.add_h2d(src.len() * 4);
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_expand_k_heads(ds, dd, n_k, n_v, head_k, std::ptr::null_mut())
+                };
+                status(rc, "expand_k_heads")
+            })?;
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP expand_k unavailable".into(),
+            )));
+        }
+        memcpy(dst.as_mut_ptr().cast(), dd.cast(), dst.len() * 4, MEMCPY_D2H)?;
+        self.add_d2h(dst.len() * 4);
+        Ok(())
+    }
+
+    pub fn gdn_decay_beta_host(
+        &self,
+        alpha: &[f32],
+        dt_bias: &[f32],
+        a: &[f32],
+        decay: &mut [f32],
+        beta: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        let n = alpha.len();
+        if n == 0 || dt_bias.len() != n || a.len() != n || decay.len() != n || beta.len() != n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gdn_decay_beta_host length mismatch".into(),
+            )));
+        }
+        let need = n * 5 * 4;
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("gdn_decay need {need}"),
+            )));
+        }
+        self.bind()?;
+        let mut off = 0usize;
+        let dalpha = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dalpha.cast(), alpha.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        off += n * 4;
+        let ddt = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(ddt.cast(), dt_bias.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        off += n * 4;
+        let da = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(da.cast(), a.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        off += n * 4;
+        let ddecay = unsafe { self.scratch.add(off).cast::<f32>() };
+        off += n * 4;
+        let dbeta = unsafe { self.scratch.add(off).cast::<f32>() };
+        memcpy(dbeta.cast(), beta.as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+        self.add_h2d(n * 4 * 4);
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_gdn_decay_beta(
+                        dalpha,
+                        ddt,
+                        da,
+                        ddecay,
+                        dbeta,
+                        n as i32,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "gdn_decay_beta")
+            })?;
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gdn_decay unavailable".into(),
+            )));
+        }
+        memcpy(decay.as_mut_ptr().cast(), ddecay.cast(), n * 4, MEMCPY_D2H)?;
+        memcpy(beta.as_mut_ptr().cast(), dbeta.cast(), n * 4, MEMCPY_D2H)?;
+        self.add_d2h(n * 8);
+        Ok(())
+    }
+
     pub fn rmsnorm_device(
         &self,
         x: *const f32,
@@ -4117,6 +4862,54 @@ impl HipWorkspace {
         theta: f32,
     ) -> Result<(), AllpacaError> {
         self.rope_qk_device_rows(q, k, 1, n_q_heads, n_k_heads, head_dim, pos, theta)
+    }
+
+    pub fn rope_imrope_qk_device(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        n_q_heads: i32,
+        n_k_heads: i32,
+        head_dim: i32,
+        n_rot: i32,
+        pos: i32,
+        theta: f32,
+        sections: [i32; 4],
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || k.is_null() || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 || n_rot <= 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device imrope".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_rope_imrope_qk(
+                        q,
+                        k,
+                        n_q_heads,
+                        n_k_heads,
+                        head_dim,
+                        n_rot,
+                        pos,
+                        theta,
+                        sections.as_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "rope_imrope_qk")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (pos, theta, sections);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rope_imrope_qk unavailable".into(),
+            )))
+        }
     }
 
     pub fn rope_qk_device_rows(
@@ -4216,6 +5009,102 @@ impl HipWorkspace {
         {
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP silu_mul unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn deinterleave_q_gate_device(
+        &self,
+        q_full: *const f32,
+        q: *mut f32,
+        gate: *mut f32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if q_full.is_null() || q.is_null() || gate.is_null() || n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid deinterleave_q_gate".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_deinterleave_q_gate(
+                        q_full,
+                        q,
+                        gate,
+                        n_heads,
+                        head_dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "deinterleave_q_gate")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP deinterleave_q_gate unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn sigmoid_mul_device(
+        &self,
+        x: *mut f32,
+        gate: *const f32,
+        n: i32,
+    ) -> Result<(), AllpacaError> {
+        if x.is_null() || gate.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid sigmoid_mul".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_sigmoid_mul(x, gate, n, std::ptr::null_mut()) };
+                status(rc, "sigmoid_mul")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP sigmoid_mul unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn rmsnorm_heads_device(
+        &self,
+        x: *mut f32,
+        weight: *const f32,
+        n_heads: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if x.is_null() || weight.is_null() || n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rmsnorm_heads".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_rmsnorm_heads(x, weight, n_heads, head_dim, eps, std::ptr::null_mut())
+                };
+                status(rc, "rmsnorm_heads")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rmsnorm_heads unavailable".into(),
             )))
         }
     }
@@ -6043,6 +6932,79 @@ mod tests {
         }
     }
 
+    /// Device IMRoPE must match CPU `rope_imrope_neox_heads` (partial + sections).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rope_imrope_qk_matches_cpu() {
+        if device_count() == 0 {
+            return;
+        }
+        let n_q = 4usize;
+        let n_k = 2usize;
+        let head_dim = 64usize;
+        let n_rot = 32usize;
+        let pos = 7usize;
+        let theta = 10_000.0f32;
+        let sections = [5i32, 5, 6, 0];
+        let mut q = vec![0.0f32; n_q * head_dim];
+        let mut k = vec![0.0f32; n_k * head_dim];
+        for (i, v) in q.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in k.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.4;
+        }
+        let mut cpu_q = q.clone();
+        let mut cpu_k = k.clone();
+        allpaca_cpu::rope_imrope_neox_heads(
+            &mut cpu_q, n_q, head_dim, pos, theta, n_rot, sections,
+        )
+        .unwrap();
+        allpaca_cpu::rope_imrope_neox_heads(
+            &mut cpu_k, n_k, head_dim, pos, theta, n_rot, sections,
+        )
+        .unwrap();
+        let hip = HipWorkspace::new(0, (n_q + n_k) * head_dim * 4 + 4096, 8).expect("hip");
+        let q_bytes = q.len() * 4;
+        let k_bytes = k.len() * 4;
+        let dq = device_malloc(q_bytes, 0).unwrap();
+        let dk = device_malloc(k_bytes, 0).unwrap();
+        memcpy(dq, q.as_ptr().cast(), q_bytes, MEMCPY_H2D).unwrap();
+        memcpy(dk, k.as_ptr().cast(), k_bytes, MEMCPY_H2D).unwrap();
+        hip.rope_imrope_qk_device(
+            dq.cast(),
+            dk.cast(),
+            n_q as i32,
+            n_k as i32,
+            head_dim as i32,
+            n_rot as i32,
+            pos as i32,
+            theta,
+            sections,
+        )
+        .expect("imrope device");
+        memcpy(q.as_mut_ptr().cast(), dq, q_bytes, MEMCPY_D2H).unwrap();
+        memcpy(k.as_mut_ptr().cast(), dk, k_bytes, MEMCPY_D2H).unwrap();
+        device_free(dq, q_bytes);
+        device_free(dk, k_bytes);
+        for i in 0..q.len() {
+            assert!(
+                gemm_close(q[i], cpu_q[i]),
+                "imrope Q mismatch idx={i} hip={} cpu={}",
+                q[i],
+                cpu_q[i]
+            );
+        }
+        for i in 0..k.len() {
+            assert!(
+                gemm_close(k[i], cpu_k[i]),
+                "imrope K mismatch idx={i} hip={} cpu={}",
+                k[i],
+                cpu_k[i]
+            );
+        }
+    }
+
     /// Prefill-shaped batched F32 embed gather must match table rows.
     #[cfg(feature = "hip")]
     #[test]
@@ -6145,6 +7107,49 @@ mod tests {
             assert!(
                 gemm_close(hip[i], cpu[i]),
                 "embed_gather_q8_0_rows mismatch idx={i} hip={} cpu={}",
+                hip[i],
+                cpu[i]
+            );
+        }
+    }
+
+    /// Prefill-shaped batched ROCmFP4 embed gather must match CPU dequant rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn embed_gather_rocmfp4_rows_matches_dequant_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        let vocab = 8usize;
+        let dim = 64usize;
+        let tokens = [0u32, 3, 7, 1, 3, 2];
+        let mut table = vec![0.0f32; vocab * dim];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        let mut packed = Vec::new();
+        for row in 0..vocab {
+            packed.extend(allpaca_cpu::quantize_rocmfp4(
+                &table[row * dim..(row + 1) * dim],
+            ));
+        }
+        let mut cpu = vec![0.0f32; tokens.len() * dim];
+        for (r, &tok) in tokens.iter().enumerate() {
+            let row_off = tok as usize * dim.div_ceil(32) * ROCMFP4_BLOCK_BYTES;
+            allpaca_cpu::dequant_rocmfp4(
+                &packed[row_off..row_off + dim.div_ceil(32) * ROCMFP4_BLOCK_BYTES],
+                dim,
+                &mut cpu[r * dim..(r + 1) * dim],
+            )
+            .unwrap();
+        }
+        let mut hip = vec![0.0f32; tokens.len() * dim];
+        embed_gather_rocmfp4_rows(&packed, &tokens, &mut hip, dim as i32)
+            .expect("HIP embed_gather_rocmfp4_rows must run when a device is present");
+        for i in 0..cpu.len() {
+            assert!(
+                gemm_close(hip[i], cpu[i]),
+                "embed_gather_rocmfp4_rows mismatch idx={i} hip={} cpu={}",
                 hip[i],
                 cpu[i]
             );

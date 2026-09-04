@@ -70,6 +70,8 @@ struct ActiveRequest {
     decode_step: u64,
     /// Last MoE router input (FFN RMSNorm) from the most recent decode forward.
     moe_norm: Vec<f32>,
+    /// Target `output_norm` hidden for MTP draft `h_nextn` handoff.
+    last_hidden: Vec<f32>,
 }
 
 struct EngineInner {
@@ -141,6 +143,7 @@ pub struct RequestHandle {
     id: u64,
     inner: Arc<Mutex<EngineInner>>,
     metrics: Arc<Metrics>,
+    hip: Option<Arc<HipWorkspace>>,
 }
 
 impl RequestHandle {
@@ -173,6 +176,9 @@ impl std::fmt::Debug for RequestHandle {
 
 impl Drop for RequestHandle {
     fn drop(&mut self) {
+        if let Some(hip) = self.hip.as_ref() {
+            hip.gdn_clear_request(self.id);
+        }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(active) = guard.active.remove(&self.id) {
                 for layer in active.pages {
@@ -832,6 +838,7 @@ impl Engine {
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
+        let mut draft_reuses_target_gguf = false;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, EngineTokenizer::from_gguf(tok));
@@ -858,11 +865,41 @@ impl Engine {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        } else if self
+            .config
+            .speculative
+            .providers
+            .contains(&DraftProviderKind::Mtp)
+            && model.config.nextn_predict_layers > 0
+        {
+            match TinyModel::from_gguf_mtp(&file) {
+                Ok(draft) => {
+                    tracing::info!(
+                        layers = draft.config.n_layers,
+                        base = draft.config.gguf_layer_base,
+                        "loaded MTP/NextN blocks as draft model"
+                    );
+                    inner.draft_model = Some(Arc::new(draft));
+                    draft_reuses_target_gguf = true;
+                    inner.flags.draft_model_speculation = true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MTP draft load failed; continuing without MTP");
+                    self.metrics
+                        .degraded_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
-        self.upload_resident_from_gguf(Some(&file), draft_file.as_ref())?;
+        let draft_ref = if draft_reuses_target_gguf {
+            Some(&file)
+        } else {
+            draft_file.as_ref()
+        };
+        self.upload_resident_from_gguf(Some(&file), draft_ref)?;
         self.note_early_exit_gate()
     }
 
@@ -881,11 +918,12 @@ impl Engine {
         let target = inner.target.clone();
         let draft = inner.draft_model.clone();
         inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
-            let uploaded = if target.config.n_experts > 0 && target.host_weights_ready() {
+            let host_ready = target.host_weights_ready();
+            let uploaded = if target.config.n_experts > 0 && host_ready {
                 ResidentModel::upload(&target, hip.device)
             } else if let Some(file) = target_gguf {
                 ResidentModel::upload_gguf(file, &target.config, hip.device)
-            } else if target.host_weights_ready() {
+            } else if host_ready {
                 ResidentModel::upload(&target, hip.device)
             } else {
                 Err(AllpacaError::Fatal(FatalError::ModelLoad(
@@ -900,6 +938,11 @@ impl Engine {
                     Some(Arc::new(resident))
                 }
                 Err(e) => {
+                    // Large GGUFs skip host F32 materialize — without a resident
+                    // upload there is no decode path left.
+                    if !host_ready {
+                        return Err(e);
+                    }
                     tracing::warn!(error = %e, "HIP target weight upload failed; GEMM will H2D per op");
                     self.metrics
                         .degraded_events
@@ -1153,9 +1196,9 @@ impl Engine {
                 )));
             }
         }
-        if let Some(eos) = tokenizer.eos_id {
-            if !params.stop_token_ids.contains(&eos) {
-                params.stop_token_ids.push(eos);
+        for id in tokenizer.stop_token_ids() {
+            if !params.stop_token_ids.contains(&id) {
+                params.stop_token_ids.push(id);
             }
         }
         let vocab = tokenizer.vocab_size();
@@ -1258,6 +1301,7 @@ impl Engine {
                 recurrent,
                 decode_step: 0,
                 moe_norm: vec![0.0f32; dim],
+                last_hidden: vec![0.0f32; dim],
             },
         );
         if self.config.structured_output.async_masks {
@@ -1285,6 +1329,7 @@ impl Engine {
             id,
             inner: Arc::clone(&self.inner),
             metrics: Arc::clone(&self.metrics),
+            hip: self.hip.clone(),
         })
     }
 
@@ -1816,10 +1861,31 @@ impl Engine {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.recurrent)
         };
+        let mut last_hidden = {
+            let active = request_mut(inner, id)?;
+            std::mem::take(&mut active.last_hidden)
+        };
         // Per-token prefill so radix (and anchors) get correct mid-prefix checkpoints.
         for (i, tok) in toks.iter().enumerate() {
             let pos = start + i;
             let last = pos + 1 >= total;
+            // MTP process: (token_pos, h_{pos-1}) before target updates last_hidden.
+            mtp_process_token(
+                inner,
+                *tok,
+                pos,
+                &last_hidden,
+                self.draft_hip.as_deref(),
+                &self.metrics,
+            )?;
+            let mut decode_side = DeviceDecodeSide {
+                request_id: id,
+                moe_norm: None,
+                layer_stagger: None,
+                ds_probe: None,
+                ds_queue: None,
+                last_hidden: Some(&mut last_hidden),
+            };
             target.forward_token(
                 *tok,
                 pos,
@@ -1832,8 +1898,11 @@ impl Engine {
                 last || write_logits,
                 recurrent.as_mut(),
                 None,
-                None,
+                Some(&mut decode_side),
             )?;
+            if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
+                hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+            }
             let prefix = request(inner, id)?.tokens[..=pos].to_vec();
             let pages_now = request(inner, id)?.pages.clone();
             let state_ref = recurrent
@@ -1866,6 +1935,7 @@ impl Engine {
             active.prefill_pos = end;
             active.pending_logits = logits;
             active.recurrent = recurrent;
+            active.last_hidden = last_hidden;
         }
         self.metrics
             .prefill_chunks
@@ -2191,7 +2261,9 @@ fn apply_provider_flags(flags: &mut FeatureFlags, config: &Config) {
     if !providers.contains(&DraftProviderKind::Ngram) {
         flags.ngram_speculation = false;
     }
-    if !providers.contains(&DraftProviderKind::DraftModel) {
+    if !providers.contains(&DraftProviderKind::DraftModel)
+        && !providers.contains(&DraftProviderKind::Mtp)
+    {
         flags.draft_model_speculation = false;
     }
 }
@@ -2293,6 +2365,99 @@ fn kick_async_mask(active: &mut ActiveRequest, vocab: usize) {
     });
 }
 
+/// True when MTP decode text is empty, whitespace-only, or dropped-word junk.
+pub fn mtp_text_is_garbled(text: &str) -> bool {
+    text.chars().all(char::is_whitespace) || mtp_text_has_dropped_words(text)
+}
+
+fn mtp_text_has_dropped_words(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    // Live Qwen MTP soaks drop a digit from "400-word" → "00-word".
+    // Do not use raw `contains("00-word")`: that also matches "400-word".
+    if t.match_indices("00-word")
+        .any(|(i, _)| i == 0 || !t.as_bytes()[i - 1].is_ascii_digit())
+    {
+        return true;
+    }
+    // Determiner + finite verb with the subject noun missing ("The wants").
+    if t.contains("the wants ") || t.contains("the is ") || t.contains("the needs ") {
+        return true;
+    }
+    // Preposition stacked on "to " after a dropped gerund ("for to code").
+    if t.contains("for to ") || t.contains("in to code") {
+        return true;
+    }
+    // "Let me" with the verb dropped ("Let me about", "Let me words").
+    t.contains("let me about ") || t.contains("let me words ")
+}
+
+fn mtp_draft_active(inner: &EngineInner) -> bool {
+    let Some(model) = inner.draft_model.as_ref() else {
+        return false;
+    };
+    model.config.gguf_layer_base > 0
+        || model.mtp_nextn.is_some()
+        || inner
+            .draft_resident
+            .as_ref()
+            .is_some_and(|r| r.has_mtp_nextn())
+}
+
+/// llama.cpp `process()`: pair `(token_k, h_{k-1})` into the MTP draft KV.
+fn mtp_process_token(
+    inner: &mut EngineInner,
+    token: u32,
+    pos: usize,
+    h_prev: &[f32],
+    draft_hip: Option<&HipWorkspace>,
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    if !mtp_draft_active(inner) {
+        return Ok(());
+    }
+    let model = inner
+        .draft_model
+        .clone()
+        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+    let dim = model.config.dim;
+    let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+    if h_prev.len() != dim {
+        return Ok(());
+    }
+    if inner.draft_kv.seq_len() > pos {
+        inner.draft_kv.truncate(pos, kv_dim);
+    }
+    if inner.draft_kv.seq_len() != pos {
+        // Missing earlier process steps — skip rather than corrupt slots.
+        metrics
+            .mtp_process_skips
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("ALLPACA_MTP_PROBE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "MTP_PROBE process skip seq_len={} pos={}",
+                inner.draft_kv.seq_len(),
+                pos
+            );
+        }
+        return Ok(());
+    }
+    inner.draft_kv.seed_h_nextn_from_target(h_prev);
+    let vocab = model.config.vocab_size;
+    let mut logits = vec![0.0f32; vocab];
+    let resident = inner.draft_resident.clone();
+    model.forward_dense_on(
+        token,
+        pos,
+        &mut inner.draft_kv,
+        &mut logits,
+        draft_hip,
+        resident.as_deref(),
+        Some(metrics),
+    )?;
+    inner.draft_kv.record(token);
+    Ok(())
+}
+
 fn propose_drafts(
     inner: &mut EngineInner,
     id: u64,
@@ -2313,6 +2478,21 @@ fn propose_drafts(
     }
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
+            let mtp = model.config.gguf_layer_base > 0
+                || model.mtp_nextn.is_some()
+                || inner
+                    .draft_resident
+                    .as_ref()
+                    .is_some_and(|r| r.has_mtp_nextn());
+            if mtp {
+                let dim = model.config.dim;
+                let seed = request(inner, id)
+                    .map(|a| a.last_hidden.clone())
+                    .unwrap_or_default();
+                if seed.len() == dim {
+                    inner.draft_kv.seed_h_nextn_from_target(&seed);
+                }
+            }
             let mut provider = DraftModelProvider::new((*model).clone());
             let resident = inner.draft_resident.clone();
             let draft = provider.propose_on(
@@ -2324,7 +2504,27 @@ fn propose_drafts(
                 resident.as_deref(),
                 Some(metrics),
             )?;
+            if mtp {
+                // Draft AR writes are speculative; process() owns the prompt KV.
+                let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+                inner.draft_kv.truncate(ctx.len(), kv_dim);
+                let seed = request(inner, id)
+                    .map(|a| a.last_hidden.clone())
+                    .unwrap_or_default();
+                if seed.len() == model.config.dim {
+                    inner.draft_kv.seed_h_nextn_from_target(&seed);
+                }
+            }
             if !draft.is_empty() {
+                if std::env::var("ALLPACA_MTP_PROBE").ok().as_deref() == Some("1") {
+                    eprintln!(
+                        "MTP_PROBE ctx_len={} n_past={} drafts={:?} draft_kv_seq={}",
+                        ctx.len(),
+                        ctx.len(),
+                        &draft[..draft.len().min(8)],
+                        inner.draft_kv.seq_len()
+                    );
+                }
                 host_stage_draft_tokens(&draft, draft_hip, metrics);
                 return Ok(draft);
             }
@@ -2398,6 +2598,7 @@ fn prefetch_draft_expert_union(
         layer_stagger: hooks.layer_stagger,
         ds_probe: Some(hooks.ds_probe),
         ds_queue: Some(hooks.ds_queue),
+        last_hidden: None,
     };
     let mut nvme = |id: ExpertId, dev_off: usize, slot_bytes: usize| {
         target.try_nvme_expert_fill(id, dev_off, slot_bytes, Some(&side), resident)
@@ -2444,6 +2645,23 @@ fn verify_and_sample(
     if let Some(hip) = hip {
         let active = request_mut(inner, id)?;
         hip.wait_logits_d2h(&mut active.pending_logits)?;
+        if std::env::var("ALLPACA_DUMP_TOPK").ok().as_deref() == Some("1") {
+            static DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let logits = &active.pending_logits;
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                idx.sort_by(|&a, &b| {
+                    logits[b]
+                        .partial_cmp(&logits[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let k = idx.len().min(10);
+                let top: Vec<(usize, f32)> =
+                    idx[..k].iter().map(|&i| (i, logits[i])).collect();
+                eprintln!("ALLPACA_DUMP_TOPK first-sample top10={top:?}");
+            }
+        }
     }
     let sampled = {
         let active = request_mut(inner, id)?;
@@ -2485,6 +2703,7 @@ fn verify_and_sample(
         sampled,
         metrics,
         hip,
+        draft_hip,
         micro_batch,
         hooks.layer_stagger,
         Some(hooks.ds_probe),
@@ -2531,6 +2750,7 @@ fn verify_and_sample(
         sampled,
         metrics,
         hip,
+        draft_hip,
         micro_batch,
         hooks.layer_stagger,
         Some(hooks.ds_probe),
@@ -2567,7 +2787,7 @@ fn finish_linear_verify(
 ) -> Result<Produced, AllpacaError> {
     if !produced.tokens.is_empty() {
         let ctx = request(inner, id)?.tokens.clone();
-        store_draft_ahead_from_ctx(inner, &ctx, depth, temperature, draft_hip, metrics)?;
+        store_draft_ahead_from_ctx(inner, id, &ctx, depth, temperature, draft_hip, metrics)?;
     }
     Ok(produced)
 }
@@ -2597,8 +2817,26 @@ fn packed_linear_verify(
         && inner.draft_model.is_some();
     if !can_ahead {
         return packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip, hooks,
+            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks,
         );
+    }
+    if mtp_draft_active(inner) {
+        // Process() KV cannot be cloned cheaply. Verify first, then propose
+        // the next span from the rebuilt warm cache (not an empty DenseKv).
+        let produced = packed_linear_verify_span(
+            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks,
+        )?;
+        let actual_ctx = request(inner, id)?.tokens.clone();
+        store_draft_ahead_from_ctx(
+            inner,
+            id,
+            &actual_ctx,
+            depth,
+            temperature,
+            draft_hip,
+            metrics,
+        )?;
+        return Ok(produced);
     }
     let mut draft_kv = std::mem::take(&mut inner.draft_kv);
     let model = inner.draft_model.clone().expect("draft-ahead needs a Draft Model");
@@ -2622,7 +2860,7 @@ fn packed_linear_verify(
             (draft_kv, tokens)
         });
         let produced = packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip, hooks,
+            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks,
         );
         let (kv, ahead) = worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
         inner.draft_kv = kv;
@@ -2640,6 +2878,7 @@ fn packed_linear_verify(
         } else {
             store_draft_ahead_from_ctx(
                 inner,
+                id,
                 &actual_ctx,
                 depth,
                 temperature,
@@ -2653,6 +2892,7 @@ fn packed_linear_verify(
 
 fn store_draft_ahead_from_ctx(
     inner: &mut EngineInner,
+    id: u64,
     ctx: &[u32],
     depth: usize,
     temperature: f32,
@@ -2665,6 +2905,16 @@ fn store_draft_ahead_from_ctx(
     let Some(model) = inner.draft_model.clone() else {
         return Ok(());
     };
+    let mtp = mtp_draft_active(inner);
+    if mtp {
+        let dim = model.config.dim;
+        let seed = request(inner, id)
+            .map(|a| a.last_hidden.clone())
+            .unwrap_or_default();
+        if seed.len() == dim {
+            inner.draft_kv.seed_h_nextn_from_target(&seed);
+        }
+    }
     let mut provider = DraftModelProvider::new((*model).clone());
     let resident = inner.draft_resident.clone();
     let tokens = provider.propose_on(
@@ -2676,6 +2926,16 @@ fn store_draft_ahead_from_ctx(
         resident.as_deref(),
         Some(metrics),
     )?;
+    if mtp {
+        let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+        inner.draft_kv.truncate(ctx.len(), kv_dim);
+        let seed = request(inner, id)
+            .map(|a| a.last_hidden.clone())
+            .unwrap_or_default();
+        if seed.len() == model.config.dim {
+            inner.draft_kv.seed_h_nextn_from_target(&seed);
+        }
+    }
     if !tokens.is_empty() {
         inner.draft_ahead = Some(DraftAhead {
             ctx: ctx.to_vec(),
@@ -2694,6 +2954,7 @@ fn packed_linear_verify_span(
     remaining: usize,
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
+    draft_hip: Option<&HipWorkspace>,
     hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
     prefetch_draft_expert_union(inner, &span, metrics, hip, hooks)?;
@@ -2724,9 +2985,16 @@ fn packed_linear_verify_span(
     request_mut(inner, id)?.pages = pages;
     let mut last_logits = std::mem::take(&mut request_mut(inner, id)?.pending_logits);
     let mut row_logits = vec![0.0f32; span.len() * vocab];
+    let mut row_hiddens = Vec::new();
     let pages = request(inner, id)?.pages.clone();
     let resident = inner.target_resident.clone();
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
+    if let (Some(hip), Some(state)) = (hip, recurrent.as_mut()) {
+        hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+    }
+    let rec_before = recurrent.clone();
+    let dim = target.config.dim;
+    let pending_h = request(inner, id)?.last_hidden.clone();
     target.forward_tokens(
         &span,
         start_pos,
@@ -2739,12 +3007,14 @@ fn packed_linear_verify_span(
         true,
         Some(&mut row_logits),
         recurrent.as_mut(),
+        Some(&mut row_hiddens),
+        id,
     )?;
     if let Some(hip) = hip {
+        hip.bind()?;
         hip.wait_logits_d2h(&mut row_logits)?;
     }
     request_mut(inner, id)?.pending_logits = last_logits;
-    request_mut(inner, id)?.recurrent = recurrent;
     metrics
         .linear_packed_verifies
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2779,10 +3049,70 @@ fn packed_linear_verify_span(
     inner
         .kv
         .rewind_filled(&pages, start_pos + keep, page_tokens as usize);
+    if keep < span.len() {
+        if let Some(saved) = rec_before {
+            recurrent = Some(saved);
+            if let Some(hip) = hip {
+                hip.gdn_invalidate_request(id);
+            }
+            let mut replay_logits = vec![0.0f32; vocab];
+            target.forward_tokens(
+                &span[..keep],
+                start_pos,
+                &pages,
+                &mut inner.kv,
+                metrics,
+                &mut replay_logits,
+                hip,
+                resident.as_deref(),
+                false,
+                None,
+                recurrent.as_mut(),
+                None,
+                id,
+            )?;
+            if let Some(hip) = hip {
+                let _ = hip.wait_logits_d2h(&mut replay_logits);
+            }
+        }
+    }
+    request_mut(inner, id)?.recurrent = recurrent;
+    // Rebuild MTP draft KV for accepted prefix with target hiddens (llama process).
+    if mtp_draft_active(inner) && dim > 0 && row_hiddens.len() >= keep * dim {
+        let kv_dim = inner
+            .draft_model
+            .as_ref()
+            .map(|m| m.config.n_kv_heads * m.config.head_dim())
+            .unwrap_or(0);
+        if kv_dim > 0 {
+            inner.draft_kv.truncate(start_pos, kv_dim);
+        }
+        for i in 0..keep {
+            let h_prev = if i == 0 {
+                pending_h.as_slice()
+            } else {
+                let off = (i - 1) * dim;
+                &row_hiddens[off..off + dim]
+            };
+            mtp_process_token(
+                inner,
+                span[i],
+                start_pos + i,
+                h_prev,
+                draft_hip,
+                metrics,
+            )?;
+        }
+    }
     {
         let active = request_mut(inner, id)?;
         active.tokens.extend_from_slice(&span[..keep]);
         active.pages = pages;
+        // MTP handoff: last accepted row's output_norm hidden (not the rejected suffix).
+        if dim > 0 && row_hiddens.len() >= keep * dim {
+            let start = (keep - 1) * dim;
+            active.last_hidden = row_hiddens[start..start + dim].to_vec();
+        }
     }
     if inner.flags.ngram_speculation {
         let ctx = request(inner, id)?.tokens.clone();
@@ -2796,6 +3126,7 @@ fn packed_linear_verify_span(
             produced[keep],
             metrics,
             hip,
+            draft_hip,
             None,
             hooks.layer_stagger,
             Some(hooks.ds_probe),
@@ -2881,6 +3212,7 @@ fn verify_forest(
         sampled,
         metrics,
         hip,
+        None,
         micro_batch,
         hooks.layer_stagger,
         Some(hooks.ds_probe),
@@ -2915,6 +3247,7 @@ fn append_and_forward(
     token: u32,
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
+    draft_hip: Option<&HipWorkspace>,
     micro_batch: Option<&MicroBatchExpertUnion>,
     layer_stagger: Option<&LayerStagger>,
     ds_probe: Option<&DirectStorageProbe>,
@@ -2955,12 +3288,15 @@ fn append_and_forward(
     let resident = inner.target_resident.clone();
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     let mut moe_norm = std::mem::take(&mut request_mut(inner, id)?.moe_norm);
+    let mut last_hidden = std::mem::take(&mut request_mut(inner, id)?.last_hidden);
+    mtp_process_token(inner, token, pos, &last_hidden, draft_hip, metrics)?;
     let mut side = DeviceDecodeSide {
         request_id: id,
         moe_norm: Some(&mut moe_norm),
         layer_stagger,
         ds_probe,
         ds_queue,
+        last_hidden: Some(&mut last_hidden),
     };
     target.forward_token(
         token,
@@ -2979,6 +3315,7 @@ fn append_and_forward(
     request_mut(inner, id)?.pending_logits = logits;
     request_mut(inner, id)?.recurrent = recurrent;
     request_mut(inner, id)?.moe_norm = moe_norm;
+    request_mut(inner, id)?.last_hidden = last_hidden;
     if let Some(active) = inner.active.get_mut(&id) {
         active.decode_step = active.decode_step.saturating_add(1);
     }
@@ -4867,6 +5204,75 @@ mod tests {
         write_gguf(path, &meta, &views).unwrap();
     }
 
+    fn write_tiny_mtp_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        use std::collections::HashMap;
+
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let w = 0.01f32;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
+        meta.insert("llama.nextn_predict_layers".into(), GgufValue::Uint32(1));
+        meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+        meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+        meta.insert(
+            "llama.feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hello".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
+            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        ];
+        for i in 0..2usize {
+            owned.push((format!("blk.{i}.attn_norm.weight"), vec![dim as u64], vec![1.0; dim]));
+            owned.push((format!("blk.{i}.attn_q.weight"), vec![dim as u64, dim as u64], vec![w; dim * dim]));
+            owned.push((format!("blk.{i}.attn_k.weight"), vec![2, dim as u64], vec![w; 2 * dim]));
+            owned.push((format!("blk.{i}.attn_v.weight"), vec![2, dim as u64], vec![w; 2 * dim]));
+            owned.push((format!("blk.{i}.attn_output.weight"), vec![dim as u64, dim as u64], vec![w; dim * dim]));
+            owned.push((format!("blk.{i}.ffn_norm.weight"), vec![dim as u64], vec![1.0; dim]));
+            owned.push((format!("blk.{i}.ffn_gate.weight"), vec![ff as u64, dim as u64], vec![w; ff * dim]));
+            owned.push((format!("blk.{i}.ffn_up.weight"), vec![ff as u64, dim as u64], vec![w; ff * dim]));
+            owned.push((format!("blk.{i}.ffn_down.weight"), vec![dim as u64, ff as u64], vec![w; dim * ff]));
+        }
+        // NextN seed tensors on the MTP block (blk.1). eh_proj: [dim, 2*dim].
+        owned.push(("blk.1.nextn.eh_proj.weight".into(), vec![dim as u64, (2 * dim) as u64], vec![w; dim * 2 * dim]));
+        owned.push(("blk.1.nextn.enorm.weight".into(), vec![dim as u64], vec![1.0; dim]));
+        owned.push(("blk.1.nextn.hnorm.weight".into(), vec![dim as u64], vec![1.0; dim]));
+        owned.push(("blk.1.nextn.shared_head_norm.weight".into(), vec![dim as u64], vec![1.0; dim]));
+        let views: Vec<GgufWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
     fn write_tiny_moe_gguf(path: &std::path::Path) {
         use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
         use std::collections::HashMap;
@@ -5146,6 +5552,10 @@ mod tests {
     }
 
     fn write_tiny_nemotron_hybrid_gguf(path: &std::path::Path) {
+        write_tiny_nemotron_hybrid_gguf_ssm_d(path, 0.25);
+    }
+
+    fn write_tiny_nemotron_hybrid_gguf_ssm_d(path: &std::path::Path, ssm_d: f32) {
         use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
         use std::collections::HashMap;
 
@@ -5216,7 +5626,7 @@ mod tests {
                 vec![w; dim * dim],
             ),
             ("blk.0.ssm_a".into(), vec![1, d_state as u64], vec![-1.0; d_state]),
-            ("blk.0.ssm_d".into(), vec![1, dim as u64], vec![0.25; dim]),
+            ("blk.0.ssm_d".into(), vec![1, dim as u64], vec![ssm_d; dim]),
             ("blk.0.ssm_dt.bias".into(), vec![d_state as u64], vec![0.0; d_state]),
             (
                 "blk.1.attn_norm.weight".into(),
@@ -6449,6 +6859,785 @@ mod tests {
         );
         let _ = std::fs::remove_file(target);
         let _ = std::fs::remove_file(draft);
+    }
+
+    #[test]
+    fn engine_hybrid_packed_verify_partial_accept_matches_target_only() {
+        let target = std::env::temp_dir().join("allpaca_pack_hybrid_tgt.gguf");
+        let draft = std::env::temp_dir().join("allpaca_pack_hybrid_dft.gguf");
+        write_tiny_nemotron_hybrid_gguf_ssm_d(&target, 0.25);
+        write_tiny_llama_gguf(&draft, 0.01, 2.0);
+        let params = GenerationParams {
+            max_tokens: 16,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(target.clone());
+        cfg.model.draft_path = Some(draft.clone());
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 4;
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("hybrid target+draft must load");
+        let mut handle = engine
+            .begin_request("hi", params.clone())
+            .expect("begin hybrid spec");
+        loop {
+            match engine.step(&mut handle).expect("spec step") {
+                StepResult::Prefill { .. } => {}
+                StepResult::Token(_) => {
+                    if engine.stats().linear_packed_verifies > 0 {
+                        break;
+                    }
+                }
+                StepResult::Finished(_) => break,
+            }
+        }
+        let stats = engine.stats();
+        assert!(
+            stats.linear_packed_verifies > 0,
+            "hybrid first draft token must match often enough to pack; stats={stats:?}"
+        );
+        let (spec_tokens, spec_ssm) = {
+            let g = engine.lock().expect("lock spec");
+            let active = g.active.get(&handle.id()).expect("active spec request");
+            let ssm = active
+                .recurrent
+                .as_ref()
+                .map(|r| r.ssm_h.clone())
+                .unwrap_or_default();
+            (active.tokens.clone(), ssm)
+        };
+        let mut plain = Config::compiled_defaults();
+        plain.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        plain.model.path = Some(target.clone());
+        plain.kv.page_tokens = 8;
+        let plain_engine = Engine::new(plain).expect("plain hybrid target must load");
+        let mut plain_handle = plain_engine
+            .begin_request("hi", params)
+            .expect("begin plain hybrid");
+        loop {
+            match plain_engine.step(&mut plain_handle).expect("plain step") {
+                StepResult::Prefill { .. } => {}
+                StepResult::Token(_) | StepResult::Finished(_) => {
+                    let n = {
+                        let g = plain_engine.lock().expect("lock plain");
+                        g.active
+                            .get(&plain_handle.id())
+                            .map(|a| a.tokens.len())
+                            .unwrap_or(0)
+                    };
+                    if n >= spec_tokens.len() {
+                        break;
+                    }
+                }
+            }
+        }
+        let (plain_tokens, plain_ssm) = {
+            let g = plain_engine.lock().expect("lock plain inner");
+            let active = g.active.get(&plain_handle.id()).expect("active plain request");
+            let ssm = active
+                .recurrent
+                .as_ref()
+                .map(|r| r.ssm_h.clone())
+                .unwrap_or_default();
+            (active.tokens.clone(), ssm)
+        };
+        assert_eq!(
+            spec_tokens, plain_tokens,
+            "partial-accept packed verify must keep Target Model tokens"
+        );
+        assert_eq!(
+            spec_ssm, plain_ssm,
+            "packed verify must rewind recurrent SSM to the accepted keep, not the rejected suffix"
+        );
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_file(draft);
+    }
+
+    #[test]
+    fn engine_mtp_draft_loads_from_target_gguf_when_provider_set() {
+        let path = std::env::temp_dir().join("allpaca_tiny_mtp_target.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("MTP target GGUF must load");
+        assert_eq!(engine.stats().degraded_events, 0);
+        {
+            let g = engine.lock().expect("lock");
+            let draft = g.draft_model.as_ref().expect("MTP draft attached");
+            assert_eq!(draft.config.n_layers, 1);
+            assert_eq!(draft.config.gguf_layer_base, 1);
+            assert!(draft.name.contains("mtp"));
+        }
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("MTP speculative generate");
+        assert!(!out.token_ids.is_empty());
+        assert!(
+            engine.stats().draft_tokens_copied > 0 || engine.stats().draft_gpu_forwards > 0,
+            "MTP draft must propose tokens; stats={:?}",
+            engine.stats()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_mtp_packed_verify_ahead_uses_warm_process_kv() {
+        let path = std::env::temp_dir().join("allpaca_mtp_ahead_warm.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 2;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("MTP target GGUF must load");
+        let mut handle = engine
+            .begin_request(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("begin MTP request");
+        loop {
+            match engine.step(&mut handle).expect("step") {
+                StepResult::Prefill { .. } => {}
+                StepResult::Token(_) => {
+                    if engine.stats().linear_packed_verifies > 0 {
+                        break;
+                    }
+                }
+                StepResult::Finished(_) => break,
+            }
+        }
+        let stats = engine.stats();
+        assert!(
+            stats.linear_packed_verifies > 0,
+            "MTP must pack a linear draft span; stats={stats:?}"
+        );
+        let depth = 2u64;
+        let g = engine.lock().expect("lock");
+        let ctx = g
+            .active
+            .get(&handle.id())
+            .expect("active request")
+            .tokens
+            .clone();
+        assert!(
+            g.draft_kv.seq_matches(&ctx),
+            "process KV must stay warm after packed verify; seq_len={} ctx_len={}",
+            g.draft_kv.seq_len(),
+            ctx.len()
+        );
+        let processed = g.draft_kv.seq_len() as u64;
+        let extras = g.draft_kv.forwards.saturating_sub(processed);
+        // First propose (1+depth) plus post-verify ahead on the same warm cache (1+depth).
+        // Empty-KV overlap leaves extras at only the first propose.
+        assert!(
+            extras >= 2 * (1 + depth),
+            "packed-verify ahead must propose on warm process KV (1 seed + {depth} drafts); forwards={} seq={} extras={extras}",
+            g.draft_kv.forwards,
+            processed
+        );
+        let last_hidden = g
+            .active
+            .get(&handle.id())
+            .expect("active request")
+            .last_hidden
+            .clone();
+        assert_eq!(
+            g.draft_kv.h_nextn, last_hidden,
+            "ahead propose is speculative; process KV must keep target last_hidden as h_nextn"
+        );
+        assert!(
+            last_hidden.iter().any(|x| *x != 0.0),
+            "last accepted output_norm must not be an all-zero rejected suffix"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_mtp_process_desync_increments_skip_count() {
+        let path = std::env::temp_dir().join("allpaca_mtp_process_skips.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("MTP target GGUF must load");
+        let handle = engine
+            .begin_request(
+                "hello",
+                GenerationParams {
+                    max_tokens: 2,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("begin MTP request");
+        assert_eq!(
+            engine.stats().mtp_process_skips, 0,
+            "matching process() during prefill must not skip; stats={:?}",
+            engine.stats()
+        );
+        let (token, dim) = {
+            let g = engine.lock().expect("lock");
+            let req = g.active.get(&handle.id()).expect("active");
+            let token = *req.tokens.last().expect("prompt token");
+            let dim = g.draft_model.as_ref().expect("MTP draft").config.dim;
+            (token, dim)
+        };
+        let h = vec![0.0f32; dim];
+        {
+            let mut g = engine.lock().expect("lock");
+            let pos = g.draft_kv.seq_len();
+            mtp_process_token(&mut g, token, pos, &h, None, engine.metrics())
+                .expect("matching process");
+        }
+        assert_eq!(
+            engine.stats().mtp_process_skips, 0,
+            "process() at seq_len must not skip; stats={:?}",
+            engine.stats()
+        );
+        {
+            let mut g = engine.lock().expect("lock");
+            let pos = g.draft_kv.seq_len().saturating_add(3);
+            mtp_process_token(&mut g, token, pos, &h, None, engine.metrics())
+                .expect("desync process returns Ok");
+        }
+        assert_eq!(
+            engine.stats().mtp_process_skips, 1,
+            "process() with seq_len != pos must increment mtp_process_skips; stats={:?}",
+            engine.stats()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mtp_quality_gate_rejects_empty_and_newline_only_text() {
+        assert!(
+            crate::mtp_text_is_garbled(""),
+            "empty decode text is garbled"
+        );
+        assert!(
+            crate::mtp_text_is_garbled("\n\n"),
+            "newline-only decode text is garbled"
+        );
+        assert!(
+            crate::mtp_text_is_garbled(" \n \t"),
+            "whitespace-only decode text is garbled"
+        );
+        assert!(
+            !crate::mtp_text_is_garbled("Hello world"),
+            "visible text must pass the quality gate"
+        );
+    }
+
+    #[test]
+    fn mtp_quality_gate_rejects_dropped_word_soak_prefix() {
+        const POST_BOS_SOAK: &str = "The wants a 404-word essay why \"hello world\" matter for to code Let me about what to cover:1. significance of world programs and their importance in to code";
+        const PRE_BOS_SOAK: &str = "user wants detailed 00-word about why world programs for learning code. me write complete essay Let me words carefully hit around 00 words";
+        assert!(
+            crate::mtp_text_is_garbled(POST_BOS_SOAK),
+            "post-BOS overnight prefix is dropped-word junk"
+        );
+        assert!(
+            crate::mtp_text_is_garbled(PRE_BOS_SOAK),
+            "pre-BOS overnight prefix (00-word) is dropped-word junk"
+        );
+        assert!(
+            !crate::mtp_text_is_garbled(
+                "The user wants a 400-word essay about why hello world programs matter for learning to code."
+            ),
+            "a complete English sentence must still pass the quality gate"
+        );
+    }
+
+    #[cfg(feature = "hip")]
+    fn gated_qwen_gguf_path() -> Option<std::path::PathBuf> {
+        for key in ["ALLPACA_ROCMFP4_GGUF", "ALLPACA_QWEN_GGUF"] {
+            if let Ok(raw) = std::env::var(key) {
+                let path = std::path::PathBuf::from(raw);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        let qwen = dir
+            .join("Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF")
+            .join("Qwen3.8-27B-Q4_0_ROCMFP4_COHERENT.gguf");
+        qwen.is_file().then_some(qwen)
+    }
+
+    #[cfg(feature = "hip")]
+    fn llama_cli_bin() -> Option<std::path::PathBuf> {
+        if let Ok(raw) = std::env::var("ALLPACA_LLAMA_CLI") {
+            let path = std::path::PathBuf::from(raw);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let nearby = [
+            "ROCmFPX/build/bin/llama-cli.exe",
+            "ROCmFPX-build/bin/llama-cli.exe",
+            "ROCmFPX/build/bin/llama-cli",
+            "ROCmFPX-build/bin/llama-cli",
+        ];
+        for rel in nearby {
+            let path = root.join(rel);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let finder = if cfg!(windows) { "where" } else { "which" };
+        let out = std::process::Command::new(finder)
+            .arg("llama-cli")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&out.stdout);
+        let path = std::path::PathBuf::from(line.lines().next()?.trim());
+        path.is_file().then_some(path)
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn llama_cli_bin_discovers_sibling_rocmfpx_when_present() {
+        if std::env::var("ALLPACA_LLAMA_CLI").is_ok() {
+            eprintln!("skip llama_cli discovery: ALLPACA_LLAMA_CLI is set");
+            return;
+        }
+        let sibling = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../ROCmFPX/build/bin/llama-cli.exe");
+        if !sibling.is_file() {
+            eprintln!("skip llama_cli discovery: no {}", sibling.display());
+            return;
+        }
+        let found = llama_cli_bin().expect("must discover sibling ROCmFPX llama-cli");
+        assert_eq!(
+            found.canonicalize().unwrap_or(found),
+            sibling.canonicalize().unwrap_or(sibling),
+            "ROCmFPX llama-cli must win over stock PATH/build_hip binaries"
+        );
+    }
+
+    #[test]
+    fn mtp_llamacpp_draft_id_parser_reads_draft_token_line() {
+        let log = "sampled token 1\ndraft tokens: 151644 8948\ndraft acceptance rate = 0.77 (10 accepted / 13 generated)\n";
+        assert_eq!(
+            parse_llamacpp_draft_ids(log),
+            Some(vec![151644, 8948])
+        );
+    }
+
+    #[test]
+    fn mtp_llamacpp_draft_id_parser_reads_rocmfpx_candidate_lines() {
+        let log = "\
+0.21.602.640 I common_speculative_state_draft_mtp: - n_max=2, n_min=0, p_min=0.75, n_embd=5120, backend_sampling=1
+0.22.900.000 D  - seq_id 0, draft candidate   0, pos   0:  151644 (   0.910) '<|im_start|>'
+0.22.900.001 D  - seq_id 0, draft candidate   1, pos   0:    8948 (   0.020) 'Hello'
+0.22.900.002 D  - seq_id 0, draft candidate   0, pos   1:    8948 (   0.880) 'Hello'
+draft acceptance rate = 0.77 (10 accepted / 13 generated)
+";
+        assert_eq!(
+            parse_llamacpp_draft_ids(log),
+            Some(vec![151644, 8948]),
+            "parser must take top (k=0) ROCmFPX draft candidates, not init-line digits"
+        );
+    }
+
+    #[test]
+    fn mtp_llamacpp_draft_id_parser_keeps_first_draft_span_only() {
+        let log = "\
+0.18.273.744 D  - seq_id 0, draft candidate   0, pos   0:    271 (   0.745) '\\n\\n'
+0.18.279.870 D  - seq_id 0, draft candidate   0, pos   1: 248069 (   1.000) '</think>'
+0.18.528.920 D  - seq_id 0, draft candidate   0, pos   0:    760 (   0.994) 'The'
+";
+        assert_eq!(
+            parse_llamacpp_draft_ids(log),
+            Some(vec![271, 248069]),
+            "later llama.cpp draft() calls must not mix into the first-step span"
+        );
+    }
+
+    fn parse_llamacpp_draft_ids(log: &str) -> Option<Vec<u32>> {
+        let mut by_pos: Vec<(u32, u32)> = Vec::new();
+        for line in log.lines() {
+            let lower = line.to_ascii_lowercase();
+            if !lower.contains("draft") || lower.contains("acceptance") {
+                continue;
+            }
+            if let Some(ids) = parse_llamacpp_draft_candidate_id(&lower) {
+                if ids.0 == 0 && !by_pos.is_empty() {
+                    break;
+                }
+                by_pos.push(ids);
+                continue;
+            }
+            if !by_pos.is_empty() {
+                continue;
+            }
+            if !lower.contains("token") {
+                continue;
+            }
+            if lower.contains("specul") || lower.contains("n_max") || lower.contains("n_embd") {
+                continue;
+            }
+            let ids: Vec<u32> = line
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if !ids.is_empty() {
+                return Some(ids);
+            }
+        }
+        if by_pos.is_empty() {
+            return None;
+        }
+        by_pos.sort_by_key(|(pos, _)| *pos);
+        Some(by_pos.into_iter().map(|(_, id)| id).collect())
+    }
+
+    fn parse_llamacpp_draft_candidate_id(lower: &str) -> Option<(u32, u32)> {
+        if !lower.contains("draft candidate") {
+            return None;
+        }
+        let after = lower.split("draft candidate").nth(1)?;
+        let mut nums = after
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<u32>().ok());
+        let rank = nums.next()?;
+        if rank != 0 {
+            return None;
+        }
+        let pos = nums.next()?;
+        let id = nums.next()?;
+        Some((pos, id))
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_qwen_mtp_first_draft_tokens_match_llamacpp_when_opt_in() {
+        if std::env::var("ALLPACA_QWEN").ok().as_deref() != Some("1") {
+            eprintln!("skip llama.cpp MTP parity: set ALLPACA_QWEN=1");
+            return;
+        }
+        let Some(gguf) = gated_qwen_gguf_path() else {
+            eprintln!("skip llama.cpp MTP parity: no Qwen GGUF");
+            return;
+        };
+        let Ok(log_path) = std::env::var("ALLPACA_LLAMA_DRAFT_LOG") else {
+            eprintln!(
+                "skip llama.cpp MTP parity: set ALLPACA_LLAMA_DRAFT_LOG to a llama-cli log from a separate process (HIP tests must not spawn llama-cli)"
+            );
+            return;
+        };
+        let prompt = std::env::var("ALLPACA_QWEN_PROMPT").unwrap_or_else(|_| {
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n".into()
+        });
+        let depth = 2usize;
+        eprintln!("llama.cpp MTP parity reading {log_path}");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path}: {e}"));
+        let llama_drafts = parse_llamacpp_draft_ids(&log).unwrap_or_else(|| {
+            let tail: Vec<&str> = log.lines().rev().take(80).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            panic!(
+                "could not parse draft token ids from {log_path} tail:\n{}",
+                tail.join("\n")
+            )
+        });
+        eprintln!("llama.cpp first-step MTP drafts={llama_drafts:?}");
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip llama.cpp MTP parity: no HIP device");
+            return;
+        }
+        let mut cfg = Config::compiled_defaults();
+        cfg.model.path = Some(gguf.clone());
+        cfg.model.synthetic = false;
+        cfg.engine.cpu_only = false;
+        cfg.engine.gpu_backend = "auto".into();
+        cfg.speculative.enabled = true;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.min_depth = depth;
+        cfg.speculative.max_depth = depth;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.kv.vram_bytes = 256 * 1024 * 1024;
+        cfg.kv.dram_bytes = 256 * 1024 * 1024;
+        cfg.kv.page_tokens = 128;
+        let engine = Engine::new(cfg).expect("Qwen MTP Engine");
+        let mut handle = engine
+            .begin_request(
+                &prompt,
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("begin Qwen request");
+        loop {
+            let prefill_done = {
+                let g = engine.lock().expect("lock");
+                let req = g.active.get(&handle.id()).expect("active");
+                req.prefill_pos >= req.prompt_len
+            };
+            if prefill_done {
+                break;
+            }
+            match engine.step(&mut handle).expect("prefill step") {
+                StepResult::Prefill { .. } => {}
+                other => panic!("expected remaining prefill, got {other:?}"),
+            }
+        }
+        let prompt_len = {
+            let g = engine.lock().expect("lock");
+            g.active.get(&handle.id()).expect("active").prompt_len
+        };
+        match engine.step(&mut handle).expect("first decode step") {
+            StepResult::Token(ev) => {
+                eprintln!(
+                    "Allpaca first decode token={} text={:?} prompt_len={prompt_len}",
+                    ev.token_id, ev.text
+                );
+            }
+            other => panic!("expected first decode token after prefill, got {other:?}"),
+        }
+        let allpaca_drafts = {
+            let mut g = engine.lock().expect("lock");
+            let req = g.active.get(&handle.id()).expect("active");
+            let mut ctx = req.tokens.clone();
+            // llama.cpp first MTP span is after the first target sample, not after
+            // packed verify may have already appended extra accepted drafts.
+            ctx.truncate(prompt_len.saturating_add(1));
+            let model = (**g.draft_model.as_ref().expect("MTP draft")).clone();
+            let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+            g.draft_kv.truncate(ctx.len(), kv_dim);
+            eprintln!(
+                "Allpaca MTP ctx n={} last={:?}",
+                ctx.len(),
+                ctx.iter().rev().take(6).copied().collect::<Vec<_>>()
+            );
+            assert!(
+                g.draft_kv.seq_matches(&ctx),
+                "draft KV must match prompt+first-token prefix before first-step propose"
+            );
+            let resident = g.draft_resident.clone();
+            let mut provider = crate::draft::DraftModelProvider::new(model);
+            provider
+                .propose_on(
+                    &ctx,
+                    depth,
+                    0.0,
+                    &mut g.draft_kv,
+                    engine.draft_hip.as_deref(),
+                    resident.as_deref(),
+                    Some(engine.metrics()),
+                )
+                .expect("Allpaca first-step MTP propose")
+        };
+        eprintln!("Allpaca first-step MTP drafts={allpaca_drafts:?}");
+        assert!(
+            !allpaca_drafts.is_empty(),
+            "Allpaca first-step MTP drafts must be non-empty"
+        );
+        assert_eq!(
+            allpaca_drafts, llama_drafts,
+            "first-step MTP draft token ids must match llama.cpp"
+        );
+    }
+
+    #[test]
+    fn mtp_eh_proj_seed_diverges_from_plain_token_embed() {
+        let path = std::env::temp_dir().join("allpaca_mtp_eh_proj.gguf");
+        write_tiny_mtp_gguf(&path);
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open tiny MTP");
+        let mtp = TinyModel::from_gguf_mtp(&file).expect("from_gguf_mtp");
+        assert!(
+            mtp.mtp_nextn.is_some(),
+            "host MTP must load nextn.eh_proj/enorm/hnorm"
+        );
+        let mut plain = mtp.clone();
+        plain.mtp_nextn = None;
+        let mut cache_m = DenseKv::default();
+        let mut cache_p = DenseKv::default();
+        let mut logits_m = vec![0.0f32; mtp.config.vocab_size];
+        let mut logits_p = vec![0.0f32; plain.config.vocab_size];
+        mtp.forward_dense(1, 0, &mut cache_m, &mut logits_m)
+            .expect("mtp forward");
+        plain
+            .forward_dense(1, 0, &mut cache_p, &mut logits_p)
+            .expect("plain forward");
+        assert_ne!(
+            logits_m, logits_p,
+            "eh_proj seed must change logits vs raw token embed"
+        );
+        assert_eq!(cache_m.h_nextn.len(), mtp.config.dim);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mtp_eh_proj_seed_uses_h_nextn_from_target() {
+        let path = std::env::temp_dir().join("allpaca_mtp_h_nextn.gguf");
+        write_tiny_mtp_gguf(&path);
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open");
+        let mtp = TinyModel::from_gguf_mtp(&file).expect("mtp");
+        let dim = mtp.config.dim;
+        let mut cache0 = DenseKv::default();
+        cache0.h_nextn = vec![0.0f32; dim];
+        let mut cache1 = DenseKv::default();
+        cache1.h_nextn = vec![1.0f32; dim];
+        let mut a = vec![0.0f32; mtp.config.vocab_size];
+        let mut b = vec![0.0f32; mtp.config.vocab_size];
+        mtp.forward_dense(1, 0, &mut cache0, &mut a).unwrap();
+        mtp.forward_dense(1, 0, &mut cache1, &mut b).unwrap();
+        assert_ne!(a, b, "different target h_nextn must change MTP logits");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mtp_dense_head_clears_trunk_expert_count() {
+        let path = std::env::temp_dir().join("allpaca_mtp_dense_experts.gguf");
+        write_tiny_mtp_gguf(&path);
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open");
+        let mtp = TinyModel::from_gguf_mtp(&file).expect("mtp");
+        assert_eq!(
+            mtp.config.n_experts, 0,
+            "dense MTP ffn_gate must clear trunk n_experts for device draft"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mtp_seed_h_nextn_marks_dirty_for_all_zero_hidden() {
+        let mut cache = DenseKv::default();
+        cache.seed_h_nextn_from_target(&vec![0.0f32; 8]);
+        assert!(cache.h_nextn_host_dirty);
+        assert_eq!(cache.h_nextn.len(), 8);
+    }
+
+    #[test]
+    fn mtp_propose_warm_kv_forwards_at_n_past() {
+        let path = std::env::temp_dir().join("allpaca_mtp_propose_warm.gguf");
+        write_tiny_mtp_gguf(&path);
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open");
+        let mtp = TinyModel::from_gguf_mtp(&file).expect("mtp");
+        let dim = mtp.config.dim;
+        let mut cache = DenseKv::default();
+        let ctx = vec![1u32, 2, 3];
+        // Simulate process(): (tok_i, h_{i-1}) into draft KV.
+        let mut logits = vec![0.0f32; mtp.config.vocab_size];
+        for (pos, &tok) in ctx.iter().enumerate() {
+            let h = if pos == 0 {
+                vec![0.0f32; dim]
+            } else {
+                vec![0.1f32 * pos as f32; dim]
+            };
+            cache.seed_h_nextn_from_target(&h);
+            mtp.forward_dense(tok, pos, &mut cache, &mut logits).unwrap();
+            cache.record(tok);
+        }
+        assert!(cache.seq_matches(&ctx));
+        let before = cache.forwards;
+        cache.seed_h_nextn_from_target(&vec![0.5f32; dim]);
+        let mut provider = crate::draft::DraftModelProvider::new(mtp);
+        let draft = provider
+            .propose_on(&ctx, 2, 0.0, &mut cache, None, None, None)
+            .expect("warm propose");
+        assert_eq!(draft.len(), 2);
+        // Warm path: 1 seed at n_past + 2 draft steps (no full replay).
+        assert_eq!(cache.forwards, before + 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mtp_propose_forwards_only_last_ctx_plus_drafts() {
+        let path = std::env::temp_dir().join("allpaca_mtp_propose_window.gguf");
+        write_tiny_mtp_gguf(&path);
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open");
+        let mtp = TinyModel::from_gguf_mtp(&file).expect("mtp");
+        let dim = mtp.config.dim;
+        let mut provider = crate::draft::DraftModelProvider::new(mtp);
+        let mut cache = DenseKv::default();
+        cache.seed_h_nextn_from_target(&vec![0.25f32; dim]);
+        let ctx = vec![1u32, 2, 3, 1, 2];
+        let draft = provider
+            .propose_on(&ctx, 3, 0.0, &mut cache, None, None, None)
+            .expect("mtp propose");
+        assert_eq!(draft.len(), 3);
+        // 1 last-ctx forward + 3 draft forwards — not ctx.len()+3.
+        assert_eq!(
+            cache.forwards, 4,
+            "MTP must not replay full prompt; forwards={}",
+            cache.forwards
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

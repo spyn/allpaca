@@ -172,6 +172,17 @@ int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float
 
 int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
 
+/* Qwen gated-attn: q_full[n_heads][2*head_dim] -> q, gate each [n_heads][head_dim]. */
+int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,
+                                int32_t head_dim, allpaca_stream_t stream);
+
+/* x[i] *= sigmoid(gate[i]) in place. */
+int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_stream_t stream);
+
+/* Per-head RMSNorm: x is [n_heads, head_dim], weight is [head_dim]. */
+int allpaca_rmsnorm_heads(float *x, const float *weight, int32_t n_heads, int32_t head_dim,
+                          float eps, allpaca_stream_t stream);
+
 int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
                          allpaca_stream_t stream);
 
@@ -193,6 +204,24 @@ int allpaca_scale_f32(float *x, int32_t n, float scale, allpaca_stream_t stream)
 int allpaca_residual_rmsnorm(float *x, const float *residual, const float *weight, float *out,
                              int32_t n, float eps, allpaca_stream_t stream);
 
+/* Qwen3.5 Gated DeltaNet one-token step. q/k L2-normalized in place; q scaled
+ * by 1/sqrt(head_k); state is [n_v][head_v][head_k] (V-first). */
+int allpaca_gated_delta_step(float *q, float *k, const float *v, const float *decay,
+                             const float *beta, float *state, float *out, int32_t n_v_heads,
+                             int32_t head_v, int32_t head_k, float eps, allpaca_stream_t stream);
+
+/* Depthwise causal conv1d + SiLU for one GDN token. kernel layout [c][k]. */
+int allpaca_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state, float *out,
+                            int32_t qkv_dim, int32_t conv_kernel, allpaca_stream_t stream);
+
+/* Tile K-heads to V-heads: dst[vh] = src[vh % n_k] (ggml repeat). */
+int allpaca_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v, int32_t head_k,
+                           allpaca_stream_t stream);
+
+/* decay = exp(softplus(alpha + dt_bias) * a); beta = sigmoid(beta) in-place. */
+int allpaca_gdn_decay_beta(const float *alpha, const float *dt_bias, const float *a, float *decay,
+                           float *beta, int32_t n, allpaca_stream_t stream);
+
 /* RoPE on Q and K in one launch. Decode uses n_tok=1 via allpaca_rope_qk. */
 int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads, int32_t head_dim,
                     int32_t pos, float theta, allpaca_stream_t stream);
@@ -201,6 +230,11 @@ int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads, in
 int allpaca_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads, int32_t n_k_heads,
                          int32_t head_dim, int32_t start_pos, float theta, allpaca_stream_t stream);
 
+/* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e). */
+int allpaca_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                           int32_t head_dim, int32_t n_rot, int32_t pos, float theta,
+                           const int32_t sections[4], allpaca_stream_t stream);
+
 int allpaca_dequant_q8_0(const uint8_t *blocks, float *out, int32_t n, allpaca_stream_t stream);
 
 int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, int32_t dim,
@@ -208,6 +242,13 @@ int allpaca_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, i
 
 int allpaca_embed_gather_q8_0_rows(const uint8_t *table, const int32_t *tokens, float *out,
                                    int32_t n_tok, int32_t dim, allpaca_stream_t stream);
+
+/* Native 18-byte ROCmFP4 blocks; row stride = ceil(dim/32)*18. */
+int allpaca_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out, int32_t dim,
+                                 allpaca_stream_t stream);
+
+int allpaca_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens, float *out,
+                                      int32_t n_tok, int32_t dim, allpaca_stream_t stream);
 
 #ifdef __cplusplus
 }

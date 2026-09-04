@@ -10,6 +10,18 @@ pub struct EngineTokenizer {
     pub tokens: Vec<String>,
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
+    pub eot_id: Option<u32>,
+    pub eom_id: Option<u32>,
+    pub unk_id: Option<u32>,
+    pub sep_id: Option<u32>,
+    pub pad_id: Option<u32>,
+    pub mask_id: Option<u32>,
+    pub fim_pre_id: Option<u32>,
+    pub fim_suf_id: Option<u32>,
+    pub fim_mid_id: Option<u32>,
+    pub fim_pad_id: Option<u32>,
+    pub fim_rep_id: Option<u32>,
+    pub fim_sep_id: Option<u32>,
     pub add_bos: bool,
 }
 
@@ -20,8 +32,33 @@ impl EngineTokenizer {
             tokens: tok.tokens,
             bos_id: tok.bos_id,
             eos_id: tok.eos_id,
+            eot_id: tok.eot_id,
+            eom_id: tok.eom_id,
+            unk_id: tok.unk_id,
+            sep_id: tok.sep_id,
+            pad_id: tok.pad_id,
+            mask_id: tok.mask_id,
+            fim_pre_id: tok.fim_pre_id,
+            fim_suf_id: tok.fim_suf_id,
+            fim_mid_id: tok.fim_mid_id,
+            fim_pad_id: tok.fim_pad_id,
+            fim_rep_id: tok.fim_rep_id,
+            fim_sep_id: tok.fim_sep_id,
             add_bos: tok.add_bos,
         }
+    }
+
+    /// End-of-generation ids used as default stop tokens (eos / eot / eom).
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for id in [self.eos_id, self.eot_id, self.eom_id] {
+            if let Some(id) = id {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        out
     }
 
     pub fn from_vocab(
@@ -55,6 +92,18 @@ impl EngineTokenizer {
             tokens,
             bos_id,
             eos_id,
+            eot_id: None,
+            eom_id: None,
+            unk_id: None,
+            sep_id: None,
+            pad_id: None,
+            mask_id: None,
+            fim_pre_id: None,
+            fim_suf_id: None,
+            fim_mid_id: None,
+            fim_pad_id: None,
+            fim_rep_id: None,
+            fim_sep_id: None,
             add_bos: bos_id.is_some(),
         })
     }
@@ -274,5 +323,134 @@ mod tests {
         assert_ne!(ids, vec![14, 0], "not a whitespace split of raw world");
         assert_eq!(tok.decode(&ids).unwrap(), "Hello world");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn from_gguf_propagates_eot_into_stop_token_ids() {
+        use allpaca_gguf::{write_gguf, GgufFile, GgufValue};
+        use std::collections::HashMap;
+
+        let path = std::env::temp_dir().join("allpaca_engine_eot_tok.gguf");
+        let mut meta = HashMap::new();
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("<|eot_id|>".into()),
+                GgufValue::String("hi".into()),
+            ]),
+        );
+        meta.insert(
+            "tokenizer.ggml.eos_token_id".into(),
+            GgufValue::Uint32(1),
+        );
+        meta.insert(
+            "tokenizer.ggml.eot_token_id".into(),
+            GgufValue::Uint32(2),
+        );
+        meta.insert(
+            "tokenizer.ggml.add_bos_token".into(),
+            GgufValue::Bool(false),
+        );
+        write_gguf(&path, &meta, &[]).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
+        assert_eq!(tok.stop_token_ids(), vec![1, 2]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn gated_qwen_gguf_path() -> Option<std::path::PathBuf> {
+        for key in ["ALLPACA_ROCMFP4_GGUF", "ALLPACA_QWEN_GGUF"] {
+            if let Ok(raw) = std::env::var(key) {
+                let path = std::path::PathBuf::from(raw);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+        let qwen = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/Qwen3.8-27B-Q4_0_ROCMFP4_COHERENT.gguf");
+        qwen.is_file().then_some(qwen)
+    }
+
+    /// llama.cpp `llama_tokenize(..., add_special=true, parse_special=true)` on the
+    /// hello+`<think>` ChatML string (vocab-only dump from ROCmFPX llama.dll).
+    const QWEN_CHATML_HELLO_THINK: &str =
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    const LLAMA_CPP_QWEN_CHATML_HELLO_THINK_IDS: &[u32] = &[
+        248045, 846, 198, 14556, 248046, 198, 248045, 74455, 198, 248068, 198,
+    ];
+
+    #[test]
+    fn encode_qwen_chatml_hello_think_matches_llamacpp_ids() {
+        let Some(path) = gated_qwen_gguf_path() else {
+            eprintln!("skip ChatML encode parity: no Qwen GGUF");
+            return;
+        };
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open Qwen GGUF");
+        let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
+        let ids = tok.encode(QWEN_CHATML_HELLO_THINK).expect("encode ChatML");
+        let pieces: Vec<String> = ids.iter().map(|&id| tok.decode_one(id)).collect();
+        assert_eq!(
+            ids,
+            LLAMA_CPP_QWEN_CHATML_HELLO_THINK_IDS,
+            "EngineTokenizer encode must match llama.cpp parse_special ids; allpaca n={} pieces={pieces:?}",
+            ids.len()
+        );
+    }
+
+    const QWEN_OVERNIGHT_ESSAY: &str =
+        "<|im_start|>user\nWrite a detailed 400-word essay about why hello world programs matter for learning to code. Do not stop early.<|im_end|>\n<|im_start|>assistant\n<think>\n";
+
+    #[test]
+    fn encode_qwen_overnight_essay_does_not_prepend_bos() {
+        let Some(path) = gated_qwen_gguf_path() else {
+            eprintln!("skip essay BOS check: no Qwen GGUF");
+            return;
+        };
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open Qwen GGUF");
+        let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
+        assert!(
+            !tok.add_bos,
+            "Qwen GGUF omits add_bos_token; BPE default is false"
+        );
+        let ids = tok.encode(QWEN_OVERNIGHT_ESSAY).expect("encode essay");
+        assert_ne!(
+            ids.first().copied(),
+            Some(248044),
+            "must not prepend BOS 248044; n={} ids={ids:?}",
+            ids.len()
+        );
+        assert_eq!(
+            ids.first().copied(),
+            Some(248045),
+            "essay prompt must start with <|im_start|>; ids={ids:?}"
+        );
+    }
+
+    #[test]
+    fn decode_qwen_keeps_content_words_in_complete_sentence() {
+        let Some(path) = gated_qwen_gguf_path() else {
+            eprintln!("skip decode roundtrip: no Qwen GGUF");
+            return;
+        };
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open Qwen GGUF");
+        let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
+        let sentence =
+            "The user wants a 400-word essay about why hello world programs matter for learning to code.";
+        let ids = tok.encode(sentence).expect("encode sentence");
+        let text = tok.decode(&ids).expect("decode sentence");
+        let pieces: Vec<String> = ids.iter().map(|&id| tok.decode_one(id)).collect();
+        for word in ["user", "400-word", "hello", "programs", "learning"] {
+            assert!(
+                text.contains(word),
+                "decode must keep {word:?}; pieces={pieces:?} text={text:?}"
+            );
+        }
     }
 }

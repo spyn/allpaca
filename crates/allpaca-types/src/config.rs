@@ -96,6 +96,11 @@ impl Config {
         if let Some(enabled) = cli.speculative {
             self.speculative.enabled = enabled;
         }
+        if let Some(providers) = &cli.speculative_providers {
+            if !providers.is_empty() {
+                self.speculative.providers = providers.clone();
+            }
+        }
         if let Some(host) = &cli.host {
             self.http.host = host.clone();
         }
@@ -219,6 +224,36 @@ impl Default for EngineSection {
 pub enum DraftProviderKind {
     Ngram,
     DraftModel,
+    /// Trailing NextN/MTP blocks from the target GGUF (self-speculation).
+    Mtp,
+}
+
+impl DraftProviderKind {
+    pub fn parse_list(raw: &str) -> Result<Vec<Self>, String> {
+        let mut out = Vec::new();
+        for part in raw.split(|c| c == ',' || c == ';' || c == '|') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            out.push(Self::parse_one(p)?);
+        }
+        if out.is_empty() {
+            return Err("empty speculative providers list".into());
+        }
+        Ok(out)
+    }
+
+    fn parse_one(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ngram" | "n-gram" => Ok(Self::Ngram),
+            "draft" | "draft_model" | "draft-model" => Ok(Self::DraftModel),
+            "mtp" | "nextn" | "next-n" => Ok(Self::Mtp),
+            other => Err(format!(
+                "unknown draft provider '{other}' (expected ngram, draft_model, mtp)"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -468,6 +503,8 @@ pub struct CliOverrides {
     pub seed: Option<u64>,
     pub cpu_only: bool,
     pub speculative: Option<bool>,
+    /// Comma-separated draft providers, e.g. `mtp`, `ngram,draft_model`.
+    pub speculative_providers: Option<Vec<DraftProviderKind>>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub synthetic: bool,
@@ -515,6 +552,18 @@ mod tests {
             cfg.engine.cpu_threads, 6,
             "CLI must not clobber unspecified TOML values"
         );
+    }
+
+    #[test]
+    fn speculative_providers_parse_mtp_list() {
+        let list = DraftProviderKind::parse_list("mtp").unwrap();
+        assert_eq!(list, vec![DraftProviderKind::Mtp]);
+        let multi = DraftProviderKind::parse_list("ngram,draft_model").unwrap();
+        assert_eq!(
+            multi,
+            vec![DraftProviderKind::Ngram, DraftProviderKind::DraftModel]
+        );
+        assert!(DraftProviderKind::parse_list("nope").is_err());
     }
 
     #[test]

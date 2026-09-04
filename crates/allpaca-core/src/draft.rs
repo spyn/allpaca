@@ -112,6 +112,11 @@ impl DraftProvider for NGramProvider {
 }
 
 /// Secondary model draft path. HIP GEMM/attention run on the resident draft GPU.
+///
+/// MTP/NextN self-speculation loads trailing `blk[n_layers..]` via
+/// `TinyModel::from_gguf_mtp` when `DraftProviderKind::Mtp` is set. Target
+/// `last_hidden` seeds `h_nextn` through process(); packed-verify ahead
+/// proposes on that warmed process KV (not an empty DenseKv clone).
 pub struct DraftModelProvider {
     model: TinyModel,
 }
@@ -135,27 +140,62 @@ impl DraftModelProvider {
             return Ok(Vec::new());
         }
         let kv_dim = self.model.config.n_kv_heads * self.model.config.head_dim();
-        let common = cache.prefix_len(ctx);
-        let start = if common == ctx.len() {
-            cache.truncate(common.saturating_sub(1), kv_dim);
-            common.saturating_sub(1)
-        } else {
-            cache.truncate(common, kv_dim);
-            common
-        };
+        let is_mtp = self.model.mtp_nextn.is_some()
+            || self.model.config.gguf_layer_base > 0
+            || resident.is_some_and(|r| r.has_mtp_nextn());
         let vocab = self.model.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
-        for (pos, tok) in ctx.iter().enumerate().skip(start) {
-            self.model.forward_dense_on(
-                *tok,
-                pos,
-                cache,
-                &mut logits,
-                hip,
-                resident,
-                metrics,
-            )?;
-            cache.record(*tok);
+        if is_mtp {
+            // llama.cpp draft-mtp: when process() has warmed draft KV to ctx,
+            // first draft step is (id_last, pending_h) at RoPE pos n_past=len.
+            // If KV is cold/out-of-sync, fall back to a single last-token seed.
+            let n_past = ctx.len();
+            let id_last = ctx[n_past - 1];
+            if cache.seq_matches(ctx) {
+                self.model.forward_dense_on(
+                    id_last,
+                    n_past,
+                    cache,
+                    &mut logits,
+                    hip,
+                    resident,
+                    metrics,
+                )?;
+                cache.record(id_last);
+            } else {
+                cache.truncate(0, kv_dim);
+                self.model.forward_dense_on(
+                    id_last,
+                    n_past.saturating_sub(1),
+                    cache,
+                    &mut logits,
+                    hip,
+                    resident,
+                    metrics,
+                )?;
+                cache.record(id_last);
+            }
+        } else {
+            let common = cache.prefix_len(ctx);
+            let start = if common == ctx.len() {
+                cache.truncate(common.saturating_sub(1), kv_dim);
+                common.saturating_sub(1)
+            } else {
+                cache.truncate(common, kv_dim);
+                common
+            };
+            for (pos, tok) in ctx.iter().enumerate().skip(start) {
+                self.model.forward_dense_on(
+                    *tok,
+                    pos,
+                    cache,
+                    &mut logits,
+                    hip,
+                    resident,
+                    metrics,
+                )?;
+                cache.record(*tok);
+            }
         }
         let mut out = Vec::new();
         let mut window = ctx.to_vec();

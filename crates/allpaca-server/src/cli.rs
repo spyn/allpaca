@@ -30,6 +30,9 @@ pub struct Cli {
     pub seed: Option<u64>,
     #[arg(long)]
     pub speculative: Option<bool>,
+    /// Draft providers: comma-separated `ngram`, `draft_model`, `mtp`.
+    #[arg(long)]
+    pub speculative_providers: Option<String>,
     #[arg(long)]
     pub json_mode: Option<bool>,
     #[arg(long)]
@@ -60,6 +63,10 @@ impl Cli {
             seed: self.seed,
             cpu_only: self.cpu_only,
             speculative: self.speculative,
+            speculative_providers: self
+                .speculative_providers
+                .as_deref()
+                .and_then(|s| allpaca_types::DraftProviderKind::parse_list(s).ok()),
             host: self.host.clone(),
             port: self.port,
             synthetic: self.synthetic,

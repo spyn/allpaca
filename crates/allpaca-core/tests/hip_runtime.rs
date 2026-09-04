@@ -978,6 +978,66 @@ fn hip_speculative_linear_verify_packs_draft_span() {
     let _ = std::fs::remove_file(draft);
 }
 
+/// Partial-RoPE skips batched HIP prefill, so packed verify is per-token.
+/// Each row's logits must be waited before the next token overwrites the D2H slot.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_imrope_packed_verify_matches_target_only() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_imrope_packed_verify_matches_target_only: no HIP device");
+        return;
+    }
+    let target = std::env::temp_dir().join("allpaca_hip_imrope_pack_tgt.gguf");
+    let draft = std::env::temp_dir().join("allpaca_hip_imrope_pack_dft.gguf");
+    write_packed_f16_gguf_with_rope_dims(&target, 16);
+    write_packed_f16_gguf_with_rope_dims(&draft, 16);
+    let mut cfg = hip_7b_config(target.clone());
+    cfg.model.draft_path = Some(draft.clone());
+    cfg.speculative.enabled = true;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    cfg.features.tree_speculation = Some(false);
+    cfg.speculative.min_depth = 2;
+    cfg.speculative.max_depth = 4;
+    cfg.kv.page_tokens = 8;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    cfg.kv.dram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("IMRoPE F16 target+draft must load");
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&draft);
+        eprintln!("skip hip_imrope_packed_verify_matches_target_only: no HIP in engine");
+        return;
+    }
+    let spec_out = engine
+        .generate("hello", greedy(8))
+        .expect("IMRoPE packed verify generate");
+    assert!(!spec_out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.linear_packed_verifies > 0,
+        "identical IMRoPE target+draft must pack; stats={stats:?}"
+    );
+    drop(engine);
+    let mut plain = hip_7b_config(target.clone());
+    plain.speculative.enabled = false;
+    plain.features.draft_model_speculation = Some(false);
+    plain.kv.page_tokens = 8;
+    plain.kv.vram_bytes = 64 * 1024 * 1024;
+    plain.kv.dram_bytes = 64 * 1024 * 1024;
+    let plain_engine = Engine::new(plain).expect("IMRoPE target-only must load");
+    let plain_out = plain_engine
+        .generate("hello", greedy(8))
+        .expect("IMRoPE target-only generate");
+    assert_eq!(
+        spec_out.token_ids, plain_out.token_ids,
+        "per-token packed verify must keep Target Model tokens; spec={:?} plain={:?} packed={}",
+        spec_out.token_ids, plain_out.token_ids, stats.linear_packed_verifies
+    );
+    let _ = std::fs::remove_file(target);
+    let _ = std::fs::remove_file(draft);
+}
+
 #[cfg(feature = "hip")]
 fn hip_speculative_synthetic() -> Config {
     let mut cfg = hip_auto_synthetic();
@@ -1454,6 +1514,11 @@ fn write_tiny_uniform_kquant_gguf(
 /// F16 GGUF with GEMM tensors larger than the n≤65536 F32 materialize cutoff.
 #[cfg(feature = "hip")]
 fn write_packed_f16_gguf(path: &std::path::Path) {
+    write_packed_f16_gguf_with_rope_dims(path, 0);
+}
+
+#[cfg(feature = "hip")]
+fn write_packed_f16_gguf_with_rope_dims(path: &std::path::Path, rope_dims: u32) {
     use allpaca_gguf::{write_gguf_quant, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
     use std::collections::HashMap;
 
@@ -1483,6 +1548,12 @@ fn write_packed_f16_gguf(path: &std::path::Path) {
         "llama.feed_forward_length".into(),
         GgufValue::Uint32(ff as u32),
     );
+    if rope_dims > 0 {
+        meta.insert(
+            "llama.rope.dimension_count".into(),
+            GgufValue::Uint32(rope_dims),
+        );
+    }
     meta.insert(
         "tokenizer.ggml.model".into(),
         GgufValue::String("wordlevel".into()),
@@ -3167,6 +3238,34 @@ fn hip_7b_config(path: std::path::PathBuf) -> Config {
     cfg
 }
 
+/// Prefer draft on HIP:1 (9060). If HIP:0 (9070) is already holding a large
+/// resident, place the target on the freer of the two boards.
+#[cfg(feature = "hip")]
+fn apply_9060_preference(cfg: &mut Config) {
+    let n = allpaca_hip::device_count();
+    if n < 2 {
+        return;
+    }
+    let info0 = allpaca_hip::device_memory_info(0).ok();
+    let info1 = allpaca_hip::device_memory_info(1).ok();
+    let used0 = info0.map(|(f, t)| t.saturating_sub(f)).unwrap_or(0);
+    let free0 = info0.map(|(f, _)| f).unwrap_or(0);
+    let free1 = info1.map(|(f, _)| f).unwrap_or(0);
+    const BUSY: u64 = 2u64 << 30;
+    const NEED: u64 = 20u64 << 30;
+    cfg.engine.pipeline_mode = Some(allpaca_types::PipelineMode::Asymmetric);
+    if used0 > BUSY && free1 >= NEED && free1 >= free0 {
+        cfg.engine.target_device = allpaca_types::DeviceSelector::Hip(1);
+        cfg.engine.draft_device = allpaca_types::DeviceSelector::Hip(0);
+        eprintln!(
+            "HIP:0 busy (used>{BUSY}); target on HIP:1 free={free1} draft on HIP:0 free={free0}"
+        );
+    } else {
+        cfg.engine.draft_device = allpaca_types::DeviceSelector::Hip(1);
+        eprintln!("draft on HIP:1 (9060); target stays default / HIP:0");
+    }
+}
+
 #[cfg(feature = "hip")]
 #[test]
 fn hip_loads_real_7b_gguf_when_path_set() {
@@ -3612,15 +3711,36 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
         "ROCmFP4 must not gate loader; got {:?}",
         report.reject_reason
     );
+    let cfg = allpaca_core::ModelConfig::from_gguf(&file).expect("qwen ModelConfig");
+    let nextn = file.meta_u32("qwen35.nextn_predict_layers");
+    let tok_model = file.meta_str("tokenizer.ggml.model");
     eprintln!(
-        "ROCmFP4 probe: path={} arch={} layers={} ssm={} attn={} types={:?}",
+        "ROCmFP4 probe: path={} arch={} layers={} ssm={} attn={} types={:?} head_dim={} rope_dims={} sections={:?} eps={} theta={} nextn={:?} tok_model={:?}",
         path.display(),
         report.architecture,
         report.n_layers,
         report.ssm_layers,
         report.attention_layers,
-        report.ggml_type_ids
+        report.ggml_type_ids,
+        cfg.head_dim(),
+        cfg.rope_dims,
+        cfg.rope_sections,
+        cfg.eps,
+        cfg.rope_theta,
+        nextn,
+        tok_model
     );
+    for i in report.n_layers.saturating_sub(3)..report.n_layers {
+        let info = &report.layers[i];
+        eprintln!(
+            "ROCmFP4 tail blk.{} block={:?} q={} qkv={} ssm_out={}",
+            i,
+            info.block,
+            file.tensor(&format!("blk.{i}.attn_q.weight")).is_some(),
+            file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some(),
+            file.tensor(&format!("blk.{i}.ssm_out.weight")).is_some()
+        );
+    }
     // Full 27B/30B generate is opt-in (VRAM + load time).
     if std::env::var("ALLPACA_QWEN").ok().as_deref() != Some("1")
         && std::env::var("ALLPACA_NEMOTRON").ok().as_deref() != Some("1")
@@ -3640,17 +3760,720 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
         eprintln!("skip ROCmFP4 HIP generate: engine has no HIP device");
         return;
     }
-    let out = generate_or_timeout(&engine, "hello", 4, overnight_timeout(4, 120));
+    let stats = engine.stats();
+    assert!(
+        stats.weight_bytes_on_device > 0,
+        "ROCmFP4 HIP upload must land resident weights; stats={stats:?}"
+    );
+    eprintln!(
+        "ROCmFP4 HIP upload: path={} weight_bytes={} backend={}",
+        path.display(),
+        stats.weight_bytes_on_device,
+        stats.backend
+    );
+    // Confirm GDN host tensors exist (upload path requires attn_qkv + ssm_out).
+    {
+        let mut gdn_ok = 0usize;
+        let mut gdn_fail = 0usize;
+        let mut attn_qnorm = 0usize;
+        for i in 0..cfg.n_layers {
+            let block = report.layers.get(i).map(|l| l.block);
+            if block == Some(allpaca_gguf::HybridLayerKind::Ssm) {
+                let qkv = file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some();
+                let out_w = file.tensor(&format!("blk.{i}.ssm_out.weight")).is_some();
+                let a = file.tensor(&format!("blk.{i}.ssm_a")).is_some();
+                let conv = file.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some();
+                if qkv && out_w && a && conv {
+                    gdn_ok += 1;
+                } else {
+                    gdn_fail += 1;
+                    if gdn_fail <= 2 {
+                        eprintln!(
+                            "GDN tensors missing blk.{i}: qkv={qkv} ssm_out={out_w} a={a} conv={conv}"
+                        );
+                    }
+                }
+            }
+            if block == Some(allpaca_gguf::HybridLayerKind::Attention)
+                && file.tensor(&format!("blk.{i}.attn_q_norm.weight")).is_some()
+            {
+                attn_qnorm += 1;
+            }
+        }
+        let nextn = file
+            .meta_u32("qwen35.nextn_predict_layers")
+            .or_else(|| file.meta_u32("qwen35.leading_dense_block_count"));
+        eprintln!(
+            "ROCmFP4 GDN tensors: ok={gdn_ok} fail={gdn_fail} attn_qnorm={attn_qnorm} nextn_meta={nextn:?} last_blocks={:?}",
+            report
+                .layers
+                .iter()
+                .rev()
+                .take(3)
+                .map(|l| (l.index, l.block))
+                .collect::<Vec<_>>()
+        );
+        assert!(gdn_ok > 0, "expected GDN tensors on SSM layers");
+        assert_eq!(gdn_fail, 0, "SSM layers missing GDN tensors");
+    }
+    let prompt = std::env::var("ALLPACA_QWEN_PROMPT").unwrap_or_else(|_| {
+        // Match llama.cpp qwen chat turn (ROCmFPX llama-cli verbose-prompt).
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n".into()
+    });
+    {
+        let tok = allpaca_gguf::extract_tokenizer(&file).expect("extract tokenizer");
+        let enc = tok
+            .inner
+            .encode(prompt.as_str(), false)
+            .expect("tokenize chat prompt");
+        eprintln!(
+            "ROCmFP4 prompt_ids={:?} (n={}) tokens={:?}",
+            enc.get_ids(),
+            enc.len(),
+            enc.get_tokens()
+        );
+    }
+    let n_tok = std::env::var("ALLPACA_QWEN_N")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(32)
+        .max(1);
+    let out = generate_or_timeout(&engine, &prompt, n_tok, overnight_timeout(n_tok, 180));
     assert!(!out.token_ids.is_empty());
     let stats = engine.stats();
     eprintln!(
-        "ROCmFP4 HIP generate: path={} tokens={} backend={} q8_us={} attn_us={} other_us={} text={:?}",
+        "ROCmFP4 HIP generate: path={} prompt_chars={} tokens={} ids={:?} backend={} q8_us={} attn_us={} other_us={} text={:?}",
         path.display(),
+        prompt.len(),
         out.token_ids.len(),
+        out.token_ids,
         stats.backend,
         stats.q8_gemm_us,
         stats.attention_us,
         stats.other_gpu_us,
         out.text
     );
+    // Lock soak: device GDN path must stay coherent (not ChatML debris / newline collapse).
+    assert!(
+        out.token_ids.len() >= n_tok.min(8),
+        "expected ≥{} decode tokens, got {}",
+        n_tok.min(8),
+        out.token_ids.len()
+    );
+    assert!(
+        !out.text.contains("<|im_"),
+        "must not emit chat markers as text: {:?}",
+        out.text
+    );
+    assert!(
+        !out.token_ids.iter().all(|&t| t == 198),
+        "must not collapse to newline-only ids={:?}",
+        out.token_ids
+    );
+    let lower = out.text.to_lowercase();
+    assert!(
+        lower.contains("hello")
+            || lower.contains("hi")
+            || lower.contains("user")
+            || lower.contains("greet"),
+        "expected hello-ish reply, got {:?}",
+        out.text
+    );
 }
+
+/// Multi-prompt coherence battery for device GDN (opt-in via ALLPACA_QWEN=1).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rocmfp4_qwen_multi_prompt_coherence_battery() {
+    let _guard = large_gguf_lock();
+    if std::env::var("ALLPACA_QWEN").ok().as_deref() != Some("1") {
+        eprintln!("skip multi-prompt battery: set ALLPACA_QWEN=1");
+        return;
+    }
+    let Some(path) = gated_rocmfp4_gguf() else {
+        eprintln!("skip multi-prompt battery: no ROCmFP4 GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip multi-prompt battery: no HIP device");
+        return;
+    }
+    let engine = Engine::new(hip_7b_config(path)).expect("Engine");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip multi-prompt battery: no HIP in engine");
+        return;
+    }
+    let prompts = [
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "<|im_start|>user\nSay hi briefly.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    ];
+    let n = overnight_usize("ALLPACA_QWEN_N", 24);
+    for (i, prompt) in prompts.iter().enumerate() {
+        let out = generate_or_timeout(&engine, prompt, n, overnight_timeout(n, 180));
+        eprintln!(
+            "multi-prompt[{i}] tokens={} text={:?}",
+            out.token_ids.len(),
+            out.text
+        );
+        assert!(!out.token_ids.is_empty(), "prompt {i} empty");
+        assert!(
+            !out.text.contains("<|im_"),
+            "prompt {i} leaked markers: {:?}",
+            out.text
+        );
+        assert!(
+            !out.token_ids.iter().all(|&t| t == 198),
+            "prompt {i} newline collapse"
+        );
+        let lower = out.text.to_lowercase();
+        assert!(
+            lower.contains("hello")
+                || lower.contains("hi")
+                || lower.contains("user")
+                || lower.contains("greet")
+                || lower.contains("help"),
+            "prompt {i} not coherent: {:?}",
+            out.text
+        );
+    }
+}
+
+/// Opt-in: load MTP/NextN trailing blocks as draft from the same Qwen ROCmFP4 GGUF.
+/// Prefer draft on HIP:1 (9060) when two devices exist.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rocmfp4_qwen_mtp_draft_provider_when_opt_in() {
+    let _guard = large_gguf_lock();
+    if std::env::var("ALLPACA_QWEN").ok().as_deref() != Some("1") {
+        eprintln!("skip MTP draft soak: set ALLPACA_QWEN=1");
+        return;
+    }
+    let Some(path) = gated_rocmfp4_gguf() else {
+        eprintln!("skip MTP draft soak: no ROCmFP4 GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip MTP draft soak: no HIP device");
+        return;
+    }
+    let file = allpaca_gguf::GgufFile::open(&path).expect("open ROCmFP4");
+    let nextn = file
+        .meta_u32("qwen35.nextn_predict_layers")
+        .unwrap_or(0);
+    if nextn == 0 {
+        eprintln!("skip MTP draft soak: GGUF has no nextn_predict_layers");
+        return;
+    }
+    let mut cfg = hip_7b_config(path);
+    cfg.speculative.enabled = true;
+    cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Mtp];
+    cfg.speculative.min_depth = 2;
+    cfg.speculative.max_depth = 4;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    apply_9060_preference(&mut cfg);
+    let engine = Engine::new(cfg).expect("MTP Engine::new");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip MTP draft soak: no HIP in engine");
+        return;
+    }
+    let stats = engine.stats();
+    eprintln!(
+        "MTP draft soak load: nextn={nextn} weight_bytes={} degraded={} target={} draft={}",
+        stats.weight_bytes_on_device,
+        stats.degraded_events,
+        stats.target_device,
+        stats.draft_device
+    );
+    assert_eq!(
+        stats.degraded_events, 0,
+        "MTP draft load must not degrade; stats={stats:?}"
+    );
+    let n = overnight_usize("ALLPACA_QWEN_N", 64);
+    let prompt = std::env::var("ALLPACA_QWEN_PROMPT").unwrap_or_else(|_| {
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n".into()
+    });
+    let out = generate_or_timeout(&engine, &prompt, n, overnight_timeout(n, 240));
+    let after = engine.stats();
+    eprintln!(
+        "MTP draft soak: gen={} acceptance={:.3} draft_copied={} draft_fwd={} target_fwd={} text={:?}",
+        out.token_ids.len(),
+        after.acceptance_rate,
+        after.draft_tokens_copied,
+        after.draft_gpu_forwards,
+        after.target_gpu_forwards,
+        out.text
+    );
+    assert!(!out.token_ids.is_empty());
+    assert!(
+        after.draft_tokens_copied > 0 || after.draft_gpu_forwards > 0,
+        "MTP provider must propose drafts; stats={after:?}"
+    );
+}
+
+/// Overnight MTP acceptance soak (ALLPACA_QWEN=1, default n=128) on draft hip:1.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rocmfp4_qwen_mtp_overnight_acceptance_when_opt_in() {
+    let _guard = large_gguf_lock();
+    if std::env::var("ALLPACA_QWEN").ok().as_deref() != Some("1") {
+        eprintln!("skip MTP overnight: set ALLPACA_QWEN=1");
+        return;
+    }
+    if std::env::var("ALLPACA_OVERNIGHT").ok().as_deref() != Some("1")
+        && std::env::var("ALLPACA_MTP_OVERNIGHT").ok().as_deref() != Some("1")
+    {
+        eprintln!("skip MTP overnight: set ALLPACA_OVERNIGHT=1 or ALLPACA_MTP_OVERNIGHT=1");
+        return;
+    }
+    let Some(path) = gated_rocmfp4_gguf() else {
+        eprintln!("skip MTP overnight: no ROCmFP4 GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip MTP overnight: no HIP");
+        return;
+    }
+    let mut cfg = hip_7b_config(path);
+    cfg.speculative.enabled = true;
+    cfg.speculative.providers =
+        allpaca_types::DraftProviderKind::parse_list("mtp").expect("mtp");
+    cfg.speculative.min_depth = 2;
+    cfg.speculative.max_depth = 6;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    apply_9060_preference(&mut cfg);
+    let engine = Engine::new(cfg).expect("MTP overnight Engine");
+    let n = overnight_usize("ALLPACA_QWEN_N", 128);
+    let prompt = std::env::var("ALLPACA_QWEN_PROMPT").unwrap_or_else(|_| {
+        "<|im_start|>user\nWrite a detailed 400-word essay about why hello world programs matter for learning to code. Do not stop early.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            .into()
+    });
+    let out = generate_or_timeout(&engine, &prompt, n, overnight_timeout(n, 300));
+    let s = engine.stats();
+    let hit_max = out.token_ids.len() >= n;
+    let early_eos = !hit_max;
+    eprintln!(
+        "MTP overnight: gen={}/{} early_eos={} finish={:?} acceptance={:.3} draft_fwd={} draft_copied={} target_fwd={} draft_dev={} text_prefix={:?}",
+        out.token_ids.len(),
+        n,
+        early_eos,
+        out.finish_reason,
+        s.acceptance_rate,
+        s.draft_gpu_forwards,
+        s.draft_tokens_copied,
+        s.target_gpu_forwards,
+        s.draft_device,
+        out.text.chars().take(160).collect::<String>()
+    );
+    assert!(!out.token_ids.is_empty());
+    assert!(
+        s.draft_gpu_forwards > 0 || s.draft_tokens_copied > 0,
+        "overnight MTP must exercise draft; {s:?}"
+    );
+    assert!(
+        !allpaca_core::mtp_text_is_garbled(&out.text),
+        "overnight MTP must not emit empty or dropped-word junk; text={:?}",
+        out.text
+    );
+    assert_eq!(
+        s.mtp_process_skips, 0,
+        "overnight MTP must not skip-storm process(); stats={s:?}"
+    );
+}
+
+/// Short dual-GPU MTP quality gate: later packed-verify steps must keep
+/// the same content words as target-only (`user`, `400-word`, `learning`).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rocmfp4_qwen_mtp_essay_n32_keeps_target_words_when_opt_in() {
+    let _guard = large_gguf_lock();
+    if std::env::var("ALLPACA_QWEN").ok().as_deref() != Some("1") {
+        eprintln!("skip MTP essay n=32: set ALLPACA_QWEN=1");
+        return;
+    }
+    let Some(path) = gated_rocmfp4_gguf() else {
+        eprintln!("skip MTP essay n=32: no ROCmFP4 GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip MTP essay n=32: no HIP");
+        return;
+    }
+    let prompt = "<|im_start|>user\nWrite a detailed 400-word essay about why hello world programs matter for learning to code. Do not stop early.<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    let n = 32;
+    let mut greedy_cfg = hip_7b_config(path.clone());
+    greedy_cfg.speculative.enabled = false;
+    greedy_cfg.features.draft_model_speculation = Some(false);
+    greedy_cfg.engine.target_device = allpaca_types::DeviceSelector::Hip(0);
+    greedy_cfg.engine.draft_device = allpaca_types::DeviceSelector::Cpu;
+    let greedy_engine = Engine::new(greedy_cfg).expect("essay target-only Engine");
+    let greedy_out = generate_or_timeout(&greedy_engine, prompt, n, overnight_timeout(n, 300));
+    eprintln!(
+        "MTP essay n=32 target-only prefix={:?}",
+        greedy_out.text.chars().take(160).collect::<String>()
+    );
+    drop(greedy_engine);
+
+    let mut cfg = hip_7b_config(path);
+    cfg.speculative.enabled = true;
+    cfg.speculative.providers =
+        allpaca_types::DraftProviderKind::parse_list("mtp").expect("mtp");
+    cfg.speculative.min_depth = 2;
+    cfg.speculative.max_depth = 6;
+    cfg.features.draft_model_speculation = Some(true);
+    cfg.features.ngram_speculation = Some(false);
+    apply_9060_preference(&mut cfg);
+    let engine = Engine::new(cfg).expect("MTP essay Engine");
+    let out = generate_or_timeout(&engine, prompt, n, overnight_timeout(n, 300));
+    let s = engine.stats();
+    eprintln!(
+        "MTP essay n=32: gen={} acceptance={:.3} packed={} draft_fwd={} target_fwd={} draft_dev={} skips={} text_prefix={:?}",
+        out.token_ids.len(),
+        s.acceptance_rate,
+        s.linear_packed_verifies,
+        s.draft_gpu_forwards,
+        s.target_gpu_forwards,
+        s.draft_device,
+        s.mtp_process_skips,
+        out.text.chars().take(160).collect::<String>()
+    );
+    assert!(
+        s.draft_gpu_forwards > 0 || s.draft_tokens_copied > 0,
+        "essay MTP must exercise draft; {s:?}"
+    );
+    assert_eq!(s.mtp_process_skips, 0, "essay MTP must not skip process(); {s:?}");
+    assert!(
+        !allpaca_core::mtp_text_is_garbled(&out.text),
+        "essay MTP must not emit dropped-word junk; text={:?}",
+        out.text
+    );
+    let lower = out.text.to_ascii_lowercase();
+    assert!(
+        lower.contains("user"),
+        "essay MTP must keep 'user'; text={:?}",
+        out.text
+    );
+    assert!(
+        lower.contains("400-word") || lower.contains("400 word"),
+        "essay MTP must keep '400-word'; text={:?}",
+        out.text
+    );
+    assert!(
+        lower.contains("learning"),
+        "essay MTP must keep 'learning'; text={:?}",
+        out.text
+    );
+    let ncmp = greedy_out.token_ids.len().min(out.token_ids.len()).min(32);
+    assert_eq!(
+        &out.token_ids[..ncmp],
+        &greedy_out.token_ids[..ncmp],
+        "essay MTP prefix must match target-only; mtp={:?} greedy={:?}",
+        &out.token_ids[..ncmp],
+        &greedy_out.token_ids[..ncmp]
+    );
+}
+
+/// Device GDN one-token step must match the host reference (public HIP ABI).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gated_delta_step_matches_host_on_tiny_state() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gated_delta_step_matches_host: no HIP device");
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 4096, 8).expect("HipWorkspace");
+    // Same fixture as deltanet::gated_delta_step_writes_and_reads_tiny_state.
+    let mut q_h = [1.0f32, 0.0];
+    let mut k_h = [0.0f32, 1.0];
+    let v_h = [2.0f32, -1.0];
+    let decay_h = [0.5f32];
+    let beta_h = [1.0f32];
+    let mut state_h = [0.0f32; 4];
+    let mut out_h = [0.0f32; 2];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q_h, &mut k_h, &v_h, &decay_h, &beta_h, &mut state_h, &mut out_h, 1, 2, 2, 1e-6,
+    );
+
+    let q0 = [1.0f32, 0.0];
+    let k0 = [0.0f32, 1.0];
+    let v = [2.0f32, -1.0];
+    let decay = [0.5f32];
+    let beta = [1.0f32];
+    let state0 = [0.0f32; 4];
+    let out0 = [0.0f32; 2];
+    let mut q = q0;
+    let k = k0;
+    let mut state = state0;
+    let mut out = out0;
+
+    let blob = allpaca_hip::DeviceWeights::alloc(0, (2 + 2 + 2 + 1 + 1 + 4 + 2) * 4).expect("alloc");
+    let mut off = 0usize;
+    let q_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(q_d, &q).unwrap();
+    off += 2 * 4;
+    let k_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(k_d, &k).unwrap();
+    off += 2 * 4;
+    let v_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(v_d, &v).unwrap();
+    off += 2 * 4;
+    let decay_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(decay_d, &decay).unwrap();
+    off += 4;
+    let beta_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(beta_d, &beta).unwrap();
+    off += 4;
+    let state_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(state_d, &state).unwrap();
+    off += 4 * 4;
+    let out_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(out_d, &out).unwrap();
+
+    hip.gated_delta_step(q_d, k_d, v_d, decay_d, beta_d, state_d, out_d, 1, 2, 2, 1e-6)
+        .expect("device gated_delta_step");
+
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    hip.copy_d2h_f32(state_d, &mut state).unwrap();
+    hip.copy_d2h_f32(q_d, &mut q).unwrap();
+
+    for i in 0..2 {
+        assert!(
+            (out[i] - out_h[i]).abs() < 1e-4,
+            "out[{i}] device={} host={}",
+            out[i],
+            out_h[i]
+        );
+        assert!(
+            (q[i] - q_h[i]).abs() < 1e-4,
+            "q[{i}] device={} host={}",
+            q[i],
+            q_h[i]
+        );
+    }
+    for i in 0..4 {
+        assert!(
+            (state[i] - state_h[i]).abs() < 1e-4,
+            "state[{i}] device={} host={}",
+            state[i],
+            state_h[i]
+        );
+    }
+}
+
+/// After ggml-style K-head expand, device delta matches host for n_v > n_k.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gated_delta_step_matches_host_after_expand_k() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gated_delta_expand: no HIP device");
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 4096, 8).expect("HipWorkspace");
+    let n_k = 2usize;
+    let n_v = 4usize;
+    let head_k = 2usize;
+    let head_v = 2usize;
+    let q_raw = [1.0f32, 0.0, 0.0, 1.0]; // 2 K-heads
+    let k_raw = [0.0f32, 1.0, 1.0, 0.0];
+    let v: Vec<f32> = (0..n_v * head_v).map(|i| (i as f32) * 0.25).collect();
+    let decay = vec![0.8f32; n_v];
+    let beta = vec![0.5f32; n_v];
+
+    let mut q_exp = vec![0.0f32; n_v * head_k];
+    let mut k_exp = vec![0.0f32; n_v * head_k];
+    allpaca_core::deltanet::expand_k_heads(&q_raw, &mut q_exp, n_k, n_v, head_k);
+    allpaca_core::deltanet::expand_k_heads(&k_raw, &mut k_exp, n_k, n_v, head_k);
+
+    let mut q_h = q_exp.clone();
+    let mut k_h = k_exp.clone();
+    let mut state_h = vec![0.0f32; n_v * head_v * head_k];
+    let mut out_h = vec![0.0f32; n_v * head_v];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q_h,
+        &mut k_h,
+        &v,
+        &decay,
+        &beta,
+        &mut state_h,
+        &mut out_h,
+        n_v,
+        head_v,
+        head_k,
+        1e-6,
+    );
+
+    let floats = q_exp.len() + k_exp.len() + v.len() + decay.len() + beta.len() + state_h.len()
+        + out_h.len();
+    let blob = allpaca_hip::DeviceWeights::alloc(0, floats * 4).expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let q_d = put(&hip, &blob, &mut off, &q_exp);
+    let k_d = put(&hip, &blob, &mut off, &k_exp);
+    let v_d = put(&hip, &blob, &mut off, &v);
+    let decay_d = put(&hip, &blob, &mut off, &decay);
+    let beta_d = put(&hip, &blob, &mut off, &beta);
+    let state_d = put(&hip, &blob, &mut off, &vec![0.0f32; state_h.len()]);
+    let out_d = put(&hip, &blob, &mut off, &vec![0.0f32; out_h.len()]);
+
+    hip.gated_delta_step(
+        q_d,
+        k_d,
+        v_d,
+        decay_d,
+        beta_d,
+        state_d,
+        out_d,
+        n_v as i32,
+        head_v as i32,
+        head_k as i32,
+        1e-6,
+    )
+    .expect("device gated_delta_step expand");
+
+    let mut out = vec![0.0f32; out_h.len()];
+    let mut state = vec![0.0f32; state_h.len()];
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    hip.copy_d2h_f32(state_d, &mut state).unwrap();
+    for i in 0..out.len() {
+        assert!(
+            (out[i] - out_h[i]).abs() < 1e-4,
+            "out[{i}] device={} host={}",
+            out[i],
+            out_h[i]
+        );
+    }
+    for i in 0..state.len() {
+        assert!(
+            (state[i] - state_h[i]).abs() < 1e-4,
+            "state[{i}] device={} host={}",
+            state[i],
+            state_h[i]
+        );
+    }
+}
+
+/// Transitional H2D scratch path used by `forward_token_device` must match host math.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gated_delta_step_host_matches_host_math() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gated_delta_step_host: no HIP device");
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 8).expect("HipWorkspace");
+    let mut q_h = [1.0f32, 0.0];
+    let mut k_h = [0.0f32, 1.0];
+    let v = [2.0f32, -1.0];
+    let decay = [0.5f32];
+    let beta = [1.0f32];
+    let mut state_h = [0.0f32; 4];
+    let mut out_h = [0.0f32; 2];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q_h, &mut k_h, &v, &decay, &beta, &mut state_h, &mut out_h, 1, 2, 2, 1e-6,
+    );
+
+    let mut q = [1.0f32, 0.0];
+    let mut k = [0.0f32, 1.0];
+    let mut state = [0.0f32; 4];
+    let mut out = [0.0f32; 2];
+    hip.gated_delta_step_host(
+        &mut q, &mut k, &v, &decay, &beta, &mut state, &mut out, 1, 2, 2, 1e-6,
+    )
+    .expect("gated_delta_step_host");
+    for i in 0..2 {
+        assert!((out[i] - out_h[i]).abs() < 1e-4, "out[{i}]={}/{}", out[i], out_h[i]);
+        assert!((q[i] - q_h[i]).abs() < 1e-4, "q[{i}]={}/{}", q[i], q_h[i]);
+    }
+    for i in 0..4 {
+        assert!(
+            (state[i] - state_h[i]).abs() < 1e-4,
+            "state[{i}]={}/{}",
+            state[i],
+            state_h[i]
+        );
+    }
+}
+
+/// Resident device state must match host across two steps without re-uploading.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gated_delta_resident_two_steps_match_host() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gated_delta_resident: no HIP device");
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 8).expect("HipWorkspace");
+    let req = 7u64;
+    let layer = 3usize;
+
+    let mut state_h = [0.0f32; 4];
+    let mut q1 = [1.0f32, 0.0];
+    let mut k1 = [0.0f32, 1.0];
+    let v1 = [2.0f32, -1.0];
+    let decay1 = [0.5f32];
+    let beta1 = [1.0f32];
+    let mut out1 = [0.0f32; 2];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q1, &mut k1, &v1, &decay1, &beta1, &mut state_h, &mut out1, 1, 2, 2, 1e-6,
+    );
+    let mut q2 = [0.0f32, 1.0];
+    let mut k2 = [0.0f32, 1.0];
+    let v2 = [0.0f32, 0.0];
+    let decay2 = [1.0f32];
+    let beta2 = [0.0f32];
+    let mut out2 = [0.0f32; 2];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q2, &mut k2, &v2, &decay2, &beta2, &mut state_h, &mut out2, 1, 2, 2, 1e-6,
+    );
+
+    let mut host_state = [0.0f32; 4];
+    let mut q = [1.0f32, 0.0];
+    let mut k = [0.0f32, 1.0];
+    let mut out = [0.0f32; 2];
+    hip.gated_delta_step_resident(
+        req, layer, &mut host_state, &mut q, &mut k, &v1, &decay1, &beta1, &mut out, 1, 2, 2,
+        1e-6,
+    )
+    .expect("resident step1");
+    for i in 0..2 {
+        assert!((out[i] - out1[i]).abs() < 1e-4, "step1 out[{i}]");
+    }
+    // Host mirror stays stale until sync; second step must use device state.
+    let mut q = [0.0f32, 1.0];
+    let mut k = [0.0f32, 1.0];
+    let mut out = [0.0f32; 2];
+    hip.gated_delta_step_resident(
+        req, layer, &mut host_state, &mut q, &mut k, &v2, &decay2, &beta2, &mut out, 1, 2, 2,
+        1e-6,
+    )
+    .expect("resident step2");
+    for i in 0..2 {
+        assert!(
+            (out[i] - out2[i]).abs() < 1e-4,
+            "step2 out[{i}] device={} host={}",
+            out[i],
+            out2[i]
+        );
+    }
+    let mut states = vec![Vec::new(); layer + 1];
+    hip.gdn_sync_request_to_host(req, &mut states).unwrap();
+    for i in 0..4 {
+        assert!(
+            (states[layer][i] - state_h[i]).abs() < 1e-4,
+            "synced state[{i}]"
+        );
+    }
+    hip.gdn_clear_request(req);
+}
+

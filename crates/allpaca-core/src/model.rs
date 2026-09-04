@@ -1,8 +1,13 @@
-use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
+use allpaca_cpu::{
+    attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu,
+};
 use allpaca_hip::{DeviceDecode, DeviceWeights, HipWorkspace};
 use crate::early_exit::EarlyExitSpec;
 use crate::forest::TokenForest;
 use allpaca_gguf::{GgufCompatReport, GgufFile, HybridLayerInfo, HybridLayerKind};
+use crate::deltanet::{
+    rmsnorm_silu_gate, GdnDims,
+};
 use crate::ssm::{selective_step, SsmLayerWeights};
 use allpaca_onnx::OnnxFile;
 use allpaca_safetensors::{HfConfig, SafetensorsFile};
@@ -28,6 +33,8 @@ pub struct DeviceDecodeSide<'a> {
     pub layer_stagger: Option<&'a LayerStagger>,
     pub ds_probe: Option<&'a DirectStorageProbe>,
     pub ds_queue: Option<&'a DirectStorageQueue>,
+    /// Target `output_norm` hidden (pre-lm-head) for MTP `h_nextn` handoff.
+    pub last_hidden: Option<&'a mut Vec<f32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,8 +49,18 @@ pub struct ModelConfig {
     pub n_active: usize,
     pub eps: f32,
     pub rope_theta: f32,
+    /// Explicit attn head width from GGUF (`attention.key_length`). 0 → `dim/n_heads`.
+    pub head_dim_explicit: usize,
+    /// Partial RoPE width (`rope.dimension_count`). 0 → full head.
+    pub rope_dims: usize,
+    /// Qwen3.5 MRoPE/IMRoPE sections; zeros → classic RoPE.
+    pub rope_sections: [i32; 4],
     /// Synthetic recurrent mix (semantic-anchor tracer). Not a KDA/FLA kernel.
     pub recurrent: bool,
+    /// Trailing NextN/MTP draft layers excluded from primary `n_layers`.
+    pub nextn_predict_layers: usize,
+    /// GGUF `blk.{gguf_layer_base + i}` index base (MTP draft remaps trailing blocks to 0..n_layers).
+    pub gguf_layer_base: usize,
 }
 
 impl ModelConfig {
@@ -59,7 +76,12 @@ impl ModelConfig {
             n_active: 0,
             eps: 1e-5,
             rope_theta: 10_000.0,
+            head_dim_explicit: 0,
+            rope_dims: 0,
+            rope_sections: [0; 4],
             recurrent: false,
+            nextn_predict_layers: 0,
+            gguf_layer_base: 0,
         }
     }
 
@@ -86,7 +108,15 @@ impl ModelConfig {
     }
 
     pub fn head_dim(&self) -> usize {
-        self.dim / self.n_heads
+        if self.head_dim_explicit > 0 {
+            self.head_dim_explicit
+        } else {
+            self.dim / self.n_heads.max(1)
+        }
+    }
+
+    pub fn uses_imrope(&self) -> bool {
+        self.rope_sections[0] > 0 && self.rope_sections[1] > 0
     }
 
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
@@ -107,10 +137,16 @@ impl ModelConfig {
             .ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("missing embedding_length".into()))
             })? as usize;
-        let n_layers = file
+        let n_layers_all = file
             .meta_u32(&format!("{arch}.block_count"))
             .ok_or_else(|| AllpacaError::Fatal(FatalError::ModelLoad("missing block_count".into())))?
             as usize;
+        // NextN/MTP draft blocks sit after the main stack (qwen35); llama.cpp
+        // excludes them from `n_layer()` for the primary decode graph.
+        let nextn = file
+            .meta_u32(&format!("{arch}.nextn_predict_layers"))
+            .unwrap_or(0) as usize;
+        let n_layers = n_layers_all.saturating_sub(nextn).max(1);
         let n_heads = file
             .meta_u32(&format!("{arch}.attention.head_count"))
             .unwrap_or(4) as usize;
@@ -122,10 +158,28 @@ impl ModelConfig {
             .unwrap_or((dim * 4) as u32) as usize;
         let eps = file
             .meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+            .or_else(|| file.meta_f32(&format!("{arch}.attention.layer_norm_rms_eps")))
             .unwrap_or(1e-5);
         let rope_theta = file
             .meta_f32(&format!("{arch}.rope.freq_base"))
             .unwrap_or(10_000.0);
+        let head_dim_explicit = file
+            .meta_u32(&format!("{arch}.attention.key_length"))
+            .or_else(|| file.meta_u32(&format!("{arch}.attention.value_length")))
+            .unwrap_or(0) as usize;
+        let rope_dims = file
+            .meta_u32(&format!("{arch}.rope.dimension_count"))
+            .unwrap_or(0) as usize;
+        let mut rope_sections = [0i32; 4];
+        if let Some(arr) = file
+            .metadata
+            .get(&format!("{arch}.rope.dimension_sections"))
+            .and_then(allpaca_gguf::GgufValue::as_i32_array)
+        {
+            for (i, v) in arr.into_iter().take(4).enumerate() {
+                rope_sections[i] = v;
+            }
+        }
         Ok(Self {
             vocab_size: vocab,
             dim,
@@ -141,11 +195,18 @@ impl ModelConfig {
                 .unwrap_or(0) as usize,
             eps,
             rope_theta,
-            recurrent: file
-                .tensors
-                .iter()
-                .any(|t| t.name.contains(".ssm_")),
+            head_dim_explicit,
+            rope_dims,
+            rope_sections,
+            recurrent: file.tensors.iter().any(|t| t.name.contains(".ssm_")),
+            nextn_predict_layers: nextn,
+            gguf_layer_base: 0,
         })
+    }
+
+    /// First GGUF block index for this config (`blk.{gguf_layer_base + local}`).
+    pub fn gguf_blk(&self, local_layer: usize) -> usize {
+        self.gguf_layer_base.saturating_add(local_layer)
     }
 }
 
@@ -195,6 +256,23 @@ struct LayerOff {
     w_down: WeightRef,
     #[allow(dead_code)]
     w_router: WeightRef,
+    /// Qwen35 Gated DeltaNet projections (zero-sized when unused).
+    w_qkv: WeightRef,
+    w_z: WeightRef,
+    w_alpha: WeightRef,
+    w_beta: WeightRef,
+    w_ssm_out: WeightRef,
+    /// Optional per-head RMSNorm (zero-sized when absent).
+    q_norm: WeightRef,
+    k_norm: WeightRef,
+}
+
+/// Device-resident NextN/MTP seed weights (`blk.{i}.nextn.*`).
+#[derive(Clone, Copy)]
+struct MtpNextnOff {
+    eh_proj: WeightRef,
+    enorm: WeightRef,
+    hnorm: WeightRef,
 }
 
 struct FfnRingState {
@@ -351,6 +429,7 @@ pub struct ResidentModel {
     layers: Vec<LayerOff>,
     norm: WeightRef,
     lm_head: WeightRef,
+    mtp_nextn: Option<MtpNextnOff>,
 }
 
 impl ResidentModel {
@@ -417,10 +496,34 @@ impl ResidentModel {
                 w_up,
                 w_down,
                 w_router,
+                w_qkv: WeightRef::f32(0, 0),
+                w_z: WeightRef::f32(0, 0),
+                w_alpha: WeightRef::f32(0, 0),
+                w_beta: WeightRef::f32(0, 0),
+                w_ssm_out: WeightRef::f32(0, 0),
+                q_norm: if layer.q_norm.is_empty() {
+                    WeightRef::f32(0, 0)
+                } else {
+                    push(&mut slices, &mut off, layer.q_norm.as_slice())
+                },
+                k_norm: if layer.k_norm.is_empty() {
+                    WeightRef::f32(0, 0)
+                } else {
+                    push(&mut slices, &mut off, layer.k_norm.as_slice())
+                },
             });
         }
         let norm = push(&mut slices, &mut off, model.norm.as_slice());
         let lm_head = push(&mut slices, &mut off, model.lm_head.as_slice());
+        let mtp_nextn = if let Some(n) = &model.mtp_nextn {
+            Some(MtpNextnOff {
+                eh_proj: push(&mut slices, &mut off, n.eh_proj.as_slice()),
+                enorm: push(&mut slices, &mut off, n.enorm.as_slice()),
+                hnorm: push(&mut slices, &mut off, n.hnorm.as_slice()),
+            })
+        } else {
+            None
+        };
         let packed = off;
         let (ring_slots, slot_bytes) = model
             .working_set
@@ -482,6 +585,7 @@ impl ResidentModel {
             layers,
             norm,
             lm_head,
+            mtp_nextn,
         })
     }
 
@@ -838,38 +942,184 @@ impl ResidentModel {
     }
 
     /// Upload a real GGUF without host-materializing every tensor as F32.
-    /// Q8_0 / large F16 GEMM weights stay packed; `output.weight` and large
-    /// `token_embd.weight` use the same path (F16 lm_head/embed stay F16).
+    /// Packed tensors stay mmap-backed until H2D (no host duplicate of the GGUF).
+    /// Large `token_embd.weight` stays packed (Q8_0 staged / ROCmFP4 native).
     /// Tied models reuse embed.
     pub fn upload_gguf(file: &GgufFile, cfg: &ModelConfig, device: i32) -> Result<Self, AllpacaError> {
-        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let report = file.compat_report();
+        let mut parts: Vec<UploadPart<'_>> = Vec::new();
         let mut off = 0usize;
         let embed = append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut expert_offs = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
+            let i = cfg.gguf_blk(i);
+            let reported = report
+                .layers
+                .get(i)
+                .map(|l| l.block)
+                .unwrap_or(HybridLayerKind::Attention);
+            // NextN/MTP is dense attn+FFN even when the trunk is hybrid SSM.
+            let block = if file.tensor(&format!("blk.{i}.attn_q.weight")).is_some() {
+                HybridLayerKind::Attention
+            } else {
+                reported
+            };
             let attn_norm = append_gguf_tensor(
                 file,
                 &format!("blk.{i}.attn_norm.weight"),
                 &mut parts,
                 &mut off,
             )?;
-            let wq = append_gguf_tensor(file, &format!("blk.{i}.attn_q.weight"), &mut parts, &mut off)?;
-            let wk = append_gguf_tensor(file, &format!("blk.{i}.attn_k.weight"), &mut parts, &mut off)?;
-            let wv = append_gguf_tensor(file, &format!("blk.{i}.attn_v.weight"), &mut parts, &mut off)?;
-            let wo = append_gguf_tensor(
-                file,
-                &format!("blk.{i}.attn_output.weight"),
-                &mut parts,
-                &mut off,
-            )?;
-            let ffn_norm = append_gguf_tensor(
-                file,
-                &format!("blk.{i}.ffn_norm.weight"),
-                &mut parts,
-                &mut off,
-            )?;
-            let (w_gate, w_up, w_down, w_router, packed_ex) = if cfg.n_experts > 0 {
+            let (wq, wk, wv, wo, w_qkv, w_z, w_alpha, w_beta, w_ssm_out) = match block {
+                HybridLayerKind::Ssm => {
+                    if file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some() {
+                        (
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.attn_qkv.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.attn_gate.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.ssm_alpha.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.ssm_beta.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.ssm_out.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                        )
+                    } else {
+                        (
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                        )
+                    }
+                }
+                HybridLayerKind::Attention
+                | HybridLayerKind::DenseFfn
+                | HybridLayerKind::Moe => {
+                    let (wq, wk, wv, wo) = if file.tensor(&format!("blk.{i}.attn_q.weight")).is_some()
+                    {
+                        (
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.attn_q.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.attn_k.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.attn_v.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                            append_gguf_tensor(
+                                file,
+                                &format!("blk.{i}.attn_output.weight"),
+                                &mut parts,
+                                &mut off,
+                            )?,
+                        )
+                    } else if file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some() {
+                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "blk.{i}.attn_qkv fused upload not wired for HIP resident path"
+                        ))));
+                    } else if matches!(
+                        block,
+                        HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+                    ) {
+                        (
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                            WeightRef::f32(0, 0),
+                        )
+                    } else {
+                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "blk.{i} attention layer missing attn_q/attn_qkv"
+                        ))));
+                    };
+                    (
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                    )
+                }
+            };
+            let ffn_norm = if file.tensor(&format!("blk.{i}.ffn_norm.weight")).is_some() {
+                append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.ffn_norm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?
+            } else if file
+                .tensor(&format!("blk.{i}.post_attention_norm.weight"))
+                .is_some()
+            {
+                append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.post_attention_norm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?
+            } else if matches!(
+                block,
+                HybridLayerKind::Ssm | HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+            ) && file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_none()
+            {
+                WeightRef::f32(0, 0)
+            } else {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "missing ffn_norm/post_attention_norm on blk.{i}"
+                ))));
+            };
+            let (w_gate, w_up, w_down, w_router, packed_ex) = if cfg.n_experts > 0
+                && (file.tensor(&format!("blk.{i}.ffn_gate_inp.weight")).is_some()
+                    || file.tensor(&format!("blk.{i}.ffn_router.weight")).is_some()
+                    || file.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some())
+            {
                 let w_router = if file.tensor(&format!("blk.{i}.ffn_gate_inp.weight")).is_some() {
                     append_gguf_tensor(
                         file,
@@ -893,7 +1143,7 @@ impl ResidentModel {
                     w_router,
                     packed_ex,
                 )
-            } else {
+            } else if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
                 (
                     append_gguf_tensor(file, &format!("blk.{i}.ffn_gate.weight"), &mut parts, &mut off)?,
                     append_gguf_tensor(file, &format!("blk.{i}.ffn_up.weight"), &mut parts, &mut off)?,
@@ -906,8 +1156,36 @@ impl ResidentModel {
                     WeightRef::f32(0, 0),
                     Vec::new(),
                 )
+            } else {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    Vec::new(),
+                )
             };
             expert_offs.push(packed_ex);
+            let q_norm = if file.tensor(&format!("blk.{i}.attn_q_norm.weight")).is_some() {
+                append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.attn_q_norm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?
+            } else {
+                WeightRef::f32(0, 0)
+            };
+            let k_norm = if file.tensor(&format!("blk.{i}.attn_k_norm.weight")).is_some() {
+                append_gguf_tensor(
+                    file,
+                    &format!("blk.{i}.attn_k_norm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?
+            } else {
+                WeightRef::f32(0, 0)
+            };
             layers.push(LayerOff {
                 attn_norm,
                 wq,
@@ -919,13 +1197,58 @@ impl ResidentModel {
                 w_up,
                 w_down,
                 w_router,
+                w_qkv,
+                w_z,
+                w_alpha,
+                w_beta,
+                w_ssm_out,
+                q_norm,
+                k_norm,
             });
         }
-        let norm = append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?;
+        let norm = if file.tensor("output_norm.weight").is_some() {
+            append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?
+        } else {
+            let b = cfg.gguf_blk(0);
+            append_gguf_tensor(
+                file,
+                &format!("blk.{b}.nextn.shared_head_norm.weight"),
+                &mut parts,
+                &mut off,
+            )?
+        };
         let lm_head = if file.tensor("output.weight").is_some() {
             append_gguf_tensor(file, "output.weight", &mut parts, &mut off)?
         } else {
             embed
+        };
+        let mtp_base = cfg.gguf_blk(0);
+        let mtp_nextn = if file
+            .tensor(&format!("blk.{mtp_base}.nextn.eh_proj.weight"))
+            .is_some()
+        {
+            Some(MtpNextnOff {
+                eh_proj: append_gguf_tensor(
+                    file,
+                    &format!("blk.{mtp_base}.nextn.eh_proj.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+                enorm: append_gguf_tensor(
+                    file,
+                    &format!("blk.{mtp_base}.nextn.enorm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+                hnorm: append_gguf_tensor(
+                    file,
+                    &format!("blk.{mtp_base}.nextn.hnorm.weight"),
+                    &mut parts,
+                    &mut off,
+                )?,
+            })
+        } else {
+            None
         };
 
         let views: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
@@ -943,6 +1266,7 @@ impl ResidentModel {
             layers,
             norm,
             lm_head,
+            mtp_nextn,
         })
     }
 
@@ -952,6 +1276,10 @@ impl ResidentModel {
 
     pub fn packed_h2d_bytes(&self) -> u64 {
         self.packed_h2d
+    }
+
+    pub fn has_mtp_nextn(&self) -> bool {
+        self.mtp_nextn.is_some()
     }
 
     fn bind_ffn<'a>(
@@ -1205,9 +1533,15 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K | WeightKind::RocmFp4 => {
+            WeightKind::RocmFp4 => hip.embed_gather_rocmfp4(
+                self.weights.byte_ptr_at(self.embed.off),
+                token,
+                out,
+                dim,
+            ),
+            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K => {
                 Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                    "Q4_K/Q5_K/Q6_K/ROCmFP4 embed must be F32 at load".into(),
+                    "Q4_K/Q5_K/Q6_K embed must be F32 at load".into(),
                 )))
             }
         }
@@ -1234,9 +1568,15 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K | WeightKind::RocmFp4 => {
+            WeightKind::RocmFp4 => hip.embed_gather_rocmfp4_rows(
+                self.weights.byte_ptr_at(self.embed.off),
+                tokens,
+                out,
+                dim,
+            ),
+            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K => {
                 Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                    "Q4_K/Q5_K/Q6_K/ROCmFP4 embed must be F32 at load".into(),
+                    "Q4_K/Q5_K/Q6_K embed must be F32 at load".into(),
                 )))
             }
         }
@@ -1412,7 +1752,10 @@ fn empty_layer() -> LayerWeights {
     LayerWeights {
         block: HybridLayerKind::Attention,
         ssm: None,
+        gdn: None,
         attn_norm: Vec::new(),
+        q_norm: Vec::new(),
+        k_norm: Vec::new(),
         wq: Vec::new(),
         wk: Vec::new(),
         wv: Vec::new(),
@@ -1424,6 +1767,60 @@ fn empty_layer() -> LayerWeights {
         w_router: Vec::new(),
         experts: Vec::new(),
     }
+}
+
+fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, AllpacaError> {
+    let arch = file.architecture().unwrap_or("qwen35");
+    let dims = GdnDims::from_meta(
+        file.meta_u32(&format!("{arch}.ssm.state_size")).unwrap_or(128) as usize,
+        file.meta_u32(&format!("{arch}.ssm.inner_size")).unwrap_or(0) as usize,
+        file.meta_u32(&format!("{arch}.ssm.time_step_rank")).unwrap_or(0) as usize,
+        file.meta_u32(&format!("{arch}.ssm.group_count")).unwrap_or(0) as usize,
+        file.meta_u32(&format!("{arch}.ssm.conv_kernel")).unwrap_or(4) as usize,
+    )
+    .ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: cannot infer GDN dims from GGUF meta"
+        )))
+    })?;
+    if file.tensor(&format!("blk.{layer}.attn_qkv.weight")).is_none()
+        || file.tensor(&format!("blk.{layer}.ssm_out.weight")).is_none()
+    {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: not a Gated DeltaNet layer"
+        ))));
+    }
+    let a = file.tensor_f32(&format!("blk.{layer}.ssm_a"))?;
+    let mut dt_bias = if file.tensor(&format!("blk.{layer}.ssm_dt.bias")).is_some() {
+        file.tensor_f32(&format!("blk.{layer}.ssm_dt.bias"))?
+    } else {
+        vec![0.0f32; dims.n_v_heads]
+    };
+    if dt_bias.len() < dims.n_v_heads {
+        dt_bias.resize(dims.n_v_heads, 0.0);
+    } else {
+        dt_bias.truncate(dims.n_v_heads);
+    }
+    let norm = file.tensor_f32(&format!("blk.{layer}.ssm_norm.weight"))?;
+    let conv1d = file.tensor_f32(&format!("blk.{layer}.ssm_conv1d.weight"))?;
+    if a.len() != dims.n_v_heads
+        || norm.len() != dims.head_v
+        || conv1d.len() != dims.conv_kernel.saturating_mul(dims.qkv_dim)
+    {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: GDN host tensor sizes mismatch dims={dims:?} a={} norm={} conv={}",
+            a.len(),
+            norm.len(),
+            conv1d.len()
+        ))));
+    }
+    Ok(GdnHostWeights {
+        dims,
+        a,
+        dt_bias,
+        norm,
+        conv1d,
+    })
 }
 
 fn load_gguf_ssm_layer(file: &GgufFile, layer: usize, dim: usize) -> Result<SsmLayerWeights, AllpacaError> {
@@ -1585,7 +1982,8 @@ fn estimated_gguf_f32_bytes(file: &GgufFile, cfg: &ModelConfig) -> u64 {
         "output_norm.weight".to_string(),
         "output.weight".to_string(),
     ];
-    for i in 0..cfg.n_layers {
+    for local in 0..cfg.n_layers {
+        let i = cfg.gguf_blk(local);
         names.push(format!("blk.{i}.attn_norm.weight"));
         names.push(format!("blk.{i}.attn_q.weight"));
         names.push(format!("blk.{i}.attn_k.weight"));
@@ -1686,18 +2084,18 @@ fn load_gguf_moe_layer(
     Ok((w_router, experts))
 }
 
-fn append_gguf_tensor(
-    file: &GgufFile,
+fn append_gguf_tensor<'a>(
+    file: &'a GgufFile,
     name: &str,
-    parts: &mut Vec<Vec<u8>>,
+    parts: &mut Vec<UploadPart<'a>>,
     off: &mut usize,
 ) -> Result<WeightRef, AllpacaError> {
     let info = file.tensor(name).ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
     })?;
     let n = info.n_elements() as usize;
-    let (bytes, kind) = match info.ggml_type {
-        allpaca_gguf::GgmlType::F32 => (file.tensor_bytes(name)?.to_vec(), WeightKind::F32),
+    let (part, kind) = match info.ggml_type {
+        allpaca_gguf::GgmlType::F32 => (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::F32),
         allpaca_gguf::GgmlType::F16 => {
             let packed = file.tensor_bytes(name)?;
             if n <= 65_536 {
@@ -1706,9 +2104,9 @@ fn append_gguf_tensor(
                 for v in &f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                (bytes, WeightKind::F32)
+                (UploadPart::Owned(bytes), WeightKind::F32)
             } else {
-                (packed.to_vec(), WeightKind::F16)
+                (UploadPart::Mapped(packed), WeightKind::F16)
             }
         }
         allpaca_gguf::GgmlType::Q4_K => {
@@ -1720,7 +2118,7 @@ fn append_gguf_tensor(
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                (bytes, WeightKind::F32)
+                (UploadPart::Owned(bytes), WeightKind::F32)
             } else {
                 let k = *info.dims.first().unwrap_or(&1) as usize;
                 if k == 0 || n % k != 0 {
@@ -1729,19 +2127,20 @@ fn append_gguf_tensor(
                         info.dims
                     ))));
                 }
-                (packed.to_vec(), WeightKind::Q4_K)
+                (UploadPart::Mapped(packed), WeightKind::Q4_K)
             }
         }
         allpaca_gguf::GgmlType::RocmFp4 => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            // Keep large embeds packed: vocab×dim F32 would be multi-GiB host RAM.
+            if n <= 65_536 {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_rocmfp4(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                (bytes, WeightKind::F32)
+                (UploadPart::Owned(bytes), WeightKind::F32)
             } else {
                 let k = *info.dims.first().unwrap_or(&1) as usize;
                 if k == 0 || n % k != 0 {
@@ -1750,7 +2149,7 @@ fn append_gguf_tensor(
                         info.dims
                     ))));
                 }
-                (packed.to_vec(), WeightKind::RocmFp4)
+                (UploadPart::Mapped(packed), WeightKind::RocmFp4)
             }
         }
         allpaca_gguf::GgmlType::Q5_K => {
@@ -1762,7 +2161,7 @@ fn append_gguf_tensor(
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                (bytes, WeightKind::F32)
+                (UploadPart::Owned(bytes), WeightKind::F32)
             } else {
                 let k = *info.dims.first().unwrap_or(&1) as usize;
                 if k == 0 || n % k != 0 {
@@ -1771,7 +2170,7 @@ fn append_gguf_tensor(
                         info.dims
                     ))));
                 }
-                (packed.to_vec(), WeightKind::Q5_K)
+                (UploadPart::Mapped(packed), WeightKind::Q5_K)
             }
         }
         allpaca_gguf::GgmlType::Q6_K => {
@@ -1783,7 +2182,7 @@ fn append_gguf_tensor(
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                (bytes, WeightKind::F32)
+                (UploadPart::Owned(bytes), WeightKind::F32)
             } else {
                 let k = *info.dims.first().unwrap_or(&1) as usize;
                 if k == 0 || n % k != 0 {
@@ -1792,7 +2191,7 @@ fn append_gguf_tensor(
                         info.dims
                     ))));
                 }
-                (packed.to_vec(), WeightKind::Q6_K)
+                (UploadPart::Mapped(packed), WeightKind::Q6_K)
             }
         }
         allpaca_gguf::GgmlType::Q8_0 => {
@@ -1804,12 +2203,12 @@ fn append_gguf_tensor(
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                (bytes, WeightKind::F32)
+                (UploadPart::Owned(bytes), WeightKind::F32)
             } else if name == "token_embd.weight" {
                 let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
                     AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
                 })?;
-                (staged, WeightKind::Q8_0)
+                (UploadPart::Owned(staged), WeightKind::Q8_0)
             } else {
                 let k = *info.dims.first().unwrap_or(&1) as usize;
                 if k == 0 || n % k != 0 {
@@ -1822,7 +2221,7 @@ fn append_gguf_tensor(
                 let staged = allpaca_hip::stage_q8_0_gemv(packed, n_rows, k).map_err(|e| {
                     AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 GEMV stage {name}: {e}")))
                 })?;
-                (staged, WeightKind::Q8_0)
+                (UploadPart::Owned(staged), WeightKind::Q8_0)
             }
         }
         _ => {
@@ -1831,17 +2230,17 @@ fn append_gguf_tensor(
             for v in &f32s {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
-            (bytes, WeightKind::F32)
+            (UploadPart::Owned(bytes), WeightKind::F32)
         }
     };
     if kind == WeightKind::Q8_0 && *off % allpaca_hip::Q8_STAGED_BLOCK != 0 {
         let pad = allpaca_hip::Q8_STAGED_BLOCK - (*off % allpaca_hip::Q8_STAGED_BLOCK);
-        parts.push(vec![0u8; pad]);
+        parts.push(UploadPart::Owned(vec![0u8; pad]));
         *off += pad;
     }
     if kind == WeightKind::F16 && *off % 16 != 0 {
         let pad = 16 - (*off % 16);
-        parts.push(vec![0u8; pad]);
+        parts.push(UploadPart::Owned(vec![0u8; pad]));
         *off += pad;
     }
     let w = WeightRef {
@@ -1849,9 +2248,29 @@ fn append_gguf_tensor(
         n,
         kind,
     };
-    *off += bytes.len();
-    parts.push(bytes);
+    *off += part.len();
+    parts.push(part);
     Ok(w)
+}
+
+/// Host staging for GGUF→device upload: mmap borrow when possible, owned only
+/// when staging/dequant forces a rewrite (keeps commit charge near one file size).
+enum UploadPart<'a> {
+    Mapped(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl<'a> UploadPart<'a> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mapped(s) => s,
+            Self::Owned(v) => v.as_slice(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
 }
 
 fn split_packed_experts(
@@ -1884,11 +2303,11 @@ fn split_packed_experts(
         .collect())
 }
 
-fn append_gguf_experts(
-    file: &GgufFile,
+fn append_gguf_experts<'a>(
+    file: &'a GgufFile,
     layer: usize,
     n_experts: usize,
-    parts: &mut Vec<Vec<u8>>,
+    parts: &mut Vec<UploadPart<'a>>,
     off: &mut usize,
 ) -> Result<Vec<[WeightRef; 3]>, AllpacaError> {
     let stacked = format!("blk.{layer}.ffn_gate_exps.weight");
@@ -1935,10 +2354,24 @@ fn append_gguf_experts(
 }
 
 #[derive(Debug, Clone)]
+pub struct GdnHostWeights {
+    pub dims: GdnDims,
+    pub a: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub norm: Vec<f32>,
+    pub conv1d: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct LayerWeights {
     pub block: HybridLayerKind,
     pub ssm: Option<SsmLayerWeights>,
+    /// Qwen35 Gated DeltaNet host scalars / conv (projections stay on device).
+    pub gdn: Option<GdnHostWeights>,
     pub attn_norm: Vec<f32>,
+    /// Per-head Q/K RMSNorm (Qwen3.5 full-attn); empty when unused.
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
     pub wq: Vec<f32>,
     pub wk: Vec<f32>,
     pub wv: Vec<f32>,
@@ -1949,6 +2382,15 @@ pub struct LayerWeights {
     pub w_down: Vec<f32>,
     pub w_router: Vec<f32>,
     pub experts: Vec<LayerFfn>,
+}
+
+/// Host NextN/MTP seed tensors (`blk.{i}.nextn.*`). Device ROCmFP4 drafts skip these.
+#[derive(Debug, Clone, Default)]
+pub struct MtpNextnWeights {
+    /// `[dim, 2*dim]` — maps concat(RMSNorm(tok), RMSNorm(h)) → seed.
+    pub eh_proj: Vec<f32>,
+    pub enorm: Vec<f32>,
+    pub hnorm: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1964,6 +2406,8 @@ pub struct TinyModel {
     pub expert_host: Option<Arc<HostExpertPool>>,
     /// Manifest early-exit capability (unsupported for synthetic / most GGUF).
     pub early_exit: EarlyExitSpec,
+    /// Present when this TinyModel is an MTP/NextN draft with host seed weights.
+    pub mtp_nextn: Option<MtpNextnWeights>,
 }
 
 impl TinyModel {
@@ -2002,7 +2446,10 @@ impl TinyModel {
             layers.push(LayerWeights {
                 block: HybridLayerKind::Attention,
                 ssm: None,
+                gdn: None,
                 attn_norm: ones(dim),
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
                 wq: rng.vec(dim * dim),
                 wk: rng.vec(kv_dim * dim),
                 wv: rng.vec(kv_dim * dim),
@@ -2026,6 +2473,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            mtp_nextn: None,
         }
     }
 
@@ -2516,6 +2964,7 @@ impl TinyModel {
             layer_stagger: s.layer_stagger,
             ds_probe,
             ds_queue,
+            last_hidden: None,
         });
         if let Some(s) = side.as_mut() {
             if let Some(norm) = s.moe_norm.as_mut() {
@@ -2689,11 +3138,88 @@ impl TinyModel {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
         }
         let cfg = ModelConfig::from_gguf(file)?;
+        Self::from_gguf_cfg(file, cfg, &report)
+    }
+
+    /// Load trailing NextN/MTP blocks as a standalone draft model (shared embed/lm_head).
+    ///
+    /// Seed uses `eh_proj(concat(RMSNorm(tok), RMSNorm(h_nextn)))` with `h_nextn`
+    /// handed off from the target `output_norm` hidden (and updated after each MTP step).
+    pub fn from_gguf_mtp(file: &GgufFile) -> Result<Self, AllpacaError> {
+        let report = file.compat_report();
+        if let Some(reason) = report.reject_reason {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
+        }
+        let trunk = ModelConfig::from_gguf(file)?;
+        if trunk.nextn_predict_layers == 0 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "GGUF has no nextn_predict_layers for MTP draft".into(),
+            )));
+        }
+        let mut cfg = trunk.clone();
+        cfg.gguf_layer_base = trunk.n_layers;
+        cfg.n_layers = trunk.nextn_predict_layers;
+        cfg.nextn_predict_layers = 0;
+        cfg.recurrent = false;
+        let base = cfg.gguf_layer_base;
+        if file
+            .tensor(&format!("blk.{base}.nextn.eh_proj.weight"))
+            .is_none()
+            && file.tensor(&format!("blk.{base}.attn_q.weight")).is_none()
+        {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "MTP blk.{base} missing attn_q / nextn.eh_proj"
+            ))));
+        }
+        let mut model = Self::from_gguf_cfg(file, cfg, &report)?;
+        // Dense MTP heads (Qwen3.5/3.8) ship `ffn_gate/up/down`, not MoE exps.
+        // Clear trunk expert count so draft decode stays on the dense device path.
+        let base = model.config.gguf_layer_base;
+        let dense_mtp = file
+            .tensor(&format!("blk.{base}.ffn_gate.weight"))
+            .is_some()
+            && file
+                .tensor(&format!("blk.{base}.ffn_gate_inp.weight"))
+                .is_none()
+            && file
+                .tensor(&format!("blk.{base}.ffn_gate_exps.weight"))
+                .is_none();
+        if dense_mtp {
+            model.config.n_experts = 0;
+            model.config.n_active = 0;
+        }
+        // Prefer MTP shared head norm when present (llama.cpp graph_mtp).
+        if let Ok(n) = file.tensor_f32(&format!("blk.{base}.nextn.shared_head_norm.weight")) {
+            if model.host_weights_ready() {
+                model.norm = n;
+            }
+        }
+        if model.host_weights_ready()
+            && file
+                .tensor(&format!("blk.{base}.nextn.eh_proj.weight"))
+                .is_some()
+        {
+            model.mtp_nextn = Some(MtpNextnWeights {
+                eh_proj: file.tensor_f32(&format!("blk.{base}.nextn.eh_proj.weight"))?,
+                enorm: file.tensor_f32(&format!("blk.{base}.nextn.enorm.weight"))?,
+                hnorm: file.tensor_f32(&format!("blk.{base}.nextn.hnorm.weight"))?,
+            });
+        }
+        model.name = format!("{}-mtp", model.name);
+        Ok(model)
+    }
+
+    fn from_gguf_cfg(
+        file: &GgufFile,
+        cfg: ModelConfig,
+        report: &GgufCompatReport,
+    ) -> Result<Self, AllpacaError> {
         let name = file
             .meta_str("general.name")
             .unwrap_or("gguf")
             .to_string();
         for i in 0..cfg.n_layers {
+            let i = cfg.gguf_blk(i);
             let info = report
                 .layers
                 .get(i)
@@ -2709,9 +3235,14 @@ impl TinyModel {
                         && file.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_none()
                         && file.tensor(&format!("blk.{i}.ssm_out.weight")).is_none()
                     {
-                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                            "missing SSM tensors on blk.{i}"
-                        ))));
+                        // Dense MTP Attention blocks sometimes sit past an SSM trunk.
+                        if file.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
+                            && file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_none()
+                        {
+                            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "missing SSM tensors on blk.{i}"
+                            ))));
+                        }
                     }
                     if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
                         require_gguf_tensor(file, &format!("blk.{i}.ffn_up.weight"))?;
@@ -2776,18 +3307,38 @@ impl TinyModel {
                 "missing tensor token_embd.weight".into(),
             )));
         }
-        if file.tensor("output_norm.weight").is_none() {
+        if file.tensor("output_norm.weight").is_none()
+            && (0..cfg.n_layers).all(|local| {
+                file.tensor(&format!(
+                    "blk.{}.nextn.shared_head_norm.weight",
+                    cfg.gguf_blk(local)
+                ))
+                .is_none()
+            })
+        {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "missing tensor output_norm.weight".into(),
             )));
         }
         let host_bytes = estimated_gguf_f32_bytes(file, &cfg);
         if host_bytes > HOST_F32_LIMIT {
-            return Ok(Self::skeleton_hybrid(cfg, name, &report));
+            return Ok(Self::skeleton_hybrid(cfg, name, report, Some(file)));
         }
+        // Continue with original host-materialize body — call into remaining logic
+        // by temporarily reconstructing what from_gguf did after validation.
+        Self::from_gguf_host_materialize(file, cfg, report, name)
+    }
+
+    fn from_gguf_host_materialize(
+        file: &GgufFile,
+        cfg: ModelConfig,
+        report: &GgufCompatReport,
+        name: String,
+    ) -> Result<Self, AllpacaError> {
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
+            let i = cfg.gguf_blk(i);
             let info = report
                 .layers
                 .get(i)
@@ -2797,7 +3348,14 @@ impl TinyModel {
                     block: HybridLayerKind::Attention,
                     moe: cfg.n_experts > 0,
                 });
-            let layer = match info.block {
+            // Compat may mark MTP blocks as Ssm if neighboring heuristics misfire; prefer Attention
+            // when Q projections exist (Qwen3.5 NextN is dense attn + FFN).
+            let block = if file.tensor(&format!("blk.{i}.attn_q.weight")).is_some() {
+                HybridLayerKind::Attention
+            } else {
+                info.block
+            };
+            let layer = match block {
                 HybridLayerKind::Ssm => {
                     let attn_norm = if file.tensor(&format!("blk.{i}.attn_norm.weight")).is_some() {
                         file.tensor_f32(&format!("blk.{i}.attn_norm.weight"))?
@@ -2818,7 +3376,10 @@ impl TinyModel {
                     LayerWeights {
                         block: HybridLayerKind::Ssm,
                         ssm: Some(load_gguf_ssm_layer(file, i, cfg.dim)?),
+                        gdn: load_gguf_gdn_host(file, i).ok(),
                         attn_norm,
+                        q_norm: Vec::new(),
+                        k_norm: Vec::new(),
                         wq: Vec::new(),
                         wk: Vec::new(),
                         wv: Vec::new(),
@@ -2849,7 +3410,10 @@ impl TinyModel {
                     LayerWeights {
                         block: info.block,
                         ssm: None,
+                gdn: None,
                         attn_norm: ones(cfg.dim),
+                        q_norm: Vec::new(),
+                        k_norm: Vec::new(),
                         wq: Vec::new(),
                         wk: Vec::new(),
                         wv: Vec::new(),
@@ -2878,7 +3442,18 @@ impl TinyModel {
                     LayerWeights {
                         block: HybridLayerKind::Attention,
                         ssm: None,
+                        gdn: None,
                         attn_norm: file.tensor_f32(&format!("blk.{i}.attn_norm.weight"))?,
+                        q_norm: if file.tensor(&format!("blk.{i}.attn_q_norm.weight")).is_some() {
+                            file.tensor_f32(&format!("blk.{i}.attn_q_norm.weight"))?
+                        } else {
+                            Vec::new()
+                        },
+                        k_norm: if file.tensor(&format!("blk.{i}.attn_k_norm.weight")).is_some() {
+                            file.tensor_f32(&format!("blk.{i}.attn_k_norm.weight"))?
+                        } else {
+                            Vec::new()
+                        },
                         wq: file.tensor_f32(&format!("blk.{i}.attn_q.weight"))?,
                         wk: file.tensor_f32(&format!("blk.{i}.attn_k.weight"))?,
                         wv: file.tensor_f32(&format!("blk.{i}.attn_v.weight"))?,
@@ -2910,46 +3485,85 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            mtp_nextn: None,
         })
     }
 
     #[allow(dead_code)]
     fn skeleton(cfg: ModelConfig, name: impl Into<String>) -> Self {
-        Self::skeleton_hybrid(cfg, name, &GgufCompatReport {
-            architecture: String::new(),
-            n_layers: 0,
-            ssm_layers: 0,
-            attention_layers: 0,
-            moe_layers: 0,
-            layers: Vec::new(),
-            ggml_type_ids: Vec::new(),
-            reject_reason: None,
-        })
+        Self::skeleton_hybrid(
+            cfg,
+            name,
+            &GgufCompatReport {
+                architecture: String::new(),
+                n_layers: 0,
+                ssm_layers: 0,
+                attention_layers: 0,
+                moe_layers: 0,
+                layers: Vec::new(),
+                ggml_type_ids: Vec::new(),
+                reject_reason: None,
+            },
+            None,
+        )
     }
 
     fn skeleton_hybrid(
         cfg: ModelConfig,
         name: impl Into<String>,
         report: &allpaca_gguf::GgufCompatReport,
+        file: Option<&GgufFile>,
     ) -> Self {
         let layers = (0..cfg.n_layers)
-            .map(|i| {
+            .map(|local| {
+                let i = cfg.gguf_blk(local);
                 let info = report.layers.get(i);
-                let block = info
+                let reported = info
                     .map(|l| l.block)
                     .unwrap_or(HybridLayerKind::Attention);
+                let block = if file
+                    .map(|f| f.tensor(&format!("blk.{i}.attn_q.weight")).is_some())
+                    .unwrap_or(false)
+                {
+                    HybridLayerKind::Attention
+                } else {
+                    reported
+                };
                 let mut layer = empty_layer();
                 layer.block = block;
                 if block == HybridLayerKind::Ssm {
-                    layer.ssm = Some(SsmLayerWeights {
-                        d_state: 2,
-                        a: vec![-1.0, -1.5],
-                        b: vec![0.5, 0.5],
-                        c: vec![1.0, 0.0],
-                        d_skip: vec![1.0; cfg.dim],
-                        dt_bias: 0.0,
-                        conv1d: None,
-                    });
+                    if let Some(f) = file {
+                        if let Ok(gdn) = load_gguf_gdn_host(f, i) {
+                            layer.gdn = Some(gdn);
+                        }
+                    }
+                    if layer.gdn.is_none() {
+                        layer.ssm = Some(match file.and_then(|f| load_gguf_ssm_layer(f, i, cfg.dim).ok()) {
+                            Some(ssm) => ssm,
+                            None => SsmLayerWeights {
+                                d_state: 2,
+                                a: vec![-1.0, -1.5],
+                                b: vec![0.5, 0.5],
+                                c: vec![1.0, 0.0],
+                                d_skip: vec![1.0; cfg.dim],
+                                dt_bias: 0.0,
+                                conv1d: None,
+                            },
+                        });
+                    }
+                } else if block == HybridLayerKind::Attention {
+                    if let Some(f) = file {
+                        if f.tensor(&format!("blk.{i}.attn_q_norm.weight")).is_some() {
+                            layer.q_norm = f
+                                .tensor_f32(&format!("blk.{i}.attn_q_norm.weight"))
+                                .unwrap_or_default();
+                        }
+                        if f.tensor(&format!("blk.{i}.attn_k_norm.weight")).is_some() {
+                            layer.k_norm = f
+                                .tensor_f32(&format!("blk.{i}.attn_k_norm.weight"))
+                                .unwrap_or_default();
+                        }
+                    }
                 }
                 layer
             })
@@ -2965,6 +3579,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            mtp_nextn: None,
         }
     }
 
@@ -2983,7 +3598,12 @@ impl TinyModel {
             n_active: 0,
             eps: hf.rms_norm_eps,
             rope_theta: hf.rope_theta,
+            head_dim_explicit: 0,
+            rope_dims: 0,
+            rope_sections: [0; 4],
             recurrent: false,
+            nextn_predict_layers: 0,
+        gguf_layer_base: 0,
         };
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -2991,7 +3611,10 @@ impl TinyModel {
             layers.push(LayerWeights {
                 block: HybridLayerKind::Attention,
                 ssm: None,
+                gdn: None,
                 attn_norm: file.tensor_f32(&format!("blk.{i}.attn_norm.weight"))?,
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
                 wq: file.tensor_f32(&format!("blk.{i}.attn_q.weight"))?,
                 wk: file.tensor_f32(&format!("blk.{i}.attn_k.weight"))?,
                 wv: file.tensor_f32(&format!("blk.{i}.attn_v.weight"))?,
@@ -3025,6 +3648,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            mtp_nextn: None,
         })
     }
 
@@ -3043,7 +3667,12 @@ impl TinyModel {
             n_active: 0,
             eps: hf.rms_norm_eps,
             rope_theta: hf.rope_theta,
+            head_dim_explicit: 0,
+            rope_dims: 0,
+            rope_sections: [0; 4],
             recurrent: false,
+            nextn_predict_layers: 0,
+        gguf_layer_base: 0,
         };
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -3051,7 +3680,10 @@ impl TinyModel {
             layers.push(LayerWeights {
                 block: HybridLayerKind::Attention,
                 ssm: None,
+                gdn: None,
                 attn_norm: file.tensor_f32(&format!("blk.{i}.attn_norm.weight"))?,
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
                 wq: file.tensor_f32(&format!("blk.{i}.attn_q.weight"))?,
                 wk: file.tensor_f32(&format!("blk.{i}.attn_k.weight"))?,
                 wv: file.tensor_f32(&format!("blk.{i}.attn_v.weight"))?,
@@ -3080,6 +3712,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            mtp_nextn: None,
         })
     }
 
@@ -3126,7 +3759,7 @@ impl TinyModel {
         prefill: bool,
         mut recurrent: Option<&mut RecurrentState>,
         micro_batch: Option<&MicroBatchExpertUnion>,
-        side: Option<&mut DeviceDecodeSide<'_>>,
+        mut side: Option<&mut DeviceDecodeSide<'_>>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -3137,19 +3770,29 @@ impl TinyModel {
                 "token {token} out of vocab"
             ))));
         }
-        if recurrent.is_none() {
-            if let (Some(hip), Some(resident)) = (hip, resident) {
-                match self.forward_token_device(
-                    token, pos, page_ids, kv, metrics, logits, hip, resident, prefill,
-                    micro_batch, side,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        if !self.host_weights_ready() {
-                            return Err(e);
-                        }
-                        tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
+        // Prefer on-device decode whenever resident weights exist — including hybrid
+        // models that carry recurrent SSM/DeltaNet state (host stub inside device path).
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            match self.forward_token_device(
+                token,
+                pos,
+                page_ids,
+                kv,
+                metrics,
+                logits,
+                hip,
+                resident,
+                prefill,
+                micro_batch,
+                side.as_deref_mut(),
+                recurrent.as_deref_mut(),
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !self.host_weights_ready() {
+                        return Err(e);
                     }
+                    tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                 }
             }
         }
@@ -3350,6 +3993,12 @@ impl TinyModel {
             &mut scratch[..dim],
             Some(metrics),
         )?;
+        if let Some(side) = side.as_mut() {
+            if let Some(out) = side.last_hidden.as_mut() {
+                out.clear();
+                out.extend_from_slice(&scratch[..dim]);
+            }
+        }
         if logits.len() < cfg.vocab_size {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
@@ -3380,6 +4029,8 @@ impl TinyModel {
     /// Decode stays on [`forward_token`]. CPU loops per token. Last-chunk logits are
     /// written for the last position only when `write_logits` is set. Packed linear
     /// verify passes `row_logits` of length `tokens.len() * vocab` to keep every row.
+    /// When `out_row_hiddens` is set it receives `n_tok * dim` `output_norm` rows
+    /// (MTP `h_nextn` handoff after packed verify). `request_id` keys device GDN.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_tokens(
         &self,
@@ -3394,11 +4045,21 @@ impl TinyModel {
         write_logits: bool,
         mut row_logits: Option<&mut [f32]>,
         mut recurrent: Option<&mut RecurrentState>,
+        mut out_row_hiddens: Option<&mut Vec<f32>>,
+        request_id: u64,
     ) -> Result<(), AllpacaError> {
         if tokens.is_empty() {
             return Ok(());
         }
         if tokens.len() == 1 {
+            let mut side = DeviceDecodeSide {
+                request_id,
+                moe_norm: None,
+                layer_stagger: None,
+                ds_probe: None,
+                ds_queue: None,
+                last_hidden: out_row_hiddens.as_deref_mut(),
+            };
             self.forward_token(
                 tokens[0],
                 start_pos,
@@ -3411,12 +4072,16 @@ impl TinyModel {
                 false,
                 recurrent,
                 None,
-                None,
+                Some(&mut side),
             )?;
             if let Some(rows) = row_logits {
                 let vocab = self.config.vocab_size;
                 if rows.len() >= vocab {
-                    rows[..vocab].copy_from_slice(&logits[..vocab]);
+                    if let Some(hip) = hip {
+                        hip.wait_logits_d2h(&mut rows[..vocab])?;
+                    } else {
+                        rows[..vocab].copy_from_slice(&logits[..vocab]);
+                    }
                 }
             }
             return Ok(());
@@ -3430,35 +4095,64 @@ impl TinyModel {
         }
         if recurrent.is_none() && self.config.n_experts == 0 {
             if let (Some(hip), Some(resident)) = (hip, resident) {
-            match self.forward_tokens_device(
-                tokens,
-                start_pos,
-                page_ids,
-                kv,
-                metrics,
-                logits,
-                hip,
-                resident,
-                write_logits,
-                row_logits.as_deref_mut(),
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if !self.host_weights_ready() {
-                        return Err(e);
+                // Gated-Q / IMRoPE need per-token workspace; batched path is plain RoPE only.
+                let gated = self.layers.iter().any(|l| {
+                    let dim = self.config.dim.max(1);
+                    if l.wq.is_empty() || l.wo.is_empty() {
+                        return false;
                     }
-                    tracing::warn!(
+                    let q_out = l.wq.len() / dim;
+                    let wo_k = l.wo.len() / dim;
+                    q_out == wo_k.saturating_mul(2) && wo_k > dim
+                });
+                let batched_ok =
+                    !gated && !self.config.uses_imrope() && self.config.rope_dims == 0;
+                if batched_ok {
+                    match self.forward_tokens_device(
+                        tokens,
                         start_pos,
-                        n = tokens.len(),
-                        error = %e,
-                        "HIP batched prefill failed; per-token host fallback"
-                    );
+                        page_ids,
+                        kv,
+                        metrics,
+                        logits,
+                        hip,
+                        resident,
+                        write_logits,
+                        row_logits.as_deref_mut(),
+                        out_row_hiddens.as_deref_mut(),
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            if !self.host_weights_ready() {
+                                return Err(e);
+                            }
+                            tracing::warn!(
+                                start_pos,
+                                n = tokens.len(),
+                                error = %e,
+                                "HIP batched prefill failed; per-token host fallback"
+                            );
+                        }
+                    }
                 }
-            }
             }
         }
         let vocab = self.config.vocab_size;
+        let dim = self.config.dim;
+        if let Some(out) = out_row_hiddens.as_mut() {
+            out.clear();
+            out.reserve(tokens.len() * dim);
+        }
         for (i, tok) in tokens.iter().enumerate() {
+            let mut last = Vec::new();
+            let mut side = DeviceDecodeSide {
+                request_id,
+                moe_norm: None,
+                layer_stagger: None,
+                ds_probe: None,
+                ds_queue: None,
+                last_hidden: Some(&mut last),
+            };
             self.forward_token(
                 *tok,
                 start_pos + i,
@@ -3471,12 +4165,23 @@ impl TinyModel {
                 true,
                 recurrent.as_deref_mut(),
                 None,
-                None,
+                Some(&mut side),
             )?;
             if let Some(rows) = row_logits.as_mut() {
                 let off = i * vocab;
                 if rows.len() >= off + vocab {
-                    rows[off..off + vocab].copy_from_slice(&logits[..vocab]);
+                    if let Some(hip) = hip {
+                        hip.wait_logits_d2h(&mut rows[off..off + vocab])?;
+                    } else {
+                        rows[off..off + vocab].copy_from_slice(&logits[..vocab]);
+                    }
+                }
+            }
+            if let Some(out) = out_row_hiddens.as_mut() {
+                if last.len() == dim {
+                    out.extend_from_slice(&last);
+                } else {
+                    out.extend(std::iter::repeat(0.0f32).take(dim));
                 }
             }
         }
@@ -3498,16 +4203,38 @@ impl TinyModel {
         prefill: bool,
         micro_batch: Option<&MicroBatchExpertUnion>,
         mut side: Option<&mut DeviceDecodeSide<'_>>,
+        mut recurrent: Option<&mut RecurrentState>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
-        let head_dim = cfg.head_dim();
-        let kv_dim = cfg.n_kv_heads * head_dim;
         let vocab = cfg.vocab_size;
         if logits.len() < vocab {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
             )));
+        }
+        // Workspace must cover gated-attention Q (often 2× attn_out) and wo K.
+        let mut q_workspace = dim;
+        let mut kv_workspace = cfg.n_kv_heads * cfg.head_dim().max(1);
+        for layer in &resident.layers {
+            if layer.wq.n > 0 && layer.wq.n % dim == 0 {
+                q_workspace = q_workspace.max(layer.wq.n / dim);
+            }
+            if layer.wo.n > 0 && layer.wo.n % dim == 0 {
+                q_workspace = q_workspace.max(layer.wo.n / dim);
+            }
+            if layer.w_qkv.n > 0 && layer.w_qkv.n % dim == 0 {
+                q_workspace = q_workspace.max(layer.w_qkv.n / dim);
+            }
+            if layer.w_ssm_out.n > 0 && layer.w_ssm_out.n % dim == 0 {
+                q_workspace = q_workspace.max(layer.w_ssm_out.n / dim);
+            }
+            if layer.w_z.n > 0 && layer.w_z.n % dim == 0 {
+                q_workspace = q_workspace.max(layer.w_z.n / dim);
+            }
+            if layer.wk.n > 0 && layer.wk.n % dim == 0 {
+                kv_workspace = kv_workspace.max(layer.wk.n / dim);
+            }
         }
         let page_tokens = page_ids
             .first()
@@ -3521,7 +4248,7 @@ impl TinyModel {
             .unwrap_or(pos + 1)
             .max(pos + 1);
         hip.bind()?;
-        let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, max_kv)?;
+        let buf = hip.ensure_decode(q_workspace, kv_workspace, cfg.ff_dim, vocab, max_kv)?;
         hip.begin_decode_profile();
         let n_exp = cfg.n_experts;
         let double_buffer = prefill
@@ -3539,7 +4266,7 @@ impl TinyModel {
         resident.embed_gather(hip, token, buf.x, dim as i32)?;
         record_elementwise(Some(metrics));
 
-        for (layer_idx, _) in self.layers.iter().enumerate() {
+        for (layer_idx, host_layer) in self.layers.iter().enumerate() {
             if double_buffer {
                 resident.prefill_wait_layer(layer_idx as u32)?;
                 if layer_idx + 1 < self.layers.len() {
@@ -3564,38 +4291,402 @@ impl TinyModel {
                 )?;
                 record_elementwise(Some(metrics));
             }
+
+            // Gated DeltaNet (qwen35) or legacy selective-SSM stub + optional device FFN.
+            if matches!(
+                host_layer.block,
+                HybridLayerKind::Ssm | HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+            ) && layer.wq.n == 0
+            {
+                if let (Some(gdn), true) = (host_layer.gdn.as_ref(), layer.w_qkv.n > 0) {
+                    let dims = &gdn.dims;
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_qkv,
+                        buf.q,
+                        1,
+                        dims.qkv_dim as i32,
+                        dim as i32,
+                    )?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_z,
+                        buf.attn,
+                        1,
+                        dims.value_dim as i32,
+                        dim as i32,
+                    )?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_alpha,
+                        buf.gate,
+                        1,
+                        dims.n_v_heads as i32,
+                        dim as i32,
+                    )?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        layer.w_beta,
+                        buf.up,
+                        1,
+                        dims.n_v_heads as i32,
+                        dim as i32,
+                    )?;
+                    let mut qkv = vec![0.0f32; dims.qkv_dim];
+                    let mut z = vec![0.0f32; dims.value_dim];
+                    let mut alpha = vec![0.0f32; dims.n_v_heads];
+                    let mut beta = vec![0.0f32; dims.n_v_heads];
+                    hip.copy_d2h_f32(buf.q, &mut qkv)?;
+                    hip.copy_d2h_f32(buf.attn, &mut z)?;
+                    hip.copy_d2h_f32(buf.gate, &mut alpha)?;
+                    hip.copy_d2h_f32(buf.up, &mut beta)?;
+                    let state = recurrent.as_deref_mut().ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::ModelLoad(
+                            "Gated DeltaNet layer requires recurrent state".into(),
+                        ))
+                    })?;
+                    state.ensure_gdn(layer_idx, dims);
+                    let mut conv_out = vec![0.0f32; dims.qkv_dim];
+                    hip.gdn_conv1d_step_host(
+                        &qkv,
+                        &gdn.conv1d,
+                        &mut state.gdn_conv[layer_idx],
+                        &mut conv_out,
+                        dims.conv_kernel as i32,
+                    )?;
+                    let q_raw = &conv_out[..dims.key_dim];
+                    let k_raw = &conv_out[dims.key_dim..dims.key_dim * 2];
+                    let v_raw = &conv_out[dims.key_dim * 2..];
+                    let mut q_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                    let mut k_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                    hip.expand_k_heads_host(
+                        q_raw,
+                        &mut q_exp,
+                        dims.n_k_heads as i32,
+                        dims.n_v_heads as i32,
+                        dims.head_k as i32,
+                    )?;
+                    hip.expand_k_heads_host(
+                        k_raw,
+                        &mut k_exp,
+                        dims.n_k_heads as i32,
+                        dims.n_v_heads as i32,
+                        dims.head_k as i32,
+                    )?;
+                    let mut decay = vec![0.0f32; dims.n_v_heads];
+                    hip.gdn_decay_beta_host(
+                        &alpha,
+                        &gdn.dt_bias,
+                        &gdn.a,
+                        &mut decay,
+                        &mut beta,
+                    )?;
+                    let mut y = vec![0.0f32; dims.value_dim];
+                    let req_id = side.as_ref().map(|s| s.request_id).unwrap_or(0);
+                    hip.gated_delta_step_resident(
+                        req_id,
+                        layer_idx,
+                        &mut state.gdn_state[layer_idx],
+                        &mut q_exp,
+                        &mut k_exp,
+                        v_raw,
+                        &decay,
+                        &beta,
+                        &mut y,
+                        dims.n_v_heads as i32,
+                        dims.head_v as i32,
+                        dims.head_k as i32,
+                        cfg.eps,
+                    )?;
+                    let mut gated = vec![0.0f32; dims.value_dim];
+                    rmsnorm_silu_gate(&y, &z, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
+                    hip.copy_h2d_f32(buf.attn, &gated)?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.attn,
+                        layer.w_ssm_out,
+                        buf.proj,
+                        1,
+                        dim as i32,
+                        dims.value_dim as i32,
+                    )?;
+                    if layer.w_gate.n > 0 {
+                        let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
+                        let ffn_norm = ffn.ffn_norm();
+                        let w_gate = ffn.w_gate();
+                        let w_up = ffn.w_up();
+                        let w_down = ffn.w_down();
+                        hip.residual_rmsnorm(
+                            buf.x,
+                            buf.proj,
+                            resident.f32_or_dequant(hip, ffn_norm)?,
+                            buf.normed,
+                            dim as i32,
+                            cfg.eps,
+                        )?;
+                        resident.gemm_nt(
+                            hip,
+                            buf.normed,
+                            w_gate,
+                            buf.gate,
+                            1,
+                            cfg.ff_dim as i32,
+                            dim as i32,
+                        )?;
+                        resident.gemm_nt(
+                            hip,
+                            buf.normed,
+                            w_up,
+                            buf.up,
+                            1,
+                            cfg.ff_dim as i32,
+                            dim as i32,
+                        )?;
+                        hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+                        resident.gemm_nt(
+                            hip,
+                            buf.gate,
+                            w_down,
+                            buf.proj,
+                            1,
+                            dim as i32,
+                            cfg.ff_dim as i32,
+                        )?;
+                        drop(ffn);
+                    }
+                    if layer_idx + 1 < resident.layers.len() {
+                        hip.residual_rmsnorm(
+                            buf.x,
+                            buf.proj,
+                            resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
+                            buf.normed,
+                            dim as i32,
+                            cfg.eps,
+                        )?;
+                    } else {
+                        hip.residual_add(buf.x, buf.proj, dim as i32)?;
+                    }
+                    continue;
+                }
+                if host_layer.block == HybridLayerKind::Ssm {
+                    let ssm = host_layer.ssm.as_ref().ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "SSM layer {layer_idx} missing stub weights"
+                        )))
+                    })?;
+                    let mut x_host = vec![0.0f32; dim];
+                    let mut normed_host = vec![0.0f32; dim];
+                    let mut y_host = vec![0.0f32; dim];
+                    hip.copy_d2h_f32(buf.x, &mut x_host)?;
+                    hip.copy_d2h_f32(buf.normed, &mut normed_host)?;
+                    let state = recurrent.as_deref_mut().ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::ModelLoad(
+                            "SSM layer requires recurrent state".into(),
+                        ))
+                    })?;
+                    state.ensure_ssm(layer_idx, dim, ssm.d_state);
+                    selective_step(
+                        &normed_host,
+                        &mut state.ssm_h[layer_idx],
+                        &ssm.a,
+                        &ssm.b,
+                        &ssm.c,
+                        ssm.dt_bias,
+                        &ssm.d_skip,
+                        &mut y_host,
+                    );
+                    for i in 0..dim {
+                        x_host[i] += y_host[i];
+                    }
+                    hip.copy_h2d_f32(buf.x, &x_host)?;
+                }
+                if layer.w_gate.n > 0 {
+                    let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
+                    let ffn_norm = ffn.ffn_norm();
+                    let w_gate = ffn.w_gate();
+                    let w_up = ffn.w_up();
+                    let w_down = ffn.w_down();
+                    if ffn_norm.n > 0 {
+                        hip.rmsnorm_device(
+                            buf.x,
+                            resident.f32_or_dequant(hip, ffn_norm)?,
+                            buf.normed,
+                            dim as i32,
+                            cfg.eps,
+                        )?;
+                    } else {
+                        // no post-norm: FFN sees residual stream directly
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(buf.x, buf.normed, dim);
+                        }
+                    }
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        w_gate,
+                        buf.gate,
+                        1,
+                        cfg.ff_dim as i32,
+                        dim as i32,
+                    )?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed,
+                        w_up,
+                        buf.up,
+                        1,
+                        cfg.ff_dim as i32,
+                        dim as i32,
+                    )?;
+                    hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+                    resident.gemm_nt(
+                        hip,
+                        buf.gate,
+                        w_down,
+                        buf.proj,
+                        1,
+                        dim as i32,
+                        cfg.ff_dim as i32,
+                    )?;
+                    drop(ffn);
+                    if layer_idx + 1 < resident.layers.len() {
+                        hip.residual_rmsnorm(
+                            buf.x,
+                            buf.proj,
+                            resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
+                            buf.normed,
+                            dim as i32,
+                            cfg.eps,
+                        )?;
+                    } else {
+                        hip.residual_add(buf.x, buf.proj, dim as i32)?;
+                    }
+                } else if layer_idx + 1 < resident.layers.len() {
+                    hip.rmsnorm_device(
+                        buf.x,
+                        resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
+                        buf.normed,
+                        dim as i32,
+                        cfg.eps,
+                    )?;
+                }
+                continue;
+            }
+
+            let q_out = if layer.wq.n > 0 && layer.wq.n % dim == 0 {
+                layer.wq.n / dim
+            } else {
+                dim
+            };
+            let kv_dim = if layer.wk.n > 0 && layer.wk.n % dim == 0 {
+                layer.wk.n / dim
+            } else {
+                cfg.n_kv_heads * cfg.head_dim().max(1)
+            };
+            let wo_k = if layer.wo.n > 0 && layer.wo.n % dim == 0 {
+                layer.wo.n / dim
+            } else {
+                dim
+            };
+            let gated = q_out == wo_k.saturating_mul(2) && wo_k > dim;
+            let attn_dim = if gated { wo_k } else { q_out.min(wo_k).max(dim) };
+            let head_dim = {
+                let c = cfg.head_dim().max(1);
+                if attn_dim % c == 0 && kv_dim % c == 0 {
+                    c
+                } else if attn_dim % 256 == 0 && kv_dim % 256 == 0 {
+                    256
+                } else {
+                    c
+                }
+            };
+            let n_heads = (attn_dim / head_dim).max(1);
+            let n_kv_heads = (kv_dim / head_dim).max(1);
+
             if layer.wq.kind == WeightKind::Q8_0 {
                 hip.profile_q8(|| {
-                    resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
+                    resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, q_out as i32, dim as i32)?;
                     resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
                     resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
                     Ok(())
                 })?;
             } else {
-                resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
+                resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, q_out as i32, dim as i32)?;
                 resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
                 resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
             }
-            hip.rope_qk_device(
-                buf.q,
-                buf.k,
-                cfg.n_heads as i32,
-                cfg.n_kv_heads as i32,
-                head_dim as i32,
-                pos as i32,
-                cfg.rope_theta,
-            )?;
+            // Qwen3.5 gated attention: Q projection is per-head interleaved [Q|gate].
+            if gated {
+                hip.deinterleave_q_gate_device(
+                    buf.q,
+                    buf.proj,
+                    buf.gate,
+                    n_heads as i32,
+                    head_dim as i32,
+                )?;
+                hip.copy_d2d_f32(buf.q, buf.proj, attn_dim)?;
+                if layer.q_norm.n == head_dim {
+                    hip.rmsnorm_heads_device(
+                        buf.q,
+                        resident.f32_or_dequant(hip, layer.q_norm)?,
+                        n_heads as i32,
+                        head_dim as i32,
+                        cfg.eps,
+                    )?;
+                }
+                if layer.k_norm.n == head_dim {
+                    hip.rmsnorm_heads_device(
+                        buf.k,
+                        resident.f32_or_dequant(hip, layer.k_norm)?,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                        cfg.eps,
+                    )?;
+                }
+            }
+            if cfg.uses_imrope() || cfg.rope_dims > 0 {
+                let n_rot = if cfg.rope_dims > 0 {
+                    cfg.rope_dims
+                } else {
+                    head_dim
+                };
+                hip.rope_imrope_qk_device(
+                    buf.q,
+                    buf.k,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    n_rot as i32,
+                    pos as i32,
+                    cfg.rope_theta,
+                    cfg.rope_sections,
+                )?;
+            } else {
+                hip.rope_qk_device(
+                    buf.q,
+                    buf.k,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    pos as i32,
+                    cfg.rope_theta,
+                )?;
+            }
             record_elementwise(Some(metrics));
 
             let page_index = pos / page_tokens;
             let slot = (pos % page_tokens) as u32;
             let page_id = page_ids[layer_idx][page_index];
-            kv.write_slot_from_device(page_id, slot, cfg.n_kv_heads, head_dim, buf.k, buf.v)?;
+            kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v)?;
             kv.touch(page_id, 1.0);
 
             let (packed_k, packed_v, n_kv) = kv.kv_device_views(
                 &page_ids[layer_idx],
-                cfg.n_kv_heads,
+                n_kv_heads,
                 head_dim,
                 buf.packed_k,
                 buf.packed_v,
@@ -3608,17 +4699,36 @@ impl TinyModel {
                 buf.attn,
                 1,
                 n_kv as i32,
-                cfg.n_heads as i32,
-                cfg.n_kv_heads as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
                 head_dim as i32,
                 true,
             )?;
+            if gated {
+                hip.sigmoid_mul_device(buf.attn, buf.gate, attn_dim as i32)?;
+            }
             if layer.wo.kind == WeightKind::Q8_0 {
                 hip.profile_q8(|| {
-                    resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)
+                    resident.gemm_nt(
+                        hip,
+                        buf.attn,
+                        layer.wo,
+                        buf.proj,
+                        1,
+                        dim as i32,
+                        wo_k as i32,
+                    )
                 })?;
             } else {
-                resident.gemm_nt(hip, buf.attn, layer.wo, buf.proj, 1, dim as i32, dim as i32)?;
+                resident.gemm_nt(
+                    hip,
+                    buf.attn,
+                    layer.wo,
+                    buf.proj,
+                    1,
+                    dim as i32,
+                    wo_k as i32,
+                )?;
             }
             if self.config.n_experts > 0 {
                 if let Some(s) = side.as_mut() {
@@ -3757,6 +4867,12 @@ impl TinyModel {
             cfg.eps,
         )?;
         record_elementwise(Some(metrics));
+        if let Some(side) = side.as_mut() {
+            if let Some(out) = side.last_hidden.as_mut() {
+                out.resize(dim, 0.0);
+                hip.copy_d2h_f32(buf.normed, out)?;
+            }
+        }
         {
             let _lm = hip.lm_head_scope();
             resident.gemm_nt(
@@ -3796,6 +4912,7 @@ impl TinyModel {
         resident: &ResidentModel,
         write_logits: bool,
         row_logits: Option<&mut [f32]>,
+        mut out_row_hiddens: Option<&mut Vec<f32>>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -4053,6 +5170,10 @@ impl TinyModel {
                     cfg.eps,
                 )?;
                 record_elementwise(Some(metrics));
+                if let Some(out) = out_row_hiddens.as_mut() {
+                    out.resize(n_tok * dim, 0.0);
+                    hip.copy_d2h_f32(buf.normed, out)?;
+                }
                 {
                     let _lm = hip.lm_head_scope();
                     resident.gemm_nt(
@@ -4076,6 +5197,10 @@ impl TinyModel {
                     cfg.eps,
                 )?;
                 record_elementwise(Some(metrics));
+                if let Some(out) = out_row_hiddens.as_mut() {
+                    out.resize(dim, 0.0);
+                    hip.copy_d2h_f32(buf.normed, out)?;
+                }
                 {
                     let _lm = hip.lm_head_scope();
                     resident.gemm_nt(
@@ -4089,6 +5214,17 @@ impl TinyModel {
                     )?;
                 }
                 hip.start_logits_d2h(buf.logits, vocab)?;
+            } else if let Some(out) = out_row_hiddens.as_mut() {
+                let x_last = buf.x_row(n_tok - 1, dim);
+                hip.rmsnorm_device(
+                    x_last,
+                    resident.f32_or_dequant(hip, resident.norm)?,
+                    buf.normed,
+                    dim as i32,
+                    cfg.eps,
+                )?;
+                out.resize(dim, 0.0);
+                hip.copy_d2h_f32(buf.normed, out)?;
             }
             metrics
                 .gpu_forwards
@@ -4305,13 +5441,16 @@ impl TinyModel {
         metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
         cache.forwards = cache.forwards.saturating_add(1);
-        if self.config.n_experts == 0 {
-            if let (Some(hip), Some(resident)) = (hip, resident) {
-                match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        tracing::warn!(pos, token, error = %e, "HIP draft on-device decode failed; host fallback");
-                    }
+        // Prefer on-device draft whenever resident weights exist (incl. MTP / MoE).
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
+                Ok(()) => return Ok(()),
+                Err(e) if !self.host_weights_ready() => {
+                    // ROCmFP4 / packed drafts are device-only skeletons — no host embed.
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::warn!(pos, token, error = %e, "HIP draft on-device decode failed; host fallback");
                 }
             }
         }
@@ -4320,7 +5459,25 @@ impl TinyModel {
         let head_dim = cfg.head_dim();
         let kv_dim = cfg.n_kv_heads * head_dim;
         cache.ensure_layers(cfg.n_layers);
-        let mut x = self.embed[token as usize * dim..(token as usize + 1) * dim].to_vec();
+        let mut x = if let Some(nextn) = self.mtp_nextn.as_ref() {
+            // llama.cpp graph_mtp: seed = eh_proj(concat(RMSNorm(tok), RMSNorm(h))).
+            let tok = &self.embed[token as usize * dim..(token as usize + 1) * dim];
+            if cache.h_nextn.len() != dim {
+                cache.h_nextn = vec![0.0f32; dim];
+            }
+            let mut e_norm = vec![0.0f32; dim];
+            let mut h_norm = vec![0.0f32; dim];
+            rmsnorm(tok, &nextn.enorm, cfg.eps, &mut e_norm)?;
+            rmsnorm(&cache.h_nextn, &nextn.hnorm, cfg.eps, &mut h_norm)?;
+            let mut concat = vec![0.0f32; 2 * dim];
+            concat[..dim].copy_from_slice(&e_norm);
+            concat[dim..].copy_from_slice(&h_norm);
+            let mut seed = vec![0.0f32; dim];
+            matmul_nt(&concat, &nextn.eh_proj, &mut seed, 1, dim, 2 * dim)?;
+            seed
+        } else {
+            self.embed[token as usize * dim..(token as usize + 1) * dim].to_vec()
+        };
         let mut normed = vec![0.0f32; dim];
         let mut q = vec![0.0f32; dim];
         let mut k = vec![0.0f32; kv_dim];
@@ -4383,6 +5540,9 @@ impl TinyModel {
             &mut normed,
             metrics,
         )?;
+        if self.mtp_nextn.is_some() {
+            cache.h_nextn = normed.clone();
+        }
         gemm_nt_dispatch(
             hip,
             &normed,
@@ -4420,29 +5580,109 @@ impl TinyModel {
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
-        let head_dim = cfg.head_dim();
-        let kv_dim = cfg.n_kv_heads * head_dim;
         let vocab = cfg.vocab_size;
         if logits.len() < vocab {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
             )));
         }
+        // Match target decode workspace sizing (gated Q is often 2× attn_out).
+        let mut q_workspace = dim;
+        let mut kv_workspace = cfg.n_kv_heads * cfg.head_dim().max(1);
+        for layer in &resident.layers {
+            if layer.wq.n > 0 && layer.wq.n % dim == 0 {
+                q_workspace = q_workspace.max(layer.wq.n / dim);
+            }
+            if layer.wo.n > 0 && layer.wo.n % dim == 0 {
+                q_workspace = q_workspace.max(layer.wo.n / dim);
+            }
+            if layer.wk.n > 0 && layer.wk.n % dim == 0 {
+                kv_workspace = kv_workspace.max(layer.wk.n / dim);
+            }
+        }
         hip.bind()?;
-        cache.ensure_device(hip.device, cfg.n_layers, kv_dim, pos + 1)?;
+        // MTP draft KV is a short local window (seq.len()), not absolute pos.
+        let mtp = resident.mtp_nextn.is_some() || self.mtp_nextn.is_some();
+        let kv_slot = if mtp { cache.seq.len() } else { pos };
+        cache.ensure_device(hip.device, cfg.n_layers, kv_workspace, kv_slot + 1)?;
         if let Some(metrics) = metrics {
             metrics
                 .draft_kv_bytes_on_device
                 .store(cache.device_bytes(), std::sync::atomic::Ordering::Relaxed);
         }
-        let buf = hip.ensure_decode(dim, kv_dim, cfg.ff_dim, vocab, pos + 1)?;
-        resident.embed_gather(hip, token, buf.x, dim as i32)?;
+        let ff_scratch = cfg.ff_dim.max(2 * dim).max(q_workspace.saturating_add(256));
+        let buf = hip.ensure_decode(q_workspace, kv_workspace, ff_scratch, vocab, kv_slot + 1)?;
+
+        if let Some(nextn) = resident.mtp_nextn {
+            // graph_mtp: seed = eh_proj(concat(RMSNorm(tok), RMSNorm(h_nextn))).
+            let h_ptr = cache.ensure_h_nextn_device(hip.device, dim)?;
+            resident.embed_gather(hip, token, buf.x, dim as i32)?;
+            hip.rmsnorm_device(
+                buf.x,
+                resident.f32_or_dequant(hip, nextn.enorm)?,
+                buf.normed,
+                dim as i32,
+                cfg.eps,
+            )?;
+            hip.rmsnorm_device(
+                h_ptr,
+                resident.f32_or_dequant(hip, nextn.hnorm)?,
+                buf.attn,
+                dim as i32,
+                cfg.eps,
+            )?;
+            hip.copy_d2d_f32(buf.gate, buf.normed, dim)?;
+            hip.copy_d2d_f32(unsafe { buf.gate.add(dim) }, buf.attn, dim)?;
+            resident.gemm_nt(
+                hip,
+                buf.gate,
+                nextn.eh_proj,
+                buf.x,
+                1,
+                dim as i32,
+                (2 * dim) as i32,
+            )?;
+        } else {
+            resident.embed_gather(hip, token, buf.x, dim as i32)?;
+        }
         record_elementwise(metrics);
 
-        // Same dtype dispatch as target decode (`resident.gemm_nt`). F32 GEMV on
-        // packed F16/Q8 reads past the weight allocation and hangs the draft GPU.
         for layer_idx in 0..self.layers.len() {
             let layer = &resident.layers[layer_idx];
+            let q_out = if layer.wq.n > 0 && layer.wq.n % dim == 0 {
+                layer.wq.n / dim
+            } else {
+                dim
+            };
+            let kv_dim = if layer.wk.n > 0 && layer.wk.n % dim == 0 {
+                layer.wk.n / dim
+            } else {
+                cfg.n_kv_heads * cfg.head_dim().max(1)
+            };
+            let wo_k = if layer.wo.n > 0 && layer.wo.n % dim == 0 {
+                layer.wo.n / dim
+            } else {
+                dim
+            };
+            let gated = q_out == wo_k.saturating_mul(2) && wo_k > dim;
+            let attn_dim = if gated {
+                wo_k
+            } else {
+                q_out.min(wo_k).max(dim)
+            };
+            let head_dim = {
+                let c = cfg.head_dim().max(1);
+                if attn_dim % c == 0 && kv_dim % c == 0 {
+                    c
+                } else if attn_dim % 256 == 0 && kv_dim % 256 == 0 {
+                    256
+                } else {
+                    c
+                }
+            };
+            let n_heads = (attn_dim / head_dim).max(1);
+            let n_kv_heads = (kv_dim / head_dim).max(1);
+
             if layer_idx == 0 {
                 hip.rmsnorm_device(
                     buf.x,
@@ -4453,37 +5693,70 @@ impl TinyModel {
                 )?;
                 record_elementwise(metrics);
             }
-            resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, dim as i32, dim as i32)?;
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                layer.wk,
-                buf.k,
-                1,
-                kv_dim as i32,
-                dim as i32,
-            )?;
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                layer.wv,
-                buf.v,
-                1,
-                kv_dim as i32,
-                dim as i32,
-            )?;
-            hip.rope_qk_device(
-                buf.q,
-                buf.k,
-                cfg.n_heads as i32,
-                cfg.n_kv_heads as i32,
-                head_dim as i32,
-                pos as i32,
-                cfg.rope_theta,
-            )?;
+            resident.gemm_nt(hip, buf.normed, layer.wq, buf.q, 1, q_out as i32, dim as i32)?;
+            resident.gemm_nt(hip, buf.normed, layer.wk, buf.k, 1, kv_dim as i32, dim as i32)?;
+            resident.gemm_nt(hip, buf.normed, layer.wv, buf.v, 1, kv_dim as i32, dim as i32)?;
+
+            if gated {
+                // q_full in buf.q → compact q into buf.proj, gate into buf.gate; then q → buf.q.
+                hip.deinterleave_q_gate_device(
+                    buf.q,
+                    buf.proj,
+                    buf.gate,
+                    n_heads as i32,
+                    head_dim as i32,
+                )?;
+                hip.copy_d2d_f32(buf.q, buf.proj, attn_dim)?;
+                if layer.q_norm.n == head_dim {
+                    hip.rmsnorm_heads_device(
+                        buf.q,
+                        resident.f32_or_dequant(hip, layer.q_norm)?,
+                        n_heads as i32,
+                        head_dim as i32,
+                        cfg.eps,
+                    )?;
+                }
+                if layer.k_norm.n == head_dim {
+                    hip.rmsnorm_heads_device(
+                        buf.k,
+                        resident.f32_or_dequant(hip, layer.k_norm)?,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                        cfg.eps,
+                    )?;
+                }
+            }
+            if cfg.uses_imrope() || cfg.rope_dims > 0 {
+                let n_rot = if cfg.rope_dims > 0 {
+                    cfg.rope_dims
+                } else {
+                    head_dim
+                };
+                hip.rope_imrope_qk_device(
+                    buf.q,
+                    buf.k,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    n_rot as i32,
+                    pos as i32,
+                    cfg.rope_theta,
+                    cfg.rope_sections,
+                )?;
+            } else {
+                hip.rope_qk_device(
+                    buf.q,
+                    buf.k,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    pos as i32,
+                    cfg.rope_theta,
+                )?;
+            }
             record_elementwise(metrics);
-            cache.write_pos_from_device(layer_idx, pos, buf.k, buf.v)?;
-            let n_kv = pos + 1;
+            cache.write_pos_from_device(layer_idx, kv_slot, buf.k, buf.v)?;
+            let n_kv = kv_slot + 1;
             hip.attention_device(
                 buf.q,
                 cache.k_ptr(layer_idx),
@@ -4491,11 +5764,14 @@ impl TinyModel {
                 buf.attn,
                 1,
                 n_kv as i32,
-                cfg.n_heads as i32,
-                cfg.n_kv_heads as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
                 head_dim as i32,
                 true,
             )?;
+            if gated {
+                hip.sigmoid_mul_device(buf.attn, buf.gate, attn_dim as i32)?;
+            }
             resident.gemm_nt(
                 hip,
                 buf.attn,
@@ -4503,8 +5779,49 @@ impl TinyModel {
                 buf.proj,
                 1,
                 dim as i32,
-                dim as i32,
+                wo_k as i32,
             )?;
+            let moe_layer = self.config.n_experts > 0 && layer.w_router.n > 0;
+            if moe_layer {
+                // MTP / draft MoE: same device_moe path as target decode (routed experts).
+                let metrics_owned;
+                let metrics_ref = match metrics {
+                    Some(m) => m,
+                    None => {
+                        metrics_owned = Metrics::default();
+                        &metrics_owned
+                    }
+                };
+                self.device_moe(
+                    layer_idx,
+                    hip,
+                    resident,
+                    buf,
+                    metrics_ref,
+                    false,
+                    None,
+                    None,
+                )?;
+                // device_moe leaves MoE out in buf.proj; fold into residual like target.
+                if layer_idx + 1 < resident.layers.len() {
+                    hip.residual_rmsnorm(
+                        buf.x,
+                        buf.proj,
+                        resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
+                        buf.normed,
+                        dim as i32,
+                        cfg.eps,
+                    )?;
+                } else {
+                    hip.residual_add(buf.x, buf.proj, dim as i32)?;
+                }
+                if let Some(metrics) = metrics {
+                    metrics
+                        .residual_gpu_ops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                record_elementwise(metrics);
+            } else {
             let ffn = self.device_ffn(resident, layer_idx, metrics)?;
             let ffn_norm = ffn.ffn_norm();
             let w_gate = ffn.w_gate();
@@ -4524,6 +5841,7 @@ impl TinyModel {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             record_elementwise(metrics);
+            // FFN reuses buf.gate (overwrites MTP attn gate — already applied).
             resident.gemm_nt(
                 hip,
                 buf.normed,
@@ -4572,6 +5890,7 @@ impl TinyModel {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             record_elementwise(metrics);
+            }
         }
 
         hip.rmsnorm_device(
@@ -4582,6 +5901,9 @@ impl TinyModel {
             cfg.eps,
         )?;
         record_elementwise(metrics);
+        if resident.mtp_nextn.is_some() || self.mtp_nextn.is_some() {
+            cache.store_h_nextn_from_device(buf.normed, dim)?;
+        }
         {
             let _lm = hip.lm_head_scope();
             resident.gemm_nt(
@@ -4635,7 +5957,19 @@ pub struct DenseKv {
     seq: Vec<u32>,
     /// Draft decode steps on this cache (CPU or HIP). Locks prefix reuse.
     pub(crate) forwards: u64,
+    /// Rolling MTP `h_nextn` host mirror (seed from target / CPU path).
+    pub(crate) h_nextn: Vec<f32>,
+    /// Device-resident `h_nextn` on the draft GPU (avoids H2D each draft step).
+    h_nextn_dev: *mut u8,
+    h_nextn_bytes: usize,
+    h_nextn_dev_device: Option<i32>,
+    /// Host `h_nextn` was refreshed from the target and needs H2D before device seed.
+    pub(crate) h_nextn_host_dirty: bool,
 }
+
+// Device pointers; Engine moves DenseKv across threads under Mutex.
+unsafe impl Send for DenseKv {}
+unsafe impl Sync for DenseKv {}
 
 impl Default for DenseKv {
     fn default() -> Self {
@@ -4648,6 +5982,11 @@ impl Default for DenseKv {
             kv_dim: 0,
             seq: Vec::new(),
             forwards: 0,
+            h_nextn: Vec::new(),
+            h_nextn_dev: std::ptr::null_mut(),
+            h_nextn_bytes: 0,
+            h_nextn_dev_device: None,
+            h_nextn_host_dirty: false,
         }
     }
 }
@@ -4676,6 +6015,8 @@ impl DenseKv {
     pub fn reset(&mut self) {
         self.tokens = 0;
         self.seq.clear();
+        self.h_nextn.clear();
+        self.h_nextn_host_dirty = false;
         for layer in &mut self.layers {
             layer.k.clear();
             layer.v.clear();
@@ -4690,6 +6031,14 @@ impl DenseKv {
             .count()
     }
 
+    pub(crate) fn seq_len(&self) -> usize {
+        self.seq.len()
+    }
+
+    pub(crate) fn seq_matches(&self, ctx: &[u32]) -> bool {
+        self.seq.as_slice() == ctx
+    }
+
     pub(crate) fn truncate(&mut self, n: usize, kv_dim: usize) {
         self.rewind_to(n, kv_dim);
         self.seq.truncate(n);
@@ -4699,11 +6048,82 @@ impl DenseKv {
         self.seq.push(token);
     }
 
+    pub(crate) fn seed_h_nextn_from_target(&mut self, hidden: &[f32]) {
+        self.h_nextn = hidden.to_vec();
+        self.h_nextn_host_dirty = true;
+    }
+
+    fn free_h_nextn_device(&mut self) {
+        if !self.h_nextn_dev.is_null() {
+            allpaca_hip::device_free(self.h_nextn_dev, self.h_nextn_bytes);
+            self.h_nextn_dev = std::ptr::null_mut();
+            self.h_nextn_bytes = 0;
+            self.h_nextn_dev_device = None;
+        }
+    }
+
+    fn ensure_h_nextn_device(&mut self, device: i32, dim: usize) -> Result<*mut f32, AllpacaError> {
+        let bytes = dim * 4;
+        let reuse = self.h_nextn_dev_device == Some(device)
+            && self.h_nextn_bytes >= bytes
+            && !self.h_nextn_dev.is_null();
+        if !reuse {
+            self.free_h_nextn_device();
+            allpaca_hip::set_device(device)?;
+            let p = allpaca_hip::device_malloc(bytes, device)?;
+            self.h_nextn_dev = p;
+            self.h_nextn_bytes = bytes;
+            self.h_nextn_dev_device = Some(device);
+        }
+        if self.h_nextn_host_dirty {
+            if self.h_nextn.len() != dim {
+                self.h_nextn.resize(dim, 0.0);
+            }
+            allpaca_hip::set_device(device)?;
+            allpaca_hip::memcpy(
+                self.h_nextn_dev,
+                self.h_nextn.as_ptr().cast(),
+                bytes,
+                allpaca_hip::MEMCPY_H2D,
+            )?;
+            self.h_nextn_host_dirty = false;
+        } else if self.h_nextn.len() != dim {
+            // First use without target seed: zeros on device.
+            self.h_nextn = vec![0.0f32; dim];
+            allpaca_hip::set_device(device)?;
+            allpaca_hip::memcpy(
+                self.h_nextn_dev,
+                self.h_nextn.as_ptr().cast(),
+                bytes,
+                allpaca_hip::MEMCPY_H2D,
+            )?;
+        }
+        Ok(self.h_nextn_dev.cast())
+    }
+
+    fn store_h_nextn_from_device(&mut self, src: *const f32, dim: usize) -> Result<(), AllpacaError> {
+        let Some(device) = self.h_nextn_dev_device else {
+            self.h_nextn.resize(dim, 0.0);
+            allpaca_hip::memcpy(
+                self.h_nextn.as_mut_ptr().cast(),
+                src.cast(),
+                dim * 4,
+                allpaca_hip::MEMCPY_D2H,
+            )?;
+            return Ok(());
+        };
+        let dst = self.ensure_h_nextn_device(device, dim)?;
+        allpaca_hip::memcpy(dst.cast(), src.cast(), dim * 4, allpaca_hip::MEMCPY_D2D)?;
+        self.h_nextn_host_dirty = false;
+        Ok(())
+    }
+
     fn free_device(&mut self) {
         for layer in self.device_layers.drain(..) {
             allpaca_hip::device_free(layer.k, layer.bytes);
             allpaca_hip::device_free(layer.v, layer.bytes);
         }
+        self.free_h_nextn_device();
         self.device = None;
         self.capacity = 0;
     }

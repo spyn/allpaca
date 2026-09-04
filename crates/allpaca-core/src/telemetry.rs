@@ -172,6 +172,8 @@ pub struct Metrics {
     pub poll_wait_ms_ema_x100: AtomicU64,
     /// Grammar masks served from a completed background prefetch.
     pub async_mask_hits: AtomicU64,
+    /// MTP process() skipped because draft KV seq_len did not match pos.
+    pub mtp_process_skips: AtomicU64,
 }
 
 impl Metrics {
@@ -325,6 +327,7 @@ impl Metrics {
             poll_decode_picks: self.poll_decode_picks.load(Ordering::Relaxed),
             poll_wait_ms_ema: self.poll_wait_ms_ema_x100.load(Ordering::Relaxed) as f64 / 100.0,
             async_mask_hits: self.async_mask_hits.load(Ordering::Relaxed),
+            mtp_process_skips: self.mtp_process_skips.load(Ordering::Relaxed),
             draft_depth,
         }
     }

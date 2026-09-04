@@ -17,6 +17,10 @@ pub struct RecurrentState {
     pub layers: Vec<Vec<f32>>,
     /// Per-layer selective-SSM hidden (`d_model * d_state`); empty when unused.
     pub ssm_h: Vec<Vec<f32>>,
+    /// Per-layer Gated DeltaNet state `[n_v * head_v * head_k]`.
+    pub gdn_state: Vec<Vec<f32>>,
+    /// Per-layer conv1d history `[(k-1) * qkv_dim]`.
+    pub gdn_conv: Vec<Vec<f32>>,
 }
 
 impl RecurrentState {
@@ -24,6 +28,8 @@ impl RecurrentState {
         Self {
             layers: vec![vec![0.0; dim]; n_layers],
             ssm_h: vec![Vec::new(); n_layers],
+            gdn_state: vec![Vec::new(); n_layers],
+            gdn_conv: vec![Vec::new(); n_layers],
         }
     }
 
@@ -34,6 +40,23 @@ impl RecurrentState {
         let need = dim.saturating_mul(d_state);
         if self.ssm_h[layer].len() != need {
             self.ssm_h[layer] = vec![0.0; need];
+        }
+    }
+
+    pub fn ensure_gdn(&mut self, layer: usize, dims: &crate::deltanet::GdnDims) {
+        if self.gdn_state.len() <= layer {
+            self.gdn_state.resize(layer + 1, Vec::new());
+        }
+        if self.gdn_conv.len() <= layer {
+            self.gdn_conv.resize(layer + 1, Vec::new());
+        }
+        let need_s = dims.state_floats();
+        if self.gdn_state[layer].len() != need_s {
+            self.gdn_state[layer] = vec![0.0; need_s];
+        }
+        let need_c = dims.conv_state_floats();
+        if self.gdn_conv[layer].len() != need_c {
+            self.gdn_conv[layer] = vec![0.0; need_c];
         }
     }
 

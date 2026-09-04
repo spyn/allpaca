@@ -266,6 +266,9 @@ pub struct StatsSnapshot {
     /// Grammar masks served from a completed background prefetch.
     #[serde(default)]
     pub async_mask_hits: u64,
+    /// MTP process() skipped because draft KV seq_len did not match pos.
+    #[serde(default)]
+    pub mtp_process_skips: u64,
     /// Current adaptive draft span (from the scheduler).
     #[serde(default)]
     pub draft_depth: u64,

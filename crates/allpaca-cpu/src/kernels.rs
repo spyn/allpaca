@@ -337,6 +337,93 @@ pub fn rope(x: &mut [f32], pos: usize, theta: f32) -> Result<(), AllpacaError> {
     Ok(())
 }
 
+/// Qwen3.5 / llama.cpp `GGML_ROPE_TYPE_IMROPE`: NeoX pairing on the first `n_rot`
+/// dims only. Text tokens use positions `(pos, pos, pos, 0)`.
+///
+/// When `sections` sum to 0, falls back to plain NeoX partial RoPE (same angle
+/// stream for every pair). `n_rot == 0` means rotate the full head.
+pub fn rope_imrope_neox(
+    x: &mut [f32],
+    pos: usize,
+    theta: f32,
+    n_rot: usize,
+    sections: [i32; 4],
+) -> Result<(), AllpacaError> {
+    let head_dim = x.len();
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "imrope head_dim must be even and non-empty".into(),
+        )));
+    }
+    let n_rot = if n_rot == 0 { head_dim } else { n_rot };
+    if n_rot > head_dim || !n_rot.is_multiple_of(2) {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "imrope n_rot must be even and <= head_dim".into(),
+        )));
+    }
+    let half = n_rot / 2;
+    let theta_scale = theta.powf(-2.0 / n_rot as f32);
+    let sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    let use_imrope = sect_dims > 0 && sections[0] > 0 && sections[1] > 0;
+
+    let mut theta_t = pos as f32;
+    let mut theta_h = pos as f32;
+    let mut theta_w = pos as f32;
+    let mut theta_e = 0.0f32;
+
+    for i in 0..half {
+        let angle = if use_imrope {
+            let sector = i as i32 % sect_dims;
+            let t = if sector % 3 == 1 && sector < 3 * sections[1] {
+                theta_h
+            } else if sector % 3 == 2 && sector < 3 * sections[2] {
+                theta_w
+            } else if sector % 3 == 0 && sector < 3 * sections[0] {
+                theta_t
+            } else {
+                theta_e
+            };
+            theta_t *= theta_scale;
+            theta_h *= theta_scale;
+            theta_w *= theta_scale;
+            theta_e *= theta_scale;
+            t
+        } else {
+            let t = theta_t;
+            theta_t *= theta_scale;
+            t
+        };
+        let (sin, cos) = angle.sin_cos();
+        let a = x[i];
+        let b = x[i + half];
+        x[i] = a * cos - b * sin;
+        x[i + half] = a * sin + b * cos;
+    }
+    Ok(())
+}
+
+/// Apply [`rope_imrope_neox`] to packed multi-head Q or K `[n_heads * head_dim]`.
+pub fn rope_imrope_neox_heads(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    theta: f32,
+    n_rot: usize,
+    sections: [i32; 4],
+) -> Result<(), AllpacaError> {
+    if n_heads == 0 || head_dim == 0 || x.len() != n_heads.saturating_mul(head_dim) {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "imrope heads length mismatch".into(),
+        )));
+    }
+    for h in 0..n_heads {
+        let row = &mut x[h * head_dim..(h + 1) * head_dim];
+        rope_imrope_neox(row, pos, theta, n_rot, sections)?;
+    }
+    Ok(())
+}
+
 pub fn softmax(x: &mut [f32]) {
     softmax_in_place(x);
 }
@@ -1192,6 +1279,38 @@ mod tests {
         rope(&mut x, 3, 10_000.0).unwrap();
         let after: f32 = x.iter().map(|v| v * v).sum();
         assert!((before - after).abs() < 1e-5);
+    }
+
+    #[test]
+    fn imrope_neox_partial_preserves_tail_and_norm() {
+        // head_dim=8, n_rot=4 → rotate NeoX pairs (0,2) and (1,3); leave 4..7.
+        let mut x = [1.0, 0.5, 0.0, 0.25, 9.0, 8.0, 7.0, 6.0];
+        let before: f32 = x[..4].iter().map(|v| v * v).sum();
+        rope_imrope_neox(&mut x, 2, 10_000.0, 4, [0, 0, 0, 0]).unwrap();
+        let after: f32 = x[..4].iter().map(|v| v * v).sum();
+        assert!((before - after).abs() < 1e-5);
+        assert_eq!(&x[4..], &[9.0, 8.0, 7.0, 6.0]);
+        // pair0: angle = 2
+        let (s0, c0) = 2.0f32.sin_cos();
+        assert!((x[0] - (1.0 * c0 - 0.0 * s0)).abs() < 1e-5);
+        assert!((x[2] - (1.0 * s0 + 0.0 * c0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn imrope_text_equal_pos_matches_plain_neox_for_qwen35_sections() {
+        // Qwen3.5 sections [11,11,10,0]: every sector maps to t/h/w, so text
+        // positions (pos,pos,pos,0) match plain NeoX partial RoPE.
+        let sections = [11, 11, 10, 0];
+        let mut a = vec![0.0f32; 256];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = (i as f32) * 0.01;
+        }
+        let mut b = a.clone();
+        rope_imrope_neox(&mut a, 5, 10_000_000.0, 64, [0, 0, 0, 0]).unwrap();
+        rope_imrope_neox(&mut b, 5, 10_000_000.0, 64, sections).unwrap();
+        for i in 0..256 {
+            assert!((a[i] - b[i]).abs() < 1e-4, "i={i} a={} b={}", a[i], b[i]);
+        }
     }
 
     #[test]

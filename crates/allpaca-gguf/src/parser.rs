@@ -134,6 +134,29 @@ impl GgufValue {
             _ => None,
         }
     }
+
+    pub fn as_i32_array(&self) -> Option<Vec<i32>> {
+        match self {
+            Self::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Self::Int32(v) => out.push(*v),
+                        Self::Int64(v) => out.push(i32::try_from(*v).ok()?),
+                        Self::Uint32(v) => out.push(i32::try_from(*v).ok()?),
+                        Self::Uint64(v) => out.push(i32::try_from(*v).ok()?),
+                        Self::Int8(v) => out.push(*v as i32),
+                        Self::Uint8(v) => out.push(*v as i32),
+                        Self::Int16(v) => out.push(*v as i32),
+                        Self::Uint16(v) => out.push(*v as i32),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1229,5 +1252,116 @@ mod tests {
             report.layers.iter().any(|l| l.moe),
             "layer map must flag MoE FFN layers"
         );
+    }
+
+    #[test]
+    fn probe_local_qwen38_layouts() {
+        for rel in [
+            "../../models/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/Qwen3.8-27B-Q4_0_ROCMFP4_COHERENT.gguf",
+            "../../models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q5_K_XL.gguf",
+        ] {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+            if !path.exists() {
+                eprintln!("skip probe_local_qwen38_layouts: missing {}", path.display());
+                continue;
+            }
+            let file = GgufFile::open(&path).expect("mmap qwen");
+            let report = file.compat_report();
+            let arch = report.architecture.as_str();
+            eprintln!(
+                "QWEN layout: path={} arch={} layers={} ssm={} attn={} types={:?} reject={:?} heads={:?}/{:?} dim={:?} ff={:?}",
+                path.display(),
+                report.architecture,
+                report.n_layers,
+                report.ssm_layers,
+                report.attention_layers,
+                report.ggml_type_ids,
+                report.reject_reason,
+                file.meta_u32(&format!("{arch}.attention.head_count")),
+                file.meta_u32(&format!("{arch}.attention.head_count_kv")),
+                file.meta_u32(&format!("{arch}.embedding_length")),
+                file.meta_u32(&format!("{arch}.feed_forward_length")),
+            );
+            for i in [0usize, 1, 3, 4] {
+                let mut names: Vec<_> = file
+                    .tensors
+                    .iter()
+                    .filter(|t| t.name.starts_with(&format!("blk.{i}.")))
+                    .map(|t| {
+                        format!(
+                            "{}:{:?}:{:?}",
+                            t.name.trim_start_matches(&format!("blk.{i}.")),
+                            t.ggml_type,
+                            t.dims
+                        )
+                    })
+                    .collect();
+                names.sort();
+                eprintln!("  blk.{i} kind={:?}: {}", report.layers.get(i).map(|l| l.block), names.join(" | "));
+            }
+            for key in [
+                "ssm.conv_kernel",
+                "ssm.state_size",
+                "ssm.inner_size",
+                "ssm.time_step_rank",
+                "ssm.group_count",
+                "full_attention_interval",
+                "rope.dimension_count",
+                "attention.key_length",
+                "attention.value_length",
+                "context_length",
+            ] {
+                let full = format!("{arch}.{key}");
+                if let Some(v) = file.meta_u32(&full) {
+                    eprintln!("  meta {full}={v}");
+                }
+            }
+            if let Some(v) = file.meta_f32(&format!("{arch}.rope.freq_base")) {
+                eprintln!("  meta {arch}.rope.freq_base={v}");
+            }
+            if let Some(v) = file.meta_f32(&format!("{arch}.attention.layer_norm_rms_eps")) {
+                eprintln!("  meta {arch}.attention.layer_norm_rms_eps={v}");
+            }
+            if let Some(v) = file.meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon")) {
+                eprintln!("  meta {arch}.attention.layer_norm_rms_epsilon={v}");
+            }
+            for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
+                if let Some(t) = file.tensor(name) {
+                    eprintln!(
+                        "  tensor {name}: {:?}/{} dims={:?}",
+                        t.ggml_type, t.ggml_type_id, t.dims
+                    );
+                }
+            }
+            if let Ok(a) = file.tensor_f32("blk.0.ssm_a") {
+                eprintln!(
+                    "  ssm_a[0..4]={:?} all_neg={}",
+                    &a[..4.min(a.len())],
+                    a.iter().all(|x| *x < 0.0)
+                );
+            }
+            let mut rope_keys: Vec<_> = file
+                .metadata
+                .iter()
+                .filter(|(k, _)| k.contains("rope") || k.contains("mrope"))
+                .collect();
+            rope_keys.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in rope_keys {
+                eprintln!("  rope-key {k}={v:?}");
+            }
+            for id in [20u32, 23] {
+                let hit: Vec<_> = file
+                    .tensors
+                    .iter()
+                    .filter(|t| t.ggml_type_id == id)
+                    .take(6)
+                    .map(|t| t.name.as_str())
+                    .collect();
+                let n = file.tensors.iter().filter(|t| t.ggml_type_id == id).count();
+                if n > 0 {
+                    eprintln!("  type {id} count={n} sample={hit:?}");
+                }
+            }
+        }
     }
 }

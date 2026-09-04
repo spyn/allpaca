@@ -851,7 +851,10 @@ mod tests {
         crate::model::LayerWeights {
             block: allpaca_gguf::HybridLayerKind::Attention,
             ssm: None,
+            gdn: None,
             attn_norm: vec![],
+            q_norm: vec![],
+            k_norm: vec![],
             wq: vec![],
             wk: vec![],
             wv: vec![],
