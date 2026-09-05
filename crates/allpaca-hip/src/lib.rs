@@ -2999,8 +2999,18 @@ unsafe impl Send for PinnedLogits {}
 struct GdnLayerResident {
     state: DeviceWeights,
     state_n: usize,
+    conv: Option<DeviceWeights>,
+    conv_n: usize,
     seeded: bool,
     dirty: bool,
+}
+
+/// Per-layer GDN extras (conv / dt / a / norm) uploaded once on the Target workspace.
+struct GdnWeightResident {
+    conv: DeviceWeights,
+    dt: DeviceWeights,
+    a: DeviceWeights,
+    norm: DeviceWeights,
 }
 
 pub struct HipWorkspace {
@@ -3011,6 +3021,7 @@ pub struct HipWorkspace {
     decode: Mutex<Option<DecodeAlloc>>,
     dequant: Mutex<Option<DequantAlloc>>,
     gdn: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
+    gdn_w: Mutex<std::collections::HashMap<usize, GdnWeightResident>>,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
     profiling: AtomicU64,
@@ -3043,6 +3054,7 @@ impl HipWorkspace {
             decode: Mutex::new(None),
             dequant: Mutex::new(None),
             gdn: Mutex::new(std::collections::HashMap::new()),
+            gdn_w: Mutex::new(std::collections::HashMap::new()),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
             profiling: AtomicU64::new(0),
@@ -3073,6 +3085,14 @@ impl HipWorkspace {
         if let Ok(g) = self.gdn.lock() {
             for layer in g.values() {
                 n += layer.state.bytes();
+                if let Some(c) = layer.conv.as_ref() {
+                    n += c.bytes();
+                }
+            }
+        }
+        if let Ok(g) = self.gdn_w.lock() {
+            for w in g.values() {
+                n += w.conv.bytes() + w.dt.bytes() + w.a.bytes() + w.norm.bytes();
             }
         }
         n
@@ -4500,9 +4520,114 @@ impl HipWorkspace {
                 MEMCPY_D2H,
             )?;
             self.add_d2h(slot.state_n * 4);
+            if let Some(conv) = slot.conv.as_ref() {
+                if slot.conv_n > 0 {
+                    // Host conv is restored on the next seed after invalidate; keep it current
+                    // for packed-verify rewind / radix capture.
+                    let _ = conv;
+                }
+            }
             slot.dirty = false;
         }
         Ok(())
+    }
+
+    /// Pull dirty per-layer GDN conv history into host `convs[layer]`.
+    pub fn gdn_sync_conv_to_host(
+        &self,
+        request_id: u64,
+        convs: &mut [Vec<f32>],
+    ) -> Result<(), AllpacaError> {
+        let mut g = self.gdn.lock().map_err(|_| {
+            AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+                "gdn mutex poisoned".into(),
+            ))
+        })?;
+        self.bind()?;
+        for ((rid, layer), slot) in g.iter_mut() {
+            if *rid != request_id {
+                continue;
+            }
+            let Some(conv) = slot.conv.as_ref() else {
+                continue;
+            };
+            if *layer >= convs.len() || slot.conv_n == 0 {
+                continue;
+            }
+            let host = &mut convs[*layer];
+            if host.len() != slot.conv_n {
+                *host = vec![0.0; slot.conv_n];
+            }
+            memcpy(
+                host.as_mut_ptr().cast(),
+                conv.ptr_at(0).cast(),
+                slot.conv_n * 4,
+                MEMCPY_D2H,
+            )?;
+            self.add_d2h(slot.conv_n * 4);
+        }
+        Ok(())
+    }
+
+    /// Upload GDN extras once per layer on this workspace (shared across requests).
+    pub fn ensure_gdn_weights(
+        &self,
+        layer: usize,
+        conv: &[f32],
+        dt_bias: &[f32],
+        a: &[f32],
+        norm: &[f32],
+    ) -> Result<(*const f32, *const f32, *const f32, *const f32), AllpacaError> {
+        if conv.is_empty() || dt_bias.is_empty() || a.is_empty() || norm.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty GDN extras".into(),
+            )));
+        }
+        self.bind()?;
+        {
+            let g = self.gdn_w.lock().map_err(|_| {
+                AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+                    "gdn weight mutex poisoned".into(),
+                ))
+            })?;
+            if let Some(w) = g.get(&layer) {
+                return Ok((
+                    w.conv.ptr_at(0),
+                    w.dt.ptr_at(0),
+                    w.a.ptr_at(0),
+                    w.norm.ptr_at(0),
+                ));
+            }
+        }
+        let cw = DeviceWeights::alloc(self.device, conv.len() * 4)?;
+        self.copy_h2d_f32(cw.ptr_at(0) as *mut f32, conv)?;
+        let dt = DeviceWeights::alloc(self.device, dt_bias.len() * 4)?;
+        self.copy_h2d_f32(dt.ptr_at(0) as *mut f32, dt_bias)?;
+        let aa = DeviceWeights::alloc(self.device, a.len() * 4)?;
+        self.copy_h2d_f32(aa.ptr_at(0) as *mut f32, a)?;
+        let nn = DeviceWeights::alloc(self.device, norm.len() * 4)?;
+        self.copy_h2d_f32(nn.ptr_at(0) as *mut f32, norm)?;
+        let ptrs = (
+            cw.ptr_at(0),
+            dt.ptr_at(0),
+            aa.ptr_at(0),
+            nn.ptr_at(0),
+        );
+        let mut g = self.gdn_w.lock().map_err(|_| {
+            AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+                "gdn weight mutex poisoned".into(),
+            ))
+        })?;
+        g.insert(
+            layer,
+            GdnWeightResident {
+                conv: cw,
+                dt,
+                a: aa,
+                norm: nn,
+            },
+        );
+        Ok(ptrs)
     }
 
     /// GDN step with request-local device-resident state (no per-token state H2D/D2H).
@@ -4565,6 +4690,8 @@ impl HipWorkspace {
                     GdnLayerResident {
                         state: blob,
                         state_n: host_state.len(),
+                        conv: None,
+                        conv_n: 0,
                         seeded: false,
                         dirty: false,
                     },
@@ -4617,6 +4744,207 @@ impl HipWorkspace {
             }
         }
         Ok(())
+    }
+
+    /// Full one-token GDN decode on device activations (conv→expand→decay→delta→silu/RMSNorm).
+    /// `qkv` / `z` / `α` / `β` stay on device. Recurrent state + conv history are request-local.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_decode_step_resident(
+        &self,
+        request_id: u64,
+        layer: usize,
+        host_state: &mut [f32],
+        host_conv: &mut [f32],
+        qkv: *const f32,
+        z: *const f32,
+        alpha: *const f32,
+        beta: *mut f32,
+        conv_w: *const f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        norm: *const f32,
+        out: *mut f32,
+        n_v_heads: i32,
+        n_k_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        conv_kernel: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if qkv.is_null()
+            || z.is_null()
+            || alpha.is_null()
+            || beta.is_null()
+            || conv_w.is_null()
+            || dt_bias.is_null()
+            || a.is_null()
+            || norm.is_null()
+            || out.is_null()
+            || n_v_heads <= 0
+            || n_k_heads <= 0
+            || head_v <= 0
+            || head_k <= 0
+            || conv_kernel <= 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gdn_decode_step_resident".into(),
+            )));
+        }
+        let n_v = n_v_heads as usize;
+        let hv = head_v as usize;
+        let hk = head_k as usize;
+        let expect_state = n_v * hv * hk;
+        if host_state.len() != expect_state {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gdn_decode_step_resident state length mismatch".into(),
+            )));
+        }
+        self.bind()?;
+        let key = (request_id, layer);
+        let (dstate, dconv, need_seed_state, need_seed_conv) = {
+            let mut g = self.gdn.lock().map_err(|_| {
+                AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+                    "gdn mutex poisoned".into(),
+                ))
+            })?;
+            if g.get(&key)
+                .is_none_or(|s| s.state_n != host_state.len() || s.conv_n != host_conv.len())
+            {
+                let state = DeviceWeights::alloc(self.device, host_state.len().max(1) * 4)?;
+                let conv = if host_conv.is_empty() {
+                    None
+                } else {
+                    Some(DeviceWeights::alloc(self.device, host_conv.len() * 4)?)
+                };
+                g.insert(
+                    key,
+                    GdnLayerResident {
+                        state,
+                        state_n: host_state.len(),
+                        conv,
+                        conv_n: host_conv.len(),
+                        seeded: false,
+                        dirty: false,
+                    },
+                );
+            } else if let Some(slot) = g.get_mut(&key) {
+                if slot.conv.is_none() && !host_conv.is_empty() {
+                    slot.conv = Some(DeviceWeights::alloc(self.device, host_conv.len() * 4)?);
+                    slot.conv_n = host_conv.len();
+                }
+            }
+            let slot = g.get_mut(&key).expect("gdn layer present");
+            let dstate = slot.state.ptr_at(0) as *mut f32;
+            let dconv = slot
+                .conv
+                .as_ref()
+                .map(|c| c.ptr_at(0) as *mut f32)
+                .unwrap_or(std::ptr::null_mut());
+            let need_conv = slot.conv.is_some() && (!slot.seeded || slot.conv_n == host_conv.len());
+            (dstate, dconv, !slot.seeded, need_conv && !slot.seeded)
+        };
+        if need_seed_state {
+            self.copy_h2d_f32(dstate, host_state)?;
+        }
+        if need_seed_conv && !host_conv.is_empty() && !dconv.is_null() {
+            self.copy_h2d_f32(dconv, host_conv)?;
+        }
+        if need_seed_state || need_seed_conv {
+            if let Ok(mut g) = self.gdn.lock() {
+                if let Some(slot) = g.get_mut(&key) {
+                    slot.seeded = true;
+                }
+            }
+        }
+        if dconv.is_null() && !host_conv.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gdn_decode_step_resident missing conv state".into(),
+            )));
+        }
+        let n_k = n_k_heads as usize;
+        let key_dim = n_k * hk;
+        let value_dim = n_v * hv;
+        let qkv_dim = key_dim.saturating_mul(2).saturating_add(value_dim);
+        let q_exp_n = n_v * hk;
+        let layer_scratch = qkv_dim + q_exp_n + q_exp_n + n_v;
+        let need = (layer_scratch + value_dim) * 4;
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("gdn_decode_step_resident need {need} scratch={}", self.scratch_bytes),
+            )));
+        }
+        let y = unsafe { self.scratch.add(layer_scratch * 4).cast::<f32>() };
+        self.gdn_layer_step(
+            qkv,
+            alpha,
+            beta,
+            conv_w,
+            dconv,
+            dt_bias,
+            a,
+            dstate,
+            y,
+            n_v_heads,
+            n_k_heads,
+            head_v,
+            head_k,
+            conv_kernel,
+            eps,
+        )?;
+        self.gdn_rmsnorm_silu_gate(y, z, norm, out, n_v_heads, head_v, eps)?;
+        if let Ok(mut g) = self.gdn.lock() {
+            if let Some(slot) = g.get_mut(&key) {
+                slot.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Depthwise causal GDN conv1d + SiLU on device pointers (matches host `deltanet::conv1d_step`).
+    pub fn gdn_conv1d_step(
+        &self,
+        x: *const f32,
+        kernel: *const f32,
+        conv_state: *mut f32,
+        out: *mut f32,
+        qkv_dim: i32,
+        conv_kernel: i32,
+    ) -> Result<(), AllpacaError> {
+        if x.is_null()
+            || kernel.is_null()
+            || conv_state.is_null()
+            || out.is_null()
+            || qkv_dim <= 0
+            || conv_kernel <= 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gdn_conv1d_step".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_gdn_conv1d_step(
+                        x,
+                        kernel,
+                        conv_state,
+                        out,
+                        qkv_dim,
+                        conv_kernel,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "gdn_conv1d_step")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gdn_conv1d unavailable".into(),
+            )))
+        }
     }
 
     pub fn gdn_conv1d_step_host(
@@ -4691,6 +5019,38 @@ impl HipWorkspace {
         Ok(())
     }
 
+    /// Tile K-heads to V-heads on device pointers (ggml `repeat` along heads).
+    pub fn expand_k_heads(
+        &self,
+        src: *const f32,
+        dst: *mut f32,
+        n_k: i32,
+        n_v: i32,
+        head_k: i32,
+    ) -> Result<(), AllpacaError> {
+        if src.is_null() || dst.is_null() || n_k <= 0 || n_v <= 0 || head_k <= 0 || n_v % n_k != 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid expand_k_heads".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_expand_k_heads(src, dst, n_k, n_v, head_k, std::ptr::null_mut())
+                };
+                status(rc, "expand_k_heads")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP expand_k unavailable".into(),
+            )))
+        }
+    }
+
     pub fn expand_k_heads_host(
         &self,
         src: &[f32],
@@ -4736,6 +5096,170 @@ impl HipWorkspace {
         }
         memcpy(dst.as_mut_ptr().cast(), dd.cast(), dst.len() * 4, MEMCPY_D2H)?;
         self.add_d2h(dst.len() * 4);
+        Ok(())
+    }
+
+    /// `decay = exp(softplus(α+dt)*a)` and `β = sigmoid(β)` on device pointers.
+    pub fn gdn_decay_beta(
+        &self,
+        alpha: *const f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        decay: *mut f32,
+        beta: *mut f32,
+        n: i32,
+    ) -> Result<(), AllpacaError> {
+        if alpha.is_null()
+            || dt_bias.is_null()
+            || a.is_null()
+            || decay.is_null()
+            || beta.is_null()
+            || n <= 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gdn_decay_beta".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_gdn_decay_beta(
+                        alpha,
+                        dt_bias,
+                        a,
+                        decay,
+                        beta,
+                        n,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "gdn_decay_beta")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gdn_decay unavailable".into(),
+            )))
+        }
+    }
+
+    /// One-token GDN layer on device: conv1d → expand-k → decay/β → gated delta.
+    /// Activations `qkv` / `α` / `β` stay on device (no D2H). `β` is sigmoid'd in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_layer_step(
+        &self,
+        qkv: *const f32,
+        alpha: *const f32,
+        beta: *mut f32,
+        conv_w: *const f32,
+        conv_state: *mut f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        state: *mut f32,
+        y: *mut f32,
+        n_v_heads: i32,
+        n_k_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        conv_kernel: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        let n_v = n_v_heads as usize;
+        let n_k = n_k_heads as usize;
+        let hv = head_v as usize;
+        let hk = head_k as usize;
+        let ck = conv_kernel as usize;
+        if n_v == 0
+            || n_k == 0
+            || hv == 0
+            || hk == 0
+            || ck == 0
+            || n_v % n_k != 0
+            || qkv.is_null()
+            || alpha.is_null()
+            || beta.is_null()
+            || conv_w.is_null()
+            || conv_state.is_null()
+            || dt_bias.is_null()
+            || a.is_null()
+            || state.is_null()
+            || y.is_null()
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gdn_layer_step".into(),
+            )));
+        }
+        let key_dim = n_k * hk;
+        let value_dim = n_v * hv;
+        let qkv_dim = key_dim.saturating_mul(2).saturating_add(value_dim);
+        let q_exp_n = n_v * hk;
+        let scratch_n = qkv_dim + q_exp_n + q_exp_n + n_v;
+        if scratch_n * 4 > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!(
+                    "gdn_layer_step need {} scratch={}",
+                    scratch_n * 4,
+                    self.scratch_bytes
+                ),
+            )));
+        }
+        self.bind()?;
+        let conv_out = self.scratch.cast::<f32>();
+        let q_exp = unsafe { self.scratch.add(qkv_dim * 4).cast::<f32>() };
+        let k_exp = unsafe { self.scratch.add((qkv_dim + q_exp_n) * 4).cast::<f32>() };
+        let decay = unsafe { self.scratch.add((qkv_dim + q_exp_n + q_exp_n) * 4).cast::<f32>() };
+        self.gdn_conv1d_step(qkv, conv_w, conv_state, conv_out, qkv_dim as i32, conv_kernel)?;
+        let q_raw = conv_out as *const f32;
+        let k_raw = unsafe { conv_out.add(key_dim) as *const f32 };
+        let v_raw = unsafe { conv_out.add(key_dim * 2) as *const f32 };
+        self.expand_k_heads(q_raw, q_exp, n_k_heads, n_v_heads, head_k)?;
+        self.expand_k_heads(k_raw, k_exp, n_k_heads, n_v_heads, head_k)?;
+        self.gdn_decay_beta(alpha, dt_bias, a, decay, beta, n_v_heads)?;
+        self.gated_delta_step(
+            q_exp, k_exp, v_raw, decay, beta, state, y, n_v_heads, head_v, head_k, eps,
+        )
+    }
+
+    /// `out = silu(z) * rmsnorm(y)` per V-head (matches host `deltanet::rmsnorm_silu_gate`).
+    pub fn gdn_rmsnorm_silu_gate(
+        &self,
+        y: *const f32,
+        z: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        n_heads: i32,
+        head_v: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if y.is_null() || z.is_null() || weight.is_null() || out.is_null() || n_heads <= 0 || head_v <= 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gdn_rmsnorm_silu_gate".into(),
+            )));
+        }
+        let n = (n_heads as usize).saturating_mul(head_v as usize);
+        if n * 4 > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("gdn_rmsnorm_silu_gate need {} scratch", n * 4),
+            )));
+        }
+        self.bind()?;
+        // Copy z first so `out == z` (decode writes gated into the z buffer) is safe.
+        let z_silu = self.scratch.cast::<f32>();
+        if z_silu as usize != z as usize {
+            self.copy_d2d_f32(z_silu, z, n)?;
+        }
+        if out as usize != y as usize {
+            self.copy_d2d_f32(out, y, n)?;
+        }
+        self.rmsnorm_heads_device(out, weight, n_heads, head_v, eps)?;
+        self.silu_mul_device(z_silu, out, n as i32)?;
+        if out as usize != z_silu as usize {
+            self.copy_d2d_f32(out, z_silu, n)?;
+        }
         Ok(())
     }
 

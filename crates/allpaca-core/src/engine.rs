@@ -1902,6 +1902,7 @@ impl Engine {
             )?;
             if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
                 hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
             }
             let prefix = request(inner, id)?.tokens[..=pos].to_vec();
             let pages_now = request(inner, id)?.pages.clone();
@@ -2458,6 +2459,50 @@ fn mtp_process_token(
     Ok(())
 }
 
+/// Process an assumed-accepted span into a process-KV snapshot (first token uses
+/// target `pending_h`; later tokens keep the rolling MTP `h_nextn`). Live process
+/// KV is rebuilt from target row hiddens after verify.
+fn mtp_process_assumed_span(
+    model: &TinyModel,
+    cache: &mut DenseKv,
+    span: &[u32],
+    start_pos: usize,
+    pending_h: &[f32],
+    draft_hip: Option<&HipWorkspace>,
+    resident: Option<&ResidentModel>,
+    metrics: Option<&Metrics>,
+) -> Result<(), AllpacaError> {
+    if span.is_empty() {
+        return Ok(());
+    }
+    let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+    let dim = model.config.dim;
+    let vocab = model.config.vocab_size;
+    if cache.seq_len() > start_pos {
+        cache.truncate(start_pos, kv_dim);
+    }
+    if cache.seq_len() != start_pos {
+        return Ok(());
+    }
+    let mut logits = vec![0.0f32; vocab];
+    for (i, &token) in span.iter().enumerate() {
+        if i == 0 && pending_h.len() == dim {
+            cache.seed_h_nextn_from_target(pending_h);
+        }
+        model.forward_dense_on(
+            token,
+            start_pos + i,
+            cache,
+            &mut logits,
+            draft_hip,
+            resident,
+            metrics,
+        )?;
+        cache.record(token);
+    }
+    Ok(())
+}
+
 fn propose_drafts(
     inner: &mut EngineInner,
     id: u64,
@@ -2817,26 +2862,26 @@ fn packed_linear_verify(
         && inner.draft_model.is_some();
     if !can_ahead {
         return packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks,
+            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None,
         );
     }
     if mtp_draft_active(inner) {
-        // Process() KV cannot be cloned cheaply. Verify first, then propose
-        // the next span from the rebuilt warm cache (not an empty DenseKv).
-        let produced = packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks,
-        )?;
-        let actual_ctx = request(inner, id)?.tokens.clone();
-        store_draft_ahead_from_ctx(
+        return packed_mtp_verify_ahead(
             inner,
             id,
-            &actual_ctx,
+            span,
+            first,
+            mask,
+            remaining,
+            metrics,
+            hip,
+            draft_hip,
             depth,
             temperature,
-            draft_hip,
-            metrics,
-        )?;
-        return Ok(produced);
+            hooks,
+            span_len,
+            next_ctx,
+        );
     }
     let mut draft_kv = std::mem::take(&mut inner.draft_kv);
     let model = inner.draft_model.clone().expect("draft-ahead needs a Draft Model");
@@ -2860,7 +2905,7 @@ fn packed_linear_verify(
             (draft_kv, tokens)
         });
         let produced = packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks,
+            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None,
         );
         let (kv, ahead) = worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
         inner.draft_kv = kv;
@@ -2875,6 +2920,138 @@ fn packed_linear_verify(
                 ctx: next_ctx,
                 tokens: ahead,
             });
+        } else {
+            store_draft_ahead_from_ctx(
+                inner,
+                id,
+                &actual_ctx,
+                depth,
+                temperature,
+                draft_hip,
+                metrics,
+            )?;
+        }
+        Ok(produced)
+    })
+}
+
+fn packed_mtp_verify_ahead(
+    inner: &mut EngineInner,
+    id: u64,
+    span: Vec<u32>,
+    first: u32,
+    mask: Option<&allpaca_types::TokenMask>,
+    remaining: usize,
+    metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
+    draft_hip: Option<&HipWorkspace>,
+    depth: usize,
+    temperature: f32,
+    hooks: &DecodePollHooks<'_>,
+    span_len: usize,
+    next_ctx: Vec<u32>,
+) -> Result<Produced, AllpacaError> {
+    let pending_h = request(inner, id)?.last_hidden.clone();
+    let start_pos = request(inner, id)?.tokens.len();
+    let snap = match inner.draft_kv.snapshot() {
+        Ok(s) => s,
+        Err(_) => {
+            let produced = packed_linear_verify_span(
+                inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None,
+            )?;
+            let actual_ctx = request(inner, id)?.tokens.clone();
+            store_draft_ahead_from_ctx(
+                inner,
+                id,
+                &actual_ctx,
+                depth,
+                temperature,
+                draft_hip,
+                metrics,
+            )?;
+            return Ok(produced);
+        }
+    };
+    let model = inner
+        .draft_model
+        .clone()
+        .expect("draft-ahead needs a Draft Model");
+    let resident = inner.draft_resident.clone();
+    let span_worker = span.clone();
+    let next_ctx_worker = next_ctx.clone();
+    std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            if let Some(h) = draft_hip {
+                let _ = h.bind();
+            }
+            let mut cache = snap;
+            mtp_process_assumed_span(
+                model.as_ref(),
+                &mut cache,
+                &span_worker,
+                start_pos,
+                &pending_h,
+                draft_hip,
+                resident.as_deref(),
+                Some(metrics),
+            )?;
+            if !cache.seq_matches(&next_ctx_worker) {
+                return Ok(Vec::new());
+            }
+            let mut provider = DraftModelProvider::new((*model).clone());
+            provider.propose_on(
+                &next_ctx_worker,
+                depth,
+                temperature,
+                &mut cache,
+                draft_hip,
+                resident.as_deref(),
+                Some(metrics),
+            )
+        });
+        let pending = std::cell::RefCell::new(Some(worker));
+        let joined = std::cell::RefCell::new(None);
+        let join_ahead = || {
+            if let Some(h) = pending.borrow_mut().take() {
+                let r = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                *joined.borrow_mut() = Some(r);
+            }
+        };
+        let produced = packed_linear_verify_span(
+            inner,
+            id,
+            span,
+            first,
+            mask,
+            remaining,
+            metrics,
+            hip,
+            draft_hip,
+            hooks,
+            Some(&join_ahead),
+        );
+        join_ahead();
+        let produced = produced?;
+        let ahead = match joined.borrow_mut().take() {
+            Some(Ok(tokens)) => tokens,
+            _ => Vec::new(),
+        };
+        let actual_ctx = request(inner, id)?.tokens.clone();
+        let full_accept = produced.accepted == produced.proposed
+            && produced.proposed == span_len as u64
+            && actual_ctx == next_ctx;
+        if full_accept && !ahead.is_empty() {
+            inner.draft_ahead = Some(DraftAhead {
+                ctx: next_ctx,
+                tokens: ahead,
+            });
+            let dim = model.config.dim;
+            let seed = request(inner, id)
+                .map(|a| a.last_hidden.clone())
+                .unwrap_or_default();
+            if seed.len() == dim {
+                inner.draft_kv.seed_h_nextn_from_target(&seed);
+            }
         } else {
             store_draft_ahead_from_ctx(
                 inner,
@@ -2956,6 +3133,7 @@ fn packed_linear_verify_span(
     hip: Option<&HipWorkspace>,
     draft_hip: Option<&HipWorkspace>,
     hooks: &DecodePollHooks<'_>,
+    before_draft_gpu: Option<&dyn Fn()>,
 ) -> Result<Produced, AllpacaError> {
     prefetch_draft_expert_union(inner, &span, metrics, hip, hooks)?;
     let drafts_len = span.len() as u64;
@@ -2991,6 +3169,7 @@ fn packed_linear_verify_span(
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     if let (Some(hip), Some(state)) = (hip, recurrent.as_mut()) {
         hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+        hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
     }
     let rec_before = recurrent.clone();
     let dim = target.config.dim;
@@ -3077,6 +3256,9 @@ fn packed_linear_verify_span(
         }
     }
     request_mut(inner, id)?.recurrent = recurrent;
+    if let Some(join) = before_draft_gpu {
+        join();
+    }
     // Rebuild MTP draft KV for accepted prefix with target hiddens (llama process).
     if mtp_draft_active(inner) && dim > 0 && row_hiddens.len() >= keep * dim {
         let kv_dim = inner
@@ -3120,6 +3302,9 @@ fn packed_linear_verify_span(
     }
 
     if produced.len() > keep {
+        if let Some(join) = before_draft_gpu {
+            join();
+        }
         append_and_forward(
             inner,
             id,
@@ -7080,14 +7265,16 @@ mod tests {
         );
         let processed = g.draft_kv.seq_len() as u64;
         let extras = g.draft_kv.forwards.saturating_sub(processed);
-        // First propose (1+depth) plus post-verify ahead on the same warm cache (1+depth).
-        // Empty-KV overlap leaves extras at only the first propose.
+        // First propose (1+depth) on live process KV. Next-span ahead runs on a snapshot.
         assert!(
-            extras >= 2 * (1 + depth),
-            "packed-verify ahead must propose on warm process KV (1 seed + {depth} drafts); forwards={} seq={} extras={extras}",
+            extras >= 1 + depth,
+            "packed-verify must keep the first propose on warm process KV (1 seed + {depth} drafts); forwards={} seq={} extras={extras}",
             g.draft_kv.forwards,
             processed
         );
+        let ahead = g.draft_ahead.as_ref().expect("packed verify must queue next-span tokens");
+        assert_eq!(ahead.ctx, ctx, "ahead ctx must match actual process KV");
+        assert!(!ahead.tokens.is_empty());
         let last_hidden = g
             .active
             .get(&handle.id())
@@ -7101,6 +7288,225 @@ mod tests {
         assert!(
             last_hidden.iter().any(|x| *x != 0.0),
             "last accepted output_norm must not be an all-zero rejected suffix"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_mtp_packed_verify_ahead_proposes_from_process_kv_snapshot() {
+        let path = std::env::temp_dir().join("allpaca_mtp_ahead_snap.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 2;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("MTP target GGUF must load");
+        let mut handle = engine
+            .begin_request(
+                "hello",
+                GenerationParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("begin MTP request");
+        let mut proposed0 = 0u64;
+        let mut accepted0 = 0u64;
+        loop {
+            let p0 = engine.stats().draft_proposed;
+            let a0 = engine.stats().draft_accepted;
+            match engine.step(&mut handle).expect("step") {
+                StepResult::Prefill { .. } => {}
+                StepResult::Token(_) => {
+                    if engine.stats().linear_packed_verifies > 0 {
+                        proposed0 = p0;
+                        accepted0 = a0;
+                        break;
+                    }
+                }
+                StepResult::Finished(_) => break,
+            }
+        }
+        let stats = engine.stats();
+        assert!(
+            stats.linear_packed_verifies > 0,
+            "MTP must pack a linear draft span; stats={stats:?}"
+        );
+        let depth = 2u64;
+        let g = engine.lock().expect("lock");
+        let ctx = g
+            .active
+            .get(&handle.id())
+            .expect("active request")
+            .tokens
+            .clone();
+        assert!(
+            g.draft_kv.seq_matches(&ctx),
+            "live process KV must stay on the engine (not moved into the ahead worker); seq_len={} ctx_len={}",
+            g.draft_kv.seq_len(),
+            ctx.len()
+        );
+        let processed = g.draft_kv.seq_len() as u64;
+        let extras = g.draft_kv.forwards.saturating_sub(processed);
+        let ahead = g.draft_ahead.as_ref().expect("packed verify must queue next-span tokens");
+        assert_eq!(
+            ahead.ctx, ctx,
+            "queued ahead must be for the actual ctx after verify, not a discarded assumed span"
+        );
+        assert!(!ahead.tokens.is_empty());
+        let dprop = stats.draft_proposed.saturating_sub(proposed0);
+        let dacc = stats.draft_accepted.saturating_sub(accepted0);
+        if dacc == dprop && dprop > 0 {
+            assert!(
+                extras < 2 * (1 + depth),
+                "full-accept ahead must propose on a process-KV snapshot, not the live cache; forwards={} seq={} extras={extras}",
+                g.draft_kv.forwards,
+                processed
+            );
+        }
+        assert!(
+            extras >= 1 + depth,
+            "first propose still runs on live process KV; extras={extras}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_mtp_packed_verify_partial_accept_discards_assumed_ahead() {
+        let path = std::env::temp_dir().join("allpaca_mtp_ahead_partial.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 4;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("MTP target GGUF must load");
+        let mut handle = engine
+            .begin_request(
+                "hello",
+                GenerationParams {
+                    max_tokens: 16,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("begin MTP request");
+        loop {
+            let p0 = engine.stats().draft_proposed;
+            let a0 = engine.stats().draft_accepted;
+            let packs0 = engine.stats().linear_packed_verifies;
+            match engine.step(&mut handle).expect("step") {
+                StepResult::Prefill { .. } => {}
+                StepResult::Token(_) => {
+                    let stats = engine.stats();
+                    if stats.linear_packed_verifies > packs0 {
+                        let dprop = stats.draft_proposed.saturating_sub(p0);
+                        let dacc = stats.draft_accepted.saturating_sub(a0);
+                        let g = engine.lock().expect("lock");
+                        let Some(active) = g.active.get(&handle.id()) else {
+                            break;
+                        };
+                        let ctx = active.tokens.clone();
+                        assert!(
+                            g.draft_kv.seq_matches(&ctx),
+                            "partial accept must not apply the ahead snapshot KV; seq_len={} ctx_len={}",
+                            g.draft_kv.seq_len(),
+                            ctx.len()
+                        );
+                        if dacc < dprop {
+                            if let Some(ahead) = g.draft_ahead.as_ref() {
+                                assert_eq!(
+                                    ahead.ctx, ctx,
+                                    "partial-accept ahead must be rebuilt for actual_ctx, not the assumed full span"
+                                );
+                            }
+                        }
+                    }
+                }
+                StepResult::Finished(_) => break,
+            }
+        }
+        assert_eq!(
+            engine.stats().mtp_process_skips, 0,
+            "partial accept must rebuild process KV without skips; stats={:?}",
+            engine.stats()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_mtp_packed_verify_full_accept_reuses_draft_ahead() {
+        let path = std::env::temp_dir().join("allpaca_mtp_ahead_hits.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 2;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("MTP target GGUF must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 16,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("MTP packed-verify generate");
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.linear_packed_verifies > 0,
+            "MTP must pack a linear draft span; stats={stats:?}"
+        );
+        assert_eq!(
+            stats.mtp_process_skips, 0,
+            "process KV must stay aligned; stats={stats:?}"
+        );
+        assert!(
+            stats.draft_ahead_hits > 0,
+            "full-accept packed verify must reuse next-span ahead tokens (ctx == actual_ctx); gen={} acceptance={:.3} stats={stats:?}",
+            out.token_ids.len(),
+            stats.acceptance_rate
         );
         let _ = std::fs::remove_file(path);
     }

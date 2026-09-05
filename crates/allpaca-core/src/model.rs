@@ -4336,75 +4336,108 @@ impl TinyModel {
                         dims.n_v_heads as i32,
                         dim as i32,
                     )?;
-                    let mut qkv = vec![0.0f32; dims.qkv_dim];
-                    let mut z = vec![0.0f32; dims.value_dim];
-                    let mut alpha = vec![0.0f32; dims.n_v_heads];
-                    let mut beta = vec![0.0f32; dims.n_v_heads];
-                    hip.copy_d2h_f32(buf.q, &mut qkv)?;
-                    hip.copy_d2h_f32(buf.attn, &mut z)?;
-                    hip.copy_d2h_f32(buf.gate, &mut alpha)?;
-                    hip.copy_d2h_f32(buf.up, &mut beta)?;
                     let state = recurrent.as_deref_mut().ok_or_else(|| {
                         AllpacaError::Fatal(FatalError::ModelLoad(
                             "Gated DeltaNet layer requires recurrent state".into(),
                         ))
                     })?;
                     state.ensure_gdn(layer_idx, dims);
-                    let mut conv_out = vec![0.0f32; dims.qkv_dim];
-                    hip.gdn_conv1d_step_host(
-                        &qkv,
-                        &gdn.conv1d,
-                        &mut state.gdn_conv[layer_idx],
-                        &mut conv_out,
-                        dims.conv_kernel as i32,
-                    )?;
-                    let q_raw = &conv_out[..dims.key_dim];
-                    let k_raw = &conv_out[dims.key_dim..dims.key_dim * 2];
-                    let v_raw = &conv_out[dims.key_dim * 2..];
-                    let mut q_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
-                    let mut k_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
-                    hip.expand_k_heads_host(
-                        q_raw,
-                        &mut q_exp,
-                        dims.n_k_heads as i32,
-                        dims.n_v_heads as i32,
-                        dims.head_k as i32,
-                    )?;
-                    hip.expand_k_heads_host(
-                        k_raw,
-                        &mut k_exp,
-                        dims.n_k_heads as i32,
-                        dims.n_v_heads as i32,
-                        dims.head_k as i32,
-                    )?;
-                    let mut decay = vec![0.0f32; dims.n_v_heads];
-                    hip.gdn_decay_beta_host(
-                        &alpha,
-                        &gdn.dt_bias,
-                        &gdn.a,
-                        &mut decay,
-                        &mut beta,
-                    )?;
-                    let mut y = vec![0.0f32; dims.value_dim];
                     let req_id = side.as_ref().map(|s| s.request_id).unwrap_or(0);
-                    hip.gated_delta_step_resident(
-                        req_id,
-                        layer_idx,
-                        &mut state.gdn_state[layer_idx],
-                        &mut q_exp,
-                        &mut k_exp,
-                        v_raw,
-                        &decay,
-                        &beta,
-                        &mut y,
-                        dims.n_v_heads as i32,
-                        dims.head_v as i32,
-                        dims.head_k as i32,
-                        cfg.eps,
-                    )?;
-                    let mut gated = vec![0.0f32; dims.value_dim];
-                    rmsnorm_silu_gate(&y, &z, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
-                    hip.copy_h2d_f32(buf.attn, &gated)?;
+                    let device_gdn = (|| {
+                        let (conv_w, dt, a, norm) = hip.ensure_gdn_weights(
+                            layer_idx,
+                            &gdn.conv1d,
+                            &gdn.dt_bias,
+                            &gdn.a,
+                            &gdn.norm,
+                        )?;
+                        hip.gdn_decode_step_resident(
+                            req_id,
+                            layer_idx,
+                            &mut state.gdn_state[layer_idx],
+                            &mut state.gdn_conv[layer_idx],
+                            buf.q,
+                            buf.attn,
+                            buf.gate,
+                            buf.up,
+                            conv_w,
+                            dt,
+                            a,
+                            norm,
+                            buf.attn,
+                            dims.n_v_heads as i32,
+                            dims.n_k_heads as i32,
+                            dims.head_v as i32,
+                            dims.head_k as i32,
+                            dims.conv_kernel as i32,
+                            cfg.eps,
+                        )
+                    })();
+                    if let Err(e) = device_gdn {
+                        let mut qkv = vec![0.0f32; dims.qkv_dim];
+                        let mut z = vec![0.0f32; dims.value_dim];
+                        let mut alpha = vec![0.0f32; dims.n_v_heads];
+                        let mut beta = vec![0.0f32; dims.n_v_heads];
+                        hip.copy_d2h_f32(buf.q, &mut qkv)?;
+                        hip.copy_d2h_f32(buf.attn, &mut z)?;
+                        hip.copy_d2h_f32(buf.gate, &mut alpha)?;
+                        hip.copy_d2h_f32(buf.up, &mut beta)?;
+                        let mut conv_out = vec![0.0f32; dims.qkv_dim];
+                        hip.gdn_conv1d_step_host(
+                            &qkv,
+                            &gdn.conv1d,
+                            &mut state.gdn_conv[layer_idx],
+                            &mut conv_out,
+                            dims.conv_kernel as i32,
+                        )?;
+                        let q_raw = &conv_out[..dims.key_dim];
+                        let k_raw = &conv_out[dims.key_dim..dims.key_dim * 2];
+                        let v_raw = &conv_out[dims.key_dim * 2..];
+                        let mut q_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                        let mut k_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                        hip.expand_k_heads_host(
+                            q_raw,
+                            &mut q_exp,
+                            dims.n_k_heads as i32,
+                            dims.n_v_heads as i32,
+                            dims.head_k as i32,
+                        )?;
+                        hip.expand_k_heads_host(
+                            k_raw,
+                            &mut k_exp,
+                            dims.n_k_heads as i32,
+                            dims.n_v_heads as i32,
+                            dims.head_k as i32,
+                        )?;
+                        let mut decay = vec![0.0f32; dims.n_v_heads];
+                        hip.gdn_decay_beta_host(
+                            &alpha,
+                            &gdn.dt_bias,
+                            &gdn.a,
+                            &mut decay,
+                            &mut beta,
+                        )?;
+                        let mut y = vec![0.0f32; dims.value_dim];
+                        hip.gated_delta_step_resident(
+                            req_id,
+                            layer_idx,
+                            &mut state.gdn_state[layer_idx],
+                            &mut q_exp,
+                            &mut k_exp,
+                            v_raw,
+                            &decay,
+                            &beta,
+                            &mut y,
+                            dims.n_v_heads as i32,
+                            dims.head_v as i32,
+                            dims.head_k as i32,
+                            cfg.eps,
+                        )?;
+                        let mut gated = vec![0.0f32; dims.value_dim];
+                        rmsnorm_silu_gate(&y, &z, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
+                        hip.copy_h2d_f32(buf.attn, &gated)?;
+                        let _ = e;
+                    }
                     resident.gemm_nt(
                         hip,
                         buf.attn,
@@ -6051,6 +6084,71 @@ impl DenseKv {
     pub(crate) fn seed_h_nextn_from_target(&mut self, hidden: &[f32]) {
         self.h_nextn = hidden.to_vec();
         self.h_nextn_host_dirty = true;
+    }
+
+    /// Independent copy of process KV (host seq/h_nextn/layers + D2D device K/V).
+    /// Pointers are never aliased; the original cache stays usable for process().
+    pub(crate) fn snapshot(&self) -> Result<DenseKv, AllpacaError> {
+        let mut out = DenseKv {
+            layers: self.layers.clone(),
+            device: None,
+            device_layers: Vec::new(),
+            tokens: self.tokens,
+            capacity: 0,
+            kv_dim: self.kv_dim,
+            seq: self.seq.clone(),
+            forwards: self.forwards,
+            h_nextn: self.h_nextn.clone(),
+            h_nextn_dev: std::ptr::null_mut(),
+            h_nextn_bytes: 0,
+            h_nextn_dev_device: None,
+            h_nextn_host_dirty: self.h_nextn_host_dirty,
+        };
+        let Some(device) = self.device else {
+            return Ok(out);
+        };
+        if !self.device_layers.is_empty() && self.kv_dim > 0 {
+            let n_layers = self.device_layers.len();
+            let cap = self.capacity.max(self.tokens).max(1);
+            out.ensure_device(device, n_layers, self.kv_dim, cap)?;
+            let copy_tokens = self.tokens.min(out.capacity);
+            let copy_bytes = copy_tokens.saturating_mul(self.kv_dim).saturating_mul(4);
+            if copy_bytes > 0 {
+                allpaca_hip::set_device(device)?;
+                for i in 0..n_layers {
+                    allpaca_hip::memcpy(
+                        out.device_layers[i].k,
+                        self.device_layers[i].k,
+                        copy_bytes,
+                        allpaca_hip::MEMCPY_D2D,
+                    )?;
+                    allpaca_hip::memcpy(
+                        out.device_layers[i].v,
+                        self.device_layers[i].v,
+                        copy_bytes,
+                        allpaca_hip::MEMCPY_D2D,
+                    )?;
+                }
+            }
+            out.tokens = self.tokens;
+        }
+        if !self.h_nextn_dev.is_null() && self.h_nextn_bytes > 0 {
+            let dim = self.h_nextn.len().max(self.h_nextn_bytes / 4).max(1);
+            if self.h_nextn_host_dirty {
+                out.h_nextn_host_dirty = true;
+            } else {
+                let dst = out.ensure_h_nextn_device(device, dim)?;
+                allpaca_hip::set_device(device)?;
+                allpaca_hip::memcpy(
+                    dst.cast(),
+                    self.h_nextn_dev,
+                    self.h_nextn_bytes.min(out.h_nextn_bytes),
+                    allpaca_hip::MEMCPY_D2D,
+                )?;
+                out.h_nextn_host_dirty = false;
+            }
+        }
+        Ok(out)
     }
 
     fn free_h_nextn_device(&mut self) {

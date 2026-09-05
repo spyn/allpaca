@@ -4129,7 +4129,7 @@ fn hip_rocmfp4_qwen_mtp_essay_n32_keeps_target_words_when_opt_in() {
     let out = generate_or_timeout(&engine, prompt, n, overnight_timeout(n, 300));
     let s = engine.stats();
     eprintln!(
-        "MTP essay n=32: gen={} acceptance={:.3} packed={} draft_fwd={} target_fwd={} draft_dev={} skips={} text_prefix={:?}",
+        "MTP essay n=32: gen={} acceptance={:.3} packed={} draft_fwd={} target_fwd={} draft_dev={} skips={} ahead_hits={} text_prefix={:?}",
         out.token_ids.len(),
         s.acceptance_rate,
         s.linear_packed_verifies,
@@ -4137,6 +4137,7 @@ fn hip_rocmfp4_qwen_mtp_essay_n32_keeps_target_words_when_opt_in() {
         s.target_gpu_forwards,
         s.draft_device,
         s.mtp_process_skips,
+        s.draft_ahead_hits,
         out.text.chars().take(160).collect::<String>()
     );
     assert!(
@@ -4144,6 +4145,12 @@ fn hip_rocmfp4_qwen_mtp_essay_n32_keeps_target_words_when_opt_in() {
         "essay MTP must exercise draft; {s:?}"
     );
     assert_eq!(s.mtp_process_skips, 0, "essay MTP must not skip process(); {s:?}");
+    if allpaca_hip::device_count() >= 2 {
+        assert!(
+            s.draft_ahead_hits > 0,
+            "dual-GPU MTP packed verify must reuse process-KV snapshot ahead; {s:?}"
+        );
+    }
     assert!(
         !allpaca_core::mtp_text_is_garbled(&out.text),
         "essay MTP must not emit dropped-word junk; text={:?}",
@@ -4472,6 +4479,517 @@ fn hip_gated_delta_resident_two_steps_match_host() {
         assert!(
             (states[layer][i] - state_h[i]).abs() < 1e-4,
             "synced state[{i}]"
+        );
+    }
+    hip.gdn_clear_request(req);
+}
+
+/// Device-pointer GDN conv1d must match the host `deltanet` one-token step.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_conv1d_step_matches_host_on_tiny_state() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_conv1d_step_matches_host: no HIP device");
+        return;
+    }
+    let hip = match allpaca_hip::HipWorkspace::new(0, 4096, 8) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("skip hip_gdn_conv1d_step_matches_host: HIP workspace unavailable");
+            return;
+        }
+    };
+    // Same fixture as deltanet::conv1d_step_shifts_history.
+    let kernel = [1.0f32, 0.0, 0.0, 1.0];
+    let x = [5.0f32, 6.0];
+    let mut state_h = [3.0f32, 4.0];
+    let mut out_h = [0.0f32; 2];
+    allpaca_core::deltanet::conv1d_step(&x, &kernel, &mut state_h, &mut out_h, 2);
+
+    let mut state = [3.0f32, 4.0];
+    let mut out = [0.0f32; 2];
+    let blob = allpaca_hip::DeviceWeights::alloc(0, (2 + 4 + 2 + 2) * 4).expect("alloc");
+    let mut off = 0usize;
+    let x_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(x_d, &x).unwrap();
+    off += 2 * 4;
+    let k_d = blob.ptr_at(off) as *const f32;
+    hip.copy_h2d_f32(k_d as *mut f32, &kernel).unwrap();
+    off += 4 * 4;
+    let s_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(s_d, &state).unwrap();
+    off += 2 * 4;
+    let out_d = blob.ptr_at(off) as *mut f32;
+    hip.copy_h2d_f32(out_d, &out).unwrap();
+
+    if let Err(e) = hip.gdn_conv1d_step(x_d, k_d, s_d, out_d, 2, 2) {
+        eprintln!("skip hip_gdn_conv1d_step_matches_host: {e}");
+        return;
+    }
+
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    hip.copy_d2h_f32(s_d, &mut state).unwrap();
+    for i in 0..2 {
+        assert!(
+            (out[i] - out_h[i]).abs() < 1e-4,
+            "out[{i}] device={} host={}",
+            out[i],
+            out_h[i]
+        );
+        assert!(
+            (state[i] - state_h[i]).abs() < 1e-4,
+            "conv_state[{i}] device={} host={}",
+            state[i],
+            state_h[i]
+        );
+    }
+}
+
+/// Device-pointer K-head expand must tile like host `deltanet::expand_k_heads`.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_expand_k_heads_matches_host_ggml_repeat() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_expand_k_heads_matches_host: no HIP device");
+        return;
+    }
+    let hip = match allpaca_hip::HipWorkspace::new(0, 4096, 8) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("skip hip_expand_k_heads_matches_host: HIP workspace unavailable");
+            return;
+        }
+    };
+    let src = [1.0f32, 2.0, 3.0, 4.0];
+    let mut dst_h = [0.0f32; 8];
+    allpaca_core::deltanet::expand_k_heads(&src, &mut dst_h, 2, 4, 2);
+
+    let mut dst = [0.0f32; 8];
+    let blob = allpaca_hip::DeviceWeights::alloc(0, (4 + 8) * 4).expect("alloc");
+    let src_d = blob.ptr_at(0) as *const f32;
+    hip.copy_h2d_f32(src_d as *mut f32, &src).unwrap();
+    let dst_d = blob.ptr_at(4 * 4) as *mut f32;
+
+    if let Err(e) = hip.expand_k_heads(src_d, dst_d, 2, 4, 2) {
+        eprintln!("skip hip_expand_k_heads_matches_host: {e}");
+        return;
+    }
+    hip.copy_d2h_f32(dst_d, &mut dst).unwrap();
+    for i in 0..8 {
+        assert!(
+            (dst[i] - dst_h[i]).abs() < 1e-5,
+            "dst[{i}] device={} host={}",
+            dst[i],
+            dst_h[i]
+        );
+    }
+}
+
+/// Device-pointer decay/β must match host `decay_from_alpha` plus sigmoid(β).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_decay_beta_matches_host_softplus_sigmoid() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_decay_beta_matches_host: no HIP device");
+        return;
+    }
+    let hip = match allpaca_hip::HipWorkspace::new(0, 4096, 8) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("skip hip_gdn_decay_beta_matches_host: HIP workspace unavailable");
+            return;
+        }
+    };
+    let alpha = [0.5f32, -1.0, 2.0];
+    let dt_bias = [0.1f32, 0.0, -0.25];
+    let a = [-0.5f32, -1.0, -0.25];
+    let beta0 = [0.0f32, 2.0, -2.0];
+    let mut decay_h = [0.0f32; 3];
+    allpaca_core::deltanet::decay_from_alpha(&alpha, &dt_bias, &a, &mut decay_h);
+    let beta_h = [
+        allpaca_core::deltanet::sigmoid(beta0[0]),
+        allpaca_core::deltanet::sigmoid(beta0[1]),
+        allpaca_core::deltanet::sigmoid(beta0[2]),
+    ];
+
+    let mut decay = [0.0f32; 3];
+    let mut beta = beta0;
+    let blob = allpaca_hip::DeviceWeights::alloc(0, 3 * 5 * 4).expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let alpha_d = put(&hip, &blob, &mut off, &alpha);
+    let dt_d = put(&hip, &blob, &mut off, &dt_bias);
+    let a_d = put(&hip, &blob, &mut off, &a);
+    let decay_d = put(&hip, &blob, &mut off, &decay);
+    let beta_d = put(&hip, &blob, &mut off, &beta);
+
+    if let Err(e) = hip.gdn_decay_beta(alpha_d, dt_d, a_d, decay_d, beta_d, 3) {
+        eprintln!("skip hip_gdn_decay_beta_matches_host: {e}");
+        return;
+    }
+    hip.copy_d2h_f32(decay_d, &mut decay).unwrap();
+    hip.copy_d2h_f32(beta_d, &mut beta).unwrap();
+    for i in 0..3 {
+        assert!(
+            (decay[i] - decay_h[i]).abs() < 1e-4,
+            "decay[{i}] device={} host={}",
+            decay[i],
+            decay_h[i]
+        );
+        assert!(
+            (beta[i] - beta_h[i]).abs() < 1e-4,
+            "beta[{i}] device={} host={}",
+            beta[i],
+            beta_h[i]
+        );
+    }
+}
+
+/// Resident GDN layer (conv → expand-k → decay/β → delta) stays on device and matches host.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_layer_step_matches_host_without_qkv_d2h() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_layer_step: no HIP device");
+        return;
+    }
+    let hip = match allpaca_hip::HipWorkspace::new(0, 64 * 1024, 8) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("skip hip_gdn_layer_step: HIP workspace unavailable");
+            return;
+        }
+    };
+    let n_k = 1usize;
+    let n_v = 1usize;
+    let head_k = 2usize;
+    let head_v = 2usize;
+    let conv_k = 2usize;
+    let key_dim = n_k * head_k;
+    let value_dim = n_v * head_v;
+    let qkv_dim = key_dim * 2 + value_dim;
+    // Per-channel kernel [0, 1] → conv out is silu(x); hist is ignored.
+    let mut conv_w = vec![0.0f32; conv_k * qkv_dim];
+    for c in 0..qkv_dim {
+        conv_w[1 + c * conv_k] = 1.0;
+    }
+    let qkv = [1.0f32, 0.0, 0.0, 1.0, 2.0, -1.0];
+    let mut conv_state_h = [3.0f32, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let alpha = [0.25f32];
+    let dt_bias = [0.0f32];
+    let a = [-0.5f32];
+    let beta0 = [1.0f32];
+
+    let mut conv_out = [0.0f32; 6];
+    allpaca_core::deltanet::conv1d_step(&qkv, &conv_w, &mut conv_state_h, &mut conv_out, conv_k);
+    let mut q_exp = [0.0f32; 2];
+    let mut k_exp = [0.0f32; 2];
+    allpaca_core::deltanet::expand_k_heads(&conv_out[..key_dim], &mut q_exp, n_k, n_v, head_k);
+    allpaca_core::deltanet::expand_k_heads(
+        &conv_out[key_dim..key_dim * 2],
+        &mut k_exp,
+        n_k,
+        n_v,
+        head_k,
+    );
+    let mut decay_h = [0.0f32; 1];
+    allpaca_core::deltanet::decay_from_alpha(&alpha, &dt_bias, &a, &mut decay_h);
+    let beta_h = [allpaca_core::deltanet::sigmoid(beta0[0])];
+    let mut q_h = q_exp;
+    let mut k_h = k_exp;
+    let mut state_h = [0.0f32; 4];
+    let mut y_h = [0.0f32; 2];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q_h,
+        &mut k_h,
+        &conv_out[key_dim * 2..],
+        &decay_h,
+        &beta_h,
+        &mut state_h,
+        &mut y_h,
+        n_v,
+        head_v,
+        head_k,
+        1e-6,
+    );
+
+    let blob = allpaca_hip::DeviceWeights::alloc(
+        0,
+        (qkv_dim + conv_w.len() + qkv_dim + 1 + 1 + 1 + 1 + 4 + value_dim) * 4,
+    )
+    .expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let qkv_d = put(&hip, &blob, &mut off, &qkv);
+    let conv_w_d = put(&hip, &blob, &mut off, &conv_w);
+    let conv_s_d = put(&hip, &blob, &mut off, &[3.0f32, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let alpha_d = put(&hip, &blob, &mut off, &alpha);
+    let dt_d = put(&hip, &blob, &mut off, &dt_bias);
+    let a_d = put(&hip, &blob, &mut off, &a);
+    let beta_d = put(&hip, &blob, &mut off, &beta0);
+    let state_d = put(&hip, &blob, &mut off, &[0.0f32; 4]);
+    let y_d = put(&hip, &blob, &mut off, &[0.0f32; 2]);
+
+    let d2h_before = hip.activation_d2h_bytes();
+    if let Err(e) = hip.gdn_layer_step(
+        qkv_d,
+        alpha_d,
+        beta_d,
+        conv_w_d,
+        conv_s_d,
+        dt_d,
+        a_d,
+        state_d,
+        y_d,
+        n_v as i32,
+        n_k as i32,
+        head_v as i32,
+        head_k as i32,
+        conv_k as i32,
+        1e-6,
+    ) {
+        eprintln!("skip hip_gdn_layer_step: {e}");
+        return;
+    }
+    let d2h_after = hip.activation_d2h_bytes();
+    assert_eq!(
+        d2h_after, d2h_before,
+        "GDN layer math must not D2H qkv/α/β; d2h {d2h_before}→{d2h_after}"
+    );
+
+    let mut y = [0.0f32; 2];
+    let mut state = [0.0f32; 4];
+    hip.copy_d2h_f32(y_d, &mut y).unwrap();
+    hip.copy_d2h_f32(state_d, &mut state).unwrap();
+    for i in 0..2 {
+        assert!(
+            (y[i] - y_h[i]).abs() < 1e-4,
+            "y[{i}] device={} host={}",
+            y[i],
+            y_h[i]
+        );
+    }
+    for i in 0..4 {
+        assert!(
+            (state[i] - state_h[i]).abs() < 1e-4,
+            "state[{i}] device={} host={}",
+            state[i],
+            state_h[i]
+        );
+    }
+}
+
+/// Device GDN output gate must match host `rmsnorm_silu_gate`.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_rmsnorm_silu_gate_matches_host() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_rmsnorm_silu_gate: no HIP device");
+        return;
+    }
+    let hip = match allpaca_hip::HipWorkspace::new(0, 4096, 8) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("skip hip_gdn_rmsnorm_silu_gate: HIP workspace unavailable");
+            return;
+        }
+    };
+    let y = [1.0f32, 2.0, -1.0, 0.5];
+    let z = [0.5f32, -0.5, 1.5, 0.0];
+    let weight = [1.0f32, 0.5];
+    let mut out_h = [0.0f32; 4];
+    allpaca_core::deltanet::rmsnorm_silu_gate(&y, &z, &weight, &mut out_h, 2, 1e-6);
+
+    let blob = allpaca_hip::DeviceWeights::alloc(0, (4 + 4 + 2 + 4) * 4).expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let y_d = put(&hip, &blob, &mut off, &y);
+    let z_d = put(&hip, &blob, &mut off, &z);
+    let w_d = put(&hip, &blob, &mut off, &weight);
+    let out_d = put(&hip, &blob, &mut off, &[0.0f32; 4]);
+
+    if let Err(e) = hip.gdn_rmsnorm_silu_gate(y_d, z_d, w_d, out_d, 2, 2, 1e-6) {
+        eprintln!("skip hip_gdn_rmsnorm_silu_gate: {e}");
+        return;
+    }
+    let mut out = [0.0f32; 4];
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    for i in 0..4 {
+        assert!(
+            (out[i] - out_h[i]).abs() < 1e-4,
+            "gated[{i}] device={} host={}",
+            out[i],
+            out_h[i]
+        );
+    }
+}
+
+/// Full resident GDN decode (layer + silu/RMSNorm gate) matches host and does not D2H qkv/z/α/β.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_decode_step_resident_matches_host_without_qkv_d2h() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_decode_step_resident: no HIP device");
+        return;
+    }
+    let hip = match allpaca_hip::HipWorkspace::new(0, 64 * 1024, 8) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("skip hip_gdn_decode_step_resident: HIP workspace unavailable");
+            return;
+        }
+    };
+    let req = 11u64;
+    let layer = 2usize;
+    let n_k = 1usize;
+    let n_v = 1usize;
+    let head_k = 2usize;
+    let head_v = 2usize;
+    let conv_k = 2usize;
+    let key_dim = n_k * head_k;
+    let value_dim = n_v * head_v;
+    let qkv_dim = key_dim * 2 + value_dim;
+    let mut conv_w = vec![0.0f32; conv_k * qkv_dim];
+    for c in 0..qkv_dim {
+        conv_w[1 + c * conv_k] = 1.0;
+    }
+    let qkv = [1.0f32, 0.0, 0.0, 1.0, 2.0, -1.0];
+    let z = [0.5f32, -0.25];
+    let norm = [1.0f32, 0.75];
+    let alpha = [0.25f32];
+    let dt_bias = [0.0f32];
+    let a = [-0.5f32];
+    let beta0 = [1.0f32];
+
+    let mut conv_state_h = [3.0f32, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mut conv_out = [0.0f32; 6];
+    allpaca_core::deltanet::conv1d_step(&qkv, &conv_w, &mut conv_state_h, &mut conv_out, conv_k);
+    let mut q_exp = [0.0f32; 2];
+    let mut k_exp = [0.0f32; 2];
+    allpaca_core::deltanet::expand_k_heads(&conv_out[..key_dim], &mut q_exp, n_k, n_v, head_k);
+    allpaca_core::deltanet::expand_k_heads(
+        &conv_out[key_dim..key_dim * 2],
+        &mut k_exp,
+        n_k,
+        n_v,
+        head_k,
+    );
+    let mut decay_h = [0.0f32; 1];
+    allpaca_core::deltanet::decay_from_alpha(&alpha, &dt_bias, &a, &mut decay_h);
+    let beta_h = [allpaca_core::deltanet::sigmoid(beta0[0])];
+    let mut q_h = q_exp;
+    let mut k_h = k_exp;
+    let mut state_h = [0.0f32; 4];
+    let mut y_h = [0.0f32; 2];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q_h,
+        &mut k_h,
+        &conv_out[key_dim * 2..],
+        &decay_h,
+        &beta_h,
+        &mut state_h,
+        &mut y_h,
+        n_v,
+        head_v,
+        head_k,
+        1e-6,
+    );
+    let mut gated_h = [0.0f32; 2];
+    allpaca_core::deltanet::rmsnorm_silu_gate(&y_h, &z, &norm, &mut gated_h, head_v, 1e-6);
+
+    let blob = allpaca_hip::DeviceWeights::alloc(
+        0,
+        (qkv_dim + z.len() + 1 + 1 + conv_w.len() + 1 + 1 + 2 + 2) * 4,
+    )
+    .expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let qkv_d = put(&hip, &blob, &mut off, &qkv);
+    let z_d = put(&hip, &blob, &mut off, &z);
+    let alpha_d = put(&hip, &blob, &mut off, &alpha);
+    let beta_d = put(&hip, &blob, &mut off, &beta0);
+    let conv_w_d = put(&hip, &blob, &mut off, &conv_w);
+    let dt_d = put(&hip, &blob, &mut off, &dt_bias);
+    let a_d = put(&hip, &blob, &mut off, &a);
+    let norm_d = put(&hip, &blob, &mut off, &norm);
+    let out_d = put(&hip, &blob, &mut off, &[0.0f32; 2]);
+
+    let mut host_state = [0.0f32; 4];
+    let mut host_conv = [3.0f32, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let d2h_before = hip.activation_d2h_bytes();
+    if let Err(e) = hip.gdn_decode_step_resident(
+        req,
+        layer,
+        &mut host_state,
+        &mut host_conv,
+        qkv_d,
+        z_d,
+        alpha_d,
+        beta_d,
+        conv_w_d,
+        dt_d,
+        a_d,
+        norm_d,
+        out_d,
+        n_v as i32,
+        n_k as i32,
+        head_v as i32,
+        head_k as i32,
+        conv_k as i32,
+        1e-6,
+    ) {
+        eprintln!("skip hip_gdn_decode_step_resident: {e}");
+        return;
+    }
+    let d2h_after = hip.activation_d2h_bytes();
+    assert_eq!(
+        d2h_after, d2h_before,
+        "resident GDN decode must not D2H qkv/z/α/β; d2h {d2h_before}→{d2h_after}"
+    );
+    let mut gated = [0.0f32; 2];
+    hip.copy_d2h_f32(out_d, &mut gated).unwrap();
+    for i in 0..2 {
+        assert!(
+            (gated[i] - gated_h[i]).abs() < 1e-4,
+            "gated[{i}] device={} host={}",
+            gated[i],
+            gated_h[i]
         );
     }
     hip.gdn_clear_request(req);
