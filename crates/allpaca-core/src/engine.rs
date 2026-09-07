@@ -1900,31 +1900,43 @@ impl Engine {
                 None,
                 Some(&mut decode_side),
             )?;
-            if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
-                hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
-                hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+            let device_gdn = self
+                .hip
+                .as_ref()
+                .is_some_and(|h| h.gdn_request_resident(id));
+            let is_anchor = inner.anchors.enabled() && inner.anchors.is_anchor(*tok);
+            // Device GDN slots are source of truth. Skip per-token D2H; sync
+            // host (and store radix/anchors) only at real anchors or request end.
+            let sync_host_gdn = !device_gdn || last || is_anchor;
+            if sync_host_gdn {
+                if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
+                    hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                    hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                }
             }
-            let prefix = request(inner, id)?.tokens[..=pos].to_vec();
-            let pages_now = request(inner, id)?.pages.clone();
-            let state_ref = recurrent
-                .clone()
-                .unwrap_or_else(|| RecurrentState::zeros(target.config.n_layers, target.config.dim));
-            inner.kv_radix.capture(
-                &prefix,
-                &state_ref,
-                &inner.kv,
-                &pages_now,
-                &target.config,
-            )?;
-            if inner.anchors.enabled() && inner.anchors.is_anchor(*tok) {
-                if let Some(state) = recurrent.as_ref() {
-                    inner.anchors.capture(
-                        &prefix,
-                        state,
-                        &inner.kv,
-                        &pages_now,
-                        &target.config,
-                    )?;
+            if sync_host_gdn {
+                let prefix = request(inner, id)?.tokens[..=pos].to_vec();
+                let pages_now = request(inner, id)?.pages.clone();
+                let state_ref = recurrent.clone().unwrap_or_else(|| {
+                    RecurrentState::zeros(target.config.n_layers, target.config.dim)
+                });
+                inner.kv_radix.capture(
+                    &prefix,
+                    &state_ref,
+                    &inner.kv,
+                    &pages_now,
+                    &target.config,
+                )?;
+                if is_anchor {
+                    if let Some(state) = recurrent.as_ref() {
+                        inner.anchors.capture(
+                            &prefix,
+                            state,
+                            &inner.kv,
+                            &pages_now,
+                            &target.config,
+                        )?;
+                    }
                 }
             }
         }
@@ -2459,15 +2471,18 @@ fn mtp_process_token(
     Ok(())
 }
 
-/// Process an assumed-accepted span into a process-KV snapshot (first token uses
-/// target `pending_h`; later tokens keep the rolling MTP `h_nextn`). Live process
-/// KV is rebuilt from target row hiddens after verify.
+/// Process an assumed-accepted span into a process-KV snapshot.
+/// Token 0 pairs with target `pending_h`; token `k>0` pairs with target
+/// `row_hiddens[(k-1)*dim..]` (`h_{k-1}`). Empty `row_hiddens` keeps rolling
+/// MTP `h_nextn` after token 0 (legacy). Live process KV is rebuilt from
+/// target row hiddens after verify.
 fn mtp_process_assumed_span(
     model: &TinyModel,
     cache: &mut DenseKv,
     span: &[u32],
     start_pos: usize,
     pending_h: &[f32],
+    row_hiddens: &[f32],
     draft_hip: Option<&HipWorkspace>,
     resident: Option<&ResidentModel>,
     metrics: Option<&Metrics>,
@@ -2486,8 +2501,18 @@ fn mtp_process_assumed_span(
     }
     let mut logits = vec![0.0f32; vocab];
     for (i, &token) in span.iter().enumerate() {
-        if i == 0 && pending_h.len() == dim {
-            cache.seed_h_nextn_from_target(pending_h);
+        let h_prev = if i == 0 {
+            pending_h
+        } else {
+            let off = (i - 1) * dim;
+            if row_hiddens.len() >= off + dim {
+                &row_hiddens[off..off + dim]
+            } else {
+                &[]
+            }
+        };
+        if h_prev.len() == dim {
+            cache.seed_h_nextn_from_target(h_prev);
         }
         model.forward_dense_on(
             token,
@@ -2862,7 +2887,7 @@ fn packed_linear_verify(
         && inner.draft_model.is_some();
     if !can_ahead {
         return packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None,
+            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None, None,
         );
     }
     if mtp_draft_active(inner) {
@@ -2905,7 +2930,7 @@ fn packed_linear_verify(
             (draft_kv, tokens)
         });
         let produced = packed_linear_verify_span(
-            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None,
+            inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None, None,
         );
         let (kv, ahead) = worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
         inner.draft_kv = kv;
@@ -2957,7 +2982,7 @@ fn packed_mtp_verify_ahead(
         Ok(s) => s,
         Err(_) => {
             let produced = packed_linear_verify_span(
-                inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None,
+                inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None, None,
             )?;
             let actual_ctx = request(inner, id)?.tokens.clone();
             store_draft_ahead_from_ctx(
@@ -2979,33 +3004,42 @@ fn packed_mtp_verify_ahead(
     let resident = inner.draft_resident.clone();
     let span_worker = span.clone();
     let next_ctx_worker = next_ctx.clone();
+    let model_w = model.clone();
+    let resident_w = resident.clone();
+    let (row_tx, row_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    let row_tx_err = row_tx.clone();
     std::thread::scope(|s| {
-        let worker = s.spawn(|| {
+        let worker = s.spawn(move || {
             if let Some(h) = draft_hip {
                 let _ = h.bind();
             }
+            let rows = row_rx.recv().unwrap_or_default();
+            if rows.is_empty() && span_worker.len() > 1 {
+                return Ok(Vec::new());
+            }
             let mut cache = snap;
             mtp_process_assumed_span(
-                model.as_ref(),
+                model_w.as_ref(),
                 &mut cache,
                 &span_worker,
                 start_pos,
                 &pending_h,
+                &rows,
                 draft_hip,
-                resident.as_deref(),
+                resident_w.as_deref(),
                 Some(metrics),
             )?;
             if !cache.seq_matches(&next_ctx_worker) {
                 return Ok(Vec::new());
             }
-            let mut provider = DraftModelProvider::new((*model).clone());
+            let mut provider = DraftModelProvider::new((*model_w).clone());
             provider.propose_on(
                 &next_ctx_worker,
                 depth,
                 temperature,
                 &mut cache,
                 draft_hip,
-                resident.as_deref(),
+                resident_w.as_deref(),
                 Some(metrics),
             )
         });
@@ -3016,6 +3050,9 @@ fn packed_mtp_verify_ahead(
                 let r = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
                 *joined.borrow_mut() = Some(r);
             }
+        };
+        let send_rows = |rows: &[f32]| {
+            let _ = row_tx.send(rows.to_vec());
         };
         let produced = packed_linear_verify_span(
             inner,
@@ -3029,7 +3066,11 @@ fn packed_mtp_verify_ahead(
             draft_hip,
             hooks,
             Some(&join_ahead),
+            Some(&send_rows),
         );
+        if produced.is_err() {
+            let _ = row_tx_err.send(Vec::new());
+        }
         join_ahead();
         let produced = produced?;
         let ahead = match joined.borrow_mut().take() {
@@ -3134,6 +3175,7 @@ fn packed_linear_verify_span(
     draft_hip: Option<&HipWorkspace>,
     hooks: &DecodePollHooks<'_>,
     before_draft_gpu: Option<&dyn Fn()>,
+    after_row_hiddens: Option<&dyn Fn(&[f32])>,
 ) -> Result<Produced, AllpacaError> {
     prefetch_draft_expert_union(inner, &span, metrics, hip, hooks)?;
     let drafts_len = span.len() as u64;
@@ -3167,72 +3209,154 @@ fn packed_linear_verify_span(
     let pages = request(inner, id)?.pages.clone();
     let resident = inner.target_resident.clone();
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
+    let mut device_gdn_cloned = 0usize;
     if let (Some(hip), Some(state)) = (hip, recurrent.as_mut()) {
-        hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
-        hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+        device_gdn_cloned = hip.gdn_clone_request(id)?;
+        if device_gdn_cloned == 0 {
+            hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+            hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+        }
     }
     let rec_before = recurrent.clone();
     let dim = target.config.dim;
     let pending_h = request(inner, id)?.last_hidden.clone();
-    target.forward_tokens(
-        &span,
-        start_pos,
-        &pages,
-        &mut inner.kv,
-        metrics,
-        &mut last_logits,
-        hip,
-        resident.as_deref(),
-        true,
-        Some(&mut row_logits),
-        recurrent.as_mut(),
-        Some(&mut row_hiddens),
-        id,
-    )?;
-    if let Some(hip) = hip {
-        hip.bind()?;
-        hip.wait_logits_d2h(&mut row_logits)?;
+    let incremental_gdn = recurrent.is_some();
+    let mut produced = vec![first];
+    let mut accepted = 1u64;
+    let mut keep = 1usize;
+    if incremental_gdn {
+        // Device clone is the pre-span GDN state. Forward only until reject so
+        // rewind is enough (state already at keep); do not replay the prefix.
+        let params_stop = request(inner, id)?.params.clone();
+        let mut one_logits = vec![0.0f32; vocab];
+        let mut one_hidden = Vec::new();
+        target.forward_tokens(
+            &[span[0]],
+            start_pos,
+            &pages,
+            &mut inner.kv,
+            metrics,
+            &mut last_logits,
+            hip,
+            resident.as_deref(),
+            true,
+            Some(&mut one_logits),
+            recurrent.as_mut(),
+            Some(&mut one_hidden),
+            id,
+        )?;
+        if let Some(hip) = hip {
+            hip.wait_logits_d2h(&mut one_logits)?;
+        }
+        row_logits[..vocab].copy_from_slice(&one_logits);
+        row_hiddens.extend_from_slice(&one_hidden);
+        for i in 0..span.len().saturating_sub(1) {
+            if produced.len() >= remaining {
+                break;
+            }
+            if is_stop(produced[produced.len() - 1], &params_stop) {
+                break;
+            }
+            let off = i * vocab;
+            let row = &mut row_logits[off..off + vocab];
+            let next = {
+                let active = request_mut(inner, id)?;
+                sample(row, mask, &active.params, &mut active.rng)
+            };
+            produced.push(next);
+            if next != span[i + 1] {
+                break;
+            }
+            accepted += 1;
+            keep = i + 2;
+            one_logits.fill(0.0);
+            one_hidden.clear();
+            target.forward_tokens(
+                &[span[i + 1]],
+                start_pos + i + 1,
+                &pages,
+                &mut inner.kv,
+                metrics,
+                &mut last_logits,
+                hip,
+                resident.as_deref(),
+                true,
+                Some(&mut one_logits),
+                recurrent.as_mut(),
+                Some(&mut one_hidden),
+                id,
+            )?;
+            if let Some(hip) = hip {
+                hip.wait_logits_d2h(&mut one_logits)?;
+            }
+            let dest = (i + 1) * vocab;
+            row_logits[dest..dest + vocab].copy_from_slice(&one_logits);
+            row_hiddens.extend_from_slice(&one_hidden);
+        }
+    } else {
+        target.forward_tokens(
+            &span,
+            start_pos,
+            &pages,
+            &mut inner.kv,
+            metrics,
+            &mut last_logits,
+            hip,
+            resident.as_deref(),
+            true,
+            Some(&mut row_logits),
+            recurrent.as_mut(),
+            Some(&mut row_hiddens),
+            id,
+        )?;
+        if let Some(hip) = hip {
+            hip.bind()?;
+            hip.wait_logits_d2h(&mut row_logits)?;
+        }
+        let params_stop = request(inner, id)?.params.clone();
+        for i in 0..span.len().saturating_sub(1) {
+            if produced.len() >= remaining {
+                break;
+            }
+            if is_stop(produced[produced.len() - 1], &params_stop) {
+                break;
+            }
+            let off = i * vocab;
+            let row = &mut row_logits[off..off + vocab];
+            let next = {
+                let active = request_mut(inner, id)?;
+                sample(row, mask, &active.params, &mut active.rng)
+            };
+            produced.push(next);
+            if next == span[i + 1] {
+                accepted += 1;
+                keep = i + 2;
+            } else {
+                break;
+            }
+        }
+    }
+    if let Some(send) = after_row_hiddens {
+        send(&row_hiddens);
     }
     request_mut(inner, id)?.pending_logits = last_logits;
     metrics
         .linear_packed_verifies
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let mut produced = vec![first];
-    let mut accepted = 1u64;
-    let mut keep = 1usize;
-    let params_stop = request(inner, id)?.params.clone();
-    for i in 0..span.len().saturating_sub(1) {
-        if produced.len() >= remaining {
-            break;
-        }
-        if is_stop(produced[produced.len() - 1], &params_stop) {
-            break;
-        }
-        let off = i * vocab;
-        let row = &mut row_logits[off..off + vocab];
-        let next = {
-            let active = request_mut(inner, id)?;
-            sample(row, mask, &active.params, &mut active.rng)
-        };
-        produced.push(next);
-        if next == span[i + 1] {
-            accepted += 1;
-            keep = i + 2;
-        } else {
-            break;
-        }
-    }
-
     let pages = request(inner, id)?.pages.clone();
     inner
         .kv
         .rewind_filled(&pages, start_pos + keep, page_tokens as usize);
-    if keep < span.len() {
+    if !incremental_gdn && keep < span.len() {
         if let Some(saved) = rec_before {
             recurrent = Some(saved);
             if let Some(hip) = hip {
-                hip.gdn_invalidate_request(id);
+                if device_gdn_cloned > 0 {
+                    hip.gdn_rewind_request(id)?;
+                } else {
+                    hip.gdn_invalidate_request(id);
+                }
             }
             let mut replay_logits = vec![0.0f32; vocab];
             target.forward_tokens(
@@ -3254,6 +3378,9 @@ fn packed_linear_verify_span(
                 let _ = hip.wait_logits_d2h(&mut replay_logits);
             }
         }
+    }
+    if let Some(hip) = hip {
+        hip.gdn_drop_clone(id);
     }
     request_mut(inner, id)?.recurrent = recurrent;
     if let Some(join) = before_draft_gpu {
@@ -5876,6 +6003,276 @@ mod tests {
         write_gguf(path, &meta, &views).unwrap();
     }
 
+    fn write_tiny_qwen_gdn_gguf(path: &std::path::Path, w: f32) {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        use std::collections::HashMap;
+
+        let dim = 16usize;
+        let vocab = 4usize;
+        let n_v = 2usize;
+        let n_k = 2usize;
+        let head = 8usize;
+        let inner = n_v * head;
+        let qkv_dim = n_k * head * 2 + inner;
+        let conv_k = 2usize;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("qwen35".into()),
+        );
+        meta.insert("qwen35.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert(
+            "qwen35.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
+        meta.insert("qwen35.block_count".into(), GgufValue::Uint32(2));
+        meta.insert("qwen35.attention.head_count".into(), GgufValue::Uint32(2));
+        meta.insert(
+            "qwen35.attention.head_count_kv".into(),
+            GgufValue::Uint32(1),
+        );
+        meta.insert(
+            "qwen35.feed_forward_length".into(),
+            GgufValue::Uint32((dim * 2) as u32),
+        );
+        meta.insert("qwen35.ssm.state_size".into(), GgufValue::Uint32(head as u32));
+        meta.insert(
+            "qwen35.ssm.inner_size".into(),
+            GgufValue::Uint32(inner as u32),
+        );
+        meta.insert(
+            "qwen35.ssm.time_step_rank".into(),
+            GgufValue::Uint32(n_v as u32),
+        );
+        meta.insert(
+            "qwen35.ssm.group_count".into(),
+            GgufValue::Uint32(n_k as u32),
+        );
+        meta.insert(
+            "qwen35.ssm.conv_kernel".into(),
+            GgufValue::Uint32(conv_k as u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hi".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![(
+            "token_embd.weight".into(),
+            vec![vocab as u64, dim as u64],
+            vec![w; vocab * dim],
+        )];
+        for i in 0..2 {
+            owned.push((
+                format!("blk.{i}.attn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_qkv.weight"),
+                vec![qkv_dim as u64, dim as u64],
+                vec![w; qkv_dim * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_gate.weight"),
+                vec![inner as u64, dim as u64],
+                vec![w; inner * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ssm_alpha.weight"),
+                vec![n_v as u64, dim as u64],
+                vec![w; n_v * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ssm_beta.weight"),
+                vec![n_v as u64, dim as u64],
+                vec![w; n_v * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ssm_out.weight"),
+                vec![dim as u64, inner as u64],
+                vec![w; dim * inner],
+            ));
+            owned.push((format!("blk.{i}.ssm_a"), vec![n_v as u64], vec![-0.5; n_v]));
+            owned.push((
+                format!("blk.{i}.ssm_dt.bias"),
+                vec![n_v as u64],
+                vec![0.0; n_v],
+            ));
+            owned.push((
+                format!("blk.{i}.ssm_norm.weight"),
+                vec![head as u64],
+                vec![1.0; head],
+            ));
+            owned.push((
+                format!("blk.{i}.ssm_conv1d.weight"),
+                vec![(conv_k * qkv_dim) as u64],
+                vec![w; conv_k * qkv_dim],
+            ));
+        }
+        owned.push((
+            "output_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        owned.push((
+            "output.weight".into(),
+            vec![vocab as u64, dim as u64],
+            vec![w; vocab * dim],
+        ));
+        let views: Vec<GgufWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_tiny_gdn_partial_accept_matches_target_without_keep_replay() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip hip_tiny_gdn_partial_accept: no HIP device");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_gdn_pack-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_tiny_qwen_gdn_gguf(&path, 0.02);
+        let prompt = "hi hi hi";
+        let n = 8usize;
+        let mut greedy_cfg = Config::compiled_defaults();
+        greedy_cfg.model.path = Some(path.clone());
+        greedy_cfg.model.synthetic = false;
+        greedy_cfg.engine.cpu_only = false;
+        greedy_cfg.engine.gpu_backend = "auto".into();
+        greedy_cfg.engine.determinism_seed = Some(7);
+        greedy_cfg.speculative.enabled = false;
+        greedy_cfg.kv.page_tokens = 32;
+        let greedy_engine = match Engine::new(greedy_cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                eprintln!("skip hip_tiny_gdn_partial_accept: Engine {e}");
+                return;
+            }
+        };
+        let greedy = greedy_engine
+            .generate(
+                prompt,
+                GenerationParams {
+                    max_tokens: n,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("target-only");
+        let greedy_fwd = greedy_engine.stats().target_gpu_forwards;
+        drop(greedy_engine);
+
+        let mut spec_cfg = Config::compiled_defaults();
+        spec_cfg.model.path = Some(path.clone());
+        spec_cfg.model.synthetic = false;
+        spec_cfg.engine.cpu_only = false;
+        spec_cfg.engine.gpu_backend = "auto".into();
+        spec_cfg.engine.determinism_seed = Some(7);
+        spec_cfg.speculative.enabled = true;
+        spec_cfg.speculative.min_depth = 4;
+        spec_cfg.speculative.max_depth = 4;
+        spec_cfg.features.draft_model_speculation = Some(false);
+        spec_cfg.features.ngram_speculation = Some(true);
+        spec_cfg.kv.page_tokens = 32;
+        let spec_engine = Engine::new(spec_cfg).expect("spec Engine");
+        let mut handle = spec_engine
+            .begin_request(
+                prompt,
+                GenerationParams {
+                    max_tokens: n,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("begin");
+        {
+            let mut inner = spec_engine.lock().expect("lock");
+            let active = inner
+                .active
+                .get(&handle.id())
+                .expect("active request after prefill");
+            let ctx = active.tokens.clone();
+            // Target-only is all 0s; draft a matching first token and a rejected suffix.
+            let mut observed = ctx.clone();
+            observed.extend_from_slice(&[0, 1, 1, 1]);
+            inner.ngram.observe(&observed);
+            inner.draft_ahead = Some(DraftAhead {
+                ctx,
+                tokens: vec![0, 1, 1, 1],
+            });
+        }
+        let mut spec_ids = Vec::new();
+        let mut packs = Vec::new();
+        loop {
+            let before = spec_engine.stats();
+            match spec_engine.step(&mut handle).expect("step") {
+                allpaca_types::StepResult::Prefill { .. } => {}
+                allpaca_types::StepResult::Token(ev) => spec_ids.push(ev.token_id),
+                allpaca_types::StepResult::Finished(_) => break,
+            }
+            let after = spec_engine.stats();
+            if after.linear_packed_verifies > before.linear_packed_verifies {
+                packs.push((
+                    after
+                        .target_gpu_forwards
+                        .saturating_sub(before.target_gpu_forwards),
+                    after.draft_accepted.saturating_sub(before.draft_accepted),
+                    after.draft_proposed.saturating_sub(before.draft_proposed),
+                ));
+            }
+        }
+        let spec = spec_engine.stats();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            spec_ids, greedy.token_ids,
+            "partial accept must match target-only"
+        );
+        assert!(
+            spec.target_gpu_forwards <= greedy_fwd.saturating_add(2),
+            "partial-accept GDN must not cost a keep-prefix replay vs target-only; spec_fwd={} greedy_fwd={greedy_fwd} spec={spec:?}",
+            spec.target_gpu_forwards
+        );
+        let (delta_fwd, dacc, dprop) = packs
+            .iter()
+            .copied()
+            .find(|(_, dacc, dprop)| dacc < dprop)
+            .expect("expected a partial-accept packed step");
+        // Incremental GDN verify forwards only keep + the bonus sample.
+        // Full-span + keep-prefix replay is span + keep + bonus.
+        assert!(
+            delta_fwd <= dacc.saturating_add(1),
+            "kept-prefix GDN replay must not re-forward accepted tokens; delta_fwd={delta_fwd} dacc={dacc} dprop={dprop} packs={packs:?} spec={spec:?}"
+        );
+    }
+
     #[test]
     fn nemotron_hybrid_synthetic_generates_and_real_fp4_loads() {
         // Synthetic F32 hybrid (SSM + attention) must generate greedily past Fatal.
@@ -7976,6 +8373,92 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
         assert_eq!(
             mtp.config.n_experts, 0,
             "dense MTP ffn_gate must clear trunk n_experts for device draft"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mtp_assumed_span_ahead_matches_process_from_row_hiddens() {
+        let path = std::env::temp_dir().join("allpaca_mtp_assumed_rows.gguf");
+        write_tiny_mtp_gguf(&path);
+        let file = allpaca_gguf::GgufFile::open(&path).expect("open");
+        let mtp = TinyModel::from_gguf_mtp(&file).expect("mtp");
+        let dim = mtp.config.dim;
+        let prefix = vec![1u32, 2];
+        let span = vec![3u32, 1, 2];
+        let pending_h = vec![0.25f32; dim];
+        let mut row_hiddens = vec![0.0f32; span.len() * dim];
+        for (i, row) in row_hiddens.chunks_mut(dim).enumerate() {
+            for (j, x) in row.iter_mut().enumerate() {
+                *x = 0.1 * (i + 1) as f32 + 0.01 * j as f32;
+            }
+        }
+
+        let mut warm = DenseKv::default();
+        let mut logits = vec![0.0f32; mtp.config.vocab_size];
+        for (pos, &tok) in prefix.iter().enumerate() {
+            let h = if pos == 0 {
+                vec![0.0f32; dim]
+            } else {
+                vec![0.05f32 * pos as f32; dim]
+            };
+            warm.seed_h_nextn_from_target(&h);
+            mtp.forward_dense(tok, pos, &mut warm, &mut logits).unwrap();
+            warm.record(tok);
+        }
+        assert!(warm.seq_matches(&prefix));
+        assert!(warm.seq_len() > 0, "must not use empty DenseKv");
+
+        let mut from_rows = warm.snapshot().expect("snapshot for process-from-rows");
+        for (i, &token) in span.iter().enumerate() {
+            let h_prev = if i == 0 {
+                pending_h.as_slice()
+            } else {
+                let off = (i - 1) * dim;
+                &row_hiddens[off..off + dim]
+            };
+            from_rows.seed_h_nextn_from_target(h_prev);
+            mtp.forward_dense(token, prefix.len() + i, &mut from_rows, &mut logits)
+                .unwrap();
+            from_rows.record(token);
+        }
+        let mut next_ctx = prefix.clone();
+        next_ctx.extend_from_slice(&span);
+        assert!(from_rows.seq_matches(&next_ctx));
+        let h_want = from_rows.h_nextn.clone();
+
+        let mut assumed = warm.snapshot().expect("snapshot for assumed span");
+        mtp_process_assumed_span(
+            &mtp,
+            &mut assumed,
+            &span,
+            prefix.len(),
+            &pending_h,
+            &row_hiddens,
+            None,
+            None,
+            None,
+        )
+        .expect("assumed span");
+        assert!(
+            assumed.seq_matches(&next_ctx),
+            "assumed span must stay a warm process KV"
+        );
+        assert_eq!(
+            assumed.h_nextn, h_want,
+            "assumed span must seed each token from target rows, not rolling MTP h_nextn"
+        );
+        let mut provider = crate::draft::DraftModelProvider::new(mtp.clone());
+        let want = provider
+            .propose_on(&next_ctx, 2, 0.0, &mut from_rows, None, None, None)
+            .expect("propose from row-processed KV");
+        let mut provider = crate::draft::DraftModelProvider::new(mtp);
+        let got = provider
+            .propose_on(&next_ctx, 2, 0.0, &mut assumed, None, None, None)
+            .expect("propose from assumed span");
+        assert_eq!(
+            got, want,
+            "full-accept ahead must match process() pairing (token_k, h_{{k-1}}) from target rows"
         );
         let _ = std::fs::remove_file(path);
     }

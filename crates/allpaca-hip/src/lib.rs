@@ -3021,6 +3021,7 @@ pub struct HipWorkspace {
     decode: Mutex<Option<DecodeAlloc>>,
     dequant: Mutex<Option<DequantAlloc>>,
     gdn: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
+    gdn_snap: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
     gdn_w: Mutex<std::collections::HashMap<usize, GdnWeightResident>>,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
@@ -3054,6 +3055,7 @@ impl HipWorkspace {
             decode: Mutex::new(None),
             dequant: Mutex::new(None),
             gdn: Mutex::new(std::collections::HashMap::new()),
+            gdn_snap: Mutex::new(std::collections::HashMap::new()),
             gdn_w: Mutex::new(std::collections::HashMap::new()),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
@@ -3083,6 +3085,14 @@ impl HipWorkspace {
             }
         }
         if let Ok(g) = self.gdn.lock() {
+            for layer in g.values() {
+                n += layer.state.bytes();
+                if let Some(c) = layer.conv.as_ref() {
+                    n += c.bytes();
+                }
+            }
+        }
+        if let Ok(g) = self.gdn_snap.lock() {
             for layer in g.values() {
                 n += layer.state.bytes();
                 if let Some(c) = layer.conv.as_ref() {
@@ -4471,9 +4481,169 @@ impl HipWorkspace {
         Ok(())
     }
 
+    /// True when this request already has seeded device GDN slots (source of truth).
+    pub fn gdn_request_resident(&self, request_id: u64) -> bool {
+        self.gdn
+            .lock()
+            .ok()
+            .map(|g| {
+                g.iter()
+                    .any(|((rid, _), slot)| *rid == request_id && slot.seeded)
+            })
+            .unwrap_or(false)
+    }
+
     /// Drop all resident GDN state for a finished / restored request.
     pub fn gdn_clear_request(&self, request_id: u64) {
         if let Ok(mut g) = self.gdn.lock() {
+            g.retain(|&(rid, _), _| rid != request_id);
+        }
+        self.gdn_drop_clone(request_id);
+    }
+
+    /// Snapshot device GDN state+conv for `request_id` (D2D). Returns layers cloned.
+    pub fn gdn_clone_request(&self, request_id: u64) -> Result<usize, AllpacaError> {
+        let layers = self.gdn_layer_sizes(request_id, false)?;
+        if layers.is_empty() {
+            return Ok(0);
+        }
+        self.gdn_ensure_slots(request_id, &layers, true)?;
+        self.gdn_copy_slots(request_id, &layers, false)?;
+        Ok(layers.len())
+    }
+
+    /// Restore live device GDN slots from the last [`Self::gdn_clone_request`].
+    pub fn gdn_rewind_request(&self, request_id: u64) -> Result<(), AllpacaError> {
+        let layers = self.gdn_layer_sizes(request_id, true)?;
+        if layers.is_empty() {
+            return Ok(());
+        }
+        self.gdn_ensure_slots(request_id, &layers, false)?;
+        self.gdn_copy_slots(request_id, &layers, true)?;
+        let mut g = self.gdn.lock().map_err(|_| {
+            AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+                "gdn mutex poisoned".into(),
+            ))
+        })?;
+        for &(layer, ..) in &layers {
+            if let Some(slot) = g.get_mut(&(request_id, layer)) {
+                slot.seeded = true;
+                slot.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn gdn_mutex_err() -> AllpacaError {
+        AllpacaError::Fatal(allpaca_types::FatalError::InvalidConfig(
+            "gdn mutex poisoned".into(),
+        ))
+    }
+
+    fn gdn_layer_sizes(
+        &self,
+        request_id: u64,
+        from_snap: bool,
+    ) -> Result<Vec<(usize, usize, usize, bool)>, AllpacaError> {
+        let g = if from_snap {
+            self.gdn_snap.lock().map_err(|_| Self::gdn_mutex_err())?
+        } else {
+            self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?
+        };
+        Ok(g.iter()
+            .filter(|((rid, _), _)| *rid == request_id)
+            .map(|((_, layer), slot)| (*layer, slot.state_n, slot.conv_n, slot.conv.is_some()))
+            .collect())
+    }
+
+    fn gdn_ensure_slots(
+        &self,
+        request_id: u64,
+        layers: &[(usize, usize, usize, bool)],
+        into_snap: bool,
+    ) -> Result<(), AllpacaError> {
+        let mut g = if into_snap {
+            self.gdn_snap.lock().map_err(|_| Self::gdn_mutex_err())?
+        } else {
+            self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?
+        };
+        for &(layer, state_n, conv_n, has_conv) in layers {
+            let key = (request_id, layer);
+            let reuse = g.get(&key).is_some_and(|s| {
+                s.state_n == state_n && s.conv_n == conv_n && s.conv.is_some() == has_conv
+            });
+            if reuse {
+                continue;
+            }
+            let state = DeviceWeights::alloc(self.device, state_n.max(1) * 4)?;
+            let conv = if has_conv && conv_n > 0 {
+                Some(DeviceWeights::alloc(self.device, conv_n * 4)?)
+            } else {
+                None
+            };
+            g.insert(
+                key,
+                GdnLayerResident {
+                    state,
+                    state_n,
+                    conv,
+                    conv_n,
+                    seeded: true,
+                    dirty: false,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn gdn_copy_slots(
+        &self,
+        request_id: u64,
+        layers: &[(usize, usize, usize, bool)],
+        snap_to_live: bool,
+    ) -> Result<(), AllpacaError> {
+        self.bind()?;
+        for &(layer, state_n, conv_n, _) in layers {
+            let (src_s, src_c, dst_s, dst_c) = {
+                let live = self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?;
+                let snap = self.gdn_snap.lock().map_err(|_| Self::gdn_mutex_err())?;
+                let (src, dst) = if snap_to_live {
+                    (snap.get(&(request_id, layer)), live.get(&(request_id, layer)))
+                } else {
+                    (live.get(&(request_id, layer)), snap.get(&(request_id, layer)))
+                };
+                let src = src.ok_or_else(|| {
+                    AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                        "gdn copy missing source slot".into(),
+                    ))
+                })?;
+                let dst = dst.ok_or_else(|| {
+                    AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                        "gdn copy missing dest slot".into(),
+                    ))
+                })?;
+                (
+                    src.state.ptr_at(0) as *const f32,
+                    src.conv.as_ref().map(|c| c.ptr_at(0) as *const f32),
+                    dst.state.ptr_at(0) as *mut f32,
+                    dst.conv.as_ref().map(|c| c.ptr_at(0) as *mut f32),
+                )
+            };
+            self.copy_d2d_f32(dst_s, src_s, state_n)?;
+            if conv_n > 0 {
+                if let (Some(d), Some(s)) = (dst_c, src_c) {
+                    self.copy_d2d_f32(d, s, conv_n)?;
+                }
+            }
+        }
+        // D2D is queued async; the next GDN kernel must see the restored slots.
+        stream_synchronize()?;
+        Ok(())
+    }
+
+    /// Free the device GDN snapshot for `request_id`.
+    pub fn gdn_drop_clone(&self, request_id: u64) {
+        if let Ok(mut g) = self.gdn_snap.lock() {
             g.retain(|&(rid, _), _| rid != request_id);
         }
     }

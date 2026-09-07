@@ -4995,3 +4995,371 @@ fn hip_gdn_decode_step_resident_matches_host_without_qkv_d2h() {
     hip.gdn_clear_request(req);
 }
 
+/// Device GDN clone/rewind must restore state+conv after an extra step without D2H.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_rewind_restores_device_state_and_conv_after_extra_step() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_rewind: no HIP device");
+        return;
+    }
+    let hip = match allpaca_hip::HipWorkspace::new(0, 64 * 1024, 8) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("skip hip_gdn_rewind: HIP workspace unavailable");
+            return;
+        }
+    };
+    let req = 13u64;
+    let layer = 1usize;
+    let n_k = 1usize;
+    let n_v = 1usize;
+    let head_k = 2usize;
+    let head_v = 2usize;
+    let conv_k = 2usize;
+    let key_dim = n_k * head_k;
+    let value_dim = n_v * head_v;
+    let qkv_dim = key_dim * 2 + value_dim;
+    let mut conv_w = vec![0.0f32; conv_k * qkv_dim];
+    for c in 0..qkv_dim {
+        conv_w[1 + c * conv_k] = 1.0;
+    }
+    let qkv_a = [1.0f32, 0.0, 0.0, 1.0, 2.0, -1.0];
+    let qkv_b = [0.0f32, 1.0, 1.0, 0.0, -0.5, 1.5];
+    let z = [0.5f32, -0.25];
+    let norm = [1.0f32, 0.75];
+    let alpha = [0.25f32];
+    let dt_bias = [0.0f32];
+    let a = [-0.5f32];
+    let beta0 = [1.0f32];
+
+    let blob = allpaca_hip::DeviceWeights::alloc(
+        0,
+        (qkv_dim * 2 + z.len() + 1 + 1 + conv_w.len() + 1 + 1 + 2 + 2) * 4,
+    )
+    .expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let qkv_a_d = put(&hip, &blob, &mut off, &qkv_a);
+    let qkv_b_d = put(&hip, &blob, &mut off, &qkv_b);
+    let z_d = put(&hip, &blob, &mut off, &z);
+    let alpha_d = put(&hip, &blob, &mut off, &alpha);
+    let beta_d = put(&hip, &blob, &mut off, &beta0);
+    let conv_w_d = put(&hip, &blob, &mut off, &conv_w);
+    let dt_d = put(&hip, &blob, &mut off, &dt_bias);
+    let a_d = put(&hip, &blob, &mut off, &a);
+    let norm_d = put(&hip, &blob, &mut off, &norm);
+    let out_d = put(&hip, &blob, &mut off, &[0.0f32; 2]);
+
+    let step = |hip: &allpaca_hip::HipWorkspace, rid: u64, qkv_d: *mut f32| {
+        hip.copy_h2d_f32(beta_d, &beta0).unwrap();
+        let mut host_state = [0.0f32; 4];
+        let mut host_conv = [3.0f32, 4.0, 5.0, 6.0, 7.0, 8.0];
+        hip.gdn_decode_step_resident(
+            rid,
+            layer,
+            &mut host_state,
+            &mut host_conv,
+            qkv_d,
+            z_d,
+            alpha_d,
+            beta_d,
+            conv_w_d,
+            dt_d,
+            a_d,
+            norm_d,
+            out_d,
+            n_v as i32,
+            n_k as i32,
+            head_v as i32,
+            head_k as i32,
+            conv_k as i32,
+            1e-6,
+        )
+    };
+    let pull = |hip: &allpaca_hip::HipWorkspace, rid: u64| {
+        let mut states = vec![Vec::new(); layer + 1];
+        let mut convs = vec![Vec::new(); layer + 1];
+        hip.gdn_sync_request_to_host(rid, &mut states).unwrap();
+        hip.gdn_sync_conv_to_host(rid, &mut convs).unwrap();
+        (states[layer].clone(), convs[layer].clone())
+    };
+
+    let req_ref = 14u64;
+    if let Err(e) = step(&hip, req_ref, qkv_a_d) {
+        eprintln!("skip hip_gdn_rewind: {e}");
+        return;
+    }
+    step(&hip, req_ref, qkv_b_d).expect("reference accepted prefix");
+    let (state_want, conv_want) = pull(&hip, req_ref);
+
+    if let Err(e) = step(&hip, req, qkv_a_d) {
+        eprintln!("skip hip_gdn_rewind: {e}");
+        return;
+    }
+    let d2h_before = hip.activation_d2h_bytes();
+    let cloned = hip.gdn_clone_request(req).expect("clone device GDN");
+    assert!(cloned > 0, "pre-verify clone must snapshot resident layers");
+    step(&hip, req, qkv_b_d).expect("rejected suffix step after clone");
+    hip.gdn_rewind_request(req).expect("rewind device GDN");
+    let d2h_after = hip.activation_d2h_bytes();
+    assert_eq!(
+        d2h_after, d2h_before,
+        "clone/rewind must stay on device; d2h {d2h_before}→{d2h_after}"
+    );
+    step(&hip, req, qkv_b_d).expect("replay accepted prefix after rewind");
+
+    let (state_got, conv_got) = pull(&hip, req);
+    assert_eq!(state_got.len(), state_want.len());
+    assert_eq!(conv_got.len(), conv_want.len());
+    for i in 0..state_want.len() {
+        assert!(
+            (state_got[i] - state_want[i]).abs() < 1e-4,
+            "rewound state[{i}] got={} want={}",
+            state_got[i],
+            state_want[i]
+        );
+    }
+    for i in 0..conv_want.len() {
+        assert!(
+            (conv_got[i] - conv_want[i]).abs() < 1e-4,
+            "rewound conv[{i}] got={} want={}",
+            conv_got[i],
+            conv_want[i]
+        );
+    }
+    hip.gdn_drop_clone(req);
+    hip.gdn_clear_request(req);
+    hip.gdn_clear_request(req_ref);
+}
+
+/// Tiny Qwen35 GDN GGUF (2 SSM layers) so prefill D2H can be measured without
+/// loading the 27B ROCmFP4 checkpoint.
+#[cfg(feature = "hip")]
+fn write_tiny_qwen_gdn_gguf(path: &std::path::Path) {
+    write_tiny_qwen_gdn_gguf_w(path, 0.02);
+}
+
+#[cfg(feature = "hip")]
+fn write_tiny_qwen_gdn_gguf_w(path: &std::path::Path, w: f32) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 16usize;
+    let vocab = 4usize;
+    let n_layers = 2usize;
+    let n_v = 2usize;
+    let n_k = 2usize;
+    let head = 8usize;
+    let inner = n_v * head;
+    let key_dim = n_k * head;
+    let qkv_dim = key_dim * 2 + inner;
+    let conv_k = 2usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("qwen35".into()),
+    );
+    meta.insert("qwen35.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert(
+        "qwen35.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
+    meta.insert(
+        "qwen35.block_count".into(),
+        GgufValue::Uint32(n_layers as u32),
+    );
+    meta.insert("qwen35.attention.head_count".into(), GgufValue::Uint32(2));
+    meta.insert(
+        "qwen35.attention.head_count_kv".into(),
+        GgufValue::Uint32(1),
+    );
+    meta.insert(
+        "qwen35.feed_forward_length".into(),
+        GgufValue::Uint32((dim * 2) as u32),
+    );
+    meta.insert("qwen35.ssm.state_size".into(), GgufValue::Uint32(head as u32));
+    meta.insert(
+        "qwen35.ssm.inner_size".into(),
+        GgufValue::Uint32(inner as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.time_step_rank".into(),
+        GgufValue::Uint32(n_v as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.group_count".into(),
+        GgufValue::Uint32(n_k as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.conv_kernel".into(),
+        GgufValue::Uint32(conv_k as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hi".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+    let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![(
+        "token_embd.weight".into(),
+        vec![vocab as u64, dim as u64],
+        vec![w; vocab * dim],
+    )];
+    for i in 0..n_layers {
+        owned.push((
+            format!("blk.{i}.attn_norm.weight"),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        owned.push((
+            format!("blk.{i}.attn_qkv.weight"),
+            vec![qkv_dim as u64, dim as u64],
+            vec![w; qkv_dim * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.attn_gate.weight"),
+            vec![inner as u64, dim as u64],
+            vec![w; inner * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_alpha.weight"),
+            vec![n_v as u64, dim as u64],
+            vec![w; n_v * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_beta.weight"),
+            vec![n_v as u64, dim as u64],
+            vec![w; n_v * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_out.weight"),
+            vec![dim as u64, inner as u64],
+            vec![w; dim * inner],
+        ));
+        owned.push((format!("blk.{i}.ssm_a"), vec![n_v as u64], vec![-0.5; n_v]));
+        owned.push((
+            format!("blk.{i}.ssm_dt.bias"),
+            vec![n_v as u64],
+            vec![0.0; n_v],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_norm.weight"),
+            vec![head as u64],
+            vec![1.0; head],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_conv1d.weight"),
+            vec![(conv_k * qkv_dim) as u64],
+            vec![w; conv_k * qkv_dim],
+        ));
+    }
+    owned.push((
+        "output_norm.weight".into(),
+        vec![dim as u64],
+        vec![1.0; dim],
+    ));
+    owned.push((
+        "output.weight".into(),
+        vec![vocab as u64, dim as u64],
+        vec![w; vocab * dim],
+    ));
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).unwrap();
+}
+
+/// Prefill with device GDN must not D2H state+conv on every prompt token.
+/// Public: generate still works; `activation_d2h_bytes` stays flat vs extra tokens.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_tiny_gdn_prefill_d2h_does_not_scale_with_every_token() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_tiny_gdn_prefill_d2h: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_tiny_gdn_prefill-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    write_tiny_qwen_gdn_gguf(&path);
+    let mut cfg = Config::compiled_defaults();
+    cfg.model.path = Some(path.clone());
+    cfg.model.synthetic = false;
+    cfg.engine.cpu_only = false;
+    cfg.engine.gpu_backend = "auto".into();
+    cfg.engine.determinism_seed = Some(7);
+    cfg.speculative.enabled = false;
+    cfg.kv.page_tokens = 32;
+    let engine = match Engine::new(cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("skip hip_tiny_gdn_prefill_d2h: Engine::new {e}");
+            return;
+        }
+    };
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("skip hip_tiny_gdn_prefill_d2h: no HIP in engine");
+        return;
+    }
+    let short = "hi hi";
+    let long = "hi hi hi hi hi hi hi hi hi hi";
+    let d2h0 = engine.stats().activation_d2h_bytes;
+    let short_out = engine.generate(short, greedy(1)).expect("short prefill");
+    let after_short = engine.stats();
+    let d2h_short = after_short.activation_d2h_bytes.saturating_sub(d2h0);
+    let long_out = engine.generate(long, greedy(1)).expect("long prefill");
+    let after_long = engine.stats();
+    let d2h_long = after_long
+        .activation_d2h_bytes
+        .saturating_sub(after_short.activation_d2h_bytes);
+    let extra_prompt = after_long
+        .prompt_tokens
+        .saturating_sub(after_short.prompt_tokens);
+    let _ = std::fs::remove_file(&path);
+    assert!(!short_out.token_ids.is_empty(), "short generate empty");
+    assert!(!long_out.token_ids.is_empty(), "long generate empty");
+    assert!(
+        extra_prompt >= 4,
+        "need a longer second prompt; extra_prompt={extra_prompt}"
+    );
+    // 2 GDN layers: state 2*8*8 + conv 1*48 floats → 1408 bytes/token if synced.
+    let gdn_all_layers = 1408u64;
+    let per_extra = d2h_long.saturating_sub(d2h_short) / extra_prompt.max(1);
+    assert!(
+        per_extra < gdn_all_layers / 2,
+        "GDN host sync must not run every prefill token; d2h_short={d2h_short} d2h_long={d2h_long} extra_prompt={extra_prompt} per_extra={per_extra} stats_short={after_short:?} stats_long={after_long:?}"
+    );
+}
+
