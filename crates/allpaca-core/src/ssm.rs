@@ -27,7 +27,7 @@ impl Mamba2Dims {
             || d_state == 0
             || n_heads == 0
             || n_groups == 0
-            || conv_kernel == 0
+            || conv_kernel < 2
             || d_inner % n_heads != 0
             || n_heads % n_groups != 0
             || d_inner % n_groups != 0

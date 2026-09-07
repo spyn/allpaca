@@ -4190,14 +4190,8 @@ impl TinyModel {
                     let wo_k = l.wo.len() / dim;
                     q_out == wo_k.saturating_mul(2) && wo_k > dim
                 });
-                let has_recurrent_blocks = self
-                    .layers
-                    .iter()
-                    .any(|layer| layer.ssm.is_some() || layer.gdn.is_some());
-                let batched_ok = !has_recurrent_blocks
-                    && !gated
-                    && !self.config.uses_imrope()
-                    && self.config.rope_dims == 0;
+                let batched_ok =
+                    !gated && !self.config.uses_imrope() && self.config.rope_dims == 0;
                 if batched_ok {
                     match self.forward_tokens_device(
                         tokens,
