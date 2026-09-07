@@ -146,10 +146,15 @@ fn hip_inventory_enumerates_stable_ids() {
     assert!(gpus.len() >= 1);
     let ids: Vec<i32> = gpus.iter().map(|d| d.id).collect();
     assert!(ids.iter().all(|id| *id >= 0));
-    assert!(gpus.iter().all(|d| d.memory_bytes > 0 && !d.name.is_empty()));
+    assert!(gpus
+        .iter()
+        .all(|d| d.memory_bytes > 0 && !d.name.is_empty()));
     let again = Engine::new(hip_auto_synthetic()).unwrap();
     let ids2: Vec<i32> = hip_gpus(&again).iter().map(|d| d.id).collect();
-    assert_eq!(ids, ids2, "HIP device ids must be stable across Engine boots");
+    assert_eq!(
+        ids, ids2,
+        "HIP device ids must be stable across Engine boots"
+    );
 }
 
 #[cfg(feature = "hip")]
@@ -378,18 +383,14 @@ fn streamed_moe_hip_greedy_tokens_match_fully_resident() {
     if hip_gpus(&resident).is_empty() {
         return;
     }
-    resident
-        .load_synthetic(ModelConfig::tiny_moe())
-        .unwrap();
+    resident.load_synthetic(ModelConfig::tiny_moe()).unwrap();
     let full = resident.generate("hello", greedy(8)).unwrap();
 
     let streamed = Engine::new(hip_moe_streamed()).unwrap();
     if hip_gpus(&streamed).is_empty() {
         return;
     }
-    streamed
-        .load_synthetic(ModelConfig::tiny_moe())
-        .unwrap();
+    streamed.load_synthetic(ModelConfig::tiny_moe()).unwrap();
     let after_load = streamed.stats();
     assert!(
         after_load.expert_slots >= 1,
@@ -428,8 +429,13 @@ fn streamed_moe_hip_greedy_tokens_match_fully_resident() {
     let dim = 32u64;
     let n_layers = 2u64;
     let logits = SYNTHETIC_VOCAB.saturating_mul(4);
-    let route = n_layers.saturating_mul(dim).saturating_mul(4).saturating_mul(2);
-    let bound = after.gpu_forwards.saturating_mul(logits.saturating_add(route));
+    let route = n_layers
+        .saturating_mul(dim)
+        .saturating_mul(4)
+        .saturating_mul(2);
+    let bound = after
+        .gpu_forwards
+        .saturating_mul(logits.saturating_add(route));
     assert!(
         after.activation_d2h_bytes <= bound,
         "MoE residual scale must stay on device; d2h={} bound={} stats={after:?}",
@@ -962,7 +968,9 @@ fn hip_speculative_linear_verify_packs_draft_span() {
         eprintln!("skip hip_speculative_linear_verify_packs_draft_span: no HIP device");
         return;
     }
-    let out = engine.generate("hello", greedy(8)).expect("packed linear verify generate");
+    let out = engine
+        .generate("hello", greedy(8))
+        .expect("packed linear verify generate");
     assert!(!out.token_ids.is_empty());
     let n = out.token_ids.len() as u64;
     let stats = engine.stats();
@@ -1250,7 +1258,10 @@ fn write_tiny_q4k_gguf(path: &std::path::Path) {
         GgufValue::String("llama".into()),
     );
     meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
     meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
     meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
     meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -1403,7 +1414,10 @@ fn write_tiny_uniform_kquant_gguf(
         GgufValue::String("llama".into()),
     );
     meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
     meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
     meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
     meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -1534,7 +1548,10 @@ fn write_packed_f16_gguf_with_rope_dims(path: &std::path::Path, rope_dims: u32) 
         GgufValue::String("llama".into()),
     );
     meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
     meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
     meta.insert(
         "llama.attention.head_count".into(),
@@ -1670,7 +1687,10 @@ fn write_tiny_f32_gguf(path: &std::path::Path) {
         GgufValue::String("llama".into()),
     );
     meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
     meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
     meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
     meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -1694,17 +1714,61 @@ fn write_tiny_f32_gguf(path: &std::path::Path) {
     meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
     meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
     let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
-        ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![0.01; vocab * dim]),
-        ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-        ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
-        ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
-        ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![0.01; 2 * dim]),
-        ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![0.01; dim * dim]),
-        ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-        ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
-        ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![0.01; ff * dim]),
-        ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![0.01; dim * ff]),
-        ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        (
+            "token_embd.weight".into(),
+            vec![vocab as u64, dim as u64],
+            vec![0.01; vocab * dim],
+        ),
+        (
+            "blk.0.attn_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
+        (
+            "blk.0.attn_q.weight".into(),
+            vec![dim as u64, dim as u64],
+            vec![0.01; dim * dim],
+        ),
+        (
+            "blk.0.attn_k.weight".into(),
+            vec![2, dim as u64],
+            vec![0.01; 2 * dim],
+        ),
+        (
+            "blk.0.attn_v.weight".into(),
+            vec![2, dim as u64],
+            vec![0.01; 2 * dim],
+        ),
+        (
+            "blk.0.attn_output.weight".into(),
+            vec![dim as u64, dim as u64],
+            vec![0.01; dim * dim],
+        ),
+        (
+            "blk.0.ffn_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
+        (
+            "blk.0.ffn_gate.weight".into(),
+            vec![ff as u64, dim as u64],
+            vec![0.01; ff * dim],
+        ),
+        (
+            "blk.0.ffn_up.weight".into(),
+            vec![ff as u64, dim as u64],
+            vec![0.01; ff * dim],
+        ),
+        (
+            "blk.0.ffn_down.weight".into(),
+            vec![dim as u64, ff as u64],
+            vec![0.01; dim * ff],
+        ),
+        (
+            "output_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
     ];
     let views: Vec<GgufWriteTensor<'_>> = owned
         .iter()
@@ -1715,6 +1779,136 @@ fn write_tiny_f32_gguf(path: &std::path::Path) {
         })
         .collect();
     write_gguf(path, &meta, &views).unwrap();
+}
+
+#[cfg(feature = "hip")]
+fn write_tiny_fused_qkv_f32_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 8usize;
+    let kv_dim = 2usize;
+    let vocab = 4usize;
+    let ff = 16usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let qkv_dim = dim + 2 * kv_dim;
+    let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+        (
+            "token_embd.weight".into(),
+            vec![vocab as u64, dim as u64],
+            vec![0.01; vocab * dim],
+        ),
+        (
+            "blk.0.attn_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
+        (
+            "blk.0.attn_qkv.weight".into(),
+            vec![dim as u64, qkv_dim as u64],
+            vec![0.01; qkv_dim * dim],
+        ),
+        (
+            "blk.0.attn_output.weight".into(),
+            vec![dim as u64, dim as u64],
+            vec![0.01; dim * dim],
+        ),
+        (
+            "blk.0.ffn_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
+        (
+            "blk.0.ffn_gate.weight".into(),
+            vec![ff as u64, dim as u64],
+            vec![0.01; ff * dim],
+        ),
+        (
+            "blk.0.ffn_up.weight".into(),
+            vec![ff as u64, dim as u64],
+            vec![0.01; ff * dim],
+        ),
+        (
+            "blk.0.ffn_down.weight".into(),
+            vec![dim as u64, ff as u64],
+            vec![0.01; dim * ff],
+        ),
+        (
+            "output_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
+    ];
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).unwrap();
+}
+
+/// A split-less attention checkpoint must load and generate on the HIP resident path.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_fused_qkv_attention_gguf_generates() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_fused_qkv_attention_gguf_generates: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca-fused-qkv-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    write_tiny_fused_qkv_f32_gguf(&path);
+    let mut cfg = Config::compiled_defaults();
+    cfg.model.path = Some(path.clone());
+    cfg.model.synthetic = false;
+    cfg.engine.cpu_only = false;
+    cfg.engine.gpu_backend = "auto".into();
+    cfg.engine.determinism_seed = Some(7);
+    cfg.speculative.enabled = false;
+    let result = Engine::new(cfg).and_then(|engine| engine.generate("hello", greedy(1)));
+    let _ = std::fs::remove_file(path);
+    let generated = result.expect("fused attn_qkv GGUF must generate on HIP");
+    assert!(!generated.token_ids.is_empty());
 }
 
 #[cfg(feature = "hip")]
@@ -1732,7 +1926,10 @@ fn write_tiny_moe_gguf(path: &std::path::Path) {
         GgufValue::String("llama".into()),
     );
     meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
     meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
     meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
     meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -1767,13 +1964,41 @@ fn write_tiny_moe_gguf(path: &std::path::Path) {
         down_exps.extend(std::iter::repeat_n(w, dim * ff));
     }
     let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
-        ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
-        ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-        ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
-        ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
-        ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
-        ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
-        ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        (
+            "token_embd.weight".into(),
+            vec![vocab as u64, dim as u64],
+            vec![w; vocab * dim],
+        ),
+        (
+            "blk.0.attn_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
+        (
+            "blk.0.attn_q.weight".into(),
+            vec![dim as u64, dim as u64],
+            vec![w; dim * dim],
+        ),
+        (
+            "blk.0.attn_k.weight".into(),
+            vec![2, dim as u64],
+            vec![w; 2 * dim],
+        ),
+        (
+            "blk.0.attn_v.weight".into(),
+            vec![2, dim as u64],
+            vec![w; 2 * dim],
+        ),
+        (
+            "blk.0.attn_output.weight".into(),
+            vec![dim as u64, dim as u64],
+            vec![w; dim * dim],
+        ),
+        (
+            "blk.0.ffn_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
         (
             "blk.0.ffn_gate_inp.weight".into(),
             vec![n_exp as u64, dim as u64],
@@ -1794,7 +2019,11 @@ fn write_tiny_moe_gguf(path: &std::path::Path) {
             vec![n_exp as u64, dim as u64, ff as u64],
             down_exps,
         ),
-        ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+        (
+            "output_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ),
     ];
     let views: Vec<GgufWriteTensor<'_>> = owned
         .iter()
@@ -1824,7 +2053,10 @@ fn write_tiny_q4k_q6k_gguf(path: &std::path::Path) {
         GgufValue::String("llama".into()),
     );
     meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
     meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
     meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
     meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -1947,7 +2179,11 @@ fn hip_generate_from_tiny_q6k_gguf() {
         return;
     }
     let path = std::env::temp_dir().join("allpaca_hip_tiny_q6k.gguf");
-    write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::Q6_K, allpaca_gguf::quantize_q6_k);
+    write_tiny_uniform_kquant_gguf(
+        &path,
+        allpaca_gguf::GgmlType::Q6_K,
+        allpaca_gguf::quantize_q6_k,
+    );
     let mut cfg = hip_7b_config(path.clone());
     cfg.kv.page_tokens = 8;
     cfg.kv.vram_bytes = 16 * 1024 * 1024;
@@ -1974,7 +2210,11 @@ fn hip_generate_from_tiny_f16_gguf() {
         return;
     }
     let path = std::env::temp_dir().join("allpaca_hip_tiny_f16.gguf");
-    write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::F16, allpaca_gguf::quantize_f16);
+    write_tiny_uniform_kquant_gguf(
+        &path,
+        allpaca_gguf::GgmlType::F16,
+        allpaca_gguf::quantize_f16,
+    );
     let mut cfg = hip_7b_config(path.clone());
     cfg.kv.page_tokens = 8;
     cfg.kv.vram_bytes = 16 * 1024 * 1024;
@@ -2101,7 +2341,11 @@ fn hip_greedy_long_prompt_matches_cpu_on_tiny_written_ggufs() {
         (
             "f16",
             Box::new(|p| {
-                write_tiny_uniform_kquant_gguf(p, allpaca_gguf::GgmlType::F16, allpaca_gguf::quantize_f16)
+                write_tiny_uniform_kquant_gguf(
+                    p,
+                    allpaca_gguf::GgmlType::F16,
+                    allpaca_gguf::quantize_f16,
+                )
             }),
         ),
         (
@@ -2424,8 +2668,13 @@ fn discovers_qwen_coder_05b_gguf_in_hf_cache_when_present() {
         eprintln!("skip discovers_qwen_coder_05b_gguf_in_hf_cache_when_present: cache dir missing");
         return;
     }
-    let found = find_gguf_under(root).expect("Qwen 0.5B HF cache must contain a GGUF blob or snapshots/*.gguf");
-    assert!(found.is_file(), "discovered path must be a file: {}", found.display());
+    let found = find_gguf_under(root)
+        .expect("Qwen 0.5B HF cache must contain a GGUF blob or snapshots/*.gguf");
+    assert!(
+        found.is_file(),
+        "discovered path must be a file: {}",
+        found.display()
+    );
     eprintln!("discovered draft GGUF {}", found.display());
 }
 
@@ -2637,7 +2886,9 @@ fn hip_local_llama32_f16_stays_packed_on_load() {
 #[test]
 fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
     if std::env::var("ALLPACA_OVERNIGHT").ok().as_deref() != Some("1") {
-        eprintln!("skip hip_overnight_llama32_f16_on_second_gpu_when_env_set: set ALLPACA_OVERNIGHT=1");
+        eprintln!(
+            "skip hip_overnight_llama32_f16_on_second_gpu_when_env_set: set ALLPACA_OVERNIGHT=1"
+        );
         return;
     }
     let _guard = large_gguf_lock();
@@ -2688,8 +2939,14 @@ fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
         stats.p2p_status
     );
     assert_eq!(stats.backend, "hip");
-    assert_eq!(stats.target_device, 0, "8B greedy baseline must run on HIP:0");
-    assert_eq!(stats.draft_device, -1, "8B greedy baseline must not place a Draft Model");
+    assert_eq!(
+        stats.target_device, 0,
+        "8B greedy baseline must run on HIP:0"
+    );
+    assert_eq!(
+        stats.draft_device, -1,
+        "8B greedy baseline must not place a Draft Model"
+    );
     let greedy_timeout = overnight_timeout(tokens, 3);
     for round in 0..rounds {
         eprintln!(
@@ -2760,8 +3017,14 @@ fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
             stats.transfer_path,
             stats.p2p_status
         );
-        assert_eq!(stats.target_device, 1, "overnight soak must run on the second HIP device");
-        assert_eq!(stats.draft_device, -1, "9060 soak must not place a Draft Model");
+        assert_eq!(
+            stats.target_device, 1,
+            "overnight soak must run on the second HIP device"
+        );
+        assert_eq!(
+            stats.draft_device, -1,
+            "9060 soak must not place a Draft Model"
+        );
         let soak_timeout = overnight_timeout(tokens, 8);
         for round in 0..rounds {
             eprintln!(
@@ -2814,7 +3077,10 @@ fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
         stats.transfer_path,
         stats.p2p_status
     );
-    assert_eq!(stats.target_device, 0, "spec Target Model must run on HIP:0");
+    assert_eq!(
+        stats.target_device, 0,
+        "spec Target Model must run on HIP:0"
+    );
     assert_eq!(stats.draft_device, 1, "spec Draft Model must run on HIP:1");
     let spec_timeout = overnight_timeout(spec_tokens, 8);
     for round in 0..spec_rounds {
@@ -2878,11 +3144,15 @@ fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
 #[test]
 fn hip_overnight_8b_greedy_on_target_gpu_when_env_set() {
     if std::env::var("ALLPACA_OVERNIGHT").ok().as_deref() != Some("1") {
-        eprintln!("skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: set ALLPACA_OVERNIGHT=1");
+        eprintln!(
+            "skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: set ALLPACA_OVERNIGHT=1"
+        );
         return;
     }
     if std::env::var("ALLPACA_OVERNIGHT_9070").ok().as_deref() != Some("1") {
-        eprintln!("skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: set ALLPACA_OVERNIGHT_9070=1");
+        eprintln!(
+            "skip hip_overnight_8b_greedy_on_target_gpu_when_env_set: set ALLPACA_OVERNIGHT_9070=1"
+        );
         return;
     }
     let _guard = large_gguf_lock();
@@ -2932,7 +3202,10 @@ fn hip_overnight_8b_greedy_on_target_gpu_when_env_set() {
         stats.target_device, 0,
         "9070 soak must run on the only visible HIP device"
     );
-    assert_eq!(stats.draft_device, -1, "9070 soak must not place a Draft Model");
+    assert_eq!(
+        stats.draft_device, -1,
+        "9070 soak must not place a Draft Model"
+    );
     let timeout = std::time::Duration::from_secs((tokens as u64).saturating_mul(3).max(180));
     for round in 0..rounds {
         eprintln!(
@@ -3030,8 +3303,14 @@ fn hip_overnight_llama32_q8_greedy_on_second_gpu_when_env_set() {
         stats.transfer_path
     );
     assert_eq!(stats.backend, "hip");
-    assert_eq!(stats.target_device, 1, "Draft Model greedy must run on HIP:1");
-    assert_eq!(stats.draft_device, -1, "Draft Model greedy must not place a second Draft Model");
+    assert_eq!(
+        stats.target_device, 1,
+        "Draft Model greedy must run on HIP:1"
+    );
+    assert_eq!(
+        stats.draft_device, -1,
+        "Draft Model greedy must not place a second Draft Model"
+    );
     assert!(
         stats.weight_bytes_on_device > 3_000_000_000
             && stats.weight_bytes_on_device < 4_000_000_000,
@@ -3094,16 +3373,12 @@ fn hip_overnight_llama32_q8_greedy_on_second_gpu_when_env_set() {
 #[test]
 fn hip_asymmetric_spec_beats_target_greedy_when_env_set() {
     if std::env::var("ALLPACA_DEMO").ok().as_deref() != Some("1") {
-        eprintln!(
-            "skip hip_asymmetric_spec_beats_target_greedy_when_env_set: set ALLPACA_DEMO=1"
-        );
+        eprintln!("skip hip_asymmetric_spec_beats_target_greedy_when_env_set: set ALLPACA_DEMO=1");
         return;
     }
     let _guard = large_gguf_lock();
     if allpaca_hip::device_count() < 2 {
-        eprintln!(
-            "skip hip_asymmetric_spec_beats_target_greedy_when_env_set: need 2 HIP devices"
-        );
+        eprintln!("skip hip_asymmetric_spec_beats_target_greedy_when_env_set: need 2 HIP devices");
         return;
     }
     let Some(target) = gated_7b_gguf() else {
@@ -3142,8 +3417,14 @@ fn hip_asymmetric_spec_beats_target_greedy_when_env_set() {
         stats.weight_bytes_on_device
     );
     assert_eq!(stats.backend, "hip");
-    assert_eq!(stats.target_device, 0, "Target Model greedy must run on HIP:0");
-    assert_eq!(stats.draft_device, -1, "Target Model greedy must not place a Draft Model");
+    assert_eq!(
+        stats.target_device, 0,
+        "Target Model greedy must run on HIP:0"
+    );
+    assert_eq!(
+        stats.draft_device, -1,
+        "Target Model greedy must not place a Draft Model"
+    );
     let greedy_timeout = overnight_timeout(tokens.max(warmup), 3);
     if warmup > 0 {
         let _ = generate_or_timeout(&greedy, "hello", warmup, greedy_timeout);
@@ -3177,20 +3458,19 @@ fn hip_asymmetric_spec_beats_target_greedy_when_env_set() {
     let stats = spec.stats();
     eprintln!(
         "demo spec load target_device={} draft_device={} weight_bytes={} transfer_path={}",
-        stats.target_device,
-        stats.draft_device,
-        stats.weight_bytes_on_device,
-        stats.transfer_path
+        stats.target_device, stats.draft_device, stats.weight_bytes_on_device, stats.transfer_path
     );
-    assert_eq!(stats.target_device, 0, "spec Target Model must run on HIP:0");
+    assert_eq!(
+        stats.target_device, 0,
+        "spec Target Model must run on HIP:0"
+    );
     assert_eq!(stats.draft_device, 1, "spec Draft Model must run on HIP:1");
     let spec_timeout = overnight_timeout(tokens.max(warmup), 8);
     if warmup > 0 {
         let _ = generate_or_timeout(&spec, "hello", warmup, spec_timeout);
     }
     let before = spec.stats();
-    let (spec_tps, spec_out) =
-        warmup_and_measure_tps(&spec, "hello", 0, tokens, spec_timeout);
+    let (spec_tps, spec_out) = warmup_and_measure_tps(&spec, "hello", 0, tokens, spec_timeout);
     let spec_stats = spec.stats();
     eprintln!(
         "demo spec gen={} tps={:.2} itl_ms={:.2} acceptance={:.3} target_fwd_delta={} draft_fwd_delta={} packed_verify_delta={} draft_ahead_delta={} greedy_tps={:.2}",
@@ -3353,7 +3633,8 @@ fn hip_generate_real_7b_gguf_when_path_set() {
     assert!(
         stats.other_gpu_us > 0.0 && stats.other_gpu_us < PROFILE_BLAS_OTHER_GPU_US * 0.85,
         "other_gpu_us {:.1} must shrink vs profile-blas {:.1}; stats={stats:?}",
-        stats.other_gpu_us, PROFILE_BLAS_OTHER_GPU_US
+        stats.other_gpu_us,
+        PROFILE_BLAS_OTHER_GPU_US
     );
     let itl_us = stats.itl_ms_ema * 1_000.0;
     assert!(
@@ -3592,12 +3873,7 @@ fn hip_speculative_7b_64_tokens_finishes_before_timeout() {
         return;
     }
     let t0 = std::time::Instant::now();
-    let out = generate_or_timeout(
-        &engine,
-        "hello",
-        64,
-        std::time::Duration::from_secs(180),
-    );
+    let out = generate_or_timeout(&engine, "hello", 64, std::time::Duration::from_secs(180));
     assert!(!out.token_ids.is_empty());
     let n = out.token_ids.len() as u64;
     let stats = engine.stats();
@@ -3671,7 +3947,8 @@ fn hip_generate_real_mixed_kquant_gguf_when_path_set() {
         eprintln!("skip hip_generate_real_mixed_kquant_gguf_when_path_set: no HIP device");
         return;
     }
-    let engine = Engine::new(hip_7b_config(path.clone())).expect("mixed K-quant GGUF load must not be Fatal");
+    let engine = Engine::new(hip_7b_config(path.clone()))
+        .expect("mixed K-quant GGUF load must not be Fatal");
     if hip_gpus(&engine).is_empty() {
         eprintln!("skip hip_generate_real_mixed_kquant_gguf_when_path_set: no HIP device");
         return;
@@ -3795,7 +4072,9 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
                 }
             }
             if block == Some(allpaca_gguf::HybridLayerKind::Attention)
-                && file.tensor(&format!("blk.{i}.attn_q_norm.weight")).is_some()
+                && file
+                    .tensor(&format!("blk.{i}.attn_q_norm.weight"))
+                    .is_some()
             {
                 attn_qnorm += 1;
             }
@@ -3958,9 +4237,7 @@ fn hip_rocmfp4_qwen_mtp_draft_provider_when_opt_in() {
         return;
     }
     let file = allpaca_gguf::GgufFile::open(&path).expect("open ROCmFP4");
-    let nextn = file
-        .meta_u32("qwen35.nextn_predict_layers")
-        .unwrap_or(0);
+    let nextn = file.meta_u32("qwen35.nextn_predict_layers").unwrap_or(0);
     if nextn == 0 {
         eprintln!("skip MTP draft soak: GGUF has no nextn_predict_layers");
         return;
@@ -4037,8 +4314,7 @@ fn hip_rocmfp4_qwen_mtp_overnight_acceptance_when_opt_in() {
     }
     let mut cfg = hip_7b_config(path);
     cfg.speculative.enabled = true;
-    cfg.speculative.providers =
-        allpaca_types::DraftProviderKind::parse_list("mtp").expect("mtp");
+    cfg.speculative.providers = allpaca_types::DraftProviderKind::parse_list("mtp").expect("mtp");
     cfg.speculative.min_depth = 2;
     cfg.speculative.max_depth = 6;
     cfg.features.draft_model_speculation = Some(true);
@@ -4118,8 +4394,7 @@ fn hip_rocmfp4_qwen_mtp_essay_n32_keeps_target_words_when_opt_in() {
 
     let mut cfg = hip_7b_config(path);
     cfg.speculative.enabled = true;
-    cfg.speculative.providers =
-        allpaca_types::DraftProviderKind::parse_list("mtp").expect("mtp");
+    cfg.speculative.providers = allpaca_types::DraftProviderKind::parse_list("mtp").expect("mtp");
     cfg.speculative.min_depth = 2;
     cfg.speculative.max_depth = 6;
     cfg.features.draft_model_speculation = Some(true);
@@ -4144,7 +4419,10 @@ fn hip_rocmfp4_qwen_mtp_essay_n32_keeps_target_words_when_opt_in() {
         s.draft_gpu_forwards > 0 || s.draft_tokens_copied > 0,
         "essay MTP must exercise draft; {s:?}"
     );
-    assert_eq!(s.mtp_process_skips, 0, "essay MTP must not skip process(); {s:?}");
+    assert_eq!(
+        s.mtp_process_skips, 0,
+        "essay MTP must not skip process(); {s:?}"
+    );
     if allpaca_hip::device_count() >= 2 {
         assert!(
             s.draft_ahead_hits > 0,
@@ -4200,7 +4478,17 @@ fn hip_gated_delta_step_matches_host_on_tiny_state() {
     let mut state_h = [0.0f32; 4];
     let mut out_h = [0.0f32; 2];
     allpaca_core::deltanet::gated_delta_step_eps(
-        &mut q_h, &mut k_h, &v_h, &decay_h, &beta_h, &mut state_h, &mut out_h, 1, 2, 2, 1e-6,
+        &mut q_h,
+        &mut k_h,
+        &v_h,
+        &decay_h,
+        &beta_h,
+        &mut state_h,
+        &mut out_h,
+        1,
+        2,
+        2,
+        1e-6,
     );
 
     let q0 = [1.0f32, 0.0];
@@ -4215,7 +4503,8 @@ fn hip_gated_delta_step_matches_host_on_tiny_state() {
     let mut state = state0;
     let mut out = out0;
 
-    let blob = allpaca_hip::DeviceWeights::alloc(0, (2 + 2 + 2 + 1 + 1 + 4 + 2) * 4).expect("alloc");
+    let blob =
+        allpaca_hip::DeviceWeights::alloc(0, (2 + 2 + 2 + 1 + 1 + 4 + 2) * 4).expect("alloc");
     let mut off = 0usize;
     let q_d = blob.ptr_at(off) as *mut f32;
     hip.copy_h2d_f32(q_d, &q).unwrap();
@@ -4238,8 +4527,10 @@ fn hip_gated_delta_step_matches_host_on_tiny_state() {
     let out_d = blob.ptr_at(off) as *mut f32;
     hip.copy_h2d_f32(out_d, &out).unwrap();
 
-    hip.gated_delta_step(q_d, k_d, v_d, decay_d, beta_d, state_d, out_d, 1, 2, 2, 1e-6)
-        .expect("device gated_delta_step");
+    hip.gated_delta_step(
+        q_d, k_d, v_d, decay_d, beta_d, state_d, out_d, 1, 2, 2, 1e-6,
+    )
+    .expect("device gated_delta_step");
 
     hip.copy_d2h_f32(out_d, &mut out).unwrap();
     hip.copy_d2h_f32(state_d, &mut state).unwrap();
@@ -4311,7 +4602,12 @@ fn hip_gated_delta_step_matches_host_after_expand_k() {
         1e-6,
     );
 
-    let floats = q_exp.len() + k_exp.len() + v.len() + decay.len() + beta.len() + state_h.len()
+    let floats = q_exp.len()
+        + k_exp.len()
+        + v.len()
+        + decay.len()
+        + beta.len()
+        + state_h.len()
         + out_h.len();
     let blob = allpaca_hip::DeviceWeights::alloc(0, floats * 4).expect("alloc");
     let mut off = 0usize;
@@ -4387,7 +4683,17 @@ fn hip_gated_delta_step_host_matches_host_math() {
     let mut state_h = [0.0f32; 4];
     let mut out_h = [0.0f32; 2];
     allpaca_core::deltanet::gated_delta_step_eps(
-        &mut q_h, &mut k_h, &v, &decay, &beta, &mut state_h, &mut out_h, 1, 2, 2, 1e-6,
+        &mut q_h,
+        &mut k_h,
+        &v,
+        &decay,
+        &beta,
+        &mut state_h,
+        &mut out_h,
+        1,
+        2,
+        2,
+        1e-6,
     );
 
     let mut q = [1.0f32, 0.0];
@@ -4399,7 +4705,12 @@ fn hip_gated_delta_step_host_matches_host_math() {
     )
     .expect("gated_delta_step_host");
     for i in 0..2 {
-        assert!((out[i] - out_h[i]).abs() < 1e-4, "out[{i}]={}/{}", out[i], out_h[i]);
+        assert!(
+            (out[i] - out_h[i]).abs() < 1e-4,
+            "out[{i}]={}/{}",
+            out[i],
+            out_h[i]
+        );
         assert!((q[i] - q_h[i]).abs() < 1e-4, "q[{i}]={}/{}", q[i], q_h[i]);
     }
     for i in 0..4 {
@@ -4432,7 +4743,17 @@ fn hip_gated_delta_resident_two_steps_match_host() {
     let beta1 = [1.0f32];
     let mut out1 = [0.0f32; 2];
     allpaca_core::deltanet::gated_delta_step_eps(
-        &mut q1, &mut k1, &v1, &decay1, &beta1, &mut state_h, &mut out1, 1, 2, 2, 1e-6,
+        &mut q1,
+        &mut k1,
+        &v1,
+        &decay1,
+        &beta1,
+        &mut state_h,
+        &mut out1,
+        1,
+        2,
+        2,
+        1e-6,
     );
     let mut q2 = [0.0f32, 1.0];
     let mut k2 = [0.0f32, 1.0];
@@ -4441,7 +4762,17 @@ fn hip_gated_delta_resident_two_steps_match_host() {
     let beta2 = [0.0f32];
     let mut out2 = [0.0f32; 2];
     allpaca_core::deltanet::gated_delta_step_eps(
-        &mut q2, &mut k2, &v2, &decay2, &beta2, &mut state_h, &mut out2, 1, 2, 2, 1e-6,
+        &mut q2,
+        &mut k2,
+        &v2,
+        &decay2,
+        &beta2,
+        &mut state_h,
+        &mut out2,
+        1,
+        2,
+        2,
+        1e-6,
     );
 
     let mut host_state = [0.0f32; 4];
@@ -4449,7 +4780,18 @@ fn hip_gated_delta_resident_two_steps_match_host() {
     let mut k = [0.0f32, 1.0];
     let mut out = [0.0f32; 2];
     hip.gated_delta_step_resident(
-        req, layer, &mut host_state, &mut q, &mut k, &v1, &decay1, &beta1, &mut out, 1, 2, 2,
+        req,
+        layer,
+        &mut host_state,
+        &mut q,
+        &mut k,
+        &v1,
+        &decay1,
+        &beta1,
+        &mut out,
+        1,
+        2,
+        2,
         1e-6,
     )
     .expect("resident step1");
@@ -4461,7 +4803,18 @@ fn hip_gated_delta_resident_two_steps_match_host() {
     let mut k = [0.0f32, 1.0];
     let mut out = [0.0f32; 2];
     hip.gated_delta_step_resident(
-        req, layer, &mut host_state, &mut q, &mut k, &v2, &decay2, &beta2, &mut out, 1, 2, 2,
+        req,
+        layer,
+        &mut host_state,
+        &mut q,
+        &mut k,
+        &v2,
+        &decay2,
+        &beta2,
+        &mut out,
+        1,
+        2,
+        2,
         1e-6,
     )
     .expect("resident step2");
@@ -5187,7 +5540,10 @@ fn write_tiny_qwen_gdn_gguf_w(path: &std::path::Path, w: f32) {
         "qwen35.feed_forward_length".into(),
         GgufValue::Uint32((dim * 2) as u32),
     );
-    meta.insert("qwen35.ssm.state_size".into(), GgufValue::Uint32(head as u32));
+    meta.insert(
+        "qwen35.ssm.state_size".into(),
+        GgufValue::Uint32(head as u32),
+    );
     meta.insert(
         "qwen35.ssm.inner_size".into(),
         GgufValue::Uint32(inner as u32),
@@ -5362,4 +5718,3 @@ fn hip_tiny_gdn_prefill_d2h_does_not_scale_with_every_token() {
         "GDN host sync must not run every prefill token; d2h_short={d2h_short} d2h_long={d2h_long} extra_prompt={extra_prompt} per_extra={per_extra} stats_short={after_short:?} stats_long={after_long:?}"
     );
 }
-

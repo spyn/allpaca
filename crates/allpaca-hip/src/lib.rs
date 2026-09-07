@@ -217,6 +217,20 @@ mod ffi {
         pub fn allpaca_hip_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_hip_host_malloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn allpaca_hip_host_free(ptr: *mut c_void) -> i32;
+        pub fn allpaca_dstorage_alloc(
+            handle: *mut *mut c_void,
+            hip_ptr: *mut *mut c_void,
+            bytes: usize,
+            device: i32,
+        ) -> i32;
+        pub fn allpaca_dstorage_read(
+            handle: *mut c_void,
+            path: *const u16,
+            file_offset: u64,
+            buffer_offset: u64,
+            bytes: usize,
+        ) -> i32;
+        pub fn allpaca_dstorage_free(handle: *mut c_void) -> i32;
         pub fn allpaca_hip_memcpy(
             dst: *mut c_void,
             src: *const c_void,
@@ -597,6 +611,33 @@ mod ffi {
             decay: *mut f32,
             beta: *mut f32,
             n: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_mamba2_conv_step(
+            xbc: *const f32,
+            kernel: *const f32,
+            bias: *const f32,
+            conv_state: *mut f32,
+            out: *mut f32,
+            conv_dim: i32,
+            conv_kernel: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_mamba2_ssd_step(
+            z: *const f32,
+            xbc: *const f32,
+            dt: *const f32,
+            a: *const f32,
+            d: *const f32,
+            dt_bias: *const f32,
+            norm: *const f32,
+            state: *mut f32,
+            out: *mut f32,
+            d_inner: i32,
+            d_state: i32,
+            n_heads: i32,
+            n_groups: i32,
+            eps: f32,
             stream: *mut c_void,
         ) -> i32;
         #[allow(dead_code)]
@@ -2701,11 +2742,124 @@ fn status(rc: i32, op: &str) -> Result<(), AllpacaError> {
     }
 }
 
+/// Shareable D3D12 buffer imported into HIP and writable by DirectStorage.
+///
+/// Construction is available only when the Windows HIP runtime and the stable
+/// Microsoft DirectStorage 1.3 SDK were found at build time.
+pub struct DirectStorageBuffer {
+    #[allow(dead_code)] // Used only by the Windows DirectStorage build.
+    handle: *mut std::ffi::c_void,
+    ptr: *mut u8,
+    device: i32,
+    bytes: usize,
+}
+
+unsafe impl Send for DirectStorageBuffer {}
+unsafe impl Sync for DirectStorageBuffer {}
+
+impl DirectStorageBuffer {
+    pub fn alloc(device: i32, bytes: usize) -> Result<Self, AllpacaError> {
+        if bytes == 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "DirectStorage buffer must not be empty".into(),
+            )));
+        }
+        #[cfg(all(windows, feature = "hip", allpaca_hip_runtime, allpaca_direct_storage))]
+        {
+            let mut handle = std::ptr::null_mut();
+            let mut ptr = std::ptr::null_mut();
+            let rc = unsafe { ffi::allpaca_dstorage_alloc(&mut handle, &mut ptr, bytes, device) };
+            if rc != ALLPACA_OK || handle.is_null() || ptr.is_null() {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    format!("D3D12/HIP external-memory allocation failed on device {device} rc={rc}"),
+                )));
+            }
+            ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+            Ok(Self { handle, ptr: ptr.cast(), device, bytes })
+        }
+        #[cfg(not(all(windows, feature = "hip", allpaca_hip_runtime, allpaca_direct_storage)))]
+        {
+            let _ = device;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "DirectStorage D3D12/HIP bridge unavailable; use host staging".into(),
+            )))
+        }
+    }
+
+    pub fn read_file(
+        &self,
+        path: &std::path::Path,
+        file_offset: u64,
+        buffer_offset: usize,
+        bytes: usize,
+    ) -> Result<(), AllpacaError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if buffer_offset.saturating_add(bytes) > self.bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("DirectStorage buffer overflow: off={buffer_offset} n={bytes} cap={}", self.bytes),
+            )));
+        }
+        #[cfg(all(windows, feature = "hip", allpaca_hip_runtime, allpaca_direct_storage))]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let rc = unsafe {
+                ffi::allpaca_dstorage_read(
+                    self.handle,
+                    wide.as_ptr(),
+                    file_offset,
+                    buffer_offset as u64,
+                    bytes,
+                )
+            };
+            status(rc, "DirectStorage file-to-D3D12 DMA")
+        }
+        #[cfg(not(all(windows, feature = "hip", allpaca_hip_runtime, allpaca_direct_storage)))]
+        {
+            let _ = (path, file_offset);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "DirectStorage D3D12/HIP bridge unavailable; use host staging".into(),
+            )))
+        }
+    }
+
+    pub fn copy_d2h(&self, offset: usize, dest: &mut [u8]) -> Result<(), AllpacaError> {
+        if offset.saturating_add(dest.len()) > self.bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "DirectStorage D2H readback overflow".into(),
+            )));
+        }
+        set_device(self.device)?;
+        memcpy(dest.as_mut_ptr(), unsafe { self.ptr.add(offset) }, dest.len(), MEMCPY_D2H)
+    }
+
+    pub fn byte_ptr_at(&self, offset: usize) -> *const u8 {
+        unsafe { self.ptr.add(offset) }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for DirectStorageBuffer {
+    fn drop(&mut self) {
+        #[cfg(all(windows, feature = "hip", allpaca_hip_runtime, allpaca_direct_storage))]
+        unsafe {
+            let _ = ffi::allpaca_dstorage_free(self.handle);
+            ALLOCATED_BYTES.fetch_sub(self.bytes as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Packed weight tensors uploaded once via H2D. GEMM must use [`Self::ptr`] — no per-op copy.
 pub struct DeviceWeights {
     device: i32,
     ptr: *mut u8,
     bytes: usize,
+    direct_storage: Option<DirectStorageBuffer>,
 }
 
 unsafe impl Send for DeviceWeights {}
@@ -2718,8 +2872,13 @@ impl DeviceWeights {
                 "empty weight upload".into(),
             )));
         }
+        #[cfg(all(windows, feature = "hip", allpaca_hip_runtime, allpaca_direct_storage))]
+        if let Ok(direct_storage) = DirectStorageBuffer::alloc(device, bytes) {
+            let ptr = direct_storage.byte_ptr_at(0) as *mut u8;
+            return Ok(Self { device, ptr, bytes, direct_storage: Some(direct_storage) });
+        }
         let ptr = device_malloc(bytes, device)?;
-        Ok(Self { device, ptr, bytes })
+        Ok(Self { device, ptr, bytes, direct_storage: None })
     }
 
     /// Copy host bytes into this blob at `offset`. Caller must keep the region unused by GEMM.
@@ -2847,6 +3006,22 @@ impl DeviceWeights {
         unsafe { self.ptr.add(byte_offset) }
     }
 
+    /// Fill a region directly from a file when this allocation is backed by an
+    /// imported D3D12 resource. Returns `false` for ordinary `hipMalloc`.
+    pub fn read_file_direct(
+        &self,
+        path: &std::path::Path,
+        file_offset: u64,
+        byte_offset: usize,
+        bytes: usize,
+    ) -> Result<bool, AllpacaError> {
+        let Some(buffer) = &self.direct_storage else {
+            return Ok(false);
+        };
+        buffer.read_file(path, file_offset, byte_offset, bytes)?;
+        Ok(true)
+    }
+
     /// Packed native-quant / F32 byte slices uploaded once via H2D.
     pub fn upload_bytes(device: i32, parts: &[&[u8]]) -> Result<Self, AllpacaError> {
         let bytes: usize = parts.iter().map(|t| t.len()).sum();
@@ -2855,23 +3030,21 @@ impl DeviceWeights {
                 "empty weight upload".into(),
             )));
         }
-        let ptr = device_malloc(bytes, device)?;
-        set_device(device)?;
+        let this = Self::alloc(device, bytes)?;
         let mut off = 0usize;
         for t in parts {
-            if let Err(e) = memcpy(unsafe { ptr.add(off) }, t.as_ptr(), t.len(), MEMCPY_H2D) {
-                device_free(ptr, bytes);
-                return Err(e);
-            }
+            this.copy_h2d(off, t)?;
             off += t.len();
         }
-        Ok(Self { device, ptr, bytes })
+        Ok(this)
     }
 }
 
 impl Drop for DeviceWeights {
     fn drop(&mut self) {
-        device_free(self.ptr, self.bytes);
+        if self.direct_storage.is_none() {
+            device_free(self.ptr, self.bytes);
+        }
     }
 }
 
@@ -3003,6 +3176,7 @@ struct GdnLayerResident {
     conv_n: usize,
     seeded: bool,
     dirty: bool,
+    ssm: bool,
 }
 
 /// Per-layer GDN extras (conv / dt / a / norm) uploaded once on the Target workspace.
@@ -3010,6 +3184,15 @@ struct GdnWeightResident {
     conv: DeviceWeights,
     dt: DeviceWeights,
     a: DeviceWeights,
+    norm: DeviceWeights,
+}
+
+struct Mamba2WeightResident {
+    conv: DeviceWeights,
+    bias: Option<DeviceWeights>,
+    dt: DeviceWeights,
+    a: DeviceWeights,
+    d: DeviceWeights,
     norm: DeviceWeights,
 }
 
@@ -3023,6 +3206,7 @@ pub struct HipWorkspace {
     gdn: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
     gdn_snap: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
     gdn_w: Mutex<std::collections::HashMap<usize, GdnWeightResident>>,
+    mamba2_w: Mutex<std::collections::HashMap<usize, Mamba2WeightResident>>,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
     profiling: AtomicU64,
@@ -3057,6 +3241,7 @@ impl HipWorkspace {
             gdn: Mutex::new(std::collections::HashMap::new()),
             gdn_snap: Mutex::new(std::collections::HashMap::new()),
             gdn_w: Mutex::new(std::collections::HashMap::new()),
+            mamba2_w: Mutex::new(std::collections::HashMap::new()),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
             profiling: AtomicU64::new(0),
@@ -3103,6 +3288,14 @@ impl HipWorkspace {
         if let Ok(g) = self.gdn_w.lock() {
             for w in g.values() {
                 n += w.conv.bytes() + w.dt.bytes() + w.a.bytes() + w.norm.bytes();
+            }
+        }
+        if let Ok(g) = self.mamba2_w.lock() {
+            for w in g.values() {
+                n += w.conv.bytes() + w.dt.bytes() + w.a.bytes() + w.d.bytes() + w.norm.bytes();
+                if let Some(bias) = w.bias.as_ref() {
+                    n += bias.bytes();
+                }
             }
         }
         n
@@ -4544,7 +4737,7 @@ impl HipWorkspace {
         &self,
         request_id: u64,
         from_snap: bool,
-    ) -> Result<Vec<(usize, usize, usize, bool)>, AllpacaError> {
+    ) -> Result<Vec<(usize, usize, usize, bool, bool)>, AllpacaError> {
         let g = if from_snap {
             self.gdn_snap.lock().map_err(|_| Self::gdn_mutex_err())?
         } else {
@@ -4552,14 +4745,14 @@ impl HipWorkspace {
         };
         Ok(g.iter()
             .filter(|((rid, _), _)| *rid == request_id)
-            .map(|((_, layer), slot)| (*layer, slot.state_n, slot.conv_n, slot.conv.is_some()))
+            .map(|((_, layer), slot)| (*layer, slot.state_n, slot.conv_n, slot.conv.is_some(), slot.ssm))
             .collect())
     }
 
     fn gdn_ensure_slots(
         &self,
         request_id: u64,
-        layers: &[(usize, usize, usize, bool)],
+        layers: &[(usize, usize, usize, bool, bool)],
         into_snap: bool,
     ) -> Result<(), AllpacaError> {
         let mut g = if into_snap {
@@ -4567,7 +4760,7 @@ impl HipWorkspace {
         } else {
             self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?
         };
-        for &(layer, state_n, conv_n, has_conv) in layers {
+        for &(layer, state_n, conv_n, has_conv, is_ssm) in layers {
             let key = (request_id, layer);
             let reuse = g.get(&key).is_some_and(|s| {
                 s.state_n == state_n && s.conv_n == conv_n && s.conv.is_some() == has_conv
@@ -4590,6 +4783,7 @@ impl HipWorkspace {
                     conv_n,
                     seeded: true,
                     dirty: false,
+                    ssm: is_ssm,
                 },
             );
         }
@@ -4599,11 +4793,11 @@ impl HipWorkspace {
     fn gdn_copy_slots(
         &self,
         request_id: u64,
-        layers: &[(usize, usize, usize, bool)],
+        layers: &[(usize, usize, usize, bool, bool)],
         snap_to_live: bool,
     ) -> Result<(), AllpacaError> {
         self.bind()?;
-        for &(layer, state_n, conv_n, _) in layers {
+        for &(layer, state_n, conv_n, _, _) in layers {
             let (src_s, src_c, dst_s, dst_c) = {
                 let live = self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?;
                 let snap = self.gdn_snap.lock().map_err(|_| Self::gdn_mutex_err())?;
@@ -4673,7 +4867,7 @@ impl HipWorkspace {
         })?;
         self.bind()?;
         for ((rid, layer), slot) in g.iter_mut() {
-            if *rid != request_id || !slot.dirty {
+            if *rid != request_id || slot.ssm || !slot.dirty {
                 continue;
             }
             if *layer >= states.len() {
@@ -4715,7 +4909,7 @@ impl HipWorkspace {
         })?;
         self.bind()?;
         for ((rid, layer), slot) in g.iter_mut() {
-            if *rid != request_id {
+            if *rid != request_id || slot.ssm {
                 continue;
             }
             let Some(conv) = slot.conv.as_ref() else {
@@ -4737,6 +4931,224 @@ impl HipWorkspace {
             self.add_d2h(slot.conv_n * 4);
         }
         Ok(())
+    }
+
+    pub fn mamba2_sync_request_to_host(
+        &self,
+        request_id: u64,
+        states: &mut [Vec<f32>],
+        convs: &mut [Vec<f32>],
+    ) -> Result<(), AllpacaError> {
+        let mut g = self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?;
+        self.bind()?;
+        for ((rid, layer), slot) in g.iter_mut() {
+            if *rid != request_id || !slot.ssm || !slot.dirty {
+                continue;
+            }
+            if *layer < states.len() {
+                let host = &mut states[*layer];
+                if host.len() != slot.state_n {
+                    *host = vec![0.0; slot.state_n];
+                }
+                memcpy(
+                    host.as_mut_ptr().cast(),
+                    slot.state.ptr_at(0).cast(),
+                    slot.state_n * 4,
+                    MEMCPY_D2H,
+                )?;
+                self.add_d2h(slot.state_n * 4);
+            }
+            if let Some(conv) = slot.conv.as_ref() {
+                if *layer < convs.len() && slot.conv_n > 0 {
+                    let host = &mut convs[*layer];
+                    if host.len() != slot.conv_n {
+                        *host = vec![0.0; slot.conv_n];
+                    }
+                    memcpy(
+                        host.as_mut_ptr().cast(),
+                        conv.ptr_at(0).cast(),
+                        slot.conv_n * 4,
+                        MEMCPY_D2H,
+                    )?;
+                    self.add_d2h(slot.conv_n * 4);
+                }
+            }
+            slot.dirty = false;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_mamba2_weights(
+        &self,
+        layer: usize,
+        conv: &[f32],
+        bias: &[f32],
+        dt_bias: &[f32],
+        a: &[f32],
+        d: &[f32],
+        norm: &[f32],
+    ) -> Result<(*const f32, *const f32, *const f32, *const f32, *const f32, *const f32), AllpacaError> {
+        if conv.is_empty() || dt_bias.is_empty() || a.is_empty() || d.is_empty() || norm.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty Mamba-2 extras".into(),
+            )));
+        }
+        self.bind()?;
+        {
+            let g = self.mamba2_w.lock().map_err(|_| Self::gdn_mutex_err())?;
+            if let Some(w) = g.get(&layer) {
+                return Ok((
+                    w.conv.ptr_at(0),
+                    w.bias.as_ref().map(|v| v.ptr_at(0)).unwrap_or(std::ptr::null()),
+                    w.dt.ptr_at(0),
+                    w.a.ptr_at(0),
+                    w.d.ptr_at(0),
+                    w.norm.ptr_at(0),
+                ));
+            }
+        }
+        let upload = |values: &[f32]| -> Result<DeviceWeights, AllpacaError> {
+            let allocation = DeviceWeights::alloc(self.device, values.len().max(1) * 4)?;
+            self.copy_h2d_f32(allocation.ptr_at(0) as *mut f32, values)?;
+            Ok(allocation)
+        };
+        let cw = upload(conv)?;
+        let bb = if bias.is_empty() { None } else { Some(upload(bias)?) };
+        let dt = upload(dt_bias)?;
+        let aa = upload(a)?;
+        let dd = upload(d)?;
+        let nn = upload(norm)?;
+        let ptrs = (
+            cw.ptr_at(0),
+            bb.as_ref().map(|v| v.ptr_at(0)).unwrap_or(std::ptr::null()),
+            dt.ptr_at(0),
+            aa.ptr_at(0),
+            dd.ptr_at(0),
+            nn.ptr_at(0),
+        );
+        self.mamba2_w.lock().map_err(|_| Self::gdn_mutex_err())?.insert(
+            layer,
+            Mamba2WeightResident { conv: cw, bias: bb, dt, a: aa, d: dd, norm: nn },
+        );
+        Ok(ptrs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_decode_step_resident(
+        &self,
+        request_id: u64,
+        layer: usize,
+        host_state: &mut [f32],
+        host_conv: &mut [f32],
+        projected: *const f32,
+        conv_w: *const f32,
+        conv_bias: *const f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        d: *const f32,
+        norm: *const f32,
+        out: *mut f32,
+        d_inner: i32,
+        d_state: i32,
+        n_heads: i32,
+        n_groups: i32,
+        conv_kernel: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if projected.is_null() || conv_w.is_null() || dt_bias.is_null() || a.is_null()
+            || d.is_null() || norm.is_null() || out.is_null() || d_inner <= 0 || d_state <= 0
+            || n_heads <= 0 || n_groups <= 0 || conv_kernel <= 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid mamba2_decode_step_resident".into(),
+            )));
+        }
+        let inner = d_inner as usize;
+        let state_size = d_state as usize;
+        let heads = n_heads as usize;
+        let groups = n_groups as usize;
+        let conv_dim = inner + 2 * groups * state_size;
+        if host_state.len() != inner * state_size
+            || host_conv.len() != (conv_kernel as usize - 1) * conv_dim
+            || inner % heads != 0
+            || heads % groups != 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Mamba-2 state/layout mismatch".into(),
+            )));
+        }
+        self.bind()?;
+        let key = (request_id, layer);
+        let (device_state, device_conv, seed) = {
+            let mut slots = self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?;
+            if slots.get(&key).is_none_or(|slot| {
+                !slot.ssm || slot.state_n != host_state.len() || slot.conv_n != host_conv.len()
+            }) {
+                slots.insert(key, GdnLayerResident {
+                    state: DeviceWeights::alloc(self.device, host_state.len().max(1) * 4)?,
+                    state_n: host_state.len(),
+                    conv: Some(DeviceWeights::alloc(self.device, host_conv.len().max(1) * 4)?),
+                    conv_n: host_conv.len(),
+                    seeded: false,
+                    dirty: false,
+                    ssm: true,
+                });
+            }
+            let slot = slots.get_mut(&key).expect("Mamba-2 slot present");
+            (
+                slot.state.ptr_at(0) as *mut f32,
+                slot.conv.as_ref().expect("Mamba-2 conv present").ptr_at(0) as *mut f32,
+                !slot.seeded,
+            )
+        };
+        if seed {
+            self.copy_h2d_f32(device_state, host_state)?;
+            self.copy_h2d_f32(device_conv, host_conv)?;
+        }
+        let need = conv_dim * 4;
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(format!(
+                "Mamba-2 scratch need={need} available={}",
+                self.scratch_bytes
+            ))));
+        }
+        let xbc_raw = unsafe { projected.add(inner) };
+        let dt = unsafe { projected.add(inner + conv_dim) };
+        let xbc = self.scratch.cast::<f32>();
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                status(unsafe {
+                    ffi::allpaca_mamba2_conv_step(
+                        xbc_raw, conv_w, conv_bias, device_conv, xbc, conv_dim as i32,
+                        conv_kernel, std::ptr::null_mut(),
+                    )
+                }, "mamba2_conv_step")
+            })?;
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                status(unsafe {
+                    ffi::allpaca_mamba2_ssd_step(
+                        projected, xbc, dt, a, d, dt_bias, norm, device_state, out, d_inner,
+                        d_state, n_heads, n_groups, eps, std::ptr::null_mut(),
+                    )
+                }, "mamba2_ssd_step")
+            })?;
+            if let Ok(mut slots) = self.gdn.lock() {
+                if let Some(slot) = slots.get_mut(&key) {
+                    slot.seeded = true;
+                    slot.dirty = true;
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (conv_bias, eps, xbc_raw, dt, xbc);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP Mamba-2 unavailable".into(),
+            )))
+        }
     }
 
     /// Upload GDN extras once per layer on this workspace (shared across requests).
@@ -4864,6 +5276,7 @@ impl HipWorkspace {
                         conv_n: 0,
                         seeded: false,
                         dirty: false,
+                        ssm: false,
                     },
                 );
             }
@@ -4995,6 +5408,7 @@ impl HipWorkspace {
                         conv_n: host_conv.len(),
                         seeded: false,
                         dirty: false,
+                        ssm: false,
                     },
                 );
             } else if let Some(slot) = g.get_mut(&key) {
@@ -6044,6 +6458,69 @@ impl Drop for HipWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(windows, feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn direct_storage_reads_file_into_hip_visible_d3d12_buffer() {
+        use std::io::Write;
+
+        const BYTES: usize = 64 * 1024;
+        let Some(device) = enumerate_devices().first().map(|d| d.id) else { return };
+        let path = std::env::temp_dir().join(format!(
+            "allpaca-dstorage-dma-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let payload: Vec<u8> = (0..BYTES).map(|i| (i % 251) as u8).collect();
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&payload).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let buffer = DirectStorageBuffer::alloc(device, BYTES)
+            .expect("D3D12 resource imported into HIP");
+        buffer.read_file(&path, 0, 0, BYTES)
+            .expect("DirectStorage NVMe-to-D3D12 request");
+        let mut readback = vec![0u8; BYTES];
+        buffer.copy_d2h(0, &mut readback)
+            .expect("HIP must read the imported D3D12 resource");
+        assert_eq!(readback, payload);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(all(windows, feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn device_weights_accepts_direct_storage_file_fill() {
+        use std::io::Write;
+
+        const BYTES: usize = 64 * 1024;
+        let Some(device) = enumerate_devices().first().map(|d| d.id) else { return };
+        let path = std::env::temp_dir().join(format!(
+            "allpaca-weight-dma-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let payload = vec![0xA5; BYTES];
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&payload).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let weights = DeviceWeights::alloc(device, BYTES).expect("device weights");
+        assert!(
+            weights.read_file_direct(&path, 0, 0, BYTES)
+                .expect("DirectStorage weight fill"),
+            "Windows HIP weights should use the D3D12-imported allocation"
+        );
+        let mut readback = vec![0u8; BYTES];
+        memcpy(readback.as_mut_ptr(), weights.byte_ptr_at(0), BYTES, MEMCPY_D2H).unwrap();
+        assert_eq!(readback, payload);
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn stage_q8_0_blocks_keeps_scale_and_qs() {

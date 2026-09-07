@@ -1,6 +1,19 @@
 #include "../include/allpaca_kernels.h"
 #include <stdint.h>
 
+#if defined(_WIN32) && defined(ALLPACA_HAS_DIRECTSTORAGE)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <d3d12.h>
+#include <dstorage.h>
+#include <dxgi1_6.h>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <wrl/client.h>
+#endif
+
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
 #define ALLPACA_HAS_HIP 1
@@ -2040,6 +2053,263 @@ extern "C" int allpaca_hip_host_free(void *ptr) {
     return hip_status(hipHostFree(ptr));
 }
 
+#if defined(_WIN32) && defined(ALLPACA_HAS_DIRECTSTORAGE)
+using Microsoft::WRL::ComPtr;
+
+struct allpaca_dstorage_buffer {
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12Resource> resource;
+    ComPtr<ID3D12Fence> fence;
+    ComPtr<IDStorageFactory> factory;
+    ComPtr<IDStorageQueue> queue;
+    ComPtr<IDStorageStatusArray> status;
+    hipExternalMemory_t external_memory = nullptr;
+    hipExternalSemaphore_t external_semaphore = nullptr;
+    void *hip_ptr = nullptr;
+    size_t bytes = 0;
+    uint64_t fence_value = 0;
+    std::mutex lock;
+};
+
+static void destroy_dstorage_buffer(allpaca_dstorage_buffer *buffer) {
+    if (!buffer) {
+        return;
+    }
+    (void)hipStreamSynchronize(nullptr);
+    if (buffer->hip_ptr) {
+        (void)hipFree(buffer->hip_ptr);
+    }
+    if (buffer->external_semaphore) {
+        (void)hipDestroyExternalSemaphore(buffer->external_semaphore);
+    }
+    if (buffer->external_memory) {
+        (void)hipDestroyExternalMemory(buffer->external_memory);
+    }
+    delete buffer;
+}
+
+extern "C" int allpaca_dstorage_alloc(void **handle, void **hip_ptr, size_t bytes,
+                                       int32_t device_id) {
+    if (!handle || !hip_ptr || bytes == 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    *handle = nullptr;
+    *hip_ptr = nullptr;
+    if (hipSetDevice(device_id) != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+
+    ComPtr<IDXGIFactory6> dxgi;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi)))) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    for (UINT index = 0;; ++index) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (dxgi->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        DXGI_ADAPTER_DESC1 adapter_desc{};
+        if (FAILED(adapter->GetDesc1(&adapter_desc)) ||
+            (adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+            continue;
+        }
+
+        ComPtr<ID3D12Device> d3d_device;
+        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0,
+                                     IID_PPV_ARGS(&d3d_device)))) {
+            continue;
+        }
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC resource_desc{};
+        resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        resource_desc.Width = static_cast<UINT64>(bytes);
+        resource_desc.Height = 1;
+        resource_desc.DepthOrArraySize = 1;
+        resource_desc.MipLevels = 1;
+        resource_desc.SampleDesc.Count = 1;
+        resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ComPtr<ID3D12Resource> resource;
+        if (FAILED(d3d_device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_SHARED, &resource_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(&resource)))) {
+            continue;
+        }
+
+        HANDLE resource_handle = nullptr;
+        if (FAILED(d3d_device->CreateSharedHandle(resource.Get(), nullptr, GENERIC_ALL, nullptr,
+                                                  &resource_handle))) {
+            continue;
+        }
+        hipExternalMemoryHandleDesc memory_desc{};
+        memory_desc.type = hipExternalMemoryHandleTypeD3D12Resource;
+        memory_desc.handle.win32.handle = resource_handle;
+        memory_desc.size = static_cast<unsigned long long>(bytes);
+        hipExternalMemory_t external_memory = nullptr;
+        hipError_t hip_result = hipImportExternalMemory(&external_memory, &memory_desc);
+        CloseHandle(resource_handle);
+        if (hip_result != hipSuccess) {
+            (void)hipGetLastError();
+            continue;
+        }
+        hipExternalMemoryBufferDesc buffer_desc{};
+        buffer_desc.size = static_cast<unsigned long long>(bytes);
+        void *mapped = nullptr;
+        hip_result = hipExternalMemoryGetMappedBuffer(&mapped, external_memory, &buffer_desc);
+        if (hip_result != hipSuccess || !mapped) {
+            (void)hipDestroyExternalMemory(external_memory);
+            (void)hipGetLastError();
+            continue;
+        }
+
+        ComPtr<ID3D12Fence> fence;
+        if (FAILED(d3d_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence)))) {
+            (void)hipFree(mapped);
+            (void)hipDestroyExternalMemory(external_memory);
+            continue;
+        }
+        HANDLE fence_handle = nullptr;
+        if (FAILED(d3d_device->CreateSharedHandle(fence.Get(), nullptr, GENERIC_ALL, nullptr,
+                                                  &fence_handle))) {
+            (void)hipFree(mapped);
+            (void)hipDestroyExternalMemory(external_memory);
+            continue;
+        }
+        hipExternalSemaphoreHandleDesc semaphore_desc{};
+        semaphore_desc.type = hipExternalSemaphoreHandleTypeD3D12Fence;
+        semaphore_desc.handle.win32.handle = fence_handle;
+        hipExternalSemaphore_t external_semaphore = nullptr;
+        hip_result = hipImportExternalSemaphore(&external_semaphore, &semaphore_desc);
+        CloseHandle(fence_handle);
+        if (hip_result != hipSuccess) {
+            (void)hipFree(mapped);
+            (void)hipDestroyExternalMemory(external_memory);
+            (void)hipGetLastError();
+            continue;
+        }
+
+        ComPtr<IDStorageFactory> factory;
+        if (FAILED(DStorageGetFactory(IID_PPV_ARGS(&factory)))) {
+            (void)hipDestroyExternalSemaphore(external_semaphore);
+            (void)hipFree(mapped);
+            (void)hipDestroyExternalMemory(external_memory);
+            continue;
+        }
+        DSTORAGE_QUEUE_DESC queue_desc{};
+        queue_desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        queue_desc.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
+        queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
+        queue_desc.Name = "allpaca NVMe-to-VRAM";
+        queue_desc.Device = d3d_device.Get();
+        ComPtr<IDStorageQueue> queue;
+        if (FAILED(factory->CreateQueue(&queue_desc, IID_PPV_ARGS(&queue)))) {
+            (void)hipDestroyExternalSemaphore(external_semaphore);
+            (void)hipFree(mapped);
+            (void)hipDestroyExternalMemory(external_memory);
+            continue;
+        }
+        ComPtr<IDStorageStatusArray> status;
+        if (FAILED(factory->CreateStatusArray(1, "allpaca DirectStorage completion",
+                                              IID_PPV_ARGS(&status)))) {
+            (void)hipDestroyExternalSemaphore(external_semaphore);
+            (void)hipFree(mapped);
+            (void)hipDestroyExternalMemory(external_memory);
+            continue;
+        }
+
+        auto *result = new (std::nothrow) allpaca_dstorage_buffer();
+        if (!result) {
+            (void)hipDestroyExternalSemaphore(external_semaphore);
+            (void)hipFree(mapped);
+            (void)hipDestroyExternalMemory(external_memory);
+            return ALLPACA_ERR_DEVICE;
+        }
+        result->device = d3d_device;
+        result->resource = resource;
+        result->fence = fence;
+        result->factory = factory;
+        result->queue = queue;
+        result->status = status;
+        result->external_memory = external_memory;
+        result->external_semaphore = external_semaphore;
+        result->hip_ptr = mapped;
+        result->bytes = bytes;
+        *handle = result;
+        *hip_ptr = mapped;
+        return ALLPACA_OK;
+    }
+    return ALLPACA_ERR_DEVICE;
+}
+
+extern "C" int allpaca_dstorage_read(void *handle, const uint16_t *path, uint64_t file_offset,
+                                      uint64_t buffer_offset, size_t bytes) {
+    auto *buffer = static_cast<allpaca_dstorage_buffer *>(handle);
+    if (!buffer || !path || bytes == 0 || bytes > std::numeric_limits<UINT32>::max() ||
+        buffer_offset > buffer->bytes || bytes > buffer->bytes - buffer_offset) {
+        return ALLPACA_ERR_INVALID;
+    }
+    std::lock_guard<std::mutex> guard(buffer->lock);
+    ComPtr<IDStorageFile> file;
+    if (FAILED(buffer->factory->OpenFile(reinterpret_cast<const WCHAR *>(path),
+                                         IID_PPV_ARGS(&file)))) {
+        return ALLPACA_ERR_DEVICE;
+    }
+
+    DSTORAGE_REQUEST request{};
+    request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+    request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+    request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+    request.Source.File.Source = file.Get();
+    request.Source.File.Offset = file_offset;
+    request.Source.File.Size = static_cast<UINT32>(bytes);
+    request.Destination.Buffer.Resource = buffer->resource.Get();
+    request.Destination.Buffer.Offset = buffer_offset;
+    request.Destination.Buffer.Size = static_cast<UINT32>(bytes);
+    request.UncompressedSize = static_cast<UINT32>(bytes);
+    request.Name = "allpaca expert fill";
+
+    const uint64_t fence_value = ++buffer->fence_value;
+    buffer->queue->EnqueueRequest(&request);
+    buffer->queue->EnqueueSignal(buffer->fence.Get(), fence_value);
+    buffer->queue->EnqueueStatus(buffer->status.Get(), 0);
+    buffer->queue->Submit();
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+    while (!buffer->status->IsComplete(0)) {
+        if (GetTickCount64() >= deadline) {
+            return ALLPACA_ERR_DEVICE;
+        }
+        Sleep(0);
+    }
+    if (FAILED(buffer->status->GetHResult(0))) {
+        return ALLPACA_ERR_DEVICE;
+    }
+
+    hipExternalSemaphoreWaitParams wait{};
+    wait.params.fence.value = fence_value;
+    if (hipWaitExternalSemaphoresAsync(&buffer->external_semaphore, &wait, 1, nullptr) !=
+        hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_dstorage_free(void *handle) {
+    destroy_dstorage_buffer(static_cast<allpaca_dstorage_buffer *>(handle));
+    return ALLPACA_OK;
+}
+#else
+extern "C" int allpaca_dstorage_alloc(void **, void **, size_t, int32_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+extern "C" int allpaca_dstorage_read(void *, const uint16_t *, uint64_t, uint64_t, size_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+extern "C" int allpaca_dstorage_free(void *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+#endif
+
 static hipMemcpyKind to_hip_memcpy_kind(int32_t kind) {
     switch (kind) {
     case ALLPACA_MEMCPY_H2D:
@@ -2750,6 +3020,104 @@ extern "C" int allpaca_gdn_decay_beta(const float *alpha, const float *dt_bias, 
     hipLaunchKernelGGL(gdn_decay_beta_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), alpha, dt_bias, a,
                        decay, beta, n);
+    return hip_status(hipGetLastError());
+}
+
+__global__ void mamba2_ssd_kernel(const float *z, const float *xbc, const float *dt,
+                                  const float *a, const float *d, const float *dt_bias,
+                                  const float *norm, float *state, float *out, int d_inner,
+                                  int d_state, int n_heads, int n_groups, float eps) {
+    const int group = static_cast<int>(blockIdx.x);
+    const int group_width = d_inner / n_groups;
+    const int head_dim = d_inner / n_heads;
+    const int heads_per_group = n_heads / n_groups;
+    const int group_start = group * group_width;
+    const int b_off = d_inner + group * d_state;
+    const int c_off = d_inner + n_groups * d_state + group * d_state;
+    __shared__ float sum_sq;
+    if (threadIdx.x == 0) {
+        sum_sq = 0.0f;
+    }
+    __syncthreads();
+    for (int local = static_cast<int>(threadIdx.x); local < group_width;
+         local += static_cast<int>(blockDim.x)) {
+        const int channel = group_start + local;
+        const int head = group * heads_per_group + local / head_dim;
+        const float delta = gdn_softplus(dt[head] + dt_bias[head]);
+        const float decay = expf(delta * a[head]);
+        float acc = 0.0f;
+        float *row = state + channel * d_state;
+        for (int n = 0; n < d_state; ++n) {
+            const float value = decay * row[n] + delta * xbc[b_off + n] * xbc[channel];
+            row[n] = value;
+            acc += xbc[c_off + n] * value;
+        }
+        const float gated = (acc + d[head] * xbc[channel]) * gdn_silu(z[channel]);
+        out[channel] = gated;
+        atomicAdd(&sum_sq, gated * gated);
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sum_sq / static_cast<float>(group_width) + eps);
+    for (int local = static_cast<int>(threadIdx.x); local < group_width;
+         local += static_cast<int>(blockDim.x)) {
+        const int channel = group_start + local;
+        out[channel] *= inv * norm[channel];
+    }
+}
+
+__global__ void mamba2_conv_compute_kernel(const float *x, const float *kernel,
+                                           const float *bias, const float *conv_state,
+                                           float *out, int conv_dim, int conv_kernel) {
+    const int channel = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= conv_dim) {
+        return;
+    }
+    const int hist = conv_kernel - 1;
+    float acc = bias ? bias[channel] : 0.0f;
+    for (int k = 0; k < hist; ++k) {
+        acc += kernel[k + channel * conv_kernel] * conv_state[k * conv_dim + channel];
+    }
+    acc += kernel[hist + channel * conv_kernel] * x[channel];
+    out[channel] = gdn_silu(acc);
+}
+
+extern "C" int allpaca_mamba2_conv_step(const float *xbc, const float *kernel,
+                                        const float *bias, float *conv_state, float *out,
+                                        int32_t conv_dim, int32_t conv_kernel,
+                                        allpaca_stream_t stream) {
+    if (!xbc || !kernel || !conv_state || !out || conv_dim <= 0 || conv_kernel <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (conv_dim + threads - 1) / threads;
+    hipLaunchKernelGGL(mamba2_conv_compute_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), xbc, kernel,
+                       bias, conv_state, out, conv_dim, conv_kernel);
+    int rc = hip_status(hipGetLastError());
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    hipLaunchKernelGGL(gdn_conv1d_shift_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), xbc, conv_state,
+                       conv_dim, conv_kernel);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_mamba2_ssd_step(const float *z, const float *xbc, const float *dt,
+                                       const float *a, const float *d, const float *dt_bias,
+                                       const float *norm, float *state, float *out,
+                                       int32_t d_inner, int32_t d_state, int32_t n_heads,
+                                       int32_t n_groups, float eps, allpaca_stream_t stream) {
+    if (!z || !xbc || !dt || !a || !d || !dt_bias || !norm || !state || !out ||
+        d_inner <= 0 || d_state <= 0 || n_heads <= 0 || n_groups <= 0 ||
+        d_inner % n_heads != 0 || n_heads % n_groups != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(mamba2_ssd_kernel, dim3(static_cast<unsigned>(n_groups)), dim3(256), 0,
+                       as_stream(stream), z, xbc, dt, a, d, dt_bias, norm, state, out, d_inner,
+                       d_state, n_heads, n_groups, eps);
     return hip_status(hipGetLastError());
 }
 
@@ -3540,6 +3908,18 @@ extern "C" int allpaca_expand_k_heads(const float *, float *, int32_t, int32_t, 
 
 extern "C" int allpaca_gdn_decay_beta(const float *, const float *, const float *, float *, float *,
                                       int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_mamba2_conv_step(const float *, const float *, const float *, float *,
+                                         float *, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_mamba2_ssd_step(const float *, const float *, const float *, const float *,
+                                        const float *, const float *, const float *, float *,
+                                        float *, int32_t, int32_t, int32_t, int32_t, float,
+                                        allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

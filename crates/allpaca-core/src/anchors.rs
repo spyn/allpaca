@@ -17,6 +17,8 @@ pub struct RecurrentState {
     pub layers: Vec<Vec<f32>>,
     /// Per-layer selective-SSM hidden (`d_model * d_state`); empty when unused.
     pub ssm_h: Vec<Vec<f32>>,
+    /// Per-layer Mamba-2 causal-convolution history.
+    pub ssm_conv: Vec<Vec<f32>>,
     /// Per-layer Gated DeltaNet state `[n_v * head_v * head_k]`.
     pub gdn_state: Vec<Vec<f32>>,
     /// Per-layer conv1d history `[(k-1) * qkv_dim]`.
@@ -28,18 +30,24 @@ impl RecurrentState {
         Self {
             layers: vec![vec![0.0; dim]; n_layers],
             ssm_h: vec![Vec::new(); n_layers],
+            ssm_conv: vec![Vec::new(); n_layers],
             gdn_state: vec![Vec::new(); n_layers],
             gdn_conv: vec![Vec::new(); n_layers],
         }
     }
 
-    pub fn ensure_ssm(&mut self, layer: usize, dim: usize, d_state: usize) {
+    pub fn ensure_ssm(&mut self, layer: usize, state_floats: usize, conv_floats: usize) {
         if self.ssm_h.len() <= layer {
             self.ssm_h.resize(layer + 1, Vec::new());
         }
-        let need = dim.saturating_mul(d_state);
-        if self.ssm_h[layer].len() != need {
-            self.ssm_h[layer] = vec![0.0; need];
+        if self.ssm_conv.len() <= layer {
+            self.ssm_conv.resize(layer + 1, Vec::new());
+        }
+        if self.ssm_h[layer].len() != state_floats {
+            self.ssm_h[layer] = vec![0.0; state_floats];
+        }
+        if self.ssm_conv[layer].len() != conv_floats {
+            self.ssm_conv[layer] = vec![0.0; conv_floats];
         }
     }
 

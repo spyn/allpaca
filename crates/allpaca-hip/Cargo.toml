@@ -15,3 +15,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 allpaca-cpu.workspace = true
+
+[build-dependencies]
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

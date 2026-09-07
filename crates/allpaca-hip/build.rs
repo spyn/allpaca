@@ -4,8 +4,12 @@
 //! GPU tests skip (`device_count() == 0`). Set `HIP_PATH` or `ROCM_PATH`.
 
 use std::env;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const DIRECT_STORAGE_VERSION: &str = "1.3.0";
 
 fn main() {
     println!("cargo:rerun-if-changed=../../hip/src/kernels.cpp");
@@ -16,6 +20,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(allpaca_hip_runtime)");
     println!("cargo:rustc-check-cfg=cfg(allpaca_rocblas)");
     println!("cargo:rustc-check-cfg=cfg(allpaca_hipblaslt)");
+    println!("cargo:rustc-check-cfg=cfg(allpaca_direct_storage)");
 
     if env::var("CARGO_FEATURE_HIP").is_err() {
         return;
@@ -29,6 +34,19 @@ fn main() {
     };
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let direct_storage = if cfg!(windows) {
+        match restore_direct_storage_sdk(&out) {
+            Ok(sdk) => Some(sdk),
+            Err(e) => {
+                println!(
+                    "cargo:warning=Microsoft.Direct3D.DirectStorage {DIRECT_STORAGE_VERSION} unavailable ({e}); Windows NVMe-to-VRAM DMA disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut hipblaslt = hipblaslt_present(&hip_root);
     if hipblaslt && cfg!(windows) {
         if let Err(e) = generate_hipblaslt_import_lib(&hip_root, &out) {
@@ -38,13 +56,16 @@ fn main() {
             hipblaslt = false;
         }
     }
-    if let Err(e) = build_kernels(&hip_root, &out, hipblaslt) {
+    if let Err(e) = build_kernels(&hip_root, &out, hipblaslt, direct_storage.as_deref()) {
         println!("cargo:warning=HIP kernel build failed ({e}); hip feature is stub-only.");
         return;
     }
 
     println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-search=native={}", hip_root.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        hip_root.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=static=allpaca_kernels");
     println!("cargo:rustc-link-lib=amdhip64");
     if cfg!(windows) {
@@ -58,7 +79,101 @@ fn main() {
         println!("cargo:rustc-link-lib=hipblaslt");
         println!("cargo:rustc-cfg=allpaca_hipblaslt");
     }
+    if let Some(sdk) = direct_storage {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            sdk.join("native/lib/x64").display()
+        );
+        println!("cargo:rustc-link-lib=dstorage");
+        println!("cargo:rustc-link-lib=d3d12");
+        println!("cargo:rustc-link-lib=dxgi");
+        println!("cargo:rustc-cfg=allpaca_direct_storage");
+    }
     println!("cargo:rustc-cfg=allpaca_hip_runtime");
+}
+
+fn restore_direct_storage_sdk(out: &Path) -> Result<PathBuf, String> {
+    println!("cargo:rerun-if-env-changed=DOTNET_ROOT");
+
+    let restore = out.join("directstorage-restore");
+    std::fs::create_dir_all(&restore).map_err(|e| format!("create restore dir: {e}"))?;
+    let project = restore.join("DirectStorage.proj");
+    let project_xml = format!(
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup><PackageReference Include="Microsoft.Direct3D.DirectStorage" Version="{DIRECT_STORAGE_VERSION}" /></ItemGroup>
+</Project>
+"#
+    );
+    std::fs::write(&project, project_xml).map_err(|e| format!("write restore project: {e}"))?;
+    let packages = restore.join("packages");
+    let output = Command::new("dotnet")
+        .arg("restore")
+        .arg(&project)
+        .arg("--nologo")
+        .arg("--verbosity")
+        .arg("quiet")
+        .arg(format!("-p:RestorePackagesPath={}", packages.display()))
+        .output()
+        .map_err(|e| format!("start dotnet restore: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "dotnet restore failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let package = packages
+        .join("microsoft.direct3d.directstorage")
+        .join(DIRECT_STORAGE_VERSION);
+    let archive = package.join(format!(
+        "microsoft.direct3d.directstorage.{DIRECT_STORAGE_VERSION}.nupkg"
+    ));
+    let sdk = out.join(format!("directstorage-{DIRECT_STORAGE_VERSION}"));
+    let required = [
+        "native/include/dstorage.h",
+        "native/include/dstorageerr.h",
+        "native/lib/x64/dstorage.lib",
+        "native/bin/x64/dstorage.dll",
+        "native/bin/x64/dstoragecore.dll",
+    ];
+    let file = File::open(&archive).map_err(|e| format!("open {}: {e}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("open SDK archive: {e}"))?;
+    for name in required {
+        let destination = sdk.join(name);
+        if destination.is_file() {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        let mut source = zip
+            .by_name(name)
+            .map_err(|e| format!("SDK is missing {name}: {e}"))?;
+        let mut bytes = Vec::with_capacity(source.size() as usize);
+        source
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read {name}: {e}"))?;
+        File::create(&destination)
+            .and_then(|mut f| f.write_all(&bytes))
+            .map_err(|e| format!("extract {}: {e}", destination.display()))?;
+    }
+
+    let mut profile = out.to_path_buf();
+    for _ in 0..3 {
+        profile.pop();
+    }
+    for directory in [profile.clone(), profile.join("deps")] {
+        std::fs::create_dir_all(&directory)
+            .map_err(|e| format!("create {}: {e}", directory.display()))?;
+        for dll in ["dstorage.dll", "dstoragecore.dll"] {
+            std::fs::copy(sdk.join("native/bin/x64").join(dll), directory.join(dll))
+                .map_err(|e| format!("copy {dll} to {}: {e}", directory.display()))?;
+        }
+    }
+    Ok(sdk)
 }
 
 fn find_hip_root() -> Option<PathBuf> {
@@ -157,7 +272,8 @@ fn generate_hipblaslt_import_lib(hip_root: &Path, out: &Path) -> Result<(), Stri
         return Err("hipBLASLt DLL not found".into());
     }
     println!("cargo:rerun-if-changed={}", dll.display());
-    let dumpbin = find_msvc_tool("dumpbin.exe").ok_or_else(|| "dumpbin.exe not found".to_string())?;
+    let dumpbin =
+        find_msvc_tool("dumpbin.exe").ok_or_else(|| "dumpbin.exe not found".to_string())?;
     let libexe = find_msvc_tool("lib.exe").ok_or_else(|| "lib.exe not found".to_string())?;
     let output = Command::new(&dumpbin)
         .arg("/EXPORTS")
@@ -213,8 +329,13 @@ fn hip_looks_valid(root: &Path) -> bool {
         && (root.join("bin/hipcc.exe").is_file() || root.join("bin/hipcc").is_file())
 }
 
-fn build_kernels(hip_root: &Path, out: &Path, hipblaslt: bool) -> Result<(), String> {
-    match try_hipcc(hip_root, out, hipblaslt) {
+fn build_kernels(
+    hip_root: &Path,
+    out: &Path,
+    hipblaslt: bool,
+    direct_storage: Option<&Path>,
+) -> Result<(), String> {
+    match try_hipcc(hip_root, out, hipblaslt, direct_storage) {
         Ok(()) => return Ok(()),
         Err(e) => println!("cargo:warning=hipcc path failed: {e}"),
     }
@@ -229,10 +350,19 @@ fn hipcc_bin(hip_root: &Path) -> PathBuf {
     }
 }
 
-fn try_hipcc(hip_root: &Path, out: &Path, hipblaslt: bool) -> Result<(), String> {
+fn try_hipcc(
+    hip_root: &Path,
+    out: &Path,
+    hipblaslt: bool,
+    direct_storage: Option<&Path>,
+) -> Result<(), String> {
     let hipcc = hipcc_bin(hip_root);
     let src = manifest_hip_dir().join("src/kernels.cpp");
-    let obj = out.join(if cfg!(windows) { "kernels.obj" } else { "kernels.o" });
+    let obj = out.join(if cfg!(windows) {
+        "kernels.obj"
+    } else {
+        "kernels.o"
+    });
     let include = manifest_hip_dir().join("include");
     let mut extra = String::new();
     if rocblas_lib_exists(hip_root) {
@@ -241,8 +371,14 @@ fn try_hipcc(hip_root: &Path, out: &Path, hipblaslt: bool) -> Result<(), String>
     if hipblaslt {
         extra.push_str(" -DALLPACA_HAS_HIPBLASLT");
     }
+    if let Some(sdk) = direct_storage {
+        extra.push_str(" -DALLPACA_HAS_DIRECTSTORAGE -I\"");
+        extra.push_str(&sdk.join("native/include").display().to_string());
+        extra.push('"');
+    }
     let output = if cfg!(windows) {
-        let vcvars = find_vcvars64().ok_or_else(|| "vcvars64.bat not found (need MSVC for hipcc)".to_string())?;
+        let vcvars = find_vcvars64()
+            .ok_or_else(|| "vcvars64.bat not found (need MSVC for hipcc)".to_string())?;
         let bat = out.join("build_kernels.bat");
         let script = format!(
             "@echo off\r\ncall \"{vc}\"\r\n\"{hipcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\"{extra} --offload-arch=gfx1201 --offload-arch=gfx1200 --offload-arch=gfx1100\r\n",
@@ -279,8 +415,7 @@ fn try_hipcc(hip_root: &Path, out: &Path, hipblaslt: bool) -> Result<(), String>
         if hipblaslt {
             cmd.arg("-DALLPACA_HAS_HIPBLASLT");
         }
-        cmd.output()
-            .map_err(|e| format!("spawn hipcc: {e}"))?
+        cmd.output().map_err(|e| format!("spawn hipcc: {e}"))?
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

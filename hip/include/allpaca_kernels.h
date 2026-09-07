@@ -40,6 +40,15 @@ int allpaca_hip_host_malloc(void **ptr, size_t bytes);
 
 int allpaca_hip_host_free(void *ptr);
 
+/* Windows DirectStorage 1.3 buffer backed by a shareable D3D12 resource and
+ * imported into HIP external memory. `handle` owns both API objects. */
+int allpaca_dstorage_alloc(void **handle, void **hip_ptr, size_t bytes, int32_t device);
+
+int allpaca_dstorage_read(void *handle, const uint16_t *path, uint64_t file_offset,
+                          uint64_t buffer_offset, size_t bytes);
+
+int allpaca_dstorage_free(void *handle);
+
 int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                        allpaca_stream_t stream);
 
@@ -221,6 +230,19 @@ int allpaca_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_
 /* decay = exp(softplus(alpha + dt_bias) * a); beta = sigmoid(beta) in-place. */
 int allpaca_gdn_decay_beta(const float *alpha, const float *dt_bias, const float *a, float *decay,
                            float *beta, int32_t n, allpaca_stream_t stream);
+
+/* Nemotron-H Mamba-2 one-token causal depthwise conv over x/B/C. */
+int allpaca_mamba2_conv_step(const float *xbc, const float *kernel, const float *bias,
+                             float *conv_state, float *out, int32_t conv_dim,
+                             int32_t conv_kernel, allpaca_stream_t stream);
+
+/* Nemotron-H Mamba-2 selective SSD + D skip + z gate + grouped RMSNorm.
+ * state is [n_heads][head_dim][d_state], xbc is x|B|C. */
+int allpaca_mamba2_ssd_step(const float *z, const float *xbc, const float *dt,
+                            const float *a, const float *d, const float *dt_bias,
+                            const float *norm, float *state, float *out,
+                            int32_t d_inner, int32_t d_state, int32_t n_heads,
+                            int32_t n_groups, float eps, allpaca_stream_t stream);
 
 /* RoPE on Q and K in one launch. Decode uses n_tok=1 via allpaca_rope_qk. */
 int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads, int32_t head_dim,

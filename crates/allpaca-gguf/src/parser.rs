@@ -441,8 +441,6 @@ impl GgufFile {
             .collect();
 
         let mut reasons = Vec::new();
-        // SSM layers are runnable via the CPU selective-SSM stub when weights are
-        // F32/F16/Q*/ROCmFP4.
         if !unsupported_types.is_empty() {
             reasons.push(format!(
                 "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K/ROCmFP4)"
@@ -464,6 +462,36 @@ impl GgufFile {
             reasons.push(format!(
                 "architecture '{architecture}' is outside the Llama-layout loader"
             ));
+        }
+        if architecture == "nemotron_h_moe" && ssm_layers > 0 {
+            for suffix in [
+                "ssm.inner_size",
+                "ssm.state_size",
+                "ssm.time_step_rank",
+                "ssm.group_count",
+                "ssm.conv_kernel",
+            ] {
+                let key = format!("{architecture}.{suffix}");
+                if self.meta_u32(&key).is_none() {
+                    reasons.push(format!("missing Mamba-2 metadata {key}"));
+                }
+            }
+            for layer in layers.iter().filter(|l| l.block == HybridLayerKind::Ssm) {
+                for suffix in [
+                    "ssm_in.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_dt.bias",
+                    "ssm_a",
+                    "ssm_d",
+                    "ssm_norm.weight",
+                    "ssm_out.weight",
+                ] {
+                    let name = format!("blk.{}.{suffix}", layer.index);
+                    if self.tensor(&name).is_none() {
+                        reasons.push(format!("missing Mamba-2 tensor {name}"));
+                    }
+                }
+            }
         }
         let reject_reason = if reasons.is_empty() {
             None
@@ -1134,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn compat_report_allows_f32_hybrid_ssm_stub() {
+    fn compat_report_rejects_incomplete_nemotron_mamba2_layout() {
         let path = std::env::temp_dir().join("allpaca_gguf_hybrid_probe.gguf");
         let mut meta = HashMap::new();
         meta.insert(
@@ -1161,11 +1189,8 @@ mod tests {
         assert_eq!(report.architecture, "nemotron_h_moe");
         assert_eq!(report.n_layers, 1);
         assert_eq!(report.ssm_layers, 1);
-        assert!(
-            report.reject_reason.is_none(),
-            "F32 hybrid SSM must be stub-runnable; got {:?}",
-            report.reject_reason
-        );
+        let reject = report.reject_reason.expect("incomplete Mamba-2 must reject");
+        assert!(reject.contains("missing Mamba-2"), "{reject}");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1175,7 +1200,7 @@ mod tests {
             .join("../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf");
         if !path.exists() {
             eprintln!(
-                "skip nemotron_rocmfp4_gguf_probe: missing {}; see compat_report_allows_f32_hybrid_ssm_stub",
+                "skip nemotron_rocmfp4_gguf_probe: missing {}; synthetic full Mamba-2 fixture remains covered",
                 path.display()
             );
             return;
@@ -1200,6 +1225,30 @@ mod tests {
             "ROCmFP4 must no longer reject; got {:?}",
             report.reject_reason
         );
+        let arch = report.architecture.as_str();
+        eprintln!(
+            "Nemotron Mamba-2 meta inner={:?} state={:?} heads={:?} groups={:?} conv={:?}",
+            file.meta_u32(&format!("{arch}.ssm.inner_size")),
+            file.meta_u32(&format!("{arch}.ssm.state_size")),
+            file.meta_u32(&format!("{arch}.ssm.time_step_rank")),
+            file.meta_u32(&format!("{arch}.ssm.group_count")),
+            file.meta_u32(&format!("{arch}.ssm.conv_kernel")),
+        );
+        if let Some(layer) = report.layers.iter().find(|l| l.block == HybridLayerKind::Ssm) {
+            for suffix in [
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_conv1d.bias",
+                "ssm_dt.bias",
+                "ssm_a",
+                "ssm_d",
+                "ssm_norm.weight",
+                "ssm_out.weight",
+            ] {
+                let name = format!("blk.{}.{suffix}", layer.index);
+                eprintln!("  {name}: {:?}", file.tensor(&name).map(|t| &t.dims));
+            }
+        }
 
         // Smallest type-100 tensor must dequant to finite, non-degenerate weights.
         let smallest = file

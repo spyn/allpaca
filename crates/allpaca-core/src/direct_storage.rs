@@ -6,11 +6,9 @@
 //!
 //! Vertical:
 //! 1. Probe `dstorage.dll` and resolve `DStorageGetFactory`.
-//! 2. COM-bind: call `DStorageGetFactory(IID_IDStorageFactory, …)` when the
-//!    export exists (`factory_bound` / `ds_com_binds`). Full queue/request DMA
-//!    still needs the SDK headers; host→VRAM remains the byte path.
-//! 3. File-coordinate DMA intents when the probe is hot (`ds_enqueued`).
-//! 4. Aligned Direct I/O + H2D into a bound expert ring slot (`ds_gpu_dma_*`).
+//! 2. Allocate expert weights as a shareable D3D12 buffer imported into HIP.
+//! 3. Submit DirectStorage file→buffer requests for NVMe expert fills.
+//! 4. Fall back to aligned Direct I/O + H2D when any runtime layer is missing.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -55,7 +53,7 @@ pub struct DirectStorageBridge {
 /// Records DMA intents, pinned Direct I/O staging, and buffered host bounce.
 #[derive(Debug, Default)]
 pub struct DirectStorageQueue {
-    /// Would-be NVMe→device DMA (probe-gated; no GPU buffer binding yet).
+    /// DirectStorage file-coordinate requests accepted by the probe.
     enqueued: AtomicU64,
     bytes: AtomicU64,
     /// Buffered host-staged fills (no Direct I/O).
@@ -64,7 +62,7 @@ pub struct DirectStorageQueue {
     /// Aligned Direct I/O into pinned-shaped host memory (H2D source).
     pinned: AtomicU64,
     pinned_bytes: AtomicU64,
-    /// NVMe→host→VRAM fills with a bound device destination.
+    /// Completed NVMe→D3D12/HIP fills with no host byte buffer.
     gpu_dma: AtomicU64,
     gpu_dma_bytes: AtomicU64,
     /// Successful COM factory binds (`DStorageGetFactory`).
@@ -191,25 +189,29 @@ impl DirectStorageQueue {
         Ok(out)
     }
 
-    /// Deepest feasible path: aligned NVMe/host read into pinned memory, then
-    /// H2D into a bound expert ring slot. Records `gpu_dma_*` when successful.
+    /// Prefer DirectStorage into a D3D12/HIP allocation, then truthfully fall
+    /// back to aligned NVMe/host read plus H2D.
     pub fn fill_to_device(
         &self,
         probe: &DirectStorageProbe,
         path: &Path,
         offset: u64,
         bytes: usize,
+        direct_dma: impl FnOnce() -> Result<bool, AllpacaError>,
         copy_h2d: impl FnOnce(&[u8]) -> Result<(), AllpacaError>,
     ) -> Result<bool, AllpacaError> {
         if !probe.available || bytes == 0 {
             return Ok(false);
         }
         let _ = self.try_enqueue(probe, path, offset, bytes);
+        if matches!(direct_dma(), Ok(true)) {
+            self.gpu_dma.fetch_add(1, Ordering::Relaxed);
+            self.gpu_dma_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+            return Ok(true);
+        }
         let host = self.stage_aligned_read(path, offset, bytes)?;
         copy_h2d(&host)?;
-        self.gpu_dma.fetch_add(1, Ordering::Relaxed);
-        self.gpu_dma_bytes
-            .fetch_add(host.len() as u64, Ordering::Relaxed);
         Ok(true)
     }
 }
@@ -327,13 +329,12 @@ struct Guid {
     data4: [u8; 8],
 }
 
-/// `{692DDCB3-5B44-4C53-9D6A-5E5A5E5A5E5A}` is wrong — use the shipping IID.
-/// From Microsoft DirectStorage 1.2 `dstorage.h`: IDStorageFactory.
+/// From stable Microsoft DirectStorage 1.3.0 `dstorage.h`: IDStorageFactory.
 const IID_IDSTORAGE_FACTORY: Guid = Guid {
-    data1: 0x5b_c1_60_4d,
-    data2: 0xc1_dd,
-    data3: 0x40_c8,
-    data4: [0x90, 0xa7, 0xc9, 0xbb, 0xf3, 0x3a, 0x18, 0x4c],
+    data1: 0x69_24_ea_0c,
+    data2: 0xc3_cd,
+    data3: 0x48_26,
+    data4: [0xb1, 0x0a, 0xf6, 0x4f, 0x4e, 0xd9, 0x27, 0xc1],
 };
 
 #[cfg(windows)]
@@ -342,15 +343,10 @@ fn probe_windows() -> DirectStorageProbe {
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> *mut std::ffi::c_void;
         fn FreeLibrary(module: *mut std::ffi::c_void) -> i32;
-        fn GetProcAddress(
-            module: *mut std::ffi::c_void,
-            name: *const u8,
-        ) -> *mut std::ffi::c_void;
+        fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
     }
-    type DStorageGetFactoryFn = unsafe extern "system" fn(
-        riid: *const Guid,
-        ppv: *mut *mut std::ffi::c_void,
-    ) -> i32;
+    type DStorageGetFactoryFn =
+        unsafe extern "system" fn(riid: *const Guid, ppv: *mut *mut std::ffi::c_void) -> i32;
 
     let wide: Vec<u16> = "dstorage.dll"
         .encode_utf16()
@@ -387,14 +383,26 @@ fn probe_windows() -> DirectStorageProbe {
     unsafe {
         let _ = FreeLibrary(handle);
     }
-    let detail = match (factory_resolved, factory_bound) {
-        (true, true) => "dstorage.dll; DStorageGetFactory COM-bound IDStorageFactory",
-        (true, false) => "dstorage.dll; DStorageGetFactory resolved but COM bind failed",
-        _ => "dstorage.dll loadable; DStorageGetFactory missing",
+    let (available, backend, detail) = match (factory_resolved, factory_bound) {
+        (true, true) => (
+            true,
+            DirectStorageBackend::WindowsDirectStorage,
+            "DirectStorage 1.3 factory bound; D3D12/HIP DMA attempted per allocation",
+        ),
+        (true, false) => (
+            false,
+            DirectStorageBackend::HostStaging,
+            "dstorage.dll export resolved but factory bind failed; keep host staging",
+        ),
+        _ => (
+            false,
+            DirectStorageBackend::HostStaging,
+            "dstorage.dll lacks DStorageGetFactory; keep host staging",
+        ),
     };
     DirectStorageProbe {
-        available: true,
-        backend: DirectStorageBackend::WindowsDirectStorage,
+        available,
+        backend,
         detail: detail.into(),
         factory_resolved,
         factory_bound,
@@ -403,11 +411,7 @@ fn probe_windows() -> DirectStorageProbe {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn probe_linux_gds() -> DirectStorageProbe {
-    let markers = [
-        "/dev/nvidia-fs0",
-        "/usr/local/cuda/gds",
-        "/etc/cufile.json",
-    ];
+    let markers = ["/dev/nvidia-fs0", "/usr/local/cuda/gds", "/etc/cufile.json"];
     if markers.iter().any(|p| Path::new(p).exists()) {
         DirectStorageProbe {
             available: true,
@@ -440,7 +444,7 @@ mod tests {
         match p.backend {
             DirectStorageBackend::HostStaging => {
                 assert!(!p.available);
-                assert!(!p.factory_resolved);
+                assert!(!p.factory_bound);
             }
             DirectStorageBackend::WindowsDirectStorage | DirectStorageBackend::LinuxGds => {
                 assert!(p.available);
@@ -522,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_to_device_records_gpu_dma_via_h2d_callback() {
+    fn fill_to_device_falls_back_to_h2d_when_direct_dma_is_unavailable() {
         let path = PathBuf::from(format!(
             "{}\\allpaca-ds-fill-{}-{}.bin",
             std::env::temp_dir().display(),
@@ -548,16 +552,55 @@ mod tests {
         };
         let mut dest = vec![0u8; DIRECT_ALIGN];
         let ok = q
-            .fill_to_device(&probe, &path, 0, DIRECT_ALIGN, |src| {
-                dest.copy_from_slice(src);
-                Ok(())
-            })
+            .fill_to_device(
+                &probe,
+                &path,
+                0,
+                DIRECT_ALIGN,
+                || Ok(false),
+                |src| {
+                    dest.copy_from_slice(src);
+                    Ok(())
+                },
+            )
             .unwrap();
         assert!(ok);
         assert_eq!(dest, payload);
-        assert!(q.gpu_dma() >= 1, "gpu_dma={}", q.gpu_dma());
-        assert!(q.gpu_dma_bytes() >= DIRECT_ALIGN as u64);
+        assert_eq!(q.gpu_dma(), 0);
+        assert_eq!(q.gpu_dma_bytes(), 0);
+        assert!(q.pinned() + q.staged() >= 1);
         assert!(q.enqueued() >= 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fill_to_device_prefers_direct_dma_and_skips_host_staging() {
+        let q = DirectStorageQueue::new();
+        let probe = DirectStorageProbe {
+            available: true,
+            backend: DirectStorageBackend::WindowsDirectStorage,
+            detail: "test".into(),
+            factory_resolved: true,
+            factory_bound: true,
+        };
+        let h2d_called = std::cell::Cell::new(false);
+        let ok = q
+            .fill_to_device(
+                &probe,
+                Path::new("experts.bin"),
+                4096,
+                DIRECT_ALIGN,
+                || Ok(true),
+                |_| {
+                    h2d_called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(ok);
+        assert!(!h2d_called.get());
+        assert_eq!(q.gpu_dma(), 1);
+        assert_eq!(q.gpu_dma_bytes(), DIRECT_ALIGN as u64);
+        assert_eq!(q.pinned() + q.staged(), 0);
     }
 }

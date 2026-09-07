@@ -28,11 +28,11 @@ and [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md)).
 | Dense cyclic scan thrashes LRU | **Pin-prefix + ring** dense trunk (kimi-style policy) |
 | Static MoE expert placement | Host-truth expert pool + **GPU LRU** + measured **`q* ≈ m·B_P/B_H`** miss split |
 | Semantic anchors only | **Radix KV** + optional **semantic recurrent anchors** |
-| No Windows DirectStorage path | **`dstorage.dll` COM bind** + aligned Direct I/O → pinned H2D (true NVMe→VRAM DMA still roadmap) |
+| No Windows DirectStorage path | Stable **DirectStorage 1.3** file→D3D12 DMA; the shared resource is imported into AMD HIP external memory, with aligned host-staged H2D fallback |
 | Single-request hybrid sync barrier | **Micro-batch** partner `poll` + **layer-stagger** CPU experts during GPU forward |
 | Reactive VRAM only | **Elastic expert↔KV rebalance**, attention-trim cold KV, **`gpu.util` / `gpu.vram`** from `hipMemGetInfo` (no AMD SMI on Windows) |
 | Narrow GGUF quants | **F16 / Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K** + **ROCmFP4 (`ggml_type_id=100`)** CPU dequant + fused HIP GEMV |
-| MoE-only / no hybrid SSM | **`nemotron_h_moe` schedule**: selective-SSM stub + attention + MoE; real ROCmFP4 opt-in via `ALLPACA_NEMOTRON=1` |
+| MoE-only / no hybrid SSM | **`nemotron_h_moe` schedule**: full Mamba-2 SSD + attention + MoE on CPU/HIP; real ROCmFP4 opt-in via `ALLPACA_NEMOTRON=1` |
 | Proprietary weight banks only | **GGUF** primary + **packed layer-major / `ALLPFTW1`** trunk for streaming |
 | No continuous batching story | Fair **`Engine::poll`**, chunked prefill, multi-request backpressure |
 | Speculative decode absent or linear-only | N-gram + draft-model; **linear packed verify**; optional **tree / Token Forest** |
@@ -41,7 +41,7 @@ and [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md)).
 | NUMA-blind host experts | **NUMA first-touch** on the host expert pool |
 
 Still out of MVP (documented, not claimed): Coral/NPU backends, BitNet, CUDA backend, production
-Mamba-2 kernels, CXL/PIM, and full DirectStorage GPU DMA.
+Mamba-2 kernels, and CXL/PIM.
 
 ---
 
@@ -210,7 +210,8 @@ Or edit `docker-compose.yml` `command` / `volumes` accordingly.
 
 ## Sources & acknowledgements
 
-Policies and formats we studied (and re-implemented on our ABI — we do **not** vendor their runtimes):
+Policies and formats we studied and re-implemented on our ABI. DirectStorage is the exception:
+its redistributable runtime is restored from Microsoft's pinned NuGet package at build time.
 
 | Source | What we took |
 |--------|----------------|
@@ -219,7 +220,7 @@ Policies and formats we studied (and re-implemented on our ABI — we do **not**
 | [llama.cpp](https://github.com/ggerganov/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) | GGUF layout, K-quant block sizes, community quant vocabulary |
 | ROCmFP4 / ggml type 100 (AMD community ROCmFP4 GGUF work) | 18 B / 32-elem dual-scale blocks; CPU dequant + fused HIP GEMV |
 | [AMD ROCm / HIP](https://rocm.docs.amd.com/) | Multi-device, P2P vs host staging, hipBLASLt where linked |
-| [Microsoft DirectStorage](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directstorage) | Windows NVMe staging API surface (`DStorageGetFactory`) |
+| [Microsoft DirectStorage](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directstorage) | Stable `Microsoft.Direct3D.DirectStorage` 1.3.0 SDK/runtime; file→D3D12 requests synchronized by a shared fence and imported into HIP |
 | [Hugging Face Tokenizers](https://github.com/huggingface/tokenizers) | Vocab / BPE encode-decode |
 | [llguidance](https://github.com/guidance-ai/llguidance) | Constrained JSON Schema / Lark decoding |
 | Speculative decoding literature (draft-then-verify, tree/forest verify) | N-gram + draft-model providers; packed linear / optional tree verify |

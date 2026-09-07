@@ -1912,6 +1912,11 @@ impl Engine {
                 if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
                     hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
                     hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                    hip.mamba2_sync_request_to_host(
+                        id,
+                        &mut state.ssm_h,
+                        &mut state.ssm_conv,
+                    )?;
                 }
             }
             if sync_host_gdn {
@@ -3215,6 +3220,7 @@ fn packed_linear_verify_span(
         if device_gdn_cloned == 0 {
             hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
             hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+            hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
         }
     }
     let rec_before = recurrent.clone();
@@ -5871,11 +5877,17 @@ mod tests {
         use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
         use std::collections::HashMap;
 
-        // Layer 0: SSM stub; layer 1: attention + dense FFN.
+        // Layer 0: full Mamba-2 SSD; layer 1: attention + dense FFN.
         let dim = 8usize;
         let vocab = 4usize;
         let ff = 16usize;
+        let d_inner = 4usize;
         let d_state = 2usize;
+        let n_heads = 2usize;
+        let n_groups = 1usize;
+        let conv_kernel = 2usize;
+        let conv_dim = d_inner + 2 * n_groups * d_state;
+        let in_proj = 2 * d_inner + 2 * n_groups * d_state + n_heads;
         let w = 0.01f32;
         let mut meta = HashMap::new();
         meta.insert(
@@ -5907,6 +5919,26 @@ mod tests {
             GgufValue::Uint32(ff as u32),
         );
         meta.insert(
+            "nemotron_h_moe.ssm.inner_size".into(),
+            GgufValue::Uint32(d_inner as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.state_size".into(),
+            GgufValue::Uint32(d_state as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.time_step_rank".into(),
+            GgufValue::Uint32(n_heads as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.group_count".into(),
+            GgufValue::Uint32(n_groups as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.conv_kernel".into(),
+            GgufValue::Uint32(conv_kernel as u32),
+        );
+        meta.insert(
             "tokenizer.ggml.model".into(),
             GgufValue::String("wordlevel".into()),
         );
@@ -5934,12 +5966,32 @@ mod tests {
             ),
             (
                 "blk.0.ssm_in.weight".into(),
-                vec![dim as u64, dim as u64],
-                vec![w; dim * dim],
+                vec![dim as u64, in_proj as u64],
+                vec![w; dim * in_proj],
             ),
-            ("blk.0.ssm_a".into(), vec![1, d_state as u64], vec![-1.0; d_state]),
-            ("blk.0.ssm_d".into(), vec![1, dim as u64], vec![ssm_d; dim]),
-            ("blk.0.ssm_dt.bias".into(), vec![d_state as u64], vec![0.0; d_state]),
+            (
+                "blk.0.ssm_out.weight".into(),
+                vec![d_inner as u64, dim as u64],
+                vec![w; dim * d_inner],
+            ),
+            (
+                "blk.0.ssm_conv1d.weight".into(),
+                vec![conv_kernel as u64, conv_dim as u64],
+                vec![0.5; conv_kernel * conv_dim],
+            ),
+            (
+                "blk.0.ssm_conv1d.bias".into(),
+                vec![conv_dim as u64],
+                vec![0.01; conv_dim],
+            ),
+            ("blk.0.ssm_a".into(), vec![1, n_heads as u64], vec![-1.0; n_heads]),
+            ("blk.0.ssm_d".into(), vec![1, n_heads as u64], vec![ssm_d; n_heads]),
+            ("blk.0.ssm_dt.bias".into(), vec![n_heads as u64], vec![0.0; n_heads]),
+            (
+                "blk.0.ssm_norm.weight".into(),
+                vec![(d_inner / n_groups) as u64, n_groups as u64],
+                vec![1.0; d_inner],
+            ),
             (
                 "blk.1.attn_norm.weight".into(),
                 vec![dim as u64],
@@ -6139,6 +6191,162 @@ mod tests {
             })
             .collect();
         write_gguf(path, &meta, &views).unwrap();
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_mamba2_matches_host_and_keeps_state_resident() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip hip_mamba2 parity: no HIP device");
+            return;
+        }
+        use crate::ssm::{mamba2_step, Mamba2Dims, SsmLayerWeights};
+        let dims = Mamba2Dims::new(2, 2, 1, 1, 1, 2).unwrap();
+        let mut w_in = vec![0.0; dims.in_proj_dim * dims.d_model];
+        for (row, col, value) in [
+            (0, 0, 1.0), (1, 1, 1.0), (2, 0, 1.0), (3, 1, 1.0),
+            (4, 0, 0.5), (5, 1, 1.0), (6, 0, 1.0),
+        ] {
+            w_in[row * dims.d_model + col] = value;
+        }
+        let weights = SsmLayerWeights {
+            dims,
+            w_in,
+            w_out: vec![1.0, 0.0, 0.0, 1.0],
+            a: vec![-1.0],
+            d_skip: vec![0.25],
+            dt_bias: vec![0.0],
+            conv1d: vec![0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0],
+            conv_bias: vec![0.0; 4],
+            norm: vec![1.0; 2],
+        };
+        let input = [1.0f32, -0.5];
+        let projected = [1.0f32, -0.5, 1.0, -0.5, 0.5, -0.5, 1.0];
+        let mut host_state = vec![0.0; dims.state_floats()];
+        let mut host_conv = vec![0.0; dims.conv_state_floats()];
+        let mut host_out = vec![0.0; dims.d_model];
+        mamba2_step(
+            &input,
+            &mut host_state,
+            &mut host_conv,
+            &weights,
+            1e-5,
+            &mut host_out,
+        )
+        .unwrap();
+
+        let hip = allpaca_hip::HipWorkspace::new(0, 4096, 4).unwrap();
+        let projection = allpaca_hip::DeviceWeights::alloc(0, projected.len() * 4).unwrap();
+        let output = allpaca_hip::DeviceWeights::alloc(0, dims.d_inner * 4).unwrap();
+        hip.copy_h2d_f32(projection.ptr_at(0) as *mut f32, &projected).unwrap();
+        let (conv, bias, dt, a, d, norm) = hip.ensure_mamba2_weights(
+            0,
+            &weights.conv1d,
+            &weights.conv_bias,
+            &weights.dt_bias,
+            &weights.a,
+            &weights.d_skip,
+            &weights.norm,
+        )
+        .unwrap();
+        let mut device_state = vec![0.0; dims.state_floats()];
+        let mut device_conv = vec![0.0; dims.conv_state_floats()];
+        hip.mamba2_decode_step_resident(
+            77,
+            0,
+            &mut device_state,
+            &mut device_conv,
+            projection.ptr_at(0),
+            conv,
+            bias,
+            dt,
+            a,
+            d,
+            norm,
+            output.ptr_at(0) as *mut f32,
+            dims.d_inner as i32,
+            dims.d_state as i32,
+            dims.n_heads as i32,
+            dims.n_groups as i32,
+            dims.conv_kernel as i32,
+            1e-5,
+        )
+        .unwrap();
+        let mut device_out = vec![0.0; dims.d_inner];
+        hip.copy_d2h_f32(output.ptr_at(0), &mut device_out).unwrap();
+        hip.mamba2_sync_request_to_host(77, std::slice::from_mut(&mut device_state), std::slice::from_mut(&mut device_conv)).unwrap();
+        for (got, want) in device_out.iter().zip(&host_out) {
+            assert!((got - want).abs() < 2e-4, "HIP={got} host={want}");
+        }
+        for (got, want) in device_state.iter().zip(&host_state) {
+            assert!((got - want).abs() < 2e-4, "state HIP={got} host={want}");
+        }
+        assert_eq!(device_conv, host_conv);
+
+        let snapshot_state = device_state.clone();
+        let snapshot_conv = device_conv.clone();
+        assert_eq!(hip.gdn_clone_request(77).unwrap(), 1);
+        let d2h_before = hip.activation_d2h_bytes();
+        hip.mamba2_decode_step_resident(
+            77, 0, &mut device_state, &mut device_conv, projection.ptr_at(0), conv, bias, dt, a, d,
+            norm, output.ptr_at(0) as *mut f32, dims.d_inner as i32, dims.d_state as i32,
+            dims.n_heads as i32, dims.n_groups as i32, dims.conv_kernel as i32, 1e-5,
+        )
+        .unwrap();
+        assert_eq!(
+            hip.activation_d2h_bytes(),
+            d2h_before,
+            "resident second step must not D2H state or activations"
+        );
+        hip.gdn_rewind_request(77).unwrap();
+        hip.mamba2_sync_request_to_host(
+            77,
+            std::slice::from_mut(&mut device_state),
+            std::slice::from_mut(&mut device_conv),
+        )
+        .unwrap();
+        assert_eq!(device_state, snapshot_state, "D2D rewind must restore SSD state");
+        assert_eq!(device_conv, snapshot_conv, "D2D rewind must restore conv history");
+        hip.gdn_clear_request(77);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_nemotron_mamba2_greedy_matches_cpu() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip HIP Nemotron end-to-end: no HIP device");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "allpaca-nemotron-mamba2-parity-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        write_tiny_nemotron_hybrid_gguf(&path);
+        let run = |cpu_only: bool| {
+            let mut cfg = Config::compiled_defaults();
+            cfg.model.path = Some(path.clone());
+            cfg.model.synthetic = false;
+            cfg.engine.cpu_only = cpu_only;
+            cfg.speculative.enabled = false;
+            Engine::new(cfg)
+                .unwrap()
+                .generate(
+                    "hi",
+                    GenerationParams {
+                        max_tokens: 6,
+                        temperature: 0.0,
+                        seed: Some(7),
+                        ..GenerationParams::default()
+                    },
+                )
+                .unwrap()
+                .token_ids
+        };
+        let cpu = run(true);
+        let gpu = run(false);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(gpu, cpu);
     }
 
     #[cfg(feature = "hip")]
@@ -6377,7 +6585,7 @@ mod tests {
         }
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
-            cpu_only: true,
+            cpu_only: !cfg!(feature = "hip"),
             ..CliOverrides::default()
         });
         cfg.model.synthetic = false;
