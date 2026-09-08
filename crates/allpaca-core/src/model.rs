@@ -147,11 +147,13 @@ impl ModelConfig {
         let n_heads = file
             .meta_u32(&format!("{arch}.attention.head_count"))
             .unwrap_or(4) as usize;
-        let n_kv_heads = file
-            .meta_u32(&format!("{arch}.attention.head_count_kv"))
+        let n_kv_heads = meta_u32_or_array_max(file, &format!("{arch}.attention.head_count_kv"))
             .unwrap_or(n_heads as u32) as usize;
+        // MoE checkpoints (Nemotron Lightning) often omit dense feed_forward_length
+        // or store per-layer arrays; prefer expert_feed_forward_length.
         let ff_dim = file
-            .meta_u32(&format!("{arch}.feed_forward_length"))
+            .meta_u32(&format!("{arch}.expert_feed_forward_length"))
+            .or_else(|| meta_u32_or_array_max(file, &format!("{arch}.feed_forward_length")))
             .unwrap_or((dim * 4) as u32) as usize;
         let eps = file
             .meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
@@ -1137,9 +1139,21 @@ impl ResidentModel {
                 )?
             } else if matches!(
                 block,
-                HybridLayerKind::Ssm | HybridLayerKind::DenseFfn | HybridLayerKind::Moe
-            ) && file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_none()
+                HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+            ) {
+                // Nemotron Lightning MoE-only: FFN RMSNorm is the block's attn_norm.
+                attn_norm
+            } else if matches!(block, HybridLayerKind::Ssm)
+                && file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_none()
             {
+                WeightRef::f32(0, 0)
+            } else if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_none()
+                && file
+                    .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
+                    .is_none()
+                && file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_none()
+            {
+                // Attention-only hybrid block: no FFN.
                 WeightRef::f32(0, 0)
             } else {
                 return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -1153,7 +1167,8 @@ impl ResidentModel {
                     || file.tensor(&format!("blk.{i}.ffn_router.weight")).is_some()
                     || file
                         .tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
-                        .is_some())
+                        .is_some()
+                    || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some())
             {
                 let w_router = if file
                     .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
@@ -1672,10 +1687,17 @@ fn expert_mlp(
     dim: usize,
     out: &mut [f32],
 ) -> Result<(), AllpacaError> {
-    let mut gate = vec![0.0f32; ff_dim];
     let mut up = vec![0.0f32; ff_dim];
-    matmul_nt(x, &ffn.w_gate, &mut gate, 1, ff_dim, dim)?;
     matmul_nt(x, &ffn.w_up, &mut up, 1, ff_dim, dim)?;
+    // Gate-less MoE (Nemotron Lightning): down(silu(up(x))).
+    if ffn.w_gate.is_empty() {
+        for v in &mut up {
+            *v = silu(*v);
+        }
+        return matmul_nt(&up, &ffn.w_down, out, 1, dim, ff_dim);
+    }
+    let mut gate = vec![0.0f32; ff_dim];
+    matmul_nt(x, &ffn.w_gate, &mut gate, 1, ff_dim, dim)?;
     for i in 0..ff_dim {
         gate[i] = silu(gate[i]) * up[i];
     }
@@ -1945,6 +1967,7 @@ fn load_gguf_ssm_layer(
     Ok(weights)
 }
 
+/// Prefer `ffn_norm` / `post_attention_norm`; MoE-only Lightning blocks reuse `attn_norm`.
 fn gguf_ffn_norm(file: &GgufFile, layer: usize) -> Result<Vec<f32>, AllpacaError> {
     if file
         .tensor(&format!("blk.{layer}.ffn_norm.weight"))
@@ -1956,10 +1979,27 @@ fn gguf_ffn_norm(file: &GgufFile, layer: usize) -> Result<Vec<f32>, AllpacaError
         .is_some()
     {
         file.tensor_f32(&format!("blk.{layer}.post_attention_norm.weight"))
+    } else if file
+        .tensor(&format!("blk.{layer}.attn_norm.weight"))
+        .is_some()
+    {
+        file.tensor_f32(&format!("blk.{layer}.attn_norm.weight"))
     } else {
         Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-            "missing ffn_norm/post_attention_norm on blk.{layer}"
+            "missing ffn_norm/post_attention_norm/attn_norm on blk.{layer}"
         ))))
+    }
+}
+
+/// Scalar meta, or max of a u32/i32 array (Nemotron stores per-layer head/ff dims).
+fn meta_u32_or_array_max(file: &GgufFile, key: &str) -> Option<u32> {
+    if let Some(v) = file.meta_u32(key) {
+        return Some(v);
+    }
+    let items = file.metadata.get(key)?;
+    match items {
+        allpaca_gguf::GgufValue::Array(arr) => arr.iter().filter_map(|v| v.as_u32()).max(),
+        _ => None,
     }
 }
 
@@ -2040,13 +2080,10 @@ fn load_gguf_moe_layer(
         .tensor_f32(&router_name)
         .or_else(|_| file.tensor_f32(&format!("blk.{layer}.ffn_router.weight")))?;
     let stacked_gate = format!("blk.{layer}.ffn_gate_exps.weight");
+    let stacked_up = format!("blk.{layer}.ffn_up_exps.weight");
     let experts = if file.tensor(&stacked_gate).is_some() {
         let gates = split_expert_rows(file.tensor_f32(&stacked_gate)?, n_experts, &stacked_gate)?;
-        let ups = split_expert_rows(
-            file.tensor_f32(&format!("blk.{layer}.ffn_up_exps.weight"))?,
-            n_experts,
-            "ffn_up_exps",
-        )?;
+        let ups = split_expert_rows(file.tensor_f32(&stacked_up)?, n_experts, "ffn_up_exps")?;
         let downs = split_expert_rows(
             file.tensor_f32(&format!("blk.{layer}.ffn_down_exps.weight"))?,
             n_experts,
@@ -2060,12 +2097,34 @@ fn load_gguf_moe_layer(
                 w_down: downs[e].clone(),
             })
             .collect()
+    } else if file.tensor(&stacked_up).is_some() {
+        // Gate-less stacked experts (Nemotron Lightning): up + down only.
+        let ups = split_expert_rows(file.tensor_f32(&stacked_up)?, n_experts, "ffn_up_exps")?;
+        let downs = split_expert_rows(
+            file.tensor_f32(&format!("blk.{layer}.ffn_down_exps.weight"))?,
+            n_experts,
+            "ffn_down_exps",
+        )?;
+        (0..n_experts)
+            .map(|e| LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate: Vec::new(),
+                w_up: ups[e].clone(),
+                w_down: downs[e].clone(),
+            })
+            .collect()
     } else {
         let mut experts = Vec::with_capacity(n_experts);
         for e in 0..n_experts {
+            let gate_name = format!("blk.{layer}.ffn_gate.{e}.weight");
+            let w_gate = if file.tensor(&gate_name).is_some() {
+                file.tensor_f32(&gate_name)?
+            } else {
+                Vec::new()
+            };
             experts.push(LayerFfn {
                 ffn_norm: Vec::new(),
-                w_gate: file.tensor_f32(&format!("blk.{layer}.ffn_gate.{e}.weight"))?,
+                w_gate,
                 w_up: file.tensor_f32(&format!("blk.{layer}.ffn_up.{e}.weight"))?,
                 w_down: file.tensor_f32(&format!("blk.{layer}.ffn_down.{e}.weight"))?,
             });
@@ -2314,10 +2373,51 @@ fn split_packed_experts(
     let stride = match w.kind {
         WeightKind::F32 => n_per.saturating_mul(4),
         WeightKind::F16 => n_per.saturating_mul(2),
-        _ => {
-            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "{what} packed quant experts cannot be sliced; use host F32"
-            ))))
+        WeightKind::RocmFp4 => {
+            if n_per % allpaca_cpu::ROCMFP4_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} ROCmFP4 expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::ROCMFP4_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES)
+        }
+        WeightKind::Q4_K => {
+            if n_per % allpaca_cpu::Q4_K_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} Q4_K expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::Q4_K_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::Q4_K_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q4_K_BLOCK_BYTES)
+        }
+        WeightKind::Q5_K => {
+            if n_per % allpaca_cpu::Q5_K_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} Q5_K expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::Q5_K_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::Q5_K_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q5_K_BLOCK_BYTES)
+        }
+        WeightKind::Q6_K => {
+            if n_per % allpaca_cpu::Q6_K_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} Q6_K expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::Q6_K_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::Q6_K_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES)
+        }
+        WeightKind::Q8_0 => {
+            if n_per % allpaca_cpu::Q8_0_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} Q8_0 expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::Q8_0_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::Q8_0_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES)
         }
     };
     Ok((0..n_experts)
@@ -2336,32 +2436,42 @@ fn append_gguf_experts<'a>(
     parts: &mut Vec<UploadPart<'a>>,
     off: &mut usize,
 ) -> Result<Vec<[WeightRef; 3]>, AllpacaError> {
-    let stacked = format!("blk.{layer}.ffn_gate_exps.weight");
-    if file.tensor(&stacked).is_some() {
-        let gate = append_gguf_tensor(file, &stacked, parts, off)?;
-        let up = append_gguf_tensor(file, &format!("blk.{layer}.ffn_up_exps.weight"), parts, off)?;
+    let stacked_gate = format!("blk.{layer}.ffn_gate_exps.weight");
+    let stacked_up = format!("blk.{layer}.ffn_up_exps.weight");
+    if file.tensor(&stacked_gate).is_some() || file.tensor(&stacked_up).is_some() {
+        let gate = if file.tensor(&stacked_gate).is_some() {
+            append_gguf_tensor(file, &stacked_gate, parts, off)?
+        } else {
+            WeightRef::f32(0, 0)
+        };
+        let up = append_gguf_tensor(file, &stacked_up, parts, off)?;
         let down = append_gguf_tensor(
             file,
             &format!("blk.{layer}.ffn_down_exps.weight"),
             parts,
             off,
         )?;
-        let gates = split_packed_experts(gate, n_experts, "ffn_gate_exps")?;
         let ups = split_packed_experts(up, n_experts, "ffn_up_exps")?;
         let downs = split_packed_experts(down, n_experts, "ffn_down_exps")?;
+        let gates = if gate.n > 0 {
+            split_packed_experts(gate, n_experts, "ffn_gate_exps")?
+        } else {
+            vec![WeightRef::f32(0, 0); n_experts]
+        };
         return Ok((0..n_experts)
             .map(|e| [gates[e], ups[e], downs[e]])
             .collect());
     }
     let mut out = Vec::with_capacity(n_experts);
     for e in 0..n_experts {
+        let gate_name = format!("blk.{layer}.ffn_gate.{e}.weight");
+        let w_gate = if file.tensor(&gate_name).is_some() {
+            append_gguf_tensor(file, &gate_name, parts, off)?
+        } else {
+            WeightRef::f32(0, 0)
+        };
         out.push([
-            append_gguf_tensor(
-                file,
-                &format!("blk.{layer}.ffn_gate.{e}.weight"),
-                parts,
-                off,
-            )?,
+            w_gate,
             append_gguf_tensor(file, &format!("blk.{layer}.ffn_up.{e}.weight"), parts, off)?,
             append_gguf_tensor(
                 file,
@@ -2525,15 +2635,22 @@ impl TinyModel {
         if let Some(pool) = &self.expert_host {
             return pool.get(id);
         }
-        self.layers
+        if let Some(ffn) = self
+            .layers
             .get(layer_idx)
             .and_then(|l| l.experts.get(expert))
-            .cloned()
-            .ok_or_else(|| {
-                AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                    "missing expert {expert} on layer {layer_idx}"
-                )))
-            })
+            .filter(|e| !e.w_up.is_empty() || !e.w_gate.is_empty())
+        {
+            return Ok(ffn.clone());
+        }
+        // Large MoE GGUFs skip host expert materialize; device-resident
+        // `expert_offs` supply weights via `bind_expert`.
+        if expert < self.config.n_experts {
+            return Ok(LayerFfn::default());
+        }
+        Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "missing expert {expert} on layer {layer_idx}"
+        ))))
     }
 
     /// Bind CPU expert MLP to the preferred NUMA node when a host pool is present.
@@ -2870,22 +2987,32 @@ impl TinyModel {
         resident.gemm_nt(
             hip,
             buf.normed,
-            w_gate,
-            buf.gate,
-            1,
-            cfg.ff_dim as i32,
-            dim as i32,
-        )?;
-        resident.gemm_nt(
-            hip,
-            buf.normed,
             w_up,
             buf.up,
             1,
             cfg.ff_dim as i32,
             dim as i32,
         )?;
-        hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+        if w_gate.n == 0 {
+            // Gate-less: silu(up) in-place via silu_mul(gate=up, up=ones) is awkward;
+            // copy up→gate then silu_mul with a ones buffer on up would need host.
+            // Use silu_mul(gate, gate) with gate←up and up filled with 1.0.
+            hip.copy_d2d_f32(buf.gate, buf.up, cfg.ff_dim)?;
+            let ones = vec![1.0f32; cfg.ff_dim];
+            hip.copy_h2d_f32(buf.up, &ones)?;
+            hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+        } else {
+            resident.gemm_nt(
+                hip,
+                buf.normed,
+                w_gate,
+                buf.gate,
+                1,
+                cfg.ff_dim as i32,
+                dim as i32,
+            )?;
+            hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+        }
         resident.gemm_nt(
             hip,
             buf.gate,
@@ -3277,42 +3404,54 @@ impl TinyModel {
                             require_gguf_tensor(file, &format!("blk.{i}.{suffix}"))?;
                         }
                     }
-                    if cfg.n_experts == 0 {
+                    let has_dense_ffn = file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some();
+                    let has_moe = file
+                        .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
+                        .is_some()
+                        || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some();
+                    if has_dense_ffn {
                         for suffix in ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"] {
                             require_gguf_tensor(file, &format!("blk.{i}.{suffix}"))?;
                         }
                     }
-                    if file.tensor(&format!("blk.{i}.ffn_norm.weight")).is_none()
-                        && file
-                            .tensor(&format!("blk.{i}.post_attention_norm.weight"))
-                            .is_none()
-                    {
-                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                            "missing ffn_norm/post_attention_norm on blk.{i}"
-                        ))));
+                    if has_dense_ffn || has_moe {
+                        if file.tensor(&format!("blk.{i}.ffn_norm.weight")).is_none()
+                            && file
+                                .tensor(&format!("blk.{i}.post_attention_norm.weight"))
+                                .is_none()
+                            && file.tensor(&format!("blk.{i}.attn_norm.weight")).is_none()
+                        {
+                            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "missing ffn_norm/post_attention_norm/attn_norm on blk.{i}"
+                            ))));
+                        }
                     }
+                    // else: attention-only block (Nemotron Lightning) — no FFN tensors.
                 }
                 HybridLayerKind::DenseFfn | HybridLayerKind::Moe => {
                     if file.tensor(&format!("blk.{i}.ffn_norm.weight")).is_none()
                         && file
                             .tensor(&format!("blk.{i}.post_attention_norm.weight"))
                             .is_none()
+                        && file.tensor(&format!("blk.{i}.attn_norm.weight")).is_none()
                     {
                         return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                            "missing ffn_norm/post_attention_norm on blk.{i}"
+                            "missing ffn_norm/post_attention_norm/attn_norm on blk.{i}"
                         ))));
                     }
                     if info.moe || cfg.n_experts > 0 {
-                        if file
+                        let has_stacked_up = file
+                            .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
+                            .is_some();
+                        let has_stacked_gate = file
                             .tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
-                            .is_some()
-                        {
+                            .is_some();
+                        if has_stacked_up || has_stacked_gate {
                             require_gguf_tensor(file, &format!("blk.{i}.ffn_gate_inp.weight"))?;
                             require_gguf_tensor(file, &format!("blk.{i}.ffn_up_exps.weight"))?;
                             require_gguf_tensor(file, &format!("blk.{i}.ffn_down_exps.weight"))?;
                         } else {
                             for e in 0..cfg.n_experts.max(1) {
-                                require_gguf_tensor(file, &format!("blk.{i}.ffn_gate.{e}.weight"))?;
                                 require_gguf_tensor(file, &format!("blk.{i}.ffn_up.{e}.weight"))?;
                                 require_gguf_tensor(file, &format!("blk.{i}.ffn_down.{e}.weight"))?;
                             }
@@ -3454,10 +3593,15 @@ impl TinyModel {
                     }
                 }
                 HybridLayerKind::Attention => {
-                    let (w_gate, w_up, w_down, w_router, experts) = if cfg.n_experts > 0 {
+                    let has_moe = cfg.n_experts > 0
+                        && (file
+                            .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
+                            .is_some()
+                            || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some());
+                    let (w_gate, w_up, w_down, w_router, experts) = if has_moe {
                         let (w_router, experts) = load_gguf_moe_layer(file, i, cfg.n_experts)?;
                         (Vec::new(), Vec::new(), Vec::new(), w_router, experts)
-                    } else {
+                    } else if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
                         (
                             file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
                             file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
@@ -3465,6 +3609,9 @@ impl TinyModel {
                             Vec::new(),
                             Vec::new(),
                         )
+                    } else {
+                        // Attention-only hybrid block.
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
                     };
                     let (wq, wk, wv) = if file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some()
                     {
@@ -3481,6 +3628,11 @@ impl TinyModel {
                             file.tensor_f32(&format!("blk.{i}.attn_k.weight"))?,
                             file.tensor_f32(&format!("blk.{i}.attn_v.weight"))?,
                         )
+                    };
+                    let ffn_norm = if !w_gate.is_empty() || !experts.is_empty() {
+                        gguf_ffn_norm(file, i)?
+                    } else {
+                        Vec::new()
                     };
                     LayerWeights {
                         block: HybridLayerKind::Attention,
@@ -3507,7 +3659,7 @@ impl TinyModel {
                         wk,
                         wv,
                         wo: file.tensor_f32(&format!("blk.{i}.attn_output.weight"))?,
-                        ffn_norm: gguf_ffn_norm(file, i)?,
+                        ffn_norm,
                         w_gate,
                         w_up,
                         w_down,
@@ -3600,6 +3752,27 @@ impl TinyModel {
                             layer.k_norm = f
                                 .tensor_f32(&format!("blk.{i}.attn_k_norm.weight"))
                                 .unwrap_or_default();
+                        }
+                    }
+                } else if matches!(block, HybridLayerKind::DenseFfn | HybridLayerKind::Moe)
+                    || (cfg.n_experts > 0
+                        && file
+                            .map(|f| {
+                                f.tensor(&format!("blk.{i}.ffn_gate_inp.weight")).is_some()
+                                    || f.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some()
+                            })
+                            .unwrap_or(false))
+                {
+                    // MoE routing runs on host even when experts stay device-resident.
+                    if let Some(f) = file {
+                        if let Ok(router) = f
+                            .tensor_f32(&format!("blk.{i}.ffn_gate_inp.weight"))
+                            .or_else(|_| f.tensor_f32(&format!("blk.{i}.ffn_router.weight")))
+                        {
+                            layer.w_router = router;
+                        }
+                        if let Ok(norm) = gguf_ffn_norm(f, i) {
+                            layer.ffn_norm = norm;
                         }
                     }
                 }
@@ -4779,6 +4952,52 @@ impl TinyModel {
                         } else {
                             hip.residual_add(buf.x, buf.proj, dim as i32)?;
                         }
+                    } else if layer.w_router.n > 0
+                        || resident
+                            .expert_offs
+                            .get(layer_idx)
+                            .is_some_and(|e| !e.is_empty())
+                    {
+                        // MoE-only DenseFfn: no prior attn residual in proj.
+                        hip.copy_h2d_f32(buf.proj, &vec![0.0f32; dim])?;
+                        if let Some(s) = side.as_mut() {
+                            self.device_moe(
+                                layer_idx,
+                                hip,
+                                resident,
+                                buf,
+                                metrics,
+                                prefill,
+                                micro_batch,
+                                Some(s),
+                            )?;
+                        } else {
+                            self.device_moe(
+                                layer_idx,
+                                hip,
+                                resident,
+                                buf,
+                                metrics,
+                                prefill,
+                                micro_batch,
+                                None,
+                            )?;
+                        }
+                        if layer_idx + 1 < resident.layers.len() {
+                            hip.residual_rmsnorm(
+                                buf.x,
+                                buf.proj,
+                                resident.f32_or_dequant(
+                                    hip,
+                                    resident.layers[layer_idx + 1].attn_norm,
+                                )?,
+                                buf.normed,
+                                dim as i32,
+                                cfg.eps,
+                            )?;
+                        } else {
+                            hip.residual_add(buf.x, buf.proj, dim as i32)?;
+                        }
                     } else if layer_idx + 1 < resident.layers.len() {
                         hip.rmsnorm_device(
                             buf.x,
@@ -4997,7 +5216,12 @@ impl TinyModel {
                         wo_k as i32,
                     )?;
                 }
-                if self.config.n_experts > 0 {
+                let moe_here = layer.w_router.n > 0
+                    || resident
+                        .expert_offs
+                        .get(layer_idx)
+                        .is_some_and(|e| !e.is_empty());
+                if moe_here {
                     if let Some(s) = side.as_mut() {
                         self.device_moe(
                             layer_idx,
@@ -5021,7 +5245,7 @@ impl TinyModel {
                             None,
                         )?;
                     }
-                } else {
+                } else if layer.w_gate.n > 0 && layer.ffn_norm.n > 0 {
                     let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
                     let ffn_norm = ffn.ffn_norm();
                     let w_gate = ffn.w_gate();
@@ -5108,6 +5332,7 @@ impl TinyModel {
                     }
                     drop(ffn);
                 }
+                // else: attention-only hybrid block — `buf.proj` still holds attn out.
                 if layer_idx + 1 < resident.layers.len() {
                     hip.residual_rmsnorm(
                         buf.x,

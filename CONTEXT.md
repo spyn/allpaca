@@ -11,6 +11,8 @@
 - NGram + DraftModel speculation providers
 - VRAM + Pinned DRAM KV tiering (2-tier); optional NVMe cold KV
 - Weight working set (dense pin-prefix + ring; MoE host-pool + GPU LRU + `q*` miss split)
+- Windows DirectStorage file→D3D12→HIP DMA (opt-in alloc); aligned host-staged H2D fallback
+- `nemotron_h_moe` hybrid schedule: Mamba-2 SSD + attention + MoE (incl. Lightning gate-less experts)
 - CPU sampling with JSON mode plus `llguidance` JSON Schema / Lark constraints
 - HIP backend (AMD GPU)
 - CPU fallback for all kernels
@@ -19,12 +21,14 @@
 - `tracing` logs + `/stats` metrics endpoint
 
 **Out (fast-follow):**
-- Tree speculation (feature-flagged; off by default)
+- Tree speculation (feature-flagged; off by default) and tree+MTP productization
 - CUDA backend
 - Auxiliary accelerators (Coral, NPU)
 - Multimodal (vision/audio)
 - Prometheus/OpenTelemetry export
 - Batched HIP GEMM across Requests (poll advances one Request per tick)
+- Legacy GGUF quants (`Q2_K`/`Q3_K`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_1`); BitNet; CXL/PIM
+- Early-exit heads (gating/metrics exist; accepts not wired)
 
 **Demo:** Load 7B GGUF, asymmetric speculative decoding on RX 9070 + 9060 XT, show speedup vs single-GPU, KV spill to DRAM when VRAM fills.
 

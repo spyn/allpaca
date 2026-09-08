@@ -6055,6 +6055,206 @@ mod tests {
         write_gguf(path, &meta, &views).unwrap();
     }
 
+    /// Nemotron-Lightning MoE block: `attn_norm` (no `ffn_norm`), stacked `up`/`down`
+    /// experts without `gate_exps`.
+    fn write_tiny_nemotron_lightning_moe_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        use std::collections::HashMap;
+
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 8usize;
+        let n_exp = 2usize;
+        let d_inner = 4usize;
+        let d_state = 2usize;
+        let n_heads = 2usize;
+        let n_groups = 1usize;
+        let conv_kernel = 2usize;
+        let conv_dim = d_inner + 2 * n_groups * d_state;
+        let in_proj = 2 * d_inner + 2 * n_groups * d_state + n_heads;
+        let w = 0.01f32;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("nemotron_h_moe".into()),
+        );
+        meta.insert(
+            "nemotron_h_moe.vocab_size".into(),
+            GgufValue::Uint32(vocab as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
+        meta.insert("nemotron_h_moe.block_count".into(), GgufValue::Uint32(2));
+        meta.insert(
+            "nemotron_h_moe.attention.head_count".into(),
+            GgufValue::Uint32(4),
+        );
+        meta.insert(
+            "nemotron_h_moe.attention.head_count_kv".into(),
+            GgufValue::Uint32(1),
+        );
+        meta.insert(
+            "nemotron_h_moe.expert_feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.expert_count".into(),
+            GgufValue::Uint32(n_exp as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.expert_used_count".into(),
+            GgufValue::Uint32(1),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.inner_size".into(),
+            GgufValue::Uint32(d_inner as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.state_size".into(),
+            GgufValue::Uint32(d_state as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.time_step_rank".into(),
+            GgufValue::Uint32(n_heads as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.group_count".into(),
+            GgufValue::Uint32(n_groups as u32),
+        );
+        meta.insert(
+            "nemotron_h_moe.ssm.conv_kernel".into(),
+            GgufValue::Uint32(conv_kernel as u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hi".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+        let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            (
+                "token_embd.weight".into(),
+                vec![vocab as u64, dim as u64],
+                vec![w; vocab * dim],
+            ),
+            (
+                "blk.0.attn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.0.ssm_in.weight".into(),
+                vec![dim as u64, in_proj as u64],
+                vec![w; dim * in_proj],
+            ),
+            (
+                "blk.0.ssm_out.weight".into(),
+                vec![d_inner as u64, dim as u64],
+                vec![w; dim * d_inner],
+            ),
+            (
+                "blk.0.ssm_conv1d.weight".into(),
+                vec![conv_kernel as u64, conv_dim as u64],
+                vec![0.5; conv_kernel * conv_dim],
+            ),
+            (
+                "blk.0.ssm_conv1d.bias".into(),
+                vec![conv_dim as u64],
+                vec![0.01; conv_dim],
+            ),
+            ("blk.0.ssm_a".into(), vec![1, n_heads as u64], vec![-1.0; n_heads]),
+            ("blk.0.ssm_d".into(), vec![1, n_heads as u64], vec![0.25; n_heads]),
+            ("blk.0.ssm_dt.bias".into(), vec![n_heads as u64], vec![0.0; n_heads]),
+            (
+                "blk.0.ssm_norm.weight".into(),
+                vec![(d_inner / n_groups) as u64, n_groups as u64],
+                vec![1.0; d_inner],
+            ),
+            // MoE-only: Lightning uses attn_norm, up/down exps, no ffn_norm / gate_exps.
+            (
+                "blk.1.attn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.1.ffn_gate_inp.weight".into(),
+                vec![dim as u64, n_exp as u64],
+                vec![w; dim * n_exp],
+            ),
+            (
+                "blk.1.ffn_up_exps.weight".into(),
+                vec![dim as u64, ff as u64, n_exp as u64],
+                vec![w; dim * ff * n_exp],
+            ),
+            (
+                "blk.1.ffn_down_exps.weight".into(),
+                vec![ff as u64, dim as u64, n_exp as u64],
+                vec![w; ff * dim * n_exp],
+            ),
+            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "output.weight".into(),
+                vec![vocab as u64, dim as u64],
+                vec![w; vocab * dim],
+            ),
+        ];
+        let views: Vec<GgufWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
+    #[test]
+    fn nemotron_lightning_moe_loads_without_ffn_norm_or_gate_exps() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_nemotron_lightning_moe-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_tiny_nemotron_lightning_moe_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).expect("Lightning MoE layout must load");
+        let out = engine
+            .generate(
+                "hi",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("Lightning MoE must generate");
+        assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
     fn write_tiny_qwen_gdn_gguf(path: &std::path::Path, w: f32) {
         use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
         use std::collections::HashMap;

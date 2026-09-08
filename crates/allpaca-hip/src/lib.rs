@@ -2866,19 +2866,40 @@ unsafe impl Send for DeviceWeights {}
 unsafe impl Sync for DeviceWeights {}
 
 impl DeviceWeights {
+    /// Ordinary HIP device heap for weight blobs (H2D memcpy / GEMM).
+    ///
+    /// DirectStorage D3D12-imported memory is opt-in via [`Self::alloc_direct_storage`];
+    /// using it for every upload breaks large H2D packs (hipMemcpy rc=3 on imported ptrs).
     pub fn alloc(device: i32, bytes: usize) -> Result<Self, AllpacaError> {
         if bytes == 0 {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "empty weight upload".into(),
             )));
         }
-        #[cfg(all(windows, feature = "hip", allpaca_hip_runtime, allpaca_direct_storage))]
-        if let Ok(direct_storage) = DirectStorageBuffer::alloc(device, bytes) {
-            let ptr = direct_storage.byte_ptr_at(0) as *mut u8;
-            return Ok(Self { device, ptr, bytes, direct_storage: Some(direct_storage) });
-        }
         let ptr = device_malloc(bytes, device)?;
-        Ok(Self { device, ptr, bytes, direct_storage: None })
+        Ok(Self {
+            device,
+            ptr,
+            bytes,
+            direct_storage: None,
+        })
+    }
+
+    /// D3D12 resource imported into HIP for DirectStorage NVMe→GPU DMA fills.
+    pub fn alloc_direct_storage(device: i32, bytes: usize) -> Result<Self, AllpacaError> {
+        if bytes == 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty weight upload".into(),
+            )));
+        }
+        let direct_storage = DirectStorageBuffer::alloc(device, bytes)?;
+        let ptr = direct_storage.byte_ptr_at(0) as *mut u8;
+        Ok(Self {
+            device,
+            ptr,
+            bytes,
+            direct_storage: Some(direct_storage),
+        })
     }
 
     /// Copy host bytes into this blob at `offset`. Caller must keep the region unused by GEMM.
@@ -6509,7 +6530,8 @@ mod tests {
             file.sync_all().unwrap();
         }
 
-        let weights = DeviceWeights::alloc(device, BYTES).expect("device weights");
+        let weights = DeviceWeights::alloc_direct_storage(device, BYTES)
+            .expect("D3D12-imported device weights");
         assert!(
             weights.read_file_direct(&path, 0, 0, BYTES)
                 .expect("DirectStorage weight fill"),
