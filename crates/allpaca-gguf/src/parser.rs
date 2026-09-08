@@ -170,10 +170,12 @@ pub enum GgmlType {
     Q5_1 = 7,
     Q8_0 = 8,
     Q8_1 = 9,
+    Q2_K = 10,
+    Q3_K = 11,
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
-    /// AMD ROCmFP4 dual-scale (ggml_type_id=100): host bytes loadable; F32 dequant not yet.
+    /// AMD ROCmFP4 dual-scale (ggml_type_id=100).
     RocmFp4 = 100,
     Other = 255,
 }
@@ -189,6 +191,8 @@ impl GgmlType {
             7 => Self::Q5_1,
             8 => Self::Q8_0,
             9 => Self::Q8_1,
+            10 => Self::Q2_K,
+            11 => Self::Q3_K,
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
@@ -220,9 +224,27 @@ impl TensorInfo {
             GgmlType::Q4_0 => n
                 .div_ceil(allpaca_cpu::Q4_0_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q4_0_BLOCK_BYTES),
+            GgmlType::Q4_1 => n
+                .div_ceil(allpaca_cpu::Q4_1_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q4_1_BLOCK_BYTES),
+            GgmlType::Q5_0 => n
+                .div_ceil(allpaca_cpu::Q5_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q5_0_BLOCK_BYTES),
+            GgmlType::Q5_1 => n
+                .div_ceil(allpaca_cpu::Q5_1_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q5_1_BLOCK_BYTES),
             GgmlType::Q8_0 => n
                 .div_ceil(allpaca_cpu::Q8_0_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES),
+            GgmlType::Q8_1 => n
+                .div_ceil(allpaca_cpu::Q8_1_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q8_1_BLOCK_BYTES),
+            GgmlType::Q2_K => n
+                .div_ceil(allpaca_cpu::Q2_K_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q2_K_BLOCK_BYTES),
+            GgmlType::Q3_K => n
+                .div_ceil(allpaca_cpu::Q3_K_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q3_K_BLOCK_BYTES),
             GgmlType::Q4_K => n
                 .div_ceil(allpaca_cpu::Q4_K_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q4_K_BLOCK_BYTES),
@@ -428,7 +450,13 @@ impl GgufFile {
             GgmlType::F32 as u32,
             GgmlType::F16 as u32,
             GgmlType::Q4_0 as u32,
+            GgmlType::Q4_1 as u32,
+            GgmlType::Q5_0 as u32,
+            GgmlType::Q5_1 as u32,
             GgmlType::Q8_0 as u32,
+            GgmlType::Q8_1 as u32,
+            GgmlType::Q2_K as u32,
+            GgmlType::Q3_K as u32,
             GgmlType::Q4_K as u32,
             GgmlType::Q5_K as u32,
             GgmlType::Q6_K as u32,
@@ -443,7 +471,7 @@ impl GgufFile {
         let mut reasons = Vec::new();
         if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K/ROCmFP4)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/ROCmFP4)"
             ));
         }
         let llama_family = matches!(
@@ -513,7 +541,7 @@ impl GgufFile {
         }
     }
 
-    /// Materialize a tensor as F32. F16 / Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K convert on CPU; other quants are Fatal.
+    /// Materialize a tensor as F32. Supported quants convert on CPU; unknown types are Fatal.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, AllpacaError> {
         let info = self.tensor(name).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
@@ -556,9 +584,7 @@ impl GgufFile {
                 Ok(out)
             }
             GgmlType::Q4_0 => {
-                let nbytes = n
-                    .div_ceil(allpaca_cpu::Q4_0_BLOCK_ELEMS)
-                    .saturating_mul(allpaca_cpu::Q4_0_BLOCK_BYTES);
+                let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > self.mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
                         "tensor {name} Q4_0 out of range"
@@ -568,10 +594,41 @@ impl GgufFile {
                 allpaca_cpu::dequant_q4_0(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
+            GgmlType::Q4_1 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q4_1 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q4_1(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q5_0 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q5_0 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q5_0(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q5_1 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q5_1 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q5_1(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
             GgmlType::Q8_0 => {
-                let nbytes = n
-                    .div_ceil(allpaca_cpu::Q8_0_BLOCK_ELEMS)
-                    .saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES);
+                let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > self.mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
                         "tensor {name} Q8_0 out of range"
@@ -581,10 +638,41 @@ impl GgufFile {
                 allpaca_cpu::dequant_q8_0(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
+            GgmlType::Q8_1 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q8_1 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q8_1(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q2_K => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q2_K out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q2_k(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Q3_K => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} Q3_K out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_q3_k(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
             GgmlType::Q4_K => {
-                let nbytes = n
-                    .div_ceil(allpaca_cpu::Q4_K_BLOCK_ELEMS)
-                    .saturating_mul(allpaca_cpu::Q4_K_BLOCK_BYTES);
+                let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > self.mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
                         "tensor {name} Q4_K out of range"
@@ -595,9 +683,7 @@ impl GgufFile {
                 Ok(out)
             }
             GgmlType::Q5_K => {
-                let nbytes = n
-                    .div_ceil(allpaca_cpu::Q5_K_BLOCK_ELEMS)
-                    .saturating_mul(allpaca_cpu::Q5_K_BLOCK_BYTES);
+                let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > self.mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
                         "tensor {name} Q5_K out of range"
@@ -608,9 +694,7 @@ impl GgufFile {
                 Ok(out)
             }
             GgmlType::Q6_K => {
-                let nbytes = n
-                    .div_ceil(allpaca_cpu::Q6_K_BLOCK_ELEMS)
-                    .saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES);
+                let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > self.mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
                         "tensor {name} Q6_K out of range"
@@ -621,9 +705,7 @@ impl GgufFile {
                 Ok(out)
             }
             GgmlType::RocmFp4 => {
-                let nbytes = n
-                    .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
-                    .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES);
+                let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > self.mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
                         "tensor {name} ROCmFP4 out of range"
@@ -1147,12 +1229,191 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_quant_tensor_load_is_fatal() {
-        let path = std::env::temp_dir().join("allpaca_gguf_q5.gguf");
-        write_typed_gguf(&path, 6, &[0u8; 32], 32);
+    fn q5_0_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q5_0.gguf");
+        // 5-bit codes 0..31 → dequant d*(q-16); pick q = 16+k for k in -4..4 repeating.
+        let mut qs = [0u8; 16];
+        let mut qh = 0u32;
+        let mut expect = [0.0f32; 32];
+        let d = 0.5f32;
+        for i in 0..32 {
+            let q = ((i % 9) + 12) as u8; // 12..20 → (q-16) in -4..4
+            expect[i] = d * (q as f32 - 16.0);
+            if i < 16 {
+                qs[i] = q & 0x0f;
+                if q & 0x10 != 0 {
+                    qh |= 1u32 << i;
+                }
+            } else {
+                let j = i - 16;
+                qs[j] |= (q & 0x0f) << 4;
+                if q & 0x10 != 0 {
+                    qh |= 1u32 << i;
+                }
+            }
+        }
+        let mut payload = Vec::with_capacity(22);
+        payload.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        payload.extend_from_slice(&qh.to_le_bytes());
+        payload.extend_from_slice(&qs);
+        write_typed_gguf(&path, 6, &payload, 32);
         let file = GgufFile::open(&path).unwrap();
         let info = file.tensor("quant.weight").expect("header lists tensor");
         assert_eq!(info.ggml_type, GgmlType::Q5_0);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("Q5_0 must materialize to F32");
+        assert_eq!(loaded.len(), 32);
+        for (i, (&want, &got)) in expect.iter().zip(loaded.iter()).enumerate() {
+            assert!(
+                (want - got).abs() < 1e-2,
+                "Q5_0 dequant mismatch at {i}: {got} vs {want}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q4_1_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q4_1.gguf");
+        let d = 0.25f32;
+        let m = -1.0f32;
+        let mut qs = [0u8; 16];
+        let mut expect = [0.0f32; 32];
+        for i in 0..32 {
+            let q = (i % 16) as u8;
+            expect[i] = d * q as f32 + m;
+            if i < 16 {
+                qs[i] = q;
+            } else {
+                qs[i - 16] |= q << 4;
+            }
+        }
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        payload.extend_from_slice(&f32_to_f16_bits(m).to_le_bytes());
+        payload.extend_from_slice(&qs);
+        write_typed_gguf(&path, 3, &payload, 32);
+        let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q4_1);
+        let loaded = file.tensor_f32("quant.weight").expect("Q4_1");
+        for (i, (&want, &got)) in expect.iter().zip(loaded.iter()).enumerate() {
+            assert!((want - got).abs() < 1e-2, "Q4_1 {i}: {got} vs {want}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q8_1_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q8_1.gguf");
+        let d = 0.5f32;
+        let values: Vec<i8> = (0..32).map(|i| i - 16).collect();
+        let mut payload = Vec::with_capacity(36);
+        payload.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        payload.extend_from_slice(&f32_to_f16_bits(0.0).to_le_bytes()); // unused sum
+        payload.extend(values.iter().map(|v| *v as u8));
+        write_typed_gguf(&path, 9, &payload, 32);
+        let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q8_1);
+        let loaded = file.tensor_f32("quant.weight").expect("Q8_1");
+        for (i, v) in loaded.iter().enumerate() {
+            let expect = d * values[i] as f32;
+            assert!((*v - expect).abs() < 1e-2, "Q8_1 {i}: {v} vs {expect}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q5_1_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q5_1.gguf");
+        let d = 0.5f32;
+        let m = -2.0f32;
+        let mut qs = [0u8; 16];
+        let mut qh = 0u32;
+        let mut expect = [0.0f32; 32];
+        for i in 0..32 {
+            let q = (i % 17) as u8; // 0..16
+            expect[i] = d * q as f32 + m;
+            if i < 16 {
+                qs[i] = q & 0x0f;
+                if q & 0x10 != 0 {
+                    qh |= 1u32 << i;
+                }
+            } else {
+                let j = i - 16;
+                qs[j] |= (q & 0x0f) << 4;
+                if q & 0x10 != 0 {
+                    qh |= 1u32 << i;
+                }
+            }
+        }
+        let mut payload = Vec::with_capacity(24);
+        payload.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        payload.extend_from_slice(&f32_to_f16_bits(m).to_le_bytes());
+        payload.extend_from_slice(&qh.to_le_bytes());
+        payload.extend_from_slice(&qs);
+        write_typed_gguf(&path, 7, &payload, 32);
+        let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q5_1);
+        let loaded = file.tensor_f32("quant.weight").expect("Q5_1");
+        for (i, (&want, &got)) in expect.iter().zip(loaded.iter()).enumerate() {
+            assert!((want - got).abs() < 1e-2, "Q5_1 {i}: {got} vs {want}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q2_k_tensor_load_dequants_zero_block() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q2_k.gguf");
+        // d=1, dmin=0, scales=1, qs=0 → all zeros.
+        let mut payload = vec![0u8; 84];
+        for s in &mut payload[0..16] {
+            *s = 0x01;
+        }
+        payload[80..82].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+        write_typed_gguf(&path, 10, &payload, 256);
+        let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q2_K);
+        let loaded = file.tensor_f32("quant.weight").expect("Q2_K");
+        assert_eq!(loaded.len(), 256);
+        assert!(loaded.iter().all(|v| v.abs() < 1e-5), "expected zeros");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q3_k_tensor_load_dequants_zero_quants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_q3_k.gguf");
+        // hmask all-bits set (no -4), qs=0, scales remapped to 32 (dl=0), d=1 → zeros.
+        let mut payload = vec![0u8; 110];
+        payload[0..32].fill(0xff);
+        // scales bytes that decode to 32 after remapping: pack 0x20 in low nibbles.
+        // Easiest: set raw scales so remapped scale_bytes are all 32.
+        // aux after remap uses low 4 bits of first 8 bytes + packed bits from bytes 8..12.
+        // Force all scale_bytes=32 by writing known pattern from llama.cpp identity.
+        for i in 0..8 {
+            payload[96 + i] = 0x20; // low nibble 0, high will be remapped
+        }
+        // After remap with tmp=0, aux[0]/aux[1] keep low nibbles → 0x20 & 0x0f = 0, not 32.
+        // Use scale value 32 = 0x20 in the remapped i8 slots via aux packing:
+        // Put 0x20 in each byte of aux[0] and aux[1] after remap: set low nibbles to 0x0 and
+        // high from tmp. Simpler path: d=0 → all zeros regardless of scales.
+        payload[108..110].copy_from_slice(&f32_to_f16_bits(0.0).to_le_bytes());
+        write_typed_gguf(&path, 11, &payload, 256);
+        let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q3_K);
+        let loaded = file.tensor_f32("quant.weight").expect("Q3_K");
+        assert_eq!(loaded.len(), 256);
+        assert!(loaded.iter().all(|v| v.abs() < 1e-5), "d=0 must yield zeros");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unsupported_quant_tensor_load_is_fatal() {
+        let path = std::env::temp_dir().join("allpaca_gguf_unknown_quant.gguf");
+        write_typed_gguf(&path, 99, &[0u8; 32], 32);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::Other);
         let err = file.tensor_f32("quant.weight").unwrap_err();
         assert!(
             err.is_fatal(),

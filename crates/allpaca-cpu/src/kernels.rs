@@ -468,6 +468,15 @@ pub fn silu(x: f32) -> f32 {
 
 pub const Q4_0_BLOCK_ELEMS: usize = 32;
 pub const Q4_0_BLOCK_BYTES: usize = 18;
+/// Legacy Q4_1: f16 d + f16 m + qs[16] (32 nibbles). `x = d*q + m`.
+pub const Q4_1_BLOCK_ELEMS: usize = 32;
+pub const Q4_1_BLOCK_BYTES: usize = 20;
+/// Legacy Q5_0: f16 d + qh u32 + qs[16]. `x = d*(q-16)` with 5-bit q.
+pub const Q5_0_BLOCK_ELEMS: usize = 32;
+pub const Q5_0_BLOCK_BYTES: usize = 22;
+/// Legacy Q5_1: f16 d + f16 m + qh u32 + qs[16]. `x = d*q + m`.
+pub const Q5_1_BLOCK_ELEMS: usize = 32;
+pub const Q5_1_BLOCK_BYTES: usize = 24;
 /// ggml_type_id=100 ROCmFP4 dual-scale: 18 bytes / 32 elems (4.5 bpw).
 /// Block layout is `qs[16]` then `e[2]`: nibble `j` low → element `j` (scale
 /// `e[0]`), nibble `j` high → element `j + 16` (scale `e[1]`).
@@ -477,6 +486,15 @@ pub const ROCMFP4_BLOCK_BYTES: usize = 18;
 pub const ROCMFP4_CODEBOOK: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10];
 pub const Q8_0_BLOCK_ELEMS: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
+/// Legacy Q8_1: f16 d + f16 s + qs[32]. `x = d*q` (s is block sum, unused here).
+pub const Q8_1_BLOCK_ELEMS: usize = 32;
+pub const Q8_1_BLOCK_BYTES: usize = 36;
+/// GGUF Q2_K super-block (256 elems).
+pub const Q2_K_BLOCK_ELEMS: usize = 256;
+pub const Q2_K_BLOCK_BYTES: usize = 84;
+/// GGUF Q3_K super-block (256 elems).
+pub const Q3_K_BLOCK_ELEMS: usize = 256;
+pub const Q3_K_BLOCK_BYTES: usize = 110;
 /// GGUF Q4_K / Q4_K_S / Q4_K_M super-block (256 elems).
 pub const Q4_K_BLOCK_ELEMS: usize = 256;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
@@ -875,6 +893,273 @@ pub fn dequant_q4_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
             if i1 < n {
                 out[i1] = d * ((packed >> 4) as i8 as f32 - 8.0);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q4_1: `x = d*q + m` with unsigned 4-bit q.
+pub fn dequant_q4_1(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q4_1 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q4_1_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q4_1_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q4_1 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q4_1_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        let m = f16_to_f32(u16::from_le_bytes([blocks[off + 2], blocks[off + 3]]));
+        for j in 0..16 {
+            let packed = blocks[off + 4 + j];
+            let i0 = b * Q4_1_BLOCK_ELEMS + j;
+            let i1 = i0 + 16;
+            if i0 < n {
+                out[i0] = d * f32::from(packed & 0x0f) + m;
+            }
+            if i1 < n {
+                out[i1] = d * f32::from(packed >> 4) + m;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q5_0: 5-bit q via qs nibbles + qh bits → `d*(q-16)`.
+pub fn dequant_q5_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q5_0 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q5_0_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q5_0_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q5_0 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q5_0_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        let qh = u32::from_le_bytes([
+            blocks[off + 2],
+            blocks[off + 3],
+            blocks[off + 4],
+            blocks[off + 5],
+        ]);
+        for j in 0..16 {
+            let packed = blocks[off + 6 + j];
+            let i0 = b * Q5_0_BLOCK_ELEMS + j;
+            let i1 = i0 + 16;
+            let q0 = (packed & 0x0f) as u32 | (((qh >> j) & 1) << 4);
+            let q1 = (packed >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4);
+            if i0 < n {
+                out[i0] = d * (q0 as f32 - 16.0);
+            }
+            if i1 < n {
+                out[i1] = d * (q1 as f32 - 16.0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q5_1: 5-bit q → `d*q + m`.
+pub fn dequant_q5_1(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q5_1 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q5_1_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q5_1_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q5_1 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q5_1_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        let m = f16_to_f32(u16::from_le_bytes([blocks[off + 2], blocks[off + 3]]));
+        let qh = u32::from_le_bytes([
+            blocks[off + 4],
+            blocks[off + 5],
+            blocks[off + 6],
+            blocks[off + 7],
+        ]);
+        for j in 0..16 {
+            let packed = blocks[off + 8 + j];
+            let i0 = b * Q5_1_BLOCK_ELEMS + j;
+            let i1 = i0 + 16;
+            let q0 = (packed & 0x0f) as u32 | (((qh >> j) & 1) << 4);
+            let q1 = (packed >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4);
+            if i0 < n {
+                out[i0] = d * q0 as f32 + m;
+            }
+            if i1 < n {
+                out[i1] = d * q1 as f32 + m;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q8_1: `x = d * q` (int8 qs); block sum `s` unused for F32 materialize.
+pub fn dequant_q8_1(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q8_1 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q8_1_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q8_1_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q8_1 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q8_1_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        for j in 0..Q8_1_BLOCK_ELEMS {
+            let i = b * Q8_1_BLOCK_ELEMS + j;
+            if i < n {
+                out[i] = d * (blocks[off + 4 + j] as i8 as f32);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q2_K (llama.cpp `dequantize_row_q2_K`).
+pub fn dequant_q2_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q2_k output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q2_K_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q2_K_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q2_k truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * Q2_K_BLOCK_BYTES;
+        let scales = &blocks[off..off + 16];
+        let mut q = &blocks[off + 16..off + 80];
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off + 80], blocks[off + 81]]));
+        let min = f16_to_f32(u16::from_le_bytes([blocks[off + 82], blocks[off + 83]]));
+        let mut y = b * Q2_K_BLOCK_ELEMS;
+        let mut is = 0usize;
+        for _ in 0..2 {
+            let mut shift = 0u32;
+            for _ in 0..4 {
+                let sc = scales[is];
+                is += 1;
+                let dl = d * f32::from(sc & 0x0f);
+                let ml = min * f32::from(sc >> 4);
+                for l in 0..16 {
+                    if y + l < n {
+                        out[y + l] = dl * f32::from((q[l] >> shift) & 3) - ml;
+                    }
+                }
+                y += 16;
+                let sc = scales[is];
+                is += 1;
+                let dl = d * f32::from(sc & 0x0f);
+                let ml = min * f32::from(sc >> 4);
+                for l in 0..16 {
+                    if y + l < n {
+                        out[y + l] = dl * f32::from((q[l + 16] >> shift) & 3) - ml;
+                    }
+                }
+                y += 16;
+                shift += 2;
+            }
+            q = &q[32..];
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF Q3_K (llama.cpp `dequantize_row_q3_K`).
+pub fn dequant_q3_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q3_k output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(Q3_K_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(Q3_K_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_q3_k truncated blocks".into(),
+        )));
+    }
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    for b in 0..n_blocks {
+        let off = b * Q3_K_BLOCK_BYTES;
+        let hm = &blocks[off..off + 32];
+        let mut q = &blocks[off + 32..off + 96];
+        let scales_raw = &blocks[off + 96..off + 108];
+        let d_all = f16_to_f32(u16::from_le_bytes([blocks[off + 108], blocks[off + 109]]));
+        let mut aux = [0u32; 4];
+        aux[0] = u32::from_le_bytes(scales_raw[0..4].try_into().unwrap());
+        aux[1] = u32::from_le_bytes(scales_raw[4..8].try_into().unwrap());
+        aux[2] = u32::from_le_bytes(scales_raw[8..12].try_into().unwrap());
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let mut scale_bytes = [0i8; 16];
+        for (i, word) in aux.iter().enumerate() {
+            let le = word.to_le_bytes();
+            for (j, b) in le.into_iter().enumerate() {
+                scale_bytes[i * 4 + j] = b as i8;
+            }
+        }
+        let mut y = b * Q3_K_BLOCK_ELEMS;
+        let mut is = 0usize;
+        let mut m: u8 = 1;
+        for _ in 0..2 {
+            let mut shift = 0u32;
+            for _ in 0..4 {
+                let dl = d_all * f32::from(i16::from(scale_bytes[is]) - 32);
+                is += 1;
+                for l in 0..16 {
+                    if y + l < n {
+                        let qv = (q[l] >> shift) & 3;
+                        let hi: u8 = if hm[l] & m != 0 { 0 } else { 4 };
+                        out[y + l] = dl * (f32::from(qv) - f32::from(hi));
+                    }
+                }
+                y += 16;
+                let dl = d_all * f32::from(i16::from(scale_bytes[is]) - 32);
+                is += 1;
+                for l in 0..16 {
+                    if y + l < n {
+                        let qv = (q[l + 16] >> shift) & 3;
+                        let hi: u8 = if hm[l + 16] & m != 0 { 0 } else { 4 };
+                        out[y + l] = dl * (f32::from(qv) - f32::from(hi));
+                    }
+                }
+                y += 16;
+                shift += 2;
+                m = m.wrapping_shl(1);
+            }
+            q = &q[32..];
         }
     }
     Ok(())
