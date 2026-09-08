@@ -4,9 +4,7 @@ use std::time::Instant;
 
 use allpaca_gguf::{extract_tokenizer, GgufFile};
 use allpaca_onnx::OnnxFile;
-use allpaca_safetensors::{
-    load_hf_config, load_vocab_sidecar, resolve_sidecar, SafetensorsFile,
-};
+use allpaca_safetensors::{load_hf_config, load_vocab_sidecar, resolve_sidecar, SafetensorsFile};
 use allpaca_types::{
     AllpacaError, Config, DraftProviderKind, FatalError, FeatureFlags, FinishReason,
     GenerationOutput, GenerationParams, KvHandle, StatsSnapshot, StepResult, TokenEvent,
@@ -23,21 +21,21 @@ use crate::direct_storage::{
 };
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
 use crate::early_exit::{gate_unsupported, EarlyExitSpec};
+use crate::expert_batch::MicroBatchExpertUnion;
 use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
-use crate::expert_batch::MicroBatchExpertUnion;
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
     alloc_pages_for_seq, ensure_pages, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
     TinyModel,
 };
+use crate::packed::{temp_pack_path, HostExpertPool, PackedStore};
 use crate::sampling::{rng_from_params, sample};
 use crate::scheduler::Scheduler;
 use crate::telemetry::{GpuSampler, Metrics};
 use crate::tokenizer::EngineTokenizer;
-use crate::packed::{temp_pack_path, PackedStore, HostExpertPool};
 use crate::weight_set::{
     expert_lru_slots, host_pool_slots, DenseTrunkPlan, ExpertId, ExpertLru, LayerFfn,
     WeightWorkingSet,
@@ -170,7 +168,9 @@ impl RequestHandle {
 
 impl std::fmt::Debug for RequestHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RequestHandle").field("id", &self.id).finish()
+        f.debug_struct("RequestHandle")
+            .field("id", &self.id)
+            .finish()
     }
 }
 
@@ -402,10 +402,9 @@ impl Engine {
                     g.kv_radix.skip_tokens(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                self.metrics.radix_evictions.store(
-                    g.kv_radix.evictions(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.metrics
+                    .radix_evictions
+                    .store(g.kv_radix.evictions(), std::sync::atomic::Ordering::Relaxed);
                 self.metrics.radix_bytes.store(
                     g.kv_radix.checkpoint_bytes() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -431,22 +430,18 @@ impl Engine {
                 self.metrics
                     .ds_pinned
                     .store(q.pinned(), std::sync::atomic::Ordering::Relaxed);
-                self.metrics.ds_pinned_bytes.store(
-                    q.pinned_bytes(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                self.metrics.ds_gpu_dma.store(
-                    q.gpu_dma(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                self.metrics.ds_gpu_dma_bytes.store(
-                    q.gpu_dma_bytes(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                self.metrics.ds_com_binds.store(
-                    q.com_binds(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.metrics
+                    .ds_pinned_bytes
+                    .store(q.pinned_bytes(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .ds_gpu_dma
+                    .store(q.gpu_dma(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .ds_gpu_dma_bytes
+                    .store(q.gpu_dma_bytes(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .ds_com_binds
+                    .store(q.com_binds(), std::sync::atomic::Ordering::Relaxed);
                 self.metrics
                     .kv_nvme_pages
                     .store(g.kv.nvme_count(), std::sync::atomic::Ordering::Relaxed);
@@ -460,18 +455,17 @@ impl Engine {
                     u64::from(g.kv.nvme_direct()),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                self.metrics.kv_nvme_prefetches.store(
-                    g.kv.nvme_prefetches(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.metrics
+                    .kv_nvme_prefetches
+                    .store(g.kv.nvme_prefetches(), std::sync::atomic::Ordering::Relaxed);
                 (
-                g.target
-                    .as_ref()
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| self.config.model.id.clone()),
-                g.kv.activation_h2d_bytes(),
-                g.kv.activation_d2h_bytes(),
-                g.draft_kv.device_bytes(),
+                    g.target
+                        .as_ref()
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| self.config.model.id.clone()),
+                    g.kv.activation_h2d_bytes(),
+                    g.kv.activation_d2h_bytes(),
+                    g.draft_kv.device_bytes(),
                 )
             }
             Err(_) => (self.config.model.id.clone(), 0, 0, 0),
@@ -507,38 +501,47 @@ impl Engine {
         self.metrics
             .draft_kv_bytes_on_device
             .store(draft_kv_bytes, std::sync::atomic::Ordering::Relaxed);
-        self.metrics
-            .activation_h2d_bytes
-            .store(hip_h2d + kv_h2d + draft_h2d, std::sync::atomic::Ordering::Relaxed);
-        self.metrics
-            .activation_d2h_bytes
-            .store(hip_d2h + kv_d2h + draft_d2h, std::sync::atomic::Ordering::Relaxed);
+        self.metrics.activation_h2d_bytes.store(
+            hip_h2d + kv_h2d + draft_h2d,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.metrics.activation_d2h_bytes.store(
+            hip_d2h + kv_d2h + draft_d2h,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(hip) = &self.hip {
             let p = hip.decode_profile();
-            self.metrics
-                .q8_gemm_ns
-                .store((p.q8_gemm_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.metrics
-                .attention_ns
-                .store((p.attention_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.metrics
-                .lm_head_ns
-                .store((p.lm_head_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.metrics
-                .other_gpu_ns
-                .store((p.other_gpu_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.q8_gemm_ns.store(
+                (p.q8_gemm_us * 1_000.0).round() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.attention_ns.store(
+                (p.attention_us * 1_000.0).round() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.lm_head_ns.store(
+                (p.lm_head_us * 1_000.0).round() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.other_gpu_ns.store(
+                (p.other_gpu_us * 1_000.0).round() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
-            let itl_us = self.metrics.itl_ms_ema_x100.load(std::sync::atomic::Ordering::Relaxed)
-                as f64
+            let itl_us = self
+                .metrics
+                .itl_ms_ema_x100
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
                 * 10.0;
             let host_us = if itl_us > gpu_us {
                 itl_us - gpu_us
             } else {
                 p.host_us
             };
-            self.metrics
-                .host_ns
-                .store((host_us * 1_000.0).round() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.host_ns.store(
+                (host_us * 1_000.0).round() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let bench = self.inventory.transfer_benchmark;
         let p2p_copy_ok = bench.map(|b| b.p2p_copy_ok).unwrap_or(false);
@@ -607,7 +610,11 @@ impl Engine {
         drop(inner);
         self.upload_resident_weights()?;
         self.note_early_exit_gate()?;
-        tracing::info!(vocab = cfg.vocab_size, layers = cfg.n_layers, "loaded synthetic model");
+        tracing::info!(
+            vocab = cfg.vocab_size,
+            layers = cfg.n_layers,
+            "loaded synthetic model"
+        );
         Ok(())
     }
 
@@ -669,7 +676,10 @@ impl Engine {
             return Ok(());
         }
         let sample = model.layers.first().and_then(|l| l.experts.first());
-        let sample_id = ExpertId { layer: 0, expert: 0 };
+        let sample_id = ExpertId {
+            layer: 0,
+            expert: 0,
+        };
         let b_host = sample
             .map(|e| {
                 if let Some(pool) = &model.expert_host {
@@ -692,9 +702,7 @@ impl Engine {
         let b_pcie = self
             .hip
             .as_ref()
-            .and_then(|hip| {
-                allpaca_hip::benchmark_h2d_bytes_per_sec(hip.device, expert_bytes).ok()
-            })
+            .and_then(|hip| allpaca_hip::benchmark_h2d_bytes_per_sec(hip.device, expert_bytes).ok())
             .unwrap_or(0.0);
         self.metrics
             .expert_host_bps
@@ -890,6 +898,11 @@ impl Engine {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        }
+        if model.early_exit.supported {
+            model.early_exit.min_confidence = self.config.early_exit.min_confidence;
+            model.early_exit.min_calibration_margin =
+                self.config.early_exit.min_calibration_margin;
         }
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
@@ -1156,10 +1169,7 @@ impl Engine {
 
     fn take_parked(&self, id: u64) -> Result<Option<StepResult>, AllpacaError> {
         let mut inner = self.lock()?;
-        Ok(inner
-            .active
-            .get_mut(&id)
-            .and_then(|r| r.parked.pop_front()))
+        Ok(inner.active.get_mut(&id).and_then(|r| r.parked.pop_front()))
     }
 
     fn park_result(&self, id: u64, result: StepResult) -> Result<(), AllpacaError> {
@@ -1272,11 +1282,7 @@ impl Engine {
         inner.draft_ahead = None;
         inner.draft_kv.reset();
         let prompt_len = tokens.len();
-        let dim = inner
-            .target
-            .as_ref()
-            .map(|m| m.config.dim)
-            .unwrap_or(0);
+        let dim = inner.target.as_ref().map(|m| m.config.dim).unwrap_or(0);
         inner.active.insert(
             id,
             ActiveRequest {
@@ -1318,10 +1324,9 @@ impl Engine {
             inner.active.len() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        self.metrics.prompt_tokens.fetch_add(
-            prompt_len as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.metrics
+            .prompt_tokens
+            .fetch_add(prompt_len as u64, std::sync::atomic::Ordering::Relaxed);
         // One chunk only — remaining prompt tokens continue in `step` so a
         // second Request can admit / decode between chunks.
         self.prefill_chunk(&mut inner, id)?;
@@ -1353,7 +1358,9 @@ impl Engine {
                 let candidates: Vec<(u64, Instant, bool)> = inner
                     .active
                     .iter()
-                    .filter(|(_, r)| !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty()))
+                    .filter(|(_, r)| {
+                        !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty())
+                    })
                     .map(|(id, r)| {
                         let prefill = r.prefill_pos < r.prompt_len
                             && r.emit_queue.is_empty()
@@ -1473,10 +1480,9 @@ impl Engine {
             } else {
                 prev * 0.9 + waited_ms * 0.1
             };
-            self.metrics.poll_wait_ms_ema_x100.store(
-                (ema * 100.0) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            self.metrics
+                .poll_wait_ms_ema_x100
+                .store((ema * 100.0) as u64, std::sync::atomic::Ordering::Relaxed);
             let dual_partner = stagger_partner.filter(|&p| p != id);
             if dual_partner.is_some() {
                 self.micro_batch.begin_dual_step(
@@ -1500,9 +1506,7 @@ impl Engine {
                         .iter()
                         .filter(|(rid, r)| {
                             (**rid == id || **rid == partner)
-                                && !(r.finished
-                                    && r.emit_queue.is_empty()
-                                    && r.parked.is_empty())
+                                && !(r.finished && r.emit_queue.is_empty() && r.parked.is_empty())
                         })
                         .map(|(rid, r)| {
                             let prefill = r.prefill_pos < r.prompt_len
@@ -1659,7 +1663,9 @@ impl Engine {
                 self.metrics
                     .degraded_events
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                m = allpaca_types::TokenMask::allow_all(inner.tokenizer.as_ref().unwrap().vocab_size());
+                m = allpaca_types::TokenMask::allow_all(
+                    inner.tokenizer.as_ref().unwrap().vocab_size(),
+                );
             }
             Some(m)
         } else {
@@ -1669,11 +1675,11 @@ impl Engine {
         let ctx_now = request(&inner, id)?.tokens.clone();
         // Prefer linear MTP/draft-ahead when a warm next span is queued; tree
         // rebuild would discard the overlapped proposal.
-        let ahead_ready = inner.draft_ahead.as_ref().is_some_and(|a| {
-            a.ctx == ctx_now && !a.tokens.is_empty()
-        });
-        let use_tree =
-            speculate && inner.flags.tree_speculation && depth > 0 && !ahead_ready;
+        let ahead_ready = inner
+            .draft_ahead
+            .as_ref()
+            .is_some_and(|a| a.ctx == ctx_now && !a.tokens.is_empty());
+        let use_tree = speculate && inner.flags.tree_speculation && depth > 0 && !ahead_ready;
         self.metrics
             .target_evals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1694,16 +1700,12 @@ impl Engine {
             } else {
                 None
             };
-            let forest = build_token_forest(
-                &inner.ngram,
-                draft,
-                &ctx_now,
-                max_nodes,
-                depth.max(1),
-            )?;
-            self.metrics
-                .tree_nodes
-                .fetch_add(forest.nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let forest =
+                build_token_forest(&inner.ngram, draft, &ctx_now, max_nodes, depth.max(1))?;
+            self.metrics.tree_nodes.fetch_add(
+                forest.nodes.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             verify_forest(
                 &mut inner,
                 id,
@@ -1732,19 +1734,19 @@ impl Engine {
                 Vec::new()
             };
             verify_and_sample(
-                    &mut inner,
-                    id,
-                    drafts,
-                    mask.as_ref(),
-                    remaining,
-                    &self.metrics,
-                    self.hip.as_deref(),
-                    self.draft_hip.as_deref(),
-                    depth,
-                    temperature,
-                    micro_batch,
-                    &hooks,
-                )?
+                &mut inner,
+                id,
+                drafts,
+                mask.as_ref(),
+                remaining,
+                &self.metrics,
+                self.hip.as_deref(),
+                self.draft_hip.as_deref(),
+                depth,
+                temperature,
+                micro_batch,
+                &hooks,
+            )?
         };
         let accepted = produced.accepted;
         let proposed = produced.proposed;
@@ -1931,11 +1933,7 @@ impl Engine {
                 if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
                     hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
                     hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
-                    hip.mamba2_sync_request_to_host(
-                        id,
-                        &mut state.ssm_h,
-                        &mut state.ssm_conv,
-                    )?;
+                    hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
                 }
             }
             if sync_host_gdn {
@@ -2032,9 +2030,8 @@ impl Engine {
         {
             let mut inner = self.lock()?;
             if let Some(model) = inner.target.as_mut() {
-                let model = Arc::get_mut(model).ok_or_else(|| {
-                    AllpacaError::Transient(TransientError::RequestBusy)
-                })?;
+                let model = Arc::get_mut(model)
+                    .ok_or_else(|| AllpacaError::Transient(TransientError::RequestBusy))?;
                 self.rebuild_expert_slots(model, cache_bytes);
             }
             inner.kv.set_vram_bytes(vram_bytes, &self.metrics)?;
@@ -2071,9 +2068,7 @@ impl Engine {
             // Attention-trim: spill cold VRAM KV → DRAM for more expert slots.
             if expert_bytes > 0 {
                 let want = expert_bytes.max(256);
-                freed = freed.saturating_add(
-                    inner.kv.trim_cold_vram_bytes(want, &self.metrics)?,
-                );
+                freed = freed.saturating_add(inner.kv.trim_cold_vram_bytes(want, &self.metrics)?);
             }
             let base_cache = self.config.weights.cache_bytes;
             let new_cache = base_cache.saturating_add(freed);
@@ -2141,7 +2136,9 @@ impl Engine {
         let mut inner = self.lock()?;
         let page_tokens = self.config.kv.page_tokens;
         for i in 0..n {
-            let _ = inner.kv.alloc_page(0, i, page_tokens, 1, 4, &self.metrics)?;
+            let _ = inner
+                .kv
+                .alloc_page(0, i, page_tokens, 1, 4, &self.metrics)?;
         }
         Ok(())
     }
@@ -2242,7 +2239,11 @@ fn open_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<Hi
     };
     match HipWorkspace::new(device, 8 * 1024 * 1024, 256) {
         Ok(ws) => {
-            tracing::info!(device, bytes = ws.allocated_bytes(), "HIP workspace allocated");
+            tracing::info!(
+                device,
+                bytes = ws.allocated_bytes(),
+                "HIP workspace allocated"
+            );
             Some(ws)
         }
         Err(e) => {
@@ -2697,13 +2698,7 @@ fn prefetch_draft_expert_union(
     let mut nvme = |id: ExpertId, dev_off: usize, slot_bytes: usize| {
         target.try_nvme_expert_fill(id, dev_off, slot_bytes, Some(&side), resident)
     };
-    resident.bulk_fill_experts(
-        &pairs,
-        Some(metrics),
-        None,
-        false,
-        Some(&mut nvme),
-    )?;
+    resident.bulk_fill_experts(&pairs, Some(metrics), None, false, Some(&mut nvme))?;
     for (id, host) in &pairs {
         lru.admit(*id, host)?;
     }
@@ -2751,8 +2746,7 @@ fn verify_and_sample(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let k = idx.len().min(10);
-                let top: Vec<(usize, f32)> =
-                    idx[..k].iter().map(|&i| (i, logits[i])).collect();
+                let top: Vec<(usize, f32)> = idx[..k].iter().map(|&i| (i, logits[i])).collect();
                 eprintln!("ALLPACA_DUMP_TOPK first-sample top10={top:?}");
             }
         }
@@ -2839,17 +2833,17 @@ fn verify_and_sample(
             draft_iter.next();
         }
         append_and_forward(
-        inner,
-        id,
-        sampled,
-        metrics,
-        hip,
-        draft_hip,
-        micro_batch,
-        hooks.layer_stagger,
-        Some(hooks.ds_probe),
-        Some(hooks.ds_queue),
-    )?;
+            inner,
+            id,
+            sampled,
+            metrics,
+            hip,
+            draft_hip,
+            micro_batch,
+            hooks.layer_stagger,
+            Some(hooks.ds_probe),
+            Some(hooks.ds_queue),
+        )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || !matched || draft_iter.peek().is_none() {
             break;
@@ -2906,9 +2900,7 @@ fn packed_linear_verify(
         ctx.extend_from_slice(&span);
         ctx
     };
-    let can_ahead = depth > 0
-        && inner.flags.draft_model_speculation
-        && inner.draft_model.is_some();
+    let can_ahead = depth > 0 && inner.flags.draft_model_speculation && inner.draft_model.is_some();
     if !can_ahead {
         return packed_linear_verify_span(
             inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None, None,
@@ -2933,7 +2925,10 @@ fn packed_linear_verify(
         );
     }
     let mut draft_kv = std::mem::take(&mut inner.draft_kv);
-    let model = inner.draft_model.clone().expect("draft-ahead needs a Draft Model");
+    let model = inner
+        .draft_model
+        .clone()
+        .expect("draft-ahead needs a Draft Model");
     let resident = inner.draft_resident.clone();
     let next_ctx_worker = next_ctx.clone();
     std::thread::scope(|s| {
@@ -2956,7 +2951,9 @@ fn packed_linear_verify(
         let produced = packed_linear_verify_span(
             inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None, None,
         );
-        let (kv, ahead) = worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        let (kv, ahead) = worker
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
         inner.draft_kv = kv;
         let produced = produced?;
         let ahead = ahead?;
@@ -3428,14 +3425,7 @@ fn packed_linear_verify_span(
                 let off = (i - 1) * dim;
                 &row_hiddens[off..off + dim]
             };
-            mtp_process_token(
-                inner,
-                span[i],
-                start_pos + i,
-                h_prev,
-                draft_hip,
-                metrics,
-            )?;
+            mtp_process_token(inner, span[i], start_pos + i, h_prev, draft_hip, metrics)?;
         }
     }
     {
@@ -3495,7 +3485,11 @@ fn verify_forest(
     micro_batch: Option<&MicroBatchExpertUnion>,
     hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
-    let vocab = inner.tokenizer.as_ref().map(|t| t.vocab_size()).unwrap_or(1);
+    let vocab = inner
+        .tokenizer
+        .as_ref()
+        .map(|t| t.vocab_size())
+        .unwrap_or(1);
     let mut node_logits = vec![vec![0.0f32; vocab]; forest.nodes.len()];
     if !forest.nodes.is_empty() {
         let pages = request(inner, id)?.pages.clone();
@@ -3769,6 +3763,185 @@ mod tests {
             .unwrap();
         assert!(!out.token_ids.is_empty(), "gate must not block generate");
         assert_eq!(engine.stats().early_exit_accepts, 0);
+    }
+
+    #[test]
+    fn early_exit_loads_gguf_manifest_and_dedicated_head() {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        use std::collections::HashMap;
+
+        let path = std::env::temp_dir().join("allpaca_early_exit_heads.gguf");
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let w = 0.01f32;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
+        meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
+        meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+        meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+        meta.insert(
+            "llama.feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert("allpaca.early_exit.supported".into(), GgufValue::Bool(true));
+        meta.insert(
+            "allpaca.early_exit.exit_layers".into(),
+            GgufValue::Array(vec![GgufValue::Uint32(0)]),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vec![
+                GgufValue::String("<unk>".into()),
+                GgufValue::String("<s>".into()),
+                GgufValue::String("</s>".into()),
+                GgufValue::String("hello".into()),
+            ]),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
+        owned.push((
+            "token_embd.weight".into(),
+            vec![vocab as u64, dim as u64],
+            vec![w; vocab * dim],
+        ));
+        for i in 0..2usize {
+            owned.push((
+                format!("blk.{i}.attn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_q.weight"),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_k.weight"),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_v.weight"),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_output.weight"),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_gate.weight"),
+                vec![dim as u64, ff as u64],
+                vec![w; dim * ff],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_up.weight"),
+                vec![dim as u64, ff as u64],
+                vec![w; dim * ff],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_down.weight"),
+                vec![ff as u64, dim as u64],
+                vec![w; ff * dim],
+            ));
+        }
+        // Sharp exit head: large bias toward token 3 for any input.
+        let mut exit_head = vec![0.0f32; vocab * dim];
+        for d in 0..dim {
+            exit_head[3 * dim + d] = 10.0;
+        }
+        owned.push((
+            "blk.0.exit_head.weight".into(),
+            vec![vocab as u64, dim as u64],
+            exit_head,
+        ));
+        owned.push((
+            "output_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        owned.push((
+            "output.weight".into(),
+            vec![vocab as u64, dim as u64],
+            vec![w; vocab * dim],
+        ));
+        let views: Vec<GgufWriteTensor> = owned
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data: data.as_slice(),
+            })
+            .collect();
+        write_gguf(&path, &meta, &views).unwrap();
+
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(2),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.synthetic = false;
+        cfg.early_exit.enabled = true;
+        cfg.early_exit.min_confidence = 0.51;
+        cfg.early_exit.min_calibration_margin = 0.0;
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("early-exit GGUF must load");
+        assert_eq!(
+            engine.stats().early_exit_gated, 0,
+            "GGUF manifest must not gate; stats={:?}",
+            engine.stats()
+        );
+        {
+            let g = engine.lock().unwrap();
+            let m = g.target.as_ref().unwrap();
+            assert!(m.early_exit.supported);
+            assert_eq!(m.early_exit.exit_layers, vec![0]);
+            assert!(
+                m.exit_heads.first().and_then(|h| h.as_ref()).is_some(),
+                "dedicated exit head must load"
+            );
+        }
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("generate");
+        assert!(!out.token_ids.is_empty());
+        assert!(
+            engine.stats().early_exit_accepts >= 1,
+            "dedicated exit head must accept; stats={:?}",
+            engine.stats()
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -4211,9 +4384,7 @@ mod tests {
         full_engine
             .load_synthetic(ModelConfig::tiny_hybrid())
             .unwrap();
-        let full = full_engine
-            .generate("hello true", params.clone())
-            .unwrap();
+        let full = full_engine.generate("hello true", params.clone()).unwrap();
 
         let mut cfg = test_config();
         cfg.model.synthetic = false;
@@ -4294,10 +4465,7 @@ mod tests {
             stats.expert_host_bps > 0,
             "q* must measure CPU expert bandwidth; stats={stats:?}"
         );
-        assert_eq!(
-            stats.expert_pcie_bps, 0,
-            "cpu_only has no PCIe expert H2D"
-        );
+        assert_eq!(stats.expert_pcie_bps, 0, "cpu_only has no PCIe expert H2D");
         let out = engine
             .generate(
                 "hello",
@@ -4404,7 +4572,10 @@ mod tests {
             w_down: vec![1.0; 32],
             ..LayerFfn::default()
         };
-        let id = ExpertId { layer: 0, expert: 1 };
+        let id = ExpertId {
+            layer: 0,
+            expert: 1,
+        };
         let b = crate::model::measure_expert_host_bandwidth_numa(&ffn, 32, 64, &topo, id);
         assert!(b > 0.0, "NUMA-aware host measure must be positive");
         assert!(
@@ -4534,8 +4705,14 @@ mod tests {
         };
         let mut first = engine.begin_request("hello", params.clone()).unwrap();
         let mut second = engine.begin_request("world", params).unwrap();
-        assert!(matches!(engine.step(&mut first).unwrap(), StepResult::Token(_)));
-        assert!(matches!(engine.step(&mut second).unwrap(), StepResult::Token(_)));
+        assert!(matches!(
+            engine.step(&mut first).unwrap(),
+            StepResult::Token(_)
+        ));
+        assert!(matches!(
+            engine.step(&mut second).unwrap(),
+            StepResult::Token(_)
+        ));
 
         let kv_a = first.kv_handle().expect("first Request KvHandle");
         let kv_b = second.kv_handle().expect("second Request KvHandle");
@@ -4760,7 +4937,10 @@ mod tests {
             switches >= 1,
             "poll must interleave Requests instead of draining one; switches={switches}"
         );
-        assert!(done_a && done_b, "both Requests must finish under poll-only driving");
+        assert!(
+            done_a && done_b,
+            "both Requests must finish under poll-only driving"
+        );
         let stats = engine.stats();
         assert!(
             stats.micro_batch_plans >= 1,
@@ -4920,9 +5100,7 @@ mod tests {
             let raised = inner.scheduler.draft_depth;
             assert!(raised > 2);
             // Neutral acceptance keeps depth; queue pressure alone must shrink.
-            inner
-                .scheduler
-                .record_acceptance_with_pressure(5, 10, 3);
+            inner.scheduler.record_acceptance_with_pressure(5, 10, 3);
             assert!(
                 inner.scheduler.draft_depth < raised,
                 "active_requests>1 must shrink depth; raised={raised} now={}",
@@ -4976,7 +5154,10 @@ mod tests {
         cfg.features.adaptive_draft_depth = Some(true);
         let engine = Engine::new(cfg).unwrap();
         let initial = engine.stats().draft_depth;
-        assert!(initial >= 2, "initial draft depth from min_depth; stats={initial}");
+        assert!(
+            initial >= 2,
+            "initial draft depth from min_depth; stats={initial}"
+        );
         {
             let mut inner = engine.lock().unwrap();
             inner.scheduler.record_acceptance(9, 10);
@@ -5128,7 +5309,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!out.token_ids.is_empty(), "generate still works after KV spill");
+        assert!(
+            !out.token_ids.is_empty(),
+            "generate still works after KV spill"
+        );
     }
 
     #[test]
@@ -5210,7 +5394,9 @@ mod tests {
         cfg.features.draft_model_speculation = Some(true);
         cfg.features.ngram_speculation = Some(true);
         let engine = Engine::new(cfg).expect("disabling Token Forest must not be Fatal");
-        let out = engine.generate("hello", params).expect("linear Draft Provider fallback");
+        let out = engine
+            .generate("hello", params)
+            .expect("linear Draft Provider fallback");
         assert!(!out.token_ids.is_empty());
         let stats = engine.stats();
         assert_eq!(
@@ -5324,9 +5510,7 @@ mod tests {
             "enable speculative.tree for forest soak; missing tree_nodes: {stats:?}"
         );
         assert!(
-            stats.tree_path_valid
-                || stats.tree_accepted_path_len > 0
-                || stats.tokens_generated > 0,
+            stats.tree_path_valid || stats.tree_accepted_path_len > 0 || stats.tokens_generated > 0,
             "tree soak must finish with path/tokens; stats={stats:?}"
         );
         assert!(
@@ -5502,7 +5686,10 @@ mod tests {
             GgufValue::String("llama".into()),
         );
         meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
         meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
         meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
         meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -5526,17 +5713,61 @@ mod tests {
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
         meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
         let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
-            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
-            ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-            ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
-            ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
-            ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
-            ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
-            ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-            ("blk.0.ffn_gate.weight".into(), vec![ff as u64, dim as u64], vec![w; ff * dim]),
-            ("blk.0.ffn_up.weight".into(), vec![ff as u64, dim as u64], vec![w; ff * dim]),
-            ("blk.0.ffn_down.weight".into(), vec![dim as u64, ff as u64], vec![ffn_down; dim * ff]),
-            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "token_embd.weight".into(),
+                vec![vocab as u64, dim as u64],
+                vec![w; vocab * dim],
+            ),
+            (
+                "blk.0.attn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.0.attn_q.weight".into(),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ),
+            (
+                "blk.0.attn_k.weight".into(),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ),
+            (
+                "blk.0.attn_v.weight".into(),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ),
+            (
+                "blk.0.attn_output.weight".into(),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ),
+            (
+                "blk.0.ffn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.0.ffn_gate.weight".into(),
+                vec![ff as u64, dim as u64],
+                vec![w; ff * dim],
+            ),
+            (
+                "blk.0.ffn_up.weight".into(),
+                vec![ff as u64, dim as u64],
+                vec![w; ff * dim],
+            ),
+            (
+                "blk.0.ffn_down.weight".into(),
+                vec![dim as u64, ff as u64],
+                vec![ffn_down; dim * ff],
+            ),
+            (
+                "output_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
         ];
         let views: Vec<GgufWriteTensor<'_>> = owned
             .iter()
@@ -5563,7 +5794,10 @@ mod tests {
             GgufValue::String("llama".into()),
         );
         meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
         meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
         meta.insert("llama.nextn_predict_layers".into(), GgufValue::Uint32(1));
         meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
@@ -5588,25 +5822,85 @@ mod tests {
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
         meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
         let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
-            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
-            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "token_embd.weight".into(),
+                vec![vocab as u64, dim as u64],
+                vec![w; vocab * dim],
+            ),
+            (
+                "output_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
         ];
         for i in 0..2usize {
-            owned.push((format!("blk.{i}.attn_norm.weight"), vec![dim as u64], vec![1.0; dim]));
-            owned.push((format!("blk.{i}.attn_q.weight"), vec![dim as u64, dim as u64], vec![w; dim * dim]));
-            owned.push((format!("blk.{i}.attn_k.weight"), vec![2, dim as u64], vec![w; 2 * dim]));
-            owned.push((format!("blk.{i}.attn_v.weight"), vec![2, dim as u64], vec![w; 2 * dim]));
-            owned.push((format!("blk.{i}.attn_output.weight"), vec![dim as u64, dim as u64], vec![w; dim * dim]));
-            owned.push((format!("blk.{i}.ffn_norm.weight"), vec![dim as u64], vec![1.0; dim]));
-            owned.push((format!("blk.{i}.ffn_gate.weight"), vec![ff as u64, dim as u64], vec![w; ff * dim]));
-            owned.push((format!("blk.{i}.ffn_up.weight"), vec![ff as u64, dim as u64], vec![w; ff * dim]));
-            owned.push((format!("blk.{i}.ffn_down.weight"), vec![dim as u64, ff as u64], vec![w; dim * ff]));
+            owned.push((
+                format!("blk.{i}.attn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_q.weight"),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_k.weight"),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_v.weight"),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.attn_output.weight"),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_gate.weight"),
+                vec![ff as u64, dim as u64],
+                vec![w; ff * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_up.weight"),
+                vec![ff as u64, dim as u64],
+                vec![w; ff * dim],
+            ));
+            owned.push((
+                format!("blk.{i}.ffn_down.weight"),
+                vec![dim as u64, ff as u64],
+                vec![w; dim * ff],
+            ));
         }
         // NextN seed tensors on the MTP block (blk.1). eh_proj: [dim, 2*dim].
-        owned.push(("blk.1.nextn.eh_proj.weight".into(), vec![dim as u64, (2 * dim) as u64], vec![w; dim * 2 * dim]));
-        owned.push(("blk.1.nextn.enorm.weight".into(), vec![dim as u64], vec![1.0; dim]));
-        owned.push(("blk.1.nextn.hnorm.weight".into(), vec![dim as u64], vec![1.0; dim]));
-        owned.push(("blk.1.nextn.shared_head_norm.weight".into(), vec![dim as u64], vec![1.0; dim]));
+        owned.push((
+            "blk.1.nextn.eh_proj.weight".into(),
+            vec![dim as u64, (2 * dim) as u64],
+            vec![w; dim * 2 * dim],
+        ));
+        owned.push((
+            "blk.1.nextn.enorm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        owned.push((
+            "blk.1.nextn.hnorm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        owned.push((
+            "blk.1.nextn.shared_head_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
         let views: Vec<GgufWriteTensor<'_>> = owned
             .iter()
             .map(|(name, dims, data)| GgufWriteTensor {
@@ -5632,7 +5926,10 @@ mod tests {
             GgufValue::String("llama".into()),
         );
         meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
         meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
         meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
         meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -5667,13 +5964,41 @@ mod tests {
             down_exps.extend(std::iter::repeat(w).take(dim * ff));
         }
         let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
-            ("token_embd.weight".into(), vec![vocab as u64, dim as u64], vec![w; vocab * dim]),
-            ("blk.0.attn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
-            ("blk.0.attn_q.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
-            ("blk.0.attn_k.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
-            ("blk.0.attn_v.weight".into(), vec![2, dim as u64], vec![w; 2 * dim]),
-            ("blk.0.attn_output.weight".into(), vec![dim as u64, dim as u64], vec![w; dim * dim]),
-            ("blk.0.ffn_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "token_embd.weight".into(),
+                vec![vocab as u64, dim as u64],
+                vec![w; vocab * dim],
+            ),
+            (
+                "blk.0.attn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                "blk.0.attn_q.weight".into(),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ),
+            (
+                "blk.0.attn_k.weight".into(),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ),
+            (
+                "blk.0.attn_v.weight".into(),
+                vec![2, dim as u64],
+                vec![w; 2 * dim],
+            ),
+            (
+                "blk.0.attn_output.weight".into(),
+                vec![dim as u64, dim as u64],
+                vec![w; dim * dim],
+            ),
+            (
+                "blk.0.ffn_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
             (
                 "blk.0.ffn_gate_inp.weight".into(),
                 vec![n_exp as u64, dim as u64],
@@ -5694,7 +6019,11 @@ mod tests {
                 vec![n_exp as u64, dim as u64, ff as u64],
                 down_exps,
             ),
-            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "output_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
         ];
         let views: Vec<GgufWriteTensor<'_>> = owned
             .iter()
@@ -5709,8 +6038,8 @@ mod tests {
 
     fn write_tiny_quant_gguf(path: &std::path::Path) {
         use allpaca_gguf::{
-            quantize_q4_0, quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
-            GgufWriteTensor,
+            quantize_q4_0, quantize_q8_0, write_gguf_quant, GgmlType, GgufValue,
+            GgufWriteQuantTensor, GgufWriteTensor,
         };
         use std::collections::HashMap;
 
@@ -5723,7 +6052,10 @@ mod tests {
             GgufValue::String("llama".into()),
         );
         meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
         meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
         meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
         meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -5857,7 +6189,10 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
-        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
+        assert!(matches!(
+            err,
+            AllpacaError::Fatal(FatalError::InvalidConfig(_))
+        ));
 
         let junk = std::env::temp_dir().join("allpaca_corrupt.gguf");
         std::fs::write(&junk, b"not a gguf").unwrap();
@@ -5929,10 +6264,7 @@ mod tests {
             "nemotron_h_moe.embedding_length".into(),
             GgufValue::Uint32(dim as u32),
         );
-        meta.insert(
-            "nemotron_h_moe.block_count".into(),
-            GgufValue::Uint32(2),
-        );
+        meta.insert("nemotron_h_moe.block_count".into(), GgufValue::Uint32(2));
         meta.insert(
             "nemotron_h_moe.attention.head_count".into(),
             GgufValue::Uint32(4),
@@ -6011,9 +6343,21 @@ mod tests {
                 vec![conv_dim as u64],
                 vec![0.01; conv_dim],
             ),
-            ("blk.0.ssm_a".into(), vec![1, n_heads as u64], vec![-1.0; n_heads]),
-            ("blk.0.ssm_d".into(), vec![1, n_heads as u64], vec![ssm_d; n_heads]),
-            ("blk.0.ssm_dt.bias".into(), vec![n_heads as u64], vec![0.0; n_heads]),
+            (
+                "blk.0.ssm_a".into(),
+                vec![1, n_heads as u64],
+                vec![-1.0; n_heads],
+            ),
+            (
+                "blk.0.ssm_d".into(),
+                vec![1, n_heads as u64],
+                vec![ssm_d; n_heads],
+            ),
+            (
+                "blk.0.ssm_dt.bias".into(),
+                vec![n_heads as u64],
+                vec![0.0; n_heads],
+            ),
             (
                 "blk.0.ssm_norm.weight".into(),
                 vec![(d_inner / n_groups) as u64, n_groups as u64],
@@ -6064,7 +6408,11 @@ mod tests {
                 vec![dim as u64, ff as u64],
                 vec![w; dim * ff],
             ),
-            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "output_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
             (
                 "output.weight".into(),
                 vec![vocab as u64, dim as u64],
@@ -6200,9 +6548,21 @@ mod tests {
                 vec![conv_dim as u64],
                 vec![0.01; conv_dim],
             ),
-            ("blk.0.ssm_a".into(), vec![1, n_heads as u64], vec![-1.0; n_heads]),
-            ("blk.0.ssm_d".into(), vec![1, n_heads as u64], vec![0.25; n_heads]),
-            ("blk.0.ssm_dt.bias".into(), vec![n_heads as u64], vec![0.0; n_heads]),
+            (
+                "blk.0.ssm_a".into(),
+                vec![1, n_heads as u64],
+                vec![-1.0; n_heads],
+            ),
+            (
+                "blk.0.ssm_d".into(),
+                vec![1, n_heads as u64],
+                vec![0.25; n_heads],
+            ),
+            (
+                "blk.0.ssm_dt.bias".into(),
+                vec![n_heads as u64],
+                vec![0.0; n_heads],
+            ),
             (
                 "blk.0.ssm_norm.weight".into(),
                 vec![(d_inner / n_groups) as u64, n_groups as u64],
@@ -6229,7 +6589,11 @@ mod tests {
                 vec![ff as u64, dim as u64, n_exp as u64],
                 vec![w; ff * dim * n_exp],
             ),
-            ("output_norm.weight".into(), vec![dim as u64], vec![1.0; dim]),
+            (
+                "output_norm.weight".into(),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
             (
                 "output.weight".into(),
                 vec![vocab as u64, dim as u64],
@@ -6314,7 +6678,10 @@ mod tests {
             "qwen35.feed_forward_length".into(),
             GgufValue::Uint32((dim * 2) as u32),
         );
-        meta.insert("qwen35.ssm.state_size".into(), GgufValue::Uint32(head as u32));
+        meta.insert(
+            "qwen35.ssm.state_size".into(),
+            GgufValue::Uint32(head as u32),
+        );
         meta.insert(
             "qwen35.ssm.inner_size".into(),
             GgufValue::Uint32(inner as u32),
@@ -6431,8 +6798,13 @@ mod tests {
         let dims = Mamba2Dims::new(2, 2, 1, 1, 1, 2).unwrap();
         let mut w_in = vec![0.0; dims.in_proj_dim * dims.d_model];
         for (row, col, value) in [
-            (0, 0, 1.0), (1, 1, 1.0), (2, 0, 1.0), (3, 1, 1.0),
-            (4, 0, 0.5), (5, 1, 1.0), (6, 0, 1.0),
+            (0, 0, 1.0),
+            (1, 1, 1.0),
+            (2, 0, 1.0),
+            (3, 1, 1.0),
+            (4, 0, 0.5),
+            (5, 1, 1.0),
+            (6, 0, 1.0),
         ] {
             w_in[row * dims.d_model + col] = value;
         }
@@ -6465,17 +6837,19 @@ mod tests {
         let hip = allpaca_hip::HipWorkspace::new(0, 4096, 4).unwrap();
         let projection = allpaca_hip::DeviceWeights::alloc(0, projected.len() * 4).unwrap();
         let output = allpaca_hip::DeviceWeights::alloc(0, dims.d_inner * 4).unwrap();
-        hip.copy_h2d_f32(projection.ptr_at(0) as *mut f32, &projected).unwrap();
-        let (conv, bias, dt, a, d, norm) = hip.ensure_mamba2_weights(
-            0,
-            &weights.conv1d,
-            &weights.conv_bias,
-            &weights.dt_bias,
-            &weights.a,
-            &weights.d_skip,
-            &weights.norm,
-        )
-        .unwrap();
+        hip.copy_h2d_f32(projection.ptr_at(0) as *mut f32, &projected)
+            .unwrap();
+        let (conv, bias, dt, a, d, norm) = hip
+            .ensure_mamba2_weights(
+                0,
+                &weights.conv1d,
+                &weights.conv_bias,
+                &weights.dt_bias,
+                &weights.a,
+                &weights.d_skip,
+                &weights.norm,
+            )
+            .unwrap();
         let mut device_state = vec![0.0; dims.state_floats()];
         let mut device_conv = vec![0.0; dims.conv_state_floats()];
         hip.mamba2_decode_step_resident(
@@ -6501,7 +6875,12 @@ mod tests {
         .unwrap();
         let mut device_out = vec![0.0; dims.d_inner];
         hip.copy_d2h_f32(output.ptr_at(0), &mut device_out).unwrap();
-        hip.mamba2_sync_request_to_host(77, std::slice::from_mut(&mut device_state), std::slice::from_mut(&mut device_conv)).unwrap();
+        hip.mamba2_sync_request_to_host(
+            77,
+            std::slice::from_mut(&mut device_state),
+            std::slice::from_mut(&mut device_conv),
+        )
+        .unwrap();
         for (got, want) in device_out.iter().zip(&host_out) {
             assert!((got - want).abs() < 2e-4, "HIP={got} host={want}");
         }
@@ -6515,9 +6894,24 @@ mod tests {
         assert_eq!(hip.gdn_clone_request(77).unwrap(), 1);
         let d2h_before = hip.activation_d2h_bytes();
         hip.mamba2_decode_step_resident(
-            77, 0, &mut device_state, &mut device_conv, projection.ptr_at(0), conv, bias, dt, a, d,
-            norm, output.ptr_at(0) as *mut f32, dims.d_inner as i32, dims.d_state as i32,
-            dims.n_heads as i32, dims.n_groups as i32, dims.conv_kernel as i32, 1e-5,
+            77,
+            0,
+            &mut device_state,
+            &mut device_conv,
+            projection.ptr_at(0),
+            conv,
+            bias,
+            dt,
+            a,
+            d,
+            norm,
+            output.ptr_at(0) as *mut f32,
+            dims.d_inner as i32,
+            dims.d_state as i32,
+            dims.n_heads as i32,
+            dims.n_groups as i32,
+            dims.conv_kernel as i32,
+            1e-5,
         )
         .unwrap();
         assert_eq!(
@@ -6532,8 +6926,14 @@ mod tests {
             std::slice::from_mut(&mut device_conv),
         )
         .unwrap();
-        assert_eq!(device_state, snapshot_state, "D2D rewind must restore SSD state");
-        assert_eq!(device_conv, snapshot_conv, "D2D rewind must restore conv history");
+        assert_eq!(
+            device_state, snapshot_state,
+            "D2D rewind must restore SSD state"
+        );
+        assert_eq!(
+            device_conv, snapshot_conv,
+            "D2D rewind must restore conv history"
+        );
         hip.gdn_clear_request(77);
     }
 
@@ -6547,7 +6947,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "allpaca-nemotron-mamba2-parity-{}-{}.gguf",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         write_tiny_nemotron_hybrid_gguf(&path);
         let run = |cpu_only: bool| {
@@ -6753,10 +7156,7 @@ mod tests {
                     },
                 )
                 .expect("synthetic hybrid generate");
-            assert!(
-                !out.token_ids.is_empty(),
-                "must emit tokens; got {out:?}"
-            );
+            assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
             let again = engine
                 .generate(
                     "hi",
@@ -6779,9 +7179,8 @@ mod tests {
         // Real ROCmFP4: type 100 no longer gates the loader. The header check is
         // cheap enough to always run; the 30B load/generate is opt-in because it
         // materializes an 18 GiB checkpoint.
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-            "../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf",
-        );
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf");
         if !path.exists() {
             eprintln!(
                 "skip nemotron real GGUF: place ROCmFP4 at {}; synthetic generate already asserted",
@@ -6821,10 +7220,9 @@ mod tests {
         cfg.weights.cache_bytes = 64 << 20;
         cfg.weights.host_bytes = 64 << 20;
         cfg.kv.nvme_bytes = 64 << 20;
-        cfg.kv.nvme_path = Some(std::env::temp_dir().join(format!(
-            "allpaca-nemotron-real-nvme-{}",
-            std::process::id()
-        )));
+        cfg.kv.nvme_path = Some(
+            std::env::temp_dir().join(format!("allpaca-nemotron-real-nvme-{}", std::process::id())),
+        );
         let nvme = cfg.kv.nvme_path.clone();
         let engine = Engine::new(cfg).expect("Nemotron ROCmFP4 must load once dequant lands");
         let out = engine
@@ -6952,17 +7350,72 @@ mod tests {
         let down = vec![0.01f32; dim * ff];
         let path = dir.join("model.safetensors");
         let owned = [
-            ("token_embd.weight", vec![vocab as u64, dim as u64], &embd, SafetensorsDtype::F32),
-            ("blk.0.attn_norm.weight", vec![dim as u64], &ones, SafetensorsDtype::F32),
-            ("blk.0.attn_q.weight", vec![dim as u64, dim as u64], &q, SafetensorsDtype::F32),
-            ("blk.0.attn_k.weight", vec![kv_dim as u64, dim as u64], &k, SafetensorsDtype::F32),
-            ("blk.0.attn_v.weight", vec![kv_dim as u64, dim as u64], &v, SafetensorsDtype::F32),
-            ("blk.0.attn_output.weight", vec![dim as u64, dim as u64], &o, SafetensorsDtype::F32),
-            ("blk.0.ffn_norm.weight", vec![dim as u64], &ones, SafetensorsDtype::F32),
-            ("blk.0.ffn_gate.weight", vec![ff as u64, dim as u64], &gate, SafetensorsDtype::F32),
-            ("blk.0.ffn_up.weight", vec![ff as u64, dim as u64], &up, SafetensorsDtype::F32),
-            ("blk.0.ffn_down.weight", vec![dim as u64, ff as u64], &down, SafetensorsDtype::F32),
-            ("output_norm.weight", vec![dim as u64], &ones, SafetensorsDtype::F32),
+            (
+                "token_embd.weight",
+                vec![vocab as u64, dim as u64],
+                &embd,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.attn_norm.weight",
+                vec![dim as u64],
+                &ones,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.attn_q.weight",
+                vec![dim as u64, dim as u64],
+                &q,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.attn_k.weight",
+                vec![kv_dim as u64, dim as u64],
+                &k,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.attn_v.weight",
+                vec![kv_dim as u64, dim as u64],
+                &v,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.attn_output.weight",
+                vec![dim as u64, dim as u64],
+                &o,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.ffn_norm.weight",
+                vec![dim as u64],
+                &ones,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.ffn_gate.weight",
+                vec![ff as u64, dim as u64],
+                &gate,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.ffn_up.weight",
+                vec![ff as u64, dim as u64],
+                &up,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "blk.0.ffn_down.weight",
+                vec![dim as u64, ff as u64],
+                &down,
+                SafetensorsDtype::F32,
+            ),
+            (
+                "output_norm.weight",
+                vec![dim as u64],
+                &ones,
+                SafetensorsDtype::F32,
+            ),
         ];
         let views: Vec<SafetensorsWriteTensor<'_>> = owned
             .iter()
@@ -7155,7 +7608,8 @@ mod tests {
             r#"{"tokens":["<unk>","<s>","</s>","hello"],"bos_id":1,"eos_id":2}"#,
         )
         .unwrap();
-        let header = r#"{"token_embd.weight":{"dtype":"I32","shape":[4,8],"data_offsets":[0,128]}}"#;
+        let header =
+            r#"{"token_embd.weight":{"dtype":"I32","shape":[4,8],"data_offsets":[0,128]}}"#;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
         bytes.extend_from_slice(header.as_bytes());
@@ -7197,7 +7651,10 @@ mod tests {
             GgufValue::String("llama".into()),
         );
         meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
         meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
         meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
         meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -7320,7 +7777,10 @@ mod tests {
             GgufValue::String("llama".into()),
         );
         meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
         meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
         meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
         meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -7458,7 +7918,11 @@ mod tests {
     #[test]
     fn engine_generate_from_f16_gguf() {
         let path = std::env::temp_dir().join("allpaca_target_f16.gguf");
-        write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::F16, allpaca_gguf::quantize_f16);
+        write_tiny_uniform_kquant_gguf(
+            &path,
+            allpaca_gguf::GgmlType::F16,
+            allpaca_gguf::quantize_f16,
+        );
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             cpu_only: true,
@@ -7487,7 +7951,11 @@ mod tests {
     #[test]
     fn engine_generate_from_q6k_gguf() {
         let path = std::env::temp_dir().join("allpaca_target_q6k.gguf");
-        write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::Q6_K, allpaca_gguf::quantize_q6_k);
+        write_tiny_uniform_kquant_gguf(
+            &path,
+            allpaca_gguf::GgmlType::Q6_K,
+            allpaca_gguf::quantize_q6_k,
+        );
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             cpu_only: true,
@@ -7516,7 +7984,11 @@ mod tests {
     #[test]
     fn engine_generate_from_q5k_gguf() {
         let path = std::env::temp_dir().join("allpaca_target_q5k.gguf");
-        write_tiny_uniform_kquant_gguf(&path, allpaca_gguf::GgmlType::Q5_K, allpaca_gguf::quantize_q5_k);
+        write_tiny_uniform_kquant_gguf(
+            &path,
+            allpaca_gguf::GgmlType::Q5_K,
+            allpaca_gguf::quantize_q5_k,
+        );
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             cpu_only: true,
@@ -7558,7 +8030,10 @@ mod tests {
             GgufValue::String("llama".into()),
         );
         meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-        meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
         meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
         meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
         meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
@@ -7967,7 +8442,10 @@ mod tests {
         }
         let (plain_tokens, plain_ssm) = {
             let g = plain_engine.lock().expect("lock plain inner");
-            let active = g.active.get(&plain_handle.id()).expect("active plain request");
+            let active = g
+                .active
+                .get(&plain_handle.id())
+                .expect("active plain request");
             let ssm = active
                 .recurrent
                 .as_ref()
@@ -8181,10 +8659,7 @@ mod tests {
             }
         }
         let stats = engine.stats();
-        assert!(
-            stats.tree_nodes > 0,
-            "tree path must run; stats={stats:?}"
-        );
+        assert!(stats.tree_nodes > 0, "tree path must run; stats={stats:?}");
         assert!(
             stats.draft_ahead_hits > 0,
             "tree+MTP must reuse overlapped MTP drafts; stats={stats:?}"
@@ -8263,7 +8738,10 @@ mod tests {
             g.draft_kv.forwards,
             processed
         );
-        let ahead = g.draft_ahead.as_ref().expect("packed verify must queue next-span tokens");
+        let ahead = g
+            .draft_ahead
+            .as_ref()
+            .expect("packed verify must queue next-span tokens");
         assert_eq!(ahead.ctx, ctx, "ahead ctx must match actual process KV");
         assert!(!ahead.tokens.is_empty());
         let last_hidden = g
@@ -8353,7 +8831,10 @@ mod tests {
         );
         let processed = g.draft_kv.seq_len() as u64;
         let extras = g.draft_kv.forwards.saturating_sub(processed);
-        let ahead = g.draft_ahead.as_ref().expect("packed verify must queue next-span tokens");
+        let ahead = g
+            .draft_ahead
+            .as_ref()
+            .expect("packed verify must queue next-span tokens");
         assert_eq!(
             ahead.ctx, ctx,
             "queued ahead must be for the actual ctx after verify, not a discarded assumed span"
@@ -8444,7 +8925,8 @@ mod tests {
             }
         }
         assert_eq!(
-            engine.stats().mtp_process_skips, 0,
+            engine.stats().mtp_process_skips,
+            0,
             "partial accept must rebuild process KV without skips; stats={:?}",
             engine.stats()
         );
@@ -8532,7 +9014,8 @@ mod tests {
             )
             .expect("begin MTP request");
         assert_eq!(
-            engine.stats().mtp_process_skips, 0,
+            engine.stats().mtp_process_skips,
+            0,
             "matching process() during prefill must not skip; stats={:?}",
             engine.stats()
         );
@@ -8551,7 +9034,8 @@ mod tests {
                 .expect("matching process");
         }
         assert_eq!(
-            engine.stats().mtp_process_skips, 0,
+            engine.stats().mtp_process_skips,
+            0,
             "process() at seq_len must not skip; stats={:?}",
             engine.stats()
         );
@@ -8562,7 +9046,8 @@ mod tests {
                 .expect("desync process returns Ok");
         }
         assert_eq!(
-            engine.stats().mtp_process_skips, 1,
+            engine.stats().mtp_process_skips,
+            1,
             "process() with seq_len != pos must increment mtp_process_skips; stats={:?}",
             engine.stats()
         );
@@ -8684,10 +9169,7 @@ mod tests {
     #[test]
     fn mtp_llamacpp_draft_id_parser_reads_draft_token_line() {
         let log = "sampled token 1\ndraft tokens: 151644 8948\ndraft acceptance rate = 0.77 (10 accepted / 13 generated)\n";
-        assert_eq!(
-            parse_llamacpp_draft_ids(log),
-            Some(vec![151644, 8948])
-        );
+        assert_eq!(parse_llamacpp_draft_ids(log), Some(vec![151644, 8948]));
     }
 
     #[test]
@@ -8799,7 +9281,8 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
         });
         let depth = 2usize;
         eprintln!("llama.cpp MTP parity reading {log_path}");
-        let log = std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path}: {e}"));
+        let log =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path}: {e}"));
         let llama_drafts = parse_llamacpp_draft_ids(&log).unwrap_or_else(|| {
             let tail: Vec<&str> = log.lines().rev().take(80).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
@@ -9083,7 +9566,8 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
                 vec![0.1f32 * pos as f32; dim]
             };
             cache.seed_h_nextn_from_target(&h);
-            mtp.forward_dense(tok, pos, &mut cache, &mut logits).unwrap();
+            mtp.forward_dense(tok, pos, &mut cache, &mut logits)
+                .unwrap();
             cache.record(tok);
         }
         assert!(cache.seq_matches(&ctx));
@@ -9345,8 +9829,9 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
             )
             .unwrap();
         assert!(!out.text.is_empty(), "schema generate must emit text");
-        let value: serde_json::Value =
-            serde_json::from_str(&out.text).unwrap_or_else(|e| panic!("schema output must parse as JSON: {e}; text={:?}", out.text));
+        let value: serde_json::Value = serde_json::from_str(&out.text).unwrap_or_else(|e| {
+            panic!("schema output must parse as JSON: {e}; text={:?}", out.text)
+        });
         let obj = value
             .as_object()
             .unwrap_or_else(|| panic!("schema output must be an object, got {value}"));

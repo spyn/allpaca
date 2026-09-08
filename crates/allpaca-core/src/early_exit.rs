@@ -24,7 +24,40 @@ impl Default for EarlyExitSpec {
     }
 }
 
-/// Per-layer exit head prediction (future wire-up).
+/// Load early-exit capability from GGUF metadata (`allpaca.early_exit.*`).
+///
+/// When `supported` is true and `exit_layers` is non-empty, the control plane
+/// may self-speculate (shared lm_head) or use dedicated `blk.{i}.exit_head.weight`.
+pub fn spec_from_gguf(
+    file: &allpaca_gguf::GgufFile,
+    min_confidence: f32,
+    min_calibration_margin: f32,
+) -> EarlyExitSpec {
+    let supported = file
+        .metadata
+        .get("allpaca.early_exit.supported")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let exit_layers = file
+        .metadata
+        .get("allpaca.early_exit.exit_layers")
+        .and_then(|v| v.as_u32_array())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v as usize)
+        .collect::<Vec<_>>();
+    if !supported || exit_layers.is_empty() {
+        return EarlyExitSpec::default();
+    }
+    EarlyExitSpec {
+        supported: true,
+        exit_layers,
+        min_confidence,
+        min_calibration_margin,
+    }
+}
+
+/// Per-layer exit head prediction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExitPrediction {
     pub confidence: f32,
@@ -33,9 +66,7 @@ pub struct ExitPrediction {
 
 /// Accept an early exit only when the model declares support and margins hold.
 pub fn accept_exit(p: &ExitPrediction, s: &EarlyExitSpec) -> bool {
-    s.supported
-        && p.confidence >= s.min_confidence
-        && p.margin >= s.min_calibration_margin
+    s.supported && p.confidence >= s.min_confidence && p.margin >= s.min_calibration_margin
 }
 
 /// True when config asks for early exit but the loaded model cannot provide it.

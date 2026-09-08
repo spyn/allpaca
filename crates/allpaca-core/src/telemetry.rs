@@ -158,7 +158,7 @@ pub struct Metrics {
     pub kv_attention_trims: AtomicU64,
     /// Config requested early exit but the loaded model has no supported manifest.
     pub early_exit_gated: AtomicU64,
-    /// Accepted early exits (reserved; exit heads not wired yet).
+    /// Accepted early exits (self-speculate or dedicated exit heads).
     pub early_exit_accepts: AtomicU64,
     pub kv_nvme_pages: AtomicU64,
     pub kv_nvme_reads: AtomicU64,
@@ -361,8 +361,10 @@ impl Metrics {
         self.draft_gpu_vram_total_bytes
             .store(draft_vram_total, Ordering::Relaxed);
         let util = if util.is_finite() { util } else { 0.0 };
-        self.gpu_util_x1e4
-            .store((util.clamp(0.0, 1.0) * 10_000.0).round() as u64, Ordering::Relaxed);
+        self.gpu_util_x1e4.store(
+            (util.clamp(0.0, 1.0) * 10_000.0).round() as u64,
+            Ordering::Relaxed,
+        );
         self.gpu_samples.fetch_add(1, Ordering::Relaxed);
     }
 

@@ -1,7 +1,9 @@
 use crate::deltanet::{rmsnorm_silu_gate, GdnDims};
 use crate::early_exit::EarlyExitSpec;
 use crate::forest::TokenForest;
-use crate::ssm::{mamba2_step, validate_weights as validate_mamba2_weights, Mamba2Dims, SsmLayerWeights};
+use crate::ssm::{
+    mamba2_step, validate_weights as validate_mamba2_weights, Mamba2Dims, SsmLayerWeights,
+};
 use allpaca_cpu::{attention, attention_with_mask, matmul_nt, rmsnorm, rope, silu};
 use allpaca_gguf::{GgufCompatReport, GgufFile, HybridLayerInfo, HybridLayerKind};
 use allpaca_hip::{DeviceDecode, DeviceWeights, HipWorkspace};
@@ -1137,10 +1139,7 @@ impl ResidentModel {
                     &mut parts,
                     &mut off,
                 )?
-            } else if matches!(
-                block,
-                HybridLayerKind::DenseFfn | HybridLayerKind::Moe
-            ) {
+            } else if matches!(block, HybridLayerKind::DenseFfn | HybridLayerKind::Moe) {
                 // Nemotron Lightning MoE-only: FFN RMSNorm is the block's attn_norm.
                 attn_norm
             } else if matches!(block, HybridLayerKind::Ssm)
@@ -1151,7 +1150,9 @@ impl ResidentModel {
                 && file
                     .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
                     .is_none()
-                && file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_none()
+                && file
+                    .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
+                    .is_none()
             {
                 // Attention-only hybrid block: no FFN.
                 WeightRef::f32(0, 0)
@@ -1168,7 +1169,9 @@ impl ResidentModel {
                     || file
                         .tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
                         .is_some()
-                    || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some())
+                    || file
+                        .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
+                        .is_some())
             {
                 let w_router = if file
                     .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
@@ -1912,9 +1915,11 @@ fn load_gguf_ssm_layer(
     let meta = |suffix: &str| {
         file.meta_u32(&format!("{arch}.ssm.{suffix}"))
             .map(|v| v as usize)
-            .ok_or_else(|| AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "blk.{layer}: missing authoritative Mamba-2 metadata {arch}.ssm.{suffix}"
-            ))))
+            .ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "blk.{layer}: missing authoritative Mamba-2 metadata {arch}.ssm.{suffix}"
+                )))
+            })
     };
     let dims = Mamba2Dims::new(
         dim,
@@ -1924,21 +1929,34 @@ fn load_gguf_ssm_layer(
         meta("group_count")?,
         meta("conv_kernel")?,
     )
-    .ok_or_else(|| AllpacaError::Fatal(FatalError::ModelLoad(format!(
-        "blk.{layer}: unsupported Mamba-2 metadata for {arch}"
-    ))))?;
+    .ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: unsupported Mamba-2 metadata for {arch}"
+        )))
+    })?;
     let required = |suffix: &str| -> Result<Vec<f32>, AllpacaError> {
         file.tensor_f32(&format!("blk.{layer}.{suffix}"))
     };
     let weights = SsmLayerWeights {
         dims,
-        w_in: if materialize_projections { required("ssm_in.weight")? } else { Vec::new() },
-        w_out: if materialize_projections { required("ssm_out.weight")? } else { Vec::new() },
+        w_in: if materialize_projections {
+            required("ssm_in.weight")?
+        } else {
+            Vec::new()
+        },
+        w_out: if materialize_projections {
+            required("ssm_out.weight")?
+        } else {
+            Vec::new()
+        },
         a: required("ssm_a")?,
         d_skip: required("ssm_d")?,
         dt_bias: required("ssm_dt.bias")?,
         conv1d: required("ssm_conv1d.weight")?,
-        conv_bias: if file.tensor(&format!("blk.{layer}.ssm_conv1d.bias")).is_some() {
+        conv_bias: if file
+            .tensor(&format!("blk.{layer}.ssm_conv1d.bias"))
+            .is_some()
+        {
             required("ssm_conv1d.bias")?
         } else {
             Vec::new()
@@ -1946,15 +1964,18 @@ fn load_gguf_ssm_layer(
         norm: required("ssm_norm.weight")?,
     };
     if materialize_projections {
-        validate_mamba2_weights(&weights).map_err(|e| {
-            AllpacaError::Fatal(FatalError::ModelLoad(format!("blk.{layer}: {e}")))
-        })?;
+        validate_mamba2_weights(&weights)
+            .map_err(|e| AllpacaError::Fatal(FatalError::ModelLoad(format!("blk.{layer}: {e}"))))?;
     } else {
         for (name, got, want) in [
             ("ssm_a", weights.a.len(), dims.n_heads),
             ("ssm_d", weights.d_skip.len(), dims.n_heads),
             ("ssm_dt.bias", weights.dt_bias.len(), dims.n_heads),
-            ("ssm_conv1d.weight", weights.conv1d.len(), dims.conv_dim * dims.conv_kernel),
+            (
+                "ssm_conv1d.weight",
+                weights.conv1d.len(),
+                dims.conv_dim * dims.conv_kernel,
+            ),
             ("ssm_norm.weight", weights.norm.len(), dims.d_inner),
         ] {
             if got != want {
@@ -2535,8 +2556,10 @@ pub struct TinyModel {
     pub working_set: Option<Arc<WeightWorkingSet>>,
     pub expert_lru: Option<Arc<ExpertLru>>,
     pub expert_host: Option<Arc<HostExpertPool>>,
-    /// Manifest early-exit capability (unsupported for synthetic / most GGUF).
+    /// Manifest early-exit capability (from GGUF `allpaca.early_exit.*` or test hook).
     pub early_exit: EarlyExitSpec,
+    /// Optional dedicated exit heads (`blk.{i}.exit_head.weight`); empty = shared lm_head.
+    pub exit_heads: Vec<Option<Vec<f32>>>,
     /// Present when this TinyModel is an MTP/NextN draft with host seed weights.
     pub mtp_nextn: Option<MtpNextnWeights>,
 }
@@ -2604,6 +2627,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            exit_heads: Vec::new(),
             mtp_nextn: None,
         }
     }
@@ -3408,7 +3432,9 @@ impl TinyModel {
                     let has_moe = file
                         .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
                         .is_some()
-                        || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some();
+                        || file
+                            .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
+                            .is_some();
                     if has_dense_ffn {
                         for suffix in ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"] {
                             require_gguf_tensor(file, &format!("blk.{i}.{suffix}"))?;
@@ -3597,7 +3623,9 @@ impl TinyModel {
                         && (file
                             .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
                             .is_some()
-                            || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some());
+                            || file
+                                .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
+                                .is_some());
                     let (w_gate, w_up, w_down, w_router, experts) = if has_moe {
                         let (w_router, experts) = load_gguf_moe_layer(file, i, cfg.n_experts)?;
                         (Vec::new(), Vec::new(), Vec::new(), w_router, experts)
@@ -3675,6 +3703,21 @@ impl TinyModel {
             Ok(w) => w,
             Err(_) => embed.clone(),
         };
+        let early_exit = crate::early_exit::spec_from_gguf(file, 0.9, 0.05);
+        let mut exit_heads = vec![None; cfg.n_layers];
+        if early_exit.supported {
+            for &layer in &early_exit.exit_layers {
+                let blk = cfg.gguf_blk(layer);
+                let name = format!("blk.{blk}.exit_head.weight");
+                if file.tensor(&name).is_some() {
+                    if let Ok(w) = file.tensor_f32(&name) {
+                        if layer < exit_heads.len() {
+                            exit_heads[layer] = Some(w);
+                        }
+                    }
+                }
+            }
+        }
         Ok(Self {
             config: cfg,
             embed,
@@ -3685,7 +3728,8 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
-            early_exit: EarlyExitSpec::default(),
+            early_exit,
+            exit_heads,
             mtp_nextn: None,
         })
     }
@@ -3790,6 +3834,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            exit_heads: Vec::new(),
             mtp_nextn: None,
         }
     }
@@ -3859,6 +3904,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            exit_heads: Vec::new(),
             mtp_nextn: None,
         })
     }
@@ -3923,6 +3969,7 @@ impl TinyModel {
             expert_lru: None,
             expert_host: None,
             early_exit: EarlyExitSpec::default(),
+            exit_heads: Vec::new(),
             mtp_nextn: None,
         })
     }
@@ -4059,9 +4106,11 @@ impl TinyModel {
                         cfg.eps,
                         &mut hidden,
                     )
-                    .map_err(|e| AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                        "SSM layer {layer_idx}: {e}"
-                    ))))?;
+                    .map_err(|e| {
+                        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "SSM layer {layer_idx}: {e}"
+                        )))
+                    })?;
                     for i in 0..dim {
                         x[i] += hidden[i];
                     }
@@ -4203,8 +4252,8 @@ impl TinyModel {
                 Some(metrics),
                 prefill,
             )?;
-            // Self-speculative early exit: provisional lm_head; skip remaining layers
-            // when confidence + margin clear the manifest gate.
+            // Self-speculative / exit-head early exit: provisional logits; skip
+            // remaining layers when confidence + margin clear the manifest gate.
             if crate::early_exit::is_exit_layer(&self.early_exit, layer_idx)
                 && layer_idx + 1 < self.layers.len()
             {
@@ -4222,16 +4271,33 @@ impl TinyModel {
                     &mut scratch[..dim],
                     Some(metrics),
                 )?;
-                gemm_nt_dispatch(
-                    hip,
-                    &scratch[..dim],
-                    &self.lm_head,
-                    resident.map(|r| r.lm_head()),
-                    &mut logits[..cfg.vocab_size],
-                    1,
-                    cfg.vocab_size,
-                    dim,
-                )?;
+                let dedicated = self
+                    .exit_heads
+                    .get(layer_idx)
+                    .and_then(|h| h.as_ref())
+                    .filter(|w| w.len() >= cfg.vocab_size * dim);
+                if let Some(head) = dedicated {
+                    // Host GEMM through the dedicated exit head (GGUF F32 materialize).
+                    allpaca_cpu::matmul_nt(
+                        &scratch[..dim],
+                        head,
+                        &mut logits[..cfg.vocab_size],
+                        1,
+                        cfg.vocab_size,
+                        dim,
+                    )?;
+                } else {
+                    gemm_nt_dispatch(
+                        hip,
+                        &scratch[..dim],
+                        &self.lm_head,
+                        resident.map(|r| r.lm_head()),
+                        &mut logits[..cfg.vocab_size],
+                        1,
+                        cfg.vocab_size,
+                        dim,
+                    )?;
+                }
                 let pred = crate::early_exit::prediction_from_logits(&logits[..cfg.vocab_size]);
                 if crate::early_exit::accept_exit(&pred, &self.early_exit) {
                     metrics
@@ -4363,8 +4429,7 @@ impl TinyModel {
                     let wo_k = l.wo.len() / dim;
                     q_out == wo_k.saturating_mul(2) && wo_k > dim
                 });
-                let batched_ok =
-                    !gated && !self.config.uses_imrope() && self.config.rope_dims == 0;
+                let batched_ok = !gated && !self.config.uses_imrope() && self.config.rope_dims == 0;
                 if batched_ok {
                     match self.forward_tokens_device(
                         tokens,
@@ -4589,11 +4654,7 @@ impl TinyModel {
                                 "Mamba-2 layer requires recurrent state".into(),
                             ))
                         })?;
-                        state.ensure_ssm(
-                            layer_idx,
-                            dims.state_floats(),
-                            dims.conv_state_floats(),
-                        );
+                        state.ensure_ssm(layer_idx, dims.state_floats(), dims.conv_state_floats());
                         let req_id = side.as_ref().map(|s| s.request_id).unwrap_or(0);
                         hip.mamba2_decode_step_resident(
                             req_id,
@@ -4880,9 +4941,11 @@ impl TinyModel {
                             cfg.eps,
                             &mut y_host,
                         )
-                        .map_err(|e| AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                            "SSM layer {layer_idx}: {e}"
-                        ))))?;
+                        .map_err(|e| {
+                            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "SSM layer {layer_idx}: {e}"
+                            )))
+                        })?;
                         for i in 0..dim {
                             x_host[i] += y_host[i];
                         }

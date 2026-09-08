@@ -16,6 +16,8 @@
 - CPU sampling with JSON mode plus `llguidance` JSON Schema / Lark constraints
 - HIP backend (AMD GPU)
 - CPU fallback for all kernels
+- Model-aware early exit from GGUF `allpaca.early_exit.*` + optional `blk.{i}.exit_head.weight`
+- BitNet/ternary GGUF via TQ1_0 / TQ2_0 CPU dequant
 - OpenAI-compatible `/v1/chat/completions` server
 - TOML config + CLI flags
 - `tracing` logs + `/stats` metrics endpoint
@@ -26,8 +28,8 @@
 - Multimodal (vision/audio)
 - Prometheus/OpenTelemetry export
 - Batched HIP GEMM across Requests (poll advances one Request per tick)
-- BitNet; CXL/PIM
-- Early-exit heads (gating/metrics exist; accepts not wired)
+- CXL/PIM
+- Ternary HIP GEMV (CPU TQ load works; GPU BitNet kernels deferred)
 
 **Demo:** Load 7B GGUF, asymmetric speculative decoding on RX 9070 + 9060 XT, show speedup vs single-GPU, KV spill to DRAM when VRAM fills.
 
