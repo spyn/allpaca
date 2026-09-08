@@ -1666,7 +1666,14 @@ impl Engine {
             None
         };
 
-        let use_tree = speculate && inner.flags.tree_speculation && depth > 0;
+        let ctx_now = request(&inner, id)?.tokens.clone();
+        // Prefer linear MTP/draft-ahead when a warm next span is queued; tree
+        // rebuild would discard the overlapped proposal.
+        let ahead_ready = inner.draft_ahead.as_ref().is_some_and(|a| {
+            a.ctx == ctx_now && !a.tokens.is_empty()
+        });
+        let use_tree =
+            speculate && inner.flags.tree_speculation && depth > 0 && !ahead_ready;
         self.metrics
             .target_evals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1681,7 +1688,6 @@ impl Engine {
             ds_queue: &self.ds_queue,
         };
         let produced = if use_tree {
-            let ctx = request(&inner, id)?.tokens.clone();
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
             let draft = if inner.flags.draft_model_speculation {
                 inner.draft_model.as_deref()
@@ -1691,14 +1697,27 @@ impl Engine {
             let forest = build_token_forest(
                 &inner.ngram,
                 draft,
-                &ctx,
+                &ctx_now,
                 max_nodes,
                 depth.max(1),
             )?;
             self.metrics
                 .tree_nodes
                 .fetch_add(forest.nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            verify_forest(&mut inner, id, &forest, mask.as_ref(), remaining, &self.metrics, self.hip.as_deref(), micro_batch, &hooks)?
+            verify_forest(
+                &mut inner,
+                id,
+                &forest,
+                mask.as_ref(),
+                remaining,
+                &self.metrics,
+                self.hip.as_deref(),
+                self.draft_hip.as_deref(),
+                depth,
+                temperature,
+                micro_batch,
+                &hooks,
+            )?
         } else {
             let drafts = if speculate && depth > 0 {
                 propose_drafts(
@@ -3470,6 +3489,9 @@ fn verify_forest(
     remaining: usize,
     metrics: &Metrics,
     hip: Option<&HipWorkspace>,
+    draft_hip: Option<&HipWorkspace>,
+    depth: usize,
+    temperature: f32,
     micro_batch: Option<&MicroBatchExpertUnion>,
     hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
@@ -3519,26 +3541,27 @@ fn verify_forest(
             )
         };
         produced.push(sampled);
-        let child = forest.children(parent).find(|&i| forest.nodes[i].token_id as u32 == sampled);
+        let child = forest
+            .children(parent)
+            .find(|&i| forest.nodes[i].token_id as u32 == sampled);
         if let Some(idx) = child {
             accepted_tokens.push(sampled);
             parent = idx as i32;
         }
         append_and_forward(
-        inner,
-        id,
-        sampled,
-        metrics,
-        hip,
-        None,
-        micro_batch,
-        hooks.layer_stagger,
-        Some(hooks.ds_probe),
-        Some(hooks.ds_queue),
-    )?;
+            inner,
+            id,
+            sampled,
+            metrics,
+            hip,
+            draft_hip,
+            micro_batch,
+            hooks.layer_stagger,
+            Some(hooks.ds_probe),
+            Some(hooks.ds_queue),
+        )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
-        if stop || child.is_none() || forest.children(parent).next().is_none()
-        {
+        if stop || child.is_none() || forest.children(parent).next().is_none() {
             break;
         }
     }
@@ -3552,6 +3575,10 @@ fn verify_forest(
         accepted_tokens.len() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
+    if !produced.is_empty() {
+        let ctx = request(inner, id)?.tokens.clone();
+        store_draft_ahead_from_ctx(inner, id, &ctx, depth, temperature, draft_hip, metrics)?;
+    }
     Ok(Produced {
         tokens: produced,
         accepted: accepted_tokens.len() as u64,
@@ -8002,6 +8029,165 @@ mod tests {
             engine.stats().draft_tokens_copied > 0 || engine.stats().draft_gpu_forwards > 0,
             "MTP draft must propose tokens; stats={:?}",
             engine.stats()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_tree_plus_mtp_builds_forest_and_generates() {
+        let path = std::env::temp_dir().join("allpaca_tree_mtp.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(3),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.tree.enabled = true;
+        cfg.speculative.tree.max_nodes = 8;
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 2;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(true);
+        cfg.features.tree_speculation = Some(true);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("tree+MTP GGUF must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 6,
+                    temperature: 0.0,
+                    seed: Some(3),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("tree+MTP generate");
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.tree_nodes > 0,
+            "Token Forest must build when tree+MTP are both on; stats={stats:?}"
+        );
+        assert!(
+            stats.tree_path_valid,
+            "accepted tree path must be valid; stats={stats:?}"
+        );
+        assert!(
+            stats.draft_proposed > 0,
+            "MTP/tree must propose draft nodes; stats={stats:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Tree verify must keep MTP process KV in lockstep (no skips) and still
+    /// branch from the MTP draft when ngram is off.
+    #[test]
+    fn engine_tree_plus_mtp_keeps_process_kv_without_ngram() {
+        let path = std::env::temp_dir().join("allpaca_tree_mtp_process.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(5),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.tree.enabled = true;
+        cfg.speculative.tree.max_nodes = 8;
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 2;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(true);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("tree+MTP must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 6,
+                    temperature: 0.0,
+                    seed: Some(5),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("tree+MTP generate without ngram");
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.tree_nodes > 0,
+            "MTP draft alone must populate the Token Forest; stats={stats:?}"
+        );
+        assert_eq!(
+            stats.mtp_process_skips, 0,
+            "tree accept path must keep MTP process KV sequential; stats={stats:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Productize tree+MTP: after forest verify, overlap the next MTP draft
+    /// span the same way linear packed verify does.
+    #[test]
+    fn engine_tree_plus_mtp_reuses_draft_ahead() {
+        let path = std::env::temp_dir().join("allpaca_tree_mtp_ahead.gguf");
+        write_tiny_mtp_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(true),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(path.clone());
+        cfg.model.draft_path = None;
+        cfg.speculative.providers = vec![DraftProviderKind::Mtp];
+        cfg.speculative.tree.enabled = true;
+        cfg.speculative.tree.max_nodes = 8;
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 2;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(true);
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("tree+MTP must load");
+        let mut handle = engine
+            .begin_request(
+                "hello",
+                GenerationParams {
+                    max_tokens: 12,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("begin tree+MTP request");
+        loop {
+            match engine.step(&mut handle).expect("step") {
+                StepResult::Prefill { .. } => {}
+                StepResult::Token(_) => {
+                    if engine.stats().draft_ahead_hits > 0 {
+                        break;
+                    }
+                }
+                StepResult::Finished(_) => break,
+            }
+        }
+        let stats = engine.stats();
+        assert!(
+            stats.tree_nodes > 0,
+            "tree path must run; stats={stats:?}"
+        );
+        assert!(
+            stats.draft_ahead_hits > 0,
+            "tree+MTP must reuse overlapped MTP drafts; stats={stats:?}"
         );
         let _ = std::fs::remove_file(path);
     }

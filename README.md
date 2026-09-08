@@ -31,7 +31,7 @@ and [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md)).
 | No Windows DirectStorage path | Stable **DirectStorage 1.3** file→D3D12 DMA into opt-in HIP-imported buffers; ordinary weight uploads stay plain `hipMalloc` + H2D; aligned host-staged fallback |
 | Single-request hybrid sync barrier | **Micro-batch** partner `poll` + **layer-stagger** CPU experts during GPU forward |
 | Reactive VRAM only | **Elastic expert↔KV rebalance**, attention-trim cold KV, **`gpu.util` / `gpu.vram`** from `hipMemGetInfo` (no AMD SMI on Windows) |
-| Narrow GGUF quants | **F16 / Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K** + **ROCmFP4 (`ggml_type_id=100`)** CPU dequant + fused HIP GEMV |
+| Narrow GGUF quants | **F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K** + **ROCmFP4 (`ggml_type_id=100`)** CPU dequant + fused HIP GEMV where wired |
 | MoE-only / no hybrid SSM | **`nemotron_h_moe` schedule**: full Mamba-2 SSD + attention + MoE on CPU/HIP (incl. Lightning gate-less `up`/`down`); real ROCmFP4 opt-in via `ALLPACA_NEMOTRON=1` |
 | Proprietary weight banks only | **GGUF** primary + **packed layer-major / `ALLPFTW1`** trunk for streaming |
 | No continuous batching story | Fair **`Engine::poll`**, chunked prefill, multi-request backpressure |
@@ -41,8 +41,7 @@ and [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md)).
 | NUMA-blind host experts | **NUMA first-touch** on the host expert pool |
 
 Still out of MVP (documented, not claimed): Coral/NPU backends, BitNet, CUDA backend, CXL/PIM,
-tree+MTP productization, legacy GGUF quants (`Q2_K`/`Q3_K`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_1`), and
-wired early-exit heads.
+and wired early-exit heads.
 
 ---
 

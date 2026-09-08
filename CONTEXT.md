@@ -8,7 +8,7 @@
 - Continuous-batching `Engine::poll`: fair-schedules the longest-waiting runnable Request (prefill or decode) so a single driver loop can interleave Requests without hand-rolled round-robin `step`
 - Chunked prompt prefill (`prefill.chunk_tokens`) so a second Request can admit or decode between chunks
 - Asymmetric GPU scheduling (target on fast GPU, draft on slow GPU)
-- NGram + DraftModel speculation providers
+- NGram + DraftModel + MTP speculation; Token Forest (off by default) overlaps MTP draft-ahead when both are on
 - VRAM + Pinned DRAM KV tiering (2-tier); optional NVMe cold KV
 - Weight working set (dense pin-prefix + ring; MoE host-pool + GPU LRU + `q*` miss split)
 - Windows DirectStorage file→D3D12→HIP DMA (opt-in alloc); aligned host-staged H2D fallback
@@ -21,13 +21,12 @@
 - `tracing` logs + `/stats` metrics endpoint
 
 **Out (fast-follow):**
-- Tree speculation (feature-flagged; off by default) and tree+MTP productization
 - CUDA backend
 - Auxiliary accelerators (Coral, NPU)
 - Multimodal (vision/audio)
 - Prometheus/OpenTelemetry export
 - Batched HIP GEMM across Requests (poll advances one Request per tick)
-- Legacy GGUF quants (`Q2_K`/`Q3_K`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_1`); BitNet; CXL/PIM
+- BitNet; CXL/PIM
 - Early-exit heads (gating/metrics exist; accepts not wired)
 
 **Demo:** Load 7B GGUF, asymmetric speculative decoding on RX 9070 + 9060 XT, show speedup vs single-GPU, KV spill to DRAM when VRAM fills.
