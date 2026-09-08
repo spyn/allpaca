@@ -105,6 +105,29 @@ impl GgufValue {
         }
     }
 
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(v) => Some(*v),
+            Self::Uint32(v) => Some(*v != 0),
+            Self::Uint64(v) => Some(*v != 0),
+            Self::Int32(v) => Some(*v != 0),
+            _ => None,
+        }
+    }
+
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(item.as_u32()?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     pub fn as_string_array(&self) -> Option<Vec<String>> {
         match self {
             Self::Array(items) => {
@@ -175,6 +198,8 @@ pub enum GgmlType {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    TQ1_0 = 34,
+    TQ2_0 = 35,
     /// AMD ROCmFP4 dual-scale (ggml_type_id=100).
     RocmFp4 = 100,
     Other = 255,
@@ -196,6 +221,8 @@ impl GgmlType {
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
+            34 => Self::TQ1_0,
+            35 => Self::TQ2_0,
             100 => Self::RocmFp4,
             _ => Self::Other,
         }
@@ -254,6 +281,12 @@ impl TensorInfo {
             GgmlType::Q6_K => n
                 .div_ceil(allpaca_cpu::Q6_K_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES),
+            GgmlType::TQ1_0 => n
+                .div_ceil(allpaca_cpu::TQ1_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::TQ1_0_BLOCK_BYTES),
+            GgmlType::TQ2_0 => n
+                .div_ceil(allpaca_cpu::TQ2_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::TQ2_0_BLOCK_BYTES),
             GgmlType::RocmFp4 => n
                 .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES),
@@ -386,10 +419,7 @@ impl GgufFile {
     /// Probe arch / layer mix / ggml type ids without loading weights.
     /// `reject_reason` is set when Allpaca cannot run the file (hybrid SSM, unknown quant, …).
     pub fn compat_report(&self) -> GgufCompatReport {
-        let architecture = self
-            .architecture()
-            .unwrap_or("unknown")
-            .to_string();
+        let architecture = self.architecture().unwrap_or("unknown").to_string();
         let n_layers = self
             .meta_u32(&format!("{architecture}.block_count"))
             .or_else(|| self.meta_u32("llama.block_count"))
@@ -417,8 +447,12 @@ impl GgufFile {
                 || self.tensor(&format!("blk.{i}.ssm_out.weight")).is_some();
             let attn = self.tensor(&format!("blk.{i}.attn_q.weight")).is_some()
                 || self.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some();
-            let moe = self.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some()
-                || self.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some()
+            let moe = self
+                .tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
+                .is_some()
+                || self
+                    .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
+                    .is_some()
                 || self.tensor(&format!("blk.{i}.ffn_gate.0.weight")).is_some();
             if ssm {
                 ssm_layers += 1;
@@ -460,6 +494,8 @@ impl GgufFile {
             GgmlType::Q4_K as u32,
             GgmlType::Q5_K as u32,
             GgmlType::Q6_K as u32,
+            GgmlType::TQ1_0 as u32,
+            GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
         ];
         let unsupported_types: Vec<u32> = ggml_type_ids
@@ -471,7 +507,7 @@ impl GgufFile {
         let mut reasons = Vec::new();
         if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/ROCmFP4)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4)"
             ));
         }
         let llama_family = matches!(
@@ -704,6 +740,28 @@ impl GgufFile {
                 allpaca_cpu::dequant_q6_k(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
+            GgmlType::TQ1_0 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} TQ1_0 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_tq1_0(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::TQ2_0 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} TQ2_0 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_tq2_0(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
             GgmlType::RocmFp4 => {
                 let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > self.mmap.len() {
@@ -836,8 +894,7 @@ impl<'a> Cursor<'a> {
     fn read_string(&mut self) -> Result<String, AllpacaError> {
         let len = self.read_u64()? as usize;
         let bytes = self.read_bytes(len)?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidUtf8))
+        String::from_utf8(bytes.to_vec()).map_err(|_| AllpacaError::Fatal(FatalError::InvalidUtf8))
     }
 
     fn read_value(&mut self, ty: GgufType) -> Result<GgufValue, AllpacaError> {
@@ -958,6 +1015,56 @@ mod tests {
         out
     }
 
+    fn encode_tq2_0(values: &[i8], scale: f32) -> Vec<u8> {
+        assert_eq!(values.len(), 256);
+        let mut out = vec![0u8; allpaca_cpu::TQ2_0_BLOCK_BYTES];
+        for group in 0..2 {
+            for m in 0..32 {
+                let mut packed = 0u8;
+                for digit in 0..4 {
+                    let trit = values[group * 128 + digit * 32 + m] + 1;
+                    assert!((0..=2).contains(&trit));
+                    packed |= (trit as u8) << (digit * 2);
+                }
+                out[group * 32 + m] = packed;
+            }
+        }
+        out[64..66].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        out
+    }
+
+    fn encode_tq1_0(values: &[i8], scale: f32) -> Vec<u8> {
+        assert_eq!(values.len(), 256);
+        let mut out = vec![0u8; allpaca_cpu::TQ1_0_BLOCK_BYTES];
+        let encode_digits = |digits: &[i8]| {
+            let mut q = 0u16;
+            for &value in digits {
+                assert!((-1..=1).contains(&value));
+                q = q * 3 + (value + 1) as u16;
+            }
+            ((q * 256 + 242) / 243) as u8
+        };
+
+        for m in 0..32 {
+            let digits: [i8; 5] = std::array::from_fn(|digit| values[digit * 32 + m]);
+            out[m] = encode_digits(&digits);
+        }
+        for m in 0..16 {
+            let digits: [i8; 5] = std::array::from_fn(|digit| values[160 + digit * 16 + m]);
+            out[32 + m] = encode_digits(&digits);
+        }
+        for m in 0..4 {
+            let mut digits = [0i8; 5];
+            for digit in 0..4 {
+                digits[digit] = values[240 + digit * 4 + m];
+            }
+            digits[4] = -1;
+            out[48 + m] = encode_digits(&digits);
+        }
+        out[52..54].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        out
+    }
+
     #[test]
     fn roundtrip_header_and_f32_tensor() {
         let dir = std::env::temp_dir();
@@ -990,10 +1097,7 @@ mod tests {
     fn meta_f32_reads_rope_freq_base() {
         let path = std::env::temp_dir().join("allpaca_gguf_rope.gguf");
         let mut meta = HashMap::new();
-        meta.insert(
-            "llama.rope.freq_base".into(),
-            GgufValue::Float32(500_000.0),
-        );
+        meta.insert("llama.rope.freq_base".into(), GgufValue::Float32(500_000.0));
         meta.insert(
             "llama.attention.layer_norm_rms_epsilon".into(),
             GgufValue::Float32(1e-5),
@@ -1001,10 +1105,9 @@ mod tests {
         write_gguf(&path, &meta, &[]).unwrap();
         let file = GgufFile::open(&path).unwrap();
         assert_eq!(file.meta_f32("llama.rope.freq_base"), Some(500_000.0));
-        assert!(
-            file.meta_f32("llama.attention.layer_norm_rms_epsilon")
-                .is_some_and(|e| (e - 1e-5).abs() < 1e-8)
-        );
+        assert!(file
+            .meta_f32("llama.attention.layer_norm_rms_epsilon")
+            .is_some_and(|e| (e - 1e-5).abs() < 1e-8));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1074,6 +1177,48 @@ mod tests {
                 (*v - expect).abs() < 1e-2,
                 "Q4_0 dequant mismatch at {i}: {v} vs {expect}"
             );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tq2_0_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_tq2_0.gguf");
+        let values: Vec<i8> = (0..256).map(|i| (i % 3) as i8 - 1).collect();
+        let scale = 0.5f32;
+        let payload = encode_tq2_0(&values, scale);
+        write_typed_gguf(&path, 35, &payload, 256);
+
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::TQ2_0);
+        assert_eq!(info.nbytes(), allpaca_cpu::TQ2_0_BLOCK_BYTES);
+        assert!(file.compat_report().reject_reason.is_none());
+        let loaded = file.tensor_f32("quant.weight").expect("TQ2_0");
+        for (i, (&value, &got)) in values.iter().zip(loaded.iter()).enumerate() {
+            let want = scale * f32::from(value);
+            assert!((got - want).abs() < 1e-3, "TQ2_0 {i}: {got} vs {want}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tq1_0_tensor_load_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_tq1_0.gguf");
+        let values: Vec<i8> = (0..256).map(|i| ((i * 7) % 3) as i8 - 1).collect();
+        let scale = 0.5f32;
+        let payload = encode_tq1_0(&values, scale);
+        write_typed_gguf(&path, 34, &payload, 256);
+
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::TQ1_0);
+        assert_eq!(info.nbytes(), allpaca_cpu::TQ1_0_BLOCK_BYTES);
+        assert!(file.compat_report().reject_reason.is_none());
+        let loaded = file.tensor_f32("quant.weight").expect("TQ1_0");
+        for (i, (&value, &got)) in values.iter().zip(loaded.iter()).enumerate() {
+            let want = scale * f32::from(value);
+            assert!((got - want).abs() < 1e-3, "TQ1_0 {i}: {got} vs {want}");
         }
         let _ = std::fs::remove_file(path);
     }
@@ -1295,7 +1440,10 @@ mod tests {
         payload.extend_from_slice(&qs);
         write_typed_gguf(&path, 3, &payload, 32);
         let file = GgufFile::open(&path).unwrap();
-        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q4_1);
+        assert_eq!(
+            file.tensor("quant.weight").unwrap().ggml_type,
+            GgmlType::Q4_1
+        );
         let loaded = file.tensor_f32("quant.weight").expect("Q4_1");
         for (i, (&want, &got)) in expect.iter().zip(loaded.iter()).enumerate() {
             assert!((want - got).abs() < 1e-2, "Q4_1 {i}: {got} vs {want}");
@@ -1314,7 +1462,10 @@ mod tests {
         payload.extend(values.iter().map(|v| *v as u8));
         write_typed_gguf(&path, 9, &payload, 32);
         let file = GgufFile::open(&path).unwrap();
-        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q8_1);
+        assert_eq!(
+            file.tensor("quant.weight").unwrap().ggml_type,
+            GgmlType::Q8_1
+        );
         let loaded = file.tensor_f32("quant.weight").expect("Q8_1");
         for (i, v) in loaded.iter().enumerate() {
             let expect = d * values[i] as f32;
@@ -1354,7 +1505,10 @@ mod tests {
         payload.extend_from_slice(&qs);
         write_typed_gguf(&path, 7, &payload, 32);
         let file = GgufFile::open(&path).unwrap();
-        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q5_1);
+        assert_eq!(
+            file.tensor("quant.weight").unwrap().ggml_type,
+            GgmlType::Q5_1
+        );
         let loaded = file.tensor_f32("quant.weight").expect("Q5_1");
         for (i, (&want, &got)) in expect.iter().zip(loaded.iter()).enumerate() {
             assert!((want - got).abs() < 1e-2, "Q5_1 {i}: {got} vs {want}");
@@ -1373,7 +1527,10 @@ mod tests {
         payload[80..82].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
         write_typed_gguf(&path, 10, &payload, 256);
         let file = GgufFile::open(&path).unwrap();
-        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q2_K);
+        assert_eq!(
+            file.tensor("quant.weight").unwrap().ggml_type,
+            GgmlType::Q2_K
+        );
         let loaded = file.tensor_f32("quant.weight").expect("Q2_K");
         assert_eq!(loaded.len(), 256);
         assert!(loaded.iter().all(|v| v.abs() < 1e-5), "expected zeros");
@@ -1400,10 +1557,16 @@ mod tests {
         payload[108..110].copy_from_slice(&f32_to_f16_bits(0.0).to_le_bytes());
         write_typed_gguf(&path, 11, &payload, 256);
         let file = GgufFile::open(&path).unwrap();
-        assert_eq!(file.tensor("quant.weight").unwrap().ggml_type, GgmlType::Q3_K);
+        assert_eq!(
+            file.tensor("quant.weight").unwrap().ggml_type,
+            GgmlType::Q3_K
+        );
         let loaded = file.tensor_f32("quant.weight").expect("Q3_K");
         assert_eq!(loaded.len(), 256);
-        assert!(loaded.iter().all(|v| v.abs() < 1e-5), "d=0 must yield zeros");
+        assert!(
+            loaded.iter().all(|v| v.abs() < 1e-5),
+            "d=0 must yield zeros"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1430,10 +1593,7 @@ mod tests {
             "general.architecture".into(),
             GgufValue::String("nemotron_h_moe".into()),
         );
-        meta.insert(
-            "nemotron_h_moe.block_count".into(),
-            GgufValue::Uint32(1),
-        );
+        meta.insert("nemotron_h_moe.block_count".into(), GgufValue::Uint32(1));
         let ssm = vec![0.0f32; 4];
         write_gguf(
             &path,
@@ -1450,7 +1610,9 @@ mod tests {
         assert_eq!(report.architecture, "nemotron_h_moe");
         assert_eq!(report.n_layers, 1);
         assert_eq!(report.ssm_layers, 1);
-        let reject = report.reject_reason.expect("incomplete Mamba-2 must reject");
+        let reject = report
+            .reject_reason
+            .expect("incomplete Mamba-2 must reject");
         assert!(reject.contains("missing Mamba-2"), "{reject}");
         let _ = std::fs::remove_file(path);
     }
@@ -1495,7 +1657,11 @@ mod tests {
             file.meta_u32(&format!("{arch}.ssm.group_count")),
             file.meta_u32(&format!("{arch}.ssm.conv_kernel")),
         );
-        if let Some(layer) = report.layers.iter().find(|l| l.block == HybridLayerKind::Ssm) {
+        if let Some(layer) = report
+            .layers
+            .iter()
+            .find(|l| l.block == HybridLayerKind::Ssm)
+        {
             for suffix in [
                 "ssm_in.weight",
                 "ssm_conv1d.weight",

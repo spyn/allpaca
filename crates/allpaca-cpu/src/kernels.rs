@@ -489,6 +489,12 @@ pub const Q8_0_BLOCK_BYTES: usize = 34;
 /// Legacy Q8_1: f16 d + f16 s + qs[32]. `x = d*q` (s is block sum, unused here).
 pub const Q8_1_BLOCK_ELEMS: usize = 32;
 pub const Q8_1_BLOCK_BYTES: usize = 36;
+/// GGUF TQ1_0 ternary super-block: qs[48] + qh[4] + f16 d.
+pub const TQ1_0_BLOCK_ELEMS: usize = 256;
+pub const TQ1_0_BLOCK_BYTES: usize = 54;
+/// GGUF TQ2_0 ternary super-block: qs[64] + f16 d.
+pub const TQ2_0_BLOCK_ELEMS: usize = 256;
+pub const TQ2_0_BLOCK_BYTES: usize = 66;
 /// GGUF Q2_K super-block (256 elems).
 pub const Q2_K_BLOCK_ELEMS: usize = 256;
 pub const Q2_K_BLOCK_BYTES: usize = 84;
@@ -1033,6 +1039,95 @@ pub fn dequant_q8_1(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
             let i = b * Q8_1_BLOCK_ELEMS + j;
             if i < n {
                 out[i] = d * (blocks[off + 4 + j] as i8 as f32);
+            }
+        }
+    }
+    Ok(())
+}
+
+const TQ1_0_POW3: [u8; 5] = [1, 3, 9, 27, 81];
+
+#[inline]
+fn decode_tq1_0_trit(byte: u8, digit: usize) -> i16 {
+    let q = byte.wrapping_mul(TQ1_0_POW3[digit]);
+    (((u16::from(q) * 3) >> 8) as i16) - 1
+}
+
+/// Dequantize GGUF TQ1_0 blocks using llama.cpp's fixed-point base-3 decode.
+pub fn dequant_tq1_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_tq1_0 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(TQ1_0_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(TQ1_0_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_tq1_0 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * TQ1_0_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off + 52], blocks[off + 53]]));
+        let base = b * TQ1_0_BLOCK_ELEMS;
+        let mut dst = base;
+
+        for digit in 0..5 {
+            for m in 0..32 {
+                if dst < n {
+                    out[dst] = d * f32::from(decode_tq1_0_trit(blocks[off + m], digit));
+                }
+                dst += 1;
+            }
+        }
+        for digit in 0..5 {
+            for m in 0..16 {
+                if dst < n {
+                    out[dst] = d * f32::from(decode_tq1_0_trit(blocks[off + 32 + m], digit));
+                }
+                dst += 1;
+            }
+        }
+        for digit in 0..4 {
+            for m in 0..4 {
+                if dst < n {
+                    out[dst] = d * f32::from(decode_tq1_0_trit(blocks[off + 48 + m], digit));
+                }
+                dst += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF TQ2_0 blocks: four 2-bit trits per byte, then f16 d.
+pub fn dequant_tq2_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_tq2_0 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(TQ2_0_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(TQ2_0_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_tq2_0 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * TQ2_0_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off + 64], blocks[off + 65]]));
+        let base = b * TQ2_0_BLOCK_ELEMS;
+        for group in 0..2 {
+            for shift in 0..4 {
+                for m in 0..32 {
+                    let i = base + group * 128 + shift * 32 + m;
+                    if i < n {
+                        let trit = (blocks[off + group * 32 + m] >> (shift * 2)) & 3;
+                        out[i] = d * (f32::from(trit) - 1.0);
+                    }
+                }
             }
         }
     }
