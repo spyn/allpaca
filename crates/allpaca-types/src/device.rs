@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub enum DeviceKind {
     Cpu,
     HipGpu,
+    CudaGpu,
+    /// Retained for serde compat; Coral/NPU backends are dropped from scope.
     EdgeTpu,
     Nvme,
 }
@@ -31,7 +33,7 @@ impl DeviceInfo {
     }
 
     pub fn is_gpu(&self) -> bool {
-        matches!(self.kind, DeviceKind::HipGpu)
+        matches!(self.kind, DeviceKind::HipGpu | DeviceKind::CudaGpu)
     }
 }
 
@@ -41,6 +43,7 @@ pub enum DeviceSelector {
     Auto,
     Cpu,
     Hip(i32),
+    Cuda(i32),
 }
 
 impl Serialize for DeviceSelector {
@@ -51,6 +54,10 @@ impl Serialize for DeviceSelector {
             Self::Cpu => "cpu",
             Self::Hip(id) => {
                 owned = format!("hip:{id}");
+                owned.as_str()
+            }
+            Self::Cuda(id) => {
+                owned = format!("cuda:{id}");
                 owned.as_str()
             }
         };
@@ -83,8 +90,17 @@ impl DeviceSelector {
                 .map_err(|_| format!("invalid HIP device id in '{raw}'"))?;
             return Ok(Self::Hip(id));
         }
+        if let Some(rest) = trimmed
+            .strip_prefix("cuda:")
+            .or_else(|| trimmed.strip_prefix("CUDA:"))
+        {
+            let id = rest
+                .parse::<i32>()
+                .map_err(|_| format!("invalid CUDA device id in '{raw}'"))?;
+            return Ok(Self::Cuda(id));
+        }
         Err(format!(
-            "unknown device selector '{raw}' (expected cpu, hip:N, or auto)"
+            "unknown device selector '{raw}' (expected cpu, hip:N, cuda:N, or auto)"
         ))
     }
 }
@@ -214,9 +230,13 @@ mod tests {
             DeviceSelector::Hip(1)
         );
         assert_eq!(
+            DeviceSelector::parse("cuda:0").unwrap(),
+            DeviceSelector::Cuda(0)
+        );
+        assert_eq!(
             DeviceSelector::parse("auto").unwrap(),
             DeviceSelector::Auto
         );
-        assert!(DeviceSelector::parse("cuda:0").is_err());
+        assert!(DeviceSelector::parse("tpu:0").is_err());
     }
 }

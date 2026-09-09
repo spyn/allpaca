@@ -1,0 +1,16 @@
+[package]
+name = "allpaca-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA kernel FFI bindings (feature-gated; compiles without a GPU)"
+
+[features]
+default = []
+cuda = []
+
+[dependencies]
+allpaca-types.workspace = true
+
+[dev-dependencies]
+allpaca-cpu.workspace = true

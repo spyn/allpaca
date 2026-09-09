@@ -28,6 +28,12 @@ pub const Q8_STAGED_QS: usize = 4;
 /// GGUF Q4_K super-block (f16 d + f16 dmin + 12 scale bytes + 128 qs).
 pub const Q4_K_BLOCK_ELEMS: usize = 256;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
+/// GGUF TQ2_0 ternary block (qs[64] + f16 d).
+pub const TQ2_0_BLOCK_ELEMS: usize = 256;
+pub const TQ2_0_BLOCK_BYTES: usize = 66;
+/// GGUF TQ1_0 ternary block (qs[48] + qh[4] + f16 d).
+pub const TQ1_0_BLOCK_ELEMS: usize = 256;
+pub const TQ1_0_BLOCK_BYTES: usize = 54;
 /// GGUF Q6_K super-block (128 ql + 64 qh + 16 scales + f16 d).
 pub const Q6_K_BLOCK_ELEMS: usize = 256;
 pub const Q6_K_BLOCK_BYTES: usize = 210;
@@ -337,6 +343,24 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gemm_nt_q4_k_untiled(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_tq2_0(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_tq1_0(
             a: *const f32,
             b: *const u8,
             c: *mut f32,
@@ -1577,6 +1601,52 @@ pub fn gemm_nt_q4_k_untiled_device(
     }
 }
 
+/// Device-pointer NT GEMM with native GGUF TQ2_0 `b` (`C = A * dequant(B)^T`).
+pub fn gemm_nt_tq2_0_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_tq2_0(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_tq2_0")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_tq2_0 unavailable".into(),
+        )))
+    }
+}
+
+/// Device-pointer NT GEMM with native GGUF TQ1_0 `b` (`C = A * dequant(B)^T`).
+pub fn gemm_nt_tq1_0_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_tq1_0(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_tq1_0")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_tq1_0 unavailable".into(),
+        )))
+    }
+}
+
 /// Device-pointer NT GEMM with native ROCmFP4 `b` (`C = A * dequant(B)^T`).
 pub fn gemm_nt_rocmfp4_device(
     a: *const f32,
@@ -1834,6 +1904,30 @@ pub fn gemm_nt_q4_k_untiled(
     k: i32,
 ) -> Result<(), AllpacaError> {
     gemm_nt_q4_k_host(a, b, c, m, n, k, gemm_nt_q4_k_untiled_device)
+}
+
+/// Host-pointer TQ2_0 NT GEMM: copies native GGUF blocks, runs the kernel, copies back.
+pub fn gemm_nt_tq2_0(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    gemm_nt_tq_host(a, b, c, m, n, k, TQ2_0_BLOCK_ELEMS, TQ2_0_BLOCK_BYTES, gemm_nt_tq2_0_device)
+}
+
+/// Host-pointer TQ1_0 NT GEMM: copies native GGUF blocks, runs the kernel, copies back.
+pub fn gemm_nt_tq1_0(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    gemm_nt_tq_host(a, b, c, m, n, k, TQ1_0_BLOCK_ELEMS, TQ1_0_BLOCK_BYTES, gemm_nt_tq1_0_device)
 }
 
 /// Host-pointer ROCmFP4 NT GEMM: copies native blocks, runs the fused kernel, copies back.
@@ -2150,6 +2244,57 @@ fn gemm_nt_q4_k_host(
         let _ = (a, b, c, m, n, k, kernel);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q4_k unavailable".into(),
+        )))
+    }
+}
+
+fn gemm_nt_tq_host(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+    block_elems: usize,
+    block_bytes: usize,
+    kernel: fn(*const f32, *const u8, *mut f32, i32, i32, i32) -> Result<(), AllpacaError>,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(block_elems);
+        let packed_bytes = (n as usize) * nblocks * block_bytes;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "TQ GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            kernel(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k, block_elems, block_bytes, kernel);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_tq unavailable".into(),
         )))
     }
 }
@@ -3518,6 +3663,40 @@ impl HipWorkspace {
             DecodeOp::OtherGpu
         };
         self.timed_gpu(op, || gemm_nt_q4_k_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_tq2_0_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::OtherGpu
+        };
+        self.timed_gpu(op, || gemm_nt_tq2_0_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_tq1_0_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::OtherGpu
+        };
+        self.timed_gpu(op, || gemm_nt_tq1_0_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_rocmfp4_dev(
@@ -6929,6 +7108,160 @@ mod tests {
                 assert!(
                     gemm_close(hip[i], cpu[i]),
                     "gemm_nt_q4_k mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    fn encode_tq2_0(values: &[i8], scale: f32) -> Vec<u8> {
+        assert_eq!(values.len(), 256);
+        let mut out = vec![0u8; TQ2_0_BLOCK_BYTES];
+        for group in 0..2 {
+            for m in 0..32 {
+                let mut packed = 0u8;
+                for digit in 0..4 {
+                    let trit = values[group * 128 + digit * 32 + m] + 1;
+                    assert!((0..=2).contains(&trit));
+                    packed |= (trit as u8) << (digit * 2);
+                }
+                out[group * 32 + m] = packed;
+            }
+        }
+        out[64..66].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        out
+    }
+
+    #[cfg(feature = "hip")]
+    fn encode_tq1_0(values: &[i8], scale: f32) -> Vec<u8> {
+        assert_eq!(values.len(), 256);
+        let mut out = vec![0u8; TQ1_0_BLOCK_BYTES];
+        let encode_digits = |digits: &[i8]| {
+            let mut q = 0u16;
+            for &value in digits {
+                assert!((-1..=1).contains(&value));
+                q = q * 3 + (value + 1) as u16;
+            }
+            ((q * 256 + 242) / 243) as u8
+        };
+
+        for m in 0..32 {
+            let digits: [i8; 5] = std::array::from_fn(|digit| values[digit * 32 + m]);
+            out[m] = encode_digits(&digits);
+        }
+        for m in 0..16 {
+            let digits: [i8; 5] = std::array::from_fn(|digit| values[160 + digit * 16 + m]);
+            out[32 + m] = encode_digits(&digits);
+        }
+        for m in 0..4 {
+            let mut digits = [0i8; 5];
+            for digit in 0..4 {
+                digits[digit] = values[240 + digit * 4 + m];
+            }
+            digits[4] = -1;
+            out[48 + m] = encode_digits(&digits);
+        }
+        out[52..54].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        out
+    }
+
+    #[cfg(feature = "hip")]
+    fn fill_tq_gemm_case(si: usize, m: usize, n: usize, k: usize, tq2: bool) -> (Vec<f32>, Vec<u8>) {
+        let mut a = vec![0.0f32; m * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+        }
+        let scale = 0.25f32;
+        let mut b_q = Vec::new();
+        let nblocks = k.div_ceil(256);
+        for row in 0..n {
+            for ib in 0..nblocks {
+                let mut trits = [0i8; 256];
+                for j in 0..256 {
+                    let idx = row * k + ib * 256 + j;
+                    trits[j] = (((idx * 13 + si * 7) % 3) as i8) - 1;
+                }
+                if tq2 {
+                    b_q.extend(encode_tq2_0(&trits, scale));
+                } else {
+                    b_q.extend(encode_tq1_0(&trits, scale));
+                }
+            }
+        }
+        (a, b_q)
+    }
+
+    #[cfg(feature = "hip")]
+    fn dequant_tq_matrix(b_q: &[u8], n: usize, k: usize, tq2: bool) -> Vec<f32> {
+        let (block_elems, block_bytes) = if tq2 {
+            (TQ2_0_BLOCK_ELEMS, TQ2_0_BLOCK_BYTES)
+        } else {
+            (TQ1_0_BLOCK_ELEMS, TQ1_0_BLOCK_BYTES)
+        };
+        let nblocks = k.div_ceil(block_elems);
+        let mut out = vec![0.0f32; n * k];
+        for row in 0..n {
+            let blk = &b_q[row * nblocks * block_bytes..(row + 1) * nblocks * block_bytes];
+            let mut tmp = vec![0.0f32; nblocks * block_elems];
+            if tq2 {
+                allpaca_cpu::dequant_tq2_0(blk, nblocks * block_elems, &mut tmp).unwrap();
+            } else {
+                allpaca_cpu::dequant_tq1_0(blk, nblocks * block_elems, &mut tmp).unwrap();
+            }
+            out[row * k..(row + 1) * k].copy_from_slice(&tmp[..k]);
+        }
+        out
+    }
+
+    /// Public `gemm_nt_tq2_0` must match CPU dequant + NT GEMM on small TQ2_0 shapes.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_tq2_0_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1, 4, 256), (1, 8, 256), (2, 3, 256), (1, 4, 512)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, b_q) = fill_tq_gemm_case(si, m, n, k, true);
+            let b_deq = dequant_tq_matrix(&b_q, n, k, true);
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_tq2_0(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_tq2_0 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_tq2_0 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// Public `gemm_nt_tq1_0` must match CPU dequant + NT GEMM on small TQ1_0 shapes.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_tq1_0_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1, 4, 256), (1, 8, 256), (2, 3, 256), (1, 4, 512)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, b_q) = fill_tq_gemm_case(si, m, n, k, false);
+            let b_deq = dequant_tq_matrix(&b_q, n, k, false);
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_tq1_0(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_tq1_0 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_tq1_0 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
                     hip[i],
                     cpu[i]
                 );

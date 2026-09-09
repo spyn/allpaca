@@ -3,7 +3,7 @@
 ## 1. Heterogeneous scheduler
 
 ### Goal
-Treat CPU, GPU0, GPU1, Coral, host DRAM and NVMe as explicit resources with measurable transfer costs.
+Treat CPU, GPU0, GPU1, host DRAM and NVMe as explicit resources with measurable transfer costs.
 
 ### Core data structures
 
@@ -51,7 +51,6 @@ Use online measurements rather than static theoretical bandwidth. The scheduler 
 - RX 9070: target model.
 - RX 9060 XT: draft model, vision encoder, audio encoder, or secondary request.
 - CPU: scheduler, tokenizer, trie/n-gram lookup, structured-output state machine.
-- Coral: independent fixed-function classifier only when useful.
 
 The scheduler must support a fallback where the draft runs on CPU when the 9060 XT is needed by a vision/audio pipeline.
 
@@ -351,32 +350,7 @@ bool accept_exit(const ExitPrediction& p, const EarlyExitSpec& s) {
 
 Prefer a self-speculative verification path over a destructive mid-graph abort when correctness requirements are strict.
 
-## 10. Coral Edge TPU plugin
-
-Use the Coral only for a compiled TensorFlow Lite side model.
-
-```python
-from tflite_runtime.interpreter import Interpreter, load_delegate
-
-interpreter = Interpreter(
-    model_path="sidecar_int8.tflite",
-    experimental_delegates=[load_delegate("libedgetpu.so.1")],
-)
-interpreter.allocate_tensors()
-
-# Sidecar input is deliberately tiny: e.g. classifier state/features.
-```
-
-Suggested workloads:
-
-- wake-word detection,
-- document/intent classifier,
-- fixed schema/state classifier,
-- vision pre-filter.
-
-Do not route the main LLM through Edge TPU unless a deliberately compiled compatible model exists.
-
-## 11. BitNet backend
+## 10. BitNet backend
 
 Implement a backend boundary instead of changing the generic GEMM path:
 
@@ -391,9 +365,9 @@ public:
 };
 ```
 
-The BitNet backend can use packed ternary weights and lookup/addition-based kernels. Do not convert ordinary Q4/Q8 weights into ternary at inference time.
+The BitNet backend can use packed ternary weights and lookup/addition-based kernels. Do not convert ordinary Q4/Q8 weights into ternary at inference time. HIP ternary GEMV is the GPU follow-on after CPU TQ1_0/TQ2_0 load.
 
-## 12. Cache-aware AMD kernels
+## 11. Cache-aware AMD kernels
 
 The RX 9070 has 64 MB Infinity Cache and the RX 9060 XT has 32 MB. The runtime cannot command cache residency as if it were a software-managed SRAM. Instead:
 
@@ -405,7 +379,7 @@ The RX 9070 has 64 MB Infinity Cache and the RX 9060 XT has 32 MB. The runtime c
 
 Do not hard-code "all intermediate matrices must fit in Infinity Cache."
 
-## 13. CXL/PIM future interface
+## 12. CXL/PIM future interface
 
 Define future memory backends now:
 

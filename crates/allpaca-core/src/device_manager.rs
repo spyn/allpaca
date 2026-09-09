@@ -30,6 +30,10 @@ impl DeviceInventory {
         let mut devices = vec![DeviceInfo::cpu()];
         if !config.engine.cpu_only {
             devices.extend(allpaca_hip::enumerate_devices());
+            #[cfg(feature = "cuda")]
+            {
+                devices.extend(allpaca_cuda::enumerate_devices());
+            }
         }
         let pipeline_mode = config
             .engine
@@ -114,11 +118,14 @@ fn resolve_devices(
         DeviceSelector::Auto => placement.target_device,
         DeviceSelector::Cpu => -1,
         DeviceSelector::Hip(id) => id,
+        // Engine execute path is still HIP; cuda:N selects a CUDA id for inventory only.
+        DeviceSelector::Cuda(id) => id,
     };
     let draft = match config.engine.draft_device {
         DeviceSelector::Auto => placement.draft_device,
         DeviceSelector::Cpu => -1,
         DeviceSelector::Hip(id) => id,
+        DeviceSelector::Cuda(id) => id,
     };
     let target = if devices.iter().any(|d| d.id == target) {
         target

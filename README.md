@@ -40,8 +40,8 @@ and [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md)).
 | Early-exit unused | Manifest **`allpaca.early_exit.*`** + optional dedicated **`exit_head`** tensors; self-speculate when heads absent |
 | NUMA-blind host experts | **NUMA first-touch** on the host expert pool |
 
-Still out of MVP (documented, not claimed): Coral/NPU backends, CUDA backend, CXL/PIM,
-and HIP ternary (BitNet) GEMV (CPU TQ1_0/TQ2_0 load works).
+Still out of MVP (documented, not claimed): full CUDA engine parity, CXL/PIM.
+Coral/NPU backends are dropped.
 
 ---
 
@@ -87,6 +87,20 @@ cargo test --workspace --features hip
 ```
 
 Kernels live in `hip/` (CMake + hipcc). `allpaca-hip/build.rs` compiles them when the SDK is found.
+
+### CUDA / NVIDIA GPU (optional scaffold)
+
+Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH`, PATH `nvcc`, and
+`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*`. Without a toolkit,
+`--features cuda` still compiles (stub). Without an NVIDIA driver/GPU,
+`device_count()` is 0 — you can still compile and link on a toolkit-only machine.
+
+```bash
+cargo test -p allpaca-cuda --features cuda
+```
+
+Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexist.
+Engine forwards remain HIP until CUDA parity lands.
 
 ---
 
@@ -191,6 +205,7 @@ Or edit `docker-compose.yml` `command` / `volumes` accordingly.
 | `allpaca-gguf` | GGUF parse, tokenizer extract, ROCmFP4 host path |
 | `allpaca-safetensors` / `allpaca-onnx` | Alternate importers |
 | `allpaca-hip` | HIP FFI (`--features hip`) |
+| `allpaca-cuda` | CUDA FFI (`--features cuda`; toolkit builds without a GPU) |
 | `allpaca-cpu` | CPU kernels + dequant |
 | `allpaca-server` | OpenAI-compatible HTTP |
 | `tools/bench` | Lightweight bench binary |

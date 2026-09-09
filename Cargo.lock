@@ -40,6 +40,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "allpaca-cpu",
+ "allpaca-cuda",
  "allpaca-gguf",
  "allpaca-hip",
  "allpaca-onnx",
@@ -62,6 +63,14 @@ version = "0.1.0"
 dependencies = [
  "allpaca-types",
  "tracing",
+]
+
+[[package]]
+name = "allpaca-cuda"
+version = "0.1.0"
+dependencies = [
+ "allpaca-cpu",
+ "allpaca-types",
 ]
 
 [[package]]

@@ -122,6 +122,14 @@ int allpaca_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32_t m, 
 int allpaca_gemm_nt_q4_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_tq2_0[n,k])^T. B is native GGUF TQ2_0 blocks (66 B). */
+int allpaca_gemm_nt_tq2_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                          int32_t k, allpaca_stream_t stream);
+
+/* C[m,n] = A[m,k] * dequant(B_tq1_0[n,k])^T. B is native GGUF TQ1_0 blocks (54 B). */
+int allpaca_gemm_nt_tq1_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                          int32_t k, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * dequant(B_rocmfp4[n,k])^T. B is native 18-byte ROCmFP4
  * blocks (ggml_type_id=100): qs[16] then two unsigned-E4M3 half-block scales.
  * Default is the cache-aware A-tile GEMV (§12). */

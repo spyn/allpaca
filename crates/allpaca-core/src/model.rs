@@ -222,6 +222,8 @@ enum WeightKind {
     Q4_K,
     Q5_K,
     Q6_K,
+    TQ1_0,
+    TQ2_0,
     RocmFp4,
 }
 
@@ -1537,8 +1539,10 @@ impl ResidentModel {
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
+            | WeightKind::TQ1_0
+            | WeightKind::TQ2_0
             | WeightKind::RocmFp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "F16/Q4_K/Q5_K/Q6_K/ROCmFP4 norm must be F32 at load".into(),
+                "F16/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
         }
     }
@@ -1568,6 +1572,12 @@ impl ResidentModel {
             WeightKind::Q6_K => {
                 hip.gemm_nt_q6_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::TQ2_0 => {
+                hip.gemm_nt_tq2_0_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
+            WeightKind::TQ1_0 => {
+                hip.gemm_nt_tq1_0_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
             WeightKind::RocmFp4 => {
                 hip.gemm_nt_rocmfp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
@@ -1595,9 +1605,13 @@ impl ResidentModel {
             WeightKind::RocmFp4 => {
                 hip.embed_gather_rocmfp4(self.weights.byte_ptr_at(self.embed.off), token, out, dim)
             }
-            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K => Err(AllpacaError::Fatal(
-                FatalError::ModelLoad("Q4_K/Q5_K/Q6_K embed must be F32 at load".into()),
-            )),
+            WeightKind::Q4_K
+            | WeightKind::Q5_K
+            | WeightKind::Q6_K
+            | WeightKind::TQ1_0
+            | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+            ))),
         }
     }
 
@@ -1628,9 +1642,13 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K | WeightKind::Q5_K | WeightKind::Q6_K => Err(AllpacaError::Fatal(
-                FatalError::ModelLoad("Q4_K/Q5_K/Q6_K embed must be F32 at load".into()),
-            )),
+            WeightKind::Q4_K
+            | WeightKind::Q5_K
+            | WeightKind::Q6_K
+            | WeightKind::TQ1_0
+            | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+            ))),
         }
     }
 
@@ -2204,6 +2222,48 @@ fn append_gguf_tensor<'a>(
                 (UploadPart::Mapped(packed), WeightKind::Q4_K)
             }
         }
+        allpaca_gguf::GgmlType::TQ2_0 => {
+            let packed = file.tensor_bytes(name)?;
+            if n <= 65_536 || name == "token_embd.weight" {
+                let mut f32s = vec![0.0f32; n];
+                allpaca_cpu::dequant_tq2_0(packed, n, &mut f32s)?;
+                let mut bytes = Vec::with_capacity(n * 4);
+                for v in f32s {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (UploadPart::Owned(bytes), WeightKind::F32)
+            } else {
+                let k = *info.dims.first().unwrap_or(&1) as usize;
+                if k == 0 || n % k != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "TQ2_0 GEMV {name} dims {:?} do not tile n={n}",
+                        info.dims
+                    ))));
+                }
+                (UploadPart::Mapped(packed), WeightKind::TQ2_0)
+            }
+        }
+        allpaca_gguf::GgmlType::TQ1_0 => {
+            let packed = file.tensor_bytes(name)?;
+            if n <= 65_536 || name == "token_embd.weight" {
+                let mut f32s = vec![0.0f32; n];
+                allpaca_cpu::dequant_tq1_0(packed, n, &mut f32s)?;
+                let mut bytes = Vec::with_capacity(n * 4);
+                for v in f32s {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (UploadPart::Owned(bytes), WeightKind::F32)
+            } else {
+                let k = *info.dims.first().unwrap_or(&1) as usize;
+                if k == 0 || n % k != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "TQ1_0 GEMV {name} dims {:?} do not tile n={n}",
+                        info.dims
+                    ))));
+                }
+                (UploadPart::Mapped(packed), WeightKind::TQ1_0)
+            }
+        }
         allpaca_gguf::GgmlType::RocmFp4 => {
             let packed = file.tensor_bytes(name)?;
             // Keep large embeds packed: vocab×dim F32 would be multi-GiB host RAM.
@@ -2412,6 +2472,24 @@ fn split_packed_experts(
                 ))));
             }
             (n_per / allpaca_cpu::Q4_K_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q4_K_BLOCK_BYTES)
+        }
+        WeightKind::TQ2_0 => {
+            if n_per % allpaca_cpu::TQ2_0_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} TQ2_0 expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::TQ2_0_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::TQ2_0_BLOCK_ELEMS).saturating_mul(allpaca_cpu::TQ2_0_BLOCK_BYTES)
+        }
+        WeightKind::TQ1_0 => {
+            if n_per % allpaca_cpu::TQ1_0_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} TQ1_0 expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::TQ1_0_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::TQ1_0_BLOCK_ELEMS).saturating_mul(allpaca_cpu::TQ1_0_BLOCK_BYTES)
         }
         WeightKind::Q5_K => {
             if n_per % allpaca_cpu::Q5_K_BLOCK_ELEMS != 0 {

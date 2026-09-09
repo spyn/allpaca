@@ -6,7 +6,7 @@
 
 ## 1. Problem statement
 
-Existing inference engines are highly optimized within a device class, but heterogeneous desktop hardware is often handled as a collection of independent devices. The reference system combines two materially different Radeon GPUs, substantial host memory, a many-core CPU and an optional Edge TPU. The opportunity is to improve latency, capacity and concurrency through explicit scheduling, memory tiering and auxiliary compute.
+Existing inference engines are highly optimized within a device class, but heterogeneous desktop hardware is often handled as a collection of independent devices. The reference system combines two materially different Radeon GPUs, substantial host memory and a many-core CPU. The opportunity is to improve latency, capacity and concurrency through explicit scheduling and memory tiering.
 
 The product should **not** try to reproduce every capability of vLLM, SGLang or llama.cpp. It should provide an experimental runtime where unusual device combinations and memory policies can be tested rapidly and measured rigorously.
 
@@ -18,7 +18,7 @@ The product should **not** try to reproduce every capability of vLLM, SGLang or 
 
 ### P0 goals
 
-- Detect CPU/GPU/TPU/NVMe topology and capabilities.
+- Detect CPU/GPU/NVMe topology and capabilities.
 - Explicitly manage multiple HIP GPUs.
 - Implement asymmetric target/draft execution.
 - Implement adaptive speculative decoding.
@@ -36,8 +36,8 @@ The product should **not** try to reproduce every capability of vLLM, SGLang or 
 - Elastic VRAM split between KV pages and expert/weight slots at scheduler safe points.
 - Multimodal device placement.
 - Model-aware early exit and self-speculation.
-- BitNet/ternary backend.
-- Coral sidecar plugin.
+- BitNet/ternary backend (CPU TQ done; HIP ternary GEMV next).
+- CUDA backend scaffold → engine parity.
 - Automated policy optimization.
 
 ### P2 research goals
@@ -53,7 +53,7 @@ The product should **not** try to reproduce every capability of vLLM, SGLang or 
 - Arbitrary GPU-to-L3 cache writes.
 - Generic mid-graph aborts on unmodified transformer checkpoints.
 - Treating NVMe as hot VRAM.
-- Treating Coral as a general LLM accelerator.
+- Coral / Edge TPU / NPU backends (dropped from scope).
 - Claiming photonic/PIM performance without target hardware.
 
 ## 5. User stories
@@ -114,12 +114,6 @@ As an application developer, I can keep vision/audio encoders resident on the 90
           | DRAM ring + host expert pool         |
           | NVMe packed trunk / FTW banks        |
           +--------------------------------------+
-
-             Optional sidecar
-                  |
-             +----v-----+
-             | Coral TPU|
-             +----------+
 ```
 
 ## 7. Core modules
@@ -128,7 +122,7 @@ As an application developer, I can keep vision/audio encoders resident on the 90
 
 Responsibilities:
 
-- enumerate HIP devices,
+- enumerate HIP devices (and CUDA inventory when `--features cuda`),
 - detect P2P capability,
 - measure PCIe/P2P transfer paths,
 - track free memory,
@@ -219,16 +213,7 @@ Maintain an optional device-side path for comparison.
 
 ### 7.7 Auxiliary accelerator API
 
-```cpp
-class AuxiliaryDevice {
-public:
-    virtual std::string name() const = 0;
-    virtual bool supports(const ModelDescriptor&) const = 0;
-    virtual Future<Result> submit(const TensorView&) = 0;
-};
-```
-
-Implement Coral as the first example. Future NPU/FPGA backends can use the same contract.
+Dropped from scope (no Coral/NPU). Historical note only: a sidecar `AuxiliaryDevice` trait was considered for fixed-function classifiers; it is not implemented.
 
 ## 8. Technical requirements
 
@@ -325,13 +310,12 @@ Deliverables:
 
 Exit gate: context capacity increase and no catastrophic tail latency for configured hot-set workloads; a model that does not fit VRAM generates the same greedy tokens as the resident path.
 
-### Phase 5 — multimodal and side accelerators
+### Phase 5 — multimodal
 
 Deliverables:
 
 - encoder placement API,
-- 9060 XT vision/audio residency,
-- Coral plugin.
+- 9060 XT vision/audio residency.
 
 Exit gate: improved concurrency/VRAM stability under multimodal workload.
 
@@ -408,10 +392,6 @@ structured_output:
 
 multimodal:
   vision_device: hip:1
-
-coral:
-  enabled: false
-  model: state_classifier_int8_edgetpu.tflite
 ```
 
 ## 11. Observability
@@ -440,7 +420,6 @@ Required dashboards:
 | Weight cache in KvTierManager | Separate working-set manager; host pool is source of truth |
 | CUDA-graph host callbacks on HIP | Keep `q*` in Rust; streams/events; device-side victims later if sync shows up |
 | Early exit degrades quality | Compatible-checkpoint gating + verification |
-| Coral unsupported ops | Compile validation and CPU fallback |
 | ROCm kernel instability | Kernel capability registry and fallback implementation |
 | Memory fragmentation | Page allocators and compaction |
 | Driver reset / device loss | Request migration to fallback backend |

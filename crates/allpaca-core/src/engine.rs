@@ -127,6 +127,8 @@ pub struct Engine {
     metrics: Arc<Metrics>,
     hip: Option<Arc<HipWorkspace>>,
     draft_hip: Option<Arc<HipWorkspace>>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<Arc<allpaca_cuda::CudaWorkspace>>,
     /// Shared DirectStorage enqueue ledger (file-coordinate + staged H2D).
     ds_queue: Arc<DirectStorageQueue>,
     ds_probe: DirectStorageProbe,
@@ -218,6 +220,8 @@ impl Engine {
         let scheduler = Scheduler::new(inventory.pipeline_mode, flags.clone(), &config.speculative);
         let hip = open_hip_workspace(&config, &inventory).map(Arc::new);
         let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
+        #[cfg(feature = "cuda")]
+        let cuda = open_cuda_workspace(&config, &inventory).map(Arc::new);
         let mut kv = KvTierManager::with_hip(
             config.kv.vram_bytes,
             config.kv.dram_bytes,
@@ -262,6 +266,8 @@ impl Engine {
             metrics: Arc::new(Metrics::default()),
             hip,
             draft_hip,
+            #[cfg(feature = "cuda")]
+            cuda,
             ds_queue,
             ds_probe,
             micro_batch: Arc::new(MicroBatchExpertUnion::new()),
@@ -473,7 +479,18 @@ impl Engine {
         let (backend, device_memory_bytes) = if self.hip.is_some() {
             ("hip".into(), allpaca_hip::allocated_bytes())
         } else {
-            ("cpu".into(), 0)
+            #[cfg(feature = "cuda")]
+            {
+                if self.cuda.is_some() {
+                    ("cuda".into(), 0u64)
+                } else {
+                    ("cpu".into(), 0)
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                ("cpu".into(), 0)
+            }
         };
         let hip_h2d = self
             .hip
@@ -2225,14 +2242,20 @@ fn open_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<Hi
     if !allpaca_hip::runtime_linked() {
         return None;
     }
-    let gpus: Vec<_> = inventory.devices.iter().filter(|d| d.is_gpu()).collect();
+    let gpus: Vec<_> = inventory
+        .devices
+        .iter()
+        .filter(|d| d.kind == allpaca_types::DeviceKind::HipGpu)
+        .collect();
     if gpus.is_empty() {
         return None;
     }
     if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "hip" {
         return None;
     }
-    let device = if inventory.target_device >= 0 {
+    let device = if inventory.target_device >= 0
+        && gpus.iter().any(|d| d.id == inventory.target_device)
+    {
         inventory.target_device
     } else {
         gpus[0].id
@@ -2269,6 +2292,13 @@ fn open_draft_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Opt
     if draft < 0 || draft == target {
         return None;
     }
+    if !inventory
+        .devices
+        .iter()
+        .any(|d| d.id == draft && d.kind == allpaca_types::DeviceKind::HipGpu)
+    {
+        return None;
+    }
     match HipWorkspace::new(draft, 8 * 1024 * 1024, 256) {
         Ok(ws) => {
             tracing::info!(
@@ -2280,6 +2310,60 @@ fn open_draft_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Opt
         }
         Err(e) => {
             tracing::warn!(error = %e, "HIP draft workspace failed; CPU draft fallback");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn open_cuda_workspace(
+    config: &Config,
+    inventory: &DeviceInventory,
+) -> Option<allpaca_cuda::CudaWorkspace> {
+    if config.engine.cpu_only || config.engine.gpu_backend == "cpu" {
+        return None;
+    }
+    if !allpaca_cuda::runtime_linked() {
+        return None;
+    }
+    if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "cuda" {
+        return None;
+    }
+    // Prefer HIP when both exist under auto; explicit `cuda` selects CUDA.
+    if config.engine.gpu_backend == "auto"
+        && inventory
+            .devices
+            .iter()
+            .any(|d| d.kind == allpaca_types::DeviceKind::HipGpu)
+    {
+        return None;
+    }
+    let gpus: Vec<_> = inventory
+        .devices
+        .iter()
+        .filter(|d| d.kind == allpaca_types::DeviceKind::CudaGpu)
+        .collect();
+    if gpus.is_empty() {
+        return None;
+    }
+    let device = if inventory.target_device >= 0
+        && gpus.iter().any(|d| d.id == inventory.target_device)
+    {
+        inventory.target_device
+    } else {
+        gpus[0].id
+    };
+    match allpaca_cuda::CudaWorkspace::new(device, 8 * 1024 * 1024) {
+        Ok(ws) => {
+            tracing::info!(
+                device,
+                bytes = ws.allocated_bytes(),
+                "CUDA workspace allocated"
+            );
+            Some(ws)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "CUDA workspace failed; CPU fallback");
             None
         }
     }

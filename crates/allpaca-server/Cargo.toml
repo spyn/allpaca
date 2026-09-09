@@ -8,6 +8,7 @@ description = "OpenAI-compatible HTTP server wrapper around the Engine"
 [features]
 default = []
 hip = ["allpaca-core/hip"]
+cuda = ["allpaca-core/cuda"]
 
 [dependencies]
 allpaca-core.workspace = true

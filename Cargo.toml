@@ -4,6 +4,7 @@ members = [
     "crates/allpaca-types",
     "crates/allpaca-cpu",
     "crates/allpaca-hip",
+    "crates/allpaca-cuda",
     "crates/allpaca-gguf",
     "crates/allpaca-safetensors",
     "crates/allpaca-onnx",
@@ -25,6 +26,7 @@ allpaca-gguf = { path = "crates/allpaca-gguf" }
 allpaca-safetensors = { path = "crates/allpaca-safetensors" }
 allpaca-onnx = { path = "crates/allpaca-onnx" }
 allpaca-hip = { path = "crates/allpaca-hip" }
+allpaca-cuda = { path = "crates/allpaca-cuda" }
 allpaca-cpu = { path = "crates/allpaca-cpu" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

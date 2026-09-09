@@ -8,6 +8,7 @@ description = "Engine, scheduler, memory tiers, and draft providers"
 [features]
 default = []
 hip = ["allpaca-hip/hip"]
+cuda = ["allpaca-cuda/cuda"]
 
 [dependencies]
 ahash.workspace = true
@@ -16,6 +17,7 @@ allpaca-gguf.workspace = true
 allpaca-safetensors.workspace = true
 allpaca-onnx.workspace = true
 allpaca-hip.workspace = true
+allpaca-cuda.workspace = true
 allpaca-types.workspace = true
 async-stream.workspace = true
 futures.workspace = true
