@@ -18,6 +18,7 @@ allpaca-safetensors.workspace = true
 allpaca-onnx.workspace = true
 allpaca-hip.workspace = true
 allpaca-cuda.workspace = true
+allpaca-rpc.workspace = true
 allpaca-types.workspace = true
 async-stream.workspace = true
 futures.workspace = true

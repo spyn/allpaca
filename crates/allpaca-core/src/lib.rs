@@ -1,9 +1,11 @@
 //! Allpaca Engine: scheduling, memory tiers, draft providers, and decode.
 
 mod anchors;
+mod batch_gemm;
 mod constraint;
 pub mod deltanet;
 mod device_manager;
+mod compute;
 mod direct_storage;
 mod draft;
 mod early_exit;
@@ -14,11 +16,15 @@ mod grammar;
 mod kv_nvme;
 mod kv_radix;
 mod kv_tier;
+mod layer_split;
 mod logits_ring;
+mod memory_tier;
 mod micro_batch;
+mod modality;
 mod model;
 mod numa;
 mod packed;
+mod rpc_runtime;
 mod sampling;
 mod scheduler;
 mod ssm;
@@ -27,11 +33,22 @@ mod tokenizer;
 mod transfer;
 mod weight_set;
 
+pub use batch_gemm::{
+    plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+};
 pub use device_manager::{detect_pipeline_mode, DeviceInventory};
+pub use compute::ComputeDev;
+pub use layer_split::{plan_layer_owners, LayerPlan};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{accept_exit, EarlyExitSpec, ExitPrediction, spec_from_gguf};
 pub use engine::{mtp_text_is_garbled, Engine, RequestHandle};
 pub use kv_tier::KvTierManager;
+pub use memory_tier::{
+    CxlMemBackend, MemoryTierBackend, PimBackend, PinnedDramBackend, ReadTicket,
+};
+pub use modality::{
+    EncoderPlacement, ImageInput, NoopVisionEncoder, VisionEncoder, VisionTokens,
+};
 pub use model::{LayerWeights, ModelConfig, MtpNextnWeights, TinyModel};
 pub use packed::{HostExpertPool, PackedStore};
 pub use scheduler::Scheduler;

@@ -1134,6 +1134,45 @@ pub fn dequant_tq2_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), All
     Ok(())
 }
 
+/// Quantize to GGUF TQ2_0 super-blocks (tests / tiny written BitNet models).
+pub fn quantize_tq2_0(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(TQ2_0_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * TQ2_0_BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * TQ2_0_BLOCK_ELEMS;
+        let end = (start + TQ2_0_BLOCK_ELEMS).min(data.len());
+        let mut amax = 0.0f32;
+        for v in &data[start..end] {
+            amax = amax.max(v.abs());
+        }
+        let d = amax;
+        let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let off = b * TQ2_0_BLOCK_BYTES;
+        let mut trits = [0i8; TQ2_0_BLOCK_ELEMS];
+        for i in 0..TQ2_0_BLOCK_ELEMS {
+            let src = start + i;
+            let q = if src < data.len() {
+                (data[src] * inv).round().clamp(-1.0, 1.0) as i8
+            } else {
+                0
+            };
+            trits[i] = q;
+        }
+        for group in 0..2 {
+            for m in 0..32 {
+                let mut packed = 0u8;
+                for digit in 0..4 {
+                    let trit = trits[group * 128 + digit * 32 + m] + 1;
+                    packed |= (trit as u8) << (digit * 2);
+                }
+                out[off + group * 32 + m] = packed;
+            }
+        }
+        out[off + 64..off + 66].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+    }
+    out
+}
+
 /// Dequantize GGUF Q2_K (llama.cpp `dequantize_row_q2_K`).
 pub fn dequant_q2_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
     if out.len() < n {

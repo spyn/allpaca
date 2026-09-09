@@ -1,5 +1,6 @@
 use allpaca_types::{
     BandwidthBenchmark, Config, DeviceInfo, DeviceKind, DeviceSelector, PipelineMode, TransferPath,
+    RPC_DEVICE_ID_BASE,
 };
 
 use crate::scheduler::Scheduler;
@@ -35,6 +36,10 @@ impl DeviceInventory {
                 devices.extend(allpaca_cuda::enumerate_devices());
             }
         }
+        for (i, endpoint) in config.rpc.endpoints.iter().enumerate() {
+            let id = RPC_DEVICE_ID_BASE + i as i32;
+            devices.push(DeviceInfo::rpc(id, endpoint, 0, DeviceKind::Cpu));
+        }
         let pipeline_mode = config
             .engine
             .pipeline_mode
@@ -42,7 +47,8 @@ impl DeviceInventory {
         let mut flags = allpaca_types::FeatureFlags::from_mode(pipeline_mode);
         flags.overlay(&config.features);
         let scheduler = Scheduler::new(pipeline_mode, flags, &config.speculative);
-        let placement = scheduler.placement(&devices);
+        let vision_device = resolve_vision_device(config, &devices);
+        let placement = scheduler.placement(&devices, vision_device);
         let (target_device, draft_device) = resolve_devices(config, &placement, &devices);
         let (transfer_path, transfer_benchmark) =
             crate::transfer::select_transfer_path_with_bench(&devices, config.engine.cpu_only);
@@ -71,7 +77,10 @@ impl DeviceInventory {
 }
 
 pub fn detect_pipeline_mode(devices: &[DeviceInfo]) -> PipelineMode {
-    let gpus: Vec<&DeviceInfo> = devices.iter().filter(|d| d.kind == DeviceKind::HipGpu).collect();
+    let gpus: Vec<&DeviceInfo> = devices
+        .iter()
+        .filter(|d| d.kind == DeviceKind::HipGpu && !d.is_rpc())
+        .collect();
     match gpus.len() {
         0 | 1 => PipelineMode::MobileTiered,
         _ => {
@@ -98,7 +107,7 @@ fn peer_flags(devices: &[DeviceInfo], cpu_only: bool) -> (bool, bool) {
     }
     let gpus: Vec<i32> = devices
         .iter()
-        .filter(|d| d.kind == DeviceKind::HipGpu)
+        .filter(|d| d.kind == DeviceKind::HipGpu && !d.is_rpc())
         .map(|d| d.id)
         .collect();
     if gpus.len() < 2 {
@@ -140,6 +149,20 @@ fn resolve_devices(
     (target, draft)
 }
 
+fn resolve_vision_device(config: &Config, devices: &[DeviceInfo]) -> Option<i32> {
+    let sel = config.multimodal.vision_device?;
+    let id = match sel {
+        DeviceSelector::Auto => return None,
+        DeviceSelector::Cpu => -1,
+        DeviceSelector::Hip(id) | DeviceSelector::Cuda(id) => id,
+    };
+    if devices.iter().any(|d| d.id == id) {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +195,51 @@ mod tests {
             },
         ];
         assert_eq!(detect_pipeline_mode(&devices), PipelineMode::Asymmetric);
+    }
+
+    #[test]
+    fn placement_uses_configured_vision_device() {
+        let devices = vec![
+            DeviceInfo::cpu(),
+            DeviceInfo {
+                id: 0,
+                kind: DeviceKind::HipGpu,
+                name: "fast".into(),
+                memory_bytes: 16 << 30,
+                bandwidth_gbps: 640.0,
+                peers: vec![1],
+            },
+            DeviceInfo {
+                id: 1,
+                kind: DeviceKind::HipGpu,
+                name: "slow".into(),
+                memory_bytes: 16 << 30,
+                bandwidth_gbps: 320.0,
+                peers: vec![0],
+            },
+        ];
+        let mut cfg = Config::compiled_defaults();
+        cfg.multimodal.vision_device = Some(DeviceSelector::Hip(1));
+        let vision = resolve_vision_device(&cfg, &devices);
+        assert_eq!(vision, Some(1));
+        let flags = allpaca_types::FeatureFlags::from_mode(PipelineMode::Asymmetric);
+        let scheduler = Scheduler::new(PipelineMode::Asymmetric, flags, &cfg.speculative);
+        let placement = scheduler.placement(&devices, vision);
+        assert_eq!(placement.vision_device, Some(1));
+        assert_eq!(placement.target_device, 0);
+        assert_eq!(placement.draft_device, 1);
+    }
+
+    #[test]
+    fn rpc_endpoints_append_devices() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.engine.cpu_only = true;
+        cfg.rpc.endpoints = vec!["127.0.0.1:50052".into()];
+        let inv = DeviceInventory::discover(&cfg);
+        assert!(inv.devices.iter().any(|d| d.is_rpc()));
+        assert_eq!(
+            inv.devices.iter().find(|d| d.is_rpc()).unwrap().rpc_endpoint(),
+            Some("127.0.0.1:50052")
+        );
     }
 }

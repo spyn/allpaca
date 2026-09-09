@@ -1,0 +1,467 @@
+use std::io::{self, Read, Write};
+
+use thiserror::Error;
+
+/// Protocol major; must match on both sides (llama.cpp HELLO rule).
+pub const PROTO_MAJOR: u16 = 1;
+pub const PROTO_MINOR: u16 = 0;
+pub const PROTO_PATCH: u16 = 0;
+/// Bump when the named kernel set or C ABI revision changes.
+pub const KERNEL_ABI_REV: u32 = 1;
+
+pub const STATUS_OK: u8 = 0;
+pub const STATUS_ERR: u8 = 1;
+
+pub const DTYPE_F32: u32 = 1;
+
+/// Generation-counted remote buffer handle. Never a raw device pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufId {
+    pub id: u32,
+    pub gen: u32,
+}
+
+impl BufId {
+    pub fn new(id: u32, gen: u32) -> Self {
+        Self { id, gen }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Cmd {
+    Hello = 0,
+    Alloc = 1,
+    Free = 2,
+    Clear = 3,
+    H2D = 4,
+    D2H = 5,
+    Copy = 6,
+    H2DHash = 7,
+    LaunchList = 8,
+    MemInfo = 9,
+    DeviceCount = 10,
+    Sync = 11,
+}
+
+impl Cmd {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Hello,
+            1 => Self::Alloc,
+            2 => Self::Free,
+            3 => Self::Clear,
+            4 => Self::H2D,
+            5 => Self::D2H,
+            6 => Self::Copy,
+            7 => Self::H2DHash,
+            8 => Self::LaunchList,
+            9 => Self::MemInfo,
+            10 => Self::DeviceCount,
+            11 => Self::Sync,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RpcBackendKind {
+    Cpu = 0,
+    Hip = 1,
+    Cuda = 2,
+}
+
+impl RpcBackendKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Cpu,
+            1 => Self::Hip,
+            2 => Self::Cuda,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KernelOp {
+    GemmNt = 1,
+    Attention = 2,
+    RmsNorm = 3,
+    Rope = 4,
+    SiluMul = 5,
+    ResidualAdd = 6,
+    EmbedGather = 7,
+    Memcpy = 8,
+}
+
+impl KernelOp {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => Self::GemmNt,
+            2 => Self::Attention,
+            3 => Self::RmsNorm,
+            4 => Self::Rope,
+            5 => Self::SiluMul,
+            6 => Self::ResidualAdd,
+            7 => Self::EmbedGather,
+            8 => Self::Memcpy,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HelloRequest {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+    pub caps: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HelloReply {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+    pub kernel_abi_rev: u32,
+    pub backend: RpcBackendKind,
+    pub dtype_mask: u32,
+    pub device_name: String,
+    pub memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchItem {
+    pub op: KernelOp,
+    pub bufs: Vec<BufId>,
+    pub i32s: Vec<i32>,
+    pub f32s: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LaunchList {
+    pub items: Vec<LaunchItem>,
+}
+
+#[derive(Debug, Error)]
+pub enum RpcError {
+    #[error("rpc io: {0}")]
+    Io(#[from] io::Error),
+    #[error("rpc protocol: {0}")]
+    Protocol(String),
+    #[error("rpc version mismatch: server {major}.{minor}.{patch}")]
+    Version {
+        major: u16,
+        minor: u16,
+        patch: u16,
+    },
+    #[error("rpc worker: {0}")]
+    Worker(String),
+}
+
+pub fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+pub fn write_u8(w: &mut Vec<u8>, v: u8) {
+    w.push(v);
+}
+
+pub fn write_u16(w: &mut Vec<u8>, v: u16) {
+    w.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn write_u32(w: &mut Vec<u8>, v: u32) {
+    w.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn write_u64(w: &mut Vec<u8>, v: u64) {
+    w.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn write_i32(w: &mut Vec<u8>, v: i32) {
+    w.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn write_f32(w: &mut Vec<u8>, v: f32) {
+    w.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn write_buf_id(w: &mut Vec<u8>, id: BufId) {
+    write_u32(w, id.id);
+    write_u32(w, id.gen);
+}
+
+pub fn write_bytes(w: &mut Vec<u8>, data: &[u8]) {
+    write_u64(w, data.len() as u64);
+    w.extend_from_slice(data);
+}
+
+pub fn write_str(w: &mut Vec<u8>, s: &str) {
+    write_bytes(w, s.as_bytes());
+}
+
+pub struct Cursor<'a> {
+    data: &'a [u8],
+    off: usize,
+}
+
+impl<'a> Cursor<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, off: 0 }
+    }
+
+    pub fn u8(&mut self) -> Result<u8, RpcError> {
+        if self.off >= self.data.len() {
+            return Err(RpcError::Protocol("truncated u8".into()));
+        }
+        let v = self.data[self.off];
+        self.off += 1;
+        Ok(v)
+    }
+
+    pub fn u16(&mut self) -> Result<u16, RpcError> {
+        let mut b = [0u8; 2];
+        self.read_exact(&mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+
+    pub fn u32(&mut self) -> Result<u32, RpcError> {
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    pub fn u64(&mut self) -> Result<u64, RpcError> {
+        let mut b = [0u8; 8];
+        self.read_exact(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    pub fn i32(&mut self) -> Result<i32, RpcError> {
+        Ok(self.u32()? as i32)
+    }
+
+    pub fn f32(&mut self) -> Result<f32, RpcError> {
+        Ok(f32::from_le_bytes(self.u32()?.to_le_bytes()))
+    }
+
+    pub fn buf_id(&mut self) -> Result<BufId, RpcError> {
+        Ok(BufId {
+            id: self.u32()?,
+            gen: self.u32()?,
+        })
+    }
+
+    pub fn bytes(&mut self) -> Result<&'a [u8], RpcError> {
+        let n = self.u64()? as usize;
+        if self.off + n > self.data.len() {
+            return Err(RpcError::Protocol("truncated bytes".into()));
+        }
+        let s = &self.data[self.off..self.off + n];
+        self.off += n;
+        Ok(s)
+    }
+
+    pub fn str(&mut self) -> Result<String, RpcError> {
+        let b = self.bytes()?;
+        String::from_utf8(b.to_vec())
+            .map_err(|_| RpcError::Protocol("invalid utf-8".into()))
+    }
+
+    fn read_exact(&mut self, dest: &mut [u8]) -> Result<(), RpcError> {
+        if self.off + dest.len() > self.data.len() {
+            return Err(RpcError::Protocol("truncated".into()));
+        }
+        dest.copy_from_slice(&self.data[self.off..self.off + dest.len()]);
+        self.off += dest.len();
+        Ok(())
+    }
+}
+
+pub fn encode_hello_req(req: &HelloRequest) -> Vec<u8> {
+    let mut w = Vec::new();
+    write_u16(&mut w, req.major);
+    write_u16(&mut w, req.minor);
+    write_u16(&mut w, req.patch);
+    write_u32(&mut w, req.caps);
+    w
+}
+
+pub fn decode_hello_req(data: &[u8]) -> Result<HelloRequest, RpcError> {
+    let mut c = Cursor::new(data);
+    Ok(HelloRequest {
+        major: c.u16()?,
+        minor: c.u16()?,
+        patch: c.u16()?,
+        caps: c.u32()?,
+    })
+}
+
+pub fn encode_hello_reply(r: &HelloReply) -> Vec<u8> {
+    let mut w = Vec::new();
+    write_u16(&mut w, r.major);
+    write_u16(&mut w, r.minor);
+    write_u16(&mut w, r.patch);
+    write_u32(&mut w, r.kernel_abi_rev);
+    write_u8(&mut w, r.backend as u8);
+    write_u32(&mut w, r.dtype_mask);
+    write_str(&mut w, &r.device_name);
+    write_u64(&mut w, r.memory_bytes);
+    w
+}
+
+pub fn decode_hello_reply(data: &[u8]) -> Result<HelloReply, RpcError> {
+    let mut c = Cursor::new(data);
+    let major = c.u16()?;
+    let minor = c.u16()?;
+    let patch = c.u16()?;
+    let kernel_abi_rev = c.u32()?;
+    let backend = RpcBackendKind::from_u8(c.u8()?)
+        .ok_or_else(|| RpcError::Protocol("bad backend".into()))?;
+    let dtype_mask = c.u32()?;
+    let device_name = c.str()?;
+    let memory_bytes = c.u64()?;
+    Ok(HelloReply {
+        major,
+        minor,
+        patch,
+        kernel_abi_rev,
+        backend,
+        dtype_mask,
+        device_name,
+        memory_bytes,
+    })
+}
+
+pub fn encode_launch_list(list: &LaunchList) -> Vec<u8> {
+    let mut w = Vec::new();
+    write_u32(&mut w, list.items.len() as u32);
+    for item in &list.items {
+        write_u8(&mut w, item.op as u8);
+        write_u8(&mut w, item.bufs.len() as u8);
+        for b in &item.bufs {
+            write_buf_id(&mut w, *b);
+        }
+        write_u8(&mut w, item.i32s.len() as u8);
+        for v in &item.i32s {
+            write_i32(&mut w, *v);
+        }
+        write_u8(&mut w, item.f32s.len() as u8);
+        for v in &item.f32s {
+            write_f32(&mut w, *v);
+        }
+    }
+    w
+}
+
+pub fn decode_launch_list(data: &[u8]) -> Result<LaunchList, RpcError> {
+    let mut c = Cursor::new(data);
+    let n = c.u32()? as usize;
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        let op = KernelOp::from_u8(c.u8()?)
+            .ok_or_else(|| RpcError::Protocol("bad kernel op".into()))?;
+        let nb = c.u8()? as usize;
+        let mut bufs = Vec::with_capacity(nb);
+        for _ in 0..nb {
+            bufs.push(c.buf_id()?);
+        }
+        let ni = c.u8()? as usize;
+        let mut i32s = Vec::with_capacity(ni);
+        for _ in 0..ni {
+            i32s.push(c.i32()?);
+        }
+        let nf = c.u8()? as usize;
+        let mut f32s = Vec::with_capacity(nf);
+        for _ in 0..nf {
+            f32s.push(c.f32()?);
+        }
+        items.push(LaunchItem {
+            op,
+            bufs,
+            i32s,
+            f32s,
+        });
+    }
+    Ok(LaunchList { items })
+}
+
+/// Length-prefixed request: cmd u8 | size u64 | payload.
+pub fn write_request<W: Write>(w: &mut W, cmd: Cmd, payload: &[u8]) -> Result<(), RpcError> {
+    w.write_all(&[cmd as u8])?;
+    w.write_all(&(payload.len() as u64).to_le_bytes())?;
+    w.write_all(payload)?;
+    w.flush()?;
+    Ok(())
+}
+
+pub fn read_request<R: Read>(r: &mut R) -> Result<(Cmd, Vec<u8>), RpcError> {
+    let mut head = [0u8; 9];
+    r.read_exact(&mut head)?;
+    let cmd = Cmd::from_u8(head[0]).ok_or_else(|| RpcError::Protocol("bad cmd".into()))?;
+    let size_bytes: [u8; 8] = head[1..9]
+        .try_into()
+        .map_err(|_| RpcError::Protocol("bad size".into()))?;
+    let size = u64::from_le_bytes(size_bytes) as usize;
+    let mut payload = vec![0u8; size];
+    if size > 0 {
+        r.read_exact(&mut payload)?;
+    }
+    Ok((cmd, payload))
+}
+
+/// Reply: status u8 | size u64 | payload.
+pub fn write_reply<W: Write>(w: &mut W, status: u8, payload: &[u8]) -> Result<(), RpcError> {
+    w.write_all(&[status])?;
+    w.write_all(&(payload.len() as u64).to_le_bytes())?;
+    w.write_all(payload)?;
+    w.flush()?;
+    Ok(())
+}
+
+pub fn read_reply<R: Read>(r: &mut R) -> Result<(u8, Vec<u8>), RpcError> {
+    let mut head = [0u8; 9];
+    r.read_exact(&mut head)?;
+    let status = head[0];
+    let size_bytes: [u8; 8] = head[1..9]
+        .try_into()
+        .map_err(|_| RpcError::Protocol("bad size".into()))?;
+    let size = u64::from_le_bytes(size_bytes) as usize;
+    let mut payload = vec![0u8; size];
+    if size > 0 {
+        r.read_exact(&mut payload)?;
+    }
+    Ok((status, payload))
+}
+
+pub fn check_hello(reply: &HelloReply) -> Result<(), RpcError> {
+    if reply.major != PROTO_MAJOR {
+        return Err(RpcError::Version {
+            major: reply.major,
+            minor: reply.minor,
+            patch: reply.patch,
+        });
+    }
+    if reply.minor > PROTO_MINOR {
+        return Err(RpcError::Version {
+            major: reply.major,
+            minor: reply.minor,
+            patch: reply.patch,
+        });
+    }
+    if reply.kernel_abi_rev > KERNEL_ABI_REV {
+        return Err(RpcError::Protocol(format!(
+            "worker kernel abi {} newer than client {}",
+            reply.kernel_abi_rev, KERNEL_ABI_REV
+        )));
+    }
+    Ok(())
+}

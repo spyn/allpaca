@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use allpaca_core::Engine;
-use allpaca_types::{Config, FinishReason, GenerationParams};
+use allpaca_core::{Engine, ImageInput};
+use allpaca_types::{AllpacaError, Config, FatalError, FinishReason, GenerationParams};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
@@ -26,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/stats", get(stats))
+        .route("/metrics", get(prometheus_metrics))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -34,7 +35,35 @@ pub fn router(state: AppState) -> Router {
 #[derive(Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default)]
+    pub content: MessageContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlSpec },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageUrlSpec {
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,16 +148,131 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn prompt_from_messages(messages: &[ChatMessage]) -> String {
+fn messages_to_prompt_and_images(
+    messages: &[ChatMessage],
+) -> Result<(String, Vec<ImageInput>), AllpacaError> {
     let mut out = String::new();
+    let mut images = Vec::new();
     for msg in messages {
         out.push_str(&msg.role);
         out.push_str(": ");
-        out.push_str(&msg.content);
+        match &msg.content {
+            MessageContent::Text(text) => out.push_str(text),
+            MessageContent::Parts(parts) => {
+                let mut texts = Vec::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => texts.push(text.as_str()),
+                        ContentPart::ImageUrl { image_url } => {
+                            images.push(load_image_url(&image_url.url)?);
+                        }
+                    }
+                }
+                out.push_str(&texts.join(" "));
+            }
+        }
         out.push('\n');
     }
     out.push_str("assistant:");
-    out
+    Ok((out, images))
+}
+
+fn load_image_url(url: &str) -> Result<ImageInput, AllpacaError> {
+    let raw = url.trim();
+    if raw.starts_with("data:") {
+        return load_data_uri(raw);
+    }
+    let path = resolve_image_path(raw)?;
+    let bytes = std::fs::read(&path).map_err(|e| {
+        AllpacaError::Fatal(FatalError::Io(format!(
+            "read image {}: {e}",
+            path.display()
+        )))
+    })?;
+    let mime = mime_from_path(&path);
+    Ok(ImageInput::new(bytes, mime))
+}
+
+fn load_data_uri(url: &str) -> Result<ImageInput, AllpacaError> {
+    // data:[<mime>][;base64],<data>
+    let rest = url
+        .strip_prefix("data:")
+        .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig("invalid data URI".into())))?;
+    let (meta, payload) = rest.split_once(',').ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::InvalidConfig(
+            "data URI missing comma separator".into(),
+        ))
+    })?;
+    let mut mime = "application/octet-stream".to_string();
+    let mut is_b64 = false;
+    for part in meta.split(';').filter(|p| !p.is_empty()) {
+        if part.eq_ignore_ascii_case("base64") {
+            is_b64 = true;
+        } else if part.contains('/') {
+            mime = part.to_ascii_lowercase();
+        }
+    }
+    let bytes = if is_b64 {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload.trim().as_bytes())
+            .map_err(|e| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "invalid data URI base64: {e}"
+                )))
+            })?
+    } else {
+        // Percent-decoded raw payload is uncommon for images; keep bytes as UTF-8 text.
+        payload.as_bytes().to_vec()
+    };
+    Ok(ImageInput::new(bytes, mime))
+}
+
+fn resolve_image_path(url: &str) -> Result<std::path::PathBuf, AllpacaError> {
+    let raw = url.trim();
+    let path = if let Some(rest) = raw.strip_prefix("file://") {
+        // file:///C:/... or file://localhost/C:/... or file:/C:/...
+        let rest = rest
+            .strip_prefix("//")
+            .unwrap_or(rest)
+            .strip_prefix("localhost/")
+            .unwrap_or(rest);
+        #[cfg(windows)]
+        let rest = rest.strip_prefix('/').unwrap_or(rest);
+        std::path::PathBuf::from(rest)
+    } else if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "http(s) image_url fetch is not supported yet".into(),
+        )));
+    } else if raw.starts_with("data:") {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "data URI must be handled by load_image_url".into(),
+        )));
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    if !path.is_file() {
+        return Err(AllpacaError::Fatal(FatalError::Io(format!(
+            "image_url path not found: {}",
+            path.display()
+        ))));
+    }
+    Ok(path)
+}
+
+fn mime_from_path(path: &std::path::Path) -> String {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png".into(),
+        Some("gif") => "image/gif".into(),
+        Some("webp") => "image/webp".into(),
+        Some("jpg") | Some("jpeg") => "image/jpeg".into(),
+        _ => "application/octet-stream".into(),
+    }
 }
 
 fn params_from_request(req: &ChatCompletionRequest, config: &Config) -> GenerationParams {
@@ -177,7 +321,10 @@ async fn chat_completions(
         )
             .into_response();
     }
-    let prompt = prompt_from_messages(&req.messages);
+    let (prompt, images) = match messages_to_prompt_and_images(&req.messages) {
+        Ok(v) => v,
+        Err(e) => return error_response(e),
+    };
     let params = params_from_request(&req, &state.config);
     let model = req
         .model
@@ -187,11 +334,15 @@ async fn chat_completions(
     let created = now_secs();
 
     if req.stream {
-        return stream_completion(state, prompt, params, model, id, created).into_response();
+        return stream_completion(state, prompt, images, params, model, id, created).into_response();
     }
 
     if state.config.engine.max_active_requests > 1 {
-        let mut stream = Box::pin(state.engine.generate_stream(prompt.clone(), params));
+        let mut stream = Box::pin(
+            state
+                .engine
+                .generate_stream_multimodal(prompt.clone(), images, params),
+        );
         let mut text = String::new();
         let mut completion_tokens = 0usize;
         let mut finish = FinishReason::Stop;
@@ -231,7 +382,9 @@ async fn chat_completions(
     }
 
     let engine = Arc::clone(&state.engine);
-    match tokio::task::spawn_blocking(move || engine.generate(&prompt, params)).await {
+    match tokio::task::spawn_blocking(move || engine.generate_multimodal(&prompt, &images, params))
+        .await
+    {
         Ok(Ok(out)) => Json(ChatCompletionResponse {
             id,
             object: "chat.completion",
@@ -264,6 +417,7 @@ async fn chat_completions(
 fn stream_completion(
     state: AppState,
     prompt: String,
+    images: Vec<ImageInput>,
     params: GenerationParams,
     model: String,
     id: String,
@@ -274,7 +428,7 @@ fn stream_completion(
     let engine = Arc::clone(&state.engine);
     if use_async_poll {
         tokio::spawn(async move {
-            let mut stream = Box::pin(engine.generate_stream(prompt, params));
+            let mut stream = Box::pin(engine.generate_stream_multimodal(prompt, images, params));
             let first = serde_json::json!({
                 "id": id,
                 "object": "chat.completion.chunk",
@@ -315,7 +469,8 @@ fn stream_completion(
     } else {
         let rt = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            let mut stream = Box::pin(state.engine.generate_stream(prompt, params));
+            let mut stream =
+                Box::pin(state.engine.generate_stream_multimodal(prompt, images, params));
             rt.block_on(async {
                 let first = serde_json::json!({
                     "id": id,
@@ -379,6 +534,112 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
 
 async fn stats(State(state): State<AppState>) -> Json<allpaca_types::StatsSnapshot> {
     Json(state.engine.stats())
+}
+
+/// Prometheus text exposition (subset of Engine `/stats`). OTel remains deferred.
+async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = render_prometheus_text(&state.engine.stats());
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
+fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
+    let mut out = String::with_capacity(2048);
+    macro_rules! counter {
+        ($name:literal, $help:literal, $val:expr) => {{
+            out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+            out.push_str(concat!("# TYPE ", $name, " counter\n"));
+            out.push_str(&format!("{} {}\n", $name, $val));
+        }};
+    }
+    macro_rules! gauge {
+        ($name:literal, $help:literal, $val:expr) => {{
+            out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+            out.push_str(concat!("# TYPE ", $name, " gauge\n"));
+            out.push_str(&format!("{} {}\n", $name, $val));
+        }};
+    }
+    counter!(
+        "allpaca_requests_total",
+        "Total admitted generation requests",
+        s.requests_total
+    );
+    gauge!(
+        "allpaca_active_requests",
+        "Currently active requests",
+        s.active_requests
+    );
+    counter!(
+        "allpaca_prompt_tokens_total",
+        "Prompt tokens processed",
+        s.prompt_tokens
+    );
+    counter!(
+        "allpaca_tokens_generated_total",
+        "Tokens generated",
+        s.tokens_generated
+    );
+    counter!(
+        "allpaca_draft_proposed_total",
+        "Draft tokens proposed",
+        s.draft_proposed
+    );
+    counter!(
+        "allpaca_draft_accepted_total",
+        "Draft tokens accepted",
+        s.draft_accepted
+    );
+    gauge!(
+        "allpaca_acceptance_rate",
+        "Draft acceptance rate",
+        s.acceptance_rate
+    );
+    counter!(
+        "allpaca_poll_ticks_total",
+        "Engine poll ticks",
+        s.poll_ticks
+    );
+    counter!(
+        "allpaca_batch_gemm_plans_total",
+        "Packed cross-request GEMM plans recorded",
+        s.batch_gemm_plans
+    );
+    counter!(
+        "allpaca_micro_batch_plans_total",
+        "Cross-request micro-batch stagger plans",
+        s.micro_batch_plans
+    );
+    gauge!(
+        "allpaca_vram_pages",
+        "KV pages in VRAM",
+        s.vram_pages
+    );
+    gauge!(
+        "allpaca_dram_pages",
+        "KV pages in pinned DRAM",
+        s.dram_pages
+    );
+    gauge!(
+        "allpaca_ttft_ms_last",
+        "Last time-to-first-token in ms",
+        s.ttft_ms_last
+    );
+    gauge!(
+        "allpaca_itl_ms_ema",
+        "Inter-token latency EMA in ms",
+        s.itl_ms_ema
+    );
+    gauge!(
+        "allpaca_gpu_util",
+        "Target GPU busy fraction from last sample",
+        s.gpu_util
+    );
+    out
 }
 
 fn error_response(e: allpaca_types::AllpacaError) -> Response {
@@ -447,6 +708,25 @@ mod tests {
         assert!(json.get("pipeline_mode").is_some());
         assert!(json.get("page_migrations").is_some());
         assert_eq!(json["model_id"], "synthetic");
+    }
+
+    #[tokio::test]
+    async fn prometheus_metrics_exposes_allpaca_prefix() {
+        let app = router(test_state());
+        let res = app
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("allpaca_requests_total"),
+            "missing allpaca_requests_total in {body}"
+        );
+        assert!(body.contains("allpaca_tokens_generated_total"));
+        assert!(body.contains("allpaca_poll_ticks_total"));
+        assert!(body.contains("allpaca_batch_gemm_plans_total"));
     }
 
     fn multi_request_state() -> AppState {
@@ -680,6 +960,186 @@ mod tests {
         assert!(json["usage"]["completion_tokens"].as_u64().unwrap() >= 1);
     }
 
+    #[test]
+    fn image_url_loads_data_uri_base64() {
+        // Minimal JPEG SOI marker payload, base64-encoded.
+        let raw = [0xFFu8, 0xD8, 0xFF, 0xD9];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
+        let url = format!("data:image/jpeg;base64,{b64}");
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "look".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrlSpec { url },
+                },
+            ]),
+        }];
+        let (prompt, images) = messages_to_prompt_and_images(&messages).unwrap();
+        assert!(prompt.contains("look"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/jpeg");
+        assert_eq!(images[0].bytes, raw);
+    }
+
+    #[test]
+    fn image_url_loads_local_jpg_into_image_input() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/images.jpg");
+        assert!(
+            path.is_file(),
+            "expected fixture at {}",
+            path.display()
+        );
+        let url = path.to_string_lossy().replace('\\', "/");
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "what is this?".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrlSpec { url: url.clone() },
+                },
+            ]),
+        }];
+        let (prompt, images) = messages_to_prompt_and_images(&messages).unwrap();
+        assert!(prompt.contains("what is this?"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/jpeg");
+        assert!(
+            images[0].bytes.len() > 1000,
+            "expected jpeg payload, got {} bytes",
+            images[0].bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_local_image_url_degraded_without_encoder() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/images.jpg");
+        let url = path.to_string_lossy().replace('\\', "/");
+        let app = router(test_state());
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": url}}
+                ]
+            }],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "degraded");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("vision encoder"),
+            "json={json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_local_image_url_with_stub_encoder() {
+        use allpaca_core::{EncoderPlacement, VisionEncoder, VisionTokens};
+
+        struct StubEnc;
+        impl EncoderPlacement for StubEnc {
+            fn device(&self) -> Option<i32> {
+                Some(1)
+            }
+        }
+        impl VisionEncoder for StubEnc {
+            fn encode(
+                &self,
+                images: &[ImageInput],
+            ) -> Result<VisionTokens, AllpacaError> {
+                assert!(!images.is_empty());
+                Ok(VisionTokens {
+                    embeddings: vec![0.1; 2 * 32],
+                    n_tokens: 2,
+                    device: Some(1),
+                })
+            }
+        }
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/images.jpg");
+        let url = path.to_string_lossy().replace('\\', "/");
+        let state = test_state();
+        state
+            .engine
+            .set_vision_encoder(Arc::new(StubEnc))
+            .unwrap();
+        let text_only = state
+            .engine
+            .generate(
+                "user: describe\nassistant:",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        let app = router(state);
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": url}}
+                ]
+            }],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("error").is_none(), "json={json}");
+        let prompt_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap();
+        assert_eq!(
+            prompt_tokens,
+            text_only.prompt_tokens as u64 + 2,
+            "soft vision tokens must increase prompt_tokens"
+        );
+    }
+
     #[tokio::test]
     async fn chat_completion_stream() {
         let app = router(test_state());
@@ -713,6 +1173,87 @@ mod tests {
         assert!(
             text.contains("\"content\"") || text.contains("assistant"),
             "stream must carry token or role deltas: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_stream_with_data_uri_image() {
+        use allpaca_core::{EncoderPlacement, VisionEncoder, VisionTokens};
+        use base64::Engine as _;
+
+        struct StubEnc;
+        impl EncoderPlacement for StubEnc {
+            fn device(&self) -> Option<i32> {
+                Some(1)
+            }
+        }
+        impl VisionEncoder for StubEnc {
+            fn encode(
+                &self,
+                images: &[ImageInput],
+            ) -> Result<VisionTokens, AllpacaError> {
+                assert!(!images.is_empty());
+                assert_eq!(images[0].mime, "image/jpeg");
+                Ok(VisionTokens {
+                    embeddings: vec![0.2; 2 * 32],
+                    n_tokens: 2,
+                    device: Some(1),
+                })
+            }
+        }
+
+        let raw = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/images.jpg"),
+        )
+        .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let url = format!("data:image/jpeg;base64,{b64}");
+        let state = test_state();
+        state
+            .engine
+            .set_vision_encoder(Arc::new(StubEnc))
+            .unwrap();
+        let app = router(state);
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "caption"},
+                    {"type": "image_url", "image_url": {"url": url}}
+                ]
+            }],
+            "stream": true,
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !text.contains("streaming multimodal"),
+            "stream multimodal must not be rejected: {text}"
+        );
+        assert!(
+            text.contains("chat.completion.chunk"),
+            "stream must emit OpenAI chunks: {text}"
+        );
+        assert!(text.contains("[DONE]"), "stream must terminate with [DONE]: {text}");
+        assert!(
+            !text.contains("\"error\""),
+            "stub encoder stream must succeed: {text}"
         );
     }
 }

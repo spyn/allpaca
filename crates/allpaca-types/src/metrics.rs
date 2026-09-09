@@ -192,6 +192,9 @@ pub struct StatsSnapshot {
     /// Cross-request layer-stagger CPU expert steps.
     #[serde(default)]
     pub layer_stagger_steps: u64,
+    /// Soft packed cross-request GEMM plans (execute deferred until kernels land).
+    #[serde(default)]
+    pub batch_gemm_plans: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,
@@ -272,4 +275,13 @@ pub struct StatsSnapshot {
     /// Current adaptive draft span (from the scheduler).
     #[serde(default)]
     pub draft_depth: u64,
+    /// RPC LaunchList round-trips (0 when no remote workers).
+    #[serde(default)]
+    pub rpc_roundtrips: u64,
+    /// Hidden-state bytes bounced through the coordinator (H2D+D2H).
+    #[serde(default)]
+    pub rpc_activation_bytes: u64,
+    /// Weight bytes uploaded to RPC workers at load.
+    #[serde(default)]
+    pub rpc_h2d_bytes: u64,
 }

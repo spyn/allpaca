@@ -164,6 +164,22 @@ cargo run -p allpaca-bench -- --tokens 32 --prompt "hello world"
 | `--speculative true\|false` | Toggle speculation |
 | `--pipeline-mode asymmetric\|symmetric\|mobile_tiered` | Feature-flag profile |
 | `--target-device` / `--draft-device` | Device selectors |
+| `--rpc host:port,...` | Remote kernel-ABI workers (layer-split) |
+| `--tensor-split a,b,...` | Relative layer weights (local target, then RPC) |
+
+### RPC workers (multi-machine)
+
+RPC pools VRAM so a model that does not fit one machine can still run. It does **not** make decode faster than a single box that already fits the model. Pin the same allpaca version on every machine (HELLO major must match). Do not expose workers on an open network.
+
+```bash
+# worker
+cargo run -p allpaca-rpc-server -- --cpu-only -H 127.0.0.1 -p 50052
+
+# coordinator
+cargo run -p allpaca-server -- --synthetic --cpu-only --rpc 127.0.0.1:50052 --port 8080
+```
+
+HIP worker: `cargo run -p allpaca-rpc-server --features hip -- --device hip:0 -H 0.0.0.0 -p 50052`. CUDA workers wait on engine CUDA parity; a CUDA-only box can still run `--cpu-only` for RAM overflow.
 
 ---
 

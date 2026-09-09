@@ -21,7 +21,10 @@ pub struct Config {
     pub structured_output: StructuredOutputSection,
     pub model: ModelSection,
     pub http: HttpSection,
+    pub multimodal: MultimodalSection,
     pub features: FeatureFlagOverlay,
+    #[serde(default)]
+    pub rpc: RpcSection,
 }
 
 impl Default for Config {
@@ -44,7 +47,9 @@ impl Config {
             structured_output: StructuredOutputSection::default(),
             model: ModelSection::default(),
             http: HttpSection::default(),
+            multimodal: MultimodalSection::default(),
             features: FeatureFlagOverlay::default(),
+            rpc: RpcSection::default(),
         }
     }
 
@@ -112,6 +117,22 @@ impl Config {
         }
         if let Some(json) = cli.json_mode {
             self.structured_output.json_mode = json;
+        }
+        if let Some(endpoints) = &cli.rpc_endpoints {
+            self.rpc.endpoints = endpoints.clone();
+        }
+        if let Some(split) = &cli.tensor_split {
+            let mut weights = Vec::new();
+            for part in split {
+                if let Ok(w) = part.parse::<f64>() {
+                    if w > 0.0 {
+                        weights.push(w);
+                    }
+                }
+            }
+            if !weights.is_empty() {
+                self.rpc.tensor_split = Some(weights);
+            }
         }
     }
 
@@ -215,6 +236,28 @@ impl Default for EngineSection {
             poll_schedule: PollSchedule::Fair,
             max_consecutive_prefill_picks: 0,
             gpu_backend: "auto".into(),
+        }
+    }
+}
+
+/// Remote kernel-ABI workers (llama.cpp `--rpc` analogue).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RpcSection {
+    /// `host:port` list. Empty = local-only.
+    pub endpoints: Vec<String>,
+    /// Relative layer weights in device order (local target, then RPC). `None` = MemInfo.
+    pub tensor_split: Option<Vec<f64>>,
+    /// KV sequence cap for remote layer caches.
+    pub max_seq: usize,
+}
+
+impl Default for RpcSection {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            tensor_split: None,
+            max_seq: 2048,
         }
     }
 }
@@ -491,6 +534,22 @@ impl Default for HttpSection {
     }
 }
 
+/// Multimodal encoder placement (vision/audio runtime deferred).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MultimodalSection {
+    /// Device for the vision encoder (`hip:N`, `cuda:N`, `cpu`, or unset/`auto`).
+    pub vision_device: Option<DeviceSelector>,
+}
+
+impl Default for MultimodalSection {
+    fn default() -> Self {
+        Self {
+            vision_device: None,
+        }
+    }
+}
+
 /// CLI flags that overlay a file (or compiled defaults).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliOverrides {
@@ -509,6 +568,10 @@ pub struct CliOverrides {
     pub port: Option<u16>,
     pub synthetic: bool,
     pub json_mode: Option<bool>,
+    /// Comma-separated `host:port` RPC workers.
+    pub rpc_endpoints: Option<Vec<String>>,
+    /// Comma-separated relative layer weights (same order as local target + RPC).
+    pub tensor_split: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -569,6 +632,22 @@ mod tests {
     #[test]
     fn compiled_defaults_validate() {
         Config::compiled_defaults().validate().unwrap();
+    }
+
+    #[test]
+    fn multimodal_vision_device_parses_from_toml() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [multimodal]
+            vision_device = "hip:1"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_device,
+            Some(DeviceSelector::Hip(1))
+        );
+        assert!(Config::compiled_defaults().multimodal.vision_device.is_none());
     }
 
     #[test]
@@ -726,5 +805,26 @@ mod tests {
             cfg.model.draft_path.as_deref(),
             Some(std::path::Path::new("path/to/draft.gguf"))
         );
+    }
+
+    #[test]
+    fn rpc_toml_and_cli() {
+        let toml = r#"
+            [rpc]
+            endpoints = ["127.0.0.1:50052"]
+            tensor_split = [2.0, 1.0]
+            max_seq = 128
+        "#;
+        let mut cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.rpc.endpoints, vec!["127.0.0.1:50052"]);
+        assert_eq!(cfg.rpc.tensor_split.as_deref(), Some(&[2.0, 1.0][..]));
+        assert_eq!(cfg.rpc.max_seq, 128);
+        cfg.merge_cli(&CliOverrides {
+            rpc_endpoints: Some(vec!["10.0.0.2:9".into()]),
+            tensor_split: Some(vec!["3".into(), "1".into()]),
+            ..CliOverrides::default()
+        });
+        assert_eq!(cfg.rpc.endpoints, vec!["10.0.0.2:9"]);
+        assert_eq!(cfg.rpc.tensor_split.as_deref(), Some(&[3.0, 1.0][..]));
     }
 }

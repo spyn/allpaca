@@ -3895,6 +3895,225 @@ fn hip_speculative_7b_64_tokens_finishes_before_timeout() {
     );
 }
 
+/// Gated BitNet / ternary GGUF. Uses `ALLPACA_TQ_GGUF` or `ALLPACA_BITNET_GGUF`.
+fn gated_tq_gguf() -> Option<std::path::PathBuf> {
+    for key in ["ALLPACA_TQ_GGUF", "ALLPACA_BITNET_GGUF"] {
+        if let Ok(raw) = std::env::var(key) {
+            let p = std::path::PathBuf::from(raw.trim());
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn write_tiny_tq2_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{
+        quantize_tq2_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor,
+    };
+    use std::collections::HashMap;
+
+    // dim*ff > 65536 so FFN stays packed TQ2_0 and exercises fused HIP GEMV.
+    let dim = 256usize;
+    let vocab = 4usize;
+    let ff = 512usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let embd_q = quantize_tq2_0(&vec![0.01f32; vocab * dim]);
+    let q_q = quantize_tq2_0(&vec![0.01f32; dim * dim]);
+    let k_q = quantize_tq2_0(&vec![0.01f32; (dim / 4) * dim]);
+    let v_q = quantize_tq2_0(&vec![0.01f32; (dim / 4) * dim]);
+    let o_q = quantize_tq2_0(&vec![0.01f32; dim * dim]);
+    let gate_q = quantize_tq2_0(&vec![0.01f32; ff * dim]);
+    let up_q = quantize_tq2_0(&vec![0.01f32; ff * dim]);
+    let down_q = quantize_tq2_0(&vec![0.01f32; dim * ff]);
+    let attn_norm = vec![1.0f32; dim];
+    let ffn_norm = vec![1.0f32; dim];
+    let output_norm = vec![1.0f32; dim];
+    write_gguf_quant(
+        path,
+        &meta,
+        &[
+            GgufWriteTensor {
+                name: "blk.0.attn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &attn_norm,
+            },
+            GgufWriteTensor {
+                name: "blk.0.ffn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &ffn_norm,
+            },
+            GgufWriteTensor {
+                name: "output_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &output_norm,
+            },
+        ],
+        &[
+            GgufWriteQuantTensor {
+                name: "token_embd.weight".into(),
+                dims: vec![vocab as u64, dim as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &embd_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_q.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &q_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_k.weight".into(),
+                dims: vec![(dim / 4) as u64, dim as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &k_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_v.weight".into(),
+                dims: vec![(dim / 4) as u64, dim as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &v_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_output.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &o_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_gate.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &gate_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &up_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_down.weight".into(),
+                dims: vec![dim as u64, ff as u64],
+                ggml_type: GgmlType::TQ2_0,
+                bytes: &down_q,
+            },
+        ],
+    )
+    .expect("write tiny TQ2_0 GGUF");
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_tiny_tq2_gguf_uses_fused_path() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_generate_tiny_tq2_gguf_uses_fused_path: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_tiny_tq2.gguf");
+    write_tiny_tq2_gguf(&path);
+    let engine = Engine::new(hip_7b_config(path.clone())).expect("TQ2_0 tiny load");
+    if hip_gpus(&engine).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("skip hip_generate_tiny_tq2_gguf_uses_fused_path: no HIP device");
+        return;
+    }
+    let after_load = engine.stats();
+    let h2d = after_load.weight_h2d_bytes;
+    assert!(
+        after_load.weight_bytes_on_device > 0,
+        "TQ2 FFN should stay packed on device"
+    );
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("TQ2_0 HIP generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert_eq!(
+        stats.weight_h2d_bytes, h2d,
+        "decode must not H2D weights; load={h2d} after={}",
+        stats.weight_h2d_bytes
+    );
+    eprintln!(
+        "TQ2_0 tiny HIP generate: tokens={} text={:?}",
+        out.token_ids.len(),
+        out.text
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_generate_real_tq_gguf_when_path_set() {
+    let _guard = large_gguf_lock();
+    let Some(path) = gated_tq_gguf() else {
+        eprintln!("skip hip_generate_real_tq_gguf_when_path_set: set ALLPACA_TQ_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_generate_real_tq_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let engine = Engine::new(hip_7b_config(path.clone())).expect("TQ GGUF load must not be Fatal");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_generate_real_tq_gguf_when_path_set: no HIP device");
+        return;
+    }
+    let after_load = engine.stats();
+    let h2d = after_load.weight_h2d_bytes;
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("TQ HIP generate must not panic or OOM");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert_eq!(
+        stats.weight_h2d_bytes, h2d,
+        "decode must not H2D weights; load={h2d} after={}",
+        stats.weight_h2d_bytes
+    );
+    eprintln!(
+        "TQ HIP generate: path={} tokens={} backend={} text={:?}",
+        path.display(),
+        out.token_ids.len(),
+        stats.backend,
+        out.text
+    );
+}
+
 #[cfg(feature = "hip")]
 #[test]
 fn hip_generate_real_q4k_gguf_when_path_set() {

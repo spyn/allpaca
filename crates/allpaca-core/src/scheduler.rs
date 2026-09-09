@@ -70,7 +70,7 @@ impl Scheduler {
         }
     }
 
-    pub fn placement(&self, devices: &[DeviceInfo]) -> Placement {
+    pub fn placement(&self, devices: &[DeviceInfo], vision_device: Option<i32>) -> Placement {
         let mut gpus: Vec<&DeviceInfo> = devices.iter().filter(|d| d.kind == DeviceKind::HipGpu).collect();
         gpus.sort_by(|a, b| {
             b.bandwidth_gbps
@@ -90,7 +90,7 @@ impl Scheduler {
         Placement {
             target_device: target,
             draft_device: draft,
-            vision_device: None,
+            vision_device,
             warm_kv: KvTierKind::Dram,
         }
     }
@@ -234,6 +234,35 @@ mod tests {
             Some(2),
             "decode priority must pick decoding Request over older prefill"
         );
+    }
+
+    #[test]
+    fn placement_carries_vision_device() {
+        let devices = vec![
+            DeviceInfo::cpu(),
+            DeviceInfo {
+                id: 0,
+                kind: DeviceKind::HipGpu,
+                name: "a".into(),
+                memory_bytes: 8 << 30,
+                bandwidth_gbps: 400.0,
+                peers: vec![1],
+            },
+            DeviceInfo {
+                id: 1,
+                kind: DeviceKind::HipGpu,
+                name: "b".into(),
+                memory_bytes: 8 << 30,
+                bandwidth_gbps: 200.0,
+                peers: vec![0],
+            },
+        ];
+        let flags = FeatureFlags::from_mode(PipelineMode::Asymmetric);
+        let spec = SpeculativeSection::default();
+        let s = Scheduler::new(PipelineMode::Asymmetric, flags, &spec);
+        let p = s.placement(&devices, Some(1));
+        assert_eq!(p.vision_device, Some(1));
+        assert_eq!(p.target_device, 0);
     }
 
     #[test]

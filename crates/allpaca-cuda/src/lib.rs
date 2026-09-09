@@ -75,6 +75,34 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_embed_gather(
+            table: *const f32,
+            token: i32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_rope(
+            x: *mut f32,
+            n_heads: i32,
+            head_dim: i32,
+            pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_attention(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_q: i32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            causal: i32,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -422,6 +450,231 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn embed_gather_dev(
+        &self,
+        table: *const f32,
+        token: i32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if table.is_null() || out.is_null() || dim <= 0 || token < 0 {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA embed_gather".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_embed_gather(table, token, out, dim, std::ptr::null_mut())
+            };
+            status(rc, "embed_gather")?;
+            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
+            status(sync, "stream_synchronize")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (table, token, out, dim);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA embed_gather unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn rope_dev(
+        &self,
+        x: *mut f32,
+        n_heads: i32,
+        head_dim: i32,
+        pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if x.is_null() || n_heads <= 0 || head_dim <= 0 || head_dim % 2 != 0 {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA rope".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_rope(x, n_heads, head_dim, pos, theta, std::ptr::null_mut())
+            };
+            status(rc, "rope")?;
+            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
+            status(sync, "stream_synchronize")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, n_heads, head_dim, pos, theta);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA rope unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dev(
+        &self,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if q.is_null()
+                || k.is_null()
+                || v.is_null()
+                || out.is_null()
+                || n_q <= 0
+                || n_kv <= 0
+                || n_heads <= 0
+                || n_kv_heads <= 0
+                || head_dim <= 0
+                || n_heads % n_kv_heads != 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA attention".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_attention(
+                    q,
+                    k,
+                    v,
+                    out,
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    i32::from(causal),
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "attention")?;
+            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
+            status(sync, "stream_synchronize")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA attention unavailable".into(),
+            )))
+        }
+    }
+
+    /// Host roundtrip: gather one F32 embed row via device.
+    pub fn embed_gather(
+        &self,
+        table: &[f32],
+        token: i32,
+        out: &mut [f32],
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if dim <= 0 || token < 0 || out.len() < dim as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid embed_gather buffers".into(),
+            )));
+        }
+        let need = (token as usize + 1).saturating_mul(dim as usize);
+        if table.len() < need {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed table too small".into(),
+            )));
+        }
+        let d_table = self.upload_f32(table)?;
+        let d_out = device_malloc((dim as usize) * 4, self.device)?;
+        let result = (|| {
+            self.embed_gather_dev(d_table, token, d_out.cast(), dim)?;
+            memcpy(out.as_mut_ptr().cast(), d_out, (dim as usize) * 4, MEMCPY_D2H)?;
+            self.activation_d2h
+                .fetch_add((dim as usize * 4) as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+        self.free_ptr(d_table);
+        device_free(d_out);
+        result
+    }
+
+    /// Host roundtrip: in-place RoPE via device.
+    pub fn rope(
+        &self,
+        x: &mut [f32],
+        n_heads: i32,
+        head_dim: i32,
+        pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        let n = (n_heads as usize).saturating_mul(head_dim as usize);
+        if n == 0 || x.len() < n || head_dim % 2 != 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rope shape".into(),
+            )));
+        }
+        let d_x = self.upload_f32(&x[..n])?;
+        let result = (|| {
+            self.rope_dev(d_x, n_heads, head_dim, pos, theta)?;
+            memcpy(x.as_mut_ptr().cast(), d_x.cast(), n * 4, MEMCPY_D2H)?;
+            self.activation_d2h
+                .fetch_add((n * 4) as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+        self.free_ptr(d_x);
+        result
+    }
+
+    /// Host roundtrip: attention via device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        let q_n = (n_q as usize) * (n_heads as usize) * (head_dim as usize);
+        let kv_n = (n_kv as usize) * (n_kv_heads as usize) * (head_dim as usize);
+        if q.len() < q_n || k.len() < kv_n || v.len() < kv_n || out.len() < q_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention buffer size mismatch".into(),
+            )));
+        }
+        let d_q = self.upload_f32(&q[..q_n])?;
+        let d_k = self.upload_f32(&k[..kv_n])?;
+        let d_v = self.upload_f32(&v[..kv_n])?;
+        let d_out = device_malloc(q_n * 4, self.device)?;
+        let result = (|| {
+            self.attention_dev(
+                d_q, d_k, d_v, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            )?;
+            memcpy(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H)?;
+            self.activation_d2h
+                .fetch_add((q_n * 4) as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+        self.free_ptr(d_q);
+        self.free_ptr(d_k);
+        self.free_ptr(d_v);
+        device_free(d_out);
+        result
+    }
+
     /// Upload host F32 weights into a device blob (H2D). Returns device pointer.
     pub fn upload_f32(&self, host: &[f32]) -> Result<*mut f32, AllpacaError> {
         let bytes = host.len().saturating_mul(4);
@@ -494,5 +747,116 @@ mod tests {
         }
         let ws = CudaWorkspace::new(0, 8192).expect("workspace");
         assert!(ws.allocated_bytes() >= 8192);
+    }
+
+    #[test]
+    fn embed_gather_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let dim = 16i32;
+        let vocab = 4usize;
+        let table: Vec<f32> = (0..(vocab * dim as usize))
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        let token = 2i32;
+        let mut cuda_out = vec![0.0f32; dim as usize];
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        ws.embed_gather(&table, token, &mut cuda_out, dim)
+            .expect("cuda embed_gather");
+        let start = (token as usize) * (dim as usize);
+        let cpu = &table[start..start + dim as usize];
+        for i in 0..dim as usize {
+            assert!(
+                (cuda_out[i] - cpu[i]).abs() < 1e-6,
+                "embed mismatch at {i}: cuda={} cpu={}",
+                cuda_out[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn rope_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_heads = 2i32;
+        let head_dim = 8i32;
+        let pos = 3i32;
+        let theta = 10000.0f32;
+        let n = (n_heads * head_dim) as usize;
+        let mut cuda_x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
+        let mut cpu_x = cuda_x.clone();
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        ws.rope(&mut cuda_x, n_heads, head_dim, pos, theta)
+            .expect("cuda rope");
+        for h in 0..n_heads as usize {
+            let off = h * head_dim as usize;
+            allpaca_cpu::rope(&mut cpu_x[off..off + head_dim as usize], pos as usize, theta)
+                .expect("cpu rope");
+        }
+        for i in 0..n {
+            assert!(
+                (cuda_x[i] - cpu_x[i]).abs() < 1e-4,
+                "rope mismatch at {i}: cuda={} cpu={}",
+                cuda_x[i],
+                cpu_x[i]
+            );
+        }
+    }
+
+    #[test]
+    fn attention_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_q = 1i32;
+        let n_kv = 4i32;
+        let n_heads = 4i32;
+        let n_kv_heads = 2i32;
+        let head_dim = 8i32;
+        let q_n = (n_q * n_heads * head_dim) as usize;
+        let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
+        let q: Vec<f32> = (0..q_n).map(|i| (i as f32) * 0.02).collect();
+        let k: Vec<f32> = (0..kv_n).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        let v: Vec<f32> = (0..kv_n).map(|i| (i as f32 + 2.0) * 0.015).collect();
+        let mut cuda_out = vec![0.0f32; q_n];
+        let mut cpu_out = vec![0.0f32; q_n];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        ws.attention(
+            &q,
+            &k,
+            &v,
+            &mut cuda_out,
+            n_q,
+            n_kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            true,
+        )
+        .expect("cuda attention");
+        allpaca_cpu::attention(
+            &q,
+            &k,
+            &v,
+            &mut cpu_out,
+            n_q as usize,
+            n_kv as usize,
+            n_heads as usize,
+            n_kv_heads as usize,
+            head_dim as usize,
+            true,
+        )
+        .expect("cpu attention");
+        for i in 0..q_n {
+            assert!(
+                (cuda_out[i] - cpu_out[i]).abs() < 1e-4,
+                "attention mismatch at {i}: cuda={} cpu={}",
+                cuda_out[i],
+                cpu_out[i]
+            );
+        }
     }
 }

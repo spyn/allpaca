@@ -15,6 +15,7 @@ allpaca-core.workspace = true
 allpaca-types.workspace = true
 async-stream.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
 futures.workspace = true
 serde.workspace = true

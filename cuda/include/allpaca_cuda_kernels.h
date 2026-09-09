@@ -52,6 +52,20 @@ int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, 
 int allpaca_cuda_silu_mul(const float *gate, const float *up, float *out, int32_t n,
                           allpaca_cuda_stream_t stream);
 
+/* Gather one token row from F32 embed table[vocab, dim] -> out[dim]. */
+int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
+                              allpaca_cuda_stream_t stream);
+
+/* In-place interleaved RoPE on x[n_heads, head_dim]. Matches HIP allpaca_rope. */
+int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
+                      allpaca_cuda_stream_t stream);
+
+/* Online-softmax attention (decode/prefill). q:[n_q,n_heads,d] k/v:[n_kv,n_kv_heads,d].
+ * Matches HIP allpaca_attention argument order. */
+int allpaca_cuda_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
+                           int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
+                           int32_t causal, allpaca_cuda_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

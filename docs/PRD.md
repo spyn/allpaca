@@ -314,8 +314,10 @@ Exit gate: context capacity increase and no catastrophic tail latency for config
 
 Deliverables:
 
-- encoder placement API,
-- 9060 XT vision/audio residency.
+- encoder placement API (`EncoderPlacement` / `VisionEncoder` / `NoopVisionEncoder`, `multimodal.vision_device` → `Placement.vision_device`) — **landed**;
+- encode + soft-prompt inject (`ImageInput` / `VisionTokens`, `begin_request_multimodal` / `generate_multimodal` / `generate_stream_multimodal`, prefill `soft_x`) — **landed**;
+- OpenAI `image_url` content parts for **local file paths** and **`data:` base64** — **landed**;
+- http(s) image fetch + real vision/audio residency on 9060 XT — **deferred**.
 
 Exit gate: improved concurrency/VRAM stability under multimodal workload.
 
@@ -335,8 +337,8 @@ Exit gate: correctness preserved and measurable speedup on compatible checkpoint
 Deliverables:
 
 - BitNet backend,
-- CXL memory abstraction,
-- PIM simulator backend,
+- CXL memory abstraction (`MemoryTierBackend` trait + `PinnedDramBackend` / `CxlMemBackend` stub) — **trait In; hardware Out**,
+- PIM simulator backend (`PimBackend` stub) — **trait In; hardware Out**,
 - remote accelerator protocol.
 
 Exit gate: backend interfaces compile and benchmark harness can simulate transfer/compute characteristics.

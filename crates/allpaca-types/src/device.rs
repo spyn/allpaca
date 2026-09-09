@@ -35,7 +35,30 @@ impl DeviceInfo {
     pub fn is_gpu(&self) -> bool {
         matches!(self.kind, DeviceKind::HipGpu | DeviceKind::CudaGpu)
     }
+
+    /// Remote worker advertised as `rpc[host:port]`.
+    pub fn rpc(id: i32, endpoint: &str, memory_bytes: u64, kind: DeviceKind) -> Self {
+        Self {
+            id,
+            kind,
+            name: format!("rpc[{endpoint}]"),
+            memory_bytes,
+            bandwidth_gbps: 1.0,
+            peers: Vec::new(),
+        }
+    }
+
+    pub fn is_rpc(&self) -> bool {
+        self.name.starts_with("rpc[")
+    }
+
+    pub fn rpc_endpoint(&self) -> Option<&str> {
+        self.name.strip_prefix("rpc[")?.strip_suffix(']')
+    }
 }
+
+/// Device ids for RPC workers start here so they do not collide with HIP ordinals.
+pub const RPC_DEVICE_ID_BASE: i32 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceSelector {

@@ -39,6 +39,12 @@ pub struct Cli {
     pub pipeline_mode: Option<String>,
     #[arg(long)]
     pub cpu_threads: Option<usize>,
+    /// Comma-separated RPC workers (`host:port`).
+    #[arg(long)]
+    pub rpc: Option<String>,
+    /// Comma-separated relative layer split weights (local target, then RPC).
+    #[arg(long)]
+    pub tensor_split: Option<String>,
 }
 
 impl Cli {
@@ -71,6 +77,8 @@ impl Cli {
             port: self.port,
             synthetic: self.synthetic,
             json_mode: self.json_mode,
+            rpc_endpoints: self.rpc.as_deref().and_then(parse_csv_nonempty),
+            tensor_split: self.tensor_split.as_deref().and_then(parse_csv_nonempty),
         }
     }
 }
@@ -81,5 +89,18 @@ fn parse_mode(raw: &str) -> Option<PipelineMode> {
         "symmetric" => Some(PipelineMode::Symmetric),
         "mobile_tiered" | "mobile" => Some(PipelineMode::MobileTiered),
         _ => None,
+    }
+}
+
+fn parse_csv_nonempty(raw: &str) -> Option<Vec<String>> {
+    let parts: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
     }
 }

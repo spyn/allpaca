@@ -140,6 +140,8 @@ pub struct Metrics {
     pub draft_expert_prefetches: AtomicU64,
     /// Cross-request layer-stagger CPU expert steps during GPU forward.
     pub layer_stagger_steps: AtomicU64,
+    /// Soft plans for packed cross-request HIP GEMM (execute still one-at-a-time).
+    pub batch_gemm_plans: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
@@ -174,6 +176,9 @@ pub struct Metrics {
     pub async_mask_hits: AtomicU64,
     /// MTP process() skipped because draft KV seq_len did not match pos.
     pub mtp_process_skips: AtomicU64,
+    pub rpc_roundtrips: AtomicU64,
+    pub rpc_activation_bytes: AtomicU64,
+    pub rpc_h2d_bytes: AtomicU64,
 }
 
 impl Metrics {
@@ -304,6 +309,7 @@ impl Metrics {
             expert_h2d_batched_copies: self.expert_h2d_batched_copies.load(Ordering::Relaxed),
             draft_expert_prefetches: self.draft_expert_prefetches.load(Ordering::Relaxed),
             layer_stagger_steps: self.layer_stagger_steps.load(Ordering::Relaxed),
+            batch_gemm_plans: self.batch_gemm_plans.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
@@ -329,6 +335,9 @@ impl Metrics {
             async_mask_hits: self.async_mask_hits.load(Ordering::Relaxed),
             mtp_process_skips: self.mtp_process_skips.load(Ordering::Relaxed),
             draft_depth,
+            rpc_roundtrips: self.rpc_roundtrips.load(Ordering::Relaxed),
+            rpc_activation_bytes: self.rpc_activation_bytes.load(Ordering::Relaxed),
+            rpc_h2d_bytes: self.rpc_h2d_bytes.load(Ordering::Relaxed),
         }
     }
 

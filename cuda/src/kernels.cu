@@ -204,3 +204,141 @@ extern "C" int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, 
     rmsnorm_kernel<<<1, 256, 0, as_stream(stream)>>>(x, w, out, n, eps);
     return cuda_status(cudaGetLastError());
 }
+
+__global__ void embed_gather_kernel(const float *table, int token, float *out, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) {
+        return;
+    }
+    out[idx] = table[static_cast<size_t>(token) * static_cast<size_t>(dim) + static_cast<size_t>(idx)];
+}
+
+extern "C" int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
+                                         allpaca_cuda_stream_t stream) {
+    if (!table || !out || dim <= 0 || token < 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    embed_gather_kernel<<<blocks, threads, 0, as_stream(stream)>>>(table, token, out, dim);
+    return cuda_status(cudaGetLastError());
+}
+
+__device__ void rope_pair(float *hvec, int i, int half, int pos, float theta) {
+    float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    float angle = static_cast<float>(pos) * freq;
+    float s = sinf(angle);
+    float c = cosf(angle);
+    float a = hvec[2 * i];
+    float b = hvec[2 * i + 1];
+    hvec[2 * i] = a * c - b * s;
+    hvec[2 * i + 1] = a * s + b * c;
+}
+
+__global__ void rope_kernel(float *x, int n_heads, int head_dim, int pos, float theta) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = head_dim / 2;
+    int total = n_heads * half;
+    if (idx >= total || (head_dim % 2) != 0) {
+        return;
+    }
+    rope_pair(x + (idx / half) * head_dim, idx % half, half, pos, theta);
+}
+
+extern "C" int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos,
+                                 float theta, allpaca_cuda_stream_t stream) {
+    if (!x || n_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int total = n_heads * (head_dim / 2);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    rope_kernel<<<blocks, threads, 0, as_stream(stream)>>>(x, n_heads, head_dim, pos, theta);
+    return cuda_status(cudaGetLastError());
+}
+
+__device__ float warp_sum32(float v) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+/* Warp-per-head online softmax. Supports head_dim <= 512 (16 dims/lane × 32). */
+__global__ void attention_online_kernel(const float *q, const float *k, const float *v, float *out,
+                                        int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
+                                        int causal) {
+    const int qi = static_cast<int>(blockIdx.x);
+    const int h = static_cast<int>(blockIdx.y);
+    if (qi >= n_q || h >= n_heads) {
+        return;
+    }
+    const int lane = static_cast<int>(threadIdx.x);
+    const int reps = n_heads / n_kv_heads;
+    const int kv_h = h / reps;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int t_max = causal ? qi + (n_kv > n_q ? n_kv - n_q : 0) : n_kv - 1;
+    const float *qh = q + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
+    float *oh = out + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+
+    constexpr int MAX_DPT = 16;
+    float qreg[MAX_DPT];
+    float acc[MAX_DPT];
+    int nd = 0;
+    for (int d = lane; d < head_dim && nd < MAX_DPT; d += 32) {
+        qreg[nd] = qh[d];
+        acc[nd] = 0.f;
+        nd++;
+    }
+
+    float m = -1.0e30f;
+    float l = 0.f;
+
+    for (int t = 0; t < n_kv; ++t) {
+        const bool valid = t <= t_max;
+        const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+        const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+        float partial = 0.f;
+        int i = 0;
+        for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
+            partial += qreg[i++] * (valid ? kh[d] : 0.f);
+        }
+        float s = warp_sum32(partial) * scale;
+        if (!valid) {
+            s = -1.0e30f;
+        }
+        const float m_new = fmaxf(m, s);
+        const float alpha = expf(m - m_new);
+        const float p = expf(s - m_new);
+        l = l * alpha + p;
+        i = 0;
+        for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
+            acc[i] = acc[i] * alpha + p * (valid ? vh[d] : 0.f);
+            i++;
+        }
+        m = m_new;
+    }
+
+    const float inv = (l == 0.f) ? 0.f : 1.f / l;
+    int i = 0;
+    for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
+        oh[d] = acc[i++] * inv;
+    }
+}
+
+extern "C" int allpaca_cuda_attention(const float *q, const float *k, const float *v, float *out,
+                                      int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                      int32_t head_dim, int32_t causal,
+                                      allpaca_cuda_stream_t stream) {
+    if (!q || !k || !v || !out || n_q <= 0 || n_kv <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
+        return ALLPACA_ERR_INVALID;
+    }
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(q, k, v, out, n_q, n_kv, n_heads,
+                                                                   n_kv_heads, head_dim, causal);
+    return cuda_status(cudaGetLastError());
+}

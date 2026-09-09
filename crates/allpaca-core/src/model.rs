@@ -2640,6 +2640,8 @@ pub struct TinyModel {
     pub exit_heads: Vec<Option<Vec<f32>>>,
     /// Present when this TinyModel is an MTP/NextN draft with host seed weights.
     pub mtp_nextn: Option<MtpNextnWeights>,
+    /// Shared RPC runtime when layers are offloaded to remote workers.
+    pub rpc: Option<std::sync::Arc<crate::rpc_runtime::RpcRuntime>>,
 }
 
 impl TinyModel {
@@ -2707,6 +2709,7 @@ impl TinyModel {
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
+            rpc: None,
         }
     }
 
@@ -3809,6 +3812,7 @@ impl TinyModel {
             early_exit,
             exit_heads,
             mtp_nextn: None,
+            rpc: None,
         })
     }
 
@@ -3914,6 +3918,7 @@ impl TinyModel {
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
+            rpc: None,
         }
     }
 
@@ -3984,6 +3989,7 @@ impl TinyModel {
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
+            rpc: None,
         })
     }
 
@@ -4049,6 +4055,7 @@ impl TinyModel {
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
+            rpc: None,
         })
     }
 
@@ -4077,6 +4084,8 @@ impl TinyModel {
     }
 
     /// Decode one token at `pos`, writing K/V into paged tiers. Logits written to `logits`.
+    ///
+    /// When `soft_x` is `Some`, it replaces the token embedding (vision soft prompt).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_token(
         &self,
@@ -4092,19 +4101,35 @@ impl TinyModel {
         mut recurrent: Option<&mut RecurrentState>,
         micro_batch: Option<&MicroBatchExpertUnion>,
         mut side: Option<&mut DeviceDecodeSide<'_>>,
+        soft_x: Option<&[f32]>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
         let head_dim = cfg.head_dim();
         let kv_dim = cfg.n_kv_heads * head_dim;
-        if token as usize >= cfg.vocab_size {
+        if soft_x.is_none() && token as usize >= cfg.vocab_size {
             return Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
                 "token {token} out of vocab"
             ))));
         }
+        if let Some(x0) = soft_x {
+            if x0.len() != dim {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "soft embed len {} != dim {dim}",
+                    x0.len()
+                ))));
+            }
+        }
         // Prefer on-device decode whenever resident weights exist — including hybrid
         // models that carry recurrent SSM/DeltaNet state (host stub inside device path).
+        // RPC layer-split keeps activations on the host and bounces at device boundaries.
+        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) && !self.host_weights_ready() {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "RPC layer-split requires host F32 weights in v1".into(),
+            )));
+        }
         if let (Some(hip), Some(resident)) = (hip, resident) {
+            if !self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
             match self.forward_token_device(
                 token,
                 pos,
@@ -4118,6 +4143,7 @@ impl TinyModel {
                 micro_batch,
                 side.as_deref_mut(),
                 recurrent.as_deref_mut(),
+                soft_x,
             ) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -4127,13 +4153,18 @@ impl TinyModel {
                     tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                 }
             }
+            }
         }
         if !self.host_weights_ready() {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "large GGUF has no host F32 weights; HIP decode is required".into(),
             )));
         }
-        let mut x = self.embed[token as usize * dim..(token as usize + 1) * dim].to_vec();
+        let mut x = if let Some(x0) = soft_x {
+            x0.to_vec()
+        } else {
+            self.embed[token as usize * dim..(token as usize + 1) * dim].to_vec()
+        };
         let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
         let mut q = vec![0.0f32; dim];
         let mut k = vec![0.0f32; kv_dim];
@@ -4142,6 +4173,12 @@ impl TinyModel {
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(rpc) = &self.rpc {
+                if rpc.is_remote(layer_idx) {
+                    rpc.run_layer(layer_idx, pos, &mut x)?;
+                    continue;
+                }
+            }
             if matches!(
                 layer.block,
                 HybridLayerKind::Ssm | HybridLayerKind::DenseFfn | HybridLayerKind::Moe
@@ -4453,6 +4490,39 @@ impl TinyModel {
         if tokens.is_empty() {
             return Ok(());
         }
+        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+            for (i, tok) in tokens.iter().enumerate() {
+                let last = i + 1 == tokens.len();
+                let mut side = DeviceDecodeSide {
+                    request_id,
+                    moe_norm: None,
+                    layer_stagger: None,
+                    ds_probe: None,
+                    ds_queue: None,
+                    last_hidden: if last {
+                        out_row_hiddens.as_deref_mut()
+                    } else {
+                        None
+                    },
+                };
+                self.forward_token(
+                    *tok,
+                    start_pos + i,
+                    page_ids,
+                    kv,
+                    metrics,
+                    logits,
+                    hip,
+                    resident,
+                    write_logits && last,
+                    recurrent.as_deref_mut(),
+                    None,
+                    Some(&mut side),
+                    None,
+                )?;
+            }
+            return Ok(());
+        }
         if tokens.len() == 1 {
             let mut side = DeviceDecodeSide {
                 request_id,
@@ -4475,6 +4545,7 @@ impl TinyModel {
                 recurrent,
                 None,
                 Some(&mut side),
+                None,
             )?;
             if let Some(rows) = row_logits {
                 let vocab = self.config.vocab_size;
@@ -4567,6 +4638,7 @@ impl TinyModel {
                 recurrent.as_deref_mut(),
                 None,
                 Some(&mut side),
+                None,
             )?;
             if let Some(rows) = row_logits.as_mut() {
                 let off = i * vocab;
@@ -4605,6 +4677,7 @@ impl TinyModel {
         micro_batch: Option<&MicroBatchExpertUnion>,
         mut side: Option<&mut DeviceDecodeSide<'_>>,
         mut recurrent: Option<&mut RecurrentState>,
+        soft_x: Option<&[f32]>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -4667,7 +4740,11 @@ impl TinyModel {
             }
         }
         let result = (|| {
-            resident.embed_gather(hip, token, buf.x, dim as i32)?;
+            if let Some(x0) = soft_x {
+                hip.copy_h2d_f32(buf.x, x0)?;
+            } else {
+                resident.embed_gather(hip, token, buf.x, dim as i32)?;
+            }
             record_elementwise(Some(metrics));
 
             for (layer_idx, host_layer) in self.layers.iter().enumerate() {

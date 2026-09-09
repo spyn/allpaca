@@ -85,6 +85,10 @@ pub fn quantize_q6_k(data: &[f32]) -> Vec<u8> {
     allpaca_cpu::quantize_q6_k(data)
 }
 
+pub fn quantize_tq2_0(data: &[f32]) -> Vec<u8> {
+    allpaca_cpu::quantize_tq2_0(data)
+}
+
 pub fn quantize_f16(data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 2);
     for v in data {

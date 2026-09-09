@@ -6,7 +6,7 @@ use allpaca_gguf::{extract_tokenizer, GgufFile};
 use allpaca_onnx::OnnxFile;
 use allpaca_safetensors::{load_hf_config, load_vocab_sidecar, resolve_sidecar, SafetensorsFile};
 use allpaca_types::{
-    AllpacaError, Config, DraftProviderKind, FatalError, FeatureFlags, FinishReason,
+    AllpacaError, Config, DegradedError, DraftProviderKind, FatalError, FeatureFlags, FinishReason,
     GenerationOutput, GenerationParams, KvHandle, StatsSnapshot, StepResult, TokenEvent,
     TransientError,
 };
@@ -26,6 +26,9 @@ use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
+use crate::batch_gemm::{
+    plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, ModelShapeKey,
+};
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
     alloc_pages_for_seq, ensure_pages, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
@@ -70,6 +73,10 @@ struct ActiveRequest {
     moe_norm: Vec<f32>,
     /// Target `output_norm` hidden for MTP draft `h_nextn` handoff.
     last_hidden: Vec<f32>,
+    /// Soft vision positions at the start of `tokens` (pre-text).
+    vision_prefix_len: usize,
+    /// Row-major `vision_prefix_len * dim` embeddings for soft prefill.
+    vision_embeds: Vec<f32>,
 }
 
 struct EngineInner {
@@ -106,6 +113,8 @@ struct EngineInner {
     elastic_rebalance_pending: bool,
     /// Prior expert LRU miss counter for streak detection.
     elastic_last_misses: u64,
+    /// Optional vision encoder (placement + encode); text-only ignores it.
+    vision_encoder: Option<Arc<dyn crate::VisionEncoder>>,
 }
 
 struct DraftAhead {
@@ -137,6 +146,7 @@ pub struct Engine {
     /// Clock for driver VRAM / GPU-busy sampling. Shared across clones so the
     /// rate limit is per engine, not per handle.
     gpu_sampler: Arc<GpuSampler>,
+    rpc: Option<Arc<crate::rpc_runtime::RpcRuntime>>,
 }
 
 pub struct RequestHandle {
@@ -213,7 +223,14 @@ impl Engine {
             }
         }
         config.validate()?;
-        let inventory = DeviceInventory::discover(&config);
+        let mut inventory = DeviceInventory::discover(&config);
+        let rpc = if config.rpc.endpoints.is_empty() {
+            None
+        } else {
+            let rt = crate::rpc_runtime::RpcRuntime::connect(&config.rpc.endpoints)?;
+            rt.apply_hello_to_inventory(&mut inventory.devices)?;
+            Some(Arc::new(rt))
+        };
         let mut flags = FeatureFlags::from_mode(inventory.pipeline_mode);
         flags.overlay(&config.features);
         apply_provider_flags(&mut flags, &config);
@@ -258,6 +275,7 @@ impl Engine {
             elastic_miss_streak: 0,
             elastic_rebalance_pending: false,
             elastic_last_misses: 0,
+            vision_encoder: None,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -273,6 +291,7 @@ impl Engine {
             micro_batch: Arc::new(MicroBatchExpertUnion::new()),
             layer_stagger: Arc::new(LayerStagger::new()),
             gpu_sampler: Arc::new(GpuSampler::default()),
+            rpc,
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -288,6 +307,41 @@ impl Engine {
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// Register a vision encoder for multimodal Requests. Text-only generate is unchanged.
+    pub fn set_vision_encoder(
+        &self,
+        encoder: Arc<dyn crate::VisionEncoder>,
+    ) -> Result<(), AllpacaError> {
+        self.lock()?.vision_encoder = Some(encoder);
+        Ok(())
+    }
+
+    /// Start a Request with optional images. Empty images match [`Self::begin_request`].
+    pub fn begin_request_multimodal(
+        &self,
+        prompt: &str,
+        images: &[crate::ImageInput],
+        params: GenerationParams,
+    ) -> Result<RequestHandle, AllpacaError> {
+        let vision = if images.is_empty() {
+            None
+        } else {
+            let enc = {
+                let inner = self.lock()?;
+                inner.vision_encoder.clone()
+            };
+            match enc {
+                Some(enc) => Some(enc.encode(images)?),
+                None => {
+                    return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                        "vision encoder not registered".into(),
+                    )));
+                }
+            }
+        };
+        self.begin_request_with_vision(prompt, vision, params)
     }
 
     /// Refresh driver VRAM and GPU busy into [`Metrics`], at most once per
@@ -476,7 +530,23 @@ impl Engine {
             }
             Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
-        let (backend, device_memory_bytes) = if self.hip.is_some() {
+        let (backend, device_memory_bytes) = if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote())
+        {
+            if let Some(rt) = &self.rpc {
+                self.metrics
+                    .rpc_roundtrips
+                    .store(rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+                self.metrics.rpc_activation_bytes.store(
+                    rt.activation_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.rpc_h2d_bytes.store(
+                    rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            ("rpc".into(), allpaca_hip::allocated_bytes())
+        } else if self.hip.is_some() {
             ("hip".into(), allpaca_hip::allocated_bytes())
         } else {
             #[cfg(feature = "cuda")]
@@ -611,6 +681,7 @@ impl Engine {
         let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
         self.apply_weight_working_set(&mut target)?;
         self.apply_expert_lru(&mut target)?;
+        self.attach_rpc(&mut target)?;
         inner.target = Some(Arc::new(target));
         if inner.flags.draft_model_speculation {
             let mut draft = TinyModel::synthetic(
@@ -631,6 +702,35 @@ impl Engine {
             vocab = cfg.vocab_size,
             layers = cfg.n_layers,
             "loaded synthetic model"
+        );
+        Ok(())
+    }
+
+    fn attach_rpc(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
+        let Some(rt) = &self.rpc else {
+            return Ok(());
+        };
+        let local_bytes = if let Some(hip) = &self.hip {
+            allpaca_hip::device_memory_info(hip.device)
+                .map(|(_, total)| total)
+                .unwrap_or(1 << 30)
+        } else {
+            8 << 30
+        };
+        rt.prepare(
+            model,
+            local_bytes,
+            self.config.rpc.tensor_split.as_deref(),
+            self.config.rpc.max_seq,
+        )?;
+        model.rpc = Some(Arc::clone(rt));
+        tracing::info!(
+            remote_layers = rt
+                .plan_has_remote()
+                .then_some("yes")
+                .unwrap_or("no"),
+            sessions = rt.session_count(),
+            "rpc layer plan ready"
         );
         Ok(())
     }
@@ -811,6 +911,7 @@ impl Engine {
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
+        self.attach_rpc(&mut model)?;
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -840,6 +941,7 @@ impl Engine {
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
+        self.attach_rpc(&mut model)?;
         let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -921,6 +1023,7 @@ impl Engine {
             model.early_exit.min_calibration_margin =
                 self.config.early_exit.min_calibration_margin;
         }
+        self.attach_rpc(&mut model)?;
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
@@ -1028,7 +1131,16 @@ impl Engine {
         prompt: &str,
         params: GenerationParams,
     ) -> Result<GenerationOutput, AllpacaError> {
-        let mut handle = self.begin_request(prompt, params)?;
+        self.generate_multimodal(prompt, &[], params)
+    }
+
+    pub fn generate_multimodal(
+        &self,
+        prompt: &str,
+        images: &[crate::ImageInput],
+        params: GenerationParams,
+    ) -> Result<GenerationOutput, AllpacaError> {
+        let mut handle = self.begin_request_multimodal(prompt, images, params)?;
         let mut token_ids = Vec::new();
         let finish = self.drive_request(&mut handle, |ev| {
             token_ids.push(ev.token_id);
@@ -1057,10 +1169,19 @@ impl Engine {
         prompt: String,
         params: GenerationParams,
     ) -> impl Stream<Item = Result<TokenEvent, AllpacaError>> + Send {
+        self.generate_stream_multimodal(prompt, Vec::new(), params)
+    }
+
+    pub fn generate_stream_multimodal(
+        &self,
+        prompt: String,
+        images: Vec<crate::ImageInput>,
+        params: GenerationParams,
+    ) -> impl Stream<Item = Result<TokenEvent, AllpacaError>> + Send {
         let engine = self.clone();
         let use_fair = engine.config.engine.max_active_requests > 1;
         async_stream::stream! {
-            let mut handle = match engine.begin_request(&prompt, params) {
+            let mut handle = match engine.begin_request_multimodal(&prompt, &images, params) {
                 Ok(h) => h,
                 Err(e) => {
                     yield Err(e);
@@ -1200,6 +1321,15 @@ impl Engine {
     pub fn begin_request(
         &self,
         prompt: &str,
+        params: GenerationParams,
+    ) -> Result<RequestHandle, AllpacaError> {
+        self.begin_request_with_vision(prompt, None, params)
+    }
+
+    fn begin_request_with_vision(
+        &self,
+        prompt: &str,
+        vision: Option<crate::VisionTokens>,
         mut params: GenerationParams,
     ) -> Result<RequestHandle, AllpacaError> {
         if params.max_tokens == 0 {
@@ -1223,6 +1353,36 @@ impl Engine {
                 )));
             }
         }
+        let dim = inner
+            .target
+            .as_ref()
+            .map(|m| m.config.dim)
+            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let (vision_prefix_len, vision_embeds) = match vision {
+            None => (0, Vec::new()),
+            Some(v) => {
+                let need = v
+                    .n_tokens
+                    .checked_mul(dim)
+                    .ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::InvalidConfig(
+                            "vision soft token size overflow".into(),
+                        ))
+                    })?;
+                if v.embeddings.len() != need {
+                    return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                        "vision embeddings len {} != n_tokens {} * dim {}",
+                        v.embeddings.len(),
+                        v.n_tokens,
+                        dim
+                    ))));
+                }
+                let mut prefixed = vec![0u32; v.n_tokens];
+                prefixed.append(&mut tokens);
+                tokens = prefixed;
+                (v.n_tokens, v.embeddings)
+            }
+        };
         for id in tokenizer.stop_token_ids() {
             if !params.stop_token_ids.contains(&id) {
                 params.stop_token_ids.push(id);
@@ -1250,25 +1410,28 @@ impl Engine {
             None
         };
         let mut prefill_pos = 0;
-        if let Some((state, rows, n)) = inner.anchors.lookup(&tokens) {
-            restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
-            if let Some(dst) = recurrent.as_mut() {
-                *dst = state;
-            }
-            prefill_pos = n;
-        }
-        if let Some((n, cp)) = inner
-            .kv_radix
-            .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
-        {
-            if n > prefill_pos {
-                restore_kv(&mut inner.kv, &pages, &cp.kv, &target.config)?;
+        // Soft vision prefixes are not text anchors / radix keys yet.
+        if vision_prefix_len == 0 {
+            if let Some((state, rows, n)) = inner.anchors.lookup(&tokens) {
+                restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
                 if let Some(dst) = recurrent.as_mut() {
-                    *dst = cp.recurrent;
-                } else if target.config.recurrent {
-                    recurrent = Some(cp.recurrent);
+                    *dst = state;
                 }
                 prefill_pos = n;
+            }
+            if let Some((n, cp)) = inner
+                .kv_radix
+                .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
+            {
+                if n > prefill_pos {
+                    restore_kv(&mut inner.kv, &pages, &cp.kv, &target.config)?;
+                    if let Some(dst) = recurrent.as_mut() {
+                        *dst = cp.recurrent;
+                    } else if target.config.recurrent {
+                        recurrent = Some(cp.recurrent);
+                    }
+                    prefill_pos = n;
+                }
             }
         }
         let rng = rng_from_params(&params, self.config.engine.determinism_seed);
@@ -1299,7 +1462,6 @@ impl Engine {
         inner.draft_ahead = None;
         inner.draft_kv.reset();
         let prompt_len = tokens.len();
-        let dim = inner.target.as_ref().map(|m| m.config.dim).unwrap_or(0);
         inner.active.insert(
             id,
             ActiveRequest {
@@ -1325,6 +1487,8 @@ impl Engine {
                 decode_step: 0,
                 moe_norm: vec![0.0f32; dim],
                 last_hidden: vec![0.0f32; dim],
+                vision_prefix_len,
+                vision_embeds,
             },
         );
         if self.config.structured_output.async_masks {
@@ -1425,6 +1589,38 @@ impl Engine {
                         if let Some(c) = plan.cpu {
                             stagger_partner = Some(c.request_id);
                         }
+                    }
+                    // Soft packed-GEMM plan: execute remains one-at-a-time until kernels land.
+                    let shape = inner
+                        .target
+                        .as_ref()
+                        .map(|m| ModelShapeKey {
+                            n_layers: m.config.n_layers,
+                            dim: m.config.dim,
+                            vocab_size: m.config.vocab_size,
+                        })
+                        .unwrap_or(ModelShapeKey {
+                            n_layers: n_layers,
+                            dim: 0,
+                            vocab_size: 0,
+                        });
+                    let gemm_cands: Vec<BatchGemmCandidate> = candidates
+                        .iter()
+                        .map(|(rid, _, pref)| BatchGemmCandidate {
+                            request_id: *rid,
+                            phase: if *pref {
+                                BatchGemmPhase::Prefill
+                            } else {
+                                BatchGemmPhase::Decode
+                            },
+                            shape,
+                            m_tokens: if *pref { 0 } else { 1 },
+                        })
+                        .collect();
+                    if plan_batch_gemm(&gemm_cands).is_some() {
+                        self.metrics
+                            .batch_gemm_plans
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 // Soft affinity from a prior failed same-tick partner step.
@@ -1904,6 +2100,14 @@ impl Engine {
             std::mem::take(&mut active.last_hidden)
         };
         // Per-token prefill so radix (and anchors) get correct mid-prefix checkpoints.
+        let (vision_prefix_len, vision_embeds, dim) = {
+            let active = request(inner, id)?;
+            (
+                active.vision_prefix_len,
+                active.vision_embeds.clone(),
+                target.config.dim,
+            )
+        };
         for (i, tok) in toks.iter().enumerate() {
             let pos = start + i;
             let last = pos + 1 >= total;
@@ -1924,6 +2128,11 @@ impl Engine {
                 ds_queue: None,
                 last_hidden: Some(&mut last_hidden),
             };
+            let soft = if pos < vision_prefix_len {
+                Some(&vision_embeds[pos * dim..(pos + 1) * dim])
+            } else {
+                None
+            };
             target.forward_token(
                 *tok,
                 pos,
@@ -1937,6 +2146,7 @@ impl Engine {
                 recurrent.as_mut(),
                 None,
                 Some(&mut decode_side),
+                soft,
             )?;
             let device_gdn = self
                 .hip
@@ -3734,6 +3944,7 @@ fn append_and_forward(
         recurrent.as_mut(),
         micro_batch,
         Some(&mut side),
+        None,
     )?;
     request_mut(inner, id)?.pending_logits = logits;
     request_mut(inner, id)?.recurrent = recurrent;
@@ -3788,6 +3999,416 @@ mod tests {
 
     fn test_engine() -> Engine {
         Engine::new(test_config()).unwrap()
+    }
+
+    fn spawn_hello_stub(
+        reply: allpaca_rpc::HelloReply,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{encode_hello_reply, write_reply, STATUS_OK};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = [0u8; 9];
+            stream.read_exact(&mut head).unwrap();
+            let size = u64::from_le_bytes(head[1..9].try_into().unwrap()) as usize;
+            if size > 0 {
+                let mut payload = vec![0u8; size];
+                stream.read_exact(&mut payload).unwrap();
+            }
+            write_reply(&mut stream, STATUS_OK, &encode_hello_reply(&reply)).unwrap();
+        });
+        (addr, worker)
+    }
+
+    fn hello_stub_reply(major: u16, minor: u16, kernel_abi_rev: u32) -> allpaca_rpc::HelloReply {
+        allpaca_rpc::HelloReply {
+            major,
+            minor,
+            patch: 0,
+            kernel_abi_rev,
+            backend: allpaca_rpc::RpcBackendKind::Cpu,
+            dtype_mask: 1,
+            device_name: "mismatch-stub".into(),
+            memory_bytes: 64 << 20,
+        }
+    }
+
+    #[test]
+    fn rpc_loopback_synthetic_generate() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.rpc.endpoints = vec![addr.to_string()];
+        cfg.rpc.max_seq = 64;
+        cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.rpc_roundtrips > 0,
+            "expected remote layer launches, got {}",
+            stats.rpc_roundtrips
+        );
+        drop(engine);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn rpc_layer_split_greedy_matches_cpu() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let mut cpu_cfg = test_config();
+        cpu_cfg.speculative.enabled = false;
+        let cpu = Engine::new(cpu_cfg).unwrap();
+        let cpu_ids = cpu
+            .generate("hello", params.clone())
+            .unwrap()
+            .token_ids;
+
+        let mut rpc_cfg = test_config();
+        rpc_cfg.speculative.enabled = false;
+        rpc_cfg.rpc.endpoints = vec![addr.to_string()];
+        rpc_cfg.rpc.max_seq = 64;
+        rpc_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let rpc = Engine::new(rpc_cfg).unwrap();
+        let rpc_out = rpc.generate("hello", params).unwrap();
+        let trips = rpc.stats().rpc_roundtrips;
+        drop(rpc);
+        worker.join().unwrap();
+
+        assert!(
+            trips > 0,
+            "parity test must exercise remote layers, rpc_roundtrips={trips}"
+        );
+        assert_eq!(rpc_out.token_ids, cpu_ids);
+    }
+
+    #[test]
+    fn tensor_split_changes_which_layers_run_on_rpc_server() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+            }
+        });
+
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let mut base = test_config();
+        base.speculative.enabled = false;
+        base.rpc.endpoints = vec![addr.to_string()];
+        base.rpc.max_seq = 64;
+
+        let mut local_cfg = base.clone();
+        local_cfg.rpc.tensor_split = None;
+        let local = Engine::new(local_cfg).unwrap();
+        assert!(!local.generate("hello", params.clone()).unwrap().token_ids.is_empty());
+        let local_trips = local.stats().rpc_roundtrips;
+        drop(local);
+
+        let mut split_cfg = base;
+        split_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let split = Engine::new(split_cfg).unwrap();
+        assert!(!split.generate("hello", params).unwrap().token_ids.is_empty());
+        let split_trips = split.stats().rpc_roundtrips;
+        drop(split);
+
+        assert_eq!(
+            local_trips, 0,
+            "default memory split keeps tiny layers local; got {local_trips}"
+        );
+        assert!(
+            split_trips > local_trips,
+            "even --tensor-split must run layers on the Rpc Server; local={local_trips} split={split_trips}"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn engine_new_is_fatal_when_rpc_hello_major_mismatches() {
+        use allpaca_rpc::{KERNEL_ABI_REV, PROTO_MAJOR};
+
+        let (addr, worker) = spawn_hello_stub(hello_stub_reply(
+            PROTO_MAJOR.wrapping_add(1),
+            0,
+            KERNEL_ABI_REV,
+        ));
+        let mut cfg = test_config();
+        cfg.rpc.endpoints = vec![addr];
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("HELLO major mismatch must refuse Engine::new"),
+            Err(e) => e,
+        };
+        assert!(
+            err.is_fatal(),
+            "HELLO major mismatch must be Fatal, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("version mismatch"),
+            "Fatal must name the version mismatch, got {msg}"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn engine_new_is_fatal_when_rpc_hello_minor_is_newer() {
+        use allpaca_rpc::{KERNEL_ABI_REV, PROTO_MAJOR, PROTO_MINOR};
+
+        let (addr, worker) = spawn_hello_stub(hello_stub_reply(
+            PROTO_MAJOR,
+            PROTO_MINOR.wrapping_add(1),
+            KERNEL_ABI_REV,
+        ));
+        let mut cfg = test_config();
+        cfg.rpc.endpoints = vec![addr];
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("newer HELLO minor must refuse Engine::new"),
+            Err(e) => e,
+        };
+        assert!(
+            err.is_fatal(),
+            "newer HELLO minor must be Fatal, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("version mismatch"),
+            "Fatal must name the version mismatch, got {msg}"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn engine_new_is_fatal_when_rpc_kernel_abi_is_newer() {
+        use allpaca_rpc::{KERNEL_ABI_REV, PROTO_MAJOR, PROTO_MINOR};
+
+        let (addr, worker) = spawn_hello_stub(hello_stub_reply(
+            PROTO_MAJOR,
+            PROTO_MINOR,
+            KERNEL_ABI_REV.saturating_add(1),
+        ));
+        let mut cfg = test_config();
+        cfg.rpc.endpoints = vec![addr];
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("newer kernel ABI must refuse Engine::new"),
+            Err(e) => e,
+        };
+        assert!(
+            err.is_fatal(),
+            "newer kernel ABI must be Fatal, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("abi"),
+            "Fatal must name the kernel ABI, got {msg}"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn engine_new_is_fatal_when_rpc_server_unreachable() {
+        let mut cfg = test_config();
+        cfg.rpc.endpoints = vec!["127.0.0.1:1".into()];
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("unreachable Rpc Server must refuse Engine::new"),
+            Err(e) => e,
+        };
+        assert!(
+            err.is_fatal(),
+            "unreachable Rpc Server must be Fatal, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rpc"),
+            "Fatal must name the Rpc path, got {msg}"
+        );
+    }
+
+    #[test]
+    fn engine_new_is_fatal_when_tensor_split_len_mismatches_devices() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.rpc.endpoints = vec![addr.to_string()];
+        cfg.rpc.tensor_split = Some(vec![1.0]);
+        let err = match Engine::new(cfg) {
+            Ok(_) => panic!("tensor_split length mismatch must refuse Engine::new"),
+            Err(e) => e,
+        };
+        let _ = worker.join();
+        assert!(
+            err.is_fatal(),
+            "tensor_split length mismatch must be Fatal, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tensor_split"),
+            "Fatal must name tensor_split, got {msg}"
+        );
+    }
+
+    #[test]
+    fn generate_is_fatal_when_rpc_server_drops() {
+        use std::net::{Shutdown, TcpListener};
+        use std::sync::mpsc;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            tx.send(stream.try_clone().unwrap()).unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.rpc.endpoints = vec![addr.to_string()];
+        cfg.rpc.max_seq = 64;
+        cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let engine = Engine::new(cfg).unwrap();
+        let peer = rx.recv().unwrap();
+        peer.shutdown(Shutdown::Both).unwrap();
+        drop(peer);
+
+        let err = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.is_fatal(),
+            "Rpc Server drop mid-generate must be Fatal, got {err}"
+        );
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn two_rpc_servers_greedy_matches_cpu() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a1 = l1.local_addr().unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let w1 = thread::spawn(move || {
+            let (stream, _) = l1.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+        let w2 = thread::spawn(move || {
+            let (stream, _) = l2.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let mut cpu_cfg = test_config();
+        cpu_cfg.speculative.enabled = false;
+        let cpu_ids = Engine::new(cpu_cfg)
+            .unwrap()
+            .generate("hello", params.clone())
+            .unwrap()
+            .token_ids;
+
+        let mut rpc_cfg = test_config();
+        rpc_cfg.speculative.enabled = false;
+        rpc_cfg.rpc.endpoints = vec![a1.to_string(), a2.to_string()];
+        rpc_cfg.rpc.max_seq = 64;
+        rpc_cfg.rpc.tensor_split = Some(vec![0.0, 1.0, 1.0]);
+        let rpc = Engine::new(rpc_cfg).unwrap();
+        let rpc_out = rpc.generate("hello", params).unwrap();
+        let trips = rpc.stats().rpc_roundtrips;
+        drop(rpc);
+        w1.join().unwrap();
+        w2.join().unwrap();
+
+        assert!(
+            trips >= 2,
+            "both Rpc Servers must run layers, rpc_roundtrips={trips}"
+        );
+        assert_eq!(rpc_out.token_ids, cpu_ids);
     }
 
     #[test]
@@ -4026,6 +4647,220 @@ mod tests {
             engine.stats()
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn text_only_generate_unchanged_with_vision_encoder() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let baseline = test_engine();
+        let out_a = baseline.generate("hello", params.clone()).unwrap();
+
+        let with_enc = test_engine();
+        with_enc
+            .set_vision_encoder(std::sync::Arc::new(crate::NoopVisionEncoder::new(Some(1))))
+            .unwrap();
+        let out_b = with_enc.generate("hello", params).unwrap();
+
+        assert_eq!(out_a.token_ids, out_b.token_ids);
+        assert_eq!(out_a.text, out_b.text);
+    }
+
+    #[derive(Clone)]
+    struct StubVisionEncoder {
+        n_tokens: usize,
+        dim: usize,
+        fill: f32,
+        device: Option<i32>,
+    }
+
+    impl crate::EncoderPlacement for StubVisionEncoder {
+        fn device(&self) -> Option<i32> {
+            self.device
+        }
+    }
+
+    impl crate::VisionEncoder for StubVisionEncoder {
+        fn encode(
+            &self,
+            images: &[crate::ImageInput],
+        ) -> Result<crate::VisionTokens, AllpacaError> {
+            if images.is_empty() {
+                return Ok(crate::VisionTokens::empty(self.device));
+            }
+            Ok(crate::VisionTokens {
+                embeddings: vec![self.fill; self.n_tokens * self.dim],
+                n_tokens: self.n_tokens,
+                device: self.device,
+            })
+        }
+    }
+
+    #[test]
+    fn multimodal_soft_prefix_counts_in_prompt_tokens() {
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let baseline = test_engine();
+        let out_text = baseline.generate("hi", params.clone()).unwrap();
+
+        let engine = test_engine();
+        engine
+            .set_vision_encoder(std::sync::Arc::new(StubVisionEncoder {
+                n_tokens: 2,
+                dim: 32,
+                fill: 0.25,
+                device: Some(1),
+            }))
+            .unwrap();
+        let images = [crate::ImageInput::new(vec![1, 2, 3], "image/png")];
+        let mut handle = engine
+            .begin_request_multimodal("hi", &images, params)
+            .unwrap();
+        let mut token_ids = Vec::new();
+        let finish = engine
+            .drive_request(&mut handle, |ev| {
+                token_ids.push(ev.token_id);
+                ev.finish_reason
+            })
+            .unwrap();
+        let prompt_tokens = handle_prompt_len(&handle, &engine.inner).unwrap();
+        assert_eq!(
+            prompt_tokens,
+            out_text.prompt_tokens + 2,
+            "vision soft tokens must prepend the text prompt"
+        );
+        assert!(!token_ids.is_empty());
+        assert!(matches!(
+            finish,
+            FinishReason::Length | FinishReason::Stop
+        ));
+    }
+
+    #[test]
+    fn multimodal_soft_embeds_change_generation() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let images = [crate::ImageInput::new(vec![1], "image/png")];
+        let run = |fill: f32| {
+            let engine = test_engine();
+            engine
+                .set_vision_encoder(std::sync::Arc::new(StubVisionEncoder {
+                    n_tokens: 2,
+                    dim: 32,
+                    fill,
+                    device: Some(1),
+                }))
+                .unwrap();
+            let mut handle = engine
+                .begin_request_multimodal("hi", &images, params.clone())
+                .unwrap();
+            let mut token_ids = Vec::new();
+            engine
+                .drive_request(&mut handle, |ev| {
+                    token_ids.push(ev.token_id);
+                    ev.finish_reason
+                })
+                .unwrap();
+            token_ids
+        };
+        let a = run(0.0);
+        let b = run(1.0);
+        assert_ne!(
+            a, b,
+            "distinct soft embeds must change greedy completions"
+        );
+    }
+
+    #[test]
+    fn multimodal_vision_shape_mismatch_is_fatal() {
+        let engine = test_engine();
+        engine
+            .set_vision_encoder(std::sync::Arc::new(StubVisionEncoder {
+                n_tokens: 2,
+                dim: 8, // tiny model dim is 32
+                fill: 0.5,
+                device: Some(1),
+            }))
+            .unwrap();
+        let images = [crate::ImageInput::new(vec![1], "image/png")];
+        let err = engine
+            .begin_request_multimodal(
+                "hi",
+                &images,
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
+        assert!(
+            err.to_string().contains("vision embeddings"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn multimodal_images_with_noop_are_degraded() {
+        let engine = test_engine();
+        engine
+            .set_vision_encoder(std::sync::Arc::new(crate::NoopVisionEncoder::new(Some(1))))
+            .unwrap();
+        let images = [crate::ImageInput::new(vec![1, 2, 3], "image/png")];
+        let err = engine
+            .begin_request_multimodal(
+                "hello",
+                &images,
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Degraded);
+        assert!(
+            err.to_string().contains("vision encoder"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn multimodal_images_without_encoder_are_degraded() {
+        let engine = test_engine();
+        let images = [crate::ImageInput::new(vec![9], "image/jpeg")];
+        let err = engine
+            .begin_request_multimodal(
+                "hello",
+                &images,
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.class(), allpaca_types::ErrorClass::Degraded);
+        assert!(
+            err.to_string().contains("not registered"),
+            "err={err}"
+        );
     }
 
     #[test]

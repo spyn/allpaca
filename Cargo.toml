@@ -8,6 +8,8 @@ members = [
     "crates/allpaca-gguf",
     "crates/allpaca-safetensors",
     "crates/allpaca-onnx",
+    "crates/allpaca-rpc",
+    "crates/allpaca-rpc-server",
     "crates/allpaca-core",
     "crates/allpaca-server",
     "tools/bench",
@@ -28,6 +30,7 @@ allpaca-onnx = { path = "crates/allpaca-onnx" }
 allpaca-hip = { path = "crates/allpaca-hip" }
 allpaca-cuda = { path = "crates/allpaca-cuda" }
 allpaca-cpu = { path = "crates/allpaca-cpu" }
+allpaca-rpc = { path = "crates/allpaca-rpc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -46,4 +49,5 @@ futures = "0.3"
 async-stream = "0.3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+base64 = "0.22"
 llguidance = "1.8"
