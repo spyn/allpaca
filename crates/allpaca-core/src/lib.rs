@@ -31,6 +31,7 @@ mod ssm;
 mod telemetry;
 mod tokenizer;
 mod transfer;
+mod vision;
 mod weight_set;
 
 pub use batch_gemm::{
@@ -55,6 +56,7 @@ pub use scheduler::Scheduler;
 pub use telemetry::Metrics;
 pub use tokenizer::EngineTokenizer;
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};
+pub use vision::PatchVisionEncoder;
 pub use weight_set::{
     expert_lru_slots, host_pool_slots, qstar_fill_count, DenseTrunkPlan, ExpertId, ExpertLru,
     WeightWorkingSet,

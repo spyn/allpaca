@@ -534,18 +534,28 @@ impl Default for HttpSection {
     }
 }
 
-/// Multimodal encoder placement (vision/audio runtime deferred).
+/// Multimodal encoder placement + optional vision weight path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MultimodalSection {
     /// Device for the vision encoder (`hip:N`, `cuda:N`, `cpu`, or unset/`auto`).
     pub vision_device: Option<DeviceSelector>,
+    /// SafeTensors with `patch_proj.weight` / optional `patch_proj.bias`.
+    /// When unset and `model.synthetic`, Engine installs deterministic patch weights.
+    pub vision_path: Option<PathBuf>,
+    /// Square resize before patching (must be multiple of `vision_patch`).
+    pub vision_image_size: u32,
+    /// Patch edge in pixels.
+    pub vision_patch: u32,
 }
 
 impl Default for MultimodalSection {
     fn default() -> Self {
         Self {
             vision_device: None,
+            vision_path: None,
+            vision_image_size: 64,
+            vision_patch: 16,
         }
     }
 }

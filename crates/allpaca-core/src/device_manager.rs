@@ -15,6 +15,7 @@ pub struct DeviceInventory {
     pub p2p_enabled: bool,
     pub target_device: i32,
     pub draft_device: i32,
+    pub vision_device: Option<i32>,
 }
 
 impl DeviceInventory {
@@ -60,6 +61,7 @@ impl DeviceInventory {
             p2p_enabled,
             target_device,
             draft_device,
+            ?vision_device,
             devices = devices.len(),
             "device inventory ready"
         );
@@ -72,7 +74,12 @@ impl DeviceInventory {
             p2p_enabled,
             target_device,
             draft_device,
+            vision_device,
         }
+    }
+
+    pub fn placement_vision_device(&self) -> Option<i32> {
+        self.vision_device
     }
 }
 

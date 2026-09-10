@@ -22,6 +22,7 @@ allpaca-rpc.workspace = true
 allpaca-types.workspace = true
 async-stream.workspace = true
 futures.workspace = true
+image.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
@@ -33,3 +34,4 @@ llguidance.workspace = true
 [dev-dependencies]
 allpaca-gguf.workspace = true
 allpaca-types.workspace = true
+reqwest.workspace = true

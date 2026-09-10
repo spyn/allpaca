@@ -26,7 +26,7 @@
 
 **Out (fast-follow):**
 - Full CUDA engine parity (weights/KV/attention on CUDA)
-- Multimodal http(s) image fetch + real vision weights (`data:` + local `image_url`, soft-prompt, streaming multimodal landed)
+- Multimodal http(s) fetch + AVIF via ffmpeg + patch-embed vision weights (`data:`/local/`https` image_url + soft-prompt landed; full ViT/CLIP checkpoint parity still deferred)
 - OpenTelemetry export (Prometheus text `/metrics` landed)
 - Batched HIP GEMM fused execute across Requests (planning seam + `batch_gemm_plans` landed; poll still advances one Request per tick)
 - CXL/PIM hardware backends (`MemoryTierBackend` trait + `PinnedDramBackend` / stubs landed)
@@ -62,7 +62,7 @@
 | **CPU Fallback** | A slow but functional kernel implementation using AVX2 intrinsics. Required for every operation so the engine runs without GPU. |
 | **Tokenizer** | Converts text ↔ tokens. Uses HuggingFace `tokenizers` crate. Vocab comes from GGUF metadata or a SafeTensors/ONNX sidecar JSON; decoupled from weight layout. GGUF `tokenizer.ggml.model = gpt2` (Llama-3) encodes with BPE plus a ByteLevel pre-tokenizer/decoder (`add_prefix_space = false`) so spaces become `Ġ` pieces before merges; WordLevel+Whitespace is only the non-gpt2 fallback. Decode maps GPT-2 `Ġ` (U+0120) and SentencePiece `▁` (U+2581) to spaces, and `<0xHH>` byte tokens to bytes. |
 | **Telemetry** | Internal metrics (TTFT, ITL, acceptance rate, `draft_ahead_hits`, page migrations, HIP decode profile buckets `q8_gemm_us` / `attention_us` / `lm_head_us` / `other_gpu_us` / `host_us`) stored in memory, exposed via `/stats` JSON and Prometheus text on `/metrics` (`allpaca_` prefixed). On HIP, `host_us` is the ITL remainder after GPU kernel events so the profile sum tracks token spacing. Uses `tracing` crate for structured logs. OpenTelemetry export is still post-MVP. |
-| **Multimodal** | Vision/audio encoder support. Placement API (`EncoderPlacement` / `VisionEncoder` / `NoopVisionEncoder`) and `multimodal.vision_device` → `Placement.vision_device`. Server accepts OpenAI-style `content` parts with local-file or `data:` base64 `image_url`; `generate_multimodal` / `generate_stream_multimodal` encode then soft-prefill. Missing/noop encoder → Degraded. http(s) fetch and real vision weights still deferred. |
+| **Multimodal** | Vision/audio encoder support. Placement API + `PatchVisionEncoder` (SafeTensors `patch_proj.weight`/`bias`, CPU patch-embed). Server accepts OpenAI `content` parts with local, `data:`, or http(s) `image_url` (AVIF via `ffmpeg` when `image` cannot decode). Soft-prompt inject into prefill. Full ViT/CLIP residency on 9060 XT still deferred. |
 | **Transfer Path** | The mechanism for moving tensors between devices. At boot the engine queries `hipDeviceCanAccessPeer`, enables both directions (`hipDeviceEnablePeerAccess`), re-queries, then benchmarks that enable+peer-copy against host staging (GPU→DRAM→GPU). `P2p` is chosen only when enable+copy succeed and measured P2P is not slower than host staging by more than 10% (`P2P_MAX_SLOWER_FRACTION`). Host staging is the fallback when P2P is unavailable or slower. Never assume P2P is faster. Speculative generate does **not** require P2P: target stays on the fast GPU, draft stays on the slow GPU, and only token-scale payloads are host-staged (`host_staging_bytes` / `draft_tokens_copied`; `weight_bytes_migrated` stays 0). |
 | **Configuration** | Engine settings loaded from TOML file, overridable by CLI flags. Compiled defaults for unspecified values. No env vars or runtime API in MVP. |
 

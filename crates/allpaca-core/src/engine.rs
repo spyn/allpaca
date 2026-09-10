@@ -298,7 +298,43 @@ impl Engine {
         } else if let Some(path) = &config.model.path {
             engine.load_model_path(path)?;
         }
+        engine.install_vision_encoder_from_config()?;
         Ok(engine)
+    }
+
+    fn install_vision_encoder_from_config(&self) -> Result<(), AllpacaError> {
+        let mm = &self.config.multimodal;
+        let out_dim = {
+            let inner = self.lock()?;
+            inner.target.as_ref().map(|m| m.config.dim)
+        };
+        let Some(out_dim) = out_dim else {
+            return Ok(());
+        };
+        let device = self.inventory.placement_vision_device();
+        let image_size = if mm.vision_image_size == 0 {
+            crate::vision::DEFAULT_IMAGE_SIZE
+        } else {
+            mm.vision_image_size
+        };
+        let patch = if mm.vision_patch == 0 {
+            crate::vision::DEFAULT_PATCH_SIZE
+        } else {
+            mm.vision_patch
+        };
+        if let Some(path) = &mm.vision_path {
+            let enc = crate::PatchVisionEncoder::load(path, device, out_dim, image_size, patch)?;
+            tracing::info!(
+                path = %path.display(),
+                out_dim,
+                image_size,
+                patch,
+                ?device,
+                "loaded patch vision encoder weights"
+            );
+            self.set_vision_encoder(Arc::new(enc))?;
+        }
+        Ok(())
     }
 
     pub fn inventory(&self) -> &DeviceInventory {

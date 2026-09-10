@@ -316,8 +316,9 @@ Deliverables:
 
 - encoder placement API (`EncoderPlacement` / `VisionEncoder` / `NoopVisionEncoder`, `multimodal.vision_device` → `Placement.vision_device`) — **landed**;
 - encode + soft-prompt inject (`ImageInput` / `VisionTokens`, `begin_request_multimodal` / `generate_multimodal` / `generate_stream_multimodal`, prefill `soft_x`) — **landed**;
-- OpenAI `image_url` content parts for **local file paths** and **`data:` base64** — **landed**;
-- http(s) image fetch + real vision/audio residency on 9060 XT — **deferred**.
+- OpenAI `image_url` for **local**, **`data:` base64**, and **http(s)** (AVIF via ffmpeg) — **landed**;
+- CPU patch-embed vision weights (`multimodal.vision_path` SafeTensors, `PatchVisionEncoder`) — **landed**;
+- full ViT/CLIP audio/vision residency on 9060 XT — **deferred**.
 
 Exit gate: improved concurrency/VRAM stability under multimodal workload.
 
@@ -394,6 +395,9 @@ structured_output:
 
 multimodal:
   vision_device: hip:1
+  vision_path: models/vision_patch_dim32.safetensors
+  vision_image_size: 64
+  vision_patch: 16
 ```
 
 ## 11. Observability

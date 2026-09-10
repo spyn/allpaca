@@ -32,14 +32,14 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: MessageContent,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
@@ -52,7 +52,7 @@ impl Default for MessageContent {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
@@ -61,7 +61,7 @@ pub enum ContentPart {
     ImageUrl { image_url: ImageUrlSpec },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ImageUrlSpec {
     pub url: String,
 }
@@ -182,6 +182,9 @@ fn load_image_url(url: &str) -> Result<ImageInput, AllpacaError> {
     if raw.starts_with("data:") {
         return load_data_uri(raw);
     }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return fetch_http_image(raw);
+    }
     let path = resolve_image_path(raw)?;
     let bytes = std::fs::read(&path).map_err(|e| {
         AllpacaError::Fatal(FatalError::Io(format!(
@@ -191,6 +194,42 @@ fn load_image_url(url: &str) -> Result<ImageInput, AllpacaError> {
     })?;
     let mime = mime_from_path(&path);
     Ok(ImageInput::new(bytes, mime))
+}
+
+fn fetch_http_image(url: &str) -> Result<ImageInput, AllpacaError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("allpaca/0.1")
+        .build()
+        .map_err(|e| {
+            AllpacaError::Fatal(FatalError::Io(format!("http client init: {e}")))
+        })?;
+    let resp = client.get(url).send().map_err(|e| {
+        AllpacaError::Fatal(FatalError::Io(format!("fetch image_url: {e}")))
+    })?;
+    if !resp.status().is_success() {
+        return Err(AllpacaError::Fatal(FatalError::Io(format!(
+            "fetch image_url {}: HTTP {}",
+            url,
+            resp.status()
+        ))));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
+        .filter(|s| s.starts_with("image/"))
+        .unwrap_or_else(|| mime_from_url_path(url));
+    let bytes = resp.bytes().map_err(|e| {
+        AllpacaError::Fatal(FatalError::Io(format!("read image_url body: {e}")))
+    })?;
+    Ok(ImageInput::new(bytes.to_vec(), mime))
+}
+
+fn mime_from_url_path(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    mime_from_path(std::path::Path::new(path))
 }
 
 fn load_data_uri(url: &str) -> Result<ImageInput, AllpacaError> {
@@ -242,7 +281,7 @@ fn resolve_image_path(url: &str) -> Result<std::path::PathBuf, AllpacaError> {
         std::path::PathBuf::from(rest)
     } else if raw.starts_with("http://") || raw.starts_with("https://") {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-            "http(s) image_url fetch is not supported yet".into(),
+            "http(s) image_url must be handled by load_image_url".into(),
         )));
     } else if raw.starts_with("data:") {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
@@ -270,6 +309,7 @@ fn mime_from_path(path: &std::path::Path) -> String {
         Some("png") => "image/png".into(),
         Some("gif") => "image/gif".into(),
         Some("webp") => "image/webp".into(),
+        Some("avif") => "image/avif".into(),
         Some("jpg") | Some("jpeg") => "image/jpeg".into(),
         _ => "application/octet-stream".into(),
     }
@@ -321,9 +361,21 @@ async fn chat_completions(
         )
             .into_response();
     }
-    let (prompt, images) = match messages_to_prompt_and_images(&req.messages) {
-        Ok(v) => v,
-        Err(e) => return error_response(e),
+    let messages = req.messages.clone();
+    let (prompt, images) = match tokio::task::spawn_blocking(move || {
+        messages_to_prompt_and_images(&messages)
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return error_response(e),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"message": e.to_string(), "type": "fatal"}})),
+            )
+                .into_response();
+        }
     };
     let params = params_from_request(&req, &state.config);
     let model = req
@@ -961,6 +1013,27 @@ mod tests {
     }
 
     #[test]
+    fn image_url_fetches_https_avif_yeelight() {
+        let url = "https://spyn.dev/_astro/yeelight.B4dLTFRe_2tsYNB.avif";
+        let img = load_image_url(url).expect("https fetch must succeed");
+        assert!(
+            img.mime == "image/avif" || img.mime.starts_with("image/"),
+            "mime={}",
+            img.mime
+        );
+        assert!(
+            img.bytes.len() > 10_000,
+            "expected avif body, got {} bytes",
+            img.bytes.len()
+        );
+        // AVIF magic / ftyp brand
+        assert!(
+            img.bytes.windows(4).any(|w| w == b"ftyp") || img.bytes[4..8] == *b"ftyp",
+            "missing ftyp brand in avif"
+        );
+    }
+
+    #[test]
     fn image_url_loads_data_uri_base64() {
         // Minimal JPEG SOI marker payload, base64-encoded.
         let raw = [0xFFu8, 0xD8, 0xFF, 0xD9];
@@ -1137,6 +1210,65 @@ mod tests {
             prompt_tokens,
             text_only.prompt_tokens as u64 + 2,
             "soft vision tokens must increase prompt_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_https_avif_with_vision_weights() {
+        let vision = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/vision_patch_dim32.safetensors");
+        if !vision.is_file() {
+            let enc = allpaca_core::PatchVisionEncoder::synthetic(None, 32, 42).unwrap();
+            enc.write_safetensors(&vision).unwrap();
+        }
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(1),
+            ..CliOverrides::default()
+        });
+        cfg.multimodal.vision_path = Some(vision);
+        let state = AppState {
+            engine: Arc::new(Engine::new(cfg.clone()).unwrap()),
+            config: cfg,
+        };
+        let app = router(state);
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what product is this?"},
+                    {"type": "image_url", "image_url": {
+                        "url": "https://spyn.dev/_astro/yeelight.B4dLTFRe_2tsYNB.avif"
+                    }}
+                ]
+            }],
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("error").is_none(), "json={json}");
+        assert!(json["choices"][0]["message"]["content"].is_string());
+        // text-only "what product..." is short; +16 vision patches for 64/16
+        assert!(
+            json["usage"]["prompt_tokens"].as_u64().unwrap() >= 16,
+            "prompt_tokens should include vision soft tokens; json={json}"
         );
     }
 

@@ -1,7 +1,7 @@
 //! Multimodal encoder placement + encode API.
 //!
-//! Config + scheduler expose `vision_device`; real vision weights are still deferred.
-//! `NoopVisionEncoder` is a placement-aware stub used until a checkpoint encoder lands.
+//! Config + scheduler expose `vision_device`. [`crate::PatchVisionEncoder`] loads
+//! real F32 patch-proj weights; [`NoopVisionEncoder`] stays for placement-only stubs.
 
 use allpaca_types::{AllpacaError, DegradedError};
 
