@@ -326,10 +326,10 @@ Exit gate: improved concurrency/VRAM stability under multimodal workload.
 
 Deliverables:
 
-- model manifest extension,
-- exit-head interface,
-- self-speculative verification mode,
-- calibration data.
+- model manifest extension (`allpaca.early_exit.*` GGUF) — **landed**;
+- exit-head interface (`blk.{i}.exit_head.weight` + shared lm_head) — **landed**;
+- self-speculative verification mode — **landed**;
+- calibration data (`calibration_version` / `requires_verification` metadata) — **landed**.
 
 Exit gate: correctness preserved and measurable speedup on compatible checkpoints.
 

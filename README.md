@@ -144,6 +144,8 @@ Gated HIP soaks (when weights are present locally):
 | `ALLPACA_ROCMFP4_GGUF` / `ALLPACA_QWEN_GGUF` | Explicit ROCmFP4 GGUF path (probe always discovers under `models/`) |
 | `ALLPACA_DEMO=1` | Asymmetric draft vs greedy tok/s |
 | `ALLPACA_OVERNIGHT=1` | Long draft soak |
+| `ALLPACA_OVERNIGHT_9060=1` | Dual-GPU bakeoff: optional HIP:1 soak (prefers Q8) |
+| `ALLPACA_OVERNIGHT_9060_Q8=0` | Force F16 for the 9060 soak leg |
 
 ### Bench helper
 

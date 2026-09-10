@@ -47,6 +47,17 @@ impl VisionTokens {
 /// Vision encoder: place on `vision_device`, produce soft tokens for the Target Model.
 pub trait VisionEncoder: EncoderPlacement {
     fn encode(&self, images: &[ImageInput]) -> Result<VisionTokens, AllpacaError>;
+
+    /// Upload encoder weights to `hip_device` when supported. Default: no-op.
+    fn ensure_device_resident(&self, hip_device: Option<i32>) -> Result<u64, AllpacaError> {
+        let _ = hip_device;
+        Ok(0)
+    }
+
+    /// Resident weight bytes in device memory (0 until upload).
+    fn weight_bytes_on_device(&self) -> u64 {
+        0
+    }
 }
 
 /// Stub vision encoder: placement only until real weights land.

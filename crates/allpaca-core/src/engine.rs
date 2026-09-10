@@ -20,15 +20,17 @@ use crate::direct_storage::{
     probe_direct_storage, DirectStorageBridge, DirectStorageProbe, DirectStorageQueue,
 };
 use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
-use crate::early_exit::{gate_unsupported, EarlyExitSpec};
+use crate::early_exit::gate_unsupported;
+#[cfg(test)]
+use crate::early_exit::EarlyExitSpec;
 use crate::expert_batch::MicroBatchExpertUnion;
 use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::batch_gemm::{
-    batch_gemm_other_ids, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan,
-    ModelShapeKey,
+    batch_gemm_other_ids, packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate,
+    BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
 };
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
@@ -96,6 +98,8 @@ struct EngineInner {
     model_id: String,
     target_resident: Option<Arc<ResidentModel>>,
     draft_resident: Option<Arc<ResidentModel>>,
+    #[cfg(feature = "cuda")]
+    target_cuda_resident: Option<Arc<crate::CudaResidentModel>>,
     draft_kv: DenseKv,
     draft_ahead: Option<DraftAhead>,
     anchors: AnchorCache,
@@ -129,6 +133,8 @@ struct DecodePollHooks<'a> {
     layer_stagger: Option<&'a LayerStagger>,
     ds_probe: &'a DirectStorageProbe,
     ds_queue: &'a DirectStorageQueue,
+    #[cfg(feature = "cuda")]
+    cuda: Option<&'a allpaca_cuda::CudaWorkspace>,
 }
 
 #[derive(Clone)]
@@ -266,6 +272,8 @@ impl Engine {
             model_id: config.model.id.clone(),
             target_resident: None,
             draft_resident: None,
+            #[cfg(feature = "cuda")]
+            target_cuda_resident: None,
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
@@ -368,10 +376,21 @@ impl Engine {
     }
 
     /// Register a vision encoder for multimodal Requests. Text-only generate is unchanged.
+    /// When the encoder's placement matches a HIP workspace, uploads weights once and
+    /// records [`Metrics::vision_weight_bytes_on_device`].
     pub fn set_vision_encoder(
         &self,
         encoder: Arc<dyn crate::VisionEncoder>,
     ) -> Result<(), AllpacaError> {
+        let hip_dev = encoder.device().and_then(|d| {
+            self.hip_workspace_for_device(d).map(|h| h.device)
+        });
+        let bytes = encoder.ensure_device_resident(hip_dev)?;
+        if bytes > 0 {
+            self.metrics
+                .vision_weight_bytes_on_device
+                .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
         self.lock()?.vision_encoder = Some(encoder);
         Ok(())
     }
@@ -1183,6 +1202,44 @@ impl Engine {
         } else {
             None
         };
+        #[cfg(feature = "cuda")]
+        {
+            let target = inner.target.clone();
+            inner.target_cuda_resident = if self.hip.is_none() {
+                if let (Some(cuda), Some(target)) = (&self.cuda, target) {
+                    if target.host_weights_ready() {
+                        match crate::CudaResidentModel::upload(&target, cuda.device) {
+                            Ok(resident) => {
+                                weight_bytes += resident.bytes();
+                                h2d += resident.packed_h2d_bytes();
+                                tracing::info!(
+                                    device = cuda.device,
+                                    bytes = resident.bytes(),
+                                    "CUDA target weight upload"
+                                );
+                                Some(Arc::new(resident))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "CUDA target weight upload failed; CPU forward"
+                                );
+                                self.metrics
+                                    .degraded_events
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        }
         self.metrics
             .weight_bytes_on_device
             .store(weight_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -1937,6 +1994,22 @@ impl Engine {
                 self.metrics
                     .batch_gemm_executes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Real packed HIP path: cohort activations × shared Target weight.
+                if let Some(hip) = self.hip.as_ref() {
+                    let m = batch_gemm_plan
+                        .as_ref()
+                        .map(|p| p.m_tokens)
+                        .unwrap_or(0);
+                    if m >= 2 {
+                        if let Some(plan) = batch_gemm_plan.as_ref() {
+                            if self.try_packed_batch_gemm_hip(hip, plan) {
+                                self.metrics
+                                    .batch_gemm_hip_kernels
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
             }
             self.layer_stagger.end();
             self.note_elastic_pressure_after_decode()?;
@@ -1945,6 +2018,72 @@ impl Engine {
                 result: primary,
             }));
         }
+    }
+
+    /// One packed HIP `gemm_nt` over cohort activations and a shared Target weight matrix.
+    /// Returns true only when real A/B were launched successfully (no synthetic diagnostic).
+    fn try_packed_batch_gemm_hip(
+        &self,
+        hip: &HipWorkspace,
+        plan: &BatchGemmPlan,
+    ) -> bool {
+        let Ok(inner) = self.lock() else {
+            return false;
+        };
+        let Some(target) = inner.target.clone() else {
+            return false;
+        };
+        let dim = target.config.dim;
+        if dim == 0 || plan.request_ids.len() < 2 {
+            return false;
+        }
+        let (b, n, k) = if let Some(wq) = target
+            .layers
+            .iter()
+            .map(|l| l.wq.as_slice())
+            .find(|wq| wq.len() >= dim * dim)
+        {
+            (wq[..dim * dim].to_vec(), dim, dim)
+        } else if !target.lm_head.is_empty()
+            && target.lm_head.len() % dim == 0
+            && target.lm_head.len() / dim >= 1
+        {
+            let n = target.lm_head.len() / dim;
+            (target.lm_head.clone(), n, dim)
+        } else {
+            return false;
+        };
+        let mut a_rows: Vec<Vec<f32>> = Vec::with_capacity(plan.request_ids.len());
+        for &rid in &plan.request_ids {
+            let Some(req) = inner.active.get(&rid) else {
+                return false;
+            };
+            let row = if req.last_hidden.len() == dim {
+                req.last_hidden.clone()
+            } else if req.moe_norm.len() == dim {
+                req.moe_norm.clone()
+            } else if let Some(&tok) = req.tokens.last() {
+                let start = (tok as usize).saturating_mul(dim);
+                if target.embed.len() >= start + dim {
+                    target.embed[start..start + dim].to_vec()
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            };
+            a_rows.push(row);
+        }
+        drop(inner);
+
+        let mut c_rows: Vec<Vec<f32>> = a_rows
+            .iter()
+            .map(|a| vec![0.0f32; (a.len() / k) * n])
+            .collect();
+        let a_refs: Vec<&[f32]> = a_rows.iter().map(|v| v.as_slice()).collect();
+        let mut c_refs: Vec<&mut [f32]> =
+            c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        packed_gemm_nt_hip(hip, &a_refs, &b, &mut c_refs, n, k).is_ok()
     }
 
     fn step_id(&self, id: u64) -> Result<StepResult, AllpacaError> {
@@ -2044,6 +2183,8 @@ impl Engine {
             layer_stagger: Some(self.layer_stagger.as_ref()),
             ds_probe: &self.ds_probe,
             ds_queue: &self.ds_queue,
+            #[cfg(feature = "cuda")]
+            cuda: self.cuda.as_deref(),
         };
         let produced = if use_tree {
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
@@ -2224,6 +2365,8 @@ impl Engine {
             .clone()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
         let resident = inner.target_resident.clone();
+        #[cfg(feature = "cuda")]
+        let cuda_resident = inner.target_cuda_resident.clone();
         let mut logits = {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.pending_logits)
@@ -2272,21 +2415,61 @@ impl Engine {
             } else {
                 None
             };
-            target.forward_token(
-                *tok,
-                pos,
-                &pages,
-                &mut inner.kv,
-                &self.metrics,
-                &mut logits,
-                self.hip.as_deref(),
-                resident.as_deref(),
-                last || write_logits,
-                recurrent.as_mut(),
-                None,
-                Some(&mut decode_side),
-                soft,
-            )?;
+            let used_cuda = {
+                #[cfg(feature = "cuda")]
+                {
+                    let mut used = false;
+                    if self.hip.is_none() {
+                        if let (Some(cuda), Some(cres)) =
+                            (self.cuda.as_deref(), cuda_resident.as_deref())
+                        {
+                            match target.forward_token_cuda(
+                                *tok,
+                                pos,
+                                &pages,
+                                &mut inner.kv,
+                                &self.metrics,
+                                &mut logits,
+                                cuda,
+                                cres,
+                                soft,
+                            ) {
+                                Ok(()) => used = true,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        pos,
+                                        token = *tok,
+                                        error = %e,
+                                        "CUDA on-device decode failed; host fallback"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    used
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    false
+                }
+            };
+            if !used_cuda {
+                target.forward_token(
+                    *tok,
+                    pos,
+                    &pages,
+                    &mut inner.kv,
+                    &self.metrics,
+                    &mut logits,
+                    self.hip.as_deref(),
+                    resident.as_deref(),
+                    last || write_logits,
+                    recurrent.as_mut(),
+                    None,
+                    Some(&mut decode_side),
+                    soft,
+                )?;
+            }
             let device_gdn = self
                 .hip
                 .as_ref()
@@ -2520,6 +2703,8 @@ impl Engine {
                         exit_layers,
                         min_confidence: self.config.early_exit.min_confidence,
                         min_calibration_margin: self.config.early_exit.min_calibration_margin,
+                        calibration_version: Some("test-v1".into()),
+                        requires_verification: true,
                     };
                 }
             }
@@ -3232,6 +3417,8 @@ fn verify_and_sample(
         hooks.layer_stagger,
         Some(hooks.ds_probe),
         Some(hooks.ds_queue),
+        #[cfg(feature = "cuda")]
+        hooks.cuda,
     )?;
     if stop || !first_match || draft_iter.peek().is_none() {
         return finish_linear_verify(
@@ -3279,6 +3466,8 @@ fn verify_and_sample(
             hooks.layer_stagger,
             Some(hooks.ds_probe),
             Some(hooks.ds_queue),
+            #[cfg(feature = "cuda")]
+            hooks.cuda,
         )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || !matched || draft_iter.peek().is_none() {
@@ -3894,6 +4083,8 @@ fn packed_linear_verify_span(
             hooks.layer_stagger,
             Some(hooks.ds_probe),
             Some(hooks.ds_queue),
+            #[cfg(feature = "cuda")]
+            hooks.cuda,
         )?;
     } else {
         let off = keep.saturating_sub(1) * vocab;
@@ -3989,6 +4180,8 @@ fn verify_forest(
             hooks.layer_stagger,
             Some(hooks.ds_probe),
             Some(hooks.ds_queue),
+            #[cfg(feature = "cuda")]
+            hooks.cuda,
         )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || child.is_none() || forest.children(parent).next().is_none() {
@@ -4027,6 +4220,7 @@ fn append_and_forward(
     layer_stagger: Option<&LayerStagger>,
     ds_probe: Option<&DirectStorageProbe>,
     ds_queue: Option<&DirectStorageQueue>,
+    #[cfg(feature = "cuda")] cuda: Option<&allpaca_cuda::CudaWorkspace>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
     let page_tokens = request(inner, id)?
@@ -4061,6 +4255,8 @@ fn append_and_forward(
     let mut logits = std::mem::take(&mut request_mut(inner, id)?.pending_logits);
     let pages = request(inner, id)?.pages.clone();
     let resident = inner.target_resident.clone();
+    #[cfg(feature = "cuda")]
+    let cuda_resident = inner.target_cuda_resident.clone();
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     let mut moe_norm = std::mem::take(&mut request_mut(inner, id)?.moe_norm);
     let mut last_hidden = std::mem::take(&mut request_mut(inner, id)?.last_hidden);
@@ -4073,21 +4269,59 @@ fn append_and_forward(
         ds_queue,
         last_hidden: Some(&mut last_hidden),
     };
-    target.forward_token(
-        token,
-        pos,
-        &pages,
-        &mut inner.kv,
-        metrics,
-        &mut logits,
-        hip,
-        resident.as_deref(),
-        false,
-        recurrent.as_mut(),
-        micro_batch,
-        Some(&mut side),
-        None,
-    )?;
+    let used_cuda = {
+        #[cfg(feature = "cuda")]
+        {
+            let mut used = false;
+            if hip.is_none() {
+                if let (Some(cuda), Some(cres)) = (cuda, cuda_resident.as_deref()) {
+                    match target.forward_token_cuda(
+                        token,
+                        pos,
+                        &pages,
+                        &mut inner.kv,
+                        metrics,
+                        &mut logits,
+                        cuda,
+                        cres,
+                        None,
+                    ) {
+                        Ok(()) => used = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                pos,
+                                token,
+                                error = %e,
+                                "CUDA on-device decode failed; host fallback"
+                            );
+                        }
+                    }
+                }
+            }
+            used
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    };
+    if !used_cuda {
+        target.forward_token(
+            token,
+            pos,
+            &pages,
+            &mut inner.kv,
+            metrics,
+            &mut logits,
+            hip,
+            resident.as_deref(),
+            false,
+            recurrent.as_mut(),
+            micro_batch,
+            Some(&mut side),
+            None,
+        )?;
+    }
     request_mut(inner, id)?.pending_logits = logits;
     request_mut(inner, id)?.recurrent = recurrent;
     request_mut(inner, id)?.moe_norm = moe_norm;
@@ -4810,6 +5044,19 @@ mod tests {
 
         assert_eq!(out_a.token_ids, out_b.token_ids);
         assert_eq!(out_a.text, out_b.text);
+    }
+
+    #[test]
+    fn cpu_vision_install_leaves_weight_residency_zero() {
+        let engine = test_engine();
+        let dim = ModelConfig::tiny().dim;
+        let enc = crate::PatchVisionEncoder::synthetic(Some(0), dim, 3).unwrap();
+        engine
+            .set_vision_encoder(std::sync::Arc::new(enc))
+            .unwrap();
+        let stats = engine.stats();
+        assert_eq!(stats.vision_weight_bytes_on_device, 0);
+        assert_eq!(stats.vision_bytes_on_device, 0);
     }
 
     #[derive(Clone)]
@@ -6098,6 +6345,61 @@ mod tests {
         assert!(
             stats.batch_gemm_executes >= 1,
             "two concurrent decode requests must soft-execute batch GEMM; stats={stats:?}"
+        );
+        drop(a);
+        drop(b);
+    }
+
+    /// HIP synthetic: packed decode GEMM increments `batch_gemm_hip_kernels` with real A/B.
+    #[test]
+    fn poll_batch_gemm_hip_kernels_with_real_activations_or_skips() {
+        if !allpaca_hip::runtime_linked() || allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: false,
+            seed: Some(7),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.engine.max_active_requests = 2;
+        cfg.engine.gpu_backend = "auto".into();
+        cfg.kv.page_tokens = 8;
+        cfg.kv.vram_bytes = 8 * 1024;
+        cfg.kv.dram_bytes = 64 * 1024;
+        let engine = match Engine::new(cfg) {
+            Ok(e) if e.stats().backend == "hip" => e,
+            _ => return,
+        };
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let a = engine.begin_request("hello", params.clone()).unwrap();
+        let b = engine.begin_request("world", params).unwrap();
+        for _ in 0..96 {
+            if engine.poll().expect("poll").is_none() {
+                break;
+            }
+            let stats = engine.stats();
+            if stats.batch_gemm_hip_kernels >= 1 {
+                assert!(
+                    stats.batch_gemm_executes >= 1,
+                    "HIP packed kernel implies soft execute; stats={stats:?}"
+                );
+                drop(a);
+                drop(b);
+                return;
+            }
+        }
+        let stats = engine.stats();
+        assert!(
+            stats.batch_gemm_hip_kernels >= 1,
+            "HIP + last_hidden/weights must packed-launch; stats={stats:?}"
         );
         drop(a);
         drop(b);

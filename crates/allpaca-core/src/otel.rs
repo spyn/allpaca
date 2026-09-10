@@ -69,12 +69,18 @@ fn otlp_metric_list(s: &StatsSnapshot, t: u64) -> Vec<Value> {
         sum_metric("allpaca_poll_ticks_total", s.poll_ticks, t, true),
         sum_metric("allpaca_batch_gemm_plans_total", s.batch_gemm_plans, t, true),
         sum_metric("allpaca_batch_gemm_executes_total", s.batch_gemm_executes, t, true),
+        sum_metric("allpaca_batch_gemm_hip_kernels_total", s.batch_gemm_hip_kernels, t, true),
         sum_metric("allpaca_micro_batch_plans_total", s.micro_batch_plans, t, true),
         gauge_metric("allpaca_vram_pages", s.vram_pages as f64, t),
         gauge_metric("allpaca_dram_pages", s.dram_pages as f64, t),
         gauge_metric("allpaca_ttft_ms_last", s.ttft_ms_last as f64, t),
         gauge_metric("allpaca_itl_ms_ema", s.itl_ms_ema, t),
         gauge_metric("allpaca_gpu_util", s.gpu_util, t),
+        gauge_metric(
+            "allpaca_vision_weight_bytes_on_device",
+            s.vision_weight_bytes_on_device as f64,
+            t,
+        ),
     ]
 }
 
@@ -155,6 +161,7 @@ mod tests {
             "allpaca_poll_ticks_total",
             "allpaca_batch_gemm_plans_total",
             "allpaca_batch_gemm_executes_total",
+            "allpaca_batch_gemm_hip_kernels_total",
             "allpaca_gpu_util",
         ] {
             assert!(body.contains(name), "missing {name} in {body}");

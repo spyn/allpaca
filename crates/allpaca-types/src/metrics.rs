@@ -198,6 +198,9 @@ pub struct StatsSnapshot {
     /// Soft co-steps that advanced other batch-GEMM plan members in one poll tick.
     #[serde(default)]
     pub batch_gemm_executes: u64,
+    /// Packed host→HIP GEMM launches (single kernel, M>1) from batch-GEMM soft execute.
+    #[serde(default)]
+    pub batch_gemm_hip_kernels: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,
@@ -290,4 +293,7 @@ pub struct StatsSnapshot {
     /// Cumulative H2D bytes of vision soft-token embeddings staged onto a HIP device.
     #[serde(default)]
     pub vision_bytes_on_device: u64,
+    /// Vision encoder weight tensors resident on a HIP device after install (0 on CPU).
+    #[serde(default)]
+    pub vision_weight_bytes_on_device: u64,
 }

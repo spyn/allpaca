@@ -601,7 +601,7 @@ async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
-/// OTLP-ish JSON metrics (`allpaca_*` names). Pull endpoint; `telemetry.otlp_endpoint` documents push target.
+/// OTLP-ish JSON metrics (`allpaca_*` names). Pull endpoint; push uses `telemetry.otlp_endpoint`.
 async fn otlp_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let snap = state.engine.stats();
     let body = state.engine.metrics().export_otlp_json(&snap);
@@ -678,6 +678,11 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
         s.batch_gemm_executes
     );
     counter!(
+        "allpaca_batch_gemm_hip_kernels_total",
+        "Packed host-to-HIP GEMM launches from batch soft execute",
+        s.batch_gemm_hip_kernels
+    );
+    counter!(
         "allpaca_micro_batch_plans_total",
         "Cross-request micro-batch stagger plans",
         s.micro_batch_plans
@@ -711,6 +716,11 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
         "allpaca_vision_bytes_on_device_total",
         "Vision soft-token embedding bytes staged H2D onto HIP",
         s.vision_bytes_on_device
+    );
+    gauge!(
+        "allpaca_vision_weight_bytes_on_device",
+        "Vision encoder weight bytes resident on HIP after install",
+        s.vision_weight_bytes_on_device
     );
     out
 }
@@ -801,6 +811,7 @@ mod tests {
         assert!(body.contains("allpaca_poll_ticks_total"));
         assert!(body.contains("allpaca_batch_gemm_plans_total"));
         assert!(body.contains("allpaca_batch_gemm_executes_total"));
+        assert!(body.contains("allpaca_batch_gemm_hip_kernels_total"));
     }
 
     #[tokio::test]

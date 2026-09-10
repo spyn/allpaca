@@ -541,7 +541,8 @@ impl Default for HttpSection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetrySection {
-    /// When set, collectors may pull `GET /v1/metrics/otlp` or a future push uses this URL.
+    /// When set, the server periodically POSTs OTLP/JSON metrics here (appends `/v1/metrics`
+    /// if the URL has no path). Pull via `GET /v1/metrics/otlp` always remains available.
     pub otlp_endpoint: Option<String>,
 }
 

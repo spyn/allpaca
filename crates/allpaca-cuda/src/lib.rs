@@ -675,7 +675,7 @@ impl CudaWorkspace {
         result
     }
 
-    /// Upload host F32 weights into a device blob (H2D). Returns device pointer.
+    /// Upload host F32 into a device blob (activation H2D accounting).
     pub fn upload_f32(&self, host: &[f32]) -> Result<*mut f32, AllpacaError> {
         let bytes = host.len().saturating_mul(4);
         set_device(self.device)?;
@@ -684,6 +684,104 @@ impl CudaWorkspace {
         self.activation_h2d
             .fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(ptr.cast())
+    }
+
+    /// Download device F32 into host (activation D2H accounting).
+    pub fn download_f32(&self, src: *const f32, dst: &mut [f32]) -> Result<(), AllpacaError> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        if src.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA D2H download".into(),
+            )));
+        }
+        set_device(self.device)?;
+        let bytes = dst.len().saturating_mul(4);
+        memcpy(dst.as_mut_ptr().cast(), src.cast(), bytes, MEMCPY_D2H)?;
+        self.activation_d2h
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// GEMM with host activation A and device-resident weight B → host C.
+    pub fn gemm_nt_host_a_dev_b(
+        &self,
+        a: &[f32],
+        b_dev: *const f32,
+        c: &mut [f32],
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if b_dev.is_null() || m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA gemm_nt_host_a_dev_b".into(),
+            )));
+        }
+        let a_n = (m as usize).saturating_mul(k as usize);
+        let c_n = (m as usize).saturating_mul(n as usize);
+        if a.len() < a_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = self.upload_f32(&a[..a_n])?;
+        let dc = device_malloc(c_n * 4, self.device)?;
+        let result = (|| {
+            self.gemm_nt_dev(da, b_dev, dc.cast(), m, n, k)?;
+            self.download_f32(dc.cast(), &mut c[..c_n])
+        })();
+        self.free_ptr(da);
+        device_free(dc);
+        result
+    }
+
+    /// RMSNorm with host x and device-resident weight → host out.
+    pub fn rmsnorm_host_x_dev_w(
+        &self,
+        x: &[f32],
+        w_dev: *const f32,
+        out: &mut [f32],
+        n: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if w_dev.is_null() || n <= 0 || x.len() < n as usize || out.len() < n as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA rmsnorm_host_x_dev_w".into(),
+            )));
+        }
+        let dx = self.upload_f32(&x[..n as usize])?;
+        let dout = device_malloc((n as usize) * 4, self.device)?;
+        let result = (|| {
+            self.rmsnorm_dev(dx, w_dev, dout.cast(), n, eps)?;
+            self.download_f32(dout.cast(), &mut out[..n as usize])
+        })();
+        self.free_ptr(dx);
+        device_free(dout);
+        result
+    }
+
+    /// Embed gather from a device-resident table → host out (no table re-upload).
+    pub fn embed_gather_dev_table(
+        &self,
+        table_dev: *const f32,
+        token: i32,
+        out: &mut [f32],
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if table_dev.is_null() || dim <= 0 || token < 0 || out.len() < dim as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA embed_gather_dev_table".into(),
+            )));
+        }
+        let dout = device_malloc((dim as usize) * 4, self.device)?;
+        let result = (|| {
+            self.embed_gather_dev(table_dev, token, dout.cast(), dim)?;
+            self.download_f32(dout.cast(), &mut out[..dim as usize])
+        })();
+        device_free(dout);
+        result
     }
 
     /// Copy host F32 into an existing device buffer (vision soft embeds / soft_x).
@@ -717,9 +815,99 @@ impl Drop for CudaWorkspace {
     }
 }
 
+/// Packed F32 weight tensors uploaded once via H2D (not activation traffic).
+pub struct CudaDeviceWeights {
+    #[allow(dead_code)]
+    device: i32,
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for CudaDeviceWeights {}
+unsafe impl Sync for CudaDeviceWeights {}
+
+impl CudaDeviceWeights {
+    /// Concatenate host F32 slices into one device blob. Returns (weights, h2d bytes).
+    pub fn upload(device: i32, slices: &[&[f32]]) -> Result<(Self, u64), AllpacaError> {
+        let floats: usize = slices.iter().map(|s| s.len()).sum();
+        let bytes = floats.saturating_mul(4);
+        if bytes == 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty CUDA weight upload".into(),
+            )));
+        }
+        set_device(device)?;
+        let ptr = device_malloc(bytes, device)?;
+        let mut off = 0usize;
+        for slice in slices {
+            if slice.is_empty() {
+                continue;
+            }
+            let n = slice.len() * 4;
+            memcpy(
+                unsafe { ptr.add(off) },
+                slice.as_ptr().cast(),
+                n,
+                MEMCPY_H2D,
+            )?;
+            off += n;
+        }
+        Ok((
+            Self {
+                device,
+                ptr: ptr.cast(),
+                bytes,
+            },
+            bytes as u64,
+        ))
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn ptr_f32(&self, byte_off: usize) -> Result<*mut f32, AllpacaError> {
+        if byte_off >= self.bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA weight ptr out of range".into(),
+            )));
+        }
+        Ok(unsafe { self.ptr.add(byte_off) }.cast())
+    }
+}
+
+impl Drop for CudaDeviceWeights {
+    fn drop(&mut self) {
+        device_free(self.ptr.cast());
+        self.ptr = std::ptr::null_mut();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_weights_upload_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [5.0f32, 6.0];
+        let (w, h2d) = CudaDeviceWeights::upload(0, &[&a, &b]).expect("upload");
+        assert_eq!(h2d, 24);
+        assert_eq!(w.bytes(), 24);
+        let p0 = w.ptr_f32(0).expect("ptr");
+        let mut back = [0.0f32; 4];
+        memcpy(
+            back.as_mut_ptr().cast(),
+            p0.cast(),
+            16,
+            MEMCPY_D2H,
+        )
+        .expect("d2h");
+        assert_eq!(back, a);
+    }
 
     #[test]
     fn stub_or_no_device_reports_zero_when_no_gpu() {

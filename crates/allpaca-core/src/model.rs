@@ -7305,6 +7305,13 @@ fn ones(n: usize) -> Vec<f32> {
     vec![1.0; n]
 }
 
+#[cfg(feature = "cuda")]
+#[path = "cuda_decode.rs"]
+mod cuda_decode;
+
+#[cfg(feature = "cuda")]
+pub use cuda_decode::CudaResidentModel;
+
 struct Lcg {
     state: u64,
 }

@@ -1,8 +1,10 @@
 mod api;
 mod cli;
+mod otlp_push;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use allpaca_core::Engine;
 use allpaca_types::Config;
@@ -33,10 +35,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     config.validate()?;
 
     let engine = Engine::new(config.clone())?;
+    let engine = Arc::new(engine);
     let state = api::AppState {
-        engine: Arc::new(engine),
+        engine: Arc::clone(&engine),
         config: config.clone(),
     };
+    let _otlp_push = otlp_push::maybe_spawn_otlp_push(
+        engine,
+        config.telemetry.otlp_endpoint.clone(),
+        Duration::from_secs(15),
+    );
     let app = api::router(state);
     let addr = SocketAddr::new(config.http.host.parse()?, config.http.port);
     tracing::info!(%addr, "allpaca-server listening (CPU-only={})", config.engine.cpu_only);

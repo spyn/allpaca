@@ -2738,6 +2738,172 @@ fn overnight_timeout(tokens: usize, secs_per_token: u64) -> std::time::Duration 
     std::time::Duration::from_secs((tokens as u64).saturating_mul(secs_per_token).max(180))
 }
 
+/// Optional 9060 soak GGUF: Q8 for better ITL unless `ALLPACA_OVERNIGHT_9060_Q8=0`.
+#[cfg(feature = "hip")]
+fn overnight_9060_prefer_q8() -> bool {
+    std::env::var("ALLPACA_OVERNIGHT_9060_Q8")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+#[cfg(feature = "hip")]
+fn overnight_9060_is_q8(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("Q8"))
+}
+
+/// Resolve 9060 soak weights: prefer Llama-3.2 Q8_0, else 3B F16.
+#[cfg(feature = "hip")]
+fn overnight_9060_gguf_with(prefer_q8: bool) -> Option<std::path::PathBuf> {
+    let dir = local_models_dir();
+    if prefer_q8 {
+        for name in [
+            "Llama-3.2-3B-Instruct-Q8_0.gguf",
+            "Llama-3.2-1B-Instruct-Q8_0.gguf",
+        ] {
+            let p = dir.join(name);
+            if p.is_file() && looks_like_gguf(&p) {
+                return Some(p);
+            }
+        }
+    }
+    let f16 = dir.join("Llama-3.2-3B-Instruct-f16.gguf");
+    if f16.is_file() && looks_like_gguf(&f16) {
+        return Some(f16);
+    }
+    None
+}
+
+#[cfg(feature = "hip")]
+fn overnight_9060_gguf() -> Option<std::path::PathBuf> {
+    overnight_9060_gguf_with(overnight_9060_prefer_q8())
+}
+
+/// 9060 soak prefers 3B Q8 over F16 when both are present.
+#[cfg(feature = "hip")]
+#[test]
+fn overnight_9060_gguf_prefers_q8_over_f16_when_available() {
+    let q8 = local_models_dir().join("Llama-3.2-3B-Instruct-Q8_0.gguf");
+    let f16 = local_models_dir().join("Llama-3.2-3B-Instruct-f16.gguf");
+    if !q8.is_file() {
+        eprintln!(
+            "skip overnight_9060_gguf_prefers_q8_over_f16_when_available: missing {}",
+            q8.display()
+        );
+        return;
+    }
+    if !f16.is_file() {
+        eprintln!(
+            "skip overnight_9060_gguf_prefers_q8_over_f16_when_available: missing {}",
+            f16.display()
+        );
+        return;
+    }
+    let found = overnight_9060_gguf_with(true).expect("Q8 must win when prefer_q8");
+    assert_eq!(
+        found.canonicalize().unwrap_or(found.clone()),
+        q8.canonicalize().unwrap_or(q8.clone()),
+        "9060 soak must prefer 3B Q8 over F16; found={}",
+        found.display()
+    );
+    assert!(overnight_9060_is_q8(&found));
+}
+
+/// `ALLPACA_OVERNIGHT_9060_Q8=0` (prefer_q8=false) keeps the F16 soak path.
+#[cfg(feature = "hip")]
+#[test]
+fn overnight_9060_gguf_falls_back_to_f16_when_q8_disabled() {
+    let f16 = local_models_dir().join("Llama-3.2-3B-Instruct-f16.gguf");
+    if !f16.is_file() {
+        eprintln!(
+            "skip overnight_9060_gguf_falls_back_to_f16_when_q8_disabled: missing {}",
+            f16.display()
+        );
+        return;
+    }
+    let found = overnight_9060_gguf_with(false).expect("F16 fallback must resolve");
+    assert_eq!(
+        found.canonicalize().unwrap_or(found.clone()),
+        f16.canonicalize().unwrap_or(f16.clone()),
+        "prefer_q8=false must select 3B F16; found={}",
+        found.display()
+    );
+    assert!(!overnight_9060_is_q8(&found));
+}
+
+/// Short Q8 smoke on HIP (prefers HIP:1): asserts `q8_gemm_us > 0` after a few
+/// tokens. Prefers 1B Q8 when present (faster load). Skips without a local
+/// Llama-3.2 Q8 GGUF or HIP device. Not overnight.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_llama32_q8_greedy_reports_q8_gemm_when_available() {
+    let _guard = large_gguf_lock();
+    let dir = local_models_dir();
+    let path = [
+        "Llama-3.2-1B-Instruct-Q8_0.gguf",
+        "Llama-3.2-3B-Instruct-Q8_0.gguf",
+    ]
+    .iter()
+    .map(|name| dir.join(name))
+    .find(|p| p.is_file() && looks_like_gguf(p));
+    let Some(path) = path else {
+        eprintln!(
+            "skip hip_llama32_q8_greedy_reports_q8_gemm_when_available: no Llama-3.2 Q8 under models/"
+        );
+        return;
+    };
+    let n_dev = allpaca_hip::device_count();
+    if n_dev == 0 {
+        eprintln!("skip hip_llama32_q8_greedy_reports_q8_gemm_when_available: no HIP device");
+        return;
+    }
+    let device = if n_dev >= 2 { 1 } else { 0 };
+    let mut cfg = hip_7b_config(path.clone());
+    cfg.engine.target_device = DeviceSelector::Hip(device);
+    cfg.engine.draft_device = DeviceSelector::Cpu;
+    cfg.speculative.enabled = false;
+    cfg.features.draft_model_speculation = Some(false);
+    cfg.kv.vram_bytes = 512 * 1024 * 1024;
+    cfg.kv.dram_bytes = 512 * 1024 * 1024;
+    eprintln!(
+        "q8 smoke Engine::new path={} device={}",
+        path.display(),
+        device
+    );
+    let engine = Engine::new(cfg).expect("Llama-3.2 Q8 must load on HIP");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_llama32_q8_greedy_reports_q8_gemm_when_available: no HIP device");
+        return;
+    }
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "hip");
+    assert_eq!(
+        stats.target_device, device as i32,
+        "Q8 smoke must place Target Model on HIP:{device}"
+    );
+    const N: usize = 4;
+    let out = engine
+        .generate("hello", greedy(N))
+        .expect("Llama-3.2 Q8 HIP generate must produce tokens");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    eprintln!(
+        "q8 smoke gen={} q8_gemm_us={:.0} attention_us={:.0} lm_head_us={:.0} itl_ms={:.2}",
+        out.token_ids.len(),
+        stats.q8_gemm_us,
+        stats.attention_us,
+        stats.lm_head_us,
+        stats.itl_ms_ema
+    );
+    assert!(
+        stats.q8_gemm_us > 0.0,
+        "Q8 greedy must time Q8 GEMV; q8_gemm_us={} stats={stats:?}",
+        stats.q8_gemm_us
+    );
+}
+
 #[cfg(feature = "hip")]
 #[test]
 fn gated_draft_prefers_local_llama32_3b_f16_over_qwen() {
@@ -2880,7 +3046,9 @@ fn hip_local_llama32_f16_stays_packed_on_load() {
 /// devices must stay visible (do not set `HIP_VISIBLE_DEVICES`).
 ///
 /// 1. 8B greedy on HIP:0 (Target Model baseline)
-/// 2. Optional 3B F16 greedy on HIP:1 (`ALLPACA_OVERNIGHT_9060=1`)
+/// 2. Optional 9060 soak on HIP:1 (`ALLPACA_OVERNIGHT_9060=1`): prefers
+///    Llama-3.2 Q8_0 (3B then 1B) for better ITL; F16 only if Q8 missing or
+///    `ALLPACA_OVERNIGHT_9060_Q8=0`
 /// 3. 8B Target + 3B Q8 Draft spec (HostStaging; draft-ahead overlaps packed verify)
 #[cfg(feature = "hip")]
 #[test]
@@ -2892,14 +3060,6 @@ fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
         return;
     }
     let _guard = large_gguf_lock();
-    let p = local_models_dir().join("Llama-3.2-3B-Instruct-f16.gguf");
-    if !p.is_file() {
-        eprintln!(
-            "skip hip_overnight_llama32_f16_on_second_gpu_when_env_set: missing {}",
-            p.display()
-        );
-        return;
-    }
     if allpaca_hip::device_count() < 2 {
         eprintln!("skip hip_overnight_llama32_f16_on_second_gpu_when_env_set: need 2 HIP devices");
         return;
@@ -2998,60 +3158,81 @@ fn hip_overnight_llama32_f16_on_second_gpu_when_env_set() {
     drop(greedy);
 
     if soak_9060 {
-        let mut cfg = hip_7b_config(p);
-        cfg.engine.target_device = DeviceSelector::Hip(1);
-        cfg.engine.draft_device = DeviceSelector::Cpu;
-        cfg.speculative.enabled = false;
-        cfg.features.draft_model_speculation = Some(false);
-        cfg.kv.vram_bytes = 512 * 1024 * 1024;
-        cfg.kv.dram_bytes = 512 * 1024 * 1024;
-        eprintln!("overnight 9060 Engine::new starting tokens={tokens} rounds={rounds}");
-        let engine = Engine::new(cfg).expect("Llama-3.2-3B F16 must load on HIP:1");
-        let stats = engine.stats();
-        eprintln!(
-            "overnight 9060 load backend={} target_device={} draft_device={} weight_bytes={} transfer_path={} p2p_status={}",
-            stats.backend,
-            stats.target_device,
-            stats.draft_device,
-            stats.weight_bytes_on_device,
-            stats.transfer_path,
-            stats.p2p_status
-        );
-        assert_eq!(
-            stats.target_device, 1,
-            "overnight soak must run on the second HIP device"
-        );
-        assert_eq!(
-            stats.draft_device, -1,
-            "9060 soak must not place a Draft Model"
-        );
-        let soak_timeout = overnight_timeout(tokens, 8);
-        for round in 0..rounds {
+        if let Some(soak_path) = overnight_9060_gguf() {
+            let soak_is_q8 = overnight_9060_is_q8(&soak_path);
+            let mut cfg = hip_7b_config(soak_path.clone());
+            cfg.engine.target_device = DeviceSelector::Hip(1);
+            cfg.engine.draft_device = DeviceSelector::Cpu;
+            cfg.speculative.enabled = false;
+            cfg.features.draft_model_speculation = Some(false);
+            cfg.kv.vram_bytes = 512 * 1024 * 1024;
+            cfg.kv.dram_bytes = 512 * 1024 * 1024;
             eprintln!(
-                "overnight 9060 round={}/{} generate starting",
-                round + 1,
-                rounds
+                "overnight 9060 Engine::new starting path={} q8={} tokens={tokens} rounds={rounds}",
+                soak_path.display(),
+                soak_is_q8
             );
-            let t0 = std::time::Instant::now();
-            let out = generate_or_timeout(&engine, "hello", tokens, soak_timeout);
+            let engine = Engine::new(cfg).expect("9060 soak GGUF must load on HIP:1");
             let stats = engine.stats();
-            let secs = t0.elapsed().as_secs_f64();
-            let tps = out.token_ids.len() as f64 / secs.max(1e-6);
             eprintln!(
-                "overnight 9060 round={}/{} gen={} tps={:.2} itl_ms={:.2} lm_head_us={:.0} other_gpu_us={:.0} q8_gemm_us={:.0} attention_us={:.0} text_prefix={:?}",
-                round + 1,
-                rounds,
-                out.token_ids.len(),
-                tps,
-                stats.itl_ms_ema,
-                stats.lm_head_us,
-                stats.other_gpu_us,
-                stats.q8_gemm_us,
-                stats.attention_us,
-                out.text.chars().take(40).collect::<String>()
+                "overnight 9060 load backend={} target_device={} draft_device={} weight_bytes={} transfer_path={} p2p_status={}",
+                stats.backend,
+                stats.target_device,
+                stats.draft_device,
+                stats.weight_bytes_on_device,
+                stats.transfer_path,
+                stats.p2p_status
             );
+            assert_eq!(
+                stats.target_device, 1,
+                "overnight soak must run on the second HIP device"
+            );
+            assert_eq!(
+                stats.draft_device, -1,
+                "9060 soak must not place a Draft Model"
+            );
+            let soak_timeout = overnight_timeout(tokens, 8);
+            for round in 0..rounds {
+                eprintln!(
+                    "overnight 9060 round={}/{} generate starting",
+                    round + 1,
+                    rounds
+                );
+                let t0 = std::time::Instant::now();
+                let out = generate_or_timeout(&engine, "hello", tokens, soak_timeout);
+                let stats = engine.stats();
+                let secs = t0.elapsed().as_secs_f64();
+                let tps = out.token_ids.len() as f64 / secs.max(1e-6);
+                eprintln!(
+                    "overnight 9060 round={}/{} gen={} tps={:.2} itl_ms={:.2} lm_head_us={:.0} other_gpu_us={:.0} q8_gemm_us={:.0} attention_us={:.0} text_prefix={:?}",
+                    round + 1,
+                    rounds,
+                    out.token_ids.len(),
+                    tps,
+                    stats.itl_ms_ema,
+                    stats.lm_head_us,
+                    stats.other_gpu_us,
+                    stats.q8_gemm_us,
+                    stats.attention_us,
+                    out.text.chars().take(40).collect::<String>()
+                );
+                assert!(
+                    !out.token_ids.is_empty(),
+                    "overnight 9060 round {} must emit tokens",
+                    round + 1
+                );
+                if soak_is_q8 {
+                    assert!(
+                        stats.q8_gemm_us > 0.0,
+                        "9060 Q8 soak must time Q8 GEMV; q8_gemm_us={} stats={stats:?}",
+                        stats.q8_gemm_us
+                    );
+                }
+            }
+            drop(engine);
+        } else {
+            eprintln!("overnight skip 9060 soak: no Llama-3.2 Q8/F16 GGUF under models/");
         }
-        drop(engine);
     } else {
         eprintln!("overnight skip 9060 soak: set ALLPACA_OVERNIGHT_9060=1");
     }
@@ -3361,6 +3542,11 @@ fn hip_overnight_llama32_q8_greedy_on_second_gpu_when_env_set() {
             target_delta > 0,
             "overnight draft-q8 round {} must forward on HIP:1; stats={stats:?}",
             round + 1
+        );
+        assert!(
+            stats.q8_gemm_us > 0.0,
+            "overnight draft-q8 must time Q8 GEMV; q8_gemm_us={} stats={stats:?}",
+            stats.q8_gemm_us
         );
     }
 }
@@ -5936,4 +6122,41 @@ fn hip_tiny_gdn_prefill_d2h_does_not_scale_with_every_token() {
         per_extra < gdn_all_layers / 2,
         "GDN host sync must not run every prefill token; d2h_short={d2h_short} d2h_long={d2h_long} extra_prompt={extra_prompt} per_extra={per_extra} stats_short={after_short:?} stats_long={after_long:?}"
     );
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_vision_encoder_install_records_weight_residency() {
+    use allpaca_core::PatchVisionEncoder;
+    use std::sync::Arc;
+
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_vision_encoder_install_records_weight_residency: no HIP device");
+        return;
+    }
+    let engine = match Engine::new(hip_auto_synthetic()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("skip hip_vision_encoder_install_records_weight_residency: Engine::new {e}");
+            return;
+        }
+    };
+    let gpus = hip_gpus(&engine);
+    if gpus.is_empty() {
+        eprintln!("skip hip_vision_encoder_install_records_weight_residency: no HIP in engine");
+        return;
+    }
+    let dev = gpus[0].id;
+    let dim = ModelConfig::tiny().dim;
+    let enc = PatchVisionEncoder::synthetic(Some(dev), dim, 42).expect("synthetic vision");
+    engine
+        .set_vision_encoder(Arc::new(enc))
+        .expect("install vision");
+    let stats = engine.stats();
+    assert!(
+        stats.vision_weight_bytes_on_device > 0,
+        "expected resident vision weights; stats={stats:?}"
+    );
+    // Soft-embed staging metric stays separate until a multimodal request.
+    assert_eq!(stats.vision_bytes_on_device, 0);
 }

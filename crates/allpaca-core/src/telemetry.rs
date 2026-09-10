@@ -144,6 +144,8 @@ pub struct Metrics {
     pub batch_gemm_plans: AtomicU64,
     /// Soft co-steps that advanced other batch-GEMM plan members in the same poll tick.
     pub batch_gemm_executes: AtomicU64,
+    /// Packed host→HIP GEMM launches (single kernel, M>1) from batch-GEMM soft execute.
+    pub batch_gemm_hip_kernels: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
@@ -183,6 +185,8 @@ pub struct Metrics {
     pub rpc_h2d_bytes: AtomicU64,
     /// Cumulative H2D bytes of vision soft-token embeddings staged onto HIP.
     pub vision_bytes_on_device: AtomicU64,
+    /// Vision encoder weight tensors resident on HIP after install (not soft embeds).
+    pub vision_weight_bytes_on_device: AtomicU64,
 }
 
 impl Metrics {
@@ -315,6 +319,7 @@ impl Metrics {
             layer_stagger_steps: self.layer_stagger_steps.load(Ordering::Relaxed),
             batch_gemm_plans: self.batch_gemm_plans.load(Ordering::Relaxed),
             batch_gemm_executes: self.batch_gemm_executes.load(Ordering::Relaxed),
+            batch_gemm_hip_kernels: self.batch_gemm_hip_kernels.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
@@ -344,6 +349,7 @@ impl Metrics {
             rpc_activation_bytes: self.rpc_activation_bytes.load(Ordering::Relaxed),
             rpc_h2d_bytes: self.rpc_h2d_bytes.load(Ordering::Relaxed),
             vision_bytes_on_device: self.vision_bytes_on_device.load(Ordering::Relaxed),
+            vision_weight_bytes_on_device: self.vision_weight_bytes_on_device.load(Ordering::Relaxed),
         }
     }
 
