@@ -140,8 +140,10 @@ pub struct Metrics {
     pub draft_expert_prefetches: AtomicU64,
     /// Cross-request layer-stagger CPU expert steps during GPU forward.
     pub layer_stagger_steps: AtomicU64,
-    /// Soft plans for packed cross-request HIP GEMM (execute still one-at-a-time).
+    /// Soft plans for packed cross-request HIP GEMM (soft co-step in poll).
     pub batch_gemm_plans: AtomicU64,
+    /// Soft co-steps that advanced other batch-GEMM plan members in the same poll tick.
+    pub batch_gemm_executes: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
@@ -179,6 +181,8 @@ pub struct Metrics {
     pub rpc_roundtrips: AtomicU64,
     pub rpc_activation_bytes: AtomicU64,
     pub rpc_h2d_bytes: AtomicU64,
+    /// Cumulative H2D bytes of vision soft-token embeddings staged onto HIP.
+    pub vision_bytes_on_device: AtomicU64,
 }
 
 impl Metrics {
@@ -310,6 +314,7 @@ impl Metrics {
             draft_expert_prefetches: self.draft_expert_prefetches.load(Ordering::Relaxed),
             layer_stagger_steps: self.layer_stagger_steps.load(Ordering::Relaxed),
             batch_gemm_plans: self.batch_gemm_plans.load(Ordering::Relaxed),
+            batch_gemm_executes: self.batch_gemm_executes.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
@@ -338,6 +343,7 @@ impl Metrics {
             rpc_roundtrips: self.rpc_roundtrips.load(Ordering::Relaxed),
             rpc_activation_bytes: self.rpc_activation_bytes.load(Ordering::Relaxed),
             rpc_h2d_bytes: self.rpc_h2d_bytes.load(Ordering::Relaxed),
+            vision_bytes_on_device: self.vision_bytes_on_device.load(Ordering::Relaxed),
         }
     }
 
@@ -380,6 +386,12 @@ impl Metrics {
     /// Target-GPU busy fraction from the last sample, 0.0..=1.0.
     pub fn gpu_util(&self) -> f64 {
         self.gpu_util_x1e4.load(Ordering::Relaxed) as f64 / 10_000.0
+    }
+
+    /// OTLP HTTP JSON metrics body for collectors (no SDK dependency).
+    pub fn export_otlp_json(&self, snapshot: &StatsSnapshot) -> String {
+        let _ = self;
+        crate::otel::export_otlp_json(snapshot)
     }
 
     /// Free VRAM on the target device from the last sample, or `None` when the

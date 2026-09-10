@@ -1,9 +1,9 @@
-//! Cross-request packed GEMM planning seam (scaffold).
+//! Cross-request packed GEMM planning + soft execute seam.
 //!
-//! Today `Engine::poll` still executes one Request per tick. When 2+ decode-ready
-//! Requests share the same model shape, [`plan_batch_gemm`] builds a
-//! [`BatchGemmPlan`] so telemetry can prove eligibility. Fused multi-request HIP
-//! execute is deferred until kernels land.
+//! When 2+ decode-ready Requests share the same model shape, [`plan_batch_gemm`]
+//! builds a [`BatchGemmPlan`]. `Engine::poll` soft-executes by co-stepping the
+//! other plan members in the same tick (parking their `StepResult`s). True fused
+//! multi-request HIP kernels remain deferred.
 
 /// Model dims that must match for a packed cross-request GEMM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,12 +30,21 @@ pub struct BatchGemmCandidate {
     pub m_tokens: usize,
 }
 
-/// Planned packed GEMM across Requests (execute not wired yet).
+/// Planned packed GEMM across Requests (soft co-step in poll; fused HIP deferred).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchGemmPlan {
     pub request_ids: Vec<u64>,
     pub m_tokens: usize,
     pub reason: &'static str,
+}
+
+/// Plan members other than `primary` (soft co-step peers).
+pub fn batch_gemm_other_ids(plan: &BatchGemmPlan, primary: u64) -> Vec<u64> {
+    plan.request_ids
+        .iter()
+        .copied()
+        .filter(|&id| id != primary)
+        .collect()
 }
 
 /// Plan a packed GEMM when 2+ decode-ready Requests share one model shape.
@@ -182,5 +191,16 @@ mod tests {
             m_tokens: 1,
         }];
         assert!(plan_batch_gemm(&cands).is_none());
+    }
+
+    #[test]
+    fn other_ids_exclude_primary() {
+        let plan = BatchGemmPlan {
+            request_ids: vec![10, 20, 30],
+            m_tokens: 3,
+            reason: "same_shape_decode_cohort",
+        };
+        assert_eq!(batch_gemm_other_ids(&plan, 20), vec![10, 30]);
+        assert_eq!(batch_gemm_other_ids(&plan, 99), vec![10, 20, 30]);
     }
 }

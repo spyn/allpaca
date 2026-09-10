@@ -23,6 +23,7 @@ mod micro_batch;
 mod modality;
 mod model;
 mod numa;
+mod otel;
 mod packed;
 mod rpc_runtime;
 mod sampling;
@@ -35,7 +36,8 @@ mod vision;
 mod weight_set;
 
 pub use batch_gemm::{
-    plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    batch_gemm_other_ids, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan,
+    ModelShapeKey,
 };
 pub use device_manager::{detect_pipeline_mode, DeviceInventory};
 pub use compute::ComputeDev;
@@ -53,6 +55,7 @@ pub use modality::{
 pub use model::{LayerWeights, ModelConfig, MtpNextnWeights, TinyModel};
 pub use packed::{HostExpertPool, PackedStore};
 pub use scheduler::Scheduler;
+pub use otel::export_otlp_json;
 pub use telemetry::Metrics;
 pub use tokenizer::EngineTokenizer;
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};

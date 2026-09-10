@@ -27,6 +27,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/stats", get(stats))
         .route("/metrics", get(prometheus_metrics))
+        .route("/v1/metrics/otlp", get(otlp_metrics))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -588,7 +589,7 @@ async fn stats(State(state): State<AppState>) -> Json<allpaca_types::StatsSnapsh
     Json(state.engine.stats())
 }
 
-/// Prometheus text exposition (subset of Engine `/stats`). OTel remains deferred.
+/// Prometheus text exposition (subset of Engine `/stats`).
 async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let body = render_prometheus_text(&state.engine.stats());
     (
@@ -596,6 +597,16 @@ async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse 
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
+        body,
+    )
+}
+
+/// OTLP-ish JSON metrics (`allpaca_*` names). Pull endpoint; `telemetry.otlp_endpoint` documents push target.
+async fn otlp_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let snap = state.engine.stats();
+    let body = state.engine.metrics().export_otlp_json(&snap);
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
 }
@@ -662,6 +673,11 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
         s.batch_gemm_plans
     );
     counter!(
+        "allpaca_batch_gemm_executes_total",
+        "Soft packed GEMM co-steps that advanced plan peers",
+        s.batch_gemm_executes
+    );
+    counter!(
         "allpaca_micro_batch_plans_total",
         "Cross-request micro-batch stagger plans",
         s.micro_batch_plans
@@ -690,6 +706,11 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
         "allpaca_gpu_util",
         "Target GPU busy fraction from last sample",
         s.gpu_util
+    );
+    counter!(
+        "allpaca_vision_bytes_on_device_total",
+        "Vision soft-token embedding bytes staged H2D onto HIP",
+        s.vision_bytes_on_device
     );
     out
 }
@@ -779,6 +800,27 @@ mod tests {
         assert!(body.contains("allpaca_tokens_generated_total"));
         assert!(body.contains("allpaca_poll_ticks_total"));
         assert!(body.contains("allpaca_batch_gemm_plans_total"));
+        assert!(body.contains("allpaca_batch_gemm_executes_total"));
+    }
+
+    #[tokio::test]
+    async fn otlp_metrics_exposes_allpaca_json() {
+        let app = router(test_state());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics/otlp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("resourceMetrics"));
+        assert!(body.contains("allpaca_requests_total"));
+        assert!(body.contains("allpaca_tokens_generated_total"));
     }
 
     fn multi_request_state() -> AppState {

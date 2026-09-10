@@ -686,6 +686,25 @@ impl CudaWorkspace {
         Ok(ptr.cast())
     }
 
+    /// Copy host F32 into an existing device buffer (vision soft embeds / soft_x).
+    /// Mirrors [`allpaca_hip::HipWorkspace::copy_h2d_f32`].
+    pub fn copy_h2d_f32(&self, dst: *mut f32, src: &[f32]) -> Result<(), AllpacaError> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        if dst.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA H2D copy".into(),
+            )));
+        }
+        set_device(self.device)?;
+        let bytes = src.len().saturating_mul(4);
+        memcpy(dst.cast(), src.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        self.activation_h2d
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn free_ptr(&self, ptr: *mut f32) {
         device_free(ptr.cast());
     }
@@ -720,6 +739,28 @@ mod tests {
     #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
     fn runtime_linked_when_toolkit_builds() {
         assert!(runtime_linked());
+    }
+
+    #[test]
+    fn copy_h2d_f32_roundtrip_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let src: Vec<f32> = (0..16).map(|i| i as f32 * 0.25).collect();
+        let d = device_malloc(src.len() * 4, 0).expect("malloc");
+        ws.copy_h2d_f32(d.cast(), &src).expect("h2d");
+        let mut back = vec![0.0f32; src.len()];
+        memcpy(
+            back.as_mut_ptr().cast(),
+            d,
+            src.len() * 4,
+            MEMCPY_D2H,
+        )
+        .expect("d2h");
+        device_free(d);
+        assert_eq!(back, src);
+        assert!(ws.activation_h2d_bytes() >= (src.len() * 4) as u64);
     }
 
     #[test]

@@ -192,9 +192,12 @@ pub struct StatsSnapshot {
     /// Cross-request layer-stagger CPU expert steps.
     #[serde(default)]
     pub layer_stagger_steps: u64,
-    /// Soft packed cross-request GEMM plans (execute deferred until kernels land).
+    /// Soft packed cross-request GEMM plans (soft co-step in poll).
     #[serde(default)]
     pub batch_gemm_plans: u64,
+    /// Soft co-steps that advanced other batch-GEMM plan members in one poll tick.
+    #[serde(default)]
+    pub batch_gemm_executes: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,
@@ -284,4 +287,7 @@ pub struct StatsSnapshot {
     /// Weight bytes uploaded to RPC workers at load.
     #[serde(default)]
     pub rpc_h2d_bytes: u64,
+    /// Cumulative H2D bytes of vision soft-token embeddings staged onto a HIP device.
+    #[serde(default)]
+    pub vision_bytes_on_device: u64,
 }

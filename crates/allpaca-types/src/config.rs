@@ -25,6 +25,8 @@ pub struct Config {
     pub features: FeatureFlagOverlay,
     #[serde(default)]
     pub rpc: RpcSection,
+    #[serde(default)]
+    pub telemetry: TelemetrySection,
 }
 
 impl Default for Config {
@@ -50,6 +52,7 @@ impl Config {
             multimodal: MultimodalSection::default(),
             features: FeatureFlagOverlay::default(),
             rpc: RpcSection::default(),
+            telemetry: TelemetrySection::default(),
         }
     }
 
@@ -534,6 +537,22 @@ impl Default for HttpSection {
     }
 }
 
+/// Optional OpenTelemetry-style export (JSON OTLP body; no SDK).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetrySection {
+    /// When set, collectors may pull `GET /v1/metrics/otlp` or a future push uses this URL.
+    pub otlp_endpoint: Option<String>,
+}
+
+impl Default for TelemetrySection {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+        }
+    }
+}
+
 /// Multimodal encoder placement + optional vision weight path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -547,6 +566,9 @@ pub struct MultimodalSection {
     pub vision_image_size: u32,
     /// Patch edge in pixels.
     pub vision_patch: u32,
+    /// Optional ViT-lite transformer blocks after patch embed (0 = patch-only).
+    #[serde(default)]
+    pub vision_n_blocks: u32,
 }
 
 impl Default for MultimodalSection {
@@ -556,6 +578,7 @@ impl Default for MultimodalSection {
             vision_path: None,
             vision_image_size: 64,
             vision_patch: 16,
+            vision_n_blocks: 0,
         }
     }
 }
@@ -650,6 +673,7 @@ mod tests {
             r#"
             [multimodal]
             vision_device = "hip:1"
+            vision_n_blocks = 1
             "#,
         )
         .unwrap();
@@ -657,7 +681,9 @@ mod tests {
             cfg.multimodal.vision_device,
             Some(DeviceSelector::Hip(1))
         );
+        assert_eq!(cfg.multimodal.vision_n_blocks, 1);
         assert!(Config::compiled_defaults().multimodal.vision_device.is_none());
+        assert_eq!(Config::compiled_defaults().multimodal.vision_n_blocks, 0);
     }
 
     #[test]

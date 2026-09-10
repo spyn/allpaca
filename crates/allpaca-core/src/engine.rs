@@ -27,7 +27,8 @@ use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::batch_gemm::{
-    plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, ModelShapeKey,
+    batch_gemm_other_ids, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan,
+    ModelShapeKey,
 };
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
@@ -77,6 +78,8 @@ struct ActiveRequest {
     vision_prefix_len: usize,
     /// Row-major `vision_prefix_len * dim` embeddings for soft prefill.
     vision_embeds: Vec<f32>,
+    /// When vision encode landed on the draft GPU, skip draft propose for this Request.
+    suppress_draft: bool,
 }
 
 struct EngineInner {
@@ -322,15 +325,34 @@ impl Engine {
         } else {
             mm.vision_patch
         };
+        let n_blocks = mm.vision_n_blocks;
         if let Some(path) = &mm.vision_path {
-            let enc = crate::PatchVisionEncoder::load(path, device, out_dim, image_size, patch)?;
+            let enc =
+                crate::PatchVisionEncoder::load(path, device, out_dim, image_size, patch, n_blocks)?;
             tracing::info!(
                 path = %path.display(),
                 out_dim,
                 image_size,
                 patch,
+                n_blocks,
                 ?device,
                 "loaded patch vision encoder weights"
+            );
+            self.set_vision_encoder(Arc::new(enc))?;
+        } else if self.config.model.synthetic
+            && (n_blocks > 0 || mm.vision_device.is_some())
+        {
+            let seed = self.config.engine.determinism_seed.unwrap_or(42);
+            let enc = crate::PatchVisionEncoder::synthetic_sized(
+                device, out_dim, image_size, patch, seed, n_blocks,
+            )?;
+            tracing::info!(
+                out_dim,
+                image_size,
+                patch,
+                n_blocks,
+                ?device,
+                "installed synthetic patch vision encoder"
             );
             self.set_vision_encoder(Arc::new(enc))?;
         }
@@ -587,8 +609,8 @@ impl Engine {
         } else {
             #[cfg(feature = "cuda")]
             {
-                if self.cuda.is_some() {
-                    ("cuda".into(), 0u64)
+                if let Some(cuda) = &self.cuda {
+                    ("cuda".into(), cuda.allocated_bytes())
                 } else {
                     ("cpu".into(), 0)
                 }
@@ -618,6 +640,14 @@ impl Engine {
             .as_ref()
             .map(|h| h.activation_d2h_bytes())
             .unwrap_or(0);
+        #[cfg(feature = "cuda")]
+        let (cuda_h2d, cuda_d2h) = self
+            .cuda
+            .as_ref()
+            .map(|c| (c.activation_h2d_bytes(), c.activation_d2h_bytes()))
+            .unwrap_or((0, 0));
+        #[cfg(not(feature = "cuda"))]
+        let (cuda_h2d, cuda_d2h) = (0u64, 0u64);
         self.metrics
             .device_memory_bytes
             .store(device_memory_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -625,11 +655,11 @@ impl Engine {
             .draft_kv_bytes_on_device
             .store(draft_kv_bytes, std::sync::atomic::Ordering::Relaxed);
         self.metrics.activation_h2d_bytes.store(
-            hip_h2d + kv_h2d + draft_h2d,
+            hip_h2d + kv_h2d + draft_h2d + cuda_h2d,
             std::sync::atomic::Ordering::Relaxed,
         );
         self.metrics.activation_d2h_bytes.store(
-            hip_d2h + kv_d2h + draft_d2h,
+            hip_d2h + kv_d2h + draft_d2h + cuda_d2h,
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(hip) = &self.hip {
@@ -1394,6 +1424,7 @@ impl Engine {
             .as_ref()
             .map(|m| m.config.dim)
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let mut suppress_draft = false;
         let (vision_prefix_len, vision_embeds) = match vision {
             None => (0, Vec::new()),
             Some(v) => {
@@ -1412,6 +1443,29 @@ impl Engine {
                         v.n_tokens,
                         dim
                     ))));
+                }
+                let draft_dev = self.inventory.draft_device;
+                if draft_dev >= 0 && v.device == Some(draft_dev) {
+                    suppress_draft = true;
+                    self.metrics
+                        .degraded_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(vdev) = v.device {
+                    if let Some(hip) = self.hip_workspace_for_device(vdev) {
+                        let bytes = v.embeddings.len().saturating_mul(4);
+                        if bytes > 0 {
+                            if let Ok(buf) = allpaca_hip::DeviceWeights::alloc(vdev, bytes) {
+                                let _ = hip.copy_h2d_f32(
+                                    buf.ptr_at(0) as *mut f32,
+                                    &v.embeddings,
+                                );
+                                self.metrics
+                                    .vision_bytes_on_device
+                                    .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 let mut prefixed = vec![0u32; v.n_tokens];
                 prefixed.append(&mut tokens);
@@ -1525,6 +1579,7 @@ impl Engine {
                 last_hidden: vec![0.0f32; dim],
                 vision_prefix_len,
                 vision_embeds,
+                suppress_draft,
             },
         );
         if self.config.structured_output.async_masks {
@@ -1555,6 +1610,20 @@ impl Engine {
         })
     }
 
+    fn hip_workspace_for_device(&self, device: i32) -> Option<&HipWorkspace> {
+        if let Some(hip) = self.hip.as_ref() {
+            if hip.device == device {
+                return Some(hip.as_ref());
+            }
+        }
+        if let Some(hip) = self.draft_hip.as_ref() {
+            if hip.device == device {
+                return Some(hip.as_ref());
+            }
+        }
+        None
+    }
+
     pub fn step(&self, handle: &mut RequestHandle) -> Result<StepResult, AllpacaError> {
         self.step_id(handle.id)
     }
@@ -1562,12 +1631,13 @@ impl Engine {
     /// Advance the longest-waiting runnable Request. `None` when nothing is runnable
     /// (idle, or only finished Requests remain until their handles are dropped).
     ///
-    /// Under concurrency (`≥2` runnable), also advances a stagger partner in the
-    /// same tick. The partner's `StepResult` is **parked** so it still surfaces as
-    /// a later `PollEvent` (prior silent dual-step broke interleave observability).
+    /// Under concurrency (`≥2` runnable), also advances a stagger partner and any
+    /// soft batch-GEMM plan peers in the same tick. Peer `StepResult`s are **parked**
+    /// so they still surface as later `PollEvent`s (prior silent dual-step broke
+    /// interleave observability).
     pub fn poll(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
         loop {
-            let (id, waited_ms, is_prefill, stagger_partner) = {
+            let (id, waited_ms, is_prefill, stagger_partner, batch_gemm_plan) = {
                 let mut inner = self.lock()?;
                 let schedule = self.config.engine.poll_schedule;
                 let max_pref = self.config.engine.max_consecutive_prefill_picks;
@@ -1586,6 +1656,7 @@ impl Engine {
                     })
                     .collect();
                 let mut stagger_partner: Option<u64> = None;
+                let mut batch_gemm_plan: Option<BatchGemmPlan> = None;
                 if candidates.len() >= 2 {
                     let n_layers = inner
                         .target
@@ -1626,7 +1697,7 @@ impl Engine {
                             stagger_partner = Some(c.request_id);
                         }
                     }
-                    // Soft packed-GEMM plan: execute remains one-at-a-time until kernels land.
+                    // Soft packed-GEMM: plan + same-tick co-step of other members.
                     let shape = inner
                         .target
                         .as_ref()
@@ -1653,10 +1724,11 @@ impl Engine {
                             m_tokens: if *pref { 0 } else { 1 },
                         })
                         .collect();
-                    if plan_batch_gemm(&gemm_cands).is_some() {
+                    if let Some(plan) = plan_batch_gemm(&gemm_cands) {
                         self.metrics
                             .batch_gemm_plans
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        batch_gemm_plan = Some(plan);
                     }
                 }
                 // Soft affinity from a prior failed same-tick partner step.
@@ -1687,10 +1759,10 @@ impl Engine {
                     let is_prefill = active.prefill_pos < active.prompt_len
                         && active.emit_queue.is_empty()
                         && active.parked.is_empty();
-                    (Some(id), waited_ms, is_prefill, stagger_partner)
+                    (Some(id), waited_ms, is_prefill, stagger_partner, batch_gemm_plan)
                 } else {
                     // Drop the mutex before rebalance (it re-locks).
-                    (None, 0.0, false, None)
+                    (None, 0.0, false, None, None)
                 }
             };
             let Some(id) = id else {
@@ -1733,6 +1805,10 @@ impl Engine {
                 .poll_wait_ms_ema_x100
                 .store((ema * 100.0) as u64, std::sync::atomic::Ordering::Relaxed);
             let dual_partner = stagger_partner.filter(|&p| p != id);
+            let batch_partners = batch_gemm_plan
+                .as_ref()
+                .map(|p| batch_gemm_other_ids(p, id))
+                .unwrap_or_default();
             if dual_partner.is_some() {
                 self.micro_batch.begin_dual_step(
                     std::time::SystemTime::now()
@@ -1818,6 +1894,7 @@ impl Engine {
             };
             // Same-tick partner: co-progress then park so the result remains a
             // PollEvent when that request is next picked (observability intact).
+            let mut batch_gemm_co_stepped = false;
             if let Some(partner) = dual_partner {
                 match self.step_id(partner) {
                     Ok(partner_result) => {
@@ -1825,6 +1902,9 @@ impl Engine {
                         self.metrics
                             .micro_batch_dual_steps
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if batch_partners.contains(&partner) {
+                            batch_gemm_co_stepped = true;
+                        }
                     }
                     Err(AllpacaError::Transient(TransientError::RequestBusy)) => {
                         let mut inner = self.lock()?;
@@ -1836,6 +1916,27 @@ impl Engine {
                     }
                 }
                 self.micro_batch.end_dual_step();
+            }
+            for partner in batch_partners {
+                if dual_partner == Some(partner) {
+                    continue;
+                }
+                match self.step_id(partner) {
+                    Ok(partner_result) => {
+                        self.park_result(partner, partner_result)?;
+                        batch_gemm_co_stepped = true;
+                    }
+                    Err(AllpacaError::Transient(TransientError::RequestBusy)) => {
+                        let mut inner = self.lock()?;
+                        inner.prefer_next = Some(partner);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if batch_gemm_co_stepped {
+                self.metrics
+                    .batch_gemm_executes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             self.layer_stagger.end();
             self.note_elastic_pressure_after_decode()?;
@@ -1880,8 +1981,10 @@ impl Engine {
 
         let json_constraints = inner.flags.json_constraints;
         let structured = json_constraints && self.config.structured_output.enabled;
+        let suppress_draft = request(&inner, id)?.suppress_draft;
         let speculate = self.config.speculative.enabled
-            && (inner.flags.ngram_speculation || inner.flags.draft_model_speculation);
+            && (inner.flags.ngram_speculation || inner.flags.draft_model_speculation)
+            && !suppress_draft;
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
@@ -2891,6 +2994,9 @@ fn propose_drafts(
     draft_hip: Option<&HipWorkspace>,
     metrics: &Metrics,
 ) -> Result<Vec<u32>, AllpacaError> {
+    if request(inner, id)?.suppress_draft {
+        return Ok(Vec::new());
+    }
     let ctx = request(inner, id)?.tokens.clone();
     if let Some(ahead) = inner.draft_ahead.take() {
         if ahead.ctx == ctx && !ahead.tokens.is_empty() {
@@ -4900,6 +5006,52 @@ mod tests {
     }
 
     #[test]
+    fn vision_on_draft_device_suppresses_draft_propose() {
+        let params = GenerationParams {
+            max_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let mut engine = test_engine();
+        engine.inventory.draft_device = 1;
+        engine
+            .set_vision_encoder(std::sync::Arc::new(StubVisionEncoder {
+                n_tokens: 2,
+                dim: 32,
+                fill: 0.1,
+                device: Some(1),
+            }))
+            .unwrap();
+        let degraded_before = engine.stats().degraded_events;
+        let images = [crate::ImageInput::new(vec![1, 2, 3], "image/png")];
+        let mut handle = engine
+            .begin_request_multimodal("hi", &images, params)
+            .unwrap();
+        {
+            let guard = engine.inner.lock().unwrap();
+            let active = guard.active.get(&handle.id).unwrap();
+            assert!(
+                active.suppress_draft,
+                "vision on draft GPU must set suppress_draft"
+            );
+        }
+        assert!(
+            engine.stats().degraded_events > degraded_before,
+            "contention must bump degraded_events"
+        );
+        let proposed_before = engine.stats().draft_proposed;
+        engine
+            .drive_request(&mut handle, |ev| ev.finish_reason)
+            .unwrap();
+        assert_eq!(
+            engine.stats().draft_proposed,
+            proposed_before,
+            "suppress_draft must skip draft propose"
+        );
+    }
+
+    #[test]
     fn generate_produces_tokens() {
         let engine = test_engine();
         let out = engine
@@ -5904,6 +6056,48 @@ mod tests {
         assert!(
             stats.micro_batch_dual_steps >= 1,
             "concurrent poll must same-tick dual-step partner; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_plans >= 1,
+            "concurrent decode peers must plan batch GEMM; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_executes >= 1,
+            "concurrent decode peers must soft-execute batch GEMM; stats={stats:?}"
+        );
+        drop(a);
+        drop(b);
+    }
+
+    #[test]
+    fn poll_batch_gemm_soft_execute_counts() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 3,
+            temperature: 0.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let a = engine.begin_request("hello", params.clone()).unwrap();
+        let b = engine.begin_request("world", params).unwrap();
+        for _ in 0..64 {
+            if engine.poll().expect("poll").is_none() {
+                break;
+            }
+            let stats = engine.stats();
+            if stats.batch_gemm_executes >= 1 {
+                drop(a);
+                drop(b);
+                return;
+            }
+        }
+        let stats = engine.stats();
+        assert!(
+            stats.batch_gemm_executes >= 1,
+            "two concurrent decode requests must soft-execute batch GEMM; stats={stats:?}"
         );
         drop(a);
         drop(b);
