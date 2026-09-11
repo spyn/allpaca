@@ -29,8 +29,8 @@ use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::batch_gemm::{
-    batch_gemm_other_ids, packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate,
-    BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    batch_gemm_other_ids, decode_layer_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm,
+    BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
 };
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
@@ -1994,7 +1994,7 @@ impl Engine {
                 self.metrics
                     .batch_gemm_executes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Real packed HIP path: cohort activations × shared Target weight.
+                // Layer-fused packed HIP: one gemm_nt per shared-A decode weight.
                 if let Some(hip) = self.hip.as_ref() {
                     let m = batch_gemm_plan
                         .as_ref()
@@ -2002,10 +2002,17 @@ impl Engine {
                         .unwrap_or(0);
                     if m >= 2 {
                         if let Some(plan) = batch_gemm_plan.as_ref() {
-                            if self.try_packed_batch_gemm_hip(hip, plan) {
+                            let (launched, applied) =
+                                self.try_packed_batch_gemm_hip(hip, plan);
+                            if launched > 0 {
                                 self.metrics
                                     .batch_gemm_hip_kernels
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    .fetch_add(launched, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if applied > 0 {
+                                self.metrics
+                                    .batch_gemm_hip_applied
+                                    .fetch_add(applied, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
@@ -2020,44 +2027,55 @@ impl Engine {
         }
     }
 
-    /// One packed HIP `gemm_nt` over cohort activations and a shared Target weight matrix.
-    /// Returns true only when real A/B were launched successfully (no synthetic diagnostic).
-    fn try_packed_batch_gemm_hip(
-        &self,
-        hip: &HipWorkspace,
-        plan: &BatchGemmPlan,
-    ) -> bool {
+    /// Packed HIP `gemm_nt` for shared-A decode weights + lm_head.
+    ///
+    /// Returns `(kernels_launched, applied)` where `applied` is 1 when packed
+    /// lm_head logits were written into at least one Request's `pending_logits`
+    /// (consumed by the next sample).
+    fn try_packed_batch_gemm_hip(&self, hip: &HipWorkspace, plan: &BatchGemmPlan) -> (u64, u64) {
         let Ok(inner) = self.lock() else {
-            return false;
+            return (0, 0);
         };
         let Some(target) = inner.target.clone() else {
-            return false;
+            return (0, 0);
         };
         let dim = target.config.dim;
+        let vocab = target.config.vocab_size;
         if dim == 0 || plan.request_ids.len() < 2 {
-            return false;
+            return (0, 0);
         }
-        let (b, n, k) = if let Some(wq) = target
-            .layers
-            .iter()
-            .map(|l| l.wq.as_slice())
-            .find(|wq| wq.len() >= dim * dim)
+        let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first()
         {
-            (wq[..dim * dim].to_vec(), dim, dim)
-        } else if !target.lm_head.is_empty()
-            && target.lm_head.len() % dim == 0
-            && target.lm_head.len() / dim >= 1
-        {
-            let n = target.lm_head.len() / dim;
-            (target.lm_head.clone(), n, dim)
+            decode_layer_shared_a_weights(
+                dim,
+                layer.wq.as_slice(),
+                layer.wk.as_slice(),
+                layer.wv.as_slice(),
+                layer.wo.as_slice(),
+                layer.w_gate.as_slice(),
+                layer.w_up.as_slice(),
+            )
+            .into_iter()
+            .map(|w| (w.b.to_vec(), w.n, w.k))
+            .collect()
         } else {
-            return false;
+            Vec::new()
         };
+        let lm_head = if !target.lm_head.is_empty() && target.lm_head.len() % dim == 0 {
+            let n = target.lm_head.len() / dim;
+            Some((target.lm_head.clone(), n, dim))
+        } else {
+            None
+        };
+        if weights.is_empty() && lm_head.is_none() {
+            return (0, 0);
+        }
         let mut a_rows: Vec<Vec<f32>> = Vec::with_capacity(plan.request_ids.len());
         for &rid in &plan.request_ids {
             let Some(req) = inner.active.get(&rid) else {
-                return false;
+                return (0, 0);
             };
+            // Prefer post-norm last_hidden (pre-lm_head); length must be dim.
             let row = if req.last_hidden.len() == dim {
                 req.last_hidden.clone()
             } else if req.moe_norm.len() == dim {
@@ -2067,23 +2085,64 @@ impl Engine {
                 if target.embed.len() >= start + dim {
                     target.embed[start..start + dim].to_vec()
                 } else {
-                    return false;
+                    return (0, 0);
                 }
             } else {
-                return false;
+                return (0, 0);
             };
             a_rows.push(row);
         }
         drop(inner);
 
-        let mut c_rows: Vec<Vec<f32>> = a_rows
-            .iter()
-            .map(|a| vec![0.0f32; (a.len() / k) * n])
-            .collect();
         let a_refs: Vec<&[f32]> = a_rows.iter().map(|v| v.as_slice()).collect();
-        let mut c_refs: Vec<&mut [f32]> =
-            c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
-        packed_gemm_nt_hip(hip, &a_refs, &b, &mut c_refs, n, k).is_ok()
+        let mut launched = 0u64;
+        for (b, n, k) in &weights {
+            let mut c_rows: Vec<Vec<f32>> = a_rows
+                .iter()
+                .map(|a| vec![0.0f32; (a.len() / k) * n])
+                .collect();
+            let mut c_refs: Vec<&mut [f32]> =
+                c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+            if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
+                launched += 1;
+            }
+        }
+
+        let mut applied = 0u64;
+        if let Some((b, n, k)) = lm_head {
+            let mut c_rows: Vec<Vec<f32>> = a_rows
+                .iter()
+                .map(|a| vec![0.0f32; (a.len() / k) * n])
+                .collect();
+            let mut c_refs: Vec<&mut [f32]> =
+                c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+            if packed_gemm_nt_hip(hip, &a_refs, &b, &mut c_refs, n, k).is_ok() {
+                launched += 1;
+                // Consume C: install packed logits for the next sample path.
+                if let Ok(mut inner) = self.lock() {
+                    let mut wrote = false;
+                    for (i, &rid) in plan.request_ids.iter().enumerate() {
+                        let Some(req) = inner.active.get_mut(&rid) else {
+                            continue;
+                        };
+                        let row = &c_rows[i];
+                        let n_logits = n.min(vocab).min(row.len());
+                        if n_logits == 0 {
+                            continue;
+                        }
+                        if req.pending_logits.len() < n_logits {
+                            req.pending_logits.resize(n_logits, 0.0);
+                        }
+                        req.pending_logits[..n_logits].copy_from_slice(&row[..n_logits]);
+                        wrote = true;
+                    }
+                    if wrote {
+                        applied = 1;
+                    }
+                }
+            }
+        }
+        (launched, applied)
     }
 
     fn step_id(&self, id: u64) -> Result<StepResult, AllpacaError> {
@@ -6350,7 +6409,7 @@ mod tests {
         drop(b);
     }
 
-    /// HIP synthetic: packed decode GEMM increments `batch_gemm_hip_kernels` with real A/B.
+    /// HIP synthetic: packed decode GEMM increments kernels; lm_head C is applied.
     #[test]
     fn poll_batch_gemm_hip_kernels_with_real_activations_or_skips() {
         if !allpaca_hip::runtime_linked() || allpaca_hip::device_count() == 0 {
@@ -6386,7 +6445,7 @@ mod tests {
                 break;
             }
             let stats = engine.stats();
-            if stats.batch_gemm_hip_kernels >= 1 {
+            if stats.batch_gemm_hip_kernels >= 6 && stats.batch_gemm_hip_applied >= 1 {
                 assert!(
                     stats.batch_gemm_executes >= 1,
                     "HIP packed kernel implies soft execute; stats={stats:?}"
@@ -6398,8 +6457,67 @@ mod tests {
         }
         let stats = engine.stats();
         assert!(
-            stats.batch_gemm_hip_kernels >= 1,
-            "HIP + last_hidden/weights must packed-launch; stats={stats:?}"
+            stats.batch_gemm_hip_kernels >= 6,
+            "layer-fused HIP must launch QKV/O/gate/up; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_hip_applied >= 1,
+            "packed lm_head logits must be applied to pending_logits; stats={stats:?}"
+        );
+        drop(a);
+        drop(b);
+    }
+
+    /// HIP: packed lm_head C is consumed (applied metric) when cohort co-steps.
+    #[test]
+    fn poll_batch_gemm_hip_applied_or_skips() {
+        if !allpaca_hip::runtime_linked() || allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: false,
+            seed: Some(11),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.engine.max_active_requests = 2;
+        cfg.engine.gpu_backend = "auto".into();
+        cfg.kv.page_tokens = 8;
+        cfg.kv.vram_bytes = 8 * 1024;
+        cfg.kv.dram_bytes = 64 * 1024;
+        let engine = match Engine::new(cfg) {
+            Ok(e) if e.stats().backend == "hip" => e,
+            _ => return,
+        };
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let a = engine.begin_request("hello", params.clone()).unwrap();
+        let b = engine.begin_request("world", params).unwrap();
+        for _ in 0..96 {
+            if engine.poll().expect("poll").is_none() {
+                break;
+            }
+            let stats = engine.stats();
+            if stats.batch_gemm_hip_applied >= 1 {
+                assert!(
+                    stats.batch_gemm_hip_kernels >= 1,
+                    "applied implies at least one packed HIP kernel; stats={stats:?}"
+                );
+                drop(a);
+                drop(b);
+                return;
+            }
+        }
+        let stats = engine.stats();
+        assert!(
+            stats.batch_gemm_hip_applied >= 1,
+            "packed lm_head must be applied on HIP cohort; stats={stats:?}"
         );
         drop(a);
         drop(b);

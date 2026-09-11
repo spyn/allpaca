@@ -318,7 +318,7 @@ Deliverables:
 - encode + soft-prompt inject (`ImageInput` / `VisionTokens`, `begin_request_multimodal` / `generate_multimodal` / `generate_stream_multimodal`, prefill `soft_x`) — **landed**;
 - OpenAI `image_url` for **local**, **`data:` base64**, and **http(s)** (AVIF via ffmpeg) — **landed**;
 - CPU patch-embed vision weights (`multimodal.vision_path` SafeTensors, `PatchVisionEncoder`) — **landed**;
-- full ViT/CLIP audio/vision residency on 9060 XT — **deferred**.
+- full ViT/CLIP audio/vision residency on 9060 XT — **partial** (HIP linears + CLIP conv1/class/pos/ln_pre load; full CLIP numeric parity deferred).
 
 Exit gate: improved concurrency/VRAM stability under multimodal workload.
 

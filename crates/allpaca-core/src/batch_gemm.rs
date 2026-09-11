@@ -4,7 +4,9 @@
 //! builds a [`BatchGemmPlan`]. `Engine::poll` soft-executes by co-stepping the
 //! other plan members in the same tick (parking their `StepResult`s), and when a
 //! HIP workspace plus real cohort activations / Target weights are present runs
-//! one packed host→device `gemm_nt` (concat A along M).
+//! packed host→device `gemm_nt` (concat A along M). Packed **lm_head** outputs
+//! are written into each Request's `pending_logits` for the sample path; FFN
+//! helpers ([`apply_packed_ffn`]) cover gate/up → silu×up → w_down.
 
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -134,6 +136,202 @@ pub fn packed_gemm_nt_cpu(
     packed_gemm_nt(a_rows, b, c_rows, n, k, |a, b, c, m, n, k| {
         allpaca_cpu::matmul_nt(a, b, c, m as usize, n as usize, k as usize)
     })
+}
+
+/// One NT weight matrix that shares the decode activation (`k == hidden dim`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PackedGemmWeight<'a> {
+    pub name: &'static str,
+    pub b: &'a [f32],
+    pub n: usize,
+    pub k: usize,
+}
+
+/// Decode-layer GEMMs whose B is `n×dim` so they share last_hidden as A (`k=dim`).
+///
+/// Includes Q/K/V/O and SwiGLU gate/up. Skips `w_down` (k = ff_dim, different A);
+/// use [`packed_ffn_shared_a`] / [`apply_packed_ffn`] for the full FFN including down.
+pub fn decode_layer_shared_a_weights<'a>(
+    dim: usize,
+    wq: &'a [f32],
+    wk: &'a [f32],
+    wv: &'a [f32],
+    wo: &'a [f32],
+    w_gate: &'a [f32],
+    w_up: &'a [f32],
+) -> Vec<PackedGemmWeight<'a>> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(6);
+    let push = |out: &mut Vec<PackedGemmWeight<'a>>, name: &'static str, b: &'a [f32]| {
+        if b.len() < dim || b.len() % dim != 0 {
+            return;
+        }
+        let n = b.len() / dim;
+        out.push(PackedGemmWeight { name, b, n, k: dim });
+    };
+    push(&mut out, "wq", wq);
+    push(&mut out, "wk", wk);
+    push(&mut out, "wv", wv);
+    push(&mut out, "wo", wo);
+    push(&mut out, "w_gate", w_gate);
+    push(&mut out, "w_up", w_up);
+    out
+}
+
+/// FFN weights: gate/up share activation A (`k=dim`); `w_down` uses post-silu A (`k=ff_dim`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedFfnWeights<'a> {
+    pub w_gate: Option<PackedGemmWeight<'a>>,
+    pub w_up: Option<PackedGemmWeight<'a>>,
+    pub w_down: Option<PackedGemmWeight<'a>>,
+    pub ff_dim: usize,
+}
+
+/// List SwiGLU FFN weights for packed apply (gate/up shared-A, then down).
+pub fn packed_ffn_shared_a<'a>(
+    dim: usize,
+    w_gate: &'a [f32],
+    w_up: &'a [f32],
+    w_down: &'a [f32],
+) -> PackedFfnWeights<'a> {
+    if dim == 0 {
+        return PackedFfnWeights {
+            w_gate: None,
+            w_up: None,
+            w_down: None,
+            ff_dim: 0,
+        };
+    }
+    let gate = if !w_gate.is_empty() && w_gate.len() % dim == 0 {
+        let n = w_gate.len() / dim;
+        Some(PackedGemmWeight {
+            name: "w_gate",
+            b: w_gate,
+            n,
+            k: dim,
+        })
+    } else {
+        None
+    };
+    let up = if !w_up.is_empty() && w_up.len() % dim == 0 {
+        let n = w_up.len() / dim;
+        Some(PackedGemmWeight {
+            name: "w_up",
+            b: w_up,
+            n,
+            k: dim,
+        })
+    } else {
+        None
+    };
+    let ff_dim = gate.map(|g| g.n).or_else(|| up.map(|u| u.n)).unwrap_or(0);
+    let down = if ff_dim > 0 && !w_down.is_empty() && w_down.len() % ff_dim == 0 {
+        let n = w_down.len() / ff_dim;
+        Some(PackedGemmWeight {
+            name: "w_down",
+            b: w_down,
+            n,
+            k: ff_dim,
+        })
+    } else {
+        None
+    };
+    PackedFfnWeights {
+        w_gate: gate,
+        w_up: up,
+        w_down: down,
+        ff_dim,
+    }
+}
+
+/// Packed FFN: gate/up GEMM → `silu(gate)*up` per row → packed `w_down` into `out_rows`.
+///
+/// Each `a_rows[i]` / `out_rows[i]` is `m_i×dim`. Uses CPU NT GEMM.
+pub fn apply_packed_ffn(
+    a_rows: &[&[f32]],
+    w_gate: &[f32],
+    w_up: &[f32],
+    w_down: &[f32],
+    dim: usize,
+    out_rows: &mut [&mut [f32]],
+) -> Result<(), AllpacaError> {
+    let ffn = packed_ffn_shared_a(dim, w_gate, w_up, w_down);
+    let Some(gate_w) = ffn.w_gate else {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn: missing w_gate".into(),
+        )));
+    };
+    let Some(up_w) = ffn.w_up else {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn: missing w_up".into(),
+        )));
+    };
+    let Some(down_w) = ffn.w_down else {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn: missing w_down".into(),
+        )));
+    };
+    if gate_w.n != up_w.n || down_w.n != dim {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn: dim/ff_dim mismatch".into(),
+        )));
+    }
+    let ff_dim = ffn.ff_dim;
+    if a_rows.len() != out_rows.len() {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn: a/out row count mismatch".into(),
+        )));
+    }
+    let mut gate_rows: Vec<Vec<f32>> = a_rows
+        .iter()
+        .map(|a| {
+            let m = a.len() / dim;
+            vec![0.0f32; m * ff_dim]
+        })
+        .collect();
+    let mut up_rows: Vec<Vec<f32>> = a_rows
+        .iter()
+        .map(|a| {
+            let m = a.len() / dim;
+            vec![0.0f32; m * ff_dim]
+        })
+        .collect();
+    {
+        let mut g_refs: Vec<&mut [f32]> = gate_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        packed_gemm_nt_cpu(a_rows, gate_w.b, &mut g_refs, ff_dim, dim)?;
+    }
+    {
+        let mut u_refs: Vec<&mut [f32]> = up_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        packed_gemm_nt_cpu(a_rows, up_w.b, &mut u_refs, ff_dim, dim)?;
+    }
+    let mut act_rows: Vec<Vec<f32>> = Vec::with_capacity(a_rows.len());
+    for (g, u) in gate_rows.iter().zip(up_rows.iter()) {
+        let mut act = vec![0.0f32; g.len()];
+        for i in 0..g.len() {
+            act[i] = allpaca_cpu::silu(g[i]) * u[i];
+        }
+        act_rows.push(act);
+    }
+    let act_refs: Vec<&[f32]> = act_rows.iter().map(|v| v.as_slice()).collect();
+    packed_gemm_nt_cpu(&act_refs, down_w.b, out_rows, dim, ff_dim)
+}
+
+/// Packed lm_head: shared-A NT GEMM of hidden rows × `lm_head` (`n=vocab`, `k=dim`).
+pub fn apply_packed_lm_head(
+    a_rows: &[&[f32]],
+    lm_head: &[f32],
+    dim: usize,
+    c_rows: &mut [&mut [f32]],
+) -> Result<(), AllpacaError> {
+    if dim == 0 || lm_head.is_empty() || lm_head.len() % dim != 0 {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_lm_head: bad lm_head shape".into(),
+        )));
+    }
+    let n = lm_head.len() / dim;
+    packed_gemm_nt_cpu(a_rows, lm_head, c_rows, n, dim)
 }
 
 /// Packed F32 NT GEMM on a HIP workspace using caller-provided A/B rows.
@@ -424,5 +622,114 @@ mod tests {
             return;
         };
         packed_gemm_nt_hip_diagnostic(&hip, 2).expect("diagnostic packed hip");
+    }
+
+    #[test]
+    fn decode_layer_shared_a_lists_qkv_and_ffn_gate_up() {
+        let dim = 4usize;
+        let wq = vec![1.0f32; dim * dim];
+        let wk = vec![2.0f32; 2 * dim];
+        let wv = vec![3.0f32; 2 * dim];
+        let wo = vec![4.0f32; dim * dim];
+        let w_gate = vec![5.0f32; 8 * dim];
+        let w_up = vec![6.0f32; 8 * dim];
+        let w = decode_layer_shared_a_weights(dim, &wq, &wk, &wv, &wo, &w_gate, &w_up);
+        let names: Vec<&str> = w.iter().map(|x| x.name).collect();
+        assert_eq!(names, vec!["wq", "wk", "wv", "wo", "w_gate", "w_up"]);
+        assert_eq!(w[1].n, 2);
+        assert_eq!(w[4].n, 8);
+        assert!(w.iter().all(|x| x.k == dim));
+        assert!(decode_layer_shared_a_weights(0, &wq, &wk, &wv, &wo, &w_gate, &w_up).is_empty());
+    }
+
+    #[test]
+    fn packed_ffn_lists_gate_up_and_down() {
+        let dim = 4usize;
+        let ff = 8usize;
+        let w_gate = vec![1.0f32; ff * dim];
+        let w_up = vec![2.0f32; ff * dim];
+        let w_down = vec![3.0f32; dim * ff];
+        let ffn = packed_ffn_shared_a(dim, &w_gate, &w_up, &w_down);
+        assert_eq!(ffn.ff_dim, ff);
+        assert_eq!(ffn.w_gate.unwrap().n, ff);
+        assert_eq!(ffn.w_up.unwrap().n, ff);
+        let down = ffn.w_down.unwrap();
+        assert_eq!(down.n, dim);
+        assert_eq!(down.k, ff);
+    }
+
+    /// Packed SwiGLU (gate/up → silu*up → down) matches per-row separate path.
+    #[test]
+    fn packed_ffn_gate_up_down_matches_separate() {
+        let dim = 4usize;
+        let ff = 6usize;
+        let a0 = [0.1f32, -0.2, 0.3, 0.0];
+        let a1 = [0.5f32, 0.25, -0.1, 0.05];
+        let w_gate: Vec<f32> = (0..ff * dim)
+            .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+            .collect();
+        let w_up: Vec<f32> = (0..ff * dim)
+            .map(|i| ((i % 5) as f32) * 0.05)
+            .collect();
+        let w_down: Vec<f32> = (0..dim * ff)
+            .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
+            .collect();
+
+        let sep = |a: &[f32]| {
+            let mut gate = vec![0.0f32; ff];
+            let mut up = vec![0.0f32; ff];
+            let mut out = vec![0.0f32; dim];
+            allpaca_cpu::matmul_nt(a, &w_gate, &mut gate, 1, ff, dim).unwrap();
+            allpaca_cpu::matmul_nt(a, &w_up, &mut up, 1, ff, dim).unwrap();
+            for i in 0..ff {
+                gate[i] = allpaca_cpu::silu(gate[i]) * up[i];
+            }
+            allpaca_cpu::matmul_nt(&gate, &w_down, &mut out, 1, dim, ff).unwrap();
+            out
+        };
+        let c0_sep = sep(&a0);
+        let c1_sep = sep(&a1);
+
+        let mut c0 = [0.0f32; 4];
+        let mut c1 = [0.0f32; 4];
+        apply_packed_ffn(
+            &[&a0[..], &a1[..]],
+            &w_gate,
+            &w_up,
+            &w_down,
+            dim,
+            &mut [&mut c0[..], &mut c1[..]],
+        )
+        .expect("packed ffn");
+        for i in 0..dim {
+            assert!((c0[i] - c0_sep[i]).abs() < 1e-5, "c0[{i}]");
+            assert!((c1[i] - c1_sep[i]).abs() < 1e-5, "c1[{i}]");
+        }
+    }
+
+    #[test]
+    fn packed_lm_head_matches_separate() {
+        let dim = 4usize;
+        let vocab = 5usize;
+        let a0 = [0.2f32, -0.1, 0.4, 0.0];
+        let a1 = [0.0f32, 0.3, -0.2, 0.1];
+        let lm: Vec<f32> = (0..vocab * dim)
+            .map(|i| ((i % 6) as f32) * 0.1 - 0.2)
+            .collect();
+        let mut c0_sep = [0.0f32; 5];
+        let mut c1_sep = [0.0f32; 5];
+        allpaca_cpu::matmul_nt(&a0, &lm, &mut c0_sep, 1, vocab, dim).unwrap();
+        allpaca_cpu::matmul_nt(&a1, &lm, &mut c1_sep, 1, vocab, dim).unwrap();
+        let mut c0 = [0.0f32; 5];
+        let mut c1 = [0.0f32; 5];
+        apply_packed_lm_head(
+            &[&a0[..], &a1[..]],
+            &lm,
+            dim,
+            &mut [&mut c0[..], &mut c1[..]],
+        )
+        .expect("packed lm_head");
+        assert_eq!(c0, c0_sep);
+        assert_eq!(c1, c1_sep);
     }
 }

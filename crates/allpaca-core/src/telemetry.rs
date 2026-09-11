@@ -146,6 +146,8 @@ pub struct Metrics {
     pub batch_gemm_executes: AtomicU64,
     /// Packed host→HIP GEMM launches (single kernel, M>1) from batch-GEMM soft execute.
     pub batch_gemm_hip_kernels: AtomicU64,
+    /// Packed HIP lm_head logits written into Request `pending_logits` (consumed by sample).
+    pub batch_gemm_hip_applied: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
@@ -320,6 +322,7 @@ impl Metrics {
             batch_gemm_plans: self.batch_gemm_plans.load(Ordering::Relaxed),
             batch_gemm_executes: self.batch_gemm_executes.load(Ordering::Relaxed),
             batch_gemm_hip_kernels: self.batch_gemm_hip_kernels.load(Ordering::Relaxed),
+            batch_gemm_hip_applied: self.batch_gemm_hip_applied.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),

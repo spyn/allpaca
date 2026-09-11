@@ -1,8 +1,10 @@
 //! CPU/HIP patch-embed vision encoder with optional ViT blocks and loadable F32 weights.
 //!
 //! HIP residency uploads patch + block tensors once; encode prefers device
-//! `gemm_nt_dev_b` for patch linear and ViT block linears. SafeTensors load
-//! accepts native `patch_proj` / `blocks.*` and CLIP-style `visual.proj` /
+//! `gemm_nt_dev_b` for patch linear and ViT block linears, and
+//! `HipWorkspace::attention` (online softmax) for ViT self-attn. LayerNorm
+//! stays host: no mean/var LN kernel (RMSNorm is not equivalent). SafeTensors
+//! load accepts native `patch_proj` / `blocks.*` and CLIP-style `visual.proj` /
 //! `visual.transformer.resblocks.*` aliases.
 //!
 //! Decodes JPEG/PNG/WebP via `image`. AVIF (and other formats `image` rejects)
@@ -12,6 +14,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static HIP_VIT_ATTN_HITS: AtomicUsize = AtomicUsize::new(0);
 
 use allpaca_hip::DeviceWeights;
 use allpaca_safetensors::{write_safetensors, SafetensorsDtype, SafetensorsFile, SafetensorsWriteTensor};
@@ -56,6 +63,12 @@ pub struct PatchVisionEncoder {
     blocks: Arc<Vec<VitBlockWeights>>,
     /// Device-resident pack of `weight` + `bias` + ViT block tensors (lifetime of encoder).
     resident: Mutex<Option<DeviceWeights>>,
+    /// CLIP `visual.class_embedding` (prepended as token 0).
+    class_emb: Option<Vec<f32>>,
+    /// CLIP `visual.positional_embedding` `[seq, dim]` including class token when present.
+    pos_emb: Option<Vec<f32>>,
+    ln_pre_w: Option<Vec<f32>>,
+    ln_pre_b: Option<Vec<f32>>,
 }
 
 impl PatchVisionEncoder {
@@ -105,6 +118,10 @@ impl PatchVisionEncoder {
             bias: Arc::new(bias),
             blocks: Arc::new(blocks),
             resident: Mutex::new(None),
+            class_emb: None,
+            pos_emb: None,
+            ln_pre_w: None,
+            ln_pre_b: None,
         })
     }
 
@@ -219,31 +236,52 @@ impl PatchVisionEncoder {
         n_blocks: u32,
     ) -> Result<Self, AllpacaError> {
         let file = SafetensorsFile::open(path)?;
-        let weight = tensor_f32_aliases(
-            &file,
-            &[
-                "patch_proj.weight",
-                "visual.proj",
-                "visual.proj.weight",
-                "visual.patch_proj.weight",
-            ],
-        )?;
-        let bias = match tensor_f32_aliases(
-            &file,
-            &[
-                "patch_proj.bias",
-                "visual.proj.bias",
-                "visual.patch_proj.bias",
-            ],
-        ) {
-            Ok(b) => b,
-            Err(_) => vec![0.0f32; out_dim],
+        let conv1 = file.tensor_f32("visual.conv1.weight");
+        let has_conv1 = conv1.is_ok();
+        let weight = if let Ok(w) = conv1 {
+            w
+        } else {
+            tensor_f32_aliases(
+                &file,
+                &[
+                    "patch_proj.weight",
+                    "visual.proj",
+                    "visual.proj.weight",
+                    "visual.patch_proj.weight",
+                ],
+            )?
+        };
+        let bias = if has_conv1 {
+            file.tensor_f32("visual.conv1.bias")
+                .unwrap_or_else(|_| vec![0.0f32; out_dim])
+        } else {
+            match tensor_f32_aliases(
+                &file,
+                &[
+                    "patch_proj.bias",
+                    "visual.proj.bias",
+                    "visual.patch_proj.bias",
+                ],
+            ) {
+                Ok(b) => b,
+                Err(_) => vec![0.0f32; out_dim],
+            }
+        };
+        let n_blocks = if n_blocks > 0 {
+            n_blocks
+        } else {
+            count_vit_blocks(&file)
         };
         let mut blocks = Vec::with_capacity(n_blocks as usize);
         for i in 0..n_blocks {
             blocks.push(load_block(&file, out_dim, i as usize)?);
         }
-        Self::new(device, out_dim, image_size, patch_size, weight, bias, blocks)
+        let mut enc = Self::new(device, out_dim, image_size, patch_size, weight, bias, blocks)?;
+        enc.class_emb = file.tensor_f32("visual.class_embedding").ok();
+        enc.pos_emb = file.tensor_f32("visual.positional_embedding").ok();
+        enc.ln_pre_w = file.tensor_f32("visual.ln_pre.weight").ok();
+        enc.ln_pre_b = file.tensor_f32("visual.ln_pre.bias").ok();
+        Ok(enc)
     }
 
     pub fn write_safetensors(&self, path: &Path) -> Result<(), AllpacaError> {
@@ -372,6 +410,36 @@ impl VisionEncoder for PatchVisionEncoder {
             let rgb = decode_rgb8(img)?;
             let resized = resize_rgb8(&rgb, self.image_size, self.image_size)?;
             let mut tokens = self.patch_embed_tokens(&resized)?;
+            if let Some(cls) = self.class_emb.as_ref() {
+                if cls.len() == self.out_dim {
+                    let mut prefixed = cls.clone();
+                    prefixed.extend_from_slice(&tokens);
+                    tokens = prefixed;
+                }
+            }
+            if let Some(pos) = self.pos_emb.as_ref() {
+                if pos.len() == tokens.len() {
+                    for (t, p) in tokens.iter_mut().zip(pos.iter()) {
+                        *t += *p;
+                    }
+                }
+            }
+            if let (Some(w), Some(b)) = (self.ln_pre_w.as_ref(), self.ln_pre_b.as_ref()) {
+                if w.len() == self.out_dim && b.len() == self.out_dim {
+                    let seq = tokens.len() / self.out_dim;
+                    let mut normed = vec![0.0f32; tokens.len()];
+                    for t in 0..seq {
+                        let row = &tokens[t * self.out_dim..(t + 1) * self.out_dim];
+                        layer_norm(
+                            row,
+                            w,
+                            b,
+                            &mut normed[t * self.out_dim..(t + 1) * self.out_dim],
+                        );
+                    }
+                    tokens = normed;
+                }
+            }
             for (bi, block) in self.blocks.iter().enumerate() {
                 let mut used_hip = false;
                 if let Ok(guard) = self.resident.lock() {
@@ -560,6 +628,20 @@ fn load_block(
     Ok(b)
 }
 
+fn count_vit_blocks(file: &SafetensorsFile) -> u32 {
+    let mut n = 0u32;
+    loop {
+        let native = format!("blocks.{n}.attn_qkv.weight");
+        let clip = format!("visual.transformer.resblocks.{n}.attn.in_proj_weight");
+        if file.tensor(&native).is_some() || file.tensor(&clip).is_some() {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
 fn tensor_f32_aliases(file: &SafetensorsFile, names: &[&str]) -> Result<Vec<f32>, AllpacaError> {
     let mut last = None;
     for name in names {
@@ -605,33 +687,7 @@ fn apply_vit_block(
         );
     }
     let mut attn_out = vec![0.0f32; seq * dim];
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut scores = vec![0.0f32; seq];
-    for h in 0..n_heads {
-        for qi in 0..seq {
-            let q_base = qi * 3 * dim + h * head_dim;
-            for kj in 0..seq {
-                let k_base = kj * 3 * dim + dim + h * head_dim;
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    dot += qkv[q_base + d] * qkv[k_base + d];
-                }
-                scores[kj] = dot * scale;
-            }
-            softmax_inplace(&mut scores);
-            let out_base = qi * dim + h * head_dim;
-            for d in 0..head_dim {
-                attn_out[out_base + d] = 0.0;
-            }
-            for kj in 0..seq {
-                let v_base = kj * 3 * dim + 2 * dim + h * head_dim;
-                let a = scores[kj];
-                for d in 0..head_dim {
-                    attn_out[out_base + d] += a * qkv[v_base + d];
-                }
-            }
-        }
-    }
+    vit_attention_cpu(&qkv, &mut attn_out, seq, dim, n_heads, head_dim);
     let mut proj = vec![0.0f32; seq * dim];
     for t in 0..seq {
         linear(
@@ -756,8 +812,9 @@ fn add_bias_rows(out: &mut [f32], rows: usize, cols: usize, bias: &[f32]) {
     }
 }
 
-/// ViT block with HIP `gemm_nt_dev_b` for attn_qkv / attn_proj / mlp_fc1 / mlp_fc2.
-/// Attention softmax and layer-norm stay on CPU for this slice.
+/// ViT block with HIP `gemm_nt_dev_b` for linears and `HipWorkspace::attention`
+/// for self-attn (softmax on device). LayerNorm stays on CPU: allpaca-hip has
+/// RMSNorm only, which is not mean/var LN.
 #[allow(clippy::too_many_arguments)]
 fn apply_vit_block_hip(
     tokens: &mut [f32],
@@ -783,7 +840,11 @@ fn apply_vit_block_hip(
 
     let max_a = seq.saturating_mul(dim.max(mlp));
     let max_c = seq.saturating_mul((3 * dim).max(mlp).max(dim));
-    let scratch = (max_a + max_c).saturating_mul(4).saturating_add(4096);
+    let attn_bytes = seq.saturating_mul(dim).saturating_mul(4).saturating_mul(4);
+    let scratch = (max_a + max_c)
+        .saturating_mul(4)
+        .saturating_add(4096)
+        .max(attn_bytes.saturating_add(4096));
     let hip = allpaca_hip::HipWorkspace::new(weights.device(), scratch, 1)?;
 
     let mut normed = vec![0.0f32; tokens.len()];
@@ -804,32 +865,11 @@ fn apply_vit_block_hip(
     add_bias_rows(&mut qkv, seq, 3 * dim, &block.attn_qkv_b);
 
     let mut attn_out = vec![0.0f32; seq * dim];
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut scores = vec![0.0f32; seq];
-    for h in 0..n_heads {
-        for qi in 0..seq {
-            let q_base = qi * 3 * dim + h * head_dim;
-            for kj in 0..seq {
-                let k_base = kj * 3 * dim + dim + h * head_dim;
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    dot += qkv[q_base + d] * qkv[k_base + d];
-                }
-                scores[kj] = dot * scale;
-            }
-            softmax_inplace(&mut scores);
-            let out_base = qi * dim + h * head_dim;
-            for d in 0..head_dim {
-                attn_out[out_base + d] = 0.0;
-            }
-            for kj in 0..seq {
-                let v_base = kj * 3 * dim + 2 * dim + h * head_dim;
-                let a = scores[kj];
-                for d in 0..head_dim {
-                    attn_out[out_base + d] += a * qkv[v_base + d];
-                }
-            }
-        }
+    if vit_attention_hip(&hip, &qkv, &mut attn_out, seq, dim, n_heads, head_dim).is_ok() {
+        #[cfg(test)]
+        HIP_VIT_ATTN_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        vit_attention_cpu(&qkv, &mut attn_out, seq, dim, n_heads, head_dim);
     }
 
     let mut proj = vec![0.0f32; seq * dim];
@@ -879,6 +919,77 @@ fn apply_vit_block_hip(
         tokens[i] += mlp_out[i];
     }
     Ok(())
+}
+
+fn vit_attention_cpu(
+    qkv: &[f32],
+    attn_out: &mut [f32],
+    seq: usize,
+    dim: usize,
+    n_heads: usize,
+    head_dim: usize,
+) {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0f32; seq];
+    for h in 0..n_heads {
+        for qi in 0..seq {
+            let q_base = qi * 3 * dim + h * head_dim;
+            for kj in 0..seq {
+                let k_base = kj * 3 * dim + dim + h * head_dim;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += qkv[q_base + d] * qkv[k_base + d];
+                }
+                scores[kj] = dot * scale;
+            }
+            softmax_inplace(&mut scores);
+            let out_base = qi * dim + h * head_dim;
+            for d in 0..head_dim {
+                attn_out[out_base + d] = 0.0;
+            }
+            for kj in 0..seq {
+                let v_base = kj * 3 * dim + 2 * dim + h * head_dim;
+                let a = scores[kj];
+                for d in 0..head_dim {
+                    attn_out[out_base + d] += a * qkv[v_base + d];
+                }
+            }
+        }
+    }
+}
+
+/// Split packed `[seq, 3*dim]` QKV into `[seq, n_heads, head_dim]` layouts and run
+/// non-causal HIP attention (device online-softmax).
+fn vit_attention_hip(
+    hip: &allpaca_hip::HipWorkspace,
+    qkv: &[f32],
+    attn_out: &mut [f32],
+    seq: usize,
+    dim: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<(), AllpacaError> {
+    let mut q = vec![0.0f32; seq * dim];
+    let mut k = vec![0.0f32; seq * dim];
+    let mut v = vec![0.0f32; seq * dim];
+    for t in 0..seq {
+        let base = t * 3 * dim;
+        q[t * dim..(t + 1) * dim].copy_from_slice(&qkv[base..base + dim]);
+        k[t * dim..(t + 1) * dim].copy_from_slice(&qkv[base + dim..base + 2 * dim]);
+        v[t * dim..(t + 1) * dim].copy_from_slice(&qkv[base + 2 * dim..base + 3 * dim]);
+    }
+    hip.attention(
+        &q,
+        &k,
+        &v,
+        attn_out,
+        seq as i32,
+        seq as i32,
+        n_heads as i32,
+        n_heads as i32,
+        head_dim as i32,
+        false,
+    )
 }
 
 fn layer_norm(x: &[f32], w: &[f32], b: &[f32], out: &mut [f32]) {
@@ -1200,6 +1311,7 @@ mod tests {
         assert_eq!(hip.n_blocks(), 1);
         let bytes = hip.ensure_device_resident(Some(0)).unwrap();
         assert!(bytes > 0, "expected weight upload including vit block");
+        HIP_VIT_ATTN_HITS.store(0, Ordering::Relaxed);
         let a = cpu
             .encode(&[ImageInput::new(jpeg.clone(), "image/jpeg")])
             .unwrap();
@@ -1212,6 +1324,40 @@ mod tests {
             assert!(
                 (x - y).abs() < 1e-3,
                 "mismatch at {i}: cpu={x} hip={y}"
+            );
+        }
+        assert!(
+            HIP_VIT_ATTN_HITS.load(Ordering::Relaxed) >= 1,
+            "expected HIP attention (device softmax) when resident"
+        );
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn vit_attention_hip_matches_cpu_on_packed_qkv() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip vit_attention_hip_matches_cpu_on_packed_qkv: no HIP device");
+            return;
+        }
+        let seq = 4usize;
+        let n_heads = 2usize;
+        let head_dim = 4usize;
+        let dim = n_heads * head_dim;
+        let mut qkv = vec![0.0f32; seq * 3 * dim];
+        for (i, x) in qkv.iter_mut().enumerate() {
+            *x = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        let mut cpu_out = vec![0.0f32; seq * dim];
+        let mut hip_out = vec![0.0f32; seq * dim];
+        vit_attention_cpu(&qkv, &mut cpu_out, seq, dim, n_heads, head_dim);
+        let scratch = (seq * dim * 4 * 4).saturating_add(4096);
+        let hip = allpaca_hip::HipWorkspace::new(0, scratch, 1).unwrap();
+        vit_attention_hip(&hip, &qkv, &mut hip_out, seq, dim, n_heads, head_dim)
+            .expect("HIP vit attention");
+        for (i, (c, h)) in cpu_out.iter().zip(hip_out.iter()).enumerate() {
+            assert!(
+                (c - h).abs() < 1e-3,
+                "attn mismatch at {i}: cpu={c} hip={h}"
             );
         }
     }
@@ -1407,6 +1553,97 @@ mod tests {
             .encode(&[ImageInput::new(jpeg, "image/jpeg")])
             .unwrap();
         assert_eq!(a.embeddings, btok.embeddings);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_clip_checkpoint_conv1_class_pos_auto_blocks() {
+        let out_dim = 32usize;
+        let patch = DEFAULT_PATCH_SIZE;
+        let image_size = DEFAULT_IMAGE_SIZE;
+        let n_patches = ((image_size / patch) as usize).pow(2);
+        let enc = PatchVisionEncoder::synthetic_sized(None, out_dim, image_size, patch, 7, 1)
+            .unwrap();
+        let block = enc.blocks[0].clone();
+        let conv1 = enc.weight.as_slice().to_vec();
+        let cls = vec![0.25f32; out_dim];
+        let mut pos = vec![0.0f32; (n_patches + 1) * out_dim];
+        for (i, p) in pos.iter_mut().enumerate() {
+            *p = (i as f32) * 0.001;
+        }
+        let ln_w = vec![1.0f32; out_dim];
+        let ln_b = vec![0.0f32; out_dim];
+        let tensors = vec![
+            SafetensorsWriteTensor {
+                name: "visual.conv1.weight".into(),
+                dims: vec![out_dim as u64, 3, patch as u64, patch as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &conv1,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.class_embedding".into(),
+                dims: vec![out_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &cls,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.positional_embedding".into(),
+                dims: vec![(n_patches + 1) as u64, out_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &pos,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.ln_pre.weight".into(),
+                dims: vec![out_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &ln_w,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.ln_pre.bias".into(),
+                dims: vec![out_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &ln_b,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.transformer.resblocks.0.attn.in_proj_weight".into(),
+                dims: vec![(3 * out_dim) as u64, out_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &block.attn_qkv_w,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.transformer.resblocks.0.attn.out_proj.weight".into(),
+                dims: vec![out_dim as u64, out_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &block.attn_proj_w,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.transformer.resblocks.0.mlp.c_fc.weight".into(),
+                dims: vec![mlp_hidden(out_dim) as u64, out_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &block.mlp_fc1_w,
+            },
+            SafetensorsWriteTensor {
+                name: "visual.transformer.resblocks.0.mlp.c_proj.weight".into(),
+                dims: vec![out_dim as u64, mlp_hidden(out_dim) as u64],
+                dtype: SafetensorsDtype::F32,
+                data: &block.mlp_fc2_w,
+            },
+        ];
+        let path = std::env::temp_dir().join("allpaca_vision_clip_ckpt.safetensors");
+        write_safetensors(&path, &tensors).unwrap();
+        let loaded =
+            PatchVisionEncoder::load(&path, None, out_dim, image_size, patch, 0).unwrap();
+        assert_eq!(loaded.n_blocks(), 1, "n_blocks=0 must auto-count resblocks");
+        let jpeg = tiny_jpeg();
+        let tokens = loaded
+            .encode(&[ImageInput::new(jpeg, "image/jpeg")])
+            .unwrap();
+        assert_eq!(
+            tokens.n_tokens,
+            n_patches + 1,
+            "CLIP class token prepends one soft token"
+        );
+        assert_eq!(tokens.embeddings.len(), tokens.n_tokens * out_dim);
         let _ = std::fs::remove_file(path);
     }
 

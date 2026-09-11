@@ -201,6 +201,9 @@ pub struct StatsSnapshot {
     /// Packed host→HIP GEMM launches (single kernel, M>1) from batch-GEMM soft execute.
     #[serde(default)]
     pub batch_gemm_hip_kernels: u64,
+    /// Packed HIP lm_head outputs applied into Request logits (used by sampling).
+    #[serde(default)]
+    pub batch_gemm_hip_applied: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,

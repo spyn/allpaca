@@ -683,6 +683,11 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
         s.batch_gemm_hip_kernels
     );
     counter!(
+        "allpaca_batch_gemm_hip_applied_total",
+        "Packed HIP lm_head logits written into Request pending_logits",
+        s.batch_gemm_hip_applied
+    );
+    counter!(
         "allpaca_micro_batch_plans_total",
         "Cross-request micro-batch stagger plans",
         s.micro_batch_plans
@@ -812,6 +817,7 @@ mod tests {
         assert!(body.contains("allpaca_batch_gemm_plans_total"));
         assert!(body.contains("allpaca_batch_gemm_executes_total"));
         assert!(body.contains("allpaca_batch_gemm_hip_kernels_total"));
+        assert!(body.contains("allpaca_batch_gemm_hip_applied_total"));
     }
 
     #[tokio::test]

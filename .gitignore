@@ -9,6 +9,9 @@ test-out*.txt
 models/**/*.gguf
 /models/.cache/
 
+# Local overnight soak capture (example name: overnight-q8-9060.log)
+overnight-*.log
+
 # Cursor / graphify local artifacts
 .cursor/
 .cursor-plugin/

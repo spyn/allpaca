@@ -147,6 +147,22 @@ Gated HIP soaks (when weights are present locally):
 | `ALLPACA_OVERNIGHT_9060=1` | Dual-GPU bakeoff: optional HIP:1 soak (prefers Q8) |
 | `ALLPACA_OVERNIGHT_9060_Q8=0` | Force F16 for the 9060 soak leg |
 
+#### Dual-GPU overnight (Q8 9060) — operator runbook
+
+Reference dual-HIP box (RX 9070 target + RX 9060 XT draft/soak). Keep both GPUs visible (do **not** set `HIP_VISIBLE_DEVICES`). Draft / 9060 soak weights resolve via test helpers (`overnight_9060_gguf`, `demo_draft_gguf`): prefer `models/Llama-3.2-3B-Instruct-Q8_0.gguf` when present (then 1B Q8; F16 only if Q8 missing or forced off).
+
+```bat
+REM Full dual-GPU bakeoff with Q8 9060 soak (default when Q8 GGUF exists)
+set ALLPACA_OVERNIGHT=1
+set ALLPACA_OVERNIGHT_9060=1
+REM optional: set ALLPACA_OVERNIGHT_9060_Q8=0   REM force F16 9060 soak (~4.5 tps historically)
+cargo test -p allpaca-core --features hip --test hip_runtime hip_overnight_llama32_f16_on_second_gpu_when_env_set -- --nocapture > overnight-q8-9060.log 2>&1
+```
+
+Short smoke: `ALLPACA_OVERNIGHT_ROUNDS=1` and `ALLPACA_OVERNIGHT_TOKENS=16`.
+
+**Ballpark (Q8 9060 soak, warm rounds):** 9070 greedy ~33 tps · 9060 Q8 greedy ~32 tps · asymmetric spec acceptance ~0.99. Example local artifact name: `overnight-q8-9060.log` (do not commit; see `.gitignore`).
+
 ### Bench helper
 
 ```bash
