@@ -166,7 +166,12 @@ impl KvTierManager {
                             "HIP KV alloc failed and pinned DRAM is full".into(),
                         ))
                     })?;
-                    (KvResidency::PinnedDram, off, DeviceBufferKind::CpuPinnedDram, -1)
+                    (
+                        KvResidency::PinnedDram,
+                        off,
+                        DeviceBufferKind::CpuPinnedDram,
+                        -1,
+                    )
                 }
             }
         } else {
@@ -178,7 +183,12 @@ impl KvTierManager {
                             "VRAM and pinned DRAM KV pools are full".into(),
                         ))
                     })?;
-                    (KvResidency::PinnedDram, off, DeviceBufferKind::CpuPinnedDram, -1)
+                    (
+                        KvResidency::PinnedDram,
+                        off,
+                        DeviceBufferKind::CpuPinnedDram,
+                        -1,
+                    )
                 }
             }
         };
@@ -272,7 +282,9 @@ impl KvTierManager {
         })?;
         let kv_width = n_kv_heads * head_dim;
         let k_off = page.location.offset + slot as usize * kv_width;
-        let v_off = page.location.offset + page.capacity_tokens as usize * kv_width + slot as usize * kv_width;
+        let v_off = page.location.offset
+            + page.capacity_tokens as usize * kv_width
+            + slot as usize * kv_width;
         match page.location.kind {
             DeviceBufferKind::Hip => {
                 let alloc = self.hip_pages.get(&id).ok_or_else(|| {
@@ -283,18 +295,8 @@ impl KvTierManager {
                 let k_bytes = kv_width * 4;
                 let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
                 let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
-                allpaca_hip::memcpy(
-                    k_ptr,
-                    k.as_ptr().cast(),
-                    k_bytes,
-                    allpaca_hip::MEMCPY_H2D,
-                )?;
-                allpaca_hip::memcpy(
-                    v_ptr,
-                    v.as_ptr().cast(),
-                    k_bytes,
-                    allpaca_hip::MEMCPY_H2D,
-                )?;
+                allpaca_hip::memcpy(k_ptr, k.as_ptr().cast(), k_bytes, allpaca_hip::MEMCPY_H2D)?;
+                allpaca_hip::memcpy(v_ptr, v.as_ptr().cast(), k_bytes, allpaca_hip::MEMCPY_H2D)?;
                 self.activation_h2d_bytes
                     .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
             }
@@ -504,7 +506,9 @@ impl KvTierManager {
             let run = (n_tok - i).min(page_tokens - slot);
             let (kind, offset, cap) = {
                 let page = self.pages.get(&page_id).ok_or_else(|| {
-                    AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {page_id}")))
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "unknown KV page {page_id}"
+                    )))
                 })?;
                 (
                     page.location.kind,
@@ -598,10 +602,7 @@ impl KvTierManager {
             let id = pages[0];
             if let Some(page) = self.pages.get(&id) {
                 let filled = page.filled as usize;
-                if filled > 0
-                    && filled <= max_kv
-                    && page.location.kind == DeviceBufferKind::Hip
-                {
+                if filled > 0 && filled <= max_kv && page.location.kind == DeviceBufferKind::Hip {
                     let alloc = self.hip_pages.get(&id).ok_or_else(|| {
                         AllpacaError::Fatal(FatalError::OutOfMemory(format!(
                             "HIP KV page {id} missing device buffer"
@@ -911,12 +912,17 @@ impl KvTierManager {
             return;
         };
         let want = page.page_index.saturating_add(1);
-        let Some(next_id) = self.pages.values().find(|p| {
-            p.layer == page.layer
-                && p.page_index == want
-                && p.tier == KvResidency::Nvme
-                && p.id != id
-        }).map(|p| p.id) else {
+        let Some(next_id) = self
+            .pages
+            .values()
+            .find(|p| {
+                p.layer == page.layer
+                    && p.page_index == want
+                    && p.tier == KvResidency::Nvme
+                    && p.id != id
+            })
+            .map(|p| p.id)
+        else {
             return;
         };
         if self.migrate_to_dram(next_id, &Metrics::default()).is_ok() {
@@ -1055,7 +1061,8 @@ impl KvTierManager {
             );
         }
         metrics.kv_nvme_prefetches.store(
-            self.nvme_prefetches.load(std::sync::atomic::Ordering::Relaxed),
+            self.nvme_prefetches
+                .load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
         let kv_dev: u64 = self.hip_pages.values().map(|p| p.bytes as u64).sum();
@@ -1149,7 +1156,12 @@ mod tests {
         }
         let (vram, dram) = kv.counts();
         assert!(dram > 0, "expected DRAM spill, vram={vram} dram={dram}");
-        assert!(metrics.page_migrations.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            metrics
+                .page_migrations
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
     }
 
     #[test]
@@ -1161,7 +1173,10 @@ mod tests {
             ids.push(kv.alloc_page(0, i, 4, 1, 4, &metrics).unwrap());
         }
         let (vram_before, dram_before) = kv.counts();
-        assert!(vram_before >= 4, "pages must start in VRAM; vram={vram_before}");
+        assert!(
+            vram_before >= 4,
+            "pages must start in VRAM; vram={vram_before}"
+        );
         assert_eq!(dram_before, 0);
         kv.set_vram_bytes(128, &metrics).unwrap();
         let (vram_after, dram_after) = kv.counts();
@@ -1217,8 +1232,16 @@ mod tests {
             kv.nvme_count()
         );
         let (k, v) = kv.read_kv(ids[0], 1, 4).unwrap();
-        assert_eq!(&k[..4], marker.as_slice(), "cold-tier read must keep K bytes");
-        assert_eq!(&v[..4], marker.as_slice(), "cold-tier read must keep V bytes");
+        assert_eq!(
+            &k[..4],
+            marker.as_slice(),
+            "cold-tier read must keep K bytes"
+        );
+        assert_eq!(
+            &v[..4],
+            marker.as_slice(),
+            "cold-tier read must keep V bytes"
+        );
         kv.write_slot(ids[0], 1, 1, 4, &marker, &marker).unwrap();
         let (k, _) = kv.read_kv(ids[0], 1, 4).unwrap();
         assert_eq!(
@@ -1308,11 +1331,34 @@ mod tests {
         }
         allpaca_hip::device_free(dk, k_bytes);
         allpaca_hip::device_free(dv, v_bytes);
-        for (a, b) in batch_ids.iter().zip(slot_ids.iter()) {
-            let (bk, bv) = batched.read_kv(*a, n_kv_heads, head_dim).unwrap();
-            let (sk, sv) = per_slot.read_kv(*b, n_kv_heads, head_dim).unwrap();
-            assert_eq!(bk, sk, "K page mismatch batched vs per-slot");
-            assert_eq!(bv, sv, "V page mismatch batched vs per-slot");
+        // Only written slots are defined. device_malloc pages are dirty, so
+        // unread slots must not be compared (parallel HIP tests reuse VRAM).
+        for page_i in 0..n_pages as usize {
+            let (bk, bv) = batched
+                .read_kv(batch_ids[page_i], n_kv_heads, head_dim)
+                .unwrap();
+            let (sk, sv) = per_slot
+                .read_kv(slot_ids[page_i], n_kv_heads, head_dim)
+                .unwrap();
+            let page_start = page_i * page_tokens as usize;
+            let page_end = page_start + page_tokens as usize;
+            let write_lo = start_pos.max(page_start);
+            let write_hi = (start_pos + n_tok).min(page_end);
+            if write_lo >= write_hi {
+                continue;
+            }
+            let lo = (write_lo - page_start) * kv_width;
+            let hi = (write_hi - page_start) * kv_width;
+            assert_eq!(
+                &bk[lo..hi],
+                &sk[lo..hi],
+                "K page {page_i} written slots mismatch"
+            );
+            assert_eq!(
+                &bv[lo..hi],
+                &sv[lo..hi],
+                "V page {page_i} written slots mismatch"
+            );
         }
     }
 }

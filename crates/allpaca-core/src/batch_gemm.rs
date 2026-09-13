@@ -108,14 +108,7 @@ where
         a_pack.extend_from_slice(a);
     }
     let mut c_pack = vec![0.0f32; m_total * n];
-    gemm_nt(
-        &a_pack,
-        b,
-        &mut c_pack,
-        m_total as i32,
-        n as i32,
-        k as i32,
-    )?;
+    gemm_nt(&a_pack, b, &mut c_pack, m_total as i32, n as i32, k as i32)?;
     let mut off = 0usize;
     for (i, m_i) in m_parts.into_iter().enumerate() {
         let span = m_i * n;
@@ -365,15 +358,10 @@ pub fn packed_gemm_nt_hip_diagnostic(
                 .collect()
         })
         .collect();
-    let b: Vec<f32> = (0..n * k)
-        .map(|i| ((i % 5) as f32) * 0.05)
-        .collect();
+    let b: Vec<f32> = (0..n * k).map(|i| ((i % 5) as f32) * 0.05).collect();
     let mut c_rows_owned: Vec<Vec<f32>> = (0..m).map(|_| vec![0.0f32; n]).collect();
     let a_refs: Vec<&[f32]> = a_rows_owned.iter().map(|v| v.as_slice()).collect();
-    let mut c_refs: Vec<&mut [f32]> = c_rows_owned
-        .iter_mut()
-        .map(|v| v.as_mut_slice())
-        .collect();
+    let mut c_refs: Vec<&mut [f32]> = c_rows_owned.iter_mut().map(|v| v.as_mut_slice()).collect();
     packed_gemm_nt_hip(hip, &a_refs, &b, &mut c_refs, n, k)
 }
 
@@ -554,8 +542,14 @@ mod tests {
 
         let mut c0 = [0.0f32; 3];
         let mut c1 = [0.0f32; 3];
-        packed_gemm_nt_cpu(&[&a0[..], &a1[..]], &b, &mut [&mut c0[..], &mut c1[..]], n, k)
-            .expect("packed cpu");
+        packed_gemm_nt_cpu(
+            &[&a0[..], &a1[..]],
+            &b,
+            &mut [&mut c0[..], &mut c1[..]],
+            n,
+            k,
+        )
+        .expect("packed cpu");
         assert_eq!(c0, c0_sep);
         assert_eq!(c1, c1_sep);
     }
@@ -584,15 +578,8 @@ mod tests {
 
         let mut c0 = vec![0.0f32; n];
         let mut c1 = vec![0.0f32; n];
-        packed_gemm_nt_hip(
-            &hip,
-            &[&a0, &a1],
-            &b,
-            &mut [&mut c0[..], &mut c1[..]],
-            n,
-            k,
-        )
-        .expect("packed hip gemm");
+        packed_gemm_nt_hip(&hip, &[&a0, &a1], &b, &mut [&mut c0[..], &mut c1[..]], n, k)
+            .expect("packed hip gemm");
         for i in 0..n {
             let d0 = (c0[i] - c0_sep[i]).abs();
             let d1 = (c1[i] - c1_sep[i]).abs();
@@ -602,8 +589,14 @@ mod tests {
 
         let mut c0_cpu = vec![0.0f32; n];
         let mut c1_cpu = vec![0.0f32; n];
-        packed_gemm_nt_cpu(&[&a0, &a1], &b, &mut [&mut c0_cpu[..], &mut c1_cpu[..]], n, k)
-            .unwrap();
+        packed_gemm_nt_cpu(
+            &[&a0, &a1],
+            &b,
+            &mut [&mut c0_cpu[..], &mut c1_cpu[..]],
+            n,
+            k,
+        )
+        .unwrap();
         for i in 0..n {
             let d0 = (c0[i] - c0_cpu[i]).abs();
             let d1 = (c1[i] - c1_cpu[i]).abs();
@@ -668,9 +661,7 @@ mod tests {
         let w_gate: Vec<f32> = (0..ff * dim)
             .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
             .collect();
-        let w_up: Vec<f32> = (0..ff * dim)
-            .map(|i| ((i % 5) as f32) * 0.05)
-            .collect();
+        let w_up: Vec<f32> = (0..ff * dim).map(|i| ((i % 5) as f32) * 0.05).collect();
         let w_down: Vec<f32> = (0..dim * ff)
             .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
             .collect();

@@ -9,7 +9,11 @@ pub(crate) fn tok_env_from_tokenizer(tok: &EngineTokenizer) -> llguidance::toktr
     let eos = tok.eos_id.unwrap_or(0);
     let mut info = TokRxInfo::new(tok.tokens.len() as u32, eos);
     info.tok_bos = tok.bos_id;
-    info.tok_unk = tok.tokens.iter().position(|t| t == "<unk>" || t == "[UNK]").map(|i| i as u32);
+    info.tok_unk = tok
+        .tokens
+        .iter()
+        .position(|t| t == "<unk>" || t == "[UNK]")
+        .map(|i| i as u32);
     let words: Vec<Vec<u8>> = (0..tok.tokens.len())
         .map(|id| trie_token_bytes(tok, id as u32))
         .collect();
@@ -17,7 +21,11 @@ pub(crate) fn tok_env_from_tokenizer(tok: &EngineTokenizer) -> llguidance::toktr
 }
 
 fn trie_token_bytes(tok: &EngineTokenizer, id: u32) -> Vec<u8> {
-    let raw = tok.tokens.get(id as usize).map(String::as_str).unwrap_or("");
+    let raw = tok
+        .tokens
+        .get(id as usize)
+        .map(String::as_str)
+        .unwrap_or("");
     let decoded = tok.decode_one(id);
     let special = Some(id) == tok.bos_id
         || Some(id) == tok.eos_id
@@ -87,7 +95,9 @@ fn compile_grammar(
         })?;
         Ok(llguidance::api::TopLevelGrammar::from_json_schema(val))
     } else if let Some(lark) = lark {
-        Ok(llguidance::api::TopLevelGrammar::from_lark(lark.to_string()))
+        Ok(llguidance::api::TopLevelGrammar::from_lark(
+            lark.to_string(),
+        ))
     } else {
         Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "no grammar specified".into(),
@@ -117,7 +127,9 @@ mod tests {
                 mask.allowed(id as usize),
                 "schema must allow {piece:?} (id={id})"
             );
-            matcher.consume_token(id).unwrap_or_else(|e| panic!("consume {piece:?}: {e}"));
+            matcher
+                .consume_token(id)
+                .unwrap_or_else(|e| panic!("consume {piece:?}: {e}"));
         }
         let vob = matcher
             .compute_mask_or_eos()

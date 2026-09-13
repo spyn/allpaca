@@ -63,9 +63,7 @@ fn cuda_synthetic_generate_uses_device_when_present() {
         stats.weight_h2d_bytes, before.weight_h2d_bytes,
         "weight_h2d must not grow during generate"
     );
-    let activation_delta = stats
-        .activation_h2d_bytes
-        .saturating_sub(h2d_after_load);
+    let activation_delta = stats.activation_h2d_bytes.saturating_sub(h2d_after_load);
     assert!(
         activation_delta < before.weight_h2d_bytes,
         "per-generate activation H2D ({activation_delta}) must stay below weight pack ({})",

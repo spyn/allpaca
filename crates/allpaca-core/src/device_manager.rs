@@ -245,7 +245,11 @@ mod tests {
         let inv = DeviceInventory::discover(&cfg);
         assert!(inv.devices.iter().any(|d| d.is_rpc()));
         assert_eq!(
-            inv.devices.iter().find(|d| d.is_rpc()).unwrap().rpc_endpoint(),
+            inv.devices
+                .iter()
+                .find(|d| d.is_rpc())
+                .unwrap()
+                .rpc_endpoint(),
             Some("127.0.0.1:50052")
         );
     }

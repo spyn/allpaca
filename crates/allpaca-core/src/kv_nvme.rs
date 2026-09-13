@@ -14,10 +14,8 @@ use std::sync::Mutex;
 
 use allpaca_types::{AllpacaError, FatalError, PageId};
 
+use crate::direct_storage::open_direct;
 use crate::weight_set::{align_up, DIRECT_ALIGN};
-
-#[cfg(windows)]
-const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 
 struct AlignedBuf {
     ptr: *mut u8,
@@ -84,7 +82,11 @@ impl std::fmt::Debug for NvmeKvStore {
 }
 
 impl NvmeKvStore {
-    pub fn open(path: &Path, budget_bytes: usize, remove_on_drop: bool) -> Result<Self, AllpacaError> {
+    pub fn open(
+        path: &Path,
+        budget_bytes: usize,
+        remove_on_drop: bool,
+    ) -> Result<Self, AllpacaError> {
         if budget_bytes == 0 {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "kv.nvme_bytes must be > 0 to open a cold tier".into(),
@@ -257,49 +259,14 @@ impl Drop for NvmeKvStore {
 pub fn temp_kv_nvme_path() -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "allpaca-kv-{}-{id}.bin",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("allpaca-kv-{}-{id}.bin", std::process::id()))
 }
 
 fn open_rw(path: &Path) -> Result<(File, bool), AllpacaError> {
-    if let Ok(file) = open_direct_rw(path) {
+    if let Ok(file) = open_direct(path, true) {
         return Ok((file, true));
     }
-    Ok((
-        OpenOptions::new().read(true).write(true).open(path)?,
-        false,
-    ))
-}
-
-fn open_direct_rw(path: &Path) -> std::io::Result<File> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        return OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open(path);
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        return OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(0o40000)
-            .open(path);
-    }
-    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Direct I/O is not available on this platform",
-        ))
-    }
+    Ok((OpenOptions::new().read(true).write(true).open(path)?, false))
 }
 
 #[cfg(test)]

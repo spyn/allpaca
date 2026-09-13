@@ -202,15 +202,18 @@ fn transfer_path_is_measured_not_assumed_p2p() {
             stats.host_staging_gbps > 0.0 || stats.host_staging_us > 0.0,
             "two-GPU boot must measure host staging"
         );
-        if stats.p2p_capable && stats.p2p_enabled && stats.p2p_gbps > 0.0 {
+        if stats.p2p_gbps > 0.0 {
             assert_eq!(stats.p2p_status, "measured");
             assert!(stats.p2p_us > 0.0);
+            assert!(
+                stats.p2p_capable,
+                "a working hipMemcpyPeer must mark P2P capable (EnablePeerAccess may still fail on gfx906)"
+            );
         } else {
             assert_eq!(
                 stats.p2p_status, "p2p_unavailable",
-                "failed enable+copy must not pretend P2P was measured"
+                "failed copy must not pretend P2P was measured"
             );
-            assert_eq!(stats.p2p_gbps, 0.0);
             assert_eq!(stats.transfer_path, "HostStaging");
         }
     }
@@ -2741,10 +2744,7 @@ fn overnight_timeout(tokens: usize, secs_per_token: u64) -> std::time::Duration 
 /// Optional 9060 soak GGUF: Q8 for better ITL unless `ALLPACA_OVERNIGHT_9060_Q8=0`.
 #[cfg(feature = "hip")]
 fn overnight_9060_prefer_q8() -> bool {
-    std::env::var("ALLPACA_OVERNIGHT_9060_Q8")
-        .ok()
-        .as_deref()
-        != Some("0")
+    std::env::var("ALLPACA_OVERNIGHT_9060_Q8").ok().as_deref() != Some("0")
 }
 
 #[cfg(feature = "hip")]
@@ -4096,7 +4096,8 @@ fn gated_tq_gguf() -> Option<std::path::PathBuf> {
 
 fn write_tiny_tq2_gguf(path: &std::path::Path) {
     use allpaca_gguf::{
-        quantize_tq2_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor,
+        quantize_tq2_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
+        GgufWriteTensor,
     };
     use std::collections::HashMap;
 

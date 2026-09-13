@@ -2,10 +2,10 @@
 
 mod anchors;
 mod batch_gemm;
+mod compute;
 mod constraint;
 pub mod deltanet;
 mod device_manager;
-mod compute;
 mod direct_storage;
 mod draft;
 mod early_exit;
@@ -41,9 +41,8 @@ pub use batch_gemm::{
     packed_gemm_nt_hip_diagnostic, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase,
     BatchGemmPlan, ModelShapeKey, PackedFfnWeights, PackedGemmWeight,
 };
-pub use device_manager::{detect_pipeline_mode, DeviceInventory};
 pub use compute::ComputeDev;
-pub use layer_split::{plan_layer_owners, LayerPlan};
+pub use device_manager::{detect_pipeline_mode, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{
     accept_exit, has_calibration_data, spec_from_gguf, spec_from_metadata, EarlyExitSpec,
@@ -51,18 +50,17 @@ pub use early_exit::{
 };
 pub use engine::{mtp_text_is_garbled, Engine, RequestHandle};
 pub use kv_tier::KvTierManager;
+pub use layer_split::{plan_layer_owners, LayerPlan};
 pub use memory_tier::{
     CxlMemBackend, MemoryTierBackend, PimBackend, PinnedDramBackend, ReadTicket,
 };
-pub use modality::{
-    EncoderPlacement, ImageInput, NoopVisionEncoder, VisionEncoder, VisionTokens,
-};
-pub use model::{LayerWeights, ModelConfig, MtpNextnWeights, TinyModel};
+pub use modality::{EncoderPlacement, ImageInput, NoopVisionEncoder, VisionEncoder, VisionTokens};
 #[cfg(feature = "cuda")]
 pub use model::CudaResidentModel;
+pub use model::{LayerWeights, ModelConfig, MtpNextnWeights, TinyModel};
+pub use otel::export_otlp_json;
 pub use packed::{HostExpertPool, PackedStore};
 pub use scheduler::Scheduler;
-pub use otel::export_otlp_json;
 pub use telemetry::Metrics;
 pub use tokenizer::EngineTokenizer;
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};

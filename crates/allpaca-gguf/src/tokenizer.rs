@@ -376,7 +376,10 @@ mod tests {
             GgufValue::Uint32(0),
         );
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
-        meta.insert("tokenizer.ggml.add_bos_token".into(), GgufValue::Bool(false));
+        meta.insert(
+            "tokenizer.ggml.add_bos_token".into(),
+            GgufValue::Bool(false),
+        );
         meta
     }
 
@@ -469,10 +472,7 @@ mod tests {
             "tokenizer.ggml.eot_token_id".into(),
             GgufValue::Uint32(eot_id),
         );
-        meta.insert(
-            "tokenizer.ggml.eos_token_id".into(),
-            GgufValue::Uint32(2),
-        );
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
         write_gguf(&path, &meta, &[]).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let tok = extract_tokenizer(&file).unwrap();

@@ -14,6 +14,10 @@ use futures::Stream;
 use rand::rngs::StdRng;
 
 use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
+use crate::batch_gemm::{
+    batch_gemm_other_ids, decode_layer_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm,
+    BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+};
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
 use crate::direct_storage::{
@@ -28,10 +32,6 @@ use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
-use crate::batch_gemm::{
-    batch_gemm_other_ids, decode_layer_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm,
-    BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
-};
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
     alloc_pages_for_seq, ensure_pages, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
@@ -335,8 +335,9 @@ impl Engine {
         };
         let n_blocks = mm.vision_n_blocks;
         if let Some(path) = &mm.vision_path {
-            let enc =
-                crate::PatchVisionEncoder::load(path, device, out_dim, image_size, patch, n_blocks)?;
+            let enc = crate::PatchVisionEncoder::load(
+                path, device, out_dim, image_size, patch, n_blocks,
+            )?;
             tracing::info!(
                 path = %path.display(),
                 out_dim,
@@ -347,9 +348,7 @@ impl Engine {
                 "loaded patch vision encoder weights"
             );
             self.set_vision_encoder(Arc::new(enc))?;
-        } else if self.config.model.synthetic
-            && (n_blocks > 0 || mm.vision_device.is_some())
-        {
+        } else if self.config.model.synthetic && (n_blocks > 0 || mm.vision_device.is_some()) {
             let seed = self.config.engine.determinism_seed.unwrap_or(42);
             let enc = crate::PatchVisionEncoder::synthetic_sized(
                 device, out_dim, image_size, patch, seed, n_blocks,
@@ -382,9 +381,9 @@ impl Engine {
         &self,
         encoder: Arc<dyn crate::VisionEncoder>,
     ) -> Result<(), AllpacaError> {
-        let hip_dev = encoder.device().and_then(|d| {
-            self.hip_workspace_for_device(d).map(|h| h.device)
-        });
+        let hip_dev = encoder
+            .device()
+            .and_then(|d| self.hip_workspace_for_device(d).map(|h| h.device));
         let bytes = encoder.ensure_device_resident(hip_dev)?;
         if bytes > 0 {
             self.metrics
@@ -607,38 +606,40 @@ impl Engine {
             }
             Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
-        let (backend, device_memory_bytes) = if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote())
-        {
-            if let Some(rt) = &self.rpc {
-                self.metrics
-                    .rpc_roundtrips
-                    .store(rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
-                self.metrics.rpc_activation_bytes.store(
-                    rt.activation_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                self.metrics.rpc_h2d_bytes.store(
-                    rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            ("rpc".into(), allpaca_hip::allocated_bytes())
-        } else if self.hip.is_some() {
-            ("hip".into(), allpaca_hip::allocated_bytes())
-        } else {
-            #[cfg(feature = "cuda")]
-            {
-                if let Some(cuda) = &self.cuda {
-                    ("cuda".into(), cuda.allocated_bytes())
-                } else {
+        let (backend, device_memory_bytes) =
+            if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+                if let Some(rt) = &self.rpc {
+                    self.metrics.rpc_roundtrips.store(
+                        rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.metrics.rpc_activation_bytes.store(
+                        rt.activation_bytes
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.metrics.rpc_h2d_bytes.store(
+                        rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                ("rpc".into(), allpaca_hip::allocated_bytes())
+            } else if self.hip.is_some() {
+                ("hip".into(), allpaca_hip::allocated_bytes())
+            } else {
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(cuda) = &self.cuda {
+                        ("cuda".into(), cuda.allocated_bytes())
+                    } else {
+                        ("cpu".into(), 0)
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
                     ("cpu".into(), 0)
                 }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                ("cpu".into(), 0)
-            }
-        };
+            };
         let hip_h2d = self
             .hip
             .as_ref()
@@ -810,10 +811,7 @@ impl Engine {
         )?;
         model.rpc = Some(Arc::clone(rt));
         tracing::info!(
-            remote_layers = rt
-                .plan_has_remote()
-                .then_some("yes")
-                .unwrap_or("no"),
+            remote_layers = rt.plan_has_remote().then_some("yes").unwrap_or("no"),
             sessions = rt.session_count(),
             "rpc layer plan ready"
         );
@@ -1105,8 +1103,7 @@ impl Engine {
         }
         if model.early_exit.supported {
             model.early_exit.min_confidence = self.config.early_exit.min_confidence;
-            model.early_exit.min_calibration_margin =
-                self.config.early_exit.min_calibration_margin;
+            model.early_exit.min_calibration_margin = self.config.early_exit.min_calibration_margin;
         }
         self.attach_rpc(&mut model)?;
         inner.model_id = model.name.clone();
@@ -1485,14 +1482,11 @@ impl Engine {
         let (vision_prefix_len, vision_embeds) = match vision {
             None => (0, Vec::new()),
             Some(v) => {
-                let need = v
-                    .n_tokens
-                    .checked_mul(dim)
-                    .ok_or_else(|| {
-                        AllpacaError::Fatal(FatalError::InvalidConfig(
-                            "vision soft token size overflow".into(),
-                        ))
-                    })?;
+                let need = v.n_tokens.checked_mul(dim).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(
+                        "vision soft token size overflow".into(),
+                    ))
+                })?;
                 if v.embeddings.len() != need {
                     return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
                         "vision embeddings len {} != n_tokens {} * dim {}",
@@ -1513,10 +1507,7 @@ impl Engine {
                         let bytes = v.embeddings.len().saturating_mul(4);
                         if bytes > 0 {
                             if let Ok(buf) = allpaca_hip::DeviceWeights::alloc(vdev, bytes) {
-                                let _ = hip.copy_h2d_f32(
-                                    buf.ptr_at(0) as *mut f32,
-                                    &v.embeddings,
-                                );
+                                let _ = hip.copy_h2d_f32(buf.ptr_at(0) as *mut f32, &v.embeddings);
                                 self.metrics
                                     .vision_bytes_on_device
                                     .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1816,7 +1807,13 @@ impl Engine {
                     let is_prefill = active.prefill_pos < active.prompt_len
                         && active.emit_queue.is_empty()
                         && active.parked.is_empty();
-                    (Some(id), waited_ms, is_prefill, stagger_partner, batch_gemm_plan)
+                    (
+                        Some(id),
+                        waited_ms,
+                        is_prefill,
+                        stagger_partner,
+                        batch_gemm_plan,
+                    )
                 } else {
                     // Drop the mutex before rebalance (it re-locks).
                     (None, 0.0, false, None, None)
@@ -1996,14 +1993,10 @@ impl Engine {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Layer-fused packed HIP: one gemm_nt per shared-A decode weight.
                 if let Some(hip) = self.hip.as_ref() {
-                    let m = batch_gemm_plan
-                        .as_ref()
-                        .map(|p| p.m_tokens)
-                        .unwrap_or(0);
+                    let m = batch_gemm_plan.as_ref().map(|p| p.m_tokens).unwrap_or(0);
                     if m >= 2 {
                         if let Some(plan) = batch_gemm_plan.as_ref() {
-                            let (launched, applied) =
-                                self.try_packed_batch_gemm_hip(hip, plan);
+                            let (launched, applied) = self.try_packed_batch_gemm_hip(hip, plan);
                             if launched > 0 {
                                 self.metrics
                                     .batch_gemm_hip_kernels
@@ -2044,8 +2037,7 @@ impl Engine {
         if dim == 0 || plan.request_ids.len() < 2 {
             return (0, 0);
         }
-        let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first()
-        {
+        let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first() {
             decode_layer_shared_a_weights(
                 dim,
                 layer.wq.as_slice(),
@@ -2101,8 +2093,7 @@ impl Engine {
                 .iter()
                 .map(|a| vec![0.0f32; (a.len() / k) * n])
                 .collect();
-            let mut c_refs: Vec<&mut [f32]> =
-                c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut c_refs: Vec<&mut [f32]> = c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
             if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
                 launched += 1;
             }
@@ -2114,8 +2105,7 @@ impl Engine {
                 .iter()
                 .map(|a| vec![0.0f32; (a.len() / k) * n])
                 .collect();
-            let mut c_refs: Vec<&mut [f32]> =
-                c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut c_refs: Vec<&mut [f32]> = c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
             if packed_gemm_nt_hip(hip, &a_refs, &b, &mut c_refs, n, k).is_ok() {
                 launched += 1;
                 // Consume C: install packed logits for the next sample path.
@@ -2440,7 +2430,6 @@ impl Engine {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.last_hidden)
         };
-        // Per-token prefill so radix (and anchors) get correct mid-prefix checkpoints.
         let (vision_prefix_len, vision_embeds, dim) = {
             let active = request(inner, id)?;
             (
@@ -2449,7 +2438,34 @@ impl Engine {
                 target.config.dim,
             )
         };
-        for (i, tok) in toks.iter().enumerate() {
+        let vision_in_chunk = (start..end).any(|p| p < vision_prefix_len);
+        let batch_prefill = !vision_in_chunk
+            && toks.len() > 1
+            && self.hip.is_some()
+            && resident.is_some()
+            && !mtp_draft_active(inner)
+            && target.supports_device_batched_prefill();
+        if batch_prefill {
+            target.forward_tokens(
+                &toks,
+                start,
+                &pages,
+                &mut inner.kv,
+                &self.metrics,
+                &mut logits,
+                self.hip.as_deref(),
+                resident.as_deref(),
+                write_logits,
+                None,
+                recurrent.as_mut(),
+                None,
+                id,
+            )?;
+            // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
+            // page (growing with seq) and break logits-only decode accounting.
+        } else {
+            let want_hidden = mtp_draft_active(inner);
+            for (i, tok) in toks.iter().enumerate() {
             let pos = start + i;
             let last = pos + 1 >= total;
             // MTP process: (token_pos, h_{pos-1}) before target updates last_hidden.
@@ -2467,7 +2483,11 @@ impl Engine {
                 layer_stagger: None,
                 ds_probe: None,
                 ds_queue: None,
-                last_hidden: Some(&mut last_hidden),
+                last_hidden: if want_hidden {
+                    Some(&mut last_hidden)
+                } else {
+                    None
+                },
             };
             let soft = if pos < vision_prefix_len {
                 Some(&vision_embeds[pos * dim..(pos + 1) * dim])
@@ -2544,7 +2564,7 @@ impl Engine {
                     hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
                 }
             }
-            if sync_host_gdn {
+            if sync_host_gdn && self.hip.is_none() {
                 let prefix = request(inner, id)?.tokens[..=pos].to_vec();
                 let pages_now = request(inner, id)?.pages.clone();
                 let state_ref = recurrent.clone().unwrap_or_else(|| {
@@ -2568,6 +2588,7 @@ impl Engine {
                         )?;
                     }
                 }
+            }
             }
         }
         if let Some(hip) = self.hip.as_deref() {
@@ -2846,13 +2867,12 @@ fn open_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<Hi
     if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "hip" {
         return None;
     }
-    let device = if inventory.target_device >= 0
-        && gpus.iter().any(|d| d.id == inventory.target_device)
-    {
-        inventory.target_device
-    } else {
-        gpus[0].id
-    };
+    let device =
+        if inventory.target_device >= 0 && gpus.iter().any(|d| d.id == inventory.target_device) {
+            inventory.target_device
+        } else {
+            gpus[0].id
+        };
     match HipWorkspace::new(device, 8 * 1024 * 1024, 256) {
         Ok(ws) => {
             tracing::info!(
@@ -2939,13 +2959,12 @@ fn open_cuda_workspace(
     if gpus.is_empty() {
         return None;
     }
-    let device = if inventory.target_device >= 0
-        && gpus.iter().any(|d| d.id == inventory.target_device)
-    {
-        inventory.target_device
-    } else {
-        gpus[0].id
-    };
+    let device =
+        if inventory.target_device >= 0 && gpus.iter().any(|d| d.id == inventory.target_device) {
+            inventory.target_device
+        } else {
+            gpus[0].id
+        };
     match allpaca_cuda::CudaWorkspace::new(device, 8 * 1024 * 1024) {
         Ok(ws) => {
             tracing::info!(
@@ -4320,13 +4339,18 @@ fn append_and_forward(
     let mut moe_norm = std::mem::take(&mut request_mut(inner, id)?.moe_norm);
     let mut last_hidden = std::mem::take(&mut request_mut(inner, id)?.last_hidden);
     mtp_process_token(inner, token, pos, &last_hidden, draft_hip, metrics)?;
+    let want_hidden = mtp_draft_active(inner);
     let mut side = DeviceDecodeSide {
         request_id: id,
         moe_norm: Some(&mut moe_norm),
         layer_stagger,
         ds_probe,
         ds_queue,
-        last_hidden: Some(&mut last_hidden),
+        last_hidden: if want_hidden {
+            Some(&mut last_hidden)
+        } else {
+            None
+        },
     };
     let used_cuda = {
         #[cfg(feature = "cuda")]
@@ -4436,9 +4460,7 @@ mod tests {
         Engine::new(test_config()).unwrap()
     }
 
-    fn spawn_hello_stub(
-        reply: allpaca_rpc::HelloReply,
-    ) -> (String, std::thread::JoinHandle<()>) {
+    fn spawn_hello_stub(reply: allpaca_rpc::HelloReply) -> (String, std::thread::JoinHandle<()>) {
         use std::io::Read;
         use std::net::TcpListener;
         use std::thread;
@@ -4539,10 +4561,7 @@ mod tests {
         let mut cpu_cfg = test_config();
         cpu_cfg.speculative.enabled = false;
         let cpu = Engine::new(cpu_cfg).unwrap();
-        let cpu_ids = cpu
-            .generate("hello", params.clone())
-            .unwrap()
-            .token_ids;
+        let cpu_ids = cpu.generate("hello", params.clone()).unwrap().token_ids;
 
         let mut rpc_cfg = test_config();
         rpc_cfg.speculative.enabled = false;
@@ -4592,14 +4611,22 @@ mod tests {
         let mut local_cfg = base.clone();
         local_cfg.rpc.tensor_split = None;
         let local = Engine::new(local_cfg).unwrap();
-        assert!(!local.generate("hello", params.clone()).unwrap().token_ids.is_empty());
+        assert!(!local
+            .generate("hello", params.clone())
+            .unwrap()
+            .token_ids
+            .is_empty());
         let local_trips = local.stats().rpc_roundtrips;
         drop(local);
 
         let mut split_cfg = base;
         split_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
         let split = Engine::new(split_cfg).unwrap();
-        assert!(!split.generate("hello", params).unwrap().token_ids.is_empty());
+        assert!(!split
+            .generate("hello", params)
+            .unwrap()
+            .token_ids
+            .is_empty());
         let split_trips = split.stats().rpc_roundtrips;
         drop(split);
 
@@ -4656,10 +4683,7 @@ mod tests {
             Ok(_) => panic!("newer HELLO minor must refuse Engine::new"),
             Err(e) => e,
         };
-        assert!(
-            err.is_fatal(),
-            "newer HELLO minor must be Fatal, got {err}"
-        );
+        assert!(err.is_fatal(), "newer HELLO minor must be Fatal, got {err}");
         let msg = err.to_string();
         assert!(
             msg.contains("version mismatch"),
@@ -4683,10 +4707,7 @@ mod tests {
             Ok(_) => panic!("newer kernel ABI must refuse Engine::new"),
             Err(e) => e,
         };
-        assert!(
-            err.is_fatal(),
-            "newer kernel ABI must be Fatal, got {err}"
-        );
+        assert!(err.is_fatal(), "newer kernel ABI must be Fatal, got {err}");
         let msg = err.to_string();
         assert!(
             msg.to_lowercase().contains("abi"),
@@ -5050,7 +5071,8 @@ mod tests {
         cfg.kv.page_tokens = 8;
         let engine = Engine::new(cfg).expect("early-exit GGUF must load");
         assert_eq!(
-            engine.stats().early_exit_gated, 0,
+            engine.stats().early_exit_gated,
+            0,
             "GGUF manifest must not gate; stats={:?}",
             engine.stats()
         );
@@ -5110,9 +5132,7 @@ mod tests {
         let engine = test_engine();
         let dim = ModelConfig::tiny().dim;
         let enc = crate::PatchVisionEncoder::synthetic(Some(0), dim, 3).unwrap();
-        engine
-            .set_vision_encoder(std::sync::Arc::new(enc))
-            .unwrap();
+        engine.set_vision_encoder(std::sync::Arc::new(enc)).unwrap();
         let stats = engine.stats();
         assert_eq!(stats.vision_weight_bytes_on_device, 0);
         assert_eq!(stats.vision_bytes_on_device, 0);
@@ -5186,10 +5206,7 @@ mod tests {
             "vision soft tokens must prepend the text prompt"
         );
         assert!(!token_ids.is_empty());
-        assert!(matches!(
-            finish,
-            FinishReason::Length | FinishReason::Stop
-        ));
+        assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
     }
 
     #[test]
@@ -5225,10 +5242,7 @@ mod tests {
         };
         let a = run(0.0);
         let b = run(1.0);
-        assert_ne!(
-            a, b,
-            "distinct soft embeds must change greedy completions"
-        );
+        assert_ne!(a, b, "distinct soft embeds must change greedy completions");
     }
 
     #[test]
@@ -5256,10 +5270,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
-        assert!(
-            err.to_string().contains("vision embeddings"),
-            "err={err}"
-        );
+        assert!(err.to_string().contains("vision embeddings"), "err={err}");
     }
 
     #[test]
@@ -5282,10 +5293,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.class(), allpaca_types::ErrorClass::Degraded);
-        assert!(
-            err.to_string().contains("vision encoder"),
-            "err={err}"
-        );
+        assert!(err.to_string().contains("vision encoder"), "err={err}");
     }
 
     #[test]
@@ -5305,10 +5313,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.class(), allpaca_types::ErrorClass::Degraded);
-        assert!(
-            err.to_string().contains("not registered"),
-            "err={err}"
-        );
+        assert!(err.to_string().contains("not registered"), "err={err}");
     }
 
     #[test]

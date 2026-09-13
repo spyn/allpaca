@@ -55,7 +55,9 @@ impl Mamba2Dims {
     }
 
     pub fn conv_state_floats(self) -> usize {
-        self.conv_kernel.saturating_sub(1).saturating_mul(self.conv_dim)
+        self.conv_kernel
+            .saturating_sub(1)
+            .saturating_mul(self.conv_dim)
     }
 }
 
@@ -103,12 +105,24 @@ fn matvec(weight: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) 
 pub fn validate_weights(w: &SsmLayerWeights) -> Result<(), String> {
     let d = w.dims;
     for (name, got, want) in [
-        ("ssm_in.weight", w.w_in.len(), d.in_proj_dim.saturating_mul(d.d_model)),
-        ("ssm_out.weight", w.w_out.len(), d.d_model.saturating_mul(d.d_inner)),
+        (
+            "ssm_in.weight",
+            w.w_in.len(),
+            d.in_proj_dim.saturating_mul(d.d_model),
+        ),
+        (
+            "ssm_out.weight",
+            w.w_out.len(),
+            d.d_model.saturating_mul(d.d_inner),
+        ),
         ("ssm_a", w.a.len(), d.n_heads),
         ("ssm_d", w.d_skip.len(), d.n_heads),
         ("ssm_dt.bias", w.dt_bias.len(), d.n_heads),
-        ("ssm_conv1d.weight", w.conv1d.len(), d.conv_dim.saturating_mul(d.conv_kernel)),
+        (
+            "ssm_conv1d.weight",
+            w.conv1d.len(),
+            d.conv_dim.saturating_mul(d.conv_kernel),
+        ),
         ("ssm_norm.weight", w.norm.len(), d.d_inner),
     ] {
         if got != want {
@@ -167,8 +181,7 @@ pub fn mamba2_step(
     for channel in 0..d.conv_dim {
         let mut acc = w.conv_bias.get(channel).copied().unwrap_or(0.0);
         for k in 0..hist {
-            acc += w.conv1d[k + channel * d.conv_kernel]
-                * conv_state[k * d.conv_dim + channel];
+            acc += w.conv1d[k + channel * d.conv_kernel] * conv_state[k * d.conv_dim + channel];
         }
         acc += w.conv1d[hist + channel * d.conv_kernel] * xbc_raw[channel];
         xbc[channel] = silu(acc);
@@ -198,8 +211,7 @@ pub fn mamba2_step(
             let mut sum = 0.0f32;
             for n in 0..d.d_state {
                 let a_bar = (dt * w.a[head]).exp();
-                let value = a_bar * state_row[n]
-                    + dt * b[group * d.d_state + n] * x[channel];
+                let value = a_bar * state_row[n] + dt * b[group * d.d_state + n] * x[channel];
                 state_row[n] = value;
                 sum += c[group * d.d_state + n] * value;
             }
@@ -212,8 +224,7 @@ pub fn mamba2_step(
     for group in 0..d.n_groups {
         let start = group * group_width;
         let row = &mut y[start..start + group_width];
-        let inv = 1.0
-            / (row.iter().map(|v| v * v).sum::<f32>() / group_width as f32 + eps).sqrt();
+        let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / group_width as f32 + eps).sqrt();
         for i in 0..group_width {
             row[i] *= inv * w.norm[start + i];
         }
@@ -232,8 +243,13 @@ mod tests {
         let mut w_in = vec![0.0; dims.in_proj_dim * dims.d_model];
         // z=x=input, B=0.5*x0, C=x1, dt=x0.
         for (row, col, value) in [
-            (0, 0, 1.0), (1, 1, 1.0), (2, 0, 1.0), (3, 1, 1.0),
-            (4, 0, 0.5), (5, 1, 1.0), (6, 0, 1.0),
+            (0, 0, 1.0),
+            (1, 1, 1.0),
+            (2, 0, 1.0),
+            (3, 1, 1.0),
+            (4, 0, 0.5),
+            (5, 1, 1.0),
+            (6, 0, 1.0),
         ] {
             w_in[row * dims.d_model + col] = value;
         }
@@ -252,16 +268,35 @@ mod tests {
         let mut state = vec![0.0; dims.state_floats()];
         let mut conv = vec![0.0; dims.conv_state_floats()];
         let mut first = vec![0.0; 2];
-        mamba2_step(&[1.0, -0.5], &mut state, &mut conv, &weights, 1e-5, &mut first).unwrap();
+        mamba2_step(
+            &[1.0, -0.5],
+            &mut state,
+            &mut conv,
+            &weights,
+            1e-5,
+            &mut first,
+        )
+        .unwrap();
         assert!(first.iter().all(|v| v.is_finite()));
         assert!(state.iter().any(|v| *v != 0.0), "SSD state must advance");
         assert_eq!(conv, vec![1.0, -0.5, 0.5, -0.5]);
 
         let before = state.clone();
         let mut second = vec![0.0; 2];
-        mamba2_step(&[0.25, 0.75], &mut state, &mut conv, &weights, 1e-5, &mut second).unwrap();
+        mamba2_step(
+            &[0.25, 0.75],
+            &mut state,
+            &mut conv,
+            &weights,
+            1e-5,
+            &mut second,
+        )
+        .unwrap();
         assert_ne!(state, before, "input-dependent dt/B/C must alter state");
-        assert_ne!(first, second, "conv history and selectivity must alter output");
+        assert_ne!(
+            first, second,
+            "conv history and selectivity must alter output"
+        );
     }
 
     #[test]

@@ -297,6 +297,8 @@ enum DeviceFfn<'a> {
     },
     Bound {
         _guard: std::sync::MutexGuard<'a, FfnRingState>,
+        /// DMA source for async H2D; must outlive the GEMMs that read this slot.
+        _keep_host: Option<LayerFfn>,
         ffn_norm: WeightRef,
         w_gate: WeightRef,
         w_up: WeightRef,
@@ -1360,7 +1362,7 @@ impl ResidentModel {
     fn bind_ffn<'a>(
         &'a self,
         layer_idx: usize,
-        host: Option<&LayerFfn>,
+        host: Option<LayerFfn>,
         working_set: Option<&WeightWorkingSet>,
         metrics: Option<&Metrics>,
     ) -> Result<DeviceFfn<'a>, AllpacaError> {
@@ -1401,9 +1403,10 @@ impl ResidentModel {
                 ws.note_bind(true);
             }
             let [ffn_norm, w_gate, w_up, w_down] =
-                slot_ffn_refs(ring.base, ring.slot_bytes, slot, host);
+                slot_ffn_refs(ring.base, ring.slot_bytes, slot, &host);
             return Ok(DeviceFfn::Bound {
                 _guard: state,
+                _keep_host: None,
                 ffn_norm,
                 w_gate,
                 w_up,
@@ -1426,6 +1429,9 @@ impl ResidentModel {
             self.weights.copy_h2d(copy_off, bytes)?;
             copy_off += n;
         }
+        // copy_h2d is hipMemcpyAsync. The host `LayerFfn` is a temporary; wait
+        // so the slot is valid before GEMM and before this stack frame drops.
+        allpaca_hip::stream_synchronize()?;
         state.bound[slot] = Some(layer_idx);
         if let Some(ws) = working_set {
             ws.note_bind(false);
@@ -1436,9 +1442,10 @@ impl ResidentModel {
                 .fetch_add(packed as u64, Ordering::Relaxed);
         }
         let [ffn_norm, w_gate, w_up, w_down] =
-            slot_ffn_refs(ring.base, ring.slot_bytes, slot, host);
+            slot_ffn_refs(ring.base, ring.slot_bytes, slot, &host);
         Ok(DeviceFfn::Bound {
             _guard: state,
+            _keep_host: Some(host),
             ffn_norm,
             w_gate,
             w_up,
@@ -2645,6 +2652,27 @@ pub struct TinyModel {
 }
 
 impl TinyModel {
+    /// HIP `forward_tokens_device` is one GEMM with M=N and full-head row RoPE.
+    /// Gated-Q, IMRoPE, partial RoPE, MoE, and recurrent SSM/GDN stay per-token.
+    pub fn supports_device_batched_prefill(&self) -> bool {
+        if self.config.n_experts != 0 || self.config.recurrent || self.config.uses_imrope() {
+            return false;
+        }
+        let head = self.config.head_dim();
+        if self.config.rope_dims != 0 && self.config.rope_dims != head {
+            return false;
+        }
+        let dim = self.config.dim.max(1);
+        !self.layers.iter().any(|l| {
+            if l.wq.is_empty() || l.wo.is_empty() {
+                return false;
+            }
+            let q_out = l.wq.len() / dim;
+            let wo_k = l.wo.len() / dim;
+            q_out == wo_k.saturating_mul(2) && wo_k > dim
+        })
+    }
+
     pub fn synthetic(cfg: ModelConfig, seed: u64, name: impl Into<String>) -> Self {
         let mut rng = Lcg::new(seed);
         let dim = cfg.dim;
@@ -2830,7 +2858,7 @@ impl TinyModel {
         };
         resident.bind_ffn(
             layer_idx,
-            host.as_ref(),
+            host,
             self.working_set.as_deref(),
             metrics,
         )
@@ -4130,29 +4158,29 @@ impl TinyModel {
         }
         if let (Some(hip), Some(resident)) = (hip, resident) {
             if !self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
-            match self.forward_token_device(
-                token,
-                pos,
-                page_ids,
-                kv,
-                metrics,
-                logits,
-                hip,
-                resident,
-                prefill,
-                micro_batch,
-                side.as_deref_mut(),
-                recurrent.as_deref_mut(),
-                soft_x,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if !self.host_weights_ready() {
-                        return Err(e);
+                match self.forward_token_device(
+                    token,
+                    pos,
+                    page_ids,
+                    kv,
+                    metrics,
+                    logits,
+                    hip,
+                    resident,
+                    prefill,
+                    micro_batch,
+                    side.as_deref_mut(),
+                    recurrent.as_deref_mut(),
+                    soft_x,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if !self.host_weights_ready() {
+                            return Err(e);
+                        }
+                        tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                     }
-                    tracing::warn!(pos, token, error = %e, "HIP on-device decode failed; host fallback");
                 }
-            }
             }
         }
         if !self.host_weights_ready() {
@@ -4566,45 +4594,32 @@ impl TinyModel {
                 ))));
             }
         }
-        if recurrent.is_none() && self.config.n_experts == 0 {
+        if self.supports_device_batched_prefill() {
             if let (Some(hip), Some(resident)) = (hip, resident) {
-                // Gated-Q / IMRoPE need per-token workspace; batched path is plain RoPE only.
-                let gated = self.layers.iter().any(|l| {
-                    let dim = self.config.dim.max(1);
-                    if l.wq.is_empty() || l.wo.is_empty() {
-                        return false;
-                    }
-                    let q_out = l.wq.len() / dim;
-                    let wo_k = l.wo.len() / dim;
-                    q_out == wo_k.saturating_mul(2) && wo_k > dim
-                });
-                let batched_ok = !gated && !self.config.uses_imrope() && self.config.rope_dims == 0;
-                if batched_ok {
-                    match self.forward_tokens_device(
-                        tokens,
-                        start_pos,
-                        page_ids,
-                        kv,
-                        metrics,
-                        logits,
-                        hip,
-                        resident,
-                        write_logits,
-                        row_logits.as_deref_mut(),
-                        out_row_hiddens.as_deref_mut(),
-                    ) {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            if !self.host_weights_ready() {
-                                return Err(e);
-                            }
-                            tracing::warn!(
-                                start_pos,
-                                n = tokens.len(),
-                                error = %e,
-                                "HIP batched prefill failed; per-token host fallback"
-                            );
+                match self.forward_tokens_device(
+                    tokens,
+                    start_pos,
+                    page_ids,
+                    kv,
+                    metrics,
+                    logits,
+                    hip,
+                    resident,
+                    write_logits,
+                    row_logits.as_deref_mut(),
+                    out_row_hiddens.as_deref_mut(),
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if !self.host_weights_ready() {
+                            return Err(e);
                         }
+                        tracing::warn!(
+                            start_pos,
+                            n = tokens.len(),
+                            error = %e,
+                            "HIP batched prefill failed; per-token host fallback"
+                        );
                     }
                 }
             }
@@ -4623,7 +4638,11 @@ impl TinyModel {
                 layer_stagger: None,
                 ds_probe: None,
                 ds_queue: None,
-                last_hidden: Some(&mut last),
+                last_hidden: if out_row_hiddens.is_some() {
+                    Some(&mut last)
+                } else {
+                    None
+                },
             };
             self.forward_token(
                 *tok,
@@ -5463,7 +5482,9 @@ impl TinyModel {
                             None,
                         )?;
                     }
-                } else if layer.w_gate.n > 0 && layer.ffn_norm.n > 0 {
+                } else if (layer.w_gate.n > 0 && layer.ffn_norm.n > 0)
+                    || self.streamed_ffn(layer_idx)
+                {
                     let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
                     let ffn_norm = ffn.ffn_norm();
                     let w_gate = ffn.w_gate();
@@ -7382,4 +7403,31 @@ pub fn ensure_pages(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "hip"))]
+#[test]
+fn streamed_ffn_h2d_matches_host_tensors() {
+    if allpaca_hip::device_count() == 0 {
+        return;
+    }
+    let mut model = TinyModel::synthetic(ModelConfig::tiny(), 7, "ring");
+    let expect_gate = model.layers[0].w_gate.clone();
+    let expect_norm = model.layers[0].ffn_norm.clone();
+    let sizes: Vec<usize> = model.layers.iter().map(|l| l.ffn_bytes()).collect();
+    let plan = crate::weight_set::DenseTrunkPlan::plan(&sizes, 64, 1);
+    assert!(plan.streams(), "tiny trunk must stream FFN");
+    model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan).unwrap());
+    let streamed = ResidentModel::upload(&model, 0).unwrap();
+    let ffn = model.device_ffn(&streamed, 0, None).unwrap();
+    let hip = HipWorkspace::new(0, 1 << 20, 64).unwrap();
+    let mut gate = vec![0.0f32; expect_gate.len()];
+    let mut norm = vec![0.0f32; expect_norm.len()];
+    hip.copy_d2h_f32(streamed.weights.ptr_at(ffn.w_gate().off), &mut gate)
+        .unwrap();
+    hip.copy_d2h_f32(streamed.weights.ptr_at(ffn.ffn_norm().off), &mut norm)
+        .unwrap();
+    drop(ffn);
+    assert_eq!(norm, expect_norm, "ring ffn_norm H2D");
+    assert_eq!(gate, expect_gate, "ring w_gate H2D");
 }

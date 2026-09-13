@@ -73,7 +73,9 @@ impl GdnDims {
     }
 
     pub fn conv_state_floats(&self) -> usize {
-        self.conv_kernel.saturating_sub(1).saturating_mul(self.qkv_dim)
+        self.conv_kernel
+            .saturating_sub(1)
+            .saturating_mul(self.qkv_dim)
     }
 }
 
@@ -168,7 +170,10 @@ pub fn gated_delta_step_eps(
     debug_assert_eq!(v.len(), n_v_heads.saturating_mul(head_v));
     debug_assert_eq!(decay.len(), n_v_heads);
     debug_assert_eq!(beta.len(), n_v_heads);
-    debug_assert_eq!(state.len(), n_v_heads.saturating_mul(head_v).saturating_mul(head_k));
+    debug_assert_eq!(
+        state.len(),
+        n_v_heads.saturating_mul(head_v).saturating_mul(head_k)
+    );
     debug_assert_eq!(out.len(), n_v_heads.saturating_mul(head_v));
 
     let q_scale = 1.0 / (head_k as f32).sqrt();
@@ -327,7 +332,9 @@ mod tests {
         let beta = [1.0f32]; // full write
         let mut state = [0.0f32; 4]; // 2x2
         let mut out = [0.0f32; 2];
-        gated_delta_step(&mut q, &mut k, &v, &decay, &beta, &mut state, &mut out, 1, 2, 2);
+        gated_delta_step(
+            &mut q, &mut k, &v, &decay, &beta, &mut state, &mut out, 1, 2, 2,
+        );
 
         // After L2: q=[1,0] then *1/√2; k=[0,1].
         // state starts 0 → kv_mem=0 → δ=v → state rows: [0, 2], [0, -1]
@@ -375,7 +382,9 @@ mod tests {
         let beta = [0.5f32];
         let mut state = [0.0f32; 4];
         let mut out = [0.0f32; 2];
-        gated_delta_step(&mut q, &mut k, &v, &decay, &beta, &mut state, &mut out, 1, 2, 2);
+        gated_delta_step(
+            &mut q, &mut k, &v, &decay, &beta, &mut state, &mut out, 1, 2, 2,
+        );
 
         let qs = 1.0f32 / 2.0f32.sqrt();
         // state0 *= 0.25 → 0; δ = 0.5*(v-0) = [0.5, 1.0]

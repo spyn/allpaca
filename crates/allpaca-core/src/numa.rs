@@ -256,9 +256,7 @@ fn try_bind_current_thread(node: usize) -> Option<ThreadAffinity> {
     if unsafe { sched_setaffinity(0, std::mem::size_of::<CpuSet>(), &set) } != 0 {
         return None;
     }
-    Some(ThreadAffinity {
-        mask: prev.bits[0],
-    })
+    Some(ThreadAffinity { mask: prev.bits[0] })
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

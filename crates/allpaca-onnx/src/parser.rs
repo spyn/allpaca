@@ -187,7 +187,7 @@ fn parse_tensor(bytes: &[u8]) -> Result<OnnxTensor, AllpacaError> {
 fn decode_raw(data_type: i32, raw: &[u8], name: &str) -> Result<Vec<f32>, AllpacaError> {
     match data_type {
         TENSOR_FLOAT => {
-            if !raw.len().is_multiple_of(4) {
+            if raw.len() % 4 != 0 {
                 return Err(onnx_err(&format!("tensor {name} F32 raw size")));
             }
             Ok(raw
@@ -196,7 +196,7 @@ fn decode_raw(data_type: i32, raw: &[u8], name: &str) -> Result<Vec<f32>, Allpac
                 .collect())
         }
         TENSOR_FLOAT16 => {
-            if !raw.len().is_multiple_of(2) {
+            if raw.len() % 2 != 0 {
                 return Err(onnx_err(&format!("tensor {name} F16 raw size")));
             }
             Ok(raw

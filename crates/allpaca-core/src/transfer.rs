@@ -1,4 +1,4 @@
-use allpaca_types::{BandwidthBenchmark, DeviceKind, DeviceInfo, TransferPath};
+use allpaca_types::{BandwidthBenchmark, DeviceInfo, DeviceKind, TransferPath};
 
 /// Benchmark P2P vs host staging when two HIP devices exist. Host staging is the fallback.
 pub fn select_transfer_path(devices: &[DeviceInfo], cpu_only: bool) -> TransferPath {
@@ -13,7 +13,10 @@ pub fn select_transfer_path_with_bench(
         tracing::info!("transfer path: HostStaging (cpu_only; P2P not assumed)");
         return (TransferPath::HostStaging, None);
     }
-    let gpus: Vec<&DeviceInfo> = devices.iter().filter(|d| d.kind == DeviceKind::HipGpu).collect();
+    let gpus: Vec<&DeviceInfo> = devices
+        .iter()
+        .filter(|d| d.kind == DeviceKind::HipGpu)
+        .collect();
     if gpus.len() < 2 {
         tracing::info!("transfer path: HostStaging (fewer than two GPUs; P2P not assumed)");
         return (TransferPath::HostStaging, None);

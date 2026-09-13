@@ -1,6 +1,6 @@
 use allpaca_types::{
-    DeviceInfo, DeviceKind, FeatureFlags, Placement, PipelineMode, PollSchedule, SpeculativeSection,
-    TaskCost, KvTierKind,
+    DeviceInfo, DeviceKind, FeatureFlags, KvTierKind, PipelineMode, Placement, PollSchedule,
+    SpeculativeSection, TaskCost,
 };
 use std::time::Instant;
 
@@ -28,7 +28,14 @@ impl Scheduler {
         }
     }
 
-    pub fn score(&self, cost: &TaskCost, sla_weight: f64, queue_penalty: f64, memory_penalty: f64, reuse_bonus: f64) -> f64 {
+    pub fn score(
+        &self,
+        cost: &TaskCost,
+        sla_weight: f64,
+        queue_penalty: f64,
+        memory_penalty: f64,
+        reuse_bonus: f64,
+    ) -> f64 {
         sla_weight * cost.predicted_latency_us()
             + cost.h2d_us
             + cost.d2h_us
@@ -71,7 +78,10 @@ impl Scheduler {
     }
 
     pub fn placement(&self, devices: &[DeviceInfo], vision_device: Option<i32>) -> Placement {
-        let mut gpus: Vec<&DeviceInfo> = devices.iter().filter(|d| d.kind == DeviceKind::HipGpu).collect();
+        let mut gpus: Vec<&DeviceInfo> = devices
+            .iter()
+            .filter(|d| d.kind == DeviceKind::HipGpu)
+            .collect();
         gpus.sort_by(|a, b| {
             b.bandwidth_gbps
                 .partial_cmp(&a.bandwidth_gbps)

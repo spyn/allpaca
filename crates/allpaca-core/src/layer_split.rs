@@ -64,10 +64,7 @@ pub fn plan_layer_owners(
         }
         split.to_vec()
     } else {
-        device_bytes
-            .iter()
-            .map(|b| (*b as f64).max(1.0))
-            .collect()
+        device_bytes.iter().map(|b| (*b as f64).max(1.0)).collect()
     };
     let total: f64 = weights.iter().sum();
     if total <= 0.0 {

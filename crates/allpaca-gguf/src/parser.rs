@@ -198,6 +198,10 @@ pub enum GgmlType {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    /// Unsloth / ggml IQ4_NL (ggml_type_id=20).
+    IQ4_NL = 20,
+    /// Unsloth / ggml IQ4_XS (ggml_type_id=23).
+    IQ4_XS = 23,
     TQ1_0 = 34,
     TQ2_0 = 35,
     /// AMD ROCmFP4 dual-scale (ggml_type_id=100).
@@ -221,6 +225,8 @@ impl GgmlType {
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
+            20 => Self::IQ4_NL,
+            23 => Self::IQ4_XS,
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
             100 => Self::RocmFp4,
@@ -281,6 +287,12 @@ impl TensorInfo {
             GgmlType::Q6_K => n
                 .div_ceil(allpaca_cpu::Q6_K_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES),
+            GgmlType::IQ4_NL => n
+                .div_ceil(allpaca_cpu::IQ4_NL_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ4_NL_BLOCK_BYTES),
+            GgmlType::IQ4_XS => n
+                .div_ceil(allpaca_cpu::IQ4_XS_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ4_XS_BLOCK_BYTES),
             GgmlType::TQ1_0 => n
                 .div_ceil(allpaca_cpu::TQ1_0_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::TQ1_0_BLOCK_BYTES),
@@ -494,6 +506,8 @@ impl GgufFile {
             GgmlType::Q4_K as u32,
             GgmlType::Q5_K as u32,
             GgmlType::Q6_K as u32,
+            GgmlType::IQ4_NL as u32,
+            GgmlType::IQ4_XS as u32,
             GgmlType::TQ1_0 as u32,
             GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
@@ -507,7 +521,7 @@ impl GgufFile {
         let mut reasons = Vec::new();
         if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/ROCmFP4)"
             ));
         }
         let llama_family = matches!(
@@ -738,6 +752,28 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_q6_k(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::IQ4_NL => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} IQ4_NL out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_iq4_nl(&self.mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::IQ4_XS => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > self.mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} IQ4_XS out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_iq4_xs(&self.mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
             GgmlType::TQ1_0 => {
@@ -1349,6 +1385,49 @@ mod tests {
     }
 
     #[test]
+    fn iq4_nl_tensor_load_dequants_ones() {
+        let path = std::env::temp_dir().join("allpaca_gguf_iq4nl.gguf");
+        let mut payload = vec![0u8; allpaca_cpu::IQ4_NL_BLOCK_BYTES];
+        payload[0..2].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+        for slot in payload.iter_mut().skip(2) {
+            *slot = 0x88;
+        }
+        write_typed_gguf(&path, 20, &payload, 32);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::IQ4_NL);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("IQ4_NL must materialize to F32");
+        assert_eq!(loaded.len(), 32);
+        assert!(loaded.iter().all(|v| (v - 1.0).abs() < 1e-4));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn iq4_xs_tensor_load_dequants_first_group() {
+        let path = std::env::temp_dir().join("allpaca_gguf_iq4xs.gguf");
+        let mut payload = vec![0u8; allpaca_cpu::IQ4_XS_BLOCK_BYTES];
+        payload[0..2].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+        payload[2..4].copy_from_slice(&0xAAAAu16.to_le_bytes());
+        payload[4] = 0x01;
+        for slot in payload.iter_mut().skip(8).take(16) {
+            *slot = 0x88;
+        }
+        write_typed_gguf(&path, 23, &payload, 256);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::IQ4_XS);
+        let loaded = file
+            .tensor_f32("quant.weight")
+            .expect("IQ4_XS must materialize to F32");
+        assert_eq!(loaded.len(), 256);
+        assert!(loaded[..32].iter().all(|v| (v - 1.0).abs() < 1e-4));
+        assert!(loaded[32..].iter().all(|v| v.abs() < 1e-5));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn rocmfp4_type_100_loads_host_bytes_and_dequants_to_f32() {
         let path = std::env::temp_dir().join("allpaca_gguf_rocmfp4.gguf");
         // One ROCmFP4 block: 32 elems → 18 bytes.
@@ -1800,6 +1879,33 @@ mod tests {
             }
             if let Some(v) = file.meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon")) {
                 eprintln!("  meta {arch}.attention.layer_norm_rms_epsilon={v}");
+            }
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("UD-Q5_K_XL"))
+            {
+                assert!(
+                    report.reject_reason.is_none(),
+                    "UD-Q5_K_XL IQ4 extras must load; got {:?}",
+                    report.reject_reason
+                );
+                assert!(report.ggml_type_ids.contains(&20));
+                assert!(report.ggml_type_ids.contains(&23));
+                let iq_nl = file
+                    .tensors
+                    .iter()
+                    .find(|t| t.ggml_type == GgmlType::IQ4_NL)
+                    .expect("type 20 tensor");
+                let packed = file.tensor_bytes(&iq_nl.name).expect("IQ4_NL bytes");
+                let mut head = vec![0.0f32; allpaca_cpu::IQ4_NL_BLOCK_ELEMS];
+                allpaca_cpu::dequant_iq4_nl(packed, head.len(), &mut head)
+                    .expect("dequant first IQ4_NL block");
+                assert!(
+                    head.iter().any(|v| v.abs() > 1e-6),
+                    "IQ4_NL {} first block was all zeros",
+                    iq_nl.name
+                );
             }
             for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
                 if let Some(t) = file.tensor(name) {

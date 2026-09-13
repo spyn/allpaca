@@ -41,10 +41,7 @@ impl MicroBatchExpertUnion {
     }
 
     pub fn dual_active(&self) -> bool {
-        self.inner
-            .lock()
-            .map(|g| g.dual_tick != 0)
-            .unwrap_or(false)
+        self.inner.lock().map(|g| g.dual_tick != 0).unwrap_or(false)
     }
 
     /// Record routed experts from the first partner at `layer`; returns None until
@@ -65,11 +62,7 @@ impl MicroBatchExpertUnion {
 
     /// Union `ids` with staged partner ids when dual-step is active.
     pub fn union_with(&self, layer: u32, ids: &[ExpertId]) -> Vec<ExpertId> {
-        let mut out: Vec<ExpertId> = ids
-            .iter()
-            .copied()
-            .filter(|id| id.layer == layer)
-            .collect();
+        let mut out: Vec<ExpertId> = ids.iter().copied().filter(|id| id.layer == layer).collect();
         if let Ok(mut g) = self.inner.lock() {
             if g.dual_tick != 0 {
                 for id in g.pending.drain() {
@@ -96,19 +89,34 @@ mod tests {
         u.stage_routed(
             0,
             &[
-                ExpertId { layer: 0, expert: 1 },
-                ExpertId { layer: 0, expert: 3 },
+                ExpertId {
+                    layer: 0,
+                    expert: 1,
+                },
+                ExpertId {
+                    layer: 0,
+                    expert: 3,
+                },
             ],
         );
         let merged = u.union_with(
             0,
             &[
-                ExpertId { layer: 0, expert: 2 },
-                ExpertId { layer: 0, expert: 3 },
+                ExpertId {
+                    layer: 0,
+                    expert: 2,
+                },
+                ExpertId {
+                    layer: 0,
+                    expert: 3,
+                },
             ],
         );
         assert_eq!(merged.len(), 3);
-        assert!(merged.contains(&ExpertId { layer: 0, expert: 1 }));
+        assert!(merged.contains(&ExpertId {
+            layer: 0,
+            expert: 1
+        }));
         u.end_dual_step();
         assert!(!u.dual_active());
     }

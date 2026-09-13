@@ -167,7 +167,7 @@ pub fn attention(
     head_dim: usize,
     causal: bool,
 ) -> Result<(), AllpacaError> {
-    if n_heads == 0 || n_kv_heads == 0 || !n_heads.is_multiple_of(n_kv_heads) {
+    if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "invalid attention head configuration".into(),
         )));
@@ -233,7 +233,7 @@ pub fn attention_with_mask(
     head_dim: usize,
     mask: &[bool],
 ) -> Result<(), AllpacaError> {
-    if n_heads == 0 || n_kv_heads == 0 || !n_heads.is_multiple_of(n_kv_heads) {
+    if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "invalid attention head configuration".into(),
         )));
@@ -319,7 +319,7 @@ pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) -> Result<(
 
 /// In-place RoPE on a single head vector (interleaved even/odd pairs).
 pub fn rope(x: &mut [f32], pos: usize, theta: f32) -> Result<(), AllpacaError> {
-    if !x.len().is_multiple_of(2) {
+    if x.len() % 2 != 0 {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "rope head_dim must be even".into(),
         )));
@@ -350,13 +350,13 @@ pub fn rope_imrope_neox(
     sections: [i32; 4],
 ) -> Result<(), AllpacaError> {
     let head_dim = x.len();
-    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+    if head_dim == 0 || head_dim % 2 != 0 {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "imrope head_dim must be even and non-empty".into(),
         )));
     }
     let n_rot = if n_rot == 0 { head_dim } else { n_rot };
-    if n_rot > head_dim || !n_rot.is_multiple_of(2) {
+    if n_rot > head_dim || n_rot % 2 != 0 {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "imrope n_rot must be even and <= head_dim".into(),
         )));
@@ -510,6 +510,17 @@ pub const Q5_K_BLOCK_BYTES: usize = 176;
 /// GGUF Q6_K super-block (256 elems): ql[128] + qh[64] + scales[16] + d.
 pub const Q6_K_BLOCK_ELEMS: usize = 256;
 pub const Q6_K_BLOCK_BYTES: usize = 210;
+/// GGUF IQ4_NL (ggml_type_id=20): f16 d + 16 packed nibbles / 32 elems.
+pub const IQ4_NL_BLOCK_ELEMS: usize = 32;
+pub const IQ4_NL_BLOCK_BYTES: usize = 18;
+/// GGUF IQ4_XS (ggml_type_id=23): f16 d + u16 scales_h + 4 scale nibbles + 128 qs / 256 elems.
+pub const IQ4_XS_BLOCK_ELEMS: usize = 256;
+pub const IQ4_XS_BLOCK_BYTES: usize = 136;
+/// ggml `kvalues_iq4nl` (shared by IQ4_NL and IQ4_XS).
+pub const KVALUES_IQ4NL: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    89.0, 113.0,
+];
 
 /// IEEE-754 binary16 → f32.
 pub fn f16_to_f32(h: u16) -> f32 {
@@ -1629,6 +1640,84 @@ pub fn dequant_q6_k(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
     Ok(())
 }
 
+/// Dequantize GGUF IQ4_NL (type 20): `y = d * kvalues_iq4nl[nibble]`.
+pub fn dequant_iq4_nl(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_iq4_nl output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(IQ4_NL_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(IQ4_NL_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_iq4_nl truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * IQ4_NL_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        let qs = &blocks[off + 2..off + IQ4_NL_BLOCK_BYTES];
+        let base = b * IQ4_NL_BLOCK_ELEMS;
+        for j in 0..16 {
+            let packed = qs[j];
+            let i0 = base + j;
+            let i1 = base + j + 16;
+            if i0 < n {
+                out[i0] = d * KVALUES_IQ4NL[usize::from(packed & 0x0f)];
+            }
+            if i1 < n {
+                out[i1] = d * KVALUES_IQ4NL[usize::from(packed >> 4)];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize GGUF IQ4_XS (type 23): `y = d * (ls - 32) * kvalues_iq4nl[nibble]`.
+pub fn dequant_iq4_xs(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_iq4_xs output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(IQ4_XS_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(IQ4_XS_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_iq4_xs truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * IQ4_XS_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+        let scales_h = u16::from_le_bytes([blocks[off + 2], blocks[off + 3]]);
+        let scales_l = &blocks[off + 4..off + 8];
+        let qs = &blocks[off + 8..off + IQ4_XS_BLOCK_BYTES];
+        let super_base = b * IQ4_XS_BLOCK_ELEMS;
+        for ib in 0..8 {
+            let nibble = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f;
+            let hi = u8::try_from((scales_h >> (2 * ib)) & 3).unwrap_or(0);
+            let ls = i16::from(nibble) | (i16::from(hi) << 4);
+            let dl = d * f32::from(ls - 32);
+            let q_off = ib * 16;
+            let y_base = super_base + ib * 32;
+            for j in 0..16 {
+                let packed = qs[q_off + j];
+                let i0 = y_base + j;
+                let i1 = y_base + j + 16;
+                if i0 < n {
+                    out[i0] = dl * KVALUES_IQ4NL[usize::from(packed & 0x0f)];
+                }
+                if i1 < n {
+                    out[i1] = dl * KVALUES_IQ4NL[usize::from(packed >> 4)];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Dequantize GGUF Q8_0 blocks: `f16 d` + `i8[32]` → `d * q`.
 pub fn dequant_q8_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
     if out.len() < n {
@@ -1814,5 +1903,63 @@ mod tests {
         let short = vec![0u8; ROCMFP4_BLOCK_BYTES - 1];
         let mut out = vec![0.0f32; ROCMFP4_BLOCK_ELEMS];
         assert!(dequant_rocmfp4(&short, ROCMFP4_BLOCK_ELEMS, &mut out).is_err());
+    }
+
+    fn encode_iq4_nl_ones() -> Vec<u8> {
+        let mut payload = vec![0u8; IQ4_NL_BLOCK_BYTES];
+        payload[0..2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        for slot in payload.iter_mut().skip(2) {
+            *slot = 0x88;
+        }
+        payload
+    }
+
+    #[test]
+    fn iq4_nl_dequants_codebook_nibble_8_to_one() {
+        let packed = encode_iq4_nl_ones();
+        let mut out = vec![0.0f32; IQ4_NL_BLOCK_ELEMS];
+        dequant_iq4_nl(&packed, IQ4_NL_BLOCK_ELEMS, &mut out).unwrap();
+        for (i, v) in out.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-4, "lane {i}: {v}");
+        }
+    }
+
+    #[test]
+    fn iq4_nl_rejects_truncated_blocks() {
+        let short = vec![0u8; IQ4_NL_BLOCK_BYTES - 1];
+        let mut out = vec![0.0f32; IQ4_NL_BLOCK_ELEMS];
+        assert!(dequant_iq4_nl(&short, IQ4_NL_BLOCK_ELEMS, &mut out).is_err());
+    }
+
+    fn encode_iq4_xs_first_group_ones() -> Vec<u8> {
+        let mut payload = vec![0u8; IQ4_XS_BLOCK_BYTES];
+        payload[0..2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        // Every group ls=32 (dl=0); ib=0 uses ls=33 (dl=1).
+        payload[2..4].copy_from_slice(&0xAAAAu16.to_le_bytes());
+        payload[4] = 0x01;
+        for slot in payload.iter_mut().skip(8).take(16) {
+            *slot = 0x88;
+        }
+        payload
+    }
+
+    #[test]
+    fn iq4_xs_dequants_first_group_ones_and_zeros_the_rest() {
+        let packed = encode_iq4_xs_first_group_ones();
+        let mut out = vec![0.0f32; IQ4_XS_BLOCK_ELEMS];
+        dequant_iq4_xs(&packed, IQ4_XS_BLOCK_ELEMS, &mut out).unwrap();
+        for (i, v) in out.iter().enumerate().take(32) {
+            assert!((v - 1.0).abs() < 1e-4, "lane {i}: {v}");
+        }
+        for (i, v) in out.iter().enumerate().skip(32) {
+            assert!(v.abs() < 1e-5, "tail {i}: {v}");
+        }
+    }
+
+    #[test]
+    fn iq4_xs_rejects_truncated_blocks() {
+        let short = vec![0u8; IQ4_XS_BLOCK_BYTES - 1];
+        let mut out = vec![0.0f32; IQ4_XS_BLOCK_ELEMS];
+        assert!(dequant_iq4_xs(&short, IQ4_XS_BLOCK_ELEMS, &mut out).is_err());
     }
 }

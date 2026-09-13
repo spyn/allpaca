@@ -16,6 +16,8 @@
 
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
+#include <cstdio>
+#include <cstring>
 #define ALLPACA_HAS_HIP 1
 #else
 #define ALLPACA_HAS_HIP 0
@@ -2106,9 +2108,16 @@ extern "C" int allpaca_hip_device_props(int32_t id, char *name, int32_t name_len
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
     }
+    char composed[256];
+    const char *label = prop.name;
+    if (prop.gcnArchName[0] != '\0'
+        && (prop.name[0] == '\0' || std::strcmp(prop.name, "AMD Radeon Graphics") == 0)) {
+        std::snprintf(composed, sizeof(composed), "AMD %s", prop.gcnArchName);
+        label = composed;
+    }
     int i = 0;
-    for (; i < name_len - 1 && prop.name[i]; ++i) {
-        name[i] = prop.name[i];
+    for (; i < name_len - 1 && label[i]; ++i) {
+        name[i] = label[i];
     }
     name[i] = '\0';
     *memory_bytes = static_cast<uint64_t>(prop.totalGlobalMem);
@@ -2116,6 +2125,27 @@ extern "C" int allpaca_hip_device_props(int32_t id, char *name, int32_t name_len
     const double clock_ghz = static_cast<double>(prop.memoryClockRate) / 1.0e6;
     const double bytes_per_cycle = static_cast<double>(prop.memoryBusWidth) / 8.0 * 2.0;
     *bandwidth_gbps = clock_ghz * bytes_per_cycle;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_hip_device_arch(int32_t id, char *arch, int32_t arch_len,
+                                       int32_t *l2_bytes) {
+    if (!arch || arch_len <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    hipDeviceProp_t prop{};
+    hipError_t err = hipGetDeviceProperties(&prop, id);
+    if (err != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    int i = 0;
+    for (; i < arch_len - 1 && prop.gcnArchName[i]; ++i) {
+        arch[i] = prop.gcnArchName[i];
+    }
+    arch[i] = '\0';
+    if (l2_bytes) {
+        *l2_bytes = prop.l2CacheSize;
+    }
     return ALLPACA_OK;
 }
 
@@ -3776,6 +3806,10 @@ extern "C" int allpaca_hip_device_count(int32_t *count) {
 }
 
 extern "C" int allpaca_hip_device_props(int32_t, char *, int32_t, uint64_t *, double *) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_device_arch(int32_t, char *, int32_t, int32_t *) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

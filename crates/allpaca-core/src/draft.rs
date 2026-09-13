@@ -49,11 +49,7 @@ impl NGramProvider {
                 let mut ranked: Vec<(u32, f32)> = nexts
                     .iter()
                     .map(|(tok, c)| {
-                        let p = if total > 0.0 {
-                            *c as f32 / total
-                        } else {
-                            0.0
-                        };
+                        let p = if total > 0.0 { *c as f32 / total } else { 0.0 };
                         (*tok, p.ln())
                     })
                     .collect();
@@ -83,12 +79,7 @@ impl DraftProvider for NGramProvider {
             let start = end.saturating_sub(self.n - 1);
             let ctx = tokens[start..end].to_vec();
             let next = tokens[end];
-            *self
-                .counts
-                .entry(ctx)
-                .or_default()
-                .entry(next)
-                .or_default() += 1;
+            *self.counts.entry(ctx).or_default().entry(next).or_default() += 1;
         }
     }
 

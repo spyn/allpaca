@@ -249,11 +249,7 @@ fn propose_branches(
     Ok(out)
 }
 
-fn draft_top_k(
-    model: &TinyModel,
-    ctx: &[u32],
-    k: usize,
-) -> Result<Vec<(u32, f32)>, AllpacaError> {
+fn draft_top_k(model: &TinyModel, ctx: &[u32], k: usize) -> Result<Vec<(u32, f32)>, AllpacaError> {
     if ctx.is_empty() || k == 0 {
         return Ok(Vec::new());
     }
@@ -285,7 +281,5 @@ fn top_k_logprobs(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     let max = idx[0].1;
     let sum: f32 = idx.iter().map(|(_, v)| (v - max).exp()).sum();
     let log_z = sum.ln();
-    idx.into_iter()
-        .map(|(t, v)| (t, v - max - log_z))
-        .collect()
+    idx.into_iter().map(|(t, v)| (t, v - max - log_z)).collect()
 }

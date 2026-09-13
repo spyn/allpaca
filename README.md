@@ -31,7 +31,7 @@ and [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md)).
 | No Windows DirectStorage path | Stable **DirectStorage 1.3** file→D3D12 DMA into opt-in HIP-imported buffers; ordinary weight uploads stay plain `hipMalloc` + H2D; aligned host-staged fallback |
 | Single-request hybrid sync barrier | **Micro-batch** partner `poll` + **layer-stagger** CPU experts during GPU forward |
 | Reactive VRAM only | **Elastic expert↔KV rebalance**, attention-trim cold KV, **`gpu.util` / `gpu.vram`** from `hipMemGetInfo` (no AMD SMI on Windows) |
-| Narrow GGUF quants | **F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / TQ1_0 / TQ2_0** + **ROCmFP4 (`ggml_type_id=100`)** CPU dequant + fused HIP GEMV where wired |
+| Narrow GGUF quants | **F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ4_NL / IQ4_XS / TQ1_0 / TQ2_0** + **ROCmFP4 (`ggml_type_id=100`)** CPU dequant + fused HIP GEMV where wired (IQ4_* dequant to F32 at load; no fused HIP GEMV yet) |
 | MoE-only / no hybrid SSM | **`nemotron_h_moe` schedule**: full Mamba-2 SSD + attention + MoE on CPU/HIP (incl. Lightning gate-less `up`/`down`); real ROCmFP4 opt-in via `ALLPACA_NEMOTRON=1` |
 | Proprietary weight banks only | **GGUF** primary + **packed layer-major / `ALLPFTW1`** trunk for streaming |
 | No continuous batching story | Fair **`Engine::poll`**, chunked prefill, multi-request backpressure |
@@ -57,7 +57,9 @@ Coral/NPU backends are dropped.
 
 ## Build
 
-Requires a recent stable Rust toolchain (`rustup`).
+Requires a recent stable Rust toolchain (`rustup`, 1.88+). Debian's `rustc` 1.85
+cannot resolve current workspace crates (`icu_*`, `llguidance`, `zip`). Put
+`$HOME/.cargo/bin` first on `PATH`.
 
 ### CPU (default)
 
@@ -69,9 +71,72 @@ cargo build -p allpaca-server --release
 
 ### HIP / AMD GPU (optional)
 
-Needs the HIP/ROCm SDK. On Windows the crate probes `HIP_PATH`, `ROCM_PATH`, and
-`C:\Program Files\AMD\ROCm\*`. MSVC (`vcvars64`) is required so `hipcc` finds the C++ STL.
-Without an SDK, `--features hip` still compiles (stub; GPU tests skip).
+Needs the HIP/ROCm **compiler** SDK (`hipcc`, `hip_runtime.h`), not only the
+runtime in `/opt/rocm`. On Linux the crate probes `HIP_PATH`, `ROCM_PATH`,
+`/opt/rocm*`, and `~/.cache/allpaca/rocm-sdk/opt/rocm-*`. On Windows it probes
+`C:\Program Files\AMD\ROCm\*`. MSVC (`vcvars64`) is required so `hipcc` finds
+the C++ STL. Without an SDK, `--features hip` still compiles (stub; GPU tests skip).
+
+Offload ISAs default to live `rocminfo` GPUs when present (this box: **gfx906**
+for MI50 / MI60 / Radeon VII). Override with `AMDGPU_TARGETS=gfx906,gfx900`.
+
+#### Linux compiler SDK (Debian 13 / runtime-only `/opt/rocm`)
+
+A runtime-only `/opt/rocm` is completed **without root** by
+`scripts/fetch-rocm-hip-sdk.sh` (ROCm 6.2.4 `hipcc` + LLVM extracted into
+`~/.cache/allpaca/rocm-sdk/opt/rocm-6.2.4`, then symlinked to the `/opt/rocm`
+runtime `.so` files). `build.rs` picks that cache path up automatically.
+
+**Do not** `sudo apt install hipcc6.2.4 hip-dev6.2.4 rocm-llvm6.2.4 hsa-rocr-dev6.2.4`
+on Debian 13 (Trixie). Those are Ubuntu noble debs and depend on
+`libstdc++-11-dev` / `libgcc-11-dev`, which Trixie does not ship (gcc-14 only).
+The fetch script uses `apt-get download` + `dpkg-deb -x` so the same debs never
+have to be installed.
+
+New shells need rustup on `PATH`:
+
+```bash
+source ~/.cargo/env   # once per session until bashrc is reloaded
+```
+
+Debian's distro `rustc` 1.85 cannot build this workspace. Use rustup 1.88+.
+
+#### Dual-GPU P2P (Linux kernel)
+
+Stock Debian kernels often ship **`# CONFIG_PCI_P2PDMA is not set`**. On gfx906
+that makes `hipDeviceCanAccessPeer` return 0 and `hipDeviceEnablePeerAccess`
+fail (`invalid device ordinal`) even when **`hipMemcpyPeer` still copies**.
+
+A custom kernel with `CONFIG_PCI_P2PDMA=y` is what KFD needs for the formal
+enable path. After reboot:
+
+```bash
+grep CONFIG_PCI_P2PDMA /boot/config-$(uname -r)
+# expect: CONFIG_PCI_P2PDMA=y
+```
+
+Optional cmdline if enable still fails (IOMMU groups split the two cards):
+`intel_iommu=on iommu=pt`, or `intel_iommu=off`. There is no xGMI cable on a
+typical dual-MI50 desktop; `use_xgmi_p2p` does not apply.
+
+The engine does **not** require EnablePeerAccess. At boot it:
+
+1. tries enable both directions (best-effort),
+2. treats a successful 64 KiB `hipMemcpyPeer` as capable,
+3. benches 4 MiB peer-copy vs host staging (GPU→DRAM→GPU),
+4. selects `P2p` only when the copy worked **and** measured P2P is not more
+   than 10% slower than host (`P2P_MAX_SLOWER_FRACTION`).
+
+Never assume P2P is faster. Speculative generate does not require P2P: target
+and draft stay on their GPUs; only token-scale payloads move.
+
+After a P2PDMA kernel lands, re-measure (look for `p2p_enabled` plus `p2p_gbps`):
+
+```bash
+source ~/.cargo/env
+cargo test -p allpaca-core --features hip --test hip_runtime \
+  transfer_path_is_measured -- --nocapture
+```
 
 ```bash
 # Linux / Git Bash
@@ -145,7 +210,8 @@ Gated HIP soaks (when weights are present locally):
 | `ALLPACA_DRAFT_GGUF` | Speculative draft GGUF |
 | `ALLPACA_Q4K_GGUF` / `ALLPACA_Q4KM_GGUF` | Q4_K / mixed Q4_K_M |
 | `ALLPACA_NEMOTRON=1` | Opt-in 30B ROCmFP4 Nemotron generate |
-| `ALLPACA_QWEN=1` | Opt-in Qwen35 ROCmFP4 generate (`models/Qwen3.8-27B-…`) |
+| `ALLPACA_QWEN=1` | Opt-in Qwen35 ROCmFP4 generate. Discovers `models/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/Qwen3.8-27B-Q4_0_ROCMFP4_COHERENT.gguf` (ggml type 100; in-file `qwen35.nextn_predict_layers`). Unsloth `Qwen3.8-27B-UD-Q5_K_XL.gguf` loads (IQ4_NL / IQ4_XS dequant to F32 at load). Sidecar `mtp-*.gguf` files are unused; MTP tests load NextN from the same ROCmFP4 GGUF. |
+| `ALLPACA_QWEN_N` | Decode length for the opt-in Qwen tests (default 32; use `8` for a short HIP smoke). |
 | `ALLPACA_ROCMFP4_GGUF` / `ALLPACA_QWEN_GGUF` | Explicit ROCmFP4 GGUF path (probe always discovers under `models/`) |
 | `ALLPACA_DEMO=1` | Asymmetric draft vs greedy tok/s |
 | `ALLPACA_OVERNIGHT=1` | Long draft soak |

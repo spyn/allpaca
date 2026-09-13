@@ -352,7 +352,9 @@ impl Metrics {
             rpc_activation_bytes: self.rpc_activation_bytes.load(Ordering::Relaxed),
             rpc_h2d_bytes: self.rpc_h2d_bytes.load(Ordering::Relaxed),
             vision_bytes_on_device: self.vision_bytes_on_device.load(Ordering::Relaxed),
-            vision_weight_bytes_on_device: self.vision_weight_bytes_on_device.load(Ordering::Relaxed),
+            vision_weight_bytes_on_device: self
+                .vision_weight_bytes_on_device
+                .load(Ordering::Relaxed),
         }
     }
 
