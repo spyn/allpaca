@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allpaca_core::{Engine, ImageInput};
-use allpaca_types::{AllpacaError, Config, FatalError, FinishReason, GenerationParams};
+use allpaca_types::{AllpacaError, Config, DeviceInfo, FatalError, FinishReason, GenerationParams, StatsSnapshot};
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -15,22 +16,77 @@ use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::auth::{self, AuthState};
+use crate::host::{HostSampler, HostSnapshot};
+use crate::logs::LogRing;
+use crate::ui;
+
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub config: Config,
+    pub auth: AuthState,
+    pub logs: LogRing,
+    pub host: Arc<HostSampler>,
+}
+
+impl AppState {
+    pub fn new(
+        engine: Arc<Engine>,
+        config: Config,
+        auth: AuthState,
+        logs: LogRing,
+    ) -> Self {
+        Self {
+            engine,
+            config,
+            auth,
+            logs,
+            host: Arc::new(HostSampler::new()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StatusBody {
+    stats: StatsSnapshot,
+    devices: Vec<DeviceInfo>,
+    host: HostSnapshot,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
+        .route("/v1/status", get(status))
+        .route("/v1/logs", get(crate::logs::logs_snapshot))
+        .route("/v1/logs/stream", get(crate::logs::logs_stream))
         .route("/stats", get(stats))
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/metrics/otlp", get(otlp_metrics))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    Router::new()
+        .route("/", get(ui::index))
+        .route("/app.js", get(ui::app_js))
+        .route("/app.css", get(ui::app_css))
+        .route("/v1/auth/login", post(auth::login))
+        .route("/v1/auth/logout", post(auth::logout))
+        .merge(protected)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn status(State(state): State<AppState>) -> Json<StatusBody> {
+    Json(StatusBody {
+        stats: state.engine.stats(),
+        devices: state.engine.inventory().devices.clone(),
+        host: state.host.snapshot(),
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,6 +441,7 @@ async fn chat_completions(
         .unwrap_or_else(|| state.engine.model_id());
     let id = format!("chatcmpl-{}", now_secs());
     let created = now_secs();
+    tracing::info!("chat completion model={model} stream={}", req.stream);
 
     if req.stream {
         return stream_completion(state, prompt, images, params, model, id, created).into_response();
@@ -765,10 +822,28 @@ mod tests {
             seed: Some(1),
             ..CliOverrides::default()
         });
-        AppState {
-            engine: Arc::new(Engine::new(cfg.clone()).unwrap()),
-            config: cfg,
-        }
+        AppState::new(
+            Arc::new(Engine::new(cfg.clone()).unwrap()),
+            cfg,
+            AuthState::from_password(None),
+            LogRing::new(64),
+        )
+    }
+
+    fn authed_state(password: &str) -> AppState {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(1),
+            ..CliOverrides::default()
+        });
+        AppState::new(
+            Arc::new(Engine::new(cfg.clone()).unwrap()),
+            cfg,
+            AuthState::from_password(Some(password.into())),
+            LogRing::new(64),
+        )
     }
 
     #[tokio::test]
@@ -849,10 +924,12 @@ mod tests {
             ..CliOverrides::default()
         });
         cfg.engine.max_active_requests = 2;
-        AppState {
-            engine: Arc::new(Engine::new(cfg.clone()).unwrap()),
-            config: cfg,
-        }
+        AppState::new(
+            Arc::new(Engine::new(cfg.clone()).unwrap()),
+            cfg,
+            AuthState::from_password(None),
+            LogRing::new(64),
+        )
     }
 
     #[tokio::test]
@@ -1288,10 +1365,12 @@ mod tests {
             ..CliOverrides::default()
         });
         cfg.multimodal.vision_path = Some(vision);
-        let state = AppState {
-            engine: Arc::new(Engine::new(cfg.clone()).unwrap()),
-            config: cfg,
-        };
+        let state = AppState::new(
+            Arc::new(Engine::new(cfg.clone()).unwrap()),
+            cfg,
+            AuthState::from_password(None),
+            LogRing::new(64),
+        );
         let app = router(state);
         let body = serde_json::json!({
             "model": "synthetic",
@@ -1445,6 +1524,222 @@ mod tests {
         assert!(
             !text.contains("\"error\""),
             "stub encoder stream must succeed: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webui_index_is_html() {
+        let app = router(test_state());
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("<title>Allpaca</title>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn password_protects_stats_and_login_sets_cookie() {
+        let app = router(authed_state("secret"));
+        let denied = app
+            .clone()
+            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"nope"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get("set-cookie")
+            .expect("session cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.contains("allpaca_session="), "{cookie}");
+
+        let ok = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .header("cookie", cookie.split(';').next().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_reaches_chat_completions() {
+        let app = router(authed_state("secret"));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 2,
+                            "temperature": 0.0,
+                            "seed": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logs_and_status_after_auth() {
+        let state = authed_state("secret");
+        state.logs.push("INFO", "allpaca.webui", "webui-test-line".into());
+        let app = router(state);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let lines = json["lines"].as_array().cloned().unwrap_or_default();
+        assert!(
+            lines.iter().any(|l| l["message"] == "webui-test-line"),
+            "{json}"
+        );
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("stats").is_some());
+        assert!(json.get("devices").is_some());
+        assert!(json.get("host").is_some());
+        assert!(json["host"].get("ram_total_bytes").is_some());
+    }
+
+    #[tokio::test]
+    async fn chat_completion_appears_in_log_ring() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let state = authed_state("secret");
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(state.logs.layer()),
+        );
+        let app = router(state);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 2,
+                            "temperature": 0.0,
+                            "seed": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let lines = json["lines"].as_array().cloned().unwrap_or_default();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("chat completion"))),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn log_ring_layer_records_tracing_event() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let ring = LogRing::new(32);
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(ring.layer()),
+        );
+        tracing::info!("webui-trace-event");
+        assert!(
+            ring.snapshot()
+                .iter()
+                .any(|l| l.message.contains("webui-trace-event")),
+            "{:?}",
+            ring.snapshot()
         );
     }
 }

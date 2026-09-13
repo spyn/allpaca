@@ -1,0 +1,112 @@
+# Allpaca server config (TOML, INI-style sections).
+# Precedence: compiled defaults < this file < CLI flags.
+#
+#   cargo run -p allpaca-server -- --config allpaca.example.toml
+#
+# Unspecified keys keep compiled defaults. Copy and edit; do not commit secrets.
+
+[http]
+host = "127.0.0.1"
+port = 8080
+# Shared WebUI login and Authorization: Bearer. If omitted, the server prints
+# `webui password: …` once at boot. LAN bind needs a password (no TLS in v1).
+# host = "0.0.0.0"
+password = "changeme"
+
+[model]
+id = "allpaca"
+# synthetic = true
+# path = "models/Llama-3.2-3B-Instruct-Q8_0.gguf"
+# draft_path = "models/Llama-3.2-1B-Instruct-Q8_0.gguf"
+# config_path = "models/config.json"
+# tokenizer_path = "models/tokenizer.json"
+
+[engine]
+scheduler = "adaptive"
+target_device = "auto"          # auto | cpu | hip:0 | cuda:0
+draft_device = "auto"
+cpu_threads = 4
+cpu_only = false
+# pipeline_mode = "asymmetric"  # asymmetric | symmetric | mobile_tiered
+gpu_backend = "auto"            # auto | hip | cpu
+max_active_requests = 1
+poll_schedule = "fair"          # fair | decode_priority | prefill_budget
+max_consecutive_prefill_picks = 0
+# determinism_seed = 1
+
+[speculative]
+enabled = true
+providers = ["ngram", "draft_model"]  # ngram | draft_model | mtp
+max_depth = 8
+min_depth = 2
+adaptive = true
+ngram_n = 3
+
+[speculative.tree]
+enabled = false
+max_nodes = 16
+
+[prefill]
+chunk_tokens = 512
+
+[kv]
+page_tokens = 128
+hot_fraction = 0.75
+vram_bytes = 4194304
+dram_bytes = 33554432
+nvme_bytes = 0
+# nvme_path = "kv-swap.bin"
+
+[weights]
+trunk_bytes = 0
+cache_bytes = 0
+ring_slots = 2
+miss_policy = "qstar"           # qstar | fill | cpu
+host_bytes = 0
+
+[sampling]
+mode = "async_host"
+pinned_ring_slots = 8
+temperature = 0.8
+top_k = 40
+top_p = 0.95
+
+[structured_output]
+enabled = true
+json_mode = false
+async = false
+
+[multimodal]
+# vision_device = "hip:0"
+# vision_path = "models/vision.safetensors"
+vision_image_size = 64
+vision_patch = 16
+vision_n_blocks = 0
+
+[rpc]
+endpoints = []
+# endpoints = ["127.0.0.1:50052"]
+# tensor_split = [1.0, 1.0]
+max_seq = 2048
+
+[telemetry]
+# otlp_endpoint = "http://127.0.0.1:4318"
+
+[anchors]
+slots = 0
+token_ids = []
+
+[early_exit]
+enabled = false
+min_confidence = 0.9
+min_calibration_margin = 0.05
+
+# Overlay pipeline-mode defaults. Uncomment only the flags you want to force.
+# [features]
+# asymmetric_drafting = true
+# dram_tiering = true
+# ngram_speculation = true
+# draft_model_speculation = true
+# tree_speculation = false
+# json_constraints = true
+# adaptive_draft_depth = true

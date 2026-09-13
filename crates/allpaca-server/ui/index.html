@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Allpaca</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div id="login" class="gate">
+    <form id="login-form" class="card login-card">
+      <h1>Allpaca</h1>
+      <p class="muted">Operator login</p>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Password" autofocus>
+      <button type="submit">Sign in</button>
+      <p id="login-error" class="error hidden"></p>
+    </form>
+  </div>
+
+  <div id="app" class="hidden">
+    <header>
+      <strong>Allpaca</strong>
+      <nav>
+        <button data-page="dashboard" class="active">Dashboard</button>
+        <button data-page="chat">Chat</button>
+        <button data-page="logs">Logs</button>
+      </nav>
+      <button id="logout" class="ghost">Log out</button>
+    </header>
+
+    <main id="page-dashboard" class="page">
+      <section class="grid" id="dash-cards"></section>
+      <section class="card">
+        <h2>Devices</h2>
+        <table>
+          <thead><tr><th>ID</th><th>Kind</th><th>Name</th><th>Memory</th></tr></thead>
+          <tbody id="device-rows"></tbody>
+        </table>
+      </section>
+    </main>
+
+    <main id="page-chat" class="page hidden">
+      <div class="chat-layout">
+        <div id="messages" class="messages"></div>
+        <form id="chat-form" class="composer">
+          <div class="controls">
+            <label>max tokens <input id="max-tokens" type="number" min="1" max="4096" value="128"></label>
+            <label>temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8"></label>
+            <span id="chat-model" class="muted"></span>
+          </div>
+          <textarea id="prompt" rows="3" placeholder="Message…"></textarea>
+          <button type="submit">Send</button>
+        </form>
+      </div>
+    </main>
+
+    <main id="page-logs" class="page hidden">
+      <div class="log-toolbar">
+        <label>level
+          <select id="log-level">
+            <option value="TRACE">TRACE</option>
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO" selected>INFO</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+        </label>
+        <label class="check"><input id="log-follow" type="checkbox" checked> follow</label>
+      </div>
+      <pre id="log-view" class="log-view"></pre>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

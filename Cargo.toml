@@ -42,6 +42,8 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 ahash = "0.8"
 memmap2 = "0.9"
 rand = { version = "0.8", features = ["small_rng"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+sysinfo = "0.33"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }

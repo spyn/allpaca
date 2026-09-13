@@ -115,6 +115,11 @@ impl Config {
         if let Some(port) = cli.port {
             self.http.port = port;
         }
+        if let Some(password) = &cli.ui_password {
+            if !password.is_empty() {
+                self.http.password = Some(password.clone());
+            }
+        }
         if cli.synthetic {
             self.model.synthetic = true;
         }
@@ -526,6 +531,10 @@ impl Default for ModelSection {
 pub struct HttpSection {
     pub host: String,
     pub port: u16,
+    /// Shared operator password for the WebUI cookie and `Authorization: Bearer`.
+    /// Empty/unset: the server binary generates one at boot and logs it once.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl Default for HttpSection {
@@ -533,6 +542,7 @@ impl Default for HttpSection {
         Self {
             host: "127.0.0.1".into(),
             port: 8080,
+            password: None,
         }
     }
 }
@@ -600,6 +610,8 @@ pub struct CliOverrides {
     pub speculative_providers: Option<Vec<DraftProviderKind>>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    /// Shared WebUI / API password (`--ui-password`).
+    pub ui_password: Option<String>,
     pub synthetic: bool,
     pub json_mode: Option<bool>,
     /// Comma-separated `host:port` RPC workers.
@@ -625,10 +637,12 @@ mod tests {
             cpu_threads = 6
             [http]
             port = 9000
+            password = "operator"
         "#;
         let mut cfg = Config::from_toml_str(toml).unwrap();
         assert_eq!(cfg.engine.cpu_threads, 6, "TOML overrides compiled default");
         assert_eq!(cfg.http.port, 9000, "TOML overrides compiled default");
+        assert_eq!(cfg.http.password.as_deref(), Some("operator"));
         assert!(
             cfg.speculative.enabled,
             "unspecified TOML field keeps compiled default"
@@ -649,6 +663,25 @@ mod tests {
             cfg.engine.cpu_threads, 6,
             "CLI must not clobber unspecified TOML values"
         );
+    }
+
+    #[test]
+    fn example_config_file_parses() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../allpaca.example.toml");
+        let cfg = Config::from_toml_file(&path).expect(path.to_str().unwrap_or("allpaca.example.toml"));
+        assert_eq!(cfg.http.host, "127.0.0.1");
+        assert_eq!(cfg.http.port, 8080);
+        assert_eq!(cfg.http.password.as_deref(), Some("changeme"));
+        assert_eq!(cfg.model.id, "allpaca");
+        assert_eq!(cfg.engine.cpu_threads, 4);
+        assert!(cfg.speculative.enabled);
+        assert_eq!(cfg.speculative.providers.len(), 2);
+        assert!(!cfg.speculative.tree.enabled);
+        assert_eq!(cfg.prefill.chunk_tokens, 512);
+        assert_eq!(cfg.weights.ring_slots, 2);
+        assert_eq!(cfg.sampling.top_k, 40);
+        assert!(cfg.rpc.endpoints.is_empty());
+        assert!(cfg.telemetry.otlp_endpoint.is_none());
     }
 
     #[test]

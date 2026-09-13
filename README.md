@@ -109,14 +109,19 @@ Engine forwards remain HIP until CUDA parity lands.
 ### Synthetic smoke (no weights)
 
 ```bash
-cargo run -p allpaca-server -- --synthetic --cpu-only --host 127.0.0.1 --port 8080
+cargo run -p allpaca-server -- --synthetic --cpu-only --host 127.0.0.1 --port 8080 --ui-password secret
 ```
 
+Open `http://127.0.0.1:8080` and sign in. If `--ui-password` / `[http] password` is omitted, the server prints `webui password: …` once at boot. The same secret is `Authorization: Bearer` for API clients.
+
+Headless on a LAN: `--host 0.0.0.0` plus a password. There is no TLS in v1.
+
 ```bash
-curl http://127.0.0.1:8080/v1/models
-curl http://127.0.0.1:8080/stats
+curl http://127.0.0.1:8080/v1/models -H "authorization: Bearer secret"
+curl http://127.0.0.1:8080/stats -H "authorization: Bearer secret"
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "content-type: application/json" \
+  -H "authorization: Bearer secret" \
   -d '{"model":"synthetic","messages":[{"role":"user","content":"hello"}],"max_tokens":8}'
 ```
 
@@ -173,10 +178,11 @@ cargo run -p allpaca-bench -- --tokens 32 --prompt "hello world"
 
 | Flag | Meaning |
 |------|---------|
-| `--config PATH` | TOML config |
+| `--config PATH` | TOML config (copy `allpaca.example.toml`) |
 | `--model PATH` | Target weights |
 | `--draft-model PATH` | Draft weights |
 | `--host` / `--port` | Bind address (default loopback; use `0.0.0.0` in Docker) |
+| `--ui-password` | Shared WebUI login and Bearer secret |
 | `--cpu-only` | Force CPU backend |
 | `--synthetic` | Built-in tiny model |
 | `--speculative true\|false` | Toggle speculation |

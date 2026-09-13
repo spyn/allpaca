@@ -17,6 +17,9 @@ pub struct Cli {
     pub host: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
+    /// Shared WebUI login and `Authorization: Bearer` secret.
+    #[arg(long)]
+    pub ui_password: Option<String>,
     #[arg(long)]
     pub target_device: Option<String>,
     #[arg(long)]
@@ -75,6 +78,7 @@ impl Cli {
                 .and_then(|s| allpaca_types::DraftProviderKind::parse_list(s).ok()),
             host: self.host.clone(),
             port: self.port,
+            ui_password: self.ui_password.clone(),
             synthetic: self.synthetic,
             json_mode: self.json_mode,
             rpc_endpoints: self.rpc.as_deref().and_then(parse_csv_nonempty),
