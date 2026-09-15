@@ -79,6 +79,15 @@ pub fn gencode_flags(arches: &[String]) -> Vec<String> {
     flags
 }
 
+/// Format a live device compute capability as `sm_86` / `sm_120`.
+pub fn sm_arch_from_capability(major: i32, minor: i32) -> Option<String> {
+    // CUDA major.minor uses a single minor digit (8.6→sm_86, 12.0→sm_120).
+    if major <= 0 || major > 99 || minor < 0 || minor > 9 {
+        return None;
+    }
+    Some(format!("sm_{major}{minor}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +154,28 @@ mod tests {
                 "-gencode=arch=compute_120,code=compute_120".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn sm_arch_from_capability_covers_ampere_ada_blackwell() {
+        assert_eq!(
+            sm_arch_from_capability(8, 6).as_deref(),
+            Some("sm_86")
+        );
+        assert_eq!(
+            sm_arch_from_capability(8, 9).as_deref(),
+            Some("sm_89")
+        );
+        assert_eq!(
+            sm_arch_from_capability(12, 0).as_deref(),
+            Some("sm_120")
+        );
+        assert_eq!(
+            sm_arch_from_capability(10, 0).as_deref(),
+            Some("sm_100")
+        );
+        assert_eq!(sm_arch_from_capability(0, 0), None);
+        assert_eq!(sm_arch_from_capability(-1, 0), None);
+        assert_eq!(sm_arch_from_capability(8, 10), None);
     }
 }

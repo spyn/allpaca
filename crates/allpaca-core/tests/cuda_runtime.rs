@@ -124,3 +124,27 @@ fn cuda_smoke_decode_keeps_device_resident() {
         stats.target_gpu_forwards
     );
 }
+
+#[test]
+fn cuda_stats_sample_vram_when_device_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_vram_total_bytes > 0,
+        "sample_gpu should report board total, got {}",
+        stats.gpu_vram_total_bytes
+    );
+    assert!(
+        stats.gpu_vram_used_bytes <= stats.gpu_vram_total_bytes,
+        "used={} total={}",
+        stats.gpu_vram_used_bytes,
+        stats.gpu_vram_total_bytes
+    );
+    let (arch, l2) = allpaca_cuda::device_sm_arch(0).expect("sm arch");
+    assert!(arch.starts_with("sm_"), "arch={arch}");
+    assert!(l2 > 0, "l2={l2}");
+}

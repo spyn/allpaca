@@ -53,6 +53,26 @@ extern "C" int allpaca_cuda_device_props(int32_t id, char *name, int32_t name_le
     return ALLPACA_OK;
 }
 
+extern "C" int allpaca_cuda_device_arch(int32_t id, char *arch, int32_t arch_len,
+                                       int32_t *l2_bytes) {
+    if (!arch || arch_len <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaDeviceProp prop;
+    if (cuda_status(cudaGetDeviceProperties(&prop, id)) != ALLPACA_OK) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    /* major.minor → sm_86 / sm_120 (single-digit minor). */
+    if (prop.major <= 0 || prop.minor < 0 || prop.minor > 9) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    std::snprintf(arch, static_cast<size_t>(arch_len), "sm_%d%d", prop.major, prop.minor);
+    if (l2_bytes) {
+        *l2_bytes = prop.l2CacheSize;
+    }
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_cuda_malloc(void **ptr, size_t bytes, int32_t device) {
     if (!ptr || bytes == 0) {
         return ALLPACA_ERR_INVALID;

@@ -238,6 +238,14 @@ mod tests {
         th.join().unwrap();
         assert_eq!(reply.backend, RpcBackendKind::Cuda);
         assert!(reply.device_name.starts_with("cuda:"));
+        if let Some((arch, _)) = allpaca_cuda::device_sm_arch(0) {
+            assert!(
+                reply.device_name.contains(&arch),
+                "hello should advertise {}, got {}",
+                arch,
+                reply.device_name
+            );
+        }
     }
 
     #[cfg(feature = "cuda")]

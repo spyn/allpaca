@@ -29,6 +29,9 @@ int allpaca_cuda_device_count(int32_t *count);
 int allpaca_cuda_device_props(int32_t id, char *name, int32_t name_len, uint64_t *memory_bytes,
                               double *bandwidth_gbps);
 
+/* Compute capability as `sm_86` / `sm_120` plus L2 cache bytes (HIP device_arch). */
+int allpaca_cuda_device_arch(int32_t id, char *arch, int32_t arch_len, int32_t *l2_bytes);
+
 int allpaca_cuda_malloc(void **ptr, size_t bytes, int32_t device);
 
 int allpaca_cuda_free(void *ptr);

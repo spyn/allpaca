@@ -38,6 +38,12 @@ mod ffi {
             memory_bytes: *mut u64,
             bandwidth_gbps: *mut f64,
         ) -> i32;
+        pub fn allpaca_cuda_device_arch(
+            id: i32,
+            arch: *mut c_char,
+            arch_len: i32,
+            l2_bytes: *mut i32,
+        ) -> i32;
         pub fn allpaca_cuda_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
         pub fn allpaca_cuda_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_cuda_free_async(ptr: *mut c_void, stream: *mut c_void) -> i32;
@@ -194,6 +200,31 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
     {
         let _ = count;
         Vec::new()
+    }
+}
+
+/// Live compute capability (`sm_86`, `sm_120`, …) and L2 cache size in bytes.
+pub fn device_sm_arch(id: i32) -> Option<(String, usize)> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut buf = [0i8; 32];
+        let mut l2 = 0i32;
+        let rc = unsafe { ffi::allpaca_cuda_device_arch(id, buf.as_mut_ptr(), 32, &mut l2) };
+        if rc != ALLPACA_OK {
+            return None;
+        }
+        let arch = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if arch.is_empty() || !arch.starts_with("sm_") {
+            return None;
+        }
+        Some((arch, l2.max(0) as usize))
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = id;
+        None
     }
 }
 
@@ -1663,6 +1694,33 @@ mod tests {
         device_free(ptr);
         let (free_now, _) = device_memory_info(0).expect("mem_info after free");
         assert!(free_now >= free_after);
+    }
+
+    #[test]
+    fn device_sm_arch_none_without_device() {
+        if device_count() > 0 {
+            return;
+        }
+        assert!(device_sm_arch(0).is_none());
+    }
+
+    #[test]
+    fn device_sm_arch_is_sm_prefix_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let (arch, l2) = device_sm_arch(0).expect("sm arch");
+        assert!(
+            arch.starts_with("sm_") && arch.len() >= 5,
+            "unexpected arch {arch}"
+        );
+        // Consumer Ampere/Ada/Blackwell laptops all have an L2 cache.
+        assert!(l2 > 0, "l2={l2}");
+        let digits: String = arch.trim_start_matches("sm_").to_string();
+        assert!(
+            digits.chars().all(|c| c.is_ascii_digit()) && !digits.is_empty(),
+            "arch digits {digits}"
+        );
     }
 
     #[test]

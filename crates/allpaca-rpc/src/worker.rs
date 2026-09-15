@@ -665,7 +665,10 @@ impl CudaWorker {
             kernel_abi_rev: KERNEL_ABI_REV,
             backend: RpcBackendKind::Cuda,
             dtype_mask: DTYPE_F32,
-            device_name: format!("cuda:{}", self.device),
+            device_name: match allpaca_cuda::device_sm_arch(self.device) {
+                Some((arch, _)) => format!("cuda:{}:{arch}", self.device),
+                None => format!("cuda:{}", self.device),
+            },
             memory_bytes: self.memory_bytes.saturating_sub(self.used),
         }
     }
