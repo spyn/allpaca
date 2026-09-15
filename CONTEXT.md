@@ -15,7 +15,7 @@
 - `nemotron_h_moe` hybrid schedule: Mamba-2 SSD + attention + MoE (incl. Lightning gate-less experts)
 - CPU sampling with JSON mode plus `llguidance` JSON Schema / Lark constraints
 - HIP backend (AMD GPU)
-- Continuous-batching soft packed HIP GEMM: co-step (`batch_gemm_plans`/`batch_gemm_executes`) + real host activations × shared Target weight `gemm_nt` (`batch_gemm_hip_kernels`); packed **lm_head** C is written into Request `pending_logits` (`batch_gemm_hip_applied`) for the sample path; packed FFN helper covers gate/up → silu*up → **w_down**
+- Continuous-batching soft packed HIP GEMM: co-step (`batch_gemm_plans`/`batch_gemm_executes`) + real host activations × shared Target weight `gemm_nt` (`batch_gemm_hip_kernels`); packed **lm_head** C is written into Request `pending_logits` (`batch_gemm_hip_applied`) for the sample path; poll-path packed FFN runs gate/up → silu×up → **w_down** via `apply_packed_ffn_hip`
 - CUDA backend scaffold (`allpaca-cuda`: discovery, `CudaWorkspace`, F32 `gemm_nt` / residual_add / rmsnorm / silu_mul / embed_gather / rope / attention / `copy_h2d_f32` for soft_x; engine opens CUDA when `gpu_backend=cuda` or auto with only CUDA GPUs; `backend=cuda` in stats when workspace open; dense TinyModel `CudaResidentModel` upload + `forward_token_cuda` for synthetic generate when device present; full 7B/KV/MoE parity still HIP-first)
 - CPU fallback for all kernels
 - Kernel-ABI RPC (`allpaca-rpc-server` + coordinator `--rpc`) for HIP layer-split across machines (CUDA workers later)
@@ -29,7 +29,7 @@
 - Full CUDA engine parity (KV on device, MoE/hybrid, 7B GGUF upload; dense TinyModel CUDA decode landed)
 - Multimodal http(s) fetch + AVIF via ffmpeg + patch-embed / ViT-lite (`vision_n_blocks`) with CLIP/ViT weight residency on `vision_device` when a HIP workspace matches (`vision_weight_bytes_on_device`; soft-embed H2D remains `vision_bytes_on_device`). Resident path runs patch linear + ViT block linears (attn_qkv/proj, mlp fc1/fc2) via HIP and ViT self-attn via `HipWorkspace::attention` (device online-softmax); LayerNorm stays CPU (no mean/var LN kernel; RMSNorm is not equivalent). CLIP-style SafeTensors: `visual.proj` / `resblocks.*` aliases plus checkpoint stem (`visual.conv1`, `class_embedding`, `positional_embedding`, `ln_pre`; `vision_n_blocks=0` auto-counts resblocks). Full OpenAI CLIP numeric parity still deferred.
 - OpenTelemetry SDK (Prometheus text `/metrics` + OTLP-ish JSON pull `GET /v1/metrics/otlp` + HTTP JSON push when `telemetry.otlp_endpoint` is set landed; full OTel SDK crate still deferred)
-- Full layer-fused cross-request decode path that *skips* per-request lm_head during cohort forward (packed lm_head already applied into `pending_logits`; Q/K/V/O still throwaway C until attn fusion)
+- Full layer-fused cross-request decode path that *skips* per-request lm_head during cohort forward (packed lm_head already applied into `pending_logits`; packed FFN C still throwaway until residual fusion; Q/K/V/O still throwaway until attn fusion)
 - CXL/PIM hardware backends (`MemoryTierBackend` + `PinnedDramBackend` + CXL/PIM **simulators** with delayed tickets; real CXL.mem / PIM devices still Out)
 
 **Demo:** Load 7B/8B GGUF, asymmetric speculative decoding on RX 9070 + 9060 XT (prefer `models/Llama-3.2-3B-Instruct-Q8_0.gguf` as Draft Model when present), show speedup vs single-GPU, KV spill to DRAM when VRAM fills. Operator overnight bakeoff: see README “Dual-GPU overnight (Q8 9060)”.

@@ -189,12 +189,19 @@ int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float
 
 int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
 
+/* Spark2_5 FFN: gate[i] = gelu(gate[i]) * up[i] (erf GELU). */
+int allpaca_gelu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
+
 /* Qwen gated-attn: q_full[n_heads][2*head_dim] -> q, gate each [n_heads][head_dim]. */
 int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,
                                 int32_t head_dim, allpaca_stream_t stream);
 
 /* x[i] *= sigmoid(gate[i]) in place. */
 int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_stream_t stream);
+
+/* Spark2_5 head-wise gate: attn[tok,h,:] *= sigmoid(scores[tok,h]). */
+int allpaca_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok, int32_t n_heads,
+                                int32_t head_dim, allpaca_stream_t stream);
 
 /* Per-head RMSNorm: x is [n_heads, head_dim], weight is [head_dim]. */
 int allpaca_rmsnorm_heads(float *x, const float *weight, int32_t n_heads, int32_t head_dim,

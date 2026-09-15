@@ -6,7 +6,8 @@ mod writer;
 
 pub use parser::{SafetensorsDtype, SafetensorsFile, TensorInfo, SAFETENSORS_MAX_HEADER};
 pub use sidecar::{
-    load_hf_config, load_vocab_sidecar, resolve_sidecar, HfConfig, VocabSidecar,
+    load_hf_config, load_vocab_sidecar, resolve_sidecar, EffectiveTextConfig, HfConfig,
+    HfQuantOverride, HfRopeParameters, HfTextConfig, VocabSidecar,
 };
 pub use writer::{write_safetensors, SafetensorsWriteTensor};
 

@@ -114,7 +114,30 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
         .unwrap_or(kind.as_str() == "llama");
 
     let mut inner = match kind.as_str() {
-        "gpt2" => build_bpe(&tokens, merges.as_deref(), unk_id)?,
+        "gpt2" => {
+            let pre = file.meta_str("tokenizer.ggml.pre").unwrap_or("");
+            match build_bpe_model(&tokens, merges.as_deref(), unk_id) {
+                Ok(model) => {
+                    if pre == "spark2_5"
+                        || pre == "qwen2"
+                        || pre == "qwen3"
+                        || pre == "gemma"
+                        || pre == "gemma2"
+                        || pre == "deepseek-llm"
+                        || pre == "deepseek-v3"
+                        || pre == "deepseek2"
+                    {
+                        spark2_5_bpe(model)
+                    } else {
+                        byte_level_bpe(model)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "BPE tokenizer build failed; falling back to WordLevel");
+                    build_wordlevel(&tokens, unk_id)?
+                }
+            }
+        }
         "llama" => build_unigram_or_wordlevel(&tokens, scores.as_deref(), unk_id)?,
         _ => build_wordlevel(&tokens, unk_id)?,
     };
@@ -246,11 +269,21 @@ fn build_unigram_or_wordlevel(
     build_wordlevel(tokens, unk_id)
 }
 
+#[allow(dead_code)]
 fn build_bpe(
     tokens: &[String],
     merges: Option<&[String]>,
     unk_id: Option<u32>,
 ) -> Result<Tokenizer, AllpacaError> {
+    let model = build_bpe_model(tokens, merges, unk_id)?;
+    Ok(byte_level_bpe(model))
+}
+
+fn build_bpe_model(
+    tokens: &[String],
+    merges: Option<&[String]>,
+    unk_id: Option<u32>,
+) -> Result<BPE, AllpacaError> {
     let vocab: AHashMap<String, u32> = tokens
         .iter()
         .enumerate()
@@ -265,17 +298,11 @@ fn build_bpe(
         })
         .collect();
     let unk = unk_token(tokens, unk_id);
-    match BPE::builder()
+    BPE::builder()
         .vocab_and_merges(vocab, merge_pairs)
         .unk_token(unk)
         .build()
-    {
-        Ok(model) => Ok(byte_level_bpe(model)),
-        Err(e) => {
-            tracing::warn!(error = %e, "BPE tokenizer build failed; falling back to WordLevel");
-            build_wordlevel(tokens, unk_id)
-        }
-    }
+        .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))
 }
 
 fn byte_level_bpe(model: BPE) -> Tokenizer {
@@ -286,6 +313,13 @@ fn byte_level_bpe(model: BPE) -> Tokenizer {
     tokenizer.with_pre_tokenizer(Some(byte_level.clone()));
     tokenizer.with_decoder(Some(byte_level));
     tokenizer
+}
+
+/// Spark2_5 (XHToken) BPE pre-tokenizer: byte-level plus documented pre type.
+/// llama.cpp uses custom regex (`LLAMA_VOCAB_PRE_TYPE_SPARK2_5`); HF ByteLevel
+/// is the practical host-side equivalent for GGUF gpt2+pre=spark2_5.
+fn spark2_5_bpe(model: BPE) -> Tokenizer {
+    byte_level_bpe(model)
 }
 
 #[cfg(test)]
@@ -492,5 +526,48 @@ mod tests {
         // With token_type present, heuristic-only pieces like bare <s> that are
         // NORMAL must not be forced special — still OK if they encode via BPE.
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn spark2_5_pre_uses_byte_level_bpe() {
+        let path = std::env::temp_dir().join("allpaca_spark2_5_tok.gguf");
+        let mut meta = gpt2_hello_world_meta();
+        meta.insert(
+            "tokenizer.ggml.pre".into(),
+            GgufValue::String("spark2_5".into()),
+        );
+        write_gguf(&path, &meta, &[]).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        assert_eq!(file.meta_str("tokenizer.ggml.pre"), Some("spark2_5"));
+        let tok = extract_tokenizer(&file).unwrap();
+        let ids = tok.inner.encode("Hello world", false).unwrap();
+        assert!(!ids.get_ids().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compat_pres_use_byte_level_bpe() {
+        for pre in [
+            "qwen2",
+            "qwen3",
+            "gemma",
+            "gemma2",
+            "deepseek-llm",
+            "deepseek-v3",
+            "deepseek2",
+        ] {
+            let path = std::env::temp_dir().join(format!("allpaca_{pre}_tok.gguf"));
+            let mut meta = gpt2_hello_world_meta();
+            meta.insert(
+                "tokenizer.ggml.pre".into(),
+                GgufValue::String(pre.into()),
+            );
+            write_gguf(&path, &meta, &[]).unwrap();
+            let file = GgufFile::open(&path).unwrap();
+            let tok = extract_tokenizer(&file).unwrap();
+            let ids = tok.inner.encode("Hello world", false).unwrap();
+            assert!(!ids.get_ids().is_empty(), "pre={pre}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

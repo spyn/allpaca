@@ -36,10 +36,11 @@ mod vision;
 mod weight_set;
 
 pub use batch_gemm::{
-    apply_packed_ffn, apply_packed_lm_head, batch_gemm_other_ids, decode_layer_shared_a_weights,
-    packed_ffn_shared_a, packed_gemm_nt, packed_gemm_nt_cpu, packed_gemm_nt_hip,
-    packed_gemm_nt_hip_diagnostic, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase,
-    BatchGemmPlan, ModelShapeKey, PackedFfnWeights, PackedGemmWeight,
+    apply_packed_ffn, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
+    decode_layer_attn_shared_a_weights, decode_layer_shared_a_weights, packed_ffn_shared_a,
+    packed_gemm_nt, packed_gemm_nt_cpu, packed_gemm_nt_hip, packed_gemm_nt_hip_diagnostic,
+    plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    PackedFfnWeights, PackedGemmWeight,
 };
 pub use device_manager::{detect_pipeline_mode, DeviceInventory};
 pub use compute::ComputeDev;

@@ -524,6 +524,12 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gelu_mul(
+            gate: *mut f32,
+            up: *const f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_deinterleave_q_gate(
             q_full: *const f32,
             q: *mut f32,
@@ -536,6 +542,14 @@ mod ffi {
             x: *mut f32,
             gate: *const f32,
             n: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_scale_heads_sigmoid(
+            attn: *mut f32,
+            scores: *const f32,
+            n_tok: i32,
+            n_heads: i32,
+            head_dim: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_rmsnorm_heads(
@@ -6317,6 +6331,110 @@ impl HipWorkspace {
         {
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP silu_mul unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn gelu_mul_device(&self, gate: *mut f32, up: *const f32, n: i32) -> Result<(), AllpacaError> {
+        if gate.is_null() || up.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device gelu_mul".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_gelu_mul(gate, up, n, std::ptr::null_mut()) };
+                status(rc, "gelu_mul")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gelu_mul unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn scale_heads_sigmoid_device(
+        &self,
+        attn: *mut f32,
+        scores: *const f32,
+        n_tok: i32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if attn.is_null() || scores.is_null() || n_tok <= 0 || n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid scale_heads_sigmoid".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_scale_heads_sigmoid(
+                        attn,
+                        scores,
+                        n_tok,
+                        n_heads,
+                        head_dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "scale_heads_sigmoid")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP scale_heads_sigmoid unavailable".into(),
+            )))
+        }
+    }
+
+    /// Device Q/K/V attention with a host-side [n_q, n_kv] uint8 mask (1 = attend).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_device_masked_upload(
+        &self,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mask: &[u8],
+    ) -> Result<(), AllpacaError> {
+        let mask_n = (n_q as usize).saturating_mul(n_kv as usize);
+        if mask.len() < mask_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention mask size mismatch".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let dm = device_malloc(mask_n, self.device)?;
+            let result = (|| {
+                memcpy(dm, mask.as_ptr(), mask_n, MEMCPY_H2D)?;
+                self.add_h2d(mask_n);
+                self.attention_device_masked(
+                    q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, dm.cast(),
+                )
+            })();
+            device_free(dm, mask_n);
+            result
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP attention_masked unavailable".into(),
             )))
         }
     }

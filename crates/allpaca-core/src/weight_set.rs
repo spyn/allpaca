@@ -865,6 +865,12 @@ mod tests {
             w_down: vec![gate + 2.0],
             w_router: vec![],
             experts: vec![],
+            mla: None,
+            shared_expert: None,
+            expert_bias: vec![],
+        attn_out_gate: vec![],
+        attn_post_norm: vec![],
+        ffn_post_norm: vec![],
         }
     }
 

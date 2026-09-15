@@ -5,8 +5,9 @@
 //! other plan members in the same tick (parking their `StepResult`s), and when a
 //! HIP workspace plus real cohort activations / Target weights are present runs
 //! packed host→device `gemm_nt` (concat A along M). Packed **lm_head** outputs
-//! are written into each Request's `pending_logits` for the sample path; FFN
-//! helpers ([`apply_packed_ffn`]) cover gate/up → silu×up → w_down.
+//! are written into each Request's `pending_logits` for the sample path; packed
+//! FFN ([`apply_packed_ffn`] / [`apply_packed_ffn_hip`]) runs gate/up → silu×up
+//! → **w_down** (HIP poll path uses the HIP variant).
 
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -147,23 +148,18 @@ pub struct PackedGemmWeight<'a> {
     pub k: usize,
 }
 
-/// Decode-layer GEMMs whose B is `n×dim` so they share last_hidden as A (`k=dim`).
-///
-/// Includes Q/K/V/O and SwiGLU gate/up. Skips `w_down` (k = ff_dim, different A);
-/// use [`packed_ffn_shared_a`] / [`apply_packed_ffn`] for the full FFN including down.
-pub fn decode_layer_shared_a_weights<'a>(
+/// Attn GEMMs whose B is `n×dim` (share last_hidden as A). Q/K/V/O only.
+pub fn decode_layer_attn_shared_a_weights<'a>(
     dim: usize,
     wq: &'a [f32],
     wk: &'a [f32],
     wv: &'a [f32],
     wo: &'a [f32],
-    w_gate: &'a [f32],
-    w_up: &'a [f32],
 ) -> Vec<PackedGemmWeight<'a>> {
     if dim == 0 {
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(4);
     let push = |out: &mut Vec<PackedGemmWeight<'a>>, name: &'static str, b: &'a [f32]| {
         if b.len() < dim || b.len() % dim != 0 {
             return;
@@ -175,6 +171,33 @@ pub fn decode_layer_shared_a_weights<'a>(
     push(&mut out, "wk", wk);
     push(&mut out, "wv", wv);
     push(&mut out, "wo", wo);
+    out
+}
+
+/// Decode-layer shared-A GEMMs: attn Q/K/V/O plus SwiGLU gate/up.
+///
+/// Prefer [`decode_layer_attn_shared_a_weights`] + [`apply_packed_ffn_hip`] on the
+/// poll path so `w_down` is included via the FFN helper.
+pub fn decode_layer_shared_a_weights<'a>(
+    dim: usize,
+    wq: &'a [f32],
+    wk: &'a [f32],
+    wv: &'a [f32],
+    wo: &'a [f32],
+    w_gate: &'a [f32],
+    w_up: &'a [f32],
+) -> Vec<PackedGemmWeight<'a>> {
+    let mut out = decode_layer_attn_shared_a_weights(dim, wq, wk, wv, wo);
+    if dim == 0 {
+        return out;
+    }
+    let push = |out: &mut Vec<PackedGemmWeight<'a>>, name: &'static str, b: &'a [f32]| {
+        if b.len() < dim || b.len() % dim != 0 {
+            return;
+        }
+        let n = b.len() / dim;
+        out.push(PackedGemmWeight { name, b, n, k: dim });
+    };
     push(&mut out, "w_gate", w_gate);
     push(&mut out, "w_up", w_up);
     out
@@ -316,6 +339,75 @@ pub fn apply_packed_ffn(
     }
     let act_refs: Vec<&[f32]> = act_rows.iter().map(|v| v.as_slice()).collect();
     packed_gemm_nt_cpu(&act_refs, down_w.b, out_rows, dim, ff_dim)
+}
+
+/// Packed FFN on HIP: gate/up `gemm_nt` → `silu_mul` → `w_down` `gemm_nt`.
+///
+/// Returns the number of HIP GEMM kernels launched (3 on full success).
+pub fn apply_packed_ffn_hip(
+    hip: &allpaca_hip::HipWorkspace,
+    a_rows: &[&[f32]],
+    w_gate: &[f32],
+    w_up: &[f32],
+    w_down: &[f32],
+    dim: usize,
+    out_rows: &mut [&mut [f32]],
+) -> Result<u64, AllpacaError> {
+    let ffn = packed_ffn_shared_a(dim, w_gate, w_up, w_down);
+    let Some(gate_w) = ffn.w_gate else {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn_hip: missing w_gate".into(),
+        )));
+    };
+    let Some(up_w) = ffn.w_up else {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn_hip: missing w_up".into(),
+        )));
+    };
+    let Some(down_w) = ffn.w_down else {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn_hip: missing w_down".into(),
+        )));
+    };
+    if gate_w.n != up_w.n || down_w.n != dim {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn_hip: dim/ff_dim mismatch".into(),
+        )));
+    }
+    let ff_dim = ffn.ff_dim;
+    if a_rows.len() != out_rows.len() {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_ffn_hip: a/out row count mismatch".into(),
+        )));
+    }
+    let mut gate_rows: Vec<Vec<f32>> = a_rows
+        .iter()
+        .map(|a| {
+            let m = a.len() / dim;
+            vec![0.0f32; m * ff_dim]
+        })
+        .collect();
+    let mut up_rows: Vec<Vec<f32>> = a_rows
+        .iter()
+        .map(|a| {
+            let m = a.len() / dim;
+            vec![0.0f32; m * ff_dim]
+        })
+        .collect();
+    {
+        let mut g_refs: Vec<&mut [f32]> = gate_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        packed_gemm_nt_hip(hip, a_rows, gate_w.b, &mut g_refs, ff_dim, dim)?;
+    }
+    {
+        let mut u_refs: Vec<&mut [f32]> = up_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        packed_gemm_nt_hip(hip, a_rows, up_w.b, &mut u_refs, ff_dim, dim)?;
+    }
+    for (g, u) in gate_rows.iter_mut().zip(up_rows.iter()) {
+        hip.silu_mul(g, u)?;
+    }
+    let act_refs: Vec<&[f32]> = gate_rows.iter().map(|v| v.as_slice()).collect();
+    packed_gemm_nt_hip(hip, &act_refs, down_w.b, out_rows, dim, ff_dim)?;
+    Ok(3)
 }
 
 /// Packed lm_head: shared-A NT GEMM of hidden rows × `lm_head` (`n=vocab`, `k=dim`).
@@ -633,6 +725,11 @@ mod tests {
         let wo = vec![4.0f32; dim * dim];
         let w_gate = vec![5.0f32; 8 * dim];
         let w_up = vec![6.0f32; 8 * dim];
+        let attn = decode_layer_attn_shared_a_weights(dim, &wq, &wk, &wv, &wo);
+        assert_eq!(
+            attn.iter().map(|x| x.name).collect::<Vec<_>>(),
+            vec!["wq", "wk", "wv", "wo"]
+        );
         let w = decode_layer_shared_a_weights(dim, &wq, &wk, &wv, &wo, &w_gate, &w_up);
         let names: Vec<&str> = w.iter().map(|x| x.name).collect();
         assert_eq!(names, vec!["wq", "wk", "wv", "wo", "w_gate", "w_up"]);
@@ -704,6 +801,59 @@ mod tests {
         for i in 0..dim {
             assert!((c0[i] - c0_sep[i]).abs() < 1e-5, "c0[{i}]");
             assert!((c1[i] - c1_sep[i]).abs() < 1e-5, "c1[{i}]");
+        }
+    }
+
+    #[test]
+    fn packed_ffn_hip_matches_cpu_or_skips() {
+        if !allpaca_hip::runtime_linked() || allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 256) else {
+            return;
+        };
+        let dim = 4usize;
+        let ff = 6usize;
+        let a0 = [0.1f32, -0.2, 0.3, 0.0];
+        let a1 = [0.5f32, 0.25, -0.1, 0.05];
+        let w_gate: Vec<f32> = (0..ff * dim)
+            .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+            .collect();
+        let w_up: Vec<f32> = (0..ff * dim)
+            .map(|i| ((i % 5) as f32) * 0.05)
+            .collect();
+        let w_down: Vec<f32> = (0..dim * ff)
+            .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
+            .collect();
+        let mut c0_cpu = [0.0f32; 4];
+        let mut c1_cpu = [0.0f32; 4];
+        apply_packed_ffn(
+            &[&a0[..], &a1[..]],
+            &w_gate,
+            &w_up,
+            &w_down,
+            dim,
+            &mut [&mut c0_cpu[..], &mut c1_cpu[..]],
+        )
+        .expect("cpu ffn");
+        let mut c0 = [0.0f32; 4];
+        let mut c1 = [0.0f32; 4];
+        let n = apply_packed_ffn_hip(
+            &hip,
+            &[&a0[..], &a1[..]],
+            &w_gate,
+            &w_up,
+            &w_down,
+            dim,
+            &mut [&mut c0[..], &mut c1[..]],
+        )
+        .expect("hip ffn");
+        assert_eq!(n, 3);
+        for i in 0..dim {
+            let d0 = (c0[i] - c0_cpu[i]).abs();
+            let d1 = (c1[i] - c1_cpu[i]).abs();
+            assert!(d0 <= 1e-3 || d0 <= 1e-3 * c0_cpu[i].abs(), "c0[{i}]");
+            assert!(d1 <= 1e-3 || d1 <= 1e-3 * c1_cpu[i].abs(), "c1[{i}]");
         }
     }
 
