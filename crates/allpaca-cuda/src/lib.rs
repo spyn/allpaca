@@ -51,6 +51,11 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_cuda_set_device(device: i32) -> i32;
+        pub fn allpaca_cuda_mem_info(
+            device: i32,
+            free_bytes: *mut u64,
+            total_bytes: *mut u64,
+        ) -> i32;
         pub fn allpaca_cuda_stream_synchronize(stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_stream_create(stream: *mut *mut c_void) -> i32;
         pub fn allpaca_cuda_stream_destroy(stream: *mut c_void) -> i32;
@@ -203,6 +208,28 @@ pub fn set_device(device: i32) -> Result<(), AllpacaError> {
         let _ = device;
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "CUDA set_device unavailable".into(),
+        )))
+    }
+}
+
+/// Driver-measured `(free, total)` VRAM bytes for `device`.
+///
+/// Like HIP [`allpaca_hip::device_memory_info`]: board-wide (other processes
+/// included). Sample off the decode hot path.
+pub fn device_memory_info(device: i32) -> Result<(u64, u64), AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut free = 0u64;
+        let mut total = 0u64;
+        let rc = unsafe { ffi::allpaca_cuda_mem_info(device, &mut free, &mut total) };
+        status(rc, "mem_info")?;
+        Ok((free, total))
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = device;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA mem_info unavailable".into(),
         )))
     }
 }
@@ -1607,6 +1634,35 @@ mod tests {
         let h2d = H2dStream::new().expect("h2d stream");
         assert!(!h2d.raw().is_null());
         h2d.synchronize().expect("h2d sync");
+    }
+
+    #[test]
+    fn mem_info_unavailable_without_device() {
+        if device_count() > 0 {
+            return;
+        }
+        assert!(device_memory_info(0).is_err());
+    }
+
+    #[test]
+    fn mem_info_reports_board_free_that_shrinks_on_allocation() {
+        if device_count() <= 0 {
+            return;
+        }
+        let (free_before, total) = device_memory_info(0).expect("mem_info");
+        assert!(total > 0, "total VRAM should be positive");
+        assert!(free_before <= total);
+        let chunk = 16 * 1024 * 1024;
+        let ptr = device_malloc(chunk, 0).expect("alloc");
+        let (free_after, total_after) = device_memory_info(0).expect("mem_info after");
+        assert_eq!(total_after, total);
+        assert!(
+            free_after + (chunk as u64) / 2 <= free_before,
+            "free_before={free_before} free_after={free_after} chunk={chunk}"
+        );
+        device_free(ptr);
+        let (free_now, _) = device_memory_info(0).expect("mem_info after free");
+        assert!(free_now >= free_after);
     }
 
     #[test]

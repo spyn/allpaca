@@ -566,51 +566,56 @@ impl Engine {
     /// Refresh driver VRAM and GPU busy into [`Metrics`], at most once per
     /// [`GpuSampler`] window, and hand the busy fraction to `q*`.
     ///
-    /// `hipMemGetInfo` is a driver round-trip, so this belongs to scheduler
-    /// safe points and `/stats` only. Decode must never call it. AMD SMI would
-    /// add per-GPU power here; ROCm does not ship it on Windows, and the busy
-    /// fraction below is measured from HIP events anyway.
+    /// `hipMemGetInfo` / `cudaMemGetInfo` are driver round-trips, so this belongs
+    /// to scheduler safe points and `/stats` only. Decode must never call it.
     fn sample_gpu(&self) {
-        let Some(hip) = self.hip.as_ref() else {
-            return;
-        };
         if !self.gpu_sampler.due() {
             return;
         }
-        let read = |dev: i32| {
-            allpaca_hip::device_memory_info(dev)
-                .map(|(free, total)| (total.saturating_sub(free), total))
-                .unwrap_or((0, 0))
-        };
-        let target_dev = self.inventory.target_device.max(0);
-        let (used, total) = read(target_dev);
-        // Reading a second device forces a rebind, and a rebind costs a
-        // driver-wide lock that decode threads are contending for. Skip it
-        // until the draft GPU has actually run something worth watching.
-        let draft_dev = self.inventory.draft_device;
-        let draft_live = self
-            .metrics
-            .draft_gpu_forwards
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0;
-        let (draft_used, draft_total) =
-            if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
-                read(draft_dev)
-            } else {
-                (0, 0)
+        #[cfg(feature = "hip")]
+        if let Some(hip) = self.hip.as_ref() {
+            let read = |dev: i32| {
+                allpaca_hip::device_memory_info(dev)
+                    .map(|(free, total)| (total.saturating_sub(free), total))
+                    .unwrap_or((0, 0))
             };
-        // Share of decode wall time the GPU spent in allpaca kernels. The
-        // profile is an EMA of the last decode steps, so no differencing.
-        let p = hip.decode_profile();
-        let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
-        let wall_us = gpu_us + p.host_us;
-        let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
-        self.metrics
-            .record_gpu_sample(used, total, draft_used, draft_total, util);
-        if let Ok(g) = self.lock() {
-            if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
-                lru.set_gpu_busy(util);
+            let target_dev = self.inventory.target_device.max(0);
+            let (used, total) = read(target_dev);
+            let draft_dev = self.inventory.draft_device;
+            let draft_live = self
+                .metrics
+                .draft_gpu_forwards
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0;
+            let (draft_used, draft_total) =
+                if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
+                    read(draft_dev)
+                } else {
+                    (0, 0)
+                };
+            let p = hip.decode_profile();
+            let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
+            let wall_us = gpu_us + p.host_us;
+            let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
+            self.metrics
+                .record_gpu_sample(used, total, draft_used, draft_total, util);
+            if let Ok(g) = self.lock() {
+                if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
+                    lru.set_gpu_busy(util);
+                }
             }
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() {
+            let target_dev = self.inventory.target_device.max(0);
+            let (used, total) = allpaca_cuda::device_memory_info(target_dev)
+                .map(|(free, total)| (total.saturating_sub(free), total))
+                .unwrap_or((0, 0));
+            // CUDA decode profiling lands with fuller workspace parity; VRAM
+            // pressure for /stats is still useful now.
+            self.metrics
+                .record_gpu_sample(used, total, 0, 0, 0.0);
         }
     }
 

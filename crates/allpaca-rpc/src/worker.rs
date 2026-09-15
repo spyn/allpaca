@@ -990,9 +990,17 @@ impl WorkerBackend {
         match self {
             Self::Cpu(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
             #[cfg(feature = "hip")]
-            Self::Hip(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
+            Self::Hip(w) => {
+                allpaca_hip::device_memory_info(w.device).unwrap_or_else(|_| {
+                    (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)
+                })
+            }
             #[cfg(feature = "cuda")]
-            Self::Cuda(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
+            Self::Cuda(w) => {
+                allpaca_cuda::device_memory_info(w.device).unwrap_or_else(|_| {
+                    (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)
+                })
+            }
         }
     }
 }

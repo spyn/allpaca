@@ -45,6 +45,9 @@ int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
 
 int allpaca_cuda_set_device(int32_t device);
 
+/* Driver-measured free/total VRAM (includes other processes). */
+int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes);
+
 int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream);
 
 /* Non-blocking compute/copy stream (mirrors allpaca_hip_stream_create). */

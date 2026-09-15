@@ -131,6 +131,36 @@ extern "C" int allpaca_cuda_set_device(int32_t device) {
     return cuda_status(cudaSetDevice(device));
 }
 
+extern "C" int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes) {
+    if (!free_bytes || !total_bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int prev = 0;
+    cudaError_t err = cudaGetDevice(&prev);
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    const bool rebind = prev != device;
+    if (rebind) {
+        err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            return ALLPACA_ERR_DEVICE;
+        }
+    }
+    size_t free_b = 0;
+    size_t total_b = 0;
+    err = cudaMemGetInfo(&free_b, &total_b);
+    if (rebind) {
+        (void)cudaSetDevice(prev);
+    }
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *free_bytes = static_cast<uint64_t>(free_b);
+    *total_bytes = static_cast<uint64_t>(total_b);
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream) {
     cudaStream_t s = as_stream(stream);
     if (s) {
