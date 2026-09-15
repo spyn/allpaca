@@ -10,7 +10,8 @@
 //! ([`apply_packed_ffn`] / [`apply_packed_ffn_hip`]) runs gate/up → silu×up
 //! → **w_down** (HIP poll path uses the HIP variant). Packed Q/K/V C feeds
 //! per-row causal attention then packed WO ([`apply_packed_attn`] /
-//! [`apply_packed_attn_hip`]); poll still discards WO until residual fusion.
+//! [`apply_packed_attn_hip`]); poll residual-adds WO into the packed stream
+//! that FFN consumes. Packed lm_head still reads original `output_norm`.
 
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -544,6 +545,31 @@ where
     let attn_refs: Vec<&[f32]> = attn_rows.iter().map(|v| v.as_slice()).collect();
     gemm_nt(&attn_refs, wo, out_rows, dim, q_dim)?;
     Ok(3u64.saturating_add(a_rows.len() as u64).saturating_add(1))
+}
+
+/// In-place residual: `x_rows[i] += y_rows[i]` (same row lengths).
+pub fn residual_add_rows(
+    x_rows: &mut [&mut [f32]],
+    y_rows: &[&[f32]],
+) -> Result<(), AllpacaError> {
+    if x_rows.len() != y_rows.len() {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "residual_add_rows: x/y row count mismatch".into(),
+        )));
+    }
+    for (i, (x, y)) in x_rows.iter_mut().zip(y_rows.iter()).enumerate() {
+        if x.len() != y.len() {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "residual_add_rows: row {i} len {} != {}",
+                x.len(),
+                y.len()
+            ))));
+        }
+        for (a, b) in x.iter_mut().zip(y.iter()) {
+            *a += *b;
+        }
+    }
+    Ok(())
 }
 
 /// Packed FFN on HIP: gate/up `gemm_nt` → `silu_mul` → `w_down` `gemm_nt`.
@@ -1162,6 +1188,15 @@ mod tests {
             attn_changed_c,
             "packed WO must consume attention C, not raw Q"
         );
+
+        let mut x0 = a0;
+        let mut x1 = a1;
+        residual_add_rows(&mut [&mut x0[..], &mut x1[..]], &[&c0[..], &c1[..]])
+            .expect("wo residual");
+        for i in 0..dim {
+            assert!((x0[i] - (a0[i] + c0[i])).abs() < 1e-6, "residual x0[{i}]");
+            assert!((x1[i] - (a1[i] + c1[i])).abs() < 1e-6, "residual x1[{i}]");
+        }
     }
 
     #[test]

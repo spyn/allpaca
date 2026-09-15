@@ -162,6 +162,6 @@ cargo test -p allpaca-core --features hip --offline --test hip_runtime tiny_deep
 
 ## Ideas still out (next slices)
 
-- Packed decode WO residual fusion (Q/K/V C → attention → WO landed; poll still discards WO C).
+- Packed FFN residual fusion (WO residual into packed FFN A landed; FFN C still discarded).
 - CUDA 7B GGUF / hybrid SSM parity (dense + synthetic MoE TinyModel CUDA decode landed).
 - Real CXL.mem / PIM (simulators only).

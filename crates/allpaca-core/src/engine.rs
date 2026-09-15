@@ -19,8 +19,8 @@ use rand::rngs::StdRng;
 use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
 use crate::batch_gemm::{
     apply_packed_attn_hip, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
-    decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate,
-    BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, residual_add_rows,
+    BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
 };
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
@@ -2344,7 +2344,7 @@ impl Engine {
         }
     }
 
-    /// Packed HIP `gemm_nt` for attn (Q/K/V C → attention → WO) + FFN (incl w_down) + lm_head.
+    /// Packed HIP attn (Q/K/V C → attention → WO residual into FFN A) + FFN + lm_head.
     ///
     /// Returns `(kernels_launched, applied)` where `applied` is 1 when packed
     /// lm_head logits were written into at least one Request's `pending_logits`
@@ -2422,6 +2422,7 @@ impl Engine {
         }
 
         let a_refs: Vec<&[f32]> = a_rows.iter().map(|v| v.as_slice()).collect();
+        let mut fused_rows = a_rows.clone();
         let mut launched = 0u64;
         let mut attn_fused = false;
         if let Some((wq, wk, wv, wo)) = attn_w.as_ref() {
@@ -2449,6 +2450,10 @@ impl Engine {
             ) {
                 launched += n;
                 attn_fused = true;
+                let y_refs: Vec<&[f32]> = attn_out.iter().map(|v| v.as_slice()).collect();
+                let mut x_refs: Vec<&mut [f32]> =
+                    fused_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+                let _ = residual_add_rows(&mut x_refs, &y_refs);
             }
         }
         if !attn_fused {
@@ -2466,7 +2471,8 @@ impl Engine {
         }
 
         if let Some((w_gate, w_up, w_down)) = ffn_weights {
-            let mut ffn_out: Vec<Vec<f32>> = a_rows
+            let ffn_a: Vec<&[f32]> = fused_rows.iter().map(|v| v.as_slice()).collect();
+            let mut ffn_out: Vec<Vec<f32>> = fused_rows
                 .iter()
                 .map(|a| {
                     let m = a.len() / dim;
@@ -2476,7 +2482,7 @@ impl Engine {
             let mut out_refs: Vec<&mut [f32]> =
                 ffn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
             if let Ok(n) =
-                apply_packed_ffn_hip(hip, &a_refs, &w_gate, &w_up, &w_down, dim, &mut out_refs)
+                apply_packed_ffn_hip(hip, &ffn_a, &w_gate, &w_up, &w_down, dim, &mut out_refs)
             {
                 launched += n;
             }
