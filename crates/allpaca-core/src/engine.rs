@@ -240,6 +240,7 @@ impl Engine {
                 }
             }
         }
+        config.apply_tune_overlay();
         config.validate()?;
         let mut inventory = DeviceInventory::discover(&config);
         let rpc = if config.rpc.endpoints.is_empty() {
@@ -973,7 +974,14 @@ impl Engine {
             model.expert_host = Some(HostExpertPool::with_direct_storage(store, n_host, ds));
         }
 
-        let n_slots = expert_lru_slots(expert_bytes, self.config.weights.cache_bytes);
+        let keep = self.tune_keep_ids(model);
+        let pin_bytes = keep.len().saturating_mul(expert_bytes);
+        let cache_bytes = if keep.is_empty() {
+            self.config.weights.cache_bytes
+        } else {
+            self.config.weights.cache_bytes.max(pin_bytes)
+        };
+        let n_slots = expert_lru_slots(expert_bytes, cache_bytes);
         ExpertLru::record_slots(&self.metrics, n_slots);
         if n_slots == 0 {
             return Ok(());
@@ -991,7 +999,41 @@ impl Engine {
         if let Some(pool) = &model.expert_host {
             HostExpertPool::record_numa(&self.metrics, pool.numa());
         }
+        self.warmup_expert_keep_set(model)?;
         Ok(())
+    }
+
+    fn tune_keep_ids(&self, model: &TinyModel) -> Vec<ExpertId> {
+        let Some(entry) = self.config.tune_for_model() else {
+            return Vec::new();
+        };
+        let shape = crate::tune::MoeShape::from_model_config(&model.config);
+        let catalog = self
+            .config
+            .model
+            .path
+            .as_ref()
+            .and_then(|p| crate::tune::load_catalog_beside(p));
+        crate::tune::keep_ids_for_entry(entry, &shape, catalog.as_ref())
+    }
+
+    fn warmup_expert_keep_set(&self, model: &TinyModel) -> Result<(), AllpacaError> {
+        let Some(lru) = model.expert_lru.as_ref() else {
+            return Ok(());
+        };
+        let keep = self.tune_keep_ids(model);
+        lru.set_keep_set(&keep);
+        let hosts: Vec<(ExpertId, LayerFfn)> = keep
+            .iter()
+            .filter_map(|id| {
+                model
+                    .host_expert(id.layer as usize, id.expert as usize)
+                    .ok()
+                    .map(|ffn| (*id, ffn))
+            })
+            .collect();
+        let refs: Vec<(ExpertId, &LayerFfn)> = hosts.iter().map(|(id, ffn)| (*id, ffn)).collect();
+        lru.warmup_keep_set(&refs)
     }
 
     fn resolve_configured_path(
@@ -1257,9 +1299,15 @@ impl Engine {
                 };
                 if let Some(target) = target {
                     match crate::dsv4_gpu::attach(&target, hip, self.draft_hip.as_ref()) {
-                        Ok(()) => tracing::info!(
-                            "DeepSeek-V4: HIP BF16 MLA + MXFP4 expert LRU (no generic GGUF upload)"
-                        ),
+                        Ok(()) => {
+                            let keep = self.tune_keep_ids(&target);
+                            if let Err(e) = crate::dsv4_gpu::apply_keep_set(&target, &keep) {
+                                tracing::warn!(error = %e, "DeepSeek-V4 keep-set warmup failed");
+                            }
+                            tracing::info!(
+                                "DeepSeek-V4: HIP BF16 MLA + MXFP4 expert LRU (no generic GGUF upload)"
+                            );
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "DeepSeek-V4 HIP working set failed; CPU MLA/MoE");
                             self.metrics
@@ -3138,6 +3186,10 @@ impl Engine {
             t_dispatch,
             expert_bytes as f64,
         ));
+        let keep = self.tune_keep_ids(model);
+        if let Some(lru) = model.expert_lru.as_ref() {
+            lru.set_keep_set(&keep);
+        }
     }
 }
 

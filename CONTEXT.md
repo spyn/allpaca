@@ -56,6 +56,9 @@
 | **KV Page** | A fixed-size block of KV cache data that can migrate between tiers. Unit of residency tracking and prefetch. |
 | **Weight Working Set** | The subset of model weights currently in VRAM or a pinned DRAM ring. Distinct from KV Tiers. When the checkpoint does not fit, host (or NVMe) is source of truth and GPU residency only changes speed. Dense layers that are walked every token use a pinned prefix plus a ring (not LRU). Routed experts use a GPU LRU of complete `(layer, expert)` slots; residual misses split between PCIe fill and in-place CPU execution by measured `q* ≈ m B_P / B_H`. See `docs/OPPORTUNITY_DESIGN.md` §8. |
 | **Expert Slot** | One complete `(layer, expert)` tensor group. Unit of MoE admit/evict. Not a KV Page. |
+| **Tune profile** | Named bundle chosen in `allpaca-server --tune` (Max resident, Balanced, Long context, layer band, router group, or a sidecar catalog profile). Decides which routed experts are pin-preferred and how GPU expert cache vs KV is split. |
+| **Keep-set** | The `(layer, expert)` ids reserved in the GPU expert LRU at load. Pin-prefer: they are never LRU victims; every expert stays routable via host/`q*`. Not Flash Spark prune (unselected experts remain valid). Saved under `[tunes."<model spec>"]` and overlaid onto `weights.cache_bytes` when that model loads. |
+| **Group** | One selectable row in the tune TUI: a catalog topic (when `allpaca-keepset.json` / `coverage.json` exists), a router group (`expert_group_count` > 1), or a layer band (early / mid / late). |
 | **Auxiliary Accelerator** | Dropped from scope (no Coral/NPU backends). |
 | **Constraint Mask** | A bitset of allowed tokens produced by the CPU grammar engine, applied to GPU logits before sampling. Enables structured output. |
 | **Structured Output** | Constrained generation (JSON, schemas, grammars). `json_mode` uses a hardcoded JSON value grammar; `json_schema` / Lark `grammar` use `llguidance`. |

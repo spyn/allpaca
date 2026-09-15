@@ -45,6 +45,8 @@ rand = { version = "0.8", features = ["small_rng"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 sysinfo = "0.33"
 clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 futures = "0.3"

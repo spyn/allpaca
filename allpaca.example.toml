@@ -67,6 +67,15 @@ ring_slots = 2
 miss_policy = "qstar"           # qstar | fill | cpu
 host_bytes = 0
 
+# Per-model MoE pin-prefer keep-set from `allpaca-server --tune`.
+# Lookup key is the unresolved model spec (path or Hub `org/name`).
+# [tunes."models/example-moe.gguf"]
+# profile = "balanced"
+# groups = ["late"]
+# ctx_tokens = 32768
+# cache_bytes = 8589934592
+# keep_experts = [[0, 1], [2]]
+
 [sampling]
 mode = "async_host"
 pinned_ring_slots = 8

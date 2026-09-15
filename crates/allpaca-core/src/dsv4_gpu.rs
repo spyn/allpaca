@@ -4,7 +4,7 @@
 //! to F32 in registers. Experts stay packed on NVMe and H2D as 17-byte MXFP4
 //! blocks. F32 tensors (tiny fixtures) stay on the CPU gemv path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,7 +18,7 @@ use allpaca_types::{AllpacaError, DegradedError, FatalError};
 
 use crate::model::{ModelConfig, TinyModel};
 use crate::telemetry::Metrics;
-use crate::weight_set::qstar_fill_count;
+use crate::weight_set::{qstar_fill_count, ExpertId};
 
 const STREAM_SLOT_BYTES: usize = 128 * 1024 * 1024;
 const PREFILL_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
@@ -86,6 +86,7 @@ pub struct Dsv4Gpu {
     h2d_reg: RegisteredMmap,
     act: Option<DeviceWeights>,
     pub used: AtomicBool,
+    keep_set: HashSet<(usize, usize)>,
 }
 
 impl Dsv4Gpu {
@@ -164,9 +165,25 @@ impl Dsv4Gpu {
             h2d_reg: RegisteredMmap { ptrs: Vec::new() },
             act: DeviceWeights::alloc(hip.device, ACT_SLOTS * ACT_SLOT_FLOATS * 4).ok(),
             used: AtomicBool::new(false),
+            keep_set: HashSet::new(),
         };
         gpu.alloc_expert_pools(cfg)?;
         Ok(gpu)
+    }
+
+    fn pin_keep(&self, key: (usize, usize)) -> bool {
+        self.keep_set.contains(&key)
+    }
+
+    /// Durable pin-prefer keep-set. Empty means no reserved slots (true LRU).
+    pub fn set_keep_set(&mut self, ids: &[ExpertId]) {
+        self.keep_set = ids
+            .iter()
+            .map(|id| (id.layer as usize, id.expert as usize))
+            .collect();
+        for slot in self.slots.iter_mut().chain(self.gpu1_slots.iter_mut()) {
+            slot.pinned = slot.key.is_some_and(|k| self.keep_set.contains(&k));
+        }
     }
 
     fn alloc_expert_pools(&mut self, cfg: &ModelConfig) -> Result<(), AllpacaError> {
@@ -463,7 +480,7 @@ impl Dsv4Gpu {
         self.clock = self.clock.saturating_add(1);
         if let Some(i) = self.slots.iter().position(|s| s.key == Some(key)) {
             self.slots[i].used = self.clock;
-            self.slots[i].pinned = true;
+            self.slots[i].pinned = self.pin_keep(key);
             if let Some(m) = metrics {
                 m.expert_lru_hits.fetch_add(1, Ordering::Relaxed);
             }
@@ -473,7 +490,7 @@ impl Dsv4Gpu {
         }
         if let Some(i) = self.gpu1_slots.iter().position(|s| s.key == Some(key)) {
             self.gpu1_slots[i].used = self.clock;
-            self.gpu1_slots[i].pinned = true;
+            self.gpu1_slots[i].pinned = self.pin_keep(key);
             if let Some(m) = metrics {
                 m.expert_lru_hits.fetch_add(1, Ordering::Relaxed);
             }
@@ -518,7 +535,7 @@ impl Dsv4Gpu {
             }
             self.slots[victim].key = Some(key);
             self.slots[victim].used = self.clock;
-            self.slots[victim].pinned = true;
+            self.slots[victim].pinned = self.pin_keep(key);
             return Ok((blob.byte_ptr_at(off), hip.device));
         }
         if !self.gpu1_slots.is_empty() {
@@ -537,7 +554,7 @@ impl Dsv4Gpu {
             }
             self.gpu1_slots[victim].key = Some(key);
             self.gpu1_slots[victim].used = self.clock;
-            self.gpu1_slots[victim].pinned = true;
+            self.gpu1_slots[victim].pinned = self.pin_keep(key);
             hip.bind()?;
             return Ok((blob.byte_ptr_at(off), self.gpu1_device));
         }
@@ -662,12 +679,12 @@ impl Dsv4Gpu {
             self.clock = self.clock.saturating_add(1);
             if let Some(i) = self.slots.iter().position(|s| s.key == Some(key)) {
                 self.slots[i].used = self.clock;
-                self.slots[i].pinned = true;
+                self.slots[i].pinned = self.pin_keep(key);
                 continue;
             }
             if let Some(i) = self.gpu1_slots.iter().position(|s| s.key == Some(key)) {
                 self.gpu1_slots[i].used = self.clock;
-                self.gpu1_slots[i].pinned = true;
+                self.gpu1_slots[i].pinned = self.pin_keep(key);
                 continue;
             }
             if let Some(m) = metrics {
@@ -685,7 +702,7 @@ impl Dsv4Gpu {
                 let victim = lru_victim(&self.gpu1_slots);
                 self.gpu1_slots[victim].key = Some(key);
                 self.gpu1_slots[victim].used = self.clock;
-                self.gpu1_slots[victim].pinned = true;
+                self.gpu1_slots[victim].pinned = self.pin_keep(key);
                 let base = victim * self.expert_slot;
                 for (rel, sl) in slices {
                     parts1.push((base + rel, sl));
@@ -701,7 +718,7 @@ impl Dsv4Gpu {
             let victim = lru_victim(&self.slots);
             self.slots[victim].key = Some(key);
             self.slots[victim].used = self.clock;
-            self.slots[victim].pinned = true;
+            self.slots[victim].pinned = self.pin_keep(key);
             let base = victim * self.expert_slot;
             for (rel, sl) in slices {
                 parts0.push((base + rel, sl));
@@ -1403,6 +1420,39 @@ pub fn attach(
         .lock()
         .map_err(|_| AllpacaError::Fatal(FatalError::ModelLoad("dsv4 gpu lock poisoned".into())))?;
     *guard = Some(gpu);
+    Ok(())
+}
+
+/// Apply a pin-prefer keep-set to an attached DeepSeek-V4 HIP working set.
+pub fn apply_keep_set(model: &TinyModel, ids: &[ExpertId]) -> Result<(), AllpacaError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let Some(dsv4) = model.dsv4.as_ref() else {
+        return Ok(());
+    };
+    let file = dsv4.gguf.clone();
+    let mut guard = dsv4.gpu.lock().map_err(|_| {
+        AllpacaError::Fatal(FatalError::ModelLoad("dsv4 gpu lock poisoned".into()))
+    })?;
+    let Some(gpu) = guard.as_mut() else {
+        return Ok(());
+    };
+    gpu.set_keep_set(ids);
+    let Some(file) = file else {
+        return Ok(());
+    };
+    let mut by_layer: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for id in ids {
+        by_layer
+            .entry(id.layer as usize)
+            .or_default()
+            .push(id.expert as usize);
+    }
+    for (layer, experts) in by_layer {
+        gpu.warmup_experts(file.as_ref(), layer, &experts, &model.config, None)?;
+    }
     Ok(())
 }
 

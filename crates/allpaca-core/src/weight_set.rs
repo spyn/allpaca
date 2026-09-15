@@ -2,6 +2,7 @@
 //!
 //! Not KV. Cyclic dense layers must not use LRU (hit rate is zero on a full walk).
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -556,6 +557,7 @@ struct ExpertLruInner {
     bound: Vec<Option<ExpertId>>,
     used_at: Vec<u64>,
     slots: Vec<LayerFfn>,
+    pinned: Vec<bool>,
     clock: u64,
 }
 
@@ -575,6 +577,7 @@ pub struct ExpertLru {
     /// expert H2D shares copy/queue time with compute, so `q*` must plan on the
     /// derated bandwidth or it will over-commit to filling. 0 = unsampled.
     gpu_busy_x1e4: AtomicU64,
+    keep: Mutex<HashSet<ExpertId>>,
     inner: Mutex<ExpertLruInner>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -624,10 +627,12 @@ impl ExpertLru {
             t_dispatch_s,
             expert_bytes,
             gpu_busy_x1e4: AtomicU64::new(0),
+            keep: Mutex::new(HashSet::new()),
             inner: Mutex::new(ExpertLruInner {
                 bound: vec![None; n],
                 used_at: vec![0; n],
                 slots: vec![LayerFfn::default(); n],
+                pinned: vec![false; n],
                 clock: 0,
             }),
             hits: AtomicU64::new(0),
@@ -681,6 +686,37 @@ impl ExpertLru {
             .store(n_slots as u64, Ordering::Relaxed);
     }
 
+    fn is_keep(&self, id: ExpertId) -> bool {
+        self.keep
+            .lock()
+            .map(|k| k.contains(&id))
+            .unwrap_or(false)
+    }
+
+    /// Durable pin-prefer keep-set. Empty means no reserved slots (true LRU).
+    pub fn set_keep_set(&self, ids: &[ExpertId]) {
+        if let Ok(mut keep) = self.keep.lock() {
+            keep.clear();
+            keep.extend(ids.iter().copied());
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            for i in 0..inner.bound.len() {
+                inner.pinned[i] = inner.bound[i].is_some_and(|id| ids.contains(&id));
+            }
+        }
+    }
+
+    /// Admit keep-set experts first so they occupy reserved slots.
+    pub fn warmup_keep_set(
+        &self,
+        experts: &[(ExpertId, &LayerFfn)],
+    ) -> Result<(), AllpacaError> {
+        for &(id, host) in experts {
+            self.admit(id, host)?;
+        }
+        Ok(())
+    }
+
     pub fn plan(&self, needed: &[ExpertId]) -> MissPlan {
         let unique = unique_in_order(needed);
         let inner = self.inner.lock().ok();
@@ -715,6 +751,7 @@ impl ExpertLru {
     }
 
     pub fn admit(&self, id: ExpertId, host: &LayerFfn) -> Result<(), AllpacaError> {
+        let is_keep = self.is_keep(id);
         let mut inner = self.inner.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig(
                 "expert LRU mutex poisoned".into(),
@@ -723,24 +760,29 @@ impl ExpertLru {
         inner.clock = inner.clock.saturating_add(1);
         if let Some(slot) = inner.bound.iter().position(|&b| b == Some(id)) {
             inner.used_at[slot] = inner.clock;
+            inner.pinned[slot] = is_keep;
             return Ok(());
         }
         let victim = inner
             .bound
             .iter()
             .position(|b| b.is_none())
-            .unwrap_or_else(|| {
+            .or_else(|| {
                 inner
-                    .used_at
+                    .bound
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, t)| *t)
+                    .filter(|(i, b)| b.is_some() && !inner.pinned[*i])
+                    .min_by_key(|(i, _)| inner.used_at[*i])
                     .map(|(i, _)| i)
-                    .unwrap_or(0)
             });
+        let Some(victim) = victim else {
+            return Ok(());
+        };
         inner.slots[victim] = host.clone();
         inner.bound[victim] = Some(id);
         inner.used_at[victim] = inner.clock;
+        inner.pinned[victim] = is_keep;
         Ok(())
     }
 
@@ -1110,5 +1152,43 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    fn tagged_ffn(tag: f32) -> LayerFfn {
+        LayerFfn {
+            w_gate: vec![tag],
+            ..LayerFfn::default()
+        }
+    }
+
+    #[test]
+    fn keep_set_is_never_evicted() {
+        let lru = ExpertLru::new(2, MissPolicy::Fill);
+        let keep = ExpertId {
+            layer: 0,
+            expert: 0,
+        };
+        let cold_a = ExpertId {
+            layer: 0,
+            expert: 1,
+        };
+        let cold_b = ExpertId {
+            layer: 0,
+            expert: 2,
+        };
+        lru.set_keep_set(&[keep]);
+        let k = tagged_ffn(1.0);
+        let a = tagged_ffn(2.0);
+        let b = tagged_ffn(3.0);
+        lru.admit(keep, &k).unwrap();
+        lru.admit(cold_a, &a).unwrap();
+        lru.admit(cold_b, &b).unwrap();
+        assert_eq!(lru.plan(&[keep]).hits.len(), 1, "keep-set must stay resident");
+        assert_eq!(
+            lru.plan(&[cold_a]).hits.len(),
+            0,
+            "unpinned victim is evicted"
+        );
+        assert_eq!(lru.plan(&[cold_b]).hits.len(), 1);
     }
 }

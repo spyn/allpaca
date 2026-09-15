@@ -28,6 +28,8 @@ tracing-subscriber.workspace = true
 rand.workspace = true
 rust-embed.workspace = true
 sysinfo.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
