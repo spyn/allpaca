@@ -160,12 +160,18 @@ Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH`, PATH `nvcc`, and
 `--features cuda` still compiles (stub). Without an NVIDIA driver/GPU,
 `device_count()` is 0 — you can still compile and link on a toolkit-only machine.
 
+GPU ISAs (same idea as HIP offload): `ALLPACA_CUDA_ARCH` / `CUDAARCHS` /
+`TORCH_CUDA_ARCH_LIST`, else live `nvidia-smi` compute caps, else a fat binary
+for **sm_86** (RTX 3060 / Ampere) and **sm_120** (Blackwell GeForce laptop).
+Example: `ALLPACA_CUDA_ARCH=sm_86,sm_120 cargo test -p allpaca-cuda --features cuda`.
+
 ```bash
 cargo test -p allpaca-cuda --features cuda
 ```
 
 Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexist.
-Engine forwards remain HIP until CUDA parity lands.
+Engine forwards remain HIP until CUDA parity lands. Kepler/K80 (`sm_37`) needs
+CUDA ≤11.4 and is not part of this fat binary.
 
 ---
 
