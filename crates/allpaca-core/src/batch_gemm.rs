@@ -8,7 +8,9 @@
 //! are written into each Request's `pending_logits` from fresh `output_norm`
 //! (HIP decode can skip the per-request lm_head GEMM). Packed FFN
 //! ([`apply_packed_ffn`] / [`apply_packed_ffn_hip`]) runs gate/up → silu×up
-//! → **w_down** (HIP poll path uses the HIP variant).
+//! → **w_down** (HIP poll path uses the HIP variant). Packed Q/K/V C feeds
+//! per-row causal attention then packed WO ([`apply_packed_attn`] /
+//! [`apply_packed_attn_hip`]); poll still discards WO until residual fusion.
 
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -333,6 +335,215 @@ pub fn apply_packed_ffn(
     }
     let act_refs: Vec<&[f32]> = act_rows.iter().map(|v| v.as_slice()).collect();
     packed_gemm_nt_cpu(&act_refs, down_w.b, out_rows, dim, ff_dim)
+}
+
+/// Q/K/V projection widths for packed attention (`wq`/`wk`/`wv`/`wo` NT layouts).
+fn packed_attn_proj_dims(
+    dim: usize,
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<(usize, usize), AllpacaError> {
+    if dim == 0 || n_heads == 0 || n_kv_heads == 0 || head_dim == 0 {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_attn: empty dim or heads".into(),
+        )));
+    }
+    if !n_heads.is_multiple_of(n_kv_heads) {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_attn: n_heads not multiple of n_kv_heads".into(),
+        )));
+    }
+    let q_dim = n_heads.saturating_mul(head_dim);
+    let kv_dim = n_kv_heads.saturating_mul(head_dim);
+    if wq.len() != q_dim.saturating_mul(dim)
+        || wk.len() != kv_dim.saturating_mul(dim)
+        || wv.len() != kv_dim.saturating_mul(dim)
+        || wo.len() != dim.saturating_mul(q_dim)
+    {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_attn: weight shape mismatch".into(),
+        )));
+    }
+    Ok((q_dim, kv_dim))
+}
+
+/// Packed Q/K/V NT GEMM → per-row causal attention → packed WO into `out_rows`.
+///
+/// Each `a_rows[i]` / `out_rows[i]` is `m_i×dim`. Attention is causal over that
+/// row (`n_q = n_kv = m_i`); decode uses `m_i = 1`. No RoPE (caller may apply
+/// it on Q/K before a later residual-fusion slice).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_packed_attn(
+    a_rows: &[&[f32]],
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+    dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out_rows: &mut [&mut [f32]],
+) -> Result<(), AllpacaError> {
+    apply_packed_attn_inner(
+        a_rows,
+        wq,
+        wk,
+        wv,
+        wo,
+        dim,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        out_rows,
+        |a, b, c, n, k| packed_gemm_nt_cpu(a, b, c, n, k),
+        |q, k, v, out, n_q, n_kv| {
+            allpaca_cpu::attention(
+                q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, true,
+            )
+        },
+    )
+    .map(|_| ())
+}
+
+/// Packed attention on HIP: Q/K/V `gemm_nt` → `HipWorkspace::attention` per row → WO.
+///
+/// Returns HIP kernel launches: 3 GEMMs + one attention per row + WO GEMM.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_packed_attn_hip(
+    hip: &allpaca_hip::HipWorkspace,
+    a_rows: &[&[f32]],
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+    dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out_rows: &mut [&mut [f32]],
+) -> Result<u64, AllpacaError> {
+    apply_packed_attn_inner(
+        a_rows,
+        wq,
+        wk,
+        wv,
+        wo,
+        dim,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        out_rows,
+        |a, b, c, n, k| packed_gemm_nt_hip(hip, a, b, c, n, k),
+        |q, k, v, out, n_q, n_kv| {
+            hip.attention(
+                q,
+                k,
+                v,
+                out,
+                n_q as i32,
+                n_kv as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
+                head_dim as i32,
+                true,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_packed_attn_inner<Gemm, Attn>(
+    a_rows: &[&[f32]],
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+    dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out_rows: &mut [&mut [f32]],
+    mut gemm_nt: Gemm,
+    mut attention: Attn,
+) -> Result<u64, AllpacaError>
+where
+    Gemm: FnMut(&[&[f32]], &[f32], &mut [&mut [f32]], usize, usize) -> Result<(), AllpacaError>,
+    Attn: FnMut(&[f32], &[f32], &[f32], &mut [f32], usize, usize) -> Result<(), AllpacaError>,
+{
+    let (q_dim, kv_dim) =
+        packed_attn_proj_dims(dim, wq, wk, wv, wo, n_heads, n_kv_heads, head_dim)?;
+    if a_rows.len() != out_rows.len() {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "apply_packed_attn: a/out row count mismatch".into(),
+        )));
+    }
+    let mut m_parts = Vec::with_capacity(a_rows.len());
+    for (i, a) in a_rows.iter().enumerate() {
+        if dim == 0 || a.len() % dim != 0 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "apply_packed_attn: a_rows[{i}] len {} not multiple of dim={dim}",
+                a.len()
+            ))));
+        }
+        let m_i = a.len() / dim;
+        if out_rows[i].len() < m_i.saturating_mul(dim) {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "apply_packed_attn: out_rows[{i}] too short"
+            ))));
+        }
+        m_parts.push(m_i);
+    }
+    let mut q_rows: Vec<Vec<f32>> = m_parts
+        .iter()
+        .map(|&m| vec![0.0f32; m.saturating_mul(q_dim)])
+        .collect();
+    let mut k_rows: Vec<Vec<f32>> = m_parts
+        .iter()
+        .map(|&m| vec![0.0f32; m.saturating_mul(kv_dim)])
+        .collect();
+    let mut v_rows: Vec<Vec<f32>> = m_parts
+        .iter()
+        .map(|&m| vec![0.0f32; m.saturating_mul(kv_dim)])
+        .collect();
+    let mut attn_rows: Vec<Vec<f32>> = m_parts
+        .iter()
+        .map(|&m| vec![0.0f32; m.saturating_mul(q_dim)])
+        .collect();
+    {
+        let mut refs: Vec<&mut [f32]> = q_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        gemm_nt(a_rows, wq, &mut refs, q_dim, dim)?;
+    }
+    {
+        let mut refs: Vec<&mut [f32]> = k_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        gemm_nt(a_rows, wk, &mut refs, kv_dim, dim)?;
+    }
+    {
+        let mut refs: Vec<&mut [f32]> = v_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        gemm_nt(a_rows, wv, &mut refs, kv_dim, dim)?;
+    }
+    for i in 0..a_rows.len() {
+        let m_i = m_parts[i];
+        if m_i == 0 {
+            continue;
+        }
+        attention(
+            &q_rows[i],
+            &k_rows[i],
+            &v_rows[i],
+            &mut attn_rows[i],
+            m_i,
+            m_i,
+        )?;
+    }
+    let attn_refs: Vec<&[f32]> = attn_rows.iter().map(|v| v.as_slice()).collect();
+    gemm_nt(&attn_refs, wo, out_rows, dim, q_dim)?;
+    Ok(3u64.saturating_add(a_rows.len() as u64).saturating_add(1))
 }
 
 /// Packed FFN on HIP: gate/up `gemm_nt` → `silu_mul` → `w_down` `gemm_nt`.
@@ -873,5 +1084,151 @@ mod tests {
         .expect("packed lm_head");
         assert_eq!(c0, c0_sep);
         assert_eq!(c1, c1_sep);
+    }
+
+    /// Packed Q/K/V → causal attn → WO matches per-row separate GEMMs + attention.
+    #[test]
+    fn packed_attn_qkv_feeds_attention_then_wo() {
+        let dim = 8usize;
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let a0 = [0.1f32, -0.2, 0.3, 0.0, 0.05, -0.1, 0.2, 0.15];
+        let a1 = [0.5f32, 0.25, -0.1, 0.05, -0.2, 0.1, 0.0, 0.3];
+        let wq: Vec<f32> = (0..q_dim * dim)
+            .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+            .collect();
+        let wk: Vec<f32> = (0..kv_dim * dim)
+            .map(|i| ((i % 5) as f32) * 0.05)
+            .collect();
+        let wv: Vec<f32> = (0..kv_dim * dim)
+            .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
+            .collect();
+        let wo: Vec<f32> = (0..dim * q_dim)
+            .map(|i| ((i % 11) as f32) * 0.04 - 0.2)
+            .collect();
+
+        let sep = |a: &[f32]| {
+            let mut q = vec![0.0f32; q_dim];
+            let mut k = vec![0.0f32; kv_dim];
+            let mut v = vec![0.0f32; kv_dim];
+            let mut attn = vec![0.0f32; q_dim];
+            let mut out = vec![0.0f32; dim];
+            allpaca_cpu::matmul_nt(a, &wq, &mut q, 1, q_dim, dim).unwrap();
+            allpaca_cpu::matmul_nt(a, &wk, &mut k, 1, kv_dim, dim).unwrap();
+            allpaca_cpu::matmul_nt(a, &wv, &mut v, 1, kv_dim, dim).unwrap();
+            allpaca_cpu::attention(
+                &q, &k, &v, &mut attn, 1, 1, n_heads, n_kv_heads, head_dim, true,
+            )
+            .unwrap();
+            allpaca_cpu::matmul_nt(&attn, &wo, &mut out, 1, dim, q_dim).unwrap();
+            out
+        };
+        let c0_sep = sep(&a0);
+        let c1_sep = sep(&a1);
+
+        let mut c0 = [0.0f32; 8];
+        let mut c1 = [0.0f32; 8];
+        apply_packed_attn(
+            &[&a0[..], &a1[..]],
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            dim,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            &mut [&mut c0[..], &mut c1[..]],
+        )
+        .expect("packed attn");
+        for i in 0..dim {
+            assert!((c0[i] - c0_sep[i]).abs() < 1e-5, "c0[{i}]");
+            assert!((c1[i] - c1_sep[i]).abs() < 1e-5, "c1[{i}]");
+        }
+
+        // WO of raw Q (skipping attention) must not match attn→WO.
+        let mut q0 = vec![0.0f32; q_dim];
+        let mut wo_of_q = vec![0.0f32; dim];
+        allpaca_cpu::matmul_nt(&a0, &wq, &mut q0, 1, q_dim, dim).unwrap();
+        allpaca_cpu::matmul_nt(&q0, &wo, &mut wo_of_q, 1, dim, q_dim).unwrap();
+        let attn_changed_c = c0
+            .iter()
+            .zip(wo_of_q.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-5);
+        assert!(
+            attn_changed_c,
+            "packed WO must consume attention C, not raw Q"
+        );
+    }
+
+    #[test]
+    fn packed_attn_hip_matches_cpu_or_skips() {
+        if !allpaca_hip::runtime_linked() || allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 256) else {
+            return;
+        };
+        let dim = 8usize;
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let a0 = [0.1f32, -0.2, 0.3, 0.0, 0.05, -0.1, 0.2, 0.15];
+        let a1 = [0.5f32, 0.25, -0.1, 0.05, -0.2, 0.1, 0.0, 0.3];
+        let wq: Vec<f32> = (0..q_dim * dim)
+            .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+            .collect();
+        let wk: Vec<f32> = (0..kv_dim * dim)
+            .map(|i| ((i % 5) as f32) * 0.05)
+            .collect();
+        let wv: Vec<f32> = (0..kv_dim * dim)
+            .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
+            .collect();
+        let wo: Vec<f32> = (0..dim * q_dim)
+            .map(|i| ((i % 11) as f32) * 0.04 - 0.2)
+            .collect();
+        let mut c0_cpu = [0.0f32; 8];
+        let mut c1_cpu = [0.0f32; 8];
+        apply_packed_attn(
+            &[&a0[..], &a1[..]],
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            dim,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            &mut [&mut c0_cpu[..], &mut c1_cpu[..]],
+        )
+        .expect("cpu attn");
+        let mut c0 = [0.0f32; 8];
+        let mut c1 = [0.0f32; 8];
+        let n = apply_packed_attn_hip(
+            &hip,
+            &[&a0[..], &a1[..]],
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            dim,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            &mut [&mut c0[..], &mut c1[..]],
+        )
+        .expect("hip attn");
+        assert_eq!(n, 6);
+        for i in 0..dim {
+            let d0 = (c0[i] - c0_cpu[i]).abs();
+            let d1 = (c1[i] - c1_cpu[i]).abs();
+            assert!(d0 <= 1e-3 || d0 <= 1e-3 * c0_cpu[i].abs(), "c0[{i}]");
+            assert!(d1 <= 1e-3 || d1 <= 1e-3 * c1_cpu[i].abs(), "c1[{i}]");
+        }
     }
 }

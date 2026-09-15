@@ -162,6 +162,6 @@ cargo test -p allpaca-core --features hip --offline --test hip_runtime tiny_deep
 
 ## Ideas still out (next slices)
 
-- Packed decode Q/K/V/O C feeding attention (lm_head skip on greedy HIP cohort landed).
+- Packed decode WO residual fusion (Q/K/V C → attention → WO landed; poll still discards WO C).
 - CUDA 7B / MoE / hybrid parity (dense TinyModel CUDA decode + CUDA KV pages landed).
 - Real CXL.mem / PIM (simulators only).

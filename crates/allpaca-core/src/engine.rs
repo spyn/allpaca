@@ -18,7 +18,7 @@ use rand::rngs::StdRng;
 
 use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
 use crate::batch_gemm::{
-    apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
+    apply_packed_attn_hip, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
     decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate,
     BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
 };
@@ -2344,7 +2344,7 @@ impl Engine {
         }
     }
 
-    /// Packed HIP `gemm_nt` for attn shared-A weights + FFN (incl w_down) + lm_head.
+    /// Packed HIP `gemm_nt` for attn (Q/K/V C → attention → WO) + FFN (incl w_down) + lm_head.
     ///
     /// Returns `(kernels_launched, applied)` where `applied` is 1 when packed
     /// lm_head logits were written into at least one Request's `pending_logits`
@@ -2358,9 +2358,20 @@ impl Engine {
         };
         let dim = target.config.dim;
         let vocab = target.config.vocab_size;
+        let n_heads = target.config.n_heads;
+        let n_kv_heads = target.config.n_kv_heads.max(1);
+        let head_dim = target.config.head_dim();
         if dim == 0 || plan.request_ids.len() < 2 {
             return (0, 0);
         }
+        let attn_w = target.layers.first().map(|layer| {
+            (
+                layer.wq.as_slice().to_vec(),
+                layer.wk.as_slice().to_vec(),
+                layer.wv.as_slice().to_vec(),
+                layer.wo.as_slice().to_vec(),
+            )
+        });
         let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first() {
             decode_layer_attn_shared_a_weights(
                 dim,
@@ -2412,14 +2423,45 @@ impl Engine {
 
         let a_refs: Vec<&[f32]> = a_rows.iter().map(|v| v.as_slice()).collect();
         let mut launched = 0u64;
-        for (b, n, k) in &weights {
-            let mut c_rows: Vec<Vec<f32>> = a_rows
+        let mut attn_fused = false;
+        if let Some((wq, wk, wv, wo)) = attn_w.as_ref() {
+            let mut attn_out: Vec<Vec<f32>> = a_rows
                 .iter()
-                .map(|a| vec![0.0f32; (a.len() / k) * n])
+                .map(|a| {
+                    let m = a.len() / dim;
+                    vec![0.0f32; m.saturating_mul(dim)]
+                })
                 .collect();
-            let mut c_refs: Vec<&mut [f32]> = c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
-            if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
-                launched += 1;
+            let mut out_refs: Vec<&mut [f32]> =
+                attn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
+            if let Ok(n) = apply_packed_attn_hip(
+                hip,
+                &a_refs,
+                wq,
+                wk,
+                wv,
+                wo,
+                dim,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &mut out_refs,
+            ) {
+                launched += n;
+                attn_fused = true;
+            }
+        }
+        if !attn_fused {
+            for (b, n, k) in &weights {
+                let mut c_rows: Vec<Vec<f32>> = a_rows
+                    .iter()
+                    .map(|a| vec![0.0f32; (a.len() / k) * n])
+                    .collect();
+                let mut c_refs: Vec<&mut [f32]> =
+                    c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+                if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
+                    launched += 1;
+                }
             }
         }
 
@@ -6820,7 +6862,7 @@ mod tests {
         let stats = engine.stats();
         assert!(
             stats.batch_gemm_hip_kernels >= 7,
-            "layer-fused HIP must launch QKV/O + FFN(gate/up/down); stats={stats:?}"
+            "packed Q/K/V C must feed attention then WO plus FFN(gate/up/down); stats={stats:?}"
         );
         assert!(
             stats.batch_gemm_hip_applied >= 1,
