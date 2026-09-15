@@ -84,3 +84,56 @@ fn cuda_absent_falls_back_to_cpu_cleanly() {
     assert_eq!(stats.gpu_forwards, 0);
     assert_eq!(stats.weight_h2d_bytes, 0);
 }
+
+#[test]
+fn cuda_synthetic_moe_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    engine
+        .load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("tiny moe");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "MoE expert weights should upload; stats={before:?}"
+    );
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA MoE forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    assert_eq!(
+        stats.weight_h2d_bytes, before.weight_h2d_bytes,
+        "weight_h2d must not grow during MoE generate"
+    );
+}
+
+#[test]
+fn cuda_synthetic_moe_matches_cpu_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cpu_cfg = cuda_synthetic();
+    cpu_cfg.engine.cpu_only = true;
+    cpu_cfg.engine.gpu_backend = "cpu".into();
+    let cpu = Engine::new(cpu_cfg).expect("cpu engine");
+    cpu.load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("cpu moe");
+    let want = cpu.generate("hello", greedy(4)).expect("cpu generate");
+
+    let gpu = Engine::new(cuda_synthetic()).expect("cuda engine");
+    gpu.load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("cuda moe");
+    let got = gpu.generate("hello", greedy(4)).expect("cuda generate");
+    assert_eq!(
+        got.token_ids, want.token_ids,
+        "CUDA MoE greedy tokens must match CPU"
+    );
+}

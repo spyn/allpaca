@@ -1,6 +1,6 @@
-//! Narrow CUDA decode path: dense TinyModel token forwards on CudaWorkspace.
+//! CUDA decode path: dense + synthetic MoE TinyModel token forwards on CudaWorkspace.
 
-use super::{gather_kv, LayerWeights, ModelConfig, TinyModel, WeightRef};
+use super::{gather_kv, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef};
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
 use allpaca_cpu::{attention, rope, silu};
@@ -10,6 +10,12 @@ use allpaca_types::{AllpacaError, FatalError};
 use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy)]
+struct CudaExpertOff {
+    w_gate: WeightRef,
+    w_up: WeightRef,
+    w_down: WeightRef,
+}
+
 struct CudaLayerOff {
     attn_norm: WeightRef,
     wq: WeightRef,
@@ -20,6 +26,8 @@ struct CudaLayerOff {
     w_gate: WeightRef,
     w_up: WeightRef,
     w_down: WeightRef,
+    w_router: WeightRef,
+    experts: Vec<CudaExpertOff>,
 }
 
 /// Dense F32 weights packed once onto a CUDA device (embed + layers + norm + lm_head).
@@ -34,10 +42,10 @@ pub struct CudaResidentModel {
 
 impl CudaResidentModel {
     pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
-        if model.config.n_experts > 0 || model.config.recurrent {
+        if model.config.recurrent {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA resident upload: dense attention TinyModel only".into(),
+                    "CUDA resident upload: attention TinyModel only (no recurrent)".into(),
                 ),
             ));
         }
@@ -62,6 +70,16 @@ impl CudaResidentModel {
                 w_gate: push(&mut slices, &mut off, layer.w_gate.as_slice()),
                 w_up: push(&mut slices, &mut off, layer.w_up.as_slice()),
                 w_down: push(&mut slices, &mut off, layer.w_down.as_slice()),
+                w_router: push(&mut slices, &mut off, layer.w_router.as_slice()),
+                experts: layer
+                    .experts
+                    .iter()
+                    .map(|e| CudaExpertOff {
+                        w_gate: push(&mut slices, &mut off, e.w_gate.as_slice()),
+                        w_up: push(&mut slices, &mut off, e.w_up.as_slice()),
+                        w_down: push(&mut slices, &mut off, e.w_down.as_slice()),
+                    })
+                    .collect(),
             });
         }
         let norm = push(&mut slices, &mut off, model.norm.as_slice());
@@ -111,10 +129,10 @@ impl TinyModel {
         soft_x: Option<&[f32]>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
-        if cfg.n_experts > 0 || cfg.recurrent {
+        if cfg.recurrent {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA decode: dense attention only".into(),
+                    "CUDA decode: attention TinyModel only (no recurrent)".into(),
                 ),
             ));
         }
@@ -327,6 +345,9 @@ fn apply_ffn_cuda(
     hidden: &mut [f32],
     metrics: &Metrics,
 ) -> Result<(), AllpacaError> {
+    if cfg.n_experts > 0 && !host.experts.is_empty() {
+        return apply_moe_cuda(cfg, host, layer, resident, cuda, x, scratch, metrics);
+    }
     let dim = cfg.dim;
     let ff = cfg.ff_dim;
     let norm_w = if host.ffn_norm.is_empty() {
@@ -377,6 +398,85 @@ fn apply_ffn_cuda(
     )?;
     for i in 0..dim {
         x[i] += hidden[i];
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_moe_cuda(
+    cfg: &ModelConfig,
+    host: &LayerWeights,
+    layer: &CudaLayerOff,
+    resident: &CudaResidentModel,
+    cuda: &CudaWorkspace,
+    x: &mut [f32],
+    scratch: &mut [f32],
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    let dim = cfg.dim;
+    let ff = cfg.ff_dim;
+    if host.ffn_norm.is_empty() || host.w_router.is_empty() {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA MoE missing ffn_norm or w_router".into(),
+        )));
+    }
+    if layer.w_router.n != 0 && layer.w_router.n != host.w_router.len() {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA MoE router size mismatch".into(),
+        )));
+    }
+    cuda.rmsnorm_host_x_dev_w(
+        x,
+        resident.ptr(layer.ffn_norm)?,
+        &mut scratch[..dim],
+        dim as i32,
+        cfg.eps,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+    let n_exp = cfg.n_experts.max(1);
+    let n_act = cfg.n_active.max(1).min(n_exp);
+    let routed = topk_route(&scratch[..dim], &host.w_router, n_exp, n_act, cfg);
+    let mut acc = vec![0.0f32; dim];
+    let mut gate = vec![0.0f32; ff];
+    let mut up = vec![0.0f32; ff];
+    let mut down = vec![0.0f32; dim];
+    for (eid, weight) in routed {
+        let Some(ex) = layer.experts.get(eid) else {
+            continue;
+        };
+        cuda.gemm_nt_host_a_dev_b(
+            &scratch[..dim],
+            resident.ptr(ex.w_gate)?,
+            &mut gate,
+            1,
+            ff as i32,
+            dim as i32,
+        )?;
+        cuda.gemm_nt_host_a_dev_b(
+            &scratch[..dim],
+            resident.ptr(ex.w_up)?,
+            &mut up,
+            1,
+            ff as i32,
+            dim as i32,
+        )?;
+        for i in 0..ff {
+            gate[i] = silu(gate[i]) * up[i];
+        }
+        cuda.gemm_nt_host_a_dev_b(
+            &gate,
+            resident.ptr(ex.w_down)?,
+            &mut down,
+            1,
+            dim as i32,
+            ff as i32,
+        )?;
+        for i in 0..dim {
+            acc[i] += weight * down[i];
+        }
+    }
+    for i in 0..dim {
+        x[i] += acc[i];
     }
     Ok(())
 }
