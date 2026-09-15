@@ -163,5 +163,5 @@ cargo test -p allpaca-core --features hip --offline --test hip_runtime tiny_deep
 ## Ideas still out (next slices)
 
 - Packed residual stream written into decode hidden (WO+FFN residuals landed; lm_head still reads original `output_norm`).
-- CUDA 7B GGUF / SSM/GDN/MLA parity (dense + synthetic MoE + hybrid-flag TinyModel CUDA decode landed).
+- CUDA 7B packed-quant GGUF / SSM/GDN/MLA parity (dense + synthetic MoE + hybrid-flag + tiny F32 GGUF CUDA decode landed).
 - Real CXL.mem / PIM (simulators only).
