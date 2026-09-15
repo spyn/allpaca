@@ -235,6 +235,27 @@ impl CudaResidentModel {
                 .map(|e| WeightRef::f32(w.off + e * stride, n_per))
                 .collect())
         };
+        let split_q8_staged_experts =
+            |w: WeightRef, n_experts: usize, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
+                if n_experts == 0 || w.n == 0 || w.n % n_experts != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "CUDA {what} n={} not divisible by {n_experts}",
+                        w.n
+                    ))));
+                }
+                let n_per = w.n / n_experts;
+                if n_per % allpaca_cpu::Q8_0_BLOCK_ELEMS != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "CUDA {what} Q8 expert elems {n_per} not aligned to {}",
+                        allpaca_cpu::Q8_0_BLOCK_ELEMS
+                    ))));
+                }
+                let stride = (n_per / allpaca_cpu::Q8_0_BLOCK_ELEMS)
+                    .saturating_mul(allpaca_cuda::Q8_STAGED_BLOCK);
+                Ok((0..n_experts)
+                    .map(|e| WeightRef::q8_0(w.off + e * stride, n_per))
+                    .collect())
+            };
 
         let (embed_bytes, embed_kind, embed_n) = take_tensor(file, "token_embd.weight", false)?;
         let embed = push_bytes(&mut owned, &mut off, embed_bytes, embed_kind, embed_n);
@@ -287,41 +308,87 @@ impl CudaResidentModel {
                 let experts = if file.tensor(&stacked_gate).is_some()
                     || file.tensor(&stacked_up).is_some()
                 {
-                    // Experts stay F32 on CUDA for now (Q8 packed expert split is a follow-up).
-                    let push_f32 = |owned: &mut Vec<Vec<u8>>,
-                                    off: &mut usize,
-                                    name: &str|
+                    // Stacked experts: F32 dequant or always-pack Q8_0 GEMV (K80 VRAM).
+                    let push_stacked = |owned: &mut Vec<Vec<u8>>,
+                                        off: &mut usize,
+                                        name: &str|
                      -> Result<WeightRef, AllpacaError> {
-                        let f32s = file.tensor_f32(name).map_err(|e| {
+                        let info = file.tensor(name).ok_or_else(|| {
                             AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                                "CUDA MoE {name}: {e}"
+                                "CUDA MoE missing {name}"
                             )))
                         })?;
-                        let n = f32s.len();
-                        let mut bytes = Vec::with_capacity(n * 4);
-                        for v in f32s {
-                            bytes.extend_from_slice(&v.to_le_bytes());
+                        let n = info.n_elements() as usize;
+                        if info.ggml_type == allpaca_gguf::GgmlType::Q8_0 {
+                            let packed = file.tensor_bytes(name).map_err(|e| {
+                                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                    "CUDA MoE Q8 bytes {name}: {e}"
+                                )))
+                            })?;
+                            let k = *info.dims.first().unwrap_or(&1) as usize;
+                            if k == 0 || n % k != 0 {
+                                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                    "Q8_0 MoE {name} dims {:?} do not tile n={n}",
+                                    info.dims
+                                ))));
+                            }
+                            let n_rows = n / k;
+                            let staged =
+                                allpaca_cuda::stage_q8_0_gemv(packed, n_rows, k).map_err(|e| {
+                                    AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                        "CUDA Q8_0 MoE stage {name}: {e}"
+                                    )))
+                                })?;
+                            Ok(push_bytes(
+                                owned,
+                                off,
+                                staged,
+                                super::WeightKind::Q8_0,
+                                n,
+                            ))
+                        } else {
+                            let f32s = file.tensor_f32(name).map_err(|e| {
+                                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                    "CUDA MoE {name}: {e}"
+                                )))
+                            })?;
+                            let n = f32s.len();
+                            let mut bytes = Vec::with_capacity(n * 4);
+                            for v in f32s {
+                                bytes.extend_from_slice(&v.to_le_bytes());
+                            }
+                            Ok(push_bytes(
+                                owned,
+                                off,
+                                bytes,
+                                super::WeightKind::F32,
+                                n,
+                            ))
                         }
-                        Ok(push_bytes(
-                            owned,
-                            off,
-                            bytes,
-                            super::WeightKind::F32,
-                            n,
-                        ))
                     };
                     let gate_w = if file.tensor(&stacked_gate).is_some() {
-                        Some(push_f32(&mut owned, &mut off, &stacked_gate)?)
+                        Some(push_stacked(&mut owned, &mut off, &stacked_gate)?)
                     } else {
                         None
                     };
-                    let up_w = push_f32(&mut owned, &mut off, &stacked_up)?;
-                    let down_w =
-                        push_f32(&mut owned, &mut off, &format!("blk.{i}.ffn_down_exps.weight"))?;
-                    let ups = split_f32_experts(up_w, n_exp, "ffn_up_exps")?;
-                    let downs = split_f32_experts(down_w, n_exp, "ffn_down_exps")?;
+                    let up_w = push_stacked(&mut owned, &mut off, &stacked_up)?;
+                    let down_w = push_stacked(
+                        &mut owned,
+                        &mut off,
+                        &format!("blk.{i}.ffn_down_exps.weight"),
+                    )?;
+                    let split = |w: WeightRef, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
+                        match w.kind {
+                            super::WeightKind::Q8_0 => {
+                                split_q8_staged_experts(w, n_exp, what)
+                            }
+                            _ => split_f32_experts(w, n_exp, what),
+                        }
+                    };
+                    let ups = split(up_w, "ffn_up_exps")?;
+                    let downs = split(down_w, "ffn_down_exps")?;
                     let gates = if let Some(g) = gate_w {
-                        split_f32_experts(g, n_exp, "ffn_gate_exps")?
+                        split(g, "ffn_gate_exps")?
                     } else {
                         vec![WeightRef::f32(0, 0); n_exp]
                     };
@@ -404,6 +471,15 @@ impl CudaResidentModel {
 
     pub fn packed_h2d_bytes(&self) -> u64 {
         self.packed_h2d
+    }
+
+    /// True when any MoE expert GEMM weight was staged as packed Q8_0.
+    pub fn has_q8_moe_experts(&self) -> bool {
+        self.layers.iter().any(|l| {
+            l.experts
+                .iter()
+                .any(|e| e.iter().any(|w| w.kind == super::WeightKind::Q8_0 && w.n > 0))
+        })
     }
 
     fn ptr(&self, w: WeightRef) -> Result<*const f32, AllpacaError> {

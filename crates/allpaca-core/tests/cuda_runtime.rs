@@ -219,6 +219,53 @@ fn cuda_upload_gguf_moe_packs_stacked_experts_when_device_present() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn cuda_upload_gguf_moe_q8_experts_stay_packed_when_device_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_cuda_moe_q8.gguf");
+    write_tiny_moe_q8_gguf(&path);
+    let file = allpaca_gguf::GgufFile::open(&path).expect("open moe q8");
+    let cfg = allpaca_core::ModelConfig::from_gguf(&file).expect("cfg");
+    assert!(cfg.n_experts >= 4);
+    let resident = allpaca_core::CudaResidentModel::upload_gguf(&file, &cfg, 0)
+        .expect("CUDA MoE Q8 upload_gguf");
+    assert!(
+        resident.has_q8_moe_experts(),
+        "stacked Q8 experts must stay packed, not F32-dequant"
+    );
+    assert!(resident.bytes() > 0);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn cuda_moe_q8_gguf_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_cuda_moe_q8_gen.gguf");
+    write_tiny_moe_q8_gguf(&path);
+    let mut cfg = cuda_synthetic();
+    cfg.model.synthetic = false;
+    cfg.model.path = Some(path.clone());
+    cfg.kv.page_tokens = 8;
+    let engine = Engine::new(cfg).expect("MoE Q8 engine");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(before.weight_bytes_on_device > 0);
+    let out = engine
+        .generate("hello", greedy(2))
+        .expect("moe q8 generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA MoE Q8 forwards; stats={stats:?}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
 fn write_tiny_llama_gguf(path: &std::path::Path) {
     use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
     use std::collections::HashMap;
@@ -445,6 +492,150 @@ fn write_tiny_moe_gguf(path: &std::path::Path) {
         })
         .collect();
     write_gguf(path, &meta, &views).expect("write tiny moe gguf");
+}
+
+/// Mixtral-style MoE with Q8_0 stacked experts (K multiple of 32 for GEMV stage).
+fn write_tiny_moe_q8_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{
+        quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
+        GgufWriteTensor,
+    };
+    use std::collections::HashMap;
+
+    let dim = 32usize;
+    let vocab = 4usize;
+    let ff = 64usize;
+    let n_exp = 4usize;
+    let n_kv = 2usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert(
+        "llama.attention.head_count_kv".into(),
+        GgufValue::Uint32(n_kv as u32),
+    );
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert("llama.expert_count".into(), GgufValue::Uint32(n_exp as u32));
+    meta.insert("llama.expert_used_count".into(), GgufValue::Uint32(2));
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+    let w = 0.01f32;
+    let embd = vec![w; vocab * dim];
+    let attn_norm = vec![1.0f32; dim];
+    let ffn_norm = vec![1.0f32; dim];
+    let output_norm = vec![1.0f32; dim];
+    let q = vec![w; dim * dim];
+    let k = vec![w; n_kv * (dim / 4) * dim];
+    let v = vec![w; n_kv * (dim / 4) * dim];
+    let o = vec![w; dim * dim];
+    let router = vec![w; n_exp * dim];
+    let mut gate_exps = Vec::new();
+    let mut up_exps = Vec::new();
+    let mut down_exps = Vec::new();
+    for _ in 0..n_exp {
+        gate_exps.extend(std::iter::repeat(w).take(ff * dim));
+        up_exps.extend(std::iter::repeat(w).take(ff * dim));
+        down_exps.extend(std::iter::repeat(w).take(dim * ff));
+    }
+    let gate_q = quantize_q8_0(&gate_exps);
+    let up_q = quantize_q8_0(&up_exps);
+    let down_q = quantize_q8_0(&down_exps);
+
+    let f32_tensors = [
+        GgufWriteTensor {
+            name: "token_embd.weight".into(),
+            dims: vec![vocab as u64, dim as u64],
+            data: &embd,
+        },
+        GgufWriteTensor {
+            name: "blk.0.attn_norm.weight".into(),
+            dims: vec![dim as u64],
+            data: &attn_norm,
+        },
+        GgufWriteTensor {
+            name: "blk.0.attn_q.weight".into(),
+            dims: vec![dim as u64, dim as u64],
+            data: &q,
+        },
+        GgufWriteTensor {
+            name: "blk.0.attn_k.weight".into(),
+            dims: vec![(n_kv * (dim / 4)) as u64, dim as u64],
+            data: &k,
+        },
+        GgufWriteTensor {
+            name: "blk.0.attn_v.weight".into(),
+            dims: vec![(n_kv * (dim / 4)) as u64, dim as u64],
+            data: &v,
+        },
+        GgufWriteTensor {
+            name: "blk.0.attn_output.weight".into(),
+            dims: vec![dim as u64, dim as u64],
+            data: &o,
+        },
+        GgufWriteTensor {
+            name: "blk.0.ffn_norm.weight".into(),
+            dims: vec![dim as u64],
+            data: &ffn_norm,
+        },
+        GgufWriteTensor {
+            name: "blk.0.ffn_gate_inp.weight".into(),
+            dims: vec![n_exp as u64, dim as u64],
+            data: &router,
+        },
+        GgufWriteTensor {
+            name: "output_norm.weight".into(),
+            dims: vec![dim as u64],
+            data: &output_norm,
+        },
+    ];
+    let quant_tensors = [
+        GgufWriteQuantTensor {
+            name: "blk.0.ffn_gate_exps.weight".into(),
+            // GGUF: innermost dim first → K=dim for GEMV rows n_exp*ff.
+            dims: vec![dim as u64, ff as u64, n_exp as u64],
+            ggml_type: GgmlType::Q8_0,
+            bytes: &gate_q,
+        },
+        GgufWriteQuantTensor {
+            name: "blk.0.ffn_up_exps.weight".into(),
+            dims: vec![dim as u64, ff as u64, n_exp as u64],
+            ggml_type: GgmlType::Q8_0,
+            bytes: &up_q,
+        },
+        GgufWriteQuantTensor {
+            name: "blk.0.ffn_down_exps.weight".into(),
+            dims: vec![ff as u64, dim as u64, n_exp as u64],
+            ggml_type: GgmlType::Q8_0,
+            bytes: &down_q,
+        },
+    ];
+    write_gguf_quant(path, &meta, &f32_tensors, &quant_tensors).expect("write moe q8");
 }
 
 fn cuda_gguf_config(path: &std::path::Path) -> Config {
