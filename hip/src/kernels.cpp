@@ -2507,6 +2507,17 @@ extern "C" int allpaca_hip_free(void *ptr) {
     return hip_status(hipFree(ptr));
 }
 
+extern "C" int allpaca_hip_free_async(void *ptr, allpaca_stream_t stream) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    hipStream_t s = as_stream(stream);
+    if (s) {
+        return hip_status(hipFreeAsync(ptr, s));
+    }
+    return allpaca_hip_free(ptr);
+}
+
 extern "C" int allpaca_hip_host_malloc(void **ptr, size_t bytes) {
     if (!ptr || bytes == 0) {
         return ALLPACA_ERR_INVALID;
@@ -4299,6 +4310,10 @@ extern "C" int allpaca_hip_enable_peer_access(int32_t, int32_t) {
 extern "C" int allpaca_hip_malloc(void **, size_t, int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_free(void *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
+extern "C" int allpaca_hip_free_async(void *, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
 
 extern "C" int allpaca_hip_host_malloc(void **, size_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 

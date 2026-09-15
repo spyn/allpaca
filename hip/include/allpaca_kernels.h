@@ -38,6 +38,9 @@ int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device);
 
 int allpaca_hip_free(void *ptr);
 
+/* Stream-ordered free (hipFreeAsync). Null stream falls back to hipFree. */
+int allpaca_hip_free_async(void *ptr, allpaca_stream_t stream);
+
 int allpaca_hip_host_malloc(void **ptr, size_t bytes);
 
 int allpaca_hip_host_free(void *ptr);

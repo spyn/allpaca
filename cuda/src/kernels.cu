@@ -70,12 +70,38 @@ extern "C" int allpaca_cuda_free(void *ptr) {
     return cuda_status(cudaFree(ptr));
 }
 
+extern "C" int allpaca_cuda_free_async(void *ptr, allpaca_cuda_stream_t stream) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    cudaStream_t s = as_stream(stream);
+    if (s) {
+        return cuda_status(cudaFreeAsync(ptr, s));
+    }
+    return cuda_status(cudaFree(ptr));
+}
+
+extern "C" int allpaca_cuda_host_malloc(void **ptr, size_t bytes) {
+    if (!ptr || bytes == 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(cudaHostAlloc(ptr, bytes, cudaHostAllocDefault));
+}
+
+extern "C" int allpaca_cuda_host_free(void *ptr) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaFreeHost(ptr));
+}
+
 extern "C" int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                                    allpaca_cuda_stream_t stream) {
     if ((!dst && bytes) || (!src && bytes)) {
         return ALLPACA_ERR_INVALID;
     }
     cudaMemcpyKind ck = cudaMemcpyDefault;
+    bool force_async = false;
     switch (kind) {
     case ALLPACA_MEMCPY_H2D:
         ck = cudaMemcpyHostToDevice;
@@ -86,12 +112,16 @@ extern "C" int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int
     case ALLPACA_MEMCPY_D2D:
         ck = cudaMemcpyDeviceToDevice;
         break;
+    case ALLPACA_MEMCPY_D2H_ASYNC:
+        ck = cudaMemcpyDeviceToHost;
+        force_async = true;
+        break;
     default:
         ck = cudaMemcpyDefault;
         break;
     }
     cudaStream_t s = as_stream(stream);
-    if (s) {
+    if (s || force_async) {
         return cuda_status(cudaMemcpyAsync(dst, src, bytes, ck, s));
     }
     return cuda_status(cudaMemcpy(dst, src, bytes, ck));
@@ -107,6 +137,63 @@ extern "C" int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream) {
         return cuda_status(cudaStreamSynchronize(s));
     }
     return cuda_status(cudaDeviceSynchronize());
+}
+
+extern "C" int allpaca_cuda_stream_create(allpaca_cuda_stream_t *stream) {
+    if (!stream) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaStream_t s = nullptr;
+    cudaError_t err = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        *stream = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *stream = s;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_stream_destroy(allpaca_cuda_stream_t stream) {
+    if (!stream) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaStreamDestroy(as_stream(stream)));
+}
+
+extern "C" int allpaca_cuda_event_create(void **event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaEvent_t ev = nullptr;
+    cudaError_t err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        *event = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *event = ev;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_event_destroy(void *event) {
+    if (!event) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
+}
+
+extern "C" int allpaca_cuda_event_record(void *event, allpaca_cuda_stream_t stream) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(cudaEventRecord(static_cast<cudaEvent_t>(event), as_stream(stream)));
+}
+
+extern "C" int allpaca_cuda_stream_wait_event(allpaca_cuda_stream_t stream, void *event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(
+        cudaStreamWaitEvent(as_stream(stream), static_cast<cudaEvent_t>(event), 0));
 }
 
 __global__ void gemm_nt_kernel(const float *a, const float *b, float *c, int m, int n, int k) {

@@ -230,6 +230,7 @@ mod ffi {
         pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
         pub fn allpaca_hip_free(ptr: *mut c_void) -> i32;
+        pub fn allpaca_hip_free_async(ptr: *mut c_void, stream: *mut c_void) -> i32;
         pub fn allpaca_hip_host_malloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn allpaca_hip_host_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_hip_host_register(ptr: *mut c_void, bytes: usize, flags: u32) -> i32;
@@ -1174,6 +1175,22 @@ pub fn device_free(ptr: *mut u8, bytes: usize) {
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
         let _ = bytes;
+    }
+}
+
+/// Stream-ordered free. Null `stream` falls back to synchronous [`device_free`].
+pub fn device_free_async(ptr: *mut u8, bytes: usize, stream: *mut std::ffi::c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    unsafe {
+        let _ = ffi::allpaca_hip_free_async(ptr.cast(), stream);
+        ALLOCATED_BYTES.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (bytes, stream);
     }
 }
 

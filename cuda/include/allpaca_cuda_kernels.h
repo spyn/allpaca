@@ -17,6 +17,7 @@ extern "C" {
 #define ALLPACA_MEMCPY_D2H 1
 #define ALLPACA_MEMCPY_D2D 2
 #define ALLPACA_MEMCPY_DEFAULT 3
+#define ALLPACA_MEMCPY_D2H_ASYNC 4
 
 typedef void *allpaca_cuda_stream_t;
 
@@ -32,12 +33,29 @@ int allpaca_cuda_malloc(void **ptr, size_t bytes, int32_t device);
 
 int allpaca_cuda_free(void *ptr);
 
+/* Stream-ordered free (cudaFreeAsync). Null stream falls back to cudaFree. */
+int allpaca_cuda_free_async(void *ptr, allpaca_cuda_stream_t stream);
+
+int allpaca_cuda_host_malloc(void **ptr, size_t bytes);
+
+int allpaca_cuda_host_free(void *ptr);
+
 int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                         allpaca_cuda_stream_t stream);
 
 int allpaca_cuda_set_device(int32_t device);
 
 int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream);
+
+/* Non-blocking compute/copy stream (mirrors allpaca_hip_stream_create). */
+int allpaca_cuda_stream_create(allpaca_cuda_stream_t *stream);
+int allpaca_cuda_stream_destroy(allpaca_cuda_stream_t stream);
+
+int allpaca_cuda_stream_wait_event(allpaca_cuda_stream_t stream, void *event);
+
+int allpaca_cuda_event_create(void **event);
+int allpaca_cuda_event_destroy(void *event);
+int allpaca_cuda_event_record(void *event, allpaca_cuda_stream_t stream);
 
 /* C[m,n] = A[m,k] * B[n,k]^T (row-major). Device pointers. */
 int allpaca_cuda_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,

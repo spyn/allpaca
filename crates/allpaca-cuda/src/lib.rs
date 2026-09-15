@@ -22,6 +22,7 @@ pub const MEMCPY_H2D: i32 = 0;
 pub const MEMCPY_D2H: i32 = 1;
 pub const MEMCPY_D2D: i32 = 2;
 pub const MEMCPY_DEFAULT: i32 = 3;
+pub const MEMCPY_D2H_ASYNC: i32 = 4;
 
 #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
 mod ffi {
@@ -39,6 +40,9 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_cuda_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
         pub fn allpaca_cuda_free(ptr: *mut c_void) -> i32;
+        pub fn allpaca_cuda_free_async(ptr: *mut c_void, stream: *mut c_void) -> i32;
+        pub fn allpaca_cuda_host_malloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
+        pub fn allpaca_cuda_host_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_cuda_memcpy(
             dst: *mut c_void,
             src: *const c_void,
@@ -48,6 +52,12 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_cuda_set_device(device: i32) -> i32;
         pub fn allpaca_cuda_stream_synchronize(stream: *mut c_void) -> i32;
+        pub fn allpaca_cuda_stream_create(stream: *mut *mut c_void) -> i32;
+        pub fn allpaca_cuda_stream_destroy(stream: *mut c_void) -> i32;
+        pub fn allpaca_cuda_stream_wait_event(stream: *mut c_void, event: *mut c_void) -> i32;
+        pub fn allpaca_cuda_event_create(event: *mut *mut c_void) -> i32;
+        pub fn allpaca_cuda_event_destroy(event: *mut c_void) -> i32;
+        pub fn allpaca_cuda_event_record(event: *mut c_void, stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_gemm_nt(
             a: *const f32,
             b: *const f32,
@@ -234,23 +244,370 @@ pub fn device_free(ptr: *mut std::ffi::c_void) {
     }
 }
 
+/// Stream-ordered device free. Null `stream` falls back to synchronous [`device_free`].
+pub fn device_free_async(ptr: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        if !ptr.is_null() {
+            unsafe {
+                let _ = ffi::allpaca_cuda_free_async(ptr, stream);
+            }
+        }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (ptr, stream);
+    }
+}
+
+/// Page-locked host allocation for faster H2D/D2H (mirrors HIP `host_malloc`).
+pub fn host_malloc(bytes: usize) -> Result<*mut u8, AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { ffi::allpaca_cuda_host_malloc(&mut ptr, bytes) };
+        status(rc, "host_malloc")?;
+        if ptr.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA host_malloc returned null".into(),
+            )));
+        }
+        Ok(ptr.cast())
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = bytes;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA host_malloc unavailable".into(),
+        )))
+    }
+}
+
+pub fn host_free(ptr: *mut u8) {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        if !ptr.is_null() {
+            unsafe {
+                let _ = ffi::allpaca_cuda_host_free(ptr.cast());
+            }
+        }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = ptr;
+    }
+}
+
 pub fn memcpy(
     dst: *mut std::ffi::c_void,
     src: *const std::ffi::c_void,
     bytes: usize,
     kind: i32,
 ) -> Result<(), AllpacaError> {
+    memcpy_on(dst, src, bytes, kind, std::ptr::null_mut())
+}
+
+/// Copy on `stream` (null = default / sync path for non-async kinds).
+pub fn memcpy_on(
+    dst: *mut std::ffi::c_void,
+    src: *const std::ffi::c_void,
+    bytes: usize,
+    kind: i32,
+    stream: *mut std::ffi::c_void,
+) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_cuda_memcpy(dst, src, bytes, kind, std::ptr::null_mut()) };
+        let rc = unsafe { ffi::allpaca_cuda_memcpy(dst, src, bytes, kind, stream) };
         status(rc, "memcpy")
     }
     #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
     {
-        let _ = (dst, src, bytes, kind);
+        let _ = (dst, src, bytes, kind, stream);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "CUDA memcpy unavailable".into(),
         )))
+    }
+}
+
+/// Wait for queued work on the default (null) stream / device.
+pub fn stream_synchronize() -> Result<(), AllpacaError> {
+    // SAFETY: null stream is the documented default-device sync path.
+    unsafe { stream_synchronize_on(std::ptr::null_mut()) }
+}
+
+/// Wait for queued work on `stream` (null synchronizes the device).
+///
+/// # Safety
+/// `stream` must be null or a stream this process still owns.
+pub unsafe fn stream_synchronize_on(stream: *mut std::ffi::c_void) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_cuda_stream_synchronize(stream) };
+        status(rc, "stream_synchronize")
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = stream;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA stream_synchronize unavailable".into(),
+        )))
+    }
+}
+
+fn stream_create_raw() -> Result<*mut std::ffi::c_void, AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut stream = std::ptr::null_mut();
+        let rc = unsafe { ffi::allpaca_cuda_stream_create(&mut stream) };
+        status(rc, "stream_create")?;
+        Ok(stream)
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA stream_create unavailable".into(),
+        )))
+    }
+}
+
+fn stream_destroy_raw(stream: *mut std::ffi::c_void) {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        if !stream.is_null() {
+            unsafe {
+                let _ = ffi::allpaca_cuda_stream_destroy(stream);
+            }
+        }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = stream;
+    }
+}
+
+fn event_create_raw() -> Result<*mut std::ffi::c_void, AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut event = std::ptr::null_mut();
+        let rc = unsafe { ffi::allpaca_cuda_event_create(&mut event) };
+        status(rc, "event_create")?;
+        Ok(event)
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA event_create unavailable".into(),
+        )))
+    }
+}
+
+/// Owned non-blocking CUDA stream (compute or H2D side stream).
+pub struct CudaStream {
+    stream: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for CudaStream {}
+unsafe impl Sync for CudaStream {}
+
+impl CudaStream {
+    pub fn new() -> Result<Self, AllpacaError> {
+        Ok(Self {
+            stream: stream_create_raw()?,
+        })
+    }
+
+    pub fn raw(&self) -> *mut std::ffi::c_void {
+        self.stream
+    }
+
+    pub fn synchronize(&self) -> Result<(), AllpacaError> {
+        unsafe { stream_synchronize_on(self.stream) }
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        stream_destroy_raw(self.stream);
+        self.stream = std::ptr::null_mut();
+    }
+}
+
+/// Side stream for overlapping H2D with compute; join via event (HIP `H2dStream`).
+pub struct H2dStream {
+    stream: *mut std::ffi::c_void,
+    event: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for H2dStream {}
+unsafe impl Sync for H2dStream {}
+
+impl H2dStream {
+    pub fn new() -> Result<Self, AllpacaError> {
+        let stream = stream_create_raw()?;
+        let event = match event_create_raw() {
+            Ok(e) => e,
+            Err(e) => {
+                stream_destroy_raw(stream);
+                return Err(e);
+            }
+        };
+        Ok(Self { stream, event })
+    }
+
+    pub fn raw(&self) -> *mut std::ffi::c_void {
+        self.stream
+    }
+
+    /// Record on this stream, then make the null compute stream wait (host does not block).
+    pub fn join_compute(&self) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_cuda_event_record(self.event, self.stream) };
+            status(rc, "h2d_event_record")?;
+            let rc =
+                unsafe { ffi::allpaca_cuda_stream_wait_event(std::ptr::null_mut(), self.event) };
+            status(rc, "h2d_stream_wait_event")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA stream_wait_event unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn synchronize(&self) -> Result<(), AllpacaError> {
+        unsafe { stream_synchronize_on(self.stream) }
+    }
+}
+
+impl Drop for H2dStream {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        unsafe {
+            let _ = ffi::allpaca_cuda_event_destroy(self.event);
+            let _ = ffi::allpaca_cuda_stream_destroy(self.stream);
+        }
+        self.event = std::ptr::null_mut();
+        self.stream = std::ptr::null_mut();
+    }
+}
+
+/// Page-locked host buffer for staging DMA.
+pub struct PinnedHostBuffer {
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for PinnedHostBuffer {}
+unsafe impl Sync for PinnedHostBuffer {}
+
+impl PinnedHostBuffer {
+    pub fn new(bytes: usize) -> Result<Self, AllpacaError> {
+        if bytes == 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty pinned host buffer".into(),
+            )));
+        }
+        Ok(Self {
+            ptr: host_malloc(bytes)?,
+            bytes,
+        })
+    }
+
+    /// Allocate and copy `src` into pinned memory (CPU memcpy).
+    pub fn from_slice(src: &[u8]) -> Result<Self, AllpacaError> {
+        let buf = Self::new(src.len())?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), buf.ptr, src.len());
+        }
+        Ok(buf)
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.bytes) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.bytes) }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        host_free(self.ptr);
+        self.ptr = std::ptr::null_mut();
+    }
+}
+
+/// RAII device allocation. Optional stream-ordered free avoids device-wide sync on drop.
+pub struct DeviceBuffer {
+    ptr: *mut std::ffi::c_void,
+    bytes: usize,
+    free_stream: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for DeviceBuffer {}
+unsafe impl Sync for DeviceBuffer {}
+
+impl DeviceBuffer {
+    pub fn alloc(bytes: usize, device: i32) -> Result<Self, AllpacaError> {
+        Ok(Self {
+            ptr: device_malloc(bytes, device)?,
+            bytes,
+            free_stream: std::ptr::null_mut(),
+        })
+    }
+
+    /// Free via `cudaFreeAsync` on `stream` when dropped (null = sync free).
+    pub fn with_async_free(mut self, stream: *mut std::ffi::c_void) -> Self {
+        self.free_stream = stream;
+        self
+    }
+
+    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.ptr
+    }
+
+    pub fn as_f32(&self) -> *mut f32 {
+        self.ptr.cast()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Release ownership without freeing (caller must free).
+    pub fn into_raw(mut self) -> *mut std::ffi::c_void {
+        let p = self.ptr;
+        self.ptr = std::ptr::null_mut();
+        p
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        if self.free_stream.is_null() {
+            device_free(self.ptr);
+        } else {
+            device_free_async(self.ptr, self.free_stream);
+        }
+        self.ptr = std::ptr::null_mut();
     }
 }
 
@@ -266,6 +623,7 @@ pub fn gemm_nt_device(
     {
         let rc = unsafe { ffi::allpaca_cuda_gemm_nt(a, b, c, m, n, k, std::ptr::null_mut()) };
         status(rc, "gemm_nt")?;
+        // Standalone / RPC contract: complete before return.
         let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
         status(sync, "stream_synchronize")
     }
@@ -321,12 +679,14 @@ pub fn gemm_nt(
     result
 }
 
-/// Minimal CUDA workspace: scratch buffer + F32 GEMM. Enough to open when a
-/// device appears; full forward parity grows behind this type (like HipWorkspace).
+/// Minimal CUDA workspace: scratch buffer + owned compute stream + F32 GEMM.
+/// Kernels enqueue on the workspace stream; call [`CudaWorkspace::synchronize`]
+/// (or a host roundtrip) to batch-wait — no per-op device sync.
 pub struct CudaWorkspace {
     pub device: i32,
     scratch: *mut std::ffi::c_void,
     scratch_bytes: usize,
+    stream: *mut std::ffi::c_void,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
 }
@@ -343,11 +703,19 @@ impl CudaWorkspace {
         }
         let scratch_bytes = scratch_bytes.max(4096);
         set_device(device)?;
-        let scratch = device_malloc(scratch_bytes, device)?;
+        let stream = stream_create_raw()?;
+        let scratch = match device_malloc(scratch_bytes, device) {
+            Ok(p) => p,
+            Err(e) => {
+                stream_destroy_raw(stream);
+                return Err(e);
+            }
+        };
         Ok(Self {
             device,
             scratch,
             scratch_bytes,
+            stream,
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
         })
@@ -365,6 +733,16 @@ impl CudaWorkspace {
         self.activation_d2h.load(Ordering::Relaxed)
     }
 
+    /// Raw compute stream handle for enqueueing work.
+    pub fn raw_stream(&self) -> *mut std::ffi::c_void {
+        self.stream
+    }
+
+    /// Wait for all work previously enqueued on this workspace stream.
+    pub fn synchronize(&self) -> Result<(), AllpacaError> {
+        unsafe { stream_synchronize_on(self.stream) }
+    }
+
     pub fn gemm_nt_dev(
         &self,
         a: *const f32,
@@ -374,8 +752,19 @@ impl CudaWorkspace {
         n: i32,
         k: i32,
     ) -> Result<(), AllpacaError> {
-        set_device(self.device)?;
-        gemm_nt_device(a, b, c, m, n, k)
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_gemm_nt(a, b, c, m, n, k, self.stream) };
+            status(rc, "gemm_nt")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (a, b, c, m, n, k);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA gemm_nt unavailable".into(),
+            )))
+        }
     }
 
     pub fn residual_add_dev(
@@ -388,11 +777,8 @@ impl CudaWorkspace {
         #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
         {
             set_device(self.device)?;
-            let rc =
-                unsafe { ffi::allpaca_cuda_residual_add(x, y, out, n, std::ptr::null_mut()) };
-            status(rc, "residual_add")?;
-            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
-            status(sync, "stream_synchronize")
+            let rc = unsafe { ffi::allpaca_cuda_residual_add(x, y, out, n, self.stream) };
+            status(rc, "residual_add")
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
@@ -414,11 +800,8 @@ impl CudaWorkspace {
         #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
         {
             set_device(self.device)?;
-            let rc =
-                unsafe { ffi::allpaca_cuda_rmsnorm(x, w, out, n, eps, std::ptr::null_mut()) };
-            status(rc, "rmsnorm")?;
-            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
-            status(sync, "stream_synchronize")
+            let rc = unsafe { ffi::allpaca_cuda_rmsnorm(x, w, out, n, eps, self.stream) };
+            status(rc, "rmsnorm")
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
@@ -439,11 +822,8 @@ impl CudaWorkspace {
         #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
         {
             set_device(self.device)?;
-            let rc =
-                unsafe { ffi::allpaca_cuda_silu_mul(gate, up, out, n, std::ptr::null_mut()) };
-            status(rc, "silu_mul")?;
-            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
-            status(sync, "stream_synchronize")
+            let rc = unsafe { ffi::allpaca_cuda_silu_mul(gate, up, out, n, self.stream) };
+            status(rc, "silu_mul")
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
@@ -469,12 +849,9 @@ impl CudaWorkspace {
                 )));
             }
             set_device(self.device)?;
-            let rc = unsafe {
-                ffi::allpaca_cuda_embed_gather(table, token, out, dim, std::ptr::null_mut())
-            };
-            status(rc, "embed_gather")?;
-            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
-            status(sync, "stream_synchronize")
+            let rc =
+                unsafe { ffi::allpaca_cuda_embed_gather(table, token, out, dim, self.stream) };
+            status(rc, "embed_gather")
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
@@ -501,12 +878,9 @@ impl CudaWorkspace {
                 )));
             }
             set_device(self.device)?;
-            let rc = unsafe {
-                ffi::allpaca_cuda_rope(x, n_heads, head_dim, pos, theta, std::ptr::null_mut())
-            };
-            status(rc, "rope")?;
-            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
-            status(sync, "stream_synchronize")
+            let rc =
+                unsafe { ffi::allpaca_cuda_rope(x, n_heads, head_dim, pos, theta, self.stream) };
+            status(rc, "rope")
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
@@ -561,12 +935,10 @@ impl CudaWorkspace {
                     n_kv_heads,
                     head_dim,
                     i32::from(causal),
-                    std::ptr::null_mut(),
+                    self.stream,
                 )
             };
-            status(rc, "attention")?;
-            let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
-            status(sync, "stream_synchronize")
+            status(rc, "attention")
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
@@ -600,13 +972,20 @@ impl CudaWorkspace {
         let d_out = device_malloc((dim as usize) * 4, self.device)?;
         let result = (|| {
             self.embed_gather_dev(d_table, token, d_out.cast(), dim)?;
-            memcpy(out.as_mut_ptr().cast(), d_out, (dim as usize) * 4, MEMCPY_D2H)?;
+            memcpy_on(
+                out.as_mut_ptr().cast(),
+                d_out,
+                (dim as usize) * 4,
+                MEMCPY_D2H,
+                self.stream,
+            )?;
+            self.synchronize()?;
             self.activation_d2h
                 .fetch_add((dim as usize * 4) as u64, Ordering::Relaxed);
             Ok(())
         })();
         self.free_ptr(d_table);
-        device_free(d_out);
+        self.free_device(d_out);
         result
     }
 
@@ -628,7 +1007,14 @@ impl CudaWorkspace {
         let d_x = self.upload_f32(&x[..n])?;
         let result = (|| {
             self.rope_dev(d_x, n_heads, head_dim, pos, theta)?;
-            memcpy(x.as_mut_ptr().cast(), d_x.cast(), n * 4, MEMCPY_D2H)?;
+            memcpy_on(
+                x.as_mut_ptr().cast(),
+                d_x.cast(),
+                n * 4,
+                MEMCPY_D2H,
+                self.stream,
+            )?;
+            self.synchronize()?;
             self.activation_d2h
                 .fetch_add((n * 4) as u64, Ordering::Relaxed);
             Ok(())
@@ -667,7 +1053,8 @@ impl CudaWorkspace {
             self.attention_dev(
                 d_q, d_k, d_v, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
             )?;
-            memcpy(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H)?;
+            memcpy_on(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H, self.stream)?;
+            self.synchronize()?;
             self.activation_d2h
                 .fetch_add((q_n * 4) as u64, Ordering::Relaxed);
             Ok(())
@@ -675,7 +1062,7 @@ impl CudaWorkspace {
         self.free_ptr(d_q);
         self.free_ptr(d_k);
         self.free_ptr(d_v);
-        device_free(d_out);
+        self.free_device(d_out);
         result
     }
 
@@ -706,22 +1093,40 @@ impl CudaWorkspace {
             self.attention_dev(
                 d_q, k_dev, v_dev, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
             )?;
-            memcpy(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H)?;
+            memcpy_on(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H, self.stream)?;
+            self.synchronize()?;
             self.activation_d2h
                 .fetch_add((q_n * 4) as u64, Ordering::Relaxed);
             Ok(())
         })();
         self.free_ptr(d_q);
-        device_free(d_out);
+        self.free_device(d_out);
         result
     }
 
     /// Upload host F32 into a device blob (activation H2D accounting).
+    /// Enqueues on the workspace stream without host-waiting; pair with kernels
+    /// and a single [`synchronize`] / [`download_f32`] at the boundary.
     pub fn upload_f32(&self, host: &[f32]) -> Result<*mut f32, AllpacaError> {
         let bytes = host.len().saturating_mul(4);
         set_device(self.device)?;
         let ptr = device_malloc(bytes, self.device)?;
-        memcpy(ptr, host.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        if bytes >= 4096 {
+            let pinned = PinnedHostBuffer::from_slice(unsafe {
+                std::slice::from_raw_parts(host.as_ptr().cast(), bytes)
+            })?;
+            memcpy_on(
+                ptr,
+                pinned.as_ptr().cast(),
+                bytes,
+                MEMCPY_H2D,
+                self.stream,
+            )?;
+            // Pinned lives until H2D completes — sync this staging only.
+            self.synchronize()?;
+        } else {
+            memcpy_on(ptr, host.as_ptr().cast(), bytes, MEMCPY_H2D, self.stream)?;
+        }
         self.activation_h2d
             .fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(ptr.cast())
@@ -739,7 +1144,29 @@ impl CudaWorkspace {
         }
         set_device(self.device)?;
         let bytes = dst.len().saturating_mul(4);
-        memcpy(dst.as_mut_ptr().cast(), src.cast(), bytes, MEMCPY_D2H)?;
+        if bytes >= 4096 {
+            let pinned = PinnedHostBuffer::new(bytes)?;
+            memcpy_on(
+                pinned.as_mut_ptr().cast(),
+                src.cast(),
+                bytes,
+                MEMCPY_D2H,
+                self.stream,
+            )?;
+            self.synchronize()?;
+            dst.copy_from_slice(unsafe {
+                std::slice::from_raw_parts(pinned.as_ptr().cast::<f32>(), dst.len())
+            });
+        } else {
+            memcpy_on(
+                dst.as_mut_ptr().cast(),
+                src.cast(),
+                bytes,
+                MEMCPY_D2H,
+                self.stream,
+            )?;
+            self.synchronize()?;
+        }
         self.activation_d2h
             .fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(())
@@ -774,7 +1201,7 @@ impl CudaWorkspace {
             self.download_f32(dc.cast(), &mut c[..c_n])
         })();
         self.free_ptr(da);
-        device_free(dc);
+        self.free_device(dc);
         result
     }
 
@@ -799,7 +1226,7 @@ impl CudaWorkspace {
             self.download_f32(dout.cast(), &mut out[..n as usize])
         })();
         self.free_ptr(dx);
-        device_free(dout);
+        self.free_device(dout);
         result
     }
 
@@ -821,12 +1248,12 @@ impl CudaWorkspace {
             self.embed_gather_dev(table_dev, token, dout.cast(), dim)?;
             self.download_f32(dout.cast(), &mut out[..dim as usize])
         })();
-        device_free(dout);
+        self.free_device(dout);
         result
     }
 
     /// Copy host F32 into an existing device buffer (vision soft embeds / soft_x).
-    /// Mirrors [`allpaca_hip::HipWorkspace::copy_h2d_f32`].
+    /// Mirrors [`allpaca_hip::HipWorkspace::copy_h2d_f32`]. Completes before return.
     pub fn copy_h2d_f32(&self, dst: *mut f32, src: &[f32]) -> Result<(), AllpacaError> {
         if src.is_empty() {
             return Ok(());
@@ -838,21 +1265,49 @@ impl CudaWorkspace {
         }
         set_device(self.device)?;
         let bytes = src.len().saturating_mul(4);
-        memcpy(dst.cast(), src.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        if bytes >= 4096 {
+            let pinned = PinnedHostBuffer::from_slice(unsafe {
+                std::slice::from_raw_parts(src.as_ptr().cast(), bytes)
+            })?;
+            memcpy_on(
+                dst.cast(),
+                pinned.as_ptr().cast(),
+                bytes,
+                MEMCPY_H2D,
+                self.stream,
+            )?;
+        } else {
+            memcpy_on(
+                dst.cast(),
+                src.as_ptr().cast(),
+                bytes,
+                MEMCPY_H2D,
+                self.stream,
+            )?;
+        }
+        self.synchronize()?;
         self.activation_h2d
             .fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(())
     }
 
+    /// Stream-ordered free of a device pointer allocated for this workspace.
     pub fn free_ptr(&self, ptr: *mut f32) {
-        device_free(ptr.cast());
+        self.free_device(ptr.cast());
+    }
+
+    pub fn free_device(&self, ptr: *mut std::ffi::c_void) {
+        device_free_async(ptr, self.stream);
     }
 }
 
 impl Drop for CudaWorkspace {
     fn drop(&mut self) {
+        let _ = unsafe { stream_synchronize_on(self.stream) };
         device_free(self.scratch);
         self.scratch = std::ptr::null_mut();
+        stream_destroy_raw(self.stream);
+        self.stream = std::ptr::null_mut();
     }
 }
 
@@ -880,18 +1335,35 @@ impl CudaDeviceWeights {
         set_device(device)?;
         let ptr = device_malloc(bytes, device)?;
         let mut off = 0usize;
-        for slice in slices {
-            if slice.is_empty() {
-                continue;
+        // Stage through pinned host memory when the packed blob is large.
+        if bytes >= 4096 {
+            let mut pinned = PinnedHostBuffer::new(bytes)?;
+            let dst = pinned.as_mut_slice();
+            for slice in slices {
+                if slice.is_empty() {
+                    continue;
+                }
+                let n = slice.len() * 4;
+                dst[off..off + n].copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), n)
+                });
+                off += n;
             }
-            let n = slice.len() * 4;
-            memcpy(
-                unsafe { ptr.add(off) },
-                slice.as_ptr().cast(),
-                n,
-                MEMCPY_H2D,
-            )?;
-            off += n;
+            memcpy(ptr, pinned.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        } else {
+            for slice in slices {
+                if slice.is_empty() {
+                    continue;
+                }
+                let n = slice.len() * 4;
+                memcpy(
+                    unsafe { ptr.add(off) },
+                    slice.as_ptr().cast(),
+                    n,
+                    MEMCPY_H2D,
+                )?;
+                off += n;
+            }
         }
         Ok((
             Self {
@@ -1038,6 +1510,7 @@ mod tests {
         let dc = device_malloc(16, 0).expect("alloc c");
         ws.gemm_nt_dev(da.cast(), db.cast(), dc.cast(), m, n, k)
             .expect("device gemm");
+        ws.synchronize().expect("sync");
         let mut device_c = [0.0f32; 4];
         memcpy(
             device_c.as_mut_ptr().cast(),
@@ -1046,9 +1519,10 @@ mod tests {
             MEMCPY_D2H,
         )
         .expect("d2h");
-        device_free(da.cast());
-        device_free(db.cast());
-        device_free(dc);
+        ws.free_ptr(da);
+        ws.free_ptr(db);
+        ws.free_device(dc);
+        let _ = ws.synchronize();
         for i in 0..4 {
             assert!(
                 (host_c[i] - device_c[i]).abs() < 1e-5,
@@ -1057,6 +1531,82 @@ mod tests {
                 device_c[i]
             );
         }
+    }
+
+    #[test]
+    fn pinned_host_and_device_buffer_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let mut pinned = PinnedHostBuffer::new(64).expect("pinned");
+        pinned.as_mut_slice()[..4].copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(&pinned.as_slice()[..4], &[1, 2, 3, 4]);
+
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        assert!(!ws.raw_stream().is_null());
+        let buf = DeviceBuffer::alloc(64, 0)
+            .expect("device buf")
+            .with_async_free(ws.raw_stream());
+        ws.copy_h2d_f32(buf.as_f32(), &[1.0, 2.0, 3.0, 4.0])
+            .expect("h2d");
+        let mut back = [0.0f32; 4];
+        ws.download_f32(buf.as_f32(), &mut back).expect("d2h");
+        assert_eq!(back, [1.0, 2.0, 3.0, 4.0]);
+        drop(buf);
+        ws.synchronize().expect("drain async free");
+    }
+
+    #[test]
+    fn fused_residual_silu_batches_on_stream_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n = 8i32;
+        let x: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let y: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        let up: Vec<f32> = (0..n).map(|i| (i as f32 + 2.0) * 0.02).collect();
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let dx = ws.upload_f32(&x).expect("x");
+        let dy = ws.upload_f32(&y).expect("y");
+        let dup = ws.upload_f32(&up).expect("up");
+        let d_tmp = device_malloc((n as usize) * 4, 0).expect("tmp");
+        let d_out = device_malloc((n as usize) * 4, 0).expect("out");
+        // Two kernels, one sync — no per-op device synchronize.
+        ws.residual_add_dev(dx, dy, d_tmp.cast(), n).expect("residual");
+        ws.silu_mul_dev(d_tmp.cast(), dup, d_out.cast(), n)
+            .expect("silu");
+        let mut out = vec![0.0f32; n as usize];
+        ws.download_f32(d_out.cast(), &mut out).expect("d2h");
+        for i in 0..n as usize {
+            let r = x[i] + y[i];
+            let gate = r / (1.0 + (-r).exp());
+            let expect = gate * up[i];
+            assert!(
+                (out[i] - expect).abs() < 1e-4,
+                "i={i} out={} expect={}",
+                out[i],
+                expect
+            );
+        }
+        ws.free_ptr(dx);
+        ws.free_ptr(dy);
+        ws.free_ptr(dup);
+        ws.free_device(d_tmp);
+        ws.free_device(d_out);
+        ws.synchronize().expect("drain");
+    }
+
+    #[test]
+    fn cuda_stream_create_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let s = CudaStream::new().expect("stream");
+        assert!(!s.raw().is_null());
+        s.synchronize().expect("sync");
+        let h2d = H2dStream::new().expect("h2d stream");
+        assert!(!h2d.raw().is_null());
+        h2d.synchronize().expect("h2d sync");
     }
 
     #[test]
