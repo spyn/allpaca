@@ -11,7 +11,8 @@
 //! → **w_down** (HIP poll path uses the HIP variant). Packed Q/K/V C feeds
 //! per-row causal attention then packed WO ([`apply_packed_attn`] /
 //! [`apply_packed_attn_hip`]); poll residual-adds WO into the packed stream
-//! that FFN consumes. Packed lm_head still reads original `output_norm`.
+//! that FFN consumes. Packed FFN C is residual-added into that same stream.
+//! Packed lm_head still reads original `output_norm`.
 
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -1030,6 +1031,14 @@ mod tests {
         for i in 0..dim {
             assert!((c0[i] - c0_sep[i]).abs() < 1e-5, "c0[{i}]");
             assert!((c1[i] - c1_sep[i]).abs() < 1e-5, "c1[{i}]");
+        }
+        let mut x0 = a0;
+        let mut x1 = a1;
+        residual_add_rows(&mut [&mut x0[..], &mut x1[..]], &[&c0[..], &c1[..]])
+            .expect("ffn residual");
+        for i in 0..dim {
+            assert!((x0[i] - (a0[i] + c0[i])).abs() < 1e-6, "residual x0[{i}]");
+            assert!((x1[i] - (a1[i] + c1[i])).abs() < 1e-6, "residual x1[{i}]");
         }
     }
 

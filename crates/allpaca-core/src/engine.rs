@@ -2471,7 +2471,6 @@ impl Engine {
         }
 
         if let Some((w_gate, w_up, w_down)) = ffn_weights {
-            let ffn_a: Vec<&[f32]> = fused_rows.iter().map(|v| v.as_slice()).collect();
             let mut ffn_out: Vec<Vec<f32>> = fused_rows
                 .iter()
                 .map(|a| {
@@ -2479,12 +2478,18 @@ impl Engine {
                     vec![0.0f32; m * dim]
                 })
                 .collect();
-            let mut out_refs: Vec<&mut [f32]> =
-                ffn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
-            if let Ok(n) =
+            let ffn_ok = {
+                let ffn_a: Vec<&[f32]> = fused_rows.iter().map(|v| v.as_slice()).collect();
+                let mut out_refs: Vec<&mut [f32]> =
+                    ffn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
                 apply_packed_ffn_hip(hip, &ffn_a, &w_gate, &w_up, &w_down, dim, &mut out_refs)
-            {
+            };
+            if let Ok(n) = ffn_ok {
                 launched += n;
+                let y_refs: Vec<&[f32]> = ffn_out.iter().map(|v| v.as_slice()).collect();
+                let mut x_refs: Vec<&mut [f32]> =
+                    fused_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+                let _ = residual_add_rows(&mut x_refs, &y_refs);
             }
         }
 

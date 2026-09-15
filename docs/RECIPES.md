@@ -162,6 +162,6 @@ cargo test -p allpaca-core --features hip --offline --test hip_runtime tiny_deep
 
 ## Ideas still out (next slices)
 
-- Packed FFN residual fusion (WO residual into packed FFN A landed; FFN C still discarded).
+- Packed residual stream written into decode hidden (WO+FFN residuals landed; lm_head still reads original `output_norm`).
 - CUDA 7B GGUF / SSM/GDN/MLA parity (dense + synthetic MoE + hybrid-flag TinyModel CUDA decode landed).
 - Real CXL.mem / PIM (simulators only).
