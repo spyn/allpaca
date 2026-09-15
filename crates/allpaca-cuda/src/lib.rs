@@ -5,6 +5,10 @@
 //! device GEMM returns unavailable — the crate still compiles and links.
 //!
 //! Symbols are `allpaca_cuda_*` so HIP and CUDA ABIs do not collide (ADR 0001).
+//!
+//! GPU ISA helpers live in [`cuda_arch`] (also linked from `build.rs`).
+
+mod cuda_arch;
 
 use allpaca_types::{AllpacaError, DegradedError, DeviceInfo, DeviceKind};
 use std::sync::atomic::{AtomicU64, Ordering};

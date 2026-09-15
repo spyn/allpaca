@@ -13,10 +13,16 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "src/cuda_arch.rs"]
+mod cuda_arch;
+
+use cuda_arch::{default_cuda_arches, gencode_flags, parse_cuda_arches};
+
 fn main() {
     println!("cargo:rerun-if-changed=../../cuda/src/kernels.cu");
     println!("cargo:rerun-if-changed=../../cuda/include/allpaca_cuda_kernels.h");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/cuda_arch.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=ALLPACA_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDAARCHS");
@@ -65,6 +71,9 @@ fn main() {
     println!("cargo:rustc-link-lib=cudart");
     if cfg!(windows) {
         println!("cargo:rustc-link-lib=dylib=cudart");
+    } else {
+        // nvcc host objects pull C++ static locals / EH personality.
+        println!("cargo:rustc-link-lib=dylib=stdc++");
     }
     println!("cargo:rustc-cfg=allpaca_cuda_runtime");
 }
@@ -144,66 +153,6 @@ fn manifest_cuda_dir() -> PathBuf {
     PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../cuda")
 }
 
-/// Default fat binary: Ampere consumer (RTX 3060 12GB / sm_86) + Blackwell
-/// GeForce laptop (RTX 50-series mobile / sm_120).
-fn default_cuda_arches() -> Vec<String> {
-    ["sm_86", "sm_120"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-fn parse_cuda_arches(raw: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for part in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some(sm) = normalize_cuda_arch(part) else {
-            continue;
-        };
-        if !out.iter().any(|a| a == &sm) {
-            out.push(sm);
-        }
-    }
-    out
-}
-
-/// Accept `sm_86`, `compute_86`, `86`, `8.6`, `12.0`.
-fn normalize_cuda_arch(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_start_matches('+').to_ascii_lowercase();
-    if s.is_empty() || s == "native" || s == "auto" {
-        return None;
-    }
-    if let Some(rest) = s.strip_prefix("sm_") {
-        if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
-            return Some(format!("sm_{rest}"));
-        }
-        return None;
-    }
-    if let Some(rest) = s.strip_prefix("compute_") {
-        if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
-            return Some(format!("sm_{rest}"));
-        }
-        return None;
-    }
-    if let Some((major, minor)) = s.split_once('.') {
-        if major.chars().all(|c| c.is_ascii_digit())
-            && minor.chars().all(|c| c.is_ascii_digit())
-            && !major.is_empty()
-            && !minor.is_empty()
-        {
-            return Some(format!("sm_{major}{minor}"));
-        }
-        return None;
-    }
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        return Some(format!("sm_{s}"));
-    }
-    None
-}
-
 fn detect_cuda_arches() -> Vec<String> {
     let candidates = [
         PathBuf::from("nvidia-smi"),
@@ -212,10 +161,7 @@ fn detect_cuda_arches() -> Vec<String> {
     ];
     for bin in candidates {
         let output = Command::new(&bin)
-            .args([
-                "--query-gpu=compute_cap",
-                "--format=csv,noheader",
-            ])
+            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
             .output();
         let Ok(output) = output else {
             continue;
@@ -226,7 +172,7 @@ fn detect_cuda_arches() -> Vec<String> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut arches = Vec::new();
         for line in stdout.lines() {
-            let Some(sm) = normalize_cuda_arch(line.trim()) else {
+            let Some(sm) = cuda_arch::normalize_cuda_arch(line.trim()) else {
                 continue;
             };
             if !arches.contains(&sm) {
@@ -254,19 +200,6 @@ fn cuda_arches() -> Vec<String> {
         return detected;
     }
     default_cuda_arches()
-}
-
-fn gencode_flags(arches: &[String]) -> Vec<String> {
-    let mut flags = Vec::with_capacity(arches.len() * 2);
-    for sm in arches {
-        let Some(num) = sm.strip_prefix("sm_") else {
-            continue;
-        };
-        // SASS for the real GPU + matching PTX for minor forward-compat.
-        flags.push(format!("-gencode=arch=compute_{num},code=sm_{num}"));
-        flags.push(format!("-gencode=arch=compute_{num},code=compute_{num}"));
-    }
-    flags
 }
 
 fn build_kernels(cuda_root: &Path, out: &Path, arches: &[String]) -> Result<(), String> {
