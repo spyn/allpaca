@@ -1,6 +1,7 @@
-//! Narrow CUDA decode path: dense TinyModel token forwards on CudaWorkspace.
+//! Narrow CUDA decode path: TinyModel token forwards on CudaWorkspace
+//! (dense + synthetic MoE; attention-only hybrid).
 
-use super::{gather_kv, LayerWeights, ModelConfig, TinyModel, WeightRef};
+use super::{gather_kv, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef};
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
 use allpaca_cpu::{attention, rope, silu};
@@ -9,7 +10,7 @@ use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
 use std::sync::atomic::Ordering;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CudaLayerOff {
     attn_norm: WeightRef,
     wq: WeightRef,
@@ -20,9 +21,11 @@ struct CudaLayerOff {
     w_gate: WeightRef,
     w_up: WeightRef,
     w_down: WeightRef,
+    /// Per-expert `[w_gate, w_up, w_down]` when `n_experts > 0`.
+    experts: Vec<[WeightRef; 3]>,
 }
 
-/// Dense F32 weights packed once onto a CUDA device (embed + layers + norm + lm_head).
+/// Device-resident weights for CUDA decode (embed + layers + experts + norm + lm_head).
 pub struct CudaResidentModel {
     weights: CudaDeviceWeights,
     packed_h2d: u64,
@@ -32,18 +35,29 @@ pub struct CudaResidentModel {
     lm_head: WeightRef,
 }
 
-impl CudaResidentModel {
-    pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
-        if model.config.n_experts > 0 || model.config.recurrent {
+fn cuda_supports_blocks(model: &TinyModel) -> Result<(), AllpacaError> {
+    for (i, layer) in model.layers.iter().enumerate() {
+        if !matches!(layer.block, HybridLayerKind::Attention) {
             return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA resident upload: dense attention TinyModel only".into(),
-                ),
+                allpaca_types::DegradedError::FeatureDisabled(format!(
+                    "CUDA resident upload: layer {i} is {:?}; only Attention (+ MoE FFN) yet",
+                    layer.block
+                )),
             ));
         }
+    }
+    Ok(())
+}
+
+impl CudaResidentModel {
+    pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
+        cuda_supports_blocks(model)?;
         let mut slices: Vec<&[f32]> = Vec::new();
         let mut off = 0usize;
         fn push<'a>(slices: &mut Vec<&'a [f32]>, off: &mut usize, s: &'a [f32]) -> WeightRef {
+            if s.is_empty() {
+                return WeightRef::f32(0, 0);
+            }
             let o = *off;
             slices.push(s);
             *off += s.len() * 4;
@@ -52,6 +66,14 @@ impl CudaResidentModel {
         let embed = push(&mut slices, &mut off, model.embed.as_slice());
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
+            let mut experts = Vec::with_capacity(layer.experts.len());
+            for expert in &layer.experts {
+                experts.push([
+                    push(&mut slices, &mut off, expert.w_gate.as_slice()),
+                    push(&mut slices, &mut off, expert.w_up.as_slice()),
+                    push(&mut slices, &mut off, expert.w_down.as_slice()),
+                ]);
+            }
             layers.push(CudaLayerOff {
                 attn_norm: push(&mut slices, &mut off, layer.attn_norm.as_slice()),
                 wq: push(&mut slices, &mut off, layer.wq.as_slice()),
@@ -62,6 +84,7 @@ impl CudaResidentModel {
                 w_gate: push(&mut slices, &mut off, layer.w_gate.as_slice()),
                 w_up: push(&mut slices, &mut off, layer.w_up.as_slice()),
                 w_down: push(&mut slices, &mut off, layer.w_down.as_slice()),
+                experts,
             });
         }
         let norm = push(&mut slices, &mut off, model.norm.as_slice());
@@ -88,7 +111,7 @@ pub fn upload_gguf(
         if cfg.n_experts > 0 || cfg.recurrent {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA GGUF upload: dense attention only (no MoE/hybrid yet)".into(),
+                    "CUDA GGUF upload: dense attention only (MoE GGUF / SSM hybrid later)".into(),
                 ),
             ));
         }
@@ -203,6 +226,7 @@ pub fn upload_gguf(
                 w_gate,
                 w_up,
                 w_down,
+                experts: Vec::new(),
             });
         }
         let (norm_bytes, norm_kind, norm_n) = take_tensor(file, "output_norm.weight", false)?;
@@ -317,10 +341,11 @@ impl TinyModel {
         soft_x: Option<&[f32]>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
-        if cfg.n_experts > 0 || cfg.recurrent {
+        // SSM/GDN blocks still unsupported; MoE FFN and attention-only recurrent are OK.
+        if self.layers.iter().any(|l| !matches!(l.block, HybridLayerKind::Attention)) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA decode: dense attention only".into(),
+                    "CUDA decode: Attention blocks only (SSM/GDN later)".into(),
                 ),
             ));
         }
@@ -536,7 +561,6 @@ fn apply_ffn_cuda(
     let dim = cfg.dim;
     let ff = cfg.ff_dim;
     let norm_w = if host.ffn_norm.is_empty() {
-        // Should not happen for synthetic dense; fall back to ones on host for rmsnorm weight upload path.
         return Err(AllpacaError::Fatal(FatalError::ModelLoad(
             "CUDA FFN missing ffn_norm".into(),
         )));
@@ -551,6 +575,36 @@ fn apply_ffn_cuda(
         cfg.eps,
     )?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+    if !layer.experts.is_empty() {
+        let n_exp = cfg.n_experts.max(layer.experts.len());
+        let n_act = cfg.n_active.max(1).min(n_exp);
+        let routed = topk_route(&scratch[..dim], &host.w_router, n_exp, n_act, cfg);
+        let mut acc = vec![0.0f32; dim];
+        let mut expert_out = vec![0.0f32; dim];
+        let mut gate = vec![0.0f32; ff];
+        let mut up = vec![0.0f32; ff];
+        for &(e, w) in &routed {
+            let Some([w_gate, w_up, w_down]) = layer.experts.get(e).copied() else {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "CUDA MoE missing expert {e}"
+                ))));
+            };
+            resident.gemm_host_a(cuda, &scratch[..dim], w_gate, &mut gate, 1, ff as i32, dim as i32)?;
+            resident.gemm_host_a(cuda, &scratch[..dim], w_up, &mut up, 1, ff as i32, dim as i32)?;
+            for i in 0..ff {
+                gate[i] = silu(gate[i]) * up[i];
+            }
+            resident.gemm_host_a(cuda, &gate, w_down, &mut expert_out, 1, dim as i32, ff as i32)?;
+            for i in 0..dim {
+                acc[i] += w * expert_out[i];
+            }
+        }
+        for i in 0..dim {
+            x[i] += acc[i];
+        }
+        return Ok(());
+    }
 
     let mut gate = vec![0.0f32; ff];
     let mut up = vec![0.0f32; ff];

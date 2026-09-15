@@ -72,6 +72,59 @@ fn cuda_synthetic_generate_uses_device_when_present() {
 }
 
 #[test]
+fn cuda_synthetic_moe_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_synthetic();
+    cfg.model.synthetic = false; // load via load_synthetic below
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("load tiny_moe");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "MoE experts must upload to CUDA"
+    );
+    let out = engine.generate("hi", greedy(2)).expect("moe generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA MoE forwards, got gpu={} target={} (CPU fallback?)",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
+
+#[test]
+fn cuda_synthetic_hybrid_attention_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_synthetic();
+    cfg.model.synthetic = false;
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .load_synthetic(allpaca_core::ModelConfig::tiny_hybrid())
+        .expect("load tiny_hybrid");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(before.weight_bytes_on_device > 0);
+    let out = engine.generate("hi", greedy(2)).expect("hybrid generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA hybrid forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
+
+#[test]
 fn cuda_absent_falls_back_to_cpu_cleanly() {
     if cuda_device_available() {
         return;
