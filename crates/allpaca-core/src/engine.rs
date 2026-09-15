@@ -246,6 +246,30 @@ fn rpc_hello_token(config: &Config) -> String {
         .unwrap_or_default()
 }
 
+fn scale_kv_vram_from_inventory(config: &mut Config, inventory: &DeviceInventory) {
+    let compiled = allpaca_types::KvSection::default().vram_bytes;
+    if config.kv.vram_bytes != compiled {
+        return;
+    }
+    let gpu_mem = inventory
+        .devices
+        .iter()
+        .filter(|d| d.is_gpu() && !d.is_rpc())
+        .map(|d| d.memory_bytes)
+        .max()
+        .unwrap_or(0);
+    let suggested = crate::suggested_kv_vram_bytes(gpu_mem);
+    if suggested > config.kv.vram_bytes {
+        tracing::info!(
+            suggested,
+            gpu_mem,
+            mode = ?inventory.pipeline_mode,
+            "scaled kv.vram_bytes from GPU capacity"
+        );
+        config.kv.vram_bytes = suggested;
+    }
+}
+
 impl Engine {
     pub fn new(config: Config) -> Result<Self, AllpacaError> {
         let mut config = config;
@@ -259,6 +283,7 @@ impl Engine {
         }
         config.validate()?;
         let mut inventory = DeviceInventory::discover(&config);
+        scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
             None
         } else {
