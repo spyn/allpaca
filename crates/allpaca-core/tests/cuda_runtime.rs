@@ -137,3 +137,29 @@ fn cuda_synthetic_moe_matches_cpu_when_present() {
         "CUDA MoE greedy tokens must match CPU"
     );
 }
+
+#[test]
+fn cuda_synthetic_hybrid_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    engine
+        .load_synthetic(allpaca_core::ModelConfig::tiny_hybrid())
+        .expect("tiny hybrid");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "hybrid TinyModel should upload; stats={before:?}"
+    );
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA hybrid forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}

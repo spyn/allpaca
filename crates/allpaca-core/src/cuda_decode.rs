@@ -9,6 +9,18 @@ use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
 use std::sync::atomic::Ordering;
 
+fn cuda_decode_blocks_ok(model: &TinyModel) -> bool {
+    model.layers.iter().all(|l| {
+        l.ssm.is_none()
+            && l.gdn.is_none()
+            && l.mla.is_none()
+            && matches!(
+                l.block,
+                HybridLayerKind::Attention | HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+            )
+    })
+}
+
 #[derive(Clone, Copy)]
 struct CudaExpertOff {
     w_gate: WeightRef,
@@ -42,10 +54,10 @@ pub struct CudaResidentModel {
 
 impl CudaResidentModel {
     pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
-        if model.config.recurrent {
+        if !cuda_decode_blocks_ok(model) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA resident upload: attention TinyModel only (no recurrent)".into(),
+                    "CUDA resident upload: attention/dense-FFN/MoE TinyModel only (no SSM/GDN/MLA)".into(),
                 ),
             ));
         }
@@ -129,10 +141,10 @@ impl TinyModel {
         soft_x: Option<&[f32]>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
-        if cfg.recurrent {
+        if !cuda_decode_blocks_ok(self) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA decode: attention TinyModel only (no recurrent)".into(),
+                    "CUDA decode: attention/dense-FFN/MoE only (no SSM/GDN/MLA)".into(),
                 ),
             ));
         }
@@ -185,6 +197,24 @@ impl TinyModel {
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, host_layer) in self.layers.iter().enumerate() {
+            let layer = &resident.layers[layer_idx];
+            if matches!(
+                host_layer.block,
+                HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+            ) {
+                apply_ffn_cuda(
+                    cfg,
+                    host_layer,
+                    layer,
+                    resident,
+                    cuda,
+                    &mut x,
+                    &mut scratch,
+                    &mut hidden,
+                    metrics,
+                )?;
+                continue;
+            }
             if host_layer.block != HybridLayerKind::Attention {
                 return Err(AllpacaError::Degraded(
                     allpaca_types::DegradedError::FeatureDisabled(
@@ -192,7 +222,6 @@ impl TinyModel {
                     ),
                 ));
             }
-            let layer = &resident.layers[layer_idx];
             cuda.rmsnorm_host_x_dev_w(
                 &x,
                 resident.ptr(layer.attn_norm)?,
