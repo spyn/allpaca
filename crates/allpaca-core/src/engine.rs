@@ -29,8 +29,9 @@ use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::batch_gemm::{
-    batch_gemm_other_ids, decode_layer_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm,
-    BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    apply_packed_ffn_hip, batch_gemm_other_ids, decode_layer_attn_shared_a_weights,
+    packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan,
+    ModelShapeKey,
 };
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
@@ -2069,7 +2070,7 @@ impl Engine {
         }
     }
 
-    /// Packed HIP `gemm_nt` for shared-A decode weights + lm_head.
+    /// Packed HIP `gemm_nt` for attn shared-A weights + FFN (incl w_down) + lm_head.
     ///
     /// Returns `(kernels_launched, applied)` where `applied` is 1 when packed
     /// lm_head logits were written into at least one Request's `pending_logits`
@@ -2088,14 +2089,12 @@ impl Engine {
         }
         let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first()
         {
-            decode_layer_shared_a_weights(
+            decode_layer_attn_shared_a_weights(
                 dim,
                 layer.wq.as_slice(),
                 layer.wk.as_slice(),
                 layer.wv.as_slice(),
                 layer.wo.as_slice(),
-                layer.w_gate.as_slice(),
-                layer.w_up.as_slice(),
             )
             .into_iter()
             .map(|w| (w.b.to_vec(), w.n, w.k))
@@ -2103,13 +2102,23 @@ impl Engine {
         } else {
             Vec::new()
         };
+        let ffn_weights = target.layers.first().map(|layer| {
+            (
+                layer.w_gate.as_slice().to_vec(),
+                layer.w_up.as_slice().to_vec(),
+                layer.w_down.as_slice().to_vec(),
+            )
+        });
         let lm_head = if !target.lm_head.is_empty() && target.lm_head.len() % dim == 0 {
             let n = target.lm_head.len() / dim;
             Some((target.lm_head.clone(), n, dim))
         } else {
             None
         };
-        if weights.is_empty() && lm_head.is_none() {
+        let has_ffn = ffn_weights
+            .as_ref()
+            .is_some_and(|(g, u, d)| !g.is_empty() && !u.is_empty() && !d.is_empty());
+        if weights.is_empty() && !has_ffn && lm_head.is_none() {
             return (0, 0);
         }
         let mut a_rows: Vec<Vec<f32>> = Vec::with_capacity(plan.request_ids.len());
@@ -2147,6 +2156,23 @@ impl Engine {
                 c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
             if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
                 launched += 1;
+            }
+        }
+
+        if let Some((w_gate, w_up, w_down)) = ffn_weights {
+            let mut ffn_out: Vec<Vec<f32>> = a_rows
+                .iter()
+                .map(|a| {
+                    let m = a.len() / dim;
+                    vec![0.0f32; m * dim]
+                })
+                .collect();
+            let mut out_refs: Vec<&mut [f32]> =
+                ffn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
+            if let Ok(n) =
+                apply_packed_ffn_hip(hip, &a_refs, &w_gate, &w_up, &w_down, dim, &mut out_refs)
+            {
+                launched += n;
             }
         }
 
@@ -6487,7 +6513,7 @@ mod tests {
                 break;
             }
             let stats = engine.stats();
-            if stats.batch_gemm_hip_kernels >= 6 && stats.batch_gemm_hip_applied >= 1 {
+            if stats.batch_gemm_hip_kernels >= 7 && stats.batch_gemm_hip_applied >= 1 {
                 assert!(
                     stats.batch_gemm_executes >= 1,
                     "HIP packed kernel implies soft execute; stats={stats:?}"
@@ -6499,8 +6525,8 @@ mod tests {
         }
         let stats = engine.stats();
         assert!(
-            stats.batch_gemm_hip_kernels >= 6,
-            "layer-fused HIP must launch QKV/O/gate/up; stats={stats:?}"
+            stats.batch_gemm_hip_kernels >= 7,
+            "layer-fused HIP must launch QKV/O + FFN(gate/up/down); stats={stats:?}"
         );
         assert!(
             stats.batch_gemm_hip_applied >= 1,
