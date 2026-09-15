@@ -43,6 +43,14 @@ int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream);
 int allpaca_cuda_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                          allpaca_cuda_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_q8)^T. B is 36-byte staged Q8_0 column-major blocks. */
+int allpaca_cuda_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                              int32_t k, allpaca_cuda_stream_t stream);
+
+/* Gather one token row from staged Q8_0 embed table → F32 out[dim]. */
+int allpaca_cuda_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out, int32_t dim,
+                                   allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_residual_add(const float *x, const float *y, float *out, int32_t n,
                               allpaca_cuda_stream_t stream);
 

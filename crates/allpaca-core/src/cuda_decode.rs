@@ -77,12 +77,10 @@ impl CudaResidentModel {
         })
     }
 
-    /// Dense Llama-family GGUF → F32 device pack (dequant on host one tensor at a
-    /// time into owned buffers, then one H2D). Used when host materialize was
-    /// skipped (`HOST_F32_LIMIT`) so CUDA-only boxes can still load Q8/F16 GGUFs
-    /// that fit in VRAM as F32 (e.g. Llama-3.2-1B on Tesla K80). Packed Q8 GEMV
-    /// for 7B-class VRAM is a follow-up slice.
-    pub fn upload_gguf(
+    /// Dense Llama-family GGUF → device pack. Small tensors dequant to F32; large
+/// Q8_0 GEMM weights and `token_embd` stay as 36-byte staged blocks so 7B-class
+/// models fit K80 VRAM (~12GiB) instead of exploding to ~32GiB F32.
+pub fn upload_gguf(
         file: &allpaca_gguf::GgufFile,
         cfg: &ModelConfig,
         device: i32,
@@ -94,84 +92,130 @@ impl CudaResidentModel {
                 ),
             ));
         }
-        let mut owned: Vec<Vec<f32>> = Vec::new();
+        let mut owned: Vec<Vec<u8>> = Vec::new();
         let mut off = 0usize;
-        let mut push = |owned: &mut Vec<Vec<f32>>, off: &mut usize, data: Vec<f32>| -> WeightRef {
-            let n = data.len();
-            let o = *off;
-            *off += n.saturating_mul(4);
-            owned.push(data);
-            WeightRef::f32(o, n)
-        };
-        let take = |file: &allpaca_gguf::GgufFile, name: &str| -> Result<Vec<f32>, AllpacaError> {
-            file.tensor_f32(name).map_err(|e| {
+        let mut push_bytes =
+            |owned: &mut Vec<Vec<u8>>, off: &mut usize, data: Vec<u8>, kind: super::WeightKind, n: usize| -> WeightRef {
+                if kind == super::WeightKind::Q8_0 && *off % allpaca_cuda::Q8_STAGED_BLOCK != 0 {
+                    let pad = allpaca_cuda::Q8_STAGED_BLOCK - (*off % allpaca_cuda::Q8_STAGED_BLOCK);
+                    owned.push(vec![0u8; pad]);
+                    *off += pad;
+                }
+                let o = *off;
+                *off += data.len();
+                owned.push(data);
+                match kind {
+                    super::WeightKind::Q8_0 => WeightRef::q8_0(o, n),
+                    _ => WeightRef::f32(o, n),
+                }
+            };
+        let take_tensor = |file: &allpaca_gguf::GgufFile,
+                           name: &str,
+                           gemv: bool|
+         -> Result<(Vec<u8>, super::WeightKind, usize), AllpacaError> {
+            let info = file.tensor(name).ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                    "CUDA GGUF upload missing {name}: {e}"
+                    "CUDA GGUF upload missing {name}"
                 )))
-            })
+            })?;
+            let n = info.n_elements() as usize;
+            match info.ggml_type {
+                allpaca_gguf::GgmlType::Q8_0 if n > 65_536 => {
+                    let packed = file.tensor_bytes(name).map_err(|e| {
+                        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "CUDA GGUF Q8 bytes {name}: {e}"
+                        )))
+                    })?;
+                    if name == "token_embd.weight" || !gemv {
+                        let staged = allpaca_cuda::stage_q8_0_blocks(packed).map_err(|e| {
+                            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "CUDA Q8_0 stage {name}: {e}"
+                            )))
+                        })?;
+                        Ok((staged, super::WeightKind::Q8_0, n))
+                    } else {
+                        let k = *info.dims.first().unwrap_or(&1) as usize;
+                        if k == 0 || n % k != 0 {
+                            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "Q8_0 GEMV {name} dims {:?} do not tile n={n}",
+                                info.dims
+                            ))));
+                        }
+                        let n_rows = n / k;
+                        let staged =
+                            allpaca_cuda::stage_q8_0_gemv(packed, n_rows, k).map_err(|e| {
+                                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                    "CUDA Q8_0 GEMV stage {name}: {e}"
+                                )))
+                            })?;
+                        Ok((staged, super::WeightKind::Q8_0, n))
+                    }
+                }
+                _ => {
+                    let f32s = file.tensor_f32(name).map_err(|e| {
+                        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                            "CUDA GGUF upload missing {name}: {e}"
+                        )))
+                    })?;
+                    let n = f32s.len();
+                    let mut bytes = Vec::with_capacity(n * 4);
+                    for v in f32s {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    Ok((bytes, super::WeightKind::F32, n))
+                }
+            }
         };
 
-        let embed = push(&mut owned, &mut off, take(file, "token_embd.weight")?);
+        let (embed_bytes, embed_kind, embed_n) = take_tensor(file, "token_embd.weight", false)?;
+        let embed = push_bytes(&mut owned, &mut off, embed_bytes, embed_kind, embed_n);
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for local in 0..cfg.n_layers {
             let i = cfg.gguf_blk(local);
+            let take = |suffix: &str, gemv: bool| {
+                take_tensor(file, &format!("blk.{i}.{suffix}"), gemv)
+            };
+            let (b, k, n) = take("attn_norm.weight", false)?;
+            let attn_norm = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("attn_q.weight", true)?;
+            let wq = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("attn_k.weight", true)?;
+            let wk = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("attn_v.weight", true)?;
+            let wv = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("attn_output.weight", true)?;
+            let wo = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("ffn_norm.weight", false)?;
+            let ffn_norm = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("ffn_gate.weight", true)?;
+            let w_gate = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("ffn_up.weight", true)?;
+            let w_up = push_bytes(&mut owned, &mut off, b, k, n);
+            let (b, k, n) = take("ffn_down.weight", true)?;
+            let w_down = push_bytes(&mut owned, &mut off, b, k, n);
             layers.push(CudaLayerOff {
-                attn_norm: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.attn_norm.weight"))?,
-                ),
-                wq: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.attn_q.weight"))?,
-                ),
-                wk: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.attn_k.weight"))?,
-                ),
-                wv: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.attn_v.weight"))?,
-                ),
-                wo: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.attn_output.weight"))?,
-                ),
-                ffn_norm: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.ffn_norm.weight"))?,
-                ),
-                w_gate: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.ffn_gate.weight"))?,
-                ),
-                w_up: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.ffn_up.weight"))?,
-                ),
-                w_down: push(
-                    &mut owned,
-                    &mut off,
-                    take(file, &format!("blk.{i}.ffn_down.weight"))?,
-                ),
+                attn_norm,
+                wq,
+                wk,
+                wv,
+                wo,
+                ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
             });
         }
-        let norm = push(&mut owned, &mut off, take(file, "output_norm.weight")?);
+        let (norm_bytes, norm_kind, norm_n) = take_tensor(file, "output_norm.weight", false)?;
+        let norm = push_bytes(&mut owned, &mut off, norm_bytes, norm_kind, norm_n);
         let lm_head = if file.tensor("output.weight").is_some() {
-            push(&mut owned, &mut off, take(file, "output.weight")?)
+            let (b, k, n) = take_tensor(file, "output.weight", true)?;
+            push_bytes(&mut owned, &mut off, b, k, n)
         } else {
             // Tied embedding / lm_head: reuse embed byte offset.
             embed
         };
-        let slices: Vec<&[f32]> = owned.iter().map(|v| v.as_slice()).collect();
-        let (weights, packed_h2d) = CudaDeviceWeights::upload(device, &slices)?;
+        let slices: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let (weights, packed_h2d) = CudaDeviceWeights::upload_bytes(device, &slices)?;
         Ok(Self {
             weights,
             packed_h2d,
@@ -196,7 +240,64 @@ impl CudaResidentModel {
                 "empty CUDA weight ref".into(),
             )));
         }
+        if w.kind != super::WeightKind::F32 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA F32 ptr requested for non-F32 weight".into(),
+            )));
+        }
         Ok(self.weights.ptr_f32(w.off)? as *const f32)
+    }
+
+    fn byte_ptr(&self, w: WeightRef) -> Result<*const u8, AllpacaError> {
+        if w.n == 0 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "empty CUDA weight ref".into(),
+            )));
+        }
+        Ok(self.weights.byte_ptr_at(w.off)? as *const u8)
+    }
+
+    fn gemm_host_a(
+        &self,
+        cuda: &CudaWorkspace,
+        a: &[f32],
+        w: WeightRef,
+        c: &mut [f32],
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        match w.kind {
+            super::WeightKind::F32 => {
+                cuda.gemm_nt_host_a_dev_b(a, self.ptr(w)?, c, m, n, k)
+            }
+            super::WeightKind::Q8_0 => {
+                cuda.gemm_nt_host_a_dev_b_q8(a, self.byte_ptr(w)?, c, m, n, k)
+            }
+            _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA decode: unsupported weight kind for GEMM".into(),
+            ))),
+        }
+    }
+
+    fn embed_gather(
+        &self,
+        cuda: &CudaWorkspace,
+        token: i32,
+        out: &mut [f32],
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        match self.embed.kind {
+            super::WeightKind::F32 => {
+                cuda.embed_gather_dev_table(self.ptr(self.embed)?, token, out, dim)
+            }
+            super::WeightKind::Q8_0 => {
+                cuda.embed_gather_q8_dev_table(self.byte_ptr(self.embed)?, token, out, dim)
+            }
+            _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA decode: unsupported embed kind".into(),
+            ))),
+        }
     }
 }
 
@@ -255,12 +356,7 @@ impl TinyModel {
             }
             x.copy_from_slice(x0);
         } else {
-            cuda.embed_gather_dev_table(
-                resident.ptr(resident.embed)?,
-                token as i32,
-                &mut x,
-                dim as i32,
-            )?;
+            resident.embed_gather(cuda, token as i32, &mut x, dim as i32)?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -289,25 +385,28 @@ impl TinyModel {
             )?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
-            cuda.gemm_nt_host_a_dev_b(
+            resident.gemm_host_a(
+                cuda,
                 &scratch[..dim],
-                resident.ptr(layer.wq)?,
+                layer.wq,
                 &mut q,
                 1,
                 dim as i32,
                 dim as i32,
             )?;
-            cuda.gemm_nt_host_a_dev_b(
+            resident.gemm_host_a(
+                cuda,
                 &scratch[..dim],
-                resident.ptr(layer.wk)?,
+                layer.wk,
                 &mut k,
                 1,
                 kv_dim as i32,
                 dim as i32,
             )?;
-            cuda.gemm_nt_host_a_dev_b(
+            resident.gemm_host_a(
+                cuda,
                 &scratch[..dim],
-                resident.ptr(layer.wv)?,
+                layer.wv,
                 &mut v,
                 1,
                 kv_dim as i32,
@@ -372,9 +471,10 @@ impl TinyModel {
                 )?;
             }
 
-            cuda.gemm_nt_host_a_dev_b(
+            resident.gemm_host_a(
+                cuda,
                 &attn_out,
-                resident.ptr(layer.wo)?,
+                layer.wo,
                 &mut hidden,
                 1,
                 dim as i32,
@@ -405,9 +505,10 @@ impl TinyModel {
             cfg.eps,
         )?;
         metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-        cuda.gemm_nt_host_a_dev_b(
+        resident.gemm_host_a(
+            cuda,
             &scratch[..dim],
-            resident.ptr(resident.lm_head)?,
+            resident.lm_head,
             &mut logits[..vocab],
             1,
             vocab as i32,
@@ -453,17 +554,19 @@ fn apply_ffn_cuda(
 
     let mut gate = vec![0.0f32; ff];
     let mut up = vec![0.0f32; ff];
-    cuda.gemm_nt_host_a_dev_b(
+    resident.gemm_host_a(
+        cuda,
         &scratch[..dim],
-        resident.ptr(layer.w_gate)?,
+        layer.w_gate,
         &mut gate,
         1,
         ff as i32,
         dim as i32,
     )?;
-    cuda.gemm_nt_host_a_dev_b(
+    resident.gemm_host_a(
+        cuda,
         &scratch[..dim],
-        resident.ptr(layer.w_up)?,
+        layer.w_up,
         &mut up,
         1,
         ff as i32,
@@ -472,9 +575,10 @@ fn apply_ffn_cuda(
     for i in 0..ff {
         gate[i] = silu(gate[i]) * up[i];
     }
-    cuda.gemm_nt_host_a_dev_b(
+    resident.gemm_host_a(
+        cuda,
         &gate,
-        resident.ptr(layer.w_down)?,
+        layer.w_down,
         hidden,
         1,
         dim as i32,

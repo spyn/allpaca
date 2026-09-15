@@ -255,6 +255,20 @@ fn cuda_generate_real_gguf_when_path_set() {
         "expected CUDA weight upload for {}",
         path.display()
     );
+    // Packed Q8 must be far below F32 blow-up (~4× element bytes).
+    if path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.contains("Q8_0"))
+    {
+        let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            before.weight_bytes_on_device < file_len.saturating_mul(3),
+            "Q8 CUDA upload should stay near packed size, not F32: weights={} file={}",
+            before.weight_bytes_on_device,
+            file_len
+        );
+    }
     let out = engine.generate("hi", greedy(1)).expect("generate");
     assert_eq!(out.token_ids.len(), 1);
     let stats = engine.stats();

@@ -506,6 +506,14 @@ impl WeightRef {
             kind: WeightKind::F32,
         }
     }
+
+    fn q8_0(off: usize, n: usize) -> Self {
+        Self {
+            off,
+            n,
+            kind: WeightKind::Q8_0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
