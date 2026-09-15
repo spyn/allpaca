@@ -276,7 +276,7 @@ cargo run -p allpaca-rpc-server -- --cpu-only -H 127.0.0.1 -p 50052
 cargo run -p allpaca-server -- --synthetic --cpu-only --rpc 127.0.0.1:50052 --port 8080
 ```
 
-HIP worker on a LAN: `cargo run -p allpaca-rpc-server --features hip -- --device hip:0 -H 0.0.0.0 -p 50052 --insecure-bind --token "$ALLPACA_RPC_TOKEN"`. Coordinator uses the same token (`--rpc-token` or `ALLPACA_RPC_TOKEN`). CUDA workers wait on engine CUDA parity; a CUDA-only box can still run `--cpu-only` for RAM overflow.
+HIP worker on a LAN: `cargo run -p allpaca-rpc-server --features hip -- --device hip:0 -H 0.0.0.0 -p 50052 --insecure-bind --token "$ALLPACA_RPC_TOKEN"`. CUDA worker (same wire ABI, e.g. RTX 3060 / Blackwell laptop): `cargo run -p allpaca-rpc-server --features cuda -- --device cuda:0 -H 0.0.0.0 -p 50052 --insecure-bind --token "$ALLPACA_RPC_TOKEN"`. Coordinator uses the same token (`--rpc-token` or `ALLPACA_RPC_TOKEN`); HIP and CUDA workers are interchangeable after HELLO. A CUDA-only box can still run `--cpu-only` for RAM overflow.
 
 ---
 

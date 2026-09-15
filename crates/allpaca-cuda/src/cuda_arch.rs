@@ -4,6 +4,8 @@
 //! Default fat binary targets RTX 3060 (Ampere / sm_86) and Blackwell GeForce
 //! laptop (sm_120).
 
+#![allow(dead_code)] // lib links this for tests; build.rs uses the same file via #[path]
+
 /// Default fat binary: Ampere consumer (RTX 3060 12GB / sm_86) + Blackwell
 /// GeForce laptop (RTX 50-series mobile / sm_120).
 pub fn default_cuda_arches() -> Vec<String> {

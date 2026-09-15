@@ -8,9 +8,11 @@ description = "Kernel-ABI RPC protocol for remote Allpaca devices"
 [features]
 default = []
 hip = ["allpaca-hip/hip"]
+cuda = ["allpaca-cuda/cuda"]
 
 [dependencies]
 allpaca-cpu.workspace = true
+allpaca-cuda.workspace = true
 allpaca-hip.workspace = true
 allpaca-types.workspace = true
 thiserror.workspace = true

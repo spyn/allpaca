@@ -19,7 +19,7 @@
 - Continuous-batching soft packed HIP GEMM: co-step (`batch_gemm_plans`/`batch_gemm_executes`) + real host activations × shared Target weight `gemm_nt` (`batch_gemm_hip_kernels`); greedy HIP decode cohorts skip per-request lm_head (`batch_gemm_lm_head_skipped`) and apply packed **lm_head** from fresh `output_norm` into `pending_logits` (`batch_gemm_hip_applied`); poll-path packed FFN runs gate/up → silu×up → **w_down** via `apply_packed_ffn_hip`
 - CUDA backend scaffold (`allpaca-cuda`: discovery, `CudaWorkspace`, F32 `gemm_nt` / residual_add / rmsnorm / silu_mul / embed_gather / rope / attention / `copy_h2d_f32` for soft_x; engine opens CUDA when `gpu_backend=cuda` or auto with only CUDA GPUs; `backend=cuda` in stats when workspace open; dense TinyModel `CudaResidentModel` upload + `forward_token_cuda` for synthetic generate when device present; full 7B/KV/MoE parity still HIP-first)
 - CPU fallback for all kernels
-- Kernel-ABI RPC (`allpaca-rpc-server` + coordinator `--rpc`) for HIP layer-split across machines (CUDA workers later)
+- Kernel-ABI RPC (`allpaca-rpc-server` + coordinator `--rpc`) for HIP/CUDA layer-split across machines (same `KernelOp` wire ABI)
 - Model-aware early exit from GGUF `allpaca.early_exit.*` (+ `calibration_version` / `requires_verification`) + optional `blk.{i}.exit_head.weight`
 - BitNet/ternary GGUF via TQ1_0 / TQ2_0 CPU dequant + fused HIP GEMV
 - OpenAI-compatible `/v1/chat/completions` server (ChatML when vocab has `<|im_start|>` / `<|im_end|>`; those pieces are default stop tokens; no auto `<think>`)

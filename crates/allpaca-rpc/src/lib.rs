@@ -2,7 +2,9 @@
 //!
 //! This is the llama.cpp RPC analogue without a ggml graph. The coordinator
 //! owns scheduling; a worker only allocates buffers and runs the existing
-//! CPU/HIP kernel ABI.
+//! CPU/HIP/CUDA kernel ABI. HIP and CUDA workers speak the same `KernelOp`
+//! wire protocol so an AMD coordinator can drive an NVIDIA worker (and vice
+//! versa) as long as HELLO majors match.
 
 mod protocol;
 mod session;
@@ -21,6 +23,9 @@ pub use worker::{
 
 #[cfg(feature = "hip")]
 pub use worker::HipWorker;
+
+#[cfg(feature = "cuda")]
+pub use worker::CudaWorker;
 
 pub use protocol::RpcError;
 
@@ -179,5 +184,59 @@ mod tests {
         assert_eq!(client.hello().major, PROTO_MAJOR);
         drop(client);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn rpc_backend_kinds_wire_compat_cpu_hip_cuda() {
+        assert_eq!(RpcBackendKind::from_u8(0), Some(RpcBackendKind::Cpu));
+        assert_eq!(RpcBackendKind::from_u8(1), Some(RpcBackendKind::Hip));
+        assert_eq!(RpcBackendKind::from_u8(2), Some(RpcBackendKind::Cuda));
+        let cuda_hello = HelloReply {
+            major: PROTO_MAJOR,
+            minor: PROTO_MINOR,
+            patch: PROTO_PATCH,
+            kernel_abi_rev: KERNEL_ABI_REV,
+            backend: RpcBackendKind::Cuda,
+            dtype_mask: 1,
+            device_name: "cuda:0".into(),
+            memory_bytes: 12 << 30,
+        };
+        let hip_hello = HelloReply {
+            backend: RpcBackendKind::Hip,
+            device_name: "hip:0".into(),
+            ..cuda_hello.clone()
+        };
+        let cuda_bytes = encode_hello_reply(&cuda_hello);
+        let hip_bytes = encode_hello_reply(&hip_hello);
+        let cuda_back = crate::protocol::decode_hello_reply(&cuda_bytes).unwrap();
+        let hip_back = crate::protocol::decode_hello_reply(&hip_bytes).unwrap();
+        assert_eq!(cuda_back.backend, RpcBackendKind::Cuda);
+        assert_eq!(hip_back.backend, RpcBackendKind::Hip);
+        assert_eq!(cuda_back.device_name, "cuda:0");
+        assert_eq!(hip_back.device_name, "hip:0");
+        // Same KernelOp set for both GPU backends — ABI revision shared.
+        assert_eq!(cuda_back.kernel_abi_rev, hip_back.kernel_abi_rev);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_worker_hello_advertises_cuda_when_device_present() {
+        if allpaca_cuda::device_count() <= 0 {
+            eprintln!("skip cuda_worker_hello: no CUDA device");
+            return;
+        }
+        let worker = CudaWorker::new(0).expect("CudaWorker");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let th = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cuda(worker)).unwrap();
+        });
+        let client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let reply = client.hello().clone();
+        drop(client);
+        th.join().unwrap();
+        assert_eq!(reply.backend, RpcBackendKind::Cuda);
+        assert!(reply.device_name.starts_with("cuda:"));
     }
 }
