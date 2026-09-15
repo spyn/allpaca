@@ -21,6 +21,9 @@ struct CudaLayerOff {
     w_gate: WeightRef,
     w_up: WeightRef,
     w_down: WeightRef,
+    /// Host copy of router logits weights for top-k when `LayerWeights.w_router` is empty
+    /// (large GGUF skeleton path).
+    router_host: Vec<f32>,
     /// Per-expert `[w_gate, w_up, w_down]` when `n_experts > 0`.
     experts: Vec<[WeightRef; 3]>,
 }
@@ -84,6 +87,7 @@ impl CudaResidentModel {
                 w_gate: push(&mut slices, &mut off, layer.w_gate.as_slice()),
                 w_up: push(&mut slices, &mut off, layer.w_up.as_slice()),
                 w_down: push(&mut slices, &mut off, layer.w_down.as_slice()),
+                router_host: layer.w_router.clone(),
                 experts,
             });
         }
@@ -100,25 +104,33 @@ impl CudaResidentModel {
         })
     }
 
-    /// Dense Llama-family GGUF → device pack. Small tensors dequant to F32; large
-/// Q8_0 GEMM weights and `token_embd` stay as 36-byte staged blocks so 7B-class
-/// models fit K80 VRAM (~12GiB) instead of exploding to ~32GiB F32.
-pub fn upload_gguf(
+    /// Llama-family GGUF → device pack. Small tensors dequant to F32; large Q8_0
+    /// GEMM weights / `token_embd` stay as 36-byte staged blocks. Mixtral-style
+    /// stacked experts (`ffn_*_exps`) upload and split into per-expert GEMV refs.
+    pub fn upload_gguf(
         file: &allpaca_gguf::GgufFile,
         cfg: &ModelConfig,
         device: i32,
     ) -> Result<Self, AllpacaError> {
-        if cfg.n_experts > 0 || cfg.recurrent {
+        if cfg.recurrent {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA GGUF upload: dense attention only (MoE GGUF / SSM hybrid later)".into(),
+                    "CUDA GGUF upload: SSM/GDN hybrid later".into(),
                 ),
             ));
         }
         let mut owned: Vec<Vec<u8>> = Vec::new();
         let mut off = 0usize;
         let mut push_bytes =
-            |owned: &mut Vec<Vec<u8>>, off: &mut usize, data: Vec<u8>, kind: super::WeightKind, n: usize| -> WeightRef {
+            |owned: &mut Vec<Vec<u8>>,
+             off: &mut usize,
+             data: Vec<u8>,
+             kind: super::WeightKind,
+             n: usize|
+             -> WeightRef {
+                if data.is_empty() || n == 0 {
+                    return WeightRef::f32(0, 0);
+                }
                 if kind == super::WeightKind::Q8_0 && *off % allpaca_cuda::Q8_STAGED_BLOCK != 0 {
                     let pad = allpaca_cuda::Q8_STAGED_BLOCK - (*off % allpaca_cuda::Q8_STAGED_BLOCK);
                     owned.push(vec![0u8; pad]);
@@ -189,6 +201,26 @@ pub fn upload_gguf(
                 }
             }
         };
+        let try_tensor = |file: &allpaca_gguf::GgufFile, name: &str, gemv: bool| {
+            if file.tensor(name).is_none() {
+                Ok(None)
+            } else {
+                take_tensor(file, name, gemv).map(Some)
+            }
+        };
+        let split_f32_experts = |w: WeightRef, n_experts: usize, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
+            if n_experts == 0 || w.n == 0 || w.n % n_experts != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "CUDA {what} n={} not divisible by {n_experts}",
+                    w.n
+                ))));
+            }
+            let n_per = w.n / n_experts;
+            let stride = n_per.saturating_mul(4);
+            Ok((0..n_experts)
+                .map(|e| WeightRef::f32(w.off + e * stride, n_per))
+                .collect())
+        };
 
         let (embed_bytes, embed_kind, embed_n) = take_tensor(file, "token_embd.weight", false)?;
         let embed = push_bytes(&mut owned, &mut off, embed_bytes, embed_kind, embed_n);
@@ -210,12 +242,114 @@ pub fn upload_gguf(
             let wo = push_bytes(&mut owned, &mut off, b, k, n);
             let (b, k, n) = take("ffn_norm.weight", false)?;
             let ffn_norm = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("ffn_gate.weight", true)?;
-            let w_gate = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("ffn_up.weight", true)?;
-            let w_up = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("ffn_down.weight", true)?;
-            let w_down = push_bytes(&mut owned, &mut off, b, k, n);
+
+            let moe = cfg.n_experts > 0
+                && (file
+                    .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
+                    .is_some()
+                    || file.tensor(&format!("blk.{i}.ffn_router.weight")).is_some()
+                    || file
+                        .tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
+                        .is_some()
+                    || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some());
+
+            let (w_gate, w_up, w_down, router_host, experts) = if moe {
+                let n_exp = cfg.n_experts.max(1);
+                let router_name = if file
+                    .tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
+                    .is_some()
+                {
+                    format!("blk.{i}.ffn_gate_inp.weight")
+                } else {
+                    format!("blk.{i}.ffn_router.weight")
+                };
+                let router_host = file.tensor_f32(&router_name).map_err(|e| {
+                    AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "CUDA MoE router {router_name}: {e}"
+                    )))
+                })?;
+                let stacked_gate = format!("blk.{i}.ffn_gate_exps.weight");
+                let stacked_up = format!("blk.{i}.ffn_up_exps.weight");
+                let experts = if file.tensor(&stacked_gate).is_some()
+                    || file.tensor(&stacked_up).is_some()
+                {
+                    // Experts stay F32 on CUDA for now (Q8 packed expert split is a follow-up).
+                    let push_f32 = |owned: &mut Vec<Vec<u8>>,
+                                    off: &mut usize,
+                                    name: &str|
+                     -> Result<WeightRef, AllpacaError> {
+                        let f32s = file.tensor_f32(name).map_err(|e| {
+                            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "CUDA MoE {name}: {e}"
+                            )))
+                        })?;
+                        let n = f32s.len();
+                        let mut bytes = Vec::with_capacity(n * 4);
+                        for v in f32s {
+                            bytes.extend_from_slice(&v.to_le_bytes());
+                        }
+                        Ok(push_bytes(
+                            owned,
+                            off,
+                            bytes,
+                            super::WeightKind::F32,
+                            n,
+                        ))
+                    };
+                    let gate_w = if file.tensor(&stacked_gate).is_some() {
+                        Some(push_f32(&mut owned, &mut off, &stacked_gate)?)
+                    } else {
+                        None
+                    };
+                    let up_w = push_f32(&mut owned, &mut off, &stacked_up)?;
+                    let down_w =
+                        push_f32(&mut owned, &mut off, &format!("blk.{i}.ffn_down_exps.weight"))?;
+                    let ups = split_f32_experts(up_w, n_exp, "ffn_up_exps")?;
+                    let downs = split_f32_experts(down_w, n_exp, "ffn_down_exps")?;
+                    let gates = if let Some(g) = gate_w {
+                        split_f32_experts(g, n_exp, "ffn_gate_exps")?
+                    } else {
+                        vec![WeightRef::f32(0, 0); n_exp]
+                    };
+                    (0..n_exp)
+                        .map(|e| [gates[e], ups[e], downs[e]])
+                        .collect()
+                } else {
+                    let mut ex = Vec::with_capacity(n_exp);
+                    for e in 0..n_exp {
+                        let gate_name = format!("blk.{i}.ffn_gate.{e}.weight");
+                        let w_gate = if let Some((b, k, n)) = try_tensor(file, &gate_name, true)? {
+                            push_bytes(&mut owned, &mut off, b, k, n)
+                        } else {
+                            WeightRef::f32(0, 0)
+                        };
+                        let (b, k, n) =
+                            take_tensor(file, &format!("blk.{i}.ffn_up.{e}.weight"), true)?;
+                        let w_up = push_bytes(&mut owned, &mut off, b, k, n);
+                        let (b, k, n) =
+                            take_tensor(file, &format!("blk.{i}.ffn_down.{e}.weight"), true)?;
+                        let w_down = push_bytes(&mut owned, &mut off, b, k, n);
+                        ex.push([w_gate, w_up, w_down]);
+                    }
+                    ex
+                };
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    router_host,
+                    experts,
+                )
+            } else {
+                let (b, k, n) = take("ffn_gate.weight", true)?;
+                let w_gate = push_bytes(&mut owned, &mut off, b, k, n);
+                let (b, k, n) = take("ffn_up.weight", true)?;
+                let w_up = push_bytes(&mut owned, &mut off, b, k, n);
+                let (b, k, n) = take("ffn_down.weight", true)?;
+                let w_down = push_bytes(&mut owned, &mut off, b, k, n);
+                (w_gate, w_up, w_down, Vec::new(), Vec::new())
+            };
+
             layers.push(CudaLayerOff {
                 attn_norm,
                 wq,
@@ -226,7 +360,8 @@ pub fn upload_gguf(
                 w_gate,
                 w_up,
                 w_down,
-                experts: Vec::new(),
+                router_host,
+                experts,
             });
         }
         let (norm_bytes, norm_kind, norm_n) = take_tensor(file, "output_norm.weight", false)?;
@@ -235,7 +370,6 @@ pub fn upload_gguf(
             let (b, k, n) = take_tensor(file, "output.weight", true)?;
             push_bytes(&mut owned, &mut off, b, k, n)
         } else {
-            // Tied embedding / lm_head: reuse embed byte offset.
             embed
         };
         let slices: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
@@ -579,7 +713,16 @@ fn apply_ffn_cuda(
     if !layer.experts.is_empty() {
         let n_exp = cfg.n_experts.max(layer.experts.len());
         let n_act = cfg.n_active.max(1).min(n_exp);
-        let routed = topk_route(&scratch[..dim], &host.w_router, n_exp, n_act, cfg);
+        let router = if !host.w_router.is_empty() {
+            host.w_router.as_slice()
+        } else if !layer.router_host.is_empty() {
+            layer.router_host.as_slice()
+        } else {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA MoE missing router weights".into(),
+            )));
+        };
+        let routed = topk_route(&scratch[..dim], router, n_exp, n_act, cfg);
         let mut acc = vec![0.0f32; dim];
         let mut expert_out = vec![0.0f32; dim];
         let mut gate = vec![0.0f32; ff];
@@ -590,12 +733,27 @@ fn apply_ffn_cuda(
                     "CUDA MoE missing expert {e}"
                 ))));
             };
-            resident.gemm_host_a(cuda, &scratch[..dim], w_gate, &mut gate, 1, ff as i32, dim as i32)?;
             resident.gemm_host_a(cuda, &scratch[..dim], w_up, &mut up, 1, ff as i32, dim as i32)?;
-            for i in 0..ff {
-                gate[i] = silu(gate[i]) * up[i];
+            if w_gate.n > 0 {
+                resident.gemm_host_a(
+                    cuda,
+                    &scratch[..dim],
+                    w_gate,
+                    &mut gate,
+                    1,
+                    ff as i32,
+                    dim as i32,
+                )?;
+                for i in 0..ff {
+                    gate[i] = silu(gate[i]) * up[i];
+                }
+                resident.gemm_host_a(cuda, &gate, w_down, &mut expert_out, 1, dim as i32, ff as i32)?;
+            } else {
+                for v in &mut up {
+                    *v = silu(*v);
+                }
+                resident.gemm_host_a(cuda, &up, w_down, &mut expert_out, 1, dim as i32, ff as i32)?;
             }
-            resident.gemm_host_a(cuda, &gate, w_down, &mut expert_out, 1, dim as i32, ff as i32)?;
             for i in 0..dim {
                 acc[i] += w * expert_out[i];
             }
