@@ -84,3 +84,18 @@ fn cuda_absent_falls_back_to_cpu_cleanly() {
     assert_eq!(stats.gpu_forwards, 0);
     assert_eq!(stats.weight_h2d_bytes, 0);
 }
+
+#[test]
+fn cuda_mobile_tiered_when_device_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    let stats = engine.stats();
+    assert!(
+        stats.pipeline_mode.contains("MobileTiered"),
+        "single CUDA GPU should be MobileTiered, got {}",
+        stats.pipeline_mode
+    );
+    assert_eq!(stats.backend, "cuda");
+}

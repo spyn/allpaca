@@ -270,6 +270,55 @@ fn scale_kv_vram_from_inventory(config: &mut Config, inventory: &DeviceInventory
     }
 }
 
+#[cfg(test)]
+mod scale_kv_tests {
+    use super::scale_kv_vram_from_inventory;
+    use allpaca_types::{
+        Config, DeviceInfo, DeviceKind, PipelineMode, TransferPath,
+    };
+    use crate::device_manager::DeviceInventory;
+
+    fn cuda_12gb_inventory() -> DeviceInventory {
+        DeviceInventory {
+            devices: vec![
+                DeviceInfo::cpu(),
+                DeviceInfo {
+                    id: 0,
+                    kind: DeviceKind::CudaGpu,
+                    name: "RTX 3060".into(),
+                    memory_bytes: 12 << 30,
+                    bandwidth_gbps: 360.0,
+                    peers: vec![],
+                },
+            ],
+            pipeline_mode: PipelineMode::MobileTiered,
+            transfer_path: TransferPath::HostStaging,
+            transfer_benchmark: None,
+            p2p_capable: false,
+            p2p_enabled: false,
+            target_device: 0,
+            draft_device: -1,
+            vision_device: None,
+        }
+    }
+
+    #[test]
+    fn scales_compiled_default_kv_for_12gb_cuda() {
+        let mut cfg = Config::compiled_defaults();
+        assert_eq!(cfg.kv.vram_bytes, 4 * 1024 * 1024);
+        scale_kv_vram_from_inventory(&mut cfg, &cuda_12gb_inventory());
+        assert_eq!(cfg.kv.vram_bytes, 4usize << 30);
+    }
+
+    #[test]
+    fn preserves_explicit_kv_override() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.kv.vram_bytes = 256 * 1024 * 1024;
+        scale_kv_vram_from_inventory(&mut cfg, &cuda_12gb_inventory());
+        assert_eq!(cfg.kv.vram_bytes, 256 * 1024 * 1024);
+    }
+}
+
 impl Engine {
     pub fn new(config: Config) -> Result<Self, AllpacaError> {
         let mut config = config;

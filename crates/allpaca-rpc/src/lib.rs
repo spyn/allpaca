@@ -239,4 +239,56 @@ mod tests {
         assert_eq!(reply.backend, RpcBackendKind::Cuda);
         assert!(reply.device_name.starts_with("cuda:"));
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_gemm_nt_when_device_present() {
+        if allpaca_cuda::device_count() <= 0 {
+            eprintln!("skip loopback_cuda_gemm_nt: no CUDA device");
+            return;
+        }
+        let worker = CudaWorker::new(0).expect("CudaWorker");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let th = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cuda(worker)).unwrap();
+        });
+
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        assert_eq!(client.hello().backend, RpcBackendKind::Cuda);
+
+        let m = 2i32;
+        let n = 2i32;
+        let k = 2i32;
+        let a = client.alloc(8 * 4).unwrap();
+        let b = client.alloc(8 * 4).unwrap();
+        let c = client.alloc(8 * 4).unwrap();
+        let a_data: Vec<u8> = [1.0f32, 0.0, 0.0, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let b_data = a_data.clone();
+        client.h2d(a, 0, &a_data).unwrap();
+        client.h2d(b, 0, &b_data).unwrap();
+        client
+            .launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::GemmNt,
+                    bufs: vec![a, b, c],
+                    i32s: vec![m, n, k],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+        client.sync().unwrap();
+        let out = client.d2h(c, 0, 16).unwrap();
+        let c00 = f32::from_le_bytes(out[0..4].try_into().unwrap());
+        assert!((c00 - 1.0).abs() < 1e-5, "c00={c00}");
+        client.free(a).unwrap();
+        client.free(b).unwrap();
+        client.free(c).unwrap();
+        drop(client);
+        th.join().unwrap();
+    }
 }
