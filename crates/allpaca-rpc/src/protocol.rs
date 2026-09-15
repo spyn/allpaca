@@ -118,6 +118,8 @@ pub struct HelloRequest {
     pub minor: u16,
     pub patch: u16,
     pub caps: u32,
+    /// Optional shared secret. Empty when the worker is loopback-only.
+    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,13 +154,11 @@ pub enum RpcError {
     #[error("rpc protocol: {0}")]
     Protocol(String),
     #[error("rpc version mismatch: server {major}.{minor}.{patch}")]
-    Version {
-        major: u16,
-        minor: u16,
-        patch: u16,
-    },
+    Version { major: u16, minor: u16, patch: u16 },
     #[error("rpc worker: {0}")]
     Worker(String),
+    #[error("rpc unauthorized")]
+    Unauthorized,
 }
 
 pub fn fnv1a64(data: &[u8]) -> u64 {
@@ -218,6 +218,10 @@ impl<'a> Cursor<'a> {
         Self { data, off: 0 }
     }
 
+    pub fn has_remaining(&self) -> bool {
+        self.off < self.data.len()
+    }
+
     pub fn u8(&mut self) -> Result<u8, RpcError> {
         if self.off >= self.data.len() {
             return Err(RpcError::Protocol("truncated u8".into()));
@@ -272,8 +276,7 @@ impl<'a> Cursor<'a> {
 
     pub fn str(&mut self) -> Result<String, RpcError> {
         let b = self.bytes()?;
-        String::from_utf8(b.to_vec())
-            .map_err(|_| RpcError::Protocol("invalid utf-8".into()))
+        String::from_utf8(b.to_vec()).map_err(|_| RpcError::Protocol("invalid utf-8".into()))
     }
 
     fn read_exact(&mut self, dest: &mut [u8]) -> Result<(), RpcError> {
@@ -292,17 +295,70 @@ pub fn encode_hello_req(req: &HelloRequest) -> Vec<u8> {
     write_u16(&mut w, req.minor);
     write_u16(&mut w, req.patch);
     write_u32(&mut w, req.caps);
+    if !req.token.is_empty() {
+        write_str(&mut w, &req.token);
+    }
     w
 }
 
 pub fn decode_hello_req(data: &[u8]) -> Result<HelloRequest, RpcError> {
     let mut c = Cursor::new(data);
+    let major = c.u16()?;
+    let minor = c.u16()?;
+    let patch = c.u16()?;
+    let caps = c.u32()?;
+    let token = if c.has_remaining() {
+        c.str()?
+    } else {
+        String::new()
+    };
     Ok(HelloRequest {
-        major: c.u16()?,
-        minor: c.u16()?,
-        patch: c.u16()?,
-        caps: c.u32()?,
+        major,
+        minor,
+        patch,
+        caps,
+        token,
     })
+}
+
+/// Constant-time compare for HELLO tokens (length mismatch is not constant-time).
+pub fn tokens_match(expected: &str, given: &str) -> bool {
+    if expected.len() != given.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(given.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+/// Loopback bind hosts that do not need `--insecure-bind` / `--token`.
+pub fn is_loopback_bind_host(host: &str) -> bool {
+    let h = host.trim().trim_matches(|c| c == '[' || c == ']');
+    h.eq_ignore_ascii_case("localhost")
+        || h == "::1"
+        || h == "0:0:0:0:0:0:0:1"
+        || h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Non-loopback RPC binds require an explicit insecure flag and a shared secret.
+pub fn check_rpc_bind(host: &str, insecure_bind: bool, token: &str) -> Result<(), RpcError> {
+    if is_loopback_bind_host(host) {
+        return Ok(());
+    }
+    if !insecure_bind {
+        return Err(RpcError::Protocol(
+            "refusing non-loopback bind without --insecure-bind (RPC has no TLS)".into(),
+        ));
+    }
+    if token.is_empty() {
+        return Err(RpcError::Protocol(
+            "refusing non-loopback bind without --token / ALLPACA_RPC_TOKEN".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn encode_hello_reply(r: &HelloReply) -> Vec<u8> {
@@ -324,8 +380,8 @@ pub fn decode_hello_reply(data: &[u8]) -> Result<HelloReply, RpcError> {
     let minor = c.u16()?;
     let patch = c.u16()?;
     let kernel_abi_rev = c.u32()?;
-    let backend = RpcBackendKind::from_u8(c.u8()?)
-        .ok_or_else(|| RpcError::Protocol("bad backend".into()))?;
+    let backend =
+        RpcBackendKind::from_u8(c.u8()?).ok_or_else(|| RpcError::Protocol("bad backend".into()))?;
     let dtype_mask = c.u32()?;
     let device_name = c.str()?;
     let memory_bytes = c.u64()?;
@@ -367,8 +423,8 @@ pub fn decode_launch_list(data: &[u8]) -> Result<LaunchList, RpcError> {
     let n = c.u32()? as usize;
     let mut items = Vec::with_capacity(n);
     for _ in 0..n {
-        let op = KernelOp::from_u8(c.u8()?)
-            .ok_or_else(|| RpcError::Protocol("bad kernel op".into()))?;
+        let op =
+            KernelOp::from_u8(c.u8()?).ok_or_else(|| RpcError::Protocol("bad kernel op".into()))?;
         let nb = c.u8()? as usize;
         let mut bufs = Vec::with_capacity(nb);
         for _ in 0..nb {

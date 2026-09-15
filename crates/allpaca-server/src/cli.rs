@@ -4,7 +4,10 @@ use allpaca_types::{CliOverrides, DeviceSelector, PipelineMode};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "allpaca-server", about = "Allpaca OpenAI-compatible inference server")]
+#[command(
+    name = "allpaca-server",
+    about = "Allpaca OpenAI-compatible inference server"
+)]
 pub struct Cli {
     /// TOML config file. CLI flags override file values; file overrides compiled defaults.
     #[arg(long)]
@@ -47,6 +50,9 @@ pub struct Cli {
     /// Comma-separated RPC workers (`host:port`).
     #[arg(long)]
     pub rpc: Option<String>,
+    /// Shared RPC HELLO token (also `ALLPACA_RPC_TOKEN`).
+    #[arg(long)]
+    pub rpc_token: Option<String>,
     /// Comma-separated relative layer split weights (local target, then RPC).
     #[arg(long)]
     pub tensor_split: Option<String>,
@@ -84,6 +90,7 @@ impl Cli {
             synthetic: self.synthetic,
             json_mode: self.json_mode,
             rpc_endpoints: self.rpc.as_deref().and_then(parse_csv_nonempty),
+            rpc_token: self.rpc_token.clone(),
             tensor_split: self.tensor_split.as_deref().and_then(parse_csv_nonempty),
         }
     }

@@ -12,15 +12,13 @@ pub struct RpcSession {
     stream: TcpStream,
     hello: HelloReply,
     endpoint: String,
+    token: String,
 }
 
 impl RpcSession {
     pub fn connect(addr: impl ToSocketAddrs + std::fmt::Display) -> Result<Self, RpcError> {
         let endpoint = addr.to_string();
-        let addrs: Vec<_> = addr
-            .to_socket_addrs()
-            .map_err(RpcError::from)?
-            .collect();
+        let addrs: Vec<_> = addr.to_socket_addrs().map_err(RpcError::from)?.collect();
         if addrs.is_empty() {
             return Err(RpcError::Protocol(format!("no addresses for {endpoint}")));
         }
@@ -28,6 +26,10 @@ impl RpcSession {
     }
 
     pub fn connect_addr(endpoint: &str) -> Result<Self, RpcError> {
+        Self::connect_addr_with_token(endpoint, "")
+    }
+
+    pub fn connect_addr_with_token(endpoint: &str, token: &str) -> Result<Self, RpcError> {
         let stream = TcpStream::connect(endpoint)?;
         stream.set_nodelay(true)?;
         let mut session = Self {
@@ -43,6 +45,7 @@ impl RpcSession {
                 memory_bytes: 0,
             },
             endpoint: endpoint.to_string(),
+            token: token.to_string(),
         };
         session.handshake()?;
         Ok(session)
@@ -54,12 +57,15 @@ impl RpcSession {
             minor: PROTO_MINOR,
             patch: PROTO_PATCH,
             caps: 0,
+            token: self.token.clone(),
         };
         let payload = encode_hello_req(&req);
         write_request(&mut self.stream, Cmd::Hello, &payload)?;
         let (status, body) = read_reply(&mut self.stream)?;
         if status != STATUS_OK {
-            return Err(RpcError::Worker(String::from_utf8_lossy(&body).into_owned()));
+            return Err(RpcError::Worker(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
         }
         let hello = decode_hello_reply(&body)?;
         check_hello(&hello)?;
@@ -83,7 +89,9 @@ impl RpcSession {
         write_request(&mut self.stream, cmd, payload)?;
         let (status, body) = read_reply(&mut self.stream)?;
         if status != STATUS_OK {
-            return Err(RpcError::Worker(String::from_utf8_lossy(&body).into_owned()));
+            return Err(RpcError::Worker(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
         }
         Ok(body)
     }

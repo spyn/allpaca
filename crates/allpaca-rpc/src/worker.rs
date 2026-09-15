@@ -5,10 +5,10 @@ use std::net::TcpStream;
 use allpaca_cpu::{attention, matmul_nt, rmsnorm, rope, silu};
 
 use crate::protocol::{
-    decode_hello_req, decode_launch_list, encode_hello_reply, fnv1a64, read_request, write_reply,
-    write_u32, write_u64, write_u8, BufId, Cmd, HelloReply, KernelOp, LaunchList, RpcBackendKind,
-    RpcError, DTYPE_F32, KERNEL_ABI_REV, PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR,
-    STATUS_OK,
+    decode_hello_req, decode_launch_list, encode_hello_reply, fnv1a64, read_request, tokens_match,
+    write_reply, write_u32, write_u64, write_u8, BufId, Cmd, HelloReply, KernelOp, LaunchList,
+    RpcBackendKind, RpcError, DTYPE_F32, KERNEL_ABI_REV, PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH,
+    STATUS_ERR, STATUS_OK,
 };
 
 struct Slot {
@@ -169,9 +169,18 @@ impl CpuWorker {
     ) -> Result<(), RpcError> {
         match op {
             KernelOp::GemmNt => {
-                let m = *i32s.first().ok_or_else(|| RpcError::Worker("gemm m".into()))? as usize;
-                let n = *i32s.get(1).ok_or_else(|| RpcError::Worker("gemm n".into()))? as usize;
-                let k = *i32s.get(2).ok_or_else(|| RpcError::Worker("gemm k".into()))? as usize;
+                let m = *i32s
+                    .first()
+                    .ok_or_else(|| RpcError::Worker("gemm m".into()))?
+                    as usize;
+                let n = *i32s
+                    .get(1)
+                    .ok_or_else(|| RpcError::Worker("gemm n".into()))?
+                    as usize;
+                let k = *i32s
+                    .get(2)
+                    .ok_or_else(|| RpcError::Worker("gemm k".into()))?
+                    as usize;
                 let a = f32_buf(self.slot(need(bufs, 0)?)?)?;
                 let b = f32_buf(self.slot(need(bufs, 1)?)?)?;
                 let mut c = f32_buf(self.slot(need(bufs, 2)?)?)?.to_vec();
@@ -180,17 +189,28 @@ impl CpuWorker {
             }
             KernelOp::Attention => {
                 let n_q = *i32s.first().unwrap_or(&1) as usize;
-                let n_kv = *i32s.get(1).ok_or_else(|| RpcError::Worker("attn n_kv".into()))? as usize;
-                let n_heads = *i32s.get(2).ok_or_else(|| RpcError::Worker("attn heads".into()))? as usize;
+                let n_kv = *i32s
+                    .get(1)
+                    .ok_or_else(|| RpcError::Worker("attn n_kv".into()))?
+                    as usize;
+                let n_heads = *i32s
+                    .get(2)
+                    .ok_or_else(|| RpcError::Worker("attn heads".into()))?
+                    as usize;
                 let n_kv_heads = *i32s.get(3).unwrap_or(&(n_heads as i32)) as usize;
-                let head_dim = *i32s.get(4).ok_or_else(|| RpcError::Worker("attn dim".into()))? as usize;
+                let head_dim = *i32s
+                    .get(4)
+                    .ok_or_else(|| RpcError::Worker("attn dim".into()))?
+                    as usize;
                 let causal = *i32s.get(5).unwrap_or(&1) != 0;
                 let q = f32_buf(self.slot(need(bufs, 0)?)?)?;
                 let k = f32_buf(self.slot(need(bufs, 1)?)?)?;
                 let v = f32_buf(self.slot(need(bufs, 2)?)?)?;
                 let mut out = f32_buf(self.slot(need(bufs, 3)?)?)?.to_vec();
-                attention(q, k, v, &mut out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)
-                    .map_err(map_kernel)?;
+                attention(
+                    q, k, v, &mut out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+                )
+                .map_err(map_kernel)?;
                 write_f32(self.slot_mut(need(bufs, 3)?)?, &out)?;
             }
             KernelOp::RmsNorm => {
@@ -204,7 +224,10 @@ impl CpuWorker {
             }
             KernelOp::Rope => {
                 let n_heads = *i32s.first().unwrap_or(&1) as usize;
-                let head_dim = *i32s.get(1).ok_or_else(|| RpcError::Worker("rope dim".into()))? as usize;
+                let head_dim = *i32s
+                    .get(1)
+                    .ok_or_else(|| RpcError::Worker("rope dim".into()))?
+                    as usize;
                 let pos = *i32s.get(2).unwrap_or(&0) as usize;
                 let theta = *f32s.first().unwrap_or(&10_000.0);
                 let mut x = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
@@ -237,7 +260,10 @@ impl CpuWorker {
                 write_f32(self.slot_mut(need(bufs, 0)?)?, &dst)?;
             }
             KernelOp::EmbedGather => {
-                let dim = *i32s.first().ok_or_else(|| RpcError::Worker("embed dim".into()))? as usize;
+                let dim = *i32s
+                    .first()
+                    .ok_or_else(|| RpcError::Worker("embed dim".into()))?
+                    as usize;
                 let table = f32_buf(self.slot(need(bufs, 0)?)?)?;
                 let ids = f32_buf(self.slot(need(bufs, 1)?)?)?;
                 // ids stored as f32 bit patterns of u32, or as u32 bytes in the buffer.
@@ -429,8 +455,13 @@ impl HipWorker {
         }
         let mut out = vec![0u8; size as usize];
         let src = unsafe { s.ptr.add(offset as usize) };
-        allpaca_hip::memcpy(out.as_mut_ptr(), src, size as usize, allpaca_hip::MEMCPY_D2H)
-            .map_err(|e| RpcError::Worker(e.to_string()))?;
+        allpaca_hip::memcpy(
+            out.as_mut_ptr(),
+            src,
+            size as usize,
+            allpaca_hip::MEMCPY_D2H,
+        )
+        .map_err(|e| RpcError::Worker(e.to_string()))?;
         Ok(out)
     }
 
@@ -535,7 +566,11 @@ impl HipWorker {
             KernelOp::ResidualAdd => {
                 let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
                 self.hip
-                    .residual_add(self.ptr_f32(need(bufs, 0)?)?, self.ptr_f32(need(bufs, 1)?)?, n)
+                    .residual_add(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        n,
+                    )
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::EmbedGather | KernelOp::Memcpy => {
@@ -552,8 +587,10 @@ impl HipWorker {
                     self.h2d(need(bufs, 0)?, 0, &tmp)?;
                     let _ = a;
                 } else {
-                    let table = self.d2h(need(bufs, 0)?, 0, self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                    let ids = self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
+                    let table =
+                        self.d2h(need(bufs, 0)?, 0, self.slot(need(bufs, 0)?)?.bytes as u64)?;
+                    let ids =
+                        self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
                     let out_n = self.slot(need(bufs, 2)?)?.bytes as u64;
                     let t = cpu.alloc(table.len() as u64)?;
                     let i = cpu.alloc(ids.len() as u64)?;
@@ -661,8 +698,17 @@ impl WorkerBackend {
 
 /// Serve one client on `stream` until disconnect. HELLO must be first.
 pub fn serve_connection<S: Read + Write>(
+    stream: S,
+    backend: WorkerBackend,
+) -> Result<(), RpcError> {
+    serve_connection_with_token(stream, backend, None)
+}
+
+/// Same as [`serve_connection`], checking an optional HELLO shared secret.
+pub fn serve_connection_with_token<S: Read + Write>(
     mut stream: S,
     mut backend: WorkerBackend,
+    expected_token: Option<&str>,
 ) -> Result<(), RpcError> {
     let mut saw_hello = false;
     loop {
@@ -675,12 +721,15 @@ pub fn serve_connection<S: Read + Write>(
             write_reply(&mut stream, STATUS_ERR, b"HELLO required")?;
             return Err(RpcError::Protocol("first command must be HELLO".into()));
         }
-        let result = handle(&mut backend, cmd, &payload, &mut saw_hello);
+        let result = handle(&mut backend, cmd, &payload, &mut saw_hello, expected_token);
         match result {
             Ok(body) => write_reply(&mut stream, STATUS_OK, &body)?,
             Err(e) => {
                 let msg = e.to_string();
                 write_reply(&mut stream, STATUS_ERR, msg.as_bytes())?;
+                if matches!(e, RpcError::Unauthorized) {
+                    return Err(e);
+                }
             }
         }
     }
@@ -691,10 +740,19 @@ pub fn serve_listener(
     listener: &std::net::TcpListener,
     backend: WorkerBackend,
 ) -> Result<(), RpcError> {
+    serve_listener_with_token(listener, backend, None)
+}
+
+/// Same as [`serve_listener`], checking an optional HELLO shared secret.
+pub fn serve_listener_with_token(
+    listener: &std::net::TcpListener,
+    backend: WorkerBackend,
+    expected_token: Option<&str>,
+) -> Result<(), RpcError> {
     let (stream, addr) = listener.accept()?;
     tracing::info!(%addr, "rpc client connected");
     stream.set_nodelay(true)?;
-    serve_connection(stream, backend)
+    serve_connection_with_token(stream, backend, expected_token)
 }
 
 pub fn serve_tcp(stream: TcpStream, backend: WorkerBackend) -> Result<(), RpcError> {
@@ -707,6 +765,7 @@ fn handle(
     cmd: Cmd,
     payload: &[u8],
     saw_hello: &mut bool,
+    expected_token: Option<&str>,
 ) -> Result<Vec<u8>, RpcError> {
     use crate::protocol::Cursor;
     match cmd {
@@ -718,6 +777,11 @@ fn handle(
                     minor: req.minor,
                     patch: req.patch,
                 });
+            }
+            if let Some(expected) = expected_token.filter(|t| !t.is_empty()) {
+                if !tokens_match(expected, &req.token) {
+                    return Err(RpcError::Unauthorized);
+                }
             }
             *saw_hello = true;
             Ok(encode_hello_reply(&backend.hello()))

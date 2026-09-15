@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allpaca_core::{Engine, ImageInput};
-use allpaca_types::{AllpacaError, Config, DeviceInfo, FatalError, FinishReason, GenerationParams, StatsSnapshot};
+use allpaca_types::{
+    AllpacaError, Config, DeviceInfo, FinishReason, GenerationParams, StatsSnapshot,
+};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware;
@@ -18,6 +20,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, AuthState};
 use crate::host::{HostSampler, HostSnapshot};
+use crate::image_url::load_image_url;
 use crate::logs::LogRing;
 use crate::ui;
 
@@ -31,12 +34,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
-        engine: Arc<Engine>,
-        config: Config,
-        auth: AuthState,
-        logs: LogRing,
-    ) -> Self {
+    pub fn new(engine: Arc<Engine>, config: Config, auth: AuthState, logs: LogRing) -> Self {
         Self {
             engine,
             config,
@@ -239,148 +237,7 @@ fn messages_to_prompt_and_images(
         .iter()
         .map(|(r, c)| (r.as_str(), c.as_str()))
         .collect();
-    Ok((
-        allpaca_core::format_chat_colon(&pairs, true),
-        images,
-    ))
-}
-
-fn load_image_url(url: &str) -> Result<ImageInput, AllpacaError> {
-    let raw = url.trim();
-    if raw.starts_with("data:") {
-        return load_data_uri(raw);
-    }
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        return fetch_http_image(raw);
-    }
-    let path = resolve_image_path(raw)?;
-    let bytes = std::fs::read(&path).map_err(|e| {
-        AllpacaError::Fatal(FatalError::Io(format!(
-            "read image {}: {e}",
-            path.display()
-        )))
-    })?;
-    let mime = mime_from_path(&path);
-    Ok(ImageInput::new(bytes, mime))
-}
-
-fn fetch_http_image(url: &str) -> Result<ImageInput, AllpacaError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("allpaca/0.1")
-        .build()
-        .map_err(|e| {
-            AllpacaError::Fatal(FatalError::Io(format!("http client init: {e}")))
-        })?;
-    let resp = client.get(url).send().map_err(|e| {
-        AllpacaError::Fatal(FatalError::Io(format!("fetch image_url: {e}")))
-    })?;
-    if !resp.status().is_success() {
-        return Err(AllpacaError::Fatal(FatalError::Io(format!(
-            "fetch image_url {}: HTTP {}",
-            url,
-            resp.status()
-        ))));
-    }
-    let mime = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
-        .filter(|s| s.starts_with("image/"))
-        .unwrap_or_else(|| mime_from_url_path(url));
-    let bytes = resp.bytes().map_err(|e| {
-        AllpacaError::Fatal(FatalError::Io(format!("read image_url body: {e}")))
-    })?;
-    Ok(ImageInput::new(bytes.to_vec(), mime))
-}
-
-fn mime_from_url_path(url: &str) -> String {
-    let path = url.split('?').next().unwrap_or(url);
-    mime_from_path(std::path::Path::new(path))
-}
-
-fn load_data_uri(url: &str) -> Result<ImageInput, AllpacaError> {
-    // data:[<mime>][;base64],<data>
-    let rest = url
-        .strip_prefix("data:")
-        .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig("invalid data URI".into())))?;
-    let (meta, payload) = rest.split_once(',').ok_or_else(|| {
-        AllpacaError::Fatal(FatalError::InvalidConfig(
-            "data URI missing comma separator".into(),
-        ))
-    })?;
-    let mut mime = "application/octet-stream".to_string();
-    let mut is_b64 = false;
-    for part in meta.split(';').filter(|p| !p.is_empty()) {
-        if part.eq_ignore_ascii_case("base64") {
-            is_b64 = true;
-        } else if part.contains('/') {
-            mime = part.to_ascii_lowercase();
-        }
-    }
-    let bytes = if is_b64 {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .decode(payload.trim().as_bytes())
-            .map_err(|e| {
-                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-                    "invalid data URI base64: {e}"
-                )))
-            })?
-    } else {
-        // Percent-decoded raw payload is uncommon for images; keep bytes as UTF-8 text.
-        payload.as_bytes().to_vec()
-    };
-    Ok(ImageInput::new(bytes, mime))
-}
-
-fn resolve_image_path(url: &str) -> Result<std::path::PathBuf, AllpacaError> {
-    let raw = url.trim();
-    let path = if let Some(rest) = raw.strip_prefix("file://") {
-        // file:///C:/... or file://localhost/C:/... or file:/C:/...
-        let rest = rest
-            .strip_prefix("//")
-            .unwrap_or(rest)
-            .strip_prefix("localhost/")
-            .unwrap_or(rest);
-        #[cfg(windows)]
-        let rest = rest.strip_prefix('/').unwrap_or(rest);
-        std::path::PathBuf::from(rest)
-    } else if raw.starts_with("http://") || raw.starts_with("https://") {
-        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-            "http(s) image_url must be handled by load_image_url".into(),
-        )));
-    } else if raw.starts_with("data:") {
-        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-            "data URI must be handled by load_image_url".into(),
-        )));
-    } else {
-        std::path::PathBuf::from(raw)
-    };
-    if !path.is_file() {
-        return Err(AllpacaError::Fatal(FatalError::Io(format!(
-            "image_url path not found: {}",
-            path.display()
-        ))));
-    }
-    Ok(path)
-}
-
-fn mime_from_path(path: &std::path::Path) -> String {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png".into(),
-        Some("gif") => "image/gif".into(),
-        Some("webp") => "image/webp".into(),
-        Some("avif") => "image/avif".into(),
-        Some("jpg") | Some("jpeg") => "image/jpeg".into(),
-        _ => "application/octet-stream".into(),
-    }
+    Ok((allpaca_core::format_chat_colon(&pairs, true), images))
 }
 
 fn params_from_request(req: &ChatCompletionRequest, config: &Config) -> GenerationParams {
@@ -398,8 +255,9 @@ fn params_from_request(req: &ChatCompletionRequest, config: &Config) -> Generati
         }
     });
     let grammar = format.and_then(|f| f.grammar.clone());
+    let requested = req.max_tokens.unwrap_or(32).max(1);
     GenerationParams {
-        max_tokens: req.max_tokens.unwrap_or(32),
+        max_tokens: requested.min(config.http.max_tokens.max(1)),
         temperature: req.temperature.unwrap_or(config.sampling.temperature),
         top_k: req.top_k.unwrap_or(config.sampling.top_k),
         top_p: req.top_p.unwrap_or(config.sampling.top_p),
@@ -452,24 +310,22 @@ async fn chat_completions(
         }
     };
     let params = params_from_request(&req, &state.config);
-    let model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| state.engine.model_id());
+    let model = req.model.clone().unwrap_or_else(|| state.engine.model_id());
     let id = format!("chatcmpl-{}", now_secs());
     let created = now_secs();
     tracing::info!("chat completion model={model} stream={}", req.stream);
 
     if req.stream {
-        return stream_completion(state, prompt, images, params, model, id, created).into_response();
+        return stream_completion(state, prompt, images, params, model, id, created)
+            .into_response();
     }
 
     if state.config.engine.max_active_requests > 1 {
-        let mut stream = Box::pin(
-            state
-                .engine
-                .generate_stream_multimodal(prompt.clone(), images, params),
-        );
+        let mut stream = Box::pin(state.engine.generate_stream_multimodal(
+            prompt.clone(),
+            images,
+            params,
+        ));
         let mut text = String::new();
         let mut completion_tokens = 0usize;
         let mut finish = FinishReason::Stop;
@@ -563,9 +419,7 @@ fn stream_completion(
                 "model": model,
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
             });
-            let _ = tx
-                .send(Ok(Event::default().data(first.to_string())))
-                .await;
+            let _ = tx.send(Ok(Event::default().data(first.to_string()))).await;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(ev) => {
@@ -580,7 +434,11 @@ fn stream_completion(
                                 "finish_reason": ev.finish_reason.map(finish_name)
                             }]
                         });
-                        if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                        if tx
+                            .send(Ok(Event::default().data(chunk.to_string())))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -596,8 +454,11 @@ fn stream_completion(
     } else {
         let rt = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            let mut stream =
-                Box::pin(state.engine.generate_stream_multimodal(prompt, images, params));
+            let mut stream = Box::pin(
+                state
+                    .engine
+                    .generate_stream_multimodal(prompt, images, params),
+            );
             rt.block_on(async {
                 let first = serde_json::json!({
                     "id": id,
@@ -606,9 +467,7 @@ fn stream_completion(
                     "model": model,
                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
                 });
-                let _ = tx
-                    .send(Ok(Event::default().data(first.to_string())))
-                    .await;
+                let _ = tx.send(Ok(Event::default().data(first.to_string()))).await;
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(ev) => {
@@ -623,7 +482,11 @@ fn stream_completion(
                                     "finish_reason": ev.finish_reason.map(finish_name)
                                 }]
                             });
-                            if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                            if tx
+                                .send(Ok(Event::default().data(chunk.to_string())))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -766,11 +629,7 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
         "Cross-request micro-batch stagger plans",
         s.micro_batch_plans
     );
-    gauge!(
-        "allpaca_vram_pages",
-        "KV pages in VRAM",
-        s.vram_pages
-    );
+    gauge!("allpaca_vram_pages", "KV pages in VRAM", s.vram_pages);
     gauge!(
         "allpaca_dram_pages",
         "KV pages in pinned DRAM",
@@ -859,6 +718,16 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/images.jpg")
     }
 
+    fn repo_jpg_data_uri() -> Option<(Vec<u8>, String)> {
+        let path = repo_models_jpg();
+        if !path.is_file() {
+            return None;
+        }
+        let raw = std::fs::read(&path).ok()?;
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw);
+        Some((raw, format!("data:image/jpeg;base64,{b64}")))
+    }
+
     fn authed_state(password: &str) -> AppState {
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
@@ -880,7 +749,12 @@ mod tests {
         let app = router(test_state());
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -891,7 +765,12 @@ mod tests {
         assert_eq!(models["data"][0]["object"], "model");
 
         let res = app
-            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -906,7 +785,12 @@ mod tests {
     async fn prometheus_metrics_exposes_allpaca_prefix() {
         let app = router(test_state());
         let res = app
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -980,10 +864,8 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let (res_a, res_b) = tokio::join!(
-            app.clone().oneshot(make_req()),
-            app.oneshot(make_req()),
-        );
+        let (res_a, res_b) =
+            tokio::join!(app.clone().oneshot(make_req()), app.oneshot(make_req()),);
         assert_eq!(res_a.expect("a").status(), StatusCode::OK);
         assert_eq!(res_b.expect("b").status(), StatusCode::OK);
         let stats = state.engine.stats();
@@ -1020,7 +902,12 @@ mod tests {
         assert_eq!(res_b.expect("b").status(), StatusCode::OK);
 
         let res = app
-            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -1066,10 +953,8 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let (res_a, res_b) = tokio::join!(
-            app.clone().oneshot(make_req()),
-            app.oneshot(make_req()),
-        );
+        let (res_a, res_b) =
+            tokio::join!(app.clone().oneshot(make_req()), app.oneshot(make_req()),);
         let res_a = res_a.expect("request a");
         let res_b = res_b.expect("request b");
         assert_ne!(
@@ -1114,10 +999,8 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let (res_a, res_b) = tokio::join!(
-            app.clone().oneshot(make_req()),
-            app.oneshot(make_req()),
-        );
+        let (res_a, res_b) =
+            tokio::join!(app.clone().oneshot(make_req()), app.oneshot(make_req()),);
         let res_a = res_a.expect("a");
         let res_b = res_b.expect("b");
         assert_eq!(res_a.status(), StatusCode::OK);
@@ -1137,7 +1020,12 @@ mod tests {
     async fn stats_exposes_draft_depth_field() {
         let app = router(test_state());
         let res = app
-            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
@@ -1223,16 +1111,32 @@ mod tests {
     }
 
     #[test]
-    fn image_url_loads_local_jpg_into_image_input() {
+    fn image_url_rejects_local_path() {
         let path = repo_models_jpg();
         if !path.is_file() {
             eprintln!(
-                "skip image_url_loads_local_jpg_into_image_input: missing {}",
+                "skip image_url_rejects_local_path: missing {}",
                 path.display()
             );
             return;
         }
         let url = path.to_string_lossy().replace('\\', "/");
+        let err = load_image_url(&url).expect_err("filesystem image_url must be rejected");
+        assert!(
+            err.to_string().contains("file paths are not allowed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn image_url_loads_local_jpg_as_data_uri() {
+        let Some((raw, url)) = repo_jpg_data_uri() else {
+            eprintln!(
+                "skip image_url_loads_local_jpg_as_data_uri: missing {}",
+                repo_models_jpg().display()
+            );
+            return;
+        };
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: MessageContent::Parts(vec![
@@ -1240,7 +1144,7 @@ mod tests {
                     text: "what is this?".into(),
                 },
                 ContentPart::ImageUrl {
-                    image_url: ImageUrlSpec { url: url.clone() },
+                    image_url: ImageUrlSpec { url },
                 },
             ]),
         }];
@@ -1248,24 +1152,18 @@ mod tests {
         assert!(prompt.contains("what is this?"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime, "image/jpeg");
-        assert!(
-            images[0].bytes.len() > 1000,
-            "expected jpeg payload, got {} bytes",
-            images[0].bytes.len()
-        );
+        assert_eq!(images[0].bytes, raw);
     }
 
     #[tokio::test]
     async fn chat_completion_local_image_url_degraded_without_encoder() {
-        let path = repo_models_jpg();
-        if !path.is_file() {
+        let Some((_, url)) = repo_jpg_data_uri() else {
             eprintln!(
                 "skip chat_completion_local_image_url_degraded_without_encoder: missing {}",
-                path.display()
+                repo_models_jpg().display()
             );
             return;
-        }
-        let url = path.to_string_lossy().replace('\\', "/");
+        };
         let app = router(test_state());
         let body = serde_json::json!({
             "model": "synthetic",
@@ -1315,10 +1213,7 @@ mod tests {
             }
         }
         impl VisionEncoder for StubEnc {
-            fn encode(
-                &self,
-                images: &[ImageInput],
-            ) -> Result<VisionTokens, AllpacaError> {
+            fn encode(&self, images: &[ImageInput]) -> Result<VisionTokens, AllpacaError> {
                 assert!(!images.is_empty());
                 Ok(VisionTokens {
                     embeddings: vec![0.1; 2 * 32],
@@ -1328,20 +1223,15 @@ mod tests {
             }
         }
 
-        let path = repo_models_jpg();
-        if !path.is_file() {
+        let Some((_, url)) = repo_jpg_data_uri() else {
             eprintln!(
                 "skip chat_completion_local_image_url_with_stub_encoder: missing {}",
-                path.display()
+                repo_models_jpg().display()
             );
             return;
-        }
-        let url = path.to_string_lossy().replace('\\', "/");
+        };
         let state = test_state();
-        state
-            .engine
-            .set_vision_encoder(Arc::new(StubEnc))
-            .unwrap();
+        state.engine.set_vision_encoder(Arc::new(StubEnc)).unwrap();
         let text_only = state
             .engine
             .generate(
@@ -1485,7 +1375,10 @@ mod tests {
             text.contains("chat.completion.chunk"),
             "stream must emit OpenAI chunks: {text}"
         );
-        assert!(text.contains("[DONE]"), "stream must terminate with [DONE]: {text}");
+        assert!(
+            text.contains("[DONE]"),
+            "stream must terminate with [DONE]: {text}"
+        );
         assert!(
             text.contains("\"content\"") || text.contains("assistant"),
             "stream must carry token or role deltas: {text}"
@@ -1504,10 +1397,7 @@ mod tests {
             }
         }
         impl VisionEncoder for StubEnc {
-            fn encode(
-                &self,
-                images: &[ImageInput],
-            ) -> Result<VisionTokens, AllpacaError> {
+            fn encode(&self, images: &[ImageInput]) -> Result<VisionTokens, AllpacaError> {
                 assert!(!images.is_empty());
                 assert_eq!(images[0].mime, "image/jpeg");
                 Ok(VisionTokens {
@@ -1530,10 +1420,7 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
         let url = format!("data:image/jpeg;base64,{b64}");
         let state = test_state();
-        state
-            .engine
-            .set_vision_encoder(Arc::new(StubEnc))
-            .unwrap();
+        state.engine.set_vision_encoder(Arc::new(StubEnc)).unwrap();
         let app = router(state);
         let body = serde_json::json!({
             "model": "synthetic",
@@ -1571,7 +1458,10 @@ mod tests {
             text.contains("chat.completion.chunk"),
             "stream must emit OpenAI chunks: {text}"
         );
-        assert!(text.contains("[DONE]"), "stream must terminate with [DONE]: {text}");
+        assert!(
+            text.contains("[DONE]"),
+            "stream must terminate with [DONE]: {text}"
+        );
         assert!(
             !text.contains("\"error\""),
             "stub encoder stream must succeed: {text}"
@@ -1596,7 +1486,12 @@ mod tests {
         let app = router(authed_state("secret"));
         let denied = app
             .clone()
-            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
@@ -1651,6 +1546,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_rate_limit_after_repeated_failures() {
+        let app = router(authed_state("secret"));
+        for i in 0..5 {
+            let bad = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"password":"nope"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(bad.status(), StatusCode::UNAUTHORIZED, "fail {i}");
+        }
+        let limited = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn params_clamp_max_tokens_to_http_cap() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.http.max_tokens = 8;
+        let req = ChatCompletionRequest {
+            model: None,
+            messages: vec![],
+            stream: false,
+            max_tokens: Some(1_000_000),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            response_format: None,
+        };
+        assert_eq!(params_from_request(&req, &cfg).max_tokens, 8);
+    }
+
+    #[tokio::test]
     async fn bearer_reaches_chat_completions() {
         let app = router(authed_state("secret"));
         let res = app
@@ -1679,7 +1624,9 @@ mod tests {
     #[tokio::test]
     async fn logs_and_status_after_auth() {
         let state = authed_state("secret");
-        state.logs.push("INFO", "allpaca.webui", "webui-test-line".into());
+        state
+            .logs
+            .push("INFO", "allpaca.webui", "webui-test-line".into());
         let app = router(state);
         let res = app
             .clone()
@@ -1767,11 +1714,9 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let lines = json["lines"].as_array().cloned().unwrap_or_default();
         assert!(
-            lines
-                .iter()
-                .any(|l| l["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("chat completion"))),
+            lines.iter().any(|l| l["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("chat completion"))),
             "{json}"
         );
     }
@@ -1781,9 +1726,8 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let ring = LogRing::new(32);
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(ring.layer()),
-        );
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(ring.layer()));
         tracing::info!("webui-trace-event");
         assert!(
             ring.snapshot()

@@ -129,6 +129,11 @@ impl Config {
         if let Some(endpoints) = &cli.rpc_endpoints {
             self.rpc.endpoints = endpoints.clone();
         }
+        if let Some(token) = &cli.rpc_token {
+            if !token.is_empty() {
+                self.rpc.token = Some(token.clone());
+            }
+        }
         if let Some(split) = &cli.tensor_split {
             let mut weights = Vec::new();
             for part in split {
@@ -173,6 +178,11 @@ impl Config {
         if self.weights.ring_slots > 2 {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "weights.ring_slots must be 0..=2".into(),
+            )));
+        }
+        if self.http.max_tokens == 0 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "http.max_tokens must be > 0".into(),
             )));
         }
         Ok(())
@@ -258,6 +268,9 @@ pub struct RpcSection {
     pub tensor_split: Option<Vec<f64>>,
     /// KV sequence cap for remote layer caches.
     pub max_seq: usize,
+    /// Shared HELLO secret (`--rpc-token` / `ALLPACA_RPC_TOKEN`). Empty = loopback workers only.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 impl Default for RpcSection {
@@ -266,6 +279,7 @@ impl Default for RpcSection {
             endpoints: Vec::new(),
             tensor_split: None,
             max_seq: 2048,
+            token: None,
         }
     }
 }
@@ -538,9 +552,17 @@ pub struct HttpSection {
     pub host: String,
     pub port: u16,
     /// Shared operator password for the WebUI cookie and `Authorization: Bearer`.
-    /// Empty/unset: the server binary generates one at boot and logs it once.
+    /// Empty/unset: the server binary generates one at boot and prints it to stderr
+    /// (not tracing / `/v1/logs`).
     #[serde(default)]
     pub password: Option<String>,
+    /// Cap for request `max_tokens`. WebUI slider max is 4096.
+    #[serde(default = "default_http_max_tokens")]
+    pub max_tokens: usize,
+}
+
+fn default_http_max_tokens() -> usize {
+    4096
 }
 
 impl Default for HttpSection {
@@ -549,6 +571,7 @@ impl Default for HttpSection {
             host: "127.0.0.1".into(),
             port: 8080,
             password: None,
+            max_tokens: default_http_max_tokens(),
         }
     }
 }
@@ -622,6 +645,8 @@ pub struct CliOverrides {
     pub json_mode: Option<bool>,
     /// Comma-separated `host:port` RPC workers.
     pub rpc_endpoints: Option<Vec<String>>,
+    /// Shared RPC HELLO token (`--rpc-token`).
+    pub rpc_token: Option<String>,
     /// Comma-separated relative layer weights (same order as local target + RPC).
     pub tensor_split: Option<Vec<String>>,
 }
@@ -674,7 +699,8 @@ mod tests {
     #[test]
     fn example_config_file_parses() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../allpaca.example.toml");
-        let cfg = Config::from_toml_file(&path).expect(path.to_str().unwrap_or("allpaca.example.toml"));
+        let cfg =
+            Config::from_toml_file(&path).expect(path.to_str().unwrap_or("allpaca.example.toml"));
         assert_eq!(cfg.http.host, "127.0.0.1");
         assert_eq!(cfg.http.port, 8080);
         assert_eq!(cfg.http.password.as_deref(), Some("changeme"));
@@ -724,12 +750,12 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(
-            cfg.multimodal.vision_device,
-            Some(DeviceSelector::Hip(1))
-        );
+        assert_eq!(cfg.multimodal.vision_device, Some(DeviceSelector::Hip(1)));
         assert_eq!(cfg.multimodal.vision_n_blocks, 1);
-        assert!(Config::compiled_defaults().multimodal.vision_device.is_none());
+        assert!(Config::compiled_defaults()
+            .multimodal
+            .vision_device
+            .is_none());
         assert_eq!(Config::compiled_defaults().multimodal.vision_n_blocks, 0);
     }
 
@@ -763,7 +789,10 @@ mod tests {
         let mut bad = Config::compiled_defaults();
         bad.weights.ring_slots = 3;
         let err = bad.validate().unwrap_err();
-        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
+        assert!(matches!(
+            err,
+            AllpacaError::Fatal(FatalError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -791,7 +820,10 @@ mod tests {
         bad.prefill.chunk_tokens = 0;
         let err = bad.validate().unwrap_err();
         assert_eq!(err.class(), crate::ErrorClass::Fatal);
-        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
+        assert!(matches!(
+            err,
+            AllpacaError::Fatal(FatalError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -819,7 +851,10 @@ mod tests {
         bad.engine.max_active_requests = 0;
         let err = bad.validate().unwrap_err();
         assert_eq!(err.class(), crate::ErrorClass::Fatal);
-        assert!(matches!(err, AllpacaError::Fatal(FatalError::InvalidConfig(_))));
+        assert!(matches!(
+            err,
+            AllpacaError::Fatal(FatalError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -844,7 +879,10 @@ mod tests {
         .unwrap();
         assert!(cfg.speculative.tree.enabled);
         assert_eq!(cfg.speculative.tree.max_nodes, 16);
-        assert!(cfg.speculative.enabled, "tree is composable, not a Pipeline Mode");
+        assert!(
+            cfg.speculative.enabled,
+            "tree is composable, not a Pipeline Mode"
+        );
     }
 
     #[test]

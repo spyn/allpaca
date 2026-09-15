@@ -26,4 +26,4 @@ Remote accelerators are **another device**, reached by a versioned kernel-ABI RP
 
 - Decode that already fits on one machine will not get faster; RPC trades latency for capacity.
 - Activation host-bounce at device boundaries is recorded in `rpc_activation_bytes`.
-- HELLO major must match on every machine. There is no authentication in v1; default bind is localhost.
+- HELLO major must match on every machine. Non-loopback worker binds require `--insecure-bind` and a shared HELLO `--token` / `ALLPACA_RPC_TOKEN`. Default bind is localhost.

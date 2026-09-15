@@ -9,12 +9,15 @@ mod session;
 mod worker;
 
 pub use protocol::{
-    encode_hello_reply, fnv1a64, write_reply, BufId, Cmd, HelloReply, HelloRequest, KernelOp,
-    LaunchItem, LaunchList, RpcBackendKind, KERNEL_ABI_REV, PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH,
-    STATUS_ERR, STATUS_OK,
+    check_rpc_bind, encode_hello_reply, fnv1a64, is_loopback_bind_host, write_reply, BufId, Cmd,
+    HelloReply, HelloRequest, KernelOp, LaunchItem, LaunchList, RpcBackendKind, KERNEL_ABI_REV,
+    PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
 };
 pub use session::RpcSession;
-pub use worker::{serve_connection, serve_listener, serve_tcp, CpuWorker, WorkerBackend};
+pub use worker::{
+    serve_connection, serve_connection_with_token, serve_listener, serve_listener_with_token,
+    serve_tcp, CpuWorker, WorkerBackend,
+};
 
 #[cfg(feature = "hip")]
 pub use worker::HipWorker;
@@ -36,6 +39,7 @@ mod tests {
             minor: PROTO_MINOR,
             patch: PROTO_PATCH,
             caps: 3,
+            token: String::new(),
         };
         let bytes = encode_hello_req(&req);
         let back = crate::protocol::decode_hello_req(&bytes).unwrap();
@@ -104,6 +108,75 @@ mod tests {
         client.free(a).unwrap();
         client.free(b).unwrap();
         client.free(c).unwrap();
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn hello_token_roundtrip() {
+        let req = HelloRequest {
+            major: PROTO_MAJOR,
+            minor: PROTO_MINOR,
+            patch: PROTO_PATCH,
+            caps: 0,
+            token: "s3cret".into(),
+        };
+        let back = crate::protocol::decode_hello_req(&encode_hello_req(&req)).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn loopback_bind_hosts() {
+        assert!(is_loopback_bind_host("127.0.0.1"));
+        assert!(is_loopback_bind_host("localhost"));
+        assert!(is_loopback_bind_host("::1"));
+        assert!(is_loopback_bind_host("[::1]"));
+        assert!(!is_loopback_bind_host("0.0.0.0"));
+        assert!(!is_loopback_bind_host("10.0.0.2"));
+        assert!(check_rpc_bind("127.0.0.1", false, "").is_ok());
+        assert!(check_rpc_bind("0.0.0.0", false, "tok").is_err());
+        assert!(check_rpc_bind("0.0.0.0", true, "").is_err());
+        assert!(check_rpc_bind("0.0.0.0", true, "tok").is_ok());
+    }
+
+    #[test]
+    fn hello_token_mismatch_rejects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection_with_token(
+                stream,
+                WorkerBackend::Cpu(CpuWorker::new(8 << 20)),
+                Some("expected"),
+            )
+        });
+        let err = match RpcSession::connect_addr_with_token(&addr.to_string(), "wrong") {
+            Ok(_) => panic!("expected unauthorized HELLO"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, RpcError::Worker(_)) || matches!(err, RpcError::Unauthorized),
+            "{err}"
+        );
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn hello_token_match_accepts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection_with_token(
+                stream,
+                WorkerBackend::Cpu(CpuWorker::new(8 << 20)),
+                Some("shared"),
+            )
+            .unwrap();
+        });
+        let client = RpcSession::connect_addr_with_token(&addr.to_string(), "shared").unwrap();
+        assert_eq!(client.hello().major, PROTO_MAJOR);
         drop(client);
         worker.join().unwrap();
     }

@@ -89,7 +89,8 @@ mod tests {
         let mut buf = vec![0u8; 65536];
         let n = stream.read(&mut buf).expect("read");
         let req = String::from_utf8_lossy(&buf[..n]).to_string();
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ =
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         req
     }
 
@@ -107,7 +108,10 @@ mod tests {
 
         let req = rx.recv_timeout(Duration::from_secs(5)).expect("request");
         assert!(req.starts_with("POST /v1/metrics "), "path: {req}");
-        assert!(req.contains("Content-Type: application/json") || req.contains("content-type: application/json"));
+        assert!(
+            req.contains("Content-Type: application/json")
+                || req.contains("content-type: application/json")
+        );
         assert!(req.contains("resourceMetrics"));
         assert!(req.contains("allpaca_requests_total"));
     }

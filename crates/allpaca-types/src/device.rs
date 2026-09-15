@@ -256,10 +256,7 @@ mod tests {
             DeviceSelector::parse("cuda:0").unwrap(),
             DeviceSelector::Cuda(0)
         );
-        assert_eq!(
-            DeviceSelector::parse("auto").unwrap(),
-            DeviceSelector::Auto
-        );
+        assert_eq!(DeviceSelector::parse("auto").unwrap(), DeviceSelector::Auto);
         assert!(DeviceSelector::parse("tpu:0").is_err());
     }
 }

@@ -1,6 +1,6 @@
 use std::net::TcpListener;
 
-use allpaca_rpc::{serve_listener, CpuWorker, WorkerBackend};
+use allpaca_rpc::{CpuWorker, WorkerBackend};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -25,6 +25,12 @@ struct Cli {
     /// Advertised worker memory in MiB (CPU backend). 0 = 8 GiB default.
     #[arg(short = 'm', long = "mem", default_value_t = 0)]
     mem_mib: u64,
+    /// Required to bind a non-loopback address. Also requires `--token`.
+    #[arg(long)]
+    insecure_bind: bool,
+    /// Shared HELLO secret. Required for non-loopback binds. Env: `ALLPACA_RPC_TOKEN`.
+    #[arg(long)]
+    token: Option<String>,
 }
 
 fn main() {
@@ -40,26 +46,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
-    if cli.host != "127.0.0.1" && cli.host != "localhost" && cli.host != "::1" {
-        eprintln!(
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
-             WARNING: allpaca-rpc-server has no authentication.\n\
-             Bound to {} — anyone who can reach this port can run\n\
-             kernels and read worker memory. Do not expose it on an\n\
-             open network. Use a private LAN or a VPN.\n\
-             !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
-            cli.host
+    let token = rpc_token(&cli);
+    allpaca_rpc::check_rpc_bind(&cli.host, cli.insecure_bind, &token)?;
+    if !allpaca_rpc::is_loopback_bind_host(&cli.host) {
+        tracing::warn!(
+            host = %cli.host,
+            "rpc worker bound off-loopback; HELLO token required, still no TLS"
         );
     }
 
     let addr = format!("{}:{}", cli.host, cli.port);
     let listener = TcpListener::bind(&addr)?;
     tracing::info!(%addr, "allpaca-rpc-server listening");
+    let token = if token.is_empty() { None } else { Some(token) };
     loop {
         let backend = open_backend(&cli)?;
-        serve_listener(&listener, backend)?;
+        allpaca_rpc::serve_listener_with_token(&listener, backend, token.as_deref())?;
         tracing::info!("rpc client disconnected; waiting for next");
     }
+}
+
+fn rpc_token(cli: &Cli) -> String {
+    if let Some(t) = cli
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return t.to_string();
+    }
+    std::env::var("ALLPACA_RPC_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
 }
 
 fn open_backend(cli: &Cli) -> Result<WorkerBackend, Box<dyn std::error::Error>> {

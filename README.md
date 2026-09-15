@@ -177,7 +177,7 @@ Engine forwards remain HIP until CUDA parity lands.
 cargo run -p allpaca-server -- --synthetic --cpu-only --host 127.0.0.1 --port 8080 --ui-password secret
 ```
 
-Open `http://127.0.0.1:8080` and sign in. If `--ui-password` / `[http] password` is omitted, the server prints `webui password: …` once at boot. The same secret is `Authorization: Bearer` for API clients.
+Open `http://127.0.0.1:8080` and sign in. If `--ui-password` / `[http] password` is omitted, the server prints `webui password: …` once to stderr (not tracing / `GET /v1/logs`). The same secret is `Authorization: Bearer` for API clients.
 
 Headless on a LAN: `--host 0.0.0.0` plus a password. There is no TLS in v1.
 
@@ -255,11 +255,12 @@ cargo run -p allpaca-bench -- --tokens 32 --prompt "hello world"
 | `--pipeline-mode asymmetric\|symmetric\|mobile_tiered` | Feature-flag profile |
 | `--target-device` / `--draft-device` | Device selectors |
 | `--rpc host:port,...` | Remote kernel-ABI workers (layer-split) |
+| `--rpc-token` | Shared RPC HELLO secret (`ALLPACA_RPC_TOKEN`) |
 | `--tensor-split a,b,...` | Relative layer weights (local target, then RPC) |
 
 ### RPC workers (multi-machine)
 
-RPC pools VRAM so a model that does not fit one machine can still run. It does **not** make decode faster than a single box that already fits the model. Pin the same allpaca version on every machine (HELLO major must match). Do not expose workers on an open network.
+RPC pools VRAM so a model that does not fit one machine can still run. It does **not** make decode faster than a single box that already fits the model. Pin the same allpaca version on every machine (HELLO major must match). Non-loopback worker binds require `--insecure-bind` and `--token` / `ALLPACA_RPC_TOKEN`.
 
 ```bash
 # worker
@@ -269,7 +270,7 @@ cargo run -p allpaca-rpc-server -- --cpu-only -H 127.0.0.1 -p 50052
 cargo run -p allpaca-server -- --synthetic --cpu-only --rpc 127.0.0.1:50052 --port 8080
 ```
 
-HIP worker: `cargo run -p allpaca-rpc-server --features hip -- --device hip:0 -H 0.0.0.0 -p 50052`. CUDA workers wait on engine CUDA parity; a CUDA-only box can still run `--cpu-only` for RAM overflow.
+HIP worker on a LAN: `cargo run -p allpaca-rpc-server --features hip -- --device hip:0 -H 0.0.0.0 -p 50052 --insecure-bind --token "$ALLPACA_RPC_TOKEN"`. Coordinator uses the same token (`--rpc-token` or `ALLPACA_RPC_TOKEN`). CUDA workers wait on engine CUDA parity; a CUDA-only box can still run `--cpu-only` for RAM overflow.
 
 ---
 

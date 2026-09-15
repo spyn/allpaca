@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -14,11 +17,14 @@ use crate::api::AppState;
 
 pub const COOKIE_NAME: &str = "allpaca_session";
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+const LOGIN_MAX_FAILS: usize = 5;
 
 #[derive(Clone)]
 pub struct AuthState {
     password: Option<String>,
     sessions: Arc<Mutex<HashMap<String, Instant>>>,
+    login_fails: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
 }
 
 impl AuthState {
@@ -34,6 +40,7 @@ impl AuthState {
         Self {
             password,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            login_fails: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -81,6 +88,40 @@ impl AuthState {
         }
         false
     }
+
+    fn client_key(addr: Option<SocketAddr>) -> String {
+        addr.map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "unknown".into())
+    }
+
+    fn login_allowed(&self, key: &str) -> bool {
+        let Ok(mut map) = self.login_fails.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        map.retain(|_, fails| {
+            fails.retain(|at| now.saturating_duration_since(*at) < LOGIN_WINDOW);
+            !fails.is_empty()
+        });
+        map.get(key)
+            .is_none_or(|fails| fails.len() < LOGIN_MAX_FAILS)
+    }
+
+    fn record_login_fail(&self, key: &str) {
+        let Ok(mut map) = self.login_fails.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let fails = map.entry(key.to_string()).or_default();
+        fails.retain(|at| now.saturating_duration_since(*at) < LOGIN_WINDOW);
+        fails.push(now);
+    }
+
+    fn clear_login_fails(&self, key: &str) {
+        if let Ok(mut map) = self.login_fails.lock() {
+            map.remove(key);
+        }
+    }
 }
 
 pub fn generate_password() -> String {
@@ -118,7 +159,8 @@ fn passwords_match(expected: &str, given: &str) -> bool {
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))
+    raw.strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
 }
 
 pub fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<String> {
@@ -150,8 +192,27 @@ pub struct LoginBody {
     pub password: String,
 }
 
+pub struct ClientAddr(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for ClientAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| *addr),
+        ))
+    }
+}
+
 pub async fn login(
     State(state): State<AppState>,
+    ClientAddr(addr): ClientAddr,
     Json(body): Json<LoginBody>,
 ) -> Response {
     if !state.auth.is_enabled() {
@@ -161,18 +222,35 @@ pub async fn login(
         )
             .into_response();
     }
+    let key = AuthState::client_key(addr);
+    if !state.auth.login_allowed(&key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            Json(serde_json::json!({"error": {"message": "too many login attempts", "type": "fatal"}})),
+        )
+            .into_response();
+    }
     match state.auth.login(&body.password) {
-        Some(token) => (
-            StatusCode::OK,
-            [(header::SET_COOKIE, session_cookie(&token))],
-            Json(serde_json::json!({"ok": true})),
-        )
-            .into_response(),
-        None => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": {"message": "invalid password", "type": "fatal"}})),
-        )
-            .into_response(),
+        Some(token) => {
+            state.auth.clear_login_fails(&key);
+            (
+                StatusCode::OK,
+                [(header::SET_COOKIE, session_cookie(&token))],
+                Json(serde_json::json!({"ok": true})),
+            )
+                .into_response()
+        }
+        None => {
+            state.auth.record_login_fail(&key);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::json!({"error": {"message": "invalid password", "type": "fatal"}}),
+                ),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -188,11 +266,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
         .into_response()
 }
 
-pub async fn require_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if state.auth.authorized(request.headers()) {
         return next.run(request).await;
     }

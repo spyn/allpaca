@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod cli;
 mod host;
+mod image_url;
 mod logs;
 mod otlp_push;
 mod ui;
@@ -53,7 +54,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => p.to_string(),
         None => {
             let generated = auth::generate_password();
-            tracing::info!("webui password: {generated}");
+            eprintln!("webui password: {generated}");
+            tracing::info!("webui password generated (printed to stderr, not captured in logs)");
             generated
         }
     };
@@ -75,6 +77,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::new(config.http.host.parse()?, config.http.port);
     tracing::info!(%addr, "allpaca-server listening (CPU-only={})", config.engine.cpu_only);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

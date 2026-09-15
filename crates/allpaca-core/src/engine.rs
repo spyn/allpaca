@@ -228,6 +228,23 @@ impl Drop for RequestHandle {
     }
 }
 
+fn rpc_hello_token(config: &Config) -> String {
+    if let Some(t) = config
+        .rpc
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return t.to_string();
+    }
+    std::env::var("ALLPACA_RPC_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
 impl Engine {
     pub fn new(config: Config) -> Result<Self, AllpacaError> {
         let mut config = config;
@@ -244,7 +261,15 @@ impl Engine {
         let rpc = if config.rpc.endpoints.is_empty() {
             None
         } else {
-            let rt = crate::rpc_runtime::RpcRuntime::connect(&config.rpc.endpoints)?;
+            let token = rpc_hello_token(&config);
+            let rt = crate::rpc_runtime::RpcRuntime::connect(
+                &config.rpc.endpoints,
+                if token.is_empty() {
+                    None
+                } else {
+                    Some(token.as_str())
+                },
+            )?;
             rt.apply_hello_to_inventory(&mut inventory.devices)?;
             Some(Arc::new(rt))
         };
@@ -8793,7 +8818,7 @@ mod tests {
         assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
         let stats = engine.stats();
         eprintln!(
-            "dsv4 generate ok chatml={} prompt_chars={} tokens={:?} text={:?} ttft_ms={} itl_ms={:.2} backend={} gpu_forwards={} target_gpu_forwards={} degraded={} dsv4_h2d_us={:.0} dsv4_h2d_bytes={} dsv4_gemv_us={:.0} dsv4_silu_us={:.0} dsv4_attn_us={:.0} dsv4_norm_us={:.0} dsv4_d2h_us={:.0} dsv4_pack_us={:.0} dsv4_hc_us={:.0} dsv4_router_us={:.0} dsv4_embed_us={:.0} q8_gemm_us={:.0} other_gpu_us={:.0} activation_h2d_bytes={} activation_d2h_bytes={} expert_lru_hits={} expert_lru_misses={} expert_lru_fills={}",
+            "dsv4 generate ok chatml={} prompt_chars={} tokens={:?} text={:?} ttft_ms={} itl_ms={:.2} backend={} gpu_forwards={} target_gpu_forwards={} degraded={} dsv4_h2d_us={:.0} dsv4_h2d_bytes={} dsv4_gemv_us={:.0} dsv4_silu_us={:.0} dsv4_attn_us={:.0} dsv4_norm_us={:.0} dsv4_d2h_us={:.0} dsv4_pack_us={:.0} dsv4_hc_us={:.0} dsv4_router_us={:.0} dsv4_embed_us={:.0} q8_gemm_us={:.0} other_gpu_us={:.0} activation_h2d_bytes={} activation_d2h_bytes={} expert_lru_hits={} expert_lru_misses={} expert_lru_fills={} expert_prefill_overlaps={} draft_expert_prefetches={}",
             chatml,
             prompt.len(),
             out.token_ids,
@@ -8822,6 +8847,8 @@ mod tests {
             stats.expert_lru_hits,
             stats.expert_lru_misses,
             stats.expert_lru_fills,
+            stats.expert_prefill_overlaps,
+            stats.draft_expert_prefetches,
         );
     }
 

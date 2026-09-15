@@ -279,6 +279,108 @@ fn sigmoid(v: f32) -> f32 {
     }
 }
 
+fn rmsnorm_unit(x: &[f32], eps: f32, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() != x.len() || x.is_empty() {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "rmsnorm_unit length mismatch".into(),
+        )));
+    }
+    let mut ss = 0.0f32;
+    for v in x {
+        ss += *v * *v;
+    }
+    let inv = (ss / x.len() as f32 + eps).sqrt().recip();
+    for i in 0..x.len() {
+        out[i] = x[i] * inv;
+    }
+    Ok(())
+}
+
+/// Packed HC residual: `[n_tok][stream][dim]` in one allocation.
+struct HcBatch {
+    data: Vec<f32>,
+    scratch: Vec<f32>,
+    n_tok: usize,
+    hc: usize,
+    dim: usize,
+}
+
+impl HcBatch {
+    fn new(n_tok: usize, hc: usize, dim: usize) -> Self {
+        let n = n_tok.saturating_mul(hc).saturating_mul(dim);
+        Self {
+            data: vec![0.0f32; n],
+            scratch: vec![0.0f32; n],
+            n_tok,
+            hc: hc.max(1),
+            dim,
+        }
+    }
+
+    fn fill_token_all_streams(&mut self, t: usize, x0: &[f32]) {
+        let dim = self.dim;
+        let n = x0.len().min(dim);
+        for s in 0..self.hc {
+            let off = t
+                .saturating_mul(self.hc)
+                .saturating_add(s)
+                .saturating_mul(dim);
+            if off + n <= self.data.len() {
+                self.data[off..off + n].copy_from_slice(&x0[..n]);
+            }
+        }
+    }
+
+    fn last_streams(&self) -> Vec<Vec<f32>> {
+        let t = self.n_tok.saturating_sub(1);
+        let dim = self.dim;
+        (0..self.hc)
+            .map(|s| {
+                let off = t
+                    .saturating_mul(self.hc)
+                    .saturating_add(s)
+                    .saturating_mul(dim);
+                if off + dim <= self.data.len() {
+                    self.data[off..off + dim].to_vec()
+                } else {
+                    vec![0.0f32; dim]
+                }
+            })
+            .collect()
+    }
+}
+
+fn pack_hc_states(states: &[Vec<Vec<f32>>], hc: usize, dim: usize) -> Vec<f32> {
+    let n_tok = states.len();
+    let mut packed = vec![0.0f32; n_tok.saturating_mul(hc).saturating_mul(dim)];
+    for (t, streams) in states.iter().enumerate() {
+        for (s, row) in streams.iter().enumerate().take(hc) {
+            let n = row.len().min(dim);
+            let off = t.saturating_mul(hc).saturating_add(s).saturating_mul(dim);
+            packed[off..off + n].copy_from_slice(&row[..n]);
+        }
+    }
+    packed
+}
+
+fn unpack_hc_states(packed: &[f32], n_tok: usize, hc: usize, dim: usize) -> Vec<Vec<Vec<f32>>> {
+    let mut states = Vec::with_capacity(n_tok);
+    for t in 0..n_tok {
+        let mut streams = Vec::with_capacity(hc);
+        for s in 0..hc {
+            let off = t.saturating_mul(hc).saturating_add(s).saturating_mul(dim);
+            let mut row = vec![0.0f32; dim];
+            if off < packed.len() {
+                let n = dim.min(packed.len().saturating_sub(off));
+                row[..n].copy_from_slice(&packed[off..off + n]);
+            }
+            streams.push(row);
+        }
+        states.push(streams);
+    }
+    states
+}
+
 /// HC pre: mix `hc` residual streams into one `dim` activation.
 fn hc_pre(
     streams: &[Vec<f32>],
@@ -299,7 +401,7 @@ fn hc_pre(
         flat[s * dim..s * dim + n].copy_from_slice(&row[..n]);
     }
     let mut normed = vec![0.0f32; hc_dim];
-    rmsnorm(&flat, &vec![1.0; hc_dim], eps, &mut normed)?;
+    rmsnorm_unit(&flat, eps, &mut normed)?;
     let mix_dim = (2 + hc) * hc;
     let mut mixes = vec![0.0f32; mix_dim];
     matmul_nt(&normed, &mix.fn_w, &mut mixes, 1, mix_dim, hc_dim)?;
@@ -321,13 +423,303 @@ fn hc_pre(
     }
     sinkhorn(&mut comb, hc, spec.hc_sinkhorn_iters, spec.hc_eps);
     let mut out = vec![0.0f32; dim];
-    for (s, row) in streams.iter().enumerate() {
-        let w = pre[s];
-        for i in 0..dim.min(row.len()) {
-            out[i] += row[i] * w;
+    hc_mix_streams(&mut out, streams, &pre, dim);
+    Ok((out, post, comb))
+}
+
+/// Token-parallel [`hc_pre`]: one mix GEMM at `M=n_tok`, per-token Sinkhorn.
+fn hc_pre_rows(
+    states: &[Vec<Vec<f32>>],
+    mix: &HcMix,
+    spec: &Dsv4Spec,
+    dim: usize,
+    eps: f32,
+) -> Result<(Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>), AllpacaError> {
+    let hc = spec.hc_mult.max(1);
+    let packed = pack_hc_states(states, hc, dim);
+    hc_pre_packed(&packed, states.len(), mix, spec, dim, eps)
+}
+
+fn hc_pre_packed(
+    packed: &[f32],
+    n_tok: usize,
+    mix: &HcMix,
+    spec: &Dsv4Spec,
+    dim: usize,
+    eps: f32,
+) -> Result<(Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>), AllpacaError> {
+    let hc = spec.hc_mult.max(1);
+    if n_tok == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let hc_dim = dim.saturating_mul(hc);
+    let need = n_tok.saturating_mul(hc_dim);
+    if mix.fn_w.is_empty() || packed.len() < need {
+        let states = unpack_hc_states(packed, n_tok, hc, dim);
+        let mut curs = vec![0.0f32; n_tok.saturating_mul(dim)];
+        let mut posts = Vec::with_capacity(n_tok);
+        let mut combs = Vec::with_capacity(n_tok);
+        for (t, streams) in states.iter().enumerate() {
+            let (cur, post, comb) = hc_pre(streams, mix, spec, dim, eps)?;
+            let n = cur.len().min(dim);
+            curs[t * dim..t * dim + n].copy_from_slice(&cur[..n]);
+            posts.push(post);
+            combs.push(comb);
+        }
+        return Ok((curs, posts, combs));
+    }
+    let mix_dim = (2 + hc).saturating_mul(hc);
+    let mut normed = vec![0.0f32; need];
+    for t in 0..n_tok {
+        let a = t.saturating_mul(hc_dim);
+        rmsnorm_unit(&packed[a..a + hc_dim], eps, &mut normed[a..a + hc_dim])?;
+    }
+    let mut mixes = vec![0.0f32; n_tok.saturating_mul(mix_dim)];
+    matmul_nt(&normed, &mix.fn_w, &mut mixes, n_tok, mix_dim, hc_dim)?;
+    let scale_pre = mix.scale.first().copied().unwrap_or(1.0);
+    let scale_post = mix.scale.get(1).copied().unwrap_or(1.0);
+    let scale_comb = mix.scale.get(2).copied().unwrap_or(1.0);
+    let mut curs = vec![0.0f32; n_tok.saturating_mul(dim)];
+    let mut posts = Vec::with_capacity(n_tok);
+    let mut combs = Vec::with_capacity(n_tok);
+    for t in 0..n_tok {
+        let row = &mixes[t * mix_dim..(t + 1) * mix_dim];
+        let mut pre = vec![0.0f32; hc];
+        let mut post = vec![0.0f32; hc];
+        for i in 0..hc {
+            let b = mix.base.get(i).copied().unwrap_or(0.0);
+            pre[i] = sigmoid(row[i] * scale_pre + b) + spec.hc_eps;
+            let b2 = mix.base.get(hc + i).copied().unwrap_or(0.0);
+            post[i] = sigmoid(row[hc + i] * scale_post + b2) * 2.0;
+        }
+        let mut comb = vec![0.0f32; hc.saturating_mul(hc)];
+        for i in 0..hc.saturating_mul(hc) {
+            let b = mix.base.get(2 * hc + i).copied().unwrap_or(0.0);
+            comb[i] = row[2 * hc + i] * scale_comb + b;
+        }
+        sinkhorn(&mut comb, hc, spec.hc_sinkhorn_iters, spec.hc_eps);
+        let dst = &mut curs[t * dim..(t + 1) * dim];
+        let tok = &packed[t * hc_dim..(t + 1) * hc_dim];
+        hc_mix_packed(dst, tok, &pre, hc, dim);
+        posts.push(post);
+        combs.push(comb);
+    }
+    Ok((curs, posts, combs))
+}
+
+fn ensure_hc_buf(buf: &mut Vec<Vec<f32>>, hc: usize, dim: usize) {
+    if buf.len() != hc {
+        *buf = vec![vec![0.0f32; dim]; hc];
+        return;
+    }
+    for row in buf.iter_mut() {
+        if row.len() != dim {
+            row.resize(dim, 0.0);
         }
     }
-    Ok((out, post, comb))
+}
+
+/// Weighted sum of HC streams into one `dim` vector (fused for `hc` 2/4).
+fn hc_mix_streams(dst: &mut [f32], streams: &[Vec<f32>], weights: &[f32], dim: usize) {
+    let n = dim.min(dst.len());
+    dst[..n].fill(0.0);
+    if streams.len() >= 4
+        && weights.len() >= 4
+        && streams[0].len() >= n
+        && streams[1].len() >= n
+        && streams[2].len() >= n
+        && streams[3].len() >= n
+    {
+        let (w0, w1, w2, w3) = (weights[0], weights[1], weights[2], weights[3]);
+        let s0 = &streams[0][..n];
+        let s1 = &streams[1][..n];
+        let s2 = &streams[2][..n];
+        let s3 = &streams[3][..n];
+        for i in 0..n {
+            dst[i] = s0[i] * w0 + s1[i] * w1 + s2[i] * w2 + s3[i] * w3;
+        }
+        return;
+    }
+    if streams.len() >= 2 && weights.len() >= 2 && streams[0].len() >= n && streams[1].len() >= n {
+        let (w0, w1) = (weights[0], weights[1]);
+        let s0 = &streams[0][..n];
+        let s1 = &streams[1][..n];
+        for i in 0..n {
+            dst[i] = s0[i] * w0 + s1[i] * w1;
+        }
+        for (s, stream) in streams.iter().enumerate().skip(2) {
+            let w = weights.get(s).copied().unwrap_or(0.0);
+            let n2 = n.min(stream.len());
+            for i in 0..n2 {
+                dst[i] += stream[i] * w;
+            }
+        }
+        return;
+    }
+    for (s, stream) in streams.iter().enumerate() {
+        let w = weights.get(s).copied().unwrap_or(0.0);
+        let n2 = n.min(stream.len());
+        for i in 0..n2 {
+            dst[i] += stream[i] * w;
+        }
+    }
+}
+
+fn hc_mix_packed(dst: &mut [f32], token_hc: &[f32], weights: &[f32], hc: usize, dim: usize) {
+    let n = dim.min(dst.len());
+    dst[..n].fill(0.0);
+    if hc >= 4 && weights.len() >= 4 && token_hc.len() >= 4 * dim {
+        let (w0, w1, w2, w3) = (weights[0], weights[1], weights[2], weights[3]);
+        let s0 = &token_hc[0..n];
+        let s1 = &token_hc[dim..dim + n];
+        let s2 = &token_hc[2 * dim..2 * dim + n];
+        let s3 = &token_hc[3 * dim..3 * dim + n];
+        for i in 0..n {
+            dst[i] = s0[i] * w0 + s1[i] * w1 + s2[i] * w2 + s3[i] * w3;
+        }
+        return;
+    }
+    if hc >= 2 && weights.len() >= 2 && token_hc.len() >= 2 * dim {
+        let (w0, w1) = (weights[0], weights[1]);
+        let s0 = &token_hc[0..n];
+        let s1 = &token_hc[dim..dim + n];
+        for i in 0..n {
+            dst[i] = s0[i] * w0 + s1[i] * w1;
+        }
+        for s in 2..hc {
+            let w = weights.get(s).copied().unwrap_or(0.0);
+            let off = s.saturating_mul(dim);
+            let n2 = n.min(token_hc.len().saturating_sub(off));
+            for i in 0..n2 {
+                dst[i] += token_hc[off + i] * w;
+            }
+        }
+        return;
+    }
+    for s in 0..hc {
+        let w = weights.get(s).copied().unwrap_or(0.0);
+        let off = s.saturating_mul(dim);
+        let n2 = n.min(token_hc.len().saturating_sub(off));
+        for i in 0..n2 {
+            dst[i] += token_hc[off + i] * w;
+        }
+    }
+}
+
+fn hc_post_into(
+    x: &[f32],
+    residual: &[Vec<f32>],
+    post: &[f32],
+    comb: &[f32],
+    spec: &Dsv4Spec,
+    dim: usize,
+    out: &mut Vec<Vec<f32>>,
+) {
+    let hc = spec.hc_mult.max(1);
+    ensure_hc_buf(out, hc, dim);
+    let n = dim.min(x.len());
+    for row in out.iter_mut().take(hc) {
+        for v in row.iter_mut().skip(n) {
+            *v = 0.0;
+        }
+    }
+    if hc == 4
+        && residual.len() >= 4
+        && residual[0].len() >= n
+        && residual[1].len() >= n
+        && residual[2].len() >= n
+        && residual[3].len() >= n
+        && out.len() >= 4
+    {
+        let r0 = &residual[0][..n];
+        let r1 = &residual[1][..n];
+        let r2 = &residual[2][..n];
+        let r3 = &residual[3][..n];
+        let xn = &x[..n];
+        let pw0 = post.first().copied().unwrap_or(1.0);
+        let pw1 = post.get(1).copied().unwrap_or(1.0);
+        let pw2 = post.get(2).copied().unwrap_or(1.0);
+        let pw3 = post.get(3).copied().unwrap_or(1.0);
+        let w00 = comb.first().copied().unwrap_or(0.0);
+        let w10 = comb.get(1).copied().unwrap_or(0.0);
+        let w20 = comb.get(2).copied().unwrap_or(0.0);
+        let w30 = comb.get(3).copied().unwrap_or(0.0);
+        let w01 = comb.get(4).copied().unwrap_or(0.0);
+        let w11 = comb.get(5).copied().unwrap_or(0.0);
+        let w21 = comb.get(6).copied().unwrap_or(0.0);
+        let w31 = comb.get(7).copied().unwrap_or(0.0);
+        let w02 = comb.get(8).copied().unwrap_or(0.0);
+        let w12 = comb.get(9).copied().unwrap_or(0.0);
+        let w22 = comb.get(10).copied().unwrap_or(0.0);
+        let w32 = comb.get(11).copied().unwrap_or(0.0);
+        let w03 = comb.get(12).copied().unwrap_or(0.0);
+        let w13 = comb.get(13).copied().unwrap_or(0.0);
+        let w23 = comb.get(14).copied().unwrap_or(0.0);
+        let w33 = comb.get(15).copied().unwrap_or(0.0);
+        let (s0, rest) = out.split_at_mut(1);
+        let (s1, rest) = rest.split_at_mut(1);
+        let (s2, rest) = rest.split_at_mut(1);
+        let o0 = &mut s0[0][..n];
+        let o1 = &mut s1[0][..n];
+        let o2 = &mut s2[0][..n];
+        let o3 = &mut rest[0][..n];
+        for i in 0..n {
+            let xv = xn[i];
+            let a = r0[i];
+            let b = r1[i];
+            let c = r2[i];
+            let d = r3[i];
+            o0[i] = xv * pw0 + a * w00 + b * w01 + c * w02 + d * w03;
+            o1[i] = xv * pw1 + a * w10 + b * w11 + c * w12 + d * w13;
+            o2[i] = xv * pw2 + a * w20 + b * w21 + c * w22 + d * w23;
+            o3[i] = xv * pw3 + a * w30 + b * w31 + c * w32 + d * w33;
+        }
+        return;
+    }
+    if hc == 2
+        && residual.len() >= 2
+        && residual[0].len() >= n
+        && residual[1].len() >= n
+        && out.len() >= 2
+    {
+        let r0 = &residual[0][..n];
+        let r1 = &residual[1][..n];
+        let xn = &x[..n];
+        let pw0 = post.first().copied().unwrap_or(1.0);
+        let pw1 = post.get(1).copied().unwrap_or(1.0);
+        let w00 = comb.first().copied().unwrap_or(0.0);
+        let w10 = comb.get(1).copied().unwrap_or(0.0);
+        let w01 = comb.get(2).copied().unwrap_or(0.0);
+        let w11 = comb.get(3).copied().unwrap_or(0.0);
+        let (s0, rest) = out.split_at_mut(1);
+        let o0 = &mut s0[0][..n];
+        let o1 = &mut rest[0][..n];
+        for i in 0..n {
+            let xv = xn[i];
+            let a = r0[i];
+            let b = r1[i];
+            o0[i] = xv * pw0 + a * w00 + b * w01;
+            o1[i] = xv * pw1 + a * w10 + b * w11;
+        }
+        return;
+    }
+    for dst in 0..hc {
+        let pw = post.get(dst).copied().unwrap_or(1.0);
+        let o = &mut out[dst][..n];
+        let xn = &x[..n];
+        for i in 0..n {
+            o[i] = xn[i] * pw;
+        }
+        for src in 0..hc {
+            let w = comb.get(dst + src * hc).copied().unwrap_or(0.0);
+            if let Some(row) = residual.get(src) {
+                let m = n.min(row.len());
+                for i in 0..m {
+                    o[i] += row[i] * w;
+                }
+            }
+        }
+    }
 }
 
 fn hc_post(
@@ -338,23 +730,181 @@ fn hc_post(
     spec: &Dsv4Spec,
     dim: usize,
 ) -> Vec<Vec<f32>> {
+    let mut out = Vec::new();
+    hc_post_into(x, residual, post, comb, spec, dim, &mut out);
+    out
+}
+
+/// Packed [`hc_post`]: one scratch buffer, swapped into `states` (no per-token alloc).
+fn hc_post_rows(
+    xs: &[f32],
+    states: &mut [Vec<Vec<f32>>],
+    posts: &[Vec<f32>],
+    combs: &[Vec<f32>],
+    spec: &Dsv4Spec,
+    dim: usize,
+) {
+    hc_post_rows_with(xs, states, spec, dim, |t| {
+        (
+            posts.get(t).map(Vec::as_slice).unwrap_or(&[]),
+            combs.get(t).map(Vec::as_slice).unwrap_or(&[]),
+        )
+    });
+}
+
+fn hc_post_rows_with<'p>(
+    xs: &[f32],
+    states: &mut [Vec<Vec<f32>>],
+    spec: &Dsv4Spec,
+    dim: usize,
+    mut post_comb: impl FnMut(usize) -> (&'p [f32], &'p [f32]),
+) {
     let hc = spec.hc_mult.max(1);
-    let mut out = vec![vec![0.0f32; dim]; hc];
+    let mut scratch = vec![vec![0.0f32; dim]; hc];
+    for t in 0..states.len() {
+        let start = t.saturating_mul(dim);
+        let x = if start < xs.len() {
+            &xs[start..xs.len().min(start.saturating_add(dim))]
+        } else {
+            &[]
+        };
+        let (post, comb) = post_comb(t);
+        hc_post_into(x, &states[t], post, comb, spec, dim, &mut scratch);
+        std::mem::swap(&mut states[t], &mut scratch);
+    }
+}
+
+fn hc_post_into_flat(
+    x: &[f32],
+    residual: &[f32],
+    post: &[f32],
+    comb: &[f32],
+    spec: &Dsv4Spec,
+    dim: usize,
+    out: &mut [f32],
+) {
+    let hc = spec.hc_mult.max(1);
+    let n = dim.min(x.len());
+    let need = hc.saturating_mul(dim);
+    if residual.len() < need || out.len() < need {
+        out.fill(0.0);
+        return;
+    }
+    for dst in 0..hc {
+        for i in n..dim {
+            out[dst * dim + i] = 0.0;
+        }
+    }
+    if hc == 4 {
+        let r0 = &residual[0..n];
+        let r1 = &residual[dim..dim + n];
+        let r2 = &residual[2 * dim..2 * dim + n];
+        let r3 = &residual[3 * dim..3 * dim + n];
+        let xn = &x[..n];
+        let pw0 = post.first().copied().unwrap_or(1.0);
+        let pw1 = post.get(1).copied().unwrap_or(1.0);
+        let pw2 = post.get(2).copied().unwrap_or(1.0);
+        let pw3 = post.get(3).copied().unwrap_or(1.0);
+        let w00 = comb.first().copied().unwrap_or(0.0);
+        let w10 = comb.get(1).copied().unwrap_or(0.0);
+        let w20 = comb.get(2).copied().unwrap_or(0.0);
+        let w30 = comb.get(3).copied().unwrap_or(0.0);
+        let w01 = comb.get(4).copied().unwrap_or(0.0);
+        let w11 = comb.get(5).copied().unwrap_or(0.0);
+        let w21 = comb.get(6).copied().unwrap_or(0.0);
+        let w31 = comb.get(7).copied().unwrap_or(0.0);
+        let w02 = comb.get(8).copied().unwrap_or(0.0);
+        let w12 = comb.get(9).copied().unwrap_or(0.0);
+        let w22 = comb.get(10).copied().unwrap_or(0.0);
+        let w32 = comb.get(11).copied().unwrap_or(0.0);
+        let w03 = comb.get(12).copied().unwrap_or(0.0);
+        let w13 = comb.get(13).copied().unwrap_or(0.0);
+        let w23 = comb.get(14).copied().unwrap_or(0.0);
+        let w33 = comb.get(15).copied().unwrap_or(0.0);
+        let (o0, rest) = out.split_at_mut(dim);
+        let (o1, rest) = rest.split_at_mut(dim);
+        let (o2, rest) = rest.split_at_mut(dim);
+        let o0 = &mut o0[..n];
+        let o1 = &mut o1[..n];
+        let o2 = &mut o2[..n];
+        let o3 = &mut rest[..n];
+        for i in 0..n {
+            let xv = xn[i];
+            let a = r0[i];
+            let b = r1[i];
+            let c = r2[i];
+            let d = r3[i];
+            o0[i] = xv * pw0 + a * w00 + b * w01 + c * w02 + d * w03;
+            o1[i] = xv * pw1 + a * w10 + b * w11 + c * w12 + d * w13;
+            o2[i] = xv * pw2 + a * w20 + b * w21 + c * w22 + d * w23;
+            o3[i] = xv * pw3 + a * w30 + b * w31 + c * w32 + d * w33;
+        }
+        return;
+    }
+    if hc == 2 {
+        let r0 = &residual[0..n];
+        let r1 = &residual[dim..dim + n];
+        let xn = &x[..n];
+        let pw0 = post.first().copied().unwrap_or(1.0);
+        let pw1 = post.get(1).copied().unwrap_or(1.0);
+        let w00 = comb.first().copied().unwrap_or(0.0);
+        let w10 = comb.get(1).copied().unwrap_or(0.0);
+        let w01 = comb.get(2).copied().unwrap_or(0.0);
+        let w11 = comb.get(3).copied().unwrap_or(0.0);
+        let (o0, rest) = out.split_at_mut(dim);
+        let o0 = &mut o0[..n];
+        let o1 = &mut rest[..n];
+        for i in 0..n {
+            let xv = xn[i];
+            let a = r0[i];
+            let b = r1[i];
+            o0[i] = xv * pw0 + a * w00 + b * w01;
+            o1[i] = xv * pw1 + a * w10 + b * w11;
+        }
+        return;
+    }
     for dst in 0..hc {
         let pw = post.get(dst).copied().unwrap_or(1.0);
-        for i in 0..dim.min(x.len()) {
-            out[dst][i] = x[i] * pw;
+        let o = &mut out[dst * dim..dst * dim + n];
+        let xn = &x[..n];
+        for i in 0..n {
+            o[i] = xn[i] * pw;
         }
         for src in 0..hc {
             let w = comb.get(dst + src * hc).copied().unwrap_or(0.0);
-            if let Some(row) = residual.get(src) {
-                for i in 0..dim.min(row.len()) {
-                    out[dst][i] += row[i] * w;
-                }
+            let off = src.saturating_mul(dim);
+            let m = n.min(residual.len().saturating_sub(off));
+            for i in 0..m {
+                o[i] += residual[off + i] * w;
             }
         }
     }
-    out
+}
+
+fn hc_post_batch<'p>(
+    xs: &[f32],
+    batch: &mut HcBatch,
+    spec: &Dsv4Spec,
+    dim: usize,
+    mut post_comb: impl FnMut(usize) -> (&'p [f32], &'p [f32]),
+) {
+    let hc = spec.hc_mult.max(1);
+    let hcd = hc.saturating_mul(dim);
+    let n_tok = batch.n_tok;
+    for t in 0..n_tok {
+        let start = t.saturating_mul(dim);
+        let x = if start < xs.len() {
+            &xs[start..xs.len().min(start.saturating_add(dim))]
+        } else {
+            &[]
+        };
+        let (post, comb) = post_comb(t);
+        let off = t.saturating_mul(hcd);
+        let residual = &batch.data[off..off + hcd];
+        let out = &mut batch.scratch[off..off + hcd];
+        hc_post_into_flat(x, residual, post, comb, spec, dim, out);
+    }
+    std::mem::swap(&mut batch.data, &mut batch.scratch);
 }
 
 fn hc_head(
@@ -377,7 +927,7 @@ fn hc_head(
         flat[s * dim..s * dim + n].copy_from_slice(&row[..n]);
     }
     let mut normed = vec![0.0f32; hc_dim];
-    rmsnorm(&flat, &vec![1.0; hc_dim], eps, &mut normed)?;
+    rmsnorm_unit(&flat, eps, &mut normed)?;
     let mut mixes = vec![0.0f32; hc];
     matmul_nt(&normed, fn_w, &mut mixes, 1, hc, hc_dim)?;
     let mut pre = vec![0.0f32; hc];
@@ -1208,7 +1758,7 @@ fn dsv4_mla_o_rows(
 fn dsv4_attn_and_route_rows(
     model: &TinyModel,
     dsv4: &Dsv4Weights,
-    states: &mut [Vec<Vec<f32>>],
+    states: &mut HcBatch,
     tokens: &[u32],
     start_pos: usize,
     layer_idx: usize,
@@ -1225,7 +1775,7 @@ fn dsv4_attn_and_route_rows(
     if n_tok == 0 {
         return Ok(Vec::new());
     }
-    if n_tok != states.len() {
+    if n_tok != states.n_tok {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "dsv4 chunk attn token count mismatch".into(),
         )));
@@ -1253,22 +1803,16 @@ fn dsv4_attn_and_route_rows(
     } else {
         &host.attn_norm
     };
-    let mut curs = vec![0.0f32; n_tok.saturating_mul(dim)];
-    let mut posts = Vec::with_capacity(n_tok);
-    let mut combs = Vec::with_capacity(n_tok);
     let t_hc = Instant::now();
-    for t in 0..n_tok {
-        let (mut cur, post, comb) = hc_pre(&states[t], &meta.hc_attn, spec, dim, eps)?;
-        if !attn_norm.is_empty() {
-            let mut n = vec![0.0f32; dim];
-            timed_rmsnorm(&cur, attn_norm, eps, &mut n, metrics)?;
-            cur = n;
+    let (curs, posts, combs) = hc_pre_packed(&states.data, n_tok, &meta.hc_attn, spec, dim, eps)?;
+    let mut curs = curs;
+    if !attn_norm.is_empty() {
+        let mut tmp = vec![0.0f32; dim];
+        for t in 0..n_tok {
+            let row = &mut curs[t * dim..(t + 1) * dim];
+            timed_rmsnorm(row, attn_norm, eps, &mut tmp, metrics)?;
+            row.copy_from_slice(&tmp);
         }
-        let off = t.saturating_mul(dim);
-        let n = cur.len().min(dim);
-        curs[off..off + n].copy_from_slice(&cur[..n]);
-        posts.push(post);
-        combs.push(comb);
     }
     metrics
         .dsv4_hc_ns
@@ -1393,37 +1937,29 @@ fn dsv4_attn_and_route_rows(
     } else {
         &host.ffn_norm
     };
-    let mut preps = Vec::with_capacity(n_tok);
-    let mut fcurs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
-    let mut fposts: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
-    let mut fcombs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
-    for t in 0..n_tok {
-        let attn_out = &attn_outs[t * dim..(t + 1) * dim];
-        let t_hc = Instant::now();
-        let streams = hc_post(attn_out, &states[t], &posts[t], &combs[t], spec, dim);
-        metrics
-            .dsv4_hc_ns
-            .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        let t_hc = Instant::now();
-        let (mut fcur, fpost, fcomb) = hc_pre(&streams, &meta.hc_ffn, spec, dim, eps)?;
-        metrics
-            .dsv4_hc_ns
-            .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        if !ffn_norm.is_empty() {
-            let mut n = vec![0.0f32; dim];
-            timed_rmsnorm(&fcur, ffn_norm, eps, &mut n, metrics)?;
-            fcur = n;
+    let t_hc = Instant::now();
+    hc_post_batch(&attn_outs, states, spec, dim, |t| {
+        (
+            posts.get(t).map(Vec::as_slice).unwrap_or(&[]),
+            combs.get(t).map(Vec::as_slice).unwrap_or(&[]),
+        )
+    });
+    let (mut xs, fposts, fcombs) =
+        hc_pre_packed(&states.data, n_tok, &meta.hc_ffn, spec, dim, eps)?;
+    metrics
+        .dsv4_hc_ns
+        .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if !ffn_norm.is_empty() {
+        let mut tmp = vec![0.0f32; dim];
+        for t in 0..n_tok {
+            let row = &mut xs[t * dim..(t + 1) * dim];
+            timed_rmsnorm(row, ffn_norm, eps, &mut tmp, metrics)?;
+            row.copy_from_slice(&tmp);
         }
-        states[t] = streams;
-        fcurs.push(fcur);
-        fposts.push(fpost);
-        fcombs.push(fcomb);
     }
-    let mut xs = vec![0.0f32; n_tok.saturating_mul(dim)];
-    for (t, fcur) in fcurs.iter().enumerate() {
-        let off = t.saturating_mul(dim);
-        let n = fcur.len().min(dim);
-        xs[off..off + n].copy_from_slice(&fcur[..n]);
+    let mut fcurs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
+    for t in 0..n_tok {
+        fcurs.push(xs[t * dim..(t + 1) * dim].to_vec());
     }
     let t_route = Instant::now();
     let routes = route_experts_rows(
@@ -1442,6 +1978,7 @@ fn dsv4_attn_and_route_rows(
     metrics
         .dsv4_router_ns
         .fetch_add(t_route.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let mut preps = Vec::with_capacity(n_tok);
     for (((fcur, fpost), fcomb), picks) in fcurs.into_iter().zip(fposts).zip(fcombs).zip(routes) {
         preps.push(Dsv4FfnPrep {
             fcur,
@@ -1591,8 +2128,8 @@ fn dsv4_apply_moe(
         fcomb,
         picks,
     } = prep;
+    let ids: Vec<usize> = picks.iter().map(|(e, _)| *e).collect();
     if warmup {
-        let ids: Vec<usize> = picks.iter().map(|(e, _)| *e).collect();
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
             let _ = g.warmup_experts(f, blk, &ids, cfg, Some(metrics));
         }
@@ -1600,15 +2137,17 @@ fn dsv4_apply_moe(
     let shexp_y = dsv4_shexp(
         model, dsv4, &fcur, layer_idx, metrics, &mut gpu, file, skip_shexp,
     )?;
-    if let Some(g) = gpu.as_mut() {
-        g.join_expert_h2d();
-    }
     let fill = gpu
         .as_ref()
         .map(|g| if g.has_expert_slots() { picks.len() } else { 0 })
         .unwrap_or(0);
     let mut routed = vec![0.0f32; dim];
+    let mut deferred: Vec<(usize, usize, f32)> = Vec::new();
     for (i, (e, w)) in picks.into_iter().enumerate() {
+        if gpu.as_ref().is_some_and(|g| g.expert_copy_pending(blk, e)) {
+            deferred.push((i, e, w));
+            continue;
+        }
         let mut y = vec![0.0f32; dim];
         let mut did = false;
         if i < fill {
@@ -1630,8 +2169,37 @@ fn dsv4_apply_moe(
             };
             expert_mlp(&fcur, &ffn, cfg.ff_dim, dim, &mut y, false)?;
         }
-        for i in 0..dim {
-            routed[i] += y[i] * w;
+        for j in 0..dim {
+            routed[j] += y[j] * w;
+        }
+    }
+    if let Some(g) = gpu.as_mut() {
+        g.join_expert_h2d();
+    }
+    for (i, e, w) in deferred {
+        let mut y = vec![0.0f32; dim];
+        let mut did = false;
+        if i < fill {
+            if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
+                if g.expert_mlp_gpu(f, blk, e, cfg, &fcur, &mut y, Some(metrics))
+                    .is_ok()
+                {
+                    did = true;
+                }
+            }
+        }
+        if !did {
+            let ffn = if !host.experts.is_empty() {
+                model.host_expert(layer_idx, e)?
+            } else if let Some(f) = file {
+                load_mxfp4_expert(f, blk, e, cfg.n_experts, dim, cfg.ff_dim)?
+            } else {
+                continue;
+            };
+            expert_mlp(&fcur, &ffn, cfg.ff_dim, dim, &mut y, false)?;
+        }
+        for j in 0..dim {
+            routed[j] += y[j] * w;
         }
     }
     if let Some(g) = gpu.as_mut() {
@@ -1640,8 +2208,44 @@ fn dsv4_apply_moe(
     for i in 0..dim {
         routed[i] += shexp_y[i];
     }
+    let next_blk = (layer_idx + 1 < cfg.n_layers).then_some(cfg.gguf_blk(layer_idx + 1));
+    let prefetch = if crate::dsv4_gpu::want_hint_prefetch(cfg) {
+        match (gpu.as_mut(), file, next_blk) {
+            (Some(g), Some(f), Some(nl)) => g
+                .begin_hint_prefetch(f, nl, &ids, cfg, Some(metrics), blk)
+                .ok(),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let t_hc = Instant::now();
-    let streams = hc_post(&routed, streams, &fpost, &fcomb, spec, dim);
+    let mut inflight = (false, false);
+    let streams = std::thread::scope(|s| {
+        let pref_jh = match (gpu.as_ref(), prefetch.as_ref()) {
+            (Some(g), Some(plan)) if !plan.is_empty() => {
+                Some(s.spawn(|| g.submit_copy_plan(plan, Some(metrics))))
+            }
+            _ => None,
+        };
+        let streams = hc_post(&routed, streams, &fpost, &fcomb, spec, dim);
+        if let Some(jh) = pref_jh {
+            match jh.join() {
+                Ok(pair) => inflight = pair,
+                Err(_) => tracing::warn!("L+1 expert prefetch H2D panicked"),
+            }
+        }
+        streams
+    });
+    if let Some(g) = gpu.as_mut() {
+        g.mark_expert_h2d(inflight.0, inflight.1);
+        if inflight.0 || inflight.1 {
+            metrics
+                .expert_prefill_overlaps
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        g.unpin_layer(blk);
+    }
     metrics
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1661,11 +2265,71 @@ fn scatter_expert_rows(routed: &mut [f32], y: &[f32], group: &[(usize, f32)], di
     }
 }
 
+fn run_expert_job_pair(
+    hip0: Option<&std::sync::Arc<allpaca_hip::HipWorkspace>>,
+    hip1: Option<&std::sync::Arc<allpaca_hip::HipWorkspace>>,
+    jobs0: Vec<crate::dsv4_gpu::ExpertSwigluJob>,
+    jobs1: Vec<crate::dsv4_gpu::ExpertSwigluJob>,
+    dim: usize,
+    ff: usize,
+    metrics: &Metrics,
+    gpu_out: &mut Vec<(Vec<f32>, Vec<(usize, f32)>)>,
+    cpu_work: &mut Vec<(usize, Vec<f32>, Vec<(usize, f32)>)>,
+) -> bool {
+    let take_fail = |failed: Vec<crate::dsv4_gpu::ExpertSwigluJob>,
+                     cpu_work: &mut Vec<(usize, Vec<f32>, Vec<(usize, f32)>)>| {
+        for job in failed {
+            cpu_work.push((job.expert, job.x, job.group));
+        }
+    };
+    if !jobs1.is_empty() {
+        if let (Some(h0), Some(h1)) = (hip0, hip1) {
+            std::thread::scope(|s| {
+                let j0 = s.spawn(|| {
+                    crate::dsv4_gpu::run_expert_swiglu_jobs(h0, jobs0, dim, ff, Some(metrics))
+                });
+                let j1 = s.spawn(|| {
+                    crate::dsv4_gpu::run_expert_swiglu_jobs(h1, jobs1, dim, ff, Some(metrics))
+                });
+                match j0.join() {
+                    Ok((rows, fail)) => {
+                        gpu_out.extend(rows);
+                        take_fail(fail, cpu_work);
+                    }
+                    Err(_) => tracing::warn!("GPU0 expert SwiGLU thread panicked"),
+                }
+                match j1.join() {
+                    Ok((rows, fail)) => {
+                        gpu_out.extend(rows);
+                        take_fail(fail, cpu_work);
+                    }
+                    Err(_) => tracing::warn!("GPU1 expert SwiGLU thread panicked"),
+                }
+            });
+            return true;
+        }
+        take_fail(jobs0, cpu_work);
+        take_fail(jobs1, cpu_work);
+        return false;
+    }
+    if !jobs0.is_empty() {
+        if let Some(h0) = hip0 {
+            let (rows, fail) =
+                crate::dsv4_gpu::run_expert_swiglu_jobs(h0, jobs0, dim, ff, Some(metrics));
+            gpu_out.extend(rows);
+            take_fail(fail, cpu_work);
+            return true;
+        }
+        take_fail(jobs0, cpu_work);
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dsv4_apply_moe_rows(
     model: &TinyModel,
     dsv4: &Dsv4Weights,
-    states: &mut [Vec<Vec<f32>>],
+    states: &mut HcBatch,
     preps: Vec<Dsv4FfnPrep>,
     layer_idx: usize,
     metrics: &Metrics,
@@ -1677,7 +2341,7 @@ fn dsv4_apply_moe_rows(
     if n_tok == 0 {
         return Ok(());
     }
-    if n_tok != states.len() {
+    if n_tok != states.n_tok {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "dsv4 chunk moe token count mismatch".into(),
         )));
@@ -1735,9 +2399,6 @@ fn dsv4_apply_moe_rows(
             shexp_y[t * dim..t * dim + n].copy_from_slice(&y[..n]);
         }
     }
-    if let Some(g) = gpu.as_mut() {
-        g.join_expert_h2d();
-    }
     let gpu_slots = gpu.as_ref().is_some_and(|g| g.has_expert_slots());
     let mut groups: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
     for (t, prep) in preps.iter().enumerate() {
@@ -1755,8 +2416,10 @@ fn dsv4_apply_moe_rows(
     };
     let dev0 = hip0.as_ref().map(|h| h.device);
     let dev1 = hip1.as_ref().map(|h| h.device);
-    let mut jobs0 = Vec::new();
-    let mut jobs1 = Vec::new();
+    let mut jobs0_ready = Vec::new();
+    let mut jobs0_wait = Vec::new();
+    let mut jobs1_ready = Vec::new();
+    let mut jobs1_wait = Vec::new();
     let mut cpu_work: Vec<(usize, Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
     for (e, group) in groups {
         let m = group.len();
@@ -1767,9 +2430,10 @@ fn dsv4_apply_moe_rows(
             gx[dst..dst + dim].copy_from_slice(&xs[src..src + dim]);
         }
         let mut job = None;
+        let pending = gpu.as_ref().is_some_and(|g| g.expert_copy_pending(blk, e));
         if gpu_slots {
             if let Some(g) = gpu.as_ref() {
-                if let Some((ptr, device)) = g.resident_expert(layer_idx, e) {
+                if let Some((ptr, device)) = g.resident_expert(blk, e) {
                     metrics.expert_lru_hits.fetch_add(1, Ordering::Relaxed);
                     job = Some((ptr as usize, device));
                 }
@@ -1777,79 +2441,92 @@ fn dsv4_apply_moe_rows(
         }
         match job {
             Some((ptr, device)) if Some(device) == dev0 => {
-                jobs0.push(crate::dsv4_gpu::ExpertSwigluJob {
+                let sw = crate::dsv4_gpu::ExpertSwigluJob {
                     expert: e,
                     ptr,
                     x: gx,
                     m,
                     group,
-                });
+                };
+                if pending {
+                    jobs0_wait.push(sw);
+                } else {
+                    jobs0_ready.push(sw);
+                }
             }
             Some((ptr, device)) if Some(device) == dev1 => {
-                jobs1.push(crate::dsv4_gpu::ExpertSwigluJob {
+                let sw = crate::dsv4_gpu::ExpertSwigluJob {
                     expert: e,
                     ptr,
                     x: gx,
                     m,
                     group,
-                });
+                };
+                if pending {
+                    jobs1_wait.push(sw);
+                } else {
+                    jobs1_ready.push(sw);
+                }
             }
             _ => cpu_work.push((e, gx, group)),
         }
     }
+    let hint: Vec<usize> = {
+        let mut u = Vec::new();
+        for prep in &preps {
+            for (e, _) in &prep.picks {
+                if !u.contains(e) {
+                    u.push(*e);
+                }
+            }
+        }
+        u
+    };
     let ff = cfg.ff_dim.max(1);
     let mut gpu_out: Vec<(Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
-    let take_fail = |failed: Vec<crate::dsv4_gpu::ExpertSwigluJob>,
-                     cpu_work: &mut Vec<(usize, Vec<f32>, Vec<(usize, f32)>)>| {
-        for job in failed {
-            cpu_work.push((job.expert, job.x, job.group));
-        }
-    };
-    if !jobs1.is_empty() {
-        if let (Some(h0), Some(h1)) = (hip0.as_ref(), hip1.as_ref()) {
-            std::thread::scope(|s| {
-                let j0 = s.spawn(|| {
-                    crate::dsv4_gpu::run_expert_swiglu_jobs(h0, jobs0, dim, ff, Some(metrics))
-                });
-                let j1 = s.spawn(|| {
-                    crate::dsv4_gpu::run_expert_swiglu_jobs(h1, jobs1, dim, ff, Some(metrics))
-                });
-                match j0.join() {
-                    Ok((rows, fail)) => {
-                        gpu_out.extend(rows);
-                        take_fail(fail, &mut cpu_work);
-                    }
-                    Err(_) => tracing::warn!("GPU0 expert SwiGLU thread panicked"),
-                }
-                match j1.join() {
-                    Ok((rows, fail)) => {
-                        gpu_out.extend(rows);
-                        take_fail(fail, &mut cpu_work);
-                    }
-                    Err(_) => tracing::warn!("GPU1 expert SwiGLU thread panicked"),
-                }
-            });
-            if let Some(g) = gpu.as_mut() {
-                g.used.store(true, Ordering::Relaxed);
-            }
-            let _ = hip0.as_ref().map(|h| h.bind());
-        } else {
-            take_fail(jobs0, &mut cpu_work);
-            take_fail(jobs1, &mut cpu_work);
-        }
-    } else if !jobs0.is_empty() {
-        if let Some(h0) = hip0.as_ref() {
-            let (rows, fail) =
-                crate::dsv4_gpu::run_expert_swiglu_jobs(h0, jobs0, dim, ff, Some(metrics));
-            gpu_out.extend(rows);
-            take_fail(fail, &mut cpu_work);
-            if let Some(g) = gpu.as_mut() {
-                g.used.store(true, Ordering::Relaxed);
-            }
-        } else {
-            take_fail(jobs0, &mut cpu_work);
-        }
+    let mut gpu_compute = run_expert_job_pair(
+        hip0.as_ref(),
+        hip1.as_ref(),
+        jobs0_ready,
+        jobs1_ready,
+        dim,
+        ff,
+        metrics,
+        &mut gpu_out,
+        &mut cpu_work,
+    );
+    if let Some(g) = gpu.as_mut() {
+        g.join_expert_h2d();
     }
+    gpu_compute |= run_expert_job_pair(
+        hip0.as_ref(),
+        hip1.as_ref(),
+        jobs0_wait,
+        jobs1_wait,
+        dim,
+        ff,
+        metrics,
+        &mut gpu_out,
+        &mut cpu_work,
+    );
+    let next_blk = (layer_idx + 1 < cfg.n_layers).then_some(cfg.gguf_blk(layer_idx + 1));
+    let prefetch = if crate::dsv4_gpu::want_hint_prefetch(cfg) {
+        match (gpu.as_mut(), file, next_blk) {
+            (Some(g), Some(f), Some(nl)) => g
+                .begin_hint_prefetch(f, nl, &hint, cfg, Some(metrics), blk)
+                .ok(),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if gpu_compute {
+        if let Some(g) = gpu.as_mut() {
+            g.used.store(true, Ordering::Relaxed);
+        }
+        let _ = hip0.as_ref().map(|h| h.bind());
+    }
+    let mut inflight = (false, false);
     for (y, group) in gpu_out {
         scatter_expert_rows(&mut routed, &y, &group, dim);
     }
@@ -1878,17 +2555,36 @@ fn dsv4_apply_moe_rows(
         }
         scatter_expert_rows(&mut routed, &gy, &group, dim);
     }
+    let t_hc = Instant::now();
+    std::thread::scope(|s| {
+        let pref_jh = match (gpu.as_ref(), prefetch.as_ref()) {
+            (Some(g), Some(plan)) if !plan.is_empty() => {
+                Some(s.spawn(|| g.submit_copy_plan(plan, Some(metrics))))
+            }
+            _ => None,
+        };
+        for i in 0..routed.len().min(shexp_y.len()) {
+            routed[i] += shexp_y[i];
+        }
+        hc_post_batch(&routed, states, spec, dim, |t| {
+            (preps[t].fpost.as_slice(), preps[t].fcomb.as_slice())
+        });
+        if let Some(jh) = pref_jh {
+            match jh.join() {
+                Ok(pair) => inflight = pair,
+                Err(_) => tracing::warn!("L+1 expert prefetch H2D panicked"),
+            }
+        }
+    });
     if let Some(g) = gpu.as_mut() {
         g.finish_h2d_keep();
-    }
-    let t_hc = Instant::now();
-    for t in 0..n_tok {
-        let mut y = vec![0.0f32; dim];
-        let off = t.saturating_mul(dim);
-        for j in 0..dim {
-            y[j] = routed[off + j] + shexp_y[off + j];
+        g.unpin_layer(blk);
+        g.mark_expert_h2d(inflight.0, inflight.1);
+        if inflight.0 || inflight.1 {
+            metrics
+                .expert_prefill_overlaps
+                .fetch_add(1, Ordering::Relaxed);
         }
-        states[t] = hc_post(&y, &states[t], &preps[t].fpost, &preps[t].fcomb, spec, dim);
     }
     metrics
         .dsv4_hc_ns
@@ -2188,8 +2884,8 @@ pub fn forward_dsv4_tokens(
             f.tensor("blk.0.ffn_up_shexp.weight")
                 .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
         });
-    let mut states: Vec<Vec<Vec<f32>>> = Vec::with_capacity(tokens.len());
-    for &token in tokens {
+    let mut states = HcBatch::new(tokens.len(), hc, dim);
+    for (t, &token) in tokens.iter().enumerate() {
         let t_embed = Instant::now();
         let x0 = if !model.embed.is_empty() {
             model.embed[token as usize * dim..(token as usize + 1) * dim].to_vec()
@@ -2203,7 +2899,7 @@ pub fn forward_dsv4_tokens(
         metrics
             .dsv4_embed_ns
             .fetch_add(t_embed.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        states.push(vec![x0; hc]);
+        states.fill_token_all_streams(t, &x0);
     }
     for layer_idx in 0..cfg.n_layers {
         tracing::debug!(layer_idx, n_layers = cfg.n_layers, "dsv4 chunk layer");
@@ -2248,8 +2944,17 @@ pub fn forward_dsv4_tokens(
         )?;
     }
     if write_logits {
-        if let Some(last) = states.last() {
-            let used = dsv4_lm_head(model, dsv4, last, logits, metrics, gpu.as_deref_mut(), file)?;
+        if states.n_tok > 0 {
+            let last = states.last_streams();
+            let used = dsv4_lm_head(
+                model,
+                dsv4,
+                &last,
+                logits,
+                metrics,
+                gpu.as_deref_mut(),
+                file,
+            )?;
             if used {
                 metrics.gpu_forwards.fetch_add(1, Ordering::Relaxed);
                 metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
@@ -3031,6 +3736,144 @@ mod tests {
         for dst in 0..hc {
             let sum: f32 = (0..hc).map(|src| comb[dst + src * hc]).sum();
             assert!((sum - 1.0).abs() < 0.15, "row {dst} sum={sum}");
+        }
+    }
+
+    #[test]
+    fn hc_pre_rows_matches_per_token() {
+        let spec = Dsv4Spec {
+            q_lora_rank: 8,
+            o_lora_rank: 8,
+            o_group_count: 2,
+            hc_mult: 2,
+            hc_sinkhorn_iters: 4,
+            hc_eps: 1e-6,
+            hash_layer_count: 0,
+            rope_offset: 0,
+        };
+        let dim = 8;
+        let hc = spec.hc_mult;
+        let hc_dim = dim * hc;
+        let mix_dim = (2 + hc) * hc;
+        let mix = HcMix {
+            fn_w: (0..mix_dim * hc_dim)
+                .map(|i| 0.01 * (i as f32 % 7.0))
+                .collect(),
+            base: vec![0.0; 2 * hc + hc * hc],
+            scale: vec![1.0, 1.0, 1.0],
+        };
+        let states: Vec<Vec<Vec<f32>>> = (0..3)
+            .map(|t| {
+                (0..hc)
+                    .map(|s| (0..dim).map(|i| 0.1 * (t + s + i) as f32).collect())
+                    .collect()
+            })
+            .collect();
+        let (curs, posts, combs) = hc_pre_rows(&states, &mix, &spec, dim, 1e-5).expect("rows");
+        for (t, streams) in states.iter().enumerate() {
+            let (cur, post, comb) = hc_pre(streams, &mix, &spec, dim, 1e-5).expect("one");
+            let row = &curs[t * dim..(t + 1) * dim];
+            for i in 0..dim {
+                assert!(
+                    (row[i] - cur[i]).abs() < 1e-5,
+                    "token {t} dim {i} rows={} seq={}",
+                    row[i],
+                    cur[i]
+                );
+            }
+            assert_eq!(post.len(), posts[t].len());
+            for (a, b) in posts[t].iter().zip(post.iter()) {
+                assert!((a - b).abs() < 1e-5);
+            }
+            for (a, b) in combs[t].iter().zip(comb.iter()) {
+                assert!((a - b).abs() < 1e-5);
+            }
+        }
+    }
+
+    fn hc_post_ref(
+        x: &[f32],
+        residual: &[Vec<f32>],
+        post: &[f32],
+        comb: &[f32],
+        hc: usize,
+        dim: usize,
+    ) -> Vec<Vec<f32>> {
+        let mut out = vec![vec![0.0f32; dim]; hc];
+        for dst in 0..hc {
+            let pw = post.get(dst).copied().unwrap_or(1.0);
+            for i in 0..dim.min(x.len()) {
+                out[dst][i] = x[i] * pw;
+            }
+            for src in 0..hc {
+                let w = comb.get(dst + src * hc).copied().unwrap_or(0.0);
+                if let Some(row) = residual.get(src) {
+                    for i in 0..dim.min(row.len()) {
+                        out[dst][i] += row[i] * w;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hc_post_rows_matches_per_token() {
+        for hc in [2usize, 4] {
+            let spec = Dsv4Spec {
+                q_lora_rank: 8,
+                o_lora_rank: 8,
+                o_group_count: 2,
+                hc_mult: hc,
+                hc_sinkhorn_iters: 4,
+                hc_eps: 1e-6,
+                hash_layer_count: 0,
+                rope_offset: 0,
+            };
+            let dim = 8;
+            let n_tok = 3;
+            let xs: Vec<f32> = (0..n_tok * dim).map(|i| 0.01 * i as f32).collect();
+            let posts: Vec<Vec<f32>> = (0..n_tok)
+                .map(|t| (0..hc).map(|i| 0.2 + 0.1 * (t + i) as f32).collect())
+                .collect();
+            let combs: Vec<Vec<f32>> = (0..n_tok)
+                .map(|t| (0..hc * hc).map(|i| 0.05 * ((t + i) % 5) as f32).collect())
+                .collect();
+            let mut states: Vec<Vec<Vec<f32>>> = (0..n_tok)
+                .map(|t| {
+                    (0..hc)
+                        .map(|s| (0..dim).map(|i| 0.1 * (t + s + i) as f32).collect())
+                        .collect()
+                })
+                .collect();
+            let expect: Vec<Vec<Vec<f32>>> = states
+                .iter()
+                .enumerate()
+                .map(|(t, residual)| {
+                    hc_post_ref(
+                        &xs[t * dim..(t + 1) * dim],
+                        residual,
+                        &posts[t],
+                        &combs[t],
+                        hc,
+                        dim,
+                    )
+                })
+                .collect();
+            hc_post_rows(&xs, &mut states, &posts, &combs, &spec, dim);
+            for t in 0..n_tok {
+                assert_eq!(states[t].len(), expect[t].len());
+                for s in 0..hc {
+                    for i in 0..dim {
+                        let a = states[t][s][i];
+                        let b = expect[t][s][i];
+                        assert!(
+                            (a - b).abs() < 1e-5,
+                            "hc={hc} token {t} stream {s} dim {i} rows={a} seq={b}"
+                        );
+                    }
+                }
+            }
         }
     }
 
