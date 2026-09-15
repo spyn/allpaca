@@ -162,8 +162,9 @@ Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH`, PATH `nvcc`, and
 
 GPU ISAs (same idea as HIP offload): `ALLPACA_CUDA_ARCH` / `CUDAARCHS` /
 `TORCH_CUDA_ARCH_LIST`, else live `nvidia-smi` compute caps, else a fat binary
-for **sm_86** (RTX 3060 / Ampere) and **sm_120** (Blackwell GeForce laptop).
-Example: `ALLPACA_CUDA_ARCH=sm_86,sm_120 cargo test -p allpaca-cuda --features cuda`.
+for **sm_86** (RTX 3060 / Ampere), **sm_89** (Ada laptop), and **sm_120**
+(Blackwell GeForce laptop).
+Example: `ALLPACA_CUDA_ARCH=sm_86,sm_89,sm_120 cargo test -p allpaca-cuda --features cuda`.
 
 ```bash
 cargo test -p allpaca-cuda --features cuda

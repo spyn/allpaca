@@ -311,6 +311,25 @@ mod scale_kv_tests {
     }
 
     #[test]
+    fn scales_8gb_laptop_to_half_vram() {
+        let mut inv = cuda_12gb_inventory();
+        inv.devices[1].name = "Ada laptop".into();
+        inv.devices[1].memory_bytes = 8 << 30;
+        let mut cfg = Config::compiled_defaults();
+        scale_kv_vram_from_inventory(&mut cfg, &inv);
+        assert_eq!(cfg.kv.vram_bytes, 4usize << 30);
+    }
+
+    #[test]
+    fn scales_6gb_card_below_cap() {
+        let mut inv = cuda_12gb_inventory();
+        inv.devices[1].memory_bytes = 6 << 30;
+        let mut cfg = Config::compiled_defaults();
+        scale_kv_vram_from_inventory(&mut cfg, &inv);
+        assert_eq!(cfg.kv.vram_bytes, 3usize << 30);
+    }
+
+    #[test]
     fn preserves_explicit_kv_override() {
         let mut cfg = Config::compiled_defaults();
         cfg.kv.vram_bytes = 256 * 1024 * 1024;
@@ -593,6 +612,11 @@ impl Engine {
                 lru.set_gpu_busy(util);
             }
         }
+    }
+
+    /// Configured KV VRAM budget after boot-time GPU capacity scaling.
+    pub fn kv_vram_budget_bytes(&self) -> usize {
+        self.config.kv.vram_bytes
     }
 
     pub fn stats(&self) -> StatsSnapshot {

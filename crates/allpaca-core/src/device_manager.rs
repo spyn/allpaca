@@ -106,8 +106,8 @@ pub fn detect_pipeline_mode(devices: &[DeviceInfo]) -> PipelineMode {
 }
 
 /// When `kv.vram_bytes` is still the tiny compiled default, scale from device VRAM.
-/// Leaves ≥50% for weights/workspace and caps KV at 4 GiB (fits RTX 3060 12 GB /
-/// Blackwell laptop MobileTiered profiles).
+/// Leaves ≥50% for weights/workspace and caps KV at 4 GiB (fits RTX 3060 12 GB,
+/// Ada/Blackwell laptop MobileTiered profiles).
 pub fn suggested_kv_vram_bytes(total_vram: u64) -> usize {
     let floor = allpaca_types::KvSection::default().vram_bytes;
     if total_vram == 0 {
@@ -243,6 +243,8 @@ mod tests {
         assert_eq!(suggested_kv_vram_bytes(twelve), 4usize << 30);
         assert_eq!(suggested_kv_vram_bytes(0), 4 * 1024 * 1024);
         assert_eq!(suggested_kv_vram_bytes(1 << 30), 512 * 1024 * 1024);
+        assert_eq!(suggested_kv_vram_bytes(6 << 30), 3usize << 30);
+        assert_eq!(suggested_kv_vram_bytes(8 << 30), 4usize << 30);
     }
 
     #[test]

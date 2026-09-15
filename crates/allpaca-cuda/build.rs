@@ -6,8 +6,8 @@
 //!
 //! GPU ISAs: `ALLPACA_CUDA_ARCH` / `CUDAARCHS` / `TORCH_CUDA_ARCH_LIST`, else live
 //! `nvidia-smi` compute caps, else a fat list for consumer Ampere (RTX 3060 /
-//! sm_86) and Blackwell GeForce laptop (sm_120). Kepler/K80 (sm_37) needs a
-//! separate CUDA ≤11.4 toolchain and is not in this fat binary.
+//! sm_86), Ada laptop (sm_89), and Blackwell GeForce laptop (sm_120). Kepler/K80
+//! (sm_37) needs a separate CUDA ≤11.4 toolchain and is not in this fat binary.
 
 use std::env;
 use std::path::{Path, PathBuf};

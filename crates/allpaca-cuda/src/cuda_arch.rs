@@ -1,15 +1,15 @@
 //! CUDA GPU ISA helpers shared by `build.rs` (via `#[path]`) and unit tests.
 //!
 //! Accepts env-style tokens (`sm_86`, `8.6`, `86`) and emits nvcc `-gencode` flags.
-//! Default fat binary targets RTX 3060 (Ampere / sm_86) and Blackwell GeForce
-//! laptop (sm_120).
+//! Default fat binary targets RTX 3060 (Ampere / sm_86), Ada laptop (sm_89), and
+//! Blackwell GeForce laptop (sm_120).
 
 #![allow(dead_code)] // lib links this for tests; build.rs uses the same file via #[path]
 
-/// Default fat binary: Ampere consumer (RTX 3060 12GB / sm_86) + Blackwell
-/// GeForce laptop (RTX 50-series mobile / sm_120).
+/// Default fat binary: Ampere consumer (RTX 3060 12GB / sm_86), Ada laptop
+/// (sm_89), and Blackwell GeForce laptop (sm_120).
 pub fn default_cuda_arches() -> Vec<String> {
-    ["sm_86", "sm_120"]
+    ["sm_86", "sm_89", "sm_120"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -120,10 +120,14 @@ mod tests {
     }
 
     #[test]
-    fn default_fat_binary_is_3060_and_blackwell_laptop() {
+    fn default_fat_binary_is_3060_ada_and_blackwell_laptop() {
         assert_eq!(
             default_cuda_arches(),
-            vec!["sm_86".to_string(), "sm_120".to_string()]
+            vec![
+                "sm_86".to_string(),
+                "sm_89".to_string(),
+                "sm_120".to_string()
+            ]
         );
     }
 
@@ -135,6 +139,8 @@ mod tests {
             vec![
                 "-gencode=arch=compute_86,code=sm_86".to_string(),
                 "-gencode=arch=compute_86,code=compute_86".to_string(),
+                "-gencode=arch=compute_89,code=sm_89".to_string(),
+                "-gencode=arch=compute_89,code=compute_89".to_string(),
                 "-gencode=arch=compute_120,code=sm_120".to_string(),
                 "-gencode=arch=compute_120,code=compute_120".to_string(),
             ]

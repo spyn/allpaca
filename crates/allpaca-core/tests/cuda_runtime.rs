@@ -98,4 +98,29 @@ fn cuda_mobile_tiered_when_device_present() {
         stats.pipeline_mode
     );
     assert_eq!(stats.backend, "cuda");
+    assert!(
+        engine.kv_vram_budget_bytes() > 4 * 1024 * 1024,
+        "expected GPU-scaled kv budget, got {}",
+        engine.kv_vram_budget_bytes()
+    );
+}
+
+#[test]
+fn cuda_smoke_decode_keeps_device_resident() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    let load = engine.stats();
+    let out = engine.generate("hi", greedy(8)).expect("generate");
+    assert_eq!(out.token_ids.len(), 8);
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(stats.weight_bytes_on_device >= load.weight_bytes_on_device);
+    assert!(
+        stats.gpu_forwards + stats.target_gpu_forwards >= 8,
+        "expected ≥8 CUDA forwards for 8 tokens, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
 }

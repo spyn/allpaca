@@ -1020,6 +1020,46 @@ mod tests {
     }
 
     #[test]
+    fn device_pointer_gemm_nt_matches_host_path_when_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let m = 2i32;
+        let n = 2i32;
+        let k = 2i32;
+        let a = [1.0f32, 0.0, 0.0, 1.0];
+        let b = [1.0f32, 0.0, 0.0, 1.0];
+        let mut host_c = [0.0f32; 4];
+        gemm_nt(&a, &b, &mut host_c, m, n, k).expect("host gemm");
+
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let da = ws.upload_f32(&a).expect("upload a");
+        let db = ws.upload_f32(&b).expect("upload b");
+        let dc = device_malloc(16, 0).expect("alloc c");
+        ws.gemm_nt_dev(da.cast(), db.cast(), dc.cast(), m, n, k)
+            .expect("device gemm");
+        let mut device_c = [0.0f32; 4];
+        memcpy(
+            device_c.as_mut_ptr().cast(),
+            dc,
+            16,
+            MEMCPY_D2H,
+        )
+        .expect("d2h");
+        device_free(da.cast());
+        device_free(db.cast());
+        device_free(dc);
+        for i in 0..4 {
+            assert!(
+                (host_c[i] - device_c[i]).abs() < 1e-5,
+                "i={i} host={} device={}",
+                host_c[i],
+                device_c[i]
+            );
+        }
+    }
+
+    #[test]
     fn embed_gather_matches_cpu_when_device_present() {
         if device_count() <= 0 {
             return;
