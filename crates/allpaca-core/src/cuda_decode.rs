@@ -156,9 +156,7 @@ impl TinyModel {
                 &mut x,
                 dim as i32,
             )?;
-            metrics
-                .elementwise_gpu_ops
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
         }
 
         let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
@@ -184,9 +182,7 @@ impl TinyModel {
                 dim as i32,
                 cfg.eps,
             )?;
-            metrics
-                .elementwise_gpu_ops
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
             cuda.gemm_nt_host_a_dev_b(
                 &scratch[..dim],
@@ -215,10 +211,18 @@ impl TinyModel {
 
             // RoPE on host (device rope available; host keeps KV slot writes simple).
             for h in 0..cfg.n_heads {
-                rope(&mut q[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
+                rope(
+                    &mut q[h * head_dim..(h + 1) * head_dim],
+                    pos,
+                    cfg.rope_theta,
+                )?;
             }
             for h in 0..cfg.n_kv_heads {
-                rope(&mut k[h * head_dim..(h + 1) * head_dim], pos, cfg.rope_theta)?;
+                rope(
+                    &mut k[h * head_dim..(h + 1) * head_dim],
+                    pos,
+                    cfg.rope_theta,
+                )?;
             }
 
             let page_tokens = kv
@@ -231,20 +235,37 @@ impl TinyModel {
             kv.write_slot(page_id, slot, cfg.n_kv_heads, head_dim, &k, &v)?;
             kv.touch(page_id, 1.0);
 
-            let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
-            let n_kv = k_all.len() / kv_dim;
-            attention(
-                &q,
-                &k_all,
-                &v_all,
-                &mut attn_out,
-                1,
-                n_kv,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                head_dim,
-                true,
-            )?;
+            if let Some((k_dev, v_dev, n_kv)) =
+                kv.cuda_single_page_view(&page_ids[layer_idx], cfg.n_kv_heads, head_dim)
+            {
+                cuda.attention_host_q_dev_kv(
+                    &q,
+                    k_dev,
+                    v_dev,
+                    &mut attn_out,
+                    1,
+                    n_kv as i32,
+                    cfg.n_heads as i32,
+                    cfg.n_kv_heads as i32,
+                    head_dim as i32,
+                    true,
+                )?;
+            } else {
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+                let n_kv = k_all.len() / kv_dim;
+                attention(
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &mut attn_out,
+                    1,
+                    n_kv,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    true,
+                )?;
+            }
 
             cuda.gemm_nt_host_a_dev_b(
                 &attn_out,
@@ -278,9 +299,7 @@ impl TinyModel {
             dim as i32,
             cfg.eps,
         )?;
-        metrics
-            .elementwise_gpu_ops
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
         cuda.gemm_nt_host_a_dev_b(
             &scratch[..dim],
             resident.ptr(resident.lm_head)?,
@@ -290,12 +309,8 @@ impl TinyModel {
             dim as i32,
         )?;
 
-        metrics
-            .gpu_forwards
-            .fetch_add(1, Ordering::Relaxed);
-        metrics
-            .target_gpu_forwards
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.gpu_forwards.fetch_add(1, Ordering::Relaxed);
+        metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -322,10 +337,14 @@ fn apply_ffn_cuda(
     } else {
         layer.ffn_norm
     };
-    cuda.rmsnorm_host_x_dev_w(x, resident.ptr(norm_w)?, &mut scratch[..dim], dim as i32, cfg.eps)?;
-    metrics
-        .elementwise_gpu_ops
-        .fetch_add(1, Ordering::Relaxed);
+    cuda.rmsnorm_host_x_dev_w(
+        x,
+        resident.ptr(norm_w)?,
+        &mut scratch[..dim],
+        dim as i32,
+        cfg.eps,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
     let mut gate = vec![0.0f32; ff];
     let mut up = vec![0.0f32; ff];

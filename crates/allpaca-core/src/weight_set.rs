@@ -89,17 +89,14 @@ pub fn lru_hits_on_cyclic_scan(n_layers: usize, n_slots: usize, cycles: usize) -
                 used_at[i] = clock;
                 continue;
             }
-            let victim = slots
-                .iter()
-                .position(|s| s.is_none())
-                .unwrap_or_else(|| {
-                    used_at
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, t)| *t)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0)
-                });
+            let victim = slots.iter().position(|s| s.is_none()).unwrap_or_else(|| {
+                used_at
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, t)| *t)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
             slots[victim] = Some(layer);
             used_at[victim] = clock;
         }
@@ -366,9 +363,7 @@ impl WeightWorkingSet {
         } else {
             Some(PackedStore::pack_layer_major(
                 &temp_pack_path(),
-                packed
-                    .iter()
-                    .map(|(id, ffn)| (id.layer as usize, ffn)),
+                packed.iter().map(|(id, ffn)| (id.layer as usize, ffn)),
             )?)
         };
         let nring = plan.ring_slots.max(1);
@@ -438,11 +433,15 @@ impl WeightWorkingSet {
                 expert: 0,
             });
         }
-        self.pool.get(layer).cloned().filter(|f| !f.w_gate.is_empty()).ok_or_else(|| {
-            AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "FFN layer {layer} missing from weight working set"
-            )))
-        })
+        self.pool
+            .get(layer)
+            .cloned()
+            .filter(|f| !f.w_gate.is_empty())
+            .ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "FFN layer {layer} missing from weight working set"
+                )))
+            })
     }
 
     fn fill_from_source(&self, layer: usize) -> Result<LayerFfn, AllpacaError> {
@@ -516,7 +515,9 @@ pub struct ExpertId {
 
 impl ExpertId {
     pub fn bank(self, n_experts: u32) -> u32 {
-        self.layer.saturating_mul(n_experts).saturating_add(self.expert)
+        self.layer
+            .saturating_mul(n_experts)
+            .saturating_add(self.expert)
     }
 }
 
@@ -866,11 +867,11 @@ mod tests {
             w_router: vec![],
             experts: vec![],
             mla: None,
-            shared_expert: None,
+            shared_expert: LayerFfn::default(),
             expert_bias: vec![],
-        attn_out_gate: vec![],
-        attn_post_norm: vec![],
-        ffn_post_norm: vec![],
+            attn_out_gate: vec![],
+            attn_post_norm: vec![],
+            ffn_post_norm: vec![],
         }
     }
 
@@ -928,7 +929,11 @@ mod tests {
         assert_eq!(qstar_fill_count(8, 52.7, 77.3), 5);
         assert_eq!(qstar_fill_count(8, 11.8, 47.5), 2);
         assert_eq!(qstar_fill_count(4, 1.0, 100.0), 1, "always keep warming");
-        assert_eq!(qstar_fill_count(8, 0.0, 50.0), 1, "unmeasured PCIe fills one, rest CPU");
+        assert_eq!(
+            qstar_fill_count(8, 0.0, 50.0),
+            1,
+            "unmeasured PCIe fills one, rest CPU"
+        );
         assert_eq!(qstar_fill_count(0, 50.0, 80.0), 0);
     }
 
@@ -960,8 +965,14 @@ mod tests {
     fn expert_lru_hits_repeating_ids_not_a_cyclic_layer_walk() {
         let lru = ExpertLru::new(2, MissPolicy::Fill);
         let dummy = LayerFfn::default();
-        let a = ExpertId { layer: 0, expert: 1 };
-        let b = ExpertId { layer: 0, expert: 3 };
+        let a = ExpertId {
+            layer: 0,
+            expert: 1,
+        };
+        let b = ExpertId {
+            layer: 0,
+            expert: 3,
+        };
         for id in [a, b, a, b, a] {
             let plan = lru.plan(&[id]);
             for f in &plan.fill {
@@ -978,10 +989,22 @@ mod tests {
         let lru = ExpertLru::with_bandwidth(1, MissPolicy::Qstar, 1.0, 100.0);
         let dummy = LayerFfn::default();
         let misses = [
-            ExpertId { layer: 0, expert: 0 },
-            ExpertId { layer: 0, expert: 1 },
-            ExpertId { layer: 0, expert: 2 },
-            ExpertId { layer: 0, expert: 3 },
+            ExpertId {
+                layer: 0,
+                expert: 0,
+            },
+            ExpertId {
+                layer: 0,
+                expert: 1,
+            },
+            ExpertId {
+                layer: 0,
+                expert: 2,
+            },
+            ExpertId {
+                layer: 0,
+                expert: 3,
+            },
         ];
         let plan = lru.plan(&misses);
         assert_eq!(plan.hits.len(), 0);
@@ -997,13 +1020,10 @@ mod tests {
     /// pegged GPU must still fill one expert so the cache keeps warming.
     #[test]
     fn qstar_shifts_to_cpu_when_sampled_gpu_is_busy() {
-        let misses: Vec<ExpertId> = (0..8)
-            .map(|expert| ExpertId { layer: 0, expert })
-            .collect();
+        let misses: Vec<ExpertId> = (0..8).map(|expert| ExpertId { layer: 0, expert }).collect();
         let bytes = 1 << 20;
-        let build = || {
-            ExpertLru::with_overhead(1, MissPolicy::Qstar, 8.0e9, 4.0e9, 0.0, 0.0, bytes as f64)
-        };
+        let build =
+            || ExpertLru::with_overhead(1, MissPolicy::Qstar, 8.0e9, 4.0e9, 0.0, 0.0, bytes as f64);
 
         let idle = build();
         let idle_fill = idle.plan(&misses).fill.len();
@@ -1038,7 +1058,10 @@ mod tests {
     #[test]
     fn cpu_miss_policy_never_admits() {
         let lru = ExpertLru::new(2, MissPolicy::Cpu);
-        let plan = lru.plan(&[ExpertId { layer: 1, expert: 2 }]);
+        let plan = lru.plan(&[ExpertId {
+            layer: 1,
+            expert: 2,
+        }]);
         assert!(plan.fill.is_empty());
         assert_eq!(plan.cpu.len(), 1);
     }

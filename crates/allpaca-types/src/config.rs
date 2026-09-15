@@ -283,6 +283,8 @@ pub enum DraftProviderKind {
     DraftModel,
     /// Trailing NextN/MTP blocks from the target GGUF (self-speculation).
     Mtp,
+    /// DeepSeek-V4-Flash DSpark sidecar (`dspark-*.gguf` / DFlash + Markov head).
+    Dspark,
 }
 
 impl DraftProviderKind {
@@ -306,8 +308,9 @@ impl DraftProviderKind {
             "ngram" | "n-gram" => Ok(Self::Ngram),
             "draft" | "draft_model" | "draft-model" => Ok(Self::DraftModel),
             "mtp" | "nextn" | "next-n" => Ok(Self::Mtp),
+            "dspark" | "dflash" | "draft-dspark" | "draft_dspark" => Ok(Self::Dspark),
             other => Err(format!(
-                "unknown draft provider '{other}' (expected ngram, draft_model, mtp)"
+                "unknown draft provider '{other}' (expected ngram, draft_model, mtp, dspark)"
             )),
         }
     }
@@ -515,6 +518,8 @@ pub struct ModelSection {
     pub config_path: Option<PathBuf>,
     /// Tokenizer sidecar JSON (vocab or HuggingFace `tokenizer.json`).
     pub tokenizer_path: Option<PathBuf>,
+    /// Hub revision when `path` is `org/name` (default `main`; also `org/name@rev`).
+    pub hf_revision: Option<String>,
     pub synthetic: bool,
     pub id: String,
     /// Edge0: skip Recover-LoRA install.
@@ -532,6 +537,7 @@ impl Default for ModelSection {
             draft_path: None,
             config_path: None,
             tokenizer_path: None,
+            hf_revision: None,
             synthetic: false,
             id: "allpaca".into(),
             edge0_no_lora: false,
@@ -710,6 +716,13 @@ mod tests {
             vec![DraftProviderKind::Ngram, DraftProviderKind::DraftModel]
         );
         assert!(DraftProviderKind::parse_list("nope").is_err());
+        let ds = DraftProviderKind::parse_list("dspark").unwrap();
+        assert_eq!(ds, vec![DraftProviderKind::Dspark]);
+        let aliases = DraftProviderKind::parse_list("dflash,draft-dspark").unwrap();
+        assert_eq!(
+            aliases,
+            vec![DraftProviderKind::Dspark, DraftProviderKind::Dspark]
+        );
     }
 
     #[test]
@@ -873,6 +886,23 @@ mod tests {
             cfg.model.tokenizer_path.as_deref(),
             Some(std::path::Path::new("tokenizer.json"))
         );
+    }
+
+    #[test]
+    fn model_section_accepts_hf_repo_and_revision() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [model]
+            path = "Qwen/Qwen2.5-0.5B-Instruct"
+            hf_revision = "main"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model.path.as_deref(),
+            Some(std::path::Path::new("Qwen/Qwen2.5-0.5B-Instruct"))
+        );
+        assert_eq!(cfg.model.hf_revision.as_deref(), Some("main"));
     }
 
     #[test]

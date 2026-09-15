@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use allpaca_types::{AllpacaError, FatalError};
 
-use crate::direct_storage::DirectStorageBridge;
+use crate::direct_storage::{open_direct, DirectStorageBridge};
 use crate::numa::NumaTopology;
 use crate::telemetry::Metrics;
 use crate::weight_set::{align_up, ExpertId, LayerFfn, DIRECT_ALIGN};
@@ -21,9 +21,6 @@ use crate::weight_set::{align_up, ExpertId, LayerFfn, DIRECT_ALIGN};
 /// Layer-major / FTW bank magic (8 bytes) + versioned header in the first aligned block.
 pub const PACKED_MAGIC: &[u8; 8] = b"ALLPFTW1";
 const PACKED_VERSION: u32 = 1;
-
-#[cfg(windows)]
-const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 
 struct AlignedBuf {
     ptr: *mut u8,
@@ -268,7 +265,11 @@ impl PackedStore {
     /// File coordinates for a DirectStorage-shaped DMA of this expert slot.
     pub fn slot_coords(&self, id: ExpertId) -> Option<(PathBuf, u64, usize)> {
         let slot = *self.index.get(&id)?;
-        Some((self.path.clone(), self.slot_file_offset(slot), self.slot_bytes))
+        Some((
+            self.path.clone(),
+            self.slot_file_offset(slot),
+            self.slot_bytes,
+        ))
     }
 }
 
@@ -285,7 +286,7 @@ impl Drop for PackedStore {
 }
 
 fn open_packed_reader(path: &Path, slot_bytes: usize) -> Result<(File, bool), AllpacaError> {
-    if let Ok(mut file) = open_direct(path) {
+    if let Ok(mut file) = open_direct(path, false) {
         if probe_slot_read(&mut file, slot_bytes).is_ok() {
             file.seek(SeekFrom::Start(0))?;
             return Ok((file, true));
@@ -314,37 +315,7 @@ fn probe_slot_read(file: &mut File, slot_bytes: usize) -> Result<(), AllpacaErro
 pub fn temp_pack_path() -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "allpaca-pack-{}-{id}.bin",
-        std::process::id()
-    ))
-}
-
-fn open_direct(path: &Path) -> std::io::Result<File> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        return OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open(path);
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        return OpenOptions::new()
-            .read(true)
-            .custom_flags(0o40000)
-            .open(path);
-    }
-    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Direct I/O is not available on this platform",
-        ))
-    }
+    std::env::temp_dir().join(format!("allpaca-pack-{}-{id}.bin", std::process::id()))
 }
 
 struct HostPoolInner {
@@ -555,10 +526,7 @@ mod tests {
     fn unique_path() -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(1);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "allpaca-pack-test-{}-{id}.bin",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("allpaca-pack-test-{}-{id}.bin", std::process::id()))
     }
 
     fn sample_ffn() -> LayerFfn {
@@ -714,7 +682,10 @@ mod tests {
             })
             .expect("coords");
         assert_eq!(coords.0, path);
-        assert_eq!(coords.1, DIRECT_ALIGN as u64, "data starts after FTW header");
+        assert_eq!(
+            coords.1, DIRECT_ALIGN as u64,
+            "data starts after FTW header"
+        );
         assert!(coords.2 >= DIRECT_ALIGN);
 
         let queue = Arc::new(DirectStorageQueue::new());

@@ -204,6 +204,9 @@ pub struct StatsSnapshot {
     /// Packed HIP lm_head outputs applied into Request logits (used by sampling).
     #[serde(default)]
     pub batch_gemm_hip_applied: u64,
+    /// Per-request lm_head GEMMs skipped for a packed HIP decode cohort.
+    #[serde(default)]
+    pub batch_gemm_lm_head_skipped: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,
@@ -299,4 +302,28 @@ pub struct StatsSnapshot {
     /// Vision encoder weight tensors resident on a HIP device after install (0 on CPU).
     #[serde(default)]
     pub vision_weight_bytes_on_device: u64,
+    /// DeepSeek-V4 HIP decode/prefill split (microseconds, cumulative).
+    #[serde(default)]
+    pub dsv4_h2d_us: f64,
+    #[serde(default)]
+    pub dsv4_gemv_us: f64,
+    #[serde(default)]
+    pub dsv4_silu_us: f64,
+    #[serde(default)]
+    pub dsv4_attn_us: f64,
+    #[serde(default)]
+    pub dsv4_norm_us: f64,
+    #[serde(default)]
+    pub dsv4_d2h_us: f64,
+    /// Packed expert / BF16 stream H2D bytes (not activation scratch).
+    #[serde(default)]
+    pub dsv4_h2d_bytes: u64,
+    #[serde(default)]
+    pub dsv4_pack_us: f64,
+    #[serde(default)]
+    pub dsv4_hc_us: f64,
+    #[serde(default)]
+    pub dsv4_router_us: f64,
+    #[serde(default)]
+    pub dsv4_embed_us: f64,
 }

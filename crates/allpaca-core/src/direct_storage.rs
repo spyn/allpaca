@@ -8,7 +8,9 @@
 //! 1. Probe `dstorage.dll` and resolve `DStorageGetFactory`.
 //! 2. Allocate expert weights as a shareable D3D12 buffer imported into HIP.
 //! 3. Submit DirectStorage file→buffer requests for NVMe expert fills.
-//! 4. Fall back to aligned Direct I/O + H2D when any runtime layer is missing.
+//! 4. Fall back to aligned Direct I/O (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`) + H2D
+//!    when any GPU-DMA layer is missing. Linux `O_DIRECT` is best-effort: tmpfs
+//!    and some network FS return EINVAL and we reopen buffered.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -255,9 +257,12 @@ impl Drop for AlignedHostBuf {
 
 #[cfg(windows)]
 const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+/// Linux `O_DIRECT` on x86_64/aarch64. Declared locally to avoid a libc crate.
+#[cfg(target_os = "linux")]
+const LINUX_O_DIRECT: i32 = 0o40000;
 
 fn read_aligned_at(path: &Path, offset: u64, dest: &mut [u8]) -> Result<bool, AllpacaError> {
-    if let Ok(mut file) = open_direct_reader(path) {
+    if let Ok(mut file) = open_direct(path, false) {
         if read_fully(&mut file, offset, dest).is_ok() {
             return Ok(true);
         }
@@ -282,19 +287,37 @@ fn read_fully(file: &mut File, offset: u64, dest: &mut [u8]) -> Result<(), Allpa
     Ok(())
 }
 
-#[cfg(windows)]
-fn open_direct_reader(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_NO_BUFFERING)
-        .open(path)
-}
-
-#[cfg(not(windows))]
-fn open_direct_reader(path: &Path) -> std::io::Result<File> {
-    // O_DIRECT is platform-specific; fall through to buffered open on failure sites.
-    File::open(path)
+/// Aligned Direct I/O open (Windows no-buffering / Linux `O_DIRECT`).
+/// Offset, length, and the caller's buffer must be [`DIRECT_ALIGN`]-aligned.
+pub(crate) fn open_direct(path: &Path, write: bool) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut opts = OpenOptions::new();
+        opts.read(true).custom_flags(FILE_FLAG_NO_BUFFERING);
+        if write {
+            opts.write(true);
+        }
+        return opts.open(path);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = OpenOptions::new();
+        opts.read(true).custom_flags(LINUX_O_DIRECT);
+        if write {
+            opts.write(true);
+        }
+        return opts.open(path);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (path, write);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Direct I/O is not available on this platform",
+        ))
+    }
 }
 
 /// Probe the host for a DirectStorage-capable stack.
@@ -525,11 +548,72 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(target_os = "linux")]
+    fn linux_fs_type(path: &Path) -> Option<String> {
+        let out = std::process::Command::new("stat")
+            .args(["-f", "-c", "%T"])
+            .arg(path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .to_ascii_lowercase(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stage_aligned_read_uses_o_direct_on_block_fs() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/allpaca-odirect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "ds-odirect-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let payload = vec![0x11u8; DIRECT_ALIGN];
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&payload).unwrap();
+            f.sync_all().unwrap();
+        }
+        let q = DirectStorageQueue::new();
+        let got = q.stage_aligned_read(&path, 0, DIRECT_ALIGN).unwrap();
+        assert_eq!(got, payload);
+        let fs = linux_fs_type(&path).unwrap_or_default();
+        let expects_direct = matches!(
+            fs.as_str(),
+            "ext2" | "ext3" | "ext4" | "ext2/ext3" | "xfs" | "btrfs" | "f2fs"
+        );
+        if expects_direct {
+            assert_eq!(
+                q.pinned(),
+                1,
+                "O_DIRECT must pin-stage on {fs}; staged={}",
+                q.staged()
+            );
+            assert_eq!(q.staged(), 0);
+        } else {
+            eprintln!(
+                "skip O_DIRECT pin assert on fs={fs:?} path={}",
+                path.display()
+            );
+            assert!(q.pinned() + q.staged() >= 1);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn fill_to_device_falls_back_to_h2d_when_direct_dma_is_unavailable() {
-        let path = PathBuf::from(format!(
-            "{}\\allpaca-ds-fill-{}-{}.bin",
-            std::env::temp_dir().display(),
+        let path = std::env::temp_dir().join(format!(
+            "allpaca-ds-fill-{}-{}.bin",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

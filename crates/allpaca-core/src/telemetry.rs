@@ -148,6 +148,8 @@ pub struct Metrics {
     pub batch_gemm_hip_kernels: AtomicU64,
     /// Packed HIP lm_head logits written into Request `pending_logits` (consumed by sample).
     pub batch_gemm_hip_applied: AtomicU64,
+    /// Per-request lm_head GEMMs skipped because a HIP decode cohort will pack them.
+    pub batch_gemm_lm_head_skipped: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
@@ -189,6 +191,18 @@ pub struct Metrics {
     pub vision_bytes_on_device: AtomicU64,
     /// Vision encoder weight tensors resident on HIP after install (not soft embeds).
     pub vision_weight_bytes_on_device: AtomicU64,
+    /// DeepSeek-V4 HIP TTFT split: expert/stream weight H2D (nanoseconds).
+    pub dsv4_h2d_ns: AtomicU64,
+    pub dsv4_gemv_ns: AtomicU64,
+    pub dsv4_silu_ns: AtomicU64,
+    pub dsv4_attn_ns: AtomicU64,
+    pub dsv4_norm_ns: AtomicU64,
+    pub dsv4_d2h_ns: AtomicU64,
+    pub dsv4_h2d_bytes: AtomicU64,
+    pub dsv4_pack_ns: AtomicU64,
+    pub dsv4_hc_ns: AtomicU64,
+    pub dsv4_router_ns: AtomicU64,
+    pub dsv4_embed_ns: AtomicU64,
 }
 
 impl Metrics {
@@ -323,6 +337,7 @@ impl Metrics {
             batch_gemm_executes: self.batch_gemm_executes.load(Ordering::Relaxed),
             batch_gemm_hip_kernels: self.batch_gemm_hip_kernels.load(Ordering::Relaxed),
             batch_gemm_hip_applied: self.batch_gemm_hip_applied.load(Ordering::Relaxed),
+            batch_gemm_lm_head_skipped: self.batch_gemm_lm_head_skipped.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
@@ -352,7 +367,20 @@ impl Metrics {
             rpc_activation_bytes: self.rpc_activation_bytes.load(Ordering::Relaxed),
             rpc_h2d_bytes: self.rpc_h2d_bytes.load(Ordering::Relaxed),
             vision_bytes_on_device: self.vision_bytes_on_device.load(Ordering::Relaxed),
-            vision_weight_bytes_on_device: self.vision_weight_bytes_on_device.load(Ordering::Relaxed),
+            vision_weight_bytes_on_device: self
+                .vision_weight_bytes_on_device
+                .load(Ordering::Relaxed),
+            dsv4_h2d_us: self.dsv4_h2d_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_gemv_us: self.dsv4_gemv_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_silu_us: self.dsv4_silu_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_attn_us: self.dsv4_attn_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_norm_us: self.dsv4_norm_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_d2h_us: self.dsv4_d2h_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_h2d_bytes: self.dsv4_h2d_bytes.load(Ordering::Relaxed),
+            dsv4_pack_us: self.dsv4_pack_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_hc_us: self.dsv4_hc_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_router_us: self.dsv4_router_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_embed_us: self.dsv4_embed_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
         }
     }
 

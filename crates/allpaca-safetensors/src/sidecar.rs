@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use allpaca_types::{AllpacaError, FatalError};
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HfQuantOverride {
@@ -150,6 +151,8 @@ pub struct HfConfig {
     pub num_key_value_heads: Option<usize>,
     #[serde(default)]
     pub intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub head_dim: Option<usize>,
     #[serde(default = "default_eps")]
     pub rms_norm_eps: f32,
     #[serde(default = "default_theta")]
@@ -166,8 +169,6 @@ pub struct HfConfig {
     pub shared_expert_intermediate_size: Option<usize>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
-    #[serde(default)]
-    pub head_dim: Option<usize>,
     #[serde(default)]
     pub partial_rotary_factor: Option<f32>,
     #[serde(default)]
@@ -197,6 +198,15 @@ pub struct HfConfig {
     pub norm_topk_prob: Option<bool>,
     #[serde(default)]
     pub n_shared_experts: Option<usize>,
+    // DeepSeek-style MoE / act (dsv4)
+    #[serde(default)]
+    pub hidden_act: Option<String>,
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
+    #[serde(default)]
+    pub num_local_experts: Option<usize>,
+    #[serde(default)]
+    pub n_routed_experts: Option<usize>,
 }
 
 fn default_vocab() -> usize {
@@ -219,6 +229,23 @@ fn default_theta() -> f32 {
 }
 
 impl HfConfig {
+    pub fn is_moe(&self) -> bool {
+        self.num_local_experts.unwrap_or(0) > 0
+            || self.n_routed_experts.unwrap_or(0) > 0
+            || self.num_experts.unwrap_or(0) > 0
+            || self.num_experts_per_tok.unwrap_or(0) > 0
+    }
+
+    pub fn hidden_act_is_silu(&self) -> bool {
+        match self.hidden_act.as_deref() {
+            None => true,
+            Some(a) => {
+                let a = a.to_ascii_lowercase();
+                a == "silu" || a == "swish" || a == "silu_and_mul"
+            }
+        }
+    }
+
     pub fn effective_text(&self) -> EffectiveTextConfig {
         let t = self.text_config.as_ref();
         EffectiveTextConfig {
@@ -308,6 +335,17 @@ pub struct VocabSidecar {
     pub eos_id: Option<u32>,
 }
 
+/// Vocab JSON used by tests, or a HuggingFace `tokenizer.json` on disk.
+#[derive(Debug, Clone)]
+pub enum SidecarTokenizer {
+    Vocab(VocabSidecar),
+    HuggingFace {
+        tokenizer_json: PathBuf,
+        tokenizer_config: Option<PathBuf>,
+        generation_config: Option<PathBuf>,
+    },
+}
+
 pub fn resolve_sidecar(explicit: Option<&Path>, weights: &Path, name: &str) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
@@ -334,39 +372,49 @@ pub fn load_hf_config(path: &Path) -> Result<HfConfig, AllpacaError> {
 }
 
 pub fn load_vocab_sidecar(path: &Path) -> Result<VocabSidecar, AllpacaError> {
+    match load_tokenizer_sidecar(path)? {
+        SidecarTokenizer::Vocab(v) => Ok(v),
+        SidecarTokenizer::HuggingFace { .. } => Err(AllpacaError::Fatal(FatalError::Tokenizer(
+            format!(
+                "{} is a HuggingFace tokenizer.json (use load_tokenizer_sidecar)",
+                path.display()
+            ),
+        ))),
+    }
+}
+
+pub fn load_tokenizer_sidecar(path: &Path) -> Result<SidecarTokenizer, AllpacaError> {
     let src = std::fs::read_to_string(path).map_err(|e| {
         AllpacaError::Fatal(FatalError::Tokenizer(format!(
-            "SafeTensors tokenizer {}: {e}",
+            "tokenizer {}: {e}",
             path.display()
         )))
     })?;
-    // HuggingFace tokenizer.json is a different schema; fall back to a minimal vocab view.
-    if let Ok(v) = serde_json::from_str::<VocabSidecar>(&src) {
-        return Ok(v);
-    }
-    let raw: serde_json::Value = serde_json::from_str(&src).map_err(|e| {
+    let value: Value = serde_json::from_str(&src).map_err(|e| {
         AllpacaError::Fatal(FatalError::Tokenizer(format!(
-            "SafeTensors tokenizer {}: {e}",
+            "tokenizer {}: {e}",
             path.display()
         )))
     })?;
-    if let Some(model) = raw.get("model") {
-        if let Some(vocab) = model.get("vocab").and_then(|v| v.as_object()) {
-            let mut pairs: Vec<(String, i64)> = vocab
-                .iter()
-                .filter_map(|(k, v)| v.as_i64().map(|i| (k.clone(), i)))
-                .collect();
-            pairs.sort_by_key(|(_, i)| *i);
-            let tokens: Vec<String> = pairs.into_iter().map(|(k, _)| k).collect();
-            return Ok(VocabSidecar {
-                tokens,
-                bos_id: None,
-                eos_id: None,
-            });
-        }
+    if value.get("tokens").and_then(Value::as_array).is_some() {
+        let vocab: VocabSidecar = serde_json::from_value(value).map_err(|e| {
+            AllpacaError::Fatal(FatalError::Tokenizer(format!(
+                "tokenizer {}: {e}",
+                path.display()
+            )))
+        })?;
+        return Ok(SidecarTokenizer::Vocab(vocab));
     }
-    Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
-        "SafeTensors tokenizer {}: unrecognized schema",
-        path.display()
-    ))))
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tokenizer_config = optional_file(dir.join("tokenizer_config.json"));
+    let generation_config = optional_file(dir.join("generation_config.json"));
+    Ok(SidecarTokenizer::HuggingFace {
+        tokenizer_json: path.to_path_buf(),
+        tokenizer_config,
+        generation_config,
+    })
+}
+
+fn optional_file(path: PathBuf) -> Option<PathBuf> {
+    path.is_file().then_some(path)
 }

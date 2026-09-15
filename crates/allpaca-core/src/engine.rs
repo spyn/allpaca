@@ -2,9 +2,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use allpaca_gguf::{extract_tokenizer, GgufFile};
+use allpaca_gguf::{discover_dspark_sidecar, extract_tokenizer, is_dspark_filename, GgufFile};
 use allpaca_onnx::OnnxFile;
-use allpaca_safetensors::{load_hf_config, load_vocab_sidecar, resolve_sidecar, SafetensorsFile};
+use allpaca_safetensors::{
+    discover_checkpoint, load_hf_config, load_tokenizer_sidecar, resolve_sidecar, CheckpointKind,
+    SafetensorsCatalog,
+};
 use allpaca_types::{
     AllpacaError, Config, DegradedError, DraftProviderKind, FatalError, FeatureFlags, FinishReason,
     GenerationOutput, GenerationParams, KvHandle, StatsSnapshot, StepResult, TokenEvent,
@@ -14,6 +17,11 @@ use futures::Stream;
 use rand::rngs::StdRng;
 
 use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
+use crate::batch_gemm::{
+    apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
+    decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate,
+    BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+};
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
 use crate::direct_storage::{
@@ -28,11 +36,6 @@ use crate::forest::{build_token_forest, TokenForest};
 use crate::kv_radix::KvRadixForest;
 use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
-use crate::batch_gemm::{
-    apply_packed_ffn_hip, batch_gemm_other_ids, decode_layer_attn_shared_a_weights,
-    packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan,
-    ModelShapeKey,
-};
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
     alloc_pages_for_seq, ensure_pages, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
@@ -77,6 +80,10 @@ struct ActiveRequest {
     moe_norm: Vec<f32>,
     /// Target `output_norm` hidden for MTP draft `h_nextn` handoff.
     last_hidden: Vec<f32>,
+    /// `last_hidden` was written by the most recent decode forward.
+    last_hidden_fresh: bool,
+    /// This tick's HIP decode cohort will pack lm_head; skip the per-request GEMM.
+    defer_lm_head: bool,
     /// Soft vision positions at the start of `tokens` (pre-text).
     vision_prefix_len: usize,
     /// Row-major `vision_prefix_len * dim` embeddings for soft prefill.
@@ -94,6 +101,7 @@ struct EngineInner {
     target: Option<Arc<TinyModel>>,
     draft_model: Option<Arc<TinyModel>>,
     ngram: NGramProvider,
+    dspark: Option<crate::dspark::DsparkProvider>,
     active: HashMap<u64, ActiveRequest>,
     next_request_id: u64,
     model_id: String,
@@ -249,11 +257,26 @@ impl Engine {
         let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
         #[cfg(feature = "cuda")]
         let cuda = open_cuda_workspace(&config, &inventory).map(Arc::new);
-        let mut kv = KvTierManager::with_hip(
+        let cuda_kv = {
+            #[cfg(feature = "cuda")]
+            {
+                if hip.is_none() {
+                    cuda.as_ref().map(|c| c.device)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        };
+        let mut kv = KvTierManager::with_devices(
             config.kv.vram_bytes,
             config.kv.dram_bytes,
             config.kv.hot_fraction,
             hip.as_ref().map(|h| h.device),
+            cuda_kv,
         );
         kv.open_nvme(config.kv.nvme_bytes, config.kv.nvme_path.as_deref())?;
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);
@@ -268,6 +291,7 @@ impl Engine {
             target: None,
             draft_model: None,
             ngram: NGramProvider::new(config.speculative.ngram_n),
+            dspark: None,
             active: HashMap::new(),
             next_request_id: 1,
             model_id: config.model.id.clone(),
@@ -308,7 +332,7 @@ impl Engine {
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
         } else if let Some(path) = &config.model.path {
-            engine.load_model_path(path)?;
+            engine.load_resolved_model(path)?;
         }
         engine.install_vision_encoder_from_config()?;
         Ok(engine)
@@ -336,8 +360,9 @@ impl Engine {
         };
         let n_blocks = mm.vision_n_blocks;
         if let Some(path) = &mm.vision_path {
-            let enc =
-                crate::PatchVisionEncoder::load(path, device, out_dim, image_size, patch, n_blocks)?;
+            let enc = crate::PatchVisionEncoder::load(
+                path, device, out_dim, image_size, patch, n_blocks,
+            )?;
             tracing::info!(
                 path = %path.display(),
                 out_dim,
@@ -348,9 +373,7 @@ impl Engine {
                 "loaded patch vision encoder weights"
             );
             self.set_vision_encoder(Arc::new(enc))?;
-        } else if self.config.model.synthetic
-            && (n_blocks > 0 || mm.vision_device.is_some())
-        {
+        } else if self.config.model.synthetic && (n_blocks > 0 || mm.vision_device.is_some()) {
             let seed = self.config.engine.determinism_seed.unwrap_or(42);
             let enc = crate::PatchVisionEncoder::synthetic_sized(
                 device, out_dim, image_size, patch, seed, n_blocks,
@@ -383,9 +406,9 @@ impl Engine {
         &self,
         encoder: Arc<dyn crate::VisionEncoder>,
     ) -> Result<(), AllpacaError> {
-        let hip_dev = encoder.device().and_then(|d| {
-            self.hip_workspace_for_device(d).map(|h| h.device)
-        });
+        let hip_dev = encoder
+            .device()
+            .and_then(|d| self.hip_workspace_for_device(d).map(|h| h.device));
         let bytes = encoder.ensure_device_resident(hip_dev)?;
         if bytes > 0 {
             self.metrics
@@ -608,38 +631,40 @@ impl Engine {
             }
             Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
-        let (backend, device_memory_bytes) = if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote())
-        {
-            if let Some(rt) = &self.rpc {
-                self.metrics
-                    .rpc_roundtrips
-                    .store(rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
-                self.metrics.rpc_activation_bytes.store(
-                    rt.activation_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                self.metrics.rpc_h2d_bytes.store(
-                    rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            ("rpc".into(), allpaca_hip::allocated_bytes())
-        } else if self.hip.is_some() {
-            ("hip".into(), allpaca_hip::allocated_bytes())
-        } else {
-            #[cfg(feature = "cuda")]
-            {
-                if let Some(cuda) = &self.cuda {
-                    ("cuda".into(), cuda.allocated_bytes())
-                } else {
+        let (backend, device_memory_bytes) =
+            if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+                if let Some(rt) = &self.rpc {
+                    self.metrics.rpc_roundtrips.store(
+                        rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.metrics.rpc_activation_bytes.store(
+                        rt.activation_bytes
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.metrics.rpc_h2d_bytes.store(
+                        rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                ("rpc".into(), allpaca_hip::allocated_bytes())
+            } else if self.hip.is_some() {
+                ("hip".into(), allpaca_hip::allocated_bytes())
+            } else {
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(cuda) = &self.cuda {
+                        ("cuda".into(), cuda.allocated_bytes())
+                    } else {
+                        ("cpu".into(), 0)
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
                     ("cpu".into(), 0)
                 }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                ("cpu".into(), 0)
-            }
-        };
+            };
         let hip_h2d = self
             .hip
             .as_ref()
@@ -811,10 +836,7 @@ impl Engine {
         )?;
         model.rpc = Some(Arc::clone(rt));
         tracing::info!(
-            remote_layers = rt
-                .plan_has_remote()
-                .then_some("yes")
-                .unwrap_or("no"),
+            remote_layers = rt.plan_has_remote().then_some("yes").unwrap_or("no"),
             sessions = rt.session_count(),
             "rpc layer plan ready"
         );
@@ -972,20 +994,34 @@ impl Engine {
         Ok(())
     }
 
-    fn load_model_path(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
-        if path.is_dir() {
-            if crate::edge0::detect_edge0_dir(path).is_some() {
-                return self.load_edge0(path);
-            }
-            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "directory is not a recognized Edge0 checkpoint: {}",
-                path.display()
-            ))));
+    fn resolve_configured_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, Option<String>), AllpacaError> {
+        let spec = path.to_string_lossy();
+        let opts =
+            crate::hf::HubOptions::from_env().with_revision(self.config.model.hf_revision.clone());
+        crate::hf::resolve_model_spec(&spec, &opts)
+    }
+
+    fn load_resolved_model(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
+        let (resolved, preferred) = self.resolve_configured_path(path)?;
+        self.load_model_path_discovered(&resolved, preferred.as_deref())
+    }
+
+    fn load_model_path_discovered(
+        &self,
+        path: &std::path::Path,
+        preferred: Option<&str>,
+    ) -> Result<(), AllpacaError> {
+        if path.is_dir() && crate::edge0::detect_edge0_dir(path).is_some() {
+            return self.load_edge0(path);
         }
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("safetensors") => self.load_safetensors(path),
-            Some("onnx") => self.load_onnx(path),
-            _ => self.load_gguf(path),
+        let discovered = discover_checkpoint(path, preferred)?;
+        match discovered.kind {
+            CheckpointKind::Safetensors => self.load_safetensors(&discovered.weights),
+            CheckpointKind::Onnx => self.load_onnx(&discovered.weights),
+            CheckpointKind::Gguf => self.load_gguf(&discovered.weights),
         }
     }
 
@@ -1023,7 +1059,7 @@ impl Engine {
     }
 
     pub fn load_safetensors(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
-        let file = SafetensorsFile::open(path)?;
+        let file = SafetensorsCatalog::open(path)?;
         let config_path = resolve_sidecar(
             self.config.model.config_path.as_deref(),
             path,
@@ -1035,12 +1071,12 @@ impl Engine {
             "tokenizer.json",
         );
         let hf = load_hf_config(&config_path)?;
-        let vocab = load_vocab_sidecar(&tokenizer_path)?;
+        let vocab = load_tokenizer_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model)?;
-        let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
+        let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, tokenizer);
@@ -1065,12 +1101,12 @@ impl Engine {
             "tokenizer.json",
         );
         let hf = load_hf_config(&config_path)?;
-        let vocab = load_vocab_sidecar(&tokenizer_path)?;
+        let vocab = load_tokenizer_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model)?;
-        let tokenizer = EngineTokenizer::from_vocab(vocab.tokens, vocab.bos_id, vocab.eos_id)?;
+        let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, tokenizer);
@@ -1082,28 +1118,48 @@ impl Engine {
     }
 
     pub fn load_gguf(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
-        let file = GgufFile::open(path)?;
+        let file = Arc::new(GgufFile::open(path)?);
         let tok = extract_tokenizer(&file)?;
         let mut model = TinyModel::from_gguf(&file)?;
-        if !model.host_weights_ready() && self.hip.is_none() {
+        model.bind_gguf(file.clone());
+        if !model.host_weights_ready() && self.hip.is_none() && model.dsv4.is_none() {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "large GGUF requires HIP (host F32 materialize is skipped to avoid OOM)".into(),
             )));
         }
+        let skip_hip = model.dsv4.is_some();
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut draft_reuses_target_gguf = false;
+        let draft_path_is_dspark = self.config.model.draft_path.as_ref().is_some_and(|p| {
+            is_dspark_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or(""))
+        });
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, EngineTokenizer::from_gguf(tok));
         if let Some(draft_path) = &self.config.model.draft_path {
-            match GgufFile::open(draft_path) {
-                Ok(f) => match TinyModel::from_gguf(&f) {
-                    Ok(draft) => {
-                        inner.draft_model = Some(Arc::new(draft));
-                        draft_file = Some(f);
-                    }
+            if !draft_path_is_dspark {
+                let opened =
+                    self.resolve_configured_path(draft_path)
+                        .and_then(|(resolved, preferred)| {
+                            discover_checkpoint(&resolved, preferred.as_deref())
+                                .and_then(|d| GgufFile::open(&d.weights))
+                        });
+                match opened {
+                    Ok(f) => match TinyModel::from_gguf(&f) {
+                        Ok(draft) => {
+                            inner.draft_model = Some(Arc::new(draft));
+                            draft_file = Some(f);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "draft GGUF failed; disabling draft-model speculation");
+                            inner.flags.draft_model_speculation = false;
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(error = %e, "draft GGUF failed; disabling draft-model speculation");
                         inner.flags.draft_model_speculation = false;
@@ -1111,13 +1167,6 @@ impl Engine {
                             .degraded_events
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "draft GGUF failed; disabling draft-model speculation");
-                    inner.flags.draft_model_speculation = false;
-                    self.metrics
-                        .degraded_events
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         } else if self
@@ -1146,21 +1195,96 @@ impl Engine {
                 }
             }
         }
+        let dspark_path = if draft_path_is_dspark {
+            self.config.model.draft_path.clone()
+        } else {
+            discover_dspark_sidecar(path)
+        };
+        if let Some(dsp) = dspark_path {
+            match GgufFile::open(&dsp) {
+                Ok(f) => {
+                    let draft = if crate::dspark::file_is_dspark(&f) {
+                        None
+                    } else {
+                        TinyModel::from_gguf(&f)
+                            .ok()
+                            .filter(|m| m.host_weights_ready())
+                    };
+                    match crate::dspark::DsparkProvider::from_gguf(&f, draft) {
+                        Ok(p) => {
+                            tracing::info!(path = %dsp.display(), "loaded DSpark sidecar");
+                            inner.dspark = Some(p);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DSpark sidecar failed; continuing without DSpark");
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "DSpark sidecar open failed; continuing without DSpark");
+                    self.metrics
+                        .degraded_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        } else if self
+            .config
+            .speculative
+            .providers
+            .contains(&DraftProviderKind::Dspark)
+        {
+            tracing::warn!("DSpark requested but no dspark-*.gguf sidecar next to the target");
+            self.metrics
+                .degraded_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if model.early_exit.supported {
             model.early_exit.min_confidence = self.config.early_exit.min_confidence;
-            model.early_exit.min_calibration_margin =
-                self.config.early_exit.min_calibration_margin;
+            model.early_exit.min_calibration_margin = self.config.early_exit.min_calibration_margin;
         }
         self.attach_rpc(&mut model)?;
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
+        if skip_hip {
+            if let Some(hip) = &self.hip {
+                let target = {
+                    let g = self.lock()?;
+                    g.target.clone()
+                };
+                if let Some(target) = target {
+                    match crate::dsv4_gpu::attach(&target, hip, self.draft_hip.as_ref()) {
+                        Ok(()) => tracing::info!(
+                            "DeepSeek-V4: HIP BF16 MLA + MXFP4 expert LRU (no generic GGUF upload)"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DeepSeek-V4 HIP working set failed; CPU MLA/MoE");
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            } else {
+                tracing::info!("DeepSeek-V4: CPU MLA/MoE decode (no HIP workspace)");
+            }
+            if let Some(hip) = self.draft_hip.as_ref().or(self.hip.as_ref()) {
+                let mut g = self.lock()?;
+                if let Some(p) = g.dspark.as_mut() {
+                    p.attach_hip(hip.clone());
+                }
+            }
+            return self.note_early_exit_gate();
+        }
         let draft_ref = if draft_reuses_target_gguf {
-            Some(&file)
+            Some(file.as_ref())
         } else {
             draft_file.as_ref()
         };
-        self.upload_resident_from_gguf(Some(&file), draft_ref)?;
+        self.upload_resident_from_gguf(Some(file.as_ref()), draft_ref)?;
         self.note_early_exit_gate()
     }
 
@@ -1298,6 +1422,19 @@ impl Engine {
         params: GenerationParams,
     ) -> Result<GenerationOutput, AllpacaError> {
         self.generate_multimodal(prompt, &[], params)
+    }
+
+    /// ChatML when the loaded vocab has `<|im_start|>` / `<|im_end|>`; else `role:`.
+    pub fn format_chat(&self, messages: &[(&str, &str)]) -> String {
+        self.lock()
+            .ok()
+            .and_then(|inner| {
+                inner
+                    .tokenizer
+                    .as_ref()
+                    .map(|t| t.format_chat(messages, true))
+            })
+            .unwrap_or_else(|| crate::tokenizer::format_chat_colon(messages, true))
     }
 
     pub fn generate_multimodal(
@@ -1528,14 +1665,11 @@ impl Engine {
         let (vision_prefix_len, vision_embeds) = match vision {
             None => (0, Vec::new()),
             Some(v) => {
-                let need = v
-                    .n_tokens
-                    .checked_mul(dim)
-                    .ok_or_else(|| {
-                        AllpacaError::Fatal(FatalError::InvalidConfig(
-                            "vision soft token size overflow".into(),
-                        ))
-                    })?;
+                let need = v.n_tokens.checked_mul(dim).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(
+                        "vision soft token size overflow".into(),
+                    ))
+                })?;
                 if v.embeddings.len() != need {
                     return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
                         "vision embeddings len {} != n_tokens {} * dim {}",
@@ -1556,10 +1690,7 @@ impl Engine {
                         let bytes = v.embeddings.len().saturating_mul(4);
                         if bytes > 0 {
                             if let Ok(buf) = allpaca_hip::DeviceWeights::alloc(vdev, bytes) {
-                                let _ = hip.copy_h2d_f32(
-                                    buf.ptr_at(0) as *mut f32,
-                                    &v.embeddings,
-                                );
+                                let _ = hip.copy_h2d_f32(buf.ptr_at(0) as *mut f32, &v.embeddings);
                                 self.metrics
                                     .vision_bytes_on_device
                                     .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1677,6 +1808,8 @@ impl Engine {
                 decode_step: 0,
                 moe_norm: vec![0.0f32; dim],
                 last_hidden: vec![0.0f32; dim],
+                last_hidden_fresh: false,
+                defer_lm_head: false,
                 vision_prefix_len,
                 vision_embeds,
                 suppress_draft,
@@ -1859,7 +1992,13 @@ impl Engine {
                     let is_prefill = active.prefill_pos < active.prompt_len
                         && active.emit_queue.is_empty()
                         && active.parked.is_empty();
-                    (Some(id), waited_ms, is_prefill, stagger_partner, batch_gemm_plan)
+                    (
+                        Some(id),
+                        waited_ms,
+                        is_prefill,
+                        stagger_partner,
+                        batch_gemm_plan,
+                    )
                 } else {
                     // Drop the mutex before rebalance (it re-locks).
                     (None, 0.0, false, None, None)
@@ -1909,6 +2048,9 @@ impl Engine {
                 .as_ref()
                 .map(|p| batch_gemm_other_ids(p, id))
                 .unwrap_or_default();
+            if let Some(plan) = batch_gemm_plan.as_ref() {
+                self.mark_cohort_defer_lm_head(plan);
+            }
             if dual_partner.is_some() {
                 self.micro_batch.begin_dual_step(
                     std::time::SystemTime::now()
@@ -2039,14 +2181,10 @@ impl Engine {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Layer-fused packed HIP: one gemm_nt per shared-A decode weight.
                 if let Some(hip) = self.hip.as_ref() {
-                    let m = batch_gemm_plan
-                        .as_ref()
-                        .map(|p| p.m_tokens)
-                        .unwrap_or(0);
+                    let m = batch_gemm_plan.as_ref().map(|p| p.m_tokens).unwrap_or(0);
                     if m >= 2 {
                         if let Some(plan) = batch_gemm_plan.as_ref() {
-                            let (launched, applied) =
-                                self.try_packed_batch_gemm_hip(hip, plan);
+                            let (launched, applied) = self.try_packed_batch_gemm_hip(hip, plan);
                             if launched > 0 {
                                 self.metrics
                                     .batch_gemm_hip_kernels
@@ -2056,10 +2194,16 @@ impl Engine {
                                 self.metrics
                                     .batch_gemm_hip_applied
                                     .fetch_add(applied, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                self.fallback_deferred_lm_head(plan);
                             }
+                            self.clear_cohort_defer_lm_head(plan);
                         }
                     }
                 }
+            } else if let Some(plan) = batch_gemm_plan.as_ref() {
+                self.fallback_deferred_lm_head(plan);
+                self.clear_cohort_defer_lm_head(plan);
             }
             self.layer_stagger.end();
             self.note_elastic_pressure_after_decode()?;
@@ -2070,11 +2214,93 @@ impl Engine {
         }
     }
 
+    fn mark_cohort_defer_lm_head(&self, plan: &BatchGemmPlan) {
+        if self.hip.is_none() || plan.m_tokens < 2 || self.config.speculative.enabled {
+            return;
+        }
+        let Ok(mut inner) = self.lock() else {
+            return;
+        };
+        let Some(target) = inner.target.as_ref() else {
+            return;
+        };
+        let dim = target.config.dim;
+        if dim == 0 || target.lm_head.is_empty() || target.lm_head.len() % dim != 0 {
+            return;
+        }
+        for &rid in &plan.request_ids {
+            if let Some(req) = inner.active.get_mut(&rid) {
+                req.defer_lm_head = true;
+            }
+        }
+    }
+
+    fn clear_cohort_defer_lm_head(&self, plan: &BatchGemmPlan) {
+        let Ok(mut inner) = self.lock() else {
+            return;
+        };
+        for &rid in &plan.request_ids {
+            if let Some(req) = inner.active.get_mut(&rid) {
+                req.defer_lm_head = false;
+            }
+        }
+    }
+
+    /// CPU lm_head from fresh `output_norm` when packed HIP apply misses.
+    fn fallback_deferred_lm_head(&self, plan: &BatchGemmPlan) {
+        let Ok(mut inner) = self.lock() else {
+            return;
+        };
+        let Some(target) = inner.target.clone() else {
+            return;
+        };
+        let dim = target.config.dim;
+        if dim == 0 || target.lm_head.is_empty() || target.lm_head.len() % dim != 0 {
+            return;
+        }
+        let mut ids = Vec::new();
+        let mut rows = Vec::new();
+        for &rid in &plan.request_ids {
+            let Some(req) = inner.active.get(&rid) else {
+                continue;
+            };
+            if req.defer_lm_head && req.last_hidden_fresh && req.last_hidden.len() == dim {
+                ids.push(rid);
+                rows.push(req.last_hidden.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let n = target.lm_head.len() / dim;
+        let mut c_rows: Vec<Vec<f32>> = ids.iter().map(|_| vec![0.0f32; n]).collect();
+        let a_refs: Vec<&[f32]> = rows.iter().map(|v| v.as_slice()).collect();
+        let mut c_refs: Vec<&mut [f32]> = c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+        if apply_packed_lm_head(&a_refs, &target.lm_head, dim, &mut c_refs).is_err() {
+            return;
+        }
+        let vocab = target.config.vocab_size;
+        for (i, rid) in ids.into_iter().enumerate() {
+            let Some(req) = inner.active.get_mut(&rid) else {
+                continue;
+            };
+            let row = &c_rows[i];
+            let n_logits = n.min(vocab).min(row.len());
+            if n_logits == 0 {
+                continue;
+            }
+            if req.pending_logits.len() < n_logits {
+                req.pending_logits.resize(n_logits, 0.0);
+            }
+            req.pending_logits[..n_logits].copy_from_slice(&row[..n_logits]);
+        }
+    }
+
     /// Packed HIP `gemm_nt` for attn shared-A weights + FFN (incl w_down) + lm_head.
     ///
     /// Returns `(kernels_launched, applied)` where `applied` is 1 when packed
     /// lm_head logits were written into at least one Request's `pending_logits`
-    /// (consumed by the next sample).
+    /// (consumed by the next sample). Only uses fresh `output_norm` rows.
     fn try_packed_batch_gemm_hip(&self, hip: &HipWorkspace, plan: &BatchGemmPlan) -> (u64, u64) {
         let Ok(inner) = self.lock() else {
             return (0, 0);
@@ -2087,8 +2313,7 @@ impl Engine {
         if dim == 0 || plan.request_ids.len() < 2 {
             return (0, 0);
         }
-        let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first()
-        {
+        let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first() {
             decode_layer_attn_shared_a_weights(
                 dim,
                 layer.wq.as_slice(),
@@ -2121,29 +2346,21 @@ impl Engine {
         if weights.is_empty() && !has_ffn && lm_head.is_none() {
             return (0, 0);
         }
-        let mut a_rows: Vec<Vec<f32>> = Vec::with_capacity(plan.request_ids.len());
+        let mut apply_ids: Vec<u64> = Vec::new();
+        let mut a_rows: Vec<Vec<f32>> = Vec::new();
         for &rid in &plan.request_ids {
             let Some(req) = inner.active.get(&rid) else {
-                return (0, 0);
+                continue;
             };
-            // Prefer post-norm last_hidden (pre-lm_head); length must be dim.
-            let row = if req.last_hidden.len() == dim {
-                req.last_hidden.clone()
-            } else if req.moe_norm.len() == dim {
-                req.moe_norm.clone()
-            } else if let Some(&tok) = req.tokens.last() {
-                let start = (tok as usize).saturating_mul(dim);
-                if target.embed.len() >= start + dim {
-                    target.embed[start..start + dim].to_vec()
-                } else {
-                    return (0, 0);
-                }
-            } else {
-                return (0, 0);
-            };
-            a_rows.push(row);
+            if req.last_hidden_fresh && req.last_hidden.len() == dim {
+                apply_ids.push(rid);
+                a_rows.push(req.last_hidden.clone());
+            }
         }
         drop(inner);
+        if a_rows.len() < 2 {
+            return (0, 0);
+        }
 
         let a_refs: Vec<&[f32]> = a_rows.iter().map(|v| v.as_slice()).collect();
         let mut launched = 0u64;
@@ -2152,8 +2369,7 @@ impl Engine {
                 .iter()
                 .map(|a| vec![0.0f32; (a.len() / k) * n])
                 .collect();
-            let mut c_refs: Vec<&mut [f32]> =
-                c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut c_refs: Vec<&mut [f32]> = c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
             if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
                 launched += 1;
             }
@@ -2182,14 +2398,13 @@ impl Engine {
                 .iter()
                 .map(|a| vec![0.0f32; (a.len() / k) * n])
                 .collect();
-            let mut c_refs: Vec<&mut [f32]> =
-                c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut c_refs: Vec<&mut [f32]> = c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
             if packed_gemm_nt_hip(hip, &a_refs, &b, &mut c_refs, n, k).is_ok() {
                 launched += 1;
                 // Consume C: install packed logits for the next sample path.
                 if let Ok(mut inner) = self.lock() {
                     let mut wrote = false;
-                    for (i, &rid) in plan.request_ids.iter().enumerate() {
+                    for (i, &rid) in apply_ids.iter().enumerate() {
                         let Some(req) = inner.active.get_mut(&rid) else {
                             continue;
                         };
@@ -2249,7 +2464,9 @@ impl Engine {
         let structured = json_constraints && self.config.structured_output.enabled;
         let suppress_draft = request(&inner, id)?.suppress_draft;
         let speculate = self.config.speculative.enabled
-            && (inner.flags.ngram_speculation || inner.flags.draft_model_speculation)
+            && (inner.flags.ngram_speculation
+                || inner.flags.draft_model_speculation
+                || inner.dspark.is_some())
             && !suppress_draft;
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
@@ -2508,7 +2725,6 @@ impl Engine {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.last_hidden)
         };
-        // Per-token prefill so radix (and anchors) get correct mid-prefix checkpoints.
         let (vision_prefix_len, vision_embeds, dim) = {
             let active = request(inner, id)?;
             (
@@ -2517,123 +2733,152 @@ impl Engine {
                 target.config.dim,
             )
         };
-        for (i, tok) in toks.iter().enumerate() {
-            let pos = start + i;
-            let last = pos + 1 >= total;
-            // MTP process: (token_pos, h_{pos-1}) before target updates last_hidden.
-            mtp_process_token(
-                inner,
-                *tok,
-                pos,
-                &last_hidden,
-                self.draft_hip.as_deref(),
+        let vision_in_chunk = (start..end).any(|p| p < vision_prefix_len);
+        let batch_prefill = !vision_in_chunk
+            && toks.len() > 1
+            && ((self.hip.is_some()
+                && resident.is_some()
+                && !mtp_draft_active(inner)
+                && target.supports_device_batched_prefill())
+                || target.dsv4.is_some());
+        if batch_prefill {
+            target.forward_tokens(
+                &toks,
+                start,
+                &pages,
+                &mut inner.kv,
                 &self.metrics,
+                &mut logits,
+                self.hip.as_deref(),
+                resident.as_deref(),
+                write_logits,
+                None,
+                recurrent.as_mut(),
+                None,
+                id,
             )?;
-            let mut decode_side = DeviceDecodeSide {
-                request_id: id,
-                moe_norm: None,
-                layer_stagger: None,
-                ds_probe: None,
-                ds_queue: None,
-                last_hidden: Some(&mut last_hidden),
-            };
-            let soft = if pos < vision_prefix_len {
-                Some(&vision_embeds[pos * dim..(pos + 1) * dim])
-            } else {
-                None
-            };
-            let used_cuda = {
-                #[cfg(feature = "cuda")]
-                {
-                    let mut used = false;
-                    if self.hip.is_none() {
-                        if let (Some(cuda), Some(cres)) =
-                            (self.cuda.as_deref(), cuda_resident.as_deref())
-                        {
-                            match target.forward_token_cuda(
-                                *tok,
-                                pos,
-                                &pages,
-                                &mut inner.kv,
-                                &self.metrics,
-                                &mut logits,
-                                cuda,
-                                cres,
-                                soft,
-                            ) {
-                                Ok(()) => used = true,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        pos,
-                                        token = *tok,
-                                        error = %e,
-                                        "CUDA on-device decode failed; host fallback"
-                                    );
+            // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
+            // page (growing with seq) and break logits-only decode accounting.
+        } else {
+            let want_hidden = mtp_draft_active(inner);
+            for (i, tok) in toks.iter().enumerate() {
+                let pos = start + i;
+                let last = pos + 1 >= total;
+                // MTP process: (token_pos, h_{pos-1}) before target updates last_hidden.
+                mtp_process_token(
+                    inner,
+                    *tok,
+                    pos,
+                    &last_hidden,
+                    self.draft_hip.as_deref(),
+                    &self.metrics,
+                )?;
+                let mut decode_side = DeviceDecodeSide {
+                    last_hidden: if want_hidden {
+                        Some(&mut last_hidden)
+                    } else {
+                        None
+                    },
+                    ..DeviceDecodeSide::new(id)
+                };
+                let soft = if pos < vision_prefix_len {
+                    Some(&vision_embeds[pos * dim..(pos + 1) * dim])
+                } else {
+                    None
+                };
+                let used_cuda = {
+                    #[cfg(feature = "cuda")]
+                    {
+                        let mut used = false;
+                        if self.hip.is_none() {
+                            if let (Some(cuda), Some(cres)) =
+                                (self.cuda.as_deref(), cuda_resident.as_deref())
+                            {
+                                match target.forward_token_cuda(
+                                    *tok,
+                                    pos,
+                                    &pages,
+                                    &mut inner.kv,
+                                    &self.metrics,
+                                    &mut logits,
+                                    cuda,
+                                    cres,
+                                    soft,
+                                ) {
+                                    Ok(()) => used = true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            pos,
+                                            token = *tok,
+                                            error = %e,
+                                            "CUDA on-device decode failed; host fallback"
+                                        );
+                                    }
                                 }
                             }
                         }
+                        used
                     }
-                    used
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        false
+                    }
+                };
+                if !used_cuda {
+                    target.forward_token(
+                        *tok,
+                        pos,
+                        &pages,
+                        &mut inner.kv,
+                        &self.metrics,
+                        &mut logits,
+                        self.hip.as_deref(),
+                        resident.as_deref(),
+                        last || write_logits,
+                        recurrent.as_mut(),
+                        None,
+                        Some(&mut decode_side),
+                        soft,
+                    )?;
                 }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    false
+                let device_gdn = self
+                    .hip
+                    .as_ref()
+                    .is_some_and(|h| h.gdn_request_resident(id));
+                let is_anchor = inner.anchors.enabled() && inner.anchors.is_anchor(*tok);
+                // Device GDN slots are source of truth. Skip per-token D2H; sync
+                // host (and store radix/anchors) only at real anchors or request end.
+                let sync_host_gdn = !device_gdn || last || is_anchor;
+                if sync_host_gdn {
+                    if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
+                        hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                        hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                        hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
+                    }
                 }
-            };
-            if !used_cuda {
-                target.forward_token(
-                    *tok,
-                    pos,
-                    &pages,
-                    &mut inner.kv,
-                    &self.metrics,
-                    &mut logits,
-                    self.hip.as_deref(),
-                    resident.as_deref(),
-                    last || write_logits,
-                    recurrent.as_mut(),
-                    None,
-                    Some(&mut decode_side),
-                    soft,
-                )?;
-            }
-            let device_gdn = self
-                .hip
-                .as_ref()
-                .is_some_and(|h| h.gdn_request_resident(id));
-            let is_anchor = inner.anchors.enabled() && inner.anchors.is_anchor(*tok);
-            // Device GDN slots are source of truth. Skip per-token D2H; sync
-            // host (and store radix/anchors) only at real anchors or request end.
-            let sync_host_gdn = !device_gdn || last || is_anchor;
-            if sync_host_gdn {
-                if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
-                    hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
-                    hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
-                    hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
-                }
-            }
-            if sync_host_gdn {
-                let prefix = request(inner, id)?.tokens[..=pos].to_vec();
-                let pages_now = request(inner, id)?.pages.clone();
-                let state_ref = recurrent.clone().unwrap_or_else(|| {
-                    RecurrentState::zeros(target.config.n_layers, target.config.dim)
-                });
-                inner.kv_radix.capture(
-                    &prefix,
-                    &state_ref,
-                    &inner.kv,
-                    &pages_now,
-                    &target.config,
-                )?;
-                if is_anchor {
-                    if let Some(state) = recurrent.as_ref() {
-                        inner.anchors.capture(
-                            &prefix,
-                            state,
-                            &inner.kv,
-                            &pages_now,
-                            &target.config,
-                        )?;
+                if sync_host_gdn && self.hip.is_none() {
+                    let prefix = request(inner, id)?.tokens[..=pos].to_vec();
+                    let pages_now = request(inner, id)?.pages.clone();
+                    let state_ref = recurrent.clone().unwrap_or_else(|| {
+                        RecurrentState::zeros(target.config.n_layers, target.config.dim)
+                    });
+                    inner.kv_radix.capture(
+                        &prefix,
+                        &state_ref,
+                        &inner.kv,
+                        &pages_now,
+                        &target.config,
+                    )?;
+                    if is_anchor {
+                        if let Some(state) = recurrent.as_ref() {
+                            inner.anchors.capture(
+                                &prefix,
+                                state,
+                                &inner.kv,
+                                &pages_now,
+                                &target.config,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2914,13 +3159,12 @@ fn open_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<Hi
     if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "hip" {
         return None;
     }
-    let device = if inventory.target_device >= 0
-        && gpus.iter().any(|d| d.id == inventory.target_device)
-    {
-        inventory.target_device
-    } else {
-        gpus[0].id
-    };
+    let device =
+        if inventory.target_device >= 0 && gpus.iter().any(|d| d.id == inventory.target_device) {
+            inventory.target_device
+        } else {
+            gpus[0].id
+        };
     match HipWorkspace::new(device, 8 * 1024 * 1024, 256) {
         Ok(ws) => {
             tracing::info!(
@@ -3007,13 +3251,12 @@ fn open_cuda_workspace(
     if gpus.is_empty() {
         return None;
     }
-    let device = if inventory.target_device >= 0
-        && gpus.iter().any(|d| d.id == inventory.target_device)
-    {
-        inventory.target_device
-    } else {
-        gpus[0].id
-    };
+    let device =
+        if inventory.target_device >= 0 && gpus.iter().any(|d| d.id == inventory.target_device) {
+            inventory.target_device
+        } else {
+            gpus[0].id
+        };
     match allpaca_cuda::CudaWorkspace::new(device, 8 * 1024 * 1024) {
         Ok(ws) => {
             tracing::info!(
@@ -3319,6 +3562,13 @@ fn propose_drafts(
             return Ok(ahead.tokens);
         }
     }
+    if let Some(provider) = inner.dspark.as_mut() {
+        let draft = provider.propose(&ctx, depth, temperature)?;
+        if !draft.is_empty() {
+            host_stage_draft_tokens(&draft, draft_hip, metrics);
+            return Ok(draft);
+        }
+    }
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mtp = model.config.gguf_layer_base > 0
@@ -3436,12 +3686,10 @@ fn prefetch_draft_expert_union(
         pairs.push((*id, host));
     }
     let side = DeviceDecodeSide {
-        request_id: 0,
-        moe_norm: None,
         layer_stagger: hooks.layer_stagger,
         ds_probe: Some(hooks.ds_probe),
         ds_queue: Some(hooks.ds_queue),
-        last_hidden: None,
+        ..DeviceDecodeSide::new(0)
     };
     let mut nvme = |id: ExpertId, dev_off: usize, slot_bytes: usize| {
         target.try_nvme_expert_fill(id, dev_off, slot_bytes, Some(&side), resident)
@@ -4387,14 +4635,21 @@ fn append_and_forward(
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     let mut moe_norm = std::mem::take(&mut request_mut(inner, id)?.moe_norm);
     let mut last_hidden = std::mem::take(&mut request_mut(inner, id)?.last_hidden);
+    let defer_lm_head = request(inner, id)?.defer_lm_head;
     mtp_process_token(inner, token, pos, &last_hidden, draft_hip, metrics)?;
+    let want_hidden = mtp_draft_active(inner) || defer_lm_head;
     let mut side = DeviceDecodeSide {
-        request_id: id,
         moe_norm: Some(&mut moe_norm),
         layer_stagger,
         ds_probe,
         ds_queue,
-        last_hidden: Some(&mut last_hidden),
+        last_hidden: if want_hidden {
+            Some(&mut last_hidden)
+        } else {
+            None
+        },
+        write_logits: !defer_lm_head,
+        ..DeviceDecodeSide::new(id)
     };
     let used_cuda = {
         #[cfg(feature = "cuda")]
@@ -4455,6 +4710,12 @@ fn append_and_forward(
     request_mut(inner, id)?.last_hidden = last_hidden;
     if let Some(active) = inner.active.get_mut(&id) {
         active.decode_step = active.decode_step.saturating_add(1);
+        active.last_hidden_fresh = want_hidden;
+        if defer_lm_head {
+            metrics
+                .batch_gemm_lm_head_skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(())
 }
@@ -4504,9 +4765,7 @@ mod tests {
         Engine::new(test_config()).unwrap()
     }
 
-    fn spawn_hello_stub(
-        reply: allpaca_rpc::HelloReply,
-    ) -> (String, std::thread::JoinHandle<()>) {
+    fn spawn_hello_stub(reply: allpaca_rpc::HelloReply) -> (String, std::thread::JoinHandle<()>) {
         use std::io::Read;
         use std::net::TcpListener;
         use std::thread;
@@ -4607,10 +4866,7 @@ mod tests {
         let mut cpu_cfg = test_config();
         cpu_cfg.speculative.enabled = false;
         let cpu = Engine::new(cpu_cfg).unwrap();
-        let cpu_ids = cpu
-            .generate("hello", params.clone())
-            .unwrap()
-            .token_ids;
+        let cpu_ids = cpu.generate("hello", params.clone()).unwrap().token_ids;
 
         let mut rpc_cfg = test_config();
         rpc_cfg.speculative.enabled = false;
@@ -4660,14 +4916,22 @@ mod tests {
         let mut local_cfg = base.clone();
         local_cfg.rpc.tensor_split = None;
         let local = Engine::new(local_cfg).unwrap();
-        assert!(!local.generate("hello", params.clone()).unwrap().token_ids.is_empty());
+        assert!(!local
+            .generate("hello", params.clone())
+            .unwrap()
+            .token_ids
+            .is_empty());
         let local_trips = local.stats().rpc_roundtrips;
         drop(local);
 
         let mut split_cfg = base;
         split_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
         let split = Engine::new(split_cfg).unwrap();
-        assert!(!split.generate("hello", params).unwrap().token_ids.is_empty());
+        assert!(!split
+            .generate("hello", params)
+            .unwrap()
+            .token_ids
+            .is_empty());
         let split_trips = split.stats().rpc_roundtrips;
         drop(split);
 
@@ -4724,10 +4988,7 @@ mod tests {
             Ok(_) => panic!("newer HELLO minor must refuse Engine::new"),
             Err(e) => e,
         };
-        assert!(
-            err.is_fatal(),
-            "newer HELLO minor must be Fatal, got {err}"
-        );
+        assert!(err.is_fatal(), "newer HELLO minor must be Fatal, got {err}");
         let msg = err.to_string();
         assert!(
             msg.contains("version mismatch"),
@@ -4751,10 +5012,7 @@ mod tests {
             Ok(_) => panic!("newer kernel ABI must refuse Engine::new"),
             Err(e) => e,
         };
-        assert!(
-            err.is_fatal(),
-            "newer kernel ABI must be Fatal, got {err}"
-        );
+        assert!(err.is_fatal(), "newer kernel ABI must be Fatal, got {err}");
         let msg = err.to_string();
         assert!(
             msg.to_lowercase().contains("abi"),
@@ -5118,7 +5376,8 @@ mod tests {
         cfg.kv.page_tokens = 8;
         let engine = Engine::new(cfg).expect("early-exit GGUF must load");
         assert_eq!(
-            engine.stats().early_exit_gated, 0,
+            engine.stats().early_exit_gated,
+            0,
             "GGUF manifest must not gate; stats={:?}",
             engine.stats()
         );
@@ -5178,9 +5437,7 @@ mod tests {
         let engine = test_engine();
         let dim = ModelConfig::tiny().dim;
         let enc = crate::PatchVisionEncoder::synthetic(Some(0), dim, 3).unwrap();
-        engine
-            .set_vision_encoder(std::sync::Arc::new(enc))
-            .unwrap();
+        engine.set_vision_encoder(std::sync::Arc::new(enc)).unwrap();
         let stats = engine.stats();
         assert_eq!(stats.vision_weight_bytes_on_device, 0);
         assert_eq!(stats.vision_bytes_on_device, 0);
@@ -5254,10 +5511,7 @@ mod tests {
             "vision soft tokens must prepend the text prompt"
         );
         assert!(!token_ids.is_empty());
-        assert!(matches!(
-            finish,
-            FinishReason::Length | FinishReason::Stop
-        ));
+        assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
     }
 
     #[test]
@@ -5293,10 +5547,7 @@ mod tests {
         };
         let a = run(0.0);
         let b = run(1.0);
-        assert_ne!(
-            a, b,
-            "distinct soft embeds must change greedy completions"
-        );
+        assert_ne!(a, b, "distinct soft embeds must change greedy completions");
     }
 
     #[test]
@@ -5324,10 +5575,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.class(), allpaca_types::ErrorClass::Fatal);
-        assert!(
-            err.to_string().contains("vision embeddings"),
-            "err={err}"
-        );
+        assert!(err.to_string().contains("vision embeddings"), "err={err}");
     }
 
     #[test]
@@ -5350,10 +5598,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.class(), allpaca_types::ErrorClass::Degraded);
-        assert!(
-            err.to_string().contains("vision encoder"),
-            "err={err}"
-        );
+        assert!(err.to_string().contains("vision encoder"), "err={err}");
     }
 
     #[test]
@@ -5373,10 +5618,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.class(), allpaca_types::ErrorClass::Degraded);
-        assert!(
-            err.to_string().contains("not registered"),
-            "err={err}"
-        );
+        assert!(err.to_string().contains("not registered"), "err={err}");
     }
 
     #[test]
@@ -6572,7 +6814,7 @@ mod tests {
                 break;
             }
             let stats = engine.stats();
-            if stats.batch_gemm_hip_applied >= 1 {
+            if stats.batch_gemm_hip_applied >= 1 && stats.batch_gemm_lm_head_skipped >= 1 {
                 assert!(
                     stats.batch_gemm_hip_kernels >= 1,
                     "applied implies at least one packed HIP kernel; stats={stats:?}"
@@ -6586,6 +6828,10 @@ mod tests {
         assert!(
             stats.batch_gemm_hip_applied >= 1,
             "packed lm_head must be applied on HIP cohort; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_lm_head_skipped >= 1,
+            "cohort decode must skip per-request lm_head; stats={stats:?}"
         );
         drop(a);
         drop(b);
@@ -8070,6 +8316,10 @@ mod tests {
     /// Nemotron-Lightning MoE block: `attn_norm` (no `ffn_norm`), stacked `up`/`down`
     /// experts without `gate_exps`.
     fn write_tiny_nemotron_lightning_moe_gguf(path: &std::path::Path) {
+        write_tiny_nemotron_lightning_moe_gguf_opts(path, false);
+    }
+
+    fn write_tiny_nemotron_lightning_moe_gguf_opts(path: &std::path::Path, with_shexp: bool) {
         use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
         use std::collections::HashMap;
 
@@ -8154,7 +8404,26 @@ mod tests {
         );
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
         meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
-        let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+        let shared_ff = 12usize;
+        if with_shexp {
+            meta.insert(
+                "nemotron_h_moe.expert_shared_count".into(),
+                GgufValue::Uint32(1),
+            );
+            meta.insert(
+                "nemotron_h_moe.expert_shared_feed_forward_length".into(),
+                GgufValue::Uint32(shared_ff as u32),
+            );
+            meta.insert(
+                "nemotron_h_moe.expert_weights_norm".into(),
+                GgufValue::Bool(true),
+            );
+            meta.insert(
+                "nemotron_h_moe.expert_weights_scale".into(),
+                GgufValue::Float32(2.5),
+            );
+        }
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
             (
                 "token_embd.weight".into(),
                 vec![vocab as u64, dim as u64],
@@ -8237,6 +8506,18 @@ mod tests {
                 vec![w; vocab * dim],
             ),
         ];
+        if with_shexp {
+            owned.push((
+                "blk.1.ffn_up_shexp.weight".into(),
+                vec![dim as u64, shared_ff as u64],
+                vec![w; dim * shared_ff],
+            ));
+            owned.push((
+                "blk.1.ffn_down_shexp.weight".into(),
+                vec![shared_ff as u64, dim as u64],
+                vec![w; shared_ff * dim],
+            ));
+        }
         let views: Vec<GgufWriteTensor<'_>> = owned
             .iter()
             .map(|(name, dims, data)| GgufWriteTensor {
@@ -8281,6 +8562,462 @@ mod tests {
             .expect("Lightning MoE must generate");
         assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nemotron_lightning_shexp_sets_routing_flags_and_generates() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_nemotron_lightning_shexp-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_tiny_nemotron_lightning_moe_gguf_opts(&path, true);
+        let file = allpaca_gguf::GgufFile::open(&path).expect("shexp fixture");
+        let mcfg = crate::model::ModelConfig::from_gguf(&file).expect("lightning cfg");
+        assert!(mcfg.moe_sigmoid_gating, "{mcfg:?}");
+        assert!(mcfg.moe_relu_sqr, "{mcfg:?}");
+        assert!(mcfg.expert_weights_norm, "{mcfg:?}");
+        assert!((mcfg.expert_weights_scale - 2.5).abs() < 1e-6, "{mcfg:?}");
+        assert_eq!(mcfg.shared_ff_dim, 12, "{mcfg:?}");
+        assert_eq!(mcfg.n_shared_experts, 1, "{mcfg:?}");
+        let model = crate::model::TinyModel::from_gguf(&file).expect("lightning model");
+        assert!(
+            model.supports_device_batched_prefill(),
+            "Lightning hybrid/MoE should opt into batched prefill"
+        );
+        assert!(
+            !model.layers[1].shared_expert.w_up.is_empty(),
+            "shexp must materialize on the MoE block"
+        );
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).expect("Lightning shexp layout must load");
+        let out = engine
+            .generate(
+                "hi",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("Lightning shexp must generate");
+        assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tiny_deepseek4_cpu_generates() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_gen-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).expect("tiny DeepSeek-V4 must load");
+        let out = engine
+            .generate(
+                "hi",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("tiny DeepSeek-V4 must generate");
+        assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "hip")]
+    fn dsv4_generate_tokens(path: &std::path::Path, cpu_only: bool) -> (Vec<u32>, StatsSnapshot) {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.to_path_buf());
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).expect("tiny DeepSeek-V4 must load");
+        let out = engine
+            .generate(
+                "hi",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(7),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("tiny DeepSeek-V4 must generate");
+        (out.token_ids, engine.stats())
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn tiny_deepseek4_hip_f32_stays_cpu() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip tiny_deepseek4_hip_f32_stays_cpu: no HIP device");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_f32_hip-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let (cpu_ids, _) = dsv4_generate_tokens(&path, true);
+        let (hip_ids, hip_stats) = dsv4_generate_tokens(&path, false);
+        let _ = std::fs::remove_file(&path);
+        assert!(!cpu_ids.is_empty(), "CPU F32 fixture must emit tokens");
+        assert_eq!(
+            hip_ids, cpu_ids,
+            "F32 DeepSeek-V4 must stay on CPU gemv; hip={hip_ids:?} cpu={cpu_ids:?}"
+        );
+        assert_eq!(
+            hip_stats.gpu_forwards, 0,
+            "F32 fixture must not count GPU forwards; stats={hip_stats:?}"
+        );
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn tiny_deepseek4_hip_packed_matches_cpu() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip tiny_deepseek4_hip_packed_matches_cpu: no HIP device");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_packed_hip-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_packed_gguf(&path);
+        let (cpu_ids, _) = dsv4_generate_tokens(&path, true);
+        let (hip_ids, hip_stats) = dsv4_generate_tokens(&path, false);
+        let _ = std::fs::remove_file(&path);
+        assert!(!cpu_ids.is_empty(), "packed fixture must emit tokens");
+        assert_eq!(
+            hip_ids, cpu_ids,
+            "packed BF16/MXFP4 HIP must match CPU; hip={hip_ids:?} cpu={cpu_ids:?} stats={hip_stats:?}"
+        );
+        if hip_stats.backend == "hip" {
+            assert!(
+                hip_stats.gpu_forwards > 0,
+                "packed HIP generate should record gpu_forwards; stats={hip_stats:?}"
+            );
+        }
+    }
+
+    fn unsloth_dsv4_q8_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("ALLPACA_DSV4_GGUF") {
+            let pb = std::path::PathBuf::from(p);
+            return pb.is_file().then_some(pb);
+        }
+        let default = std::path::PathBuf::from(
+            "/zepool/cache/huggingface/hub/models--unsloth--DeepSeek-V4-Flash-0731-GGUF/snapshots/fbbb5b93fb787c21338159b0af3318bb3f4d9768/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+        );
+        default.is_file().then_some(default)
+    }
+
+    #[test]
+    fn unsloth_dsv4_q8_loads_when_env_set() {
+        if std::env::var("ALLPACA_DSV4").ok().as_deref() != Some("1") {
+            return;
+        }
+        let path = unsloth_dsv4_q8_path().expect("ALLPACA_DSV4=1 but GGUF missing");
+        {
+            let file = allpaca_gguf::GgufFile::open(&path).expect("probe open");
+            for name in [
+                "token_embd.weight",
+                "output.weight",
+                "output_hc_fn.weight",
+                "output_hc_base.weight",
+                "output_hc_scale.weight",
+                "blk.0.attn_q_a.weight",
+                "blk.0.attn_q_a_norm.weight",
+                "blk.0.attn_q_b.weight",
+                "blk.0.attn_kv.weight",
+                "blk.0.attn_kv_a_norm.weight",
+                "blk.0.attn_output_a.weight",
+                "blk.0.attn_output_b.weight",
+                "blk.0.hc_attn_fn.weight",
+                "blk.0.hc_attn_base.weight",
+                "blk.0.hc_attn_scale.weight",
+                "blk.0.ffn_gate_inp.weight",
+                "blk.0.ffn_gate_exps.weight",
+                "blk.0.ffn_up_exps.weight",
+                "blk.0.ffn_down_exps.weight",
+                "blk.0.ffn_up_shexp.weight",
+                "blk.0.ffn_down_shexp.weight",
+            ] {
+                match file.tensor(name) {
+                    Some(t) => eprintln!(
+                        "dsv4 tensor {name} dims={:?} type={:?} n={}",
+                        t.dims,
+                        t.ggml_type,
+                        t.n_elements()
+                    ),
+                    None => eprintln!("dsv4 tensor {name} MISSING"),
+                }
+            }
+        }
+        if let Some(dsp) = allpaca_gguf::discover_dspark_sidecar(&path) {
+            let file = allpaca_gguf::GgufFile::open(&dsp).expect("dspark probe open");
+            eprintln!(
+                "dspark sidecar {} arch={:?} n_tensors={}",
+                dsp.display(),
+                file.architecture(),
+                file.tensors.len()
+            );
+            for name in [
+                "markov_w1.weight",
+                "markov_w2.weight",
+                "dspark.markov_w1.weight",
+                "dspark.markov_w2.weight",
+            ] {
+                match file.tensor(name) {
+                    Some(t) => eprintln!(
+                        "dspark tensor {name} dims={:?} type={:?}",
+                        t.dims, t.ggml_type
+                    ),
+                    None => eprintln!("dspark tensor {name} MISSING"),
+                }
+            }
+        } else {
+            eprintln!("dspark sidecar not found next to {}", path.display());
+        }
+        let mut cfg = Config::compiled_defaults();
+        let hip = std::env::var("ALLPACA_DSV4_HIP").ok().as_deref() == Some("1");
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: !hip,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path);
+        cfg.speculative.enabled = true;
+        cfg.speculative.providers = vec![DraftProviderKind::Dspark, DraftProviderKind::Ngram];
+        let engine = Engine::new(cfg).expect("Unsloth DeepSeek-V4-Flash Q8 must load");
+        let stats = engine.stats();
+        eprintln!(
+            "dsv4 load ok backend={} degraded={}",
+            stats.backend, stats.degraded_events
+        );
+        if std::env::var("ALLPACA_DSV4_GENERATE").ok().as_deref() != Some("1") {
+            return;
+        }
+        let chatml = std::env::var("ALLPACA_DSV4_CHATML").ok().as_deref() == Some("1");
+        let prompt = if chatml {
+            crate::format_chatml(&[("user", "hi")], true)
+        } else {
+            "hi".to_string()
+        };
+        let out = engine
+            .generate(
+                &prompt,
+                GenerationParams {
+                    max_tokens: 1,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("Unsloth DeepSeek-V4-Flash must emit a token");
+        assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
+        let stats = engine.stats();
+        eprintln!(
+            "dsv4 generate ok chatml={} prompt_chars={} tokens={:?} text={:?} ttft_ms={} itl_ms={:.2} backend={} gpu_forwards={} target_gpu_forwards={} degraded={} dsv4_h2d_us={:.0} dsv4_h2d_bytes={} dsv4_gemv_us={:.0} dsv4_silu_us={:.0} dsv4_attn_us={:.0} dsv4_norm_us={:.0} dsv4_d2h_us={:.0} dsv4_pack_us={:.0} dsv4_hc_us={:.0} dsv4_router_us={:.0} dsv4_embed_us={:.0} q8_gemm_us={:.0} other_gpu_us={:.0} activation_h2d_bytes={} activation_d2h_bytes={} expert_lru_hits={} expert_lru_misses={} expert_lru_fills={}",
+            chatml,
+            prompt.len(),
+            out.token_ids,
+            out.text,
+            stats.ttft_ms_last,
+            stats.itl_ms_ema,
+            stats.backend,
+            stats.gpu_forwards,
+            stats.target_gpu_forwards,
+            stats.degraded_events,
+            stats.dsv4_h2d_us,
+            stats.dsv4_h2d_bytes,
+            stats.dsv4_gemv_us,
+            stats.dsv4_silu_us,
+            stats.dsv4_attn_us,
+            stats.dsv4_norm_us,
+            stats.dsv4_d2h_us,
+            stats.dsv4_pack_us,
+            stats.dsv4_hc_us,
+            stats.dsv4_router_us,
+            stats.dsv4_embed_us,
+            stats.q8_gemm_us,
+            stats.other_gpu_us,
+            stats.activation_h2d_bytes,
+            stats.activation_d2h_bytes,
+            stats.expert_lru_hits,
+            stats.expert_lru_misses,
+            stats.expert_lru_fills,
+        );
+    }
+
+    #[test]
+    fn tiny_dspark_sidecar_is_used_when_present() {
+        let dir = std::env::temp_dir().join(format!(
+            "allpaca_dspark_pair-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("tiny-dsv4.gguf");
+        let sidecar = dir.join("dspark-tiny.gguf");
+        crate::deepseek4::write_tiny_deepseek4_gguf(&target);
+        {
+            use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+            use std::collections::HashMap;
+            let mut meta = HashMap::new();
+            meta.insert(
+                "general.architecture".into(),
+                GgufValue::String("dflash".into()),
+            );
+            meta.insert("dspark.block_size".into(), GgufValue::Uint32(2));
+            meta.insert("dspark.markov_rank".into(), GgufValue::Uint32(2));
+            let w1 = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5];
+            let w2 = vec![0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 0.0, 0.0];
+            write_gguf(
+                &sidecar,
+                &meta,
+                &[
+                    GgufWriteTensor {
+                        name: "dspark.markov_w1.weight".into(),
+                        dims: vec![2, 4],
+                        data: &w1,
+                    },
+                    GgufWriteTensor {
+                        name: "dspark.markov_w2.weight".into(),
+                        dims: vec![2, 4],
+                        data: &w2,
+                    },
+                ],
+            )
+            .unwrap();
+        }
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(target.clone());
+        cfg.speculative.enabled = true;
+        cfg.speculative.providers = vec![DraftProviderKind::Dspark];
+        let engine = Engine::new(cfg).expect("DSpark pair must load");
+        let out = engine
+            .generate(
+                "hi",
+                GenerationParams {
+                    max_tokens: 3,
+                    temperature: 0.0,
+                    seed: Some(3),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("DSpark pair must generate");
+        assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_file(sidecar);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_lightning_shexp_long_prompt_batches_prefill() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip hip_lightning_shexp_long_prompt_batches_prefill: no HIP device");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_nemotron_lightning_shexp_hip-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_tiny_nemotron_lightning_moe_gguf_opts(&path, true);
+        let prompt = "hi hi hi hi hi hi hi hi";
+        let run = |cpu_only: bool| {
+            let mut cfg = Config::compiled_defaults();
+            cfg.model.path = Some(path.clone());
+            cfg.model.synthetic = false;
+            cfg.engine.cpu_only = cpu_only;
+            cfg.speculative.enabled = false;
+            let engine = Engine::new(cfg).expect("Lightning shexp HIP load");
+            let out = engine
+                .generate(
+                    prompt,
+                    GenerationParams {
+                        max_tokens: 4,
+                        temperature: 0.0,
+                        seed: Some(7),
+                        ..GenerationParams::default()
+                    },
+                )
+                .expect("Lightning shexp HIP generate");
+            (engine, out)
+        };
+        let (cpu_engine, cpu_out) = run(true);
+        drop(cpu_engine);
+        let (hip_engine, hip_out) = run(false);
+        let stats = hip_engine.stats();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            hip_out.token_ids, cpu_out.token_ids,
+            "batched Lightning prefill must match CPU; hip={:?} cpu={:?}",
+            hip_out.token_ids, cpu_out.token_ids
+        );
+        assert!(
+            hip_out.prompt_tokens >= 8,
+            "need a multi-token prompt, got {}",
+            hip_out.prompt_tokens
+        );
+        if stats.backend == "hip" {
+            assert!(
+                stats.gpu_forwards < hip_out.prompt_tokens as u64,
+                "hybrid batched prefill must not run one forward per prompt token; gpu_forwards={} prompt_tokens={} stats={stats:?}",
+                stats.gpu_forwards,
+                hip_out.prompt_tokens
+            );
+        }
     }
 
     fn write_tiny_qwen_gdn_gguf(path: &std::path::Path, w: f32) {
@@ -9067,6 +9804,120 @@ mod tests {
         path
     }
 
+    fn write_tiny_hf_safetensors_checkpoint(dir: &std::path::Path) -> std::path::PathBuf {
+        use allpaca_safetensors::{write_safetensors, SafetensorsDtype, SafetensorsWriteTensor};
+
+        std::fs::create_dir_all(dir).unwrap();
+        let dim = 8usize;
+        let vocab = 4usize;
+        let ff = 16usize;
+        let kv_dim = 2usize;
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"architectures":["LlamaForCausalLM"],"model_type":"llama","vocab_size":{vocab},"hidden_size":{dim},"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":1,"intermediate_size":{ff},"rms_norm_eps":1e-5,"rope_theta":10000.0,"hidden_act":"silu","tie_word_embeddings":true}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            r#"{
+                "version": "1.0",
+                "added_tokens": [
+                    {"id": 0, "special": true, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false},
+                    {"id": 1, "special": true, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false},
+                    {"id": 2, "special": true, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}
+                ],
+                "pre_tokenizer": {"type": "Whitespace"},
+                "model": {
+                    "type": "WordLevel",
+                    "unk_token": "<unk>",
+                    "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "hello": 3}
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"bos_token": "<s>", "eos_token": "</s>", "add_bos_token": false}"#,
+        )
+        .unwrap();
+        let embd = vec![0.01f32; vocab * dim];
+        let ones = vec![1.0f32; dim];
+        let q = vec![0.01f32; dim * dim];
+        let k = vec![0.01f32; kv_dim * dim];
+        let v = vec![0.01f32; kv_dim * dim];
+        let o = vec![0.01f32; dim * dim];
+        let gate = vec![0.01f32; ff * dim];
+        let up = vec![0.01f32; ff * dim];
+        let down = vec![0.01f32; dim * ff];
+        let path = dir.join("model.safetensors");
+        let owned = [
+            (
+                "model.embed_tokens.weight",
+                vec![vocab as u64, dim as u64],
+                &embd,
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                vec![dim as u64],
+                &ones,
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![dim as u64, dim as u64],
+                &q,
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![kv_dim as u64, dim as u64],
+                &k,
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![kv_dim as u64, dim as u64],
+                &v,
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![dim as u64, dim as u64],
+                &o,
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                vec![dim as u64],
+                &ones,
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![ff as u64, dim as u64],
+                &gate,
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![ff as u64, dim as u64],
+                &up,
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![dim as u64, ff as u64],
+                &down,
+            ),
+            ("model.norm.weight", vec![dim as u64], &ones),
+        ];
+        let views: Vec<SafetensorsWriteTensor<'_>> = owned
+            .iter()
+            .map(|(name, dims, data)| SafetensorsWriteTensor {
+                name: (*name).into(),
+                dims: dims.clone(),
+                dtype: SafetensorsDtype::BF16,
+                data,
+            })
+            .collect();
+        write_safetensors(&path, &views).unwrap();
+        path
+    }
+
     #[test]
     fn engine_generate_from_tiny_safetensors() {
         let dir = std::env::temp_dir().join("allpaca_tiny_safetensors_ckpt");
@@ -9092,6 +9943,36 @@ mod tests {
                 },
             )
             .expect("generate must work on SafeTensors weights");
+        assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn engine_generate_from_hf_named_bf16_safetensors_dir() {
+        let dir = std::env::temp_dir().join("allpaca_tiny_hf_safetensors_ckpt");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _path = write_tiny_hf_safetensors_checkpoint(&dir);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(1),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cfg.model.path = Some(dir.clone());
+        cfg.kv.page_tokens = 8;
+        let engine = Engine::new(cfg).expect("HuggingFace SafeTensors dir must load");
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("generate must work on HuggingFace BF16 SafeTensors");
         assert!(!out.token_ids.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }

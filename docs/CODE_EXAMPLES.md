@@ -53,7 +53,7 @@ hipMemcpyPeerAsync(
     transfer_stream);
 ```
 
-Use P2P only when the topology test shows a useful path. The engine should benchmark PCIe P2P against pinned-host staging because "supported" does not mean "faster for every transfer size."
+Use P2P only when a **measured** peer copy is useful. On gfx906, `hipDeviceCanAccessPeer` can be 0 and `hipDeviceEnablePeerAccess` can fail while `hipMemcpyPeer` still succeeds (stock Debian: `# CONFIG_PCI_P2PDMA is not set`). The engine treats a working memcpy as capable, then benches it against pinned-host staging — "supported" does not mean "faster for every transfer size." See the root README Dual-GPU P2P section.
 
 ## Example 4 — Async pinned logits ring
 

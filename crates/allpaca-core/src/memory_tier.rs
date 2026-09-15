@@ -12,11 +12,7 @@ pub type ReadTicket = u64;
 
 /// Pluggable page fetch backend (VRAM / pinned DRAM / NVMe / future CXL/PIM).
 pub trait MemoryTierBackend: Send + Sync {
-    fn prefetch(
-        &mut self,
-        page: PageId,
-        dst: &mut [u8],
-    ) -> Result<ReadTicket, AllpacaError>;
+    fn prefetch(&mut self, page: PageId, dst: &mut [u8]) -> Result<ReadTicket, AllpacaError>;
     fn ready(&self, ticket: ReadTicket) -> bool;
     fn release(&mut self, page: PageId);
 }
@@ -42,11 +38,7 @@ impl PinnedDramBackend {
 }
 
 impl MemoryTierBackend for PinnedDramBackend {
-    fn prefetch(
-        &mut self,
-        page: PageId,
-        dst: &mut [u8],
-    ) -> Result<ReadTicket, AllpacaError> {
+    fn prefetch(&mut self, page: PageId, dst: &mut [u8]) -> Result<ReadTicket, AllpacaError> {
         // Conceptual fill: zero the destination; real DRAM copy is elsewhere.
         dst.fill(0);
         self.next_ticket = self.next_ticket.saturating_add(1).max(1);
@@ -129,11 +121,7 @@ impl CxlMemBackend {
 }
 
 impl MemoryTierBackend for CxlMemBackend {
-    fn prefetch(
-        &mut self,
-        page: PageId,
-        dst: &mut [u8],
-    ) -> Result<ReadTicket, AllpacaError> {
+    fn prefetch(&mut self, page: PageId, dst: &mut [u8]) -> Result<ReadTicket, AllpacaError> {
         if self.unimplemented {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "CxlMemBackend not implemented".into(),
@@ -237,11 +225,7 @@ pub fn pim_xor_checksum(dst: &mut [u8]) {
 }
 
 impl MemoryTierBackend for PimBackend {
-    fn prefetch(
-        &mut self,
-        page: PageId,
-        dst: &mut [u8],
-    ) -> Result<ReadTicket, AllpacaError> {
+    fn prefetch(&mut self, page: PageId, dst: &mut [u8]) -> Result<ReadTicket, AllpacaError> {
         if self.unimplemented {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "PimBackend not implemented".into(),

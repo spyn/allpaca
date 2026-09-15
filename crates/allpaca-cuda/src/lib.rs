@@ -675,6 +675,43 @@ impl CudaWorkspace {
         result
     }
 
+    /// Host Q + resident device K/V (no KV D2H). Used by CUDA decode pages.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_host_q_dev_kv(
+        &self,
+        q: &[f32],
+        k_dev: *const f32,
+        v_dev: *const f32,
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        let q_n = (n_q as usize) * (n_heads as usize) * (head_dim as usize);
+        if q.len() < q_n || out.len() < q_n || k_dev.is_null() || v_dev.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention_host_q_dev_kv buffer mismatch".into(),
+            )));
+        }
+        let d_q = self.upload_f32(&q[..q_n])?;
+        let d_out = device_malloc(q_n * 4, self.device)?;
+        let result = (|| {
+            self.attention_dev(
+                d_q, k_dev, v_dev, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            )?;
+            memcpy(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H)?;
+            self.activation_d2h
+                .fetch_add((q_n * 4) as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+        self.free_ptr(d_q);
+        device_free(d_out);
+        result
+    }
+
     /// Upload host F32 into a device blob (activation H2D accounting).
     pub fn upload_f32(&self, host: &[f32]) -> Result<*mut f32, AllpacaError> {
         let bytes = host.len().saturating_mul(4);

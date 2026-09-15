@@ -28,6 +28,8 @@ int allpaca_hip_device_count(int32_t *count);
 int allpaca_hip_device_props(int32_t id, char *name, int32_t name_len, uint64_t *memory_bytes,
                              double *bandwidth_gbps);
 
+int allpaca_hip_device_arch(int32_t id, char *arch, int32_t arch_len, int32_t *l2_bytes);
+
 int allpaca_hip_can_p2p(int32_t src, int32_t dst, int32_t *can);
 
 int allpaca_hip_enable_peer_access(int32_t src, int32_t dst);
@@ -39,6 +41,10 @@ int allpaca_hip_free(void *ptr);
 int allpaca_hip_host_malloc(void **ptr, size_t bytes);
 
 int allpaca_hip_host_free(void *ptr);
+
+int allpaca_hip_host_register(void *ptr, size_t bytes, unsigned int flags);
+
+int allpaca_hip_host_unregister(void *ptr);
 
 /* Windows DirectStorage 1.3 buffer backed by a shareable D3D12 resource and
  * imported into HIP external memory. `handle` owns both API objects. */
@@ -166,9 +172,29 @@ int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, 
 int allpaca_gemm_nt_f16_untiled(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_bf16[n,k])^T. B is packed bfloat16, row-major [n,k].
+ * gfx906 has no BF16 ALU: load u16, expand to F32, FMA. Decode M<=8 is A-tile GEMV. */
+int allpaca_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                         int32_t k, allpaca_stream_t stream);
+
+int allpaca_gemm_nt_bf16_untiled(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                                 int32_t k, allpaca_stream_t stream);
+
+/* C[m,n] = A[m,k] * dequant(B_mxfp4[n,k])^T. ggml MXFP4: 17-byte blocks / 32 elems. */
+int allpaca_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                          int32_t k, allpaca_stream_t stream);
+
+int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                  int32_t k, allpaca_stream_t stream);
+
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);
+
+/* Online-softmax attention with a virtual sink logit per head (`sinks[n_heads]`; null = none). */
+int allpaca_attention_sinks(const float *q, const float *k, const float *v, float *out, int32_t n_q,
+                            int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
+                            int32_t causal, const float *sinks, allpaca_stream_t stream);
 
 /* Same layout as allpaca_attention. mask is [n_q, n_kv] uint8 (nonzero = attend). */
 int allpaca_attention_masked(const float *q, const float *k, const float *v, float *out,
@@ -184,6 +210,10 @@ int allpaca_rmsnorm(const float *x, const float *weight, float *out, int32_t n, 
 int allpaca_rmsnorm_rows(const float *x, const float *weight, float *out, int32_t rows, int32_t n,
                          float eps, allpaca_stream_t stream);
 
+/* out[rows, n] = LayerNorm(x[rows, n], weight[n], bias[n]). Mean/var per row; not RMSNorm. */
+int allpaca_layernorm_rows(const float *x, const float *weight, const float *bias, float *out,
+                           int32_t rows, int32_t n, float eps, allpaca_stream_t stream);
+
 int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
                  allpaca_stream_t stream);
 
@@ -191,6 +221,9 @@ int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t s
 
 /* Spark2_5 FFN: gate[i] = gelu(gate[i]) * up[i] (erf GELU). */
 int allpaca_gelu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
+
+/* x[i] = relu(x[i])^2 in place (Nemotron Lightning / DeepSeek gate-less MoE). */
+int allpaca_relu_sqr(float *x, int32_t n, allpaca_stream_t stream);
 
 /* Qwen gated-attn: q_full[n_heads][2*head_dim] -> q, gate each [n_heads][head_dim]. */
 int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,

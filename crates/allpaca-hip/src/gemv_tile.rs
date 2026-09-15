@@ -50,16 +50,15 @@ pub fn profiled_gemv_tile_cols() -> Option<i32> {
     PROFILED_GEMV_COLS.get().copied()
 }
 
-/// Pick GEMV column tile for MoE expert decode on AMD RDNA.
-///
-/// Uses a measured profile when present; otherwise heuristic (OPPORTUNITY §12).
-pub fn select_gemv_tile_cols(n: i32, k: i32, infinity_cache_bytes: usize, block_bytes: usize) -> i32 {
+/// Heuristic tile width from cache budget (ignores the process-wide profile).
+pub fn select_gemv_tile_cols_heuristic(
+    n: i32,
+    k: i32,
+    infinity_cache_bytes: usize,
+    block_bytes: usize,
+) -> i32 {
     let _ = (n, k);
-    if let Some(cols) = profiled_gemv_tile_cols() {
-        return cols;
-    }
     let budget = if infinity_cache_bytes == 0 {
-        // Unknown device: keep the shipped default.
         return 64;
     } else {
         infinity_cache_bytes / 8
@@ -71,6 +70,21 @@ pub fn select_gemv_tile_cols(n: i32, k: i32, infinity_cache_bytes: usize, block_
         }
     }
     32
+}
+
+/// Pick GEMV column tile for MoE expert decode on AMD RDNA.
+///
+/// Uses a measured profile when present; otherwise heuristic (OPPORTUNITY §12).
+pub fn select_gemv_tile_cols(
+    n: i32,
+    k: i32,
+    infinity_cache_bytes: usize,
+    block_bytes: usize,
+) -> i32 {
+    if let Some(cols) = profiled_gemv_tile_cols() {
+        return cols;
+    }
+    select_gemv_tile_cols_heuristic(n, k, infinity_cache_bytes, block_bytes)
 }
 
 /// Infer a usable Infinity Cache budget from L2 cache size (HIP proxy).
@@ -89,13 +103,13 @@ mod tests {
 
     #[test]
     fn unknown_cache_keeps_default_64() {
-        assert_eq!(select_gemv_tile_cols(256, 4096, 0, 176), 64);
+        assert_eq!(select_gemv_tile_cols_heuristic(256, 4096, 0, 176), 64);
     }
 
     #[test]
     fn large_cache_prefers_wide_tile() {
         assert_eq!(
-            select_gemv_tile_cols(256, 4096, 64 << 20, 176),
+            select_gemv_tile_cols_heuristic(256, 4096, 64 << 20, 176),
             128,
             "64 MiB Infinity Cache should allow COLS=128"
         );
@@ -104,7 +118,7 @@ mod tests {
     #[test]
     fn tiny_cache_narrows_tile() {
         // Budget = 64KiB/8 = 8KiB. COLS=128 needs ~23KiB; 64 needs ~12KiB; 32 needs ~6KiB.
-        assert_eq!(select_gemv_tile_cols(64, 256, 64 << 10, 176), 32);
+        assert_eq!(select_gemv_tile_cols_heuristic(64, 256, 64 << 10, 176), 32);
     }
 
     #[test]

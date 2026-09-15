@@ -267,7 +267,11 @@ pub(crate) fn snapshot_kv(
     let mut out = Vec::with_capacity(pages.len());
     for layer_pages in pages {
         let (ks, vs) = crate::model::gather_kv(kv, layer_pages, cfg.n_kv_heads, cfg.head_dim())?;
-        let n = if kv_width == 0 { 0 } else { ks.len() / kv_width };
+        let n = if kv_width == 0 {
+            0
+        } else {
+            ks.len() / kv_width
+        };
         let mut rows = Vec::with_capacity(n);
         for i in 0..n {
             let a = i * kv_width;

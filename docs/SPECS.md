@@ -389,6 +389,6 @@ The scheduler chooses:
 
 ### P2P Constraints
 
-- P2P must be validated at runtime: query `hipDeviceCanAccessPeer`, enable both directions with `hipDeviceEnablePeerAccess`, then re-query
-- Benchmark enable+peer-copy vs host staging for each transfer size
-- Never assume P2P is faster without measurement; prefer P2P only when it is not more than 10% slower than host staging
+- P2P must be validated at runtime. Formal `hipDeviceCanAccessPeer` / `hipDeviceEnablePeerAccess` are best-effort: kernels without `CONFIG_PCI_P2PDMA` (typical stock Debian) often deny enable on gfx906 while `hipMemcpyPeer` still copies. A successful peer memcpy is capability.
+- Benchmark peer-copy vs host staging (boot uses 4 MiB). Never assume P2P is faster; prefer P2P only when the copy worked and measured P2P is not more than 10% slower than host staging (`P2P_MAX_SLOWER_FRACTION`).
+- Linux operator notes (Debian SDK, custom `CONFIG_PCI_P2PDMA=y` kernel, post-reboot check): README “Linux compiler SDK” and “Dual-GPU P2P”.

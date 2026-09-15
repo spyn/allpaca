@@ -1,6 +1,8 @@
 use ahash::AHashMap;
 use allpaca_gguf::GgufTokenizer;
+use allpaca_safetensors::SidecarTokenizer;
 use allpaca_types::{AllpacaError, FatalError};
+use serde_json::Value;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
 use tokenizers::tokenizer::Tokenizer;
@@ -23,6 +25,8 @@ pub struct EngineTokenizer {
     pub fim_rep_id: Option<u32>,
     pub fim_sep_id: Option<u32>,
     pub add_bos: bool,
+    /// HuggingFace `tokenizer.json` decoder (ByteLevel / BPE), not piece-concat.
+    hf_native_decode: bool,
 }
 
 impl EngineTokenizer {
@@ -45,20 +49,51 @@ impl EngineTokenizer {
             fim_rep_id: tok.fim_rep_id,
             fim_sep_id: tok.fim_sep_id,
             add_bos: tok.add_bos,
+            hf_native_decode: false,
         }
     }
 
-    /// End-of-generation ids used as default stop tokens (eos / eot / eom).
+    /// End-of-generation ids: GGUF eos/eot/eom plus ChatML/Llama pieces in vocab.
+    ///
+    /// `<|im_end|>` is not always `tokenizer.ggml.eot_token_id`. Without it in
+    /// the stop set, ChatML models keep emitting the next turn (role-echo).
     pub fn stop_token_ids(&self) -> Vec<u32> {
         let mut out = Vec::new();
         for id in [self.eos_id, self.eot_id, self.eom_id] {
             if let Some(id) = id {
-                if !out.contains(&id) {
-                    out.push(id);
-                }
+                push_unique(&mut out, id);
+            }
+        }
+        for piece in CHAT_EOG_PIECES {
+            if let Some(id) = self.token_id(piece) {
+                push_unique(&mut out, id);
             }
         }
         out
+    }
+
+    pub fn token_id(&self, piece: &str) -> Option<u32> {
+        self.tokens
+            .iter()
+            .position(|t| t == piece)
+            .map(|i| i as u32)
+    }
+
+    /// Vocab has ChatML turn delimiters as single pieces.
+    pub fn uses_chatml(&self) -> bool {
+        self.token_id("<|im_start|>").is_some() && self.token_id("<|im_end|>").is_some()
+    }
+
+    /// ChatML when the vocab has the specials; otherwise `role: text` (tiny/synthetic).
+    ///
+    /// Does **not** open `<think>` — that is Qwen-specific and role-echoes on
+    /// Nemotron Lightning.
+    pub fn format_chat(&self, messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+        if self.uses_chatml() {
+            format_chatml(messages, add_generation_prompt)
+        } else {
+            format_chat_colon(messages, add_generation_prompt)
+        }
     }
 
     pub fn from_vocab(
@@ -105,6 +140,7 @@ impl EngineTokenizer {
             fim_rep_id: None,
             fim_sep_id: None,
             add_bos: bos_id.is_some(),
+            hf_native_decode: false,
         })
     }
 
@@ -128,7 +164,103 @@ impl EngineTokenizer {
         Ok(ids)
     }
 
+    pub fn from_sidecar(side: SidecarTokenizer) -> Result<Self, AllpacaError> {
+        match side {
+            SidecarTokenizer::Vocab(v) => Self::from_vocab(v.tokens, v.bos_id, v.eos_id),
+            SidecarTokenizer::HuggingFace {
+                tokenizer_json,
+                tokenizer_config,
+                generation_config,
+            } => Self::from_hf_files(
+                &tokenizer_json,
+                tokenizer_config.as_deref(),
+                generation_config.as_deref(),
+            ),
+        }
+    }
+
+    pub fn from_hf_files(
+        tokenizer_json: &std::path::Path,
+        tokenizer_config: Option<&std::path::Path>,
+        generation_config: Option<&std::path::Path>,
+    ) -> Result<Self, AllpacaError> {
+        let inner = Tokenizer::from_file(tokenizer_json).map_err(|e| {
+            AllpacaError::Fatal(FatalError::Tokenizer(format!(
+                "HuggingFace tokenizer.json {}: {e}",
+                tokenizer_json.display()
+            )))
+        })?;
+        let n = inner.get_vocab_size(true);
+        let mut tokens = Vec::with_capacity(n);
+        for i in 0..n {
+            tokens.push(
+                inner
+                    .id_to_token(i as u32)
+                    .unwrap_or_else(|| format!("<{i}>")),
+            );
+        }
+        if tokens.is_empty() {
+            return Err(AllpacaError::Fatal(FatalError::Tokenizer(
+                "HuggingFace tokenizer.json vocab is empty".into(),
+            )));
+        }
+        let tok_cfg = read_json_object(tokenizer_config)?;
+        let gen_cfg = read_json_object(generation_config)?;
+        let mut bos_id = gen_cfg
+            .as_ref()
+            .and_then(|v| json_u32_first(v.get("bos_token_id")));
+        let mut eos_id = gen_cfg
+            .as_ref()
+            .and_then(|v| json_u32_first(v.get("eos_token_id")));
+        let eot_id = gen_cfg
+            .as_ref()
+            .and_then(|v| json_u32_second(v.get("eos_token_id")));
+        if bos_id.is_none() {
+            bos_id = tok_cfg
+                .as_ref()
+                .and_then(|v| json_token_string(v.get("bos_token")))
+                .and_then(|s| tokens.iter().position(|t| t == &s).map(|i| i as u32));
+        }
+        if eos_id.is_none() {
+            eos_id = tok_cfg
+                .as_ref()
+                .and_then(|v| json_token_string(v.get("eos_token")))
+                .and_then(|s| tokens.iter().position(|t| t == &s).map(|i| i as u32));
+        }
+        let add_bos = tok_cfg
+            .as_ref()
+            .and_then(|v| v.get("add_bos_token"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(Self {
+            inner,
+            tokens,
+            bos_id,
+            eos_id,
+            eot_id,
+            eom_id: None,
+            unk_id: None,
+            sep_id: None,
+            pad_id: None,
+            mask_id: None,
+            fim_pre_id: None,
+            fim_suf_id: None,
+            fim_mid_id: None,
+            fim_pad_id: None,
+            fim_rep_id: None,
+            fim_sep_id: None,
+            add_bos,
+            hf_native_decode: true,
+        })
+    }
+
     pub fn decode(&self, ids: &[u32]) -> Result<String, AllpacaError> {
+        if self.hf_native_decode {
+            return self
+                .inner
+                .decode(ids, true)
+                .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())));
+        }
         let mut out = String::new();
         for &id in ids {
             let piece = self.decode_one(id);
@@ -150,6 +282,53 @@ impl EngineTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
     }
+}
+
+/// llama.cpp-style extra EOG pieces (not always in GGUF eot/eos keys).
+const CHAT_EOG_PIECES: &[&str] = &[
+    "<|im_end|>",
+    "<|eot_id|>",
+    "<|eom_id|>",
+    "<|end_of_turn|>",
+    "<|endoftext|>",
+    "<|end_of_text|>",
+];
+
+fn push_unique(out: &mut Vec<u32>, id: u32) {
+    if !out.contains(&id) {
+        out.push(id);
+    }
+}
+
+/// ChatML turns. Does not open `<think>`.
+pub fn format_chatml(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+    let mut out = String::new();
+    for (role, content) in messages {
+        out.push_str("<|im_start|>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(content);
+        out.push_str("<|im_end|>\n");
+    }
+    if add_generation_prompt {
+        out.push_str("<|im_start|>assistant\n");
+    }
+    out
+}
+
+/// Colon fallback for synthetic / non-ChatML vocabs.
+pub fn format_chat_colon(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+    let mut out = String::new();
+    for (role, content) in messages {
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(content);
+        out.push('\n');
+    }
+    if add_generation_prompt {
+        out.push_str("assistant:");
+    }
+    out
 }
 
 pub fn synthetic_vocab(vocab_size: usize) -> Vec<String> {
@@ -216,6 +395,55 @@ fn byte_to_string(byte: u8) -> String {
 
 fn is_special_piece(piece: &str) -> bool {
     piece.starts_with('<') && piece.ends_with('>')
+}
+
+fn read_json_object(path: Option<&std::path::Path>) -> Result<Option<Value>, AllpacaError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let src = std::fs::read_to_string(path).map_err(|e| {
+        AllpacaError::Fatal(FatalError::Tokenizer(format!(
+            "tokenizer sidecar {}: {e}",
+            path.display()
+        )))
+    })?;
+    let value: Value = serde_json::from_str(&src).map_err(|e| {
+        AllpacaError::Fatal(FatalError::Tokenizer(format!(
+            "tokenizer sidecar {}: {e}",
+            path.display()
+        )))
+    })?;
+    Ok(Some(value))
+}
+
+fn json_token_string(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    value
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn json_u32(value: &Value) -> Option<u32> {
+    value.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+fn json_u32_first(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    if let Some(n) = json_u32(value) {
+        return Some(n);
+    }
+    value.as_array()?.iter().find_map(json_u32)
+}
+
+fn json_u32_second(value: Option<&Value>) -> Option<u32> {
+    value?.as_array()?.get(1).and_then(json_u32)
 }
 
 #[cfg(test)]
@@ -309,7 +537,10 @@ mod tests {
             GgufValue::Uint32(0),
         );
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
-        meta.insert("tokenizer.ggml.add_bos_token".into(), GgufValue::Bool(false));
+        meta.insert(
+            "tokenizer.ggml.add_bos_token".into(),
+            GgufValue::Bool(false),
+        );
         write_gguf(&path, &meta, &[]).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let gguf_tok = allpaca_gguf::extract_tokenizer(&file).unwrap();
@@ -345,14 +576,8 @@ mod tests {
                 GgufValue::String("hi".into()),
             ]),
         );
-        meta.insert(
-            "tokenizer.ggml.eos_token_id".into(),
-            GgufValue::Uint32(1),
-        );
-        meta.insert(
-            "tokenizer.ggml.eot_token_id".into(),
-            GgufValue::Uint32(2),
-        );
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eot_token_id".into(), GgufValue::Uint32(2));
         meta.insert(
             "tokenizer.ggml.add_bos_token".into(),
             GgufValue::Bool(false),
@@ -362,6 +587,88 @@ mod tests {
         let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
         assert_eq!(tok.stop_token_ids(), vec![1, 2]);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn chatml_im_end_is_stop_without_eot_metadata() {
+        let tokens = vec![
+            "<unk>".into(),
+            "</s>".into(),
+            "<|im_start|>".into(),
+            "<|im_end|>".into(),
+            "hi".into(),
+        ];
+        let tok = EngineTokenizer::from_vocab(tokens, None, Some(1)).expect("vocab");
+        assert!(tok.uses_chatml());
+        assert_eq!(tok.token_id("<|im_end|>"), Some(3));
+        assert_eq!(tok.stop_token_ids(), vec![1, 3]);
+        assert_eq!(
+            tok.format_chat(&[("user", "hello")], true),
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert!(
+            !tok.format_chat(&[("user", "hello")], true)
+                .contains("<think>"),
+            "must not open Qwen think on ChatML"
+        );
+    }
+
+    #[test]
+    fn from_hf_tokenizer_json_wordlevel_encodes_hello() {
+        let dir = std::env::temp_dir().join("allpaca_hf_tok_json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            r#"{
+                "version": "1.0",
+                "added_tokens": [
+                    {"id": 0, "special": true, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false},
+                    {"id": 1, "special": true, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false},
+                    {"id": 2, "special": true, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}
+                ],
+                "pre_tokenizer": {"type": "Whitespace"},
+                "model": {
+                    "type": "WordLevel",
+                    "unk_token": "<unk>",
+                    "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "hello": 3}
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"bos_token": "<s>", "eos_token": "</s>", "add_bos_token": false}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("generation_config.json"),
+            r#"{"bos_token_id": 1, "eos_token_id": [2, 2]}"#,
+        )
+        .unwrap();
+        let tok = EngineTokenizer::from_hf_files(
+            &dir.join("tokenizer.json"),
+            Some(&dir.join("tokenizer_config.json")),
+            Some(&dir.join("generation_config.json")),
+        )
+        .expect("HF tokenizer.json");
+        assert_eq!(tok.bos_id, Some(1));
+        assert_eq!(tok.eos_id, Some(2));
+        assert!(!tok.add_bos);
+        let ids = tok.encode("hello").expect("encode");
+        assert_eq!(ids, vec![3]);
+        assert_eq!(tok.decode(&ids).expect("decode"), "hello");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn synthetic_vocab_keeps_colon_chat() {
+        let tok = EngineTokenizer::synthetic(32).expect("synthetic");
+        assert!(!tok.uses_chatml());
+        assert_eq!(
+            tok.format_chat(&[("user", "hello")], true),
+            "user: hello\nassistant:"
+        );
     }
 
     fn gated_qwen_gguf_path() -> Option<std::path::PathBuf> {

@@ -219,9 +219,6 @@ fn model_config_from_hf(tier: Edge0Tier, hf: &HfConfig, moe: &MoESpec) -> ModelC
         head_dim_explicit: head_dim,
         rope_dims: ((head_dim as f32) * text.partial_rotary_factor) as usize,
         rope_sections,
-        recurrent: false,
-        nextn_predict_layers: 0,
-        gguf_layer_base: 0,
         router_kind: moe.router,
         shared_experts: moe.shared_experts,
         n_group: moe.n_group.unwrap_or(0),
@@ -229,18 +226,7 @@ fn model_config_from_hf(tier: Edge0Tier, hf: &HfConfig, moe: &MoESpec) -> ModelC
         routed_scaling: moe.routed_scaling.unwrap_or(1.0),
         moe_norm_topk: moe.norm_topk_prob,
         edge0_tier: Some(tier),
-        ffn_gelu: false,
-        sliding_window: 0,
-        swa_pattern: Vec::new(),
-        rope_dims_swa: 0,
-        rope_theta_swa: 0.0,
-        headwise_attn_gate: false,
-        attn_logit_softcap: 0.0,
-        final_logit_softcap: 0.0,
-        scale_embed: false,
-        leading_dense_blocks: 0,
-        q_lora_rank: 0,
-        kv_lora_rank: 0,
+        ..ModelConfig::tiny()
     }
 }
 
@@ -274,12 +260,12 @@ fn synthetic_edge0_model(
     // Attach shared experts + MLA on Ling layers.
     for (i, layer) in model.layers.iter_mut().enumerate() {
         if cfg.shared_experts > 0 && cfg.n_experts > 0 {
-            layer.shared_expert = Some(LayerFfn {
+            layer.shared_expert = LayerFfn {
                 ffn_norm: Vec::new(),
                 w_gate: vec![0.01; cfg.ff_dim * cfg.dim],
                 w_up: vec![0.01; cfg.ff_dim * cfg.dim],
                 w_down: vec![0.01; cfg.dim * cfg.ff_dim],
-            });
+            };
         }
         if matches!(tier, Edge0Tier::Ling8) && i > 0 {
             let mla = MlaDims::from_hidden(cfg.dim, cfg.n_heads);
@@ -379,7 +365,8 @@ fn load_edge0_weights(
         mtp_nextn: None,
         rpc: None,
         edge0: None,
-            mla_cache: None,
+        mla_cache: None,
+        dsv4: None,
     })
 }
 
@@ -475,16 +462,16 @@ fn load_qwen35_layer(
     let shared_expert = if let Some(w_gate) =
         get_f32(&format!("{prefix}.mlp.shared_expert.gate_proj.weight"))?
     {
-        Some(LayerFfn {
+        LayerFfn {
             ffn_norm: Vec::new(),
             w_gate,
             w_up: get_f32(&format!("{prefix}.mlp.shared_expert.up_proj.weight"))?
                 .unwrap_or_default(),
             w_down: get_f32(&format!("{prefix}.mlp.shared_expert.down_proj.weight"))?
                 .unwrap_or_default(),
-        })
+        }
     } else {
-        None
+        LayerFfn::default()
     };
 
     Ok(LayerWeights {
@@ -557,7 +544,7 @@ fn load_ling8_layer(
             w_down: get_f32(&format!("{prefix}.mlp.down_proj.weight"))?.unwrap_or_default(),
             w_router: Vec::new(),
             experts: Vec::new(),
-            shared_expert: None,
+            shared_expert: LayerFfn::default(),
             expert_bias: Vec::new(),
             attn_out_gate: Vec::new(),
             attn_post_norm: Vec::new(),
@@ -581,16 +568,16 @@ fn load_ling8_layer(
     let shared_expert = if let Some(w_gate) =
         get_f32(&format!("{prefix}.mlp.shared_experts.gate_proj.weight"))?
     {
-        Some(LayerFfn {
+        LayerFfn {
             ffn_norm: Vec::new(),
             w_gate,
             w_up: get_f32(&format!("{prefix}.mlp.shared_experts.up_proj.weight"))?
                 .unwrap_or_default(),
             w_down: get_f32(&format!("{prefix}.mlp.shared_experts.down_proj.weight"))?
                 .unwrap_or_default(),
-        })
+        }
     } else {
-        None
+        LayerFfn::default()
     };
 
     Ok(LayerWeights {
@@ -683,7 +670,7 @@ mod tests {
         assert_eq!(loaded.tier, Edge0Tier::Qwen35);
         assert_eq!(loaded.model.name, "edge0-35b");
         assert!(loaded.model.config.n_experts > 0);
-        assert!(loaded.model.layers[0].shared_expert.is_some());
+        assert!(!loaded.model.layers[0].shared_expert.w_up.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

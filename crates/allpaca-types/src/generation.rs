@@ -84,7 +84,7 @@ impl TokenMask {
     pub fn allow_all(vocab: usize) -> Self {
         let n_words = vocab.div_ceil(64);
         let mut words = vec![u64::MAX; n_words];
-        if !vocab.is_multiple_of(64) {
+        if vocab % 64 != 0 {
             let leftover = vocab % 64;
             words[n_words - 1] = (1u64 << leftover) - 1;
         }

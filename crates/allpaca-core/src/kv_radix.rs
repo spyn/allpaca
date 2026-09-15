@@ -160,9 +160,7 @@ impl KvRadixForest {
             cur = cur.children.get_mut(&tok).expect("just inserted");
         }
         if let Some(old) = cur.checkpoint.take() {
-            self.checkpoint_bytes = self
-                .checkpoint_bytes
-                .saturating_sub(old.approx_bytes());
+            self.checkpoint_bytes = self.checkpoint_bytes.saturating_sub(old.approx_bytes());
         }
         cur.checkpoint = Some(cp);
         cur.used_at = stamp;
@@ -223,7 +221,9 @@ impl KvRadixForest {
                                 (false, true) => cand,
                                 (true, true) | (false, false) => {
                                     if cand.used_at < prev.used_at
-                                        || (cand.used_at == prev.used_at && cand.is_leaf && !prev.is_leaf)
+                                        || (cand.used_at == prev.used_at
+                                            && cand.is_leaf
+                                            && !prev.is_leaf)
                                     {
                                         cand
                                     } else {
@@ -274,9 +274,7 @@ impl KvRadixForest {
         }
         if let Some(removed) = cur.children.remove(&last) {
             if let Some(cp) = removed.checkpoint.as_ref() {
-                self.checkpoint_bytes = self
-                    .checkpoint_bytes
-                    .saturating_sub(cp.approx_bytes());
+                self.checkpoint_bytes = self.checkpoint_bytes.saturating_sub(cp.approx_bytes());
             }
             // Dropping a subtree: subtract nested checkpoint bytes + node counts.
             fn walk_drop(node: &RadixNode, bytes: &mut usize, nodes: &mut usize) {
@@ -319,12 +317,42 @@ impl KvRadixForest {
         Ok(())
     }
 
-    /// Longest restorable prefix: deepest node on the walk that has a checkpoint
-    /// with `depth <= max_depth` (use `max_depth = tokens.len()-1` to leave logits work).
-    pub fn lookup_checkpoint(
+    /// After a batched prefill write, snapshot KV once and attach a checkpoint
+    /// at every prefix. Each checkpoint keeps only the first `i` KV rows so a
+    /// later mid-prompt edit can restore the LCP without leftover page slots.
+    /// HIP device pages are not snapshotted here: `read_kv` would D2H the
+    /// growing sequence and break logits-only decode accounting.
+    #[allow(dead_code)]
+    pub fn capture_prefixes(
         &mut self,
         tokens: &[u32],
-    ) -> Option<(usize, RadixCheckpoint)> {
+        recurrent: &RecurrentState,
+        kv: &KvTierManager,
+        pages: &[Vec<u64>],
+        cfg: &ModelConfig,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let full = snapshot_kv(kv, pages, cfg)?;
+        for i in 0..tokens.len() {
+            let n = i + 1;
+            let sliced = full
+                .iter()
+                .map(|layer| layer[..n.min(layer.len())].to_vec())
+                .collect();
+            let cp = RadixCheckpoint {
+                recurrent: recurrent.clone(),
+                kv: sliced,
+            };
+            self.insert_checkpoint(&tokens[..n], cp);
+        }
+        Ok(())
+    }
+
+    /// Longest restorable prefix: deepest node on the walk that has a checkpoint
+    /// with `depth <= max_depth` (use `max_depth = tokens.len()-1` to leave logits work).
+    pub fn lookup_checkpoint(&mut self, tokens: &[u32]) -> Option<(usize, RadixCheckpoint)> {
         self.lookup_checkpoint_capped(tokens, usize::MAX)
     }
 

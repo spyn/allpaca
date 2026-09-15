@@ -2,13 +2,20 @@
 //!
 //! Without an SDK, `--features hip` still compiles: Rust uses host stubs and
 //! GPU tests skip (`device_count() == 0`). Set `HIP_PATH` or `ROCM_PATH`.
+//!
+//! Offload ISAs: `AMDGPU_TARGETS` / `HIP_AMDGPU_TARGETS` / `ALLPACA_OFFLOAD_ARCH`,
+//! else live `rocminfo` GPUs, else a fat list that includes gfx906 (MI50 / Radeon
+//! VII) and gfx900 (home Vega) plus the RDNA3/4 targets.
 
 use std::env;
+#[cfg(windows)]
 use std::fs::File;
+#[cfg(windows)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
 const DIRECT_STORAGE_VERSION: &str = "1.3.0";
 
 fn main() {
@@ -17,6 +24,10 @@ fn main() {
     println!("cargo:rerun-if-changed=../../hip/CMakeLists.txt");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=AMDGPU_TARGETS");
+    println!("cargo:rerun-if-env-changed=HIP_AMDGPU_TARGETS");
+    println!("cargo:rerun-if-env-changed=ALLPACA_OFFLOAD_ARCH");
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(allpaca_hip_runtime)");
     println!("cargo:rustc-check-cfg=cfg(allpaca_rocblas)");
     println!("cargo:rustc-check-cfg=cfg(allpaca_hipblaslt)");
@@ -28,25 +39,13 @@ fn main() {
 
     let Some(hip_root) = find_hip_root() else {
         println!(
-            "cargo:warning=HIP SDK not found; hip feature is stub-only. Install ROCm and set HIP_PATH or ROCM_PATH (Windows default: C:\\Program Files\\AMD\\ROCm\\*)."
+            "cargo:warning=HIP SDK not found; hip feature is stub-only. Need hipcc + hip_runtime.h (runtime-only /opt/rocm is not enough). Install hipcc/hip-dev matching the runtime, or run scripts/fetch-rocm-hip-sdk.sh, and set HIP_PATH or ROCM_PATH."
         );
         return;
     };
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let direct_storage = if cfg!(windows) {
-        match restore_direct_storage_sdk(&out) {
-            Ok(sdk) => Some(sdk),
-            Err(e) => {
-                println!(
-                    "cargo:warning=Microsoft.Direct3D.DirectStorage {DIRECT_STORAGE_VERSION} unavailable ({e}); Windows NVMe-to-VRAM DMA disabled"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let direct_storage = windows_direct_storage(&out);
     let mut hipblaslt = hipblaslt_present(&hip_root);
     if hipblaslt && cfg!(windows) {
         if let Err(e) = generate_hipblaslt_import_lib(&hip_root, &out) {
@@ -56,20 +55,37 @@ fn main() {
             hipblaslt = false;
         }
     }
-    if let Err(e) = build_kernels(&hip_root, &out, hipblaslt, direct_storage.as_deref()) {
+    let arches = offload_arches();
+    println!(
+        "cargo:warning=HIP SDK {} offload={}",
+        hip_root.display(),
+        arches.join(",")
+    );
+    if let Err(e) = build_kernels(
+        &hip_root,
+        &out,
+        hipblaslt,
+        direct_storage.as_deref(),
+        &arches,
+    ) {
         println!("cargo:warning=HIP kernel build failed ({e}); hip feature is stub-only.");
         return;
     }
 
     println!("cargo:rustc-link-search=native={}", out.display());
-    println!(
-        "cargo:rustc-link-search=native={}",
-        hip_root.join("lib").display()
-    );
+    for libdir in hip_lib_dirs(&hip_root) {
+        println!("cargo:rustc-link-search=native={}", libdir.display());
+        if cfg!(unix) {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libdir.display());
+        }
+    }
     println!("cargo:rustc-link-lib=static=allpaca_kernels");
     println!("cargo:rustc-link-lib=amdhip64");
     if cfg!(windows) {
         println!("cargo:rustc-link-lib=dylib=amdhip64");
+    }
+    if cfg!(unix) {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
     }
     if rocblas_lib_exists(&hip_root) {
         println!("cargo:rustc-link-lib=rocblas");
@@ -92,6 +108,25 @@ fn main() {
     println!("cargo:rustc-cfg=allpaca_hip_runtime");
 }
 
+#[cfg(not(windows))]
+fn windows_direct_storage(_out: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn windows_direct_storage(out: &Path) -> Option<PathBuf> {
+    match restore_direct_storage_sdk(out) {
+        Ok(sdk) => Some(sdk),
+        Err(e) => {
+            println!(
+                "cargo:warning=Microsoft.Direct3D.DirectStorage {DIRECT_STORAGE_VERSION} unavailable ({e}); Windows NVMe-to-VRAM DMA disabled"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
 fn restore_direct_storage_sdk(out: &Path) -> Result<PathBuf, String> {
     println!("cargo:rerun-if-env-changed=DOTNET_ROOT");
 
@@ -185,19 +220,7 @@ fn find_hip_root() -> Option<PathBuf> {
             }
         }
     }
-    let extras = [
-        r"C:\Program Files\AMD\ROCm\7.1",
-        r"C:\Program Files\AMD\ROCm\7.0",
-        r"C:\Program Files\AMD\ROCm\6.4",
-        r"C:\Program Files\AMD\ROCm\6.3",
-        r"C:\Program Files\AMD\ROCm\6.2",
-        r"C:\Program Files\AMD\ROCm\5.7",
-        "/opt/rocm",
-        "/opt/rocm-7.1",
-        "/opt/rocm-6.3",
-    ];
-    for p in extras {
-        let p = PathBuf::from(p);
+    for p in extra_hip_roots() {
         if hip_looks_valid(&p) {
             return Some(p);
         }
@@ -324,9 +347,133 @@ fn generate_hipblaslt_import_lib(hip_root: &Path, out: &Path) -> Result<(), Stri
     Ok(())
 }
 
+fn extra_hip_roots() -> Vec<PathBuf> {
+    let mut extras = vec![
+        PathBuf::from(r"C:\Program Files\AMD\ROCm\7.1"),
+        PathBuf::from(r"C:\Program Files\AMD\ROCm\7.0"),
+        PathBuf::from(r"C:\Program Files\AMD\ROCm\6.4"),
+        PathBuf::from(r"C:\Program Files\AMD\ROCm\6.3"),
+        PathBuf::from(r"C:\Program Files\AMD\ROCm\6.2"),
+        PathBuf::from(r"C:\Program Files\AMD\ROCm\5.7"),
+        PathBuf::from("/opt/rocm"),
+        PathBuf::from("/opt/rocm-7.1"),
+        PathBuf::from("/opt/rocm-6.3"),
+        PathBuf::from("/opt/rocm-6.2.4"),
+        PathBuf::from("/opt/rocm-6.2"),
+    ];
+    if let Ok(home) = env::var("HOME") {
+        let cache = PathBuf::from(&home).join(".cache/allpaca/rocm-sdk/opt");
+        if let Ok(entries) = std::fs::read_dir(&cache) {
+            let mut vers: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            vers.sort();
+            vers.reverse();
+            extras.extend(vers);
+        }
+        extras.push(PathBuf::from(home).join(".cache/allpaca/rocm-sdk/opt/rocm-6.2.4"));
+    }
+    extras
+}
+
+fn hip_lib_dirs(hip_root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![hip_root.join("lib")];
+    let system = PathBuf::from("/opt/rocm/lib");
+    if system.is_dir() && !dirs.contains(&system) {
+        dirs.push(system);
+    }
+    dirs
+}
+
 fn hip_looks_valid(root: &Path) -> bool {
-    root.join("include/hip/hip_runtime.h").is_file()
-        && (root.join("bin/hipcc.exe").is_file() || root.join("bin/hipcc").is_file())
+    root.join("include/hip/hip_runtime.h").is_file() && hipcc_bin(root).is_file()
+}
+
+/// Default fat binary when no live GPU is visible: Vega/GCN5 (MI50, Radeon VII,
+/// home Vega) plus the RDNA3/4 targets the kernels were first brought up on.
+fn default_offload_arches() -> Vec<String> {
+    ["gfx906", "gfx900", "gfx1100", "gfx1200", "gfx1201"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_offload_arches(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|a| a == part) {
+            out.push(part.to_string());
+        }
+    }
+    out
+}
+
+fn gfx_arch_token(raw: &str) -> Option<String> {
+    let idx = raw.find("gfx")?;
+    let rest = &raw[idx..];
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == ':')
+        .collect();
+    let base = token.split(':').next().unwrap_or("");
+    if base.starts_with("gfx") && base.len() > 3 {
+        Some(base.to_string())
+    } else {
+        None
+    }
+}
+
+fn detect_offload_arches() -> Vec<String> {
+    let candidates = [
+        PathBuf::from("rocminfo"),
+        PathBuf::from("/usr/bin/rocminfo"),
+        PathBuf::from("/opt/rocm/bin/rocminfo"),
+    ];
+    for bin in candidates {
+        let output = Command::new(&bin).output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut arches = Vec::new();
+        for line in stdout.lines() {
+            let Some(arch) = gfx_arch_token(line) else {
+                continue;
+            };
+            if !arches.contains(&arch) {
+                arches.push(arch);
+            }
+        }
+        if !arches.is_empty() {
+            return arches;
+        }
+    }
+    Vec::new()
+}
+
+fn offload_arches() -> Vec<String> {
+    for key in [
+        "AMDGPU_TARGETS",
+        "HIP_AMDGPU_TARGETS",
+        "ALLPACA_OFFLOAD_ARCH",
+    ] {
+        if let Ok(raw) = env::var(key) {
+            let parsed = parse_offload_arches(&raw);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    let detected = detect_offload_arches();
+    if !detected.is_empty() {
+        return detected;
+    }
+    default_offload_arches()
 }
 
 fn build_kernels(
@@ -334,12 +481,13 @@ fn build_kernels(
     out: &Path,
     hipblaslt: bool,
     direct_storage: Option<&Path>,
+    arches: &[String],
 ) -> Result<(), String> {
-    match try_hipcc(hip_root, out, hipblaslt, direct_storage) {
+    match try_hipcc(hip_root, out, hipblaslt, direct_storage, arches) {
         Ok(()) => return Ok(()),
         Err(e) => println!("cargo:warning=hipcc path failed: {e}"),
     }
-    try_cmake(hip_root, out)
+    try_cmake(hip_root, out, arches)
 }
 
 fn hipcc_bin(hip_root: &Path) -> PathBuf {
@@ -350,11 +498,21 @@ fn hipcc_bin(hip_root: &Path) -> PathBuf {
     }
 }
 
+fn apply_hip_env(cmd: &mut Command, hip_root: &Path) {
+    cmd.env("HIP_PATH", hip_root);
+    cmd.env("ROCM_PATH", hip_root);
+    let clang = hip_root.join("lib/llvm/bin");
+    if clang.join("clang++").is_file() || clang.join("clang++.exe").is_file() {
+        cmd.env("HIP_CLANG_PATH", clang);
+    }
+}
+
 fn try_hipcc(
     hip_root: &Path,
     out: &Path,
     hipblaslt: bool,
     direct_storage: Option<&Path>,
+    arches: &[String],
 ) -> Result<(), String> {
     let hipcc = hipcc_bin(hip_root);
     let src = manifest_hip_dir().join("src/kernels.cpp");
@@ -364,6 +522,10 @@ fn try_hipcc(
         "kernels.o"
     });
     let include = manifest_hip_dir().join("include");
+    let arch_flags: Vec<String> = arches
+        .iter()
+        .map(|a| format!("--offload-arch={a}"))
+        .collect();
     let mut extra = String::new();
     if rocblas_lib_exists(hip_root) {
         extra.push_str(" -DALLPACA_HAS_ROCBLAS");
@@ -381,20 +543,20 @@ fn try_hipcc(
             .ok_or_else(|| "vcvars64.bat not found (need MSVC for hipcc)".to_string())?;
         let bat = out.join("build_kernels.bat");
         let script = format!(
-            "@echo off\r\ncall \"{vc}\"\r\n\"{hipcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\"{extra} --offload-arch=gfx1201 --offload-arch=gfx1200 --offload-arch=gfx1100\r\n",
+            "@echo off\r\ncall \"{vc}\"\r\n\"{hipcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\"{extra} {arches}\r\n",
             vc = vcvars.display(),
             hipcc = hipcc.display(),
             src = src.display(),
             obj = obj.display(),
             inc = include.display(),
             extra = extra,
+            arches = arch_flags.join(" "),
         );
         std::fs::write(&bat, script).map_err(|e| format!("write bat: {e}"))?;
-        Command::new("cmd")
-            .arg("/C")
-            .arg(&bat)
-            .env("HIP_PATH", hip_root)
-            .output()
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(&bat);
+        apply_hip_env(&mut cmd, hip_root);
+        cmd.output()
             .map_err(|e| format!("spawn hipcc via vcvars: {e}"))?
     } else {
         let mut cmd = Command::new(&hipcc);
@@ -404,11 +566,12 @@ fn try_hipcc(
             .arg(&obj)
             .arg("-O2")
             .arg("-std=c++17")
-            .arg(format!("-I{}", include.display()))
-            .arg("--offload-arch=gfx1201")
-            .arg("--offload-arch=gfx1200")
-            .arg("--offload-arch=gfx1100")
-            .env("HIP_PATH", hip_root);
+            .arg("-fPIC")
+            .arg(format!("-I{}", include.display()));
+        for flag in &arch_flags {
+            cmd.arg(flag);
+        }
+        apply_hip_env(&mut cmd, hip_root);
         if rocblas_lib_exists(hip_root) {
             cmd.arg("-DALLPACA_HAS_ROCBLAS");
         }
@@ -461,12 +624,20 @@ fn archive_objects(hip_root: &Path, out: &Path, obj: &Path) -> Result<(), String
     } else {
         "liballpaca_kernels.a"
     });
-    let llvm_ar = if cfg!(windows) {
-        hip_root.join("bin/llvm-ar.exe")
+    let llvm_ar_name = if cfg!(windows) {
+        "llvm-ar.exe"
     } else {
-        hip_root.join("bin/llvm-ar")
+        "llvm-ar"
     };
-    if llvm_ar.is_file() {
+    let llvm_ar_candidates = [
+        hip_root.join("bin").join(llvm_ar_name),
+        hip_root.join("lib/llvm/bin").join(llvm_ar_name),
+        hip_root.join("llvm/bin").join(llvm_ar_name),
+    ];
+    for llvm_ar in llvm_ar_candidates {
+        if !llvm_ar.is_file() {
+            continue;
+        }
         let st = Command::new(&llvm_ar)
             .arg("rcs")
             .arg(&lib)
@@ -500,7 +671,7 @@ fn archive_objects(hip_root: &Path, out: &Path, obj: &Path) -> Result<(), String
     }
 }
 
-fn try_cmake(hip_root: &Path, out: &Path) -> Result<(), String> {
+fn try_cmake(hip_root: &Path, out: &Path, arches: &[String]) -> Result<(), String> {
     let build = out.join("cmake-hip");
     let _ = std::fs::create_dir_all(&build);
     let mut conf = Command::new("cmake");
@@ -510,8 +681,8 @@ fn try_cmake(hip_root: &Path, out: &Path) -> Result<(), String> {
         .arg(&build)
         .arg("-DCMAKE_BUILD_TYPE=Release")
         .arg(format!("-DCMAKE_PREFIX_PATH={}", hip_root.display()))
-        .env("HIP_PATH", hip_root)
-        .env("ROCM_PATH", hip_root);
+        .arg(format!("-DAMDGPU_TARGETS={}", arches.join(";")));
+    apply_hip_env(&mut conf, hip_root);
     if cfg!(windows) {
         conf.arg("-G").arg("Ninja");
     }

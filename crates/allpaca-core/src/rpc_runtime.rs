@@ -103,10 +103,7 @@ impl RpcRuntime {
     }
 
     pub fn plan_has_remote(&self) -> bool {
-        self.plan
-            .lock()
-            .map(|p| p.has_remote())
-            .unwrap_or(false)
+        self.plan.lock().map(|p| p.has_remote()).unwrap_or(false)
     }
 
     pub fn session_count(&self) -> usize {
@@ -140,10 +137,7 @@ impl RpcRuntime {
                 continue;
             }
             if !is_dense_attn_ffn(layer) {
-                tracing::warn!(
-                    layer_idx,
-                    "rpc owner skipped; layer is not dense attn+ffn"
-                );
+                tracing::warn!(layer_idx, "rpc owner skipped; layer is not dense attn+ffn");
                 continue;
             }
             let session_idx = owner - 1;
@@ -265,7 +259,12 @@ impl RpcRuntime {
     }
 
     /// Run one remote layer; hidden state `x` is host-side f32.
-    pub fn run_layer(&self, layer_idx: usize, pos: usize, x: &mut [f32]) -> Result<(), AllpacaError> {
+    pub fn run_layer(
+        &self,
+        layer_idx: usize,
+        pos: usize,
+        x: &mut [f32],
+    ) -> Result<(), AllpacaError> {
         let guard = self.remote.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
         })?;
@@ -326,7 +325,14 @@ impl RpcRuntime {
         let list = LaunchList {
             items: vec![
                 rms(layer.x, layer.attn_norm, layer.norm_out, layer.eps),
-                gemm(layer.norm_out, layer.wq, layer.q, 1, layer.dim as i32, layer.dim as i32),
+                gemm(
+                    layer.norm_out,
+                    layer.wq,
+                    layer.q,
+                    1,
+                    layer.dim as i32,
+                    layer.dim as i32,
+                ),
                 gemm(
                     layer.norm_out,
                     layer.wk,
@@ -357,7 +363,14 @@ impl RpcRuntime {
                     layer.n_kv_heads,
                     layer.head_dim,
                 ),
-                gemm(layer.attn_out, layer.wo, layer.hidden, 1, layer.dim as i32, layer.dim as i32),
+                gemm(
+                    layer.attn_out,
+                    layer.wo,
+                    layer.hidden,
+                    1,
+                    layer.dim as i32,
+                    layer.dim as i32,
+                ),
                 residual(layer.x, layer.hidden),
                 rms(layer.x, layer.ffn_norm, layer.norm_out, layer.eps),
                 gemm(
@@ -390,17 +403,23 @@ impl RpcRuntime {
         };
         // KV slot write: copy k/v into cache at pos. Memcpy copies whole buffers;
         // use H2D of k/v after rope into cache offset instead.
-        session.launch(&LaunchList {
-            items: list.items[..6].to_vec(),
-        }).map_err(map_rpc)?;
+        session
+            .launch(&LaunchList {
+                items: list.items[..6].to_vec(),
+            })
+            .map_err(map_rpc)?;
         let k_bytes = session
             .d2h(layer.k, 0, (layer.kv_dim * 4) as u64)
             .map_err(map_rpc)?;
         let v_bytes = session
             .d2h(layer.v, 0, (layer.kv_dim * 4) as u64)
             .map_err(map_rpc)?;
-        session.h2d(layer.k_cache, kv_off, &k_bytes).map_err(map_rpc)?;
-        session.h2d(layer.v_cache, kv_off, &v_bytes).map_err(map_rpc)?;
+        session
+            .h2d(layer.k_cache, kv_off, &k_bytes)
+            .map_err(map_rpc)?;
+        session
+            .h2d(layer.v_cache, kv_off, &v_bytes)
+            .map_err(map_rpc)?;
         session
             .launch(&LaunchList {
                 items: list.items[8..].to_vec(),

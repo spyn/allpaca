@@ -97,6 +97,14 @@ pub fn quantize_f16(data: &[f32]) -> Vec<u8> {
     out
 }
 
+pub fn quantize_bf16(data: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    for v in data {
+        out.extend_from_slice(&allpaca_cpu::f32_to_bf16(*v).to_le_bytes());
+    }
+    out
+}
+
 /// Write a GGUF that mixes F32 tensors with quantized blocks (tests / tiny models).
 pub fn write_gguf_quant(
     path: &Path,

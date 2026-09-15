@@ -59,6 +59,7 @@ dependencies = [
  "llguidance",
  "rand 0.8.7",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokenizers",
@@ -141,6 +142,7 @@ name = "allpaca-safetensors"
 version = "0.1.0"
 dependencies = [
  "allpaca-types",
+ "memmap2",
  "serde",
  "serde_json",
 ]

@@ -17,6 +17,9 @@ password = "changeme"
 id = "allpaca"
 # synthetic = true
 # path = "models/Llama-3.2-3B-Instruct-Q8_0.gguf"
+# HuggingFace Hub id (downloads into HF cache, then loads SafeTensors or GGUF):
+# path = "Qwen/Qwen2.5-0.5B-Instruct"
+# hf_revision = "main"
 # draft_path = "models/Llama-3.2-1B-Instruct-Q8_0.gguf"
 # config_path = "models/config.json"
 # tokenizer_path = "models/tokenizer.json"
@@ -36,7 +39,7 @@ max_consecutive_prefill_picks = 0
 
 [speculative]
 enabled = true
-providers = ["ngram", "draft_model"]  # ngram | draft_model | mtp
+providers = ["ngram", "draft_model"]  # ngram | draft_model | mtp | dspark
 max_depth = 8
 min_depth = 2
 adaptive = true

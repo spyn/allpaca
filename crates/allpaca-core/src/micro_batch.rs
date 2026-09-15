@@ -170,7 +170,11 @@ mod tests {
         let plan = plan_micro_batch(&hints);
         assert_eq!(plan.gpu.map(|g| g.request_id), Some(1));
         assert_eq!(plan.cpu.map(|c| c.request_id), Some(2));
-        assert_eq!(plan.cpu.map(|c| c.layer), Some(3), "cpu one layer behind gpu");
+        assert_eq!(
+            plan.cpu.map(|c| c.layer),
+            Some(3),
+            "cpu one layer behind gpu"
+        );
         assert_ne!(
             plan.gpu.map(|g| g.request_id),
             plan.cpu.map(|c| c.request_id)

@@ -4,7 +4,7 @@ Research inference engine with a **thick Rust control plane** and a **thin C/HIP
 It treats the whole machine — AMD GPUs, host DRAM, NVMe, and CPU — as one elastic serving
 platform, not a single undersized VRAM pool.
 
-OpenAI-compatible HTTP server · GGUF / SafeTensors / ONNX weight import · CPU always works ·
+OpenAI-compatible HTTP server · GGUF / HuggingFace SafeTensors / ONNX weight import · Hub download · CPU always works ·
 optional HIP on AMD ROCm.
 
 **License:** [MIT](LICENSE)
@@ -31,11 +31,11 @@ and [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md)).
 | No Windows DirectStorage path | Stable **DirectStorage 1.3** file→D3D12 DMA into opt-in HIP-imported buffers; ordinary weight uploads stay plain `hipMalloc` + H2D; aligned host-staged fallback |
 | Single-request hybrid sync barrier | **Micro-batch** partner `poll` + **layer-stagger** CPU experts during GPU forward |
 | Reactive VRAM only | **Elastic expert↔KV rebalance**, attention-trim cold KV, **`gpu.util` / `gpu.vram`** from `hipMemGetInfo` (no AMD SMI on Windows) |
-| Narrow GGUF quants | **F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / TQ1_0 / TQ2_0** + **ROCmFP4 (`ggml_type_id=100`)** CPU dequant + fused HIP GEMV where wired |
+| Narrow GGUF quants | **F16 / BF16 / I32 / MXFP4 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ4_NL / IQ4_XS / TQ1_0 / TQ2_0** + **ROCmFP4 (`ggml_type_id=100`)** CPU dequant + fused HIP GEMV where wired (IQ4_* dequant to F32 at load; no fused HIP GEMV yet). Split `*-NNNNN-of-MMMMM.gguf` catalogs merge. |
 | MoE-only / no hybrid SSM | **`nemotron_h_moe` schedule**: full Mamba-2 SSD + attention + MoE on CPU/HIP (incl. Lightning gate-less `up`/`down`); real ROCmFP4 opt-in via `ALLPACA_NEMOTRON=1` |
 | Proprietary weight banks only | **GGUF** primary + **packed layer-major / `ALLPFTW1`** trunk for streaming |
 | No continuous batching story | Fair **`Engine::poll`**, chunked prefill, multi-request backpressure |
-| Speculative decode absent or linear-only | N-gram + draft-model; **linear packed verify**; optional **tree / Token Forest** (overlaps MTP draft-ahead) |
+| Speculative decode absent or linear-only | N-gram + draft-model + **MTP** + **DSpark** (`dspark` / `dflash`); **linear packed verify**; optional **tree / Token Forest** (overlaps MTP draft-ahead) |
 | Structured output bolted on | CPU **JSON / JSON Schema / Lark** via `llguidance` |
 | Early-exit unused | Manifest **`allpaca.early_exit.*`** + optional dedicated **`exit_head`** tensors; self-speculate when heads absent |
 | NUMA-blind host experts | **NUMA first-touch** on the host expert pool |
@@ -49,7 +49,7 @@ Coral/NPU backends are dropped.
 
 - **Control plane:** scheduling, KV tiers (VRAM / pinned DRAM / optional NVMe), weight working set, speculation, constraints — all Rust ([ADR 0001](docs/adr/0001-thick-rust-control-plane.md)).
 - **Kernels:** `hip/` C ABI (`allpaca_gemm*`, attention, RoPE, RMSNorm, …); `allpaca-cpu` AVX2 fallbacks.
-- **Formats:** GGUF (Llama-family + hybrid Nemotron), SafeTensors + HF sidecars, ONNX weight-export.
+- **Formats:** GGUF (Llama-family + hybrid Nemotron + **DeepSeek-V4 `deepseek4`**, including split shards and BF16/MXFP4), HuggingFace SafeTensors (`config.json` + `tokenizer.json`, F32/F16/BF16, sharded `index.json`) with Hub `org/name` download, ONNX weight-export.
 - **Server:** `POST /v1/chat/completions`, `GET /v1/models`, `GET /stats`.
 - **Config:** TOML + CLI; CLI overrides file; file overrides compiled defaults (`Config::compiled_defaults`).
 
@@ -57,7 +57,9 @@ Coral/NPU backends are dropped.
 
 ## Build
 
-Requires a recent stable Rust toolchain (`rustup`).
+Requires a recent stable Rust toolchain (`rustup`, 1.88+). Debian's `rustc` 1.85
+cannot resolve current workspace crates (`icu_*`, `llguidance`, `zip`). Put
+`$HOME/.cargo/bin` first on `PATH`.
 
 ### CPU (default)
 
@@ -69,9 +71,72 @@ cargo build -p allpaca-server --release
 
 ### HIP / AMD GPU (optional)
 
-Needs the HIP/ROCm SDK. On Windows the crate probes `HIP_PATH`, `ROCM_PATH`, and
-`C:\Program Files\AMD\ROCm\*`. MSVC (`vcvars64`) is required so `hipcc` finds the C++ STL.
-Without an SDK, `--features hip` still compiles (stub; GPU tests skip).
+Needs the HIP/ROCm **compiler** SDK (`hipcc`, `hip_runtime.h`), not only the
+runtime in `/opt/rocm`. On Linux the crate probes `HIP_PATH`, `ROCM_PATH`,
+`/opt/rocm*`, and `~/.cache/allpaca/rocm-sdk/opt/rocm-*`. On Windows it probes
+`C:\Program Files\AMD\ROCm\*`. MSVC (`vcvars64`) is required so `hipcc` finds
+the C++ STL. Without an SDK, `--features hip` still compiles (stub; GPU tests skip).
+
+Offload ISAs default to live `rocminfo` GPUs when present (this box: **gfx906**
+for MI50 / MI60 / Radeon VII). Override with `AMDGPU_TARGETS=gfx906,gfx900`.
+
+#### Linux compiler SDK (Debian 13 / runtime-only `/opt/rocm`)
+
+A runtime-only `/opt/rocm` is completed **without root** by
+`scripts/fetch-rocm-hip-sdk.sh` (ROCm 6.2.4 `hipcc` + LLVM extracted into
+`~/.cache/allpaca/rocm-sdk/opt/rocm-6.2.4`, then symlinked to the `/opt/rocm`
+runtime `.so` files). `build.rs` picks that cache path up automatically.
+
+**Do not** `sudo apt install hipcc6.2.4 hip-dev6.2.4 rocm-llvm6.2.4 hsa-rocr-dev6.2.4`
+on Debian 13 (Trixie). Those are Ubuntu noble debs and depend on
+`libstdc++-11-dev` / `libgcc-11-dev`, which Trixie does not ship (gcc-14 only).
+The fetch script uses `apt-get download` + `dpkg-deb -x` so the same debs never
+have to be installed.
+
+New shells need rustup on `PATH`:
+
+```bash
+source ~/.cargo/env   # once per session until bashrc is reloaded
+```
+
+Debian's distro `rustc` 1.85 cannot build this workspace. Use rustup 1.88+.
+
+#### Dual-GPU P2P (Linux kernel)
+
+Stock Debian kernels often ship **`# CONFIG_PCI_P2PDMA is not set`**. On gfx906
+that makes `hipDeviceCanAccessPeer` return 0 and `hipDeviceEnablePeerAccess`
+fail (`invalid device ordinal`) even when **`hipMemcpyPeer` still copies**.
+
+A custom kernel with `CONFIG_PCI_P2PDMA=y` is what KFD needs for the formal
+enable path. After reboot:
+
+```bash
+grep CONFIG_PCI_P2PDMA /boot/config-$(uname -r)
+# expect: CONFIG_PCI_P2PDMA=y
+```
+
+Optional cmdline if enable still fails (IOMMU groups split the two cards):
+`intel_iommu=on iommu=pt`, or `intel_iommu=off`. There is no xGMI cable on a
+typical dual-MI50 desktop; `use_xgmi_p2p` does not apply.
+
+The engine does **not** require EnablePeerAccess. At boot it:
+
+1. tries enable both directions (best-effort),
+2. treats a successful 64 KiB `hipMemcpyPeer` as capable,
+3. benches 4 MiB peer-copy vs host staging (GPU→DRAM→GPU),
+4. selects `P2p` only when the copy worked **and** measured P2P is not more
+   than 10% slower than host (`P2P_MAX_SLOWER_FRACTION`).
+
+Never assume P2P is faster. Speculative generate does not require P2P: target
+and draft stay on their GPUs; only token-scale payloads move.
+
+After a P2PDMA kernel lands, re-measure (look for `p2p_enabled` plus `p2p_gbps`):
+
+```bash
+source ~/.cargo/env
+cargo test -p allpaca-core --features hip --test hip_runtime \
+  transfer_path_is_measured -- --nocapture
+```
 
 ```bash
 # Linux / Git Bash
@@ -145,7 +210,8 @@ Gated HIP soaks (when weights are present locally):
 | `ALLPACA_DRAFT_GGUF` | Speculative draft GGUF |
 | `ALLPACA_Q4K_GGUF` / `ALLPACA_Q4KM_GGUF` | Q4_K / mixed Q4_K_M |
 | `ALLPACA_NEMOTRON=1` | Opt-in 30B ROCmFP4 Nemotron generate |
-| `ALLPACA_QWEN=1` | Opt-in Qwen35 ROCmFP4 generate (`models/Qwen3.8-27B-…`) |
+| `ALLPACA_QWEN=1` | Opt-in Qwen35 ROCmFP4 generate. Discovers `models/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/Qwen3.8-27B-Q4_0_ROCMFP4_COHERENT.gguf` (ggml type 100; in-file `qwen35.nextn_predict_layers`). Unsloth `Qwen3.8-27B-UD-Q5_K_XL.gguf` loads (IQ4_NL / IQ4_XS dequant to F32 at load). Sidecar `mtp-*.gguf` files are unused; MTP tests load NextN from the same ROCmFP4 GGUF. |
+| `ALLPACA_QWEN_N` | Decode length for the opt-in Qwen tests (default 32; use `8` for a short HIP smoke). |
 | `ALLPACA_ROCMFP4_GGUF` / `ALLPACA_QWEN_GGUF` | Explicit ROCmFP4 GGUF path (probe always discovers under `models/`) |
 | `ALLPACA_DEMO=1` | Asymmetric draft vs greedy tok/s |
 | `ALLPACA_OVERNIGHT=1` | Long draft soak |
@@ -243,7 +309,7 @@ Or edit `docker-compose.yml` `command` / `volumes` accordingly.
 | `allpaca-types` | Config, devices, metrics, errors |
 | `allpaca-core` | Engine, scheduler, KV / weight tiers, draft, DS bridge |
 | `allpaca-gguf` | GGUF parse, tokenizer extract, ROCmFP4 host path |
-| `allpaca-safetensors` / `allpaca-onnx` | Alternate importers |
+| `allpaca-safetensors` / `allpaca-onnx` | HuggingFace SafeTensors (BF16/F16/F32, shards, Llama-family names) / ONNX importers |
 | `allpaca-hip` | HIP FFI (`--features hip`) |
 | `allpaca-cuda` | CUDA FFI (`--features cuda`; toolkit builds without a GPU) |
 | `allpaca-cpu` | CPU kernels + dequant |
@@ -253,12 +319,28 @@ Or edit `docker-compose.yml` `command` / `volumes` accordingly.
 
 ---
 
+## HuggingFace models
+
+`--model` / `model.path` accepts a local GGUF/SafeTensors/ONNX file, a snapshot directory (`config.json` + `model.safetensors` or `model.safetensors.index.json` + `tokenizer.json`), or a Hub id:
+
+```bash
+cargo run -p allpaca-server -- --model Qwen/Qwen2.5-0.5B-Instruct --cpu-only
+# revision: Qwen/Qwen2.5-0.5B-Instruct@main
+# one file in a multi-GGUF repo: bartowski/Llama-3.2-1B-Instruct-GGUF:Llama-3.2-1B-Instruct-Q8_0.gguf
+```
+
+Downloads land in the HuggingFace hub cache (`HF_HOME` / `HF_HUB_CACHE` / `ALLPACA_HF_CACHE`). Gated repos need `HF_TOKEN`. Dense Llama / Qwen2 / Mistral / Gemma SafeTensors (F32 / F16 / BF16) load into the engine; Mixtral-style MoE SafeTensors is Fatal for now.
+
+---
+
 ## Configuration & docs
 
 - Compiled defaults: `allpaca-types` `Config::compiled_defaults`
 - Domain glossary / MVP scope: [`CONTEXT.md`](CONTEXT.md)
 - Opportunity → implementation notes: [`docs/OPPORTUNITY_DESIGN.md`](docs/OPPORTUNITY_DESIGN.md)
 - Benchmark field contract: [`docs/BENCHMARK_SPEC.md`](docs/BENCHMARK_SPEC.md)
+- Measured runs: [`docs/BENCHMARK.md`](docs/BENCHMARK.md) (append a row after every successful generate / transfer)
+- Operator recipes: [`docs/RECIPES.md`](docs/RECIPES.md)
 - Architecture decisions: [`docs/adr/`](docs/adr/)
 
 ---
@@ -277,6 +359,7 @@ its redistributable runtime is restored from Microsoft's pinned NuGet package at
 | [AMD ROCm / HIP](https://rocm.docs.amd.com/) | Multi-device, P2P vs host staging, hipBLASLt where linked |
 | [Microsoft DirectStorage](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directstorage) | Stable `Microsoft.Direct3D.DirectStorage` 1.3.0 SDK/runtime; file→D3D12 requests synchronized by a shared fence and imported into HIP |
 | [Hugging Face Tokenizers](https://github.com/huggingface/tokenizers) | Vocab / BPE encode-decode |
+| [Hugging Face Hub](https://huggingface.co/docs/hub/en/models-downloading) + [SafeTensors](https://huggingface.co/docs/safetensors) | `org/name` download, `config.json` / `tokenizer.json`, F32/F16/BF16, sharded `index.json` |
 | [llguidance](https://github.com/guidance-ai/llguidance) | Constrained JSON Schema / Lark decoding |
 | Speculative decoding literature (draft-then-verify, tree/forest verify) | N-gram + draft-model providers; packed linear / optional tree verify |
 | Attention cache work (H₂O / StreamingLLM-style cold trim ideas) | Soft **attention-trim** of cold VRAM KV for expert headroom |
