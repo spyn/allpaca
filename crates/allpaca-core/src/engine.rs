@@ -972,11 +972,53 @@ impl Engine {
     }
 
     fn load_model_path(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
+        if path.is_dir() {
+            if crate::edge0::detect_edge0_dir(path).is_some() {
+                return self.load_edge0(path);
+            }
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "directory is not a recognized Edge0 checkpoint: {}",
+                path.display()
+            ))));
+        }
         match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => self.load_safetensors(path),
             Some("onnx") => self.load_onnx(path),
             _ => self.load_gguf(path),
         }
+    }
+
+    /// Load an Edge0 HF checkpoint directory (35b / 8b recipe).
+    pub fn load_edge0(&self, dir: &std::path::Path) -> Result<(), AllpacaError> {
+        let opts = crate::edge0::Edge0LoadOptions {
+            no_lora: self.config.model.edge0_no_lora,
+            no_prerouter: self.config.model.edge0_no_prerouter,
+            lora_rank: 16,
+            lora_alpha: 32.0,
+        };
+        let loaded = crate::edge0::load_edge0_dir(dir, &opts)?;
+        let mut model = loaded.model;
+        model.edge0 = Some(crate::model::Edge0Runtime {
+            lora: loaded.lora,
+            stager: loaded.stager.map(std::sync::Mutex::new),
+        });
+        model.name = loaded.tier.name().into();
+        self.apply_weight_working_set(&mut model)?;
+        self.apply_expert_lru(&mut model)?;
+        self.attach_rpc(&mut model)?;
+        let tokenizer = EngineTokenizer::from_vocab(
+            loaded.vocab_tokens,
+            loaded.bos_id,
+            loaded.eos_id,
+        )?;
+        let mut inner = self.lock()?;
+        inner.ring.resize_vocab(model.config.vocab_size);
+        set_tokenizer(&mut inner, tokenizer);
+        inner.model_id = model.name.clone();
+        inner.target = Some(Arc::new(model));
+        drop(inner);
+        self.upload_resident_weights()?;
+        self.note_early_exit_gate()
     }
 
     pub fn load_safetensors(&self, path: &std::path::Path) -> Result<(), AllpacaError> {

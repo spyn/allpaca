@@ -9,6 +9,7 @@ mod compute;
 mod direct_storage;
 mod draft;
 mod early_exit;
+pub mod edge0;
 mod engine;
 mod expert_batch;
 mod forest;
@@ -49,6 +50,10 @@ pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{
     accept_exit, has_calibration_data, spec_from_gguf, spec_from_metadata, EarlyExitSpec,
     ExitPrediction,
+};
+pub use edge0::{
+    detect_edge0_dir, load_edge0_dir, Edge0LoadOptions, Edge0Loaded, Edge0Tier, MoESpec,
+    RecoverLora, RouterKind,
 };
 pub use engine::{mtp_text_is_garbled, Engine, RequestHandle};
 pub use kv_tier::KvTierManager;
