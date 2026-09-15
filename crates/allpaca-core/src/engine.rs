@@ -1147,9 +1147,14 @@ impl Engine {
         let tok = extract_tokenizer(&file)?;
         let mut model = TinyModel::from_gguf(&file)?;
         model.bind_gguf(file.clone());
-        if !model.host_weights_ready() && self.hip.is_none() && model.dsv4.is_none() {
+        #[cfg(feature = "cuda")]
+        let has_cuda = self.cuda.is_some();
+        #[cfg(not(feature = "cuda"))]
+        let has_cuda = false;
+        if !model.host_weights_ready() && self.hip.is_none() && !has_cuda && model.dsv4.is_none() {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "large GGUF requires HIP (host F32 materialize is skipped to avoid OOM)".into(),
+                "large GGUF requires HIP or CUDA (host F32 materialize is skipped to avoid OOM)"
+                    .into(),
             )));
         }
         let skip_hip = model.dsv4.is_some();
@@ -1399,31 +1404,40 @@ impl Engine {
             let target = inner.target.clone();
             inner.target_cuda_resident = if self.hip.is_none() {
                 if let (Some(cuda), Some(target)) = (&self.cuda, target) {
-                    if target.host_weights_ready() {
-                        match crate::CudaResidentModel::upload(&target, cuda.device) {
-                            Ok(resident) => {
-                                weight_bytes += resident.bytes();
-                                h2d += resident.packed_h2d_bytes();
-                                tracing::info!(
-                                    device = cuda.device,
-                                    bytes = resident.bytes(),
-                                    "CUDA target weight upload"
-                                );
-                                Some(Arc::new(resident))
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "CUDA target weight upload failed; CPU forward"
-                                );
-                                self.metrics
-                                    .degraded_events
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                None
-                            }
-                        }
+                    let host_ready = target.host_weights_ready();
+                    let uploaded = if host_ready {
+                        crate::CudaResidentModel::upload(&target, cuda.device)
+                    } else if let Some(file) = target_gguf {
+                        crate::CudaResidentModel::upload_gguf(file, &target.config, cuda.device)
                     } else {
-                        None
+                        Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                            "large GGUF missing file handle for CUDA upload".into(),
+                        )))
+                    };
+                    match uploaded {
+                        Ok(resident) => {
+                            weight_bytes += resident.bytes();
+                            h2d += resident.packed_h2d_bytes();
+                            tracing::info!(
+                                device = cuda.device,
+                                bytes = resident.bytes(),
+                                "CUDA target weight upload"
+                            );
+                            Some(Arc::new(resident))
+                        }
+                        Err(e) => {
+                            if !host_ready {
+                                return Err(e);
+                            }
+                            tracing::warn!(
+                                error = %e,
+                                "CUDA target weight upload failed; CPU forward"
+                            );
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            None
+                        }
                     }
                 } else {
                     None

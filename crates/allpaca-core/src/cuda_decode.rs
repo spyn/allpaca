@@ -77,6 +77,111 @@ impl CudaResidentModel {
         })
     }
 
+    /// Dense Llama-family GGUF → F32 device pack (dequant on host one tensor at a
+    /// time into owned buffers, then one H2D). Used when host materialize was
+    /// skipped (`HOST_F32_LIMIT`) so CUDA-only boxes can still load Q8/F16 GGUFs
+    /// that fit in VRAM as F32 (e.g. Llama-3.2-1B on Tesla K80). Packed Q8 GEMV
+    /// for 7B-class VRAM is a follow-up slice.
+    pub fn upload_gguf(
+        file: &allpaca_gguf::GgufFile,
+        cfg: &ModelConfig,
+        device: i32,
+    ) -> Result<Self, AllpacaError> {
+        if cfg.n_experts > 0 || cfg.recurrent {
+            return Err(AllpacaError::Degraded(
+                allpaca_types::DegradedError::FeatureDisabled(
+                    "CUDA GGUF upload: dense attention only (no MoE/hybrid yet)".into(),
+                ),
+            ));
+        }
+        let mut owned: Vec<Vec<f32>> = Vec::new();
+        let mut off = 0usize;
+        let mut push = |owned: &mut Vec<Vec<f32>>, off: &mut usize, data: Vec<f32>| -> WeightRef {
+            let n = data.len();
+            let o = *off;
+            *off += n.saturating_mul(4);
+            owned.push(data);
+            WeightRef::f32(o, n)
+        };
+        let take = |file: &allpaca_gguf::GgufFile, name: &str| -> Result<Vec<f32>, AllpacaError> {
+            file.tensor_f32(name).map_err(|e| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "CUDA GGUF upload missing {name}: {e}"
+                )))
+            })
+        };
+
+        let embed = push(&mut owned, &mut off, take(file, "token_embd.weight")?);
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for local in 0..cfg.n_layers {
+            let i = cfg.gguf_blk(local);
+            layers.push(CudaLayerOff {
+                attn_norm: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.attn_norm.weight"))?,
+                ),
+                wq: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.attn_q.weight"))?,
+                ),
+                wk: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.attn_k.weight"))?,
+                ),
+                wv: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.attn_v.weight"))?,
+                ),
+                wo: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.attn_output.weight"))?,
+                ),
+                ffn_norm: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.ffn_norm.weight"))?,
+                ),
+                w_gate: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.ffn_gate.weight"))?,
+                ),
+                w_up: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.ffn_up.weight"))?,
+                ),
+                w_down: push(
+                    &mut owned,
+                    &mut off,
+                    take(file, &format!("blk.{i}.ffn_down.weight"))?,
+                ),
+            });
+        }
+        let norm = push(&mut owned, &mut off, take(file, "output_norm.weight")?);
+        let lm_head = if file.tensor("output.weight").is_some() {
+            push(&mut owned, &mut off, take(file, "output.weight")?)
+        } else {
+            // Tied embedding / lm_head: reuse embed byte offset.
+            embed
+        };
+        let slices: Vec<&[f32]> = owned.iter().map(|v| v.as_slice()).collect();
+        let (weights, packed_h2d) = CudaDeviceWeights::upload(device, &slices)?;
+        Ok(Self {
+            weights,
+            packed_h2d,
+            embed,
+            layers,
+            norm,
+            lm_head,
+        })
+    }
+
     pub fn bytes(&self) -> u64 {
         self.weights.bytes() as u64
     }
