@@ -155,17 +155,43 @@ Kernels live in `hip/` (CMake + hipcc). `allpaca-hip/build.rs` compiles them whe
 
 ### CUDA / NVIDIA GPU (optional scaffold)
 
-Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH`, PATH `nvcc`, and
+Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH` / `CUDA_HOME`, PATH `nvcc`,
+`~/.cache/allpaca/cuda-sdk/cuda-*` (from `scripts/fetch-cuda-toolkit.sh`),
+`/usr/local/cuda*`, and
 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*`. Without a toolkit,
 `--features cuda` still compiles (stub). Without an NVIDIA driver/GPU,
 `device_count()` is 0 — you can still compile and link on a toolkit-only machine.
+
+**GPU arches:** `CUDA_ARCHES` / `ALLPACA_CUDA_ARCHES` (e.g. `sm_37` or `3.7`),
+else live `nvidia-smi` devices (product-name map covers **Tesla K80 → sm_37**
+when `compute_cap` is missing on driver 470), else a fat default that includes
+`sm_37` on CUDA 11.x. CUDA 12+ toolkits drop Kepler; those arches are filtered
+out. Attention uses pre-Volta `__shfl_down` on `sm < 70`.
+
+#### Tesla K80 / driver 470 (Kepler)
+
+K80 is **sm_37**. Driver 470 advertises CUDA **11.4** max; CUDA **12** removed
+Kepler. Stage a matching toolkit without root:
+
+```bash
+./scripts/fetch-cuda-toolkit.sh   # ~50 MiB redistributables → ~/.cache/allpaca/cuda-sdk/cuda-11.4
+# Ubuntu 22.04: CUDA 11.4 prefers g++-10
+sudo apt install g++-10
+export CUDA_PATH="$HOME/.cache/allpaca/cuda-sdk/cuda-11.4"
+export PATH="$CUDA_PATH/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_PATH/lib64:${LD_LIBRARY_PATH:-}"
+export CXX=g++-10
+cargo test -p allpaca-cuda --features cuda
+```
 
 ```bash
 cargo test -p allpaca-cuda --features cuda
 ```
 
 Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexist.
-Engine forwards remain HIP until CUDA parity lands.
+Engine forwards remain HIP until CUDA parity lands. Dual K80 (two compute devices
+in one board) shows up as two ordinals for asymmetric draft once CUDA parity
+lands.
 
 ---
 

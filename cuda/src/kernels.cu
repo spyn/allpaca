@@ -47,9 +47,15 @@ extern "C" int allpaca_cuda_device_props(int32_t id, char *name, int32_t name_le
     }
     std::snprintf(name, static_cast<size_t>(name_len), "%s", prop.name);
     *memory_bytes = static_cast<uint64_t>(prop.totalGlobalMem);
-    /* CUDA 13+ dropped memoryClockRate from cudaDeviceProp; leave 0 and let
-     * the scheduler treat bandwidth as unknown until a real benchmark runs. */
+#if CUDART_VERSION < 12000
+    /* Theoretical peak: 2 * clock(kHz) * bus_width(bits) / 8 → GB/s.
+     * CUDA 12+ removed memoryClockRate; leave 0 and let the scheduler
+     * treat bandwidth as unknown until a real benchmark runs. */
+    *bandwidth_gbps = 2.0 * (static_cast<double>(prop.memoryClockRate) / 1.0e6) *
+                      (static_cast<double>(prop.memoryBusWidth) / 8.0);
+#else
     *bandwidth_gbps = 0.0;
+#endif
     return ALLPACA_OK;
 }
 
@@ -260,7 +266,14 @@ extern "C" int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, in
 __device__ float warp_sum32(float v) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
+        /* XOR butterfly leaves the full sum on every lane (needed: all 32
+         * threads share one attention score). Down-shuffle only fills lane 0.
+         * Kepler/Maxwell/Pascal lack *_sync; Tesla K80 is sm_37. */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+        v += __shfl_xor(v, offset);
+#else
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+#endif
     }
     return v;
 }
