@@ -10,6 +10,8 @@ This bundle contains the deep-research assessment and implementation plan for a 
 - `OPPORTUNITY_DESIGN.md` — detailed architecture and implementation notes for each opportunity.
 - `CODE_EXAMPLES.md` — C++/HIP/Python examples for the core building blocks.
 - `BENCHMARK_SPEC.md` — experimental design, workload matrix and acceptance gates.
+- `BENCHMARK.md` — measured successful runs (environment, setup, model/params/quant). Append a row after every successful run.
+- `RECIPES.md` — operator generate / HIP / Lightning / DeepSeek-V4 / DSpark / overnight copy-paste commands.
 
 ## Core design decision
 

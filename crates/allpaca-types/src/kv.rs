@@ -14,6 +14,7 @@ pub enum DeviceBufferKind {
     CpuVram,
     CpuPinnedDram,
     Hip,
+    Cuda,
     Nvme,
 }
 

@@ -75,7 +75,12 @@ pub fn select_gemv_tile_cols_heuristic(
 /// Pick GEMV column tile for MoE expert decode on AMD RDNA.
 ///
 /// Uses a measured profile when present; otherwise heuristic (OPPORTUNITY §12).
-pub fn select_gemv_tile_cols(n: i32, k: i32, infinity_cache_bytes: usize, block_bytes: usize) -> i32 {
+pub fn select_gemv_tile_cols(
+    n: i32,
+    k: i32,
+    infinity_cache_bytes: usize,
+    block_bytes: usize,
+) -> i32 {
     if let Some(cols) = profiled_gemv_tile_cols() {
         return cols;
     }

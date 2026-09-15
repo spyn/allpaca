@@ -5,8 +5,9 @@
 //! other plan members in the same tick (parking their `StepResult`s), and when a
 //! HIP workspace plus real cohort activations / Target weights are present runs
 //! packed host→device `gemm_nt` (concat A along M). Packed **lm_head** outputs
-//! are written into each Request's `pending_logits` for the sample path; FFN
-//! helpers ([`apply_packed_ffn`]) cover gate/up → silu×up → w_down.
+//! are written into each Request's `pending_logits` from fresh `output_norm`
+//! (HIP decode can skip the per-request lm_head GEMM). FFN helpers
+//! ([`apply_packed_ffn`]) cover gate/up → silu×up → w_down.
 
 use allpaca_types::{AllpacaError, FatalError};
 

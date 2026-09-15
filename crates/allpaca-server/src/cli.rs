@@ -9,8 +9,10 @@ pub struct Cli {
     /// TOML config file. CLI flags override file values; file overrides compiled defaults.
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Local GGUF / SafeTensors / ONNX path, HuggingFace snapshot dir, or Hub `org/name`.
     #[arg(long)]
     pub model: Option<PathBuf>,
+    /// Draft GGUF path or Hub `org/name` (optional `:file.gguf`).
     #[arg(long)]
     pub draft_model: Option<PathBuf>,
     #[arg(long)]

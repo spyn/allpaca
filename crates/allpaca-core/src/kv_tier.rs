@@ -72,9 +72,17 @@ impl BufferPool {
     }
 }
 
+struct CudaPageAlloc {
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for CudaPageAlloc {}
+unsafe impl Sync for CudaPageAlloc {}
+
 /// Three-tier KV manager: VRAM (hot) <-> Pinned DRAM (warm) <-> NVMe (cold).
 /// NVMe is off until [`Self::open_nvme`]. When `hip_device` is set, VRAM pages
-/// are real `hipMalloc` buffers.
+/// are real `hipMalloc` buffers. CUDA-only engines use `cudaMalloc` pages.
 pub struct KvTierManager {
     pages: HashMap<PageId, KvPage>,
     vram: BufferPool,
@@ -82,6 +90,8 @@ pub struct KvTierManager {
     nvme: Option<NvmeKvStore>,
     hip_pages: HashMap<PageId, HipPageAlloc>,
     hip_device: Option<i32>,
+    cuda_pages: HashMap<PageId, CudaPageAlloc>,
+    cuda_device: Option<i32>,
     activation_h2d_bytes: AtomicU64,
     activation_d2h_bytes: AtomicU64,
     nvme_prefetches: AtomicU64,
@@ -102,6 +112,16 @@ impl KvTierManager {
         hot_fraction: f32,
         hip_device: Option<i32>,
     ) -> Self {
+        Self::with_devices(vram_bytes, dram_bytes, hot_fraction, hip_device, None)
+    }
+
+    pub fn with_devices(
+        vram_bytes: usize,
+        dram_bytes: usize,
+        hot_fraction: f32,
+        hip_device: Option<i32>,
+        cuda_device: Option<i32>,
+    ) -> Self {
         Self {
             pages: HashMap::new(),
             vram: BufferPool::new(vram_bytes),
@@ -109,6 +129,12 @@ impl KvTierManager {
             nvme: None,
             hip_pages: HashMap::new(),
             hip_device,
+            cuda_pages: HashMap::new(),
+            cuda_device: if hip_device.is_some() {
+                None
+            } else {
+                cuda_device
+            },
             activation_h2d_bytes: AtomicU64::new(0),
             activation_d2h_bytes: AtomicU64::new(0),
             nvme_prefetches: AtomicU64::new(0),
@@ -164,6 +190,33 @@ impl KvTierManager {
                     let off = self.dram_alloc(len, metrics).map_err(|_| {
                         AllpacaError::Fatal(FatalError::OutOfMemory(
                             "HIP KV alloc failed and pinned DRAM is full".into(),
+                        ))
+                    })?;
+                    (
+                        KvResidency::PinnedDram,
+                        off,
+                        DeviceBufferKind::CpuPinnedDram,
+                        -1,
+                    )
+                }
+            }
+        } else if let Some(dev) = self.cuda_device {
+            let bytes = len * 4;
+            match allpaca_cuda::device_malloc(bytes, dev) {
+                Ok(ptr) => {
+                    self.cuda_pages.insert(
+                        id,
+                        CudaPageAlloc {
+                            ptr: ptr.cast(),
+                            bytes,
+                        },
+                    );
+                    (KvResidency::Vram, 0, DeviceBufferKind::Cuda, dev)
+                }
+                Err(_) => {
+                    let off = self.dram_alloc(len, metrics).map_err(|_| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(
+                            "CUDA KV alloc failed and pinned DRAM is full".into(),
                         ))
                     })?;
                     (
@@ -255,6 +308,11 @@ impl KvTierManager {
                     allpaca_hip::device_free(alloc.ptr, alloc.bytes);
                 }
             }
+            DeviceBufferKind::Cuda => {
+                if let Some(alloc) = self.cuda_pages.remove(&id) {
+                    allpaca_cuda::device_free(alloc.ptr.cast());
+                }
+            }
             DeviceBufferKind::CpuVram => self.vram.free(loc.offset, loc.len),
             DeviceBufferKind::CpuPinnedDram => self.dram.free(loc.offset, loc.len),
             DeviceBufferKind::Nvme => {
@@ -297,6 +355,30 @@ impl KvTierManager {
                 let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
                 allpaca_hip::memcpy(k_ptr, k.as_ptr().cast(), k_bytes, allpaca_hip::MEMCPY_H2D)?;
                 allpaca_hip::memcpy(v_ptr, v.as_ptr().cast(), k_bytes, allpaca_hip::MEMCPY_H2D)?;
+                self.activation_h2d_bytes
+                    .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
+            }
+            DeviceBufferKind::Cuda => {
+                let alloc = self.cuda_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "CUDA KV page {id} missing device buffer"
+                    )))
+                })?;
+                let k_bytes = kv_width * 4;
+                let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
+                let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
+                allpaca_cuda::memcpy(
+                    k_ptr.cast(),
+                    k.as_ptr().cast(),
+                    k_bytes,
+                    allpaca_cuda::MEMCPY_H2D,
+                )?;
+                allpaca_cuda::memcpy(
+                    v_ptr.cast(),
+                    v.as_ptr().cast(),
+                    k_bytes,
+                    allpaca_cuda::MEMCPY_H2D,
+                )?;
                 self.activation_h2d_bytes
                     .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
             }
@@ -356,6 +438,30 @@ impl KvTierManager {
                     unsafe { alloc.ptr.add(v_off * 4) },
                     n * 4,
                     allpaca_hip::MEMCPY_D2H,
+                )?;
+                self.activation_d2h_bytes
+                    .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                (k, v)
+            }
+            DeviceBufferKind::Cuda => {
+                let alloc = self.cuda_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "CUDA KV page {id} missing device buffer"
+                    )))
+                })?;
+                let mut k = vec![0.0f32; n];
+                let mut v = vec![0.0f32; n];
+                allpaca_cuda::memcpy(
+                    k.as_mut_ptr().cast(),
+                    unsafe { alloc.ptr.add(k_off * 4) }.cast(),
+                    n * 4,
+                    allpaca_cuda::MEMCPY_D2H,
+                )?;
+                allpaca_cuda::memcpy(
+                    v.as_mut_ptr().cast(),
+                    unsafe { alloc.ptr.add(v_off * 4) }.cast(),
+                    n * 4,
+                    allpaca_cuda::MEMCPY_D2H,
                 )?;
                 self.activation_d2h_bytes
                     .fetch_add((n * 8) as u64, Ordering::Relaxed);
@@ -433,6 +539,27 @@ impl KvTierManager {
                 let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
                 allpaca_hip::memcpy(k_ptr, k_dev.cast(), k_bytes, allpaca_hip::MEMCPY_D2D)?;
                 allpaca_hip::memcpy(v_ptr, v_dev.cast(), k_bytes, allpaca_hip::MEMCPY_D2D)?;
+            }
+            DeviceBufferKind::Cuda => {
+                let alloc = self.cuda_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "CUDA KV page {id} missing device buffer"
+                    )))
+                })?;
+                let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
+                let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
+                allpaca_cuda::memcpy(
+                    k_ptr.cast(),
+                    k_dev.cast(),
+                    k_bytes,
+                    allpaca_cuda::MEMCPY_D2D,
+                )?;
+                allpaca_cuda::memcpy(
+                    v_ptr.cast(),
+                    v_dev.cast(),
+                    k_bytes,
+                    allpaca_cuda::MEMCPY_D2D,
+                )?;
             }
             DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
                 let mut k = vec![0.0f32; kv_width];
@@ -536,6 +663,35 @@ impl KvTierManager {
                         page.filled = page.filled.max((slot + run) as u32);
                     }
                 }
+                DeviceBufferKind::Cuda => {
+                    let k_off = offset + slot * kv_width;
+                    let v_off = offset + cap * kv_width + slot * kv_width;
+                    let alloc = self.cuda_pages.get(&page_id).ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                            "CUDA KV page {page_id} missing device buffer"
+                        )))
+                    })?;
+                    let run_bytes = run * kv_width * 4;
+                    let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
+                    let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
+                    let k_src = unsafe { k_dev.add(i * kv_width) };
+                    let v_src = unsafe { v_dev.add(i * kv_width) };
+                    allpaca_cuda::memcpy(
+                        k_ptr.cast(),
+                        k_src.cast(),
+                        run_bytes,
+                        allpaca_cuda::MEMCPY_D2D,
+                    )?;
+                    allpaca_cuda::memcpy(
+                        v_ptr.cast(),
+                        v_src.cast(),
+                        run_bytes,
+                        allpaca_cuda::MEMCPY_D2D,
+                    )?;
+                    if let Some(page) = self.pages.get_mut(&page_id) {
+                        page.filled = page.filled.max((slot + run) as u32);
+                    }
+                }
                 DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
                     for t in 0..run {
                         self.write_slot_from_device(
@@ -621,6 +777,32 @@ impl KvTierManager {
         Ok((dest_k as *const f32, dest_v as *const f32, n_kv))
     }
 
+    /// In-place CUDA K/V for a single resident page (no D2H pack).
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    pub(crate) fn cuda_single_page_view(
+        &self,
+        pages: &[u64],
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Option<(*const f32, *const f32, usize)> {
+        if pages.len() != 1 {
+            return None;
+        }
+        let id = pages[0];
+        let page = self.pages.get(&id)?;
+        if page.location.kind != DeviceBufferKind::Cuda || page.filled == 0 {
+            return None;
+        }
+        let alloc = self.cuda_pages.get(&id)?;
+        let kv_width = n_kv_heads * head_dim;
+        let k_off = page.location.offset;
+        let v_off = page.location.offset + page.capacity_tokens as usize * kv_width;
+        let k = unsafe { alloc.ptr.add(k_off * 4).cast::<f32>() };
+        let v = unsafe { alloc.ptr.add(v_off * 4).cast::<f32>() };
+        Some((k, v, page.filled as usize))
+    }
+
     /// Pack filled tokens from `pages` into device K/V buffers (D2D when resident).
     pub(crate) fn pack_kv_device(
         &self,
@@ -675,6 +857,33 @@ impl KvTierManager {
                         n * 4,
                         allpaca_hip::MEMCPY_D2D,
                     )?;
+                }
+                DeviceBufferKind::Cuda => {
+                    let alloc = self.cuda_pages.get(id).ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                            "CUDA KV page {id} missing device buffer"
+                        )))
+                    })?;
+                    let mut k = vec![0.0f32; n];
+                    let mut v = vec![0.0f32; n];
+                    allpaca_cuda::memcpy(
+                        k.as_mut_ptr().cast(),
+                        unsafe { alloc.ptr.add(k_off * 4) }.cast(),
+                        n * 4,
+                        allpaca_cuda::MEMCPY_D2H,
+                    )?;
+                    allpaca_cuda::memcpy(
+                        v.as_mut_ptr().cast(),
+                        unsafe { alloc.ptr.add(v_off * 4) }.cast(),
+                        n * 4,
+                        allpaca_cuda::MEMCPY_D2H,
+                    )?;
+                    allpaca_hip::memcpy(dk, k.as_ptr().cast(), n * 4, allpaca_hip::MEMCPY_H2D)?;
+                    allpaca_hip::memcpy(dv, v.as_ptr().cast(), n * 4, allpaca_hip::MEMCPY_H2D)?;
+                    self.activation_h2d_bytes
+                        .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                    self.activation_d2h_bytes
+                        .fetch_add((n * 8) as u64, Ordering::Relaxed);
                 }
                 DeviceBufferKind::CpuVram => {
                     allpaca_hip::memcpy(
@@ -754,6 +963,17 @@ impl KvTierManager {
                     allpaca_hip::device_free(alloc.ptr, alloc.bytes);
                 }
             }
+            DeviceBufferKind::Cuda => {
+                if let Some(alloc) = self.cuda_pages.remove(&id) {
+                    allpaca_cuda::memcpy(
+                        self.dram.slice_mut(dst, len).as_mut_ptr().cast(),
+                        alloc.ptr.cast(),
+                        alloc.bytes,
+                        allpaca_cuda::MEMCPY_D2H,
+                    )?;
+                    allpaca_cuda::device_free(alloc.ptr.cast());
+                }
+            }
             DeviceBufferKind::CpuVram => {
                 copy_f32(
                     self.dram.slice_mut(dst, len),
@@ -819,6 +1039,29 @@ impl KvTierManager {
             if let Some(page) = self.pages.get_mut(&id) {
                 page.tier = KvResidency::Vram;
                 page.location.kind = DeviceBufferKind::Hip;
+                page.location.device_id = dev;
+                page.location.offset = 0;
+            }
+        } else if let Some(dev) = self.cuda_device {
+            let bytes = len * 4;
+            let ptr = allpaca_cuda::device_malloc(bytes, dev)?;
+            allpaca_cuda::memcpy(
+                ptr,
+                self.dram.slice(page.location.offset, len).as_ptr().cast(),
+                bytes,
+                allpaca_cuda::MEMCPY_H2D,
+            )?;
+            self.dram.free(page.location.offset, len);
+            self.cuda_pages.insert(
+                id,
+                CudaPageAlloc {
+                    ptr: ptr.cast(),
+                    bytes,
+                },
+            );
+            if let Some(page) = self.pages.get_mut(&id) {
+                page.tier = KvResidency::Vram;
+                page.location.kind = DeviceBufferKind::Cuda;
                 page.location.device_id = dev;
                 page.location.offset = 0;
             }
@@ -945,6 +1188,8 @@ impl KvTierManager {
     fn vram_live_floats(&self) -> usize {
         if self.hip_device.is_some() {
             self.hip_pages.values().map(|p| p.bytes / 4).sum()
+        } else if self.cuda_device.is_some() {
+            self.cuda_pages.values().map(|p| p.bytes / 4).sum()
         } else {
             self.vram.live
         }
@@ -1065,7 +1310,12 @@ impl KvTierManager {
                 .load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let kv_dev: u64 = self.hip_pages.values().map(|p| p.bytes as u64).sum();
+        let kv_dev: u64 = self.hip_pages.values().map(|p| p.bytes as u64).sum::<u64>()
+            + self
+                .cuda_pages
+                .values()
+                .map(|p| p.bytes as u64)
+                .sum::<u64>();
         metrics
             .kv_bytes_on_device
             .store(kv_dev, std::sync::atomic::Ordering::Relaxed);
@@ -1144,6 +1394,28 @@ mod tests {
         kv.rewind_filled(&[vec![id]], 2, 8);
         let (k, _) = kv.read_kv(id, 1, 4).unwrap();
         assert_eq!(k.len(), 8, "seq_len=2 must leave two KV slots");
+    }
+
+    #[test]
+    fn cuda_kv_alloc_write_read_or_dram_fallback() {
+        let metrics = Metrics::default();
+        let mut kv = KvTierManager::with_devices(1 << 20, 1 << 20, 0.9, None, Some(0));
+        let id = kv.alloc_page(0, 0, 8, 1, 4, &metrics).unwrap();
+        let page = kv.get(id).expect("page");
+        assert!(
+            matches!(
+                page.location.kind,
+                DeviceBufferKind::Cuda | DeviceBufferKind::CpuPinnedDram
+            ),
+            "CUDA runtime uses device pages; no driver falls back to DRAM; kind={:?}",
+            page.location.kind
+        );
+        let marker = vec![1.5f32, -0.25, 0.5, 2.0];
+        kv.write_slot(id, 0, 1, 4, &marker, &marker).unwrap();
+        let (k, v) = kv.read_kv(id, 1, 4).unwrap();
+        assert_eq!(k, marker);
+        assert_eq!(v, marker);
+        kv.release(id, &metrics);
     }
 
     #[test]

@@ -2467,6 +2467,11 @@ fn gated_7b_gguf() -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Shared ROCmFP4 quality prompt (Qwen, Nemotron, …). Override with `ALLPACA_QWEN_PROMPT`.
+#[cfg(feature = "hip")]
+const ROCMFP4_FACT_PROMPT: &str =
+    "<|im_start|>user\nWhat is the capitol of Western Australia<|im_end|>\n<|im_start|>assistant\n";
+
 /// Gated ROCmFP4 GGUF (Qwen35 / Nemotron). Env overrides discovery under `models/`.
 #[cfg(feature = "hip")]
 fn gated_rocmfp4_gguf() -> Option<std::path::PathBuf> {
@@ -4413,6 +4418,19 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
         nextn,
         tok_model
     );
+    eprintln!(
+        "ROCmFP4 moe: experts={} active={} groups={} group_used={} shared={} shared_ff={} w_norm={} w_scale={} sigmoid={} relu_sqr={}",
+        cfg.n_experts,
+        cfg.n_active,
+        cfg.n_expert_groups,
+        cfg.n_group_used,
+        cfg.n_shared_experts,
+        cfg.shared_ff_dim,
+        cfg.expert_weights_norm,
+        cfg.expert_weights_scale,
+        cfg.moe_sigmoid_gating,
+        cfg.moe_relu_sqr
+    );
     for i in report.n_layers.saturating_sub(3)..report.n_layers {
         let info = &report.layers[i];
         eprintln!(
@@ -4454,25 +4472,38 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
         stats.weight_bytes_on_device,
         stats.backend
     );
-    // Confirm GDN host tensors exist (upload path requires attn_qkv + ssm_out).
+    // Qwen35 GDN uses attn_qkv + ssm_out; Nemotron Lightning uses ssm_in + ssm_out.
     {
         let mut gdn_ok = 0usize;
         let mut gdn_fail = 0usize;
+        let mut mamba_ok = 0usize;
+        let mut mamba_fail = 0usize;
         let mut attn_qnorm = 0usize;
         for i in 0..cfg.n_layers {
             let block = report.layers.get(i).map(|l| l.block);
             if block == Some(allpaca_gguf::HybridLayerKind::Ssm) {
                 let qkv = file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some();
+                let ssm_in = file.tensor(&format!("blk.{i}.ssm_in.weight")).is_some();
                 let out_w = file.tensor(&format!("blk.{i}.ssm_out.weight")).is_some();
                 let a = file.tensor(&format!("blk.{i}.ssm_a")).is_some();
                 let conv = file.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some();
                 if qkv && out_w && a && conv {
                     gdn_ok += 1;
-                } else {
+                } else if qkv || report.architecture == "qwen35" {
                     gdn_fail += 1;
                     if gdn_fail <= 2 {
                         eprintln!(
                             "GDN tensors missing blk.{i}: qkv={qkv} ssm_out={out_w} a={a} conv={conv}"
+                        );
+                    }
+                }
+                if ssm_in && out_w && a && conv {
+                    mamba_ok += 1;
+                } else if ssm_in || report.architecture == "nemotron_h_moe" {
+                    mamba_fail += 1;
+                    if mamba_fail <= 2 {
+                        eprintln!(
+                            "Mamba-2 tensors missing blk.{i}: ssm_in={ssm_in} ssm_out={out_w} a={a} conv={conv}"
                         );
                     }
                 }
@@ -4489,7 +4520,8 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
             .meta_u32("qwen35.nextn_predict_layers")
             .or_else(|| file.meta_u32("qwen35.leading_dense_block_count"));
         eprintln!(
-            "ROCmFP4 GDN tensors: ok={gdn_ok} fail={gdn_fail} attn_qnorm={attn_qnorm} nextn_meta={nextn:?} last_blocks={:?}",
+            "ROCmFP4 hybrid tensors: arch={} gdn_ok={gdn_ok} gdn_fail={gdn_fail} mamba_ok={mamba_ok} mamba_fail={mamba_fail} attn_qnorm={attn_qnorm} nextn_meta={nextn:?} last_blocks={:?}",
+            report.architecture,
             report
                 .layers
                 .iter()
@@ -4498,13 +4530,19 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
                 .map(|l| (l.index, l.block))
                 .collect::<Vec<_>>()
         );
-        assert!(gdn_ok > 0, "expected GDN tensors on SSM layers");
-        assert_eq!(gdn_fail, 0, "SSM layers missing GDN tensors");
+        if report.architecture == "qwen35" {
+            assert!(gdn_ok > 0, "expected GDN tensors on Qwen SSM layers");
+            assert_eq!(gdn_fail, 0, "Qwen SSM layers missing GDN tensors");
+        } else if report.architecture == "nemotron_h_moe" {
+            assert!(
+                mamba_ok > 0,
+                "expected Mamba-2 tensors on Nemotron SSM layers"
+            );
+            assert_eq!(mamba_fail, 0, "Nemotron SSM layers missing Mamba-2 tensors");
+        }
     }
-    let prompt = std::env::var("ALLPACA_QWEN_PROMPT").unwrap_or_else(|_| {
-        // Match llama.cpp qwen chat turn (ROCmFPX llama-cli verbose-prompt).
-        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n".into()
-    });
+    let prompt =
+        std::env::var("ALLPACA_QWEN_PROMPT").unwrap_or_else(|_| ROCMFP4_FACT_PROMPT.into());
     {
         let tok = allpaca_gguf::extract_tokenizer(&file).expect("extract tokenizer");
         let enc = tok
@@ -4523,19 +4561,31 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(32)
         .max(1);
+    let gen_started = std::time::Instant::now();
     let out = generate_or_timeout(&engine, &prompt, n_tok, overnight_timeout(n_tok, 180));
+    let generate_elapsed = gen_started.elapsed();
     assert!(!out.token_ids.is_empty());
     let stats = engine.stats();
+    let toks = out.token_ids.len().max(1) as f64;
+    let tps = toks / generate_elapsed.as_secs_f64().max(1e-6);
     eprintln!(
-        "ROCmFP4 HIP generate: path={} prompt_chars={} tokens={} ids={:?} backend={} q8_us={} attn_us={} other_us={} text={:?}",
+        "ROCmFP4 HIP generate: path={} prompt_tokens={} gen={} completion_tokens={} ttft_ms={} itl_ms={:.2} tokens/s={:.2} generate_ms={} gpu_forwards={} prefill_chunks={} tokens_generated={} backend={} q8_us={} attn_us={} other_us={} ids={:?} text={:?}",
         path.display(),
-        prompt.len(),
+        out.prompt_tokens,
         out.token_ids.len(),
-        out.token_ids,
+        out.completion_tokens,
+        stats.ttft_ms_last,
+        stats.itl_ms_ema,
+        tps,
+        generate_elapsed.as_millis(),
+        stats.gpu_forwards,
+        stats.prefill_chunks,
+        stats.tokens_generated,
         stats.backend,
         stats.q8_gemm_us,
         stats.attention_us,
         stats.other_gpu_us,
+        out.token_ids,
         out.text
     );
     // Lock soak: device GDN path must stay coherent (not ChatML debris / newline collapse).
@@ -4556,12 +4606,21 @@ fn hip_rocmfp4_qwen_probe_and_optional_generate() {
         out.token_ids
     );
     let lower = out.text.to_lowercase();
+    let unique = out
+        .token_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     assert!(
-        lower.contains("hello")
-            || lower.contains("hi")
-            || lower.contains("user")
-            || lower.contains("greet"),
-        "expected hello-ish reply, got {:?}",
+        unique >= 4,
+        "must not role-loop; unique={unique} ids={:?} text={:?}",
+        out.token_ids,
+        out.text
+    );
+    assert!(
+        lower.contains("perth"),
+        "must name Perth for Western Australia, got {:?}",
         out.text
     );
 }
@@ -6160,4 +6219,78 @@ fn hip_vision_encoder_install_records_weight_residency() {
     );
     // Soft-embed staging metric stays separate until a multimodal request.
     assert_eq!(stats.vision_bytes_on_device, 0);
+}
+
+#[cfg(feature = "hip")]
+fn tiny_dsv4_generate(
+    path: &std::path::Path,
+    cpu_only: bool,
+) -> (Vec<u32>, allpaca_types::StatsSnapshot) {
+    let mut cfg = Config::compiled_defaults();
+    cfg.model.synthetic = false;
+    cfg.model.path = Some(path.to_path_buf());
+    cfg.engine.cpu_only = cpu_only;
+    cfg.engine.gpu_backend = "auto".into();
+    cfg.speculative.enabled = false;
+    let engine = Engine::new(cfg).expect("tiny DeepSeek-V4 must load");
+    let out = engine
+        .generate("hi", greedy(4))
+        .expect("tiny DeepSeek-V4 must generate");
+    (out.token_ids, engine.stats())
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn tiny_deepseek4_hip_f32_stays_cpu() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip tiny_deepseek4_hip_f32_stays_cpu: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_hip_tiny_dsv4_f32-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    allpaca_core::write_tiny_deepseek4_gguf(&path);
+    let (cpu_ids, _) = tiny_dsv4_generate(&path, true);
+    let (hip_ids, hip_stats) = tiny_dsv4_generate(&path, false);
+    let _ = std::fs::remove_file(&path);
+    assert!(!cpu_ids.is_empty());
+    assert_eq!(hip_ids, cpu_ids, "F32 fixture must not use HIP GEMV");
+    assert_eq!(hip_stats.gpu_forwards, 0, "stats={hip_stats:?}");
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn tiny_deepseek4_hip_matches_cpu() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip tiny_deepseek4_hip_matches_cpu: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_hip_tiny_dsv4_packed-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    allpaca_core::write_tiny_deepseek4_packed_gguf(&path);
+    let (cpu_ids, _) = tiny_dsv4_generate(&path, true);
+    let (hip_ids, hip_stats) = tiny_dsv4_generate(&path, false);
+    let _ = std::fs::remove_file(&path);
+    assert!(!cpu_ids.is_empty());
+    assert_eq!(
+        hip_ids, cpu_ids,
+        "packed BF16/MXFP4 HIP must match CPU; hip={hip_ids:?} cpu={cpu_ids:?} stats={hip_stats:?}"
+    );
+    if hip_stats.backend == "hip" {
+        assert!(
+            hip_stats.gpu_forwards > 0,
+            "packed HIP generate should record gpu_forwards; stats={hip_stats:?}"
+        );
+    }
 }

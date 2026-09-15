@@ -235,20 +235,37 @@ impl TinyModel {
             kv.write_slot(page_id, slot, cfg.n_kv_heads, head_dim, &k, &v)?;
             kv.touch(page_id, 1.0);
 
-            let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
-            let n_kv = k_all.len() / kv_dim;
-            attention(
-                &q,
-                &k_all,
-                &v_all,
-                &mut attn_out,
-                1,
-                n_kv,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                head_dim,
-                true,
-            )?;
+            if let Some((k_dev, v_dev, n_kv)) =
+                kv.cuda_single_page_view(&page_ids[layer_idx], cfg.n_kv_heads, head_dim)
+            {
+                cuda.attention_host_q_dev_kv(
+                    &q,
+                    k_dev,
+                    v_dev,
+                    &mut attn_out,
+                    1,
+                    n_kv as i32,
+                    cfg.n_heads as i32,
+                    cfg.n_kv_heads as i32,
+                    head_dim as i32,
+                    true,
+                )?;
+            } else {
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+                let n_kv = k_all.len() / kv_dim;
+                attention(
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &mut attn_out,
+                    1,
+                    n_kv,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    true,
+                )?;
+            }
 
             cuda.gemm_nt_host_a_dev_b(
                 &attn_out,

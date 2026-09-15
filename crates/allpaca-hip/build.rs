@@ -61,7 +61,13 @@ fn main() {
         hip_root.display(),
         arches.join(",")
     );
-    if let Err(e) = build_kernels(&hip_root, &out, hipblaslt, direct_storage.as_deref(), &arches) {
+    if let Err(e) = build_kernels(
+        &hip_root,
+        &out,
+        hipblaslt,
+        direct_storage.as_deref(),
+        &arches,
+    ) {
         println!("cargo:warning=HIP kernel build failed ({e}); hip feature is stub-only.");
         return;
     }
@@ -451,7 +457,11 @@ fn detect_offload_arches() -> Vec<String> {
 }
 
 fn offload_arches() -> Vec<String> {
-    for key in ["AMDGPU_TARGETS", "HIP_AMDGPU_TARGETS", "ALLPACA_OFFLOAD_ARCH"] {
+    for key in [
+        "AMDGPU_TARGETS",
+        "HIP_AMDGPU_TARGETS",
+        "ALLPACA_OFFLOAD_ARCH",
+    ] {
         if let Ok(raw) = env::var(key) {
             let parsed = parse_offload_arches(&raw);
             if !parsed.is_empty() {
@@ -512,7 +522,10 @@ fn try_hipcc(
         "kernels.o"
     });
     let include = manifest_hip_dir().join("include");
-    let arch_flags: Vec<String> = arches.iter().map(|a| format!("--offload-arch={a}")).collect();
+    let arch_flags: Vec<String> = arches
+        .iter()
+        .map(|a| format!("--offload-arch={a}"))
+        .collect();
     let mut extra = String::new();
     if rocblas_lib_exists(hip_root) {
         extra.push_str(" -DALLPACA_HAS_ROCBLAS");
@@ -611,7 +624,11 @@ fn archive_objects(hip_root: &Path, out: &Path, obj: &Path) -> Result<(), String
     } else {
         "liballpaca_kernels.a"
     });
-    let llvm_ar_name = if cfg!(windows) { "llvm-ar.exe" } else { "llvm-ar" };
+    let llvm_ar_name = if cfg!(windows) {
+        "llvm-ar.exe"
+    } else {
+        "llvm-ar"
+    };
     let llvm_ar_candidates = [
         hip_root.join("bin").join(llvm_ar_name),
         hip_root.join("lib/llvm/bin").join(llvm_ar_name),

@@ -24,12 +24,14 @@ async-stream.workspace = true
 futures.workspace = true
 image.workspace = true
 rand.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 llguidance.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 allpaca-gguf.workspace = true

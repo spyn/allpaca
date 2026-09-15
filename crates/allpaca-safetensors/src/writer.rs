@@ -3,7 +3,7 @@ use std::path::Path;
 use allpaca_types::{AllpacaError, FatalError};
 use serde_json::{json, Map, Value};
 
-use crate::parser::{f32_to_f16, SafetensorsDtype};
+use crate::parser::{f32_to_bf16, f32_to_f16, SafetensorsDtype};
 
 pub struct SafetensorsWriteTensor<'a> {
     pub name: String,
@@ -38,6 +38,11 @@ pub fn write_safetensors(
                 .data
                 .iter()
                 .flat_map(|v| f32_to_f16(*v).to_le_bytes())
+                .collect::<Vec<u8>>(),
+            SafetensorsDtype::BF16 => t
+                .data
+                .iter()
+                .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
                 .collect::<Vec<u8>>(),
         };
         let end = offset + bytes.len() as u64;

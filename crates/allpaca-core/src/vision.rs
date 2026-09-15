@@ -2,9 +2,10 @@
 //!
 //! HIP residency uploads patch + block tensors once; encode prefers device
 //! `gemm_nt_dev_b` for patch linear and ViT block linears, and
-//! `HipWorkspace::attention` (online softmax) for ViT self-attn. LayerNorm
-//! stays host: no mean/var LN kernel (RMSNorm is not equivalent). SafeTensors
-//! load accepts native `patch_proj` / `blocks.*` and CLIP-style `visual.proj` /
+//! `HipWorkspace::attention` (online softmax) for ViT self-attn. Mean/var
+//! LayerNorm uses `allpaca_layernorm_rows` on HIP (RMSNorm is not equivalent).
+//! SafeTensors load accepts native `patch_proj` / `blocks.*` and CLIP-style
+//! `visual.proj` /
 //! `visual.transformer.resblocks.*` aliases.
 //!
 //! Decodes JPEG/PNG/WebP via `image`. AVIF (and other formats `image` rejects)
@@ -19,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 static HIP_VIT_ATTN_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static HIP_VIT_LN_HITS: AtomicUsize = AtomicUsize::new(0);
 
 use allpaca_hip::DeviceWeights;
 use allpaca_safetensors::{
@@ -430,17 +433,8 @@ impl VisionEncoder for PatchVisionEncoder {
             }
             if let (Some(w), Some(b)) = (self.ln_pre_w.as_ref(), self.ln_pre_b.as_ref()) {
                 if w.len() == self.out_dim && b.len() == self.out_dim {
-                    let seq = tokens.len() / self.out_dim;
                     let mut normed = vec![0.0f32; tokens.len()];
-                    for t in 0..seq {
-                        let row = &tokens[t * self.out_dim..(t + 1) * self.out_dim];
-                        layer_norm(
-                            row,
-                            w,
-                            b,
-                            &mut normed[t * self.out_dim..(t + 1) * self.out_dim],
-                        );
-                    }
+                    layer_norm_rows(&tokens, w, b, &mut normed, self.device.is_some(), None);
                     tokens = normed;
                 }
             }
@@ -829,9 +823,9 @@ fn add_bias_rows(out: &mut [f32], rows: usize, cols: usize, bias: &[f32]) {
     }
 }
 
-/// ViT block with HIP `gemm_nt_dev_b` for linears and `HipWorkspace::attention`
-/// for self-attn (softmax on device). LayerNorm stays on CPU: allpaca-hip has
-/// RMSNorm only, which is not mean/var LN.
+/// ViT block with HIP `gemm_nt_dev_b` for linears, `HipWorkspace::attention`
+/// for self-attn (softmax on device), and mean/var LayerNorm via
+/// `HipWorkspace::layernorm_rows` (not RMSNorm).
 #[allow(clippy::too_many_arguments)]
 fn apply_vit_block_hip(
     tokens: &mut [f32],
@@ -858,22 +852,26 @@ fn apply_vit_block_hip(
     let max_a = seq.saturating_mul(dim.max(mlp));
     let max_c = seq.saturating_mul((3 * dim).max(mlp).max(dim));
     let attn_bytes = seq.saturating_mul(dim).saturating_mul(4).saturating_mul(4);
+    let ln_bytes = seq
+        .saturating_mul(dim)
+        .saturating_mul(8)
+        .saturating_add(dim.saturating_mul(8));
     let scratch = (max_a + max_c)
         .saturating_mul(4)
         .saturating_add(4096)
-        .max(attn_bytes.saturating_add(4096));
+        .max(attn_bytes.saturating_add(4096))
+        .max(ln_bytes.saturating_add(4096));
     let hip = allpaca_hip::HipWorkspace::new(weights.device(), scratch, 1)?;
 
     let mut normed = vec![0.0f32; tokens.len()];
-    for t in 0..seq {
-        let row = &tokens[t * dim..(t + 1) * dim];
-        layer_norm(
-            row,
-            &block.ln1_w,
-            &block.ln1_b,
-            &mut normed[t * dim..(t + 1) * dim],
-        );
-    }
+    layer_norm_rows(
+        tokens,
+        &block.ln1_w,
+        &block.ln1_b,
+        &mut normed,
+        true,
+        Some(&hip),
+    );
 
     let mut qkv = vec![0.0f32; seq * 3 * dim];
     hip.gemm_nt_dev_b(
@@ -908,15 +906,14 @@ fn apply_vit_block_hip(
         tokens[i] += proj[i];
     }
 
-    for t in 0..seq {
-        let row = &tokens[t * dim..(t + 1) * dim];
-        layer_norm(
-            row,
-            &block.ln2_w,
-            &block.ln2_b,
-            &mut normed[t * dim..(t + 1) * dim],
-        );
-    }
+    layer_norm_rows(
+        tokens,
+        &block.ln2_w,
+        &block.ln2_b,
+        &mut normed,
+        true,
+        Some(&hip),
+    );
 
     let mut hidden = vec![0.0f32; seq * mlp];
     hip.gemm_nt_dev_b(
@@ -1017,6 +1014,41 @@ fn vit_attention_hip(
         head_dim as i32,
         false,
     )
+}
+
+fn layer_norm_rows(
+    x: &[f32],
+    w: &[f32],
+    b: &[f32],
+    out: &mut [f32],
+    try_hip: bool,
+    hip: Option<&allpaca_hip::HipWorkspace>,
+) {
+    let n = w.len();
+    if n == 0 || x.len() != out.len() || x.len() % n != 0 || b.len() != n {
+        return;
+    }
+    let rows = x.len() / n;
+    if try_hip {
+        if let Some(ws) = hip {
+            if ws
+                .layernorm_rows(x, w, b, out, rows as i32, n as i32, LN_EPS)
+                .is_ok()
+            {
+                #[cfg(test)]
+                HIP_VIT_LN_HITS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        if allpaca_hip::layernorm_rows(x, w, b, out, rows as i32, n as i32, LN_EPS).is_ok() {
+            #[cfg(test)]
+            HIP_VIT_LN_HITS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+    for t in 0..rows {
+        layer_norm(&x[t * n..(t + 1) * n], w, b, &mut out[t * n..(t + 1) * n]);
+    }
 }
 
 fn layer_norm(x: &[f32], w: &[f32], b: &[f32], out: &mut [f32]) {
@@ -1334,6 +1366,7 @@ mod tests {
         let bytes = hip.ensure_device_resident(Some(0)).unwrap();
         assert!(bytes > 0, "expected weight upload including vit block");
         HIP_VIT_ATTN_HITS.store(0, Ordering::Relaxed);
+        HIP_VIT_LN_HITS.store(0, Ordering::Relaxed);
         let a = cpu
             .encode(&[ImageInput::new(jpeg.clone(), "image/jpeg")])
             .unwrap();
@@ -1346,6 +1379,10 @@ mod tests {
         assert!(
             HIP_VIT_ATTN_HITS.load(Ordering::Relaxed) >= 1,
             "expected HIP attention (device softmax) when resident"
+        );
+        assert!(
+            HIP_VIT_LN_HITS.load(Ordering::Relaxed) >= 2,
+            "expected HIP mean/var LayerNorm for ln1 and ln2 when resident"
         );
     }
 

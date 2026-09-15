@@ -205,16 +205,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn messages_to_prompt_and_images(
+fn flatten_chat_messages(
     messages: &[ChatMessage],
-) -> Result<(String, Vec<ImageInput>), AllpacaError> {
-    let mut out = String::new();
+) -> Result<(Vec<(String, String)>, Vec<ImageInput>), AllpacaError> {
+    let mut turns = Vec::new();
     let mut images = Vec::new();
     for msg in messages {
-        out.push_str(&msg.role);
-        out.push_str(": ");
-        match &msg.content {
-            MessageContent::Text(text) => out.push_str(text),
+        let text = match &msg.content {
+            MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(parts) => {
                 let mut texts = Vec::new();
                 for part in parts {
@@ -225,13 +223,26 @@ fn messages_to_prompt_and_images(
                         }
                     }
                 }
-                out.push_str(&texts.join(" "));
+                texts.join(" ")
             }
-        }
-        out.push('\n');
+        };
+        turns.push((msg.role.clone(), text));
     }
-    out.push_str("assistant:");
-    Ok((out, images))
+    Ok((turns, images))
+}
+
+fn messages_to_prompt_and_images(
+    messages: &[ChatMessage],
+) -> Result<(String, Vec<ImageInput>), AllpacaError> {
+    let (turns, images) = flatten_chat_messages(messages)?;
+    let pairs: Vec<(&str, &str)> = turns
+        .iter()
+        .map(|(r, c)| (r.as_str(), c.as_str()))
+        .collect();
+    Ok((
+        allpaca_core::format_chat_colon(&pairs, true),
+        images,
+    ))
 }
 
 fn load_image_url(url: &str) -> Result<ImageInput, AllpacaError> {
@@ -419,8 +430,14 @@ async fn chat_completions(
             .into_response();
     }
     let messages = req.messages.clone();
+    let engine = state.engine.clone();
     let (prompt, images) = match tokio::task::spawn_blocking(move || {
-        messages_to_prompt_and_images(&messages)
+        let (turns, images) = flatten_chat_messages(&messages)?;
+        let pairs: Vec<(&str, &str)> = turns
+            .iter()
+            .map(|(r, c)| (r.as_str(), c.as_str()))
+            .collect();
+        Ok::<_, AllpacaError>((engine.format_chat(&pairs), images))
     })
     .await
     {
@@ -1328,7 +1345,7 @@ mod tests {
         let text_only = state
             .engine
             .generate(
-                "user: describe\nassistant:",
+                &state.engine.format_chat(&[("user", "describe")]),
                 GenerationParams {
                     max_tokens: 4,
                     temperature: 0.0,

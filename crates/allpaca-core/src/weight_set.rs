@@ -866,6 +866,7 @@ mod tests {
             w_down: vec![gate + 2.0],
             w_router: vec![],
             experts: vec![],
+            shared_expert: LayerFfn::default(),
         }
     }
 

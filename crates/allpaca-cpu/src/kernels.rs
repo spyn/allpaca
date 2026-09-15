@@ -337,6 +337,65 @@ pub fn rope(x: &mut [f32], pos: usize, theta: f32) -> Result<(), AllpacaError> {
     Ok(())
 }
 
+/// Partial RoPE on `x[offset..offset+n_rot]` (DeepSeek-V4: nope prefix, RoPE suffix).
+pub fn rope_offset(
+    x: &mut [f32],
+    pos: usize,
+    theta: f32,
+    n_rot: usize,
+    offset: usize,
+) -> Result<(), AllpacaError> {
+    let end = offset.saturating_add(n_rot);
+    if n_rot == 0 {
+        return rope(x, pos, theta);
+    }
+    if end > x.len() || n_rot % 2 != 0 {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "rope_offset n_rot must be even and fit in the head".into(),
+        )));
+    }
+    rope(&mut x[offset..end], pos, theta)
+}
+
+/// Inverse of [`rope_offset`]: same frequencies, negated sine (ggml `rope_ext_back`).
+pub fn rope_offset_back(
+    x: &mut [f32],
+    pos: usize,
+    theta: f32,
+    n_rot: usize,
+    offset: usize,
+) -> Result<(), AllpacaError> {
+    let end = offset.saturating_add(n_rot);
+    if n_rot == 0 {
+        return rope_back(x, pos, theta);
+    }
+    if end > x.len() || n_rot % 2 != 0 {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "rope_offset_back n_rot must be even and fit in the head".into(),
+        )));
+    }
+    rope_back(&mut x[offset..end], pos, theta)
+}
+
+fn rope_back(x: &mut [f32], pos: usize, theta: f32) -> Result<(), AllpacaError> {
+    if x.len() % 2 != 0 {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "rope head_dim must be even".into(),
+        )));
+    }
+    let half = x.len() / 2;
+    for i in 0..half {
+        let freq = 1.0 / theta.powf(i as f32 / half as f32);
+        let angle = pos as f32 * freq;
+        let (sin, cos) = angle.sin_cos();
+        let a = x[2 * i];
+        let b = x[2 * i + 1];
+        x[2 * i] = a * cos + b * sin;
+        x[2 * i + 1] = -a * sin + b * cos;
+    }
+    Ok(())
+}
+
 /// Qwen3.5 / llama.cpp `GGML_ROPE_TYPE_IMROPE`: NeoX pairing on the first `n_rot`
 /// dims only. Text tokens use positions `(pos, pos, pos, 0)`.
 ///
@@ -484,6 +543,11 @@ pub const ROCMFP4_BLOCK_ELEMS: usize = 32;
 pub const ROCMFP4_BLOCK_BYTES: usize = 18;
 /// Signed E2M1-derived codebook at half-scale, top magnitude retuned 12 → 10.
 pub const ROCMFP4_CODEBOOK: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10];
+/// ggml MXFP4: 1× E8M0 scale + 16 packed nibbles / 32 elems (ggml_type_id=39).
+pub const MXFP4_BLOCK_ELEMS: usize = 32;
+pub const MXFP4_BLOCK_BYTES: usize = 17;
+/// ggml `kvalues_fp4` / `kvalues_mxfp4`.
+pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 pub const Q8_0_BLOCK_ELEMS: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
 /// Legacy Q8_1: f16 d + f16 s + qs[32]. `x = d*q` (s is block sum, unused here).
@@ -521,6 +585,30 @@ pub const KVALUES_IQ4NL: [f32; 16] = [
     -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
     89.0, 113.0,
 ];
+
+/// IEEE-754 bfloat16 → f32 (high 16 bits of an f32).
+pub fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits(u32::from(h) << 16)
+}
+
+/// Truncating f32 → bfloat16 (matches HIP `h << 16` expand).
+pub fn f32_to_bf16(v: f32) -> u16 {
+    (v.to_bits() >> 16) as u16
+}
+
+/// ggml E8M0 → f32 (exponent-only). `e==0` is 2^-126.
+pub fn e8m0_to_fp32(e: u8) -> f32 {
+    if e == 0 {
+        f32::from_bits(0x0040_0000)
+    } else {
+        f32::from_bits(u32::from(e) << 23)
+    }
+}
+
+/// ggml `GGML_E8M0_TO_FP32_HALF` used by MXFP4 dequant.
+pub fn e8m0_to_fp32_half(e: u8) -> f32 {
+    e8m0_to_fp32(e) * 0.5
+}
 
 /// IEEE-754 binary16 → f32.
 pub fn f16_to_f32(h: u16) -> f32 {
@@ -1718,6 +1806,98 @@ pub fn dequant_iq4_xs(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Al
     Ok(())
 }
 
+/// Dequantize ggml MXFP4 blocks: `e8m0` + `qs[16]` → `kvalues[nibble] * e8m0/2`.
+pub fn dequant_mxfp4(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_mxfp4 output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(MXFP4_BLOCK_ELEMS);
+    let need = n_blocks.saturating_mul(MXFP4_BLOCK_BYTES);
+    if blocks.len() < need {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_mxfp4 truncated blocks".into(),
+        )));
+    }
+    for b in 0..n_blocks {
+        let off = b * MXFP4_BLOCK_BYTES;
+        let d = e8m0_to_fp32_half(blocks[off]);
+        let qs = &blocks[off + 1..off + 1 + MXFP4_BLOCK_ELEMS / 2];
+        for j in 0..MXFP4_BLOCK_ELEMS / 2 {
+            let i0 = b * MXFP4_BLOCK_ELEMS + j;
+            let i1 = i0 + MXFP4_BLOCK_ELEMS / 2;
+            let x0 = KVALUES_MXFP4[usize::from(qs[j] & 0x0f)] as f32;
+            let x1 = KVALUES_MXFP4[usize::from(qs[j] >> 4)] as f32;
+            if i0 < n {
+                out[i0] = x0 * d;
+            }
+            if i1 < n {
+                out[i1] = x1 * d;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pack ggml MXFP4 blocks (tests / tiny HIP fixtures). Nearest codebook at half-scale.
+pub fn quantize_mxfp4(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(MXFP4_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * MXFP4_BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * MXFP4_BLOCK_ELEMS;
+        let mut amax = 0.0f32;
+        for i in 0..MXFP4_BLOCK_ELEMS {
+            let v = data.get(start + i).copied().unwrap_or(0.0).abs();
+            if v > amax {
+                amax = v;
+            }
+        }
+        let d = if amax == 0.0 { 0.0 } else { amax / 12.0 };
+        let e = f32_to_e8m0(d * 2.0);
+        let scale = e8m0_to_fp32_half(e);
+        let inv = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+        let off = b * MXFP4_BLOCK_BYTES;
+        out[off] = e;
+        for j in 0..MXFP4_BLOCK_ELEMS / 2 {
+            let x0 = data.get(start + j).copied().unwrap_or(0.0);
+            let x1 = data
+                .get(start + j + MXFP4_BLOCK_ELEMS / 2)
+                .copied()
+                .unwrap_or(0.0);
+            let q0 = mxfp4_best_index(x0 * inv);
+            let q1 = mxfp4_best_index(x1 * inv);
+            out[off + 1 + j] = q0 | (q1 << 4);
+        }
+    }
+    out
+}
+
+fn f32_to_e8m0(v: f32) -> u8 {
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    let exp = ((v.to_bits() >> 23) & 0xff) as u8;
+    if exp == 0 {
+        0
+    } else {
+        exp
+    }
+}
+
+fn mxfp4_best_index(target: f32) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = f32::INFINITY;
+    for (i, &code) in KVALUES_MXFP4.iter().enumerate() {
+        let d = (target - f32::from(code)).abs();
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
 /// Dequantize GGUF Q8_0 blocks: `f16 d` + `i8[32]` → `d * q`.
 pub fn dequant_q8_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), AllpacaError> {
     if out.len() < n {
@@ -1790,6 +1970,22 @@ mod tests {
     }
 
     #[test]
+    fn rope_offset_back_inverts_forward() {
+        let mut x = [0.7, -0.2, 1.5, 0.25, 9.0, 8.0];
+        let orig = x;
+        rope_offset(&mut x, 4, 10_000.0, 4, 2).unwrap();
+        rope_offset_back(&mut x, 4, 10_000.0, 4, 2).unwrap();
+        for i in 0..x.len() {
+            assert!(
+                (x[i] - orig[i]).abs() < 1e-5,
+                "idx={i} got={} want={}",
+                x[i],
+                orig[i]
+            );
+        }
+    }
+
+    #[test]
     fn imrope_neox_partial_preserves_tail_and_norm() {
         // head_dim=8, n_rot=4 → rotate NeoX pairs (0,2) and (1,3); leave 4..7.
         let mut x = [1.0, 0.5, 0.0, 0.25, 9.0, 8.0, 7.0, 6.0];
@@ -1834,6 +2030,26 @@ mod tests {
 
     /// Scale bytes decode as unsigned finite E4M3 at half-scale, so codebook
     /// level 10 reconstructs 5.0 raw units at scale byte 0x38 (1.0).
+    #[test]
+    fn bf16_to_f32_preserves_high_bits() {
+        assert_eq!(bf16_to_f32(0x3f80), 1.0);
+        assert_eq!(bf16_to_f32(0x0000), 0.0);
+        assert!((bf16_to_f32(0xbf80) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mxfp4_e127_nibble1_is_half() {
+        // e=127 → 1.0, HALF → 0.5; nibble 1 → codebook 1 → 0.5
+        let mut block = vec![0u8; MXFP4_BLOCK_BYTES];
+        block[0] = 127;
+        block[1] = 0x01;
+        let mut out = vec![0.0f32; MXFP4_BLOCK_ELEMS];
+        dequant_mxfp4(&block, MXFP4_BLOCK_ELEMS, &mut out).unwrap();
+        assert!((out[0] - 0.5).abs() < 1e-6, "lane0={}", out[0]);
+        assert_eq!(out[1], 0.0);
+        assert_eq!(out[16], 0.0);
+    }
+
     #[test]
     fn rocmfp4_scale_decodes_ue4m3_half() {
         assert_eq!(rocmfp4_scale(0), 0.0);

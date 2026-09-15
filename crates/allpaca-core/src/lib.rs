@@ -4,15 +4,19 @@ mod anchors;
 mod batch_gemm;
 mod compute;
 mod constraint;
+mod deepseek4;
 pub mod deltanet;
 mod device_manager;
 mod direct_storage;
 mod draft;
+mod dspark;
+mod dsv4_gpu;
 mod early_exit;
 mod engine;
 mod expert_batch;
 mod forest;
 mod grammar;
+mod hf;
 mod kv_nvme;
 mod kv_radix;
 mod kv_tier;
@@ -42,6 +46,8 @@ pub use batch_gemm::{
     BatchGemmPlan, ModelShapeKey, PackedFfnWeights, PackedGemmWeight,
 };
 pub use compute::ComputeDev;
+#[doc(hidden)]
+pub use deepseek4::{write_tiny_deepseek4_gguf, write_tiny_deepseek4_packed_gguf};
 pub use device_manager::{detect_pipeline_mode, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{
@@ -62,7 +68,7 @@ pub use otel::export_otlp_json;
 pub use packed::{HostExpertPool, PackedStore};
 pub use scheduler::Scheduler;
 pub use telemetry::Metrics;
-pub use tokenizer::EngineTokenizer;
+pub use tokenizer::{format_chat_colon, format_chatml, EngineTokenizer};
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};
 pub use vision::PatchVisionEncoder;
 pub use weight_set::{
