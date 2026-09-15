@@ -125,6 +125,40 @@ fn cuda_synthetic_hybrid_attention_generate_uses_device_when_present() {
 }
 
 #[test]
+fn cuda_synthetic_ssm_hybrid_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_synthetic();
+    cfg.model.synthetic = false;
+    let engine = Engine::new(cfg).expect("engine");
+    let seed = 7u64;
+    engine
+        .load_tiny_model(
+            allpaca_core::TinyModel::synthetic_ssm_hybrid(seed, "synthetic-ssm-hybrid"),
+            "synthetic-ssm-hybrid",
+        )
+        .expect("load ssm hybrid");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "SSM hybrid attention/FFN weights must upload"
+    );
+    let out = engine
+        .generate("hi", greedy(2))
+        .expect("ssm hybrid generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA SSM hybrid forwards, got gpu={} target={} (CPU fallback?)",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
+
+#[test]
 fn cuda_absent_falls_back_to_cpu_cleanly() {
     if cuda_device_available() {
         return;

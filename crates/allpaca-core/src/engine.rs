@@ -810,11 +810,21 @@ impl Engine {
     }
 
     pub fn load_synthetic(&self, cfg: ModelConfig) -> Result<(), AllpacaError> {
+        let seed = self.config.engine.determinism_seed.unwrap_or(42);
+        let vocab = cfg.vocab_size;
+        let layers = cfg.n_layers;
+        let target = TinyModel::synthetic(cfg, seed, "synthetic");
+        self.load_tiny_model(target, "synthetic")?;
+        tracing::info!(vocab, layers, "loaded synthetic model");
+        Ok(())
+    }
+
+    /// Load a host-ready TinyModel (tests / synthetic variants).
+    pub fn load_tiny_model(&self, mut target: TinyModel, model_id: &str) -> Result<(), AllpacaError> {
         let mut inner = self.lock()?;
         let seed = self.config.engine.determinism_seed.unwrap_or(42);
-        let tokenizer = EngineTokenizer::synthetic(cfg.vocab_size)?;
-        inner.ring.resize_vocab(cfg.vocab_size);
-        let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
+        let tokenizer = EngineTokenizer::synthetic(target.config.vocab_size)?;
+        inner.ring.resize_vocab(target.config.vocab_size);
         self.apply_weight_working_set(&mut target)?;
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target)?;
@@ -830,15 +840,10 @@ impl Engine {
             inner.draft_model = Some(Arc::new(draft));
         }
         set_tokenizer(&mut inner, tokenizer);
-        inner.model_id = "synthetic".into();
+        inner.model_id = model_id.into();
         drop(inner);
         self.upload_resident_weights()?;
         self.note_early_exit_gate()?;
-        tracing::info!(
-            vocab = cfg.vocab_size,
-            layers = cfg.n_layers,
-            "loaded synthetic model"
-        );
         Ok(())
     }
 
@@ -2843,6 +2848,7 @@ impl Engine {
                                     cuda,
                                     cres,
                                     soft,
+                                    recurrent.as_mut(),
                                 ) {
                                     Ok(()) => used = true,
                                     Err(e) => {
@@ -4706,6 +4712,7 @@ fn append_and_forward(
                         cuda,
                         cres,
                         None,
+                        recurrent.as_mut(),
                     ) {
                         Ok(()) => used = true,
                         Err(e) => {

@@ -207,6 +207,15 @@ impl ModelConfig {
         }
     }
 
+    /// Attention + Mamba-2 SSM hybrid (layer 0 attn, layer 1 SSM).
+    pub fn tiny_ssm_hybrid() -> Self {
+        Self {
+            recurrent: true,
+            n_layers: 2,
+            ..Self::tiny()
+        }
+    }
+
     pub fn draft_tiny() -> Self {
         Self {
             n_layers: 1,
@@ -3496,6 +3505,57 @@ impl TinyModel {
             edge0: None,
             mla_cache: None,
         }
+    }
+
+    /// Tiny attention + host Mamba-2 SSM hybrid for CUDA/CPU decode tests.
+    pub fn synthetic_ssm_hybrid(seed: u64, name: impl Into<String>) -> Self {
+        let cfg = ModelConfig::tiny_ssm_hybrid();
+        let mut model = Self::synthetic(cfg, seed, name);
+        let dim = model.config.dim;
+        let dims = Mamba2Dims::new(dim, dim, 4, 4, 2, 4).expect("tiny SSM dims");
+        let mut rng = Lcg::new(seed.wrapping_add(0x5a11));
+        let scale = 0.05f32;
+        let mut scale_vec = |n: usize| {
+            rng.vec(n)
+                .into_iter()
+                .map(|v| v * scale)
+                .collect::<Vec<_>>()
+        };
+        model.layers[1] = LayerWeights {
+            block: HybridLayerKind::Ssm,
+            ssm: Some(SsmLayerWeights {
+                dims,
+                w_in: scale_vec(dims.in_proj_dim * dim),
+                w_out: scale_vec(dim * dims.d_inner),
+                a: vec![-1.0; dims.n_heads],
+                d_skip: vec![0.25; dims.n_heads],
+                dt_bias: vec![0.0; dims.n_heads],
+                conv1d: scale_vec(dims.conv_dim * dims.conv_kernel),
+                conv_bias: vec![0.0; dims.conv_dim],
+                norm: ones(dims.d_inner),
+            }),
+            gdn: None,
+            mla: None,
+            attn_norm: ones(dim),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            wq: Vec::new(),
+            wk: Vec::new(),
+            wv: Vec::new(),
+            wo: Vec::new(),
+            ffn_norm: ones(dim),
+            w_gate: scale_vec(model.config.ff_dim * dim),
+            w_up: scale_vec(model.config.ff_dim * dim),
+            w_down: scale_vec(dim * model.config.ff_dim),
+            w_router: Vec::new(),
+            experts: Vec::new(),
+            shared_expert: LayerFfn::default(),
+            expert_bias: Vec::new(),
+            attn_out_gate: Vec::new(),
+            attn_post_norm: Vec::new(),
+            ffn_post_norm: Vec::new(),
+        };
+        model
     }
 
     pub fn host_weights_ready(&self) -> bool {
