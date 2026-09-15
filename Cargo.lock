@@ -118,6 +118,7 @@ name = "allpaca-rpc"
 version = "0.1.0"
 dependencies = [
  "allpaca-cpu",
+ "allpaca-cuda",
  "allpaca-hip",
  "allpaca-types",
  "thiserror",
@@ -129,6 +130,7 @@ name = "allpaca-rpc-server"
 version = "0.1.0"
 dependencies = [
  "allpaca-core",
+ "allpaca-cuda",
  "allpaca-hip",
  "allpaca-rpc",
  "allpaca-types",
