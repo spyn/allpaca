@@ -167,7 +167,36 @@ pub fn attention(
     head_dim: usize,
     causal: bool,
 ) -> Result<(), AllpacaError> {
-    if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+    attention_softcap(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, 0.0,
+    )
+}
+
+#[inline]
+fn softcap_score(score: f32, softcap: f32) -> f32 {
+    if softcap <= 0.0 || !score.is_finite() {
+        score
+    } else {
+        (score / softcap).tanh() * softcap
+    }
+}
+
+/// Like [`attention`], with optional Gemma-style logit softcapping (`0` = off).
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attention_softcap(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    softcap: f32,
+) -> Result<(), AllpacaError> {
+    if n_heads == 0 || n_kv_heads == 0 || !n_heads.is_multiple_of(n_kv_heads) {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "invalid attention head configuration".into(),
         )));
@@ -197,7 +226,7 @@ pub fn attention(
                 for d in 0..head_dim {
                     dot += qh[d] * k[k_off + d];
                 }
-                scores[t] = dot * scale;
+                scores[t] = softcap_score(dot * scale, softcap);
             }
             softmax_in_place(&mut scores);
             let o_off = (qi * n_heads + h) * head_dim;
@@ -233,7 +262,26 @@ pub fn attention_with_mask(
     head_dim: usize,
     mask: &[bool],
 ) -> Result<(), AllpacaError> {
-    if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+    attention_with_mask_softcap(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, mask, 0.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attention_with_mask_softcap(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    mask: &[bool],
+    softcap: f32,
+) -> Result<(), AllpacaError> {
+    if n_heads == 0 || n_kv_heads == 0 || !n_heads.is_multiple_of(n_kv_heads) {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "invalid attention head configuration".into(),
         )));
@@ -268,7 +316,7 @@ pub fn attention_with_mask(
                 for d in 0..head_dim {
                     dot += qh[d] * k[k_off + d];
                 }
-                scores[t] = dot * scale;
+                scores[t] = softcap_score(dot * scale, softcap);
             }
             softmax_in_place(&mut scores);
             let o_off = (qi * n_heads + h) * head_dim;
@@ -523,6 +571,23 @@ fn softmax_in_place(x: &mut [f32]) {
 
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// Exact GELU via erf (Spark2_5 FFN).
+pub fn gelu(x: f32) -> f32 {
+    0.5 * x * (1.0 + erf_approx(x * std::f32::consts::FRAC_1_SQRT_2))
+}
+
+fn erf_approx(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    sign * y
 }
 
 pub const Q4_0_BLOCK_ELEMS: usize = 32;

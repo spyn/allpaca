@@ -12,6 +12,7 @@ mod draft;
 mod dspark;
 mod dsv4_gpu;
 mod early_exit;
+pub mod edge0;
 mod engine;
 mod expert_batch;
 mod forest;
@@ -40,10 +41,11 @@ mod vision;
 mod weight_set;
 
 pub use batch_gemm::{
-    apply_packed_ffn, apply_packed_lm_head, batch_gemm_other_ids, decode_layer_shared_a_weights,
-    packed_ffn_shared_a, packed_gemm_nt, packed_gemm_nt_cpu, packed_gemm_nt_hip,
-    packed_gemm_nt_hip_diagnostic, plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase,
-    BatchGemmPlan, ModelShapeKey, PackedFfnWeights, PackedGemmWeight,
+    apply_packed_ffn, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
+    decode_layer_attn_shared_a_weights, decode_layer_shared_a_weights, packed_ffn_shared_a,
+    packed_gemm_nt, packed_gemm_nt_cpu, packed_gemm_nt_hip, packed_gemm_nt_hip_diagnostic,
+    plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    PackedFfnWeights, PackedGemmWeight,
 };
 pub use compute::ComputeDev;
 #[doc(hidden)]
@@ -53,6 +55,10 @@ pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{
     accept_exit, has_calibration_data, spec_from_gguf, spec_from_metadata, EarlyExitSpec,
     ExitPrediction,
+};
+pub use edge0::{
+    detect_edge0_dir, load_edge0_dir, Edge0LoadOptions, Edge0Loaded, Edge0Tier, MoESpec,
+    RecoverLora, RouterKind,
 };
 pub use engine::{mtp_text_is_garbled, Engine, RequestHandle};
 pub use kv_tier::KvTierManager;

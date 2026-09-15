@@ -3363,6 +3363,17 @@ __global__ void silu_mul_kernel(float *gate, const float *up, int n) {
     gate[idx] = (g / (1.0f + expf(-g))) * up[idx];
 }
 
+__global__ void gelu_mul_kernel(float *gate, const float *up, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    const float g = gate[idx];
+    /* Exact GELU via erff — matches allpaca-cpu::gelu. */
+    const float gelu = 0.5f * g * (1.0f + erff(g * 0.7071067811865476f));
+    gate[idx] = gelu * up[idx];
+}
+
 __global__ void relu_sqr_kernel(float *x, int n) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= n) {
@@ -3370,6 +3381,21 @@ __global__ void relu_sqr_kernel(float *x, int n) {
     }
     const float v = x[idx];
     x[idx] = v > 0.0f ? v * v : 0.0f;
+}
+
+__global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok,
+                                           int n_heads, int head_dim) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int n = n_tok * n_heads * head_dim;
+    if (idx >= n) {
+        return;
+    }
+    const int head_elems = n_heads * head_dim;
+    const int tok = idx / head_elems;
+    const int within = idx % head_elems;
+    const int h = within / head_dim;
+    const float s = scores[tok * n_heads + h];
+    attn[idx] *= 1.0f / (1.0f + expf(-s));
 }
 
 __global__ void deinterleave_q_gate_kernel(const float *q_full, float *q, float *gate, int n_heads,
@@ -3806,6 +3832,18 @@ extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca
     return hip_status(hipGetLastError());
 }
 
+extern "C" int allpaca_gelu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream) {
+    if (!gate || !up || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(gelu_mul_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_relu_sqr(float *x, int32_t n, allpaca_stream_t stream) {
     if (!x || n <= 0) {
         return ALLPACA_ERR_INVALID;
@@ -3844,6 +3882,22 @@ extern "C" int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n,
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(sigmoid_mul_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, gate, n);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
+                                           int32_t n_heads, int32_t head_dim,
+                                           allpaca_stream_t stream) {
+    if (!attn || !scores || n_tok <= 0 || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int n = n_tok * n_heads * head_dim;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(scale_heads_sigmoid_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), attn, scores,
+                       n_tok, n_heads, head_dim);
     return hip_status(hipGetLastError());
 }
 
@@ -4471,6 +4525,10 @@ extern "C" int allpaca_silu_mul(float *, const float *, int32_t, allpaca_stream_
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gelu_mul(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_relu_sqr(float *, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
@@ -4481,6 +4539,11 @@ extern "C" int allpaca_deinterleave_q_gate(const float *, float *, float *, int3
 }
 
 extern "C" int allpaca_sigmoid_mul(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scale_heads_sigmoid(float *, const float *, int32_t, int32_t, int32_t,
+                                           allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
