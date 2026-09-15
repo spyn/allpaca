@@ -50,6 +50,12 @@ pub struct Cli {
     /// Comma-separated relative layer split weights (local target, then RPC).
     #[arg(long)]
     pub tensor_split: Option<String>,
+    /// Edge0: disable Recover-LoRA.
+    #[arg(long)]
+    pub no_lora: bool,
+    /// Edge0: disable prerouter (reactive expert fill).
+    #[arg(long)]
+    pub no_prerouter: bool,
 }
 
 impl Cli {
@@ -85,6 +91,8 @@ impl Cli {
             json_mode: self.json_mode,
             rpc_endpoints: self.rpc.as_deref().and_then(parse_csv_nonempty),
             tensor_split: self.tensor_split.as_deref().and_then(parse_csv_nonempty),
+            edge0_no_lora: self.no_lora,
+            edge0_no_prerouter: self.no_prerouter,
         }
     }
 }

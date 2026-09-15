@@ -219,6 +219,9 @@ int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float
 
 int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
 
+/* Spark2_5 FFN: gate[i] = gelu(gate[i]) * up[i] (erf GELU). */
+int allpaca_gelu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
+
 /* x[i] = relu(x[i])^2 in place (Nemotron Lightning / DeepSeek gate-less MoE). */
 int allpaca_relu_sqr(float *x, int32_t n, allpaca_stream_t stream);
 
@@ -228,6 +231,10 @@ int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int3
 
 /* x[i] *= sigmoid(gate[i]) in place. */
 int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_stream_t stream);
+
+/* Spark2_5 head-wise gate: attn[tok,h,:] *= sigmoid(scores[tok,h]). */
+int allpaca_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok, int32_t n_heads,
+                                int32_t head_dim, allpaca_stream_t stream);
 
 /* Per-head RMSNorm: x is [n_heads, head_dim], weight is [head_dim]. */
 int allpaca_rmsnorm_heads(float *x, const float *weight, int32_t n_heads, int32_t head_dim,

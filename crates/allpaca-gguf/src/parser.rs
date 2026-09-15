@@ -663,10 +663,16 @@ impl GgufFile {
                 | "mixtral"
                 | "qwen2"
                 | "qwen2moe"
+                | "qwen3"
+                | "qwen3moe"
                 | "qwen35"
                 | "phi3"
                 | "minicpm"
                 | "nemotron_h_moe"
+                | "spark2_5"
+                | "gemma2"
+                | "gemma3"
+                | "deepseek2"
                 | "deepseek4"
                 | "deepseek_v4"
                 | "dflash"
@@ -2316,6 +2322,91 @@ mod tests {
                     eprintln!("  type {id} count={n} sample={hit:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn compat_report_recognizes_spark2_5_architecture() {
+        let path = std::env::temp_dir().join("allpaca_spark2_5_arch.gguf");
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("spark2_5".into()),
+        );
+        meta.insert("spark2_5.block_count".into(), GgufValue::Uint32(4));
+        meta.insert("spark2_5.embedding_length".into(), GgufValue::Uint32(32));
+        meta.insert(
+            "spark2_5.attention.head_count".into(),
+            GgufValue::Uint32(4),
+        );
+        write_gguf(&path, &meta, &[]).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let report = file.compat_report();
+        assert_eq!(report.architecture, "spark2_5");
+        if let Some(reason) = &report.reject_reason {
+            assert!(
+                !reason.contains("outside the Llama-layout loader"),
+                "{reason}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compat_report_recognizes_qwen3_and_qwen3moe() {
+        for arch in ["qwen3", "qwen3moe"] {
+            let path = std::env::temp_dir().join(format!("allpaca_{arch}_arch.gguf"));
+            let mut meta = HashMap::new();
+            meta.insert(
+                "general.architecture".into(),
+                GgufValue::String(arch.into()),
+            );
+            meta.insert(format!("{arch}.block_count"), GgufValue::Uint32(4));
+            meta.insert(format!("{arch}.embedding_length"), GgufValue::Uint32(32));
+            meta.insert(
+                format!("{arch}.attention.head_count"),
+                GgufValue::Uint32(4),
+            );
+            write_gguf(&path, &meta, &[]).unwrap();
+            let file = GgufFile::open(&path).unwrap();
+            let report = file.compat_report();
+            assert_eq!(report.architecture, arch);
+            if let Some(reason) = &report.reject_reason {
+                assert!(
+                    !reason.contains("outside the Llama-layout loader"),
+                    "{arch}: {reason}"
+                );
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn compat_report_recognizes_gemma_and_deepseek2() {
+        for arch in ["gemma2", "gemma3", "deepseek2"] {
+            let path = std::env::temp_dir().join(format!("allpaca_{arch}_arch.gguf"));
+            let mut meta = HashMap::new();
+            meta.insert(
+                "general.architecture".into(),
+                GgufValue::String(arch.into()),
+            );
+            meta.insert(format!("{arch}.block_count"), GgufValue::Uint32(4));
+            meta.insert(format!("{arch}.embedding_length"), GgufValue::Uint32(32));
+            meta.insert(
+                format!("{arch}.attention.head_count"),
+                GgufValue::Uint32(4),
+            );
+            write_gguf(&path, &meta, &[]).unwrap();
+            let file = GgufFile::open(&path).unwrap();
+            let report = file.compat_report();
+            assert_eq!(report.architecture, arch);
+            if let Some(reason) = &report.reject_reason {
+                assert!(
+                    !reason.contains("outside the Llama-layout loader"),
+                    "{arch}: {reason}"
+                );
+            }
+            let _ = std::fs::remove_file(path);
         }
     }
 

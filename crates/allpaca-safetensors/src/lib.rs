@@ -14,7 +14,8 @@ pub use catalog::{
 pub use names::{aliases, WeightKey};
 pub use parser::{SafetensorsDtype, SafetensorsFile, TensorInfo, SAFETENSORS_MAX_HEADER};
 pub use sidecar::{
-    load_hf_config, load_tokenizer_sidecar, load_vocab_sidecar, resolve_sidecar, HfConfig,
+    load_hf_config, load_tokenizer_sidecar, load_vocab_sidecar, resolve_sidecar,
+    EffectiveTextConfig, HfConfig, HfQuantOverride, HfRopeParameters, HfTextConfig,
     SidecarTokenizer, VocabSidecar,
 };
 pub use writer::{write_safetensors, SafetensorsWriteTensor};

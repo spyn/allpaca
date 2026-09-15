@@ -123,6 +123,12 @@ impl Config {
         if cli.synthetic {
             self.model.synthetic = true;
         }
+        if cli.edge0_no_lora {
+            self.model.edge0_no_lora = true;
+        }
+        if cli.edge0_no_prerouter {
+            self.model.edge0_no_prerouter = true;
+        }
         if let Some(json) = cli.json_mode {
             self.structured_output.json_mode = json;
         }
@@ -516,6 +522,12 @@ pub struct ModelSection {
     pub hf_revision: Option<String>,
     pub synthetic: bool,
     pub id: String,
+    /// Edge0: skip Recover-LoRA install.
+    #[serde(default)]
+    pub edge0_no_lora: bool,
+    /// Edge0: skip prerouter install (reactive expert fill only).
+    #[serde(default)]
+    pub edge0_no_prerouter: bool,
 }
 
 impl Default for ModelSection {
@@ -528,6 +540,8 @@ impl Default for ModelSection {
             hf_revision: None,
             synthetic: false,
             id: "allpaca".into(),
+            edge0_no_lora: false,
+            edge0_no_prerouter: false,
         }
     }
 }
@@ -624,6 +638,8 @@ pub struct CliOverrides {
     pub rpc_endpoints: Option<Vec<String>>,
     /// Comma-separated relative layer weights (same order as local target + RPC).
     pub tensor_split: Option<Vec<String>>,
+    pub edge0_no_lora: bool,
+    pub edge0_no_prerouter: bool,
 }
 
 #[cfg(test)]
