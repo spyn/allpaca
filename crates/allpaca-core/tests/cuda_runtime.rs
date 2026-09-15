@@ -44,32 +44,24 @@ fn cuda_gguf(path: PathBuf) -> Config {
     cfg
 }
 
-/// Tiny llama-family F32 GGUF (dim=8, vocab=4, 1 layer). Host-materializes so
-/// `CudaResidentModel::upload` can run without packed CUDA quant GEMM.
-fn write_tiny_f32_gguf(path: &Path) {
-    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+fn tiny_llama_meta() -> std::collections::HashMap<String, allpaca_gguf::GgufValue> {
+    use allpaca_gguf::GgufValue;
     use std::collections::HashMap;
 
-    let dim = 8usize;
-    let vocab = 4usize;
-    let ff = 16usize;
+    let dim = 8u32;
+    let vocab = 4u32;
+    let ff = 16u32;
     let mut meta = HashMap::new();
     meta.insert(
         "general.architecture".into(),
         GgufValue::String("llama".into()),
     );
-    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
-    meta.insert(
-        "llama.embedding_length".into(),
-        GgufValue::Uint32(dim as u32),
-    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab));
+    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim));
     meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
     meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
     meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
-    meta.insert(
-        "llama.feed_forward_length".into(),
-        GgufValue::Uint32(ff as u32),
-    );
+    meta.insert("llama.feed_forward_length".into(), GgufValue::Uint32(ff));
     meta.insert(
         "tokenizer.ggml.model".into(),
         GgufValue::String("wordlevel".into()),
@@ -85,6 +77,18 @@ fn write_tiny_f32_gguf(path: &Path) {
     );
     meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
     meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    meta
+}
+
+/// Tiny llama-family F32 GGUF (dim=8, vocab=4, 1 layer). Host-materializes so
+/// `CudaResidentModel::upload` can run without packed CUDA quant GEMM.
+fn write_tiny_f32_gguf(path: &Path) {
+    use allpaca_gguf::{write_gguf, GgufWriteTensor};
+
+    let dim = 8usize;
+    let vocab = 4usize;
+    let ff = 16usize;
+    let meta = tiny_llama_meta();
     let owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
         (
             "token_embd.weight".into(),
@@ -151,6 +155,101 @@ fn write_tiny_f32_gguf(path: &Path) {
         })
         .collect();
     write_gguf(path, &meta, &views).expect("write tiny F32 GGUF");
+}
+
+/// Tiny Q4_K GGUF. Host dequants under `HOST_F32_LIMIT`, then CUDA F32 upload.
+fn write_tiny_q4k_gguf(path: &Path) {
+    use allpaca_gguf::{
+        quantize_q4_k, write_gguf_quant, GgmlType, GgufWriteQuantTensor, GgufWriteTensor,
+    };
+
+    let dim = 8usize;
+    let vocab = 4usize;
+    let ff = 16usize;
+    let meta = tiny_llama_meta();
+    let embd_q = quantize_q4_k(&vec![0.01f32; vocab * dim]);
+    let q_q = quantize_q4_k(&vec![0.01f32; dim * dim]);
+    let k_q = quantize_q4_k(&vec![0.01f32; 2 * dim]);
+    let v_q = quantize_q4_k(&vec![0.01f32; 2 * dim]);
+    let o_q = quantize_q4_k(&vec![0.01f32; dim * dim]);
+    let gate_q = quantize_q4_k(&vec![0.01f32; ff * dim]);
+    let up_q = quantize_q4_k(&vec![0.01f32; ff * dim]);
+    let down_q = quantize_q4_k(&vec![0.01f32; dim * ff]);
+    let attn_norm = vec![1.0f32; dim];
+    let ffn_norm = vec![1.0f32; dim];
+    let output_norm = vec![1.0f32; dim];
+    write_gguf_quant(
+        path,
+        &meta,
+        &[
+            GgufWriteTensor {
+                name: "blk.0.attn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &attn_norm,
+            },
+            GgufWriteTensor {
+                name: "blk.0.ffn_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &ffn_norm,
+            },
+            GgufWriteTensor {
+                name: "output_norm.weight".into(),
+                dims: vec![dim as u64],
+                data: &output_norm,
+            },
+        ],
+        &[
+            GgufWriteQuantTensor {
+                name: "token_embd.weight".into(),
+                dims: vec![vocab as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &embd_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_q.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &q_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_k.weight".into(),
+                dims: vec![2, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &k_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_v.weight".into(),
+                dims: vec![2, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &v_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.attn_output.weight".into(),
+                dims: vec![dim as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &o_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_gate.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &gate_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                dims: vec![ff as u64, dim as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &up_q,
+            },
+            GgufWriteQuantTensor {
+                name: "blk.0.ffn_down.weight".into(),
+                dims: vec![dim as u64, ff as u64],
+                ggml_type: GgmlType::Q4_K,
+                bytes: &down_q,
+            },
+        ],
+    )
+    .expect("write tiny Q4_K GGUF");
 }
 
 #[test]
@@ -376,4 +475,77 @@ fn cuda_tiny_f32_gguf_absent_falls_back_to_cpu() {
     assert_eq!(stats.backend, "cpu");
     assert_eq!(stats.gpu_forwards, 0);
     assert_eq!(stats.weight_h2d_bytes, 0);
+}
+
+#[test]
+fn cuda_tiny_q4k_gguf_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_cuda_tiny_q4k.gguf");
+    write_tiny_q4k_gguf(&path);
+    let engine = match Engine::new(cuda_gguf(path.clone())) {
+        Ok(e) if e.stats().backend == "cuda" => e,
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            panic!("tiny Q4_K GGUF must load on CUDA: {e}");
+        }
+    };
+    let before = engine.stats();
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "Q4_K GGUF should host-dequant and upload; stats={before:?}"
+    );
+    let h2d_after_load = before.weight_h2d_bytes;
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("tiny Q4_K CUDA generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA Q4_K forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    assert_eq!(
+        stats.weight_h2d_bytes, h2d_after_load,
+        "weight_h2d must not grow during Q4_K generate"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cuda_tiny_q4k_gguf_matches_cpu_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_cuda_tiny_q4k_match.gguf");
+    write_tiny_q4k_gguf(&path);
+    let mut cpu_cfg = cuda_gguf(path.clone());
+    cpu_cfg.engine.cpu_only = true;
+    cpu_cfg.engine.gpu_backend = "cpu".into();
+    let cpu = Engine::new(cpu_cfg).expect("cpu q4k engine");
+    let want = cpu.generate("hello", greedy(4)).expect("cpu generate");
+    let gpu = match Engine::new(cuda_gguf(path.clone())) {
+        Ok(e) if e.stats().backend == "cuda" => e,
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            panic!("tiny Q4_K GGUF must load on CUDA: {e}");
+        }
+    };
+    let got = gpu.generate("hello", greedy(4)).expect("cuda generate");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        got.token_ids, want.token_ids,
+        "CUDA Q4_K GGUF greedy tokens must match CPU"
+    );
 }
