@@ -573,6 +573,34 @@ pub fn residual_add_rows(
     Ok(())
 }
 
+/// Copy packed residual rows (`x+WO+FFN`) into decode-hidden buffers.
+///
+/// Lengths must match. Used after packed lm_head has already consumed the
+/// original `output_norm` rows.
+pub fn write_residual_into_hidden(
+    hidden_rows: &mut [&mut [f32]],
+    fused_rows: &[&[f32]],
+) -> Result<usize, AllpacaError> {
+    if hidden_rows.len() != fused_rows.len() {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "write_residual_into_hidden: row count mismatch".into(),
+        )));
+    }
+    let mut n = 0usize;
+    for (i, (dst, src)) in hidden_rows.iter_mut().zip(fused_rows.iter()).enumerate() {
+        if dst.len() != src.len() {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "write_residual_into_hidden: row {i} len {} != {}",
+                dst.len(),
+                src.len()
+            ))));
+        }
+        dst.copy_from_slice(src);
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Packed FFN on HIP: gate/up `gemm_nt` → `silu_mul` → `w_down` `gemm_nt`.
 ///
 /// Returns the number of HIP GEMM kernels launched (3 on full success).
@@ -1040,6 +1068,13 @@ mod tests {
             assert!((x0[i] - (a0[i] + c0[i])).abs() < 1e-6, "residual x0[{i}]");
             assert!((x1[i] - (a1[i] + c1[i])).abs() < 1e-6, "residual x1[{i}]");
         }
+        let mut h0 = [9.0f32; 4];
+        let mut h1 = [8.0f32; 4];
+        let n = write_residual_into_hidden(&mut [&mut h0[..], &mut h1[..]], &[&x0[..], &x1[..]])
+            .expect("write hidden");
+        assert_eq!(n, 2);
+        assert_eq!(h0, x0);
+        assert_eq!(h1, x1);
     }
 
     #[test]

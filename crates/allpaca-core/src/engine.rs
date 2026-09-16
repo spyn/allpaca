@@ -20,7 +20,7 @@ use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
 use crate::batch_gemm::{
     apply_packed_attn_hip, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
     decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, residual_add_rows,
-    BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    write_residual_into_hidden, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
 };
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
@@ -78,7 +78,8 @@ struct ActiveRequest {
     decode_step: u64,
     /// Last MoE router input (FFN RMSNorm) from the most recent decode forward.
     moe_norm: Vec<f32>,
-    /// Target `output_norm` hidden for MTP draft `h_nextn` handoff.
+    /// Target hidden: `output_norm` after decode; packed HIP residual may
+    /// overwrite with `x+WO+FFN` when MTP is off (`h_nextn` stays `output_norm`).
     last_hidden: Vec<f32>,
     /// `last_hidden` was written by the most recent decode forward.
     last_hidden_fresh: bool,
@@ -2232,7 +2233,8 @@ impl Engine {
                     let m = batch_gemm_plan.as_ref().map(|p| p.m_tokens).unwrap_or(0);
                     if m >= 2 {
                         if let Some(plan) = batch_gemm_plan.as_ref() {
-                            let (launched, applied) = self.try_packed_batch_gemm_hip(hip, plan);
+                            let (launched, applied, hidden) =
+                                self.try_packed_batch_gemm_hip(hip, plan);
                             if launched > 0 {
                                 self.metrics
                                     .batch_gemm_hip_kernels
@@ -2244,6 +2246,12 @@ impl Engine {
                                     .fetch_add(applied, std::sync::atomic::Ordering::Relaxed);
                             } else {
                                 self.fallback_deferred_lm_head(plan);
+                            }
+                            if hidden > 0 {
+                                self.metrics.batch_gemm_residual_hidden.fetch_add(
+                                    hidden,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                             self.clear_cohort_defer_lm_head(plan);
                         }
@@ -2344,17 +2352,17 @@ impl Engine {
         }
     }
 
-    /// Packed HIP attn (Q/K/V C → attention → WO residual into FFN A) + FFN + lm_head.
-    ///
-    /// Returns `(kernels_launched, applied)` where `applied` is 1 when packed
-    /// lm_head logits were written into at least one Request's `pending_logits`
-    /// (consumed by the next sample). Only uses fresh `output_norm` rows.
-    fn try_packed_batch_gemm_hip(&self, hip: &HipWorkspace, plan: &BatchGemmPlan) -> (u64, u64) {
+    /// Returns `(kernels_launched, applied, residual_hidden)` where `applied`
+    /// is 1 when packed lm_head logits were written into at least one Request's
+    /// `pending_logits` (consumed by the next sample). Only uses fresh
+    /// `output_norm` rows for lm_head. `residual_hidden` counts Requests whose
+    /// `last_hidden` was overwritten with the packed `x+WO+FFN` stream.
+    fn try_packed_batch_gemm_hip(&self, hip: &HipWorkspace, plan: &BatchGemmPlan) -> (u64, u64, u64) {
         let Ok(inner) = self.lock() else {
-            return (0, 0);
+            return (0, 0, 0);
         };
         let Some(target) = inner.target.clone() else {
-            return (0, 0);
+            return (0, 0, 0);
         };
         let dim = target.config.dim;
         let vocab = target.config.vocab_size;
@@ -2362,7 +2370,7 @@ impl Engine {
         let n_kv_heads = target.config.n_kv_heads.max(1);
         let head_dim = target.config.head_dim();
         if dim == 0 || plan.request_ids.len() < 2 {
-            return (0, 0);
+            return (0, 0, 0);
         }
         let attn_w = target.layers.first().map(|layer| {
             (
@@ -2403,7 +2411,7 @@ impl Engine {
             .as_ref()
             .is_some_and(|(g, u, d)| !g.is_empty() && !u.is_empty() && !d.is_empty());
         if weights.is_empty() && !has_ffn && lm_head.is_none() {
-            return (0, 0);
+            return (0, 0, 0);
         }
         let mut apply_ids: Vec<u64> = Vec::new();
         let mut a_rows: Vec<Vec<f32>> = Vec::new();
@@ -2418,7 +2426,7 @@ impl Engine {
         }
         drop(inner);
         if a_rows.len() < 2 {
-            return (0, 0);
+            return (0, 0, 0);
         }
 
         let a_refs: Vec<&[f32]> = a_rows.iter().map(|v| v.as_slice()).collect();
@@ -2494,6 +2502,7 @@ impl Engine {
         }
 
         let mut applied = 0u64;
+        let mut hidden_writes = 0u64;
         if let Some((b, n, k)) = lm_head {
             let mut c_rows: Vec<Vec<f32>> = a_rows
                 .iter()
@@ -2522,11 +2531,29 @@ impl Engine {
                     }
                     if wrote {
                         applied = 1;
+                        // lm_head already consumed `a_rows` (`output_norm`). Persist
+                        // fused `x+WO+FFN` into decode hidden unless MTP needs
+                        // the original output_norm for `h_nextn`.
+                        if !mtp_draft_active(&inner) {
+                            for (i, &rid) in apply_ids.iter().enumerate() {
+                                let Some(req) = inner.active.get_mut(&rid) else {
+                                    continue;
+                                };
+                                if write_residual_into_hidden(
+                                    &mut [req.last_hidden.as_mut_slice()],
+                                    &[fused_rows[i].as_slice()],
+                                )
+                                .is_ok()
+                                {
+                                    hidden_writes += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        (launched, applied)
+        (launched, applied, hidden_writes)
     }
 
     fn step_id(&self, id: u64) -> Result<StepResult, AllpacaError> {
@@ -6865,6 +6892,10 @@ mod tests {
                     stats.batch_gemm_executes >= 1,
                     "HIP packed kernel implies soft execute; stats={stats:?}"
                 );
+                assert!(
+                    stats.batch_gemm_residual_hidden >= 1,
+                    "fused residual must land in last_hidden; stats={stats:?}"
+                );
                 drop(a);
                 drop(b);
                 return;
@@ -6878,6 +6909,10 @@ mod tests {
         assert!(
             stats.batch_gemm_hip_applied >= 1,
             "packed lm_head logits must be applied to pending_logits; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_residual_hidden >= 1,
+            "fused residual must land in last_hidden; stats={stats:?}"
         );
         drop(a);
         drop(b);
@@ -6924,6 +6959,10 @@ mod tests {
                     stats.batch_gemm_hip_kernels >= 1,
                     "applied implies at least one packed HIP kernel; stats={stats:?}"
                 );
+                assert!(
+                    stats.batch_gemm_residual_hidden >= 1,
+                    "applied must write fused residual into last_hidden; stats={stats:?}"
+                );
                 drop(a);
                 drop(b);
                 return;
@@ -6937,6 +6976,10 @@ mod tests {
         assert!(
             stats.batch_gemm_lm_head_skipped >= 1,
             "cohort decode must skip per-request lm_head; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_residual_hidden >= 1,
+            "packed residual must land in last_hidden; stats={stats:?}"
         );
         drop(a);
         drop(b);

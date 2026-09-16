@@ -207,6 +207,9 @@ pub struct StatsSnapshot {
     /// Per-request lm_head GEMMs skipped for a packed HIP decode cohort.
     #[serde(default)]
     pub batch_gemm_lm_head_skipped: u64,
+    /// Packed residual stream (`x+WO+FFN`) written into decode `last_hidden`.
+    #[serde(default)]
+    pub batch_gemm_residual_hidden: u64,
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,
