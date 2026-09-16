@@ -820,7 +820,11 @@ impl Engine {
     }
 
     /// Load a host-ready TinyModel (tests / synthetic variants).
-    pub fn load_tiny_model(&self, mut target: TinyModel, model_id: &str) -> Result<(), AllpacaError> {
+    pub fn load_tiny_model(
+        &self,
+        mut target: TinyModel,
+        model_id: &str,
+    ) -> Result<(), AllpacaError> {
         let mut inner = self.lock()?;
         let seed = self.config.engine.determinism_seed.unwrap_or(42);
         let tokenizer = EngineTokenizer::synthetic(target.config.vocab_size)?;
@@ -1073,11 +1077,8 @@ impl Engine {
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model)?;
-        let tokenizer = EngineTokenizer::from_vocab(
-            loaded.vocab_tokens,
-            loaded.bos_id,
-            loaded.eos_id,
-        )?;
+        let tokenizer =
+            EngineTokenizer::from_vocab(loaded.vocab_tokens, loaded.bos_id, loaded.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, tokenizer);
@@ -1410,7 +1411,8 @@ impl Engine {
             inner.target_cuda_resident = if self.hip.is_none() {
                 if let (Some(cuda), Some(target)) = (&self.cuda, target) {
                     let host_ready = target.host_weights_ready();
-                    let uploaded = if host_ready {
+                    let gdn_device = target.gdn_needs_device_projections();
+                    let uploaded = if host_ready && !gdn_device {
                         crate::CudaResidentModel::upload(&target, cuda.device)
                     } else if let Some(file) = target_gguf {
                         crate::CudaResidentModel::upload_gguf(file, &target.config, cuda.device)
@@ -1431,7 +1433,7 @@ impl Engine {
                             Some(Arc::new(resident))
                         }
                         Err(e) => {
-                            if !host_ready {
+                            if !host_ready || gdn_device {
                                 return Err(e);
                             }
                             tracing::warn!(

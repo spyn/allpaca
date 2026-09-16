@@ -33,6 +33,12 @@ struct CudaLayerOff {
     router_host: Vec<f32>,
     /// Per-expert `[w_gate, w_up, w_down]` when `n_experts > 0`.
     experts: Vec<[WeightRef; 3]>,
+    /// GDN projections (`attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_out`).
+    w_qkv: WeightRef,
+    w_z: WeightRef,
+    w_alpha: WeightRef,
+    w_beta: WeightRef,
+    w_ssm_out: WeightRef,
 }
 
 /// Device-resident weights for CUDA decode (embed + layers + experts + norm + lm_head).
@@ -48,7 +54,10 @@ pub struct CudaResidentModel {
 fn cuda_supports_blocks(model: &TinyModel) -> Result<(), AllpacaError> {
     for (i, layer) in model.layers.iter().enumerate() {
         match layer.block {
-            HybridLayerKind::Attention | HybridLayerKind::Ssm | HybridLayerKind::DenseFfn | HybridLayerKind::Moe => {}
+            HybridLayerKind::Attention
+            | HybridLayerKind::Ssm
+            | HybridLayerKind::DenseFfn
+            | HybridLayerKind::Moe => {}
             other => {
                 return Err(AllpacaError::Degraded(
                     allpaca_types::DegradedError::FeatureDisabled(format!(
@@ -63,10 +72,12 @@ fn cuda_supports_blocks(model: &TinyModel) -> Result<(), AllpacaError> {
             ))));
         }
         if let Some(gdn) = layer.gdn.as_ref() {
-            if gdn.w_qkv.is_empty() || gdn.w_out.is_empty() {
+            let host_qkv = !gdn.w_qkv.is_empty();
+            let host_out = !gdn.w_out.is_empty();
+            if host_qkv != host_out {
                 return Err(AllpacaError::Degraded(
                     allpaca_types::DegradedError::FeatureDisabled(
-                        "CUDA GDN needs host projection weights".into(),
+                        "CUDA GDN host projections incomplete".into(),
                     ),
                 ));
             }
@@ -100,6 +111,8 @@ impl CudaResidentModel {
                     push(&mut slices, &mut off, expert.w_down.as_slice()),
                 ]);
             }
+            let gdn = layer.gdn.as_ref();
+            let empty: &[f32] = &[];
             layers.push(CudaLayerOff {
                 attn_norm: push(&mut slices, &mut off, layer.attn_norm.as_slice()),
                 wq: push(&mut slices, &mut off, layer.wq.as_slice()),
@@ -112,6 +125,31 @@ impl CudaResidentModel {
                 w_down: push(&mut slices, &mut off, layer.w_down.as_slice()),
                 router_host: layer.w_router.clone(),
                 experts,
+                w_qkv: push(
+                    &mut slices,
+                    &mut off,
+                    gdn.map(|g| g.w_qkv.as_slice()).unwrap_or(empty),
+                ),
+                w_z: push(
+                    &mut slices,
+                    &mut off,
+                    gdn.map(|g| g.w_z.as_slice()).unwrap_or(empty),
+                ),
+                w_alpha: push(
+                    &mut slices,
+                    &mut off,
+                    gdn.map(|g| g.w_alpha.as_slice()).unwrap_or(empty),
+                ),
+                w_beta: push(
+                    &mut slices,
+                    &mut off,
+                    gdn.map(|g| g.w_beta.as_slice()).unwrap_or(empty),
+                ),
+                w_ssm_out: push(
+                    &mut slices,
+                    &mut off,
+                    gdn.map(|g| g.w_out.as_slice()).unwrap_or(empty),
+                ),
             });
         }
         let norm = push(&mut slices, &mut off, model.norm.as_slice());
@@ -135,34 +173,34 @@ impl CudaResidentModel {
         cfg: &ModelConfig,
         device: i32,
     ) -> Result<Self, AllpacaError> {
-        // Recurrent/SSM/GDN GGUFs upload attention (+ MoE) tensors; Mamba-2 / GDN
-        // extras stay on host (`GdnHostWeights` / `SsmLayerWeights`).
+        // Recurrent GGUFs upload attention (+ MoE + GDN projections). Mamba-2
+        // extras and GDN scalars/conv stay on host (`SsmLayerWeights` /
+        // `GdnHostWeights`).
 
         let mut owned: Vec<Vec<u8>> = Vec::new();
         let mut off = 0usize;
-        let mut push_bytes =
-            |owned: &mut Vec<Vec<u8>>,
-             off: &mut usize,
-             data: Vec<u8>,
-             kind: super::WeightKind,
-             n: usize|
-             -> WeightRef {
-                if data.is_empty() || n == 0 {
-                    return WeightRef::f32(0, 0);
-                }
-                if kind == super::WeightKind::Q8_0 && *off % allpaca_cuda::Q8_STAGED_BLOCK != 0 {
-                    let pad = allpaca_cuda::Q8_STAGED_BLOCK - (*off % allpaca_cuda::Q8_STAGED_BLOCK);
-                    owned.push(vec![0u8; pad]);
-                    *off += pad;
-                }
-                let o = *off;
-                *off += data.len();
-                owned.push(data);
-                match kind {
-                    super::WeightKind::Q8_0 => WeightRef::q8_0(o, n),
-                    _ => WeightRef::f32(o, n),
-                }
-            };
+        let push_bytes = |owned: &mut Vec<Vec<u8>>,
+                          off: &mut usize,
+                          data: Vec<u8>,
+                          kind: super::WeightKind,
+                          n: usize|
+         -> WeightRef {
+            if data.is_empty() || n == 0 {
+                return WeightRef::f32(0, 0);
+            }
+            if kind == super::WeightKind::Q8_0 && *off % allpaca_cuda::Q8_STAGED_BLOCK != 0 {
+                let pad = allpaca_cuda::Q8_STAGED_BLOCK - (*off % allpaca_cuda::Q8_STAGED_BLOCK);
+                owned.push(vec![0u8; pad]);
+                *off += pad;
+            }
+            let o = *off;
+            *off += data.len();
+            owned.push(data);
+            match kind {
+                super::WeightKind::Q8_0 => WeightRef::q8_0(o, n),
+                _ => WeightRef::f32(o, n),
+            }
+        };
         let take_tensor = |file: &allpaca_gguf::GgufFile,
                            name: &str,
                            gemv: bool|
@@ -227,19 +265,20 @@ impl CudaResidentModel {
                 take_tensor(file, name, gemv).map(Some)
             }
         };
-        let split_f32_experts = |w: WeightRef, n_experts: usize, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
-            if n_experts == 0 || w.n == 0 || w.n % n_experts != 0 {
-                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                    "CUDA {what} n={} not divisible by {n_experts}",
-                    w.n
-                ))));
-            }
-            let n_per = w.n / n_experts;
-            let stride = n_per.saturating_mul(4);
-            Ok((0..n_experts)
-                .map(|e| WeightRef::f32(w.off + e * stride, n_per))
-                .collect())
-        };
+        let split_f32_experts =
+            |w: WeightRef, n_experts: usize, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
+                if n_experts == 0 || w.n == 0 || w.n % n_experts != 0 {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "CUDA {what} n={} not divisible by {n_experts}",
+                        w.n
+                    ))));
+                }
+                let n_per = w.n / n_experts;
+                let stride = n_per.saturating_mul(4);
+                Ok((0..n_experts)
+                    .map(|e| WeightRef::f32(w.off + e * stride, n_per))
+                    .collect())
+            };
         let split_q8_staged_experts =
             |w: WeightRef, n_experts: usize, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
                 if n_experts == 0 || w.n == 0 || w.n % n_experts != 0 {
@@ -267,9 +306,8 @@ impl CudaResidentModel {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for local in 0..cfg.n_layers {
             let i = cfg.gguf_blk(local);
-            let take = |suffix: &str, gemv: bool| {
-                take_tensor(file, &format!("blk.{i}.{suffix}"), gemv)
-            };
+            let take =
+                |suffix: &str, gemv: bool| take_tensor(file, &format!("blk.{i}.{suffix}"), gemv);
             let (b, k, n) = take("attn_norm.weight", false)?;
             let attn_norm = push_bytes(&mut owned, &mut off, b, k, n);
             let gdn = file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some()
@@ -293,7 +331,9 @@ impl CudaResidentModel {
                 let wo = push_bytes(&mut owned, &mut off, b, k, n);
                 (wq, wk, wv, wo)
             };
-            let ffn_norm = if let Some((b, k, n)) = try_tensor(file, &format!("blk.{i}.ffn_norm.weight"), false)? {
+            let ffn_norm = if let Some((b, k, n)) =
+                try_tensor(file, &format!("blk.{i}.ffn_norm.weight"), false)?
+            {
                 push_bytes(&mut owned, &mut off, b, k, n)
             } else {
                 WeightRef::f32(0, 0)
@@ -307,7 +347,9 @@ impl CudaResidentModel {
                     || file
                         .tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
                         .is_some()
-                    || file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some());
+                    || file
+                        .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
+                        .is_some());
 
             let (w_gate, w_up, w_down, router_host, experts) = if moe {
                 let n_exp = cfg.n_experts.max(1);
@@ -360,13 +402,7 @@ impl CudaResidentModel {
                                         "CUDA Q8_0 MoE stage {name}: {e}"
                                     )))
                                 })?;
-                            Ok(push_bytes(
-                                owned,
-                                off,
-                                staged,
-                                super::WeightKind::Q8_0,
-                                n,
-                            ))
+                            Ok(push_bytes(owned, off, staged, super::WeightKind::Q8_0, n))
                         } else {
                             let f32s = file.tensor_f32(name).map_err(|e| {
                                 AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -378,13 +414,7 @@ impl CudaResidentModel {
                             for v in f32s {
                                 bytes.extend_from_slice(&v.to_le_bytes());
                             }
-                            Ok(push_bytes(
-                                owned,
-                                off,
-                                bytes,
-                                super::WeightKind::F32,
-                                n,
-                            ))
+                            Ok(push_bytes(owned, off, bytes, super::WeightKind::F32, n))
                         }
                     };
                     let gate_w = if file.tensor(&stacked_gate).is_some() {
@@ -398,14 +428,13 @@ impl CudaResidentModel {
                         &mut off,
                         &format!("blk.{i}.ffn_down_exps.weight"),
                     )?;
-                    let split = |w: WeightRef, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
-                        match w.kind {
-                            super::WeightKind::Q8_0 => {
-                                split_q8_staged_experts(w, n_exp, what)
+                    let split =
+                        |w: WeightRef, what: &str| -> Result<Vec<WeightRef>, AllpacaError> {
+                            match w.kind {
+                                super::WeightKind::Q8_0 => split_q8_staged_experts(w, n_exp, what),
+                                _ => split_f32_experts(w, n_exp, what),
                             }
-                            _ => split_f32_experts(w, n_exp, what),
-                        }
-                    };
+                        };
                     let ups = split(up_w, "ffn_up_exps")?;
                     let downs = split(down_w, "ffn_down_exps")?;
                     let gates = if let Some(g) = gate_w {
@@ -413,9 +442,7 @@ impl CudaResidentModel {
                     } else {
                         vec![WeightRef::f32(0, 0); n_exp]
                     };
-                    (0..n_exp)
-                        .map(|e| [gates[e], ups[e], downs[e]])
-                        .collect()
+                    (0..n_exp).map(|e| [gates[e], ups[e], downs[e]]).collect()
                 } else {
                     let mut ex = Vec::with_capacity(n_exp);
                     for e in 0..n_exp {
@@ -460,6 +487,32 @@ impl CudaResidentModel {
                 )
             };
 
+            let (w_qkv, w_z, w_alpha, w_beta, w_ssm_out) = if gdn {
+                let push_t = |owned: &mut Vec<Vec<u8>>,
+                              off: &mut usize,
+                              suffix: &str,
+                              gemv: bool|
+                 -> Result<WeightRef, AllpacaError> {
+                    let (b, k, n) = take_tensor(file, &format!("blk.{i}.{suffix}"), gemv)?;
+                    Ok(push_bytes(owned, off, b, k, n))
+                };
+                (
+                    push_t(&mut owned, &mut off, "attn_qkv.weight", true)?,
+                    push_t(&mut owned, &mut off, "attn_gate.weight", true)?,
+                    push_t(&mut owned, &mut off, "ssm_alpha.weight", true)?,
+                    push_t(&mut owned, &mut off, "ssm_beta.weight", true)?,
+                    push_t(&mut owned, &mut off, "ssm_out.weight", true)?,
+                )
+            } else {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                )
+            };
+
             layers.push(CudaLayerOff {
                 attn_norm,
                 wq,
@@ -472,6 +525,11 @@ impl CudaResidentModel {
                 w_down,
                 router_host,
                 experts,
+                w_qkv,
+                w_z,
+                w_alpha,
+                w_beta,
+                w_ssm_out,
             });
         }
         let (norm_bytes, norm_kind, norm_n) = take_tensor(file, "output_norm.weight", false)?;
@@ -502,12 +560,20 @@ impl CudaResidentModel {
         self.packed_h2d
     }
 
+    /// True when GDN projection GEMMs are device-resident.
+    pub fn has_gdn_device_projections(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.w_qkv.n > 0 && l.w_ssm_out.n > 0)
+    }
+
     /// True when any MoE expert GEMM weight was staged as packed Q8_0.
     pub fn has_q8_moe_experts(&self) -> bool {
         self.layers.iter().any(|l| {
-            l.experts
-                .iter()
-                .any(|e| e.iter().any(|w| w.kind == super::WeightKind::Q8_0 && w.n > 0))
+            l.experts.iter().any(|e| {
+                e.iter()
+                    .any(|w| w.kind == super::WeightKind::Q8_0 && w.n > 0)
+            })
         })
     }
 
@@ -545,9 +611,7 @@ impl CudaResidentModel {
         k: i32,
     ) -> Result<(), AllpacaError> {
         match w.kind {
-            super::WeightKind::F32 => {
-                cuda.gemm_nt_host_a_dev_b(a, self.ptr(w)?, c, m, n, k)
-            }
+            super::WeightKind::F32 => cuda.gemm_nt_host_a_dev_b(a, self.ptr(w)?, c, m, n, k),
             super::WeightKind::Q8_0 => {
                 cuda.gemm_nt_host_a_dev_b_q8(a, self.byte_ptr(w)?, c, m, n, k)
             }
@@ -923,14 +987,16 @@ fn apply_gdn_cuda(
 ) -> Result<(), AllpacaError> {
     let dim = cfg.dim;
     let d = gdn.dims;
-    if gdn.w_qkv.len() != d.qkv_dim * dim
-        || gdn.w_z.len() != d.value_dim * dim
-        || gdn.w_alpha.len() != d.n_v_heads * dim
-        || gdn.w_beta.len() != d.n_v_heads * dim
-        || gdn.w_out.len() != dim * d.value_dim
+    let device_proj = layer.w_qkv.n > 0 && layer.w_ssm_out.n > 0;
+    if !device_proj
+        && (gdn.w_qkv.len() != d.qkv_dim * dim
+            || gdn.w_z.len() != d.value_dim * dim
+            || gdn.w_alpha.len() != d.n_v_heads * dim
+            || gdn.w_beta.len() != d.n_v_heads * dim
+            || gdn.w_out.len() != dim * d.value_dim)
     {
         return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-            "CUDA GDN layer {layer_idx} projection size mismatch"
+            "CUDA GDN layer {layer_idx} missing host and device projections"
         ))));
     }
     if layer.attn_norm.n == 0 {
@@ -951,10 +1017,49 @@ fn apply_gdn_cuda(
     let mut z = vec![0.0f32; d.value_dim];
     let mut alpha = vec![0.0f32; d.n_v_heads];
     let mut beta = vec![0.0f32; d.n_v_heads];
-    matvec_rows(&gdn.w_qkv, d.qkv_dim, dim, &scratch[..dim], &mut qkv);
-    matvec_rows(&gdn.w_z, d.value_dim, dim, &scratch[..dim], &mut z);
-    matvec_rows(&gdn.w_alpha, d.n_v_heads, dim, &scratch[..dim], &mut alpha);
-    matvec_rows(&gdn.w_beta, d.n_v_heads, dim, &scratch[..dim], &mut beta);
+    if device_proj {
+        resident.gemm_host_a(
+            cuda,
+            &scratch[..dim],
+            layer.w_qkv,
+            &mut qkv,
+            1,
+            d.qkv_dim as i32,
+            dim as i32,
+        )?;
+        resident.gemm_host_a(
+            cuda,
+            &scratch[..dim],
+            layer.w_z,
+            &mut z,
+            1,
+            d.value_dim as i32,
+            dim as i32,
+        )?;
+        resident.gemm_host_a(
+            cuda,
+            &scratch[..dim],
+            layer.w_alpha,
+            &mut alpha,
+            1,
+            d.n_v_heads as i32,
+            dim as i32,
+        )?;
+        resident.gemm_host_a(
+            cuda,
+            &scratch[..dim],
+            layer.w_beta,
+            &mut beta,
+            1,
+            d.n_v_heads as i32,
+            dim as i32,
+        )?;
+    } else {
+        matvec_rows(&gdn.w_qkv, d.qkv_dim, dim, &scratch[..dim], &mut qkv);
+        matvec_rows(&gdn.w_z, d.value_dim, dim, &scratch[..dim], &mut z);
+        matvec_rows(&gdn.w_alpha, d.n_v_heads, dim, &scratch[..dim], &mut alpha);
+        matvec_rows(&gdn.w_beta, d.n_v_heads, dim, &scratch[..dim], &mut beta);
+    }
 
     let state = recurrent.ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad(
@@ -1004,7 +1109,19 @@ fn apply_gdn_cuda(
             "CUDA GDN hidden buffer too small".into(),
         )));
     }
-    matvec_rows(&gdn.w_out, dim, d.value_dim, &gated, &mut hidden[..dim]);
+    if device_proj {
+        resident.gemm_host_a(
+            cuda,
+            &gated,
+            layer.w_ssm_out,
+            &mut hidden[..dim],
+            1,
+            dim as i32,
+            d.value_dim as i32,
+        )?;
+    } else {
+        matvec_rows(&gdn.w_out, dim, d.value_dim, &gated, &mut hidden[..dim]);
+    }
     for i in 0..dim {
         x[i] += hidden[i];
     }
@@ -1064,7 +1181,15 @@ fn apply_ffn_cuda(
                     "CUDA MoE missing expert {e}"
                 ))));
             };
-            resident.gemm_host_a(cuda, &scratch[..dim], w_up, &mut up, 1, ff as i32, dim as i32)?;
+            resident.gemm_host_a(
+                cuda,
+                &scratch[..dim],
+                w_up,
+                &mut up,
+                1,
+                ff as i32,
+                dim as i32,
+            )?;
             if w_gate.n > 0 {
                 resident.gemm_host_a(
                     cuda,
@@ -1078,12 +1203,28 @@ fn apply_ffn_cuda(
                 for i in 0..ff {
                     gate[i] = silu(gate[i]) * up[i];
                 }
-                resident.gemm_host_a(cuda, &gate, w_down, &mut expert_out, 1, dim as i32, ff as i32)?;
+                resident.gemm_host_a(
+                    cuda,
+                    &gate,
+                    w_down,
+                    &mut expert_out,
+                    1,
+                    dim as i32,
+                    ff as i32,
+                )?;
             } else {
                 for v in &mut up {
                     *v = silu(*v);
                 }
-                resident.gemm_host_a(cuda, &up, w_down, &mut expert_out, 1, dim as i32, ff as i32)?;
+                resident.gemm_host_a(
+                    cuda,
+                    &up,
+                    w_down,
+                    &mut expert_out,
+                    1,
+                    dim as i32,
+                    ff as i32,
+                )?;
             }
             for i in 0..dim {
                 acc[i] += w * expert_out[i];
@@ -1118,15 +1259,7 @@ fn apply_ffn_cuda(
     for i in 0..ff {
         gate[i] = silu(gate[i]) * up[i];
     }
-    resident.gemm_host_a(
-        cuda,
-        &gate,
-        layer.w_down,
-        hidden,
-        1,
-        dim as i32,
-        ff as i32,
-    )?;
+    resident.gemm_host_a(cuda, &gate, layer.w_down, hidden, 1, dim as i32, ff as i32)?;
     for i in 0..dim {
         x[i] += hidden[i];
     }
