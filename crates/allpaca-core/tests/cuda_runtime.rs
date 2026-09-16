@@ -4,7 +4,7 @@
 #![cfg(feature = "cuda")]
 
 use allpaca_core::Engine;
-use allpaca_types::{Config, GenerationParams};
+use allpaca_types::{Config, GenerationParams, StepResult};
 
 fn cuda_synthetic() -> Config {
     let mut cfg = Config::compiled_defaults();
@@ -69,6 +69,58 @@ fn cuda_synthetic_generate_uses_device_when_present() {
         "per-generate activation H2D ({activation_delta}) must stay below weight pack ({})",
         before.weight_h2d_bytes
     );
+}
+
+#[test]
+fn cuda_live_request_kv_pages_are_device_resident() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    let mut handle = engine.begin_request("hello", greedy(4)).expect("begin");
+    assert!(matches!(
+        engine.step(&mut handle).expect("step"),
+        StepResult::Token(_) | StepResult::Finished(_) | StepResult::Prefill { .. }
+    ));
+    let stats = engine.stats();
+    assert!(
+        stats.device_memory_bytes > 0,
+        "CUDA workspace must report device memory; got {}",
+        stats.device_memory_bytes
+    );
+    assert!(
+        stats.kv_bytes_on_device > 0,
+        "live Request KV pages must be cudaMalloc, not host Vecs; kv_bytes_on_device={}",
+        stats.kv_bytes_on_device
+    );
+    drop(handle);
+}
+
+#[test]
+fn cuda_device_attention_spans_multiple_kv_pages() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_synthetic();
+    cfg.kv.page_tokens = 2;
+    let engine = Engine::new(cfg).expect("engine");
+    let mut handle = engine.begin_request("hello", greedy(8)).expect("begin");
+    for _ in 0..8 {
+        match engine.step(&mut handle).expect("step") {
+            StepResult::Finished(_) => break,
+            _ => {}
+        }
+    }
+    let stats = engine.stats();
+    assert!(
+        stats.kv_bytes_on_device > 0,
+        "multi-page CUDA KV must stay on device; stats={stats:?}"
+    );
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "multi-page decode must use CUDA attention; stats={stats:?}"
+    );
+    drop(handle);
 }
 
 #[test]

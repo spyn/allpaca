@@ -484,7 +484,6 @@ pub fn embed_gather_q8_0_device(
     }
 }
 
-
 /// Minimal CUDA workspace: scratch buffer + F32 GEMM. Enough to open when a
 /// device appears; full forward parity grows behind this type (like HipWorkspace).
 pub struct CudaWorkspace {
@@ -519,6 +518,32 @@ impl CudaWorkspace {
 
     pub fn allocated_bytes(&self) -> u64 {
         self.scratch_bytes as u64
+    }
+
+    /// Scratch K/V pair for packing paged KV into one contiguous device view.
+    pub fn kv_scratch_pair(
+        &self,
+        n_kv: usize,
+        kv_width: usize,
+    ) -> Result<(*mut f32, *mut f32), AllpacaError> {
+        let k_n = n_kv.saturating_mul(kv_width);
+        let need = k_n.saturating_mul(8);
+        if k_n == 0 {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                "CUDA KV scratch needs n_kv>0".into(),
+            )));
+        }
+        if need > self.scratch_bytes {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                format!(
+                    "packed CUDA KV ({need} bytes) exceeds scratch {}",
+                    self.scratch_bytes
+                ),
+            )));
+        }
+        let k = self.scratch.cast::<f32>();
+        let v = unsafe { self.scratch.add(k_n * 4).cast::<f32>() };
+        Ok((k, v))
     }
 
     pub fn activation_h2d_bytes(&self) -> u64 {
@@ -576,8 +601,7 @@ impl CudaWorkspace {
         #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
         {
             set_device(self.device)?;
-            let rc =
-                unsafe { ffi::allpaca_cuda_residual_add(x, y, out, n, std::ptr::null_mut()) };
+            let rc = unsafe { ffi::allpaca_cuda_residual_add(x, y, out, n, std::ptr::null_mut()) };
             status(rc, "residual_add")?;
             let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
             status(sync, "stream_synchronize")
@@ -602,8 +626,7 @@ impl CudaWorkspace {
         #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
         {
             set_device(self.device)?;
-            let rc =
-                unsafe { ffi::allpaca_cuda_rmsnorm(x, w, out, n, eps, std::ptr::null_mut()) };
+            let rc = unsafe { ffi::allpaca_cuda_rmsnorm(x, w, out, n, eps, std::ptr::null_mut()) };
             status(rc, "rmsnorm")?;
             let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
             status(sync, "stream_synchronize")
@@ -627,8 +650,7 @@ impl CudaWorkspace {
         #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
         {
             set_device(self.device)?;
-            let rc =
-                unsafe { ffi::allpaca_cuda_silu_mul(gate, up, out, n, std::ptr::null_mut()) };
+            let rc = unsafe { ffi::allpaca_cuda_silu_mul(gate, up, out, n, std::ptr::null_mut()) };
             status(rc, "silu_mul")?;
             let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
             status(sync, "stream_synchronize")
@@ -758,7 +780,9 @@ impl CudaWorkspace {
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
-            let _ = (q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal);
+            let _ = (
+                q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            );
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "CUDA attention unavailable".into(),
             )))
@@ -788,7 +812,12 @@ impl CudaWorkspace {
         let d_out = device_malloc((dim as usize) * 4, self.device)?;
         let result = (|| {
             self.embed_gather_dev(d_table, token, d_out.cast(), dim)?;
-            memcpy(out.as_mut_ptr().cast(), d_out, (dim as usize) * 4, MEMCPY_D2H)?;
+            memcpy(
+                out.as_mut_ptr().cast(),
+                d_out,
+                (dim as usize) * 4,
+                MEMCPY_D2H,
+            )?;
             self.activation_d2h
                 .fetch_add((dim as usize * 4) as u64, Ordering::Relaxed);
             Ok(())
@@ -853,7 +882,16 @@ impl CudaWorkspace {
         let d_out = device_malloc(q_n * 4, self.device)?;
         let result = (|| {
             self.attention_dev(
-                d_q, d_k, d_v, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+                d_q,
+                d_k,
+                d_v,
+                d_out.cast(),
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
             )?;
             memcpy(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H)?;
             self.activation_d2h
@@ -892,7 +930,16 @@ impl CudaWorkspace {
         let d_out = device_malloc(q_n * 4, self.device)?;
         let result = (|| {
             self.attention_dev(
-                d_q, k_dev, v_dev, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+                d_q,
+                k_dev,
+                v_dev,
+                d_out.cast(),
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
             )?;
             memcpy(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H)?;
             self.activation_d2h
@@ -1220,13 +1267,7 @@ mod tests {
         assert_eq!(w.bytes(), 24);
         let p0 = w.ptr_f32(0).expect("ptr");
         let mut back = [0.0f32; 4];
-        memcpy(
-            back.as_mut_ptr().cast(),
-            p0.cast(),
-            16,
-            MEMCPY_D2H,
-        )
-        .expect("d2h");
+        memcpy(back.as_mut_ptr().cast(), p0.cast(), 16, MEMCPY_D2H).expect("d2h");
         assert_eq!(back, a);
     }
 
@@ -1238,7 +1279,14 @@ mod tests {
         if !runtime_linked() || device_count() == 0 {
             assert!(enumerate_devices().is_empty());
             let mut c = [0.0f32; 4];
-            let err = gemm_nt(&[1.0, 0.0, 0.0, 1.0], &[1.0, 0.0, 0.0, 1.0], &mut c, 2, 2, 2);
+            let err = gemm_nt(
+                &[1.0, 0.0, 0.0, 1.0],
+                &[1.0, 0.0, 0.0, 1.0],
+                &mut c,
+                2,
+                2,
+                2,
+            );
             assert!(err.is_err());
             assert!(CudaWorkspace::new(0, 4096).is_err());
         }
@@ -1260,13 +1308,7 @@ mod tests {
         let d = device_malloc(src.len() * 4, 0).expect("malloc");
         ws.copy_h2d_f32(d.cast(), &src).expect("h2d");
         let mut back = vec![0.0f32; src.len()];
-        memcpy(
-            back.as_mut_ptr().cast(),
-            d,
-            src.len() * 4,
-            MEMCPY_D2H,
-        )
-        .expect("d2h");
+        memcpy(back.as_mut_ptr().cast(), d, src.len() * 4, MEMCPY_D2H).expect("d2h");
         device_free(d);
         assert_eq!(back, src);
         assert!(ws.activation_h2d_bytes() >= (src.len() * 4) as u64);
@@ -1343,8 +1385,12 @@ mod tests {
             .expect("cuda rope");
         for h in 0..n_heads as usize {
             let off = h * head_dim as usize;
-            allpaca_cpu::rope(&mut cpu_x[off..off + head_dim as usize], pos as usize, theta)
-                .expect("cpu rope");
+            allpaca_cpu::rope(
+                &mut cpu_x[off..off + head_dim as usize],
+                pos as usize,
+                theta,
+            )
+            .expect("cpu rope");
         }
         for i in 0..n {
             assert!(

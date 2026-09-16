@@ -1,9 +1,7 @@
 //! Narrow CUDA decode path: TinyModel token forwards on CudaWorkspace
 //! (dense + synthetic MoE; attention + host Mamba-2 / GDN hybrid).
 
-use super::{
-    gather_kv, topk_route, GdnHostWeights, LayerWeights, ModelConfig, TinyModel, WeightRef,
-};
+use super::{topk_route, GdnHostWeights, LayerWeights, ModelConfig, TinyModel, WeightRef};
 use crate::anchors::RecurrentState;
 use crate::deltanet::{
     conv1d_step, decay_from_alpha, expand_k_heads, gated_delta_step_eps, rmsnorm_silu_gate, sigmoid,
@@ -11,7 +9,7 @@ use crate::deltanet::{
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
-use allpaca_cpu::{attention, rope, silu};
+use allpaca_cpu::{rope, silu};
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
@@ -887,37 +885,28 @@ impl TinyModel {
             kv.write_slot(page_id, slot, cfg.n_kv_heads, head_dim, &k, &v)?;
             kv.touch(page_id, 1.0);
 
-            if let Some((k_dev, v_dev, n_kv)) =
-                kv.cuda_single_page_view(&page_ids[layer_idx], cfg.n_kv_heads, head_dim)
-            {
-                cuda.attention_host_q_dev_kv(
-                    &q,
-                    k_dev,
-                    v_dev,
-                    &mut attn_out,
-                    1,
-                    n_kv as i32,
-                    cfg.n_heads as i32,
-                    cfg.n_kv_heads as i32,
-                    head_dim as i32,
-                    true,
-                )?;
-            } else {
-                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
-                let n_kv = k_all.len() / kv_dim;
-                attention(
-                    &q,
-                    &k_all,
-                    &v_all,
-                    &mut attn_out,
-                    1,
-                    n_kv,
-                    cfg.n_heads,
-                    cfg.n_kv_heads,
-                    head_dim,
-                    true,
-                )?;
-            }
+            let n_kv_max = pos + 1;
+            let (dest_k, dest_v) = cuda.kv_scratch_pair(n_kv_max, kv_dim)?;
+            let (k_dev, v_dev, n_kv) = kv.cuda_kv_views(
+                &page_ids[layer_idx],
+                cfg.n_kv_heads,
+                head_dim,
+                dest_k,
+                dest_v,
+                n_kv_max,
+            )?;
+            cuda.attention_host_q_dev_kv(
+                &q,
+                k_dev,
+                v_dev,
+                &mut attn_out,
+                1,
+                n_kv as i32,
+                cfg.n_heads as i32,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                true,
+            )?;
 
             resident.gemm_host_a(
                 cuda,
