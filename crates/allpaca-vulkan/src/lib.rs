@@ -558,7 +558,7 @@ impl VulkanWorkspace {
         }
         #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
         {
-            let _ = (k, v, causal);
+            let _ = (k, v, n_kv, n_kv_heads, causal);
             Err(degraded("Vulkan attention unavailable"))
         }
     }

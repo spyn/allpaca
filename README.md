@@ -165,7 +165,8 @@ cargo test -p allpaca-cuda --features cuda
 ```
 
 Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexist.
-Engine forwards remain HIP until CUDA parity lands.
+TinyModel F32 decode (KV pages + device attention, tiny F32/Q4_K/F16 GGUF)
+runs on CUDA when a device is present. 7B packed-quant still HIP.
 
 ### Vulkan (optional rust-gpu scaffold)
 
@@ -182,8 +183,8 @@ cargo test -p allpaca-core --features vulkan --test vulkan_runtime
 Set `ALLPACA_SKIP_VULKAN_SHADERS=1` to skip the rust-gpu nested build (stub
 only). Auto backend order is HIP, then CUDA, then Vulkan, then CPU. Explicit
 `gpu_backend = "vulkan"` / `vulkan:N` selects Vulkan. This is an F32 TinyModel
-scaffold (tiny F32 / host-dequant Q4_K / F16 GGUF), not HIP packed-quant parity
-([ADR 0005](docs/adr/0005-vulkan-rust-gpu.md)).
+scaffold (KV pages + device attention, tiny F32 / host-dequant Q4_K / F16 GGUF),
+not HIP packed-quant parity ([ADR 0005](docs/adr/0005-vulkan-rust-gpu.md)).
 
 ---
 
