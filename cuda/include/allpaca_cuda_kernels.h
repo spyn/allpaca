@@ -55,6 +55,8 @@ int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
 int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count, int32_t kind,
                               allpaca_cuda_stream_t stream);
 
+int allpaca_cuda_memset(void *dst, int32_t value, size_t bytes, allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_set_device(int32_t device);
 
 int allpaca_cuda_can_p2p(int32_t src, int32_t dst, int32_t *can);

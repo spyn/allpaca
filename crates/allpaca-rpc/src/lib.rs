@@ -457,4 +457,31 @@ mod tests {
         drop(client);
         th.join().unwrap();
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_clear_fills_device_buffer_when_present() {
+        if allpaca_cuda::device_count() <= 0 {
+            eprintln!("skip loopback_cuda_clear: no CUDA device");
+            return;
+        }
+        let worker = CudaWorker::new(0).expect("CudaWorker");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let th = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cuda(worker)).unwrap();
+        });
+
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let buf = client.alloc(16).unwrap();
+        client.h2d(buf, 0, &[1u8; 16]).unwrap();
+        client.clear(buf, 0xAB).unwrap();
+        client.sync().unwrap();
+        let out = client.d2h(buf, 0, 16).unwrap();
+        assert_eq!(out, vec![0xAB; 16]);
+        client.free(buf).unwrap();
+        drop(client);
+        th.join().unwrap();
+    }
 }

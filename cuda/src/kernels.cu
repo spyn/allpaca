@@ -206,6 +206,22 @@ extern "C" int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes
     return ALLPACA_OK;
 }
 
+extern "C" int allpaca_cuda_memset(void *dst, int32_t value, size_t bytes,
+                                   allpaca_cuda_stream_t stream) {
+    if (!dst && bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (bytes == 0) {
+        return ALLPACA_OK;
+    }
+    cudaStream_t s = as_stream(stream);
+    const int fill = value & 0xff;
+    if (s) {
+        return cuda_status(cudaMemsetAsync(dst, fill, bytes, s));
+    }
+    return cuda_status(cudaMemset(dst, fill, bytes));
+}
+
 extern "C" int allpaca_cuda_set_device(int32_t device) {
     return cuda_status(cudaSetDevice(device));
 }

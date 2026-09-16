@@ -789,8 +789,9 @@ impl CudaWorker {
     }
 
     fn clear(&mut self, id: BufId, value: u8) -> Result<(), RpcError> {
-        let zeros = vec![value; self.slot(id)?.bytes];
-        self.h2d(id, 0, &zeros)
+        let s = self.slot(id)?;
+        allpaca_cuda::memset_on(s.ptr, value, s.bytes, self.cuda.raw_stream())
+            .map_err(|e| RpcError::Worker(e.to_string()))
     }
 
     fn launch(&mut self, list: &LaunchList) -> Result<(), RpcError> {

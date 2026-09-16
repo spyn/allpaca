@@ -68,6 +68,12 @@ mod ffi {
             kind: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_memset(
+            dst: *mut c_void,
+            value: i32,
+            bytes: usize,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_set_device(device: i32) -> i32;
         pub fn allpaca_cuda_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
         pub fn allpaca_cuda_enable_peer_access(src: i32, dst: i32) -> i32;
@@ -589,6 +595,39 @@ pub fn memcpy_on(
         let _ = (dst, src, bytes, kind, stream);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "CUDA memcpy unavailable".into(),
+        )))
+    }
+}
+
+/// Fill `bytes` of device memory with `value` (low 8 bits). Null stream is synchronous.
+pub fn device_memset(
+    dst: *mut std::ffi::c_void,
+    value: u8,
+    bytes: usize,
+) -> Result<(), AllpacaError> {
+    memset_on(dst, value, bytes, std::ptr::null_mut())
+}
+
+/// Fill on `stream` (`cudaMemsetAsync`). Null stream uses synchronous `cudaMemset`.
+pub fn memset_on(
+    dst: *mut std::ffi::c_void,
+    value: u8,
+    bytes: usize,
+    stream: *mut std::ffi::c_void,
+) -> Result<(), AllpacaError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_cuda_memset(dst, i32::from(value), bytes, stream) };
+        status(rc, "memset")
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (dst, value, bytes, stream);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA memset unavailable".into(),
         )))
     }
 }
@@ -2325,6 +2364,46 @@ mod tests {
             devices.iter().any(|d| !d.peers.is_empty()),
             "enumerate_devices must record at least one peer pair"
         );
+    }
+
+    #[test]
+    fn memset_empty_is_ok() {
+        device_memset(std::ptr::null_mut(), 0xAB, 0).expect("empty memset");
+    }
+
+    #[test]
+    fn memset_rejects_null_payload() {
+        assert!(device_memset(std::ptr::null_mut(), 0xAB, 64).is_err());
+    }
+
+    #[test]
+    fn memset_fills_device_buffer_when_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n = 256usize;
+        let d = device_malloc(n, 0).expect("malloc");
+        device_memset(d, 0xAB, n).expect("memset");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr().cast(), d, n, MEMCPY_D2H).expect("d2h");
+        device_free(d);
+        assert_eq!(back, vec![0xAB; n]);
+    }
+
+    #[test]
+    fn memset_on_workspace_stream_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n = 128usize;
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let d = device_malloc(n, 0).expect("malloc");
+        memset_on(d, 0x3C, n, ws.raw_stream()).expect("memset_on");
+        ws.synchronize().expect("sync");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr().cast(), d, n, MEMCPY_D2H).expect("d2h");
+        device_free(d);
+        assert_eq!(back, vec![0x3C; n]);
     }
 
     #[test]
