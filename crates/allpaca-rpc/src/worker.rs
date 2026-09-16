@@ -160,6 +160,10 @@ impl CpuWorker {
         Ok(())
     }
 
+    fn sync(&self) -> Result<(), RpcError> {
+        Ok(())
+    }
+
     fn launch_one(
         &mut self,
         op: KernelOp,
@@ -489,6 +493,10 @@ impl HipWorker {
         Ok(())
     }
 
+    fn sync(&self) -> Result<(), RpcError> {
+        allpaca_hip::stream_synchronize().map_err(|e| RpcError::Worker(e.to_string()))
+    }
+
     fn ptr_f32(&self, id: BufId) -> Result<*mut f32, RpcError> {
         Ok(self.slot(id)?.ptr.cast())
     }
@@ -716,11 +724,12 @@ impl CudaWorker {
             return Err(RpcError::Worker("cuda h2d oob".into()));
         }
         let dst = unsafe { s.ptr.cast::<u8>().add(offset as usize) }.cast();
-        allpaca_cuda::memcpy(
+        allpaca_cuda::memcpy_on(
             dst,
             data.as_ptr().cast(),
             data.len(),
             allpaca_cuda::MEMCPY_H2D,
+            self.cuda.raw_stream(),
         )
         .map_err(|e| RpcError::Worker(e.to_string()))?;
         if data.len() > 10 * 1024 * 1024 {
@@ -744,13 +753,17 @@ impl CudaWorker {
         }
         let mut out = vec![0u8; size as usize];
         let src = unsafe { s.ptr.cast::<u8>().add(offset as usize) }.cast();
-        allpaca_cuda::memcpy(
+        allpaca_cuda::memcpy_on(
             out.as_mut_ptr().cast(),
             src,
             size as usize,
             allpaca_cuda::MEMCPY_D2H,
+            self.cuda.raw_stream(),
         )
         .map_err(|e| RpcError::Worker(e.to_string()))?;
+        self.cuda
+            .synchronize()
+            .map_err(|e| RpcError::Worker(e.to_string()))?;
         Ok(out)
     }
 
@@ -758,9 +771,21 @@ impl CudaWorker {
         let src_s = self.slot(src)?;
         let dst_s = self.slot(dst)?;
         let n = src_s.bytes.min(dst_s.bytes);
-        allpaca_cuda::memcpy(dst_s.ptr, src_s.ptr, n, allpaca_cuda::MEMCPY_D2D)
-            .map_err(|e| RpcError::Worker(e.to_string()))?;
+        allpaca_cuda::memcpy_on(
+            dst_s.ptr,
+            src_s.ptr,
+            n,
+            allpaca_cuda::MEMCPY_D2D,
+            self.cuda.raw_stream(),
+        )
+        .map_err(|e| RpcError::Worker(e.to_string()))?;
         Ok(())
+    }
+
+    fn sync(&self) -> Result<(), RpcError> {
+        self.cuda
+            .synchronize()
+            .map_err(|e| RpcError::Worker(e.to_string()))
     }
 
     fn clear(&mut self, id: BufId, value: u8) -> Result<(), RpcError> {
@@ -795,7 +820,8 @@ impl CudaWorker {
                 let a = self.ptr_f32(need(bufs, 0)?)?;
                 let b = self.ptr_f32(need(bufs, 1)?)?;
                 let c = self.ptr_f32(need(bufs, 2)?)?;
-                allpaca_cuda::gemm_nt_device(a, b, c, m, n, k)
+                self.cuda
+                    .gemm_nt_dev(a, b, c, m, n, k)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::Attention => {
@@ -858,32 +884,40 @@ impl CudaWorker {
                     .residual_add_dev(x, y, x, n)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
-            KernelOp::EmbedGather | KernelOp::Memcpy => {
-                let src = self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                let mut cpu = CpuWorker::new(1 << 30);
-                let a = cpu.alloc(self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                let b = cpu.alloc(src.len() as u64)?;
-                cpu.h2d(b, 0, &src)?;
-                if op == KernelOp::Memcpy {
-                    let tmp = cpu.d2h(b, 0, src.len() as u64)?;
-                    self.h2d(need(bufs, 0)?, 0, &tmp)?;
-                    let _ = a;
-                } else {
-                    let table =
-                        self.d2h(need(bufs, 0)?, 0, self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                    let ids =
-                        self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                    let out_n = self.slot(need(bufs, 2)?)?.bytes as u64;
-                    let t = cpu.alloc(table.len() as u64)?;
-                    let i = cpu.alloc(ids.len() as u64)?;
-                    let o = cpu.alloc(out_n)?;
-                    cpu.h2d(t, 0, &table)?;
-                    cpu.h2d(i, 0, &ids)?;
-                    cpu.launch_one(op, &[t, i, o], i32s, f32s)?;
-                    let out = cpu.d2h(o, 0, out_n)?;
-                    self.h2d(need(bufs, 2)?, 0, &out)?;
-                    let _ = a;
+            KernelOp::Memcpy => {
+                self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+            }
+            KernelOp::EmbedGather => {
+                let dim = *i32s
+                    .first()
+                    .ok_or_else(|| RpcError::Worker("embed dim".into()))?;
+                let n_tok = *i32s.get(1).unwrap_or(&1);
+                if n_tok != 1 {
+                    return Err(RpcError::Worker(
+                        "cuda embed_gather supports n_tok=1".into(),
+                    ));
                 }
+                let table = self.ptr_f32(need(bufs, 0)?)?;
+                let ids = self.slot(need(bufs, 1)?)?;
+                if ids.bytes < 4 {
+                    return Err(RpcError::Worker("embed id".into()));
+                }
+                let mut tok = 0i32;
+                allpaca_cuda::memcpy_on(
+                    (&mut tok as *mut i32).cast(),
+                    ids.ptr,
+                    4,
+                    allpaca_cuda::MEMCPY_D2H,
+                    self.cuda.raw_stream(),
+                )
+                .map_err(|e| RpcError::Worker(e.to_string()))?;
+                self.cuda
+                    .synchronize()
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+                let out = self.ptr_f32(need(bufs, 2)?)?;
+                self.cuda
+                    .embed_gather_dev(table, tok, out, dim)
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
         }
         Ok(())
@@ -986,6 +1020,16 @@ impl WorkerBackend {
             Self::Hip(w) => w.launch(list),
             #[cfg(feature = "cuda")]
             Self::Cuda(w) => w.launch(list),
+        }
+    }
+
+    fn sync(&self) -> Result<(), RpcError> {
+        match self {
+            Self::Cpu(w) => w.sync(),
+            #[cfg(feature = "hip")]
+            Self::Hip(w) => w.sync(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(w) => w.sync(),
         }
     }
 
@@ -1167,6 +1211,9 @@ fn handle(
             write_u32(&mut out, 1);
             Ok(out)
         }
-        Cmd::Sync => Ok(Vec::new()),
+        Cmd::Sync => {
+            backend.sync()?;
+            Ok(Vec::new())
+        }
     }
 }

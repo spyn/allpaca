@@ -347,4 +347,114 @@ mod tests {
         drop(client);
         th.join().unwrap();
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_fused_residual_silu_on_one_stream() {
+        if allpaca_cuda::device_count() <= 0 {
+            eprintln!("skip loopback_cuda_fused: no CUDA device");
+            return;
+        }
+        let worker = CudaWorker::new(0).expect("CudaWorker");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let th = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cuda(worker)).unwrap();
+        });
+
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let n = 4usize;
+        let gate = client.alloc((n * 4) as u64).unwrap();
+        let residual = client.alloc((n * 4) as u64).unwrap();
+        let up = client.alloc((n * 4) as u64).unwrap();
+        let g_host = [1.0f32, 2.0, -1.0, 0.5];
+        let r_host = [0.5f32, 0.5, 0.5, 0.5];
+        let u_host = [2.0f32, 1.0, 1.0, 3.0];
+        let to_bytes = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|x| x.to_le_bytes()).collect()
+        };
+        client.h2d(gate, 0, &to_bytes(&g_host)).unwrap();
+        client.h2d(residual, 0, &to_bytes(&r_host)).unwrap();
+        client.h2d(up, 0, &to_bytes(&u_host)).unwrap();
+        client
+            .launch(&LaunchList {
+                items: vec![
+                    LaunchItem {
+                        op: KernelOp::ResidualAdd,
+                        bufs: vec![gate, residual],
+                        i32s: vec![],
+                        f32s: vec![],
+                    },
+                    LaunchItem {
+                        op: KernelOp::SiluMul,
+                        bufs: vec![gate, up],
+                        i32s: vec![],
+                        f32s: vec![],
+                    },
+                ],
+            })
+            .unwrap();
+        client.sync().unwrap();
+        let out = client.d2h(gate, 0, (n * 4) as u64).unwrap();
+        for i in 0..n {
+            let got = f32::from_le_bytes(out[i * 4..(i + 1) * 4].try_into().unwrap());
+            let r = g_host[i] + r_host[i];
+            let silu = r / (1.0 + (-r).exp());
+            let want = silu * u_host[i];
+            assert!((got - want).abs() < 1e-4, "i={i} got={got} want={want}");
+        }
+        client.free(gate).unwrap();
+        client.free(residual).unwrap();
+        client.free(up).unwrap();
+        drop(client);
+        th.join().unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_embed_gather_when_device_present() {
+        if allpaca_cuda::device_count() <= 0 {
+            eprintln!("skip loopback_cuda_embed: no CUDA device");
+            return;
+        }
+        let worker = CudaWorker::new(0).expect("CudaWorker");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let th = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cuda(worker)).unwrap();
+        });
+
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let dim = 4i32;
+        let table_host = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let table = client.alloc((table_host.len() * 4) as u64).unwrap();
+        let ids = client.alloc(4).unwrap();
+        let out = client.alloc((dim * 4) as u64).unwrap();
+        let table_bytes: Vec<u8> = table_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        client.h2d(table, 0, &table_bytes).unwrap();
+        client.h2d(ids, 0, &1u32.to_le_bytes()).unwrap();
+        client
+            .launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::EmbedGather,
+                    bufs: vec![table, ids, out],
+                    i32s: vec![dim, 1],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+        client.sync().unwrap();
+        let got = client.d2h(out, 0, (dim * 4) as u64).unwrap();
+        for i in 0..dim as usize {
+            let v = f32::from_le_bytes(got[i * 4..(i + 1) * 4].try_into().unwrap());
+            assert!((v - table_host[4 + i]).abs() < 1e-5, "i={i} v={v}");
+        }
+        client.free(table).unwrap();
+        client.free(ids).unwrap();
+        client.free(out).unwrap();
+        drop(client);
+        th.join().unwrap();
+    }
 }
