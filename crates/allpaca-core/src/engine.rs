@@ -287,6 +287,28 @@ impl Engine {
             config.kv.hot_fraction,
             hip.as_ref().map(|h| h.device),
             cuda_kv,
+            {
+                #[cfg(feature = "vulkan")]
+                {
+                    if hip.is_none() {
+                        #[cfg(feature = "cuda")]
+                        let skip = cuda.is_some();
+                        #[cfg(not(feature = "cuda"))]
+                        let skip = false;
+                        if skip {
+                            None
+                        } else {
+                            vulkan.clone()
+                        }
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    None
+                }
+            },
         );
         kv.open_nvme(config.kv.nvme_bytes, config.kv.nvme_path.as_deref())?;
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);

@@ -659,6 +659,19 @@ impl Inner {
         Self::mapped_read(buf, 0, raw)
     }
 
+    pub(crate) fn read_into(
+        &self,
+        buf: &DeviceBuf,
+        offset: u64,
+        dst: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        self.wait()?;
+        // SAFETY: `f32` is POD; the byte length is `len * 4`.
+        let raw =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len() * 4) };
+        Self::mapped_read(buf, offset, raw)
+    }
+
     pub(crate) fn write_into(
         &self,
         buf: &DeviceBuf,

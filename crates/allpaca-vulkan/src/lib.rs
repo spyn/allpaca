@@ -544,6 +544,98 @@ impl VulkanWorkspace {
             Err(degraded("Vulkan H2D copy unavailable"))
         }
     }
+
+    pub fn alloc_kv_page(&self, bytes: usize) -> Result<VulkanKvPage, AllpacaError> {
+        let bytes = bytes.max(256);
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            let buf = self.inner.alloc(bytes as u64, "kv")?;
+            Ok(VulkanKvPage { buf, bytes })
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            let _ = bytes;
+            Err(degraded("Vulkan KV alloc unavailable"))
+        }
+    }
+
+    pub fn kv_write_f32(
+        &self,
+        page: &VulkanKvPage,
+        float_off: usize,
+        src: &[f32],
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            self.inner
+                .write_into(&page.buf, (float_off * 4) as u64, src)
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            let _ = (page, float_off, src);
+            Err(degraded("Vulkan KV write unavailable"))
+        }
+    }
+
+    pub fn kv_read_f32(
+        &self,
+        page: &VulkanKvPage,
+        float_off: usize,
+        dst: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            self.inner
+                .read_into(&page.buf, (float_off * 4) as u64, dst)
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            let _ = (page, float_off, dst);
+            Err(degraded("Vulkan KV read unavailable"))
+        }
+    }
+
+    pub fn kv_slice(
+        &self,
+        page: &VulkanKvPage,
+        float_off: usize,
+        n: usize,
+    ) -> Result<DeviceSlice, AllpacaError> {
+        let bytes = n.saturating_mul(4);
+        let start = float_off.saturating_mul(4);
+        if start.saturating_add(bytes) > page.bytes {
+            return Err(degraded("Vulkan KV slice out of range"));
+        }
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            Ok(runtime::Inner::slice_of(
+                &page.buf,
+                start as u64,
+                bytes as u64,
+            ))
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            Ok(DeviceSlice::dummy(start as u64, bytes as u64))
+        }
+    }
+}
+
+/// Device-resident KV page (host-visible storage buffer).
+pub struct VulkanKvPage {
+    #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+    buf: runtime::DeviceBuf,
+    bytes: usize,
+}
+
+// SAFETY: `DeviceBuf` is only touched under the workspace submit/allocator mutexes.
+unsafe impl Send for VulkanKvPage {}
+unsafe impl Sync for VulkanKvPage {}
+
+impl VulkanKvPage {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 /// Packed F32 weights uploaded once (not activation traffic).
