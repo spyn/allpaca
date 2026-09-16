@@ -192,6 +192,34 @@ fn cuda_synthetic_gdn_hybrid_generate_uses_device_when_present() {
 }
 
 #[test]
+fn cuda_gdn_gguf_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_cuda_gdn.gguf");
+    write_tiny_qwen_gdn_gguf(&path);
+    let mut cfg = cuda_synthetic();
+    cfg.model.synthetic = false;
+    cfg.model.path = Some(path.clone());
+    cfg.kv.page_tokens = 8;
+    let engine = Engine::new(cfg).expect("GDN GGUF engine");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "GDN GGUF weights must upload to CUDA"
+    );
+    let out = engine.generate("hi", greedy(2)).expect("gdn gguf generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA GDN GGUF forwards; stats={stats:?}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn cuda_absent_falls_back_to_cpu_cleanly() {
     if cuda_device_available() {
         return;
@@ -525,6 +553,146 @@ fn write_tiny_moe_gguf(path: &std::path::Path) {
         })
         .collect();
     write_gguf(path, &meta, &views).expect("write tiny moe gguf");
+}
+
+/// Tiny Qwen35 Gated DeltaNet GGUF (2 GDN layers, no dense attn Q).
+fn write_tiny_qwen_gdn_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 16usize;
+    let vocab = 4usize;
+    let n_layers = 2usize;
+    let n_v = 2usize;
+    let n_k = 2usize;
+    let head = 8usize;
+    let inner = n_v * head;
+    let key_dim = n_k * head;
+    let qkv_dim = key_dim * 2 + inner;
+    let conv_k = 2usize;
+    let w = 0.02f32;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("qwen35".into()),
+    );
+    meta.insert("qwen35.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert(
+        "qwen35.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
+    meta.insert(
+        "qwen35.block_count".into(),
+        GgufValue::Uint32(n_layers as u32),
+    );
+    meta.insert("qwen35.attention.head_count".into(), GgufValue::Uint32(2));
+    meta.insert(
+        "qwen35.attention.head_count_kv".into(),
+        GgufValue::Uint32(1),
+    );
+    meta.insert(
+        "qwen35.feed_forward_length".into(),
+        GgufValue::Uint32((dim * 2) as u32),
+    );
+    meta.insert("qwen35.ssm.state_size".into(), GgufValue::Uint32(head as u32));
+    meta.insert("qwen35.ssm.inner_size".into(), GgufValue::Uint32(inner as u32));
+    meta.insert(
+        "qwen35.ssm.time_step_rank".into(),
+        GgufValue::Uint32(n_v as u32),
+    );
+    meta.insert("qwen35.ssm.group_count".into(), GgufValue::Uint32(n_k as u32));
+    meta.insert(
+        "qwen35.ssm.conv_kernel".into(),
+        GgufValue::Uint32(conv_k as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hi".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+    let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![(
+        "token_embd.weight".into(),
+        vec![vocab as u64, dim as u64],
+        vec![w; vocab * dim],
+    )];
+    for i in 0..n_layers {
+        owned.push((
+            format!("blk.{i}.attn_norm.weight"),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        owned.push((
+            format!("blk.{i}.attn_qkv.weight"),
+            vec![qkv_dim as u64, dim as u64],
+            vec![w; qkv_dim * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.attn_gate.weight"),
+            vec![inner as u64, dim as u64],
+            vec![w; inner * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_alpha.weight"),
+            vec![n_v as u64, dim as u64],
+            vec![w; n_v * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_beta.weight"),
+            vec![n_v as u64, dim as u64],
+            vec![w; n_v * dim],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_out.weight"),
+            vec![dim as u64, inner as u64],
+            vec![w; dim * inner],
+        ));
+        owned.push((format!("blk.{i}.ssm_a"), vec![n_v as u64], vec![-0.5; n_v]));
+        owned.push((
+            format!("blk.{i}.ssm_dt.bias"),
+            vec![n_v as u64],
+            vec![0.0; n_v],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_norm.weight"),
+            vec![head as u64],
+            vec![1.0; head],
+        ));
+        owned.push((
+            format!("blk.{i}.ssm_conv1d.weight"),
+            vec![(conv_k * qkv_dim) as u64],
+            vec![w; conv_k * qkv_dim],
+        ));
+    }
+    owned.push((
+        "output_norm.weight".into(),
+        vec![dim as u64],
+        vec![1.0; dim],
+    ));
+    owned.push((
+        "output.weight".into(),
+        vec![vocab as u64, dim as u64],
+        vec![w; vocab * dim],
+    ));
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).expect("write tiny qwen gdn gguf");
 }
 
 /// Mixtral-style MoE with Q8_0 stacked experts (K multiple of 32 for GEMV stage).

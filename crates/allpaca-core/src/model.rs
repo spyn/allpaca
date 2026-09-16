@@ -2438,6 +2438,44 @@ fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, A
     })
 }
 
+fn fill_gdn_host_projections(
+    file: &GgufFile,
+    layer: usize,
+    gdn: &mut GdnHostWeights,
+) -> Result<(), AllpacaError> {
+    let d = gdn.dims;
+    let take = |suffix: &str| -> Result<Vec<f32>, AllpacaError> {
+        file.tensor_f32(&format!("blk.{layer}.{suffix}")).map_err(|e| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "blk.{layer} GDN {suffix}: {e}"
+            )))
+        })
+    };
+    gdn.w_qkv = take("attn_qkv.weight")?;
+    gdn.w_z = take("attn_gate.weight")?;
+    gdn.w_alpha = take("ssm_alpha.weight")?;
+    gdn.w_beta = take("ssm_beta.weight")?;
+    gdn.w_out = take("ssm_out.weight")?;
+    if d.qkv_dim == 0 || gdn.w_qkv.len() % d.qkv_dim != 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: GDN qkv len {} not divisible by qkv_dim {}",
+            gdn.w_qkv.len(),
+            d.qkv_dim
+        ))));
+    }
+    let dim = gdn.w_qkv.len() / d.qkv_dim;
+    if gdn.w_z.len() != d.value_dim * dim
+        || gdn.w_alpha.len() != d.n_v_heads * dim
+        || gdn.w_beta.len() != d.n_v_heads * dim
+        || gdn.w_out.len() != dim * d.value_dim
+    {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: GDN projection sizes mismatch dims={d:?} dim={dim}"
+        ))));
+    }
+    Ok(())
+}
+
 fn load_gguf_ssm_layer(
     file: &GgufFile,
     layer: usize,
@@ -4984,7 +5022,13 @@ impl TinyModel {
                             Some(load_gguf_ssm_layer(file, i, cfg.dim, true)?)
                         },
                         gdn: if file.architecture() == Some("qwen35") {
-                            load_gguf_gdn_host(file, i).ok()
+                            match load_gguf_gdn_host(file, i) {
+                                Ok(mut gdn) => {
+                                    fill_gdn_host_projections(file, i, &mut gdn)?;
+                                    Some(gdn)
+                                }
+                                Err(_) => None,
+                            }
                         } else {
                             None
                         },

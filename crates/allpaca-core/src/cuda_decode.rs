@@ -135,18 +135,9 @@ impl CudaResidentModel {
         cfg: &ModelConfig,
         device: i32,
     ) -> Result<Self, AllpacaError> {
-        // Recurrent/SSM GGUFs upload attention (+ MoE) tensors; Mamba-2 weights stay on host.
-        // Pure GDN-without-SSM is still deferred.
-        if cfg.recurrent
-            && file.tensors.iter().any(|t| t.name.contains("gdn_"))
-            && !file.tensors.iter().any(|t| t.name.contains("ssm_"))
-        {
-            return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA GGUF upload: GDN-only hybrid later".into(),
-                ),
-            ));
-        }
+        // Recurrent/SSM/GDN GGUFs upload attention (+ MoE) tensors; Mamba-2 / GDN
+        // extras stay on host (`GdnHostWeights` / `SsmLayerWeights`).
+
         let mut owned: Vec<Vec<u8>> = Vec::new();
         let mut off = 0usize;
         let mut push_bytes =
@@ -281,16 +272,32 @@ impl CudaResidentModel {
             };
             let (b, k, n) = take("attn_norm.weight", false)?;
             let attn_norm = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("attn_q.weight", true)?;
-            let wq = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("attn_k.weight", true)?;
-            let wk = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("attn_v.weight", true)?;
-            let wv = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("attn_output.weight", true)?;
-            let wo = push_bytes(&mut owned, &mut off, b, k, n);
-            let (b, k, n) = take("ffn_norm.weight", false)?;
-            let ffn_norm = push_bytes(&mut owned, &mut off, b, k, n);
+            let gdn = file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some()
+                && file.tensor(&format!("blk.{i}.ssm_out.weight")).is_some()
+                && file.tensor(&format!("blk.{i}.attn_q.weight")).is_none();
+            let (wq, wk, wv, wo) = if gdn {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                )
+            } else {
+                let (b, k, n) = take("attn_q.weight", true)?;
+                let wq = push_bytes(&mut owned, &mut off, b, k, n);
+                let (b, k, n) = take("attn_k.weight", true)?;
+                let wk = push_bytes(&mut owned, &mut off, b, k, n);
+                let (b, k, n) = take("attn_v.weight", true)?;
+                let wv = push_bytes(&mut owned, &mut off, b, k, n);
+                let (b, k, n) = take("attn_output.weight", true)?;
+                let wo = push_bytes(&mut owned, &mut off, b, k, n);
+                (wq, wk, wv, wo)
+            };
+            let ffn_norm = if let Some((b, k, n)) = try_tensor(file, &format!("blk.{i}.ffn_norm.weight"), false)? {
+                push_bytes(&mut owned, &mut off, b, k, n)
+            } else {
+                WeightRef::f32(0, 0)
+            };
 
             let moe = cfg.n_experts > 0
                 && (file
@@ -435,7 +442,7 @@ impl CudaResidentModel {
                     router_host,
                     experts,
                 )
-            } else {
+            } else if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
                 let (b, k, n) = take("ffn_gate.weight", true)?;
                 let w_gate = push_bytes(&mut owned, &mut off, b, k, n);
                 let (b, k, n) = take("ffn_up.weight", true)?;
@@ -443,6 +450,14 @@ impl CudaResidentModel {
                 let (b, k, n) = take("ffn_down.weight", true)?;
                 let w_down = push_bytes(&mut owned, &mut off, b, k, n);
                 (w_gate, w_up, w_down, Vec::new(), Vec::new())
+            } else {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    Vec::new(),
+                    Vec::new(),
+                )
             };
 
             layers.push(CudaLayerOff {
