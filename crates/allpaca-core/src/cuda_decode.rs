@@ -567,6 +567,15 @@ impl CudaResidentModel {
             .any(|l| l.w_qkv.n > 0 && l.w_ssm_out.n > 0)
     }
 
+    /// True when any GDN projection was staged as packed Q8_0 (n>65536).
+    pub fn has_q8_gdn_projections(&self) -> bool {
+        self.layers.iter().any(|l| {
+            [l.w_qkv, l.w_z, l.w_alpha, l.w_beta, l.w_ssm_out]
+                .iter()
+                .any(|w| w.kind == super::WeightKind::Q8_0 && w.n > 0)
+        })
+    }
+
     /// True when any MoE expert GEMM weight was staged as packed Q8_0.
     pub fn has_q8_moe_experts(&self) -> bool {
         self.layers.iter().any(|l| {

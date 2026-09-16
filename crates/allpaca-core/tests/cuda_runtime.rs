@@ -284,6 +284,60 @@ fn cuda_gdn_q8_gguf_generate_without_host_f32_projections() {
 }
 
 #[test]
+fn cuda_upload_gguf_gdn_q8_projections_stay_packed_when_n_exceeds_dequant() {
+    if !cuda_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_cuda_gdn_q8_packed.gguf");
+    write_qwen_gdn_q8_packed_gguf(&path);
+    let file = allpaca_gguf::GgufFile::open(&path).expect("open packed gdn q8");
+    let qkv = file.tensor("blk.0.attn_qkv.weight").expect("qkv");
+    assert!(
+        qkv.n_elements() > 65_536,
+        "fixture qkv must exceed F32 dequant threshold, got {}",
+        qkv.n_elements()
+    );
+    let cfg = allpaca_core::ModelConfig::from_gguf(&file).expect("cfg");
+    let resident = allpaca_core::CudaResidentModel::upload_gguf(&file, &cfg, 0)
+        .expect("CUDA packed GDN Q8 upload_gguf");
+    assert!(
+        resident.has_q8_gdn_projections(),
+        "large Q8 GDN projections must stay packed, not F32-dequant"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn cuda_gdn_q8_packed_gguf_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_cuda_gdn_q8_packed_gen.gguf");
+    write_qwen_gdn_q8_packed_gguf(&path);
+    let mut cfg = cuda_synthetic();
+    cfg.model.synthetic = false;
+    cfg.model.path = Some(path.clone());
+    cfg.kv.page_tokens = 8;
+    let engine = Engine::new(cfg).expect("packed GDN Q8 engine");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "packed Q8 GDN weights must upload to CUDA"
+    );
+    let out = engine
+        .generate("hi", greedy(2))
+        .expect("packed gdn q8 generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA packed GDN Q8 forwards; stats={stats:?}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn cuda_absent_falls_back_to_cpu_cleanly() {
     if cuda_device_available() {
         return;
@@ -933,6 +987,172 @@ fn write_tiny_qwen_gdn_q8_gguf(path: &std::path::Path) {
         })
         .collect();
     write_gguf_quant(path, &meta, &f32_tensors, &quant_tensors).expect("write tiny qwen gdn q8");
+}
+
+/// Qwen35 GDN with Q8_0 projections large enough to stay packed (n>65536).
+/// GGUF dims are innermost-first so GEMV K is `dims[0]` (must be multiple of 32).
+fn write_qwen_gdn_q8_packed_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{
+        quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor,
+    };
+    use std::collections::HashMap;
+
+    let dim = 288usize;
+    let vocab = 4usize;
+    let n_layers = 1usize;
+    let n_v = 4usize;
+    let n_k = 4usize;
+    let head = 64usize;
+    let inner = n_v * head;
+    let key_dim = n_k * head;
+    let qkv_dim = key_dim * 2 + inner;
+    let conv_k = 2usize;
+    let w = 0.02f32;
+    debug_assert!(qkv_dim * dim > 65_536);
+    debug_assert_eq!(dim % 32, 0);
+    debug_assert_eq!(inner % 32, 0);
+
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("qwen35".into()),
+    );
+    meta.insert("qwen35.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert(
+        "qwen35.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
+    meta.insert(
+        "qwen35.block_count".into(),
+        GgufValue::Uint32(n_layers as u32),
+    );
+    meta.insert("qwen35.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert(
+        "qwen35.attention.head_count_kv".into(),
+        GgufValue::Uint32(1),
+    );
+    meta.insert(
+        "qwen35.feed_forward_length".into(),
+        GgufValue::Uint32((dim * 2) as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.state_size".into(),
+        GgufValue::Uint32(head as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.inner_size".into(),
+        GgufValue::Uint32(inner as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.time_step_rank".into(),
+        GgufValue::Uint32(n_v as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.group_count".into(),
+        GgufValue::Uint32(n_k as u32),
+    );
+    meta.insert(
+        "qwen35.ssm.conv_kernel".into(),
+        GgufValue::Uint32(conv_k as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hi".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+    let mut f32_owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![(
+        "token_embd.weight".into(),
+        vec![vocab as u64, dim as u64],
+        vec![w; vocab * dim],
+    )];
+    let mut q_owned: Vec<(String, Vec<u64>, Vec<u8>)> = Vec::new();
+    for i in 0..n_layers {
+        f32_owned.push((
+            format!("blk.{i}.attn_norm.weight"),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        q_owned.push((
+            format!("blk.{i}.attn_qkv.weight"),
+            vec![dim as u64, qkv_dim as u64],
+            quantize_q8_0(&vec![w; qkv_dim * dim]),
+        ));
+        q_owned.push((
+            format!("blk.{i}.attn_gate.weight"),
+            vec![dim as u64, inner as u64],
+            quantize_q8_0(&vec![w; inner * dim]),
+        ));
+        q_owned.push((
+            format!("blk.{i}.ssm_alpha.weight"),
+            vec![dim as u64, n_v as u64],
+            quantize_q8_0(&vec![w; n_v * dim]),
+        ));
+        q_owned.push((
+            format!("blk.{i}.ssm_beta.weight"),
+            vec![dim as u64, n_v as u64],
+            quantize_q8_0(&vec![w; n_v * dim]),
+        ));
+        q_owned.push((
+            format!("blk.{i}.ssm_out.weight"),
+            vec![inner as u64, dim as u64],
+            quantize_q8_0(&vec![w; dim * inner]),
+        ));
+        f32_owned.push((format!("blk.{i}.ssm_a"), vec![n_v as u64], vec![-0.5; n_v]));
+        f32_owned.push((
+            format!("blk.{i}.ssm_dt.bias"),
+            vec![n_v as u64],
+            vec![0.0; n_v],
+        ));
+        f32_owned.push((
+            format!("blk.{i}.ssm_norm.weight"),
+            vec![head as u64],
+            vec![1.0; head],
+        ));
+        f32_owned.push((
+            format!("blk.{i}.ssm_conv1d.weight"),
+            vec![(conv_k * qkv_dim) as u64],
+            vec![w; conv_k * qkv_dim],
+        ));
+    }
+    f32_owned.push((
+        "output_norm.weight".into(),
+        vec![dim as u64],
+        vec![1.0; dim],
+    ));
+    f32_owned.push((
+        "output.weight".into(),
+        vec![vocab as u64, dim as u64],
+        vec![w; vocab * dim],
+    ));
+    let f32_tensors: Vec<GgufWriteTensor<'_>> = f32_owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    let quant_tensors: Vec<GgufWriteQuantTensor<'_>> = q_owned
+        .iter()
+        .map(|(name, dims, bytes)| GgufWriteQuantTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            ggml_type: GgmlType::Q8_0,
+            bytes,
+        })
+        .collect();
+    write_gguf_quant(path, &meta, &f32_tensors, &quant_tensors).expect("write packed qwen gdn q8");
 }
 
 /// Mixtral-style MoE with Q8_0 stacked experts (K multiple of 32 for GEMV stage).
