@@ -240,6 +240,20 @@ extern "C" int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint6
     return ALLPACA_OK;
 }
 
+extern "C" int allpaca_cuda_mem_used(int32_t device, uint64_t *used_bytes) {
+    if (!used_bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    uint64_t free_b = 0;
+    uint64_t total_b = 0;
+    int rc = allpaca_cuda_mem_info(device, &free_b, &total_b);
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    *used_bytes = total_b - free_b;
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream) {
     cudaStream_t s = as_stream(stream);
     if (s) {

@@ -74,6 +74,7 @@ mod ffi {
             free_bytes: *mut u64,
             total_bytes: *mut u64,
         ) -> i32;
+        pub fn allpaca_cuda_mem_used(device: i32, used_bytes: *mut u64) -> i32;
         pub fn allpaca_cuda_stream_synchronize(stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_stream_create(stream: *mut *mut c_void) -> i32;
         pub fn allpaca_cuda_stream_destroy(stream: *mut c_void) -> i32;
@@ -279,6 +280,24 @@ pub fn device_memory_info(device: i32) -> Result<(u64, u64), AllpacaError> {
         let _ = device;
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "CUDA mem_info unavailable".into(),
+        )))
+    }
+}
+
+/// Driver-measured used VRAM (`total - free`) for `device`.
+pub fn device_memory_used(device: i32) -> Result<u64, AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut used = 0u64;
+        let rc = unsafe { ffi::allpaca_cuda_mem_used(device, &mut used) };
+        status(rc, "mem_used")?;
+        Ok(used)
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = device;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA mem_used unavailable".into(),
         )))
     }
 }
@@ -1475,18 +1494,30 @@ impl CudaWorkspace {
         set_device(self.device)?;
         let bytes = dst.len().saturating_mul(4);
         if bytes >= 4096 {
-            let pinned = PinnedHostBuffer::new(bytes)?;
-            memcpy_on(
-                pinned.as_mut_ptr().cast(),
-                src.cast(),
-                bytes,
-                MEMCPY_D2H,
-                self.stream,
-            )?;
-            self.synchronize()?;
-            dst.copy_from_slice(unsafe {
-                std::slice::from_raw_parts(pinned.as_ptr().cast::<f32>(), dst.len())
-            });
+            let dst_ptr = dst.as_mut_ptr() as *mut u8;
+            if let Ok(_pin) = HostRegistration::new(dst_ptr, bytes) {
+                memcpy_on(
+                    dst.as_mut_ptr().cast(),
+                    src.cast(),
+                    bytes,
+                    MEMCPY_D2H,
+                    self.stream,
+                )?;
+                self.synchronize()?;
+            } else {
+                let pinned = PinnedHostBuffer::new(bytes)?;
+                memcpy_on(
+                    pinned.as_mut_ptr().cast(),
+                    src.cast(),
+                    bytes,
+                    MEMCPY_D2H,
+                    self.stream,
+                )?;
+                self.synchronize()?;
+                dst.copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(pinned.as_ptr().cast::<f32>(), dst.len())
+                });
+            }
         } else {
             memcpy_on(
                 dst.as_mut_ptr().cast(),
@@ -2068,6 +2099,37 @@ mod tests {
         device_free(ptr);
         let (free_now, _) = device_memory_info(0).expect("mem_info after free");
         assert!(free_now >= free_after);
+    }
+
+    #[test]
+    fn mem_used_unavailable_without_device() {
+        if device_count() > 0 {
+            return;
+        }
+        assert!(device_memory_used(0).is_err());
+    }
+
+    #[test]
+    fn mem_used_matches_total_minus_free_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let (free, total) = device_memory_info(0).expect("mem_info");
+        let used = device_memory_used(0).expect("mem_used");
+        let derived = total.saturating_sub(free);
+        let skew = used.abs_diff(derived);
+        assert!(
+            skew < 16 * 1024 * 1024,
+            "mem_used {used} and total-free {derived} disagree by {skew}"
+        );
+        let chunk = 16 * 1024 * 1024;
+        let ptr = device_malloc(chunk, 0).expect("alloc");
+        let used_after = device_memory_used(0).expect("mem_used after");
+        assert!(
+            used_after >= used + (chunk as u64) / 2,
+            "used={used} used_after={used_after} chunk={chunk}"
+        );
+        device_free(ptr);
     }
 
     #[test]
