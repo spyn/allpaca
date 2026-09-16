@@ -110,6 +110,8 @@ struct EngineInner {
     draft_resident: Option<Arc<ResidentModel>>,
     #[cfg(feature = "cuda")]
     target_cuda_resident: Option<Arc<crate::CudaResidentModel>>,
+    #[cfg(feature = "vulkan")]
+    target_vulkan_resident: Option<Arc<crate::VulkanResidentModel>>,
     draft_kv: DenseKv,
     draft_ahead: Option<DraftAhead>,
     anchors: AnchorCache,
@@ -145,6 +147,8 @@ struct DecodePollHooks<'a> {
     ds_queue: &'a DirectStorageQueue,
     #[cfg(feature = "cuda")]
     cuda: Option<&'a allpaca_cuda::CudaWorkspace>,
+    #[cfg(feature = "vulkan")]
+    vulkan: Option<&'a allpaca_vulkan::VulkanWorkspace>,
 }
 
 #[derive(Clone)]
@@ -157,6 +161,8 @@ pub struct Engine {
     draft_hip: Option<Arc<HipWorkspace>>,
     #[cfg(feature = "cuda")]
     cuda: Option<Arc<allpaca_cuda::CudaWorkspace>>,
+    #[cfg(feature = "vulkan")]
+    vulkan: Option<Arc<allpaca_vulkan::VulkanWorkspace>>,
     /// Shared DirectStorage enqueue ledger (file-coordinate + staged H2D).
     ds_queue: Arc<DirectStorageQueue>,
     ds_probe: DirectStorageProbe,
@@ -259,6 +265,8 @@ impl Engine {
         let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
         #[cfg(feature = "cuda")]
         let cuda = open_cuda_workspace(&config, &inventory).map(Arc::new);
+        #[cfg(feature = "vulkan")]
+        let vulkan = open_vulkan_workspace(&config, &inventory).map(Arc::new);
         let cuda_kv = {
             #[cfg(feature = "cuda")]
             {
@@ -301,6 +309,8 @@ impl Engine {
             draft_resident: None,
             #[cfg(feature = "cuda")]
             target_cuda_resident: None,
+            #[cfg(feature = "vulkan")]
+            target_vulkan_resident: None,
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
@@ -324,6 +334,8 @@ impl Engine {
             draft_hip,
             #[cfg(feature = "cuda")]
             cuda,
+            #[cfg(feature = "vulkan")]
+            vulkan,
             ds_queue,
             ds_probe,
             micro_batch: Arc::new(MicroBatchExpertUnion::new()),
@@ -659,12 +671,34 @@ impl Engine {
                     if let Some(cuda) = &self.cuda {
                         ("cuda".into(), cuda.allocated_bytes())
                     } else {
-                        ("cpu".into(), 0)
+                        #[cfg(feature = "vulkan")]
+                        {
+                            if let Some(vk) = &self.vulkan {
+                                ("vulkan".into(), vk.allocated_bytes())
+                            } else {
+                                ("cpu".into(), 0)
+                            }
+                        }
+                        #[cfg(not(feature = "vulkan"))]
+                        {
+                            ("cpu".into(), 0)
+                        }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    ("cpu".into(), 0)
+                    #[cfg(feature = "vulkan")]
+                    {
+                        if let Some(vk) = &self.vulkan {
+                            ("vulkan".into(), vk.allocated_bytes())
+                        } else {
+                            ("cpu".into(), 0)
+                        }
+                    }
+                    #[cfg(not(feature = "vulkan"))]
+                    {
+                        ("cpu".into(), 0)
+                    }
                 }
             };
         let hip_h2d = self
@@ -695,6 +729,14 @@ impl Engine {
             .unwrap_or((0, 0));
         #[cfg(not(feature = "cuda"))]
         let (cuda_h2d, cuda_d2h) = (0u64, 0u64);
+        #[cfg(feature = "vulkan")]
+        let (vk_h2d, vk_d2h) = self
+            .vulkan
+            .as_ref()
+            .map(|c| (c.activation_h2d_bytes(), c.activation_d2h_bytes()))
+            .unwrap_or((0, 0));
+        #[cfg(not(feature = "vulkan"))]
+        let (vk_h2d, vk_d2h) = (0u64, 0u64);
         self.metrics
             .device_memory_bytes
             .store(device_memory_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -702,11 +744,11 @@ impl Engine {
             .draft_kv_bytes_on_device
             .store(draft_kv_bytes, std::sync::atomic::Ordering::Relaxed);
         self.metrics.activation_h2d_bytes.store(
-            hip_h2d + kv_h2d + draft_h2d + cuda_h2d,
+            hip_h2d + kv_h2d + draft_h2d + cuda_h2d + vk_h2d,
             std::sync::atomic::Ordering::Relaxed,
         );
         self.metrics.activation_d2h_bytes.store(
-            hip_d2h + kv_d2h + draft_d2h + cuda_d2h,
+            hip_d2h + kv_d2h + draft_d2h + cuda_d2h + vk_d2h,
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(hip) = &self.hip {
@@ -1332,6 +1374,16 @@ impl Engine {
             if self.hip.is_none() {
                 self.upload_resident_from_gguf(None, None)?;
             }
+            #[cfg(feature = "vulkan")]
+            if self.hip.is_none() {
+                #[cfg(feature = "cuda")]
+                let skip = self.cuda.is_some();
+                #[cfg(not(feature = "cuda"))]
+                let skip = false;
+                if !skip {
+                    self.upload_resident_from_gguf(None, None)?;
+                }
+            }
             return self.note_early_exit_gate();
         }
         let draft_ref = if draft_reuses_target_gguf {
@@ -1445,6 +1497,50 @@ impl Engine {
                                 tracing::warn!(
                                     error = %e,
                                     "CUDA target weight upload failed; CPU forward"
+                                );
+                                self.metrics
+                                    .degraded_events
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        }
+        #[cfg(feature = "vulkan")]
+        {
+            let target = inner.target.clone();
+            inner.target_vulkan_resident = if self.hip.is_none() {
+                #[cfg(feature = "cuda")]
+                let cuda_busy = self.cuda.is_some();
+                #[cfg(not(feature = "cuda"))]
+                let cuda_busy = false;
+                if cuda_busy {
+                    None
+                } else if let (Some(vk), Some(target)) = (&self.vulkan, target) {
+                    if target.host_weights_ready() {
+                        match crate::VulkanResidentModel::upload(&target, vk) {
+                            Ok(resident) => {
+                                weight_bytes += resident.bytes();
+                                h2d += resident.packed_h2d_bytes();
+                                tracing::info!(
+                                    device = vk.device,
+                                    bytes = resident.bytes(),
+                                    "Vulkan target weight upload"
+                                );
+                                Some(Arc::new(resident))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Vulkan target weight upload failed; CPU forward"
                                 );
                                 self.metrics
                                     .degraded_events
@@ -2663,6 +2759,8 @@ impl Engine {
             ds_queue: &self.ds_queue,
             #[cfg(feature = "cuda")]
             cuda: self.cuda.as_deref(),
+            #[cfg(feature = "vulkan")]
+            vulkan: self.vulkan.as_deref(),
         };
         let produced = if use_tree {
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
@@ -2845,6 +2943,8 @@ impl Engine {
         let resident = inner.target_resident.clone();
         #[cfg(feature = "cuda")]
         let cuda_resident = inner.target_cuda_resident.clone();
+        #[cfg(feature = "vulkan")]
+        let vulkan_resident = inner.target_vulkan_resident.clone();
         let mut logits = {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.pending_logits)
@@ -2958,7 +3058,45 @@ impl Engine {
                         false
                     }
                 };
-                if !used_cuda {
+                let used_vulkan = {
+                    #[cfg(feature = "vulkan")]
+                    {
+                        let mut used = false;
+                        if self.hip.is_none() && !used_cuda {
+                            if let (Some(vk), Some(vres)) =
+                                (self.vulkan.as_deref(), vulkan_resident.as_deref())
+                            {
+                                match target.forward_token_vulkan(
+                                    *tok,
+                                    pos,
+                                    &pages,
+                                    &mut inner.kv,
+                                    &self.metrics,
+                                    &mut logits,
+                                    vk,
+                                    vres,
+                                    soft,
+                                ) {
+                                    Ok(()) => used = true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            pos,
+                                            token = *tok,
+                                            error = %e,
+                                            "Vulkan on-device decode failed; host fallback"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        used
+                    }
+                    #[cfg(not(feature = "vulkan"))]
+                    {
+                        false
+                    }
+                };
+                if !used_cuda && !used_vulkan {
                     target.forward_token(
                         *tok,
                         pos,
@@ -3406,6 +3544,66 @@ fn open_cuda_workspace(
         }
         Err(e) => {
             tracing::warn!(error = %e, "CUDA workspace failed; CPU fallback");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn open_vulkan_workspace(
+    config: &Config,
+    inventory: &DeviceInventory,
+) -> Option<allpaca_vulkan::VulkanWorkspace> {
+    if config.engine.cpu_only || config.engine.gpu_backend == "cpu" {
+        return None;
+    }
+    if !allpaca_vulkan::runtime_linked() {
+        return None;
+    }
+    if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "vulkan" {
+        return None;
+    }
+    if config.engine.gpu_backend == "auto"
+        && inventory
+            .devices
+            .iter()
+            .any(|d| d.kind == allpaca_types::DeviceKind::HipGpu)
+    {
+        return None;
+    }
+    if config.engine.gpu_backend == "auto"
+        && inventory
+            .devices
+            .iter()
+            .any(|d| d.kind == allpaca_types::DeviceKind::CudaGpu)
+    {
+        return None;
+    }
+    let gpus: Vec<_> = inventory
+        .devices
+        .iter()
+        .filter(|d| d.kind == allpaca_types::DeviceKind::VulkanGpu)
+        .collect();
+    if gpus.is_empty() {
+        return None;
+    }
+    let device =
+        if inventory.target_device >= 0 && gpus.iter().any(|d| d.id == inventory.target_device) {
+            inventory.target_device
+        } else {
+            gpus[0].id
+        };
+    match allpaca_vulkan::VulkanWorkspace::new(device, 8 * 1024 * 1024) {
+        Ok(ws) => {
+            tracing::info!(
+                device,
+                bytes = ws.allocated_bytes(),
+                "Vulkan workspace allocated"
+            );
+            Some(ws)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Vulkan workspace failed; CPU fallback");
             None
         }
     }
@@ -3932,6 +4130,8 @@ fn verify_and_sample(
         Some(hooks.ds_queue),
         #[cfg(feature = "cuda")]
         hooks.cuda,
+        #[cfg(feature = "vulkan")]
+        hooks.vulkan,
     )?;
     if stop || !first_match || draft_iter.peek().is_none() {
         return finish_linear_verify(
@@ -3981,6 +4181,8 @@ fn verify_and_sample(
             Some(hooks.ds_queue),
             #[cfg(feature = "cuda")]
             hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
         )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || !matched || draft_iter.peek().is_none() {
@@ -4598,6 +4800,8 @@ fn packed_linear_verify_span(
             Some(hooks.ds_queue),
             #[cfg(feature = "cuda")]
             hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
         )?;
     } else {
         let off = keep.saturating_sub(1) * vocab;
@@ -4695,6 +4899,8 @@ fn verify_forest(
             Some(hooks.ds_queue),
             #[cfg(feature = "cuda")]
             hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
         )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || child.is_none() || forest.children(parent).next().is_none() {
@@ -4734,6 +4940,7 @@ fn append_and_forward(
     ds_probe: Option<&DirectStorageProbe>,
     ds_queue: Option<&DirectStorageQueue>,
     #[cfg(feature = "cuda")] cuda: Option<&allpaca_cuda::CudaWorkspace>,
+    #[cfg(feature = "vulkan")] vulkan: Option<&allpaca_vulkan::VulkanWorkspace>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
     let page_tokens = request(inner, id)?
@@ -4770,6 +4977,8 @@ fn append_and_forward(
     let resident = inner.target_resident.clone();
     #[cfg(feature = "cuda")]
     let cuda_resident = inner.target_cuda_resident.clone();
+    #[cfg(feature = "vulkan")]
+    let vulkan_resident = inner.target_vulkan_resident.clone();
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     let mut moe_norm = std::mem::take(&mut request_mut(inner, id)?.moe_norm);
     let mut last_hidden = std::mem::take(&mut request_mut(inner, id)?.last_hidden);
@@ -4825,7 +5034,43 @@ fn append_and_forward(
             false
         }
     };
-    if !used_cuda {
+    let used_vulkan = {
+        #[cfg(feature = "vulkan")]
+        {
+            let mut used = false;
+            if hip.is_none() && !used_cuda {
+                if let (Some(vk), Some(vres)) = (vulkan, vulkan_resident.as_deref()) {
+                    match target.forward_token_vulkan(
+                        token,
+                        pos,
+                        &pages,
+                        &mut inner.kv,
+                        metrics,
+                        &mut logits,
+                        vk,
+                        vres,
+                        None,
+                    ) {
+                        Ok(()) => used = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                pos,
+                                token,
+                                error = %e,
+                                "Vulkan on-device decode failed; host fallback"
+                            );
+                        }
+                    }
+                }
+            }
+            used
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            false
+        }
+    };
+    if !used_cuda && !used_vulkan {
         target.forward_token(
             token,
             pos,

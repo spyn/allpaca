@@ -71,6 +71,8 @@ pub use memory_tier::{
 pub use modality::{EncoderPlacement, ImageInput, NoopVisionEncoder, VisionEncoder, VisionTokens};
 #[cfg(feature = "cuda")]
 pub use model::CudaResidentModel;
+#[cfg(feature = "vulkan")]
+pub use model::VulkanResidentModel;
 pub use model::{LayerWeights, ModelConfig, MtpNextnWeights, TinyModel};
 pub use otel::export_otlp_json;
 pub use packed::{HostExpertPool, PackedStore};

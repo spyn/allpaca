@@ -36,6 +36,10 @@ impl DeviceInventory {
             {
                 devices.extend(allpaca_cuda::enumerate_devices());
             }
+            #[cfg(feature = "vulkan")]
+            {
+                devices.extend(allpaca_vulkan::enumerate_devices());
+            }
         }
         for (i, endpoint) in config.rpc.endpoints.iter().enumerate() {
             let id = RPC_DEVICE_ID_BASE + i as i32;
@@ -134,14 +138,14 @@ fn resolve_devices(
         DeviceSelector::Auto => placement.target_device,
         DeviceSelector::Cpu => -1,
         DeviceSelector::Hip(id) => id,
-        // Engine execute path is still HIP; cuda:N selects a CUDA id for inventory only.
-        DeviceSelector::Cuda(id) => id,
+        // Engine execute path is still HIP; cuda:N / vulkan:N select inventory ids.
+        DeviceSelector::Cuda(id) | DeviceSelector::Vulkan(id) => id,
     };
     let draft = match config.engine.draft_device {
         DeviceSelector::Auto => placement.draft_device,
         DeviceSelector::Cpu => -1,
         DeviceSelector::Hip(id) => id,
-        DeviceSelector::Cuda(id) => id,
+        DeviceSelector::Cuda(id) | DeviceSelector::Vulkan(id) => id,
     };
     let target = if devices.iter().any(|d| d.id == target) {
         target
@@ -161,7 +165,7 @@ fn resolve_vision_device(config: &Config, devices: &[DeviceInfo]) -> Option<i32>
     let id = match sel {
         DeviceSelector::Auto => return None,
         DeviceSelector::Cpu => -1,
-        DeviceSelector::Hip(id) | DeviceSelector::Cuda(id) => id,
+        DeviceSelector::Hip(id) | DeviceSelector::Cuda(id) | DeviceSelector::Vulkan(id) => id,
     };
     if devices.iter().any(|d| d.id == id) {
         Some(id)

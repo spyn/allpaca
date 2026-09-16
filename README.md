@@ -167,6 +167,24 @@ cargo test -p allpaca-cuda --features cuda
 Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexist.
 Engine forwards remain HIP until CUDA parity lands.
 
+### Vulkan (optional rust-gpu scaffold)
+
+Needs a Vulkan 1.3 loader/device. `--features vulkan` compiles first-party
+compute shaders with [rust-gpu](https://rust-gpu.github.io/) (nested nightly via
+`cargo-gpu-install`) and dispatches them with `ash`. Without a successful SPIR-V
+build or GPU, `device_count()` is 0 and the crate still compiles (stub).
+
+```bash
+cargo test -p allpaca-vulkan --features vulkan
+cargo test -p allpaca-core --features vulkan --test vulkan_runtime
+```
+
+Set `ALLPACA_SKIP_VULKAN_SHADERS=1` to skip the rust-gpu nested build (stub
+only). Auto backend order is HIP, then CUDA, then Vulkan, then CPU. Explicit
+`gpu_backend = "vulkan"` / `vulkan:N` selects Vulkan. This is an F32 TinyModel
+scaffold (tiny F32 / host-dequant Q4_K / F16 GGUF), not HIP packed-quant parity
+([ADR 0005](docs/adr/0005-vulkan-rust-gpu.md)).
+
 ---
 
 ## Run
@@ -312,6 +330,8 @@ Or edit `docker-compose.yml` `command` / `volumes` accordingly.
 | `allpaca-safetensors` / `allpaca-onnx` | HuggingFace SafeTensors (BF16/F16/F32, shards, Llama-family names) / ONNX importers |
 | `allpaca-hip` | HIP FFI (`--features hip`) |
 | `allpaca-cuda` | CUDA FFI (`--features cuda`; toolkit builds without a GPU) |
+| `allpaca-vulkan` | Vulkan/`ash` host (`--features vulkan`; rust-gpu SPIR-V at build) |
+| `allpaca-shaders` | rust-gpu compute crate (not a workspace member; built from `allpaca-vulkan`) |
 | `allpaca-cpu` | CPU kernels + dequant |
 | `allpaca-server` | OpenAI-compatible HTTP |
 | `tools/bench` | Lightweight bench binary |

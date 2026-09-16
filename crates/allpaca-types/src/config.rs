@@ -327,7 +327,7 @@ pub struct EngineSection {
     /// When `poll_schedule = prefill_budget`, max consecutive prefill picks before a
     /// decode Request must be served (0 = unlimited). Ignored for other schedules.
     pub max_consecutive_prefill_picks: usize,
-    /// `"auto"` (HIP when the `hip` feature sees devices), `"hip"`, or `"cpu"`.
+    /// `"auto"` (HIP, else CUDA, else Vulkan), `"hip"`, `"cuda"`, `"vulkan"`, or `"cpu"`.
     pub gpu_backend: String,
 }
 

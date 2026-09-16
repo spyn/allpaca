@@ -5,6 +5,7 @@ members = [
     "crates/allpaca-cpu",
     "crates/allpaca-hip",
     "crates/allpaca-cuda",
+    "crates/allpaca-vulkan",
     "crates/allpaca-gguf",
     "crates/allpaca-safetensors",
     "crates/allpaca-onnx",
@@ -14,6 +15,7 @@ members = [
     "crates/allpaca-server",
     "tools/bench",
 ]
+exclude = ["crates/allpaca-shaders"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,6 +31,7 @@ allpaca-safetensors = { path = "crates/allpaca-safetensors" }
 allpaca-onnx = { path = "crates/allpaca-onnx" }
 allpaca-hip = { path = "crates/allpaca-hip" }
 allpaca-cuda = { path = "crates/allpaca-cuda" }
+allpaca-vulkan = { path = "crates/allpaca-vulkan" }
 allpaca-cpu = { path = "crates/allpaca-cpu" }
 allpaca-rpc = { path = "crates/allpaca-rpc" }
 serde = { version = "1", features = ["derive"] }
@@ -57,3 +60,10 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 llguidance = "1.8"
+
+# rust-gpu nested builds compile rustc_codegen_spirv; keep it optimized.
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3

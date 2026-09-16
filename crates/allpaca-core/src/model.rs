@@ -9116,6 +9116,13 @@ mod cuda_decode;
 #[cfg(feature = "cuda")]
 pub use cuda_decode::CudaResidentModel;
 
+#[cfg(feature = "vulkan")]
+#[path = "vulkan_decode.rs"]
+mod vulkan_decode;
+
+#[cfg(feature = "vulkan")]
+pub use vulkan_decode::VulkanResidentModel;
+
 struct Lcg {
     state: u64,
 }
