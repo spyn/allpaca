@@ -9309,6 +9309,41 @@ mod tests {
         write_gguf(path, &meta, &views).unwrap();
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_tiny_gdn_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join("allpaca_cuda_tiny_gdn.gguf");
+        write_tiny_qwen_gdn_gguf(&path, 0.02);
+        let mut cfg = Config::compiled_defaults();
+        cfg.model.path = Some(path.clone());
+        cfg.model.synthetic = false;
+        cfg.engine.cpu_only = false;
+        cfg.engine.gpu_backend = "cuda".into();
+        cfg.engine.determinism_seed = Some(7);
+        cfg.speculative.enabled = false;
+        cfg.kv.page_tokens = 8;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny GDN GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "cuda" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "GDN/SSM must not CUDA-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "CUDA GDN upload reject must degrade; stats={stats:?}"
+        );
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn hip_mamba2_matches_host_and_keeps_state_resident() {
