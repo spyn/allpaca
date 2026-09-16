@@ -3,7 +3,6 @@
 use super::{gather_kv, LayerWeights, ModelConfig, TinyModel, WeightRef};
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
-use allpaca_cpu::{attention, rope, silu};
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
@@ -220,21 +219,16 @@ impl TinyModel {
                 dim as i32,
             )?;
 
-            // RoPE on host (device rope available; host keeps KV slot writes simple).
-            for h in 0..cfg.n_heads {
-                rope(
-                    &mut q[h * head_dim..(h + 1) * head_dim],
-                    pos,
-                    cfg.rope_theta,
-                )?;
-            }
-            for h in 0..cfg.n_kv_heads {
-                rope(
-                    &mut k[h * head_dim..(h + 1) * head_dim],
-                    pos,
-                    cfg.rope_theta,
-                )?;
-            }
+            // RoPE on device (interleaved heads, same layout as HIP allpaca_rope).
+            cuda.rope(&mut q, cfg.n_heads as i32, head_dim as i32, pos as i32, cfg.rope_theta)?;
+            cuda.rope(
+                &mut k,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                cfg.rope_theta,
+            )?;
+            metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
 
             let page_tokens = kv
                 .get(page_ids[layer_idx][0])
@@ -264,16 +258,16 @@ impl TinyModel {
             } else {
                 let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim;
-                attention(
+                cuda.attention(
                     &q,
                     &k_all,
                     &v_all,
                     &mut attn_out,
                     1,
-                    n_kv,
-                    cfg.n_heads,
-                    cfg.n_kv_heads,
-                    head_dim,
+                    n_kv as i32,
+                    cfg.n_heads as i32,
+                    cfg.n_kv_heads as i32,
+                    head_dim as i32,
                     true,
                 )?;
             }
@@ -286,9 +280,8 @@ impl TinyModel {
                 dim as i32,
                 dim as i32,
             )?;
-            for i in 0..dim {
-                x[i] += hidden[i];
-            }
+            cuda.residual_add_host(&mut x, &hidden)?;
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
             apply_ffn_cuda(
                 cfg,
@@ -375,9 +368,8 @@ fn apply_ffn_cuda(
         ff as i32,
         dim as i32,
     )?;
-    for i in 0..ff {
-        gate[i] = silu(gate[i]) * up[i];
-    }
+    cuda.silu_mul_host(&mut gate, &up)?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     cuda.gemm_nt_host_a_dev_b(
         &gate,
         resident.ptr(layer.w_down)?,
@@ -386,8 +378,7 @@ fn apply_ffn_cuda(
         dim as i32,
         ff as i32,
     )?;
-    for i in 0..dim {
-        x[i] += hidden[i];
-    }
+    cuda.residual_add_host(x, hidden)?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }

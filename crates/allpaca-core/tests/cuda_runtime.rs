@@ -123,6 +123,11 @@ fn cuda_smoke_decode_keeps_device_resident() {
         stats.gpu_forwards,
         stats.target_gpu_forwards
     );
+    assert!(
+        stats.elementwise_gpu_ops > 0,
+        "RoPE/SiLU/residual should run on device, elementwise_gpu_ops={}",
+        stats.elementwise_gpu_ops
+    );
 }
 
 #[test]

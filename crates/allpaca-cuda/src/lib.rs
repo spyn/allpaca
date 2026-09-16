@@ -1206,6 +1206,40 @@ impl CudaWorkspace {
         result
     }
 
+    /// Host roundtrip: in-place `x += y` via device residual_add.
+    pub fn residual_add_host(&self, x: &mut [f32], y: &[f32]) -> Result<(), AllpacaError> {
+        let n = x.len().min(y.len());
+        if n == 0 {
+            return Ok(());
+        }
+        let dx = self.upload_f32(&x[..n])?;
+        let dy = self.upload_f32(&y[..n])?;
+        let result = (|| {
+            self.residual_add_dev(dx, dy, dx, n as i32)?;
+            self.download_f32(dx, &mut x[..n])
+        })();
+        self.free_ptr(dx);
+        self.free_ptr(dy);
+        result
+    }
+
+    /// Host roundtrip: in-place `gate = silu(gate) * up` via device.
+    pub fn silu_mul_host(&self, gate: &mut [f32], up: &[f32]) -> Result<(), AllpacaError> {
+        let n = gate.len().min(up.len());
+        if n == 0 {
+            return Ok(());
+        }
+        let dg = self.upload_f32(&gate[..n])?;
+        let du = self.upload_f32(&up[..n])?;
+        let result = (|| {
+            self.silu_mul_dev(dg, du, dg, n as i32)?;
+            self.download_f32(dg, &mut gate[..n])
+        })();
+        self.free_ptr(dg);
+        self.free_ptr(du);
+        result
+    }
+
     /// Host roundtrip: attention via device.
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
@@ -1932,6 +1966,31 @@ mod tests {
                 cuda_x[i],
                 cpu_x[i]
             );
+        }
+    }
+
+    #[test]
+    fn residual_add_and_silu_mul_host_match_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let mut x = [1.0f32, 2.0, -0.5, 0.25];
+        let y = [0.5f32, 0.25, 1.0, -0.25];
+        let mut cpu_x = x;
+        ws.residual_add_host(&mut x, &y).expect("residual");
+        for i in 0..4 {
+            cpu_x[i] += y[i];
+            assert!((x[i] - cpu_x[i]).abs() < 1e-5, "residual i={i}");
+        }
+        let mut gate = [1.0f32, -1.0, 0.5, 2.0];
+        let up = [2.0f32, 0.5, 1.0, 0.25];
+        let mut cpu_g = gate;
+        ws.silu_mul_host(&mut gate, &up).expect("silu");
+        for i in 0..4 {
+            let s = cpu_g[i] / (1.0 + (-cpu_g[i]).exp());
+            cpu_g[i] = s * up[i];
+            assert!((gate[i] - cpu_g[i]).abs() < 1e-4, "silu i={i}");
         }
     }
 
