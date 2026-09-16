@@ -523,6 +523,46 @@ impl VulkanWorkspace {
         }
     }
 
+    /// Host Q + resident device K/V (no KV D2H). Used by Vulkan decode pages.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_host_q_dev_kv(
+        &self,
+        q: &[f32],
+        k: DeviceSlice,
+        v: DeviceSlice,
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        let q_n = (n_q as usize) * (n_heads as usize) * (head_dim as usize);
+        if q.len() < q_n || out.len() < q_n {
+            return Err(degraded("attention_host_q_dev_kv buffer mismatch"));
+        }
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            let dq = self.inner.upload_f32(&q[..q_n])?;
+            self.account_h2d((q_n * 4) as u64);
+            let dout = self.inner.alloc((q_n * 4) as u64, "attn_out")?;
+            let sq = runtime::Inner::slice_of(&dq, 0, (q_n * 4) as u64);
+            let so = runtime::Inner::slice_of(&dout, 0, (q_n * 4) as u64);
+            self.inner.attention(
+                sq, k, v, so, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            )?;
+            self.inner.download_f32(&dout, &mut out[..q_n])?;
+            self.account_d2h((q_n * 4) as u64);
+            Ok(())
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            let _ = (k, v, causal);
+            Err(degraded("Vulkan attention unavailable"))
+        }
+    }
+
     pub fn copy_h2d_f32(
         &self,
         dst: &VulkanDeviceWeights,
@@ -956,6 +996,66 @@ mod tests {
             assert!(
                 (gpu_out[i] - cpu_out[i]).abs() < 1e-4,
                 "attention mismatch at {i}: vulkan={} cpu={}",
+                gpu_out[i],
+                cpu_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn attention_host_q_dev_kv_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_q = 1i32;
+        let n_kv = 4i32;
+        let n_heads = 4i32;
+        let n_kv_heads = 2i32;
+        let head_dim = 8i32;
+        let q_n = (n_q * n_heads * head_dim) as usize;
+        let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
+        let q: Vec<f32> = (0..q_n).map(|i| (i as f32) * 0.02).collect();
+        let k: Vec<f32> = (0..kv_n).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        let v: Vec<f32> = (0..kv_n).map(|i| (i as f32 + 2.0) * 0.015).collect();
+        let mut gpu_out = vec![0.0f32; q_n];
+        let mut cpu_out = vec![0.0f32; q_n];
+        let ws = VulkanWorkspace::new(0, 64 * 1024).expect("workspace");
+        let k_page = ws.alloc_kv_page(kv_n * 4).expect("k page");
+        let v_page = ws.alloc_kv_page(kv_n * 4).expect("v page");
+        ws.kv_write_f32(&k_page, 0, &k).expect("write k");
+        ws.kv_write_f32(&v_page, 0, &v).expect("write v");
+        let k_dev = ws.kv_slice(&k_page, 0, kv_n).expect("k slice");
+        let v_dev = ws.kv_slice(&v_page, 0, kv_n).expect("v slice");
+        ws.attention_host_q_dev_kv(
+            &q,
+            k_dev,
+            v_dev,
+            &mut gpu_out,
+            n_q,
+            n_kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            true,
+        )
+        .expect("vulkan resident-kv attention");
+        allpaca_cpu::attention(
+            &q,
+            &k,
+            &v,
+            &mut cpu_out,
+            n_q as usize,
+            n_kv as usize,
+            n_heads as usize,
+            n_kv_heads as usize,
+            head_dim as usize,
+            true,
+        )
+        .expect("cpu attention");
+        for i in 0..q_n {
+            assert!(
+                (gpu_out[i] - cpu_out[i]).abs() < 1e-4,
+                "resident-kv attention mismatch at {i}: vulkan={} cpu={}",
                 gpu_out[i],
                 cpu_out[i]
             );

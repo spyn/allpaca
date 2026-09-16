@@ -310,6 +310,26 @@ fn vulkan_synthetic_generate_uses_device_when_present() {
 }
 
 #[test]
+fn vulkan_generate_uses_device_kv_when_present() {
+    if !vulkan_device_available() {
+        return;
+    }
+    let engine = Engine::new(vulkan_synthetic()).expect("engine");
+    let mut handle = engine.begin_request("hello", greedy(4)).expect("begin");
+    assert!(matches!(
+        engine.step(&mut handle).expect("step"),
+        allpaca_types::StepResult::Token(_) | allpaca_types::StepResult::Finished(_)
+    ));
+    let stats = engine.stats();
+    assert!(
+        stats.kv_bytes_on_device > 0,
+        "live Request KV pages must be Vulkan device buffers; kv_bytes_on_device={}",
+        stats.kv_bytes_on_device
+    );
+    drop(handle);
+}
+
+#[test]
 fn vulkan_absent_falls_back_to_cpu_cleanly() {
     if vulkan_device_available() {
         return;
@@ -389,6 +409,36 @@ fn vulkan_synthetic_hybrid_generate_uses_device_when_present() {
     );
     let out = engine.generate("hello", greedy(4)).expect("generate");
     assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected Vulkan hybrid forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
+
+#[test]
+fn vulkan_synthetic_hybrid_matches_cpu_when_present() {
+    if !vulkan_device_available() {
+        return;
+    }
+    let mut cpu_cfg = vulkan_synthetic();
+    cpu_cfg.engine.cpu_only = true;
+    cpu_cfg.engine.gpu_backend = "cpu".into();
+    let cpu = Engine::new(cpu_cfg).expect("cpu engine");
+    cpu.load_synthetic(allpaca_core::ModelConfig::tiny_hybrid())
+        .expect("cpu hybrid");
+    let want = cpu.generate("hello", greedy(4)).expect("cpu generate");
+
+    let gpu = Engine::new(vulkan_synthetic()).expect("vulkan engine");
+    gpu.load_synthetic(allpaca_core::ModelConfig::tiny_hybrid())
+        .expect("vulkan hybrid");
+    let got = gpu.generate("hello", greedy(4)).expect("vulkan generate");
+    assert_eq!(
+        got.token_ids, want.token_ids,
+        "Vulkan hybrid greedy tokens must match CPU"
+    );
 }
 
 #[test]
