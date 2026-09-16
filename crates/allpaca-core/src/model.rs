@@ -2519,6 +2519,11 @@ fn load_gguf_mla_host(
     layer: usize,
     cfg: &ModelConfig,
 ) -> Result<Option<MlaHostWeights>, AllpacaError> {
+    // DeepSeek-V4 MLA lives in `Dsv4Weights` (`attn_kv.weight` + output LoRA).
+    // The DeepSeek-V2 host pack (`attn_kv_a_mqa` + dense `attn_output`) is absent.
+    if matches!(file.architecture(), Some("deepseek4" | "deepseek_v4")) {
+        return Ok(None);
+    }
     if file.tensor(&format!("blk.{layer}.attn_q_a.weight")).is_none()
         && file.tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight")).is_none()
     {

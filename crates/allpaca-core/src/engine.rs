@@ -1326,6 +1326,12 @@ impl Engine {
                     p.attach_hip(hip.clone());
                 }
             }
+            // DSV4 skips generic HIP GGUF upload (`dsv4_gpu::attach` above). CUDA-only
+            // still attempts resident upload so MLA/DSV4 is explicitly rejected.
+            #[cfg(feature = "cuda")]
+            if self.hip.is_none() {
+                self.upload_resident_from_gguf(None, None)?;
+            }
             return self.note_early_exit_gate();
         }
         let draft_ref = if draft_reuses_target_gguf {
@@ -8797,6 +8803,49 @@ mod tests {
             .expect("tiny DeepSeek-V4 must generate");
         assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_tiny_deepseek4_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_cuda_tiny_dsv4-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: false,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg.engine.gpu_backend = "cuda".into();
+        cfg.speculative.enabled = false;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny DeepSeek-V4 GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "cuda" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "MLA/DSV4 must not CUDA-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "CUDA MLA upload reject must degrade; stats={stats:?}"
+        );
     }
 
     #[cfg(feature = "hip")]

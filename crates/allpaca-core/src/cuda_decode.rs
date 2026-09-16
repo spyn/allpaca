@@ -10,6 +10,9 @@ use allpaca_types::{AllpacaError, FatalError};
 use std::sync::atomic::Ordering;
 
 fn cuda_decode_blocks_ok(model: &TinyModel) -> bool {
+    if model.dsv4.is_some() {
+        return false;
+    }
     model.layers.iter().all(|l| {
         l.ssm.is_none()
             && l.gdn.is_none()
@@ -57,7 +60,7 @@ impl CudaResidentModel {
         if !cuda_decode_blocks_ok(model) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA resident upload: attention/dense-FFN/MoE TinyModel only (no SSM/GDN/MLA)".into(),
+                    "CUDA resident upload: attention/dense-FFN/MoE TinyModel only (no SSM/GDN/MLA/DSV4)".into(),
                 ),
             ));
         }
@@ -144,7 +147,7 @@ impl TinyModel {
         if !cuda_decode_blocks_ok(self) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA decode: attention/dense-FFN/MoE only (no SSM/GDN/MLA)".into(),
+                    "CUDA decode: attention/dense-FFN/MoE only (no SSM/GDN/MLA/DSV4)".into(),
                 ),
             ));
         }
