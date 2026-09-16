@@ -12,6 +12,8 @@ mod cuda_arch;
 
 use allpaca_types::{AllpacaError, DegradedError, DeviceInfo, DeviceKind};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 
 pub const ALLPACA_OK: i32 = 0;
 pub const ALLPACA_ERR_NOT_IMPLEMENTED: i32 = 1;
@@ -67,8 +69,14 @@ mod ffi {
         pub fn allpaca_cuda_stream_destroy(stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_stream_wait_event(stream: *mut c_void, event: *mut c_void) -> i32;
         pub fn allpaca_cuda_event_create(event: *mut *mut c_void) -> i32;
+        pub fn allpaca_cuda_event_create_timing(event: *mut *mut c_void) -> i32;
         pub fn allpaca_cuda_event_destroy(event: *mut c_void) -> i32;
         pub fn allpaca_cuda_event_record(event: *mut c_void, stream: *mut c_void) -> i32;
+        pub fn allpaca_cuda_event_elapsed_us(
+            start: *mut c_void,
+            stop: *mut c_void,
+            us: *mut f64,
+        ) -> i32;
         pub fn allpaca_cuda_gemm_nt(
             a: *const f32,
             b: *const f32,
@@ -459,6 +467,44 @@ fn event_create_raw() -> Result<*mut std::ffi::c_void, AllpacaError> {
     }
 }
 
+fn event_create_timing_raw() -> Result<*mut std::ffi::c_void, AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut event = std::ptr::null_mut();
+        let rc = unsafe { ffi::allpaca_cuda_event_create_timing(&mut event) };
+        status(rc, "event_create_timing")?;
+        Ok(event)
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA event_create_timing unavailable".into(),
+        )))
+    }
+}
+
+fn event_destroy_raw(event: *mut std::ffi::c_void) {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        if !event.is_null() {
+            unsafe {
+                let _ = ffi::allpaca_cuda_event_destroy(event);
+            }
+        }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = event;
+    }
+}
+
+/// Last decode sample: GPU kernel time vs host wall remainder (microseconds).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecodeProfile {
+    pub gpu_us: f64,
+    pub host_us: f64,
+}
+
 /// Owned non-blocking CUDA stream (compute or H2D side stream).
 pub struct CudaStream {
     stream: *mut std::ffi::c_void,
@@ -745,6 +791,11 @@ pub struct CudaWorkspace {
     scratch: *mut std::ffi::c_void,
     scratch_bytes: usize,
     stream: *mut std::ffi::c_void,
+    t0: *mut std::ffi::c_void,
+    t1: *mut std::ffi::c_void,
+    profile_wall: Mutex<Option<Instant>>,
+    ema_gpu_us: AtomicU64,
+    ema_host_us: AtomicU64,
     activation_h2d: AtomicU64,
     activation_d2h: AtomicU64,
 }
@@ -769,11 +820,33 @@ impl CudaWorkspace {
                 return Err(e);
             }
         };
+        let t0 = match event_create_timing_raw() {
+            Ok(e) => e,
+            Err(e) => {
+                device_free(scratch);
+                stream_destroy_raw(stream);
+                return Err(e);
+            }
+        };
+        let t1 = match event_create_timing_raw() {
+            Ok(e) => e,
+            Err(e) => {
+                event_destroy_raw(t0);
+                device_free(scratch);
+                stream_destroy_raw(stream);
+                return Err(e);
+            }
+        };
         Ok(Self {
             device,
             scratch,
             scratch_bytes,
             stream,
+            t0,
+            t1,
+            profile_wall: Mutex::new(None),
+            ema_gpu_us: AtomicU64::new(0),
+            ema_host_us: AtomicU64::new(0),
             activation_h2d: AtomicU64::new(0),
             activation_d2h: AtomicU64::new(0),
         })
@@ -799,6 +872,58 @@ impl CudaWorkspace {
     /// Wait for all work previously enqueued on this workspace stream.
     pub fn synchronize(&self) -> Result<(), AllpacaError> {
         unsafe { stream_synchronize_on(self.stream) }
+    }
+
+    /// Record a GPU start event and host wall clock for this decode step.
+    pub fn begin_decode_profile(&self) {
+        *self.profile_wall.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        unsafe {
+            let _ = ffi::allpaca_cuda_event_record(self.t0, self.stream);
+        }
+    }
+
+    /// Finish the sample: GPU elapsed from events, host remainder from wall.
+    pub fn end_decode_profile(&self) {
+        let wall = self
+            .profile_wall
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|t| t.elapsed().as_secs_f64() * 1_000_000.0)
+            .unwrap_or(0.0);
+        let mut gpu_us = 0.0f64;
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            unsafe {
+                let _ = ffi::allpaca_cuda_event_record(self.t1, self.stream);
+            }
+            let _ = self.synchronize();
+            let rc = unsafe { ffi::allpaca_cuda_event_elapsed_us(self.t0, self.t1, &mut gpu_us) };
+            if rc != ALLPACA_OK {
+                gpu_us = 0.0;
+            }
+        }
+        let host_us = (wall - gpu_us).max(0.0);
+        // EMA: 7/8 previous + 1/8 sample, stored as microsecond integers.
+        let blend = |prev: &AtomicU64, sample: f64| {
+            let old = prev.load(Ordering::Relaxed) as f64;
+            let next = if old == 0.0 {
+                sample
+            } else {
+                old * 0.875 + sample * 0.125
+            };
+            prev.store(next.round() as u64, Ordering::Relaxed);
+        };
+        blend(&self.ema_gpu_us, gpu_us);
+        blend(&self.ema_host_us, host_us);
+    }
+
+    pub fn decode_profile(&self) -> DecodeProfile {
+        DecodeProfile {
+            gpu_us: self.ema_gpu_us.load(Ordering::Relaxed) as f64,
+            host_us: self.ema_host_us.load(Ordering::Relaxed) as f64,
+        }
     }
 
     pub fn gemm_nt_dev(
@@ -1362,6 +1487,10 @@ impl CudaWorkspace {
 impl Drop for CudaWorkspace {
     fn drop(&mut self) {
         let _ = unsafe { stream_synchronize_on(self.stream) };
+        event_destroy_raw(self.t0);
+        event_destroy_raw(self.t1);
+        self.t0 = std::ptr::null_mut();
+        self.t1 = std::ptr::null_mut();
         device_free(self.scratch);
         self.scratch = std::ptr::null_mut();
         stream_destroy_raw(self.stream);
@@ -1652,6 +1781,32 @@ mod tests {
         ws.free_device(d_tmp);
         ws.free_device(d_out);
         ws.synchronize().expect("drain");
+    }
+
+    #[test]
+    fn decode_profile_records_gpu_time_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let n = 256i32;
+        let x: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+        let y: Vec<f32> = (0..n).map(|i| (n - i) as f32 * 0.01).collect();
+        let dx = ws.upload_f32(&x).expect("x");
+        let dy = ws.upload_f32(&y).expect("y");
+        let dout = device_malloc((n as usize) * 4, 0).expect("out");
+        ws.begin_decode_profile();
+        ws.residual_add_dev(dx, dy, dout.cast(), n).expect("add");
+        ws.end_decode_profile();
+        let p = ws.decode_profile();
+        assert!(
+            p.gpu_us > 0.0,
+            "expected GPU event time after residual, got {p:?}"
+        );
+        assert!(p.host_us >= 0.0);
+        ws.free_ptr(dx);
+        ws.free_ptr(dy);
+        ws.free_device(dout);
     }
 
     #[test]

@@ -60,8 +60,10 @@ int allpaca_cuda_stream_destroy(allpaca_cuda_stream_t stream);
 int allpaca_cuda_stream_wait_event(allpaca_cuda_stream_t stream, void *event);
 
 int allpaca_cuda_event_create(void **event);
+int allpaca_cuda_event_create_timing(void **event);
 int allpaca_cuda_event_destroy(void *event);
 int allpaca_cuda_event_record(void *event, allpaca_cuda_stream_t stream);
+int allpaca_cuda_event_elapsed_us(void *start, void *stop, double *us);
 
 /* C[m,n] = A[m,k] * B[n,k]^T (row-major). Device pointers. */
 int allpaca_cuda_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,

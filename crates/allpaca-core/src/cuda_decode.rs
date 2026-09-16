@@ -140,6 +140,17 @@ impl TinyModel {
             ))));
         }
 
+        struct ProfileGuard<'a> {
+            cuda: &'a CudaWorkspace,
+        }
+        impl Drop for ProfileGuard<'_> {
+            fn drop(&mut self) {
+                self.cuda.end_decode_profile();
+            }
+        }
+        cuda.begin_decode_profile();
+        let _profile = ProfileGuard { cuda };
+
         let mut x = vec![0.0f32; dim];
         if let Some(x0) = soft_x {
             if x0.len() != dim {

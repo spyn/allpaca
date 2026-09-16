@@ -224,6 +224,20 @@ extern "C" int allpaca_cuda_event_create(void **event) {
     return ALLPACA_OK;
 }
 
+extern "C" int allpaca_cuda_event_create_timing(void **event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaEvent_t ev = nullptr;
+    cudaError_t err = cudaEventCreateWithFlags(&ev, cudaEventDefault);
+    if (err != cudaSuccess) {
+        *event = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *event = ev;
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_cuda_event_destroy(void *event) {
     if (!event) {
         return ALLPACA_OK;
@@ -236,6 +250,20 @@ extern "C" int allpaca_cuda_event_record(void *event, allpaca_cuda_stream_t stre
         return ALLPACA_ERR_INVALID;
     }
     return cuda_status(cudaEventRecord(static_cast<cudaEvent_t>(event), as_stream(stream)));
+}
+
+extern "C" int allpaca_cuda_event_elapsed_us(void *start, void *stop, double *us) {
+    if (!start || !stop || !us) {
+        return ALLPACA_ERR_INVALID;
+    }
+    float ms = 0.0f;
+    cudaError_t err = cudaEventElapsedTime(
+        &ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(stop));
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *us = static_cast<double>(ms) * 1000.0;
+    return ALLPACA_OK;
 }
 
 extern "C" int allpaca_cuda_stream_wait_event(allpaca_cuda_stream_t stream, void *event) {

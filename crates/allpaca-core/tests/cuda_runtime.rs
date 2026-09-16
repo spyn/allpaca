@@ -148,3 +148,25 @@ fn cuda_stats_sample_vram_when_device_present() {
     assert!(arch.starts_with("sm_"), "arch={arch}");
     assert!(l2 > 0, "l2={l2}");
 }
+
+#[test]
+fn cuda_stats_gpu_util_after_generate_when_device_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    let _ = engine.generate("hi", greedy(4)).expect("generate");
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_samples > 0,
+        "sampler should have run, samples={}",
+        stats.gpu_samples
+    );
+    // Host still owns much of the CUDA decode loop; util is GPU/(GPU+host).
+    assert!(
+        stats.gpu_util > 0.0 && stats.gpu_util <= 1.0,
+        "expected positive GPU util after decode profile, got {}",
+        stats.gpu_util
+    );
+}

@@ -612,10 +612,15 @@ impl Engine {
             let (used, total) = allpaca_cuda::device_memory_info(target_dev)
                 .map(|(free, total)| (total.saturating_sub(free), total))
                 .unwrap_or((0, 0));
-            // CUDA decode profiling lands with fuller workspace parity; VRAM
-            // pressure for /stats is still useful now.
+            let p = self
+                .cuda
+                .as_ref()
+                .map(|c| c.decode_profile())
+                .unwrap_or_default();
+            let wall = p.gpu_us + p.host_us;
+            let util = if wall > 0.0 { p.gpu_us / wall } else { 0.0 };
             self.metrics
-                .record_gpu_sample(used, total, 0, 0, 0.0);
+                .record_gpu_sample(used, total, 0, 0, util);
         }
     }
 
