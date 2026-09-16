@@ -9,7 +9,7 @@ use crate::deltanet::{
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
-use allpaca_cpu::{rope, silu};
+use allpaca_cpu::silu;
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
@@ -628,6 +628,30 @@ impl CudaResidentModel {
         }
     }
 
+    fn gemm_dev_a(
+        &self,
+        cuda: &CudaWorkspace,
+        a: *const f32,
+        w: WeightRef,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if a.is_null() || c.is_null() {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA decode: null GEMM activation pointer".into(),
+            )));
+        }
+        match w.kind {
+            super::WeightKind::F32 => cuda.gemm_nt_dev(a, self.ptr(w)?, c, m, n, k),
+            super::WeightKind::Q8_0 => cuda.gemm_nt_q8_dev(a, self.byte_ptr(w)?, c, m, n, k),
+            _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA decode: unsupported weight kind for device GEMM".into(),
+            ))),
+        }
+    }
+
     fn embed_gather(
         &self,
         cuda: &CudaWorkspace,
@@ -718,11 +742,8 @@ impl TinyModel {
         }
 
         let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
-        let mut q = vec![0.0f32; dim];
-        let mut k = vec![0.0f32; kv_dim];
-        let mut v = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; dim];
         let mut hidden = vec![0.0f32; dim];
+        let acts = cuda.decode_acts(dim, kv_dim)?;
 
         for (layer_idx, host_layer) in self.layers.iter().enumerate() {
             let layer = &resident.layers[layer_idx];
@@ -822,58 +843,51 @@ impl TinyModel {
                     )),
                 ));
             }
-            cuda.rmsnorm_host_x_dev_w(
-                &x,
+            cuda.copy_h2d_f32(acts.x, &x)?;
+            cuda.rmsnorm_dev(
+                acts.x,
                 resident.ptr(layer.attn_norm)?,
-                &mut scratch[..dim],
+                acts.norm,
                 dim as i32,
                 cfg.eps,
             )?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
-            resident.gemm_host_a(
+            resident.gemm_dev_a(cuda, acts.norm, layer.wq, acts.q, 1, dim as i32, dim as i32)?;
+            resident.gemm_dev_a(
                 cuda,
-                &scratch[..dim],
-                layer.wq,
-                &mut q,
-                1,
-                dim as i32,
-                dim as i32,
-            )?;
-            resident.gemm_host_a(
-                cuda,
-                &scratch[..dim],
+                acts.norm,
                 layer.wk,
-                &mut k,
+                acts.k,
                 1,
                 kv_dim as i32,
                 dim as i32,
             )?;
-            resident.gemm_host_a(
+            resident.gemm_dev_a(
                 cuda,
-                &scratch[..dim],
+                acts.norm,
                 layer.wv,
-                &mut v,
+                acts.v,
                 1,
                 kv_dim as i32,
                 dim as i32,
             )?;
 
-            // RoPE on host (device rope available; host keeps KV slot writes simple).
-            for h in 0..cfg.n_heads {
-                rope(
-                    &mut q[h * head_dim..(h + 1) * head_dim],
-                    pos,
-                    cfg.rope_theta,
-                )?;
-            }
-            for h in 0..cfg.n_kv_heads {
-                rope(
-                    &mut k[h * head_dim..(h + 1) * head_dim],
-                    pos,
-                    cfg.rope_theta,
-                )?;
-            }
+            cuda.rope_dev(
+                acts.q,
+                cfg.n_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                cfg.rope_theta,
+            )?;
+            cuda.rope_dev(
+                acts.k,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                cfg.rope_theta,
+            )?;
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
             let page_tokens = kv
                 .get(page_ids[layer_idx][0])
@@ -882,11 +896,11 @@ impl TinyModel {
             let page_index = pos / page_tokens as usize;
             let slot = (pos % page_tokens as usize) as u32;
             let page_id = page_ids[layer_idx][page_index];
-            kv.write_slot(page_id, slot, cfg.n_kv_heads, head_dim, &k, &v)?;
+            kv.write_slot_from_device(page_id, slot, cfg.n_kv_heads, head_dim, acts.k, acts.v)?;
             kv.touch(page_id, 1.0);
 
             let n_kv_max = pos + 1;
-            let (dest_k, dest_v) = cuda.kv_scratch_pair(n_kv_max, kv_dim)?;
+            let (dest_k, dest_v) = cuda.kv_scratch_pair_after(acts.bytes, n_kv_max, kv_dim)?;
             let (k_dev, v_dev, n_kv) = kv.cuda_kv_views(
                 &page_ids[layer_idx],
                 cfg.n_kv_heads,
@@ -895,11 +909,11 @@ impl TinyModel {
                 dest_v,
                 n_kv_max,
             )?;
-            cuda.attention_host_q_dev_kv(
-                &q,
+            cuda.attention_dev(
+                acts.q,
                 k_dev,
                 v_dev,
-                &mut attn_out,
+                acts.attn,
                 1,
                 n_kv as i32,
                 cfg.n_heads as i32,
@@ -908,15 +922,10 @@ impl TinyModel {
                 true,
             )?;
 
-            resident.gemm_host_a(
-                cuda,
-                &attn_out,
-                layer.wo,
-                &mut hidden,
-                1,
-                dim as i32,
-                dim as i32,
+            resident.gemm_dev_a(
+                cuda, acts.attn, layer.wo, acts.proj, 1, dim as i32, dim as i32,
             )?;
+            cuda.download_f32(acts.proj, &mut hidden)?;
             for i in 0..dim {
                 x[i] += hidden[i];
             }

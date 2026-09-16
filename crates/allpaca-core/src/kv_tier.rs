@@ -564,18 +564,33 @@ impl KvTierManager {
             DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
                 let mut k = vec![0.0f32; kv_width];
                 let mut v = vec![0.0f32; kv_width];
-                allpaca_hip::memcpy(
-                    k.as_mut_ptr().cast(),
-                    k_dev.cast(),
-                    k_bytes,
-                    allpaca_hip::MEMCPY_D2H,
-                )?;
-                allpaca_hip::memcpy(
-                    v.as_mut_ptr().cast(),
-                    v_dev.cast(),
-                    k_bytes,
-                    allpaca_hip::MEMCPY_D2H,
-                )?;
+                if self.cuda_device.is_some() {
+                    allpaca_cuda::memcpy(
+                        k.as_mut_ptr().cast(),
+                        k_dev.cast(),
+                        k_bytes,
+                        allpaca_cuda::MEMCPY_D2H,
+                    )?;
+                    allpaca_cuda::memcpy(
+                        v.as_mut_ptr().cast(),
+                        v_dev.cast(),
+                        k_bytes,
+                        allpaca_cuda::MEMCPY_D2H,
+                    )?;
+                } else {
+                    allpaca_hip::memcpy(
+                        k.as_mut_ptr().cast(),
+                        k_dev.cast(),
+                        k_bytes,
+                        allpaca_hip::MEMCPY_D2H,
+                    )?;
+                    allpaca_hip::memcpy(
+                        v.as_mut_ptr().cast(),
+                        v_dev.cast(),
+                        k_bytes,
+                        allpaca_hip::MEMCPY_D2H,
+                    )?;
+                }
                 self.activation_d2h_bytes
                     .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
                 return self.write_slot(id, slot, n_kv_heads, head_dim, &k, &v);

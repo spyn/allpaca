@@ -484,6 +484,20 @@ pub fn embed_gather_q8_0_device(
     }
 }
 
+/// Fixed activation region at the front of CUDA scratch for in-layer QKV fusion.
+/// Packed KV uses the remainder (`kv_scratch_pair_after`).
+#[derive(Clone, Copy)]
+pub struct CudaDecodeActs {
+    pub x: *mut f32,
+    pub norm: *mut f32,
+    pub q: *mut f32,
+    pub k: *mut f32,
+    pub v: *mut f32,
+    pub attn: *mut f32,
+    pub proj: *mut f32,
+    pub bytes: usize,
+}
+
 /// Minimal CUDA workspace: scratch buffer + F32 GEMM. Enough to open when a
 /// device appears; full forward parity grows behind this type (like HipWorkspace).
 pub struct CudaWorkspace {
@@ -520,9 +534,47 @@ impl CudaWorkspace {
         self.scratch_bytes as u64
     }
 
-    /// Scratch K/V pair for packing paged KV into one contiguous device view.
-    pub fn kv_scratch_pair(
+    /// Bytes for `decode_acts`: x, norm, q, attn, proj (`dim`) plus k, v (`kv_dim`).
+    pub fn decode_act_bytes(dim: usize, kv_dim: usize) -> usize {
+        (5usize
+            .saturating_mul(dim)
+            .saturating_add(2usize.saturating_mul(kv_dim)))
+        .saturating_mul(4)
+    }
+
+    /// Device Q/K/V/attn slots at the front of scratch (no host QKV roundtrip).
+    pub fn decode_acts(&self, dim: usize, kv_dim: usize) -> Result<CudaDecodeActs, AllpacaError> {
+        let bytes = Self::decode_act_bytes(dim, kv_dim);
+        if dim == 0 || kv_dim == 0 || bytes == 0 {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                "CUDA decode acts need dim>0 and kv_dim>0".into(),
+            )));
+        }
+        if bytes > self.scratch_bytes {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                format!(
+                    "CUDA decode acts ({bytes} bytes) exceed scratch {}",
+                    self.scratch_bytes
+                ),
+            )));
+        }
+        let base = self.scratch.cast::<f32>();
+        Ok(CudaDecodeActs {
+            x: base,
+            norm: unsafe { base.add(dim) },
+            q: unsafe { base.add(2 * dim) },
+            k: unsafe { base.add(3 * dim) },
+            v: unsafe { base.add(3 * dim + kv_dim) },
+            attn: unsafe { base.add(3 * dim + 2 * kv_dim) },
+            proj: unsafe { base.add(4 * dim + 2 * kv_dim) },
+            bytes,
+        })
+    }
+
+    /// Scratch K/V pair after a byte prefix (QKV acts live in `[0, prefix)`).
+    pub fn kv_scratch_pair_after(
         &self,
+        prefix_bytes: usize,
         n_kv: usize,
         kv_width: usize,
     ) -> Result<(*mut f32, *mut f32), AllpacaError> {
@@ -533,17 +585,32 @@ impl CudaWorkspace {
                 "CUDA KV scratch needs n_kv>0".into(),
             )));
         }
-        if need > self.scratch_bytes {
+        if prefix_bytes % 4 != 0 {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                "CUDA KV scratch prefix must be 4-byte aligned".into(),
+            )));
+        }
+        let total = prefix_bytes.saturating_add(need);
+        if total > self.scratch_bytes {
             return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
                 format!(
-                    "packed CUDA KV ({need} bytes) exceeds scratch {}",
+                    "packed CUDA KV ({need} bytes after {prefix_bytes}) exceeds scratch {}",
                     self.scratch_bytes
                 ),
             )));
         }
-        let k = self.scratch.cast::<f32>();
-        let v = unsafe { self.scratch.add(k_n * 4).cast::<f32>() };
+        let k = unsafe { self.scratch.add(prefix_bytes).cast::<f32>() };
+        let v = unsafe { self.scratch.add(prefix_bytes + k_n * 4).cast::<f32>() };
         Ok((k, v))
+    }
+
+    /// Scratch K/V pair for packing paged KV into one contiguous device view.
+    pub fn kv_scratch_pair(
+        &self,
+        n_kv: usize,
+        kv_width: usize,
+    ) -> Result<(*mut f32, *mut f32), AllpacaError> {
+        self.kv_scratch_pair_after(0, n_kv, kv_width)
     }
 
     pub fn activation_h2d_bytes(&self) -> u64 {
@@ -1296,6 +1363,32 @@ mod tests {
     #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
     fn runtime_linked_when_toolkit_builds() {
         assert!(runtime_linked());
+    }
+
+    #[test]
+    fn decode_acts_kv_scratch_do_not_overlap_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 8 * 1024 * 1024).expect("workspace");
+        let dim = 32usize;
+        let kv_dim = 16usize;
+        let acts = ws.decode_acts(dim, kv_dim).expect("acts");
+        let marker = vec![7.0f32; dim];
+        ws.copy_h2d_f32(acts.q, &marker).expect("q h2d");
+        let n_kv = 4usize;
+        let (dk, dv) = ws
+            .kv_scratch_pair_after(acts.bytes, n_kv, kv_dim)
+            .expect("kv scratch");
+        let packed = vec![9.0f32; n_kv * kv_dim];
+        ws.copy_h2d_f32(dk, &packed).expect("k pack");
+        ws.copy_h2d_f32(dv, &packed).expect("v pack");
+        let mut back = vec![0.0f32; dim];
+        ws.download_f32(acts.q, &mut back).expect("q d2h");
+        assert_eq!(
+            back, marker,
+            "KV pack must not clobber QKV activation slots"
+        );
     }
 
     #[test]
