@@ -57,6 +57,13 @@ int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t co
 
 int allpaca_cuda_set_device(int32_t device);
 
+int allpaca_cuda_can_p2p(int32_t src, int32_t dst, int32_t *can);
+
+int allpaca_cuda_enable_peer_access(int32_t src, int32_t dst);
+
+int allpaca_cuda_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
+                             size_t bytes, allpaca_cuda_stream_t stream);
+
 /* Driver-measured free/total VRAM (includes other processes). */
 int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes);
 

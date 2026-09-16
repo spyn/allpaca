@@ -210,6 +210,48 @@ extern "C" int allpaca_cuda_set_device(int32_t device) {
     return cuda_status(cudaSetDevice(device));
 }
 
+extern "C" int allpaca_cuda_can_p2p(int32_t src, int32_t dst, int32_t *can) {
+    if (!can) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int yes = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&yes, src, dst);
+    if (err != cudaSuccess) {
+        *can = 0;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *can = yes;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_enable_peer_access(int32_t src, int32_t dst) {
+    cudaError_t err = cudaSetDevice(src);
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    err = cudaDeviceEnablePeerAccess(dst, 0);
+    if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
+                                        size_t bytes, allpaca_cuda_stream_t stream) {
+    if ((!dst && bytes) || (!src && bytes)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaStream_t s = as_stream(stream);
+    cudaError_t err = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (s) {
+        return cuda_status(cudaStreamSynchronize(s));
+    }
+    return cuda_status(cudaDeviceSynchronize());
+}
+
 extern "C" int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes) {
     if (!free_bytes || !total_bytes) {
         return ALLPACA_ERR_INVALID;

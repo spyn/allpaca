@@ -69,6 +69,16 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_cuda_set_device(device: i32) -> i32;
+        pub fn allpaca_cuda_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
+        pub fn allpaca_cuda_enable_peer_access(src: i32, dst: i32) -> i32;
+        pub fn allpaca_cuda_memcpy_peer(
+            dst: *mut c_void,
+            dst_dev: i32,
+            src: *const c_void,
+            src_dev: i32,
+            bytes: usize,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_mem_info(
             device: i32,
             free_bytes: *mut u64,
@@ -182,6 +192,103 @@ pub fn device_count() -> i32 {
     }
 }
 
+pub fn can_p2p(src: i32, dst: i32) -> bool {
+    if src == dst {
+        return false;
+    }
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        unsafe {
+            let mut can = 0;
+            ffi::allpaca_cuda_can_p2p(src, dst, &mut can) == ALLPACA_OK && can != 0
+        }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (src, dst);
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerAccess {
+    pub capable: bool,
+    pub enabled: bool,
+}
+
+pub fn enable_peer_access(src: i32, dst: i32) -> bool {
+    if src == dst {
+        return false;
+    }
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        unsafe { ffi::allpaca_cuda_enable_peer_access(src, dst) == ALLPACA_OK }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (src, dst);
+        false
+    }
+}
+
+pub fn memcpy_peer(
+    dst: *mut std::ffi::c_void,
+    dst_dev: i32,
+    src: *const std::ffi::c_void,
+    src_dev: i32,
+    bytes: usize,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_cuda_memcpy_peer(dst, dst_dev, src, src_dev, bytes, std::ptr::null_mut())
+        };
+        status(rc, "memcpy_peer")
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (dst, dst_dev, src, src_dev, bytes);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA memcpy_peer unavailable".into(),
+        )))
+    }
+}
+
+fn peer_copy_reachable(src: i32, dst: i32) -> bool {
+    const N: usize = 64 * 1024;
+    let Ok(s) = device_malloc(N, src) else {
+        return false;
+    };
+    let Ok(d) = device_malloc(N, dst) else {
+        device_free(s);
+        return false;
+    };
+    let ok = memcpy_peer(d, dst, s, src, N).is_ok();
+    device_free(s);
+    device_free(d);
+    ok
+}
+
+/// Query, attempt enable, re-query. `capable` is post-enable *or* a working peer copy.
+pub fn probe_peer(src: i32, dst: i32) -> PeerAccess {
+    if src == dst {
+        return PeerAccess {
+            capable: false,
+            enabled: false,
+        };
+    }
+    let queried = can_p2p(src, dst);
+    let enabled = enable_peer_access(src, dst);
+    let mut capable = can_p2p(src, dst);
+    if !capable {
+        capable = peer_copy_reachable(src, dst);
+    }
+    PeerAccess {
+        capable: capable || queried,
+        enabled,
+    }
+}
+
 /// Enumerate CUDA devices. Empty when feature off, no toolkit, no driver, or no GPU.
 pub fn enumerate_devices() -> Vec<DeviceInfo> {
     let count = device_count();
@@ -204,13 +311,19 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
             let name = unsafe { std::ffi::CStr::from_ptr(name_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
+            let mut peers = Vec::new();
+            for other in 0..count {
+                if other != id && probe_peer(id, other).capable {
+                    peers.push(other);
+                }
+            }
             out.push(DeviceInfo {
                 id,
                 kind: DeviceKind::CudaGpu,
                 name,
                 memory_bytes: mem,
                 bandwidth_gbps: bw,
-                peers: Vec::new(),
+                peers,
             });
         }
         out
@@ -2130,6 +2243,88 @@ mod tests {
             "used={used} used_after={used_after} chunk={chunk}"
         );
         device_free(ptr);
+    }
+
+    #[test]
+    fn can_p2p_same_device_is_false() {
+        assert!(!can_p2p(0, 0));
+        let access = probe_peer(0, 0);
+        assert!(!access.capable);
+        assert!(!access.enabled);
+        assert!(!enable_peer_access(0, 0));
+    }
+
+    #[test]
+    fn can_p2p_unavailable_without_second_device() {
+        if device_count() >= 2 {
+            return;
+        }
+        assert!(!can_p2p(0, 1));
+        assert!(!enable_peer_access(0, 1));
+        let access = probe_peer(0, 1);
+        assert!(!access.capable);
+        assert!(!access.enabled);
+    }
+
+    #[test]
+    fn memcpy_peer_rejects_null_payload() {
+        assert!(memcpy_peer(std::ptr::null_mut(), 0, std::ptr::null(), 0, 64).is_err());
+    }
+
+    #[test]
+    fn enumerate_devices_single_gpu_has_empty_peers() {
+        if device_count() != 1 {
+            return;
+        }
+        let devices = enumerate_devices();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].peers.is_empty());
+    }
+
+    #[test]
+    fn memcpy_peer_same_device_roundtrip_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n = 256usize;
+        let src_host: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let d_src = device_malloc(n, 0).expect("src");
+        let d_dst = device_malloc(n, 0).expect("dst");
+        memcpy(d_src, src_host.as_ptr().cast(), n, MEMCPY_H2D).expect("h2d");
+        memcpy_peer(d_dst, 0, d_src, 0, n).expect("peer same device");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr().cast(), d_dst, n, MEMCPY_D2H).expect("d2h");
+        device_free(d_src);
+        device_free(d_dst);
+        assert_eq!(back, src_host);
+    }
+
+    #[test]
+    fn memcpy_peer_two_gpus_when_present() {
+        if device_count() < 2 {
+            return;
+        }
+        let access = probe_peer(0, 1);
+        assert!(
+            access.capable,
+            "cudaMemcpyPeer must count as P2P capable"
+        );
+        let n = 64 * 1024;
+        let src_host: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let d_src = device_malloc(n, 0).expect("src");
+        let d_dst = device_malloc(n, 1).expect("dst");
+        memcpy(d_src, src_host.as_ptr().cast(), n, MEMCPY_H2D).expect("h2d");
+        memcpy_peer(d_dst, 1, d_src, 0, n).expect("p2p");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr().cast(), d_dst, n, MEMCPY_D2H).expect("d2h");
+        device_free(d_src);
+        device_free(d_dst);
+        assert_eq!(back, src_host);
+        let devices = enumerate_devices();
+        assert!(
+            devices.iter().any(|d| !d.peers.is_empty()),
+            "enumerate_devices must record at least one peer pair"
+        );
     }
 
     #[test]
