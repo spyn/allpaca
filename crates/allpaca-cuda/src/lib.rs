@@ -58,6 +58,14 @@ mod ffi {
             kind: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_memcpy_batch(
+            dsts: *mut *mut c_void,
+            srcs: *mut *mut c_void,
+            sizes: *mut usize,
+            count: usize,
+            kind: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_set_device(device: i32) -> i32;
         pub fn allpaca_cuda_mem_info(
             device: i32,
@@ -391,6 +399,46 @@ pub fn memcpy_on(
         let _ = (dst, src, bytes, kind, stream);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "CUDA memcpy unavailable".into(),
+        )))
+    }
+}
+
+/// Batch of 1D copies on one stream. Empty `copies` is a no-op.
+///
+/// # Safety
+/// Each `dst`/`src` must stay live for `bytes` until the stream drains.
+pub unsafe fn memcpy_batch_on(
+    copies: &[(*mut u8, *const u8, usize)],
+    kind: i32,
+    stream: *mut std::ffi::c_void,
+) -> Result<(), AllpacaError> {
+    if copies.is_empty() {
+        return Ok(());
+    }
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let mut dsts: Vec<*mut std::ffi::c_void> =
+            copies.iter().map(|(d, _, _)| d.cast()).collect();
+        let mut srcs: Vec<*mut std::ffi::c_void> =
+            copies.iter().map(|(_, s, _)| s.cast_mut().cast()).collect();
+        let mut sizes: Vec<usize> = copies.iter().map(|(_, _, n)| *n).collect();
+        let rc = unsafe {
+            ffi::allpaca_cuda_memcpy_batch(
+                dsts.as_mut_ptr(),
+                srcs.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                copies.len(),
+                kind,
+                stream,
+            )
+        };
+        status(rc, "memcpy_batch")
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (copies, kind, stream);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA memcpy_batch unavailable".into(),
         )))
     }
 }
@@ -1572,19 +1620,17 @@ impl CudaDeviceWeights {
             }
             memcpy(ptr, pinned.as_ptr().cast(), bytes, MEMCPY_H2D)?;
         } else {
-            for slice in slices {
-                if slice.is_empty() {
-                    continue;
-                }
-                let n = slice.len() * 4;
-                memcpy(
-                    unsafe { ptr.add(off) },
-                    slice.as_ptr().cast(),
-                    n,
-                    MEMCPY_H2D,
-                )?;
-                off += n;
-            }
+            let copies: Vec<(*mut u8, *const u8, usize)> = slices
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|slice| {
+                    let n = slice.len() * 4;
+                    let dst = unsafe { ptr.add(off) }.cast();
+                    off += n;
+                    (dst, slice.as_ptr().cast(), n)
+                })
+                .collect();
+            unsafe { memcpy_batch_on(&copies, MEMCPY_H2D, std::ptr::null_mut()) }?;
         }
         Ok((
             Self {
@@ -1683,6 +1729,39 @@ mod tests {
         device_free(d);
         assert_eq!(back, src);
         assert!(ws.activation_h2d_bytes() >= (src.len() * 4) as u64);
+    }
+
+    #[test]
+    fn memcpy_batch_empty_is_ok() {
+        unsafe {
+            memcpy_batch_on(&[], MEMCPY_H2D, std::ptr::null_mut()).expect("empty batch");
+        }
+    }
+
+    #[test]
+    fn memcpy_batch_two_h2d_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [5.0f32, 6.0];
+        let da = device_malloc(16, 0).expect("a");
+        let db = device_malloc(8, 0).expect("b");
+        let copies = [
+            (da.cast(), a.as_ptr().cast(), 16usize),
+            (db.cast(), b.as_ptr().cast(), 8usize),
+        ];
+        unsafe {
+            memcpy_batch_on(&copies, MEMCPY_H2D, std::ptr::null_mut()).expect("batch h2d");
+        }
+        let mut a_back = [0.0f32; 4];
+        let mut b_back = [0.0f32; 2];
+        memcpy(a_back.as_mut_ptr().cast(), da, 16, MEMCPY_D2H).expect("d2h a");
+        memcpy(b_back.as_mut_ptr().cast(), db, 8, MEMCPY_D2H).expect("d2h b");
+        device_free(da);
+        device_free(db);
+        assert_eq!(a_back, a);
+        assert_eq!(b_back, b);
     }
 
     #[test]

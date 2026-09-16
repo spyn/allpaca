@@ -46,6 +46,10 @@ int allpaca_cuda_host_free(void *ptr);
 int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                         allpaca_cuda_stream_t stream);
 
+/* Batch of `count` 1D copies, same `kind`, one stream (per-copy cudaMemcpyAsync). */
+int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count, int32_t kind,
+                              allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_set_device(int32_t device);
 
 /* Driver-measured free/total VRAM (includes other processes). */

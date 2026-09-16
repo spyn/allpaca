@@ -147,6 +147,51 @@ extern "C" int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int
     return cuda_status(cudaMemcpy(dst, src, bytes, ck));
 }
 
+extern "C" int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count,
+                                         int32_t kind, allpaca_cuda_stream_t stream) {
+    if (!dsts || !srcs || !sizes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (count == 0) {
+        return ALLPACA_OK;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!dsts[i] || !srcs[i]) {
+            return ALLPACA_ERR_INVALID;
+        }
+    }
+    cudaMemcpyKind ck = cudaMemcpyDefault;
+    switch (kind) {
+    case ALLPACA_MEMCPY_H2D:
+        ck = cudaMemcpyHostToDevice;
+        break;
+    case ALLPACA_MEMCPY_D2H:
+    case ALLPACA_MEMCPY_D2H_ASYNC:
+        ck = cudaMemcpyDeviceToHost;
+        break;
+    case ALLPACA_MEMCPY_D2D:
+        ck = cudaMemcpyDeviceToDevice;
+        break;
+    default:
+        ck = cudaMemcpyDefault;
+        break;
+    }
+    cudaStream_t s = as_stream(stream);
+    for (size_t i = 0; i < count; ++i) {
+        cudaError_t err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], ck, s);
+        if (err != cudaSuccess) {
+            return ALLPACA_ERR_DEVICE;
+        }
+    }
+    if (kind == ALLPACA_MEMCPY_D2H) {
+        if (s) {
+            return cuda_status(cudaStreamSynchronize(s));
+        }
+        return cuda_status(cudaDeviceSynchronize());
+    }
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_cuda_set_device(int32_t device) {
     return cuda_status(cudaSetDevice(device));
 }
