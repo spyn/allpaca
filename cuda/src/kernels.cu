@@ -115,6 +115,20 @@ extern "C" int allpaca_cuda_host_free(void *ptr) {
     return cuda_status(cudaFreeHost(ptr));
 }
 
+extern "C" int allpaca_cuda_host_register(void *ptr, size_t bytes, unsigned int flags) {
+    if (!ptr || bytes == 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(cudaHostRegister(ptr, bytes, flags));
+}
+
+extern "C" int allpaca_cuda_host_unregister(void *ptr) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaHostUnregister(ptr));
+}
+
 extern "C" int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                                    allpaca_cuda_stream_t stream) {
     if ((!dst && bytes) || (!src && bytes)) {

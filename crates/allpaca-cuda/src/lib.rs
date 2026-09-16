@@ -51,6 +51,8 @@ mod ffi {
         pub fn allpaca_cuda_free_async(ptr: *mut c_void, stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_host_malloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn allpaca_cuda_host_free(ptr: *mut c_void) -> i32;
+        pub fn allpaca_cuda_host_register(ptr: *mut c_void, bytes: usize, flags: u32) -> i32;
+        pub fn allpaca_cuda_host_unregister(ptr: *mut c_void) -> i32;
         pub fn allpaca_cuda_memcpy(
             dst: *mut c_void,
             src: *const c_void,
@@ -369,6 +371,62 @@ pub fn host_free(ptr: *mut u8) {
     #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
     {
         let _ = ptr;
+    }
+}
+
+/// Pin existing host memory for async DMA (mirrors HIP `host_register`).
+pub fn host_register(ptr: *mut u8, bytes: usize, flags: u32) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        if ptr.is_null() || bytes == 0 {
+            return Ok(());
+        }
+        let rc = unsafe { ffi::allpaca_cuda_host_register(ptr.cast(), bytes, flags) };
+        status(rc, "host_register")
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (ptr, bytes, flags);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA host_register unavailable".into(),
+        )))
+    }
+}
+
+pub fn host_unregister(ptr: *mut u8) {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        if !ptr.is_null() {
+            unsafe {
+                let _ = ffi::allpaca_cuda_host_unregister(ptr.cast());
+            }
+        }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// RAII pin of a host byte range. Unregisters on drop.
+pub struct HostRegistration {
+    ptr: *mut u8,
+}
+
+unsafe impl Send for HostRegistration {}
+unsafe impl Sync for HostRegistration {}
+
+impl HostRegistration {
+    pub fn new(ptr: *mut u8, bytes: usize) -> Result<Self, AllpacaError> {
+        host_register(ptr, bytes, 0)?;
+        Ok(Self { ptr })
+    }
+}
+
+impl Drop for HostRegistration {
+    fn drop(&mut self) {
+        host_unregister(self.ptr);
+        self.ptr = std::ptr::null_mut();
     }
 }
 
@@ -1377,18 +1435,25 @@ impl CudaWorkspace {
         set_device(self.device)?;
         let ptr = device_malloc(bytes, self.device)?;
         if bytes >= 4096 {
-            let pinned = PinnedHostBuffer::from_slice(unsafe {
-                std::slice::from_raw_parts(host.as_ptr().cast(), bytes)
-            })?;
-            memcpy_on(
-                ptr,
-                pinned.as_ptr().cast(),
-                bytes,
-                MEMCPY_H2D,
-                self.stream,
-            )?;
-            // Pinned lives until H2D completes — sync this staging only.
-            self.synchronize()?;
+            // Pin the caller's pages when the driver allows it; otherwise copy
+            // through a dedicated pinned staging buffer.
+            let host_ptr = host.as_ptr() as *mut u8;
+            if let Ok(_pin) = HostRegistration::new(host_ptr, bytes) {
+                memcpy_on(ptr, host.as_ptr().cast(), bytes, MEMCPY_H2D, self.stream)?;
+                self.synchronize()?;
+            } else {
+                let pinned = PinnedHostBuffer::from_slice(unsafe {
+                    std::slice::from_raw_parts(host.as_ptr().cast(), bytes)
+                })?;
+                memcpy_on(
+                    ptr,
+                    pinned.as_ptr().cast(),
+                    bytes,
+                    MEMCPY_H2D,
+                    self.stream,
+                )?;
+                self.synchronize()?;
+            }
         } else {
             memcpy_on(ptr, host.as_ptr().cast(), bytes, MEMCPY_H2D, self.stream)?;
         }
@@ -1762,6 +1827,47 @@ mod tests {
         device_free(db);
         assert_eq!(a_back, a);
         assert_eq!(b_back, b);
+    }
+
+    #[test]
+    fn host_register_empty_is_ok() {
+        host_register(std::ptr::null_mut(), 0, 0).expect("empty register");
+    }
+
+    #[test]
+    fn host_register_roundtrip_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let mut host: Vec<f32> = (0..1024).map(|i| i as f32 * 0.5).collect();
+        let bytes = host.len() * 4;
+        let pin = HostRegistration::new(host.as_mut_ptr().cast(), bytes).expect("register");
+        let d = device_malloc(bytes, 0).expect("malloc");
+        memcpy(d, host.as_ptr().cast(), bytes, MEMCPY_H2D).expect("h2d");
+        host.fill(0.0);
+        memcpy(host.as_mut_ptr().cast(), d, bytes, MEMCPY_D2H).expect("d2h");
+        device_free(d);
+        drop(pin);
+        for i in 0..host.len() {
+            assert!((host[i] - i as f32 * 0.5).abs() < 1e-6, "i={i}");
+        }
+        // Unregister on drop must allow a second pin of the same range.
+        let pin2 = HostRegistration::new(host.as_mut_ptr().cast(), bytes).expect("re-register");
+        drop(pin2);
+    }
+
+    #[test]
+    fn upload_f32_large_uses_register_or_pinned_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let host: Vec<f32> = (0..2048).map(|i| i as f32).collect();
+        let d = ws.upload_f32(&host).expect("upload");
+        let mut back = vec![0.0f32; host.len()];
+        ws.download_f32(d, &mut back).expect("download");
+        ws.free_ptr(d);
+        assert_eq!(back, host);
     }
 
     #[test]

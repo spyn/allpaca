@@ -43,6 +43,11 @@ int allpaca_cuda_host_malloc(void **ptr, size_t bytes);
 
 int allpaca_cuda_host_free(void *ptr);
 
+/* Pin existing host pages for DMA (HIP host_register). flags: cudaHostRegister* bits. */
+int allpaca_cuda_host_register(void *ptr, size_t bytes, unsigned int flags);
+
+int allpaca_cuda_host_unregister(void *ptr);
+
 int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                         allpaca_cuda_stream_t stream);
 
