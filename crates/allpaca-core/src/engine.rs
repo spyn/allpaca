@@ -9093,6 +9093,49 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_tiny_deepseek4_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_vulkan_tiny_dsv4-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: false,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg.engine.gpu_backend = "vulkan".into();
+        cfg.speculative.enabled = false;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny DeepSeek-V4 GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "vulkan" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "MLA/DSV4 must not Vulkan-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "Vulkan MLA upload reject must degrade; stats={stats:?}"
+        );
+    }
+
     #[cfg(feature = "hip")]
     fn dsv4_generate_tokens(path: &std::path::Path, cpu_only: bool) -> (Vec<u32>, StatsSnapshot) {
         let mut cfg = Config::compiled_defaults();
@@ -9635,6 +9678,48 @@ mod tests {
         assert!(
             stats.degraded_events >= 1,
             "CUDA GDN upload reject must degrade; stats={stats:?}"
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_tiny_gdn_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_vulkan_tiny_gdn-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_tiny_qwen_gdn_gguf(&path, 0.02);
+        let mut cfg = Config::compiled_defaults();
+        cfg.model.path = Some(path.clone());
+        cfg.model.synthetic = false;
+        cfg.engine.cpu_only = false;
+        cfg.engine.gpu_backend = "vulkan".into();
+        cfg.engine.determinism_seed = Some(7);
+        cfg.speculative.enabled = false;
+        cfg.kv.page_tokens = 8;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny GDN GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "vulkan" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "GDN/SSM must not Vulkan-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "Vulkan GDN upload reject must degrade; stats={stats:?}"
         );
     }
 
