@@ -2,7 +2,7 @@
 //!
 //! This is the llama.cpp RPC analogue without a ggml graph. The coordinator
 //! owns scheduling; a worker only allocates buffers and runs the existing
-//! CPU/HIP kernel ABI.
+//! CPU/HIP/CUDA kernel ABI.
 
 mod protocol;
 mod session;
@@ -19,6 +19,8 @@ pub use worker::{
     serve_tcp, CpuWorker, WorkerBackend,
 };
 
+#[cfg(feature = "cuda")]
+pub use worker::CudaWorker;
 #[cfg(feature = "hip")]
 pub use worker::HipWorker;
 
@@ -179,5 +181,62 @@ mod tests {
         assert_eq!(client.hello().major, PROTO_MAJOR);
         drop(client);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn loopback_cuda_gemm_nt_when_device_present() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let worker = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let backend = WorkerBackend::Cuda(crate::CudaWorker::new(0).expect("cuda worker"));
+                serve_connection(stream, backend).unwrap();
+            });
+
+            let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+            assert_eq!(client.hello().backend, RpcBackendKind::Cuda);
+            assert!(client.hello().device_name.starts_with("cuda:"));
+
+            let m = 2i32;
+            let n = 2i32;
+            let k = 2i32;
+            let a = client.alloc(8 * 4).unwrap();
+            let b = client.alloc(8 * 4).unwrap();
+            let c = client.alloc(8 * 4).unwrap();
+            let a_data: Vec<u8> = [1.0f32, 0.0, 0.0, 1.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            client.h2d(a, 0, &a_data).unwrap();
+            client.h2d(b, 0, &a_data).unwrap();
+            client
+                .launch(&LaunchList {
+                    items: vec![LaunchItem {
+                        op: KernelOp::GemmNt,
+                        bufs: vec![a, b, c],
+                        i32s: vec![m, n, k],
+                        f32s: vec![],
+                    }],
+                })
+                .unwrap();
+            client.sync().unwrap();
+            let out = client.d2h(c, 0, 16).unwrap();
+            let c00 = f32::from_le_bytes(out[0..4].try_into().unwrap());
+            assert!((c00 - 1.0).abs() < 1e-4, "cuda rpc gemm c00={c00}");
+            client.free(a).unwrap();
+            client.free(b).unwrap();
+            client.free(c).unwrap();
+            drop(client);
+            worker.join().unwrap();
+        }
     }
 }

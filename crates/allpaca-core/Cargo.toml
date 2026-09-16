@@ -8,7 +8,7 @@ description = "Engine, scheduler, memory tiers, and draft providers"
 [features]
 default = []
 hip = ["allpaca-hip/hip"]
-cuda = ["allpaca-cuda/cuda"]
+cuda = ["allpaca-cuda/cuda", "allpaca-rpc/cuda"]
 
 [dependencies]
 ahash.workspace = true

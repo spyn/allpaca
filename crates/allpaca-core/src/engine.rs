@@ -4891,6 +4891,53 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn rpc_loopback_cuda_worker_synthetic_generate() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CudaWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Cuda(CudaWorker::new(0).expect("cuda worker"));
+            serve_connection(stream, backend).unwrap();
+        });
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.rpc.endpoints = vec![addr.to_string()];
+        cfg.rpc.max_seq = 64;
+        cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.rpc_roundtrips > 0,
+            "expected CUDA RPC layer launches, got {}",
+            stats.rpc_roundtrips
+        );
+        drop(engine);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn rpc_layer_split_greedy_matches_cpu() {
         use std::net::TcpListener;

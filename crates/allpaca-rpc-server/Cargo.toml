@@ -3,13 +3,15 @@ name = "allpaca-rpc-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RPC worker exposing local CPU or HIP kernels to an Allpaca coordinator"
+description = "RPC worker exposing local CPU, HIP, or CUDA kernels to an Allpaca coordinator"
 
 [features]
 default = []
 hip = ["allpaca-rpc/hip", "allpaca-hip/hip"]
+cuda = ["allpaca-rpc/cuda", "allpaca-cuda/cuda"]
 
 [dependencies]
+allpaca-cuda.workspace = true
 allpaca-hip.workspace = true
 allpaca-rpc.workspace = true
 clap.workspace = true

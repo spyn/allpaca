@@ -16,7 +16,7 @@ struct Cli {
     /// Listen port.
     #[arg(short = 'p', long = "port", default_value_t = 50052)]
     port: u16,
-    /// Device selector: `cpu`, `hip:N`. CUDA workers land after engine CUDA parity.
+    /// Device selector: `cpu`, `hip:N`, `cuda:N`.
     #[arg(short = 'd', long = "device", default_value = "cpu")]
     device: String,
     /// Force the CPU kernel backend.
@@ -107,10 +107,25 @@ fn open_backend(cli: &Cli) -> Result<WorkerBackend, Box<dyn std::error::Error>> 
             return Err("rebuild with --features hip for hip:N workers".into());
         }
     }
-    if cli.device.starts_with("cuda:") || cli.device.starts_with("CUDA:") {
-        return Err(
-            "CUDA RPC workers require engine CUDA parity; use --cpu-only or hip:N for v1".into(),
-        );
+    if let Some(rest) = cli
+        .device
+        .strip_prefix("cuda:")
+        .or_else(|| cli.device.strip_prefix("CUDA:"))
+    {
+        let id: i32 = rest.parse()?;
+        #[cfg(feature = "cuda")]
+        {
+            return Ok(WorkerBackend::Cuda(allpaca_rpc::CudaWorker::new(id)?));
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = id;
+            return Err("rebuild with --features cuda for cuda:N workers".into());
+        }
     }
-    Err(format!("unknown --device {} (expected cpu or hip:N)", cli.device).into())
+    Err(format!(
+        "unknown --device {} (expected cpu, hip:N, or cuda:N)",
+        cli.device
+    )
+    .into())
 }
