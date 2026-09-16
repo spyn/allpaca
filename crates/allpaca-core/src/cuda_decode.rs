@@ -1,8 +1,13 @@
 //! Narrow CUDA decode path: TinyModel token forwards on CudaWorkspace
-//! (dense + synthetic MoE; attention + host Mamba-2 SSM hybrid).
+//! (dense + synthetic MoE; attention + host Mamba-2 / GDN hybrid).
 
-use super::{gather_kv, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef};
+use super::{
+    gather_kv, topk_route, GdnHostWeights, LayerWeights, ModelConfig, TinyModel, WeightRef,
+};
 use crate::anchors::RecurrentState;
+use crate::deltanet::{
+    conv1d_step, decay_from_alpha, expand_k_heads, gated_delta_step_eps, rmsnorm_silu_gate, sigmoid,
+};
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
@@ -52,10 +57,19 @@ fn cuda_supports_blocks(model: &TinyModel) -> Result<(), AllpacaError> {
                 ));
             }
         }
-        if layer.block == HybridLayerKind::Ssm && layer.ssm.is_none() {
+        if layer.block == HybridLayerKind::Ssm && layer.ssm.is_none() && layer.gdn.is_none() {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "CUDA upload: SSM layer {i} missing host Mamba-2 weights"
+                "CUDA upload: SSM/GDN layer {i} missing host recurrent weights"
             ))));
+        }
+        if let Some(gdn) = layer.gdn.as_ref() {
+            if gdn.w_qkv.is_empty() || gdn.w_out.is_empty() {
+                return Err(AllpacaError::Degraded(
+                    allpaca_types::DegradedError::FeatureDisabled(
+                        "CUDA GDN needs host projection weights".into(),
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -632,52 +646,67 @@ impl TinyModel {
             ) && layer.wq.n == 0
             {
                 if host_layer.block == HybridLayerKind::Ssm {
-                    let ssm = host_layer.ssm.as_ref().ok_or_else(|| {
-                        AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                            "CUDA SSM layer {layer_idx} missing host Mamba-2 weights"
-                        )))
-                    })?;
-                    let norm_ptr = if layer.attn_norm.n > 0 {
-                        resident.ptr(layer.attn_norm)?
+                    if let Some(gdn) = host_layer.gdn.as_ref() {
+                        apply_gdn_cuda(
+                            cfg,
+                            layer_idx,
+                            gdn,
+                            layer,
+                            resident,
+                            cuda,
+                            &mut x,
+                            &mut scratch,
+                            &mut hidden,
+                            recurrent.as_deref_mut(),
+                            metrics,
+                        )?;
                     } else {
-                        // Fall back to identity rmsnorm via host ones (rare).
-                        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                            "CUDA SSM layer {layer_idx} missing attn_norm"
-                        ))));
-                    };
-                    cuda.rmsnorm_host_x_dev_w(
-                        &x,
-                        norm_ptr,
-                        &mut scratch[..dim],
-                        dim as i32,
-                        cfg.eps,
-                    )?;
-                    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-                    let state = recurrent.as_deref_mut().ok_or_else(|| {
-                        AllpacaError::Fatal(FatalError::ModelLoad(
-                            "CUDA SSM layer requires recurrent state".into(),
-                        ))
-                    })?;
-                    state.ensure_ssm(
-                        layer_idx,
-                        ssm.dims.state_floats(),
-                        ssm.dims.conv_state_floats(),
-                    );
-                    mamba2_step(
-                        &scratch[..dim],
-                        &mut state.ssm_h[layer_idx],
-                        &mut state.ssm_conv[layer_idx],
-                        ssm,
-                        cfg.eps,
-                        &mut hidden,
-                    )
-                    .map_err(|e| {
-                        AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                            "CUDA SSM layer {layer_idx}: {e}"
-                        )))
-                    })?;
-                    for i in 0..dim {
-                        x[i] += hidden[i];
+                        let ssm = host_layer.ssm.as_ref().ok_or_else(|| {
+                            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "CUDA SSM layer {layer_idx} missing host Mamba-2 weights"
+                            )))
+                        })?;
+                        let norm_ptr = if layer.attn_norm.n > 0 {
+                            resident.ptr(layer.attn_norm)?
+                        } else {
+                            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "CUDA SSM layer {layer_idx} missing attn_norm"
+                            ))));
+                        };
+                        cuda.rmsnorm_host_x_dev_w(
+                            &x,
+                            norm_ptr,
+                            &mut scratch[..dim],
+                            dim as i32,
+                            cfg.eps,
+                        )?;
+                        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+                        let state = recurrent.as_deref_mut().ok_or_else(|| {
+                            AllpacaError::Fatal(FatalError::ModelLoad(
+                                "CUDA SSM layer requires recurrent state".into(),
+                            ))
+                        })?;
+                        state.ensure_ssm(
+                            layer_idx,
+                            ssm.dims.state_floats(),
+                            ssm.dims.conv_state_floats(),
+                        );
+                        mamba2_step(
+                            &scratch[..dim],
+                            &mut state.ssm_h[layer_idx],
+                            &mut state.ssm_conv[layer_idx],
+                            ssm,
+                            cfg.eps,
+                            &mut hidden,
+                        )
+                        .map_err(|e| {
+                            AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                "CUDA SSM layer {layer_idx}: {e}"
+                            )))
+                        })?;
+                        for i in 0..dim {
+                            x[i] += hidden[i];
+                        }
                     }
                 }
                 if !host_layer.w_gate.is_empty()
@@ -850,6 +879,121 @@ impl TinyModel {
         metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+fn matvec_rows(weight: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(weight.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(out.len(), rows);
+    for r in 0..rows {
+        let row = &weight[r * cols..(r + 1) * cols];
+        out[r] = row.iter().zip(x.iter()).map(|(w, v)| w * v).sum();
+    }
+}
+
+/// Host Gated DeltaNet (HIP fallback layout) after CUDA rmsnorm.
+#[allow(clippy::too_many_arguments)]
+fn apply_gdn_cuda(
+    cfg: &ModelConfig,
+    layer_idx: usize,
+    gdn: &GdnHostWeights,
+    layer: &CudaLayerOff,
+    resident: &CudaResidentModel,
+    cuda: &CudaWorkspace,
+    x: &mut [f32],
+    scratch: &mut [f32],
+    hidden: &mut [f32],
+    recurrent: Option<&mut RecurrentState>,
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    let dim = cfg.dim;
+    let d = gdn.dims;
+    if gdn.w_qkv.len() != d.qkv_dim * dim
+        || gdn.w_z.len() != d.value_dim * dim
+        || gdn.w_alpha.len() != d.n_v_heads * dim
+        || gdn.w_beta.len() != d.n_v_heads * dim
+        || gdn.w_out.len() != dim * d.value_dim
+    {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA GDN layer {layer_idx} projection size mismatch"
+        ))));
+    }
+    if layer.attn_norm.n == 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA GDN layer {layer_idx} missing attn_norm"
+        ))));
+    }
+    cuda.rmsnorm_host_x_dev_w(
+        x,
+        resident.ptr(layer.attn_norm)?,
+        &mut scratch[..dim],
+        dim as i32,
+        cfg.eps,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+    let mut qkv = vec![0.0f32; d.qkv_dim];
+    let mut z = vec![0.0f32; d.value_dim];
+    let mut alpha = vec![0.0f32; d.n_v_heads];
+    let mut beta = vec![0.0f32; d.n_v_heads];
+    matvec_rows(&gdn.w_qkv, d.qkv_dim, dim, &scratch[..dim], &mut qkv);
+    matvec_rows(&gdn.w_z, d.value_dim, dim, &scratch[..dim], &mut z);
+    matvec_rows(&gdn.w_alpha, d.n_v_heads, dim, &scratch[..dim], &mut alpha);
+    matvec_rows(&gdn.w_beta, d.n_v_heads, dim, &scratch[..dim], &mut beta);
+
+    let state = recurrent.ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA GDN layer requires recurrent state".into(),
+        ))
+    })?;
+    state.ensure_gdn(layer_idx, &d);
+
+    let mut conv_out = vec![0.0f32; d.qkv_dim];
+    conv1d_step(
+        &qkv,
+        &gdn.conv1d,
+        &mut state.gdn_conv[layer_idx],
+        &mut conv_out,
+        d.conv_kernel,
+    );
+    let q_raw = &conv_out[..d.key_dim];
+    let k_raw = &conv_out[d.key_dim..d.key_dim * 2];
+    let v_raw = &conv_out[d.key_dim * 2..];
+    let mut q_exp = vec![0.0f32; d.n_v_heads * d.head_k];
+    let mut k_exp = vec![0.0f32; d.n_v_heads * d.head_k];
+    expand_k_heads(q_raw, &mut q_exp, d.n_k_heads, d.n_v_heads, d.head_k);
+    expand_k_heads(k_raw, &mut k_exp, d.n_k_heads, d.n_v_heads, d.head_k);
+    let mut decay = vec![0.0f32; d.n_v_heads];
+    decay_from_alpha(&alpha, &gdn.dt_bias, &gdn.a, &mut decay);
+    for b in &mut beta {
+        *b = sigmoid(*b);
+    }
+    let mut y = vec![0.0f32; d.value_dim];
+    gated_delta_step_eps(
+        &mut q_exp,
+        &mut k_exp,
+        v_raw,
+        &decay,
+        &beta,
+        &mut state.gdn_state[layer_idx],
+        &mut y,
+        d.n_v_heads,
+        d.head_v,
+        d.head_k,
+        cfg.eps,
+    );
+    let mut gated = vec![0.0f32; d.value_dim];
+    rmsnorm_silu_gate(&y, &z, &gdn.norm, &mut gated, d.head_v, cfg.eps);
+    if hidden.len() < dim {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA GDN hidden buffer too small".into(),
+        )));
+    }
+    matvec_rows(&gdn.w_out, dim, d.value_dim, &gated, &mut hidden[..dim]);
+    for i in 0..dim {
+        x[i] += hidden[i];
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

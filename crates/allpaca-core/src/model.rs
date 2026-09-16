@@ -216,6 +216,15 @@ impl ModelConfig {
         }
     }
 
+    /// Attention + Gated DeltaNet hybrid (layer 0 attn, layer 1 GDN).
+    pub fn tiny_gdn_hybrid() -> Self {
+        Self {
+            recurrent: true,
+            n_layers: 2,
+            ..Self::tiny()
+        }
+    }
+
     pub fn draft_tiny() -> Self {
         Self {
             n_layers: 1,
@@ -2421,6 +2430,11 @@ fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, A
         dt_bias,
         norm,
         conv1d,
+        w_qkv: Vec::new(),
+        w_z: Vec::new(),
+        w_alpha: Vec::new(),
+        w_beta: Vec::new(),
+        w_out: Vec::new(),
     })
 }
 
@@ -3257,6 +3271,12 @@ pub struct GdnHostWeights {
     pub dt_bias: Vec<f32>,
     pub norm: Vec<f32>,
     pub conv1d: Vec<f32>,
+    /// Host projections for CUDA / CPU GDN (empty when HIP keeps them on device).
+    pub w_qkv: Vec<f32>,
+    pub w_z: Vec<f32>,
+    pub w_alpha: Vec<f32>,
+    pub w_beta: Vec<f32>,
+    pub w_out: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -3535,6 +3555,58 @@ impl TinyModel {
                 norm: ones(dims.d_inner),
             }),
             gdn: None,
+            mla: None,
+            attn_norm: ones(dim),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            wq: Vec::new(),
+            wk: Vec::new(),
+            wv: Vec::new(),
+            wo: Vec::new(),
+            ffn_norm: ones(dim),
+            w_gate: scale_vec(model.config.ff_dim * dim),
+            w_up: scale_vec(model.config.ff_dim * dim),
+            w_down: scale_vec(dim * model.config.ff_dim),
+            w_router: Vec::new(),
+            experts: Vec::new(),
+            shared_expert: LayerFfn::default(),
+            expert_bias: Vec::new(),
+            attn_out_gate: Vec::new(),
+            attn_post_norm: Vec::new(),
+            ffn_post_norm: Vec::new(),
+        };
+        model
+    }
+
+    /// Tiny attention + host Gated DeltaNet hybrid for CUDA/CPU decode tests.
+    pub fn synthetic_gdn_hybrid(seed: u64, name: impl Into<String>) -> Self {
+        let cfg = ModelConfig::tiny_gdn_hybrid();
+        let mut model = Self::synthetic(cfg, seed, name);
+        let dim = model.config.dim;
+        let dims = GdnDims::from_meta(4, 16, 4, 2, 2).expect("tiny GDN dims");
+        let mut rng = Lcg::new(seed.wrapping_add(0x0d17));
+        let scale = 0.05f32;
+        let mut scale_vec = |n: usize| {
+            rng.vec(n)
+                .into_iter()
+                .map(|v| v * scale)
+                .collect::<Vec<_>>()
+        };
+        model.layers[1] = LayerWeights {
+            block: HybridLayerKind::Ssm,
+            ssm: None,
+            gdn: Some(GdnHostWeights {
+                dims,
+                a: vec![-1.0; dims.n_v_heads],
+                dt_bias: vec![0.0; dims.n_v_heads],
+                norm: ones(dims.head_v),
+                conv1d: scale_vec(dims.conv_kernel * dims.qkv_dim),
+                w_qkv: scale_vec(dims.qkv_dim * dim),
+                w_z: scale_vec(dims.value_dim * dim),
+                w_alpha: scale_vec(dims.n_v_heads * dim),
+                w_beta: scale_vec(dims.n_v_heads * dim),
+                w_out: scale_vec(dim * dims.value_dim),
+            }),
             mla: None,
             attn_norm: ones(dim),
             q_norm: Vec::new(),
