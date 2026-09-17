@@ -2534,57 +2534,78 @@ mod tests {
         }
     }
 
+    fn attn_close(got: f32, exp: f32) -> bool {
+        let d = (got - exp).abs();
+        d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
+    }
+
     #[test]
     fn attention_matches_cpu_when_device_present() {
         if device_count() <= 0 {
             return;
         }
-        let n_q = 1i32;
-        let n_kv = 4i32;
-        let n_heads = 4i32;
-        let n_kv_heads = 2i32;
-        let head_dim = 8i32;
-        let q_n = (n_q * n_heads * head_dim) as usize;
-        let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
-        let q: Vec<f32> = (0..q_n).map(|i| (i as f32) * 0.02).collect();
-        let k: Vec<f32> = (0..kv_n).map(|i| (i as f32 + 1.0) * 0.01).collect();
-        let v: Vec<f32> = (0..kv_n).map(|i| (i as f32 + 2.0) * 0.015).collect();
-        let mut cuda_out = vec![0.0f32; q_n];
-        let mut cpu_out = vec![0.0f32; q_n];
+        let shapes = [
+            (1i32, 4i32, 4i32, 2i32, 8i32, true),
+            (1, 1, 1, 1, 2, true),
+            (1, 8, 4, 1, 4, true),
+            (1, 16, 2, 2, 8, true),
+            (1, 32, 4, 2, 16, true),
+            (1, 8, 1, 1, 128, true),
+            (4, 4, 2, 2, 4, true),
+            (3, 8, 4, 1, 8, true),
+            (2, 2, 1, 1, 4, false),
+        ];
         let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
-        ws.attention(
-            &q,
-            &k,
-            &v,
-            &mut cuda_out,
-            n_q,
-            n_kv,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            true,
-        )
-        .expect("cuda attention");
-        allpaca_cpu::attention(
-            &q,
-            &k,
-            &v,
-            &mut cpu_out,
-            n_q as usize,
-            n_kv as usize,
-            n_heads as usize,
-            n_kv_heads as usize,
-            head_dim as usize,
-            true,
-        )
-        .expect("cpu attention");
-        for i in 0..q_n {
-            assert!(
-                (cuda_out[i] - cpu_out[i]).abs() < 1e-4,
-                "attention mismatch at {i}: cuda={} cpu={}",
-                cuda_out[i],
-                cpu_out[i]
-            );
+        for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
+            shapes.iter().copied().enumerate()
+        {
+            let q_n = (n_q * n_heads * head_dim) as usize;
+            let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
+            let q: Vec<f32> = (0..q_n)
+                .map(|i| ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5)
+                .collect();
+            let k: Vec<f32> = (0..kv_n)
+                .map(|i| ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5)
+                .collect();
+            let v: Vec<f32> = (0..kv_n)
+                .map(|i| ((i * 11 + si * 5) % 50) as f32 * 0.02 - 0.5)
+                .collect();
+            let mut cuda_out = vec![0.0f32; q_n];
+            let mut cpu_out = vec![0.0f32; q_n];
+            ws.attention(
+                &q,
+                &k,
+                &v,
+                &mut cuda_out,
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
+            )
+            .expect("cuda attention");
+            allpaca_cpu::attention(
+                &q,
+                &k,
+                &v,
+                &mut cpu_out,
+                n_q as usize,
+                n_kv as usize,
+                n_heads as usize,
+                n_kv_heads as usize,
+                head_dim as usize,
+                causal,
+            )
+            .expect("cpu attention");
+            for i in 0..q_n {
+                assert!(
+                    attn_close(cuda_out[i], cpu_out[i]),
+                    "attention mismatch n_q={n_q} n_kv={n_kv} heads={n_heads}/{n_kv_heads} d={head_dim} causal={causal} idx={i}: cuda={} cpu={}",
+                    cuda_out[i],
+                    cpu_out[i]
+                );
+            }
         }
     }
 }

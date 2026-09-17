@@ -569,7 +569,8 @@ __device__ float warp_sum32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
     }
-    return v;
+    /* shfl_down leaves the full sum on lane 0; broadcast so every lane uses it. */
+    return __shfl_sync(0xffffffffu, v, 0);
 }
 
 /* Warp-per-head online softmax. Supports head_dim <= 512 (16 dims/lane × 32). */
