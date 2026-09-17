@@ -511,4 +511,69 @@ mod tests {
         drop(client);
         th.join().unwrap();
     }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn loopback_hip_memcpy_and_embed_gather_when_present() {
+        if allpaca_hip::device_count() <= 0 {
+            eprintln!("skip loopback_hip_memcpy_embed: no HIP device");
+            return;
+        }
+        let worker = HipWorker::new(0).expect("HipWorker");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let th = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Hip(worker)).unwrap();
+        });
+
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let src = client.alloc(8).unwrap();
+        let dst = client.alloc(8).unwrap();
+        client.h2d(src, 0, &[1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        client
+            .launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::Memcpy,
+                    bufs: vec![dst, src],
+                    i32s: vec![],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+        client.sync().unwrap();
+        assert_eq!(client.d2h(dst, 0, 8).unwrap(), vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
+
+        let dim = 4i32;
+        let table_host = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let table = client.alloc((table_host.len() * 4) as u64).unwrap();
+        let ids = client.alloc(4).unwrap();
+        let out = client.alloc((dim * 4) as u64).unwrap();
+        let table_bytes: Vec<u8> = table_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        client.h2d(table, 0, &table_bytes).unwrap();
+        client.h2d(ids, 0, &1u32.to_le_bytes()).unwrap();
+        client
+            .launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::EmbedGather,
+                    bufs: vec![table, ids, out],
+                    i32s: vec![dim, 1],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+        client.sync().unwrap();
+        let got = client.d2h(out, 0, (dim * 4) as u64).unwrap();
+        for i in 0..dim as usize {
+            let v = f32::from_le_bytes(got[i * 4..(i + 1) * 4].try_into().unwrap());
+            assert!((v - table_host[4 + i]).abs() < 1e-5, "i={i} v={v}");
+        }
+        client.free(src).unwrap();
+        client.free(dst).unwrap();
+        client.free(table).unwrap();
+        client.free(ids).unwrap();
+        client.free(out).unwrap();
+        drop(client);
+        th.join().unwrap();
+    }
 }

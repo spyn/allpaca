@@ -583,34 +583,36 @@ impl HipWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::EmbedGather | KernelOp::Memcpy => {
-                // Fall back to host bounce for these less common ops.
-                let src = self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                let mut cpu = CpuWorker::new(1 << 30);
-                let a = cpu.alloc(self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                let b = cpu.alloc(src.len() as u64)?;
-                cpu.h2d(b, 0, &src)?;
                 if op == KernelOp::Memcpy {
-                    cpu.launch_one(op, &[need(bufs, 0)?, need(bufs, 1)?], i32s, f32s)?;
-                    // remap: copy into a from b after swapping ids — simpler host copy:
-                    let tmp = cpu.d2h(b, 0, src.len() as u64)?;
-                    self.h2d(need(bufs, 0)?, 0, &tmp)?;
-                    let _ = a;
-                } else {
-                    let table =
-                        self.d2h(need(bufs, 0)?, 0, self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                    let ids =
-                        self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                    let out_n = self.slot(need(bufs, 2)?)?.bytes as u64;
-                    let t = cpu.alloc(table.len() as u64)?;
-                    let i = cpu.alloc(ids.len() as u64)?;
-                    let o = cpu.alloc(out_n)?;
-                    cpu.h2d(t, 0, &table)?;
-                    cpu.h2d(i, 0, &ids)?;
-                    cpu.launch_one(op, &[t, i, o], i32s, f32s)?;
-                    let out = cpu.d2h(o, 0, out_n)?;
-                    self.h2d(need(bufs, 2)?, 0, &out)?;
-                    let _ = a;
+                    self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+                    return Ok(());
                 }
+                let dim = *i32s
+                    .first()
+                    .ok_or_else(|| RpcError::Worker("embed dim".into()))?;
+                let n_tok = *i32s.get(1).unwrap_or(&1);
+                if n_tok != 1 {
+                    return Err(RpcError::Worker(
+                        "hip embed_gather supports n_tok=1".into(),
+                    ));
+                }
+                let table = self.ptr_f32(need(bufs, 0)?)?;
+                let ids = self.slot(need(bufs, 1)?)?;
+                if ids.bytes < 4 {
+                    return Err(RpcError::Worker("embed id".into()));
+                }
+                let mut tok = 0i32;
+                allpaca_hip::memcpy(
+                    (&mut tok as *mut i32).cast(),
+                    ids.ptr,
+                    4,
+                    allpaca_hip::MEMCPY_D2H,
+                )
+                .map_err(|e| RpcError::Worker(e.to_string()))?;
+                let out = self.ptr_f32(need(bufs, 2)?)?;
+                self.hip
+                    .embed_gather(table, tok as u32, out, dim)
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
         }
         Ok(())
