@@ -47,9 +47,20 @@ extern "C" int allpaca_cuda_device_props(int32_t id, char *name, int32_t name_le
     }
     std::snprintf(name, static_cast<size_t>(name_len), "%s", prop.name);
     *memory_bytes = static_cast<uint64_t>(prop.totalGlobalMem);
-    /* CUDA 13+ dropped memoryClockRate from cudaDeviceProp; leave 0 and let
-     * the scheduler treat bandwidth as unknown until a real benchmark runs. */
+    /* CUDA 13 dropped memoryClockRate from cudaDeviceProp; query attributes.
+     * Same theoretical peak as HIP: clock (GHz) * bus bytes * 2 (DDR). */
+    int mem_clock_khz = 0;
+    int bus_width_bits = 0;
+    const cudaError_t clk =
+        cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, id);
+    const cudaError_t bus =
+        cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, id);
     *bandwidth_gbps = 0.0;
+    if (clk == cudaSuccess && bus == cudaSuccess && mem_clock_khz > 0 && bus_width_bits > 0) {
+        const double clock_ghz = static_cast<double>(mem_clock_khz) / 1.0e6;
+        const double bytes_per_cycle = static_cast<double>(bus_width_bits) / 8.0 * 2.0;
+        *bandwidth_gbps = clock_ghz * bytes_per_cycle;
+    }
     return ALLPACA_OK;
 }
 

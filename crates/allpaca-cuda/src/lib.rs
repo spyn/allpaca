@@ -2321,6 +2321,25 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_devices_reports_theoretical_bandwidth_when_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let devices = enumerate_devices();
+        assert!(!devices.is_empty());
+        for d in &devices {
+            assert!(
+                d.bandwidth_gbps > 10.0 && d.bandwidth_gbps < 50_000.0,
+                "id={} name={} bandwidth_gbps={} (clock*bus*2, GB/s)",
+                d.id,
+                d.name,
+                d.bandwidth_gbps
+            );
+            assert!(d.memory_bytes > 0, "id={} memory_bytes=0", d.id);
+        }
+    }
+
+    #[test]
     fn memcpy_peer_same_device_roundtrip_when_device_present() {
         if device_count() <= 0 {
             return;
