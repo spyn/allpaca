@@ -1,7 +1,9 @@
-//! CUDA decode path: dense + tiny MoE TinyModel token forwards on CudaWorkspace.
+//! CUDA decode path: dense, tiny MoE, and host-step SSM hybrid on CudaWorkspace.
 
 use super::{gather_kv, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef};
+use crate::anchors::RecurrentState;
 use crate::kv_tier::KvTierManager;
+use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
@@ -127,20 +129,13 @@ impl CudaResidentModel {
     }
 }
 
-/// Attention (+ tiny MoE) only. SSM / GDN / MLA stay on HIP or host.
+/// Attention / tiny MoE / host-step SSM. GDN and MLA stay on HIP or host.
 fn cuda_reject_unsupported_layers(model: &TinyModel) -> Result<(), AllpacaError> {
     for (i, layer) in model.layers.iter().enumerate() {
-        if layer.ssm.is_some() || layer.gdn.is_some() || layer.mla.is_some() {
+        if layer.gdn.is_some() || layer.mla.is_some() {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(format!(
-                    "CUDA resident: layer {i} has SSM/GDN/MLA weights"
-                )),
-            ));
-        }
-        if matches!(layer.block, HybridLayerKind::Ssm) {
-            return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(format!(
-                    "CUDA resident: SSM block at layer {i}"
+                    "CUDA resident: layer {i} has GDN/MLA weights"
                 )),
             ));
         }
@@ -149,7 +144,8 @@ fn cuda_reject_unsupported_layers(model: &TinyModel) -> Result<(), AllpacaError>
 }
 
 impl TinyModel {
-    /// One-token decode using CUDA-resident weights + CudaWorkspace ops (dense or tiny MoE).
+    /// One-token decode using CUDA-resident weights + CudaWorkspace ops
+    /// (dense, tiny MoE, or host `mamba2_step` SSM hybrid).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_token_cuda(
         &self,
@@ -162,6 +158,7 @@ impl TinyModel {
         cuda: &CudaWorkspace,
         resident: &CudaResidentModel,
         soft_x: Option<&[f32]>,
+        mut recurrent: Option<&mut RecurrentState>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         cuda_reject_unsupported_layers(self)?;
@@ -225,14 +222,30 @@ impl TinyModel {
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, host_layer) in self.layers.iter().enumerate() {
+            let layer = &resident.layers[layer_idx];
+            if host_layer.block == HybridLayerKind::Ssm {
+                apply_ssm_cuda(
+                    cfg,
+                    layer_idx,
+                    host_layer,
+                    layer,
+                    resident,
+                    cuda,
+                    &mut x,
+                    &mut scratch,
+                    &mut hidden,
+                    metrics,
+                    recurrent.as_deref_mut(),
+                )?;
+                continue;
+            }
             if host_layer.block != HybridLayerKind::Attention {
                 return Err(AllpacaError::Degraded(
                     allpaca_types::DegradedError::FeatureDisabled(
-                        "CUDA decode: attention blocks only".into(),
+                        "CUDA decode: attention or SSM blocks only".into(),
                     ),
                 ));
             }
-            let layer = &resident.layers[layer_idx];
             cuda.rmsnorm_host_x_dev_w(
                 &x,
                 resident.ptr(layer.attn_norm)?,
@@ -366,6 +379,83 @@ impl TinyModel {
         metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_ssm_cuda(
+    cfg: &ModelConfig,
+    layer_idx: usize,
+    host: &LayerWeights,
+    layer: &CudaLayerOff,
+    resident: &CudaResidentModel,
+    cuda: &CudaWorkspace,
+    x: &mut [f32],
+    scratch: &mut [f32],
+    hidden: &mut [f32],
+    metrics: &Metrics,
+    recurrent: Option<&mut RecurrentState>,
+) -> Result<(), AllpacaError> {
+    let dim = cfg.dim;
+    let ssm = host.ssm.as_ref().ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA SSM layer {layer_idx} missing Mamba-2 weights"
+        )))
+    })?;
+    if layer.attn_norm.n == 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA SSM layer {layer_idx} missing attn_norm"
+        ))));
+    }
+    cuda.rmsnorm_host_x_dev_w(
+        x,
+        resident.ptr(layer.attn_norm)?,
+        &mut scratch[..dim],
+        dim as i32,
+        cfg.eps,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+    let state = recurrent.ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA SSM layer requires recurrent state".into(),
+        ))
+    })?;
+    state.ensure_ssm(
+        layer_idx,
+        ssm.dims.state_floats(),
+        ssm.dims.conv_state_floats(),
+    );
+    mamba2_step(
+        &scratch[..dim],
+        &mut state.ssm_h[layer_idx],
+        &mut state.ssm_conv[layer_idx],
+        ssm,
+        cfg.eps,
+        hidden,
+    )
+    .map_err(|e| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA SSM layer {layer_idx}: {e}"
+        )))
+    })?;
+    cuda.residual_add_host(x, hidden)?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+    if !host.w_gate.is_empty() || !host.experts.is_empty() {
+        apply_ffn_cuda(
+            cfg,
+            layer_idx,
+            host,
+            layer,
+            resident,
+            cuda,
+            x,
+            scratch,
+            hidden,
+            metrics,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

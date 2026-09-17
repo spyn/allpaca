@@ -252,3 +252,29 @@ fn cuda_synthetic_hybrid_generate_uses_device_when_present() {
         stats.target_gpu_forwards
     );
 }
+
+#[test]
+fn cuda_synthetic_ssm_hybrid_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_moe_cfg()).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_ssm_hybrid(7))
+        .expect("load ssm hybrid");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_h2d_bytes > 0,
+        "SSM hybrid should upload attention/FFN pack; stats={before:?}"
+    );
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA SSM-hybrid forwards (host mamba2_step), got gpu={} target={}; stats={stats:?}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}

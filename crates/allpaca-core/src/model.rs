@@ -3490,6 +3490,53 @@ impl TinyModel {
         }
     }
 
+    /// Attention + Mamba-2 SSM hybrid for CUDA/host decode tracers.
+    /// Layer 0 is SSM; remaining layers stay dense attention.
+    pub fn synthetic_ssm_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny_hybrid(), seed, "ssm-hybrid");
+        let dim = model.config.dim;
+        let dims = crate::ssm::Mamba2Dims::new(dim, dim, 2, 4, 2, 2)
+            .expect("tiny SSM dims");
+        let mut rng = Lcg::new(seed.wrapping_add(99));
+        // Mildly negative A so selective scan stays stable under random inputs.
+        let a: Vec<f32> = (0..dims.n_heads).map(|_| -0.5 + rng.next_f32()).collect();
+        model.layers[0] = LayerWeights {
+            block: HybridLayerKind::Ssm,
+            ssm: Some(crate::ssm::SsmLayerWeights {
+                dims,
+                w_in: rng.vec(dims.in_proj_dim * dim),
+                w_out: rng.vec(dim * dims.d_inner),
+                a,
+                d_skip: rng.vec(dims.n_heads),
+                dt_bias: rng.vec(dims.n_heads),
+                conv1d: rng.vec(dims.conv_dim * dims.conv_kernel),
+                conv_bias: rng.vec(dims.conv_dim),
+                norm: ones(dims.d_inner),
+            }),
+            gdn: None,
+            mla: None,
+            attn_norm: ones(dim),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            wq: Vec::new(),
+            wk: Vec::new(),
+            wv: Vec::new(),
+            wo: Vec::new(),
+            ffn_norm: Vec::new(),
+            w_gate: Vec::new(),
+            w_up: Vec::new(),
+            w_down: Vec::new(),
+            w_router: Vec::new(),
+            experts: Vec::new(),
+            shared_expert: LayerFfn::default(),
+            expert_bias: Vec::new(),
+            attn_out_gate: Vec::new(),
+            attn_post_norm: Vec::new(),
+            ffn_post_norm: Vec::new(),
+        };
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
     }

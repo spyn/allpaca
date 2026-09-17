@@ -950,6 +950,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Install a ready synthetic `TinyModel` (e.g. SSM hybrid) and upload resident weights.
+    pub fn load_synthetic_model(&self, mut target: TinyModel) -> Result<(), AllpacaError> {
+        let mut inner = self.lock()?;
+        let vocab = target.config.vocab_size;
+        let n_layers = target.config.n_layers;
+        let tokenizer = EngineTokenizer::synthetic(vocab)?;
+        inner.ring.resize_vocab(vocab);
+        self.apply_weight_working_set(&mut target)?;
+        self.apply_expert_lru(&mut target)?;
+        self.attach_rpc(&mut target)?;
+        inner.target = Some(Arc::new(target));
+        set_tokenizer(&mut inner, tokenizer);
+        inner.model_id = "synthetic".into();
+        drop(inner);
+        self.upload_resident_weights()?;
+        self.note_early_exit_gate()?;
+        tracing::info!(vocab, layers = n_layers, "loaded synthetic TinyModel");
+        Ok(())
+    }
+
     fn attach_rpc(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
         let Some(rt) = &self.rpc else {
             return Ok(());
@@ -2937,6 +2957,7 @@ impl Engine {
                                     cuda,
                                     cres,
                                     soft,
+                                    recurrent.as_mut(),
                                 ) {
                                     Ok(()) => used = true,
                                     Err(e) => {
@@ -4800,6 +4821,7 @@ fn append_and_forward(
                         cuda,
                         cres,
                         None,
+                        recurrent.as_mut(),
                     ) {
                         Ok(()) => used = true,
                         Err(e) => {
