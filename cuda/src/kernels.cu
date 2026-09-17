@@ -480,8 +480,11 @@ extern "C" int allpaca_cuda_silu_mul(const float *gate, const float *up, float *
     return cuda_status(cudaGetLastError());
 }
 
-/* Single-block RMSNorm for decode-sized rows (n fits one reduction). */
+/* One block per row. Decode uses rows=1. n is reduced in shared memory (256 threads). */
 __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
+    const int row = static_cast<int>(blockIdx.x);
+    x += static_cast<size_t>(row) * static_cast<size_t>(n);
+    out += static_cast<size_t>(row) * static_cast<size_t>(n);
     __shared__ float buf[256];
     int tid = threadIdx.x;
     float acc = 0.f;
@@ -503,13 +506,18 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int n
     }
 }
 
-extern "C" int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, float eps,
-                                    allpaca_cuda_stream_t stream) {
-    if (!x || !w || !out || n <= 0) {
+extern "C" int allpaca_cuda_rmsnorm_rows(const float *x, const float *w, float *out, int32_t rows,
+                                        int32_t n, float eps, allpaca_cuda_stream_t stream) {
+    if (!x || !w || !out || rows <= 0 || n <= 0) {
         return ALLPACA_ERR_INVALID;
     }
-    rmsnorm_kernel<<<1, 256, 0, as_stream(stream)>>>(x, w, out, n, eps);
+    rmsnorm_kernel<<<static_cast<unsigned>(rows), 256, 0, as_stream(stream)>>>(x, w, out, n, eps);
     return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, float eps,
+                                    allpaca_cuda_stream_t stream) {
+    return allpaca_cuda_rmsnorm_rows(x, w, out, 1, n, eps, stream);
 }
 
 __global__ void embed_gather_kernel(const float *table, int token, float *out, int dim) {

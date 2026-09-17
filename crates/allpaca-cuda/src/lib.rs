@@ -128,6 +128,15 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_rmsnorm_rows(
+            x: *const f32,
+            w: *const f32,
+            out: *mut f32,
+            rows: i32,
+            n: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_silu_mul(
             gate: *const f32,
             up: *const f32,
@@ -1270,6 +1279,73 @@ impl CudaWorkspace {
                 "CUDA rmsnorm unavailable".into(),
             )))
         }
+    }
+
+    pub fn rmsnorm_dev_rows(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if x.is_null() || w.is_null() || out.is_null() || rows < 0 || n <= 0 {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA rmsnorm_rows".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc =
+                unsafe { ffi::allpaca_cuda_rmsnorm_rows(x, w, out, rows, n, eps, self.stream) };
+            status(rc, "rmsnorm_rows")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, w, out, rows, n, eps);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA rmsnorm unavailable".into(),
+            )))
+        }
+    }
+
+    /// Host-pointer batched RMSNorm: `out[rows, n] = RMSNorm(x[rows, n], weight[n])`.
+    pub fn rmsnorm_rows(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        out: &mut [f32],
+        rows: i32,
+        n: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if rows <= 0 || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA rmsnorm_rows shape".into(),
+            )));
+        }
+        let rows_n = (rows as usize).saturating_mul(n as usize);
+        if x.len() < rows_n || out.len() < rows_n || weight.len() < n as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "rmsnorm_rows buffer size mismatch".into(),
+            )));
+        }
+        let dx = self.upload_f32(&x[..rows_n])?;
+        let dw = self.upload_f32(&weight[..n as usize])?;
+        let dout = device_malloc(rows_n * 4, self.device)?;
+        let result = (|| {
+            self.rmsnorm_dev_rows(dx, dw, dout.cast(), rows, n, eps)?;
+            self.download_f32(dout.cast(), &mut out[..rows_n])
+        })();
+        self.free_ptr(dx);
+        self.free_ptr(dw);
+        self.free_device(dout);
+        result
     }
 
     pub fn silu_mul_dev(
@@ -2604,6 +2680,47 @@ mod tests {
                     "attention mismatch n_q={n_q} n_kv={n_kv} heads={n_heads}/{n_kv_heads} d={head_dim} causal={causal} idx={i}: cuda={} cpu={}",
                     cuda_out[i],
                     cpu_out[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rmsnorm_rows_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let eps = 1e-6f32;
+        let shapes = [(16usize, 32usize), (9, 8), (1, 64)];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        for (si, (rows, n)) in shapes.iter().copied().enumerate() {
+            let mut x = vec![0.0f32; rows * n];
+            let mut weight = vec![0.0f32; n];
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in weight.iter_mut().enumerate() {
+                *v = 0.5 + ((i * 13 + si) % 20) as f32 * 0.05;
+            }
+            let mut cpu = vec![0.0f32; rows * n];
+            for r in 0..rows {
+                allpaca_cpu::rmsnorm(
+                    &x[r * n..(r + 1) * n],
+                    &weight,
+                    eps,
+                    &mut cpu[r * n..(r + 1) * n],
+                )
+                .expect("CPU rmsnorm");
+            }
+            let mut cuda_out = vec![0.0f32; rows * n];
+            ws.rmsnorm_rows(&x, &weight, &mut cuda_out, rows as i32, n as i32, eps)
+                .expect("cuda rmsnorm_rows");
+            for i in 0..rows * n {
+                assert!(
+                    attn_close(cuda_out[i], cpu[i]),
+                    "rmsnorm_rows mismatch rows={rows} n={n} idx={i}: cuda={} cpu={}",
+                    cuda_out[i],
+                    cpu[i]
                 );
             }
         }

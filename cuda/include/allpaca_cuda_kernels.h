@@ -95,6 +95,10 @@ int allpaca_cuda_residual_add(const float *x, const float *y, float *out, int32_
 int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, float eps,
                          allpaca_cuda_stream_t stream);
 
+/* out[rows, n] = RMSNorm(x[rows, n], w[n]). One block per row (HIP allpaca_rmsnorm_rows). */
+int allpaca_cuda_rmsnorm_rows(const float *x, const float *w, float *out, int32_t rows, int32_t n,
+                              float eps, allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_silu_mul(const float *gate, const float *up, float *out, int32_t n,
                           allpaca_cuda_stream_t stream);
 
