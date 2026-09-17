@@ -2404,6 +2404,11 @@ fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, A
         dt_bias,
         norm,
         conv1d,
+        w_qkv: Vec::new(),
+        w_z: Vec::new(),
+        w_alpha: Vec::new(),
+        w_beta: Vec::new(),
+        w_out: Vec::new(),
     })
 }
 
@@ -3240,6 +3245,13 @@ pub struct GdnHostWeights {
     pub dt_bias: Vec<f32>,
     pub norm: Vec<f32>,
     pub conv1d: Vec<f32>,
+    /// Optional host projections for synthetic / CUDA host-step path.
+    /// Empty when HIP keeps projections on-device only.
+    pub w_qkv: Vec<f32>,
+    pub w_z: Vec<f32>,
+    pub w_alpha: Vec<f32>,
+    pub w_beta: Vec<f32>,
+    pub w_out: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -3514,6 +3526,53 @@ impl TinyModel {
                 norm: ones(dims.d_inner),
             }),
             gdn: None,
+            mla: None,
+            attn_norm: ones(dim),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            wq: Vec::new(),
+            wk: Vec::new(),
+            wv: Vec::new(),
+            wo: Vec::new(),
+            ffn_norm: Vec::new(),
+            w_gate: Vec::new(),
+            w_up: Vec::new(),
+            w_down: Vec::new(),
+            w_router: Vec::new(),
+            experts: Vec::new(),
+            shared_expert: LayerFfn::default(),
+            expert_bias: Vec::new(),
+            attn_out_gate: Vec::new(),
+            attn_post_norm: Vec::new(),
+            ffn_post_norm: Vec::new(),
+        };
+        model
+    }
+
+    /// Attention + Gated DeltaNet hybrid for CUDA/host decode tracers.
+    /// Layer 0 is GDN (SSM block kind); remaining layers stay dense attention.
+    pub fn synthetic_gdn_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny_hybrid(), seed, "gdn-hybrid");
+        let dim = model.config.dim;
+        // head_v=4, n_v=4 → inner=16; n_k=2 → key_dim=8; qkv_dim=32 (=dim).
+        let dims = GdnDims::from_meta(4, 16, 4, 2, 2).expect("tiny GDN dims");
+        let mut rng = Lcg::new(seed.wrapping_add(77));
+        let a: Vec<f32> = (0..dims.n_v_heads).map(|_| -0.5 + rng.next_f32()).collect();
+        model.layers[0] = LayerWeights {
+            block: HybridLayerKind::Ssm,
+            ssm: None,
+            gdn: Some(GdnHostWeights {
+                dims,
+                a,
+                dt_bias: rng.vec(dims.n_v_heads),
+                norm: ones(dims.head_v),
+                conv1d: rng.vec(dims.conv_kernel * dims.qkv_dim),
+                w_qkv: rng.vec(dims.qkv_dim * dim),
+                w_z: rng.vec(dims.value_dim * dim),
+                w_alpha: rng.vec(dims.n_v_heads * dim),
+                w_beta: rng.vec(dims.n_v_heads * dim),
+                w_out: rng.vec(dim * dims.value_dim),
+            }),
             mla: None,
             attn_norm: ones(dim),
             q_norm: Vec::new(),
