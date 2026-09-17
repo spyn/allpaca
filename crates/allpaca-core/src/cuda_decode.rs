@@ -40,13 +40,7 @@ pub struct CudaResidentModel {
 
 impl CudaResidentModel {
     pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
-        if model.config.recurrent {
-            return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA resident upload: recurrent/hybrid SSM unsupported".into(),
-                ),
-            ));
-        }
+        cuda_reject_unsupported_layers(model)?;
         let mut slices: Vec<&[f32]> = Vec::new();
         let mut off = 0usize;
         fn push<'a>(slices: &mut Vec<&'a [f32]>, off: &mut usize, s: &'a [f32]) -> WeightRef {
@@ -133,6 +127,27 @@ impl CudaResidentModel {
     }
 }
 
+/// Attention (+ tiny MoE) only. SSM / GDN / MLA stay on HIP or host.
+fn cuda_reject_unsupported_layers(model: &TinyModel) -> Result<(), AllpacaError> {
+    for (i, layer) in model.layers.iter().enumerate() {
+        if layer.ssm.is_some() || layer.gdn.is_some() || layer.mla.is_some() {
+            return Err(AllpacaError::Degraded(
+                allpaca_types::DegradedError::FeatureDisabled(format!(
+                    "CUDA resident: layer {i} has SSM/GDN/MLA weights"
+                )),
+            ));
+        }
+        if matches!(layer.block, HybridLayerKind::Ssm) {
+            return Err(AllpacaError::Degraded(
+                allpaca_types::DegradedError::FeatureDisabled(format!(
+                    "CUDA resident: SSM block at layer {i}"
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl TinyModel {
     /// One-token decode using CUDA-resident weights + CudaWorkspace ops (dense or tiny MoE).
     #[allow(clippy::too_many_arguments)]
@@ -149,13 +164,7 @@ impl TinyModel {
         soft_x: Option<&[f32]>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
-        if cfg.recurrent {
-            return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA decode: recurrent/hybrid SSM unsupported".into(),
-                ),
-            ));
-        }
+        cuda_reject_unsupported_layers(self)?;
         if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
