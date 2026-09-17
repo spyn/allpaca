@@ -172,6 +172,20 @@ mod ffi {
             causal: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_attention_sinks(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_q: i32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            causal: i32,
+            sinks: *const f32,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -1485,6 +1499,73 @@ impl CudaWorkspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dev_sinks(
+        &self,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        sinks: *const f32,
+        out: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        if sinks.is_null() {
+            return self.attention_dev(
+                q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            );
+        }
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if q.is_null()
+                || k.is_null()
+                || v.is_null()
+                || out.is_null()
+                || n_q <= 0
+                || n_kv <= 0
+                || n_heads <= 0
+                || n_kv_heads <= 0
+                || head_dim <= 0
+                || n_heads % n_kv_heads != 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA attention_sinks".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_attention_sinks(
+                    q,
+                    k,
+                    v,
+                    out,
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    i32::from(causal),
+                    sinks,
+                    self.stream,
+                )
+            };
+            status(rc, "attention_sinks")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (
+                q, k, v, sinks, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            );
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA attention_sinks unavailable".into(),
+            )))
+        }
+    }
+
     /// Host roundtrip: gather one F32 embed row via device.
     pub fn embed_gather(
         &self,
@@ -1632,6 +1713,72 @@ impl CudaWorkspace {
         self.free_ptr(d_q);
         self.free_ptr(d_k);
         self.free_ptr(d_v);
+        self.free_device(d_out);
+        result
+    }
+
+    /// Host Q/K/V attention with optional per-head sink logits (virtual token, no V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_sinks(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        sinks: &[f32],
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        if sinks.is_empty() {
+            return self.attention(
+                q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            );
+        }
+        if sinks.len() < n_heads as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention_sinks length mismatch".into(),
+            )));
+        }
+        let q_n = (n_q as usize) * (n_heads as usize) * (head_dim as usize);
+        let kv_n = (n_kv as usize) * (n_kv_heads as usize) * (head_dim as usize);
+        if q.len() < q_n || k.len() < kv_n || v.len() < kv_n || out.len() < q_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention buffer size mismatch".into(),
+            )));
+        }
+        let d_q = self.upload_f32(&q[..q_n])?;
+        let d_k = self.upload_f32(&k[..kv_n])?;
+        let d_v = self.upload_f32(&v[..kv_n])?;
+        let d_s = self.upload_f32(&sinks[..n_heads as usize])?;
+        let d_out = device_malloc(q_n * 4, self.device)?;
+        let result = (|| {
+            self.attention_dev_sinks(
+                d_q,
+                d_k,
+                d_v,
+                d_s,
+                d_out.cast(),
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
+            )?;
+            memcpy_on(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H, self.stream)?;
+            self.synchronize()?;
+            self.activation_d2h
+                .fetch_add((q_n * 4) as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+        self.free_ptr(d_q);
+        self.free_ptr(d_k);
+        self.free_ptr(d_v);
+        self.free_ptr(d_s);
         self.free_device(d_out);
         result
     }
@@ -2723,6 +2870,131 @@ mod tests {
                     cpu[i]
                 );
             }
+        }
+    }
+
+    fn cpu_attention_sinks(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        sinks: &[f32],
+        out: &mut [f32],
+        n_q: usize,
+        n_kv: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        causal: bool,
+    ) {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let reps = n_heads / n_kv_heads;
+        out.fill(0.0);
+        for qi in 0..n_q {
+            for h in 0..n_heads {
+                let kv_h = h / reps;
+                let q_off = (qi * n_heads + h) * head_dim;
+                let qh = &q[q_off..q_off + head_dim];
+                let sink = sinks[h];
+                let mut scores = vec![0.0f32; n_kv];
+                let mut max = sink;
+                for t in 0..n_kv {
+                    if causal && t > qi + n_kv.saturating_sub(n_q) {
+                        scores[t] = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_off = (t * n_kv_heads + kv_h) * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += qh[d] * k[k_off + d];
+                    }
+                    scores[t] = dot * scale;
+                    if scores[t] > max {
+                        max = scores[t];
+                    }
+                }
+                let mut acc = (sink - max).exp();
+                for s in &mut scores {
+                    *s = (*s - max).exp();
+                    acc += *s;
+                }
+                let inv = 1.0 / acc.max(1e-9);
+                let o_off = (qi * n_heads + h) * head_dim;
+                for t in 0..n_kv {
+                    let w = scores[t] * inv;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let v_off = (t * n_kv_heads + kv_h) * head_dim;
+                    for d in 0..head_dim {
+                        out[o_off + d] += w * v[v_off + d];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Virtual per-head sink logits soak softmax mass without contributing V.
+    #[test]
+    fn attention_sinks_match_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_q = 1i32;
+        let n_kv = 4i32;
+        let n_heads = 4i32;
+        let n_kv_heads = 2i32;
+        let head_dim = 8i32;
+        let q_n = (n_q * n_heads * head_dim) as usize;
+        let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
+        let q: Vec<f32> = (0..q_n)
+            .map(|i| ((i * 17) % 50) as f32 * 0.02 - 0.5)
+            .collect();
+        let k: Vec<f32> = (0..kv_n)
+            .map(|i| ((i * 13) % 50) as f32 * 0.02 - 0.5)
+            .collect();
+        let v: Vec<f32> = (0..kv_n)
+            .map(|i| ((i * 11) % 50) as f32 * 0.02 - 0.5)
+            .collect();
+        let sinks: Vec<f32> = (0..n_heads as usize)
+            .map(|h| 0.25 + h as f32 * 0.5)
+            .collect();
+        let mut cuda_out = vec![0.0f32; q_n];
+        let mut cpu_out = vec![0.0f32; q_n];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        ws.attention_sinks(
+            &q,
+            &k,
+            &v,
+            &sinks,
+            &mut cuda_out,
+            n_q,
+            n_kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            true,
+        )
+        .expect("cuda attention_sinks");
+        cpu_attention_sinks(
+            &q,
+            &k,
+            &v,
+            &sinks,
+            &mut cpu_out,
+            n_q as usize,
+            n_kv as usize,
+            n_heads as usize,
+            n_kv_heads as usize,
+            head_dim as usize,
+            true,
+        );
+        for i in 0..q_n {
+            assert!(
+                attn_close(cuda_out[i], cpu_out[i]),
+                "attention_sinks mismatch at {i}: cuda={} cpu={}",
+                cuda_out[i],
+                cpu_out[i]
+            );
         }
     }
 }

@@ -116,6 +116,12 @@ int allpaca_cuda_attention(const float *q, const float *k, const float *v, float
                            int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                            int32_t causal, allpaca_cuda_stream_t stream);
 
+/* Online-softmax attention with a virtual sink logit per head (`sinks[n_heads]`; null = none). */
+int allpaca_cuda_attention_sinks(const float *q, const float *k, const float *v, float *out,
+                                 int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                 int32_t head_dim, int32_t causal, const float *sinks,
+                                 allpaca_cuda_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
