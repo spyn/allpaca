@@ -3,7 +3,7 @@
 
 #![cfg(feature = "cuda")]
 
-use allpaca_core::Engine;
+use allpaca_core::{Engine, ModelConfig};
 use allpaca_types::{Config, GenerationParams};
 
 fn cuda_synthetic() -> Config {
@@ -173,5 +173,56 @@ fn cuda_stats_gpu_util_after_generate_when_device_present() {
         stats.gpu_util > 0.0 && stats.gpu_util <= 1.0,
         "expected positive GPU util after decode profile, got {}",
         stats.gpu_util
+    );
+}
+
+fn cuda_moe_cfg() -> Config {
+    let mut cfg = cuda_synthetic();
+    // Engine::new auto-loads dense tiny when synthetic; load MoE explicitly.
+    cfg.model.synthetic = false;
+    cfg
+}
+
+#[test]
+fn cuda_synthetic_moe_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_moe_cfg()).expect("engine");
+    engine
+        .load_synthetic(ModelConfig::tiny_moe())
+        .expect("load moe");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_h2d_bytes > 0,
+        "MoE router+experts should upload at load; stats={before:?}"
+    );
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "MoE weights should be resident; stats={before:?}"
+    );
+    let h2d_after_load = before.activation_h2d_bytes;
+
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA MoE forwards, got gpu={} target={}; stats={stats:?}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    assert_eq!(
+        stats.weight_h2d_bytes, before.weight_h2d_bytes,
+        "weight_h2d must not grow during MoE generate"
+    );
+    let activation_delta = stats.activation_h2d_bytes.saturating_sub(h2d_after_load);
+    assert!(
+        activation_delta < before.weight_h2d_bytes,
+        "per-generate activation H2D ({activation_delta}) must stay below weight pack ({})",
+        before.weight_h2d_bytes
     );
 }
