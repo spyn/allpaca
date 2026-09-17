@@ -186,6 +186,19 @@ mod ffi {
             sinks: *const f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_attention_masked(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_q: i32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            mask: *const u8,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -1783,6 +1796,123 @@ impl CudaWorkspace {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dev_masked(
+        &self,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mask: *const u8,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if q.is_null()
+                || k.is_null()
+                || v.is_null()
+                || out.is_null()
+                || mask.is_null()
+                || n_q <= 0
+                || n_kv <= 0
+                || n_heads <= 0
+                || n_kv_heads <= 0
+                || head_dim <= 0
+                || n_heads % n_kv_heads != 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA attention_masked".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_attention_masked(
+                    q,
+                    k,
+                    v,
+                    out,
+                    n_q,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    mask,
+                    self.stream,
+                )
+            };
+            status(rc, "attention_masked")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, mask);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA attention_masked unavailable".into(),
+            )))
+        }
+    }
+
+    /// Host Q/K/V attention with an explicit [n_q, n_kv] uint8 mask (nonzero = attend).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_masked(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mask: &[u8],
+    ) -> Result<(), AllpacaError> {
+        let q_n = (n_q as usize) * (n_heads as usize) * (head_dim as usize);
+        let kv_n = (n_kv as usize) * (n_kv_heads as usize) * (head_dim as usize);
+        let mask_n = (n_q as usize).saturating_mul(n_kv as usize);
+        if q.len() < q_n || k.len() < kv_n || v.len() < kv_n || out.len() < q_n || mask.len() < mask_n
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "attention mask size mismatch".into(),
+            )));
+        }
+        let d_q = self.upload_f32(&q[..q_n])?;
+        let d_k = self.upload_f32(&k[..kv_n])?;
+        let d_v = self.upload_f32(&v[..kv_n])?;
+        let d_m = device_malloc(mask_n, self.device)?;
+        let d_out = device_malloc(q_n * 4, self.device)?;
+        let result = (|| {
+            set_device(self.device)?;
+            memcpy_on(d_m, mask.as_ptr().cast(), mask_n, MEMCPY_H2D, self.stream)?;
+            self.attention_dev_masked(
+                d_q,
+                d_k,
+                d_v,
+                d_out.cast(),
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                d_m.cast(),
+            )?;
+            memcpy_on(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H, self.stream)?;
+            self.synchronize()?;
+            self.activation_d2h
+                .fetch_add((q_n * 4) as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+        self.free_ptr(d_q);
+        self.free_ptr(d_k);
+        self.free_ptr(d_v);
+        self.free_device(d_m);
+        self.free_device(d_out);
+        result
+    }
+
     /// Host Q + resident device K/V (no KV D2H). Used by CUDA decode pages.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_host_q_dev_kv(
@@ -2992,6 +3122,74 @@ mod tests {
             assert!(
                 attn_close(cuda_out[i], cpu_out[i]),
                 "attention_sinks mismatch at {i}: cuda={} cpu={}",
+                cuda_out[i],
+                cpu_out[i]
+            );
+        }
+    }
+
+    /// Explicit [n_q, n_kv] uint8 mask (nonzero = attend) must match CPU attention_with_mask.
+    #[test]
+    fn attention_masked_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_q = 2i32;
+        let n_kv = 4i32;
+        let n_heads = 2i32;
+        let n_kv_heads = 1i32;
+        let head_dim = 8i32;
+        let q_n = (n_q * n_heads * head_dim) as usize;
+        let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
+        let q: Vec<f32> = (0..q_n)
+            .map(|i| ((i * 17) % 50) as f32 * 0.02 - 0.5)
+            .collect();
+        let k: Vec<f32> = (0..kv_n)
+            .map(|i| ((i * 13) % 50) as f32 * 0.02 - 0.5)
+            .collect();
+        let v: Vec<f32> = (0..kv_n)
+            .map(|i| ((i * 11) % 50) as f32 * 0.02 - 0.5)
+            .collect();
+        let mut mask = vec![0u8; (n_q * n_kv) as usize];
+        mask[0] = 1;
+        mask[2] = 1;
+        mask[4] = 1;
+        mask[5] = 1;
+        mask[7] = 1;
+        let bool_mask: Vec<bool> = mask.iter().map(|&b| b != 0).collect();
+        let mut cuda_out = vec![0.0f32; q_n];
+        let mut cpu_out = vec![0.0f32; q_n];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        ws.attention_masked(
+            &q,
+            &k,
+            &v,
+            &mut cuda_out,
+            n_q,
+            n_kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            &mask,
+        )
+        .expect("cuda attention_masked");
+        allpaca_cpu::attention_with_mask(
+            &q,
+            &k,
+            &v,
+            &mut cpu_out,
+            n_q as usize,
+            n_kv as usize,
+            n_heads as usize,
+            n_kv_heads as usize,
+            head_dim as usize,
+            &bool_mask,
+        )
+        .expect("cpu attention_with_mask");
+        for i in 0..q_n {
+            assert!(
+                attn_close(cuda_out[i], cpu_out[i]),
+                "attention_masked mismatch at {i}: cuda={} cpu={}",
                 cuda_out[i],
                 cpu_out[i]
             );

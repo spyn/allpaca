@@ -585,7 +585,7 @@ __device__ float warp_sum32(float v) {
  * Optional sinks[h] is a virtual logit with no V (HIP attention_flash_kernel). */
 __global__ void attention_online_kernel(const float *q, const float *k, const float *v, float *out,
                                         int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
-                                        int causal, const float *sinks) {
+                                        int causal, const uint8_t *mask, const float *sinks) {
     const int qi = static_cast<int>(blockIdx.x);
     const int h = static_cast<int>(blockIdx.y);
     if (qi >= n_q || h >= n_heads) {
@@ -618,7 +618,9 @@ __global__ void attention_online_kernel(const float *q, const float *k, const fl
     }
 
     for (int t = 0; t < n_kv; ++t) {
-        const bool valid = t <= t_max;
+        const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
+                                       static_cast<size_t>(t)] != 0
+                                : t <= t_max;
         const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         float partial = 0.f;
@@ -659,9 +661,23 @@ extern "C" int allpaca_cuda_attention_sinks(const float *q, const float *k, cons
     }
     dim3 block(32);
     dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(q, k, v, out, n_q, n_kv, n_heads,
-                                                                   n_kv_heads, head_dim, causal,
-                                                                   sinks);
+    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, nullptr, sinks);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_attention_masked(const float *q, const float *k, const float *v,
+                                             float *out, int32_t n_q, int32_t n_kv, int32_t n_heads,
+                                             int32_t n_kv_heads, int32_t head_dim,
+                                             const uint8_t *mask, allpaca_cuda_stream_t stream) {
+    if (!q || !k || !v || !out || !mask || n_q <= 0 || n_kv <= 0 || n_heads <= 0 ||
+        n_kv_heads <= 0 || head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
+        return ALLPACA_ERR_INVALID;
+    }
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask, nullptr);
     return cuda_status(cudaGetLastError());
 }
 

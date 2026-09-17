@@ -122,6 +122,12 @@ int allpaca_cuda_attention_sinks(const float *q, const float *k, const float *v,
                                  int32_t head_dim, int32_t causal, const float *sinks,
                                  allpaca_cuda_stream_t stream);
 
+/* Same layout as allpaca_cuda_attention. mask is [n_q, n_kv] uint8 (nonzero = attend). */
+int allpaca_cuda_attention_masked(const float *q, const float *k, const float *v, float *out,
+                                  int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                  int32_t head_dim, const uint8_t *mask,
+                                  allpaca_cuda_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
