@@ -26,6 +26,63 @@ pub const MEMCPY_D2D: i32 = 2;
 pub const MEMCPY_DEFAULT: i32 = 3;
 pub const MEMCPY_D2H_ASYNC: i32 = 4;
 
+/// GGUF Q8_0 packed block (f16 scale + 32 qs).
+pub const Q8_PACKED_BLOCK: usize = 34;
+/// Device-staged Q8_0: f32 scale at 0, qs at 4, 36-byte stride.
+pub const Q8_STAGED_BLOCK: usize = 36;
+pub const Q8_STAGED_QS: usize = 4;
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = u32::from(h & 0x3ff);
+    let bits = if exp == 0 {
+        sign
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((u32::from(exp) + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Repack GGUF 34-byte Q8_0 blocks into 36-byte device blocks with an F32 scale.
+pub fn stage_q8_0_blocks(packed: &[u8]) -> Result<Vec<u8>, AllpacaError> {
+    if packed.len() % Q8_PACKED_BLOCK != 0 {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 packed length is not a multiple of 34".into(),
+        )));
+    }
+    let n = packed.len() / Q8_PACKED_BLOCK;
+    let mut out = vec![0u8; n * Q8_STAGED_BLOCK];
+    for i in 0..n {
+        let src = i * Q8_PACKED_BLOCK;
+        let dst = i * Q8_STAGED_BLOCK;
+        let h = u16::from_le_bytes([packed[src], packed[src + 1]]);
+        out[dst..dst + 4].copy_from_slice(&f16_bits_to_f32(h).to_le_bytes());
+        out[dst + Q8_STAGED_QS..dst + Q8_STAGED_QS + 32]
+            .copy_from_slice(&packed[src + 2..src + Q8_PACKED_BLOCK]);
+    }
+    Ok(out)
+}
+
+/// Repack GGUF Q8_0 into 36-byte column-major GEMV blocks (F32 scale + aligned qs).
+pub fn stage_q8_0_gemv(packed: &[u8], n: usize, k: usize) -> Result<Vec<u8>, AllpacaError> {
+    if n == 0 || k == 0 {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 GEMV stage needs n>0 and k>0".into(),
+        )));
+    }
+    let nblocks = k.div_ceil(32);
+    let packed_need = n.saturating_mul(nblocks).saturating_mul(Q8_PACKED_BLOCK);
+    if packed.len() < packed_need {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 GEMV packed length is short for n,k".into(),
+        )));
+    }
+    stage_q8_0_blocks(&packed[..packed_need])
+}
+
 #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
 mod ffi {
     use std::ffi::c_void;
@@ -107,6 +164,15 @@ mod ffi {
         pub fn allpaca_cuda_gemm_nt(
             a: *const f32,
             b: *const f32,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_gemm_nt_q8_0(
+            a: *const f32,
+            b: *const u8,
             c: *mut f32,
             m: i32,
             n: i32,
@@ -1096,7 +1162,75 @@ pub fn gemm_nt(
     result
 }
 
-/// Minimal CUDA workspace: scratch buffer + owned compute stream + F32 GEMM.
+/// Device-pointer float A × staged Q8_0 B NT GEMM (HIP `gemm_nt_q8_0_device`).
+pub fn gemm_nt_q8_0_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_cuda_gemm_nt_q8_0(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q8_0")?;
+        let sync = unsafe { ffi::allpaca_cuda_stream_synchronize(std::ptr::null_mut()) };
+        status(sync, "gemm_nt_q8_0 sync")
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA gemm_nt_q8_0 unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer Q8_0 NT GEMM: stages GGUF blocks, copies to device, runs kernel, copies back.
+pub fn gemm_nt_q8_0(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    if device_count() <= 0 {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "CUDA gemm_nt_q8_0: no device".into(),
+        )));
+    }
+    if m <= 0 || n <= 0 || k <= 0 {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "invalid GEMM shape".into(),
+        )));
+    }
+    let a_n = (m as usize) * (k as usize);
+    let c_n = (m as usize) * (n as usize);
+    let nblocks = (k as usize).div_ceil(32);
+    let packed_bytes = (n as usize) * nblocks * Q8_PACKED_BLOCK;
+    if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "Q8_0 GEMM buffer size mismatch".into(),
+        )));
+    }
+    let staged = stage_q8_0_gemv(&b[..packed_bytes], n as usize, k as usize)?;
+    let da = device_malloc(a_n * 4, 0)?;
+    let db = device_malloc(staged.len(), 0)?;
+    let dc = device_malloc(c_n * 4, 0)?;
+    set_device(0)?;
+    let result = (|| {
+        memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+        memcpy(db, staged.as_ptr().cast(), staged.len(), MEMCPY_H2D)?;
+        gemm_nt_q8_0_device(da.cast(), db.cast(), dc.cast(), m, n, k)?;
+        memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+    })();
+    device_free(da);
+    device_free(db);
+    device_free(dc);
+    result
+}
 /// Kernels enqueue on the workspace stream; call [`CudaWorkspace::synchronize`]
 /// (or a host roundtrip) to batch-wait — no per-op device sync.
 pub struct CudaWorkspace {
@@ -3193,6 +3327,113 @@ mod tests {
                 cuda_out[i],
                 cpu_out[i]
             );
+        }
+    }
+
+    fn gemm_close(got: f32, exp: f32) -> bool {
+        let d = (got - exp).abs();
+        d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
+    }
+
+    fn f32_to_f16_bits(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let mant = bits & 0x7f_ffff;
+        if exp == 255 {
+            return sign | 0x7c00 | ((mant >> 13) as u16);
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            return sign | 0x7c00;
+        }
+        if new_exp <= 0 {
+            return sign;
+        }
+        sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+
+    fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
+        let n_blocks = data.len().div_ceil(32);
+        let mut out = vec![0u8; n_blocks * 34];
+        for b in 0..n_blocks {
+            let start = b * 32;
+            let end = (start + 32).min(data.len());
+            let mut amax = 0.0f32;
+            for v in &data[start..end] {
+                amax = amax.max(v.abs());
+            }
+            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+            let off = b * 34;
+            out[off..off + 2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+            for i in 0..32 {
+                let src = start + i;
+                let q = if src < data.len() {
+                    (data[src] * inv).round().clamp(-127.0, 127.0) as i8
+                } else {
+                    0
+                };
+                out[off + 2 + i] = q as u8;
+            }
+        }
+        out
+    }
+
+    fn dequant_q8_matrix(b_packed: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let nblocks = k.div_ceil(32);
+        let mut b_deq = vec![0.0f32; n * k];
+        for row in 0..n {
+            let blk = &b_packed[row * nblocks * 34..(row + 1) * nblocks * 34];
+            let mut row_f = vec![0.0f32; nblocks * 32];
+            allpaca_cpu::dequant_q8_0(blk, nblocks * 32, &mut row_f).expect("dequant");
+            for j in 0..k {
+                b_deq[row * k + j] = row_f[j];
+            }
+        }
+        b_deq
+    }
+
+    /// Public `gemm_nt_q8_0` must match CPU dequant + NT GEMM on decode-shaped matrices.
+    #[test]
+    fn gemm_nt_q8_0_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let shapes = [
+            (1usize, 8usize, 32usize),
+            (1, 17, 32),
+            (2, 5, 64),
+            (1, 4, 33),
+            (1, 64, 128),
+        ];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let mut b_q8 = Vec::new();
+            for row in 0..n {
+                b_q8.extend(quantize_q8_0(&b_f[row * k..(row + 1) * k]));
+            }
+            let b_deq = dequant_q8_matrix(&b_q8, n, k);
+            let mut cpu = vec![0.0f32; m * n];
+            let mut cuda_out = vec![0.0f32; m * n];
+            allpaca_cpu::matmul_nt(&a, &b_deq, &mut cpu, m, n, k).expect("cpu gemm");
+            gemm_nt_q8_0(&a, &b_q8, &mut cuda_out, m as i32, n as i32, k as i32)
+                .expect("cuda gemm_nt_q8_0");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(cuda_out[i], cpu[i]),
+                    "gemm_nt_q8_0 mismatch shape {m}x{n}x{k} idx={i}: cuda={} cpu={}",
+                    cuda_out[i],
+                    cpu[i]
+                );
+            }
         }
     }
 }

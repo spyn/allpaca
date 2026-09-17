@@ -89,6 +89,10 @@ int allpaca_cuda_event_elapsed_us(void *start, void *stop, double *us);
 int allpaca_cuda_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                          allpaca_cuda_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_q8_0[n,k])^T. B is 36-byte staged Q8_0 (HIP layout). */
+int allpaca_cuda_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                              int32_t k, allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_residual_add(const float *x, const float *y, float *out, int32_t n,
                               allpaca_cuda_stream_t stream);
 

@@ -442,6 +442,194 @@ extern "C" int allpaca_cuda_gemm_nt(const float *a, const float *b, float *c, in
     return cuda_status(cudaGetLastError());
 }
 
+/* Staged Q8_0: f32 scale at 0, qs at 4, 36-byte stride (HIP Q8_STAGED_*). */
+constexpr int Q8_STAGED_STRIDE = 36;
+constexpr int Q8_STAGED_QS = 4;
+
+__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                        int k) {
+    constexpr int WARPS = 16;
+    constexpr int COLS = 8;
+    constexpr int SUB = 4;
+    constexpr int TILE = 8;
+    __shared__ float As[TILE * 32];
+
+    const int row = static_cast<int>(blockIdx.y);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int sub = lane / SUB;
+    const int sublane = lane % SUB;
+    const int col = (static_cast<int>(blockIdx.x) * WARPS + warp) * COLS + sub;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const size_t row_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
+    const uint8_t *brow = (col < n) ? b + static_cast<size_t>(col) * row_stride : nullptr;
+    float acc = 0.0f;
+    const int tid = static_cast<int>(threadIdx.x);
+
+    for (int blk0 = 0; blk0 < nblocks; blk0 += TILE) {
+        const int ntile = (blk0 + TILE <= nblocks) ? TILE : (nblocks - blk0);
+        const int a0 = blk0 * 32;
+        const int nfloat = ntile * 32;
+        for (int i = tid; i < nfloat; i += static_cast<int>(blockDim.x)) {
+            const int gi = a0 + i;
+            As[i] = (gi < k) ? arow[gi] : 0.0f;
+        }
+        __syncthreads();
+
+        if (brow) {
+            for (int t = 0; t < ntile; ++t) {
+                const uint8_t *bp = brow + static_cast<size_t>(blk0 + t) * Q8_STAGED_STRIDE;
+                const float d = *reinterpret_cast<const float *>(bp);
+                const int qbase = sublane * 8;
+                const uint8_t *qp = bp + Q8_STAGED_QS + qbase;
+                const uint32_t qlo = *reinterpret_cast<const uint32_t *>(qp);
+                const uint32_t qhi = *reinterpret_cast<const uint32_t *>(qp + 4);
+                const float *as = As + t * 32 + qbase;
+                float dot = as[0] * static_cast<float>(static_cast<int8_t>(qlo & 0xff));
+                dot += as[1] * static_cast<float>(static_cast<int8_t>((qlo >> 8) & 0xff));
+                dot += as[2] * static_cast<float>(static_cast<int8_t>((qlo >> 16) & 0xff));
+                dot += as[3] * static_cast<float>(static_cast<int8_t>((qlo >> 24) & 0xff));
+                dot += as[4] * static_cast<float>(static_cast<int8_t>(qhi & 0xff));
+                dot += as[5] * static_cast<float>(static_cast<int8_t>((qhi >> 8) & 0xff));
+                dot += as[6] * static_cast<float>(static_cast<int8_t>((qhi >> 16) & 0xff));
+                dot += as[7] * static_cast<float>(static_cast<int8_t>((qhi >> 24) & 0xff));
+                acc += d * dot;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int off = 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (col < n && sublane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+__global__ void gemm_nt_q8_0_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                          int k) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 32;
+    constexpr int TX = 16;
+    constexpr int TY = 16;
+    constexpr int TM = BM / TY;
+    constexpr int TN = BN / TX;
+
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BN][BK + 1];
+
+    const int row0 = static_cast<int>(blockIdx.y) * BM;
+    const int col0 = static_cast<int>(blockIdx.x) * BN;
+    const int tx = static_cast<int>(threadIdx.x);
+    const int ty = static_cast<int>(threadIdx.y);
+    const int tid = ty * TX + tx;
+    const int nblocks = (k + 31) / 32;
+    const size_t brow_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int k0 = 0; k0 < k; k0 += BK) {
+        const int blk = k0 / BK;
+        for (int t = tid; t < BM * BK; t += TX * TY) {
+            const int r = t / BK;
+            const int p = t % BK;
+            const int gr = row0 + r;
+            const int gp = k0 + p;
+            As[r][p] = (gr < m && gp < k) ? a[static_cast<size_t>(gr) * static_cast<size_t>(k) + gp]
+                                         : 0.0f;
+        }
+        for (int t = tid; t < BN * BK; t += TX * TY) {
+            const int col = t / BK;
+            const int p = t % BK;
+            const int gc = col0 + col;
+            const int gp = k0 + p;
+            float v = 0.0f;
+            if (gc < n && gp < k) {
+                const uint8_t *bp = b + static_cast<size_t>(gc) * brow_stride +
+                                    static_cast<size_t>(blk) * static_cast<size_t>(Q8_STAGED_STRIDE);
+                const float d = *reinterpret_cast<const float *>(bp);
+                v = d * static_cast<float>(static_cast<int8_t>(bp[Q8_STAGED_QS + p]));
+            }
+            Bs[col][p] = v;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BK; ++p) {
+            float av[TM];
+            float bv[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                av[i] = As[ty * TM + i][p];
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                bv[j] = Bs[tx * TN + j][p];
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += av[i] * bv[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gr = row0 + ty * TM + i;
+        if (gr >= m) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int gc = col0 + tx * TN + j;
+            if (gc < n) {
+                c[static_cast<size_t>(gr) * static_cast<size_t>(n) + gc] = acc[i][j];
+            }
+        }
+    }
+}
+
+extern "C" int allpaca_cuda_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m,
+                                         int32_t n, int32_t k, allpaca_cuda_stream_t stream) {
+    if (!a || !b || !c || m <= 0 || n <= 0 || k <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (m > 8) {
+        constexpr int BM = 64;
+        constexpr int BN = 64;
+        dim3 block(16, 16);
+        dim3 grid(static_cast<unsigned>((n + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+        gemm_nt_q8_0_tiled_kernel<<<grid, block, 0, as_stream(stream)>>>(a, b, c, m, n, k);
+    } else {
+        constexpr int warps = 16;
+        constexpr int cols = 8;
+        constexpr int cols_per_block = warps * cols;
+        dim3 block(512);
+        dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
+                  static_cast<unsigned>(m));
+        gemv_nt_q8_0_f32_kernel<<<grid, block, 0, as_stream(stream)>>>(a, b, c, m, n, k);
+    }
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void residual_add_kernel(const float *x, const float *y, float *out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
