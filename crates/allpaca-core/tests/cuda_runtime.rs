@@ -154,6 +154,46 @@ fn cuda_qkv_fusion_keeps_qkv_on_device() {
 }
 
 #[test]
+fn cuda_coordinator_rpc_split_keeps_local_layers_on_device() {
+    if !cuda_device_available() {
+        return;
+    }
+    use std::net::TcpListener;
+    use std::thread;
+
+    use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+    });
+
+    let mut cfg = cuda_synthetic();
+    cfg.rpc.endpoints = vec![addr.to_string()];
+    cfg.rpc.max_seq = 64;
+    cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+    let engine = Engine::new(cfg).expect("engine");
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.rpc_roundtrips > 0,
+        "expected remote layer launches, got {}",
+        stats.rpc_roundtrips
+    );
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "CUDA coordinator should keep local layers on device, gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    drop(engine);
+    worker.join().unwrap();
+}
+
+#[test]
 fn cuda_synthetic_moe_generate_uses_device_when_present() {
     if !cuda_device_available() {
         return;

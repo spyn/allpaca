@@ -705,13 +705,6 @@ impl TinyModel {
                 }
             }
         }
-        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
-            return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA decode: RPC layer-split unsupported".into(),
-                ),
-            ));
-        }
         let dim = cfg.dim;
         let head_dim = cfg.head_dim();
         let kv_dim = cfg.n_kv_heads * head_dim;
@@ -746,6 +739,12 @@ impl TinyModel {
         let acts = cuda.decode_acts(dim, kv_dim)?;
 
         for (layer_idx, host_layer) in self.layers.iter().enumerate() {
+            if let Some(rpc) = &self.rpc {
+                if rpc.is_remote(layer_idx) {
+                    rpc.run_layer(layer_idx, pos, &mut x)?;
+                    continue;
+                }
+            }
             let layer = &resident.layers[layer_idx];
             if matches!(
                 host_layer.block,
