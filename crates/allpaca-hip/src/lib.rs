@@ -256,6 +256,12 @@ mod ffi {
             kind: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_hip_memset(
+            dst: *mut c_void,
+            value: i32,
+            bytes: usize,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_hip_memcpy_peer(
             dst: *mut c_void,
             dst_dev: i32,
@@ -1278,6 +1284,35 @@ pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(
         let _ = (dst, src, bytes, kind);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP memcpy unavailable".into(),
+        )))
+    }
+}
+
+/// Fill `bytes` of device memory with `value` (low 8 bits). Null stream is synchronous.
+pub fn device_memset(dst: *mut u8, value: u8, bytes: usize) -> Result<(), AllpacaError> {
+    memset_on(dst, value, bytes, std::ptr::null_mut())
+}
+
+/// Fill on `stream` (`hipMemsetAsync`). Null stream uses synchronous `hipMemset`.
+pub fn memset_on(
+    dst: *mut u8,
+    value: u8,
+    bytes: usize,
+    stream: *mut std::ffi::c_void,
+) -> Result<(), AllpacaError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_memset(dst.cast(), i32::from(value), bytes, stream) };
+        status(rc, "memset")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (dst, value, bytes, stream);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP memset unavailable".into(),
         )))
     }
 }
@@ -8295,6 +8330,48 @@ mod tests {
             assert!(!access.enabled);
             assert_eq!(device_count(), 0);
         }
+    }
+
+    #[test]
+    fn memset_empty_is_ok() {
+        device_memset(std::ptr::null_mut(), 0xAB, 0).expect("empty memset");
+    }
+
+    #[test]
+    fn memset_rejects_null_payload() {
+        assert!(device_memset(std::ptr::null_mut(), 0xAB, 64).is_err());
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn memset_fills_device_buffer_when_present() {
+        if device_count() == 0 {
+            return;
+        }
+        let n = 256usize;
+        let d = device_malloc(n, 0).expect("malloc");
+        device_memset(d, 0xAB, n).expect("memset");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr(), d, n, MEMCPY_D2H).expect("d2h");
+        device_free(d, n);
+        assert_eq!(back, vec![0xAB; n]);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn memset_on_side_stream_when_device_present() {
+        if device_count() == 0 {
+            return;
+        }
+        let n = 128usize;
+        let d = device_malloc(n, 0).expect("malloc");
+        let h2d = H2dStream::new().expect("side stream");
+        memset_on(d, 0x3C, n, h2d.raw()).expect("memset_on");
+        h2d.synchronize().expect("sync");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr(), d, n, MEMCPY_D2H).expect("d2h");
+        device_free(d, n);
+        assert_eq!(back, vec![0x3C; n]);
     }
 
     #[cfg(feature = "hip")]
