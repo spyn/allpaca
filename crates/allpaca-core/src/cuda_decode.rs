@@ -33,6 +33,7 @@ struct CudaLayerOff {
     w_up: WeightRef,
     w_down: WeightRef,
     experts: Vec<CudaExpertOff>,
+    shared_expert: CudaExpertOff,
 }
 
 /// F32 weights packed once onto a CUDA device (embed + layers + experts + norm + lm_head).
@@ -90,6 +91,23 @@ impl CudaResidentModel {
                     w_down: push(&mut slices, &mut off, expert.w_down.as_slice()),
                 });
             }
+            let shared_expert = if layer.shared_expert.w_up.is_empty() {
+                CudaExpertOff {
+                    w_gate: WeightRef::f32(0, 0),
+                    w_up: WeightRef::f32(0, 0),
+                    w_down: WeightRef::f32(0, 0),
+                }
+            } else {
+                CudaExpertOff {
+                    w_gate: if layer.shared_expert.w_gate.is_empty() {
+                        WeightRef::f32(0, 0)
+                    } else {
+                        push(&mut slices, &mut off, layer.shared_expert.w_gate.as_slice())
+                    },
+                    w_up: push(&mut slices, &mut off, layer.shared_expert.w_up.as_slice()),
+                    w_down: push(&mut slices, &mut off, layer.shared_expert.w_down.as_slice()),
+                }
+            };
             layers.push(CudaLayerOff {
                 attn_norm,
                 wq,
@@ -101,6 +119,7 @@ impl CudaResidentModel {
                 w_up,
                 w_down,
                 experts,
+                shared_expert,
             });
         }
         let norm = push(&mut slices, &mut off, model.norm.as_slice());
@@ -856,12 +875,73 @@ fn apply_moe_cuda(
         }
     }
 
-    if !host.shared_expert.w_up.is_empty() {
-        return Err(AllpacaError::Degraded(
-            allpaca_types::DegradedError::FeatureDisabled(
-                "CUDA MoE shared expert unsupported".into(),
-            ),
-        ));
+    if layer.shared_expert.w_up.n > 0 {
+        let sff = if cfg.shared_ff_dim > 0 {
+            cfg.shared_ff_dim
+        } else {
+            layer.shared_expert.w_up.n / dim.max(1)
+        };
+        let mut shared_gate = vec![0.0f32; sff];
+        let mut shared_up = vec![0.0f32; sff];
+        if layer.shared_expert.w_gate.n > 0 {
+            cuda.gemm_nt_host_a_dev_b(
+                &scratch[..dim],
+                resident.ptr(layer.shared_expert.w_gate)?,
+                &mut shared_gate,
+                1,
+                sff as i32,
+                dim as i32,
+            )?;
+            cuda.gemm_nt_host_a_dev_b(
+                &scratch[..dim],
+                resident.ptr(layer.shared_expert.w_up)?,
+                &mut shared_up,
+                1,
+                sff as i32,
+                dim as i32,
+            )?;
+            cuda.silu_mul_host(&mut shared_gate, &shared_up)?;
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+            cuda.gemm_nt_host_a_dev_b(
+                &shared_gate,
+                resident.ptr(layer.shared_expert.w_down)?,
+                &mut expert_out,
+                1,
+                dim as i32,
+                sff as i32,
+            )?;
+        } else {
+            // Gate-less shared expert: act(up) @ down (SiLU; ReLU² stays host/HIP).
+            if cfg.moe_relu_sqr {
+                return Err(AllpacaError::Degraded(
+                    allpaca_types::DegradedError::FeatureDisabled(
+                        "CUDA MoE shared expert ReLU² unsupported".into(),
+                    ),
+                ));
+            }
+            cuda.gemm_nt_host_a_dev_b(
+                &scratch[..dim],
+                resident.ptr(layer.shared_expert.w_up)?,
+                &mut shared_up,
+                1,
+                sff as i32,
+                dim as i32,
+            )?;
+            for v in &mut shared_up {
+                *v = *v * (1.0 / (1.0 + (-*v).exp()));
+            }
+            cuda.gemm_nt_host_a_dev_b(
+                &shared_up,
+                resident.ptr(layer.shared_expert.w_down)?,
+                &mut expert_out,
+                1,
+                dim as i32,
+                sff as i32,
+            )?;
+        }
+        for i in 0..dim {
+            acc[i] += expert_out[i];
+        }
     }
 
     cuda.residual_add_host(x, &acc)?;

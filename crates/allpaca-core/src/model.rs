@@ -3612,6 +3612,23 @@ impl TinyModel {
         model
     }
 
+    /// Tiny MoE with an always-on shared expert (SwiGLU) on every layer.
+    pub fn synthetic_moe_shared(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny_moe(), seed, "moe-shared");
+        let dim = model.config.dim;
+        let ff = model.config.ff_dim;
+        let mut rng = Lcg::new(seed.wrapping_add(55));
+        for layer in &mut model.layers {
+            layer.shared_expert = LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate: rng.vec(ff * dim),
+                w_up: rng.vec(ff * dim),
+                w_down: rng.vec(dim * ff),
+            };
+        }
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
     }
