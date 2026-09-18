@@ -3724,6 +3724,13 @@ impl TinyModel {
         model
     }
 
+    /// Tiny dense model with Gemma/Spark GELU FFN activation.
+    pub fn synthetic_gelu_ffn(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "gelu-ffn");
+        model.config.ffn_gelu = true;
+        model
+    }
+
     /// Tiny dense model with sliding-window attention on every layer.
     pub fn synthetic_swa(seed: u64) -> Self {
         let mut model = Self::synthetic(ModelConfig::tiny(), seed, "swa");
@@ -9909,6 +9916,26 @@ mod cuda_softcap_tests {
         assert!(
             max_diff > 1e-3,
             "scale_embed + post-norms should change logits; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_gelu_ffn_changes_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let silu = TinyModel::synthetic(ModelConfig::tiny(), 61, "silu-ffn");
+        let gelu = TinyModel::synthetic_gelu_ffn(61);
+        let a = cuda_decode_n_tokens(&silu, 2);
+        let b = cuda_decode_n_tokens(&gelu, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "ffn_gelu should change logits vs SiLU; max_diff={max_diff}"
         );
     }
 }

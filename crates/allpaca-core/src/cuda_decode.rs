@@ -941,7 +941,13 @@ fn apply_ffn_cuda(
         ff as i32,
         dim as i32,
     )?;
-    cuda.silu_mul_host(&mut gate, &up)?;
+    if cfg.ffn_gelu {
+        for i in 0..gate.len() {
+            gate[i] = allpaca_cpu::gelu(gate[i]) * up[i];
+        }
+    } else {
+        cuda.silu_mul_host(&mut gate, &up)?;
+    }
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     cuda.gemm_nt_host_a_dev_b(
         &gate,
