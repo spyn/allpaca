@@ -3629,6 +3629,18 @@ impl TinyModel {
         model
     }
 
+    /// Layer 0 is DenseFfn-only (no attention); remaining layers stay dense attention.
+    pub fn synthetic_dense_ffn_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "dense-ffn-hybrid");
+        let layer = &mut model.layers[0];
+        layer.block = HybridLayerKind::DenseFfn;
+        layer.wq.clear();
+        layer.wk.clear();
+        layer.wv.clear();
+        layer.wo.clear();
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
     }

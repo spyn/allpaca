@@ -281,10 +281,29 @@ impl TinyModel {
                 )?;
                 continue;
             }
+            if matches!(
+                host_layer.block,
+                HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+            ) {
+                // FFN / MoE-only hybrid block: no attention QKV.
+                apply_ffn_cuda(
+                    cfg,
+                    layer_idx,
+                    host_layer,
+                    layer,
+                    resident,
+                    cuda,
+                    &mut x,
+                    &mut scratch,
+                    &mut hidden,
+                    metrics,
+                )?;
+                continue;
+            }
             if host_layer.block != HybridLayerKind::Attention {
                 return Err(AllpacaError::Degraded(
                     allpaca_types::DegradedError::FeatureDisabled(
-                        "CUDA decode: attention or SSM blocks only".into(),
+                        "CUDA decode: attention, SSM, DenseFfn, or MoE blocks only".into(),
                     ),
                 ));
             }
