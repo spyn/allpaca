@@ -2398,17 +2398,40 @@ fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, A
             conv1d.len()
         ))));
     }
+    // Host projections for CUDA / CPU host-step GDN (HIP also uploads these on-device).
+    let w_qkv = file.tensor_f32(&format!("blk.{layer}.attn_qkv.weight"))?;
+    let w_z = file.tensor_f32(&format!("blk.{layer}.attn_gate.weight"))?;
+    let w_alpha = file.tensor_f32(&format!("blk.{layer}.ssm_alpha.weight"))?;
+    let w_beta = file.tensor_f32(&format!("blk.{layer}.ssm_beta.weight"))?;
+    let w_out = file.tensor_f32(&format!("blk.{layer}.ssm_out.weight"))?;
+    let dim_in = w_qkv.len() / dims.qkv_dim.max(1);
+    if dim_in == 0
+        || w_qkv.len() != dims.qkv_dim.saturating_mul(dim_in)
+        || w_z.len() != dims.value_dim.saturating_mul(dim_in)
+        || w_alpha.len() != dims.n_v_heads.saturating_mul(dim_in)
+        || w_beta.len() != dims.n_v_heads.saturating_mul(dim_in)
+        || w_out.len() != dim_in.saturating_mul(dims.value_dim)
+    {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: GDN projection sizes mismatch dims={dims:?} qkv={} z={} alpha={} beta={} out={}",
+            w_qkv.len(),
+            w_z.len(),
+            w_alpha.len(),
+            w_beta.len(),
+            w_out.len()
+        ))));
+    }
     Ok(GdnHostWeights {
         dims,
         a,
         dt_bias,
         norm,
         conv1d,
-        w_qkv: Vec::new(),
-        w_z: Vec::new(),
-        w_alpha: Vec::new(),
-        w_beta: Vec::new(),
-        w_out: Vec::new(),
+        w_qkv,
+        w_z,
+        w_alpha,
+        w_beta,
+        w_out,
     })
 }
 
