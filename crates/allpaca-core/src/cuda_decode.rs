@@ -1,6 +1,8 @@
 //! CUDA decode path: dense, tiny MoE, and host-step SSM hybrid on CudaWorkspace.
 
-use super::{gather_kv, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef};
+use super::{
+    gather_kv, softcap_inplace, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef,
+};
 use crate::anchors::RecurrentState;
 use crate::deltanet::{
     conv1d_step, decay_from_alpha, expand_k_heads, gated_delta_step, rmsnorm_silu_gate,
@@ -9,7 +11,7 @@ use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
-use allpaca_cpu::matmul_nt;
+use allpaca_cpu::{attention_softcap, matmul_nt};
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
@@ -379,7 +381,25 @@ impl TinyModel {
             kv.write_slot(page_id, slot, cfg.n_kv_heads, head_dim, &k, &v)?;
             kv.touch(page_id, 1.0);
 
-            if let Some((k_dev, v_dev, n_kv)) =
+            // Softcap path is host-only until CUDA kernels grow a softcap arg
+            // (same split as HIP `attention_dispatch`).
+            if cfg.attn_logit_softcap > 0.0 {
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+                let n_kv = k_all.len() / kv_dim.max(1);
+                attention_softcap(
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &mut attn_out,
+                    1,
+                    n_kv,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    true,
+                    cfg.attn_logit_softcap,
+                )?;
+            } else if let Some((k_dev, v_dev, n_kv)) =
                 kv.cuda_single_page_view(&page_ids[layer_idx], cfg.n_kv_heads, head_dim)
             {
                 cuda.attention_host_q_dev_kv(
@@ -396,7 +416,7 @@ impl TinyModel {
                 )?;
             } else {
                 let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
-                let n_kv = k_all.len() / kv_dim;
+                let n_kv = k_all.len() / kv_dim.max(1);
                 cuda.attention(
                     &q,
                     &k_all,
@@ -452,6 +472,7 @@ impl TinyModel {
             vocab as i32,
             dim as i32,
         )?;
+        softcap_inplace(&mut logits[..vocab], cfg.final_logit_softcap);
 
         metrics.gpu_forwards.fetch_add(1, Ordering::Relaxed);
         metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);

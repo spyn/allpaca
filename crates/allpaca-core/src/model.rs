@@ -3660,6 +3660,14 @@ impl TinyModel {
         model
     }
 
+    /// Tiny dense model with Gemma-style attn + final logit softcaps.
+    pub fn synthetic_softcap(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "softcap");
+        model.config.attn_logit_softcap = 50.0;
+        model.config.final_logit_softcap = 30.0;
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
     }
@@ -9633,5 +9641,46 @@ mod lightning_moe_tests {
         expert_mlp(&x, &ffn, ff, dim, &mut out, true).unwrap();
         assert!((out[0] - 4.0).abs() < 1e-5, "{out:?}");
         assert!(out[1].abs() < 1e-5, "{out:?}");
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_softcap_tests {
+    use super::*;
+
+    #[test]
+    fn cuda_final_logit_softcap_bounds_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let mut model = TinyModel::synthetic_softcap(31);
+        // Tight cap so raw tiny-model logits exceed it without softcap.
+        model.config.final_logit_softcap = 0.05;
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        let metrics = Metrics::default();
+        let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 0.5);
+        let pages =
+            alloc_pages_for_seq(&mut kv, &model.config, 128, 1, &metrics).expect("pages");
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        model
+            .forward_token_cuda(
+                0,
+                0,
+                &pages,
+                &mut kv,
+                &metrics,
+                &mut logits,
+                &cuda,
+                &resident,
+                None,
+                None,
+            )
+            .expect("forward");
+        let max_abs = logits.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.05 + 1e-4,
+            "final_logit_softcap must bound |logits|, got max_abs={max_abs}"
+        );
     }
 }
