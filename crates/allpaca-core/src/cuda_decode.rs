@@ -5,6 +5,7 @@ use crate::anchors::RecurrentState;
 use crate::deltanet::{
     conv1d_step, decay_from_alpha, expand_k_heads, gated_delta_step, rmsnorm_silu_gate,
 };
+use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
@@ -133,16 +134,9 @@ impl CudaResidentModel {
     }
 }
 
-/// Attention / tiny MoE / host-step SSM or GDN. MLA stays unsupported on CUDA.
+/// Attention / tiny MoE / host-step SSM, GDN, or MLA.
 fn cuda_reject_unsupported_layers(model: &TinyModel) -> Result<(), AllpacaError> {
     for (i, layer) in model.layers.iter().enumerate() {
-        if layer.mla.is_some() {
-            return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(format!(
-                    "CUDA resident: layer {i} has MLA weights"
-                )),
-            ));
-        }
         if let Some(gdn) = &layer.gdn {
             if gdn.w_qkv.is_empty() {
                 return Err(AllpacaError::Degraded(
@@ -158,7 +152,7 @@ fn cuda_reject_unsupported_layers(model: &TinyModel) -> Result<(), AllpacaError>
 
 impl TinyModel {
     /// One-token decode using CUDA-resident weights + CudaWorkspace ops
-    /// (dense, tiny MoE, or host-step SSM / GDN hybrid).
+    /// (dense, tiny MoE, or host-step SSM / GDN / MLA hybrid).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_token_cuda(
         &self,
@@ -284,6 +278,23 @@ impl TinyModel {
             )?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
+            if host_layer.mla.is_some() {
+                apply_mla_cuda(
+                    self,
+                    cfg,
+                    layer_idx,
+                    host_layer,
+                    layer,
+                    resident,
+                    cuda,
+                    &mut x,
+                    &mut scratch,
+                    &mut hidden,
+                    metrics,
+                )?;
+                continue;
+            }
+
             cuda.gemm_nt_host_a_dev_b(
                 &scratch[..dim],
                 resident.ptr(layer.wq)?,
@@ -408,6 +419,71 @@ impl TinyModel {
         metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_mla_cuda(
+    model: &TinyModel,
+    cfg: &ModelConfig,
+    layer_idx: usize,
+    host: &LayerWeights,
+    layer: &CudaLayerOff,
+    resident: &CudaResidentModel,
+    cuda: &CudaWorkspace,
+    x: &mut [f32],
+    scratch: &mut [f32],
+    hidden: &mut [f32],
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    let dim = cfg.dim;
+    let mla_w = host.mla.as_ref().ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA MLA layer {layer_idx} missing host weights"
+        )))
+    })?;
+    if let Some(cache) = &model.mla_cache {
+        let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() <= layer_idx {
+            g.resize(layer_idx + 1, (Vec::new(), Vec::new()));
+        }
+        let (ckv, krope) = &mut g[layer_idx];
+        mla_attend_cpu(
+            &scratch[..dim],
+            mla_w,
+            ckv,
+            krope,
+            cfg.rope_theta,
+            cfg.eps,
+            hidden,
+        )?;
+    } else {
+        let mut ckv = Vec::new();
+        let mut krope = Vec::new();
+        mla_attend_cpu(
+            &scratch[..dim],
+            mla_w,
+            &mut ckv,
+            &mut krope,
+            cfg.rope_theta,
+            cfg.eps,
+            hidden,
+        )?;
+    }
+    cuda.residual_add_host(x, hidden)?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+    apply_ffn_cuda(
+        cfg,
+        layer_idx,
+        host,
+        layer,
+        resident,
+        cuda,
+        x,
+        scratch,
+        hidden,
+        metrics,
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -3596,6 +3596,22 @@ impl TinyModel {
         model
     }
 
+    /// Attention layers with Multi-head Latent Attention on layer 0 (host MLA step).
+    pub fn synthetic_mla_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "mla-hybrid");
+        let dims = crate::edge0::MlaDims::from_hidden(model.config.dim, model.config.n_heads);
+        model.layers[0].mla = Some(crate::edge0::MlaHostWeights::synthetic(dims, 0.01));
+        // Prefer MLA over dense QKV on layer 0.
+        model.layers[0].wq.clear();
+        model.layers[0].wk.clear();
+        model.layers[0].wv.clear();
+        model.layers[0].wo.clear();
+        model.mla_cache = Some(Arc::new(std::sync::Mutex::new(
+            vec![(Vec::new(), Vec::new()); model.layers.len()],
+        )));
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
     }
