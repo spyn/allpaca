@@ -9839,4 +9839,44 @@ mod cuda_softcap_tests {
             "headwise attn gate should change logits; max_diff={max_diff}"
         );
     }
+
+    #[test]
+    fn cuda_moe_shared_expert_uploads_as_q8_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic_moe_shared(47);
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        assert!(
+            resident.shared_expert_is_q8(),
+            "shared expert up should be staged Q8_0"
+        );
+        let mut f32_bytes = 0usize;
+        f32_bytes += model.embed.len() * 4;
+        f32_bytes += model.norm.len() * 4;
+        f32_bytes += model.lm_head.len() * 4;
+        for layer in &model.layers {
+            f32_bytes += layer.attn_norm.len() * 4;
+            f32_bytes += layer.wq.len() * 4;
+            f32_bytes += layer.wk.len() * 4;
+            f32_bytes += layer.wv.len() * 4;
+            f32_bytes += layer.wo.len() * 4;
+            f32_bytes += layer.ffn_norm.len() * 4;
+            for expert in &layer.experts {
+                f32_bytes += expert.w_gate.len() * 4;
+                f32_bytes += expert.w_up.len() * 4;
+                f32_bytes += expert.w_down.len() * 4;
+            }
+            f32_bytes += layer.shared_expert.w_gate.len() * 4;
+            f32_bytes += layer.shared_expert.w_up.len() * 4;
+            f32_bytes += layer.shared_expert.w_down.len() * 4;
+        }
+        assert!(
+            (resident.packed_h2d_bytes() as usize) < f32_bytes,
+            "Q8 shared+routed should shrink pack: packed={} f32_est={}",
+            resident.packed_h2d_bytes(),
+            f32_bytes
+        );
+    }
 }

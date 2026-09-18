@@ -129,11 +129,34 @@ impl CudaResidentModel {
                     w_down: WeightRef::f32(0, 0),
                 }
             } else {
-                // Shared expert stays F32 (gate-less ReLU² / SiLU paths).
+                let sff = if model.config.shared_ff_dim > 0 {
+                    model.config.shared_ff_dim
+                } else {
+                    layer.shared_expert.w_up.len() / dim.max(1)
+                };
                 CudaExpertOff {
-                    w_gate: push_f32(&mut pack, layer.shared_expert.w_gate.as_slice()),
-                    w_up: push_f32(&mut pack, layer.shared_expert.w_up.as_slice()),
-                    w_down: push_f32(&mut pack, layer.shared_expert.w_down.as_slice()),
+                    w_gate: if layer.shared_expert.w_gate.is_empty() {
+                        WeightRef::f32(0, 0)
+                    } else {
+                        push_q8_matrix(
+                            &mut pack,
+                            layer.shared_expert.w_gate.as_slice(),
+                            sff,
+                            dim,
+                        )?
+                    },
+                    w_up: push_q8_matrix(
+                        &mut pack,
+                        layer.shared_expert.w_up.as_slice(),
+                        sff,
+                        dim,
+                    )?,
+                    w_down: push_q8_matrix(
+                        &mut pack,
+                        layer.shared_expert.w_down.as_slice(),
+                        dim,
+                        sff,
+                    )?,
                 }
             };
             layers.push(CudaLayerOff {
@@ -169,6 +192,14 @@ impl CudaResidentModel {
 
     pub fn packed_h2d_bytes(&self) -> u64 {
         self.packed_h2d
+    }
+
+    /// True when any layer's shared expert up-projection is staged Q8_0.
+    #[cfg(test)]
+    pub(crate) fn shared_expert_is_q8(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.shared_expert.w_up.n > 0 && l.shared_expert.w_up.kind == WeightKind::Q8_0)
     }
 
     fn ptr(&self, w: WeightRef) -> Result<*const f32, AllpacaError> {
@@ -1022,17 +1053,21 @@ fn apply_moe_cuda(
         let mut shared_gate = vec![0.0f32; sff];
         let mut shared_up = vec![0.0f32; sff];
         if layer.shared_expert.w_gate.n > 0 {
-            cuda.gemm_nt_host_a_dev_b(
+            gemm_host_a_resident_b(
+                cuda,
+                resident,
                 &scratch[..dim],
-                resident.ptr(layer.shared_expert.w_gate)?,
+                layer.shared_expert.w_gate,
                 &mut shared_gate,
                 1,
                 sff as i32,
                 dim as i32,
             )?;
-            cuda.gemm_nt_host_a_dev_b(
+            gemm_host_a_resident_b(
+                cuda,
+                resident,
                 &scratch[..dim],
-                resident.ptr(layer.shared_expert.w_up)?,
+                layer.shared_expert.w_up,
                 &mut shared_up,
                 1,
                 sff as i32,
@@ -1040,9 +1075,11 @@ fn apply_moe_cuda(
             )?;
             cuda.silu_mul_host(&mut shared_gate, &shared_up)?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-            cuda.gemm_nt_host_a_dev_b(
+            gemm_host_a_resident_b(
+                cuda,
+                resident,
                 &shared_gate,
-                resident.ptr(layer.shared_expert.w_down)?,
+                layer.shared_expert.w_down,
                 &mut expert_out,
                 1,
                 dim as i32,
@@ -1050,9 +1087,11 @@ fn apply_moe_cuda(
             )?;
         } else {
             // Gate-less shared expert: act(up) @ down (Lightning ReLU² or SiLU).
-            cuda.gemm_nt_host_a_dev_b(
+            gemm_host_a_resident_b(
+                cuda,
+                resident,
                 &scratch[..dim],
-                resident.ptr(layer.shared_expert.w_up)?,
+                layer.shared_expert.w_up,
                 &mut shared_up,
                 1,
                 sff as i32,
@@ -1067,9 +1106,11 @@ fn apply_moe_cuda(
                     *v = *v * (1.0 / (1.0 + (-*v).exp()));
                 }
             }
-            cuda.gemm_nt_host_a_dev_b(
+            gemm_host_a_resident_b(
+                cuda,
+                resident,
                 &shared_up,
-                resident.ptr(layer.shared_expert.w_down)?,
+                layer.shared_expert.w_down,
                 &mut expert_out,
                 1,
                 dim as i32,
