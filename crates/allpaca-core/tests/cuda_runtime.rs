@@ -461,6 +461,32 @@ fn cuda_synthetic_swa_generate_uses_device_when_present() {
     );
 }
 
+#[test]
+fn cuda_synthetic_headwise_gate_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_moe_cfg()).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_headwise_gate(41))
+        .expect("load headwise gate");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_h2d_bytes > 0,
+        "headwise-gate dense should upload; stats={before:?}"
+    );
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA headwise-gate forwards, got gpu={} target={}; stats={stats:?}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
+
 fn write_tiny_qwen_gdn_gguf(path: &std::path::Path, w: f32) {
     use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
     use std::collections::HashMap;

@@ -3699,6 +3699,19 @@ impl TinyModel {
         model
     }
 
+    /// Tiny dense model with Spark2_5 head-wise sigmoid attention gate.
+    pub fn synthetic_headwise_gate(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "headwise-gate");
+        model.config.headwise_attn_gate = true;
+        let dim = model.config.dim;
+        let n_heads = model.config.n_heads;
+        let mut rng = Lcg::new(seed.wrapping_add(91));
+        for layer in &mut model.layers {
+            layer.attn_out_gate = rng.vec(n_heads * dim);
+        }
+        model
+    }
+
     /// Tiny dense model with sliding-window attention on every layer.
     pub fn synthetic_swa(seed: u64) -> Self {
         let mut model = Self::synthetic(ModelConfig::tiny(), seed, "swa");
@@ -9804,6 +9817,26 @@ mod cuda_softcap_tests {
             "Q8 MoE experts should shrink device pack: packed={} f32_est={}",
             resident.packed_h2d_bytes(),
             f32_bytes
+        );
+    }
+
+    #[test]
+    fn cuda_headwise_gate_changes_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 53, "hw-plain");
+        let gated = TinyModel::synthetic_headwise_gate(53);
+        let a = cuda_decode_n_tokens(&plain, 2);
+        let b = cuda_decode_n_tokens(&gated, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "headwise attn gate should change logits; max_diff={max_diff}"
         );
     }
 }

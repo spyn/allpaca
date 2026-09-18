@@ -492,6 +492,18 @@ impl TinyModel {
                 )?;
             }
 
+            // Spark2_5 head-wise sigmoid attention gate (host weights, before wo).
+            if cfg.headwise_attn_gate && !host_layer.attn_out_gate.is_empty() {
+                super::apply_headwise_attn_gate(
+                    &scratch[..dim],
+                    &host_layer.attn_out_gate,
+                    &mut attn_out,
+                    cfg.n_heads,
+                    head_dim,
+                    dim,
+                );
+            }
+
             cuda.gemm_nt_host_a_dev_b(
                 &attn_out,
                 resident.ptr(layer.wo)?,
