@@ -1,7 +1,8 @@
 //! CUDA decode path: dense, tiny MoE, and host-step SSM hybrid on CudaWorkspace.
 
 use super::{
-    gather_kv, softcap_inplace, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef,
+    gather_kv, softcap_inplace, topk_route, LayerWeights, ModelConfig, TinyModel, WeightKind,
+    WeightRef,
 };
 use crate::anchors::RecurrentState;
 use crate::deltanet::{
@@ -38,7 +39,7 @@ struct CudaLayerOff {
     shared_expert: CudaExpertOff,
 }
 
-/// F32 weights packed once onto a CUDA device (embed + layers + experts + norm + lm_head).
+/// F32 (+ staged Q8_0 MoE experts) weights packed once onto a CUDA device.
 pub struct CudaResidentModel {
     weights: CudaDeviceWeights,
     packed_h2d: u64,
@@ -51,27 +52,54 @@ pub struct CudaResidentModel {
 impl CudaResidentModel {
     pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
         cuda_reject_unsupported_layers(model)?;
-        let mut slices: Vec<&[f32]> = Vec::new();
-        let mut off = 0usize;
-        fn push<'a>(slices: &mut Vec<&'a [f32]>, off: &mut usize, s: &'a [f32]) -> WeightRef {
-            let o = *off;
-            slices.push(s);
-            *off += s.len() * 4;
+        let mut pack = Vec::<u8>::new();
+        fn push_f32(pack: &mut Vec<u8>, s: &[f32]) -> WeightRef {
+            if s.is_empty() {
+                return WeightRef::f32(0, 0);
+            }
+            let o = pack.len();
+            for v in s {
+                pack.extend_from_slice(&v.to_le_bytes());
+            }
             WeightRef::f32(o, s.len())
         }
-        let embed = push(&mut slices, &mut off, model.embed.as_slice());
+        /// Quantize row-major `n × k` F32 into staged Q8_0 GEMV blocks.
+        fn push_q8_matrix(pack: &mut Vec<u8>, data: &[f32], n: usize, k: usize) -> Result<WeightRef, AllpacaError> {
+            if data.is_empty() || n == 0 || k == 0 {
+                return Ok(WeightRef::f32(0, 0));
+            }
+            if data.len() != n.saturating_mul(k) {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "Q8 expert matrix len {} != n={n} * k={k}",
+                    data.len()
+                ))));
+            }
+            let mut packed = Vec::new();
+            for row in 0..n {
+                packed.extend(allpaca_cpu::quantize_q8_0(&data[row * k..(row + 1) * k]));
+            }
+            let staged = allpaca_cuda::stage_q8_0_gemv(&packed, n, k).map_err(|e| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8 stage expert: {e}")))
+            })?;
+            let align = allpaca_cuda::Q8_STAGED_BLOCK;
+            while pack.len() % align != 0 {
+                pack.push(0);
+            }
+            let o = pack.len();
+            pack.extend_from_slice(&staged);
+            Ok(WeightRef::q8(o, n.saturating_mul(k)))
+        }
+        let embed = push_f32(&mut pack, model.embed.as_slice());
         let mut layers = Vec::with_capacity(model.layers.len());
+        let dim = model.config.dim;
+        let ff = model.config.ff_dim;
         for layer in &model.layers {
-            let attn_norm = push(&mut slices, &mut off, layer.attn_norm.as_slice());
-            let wq = push(&mut slices, &mut off, layer.wq.as_slice());
-            let wk = push(&mut slices, &mut off, layer.wk.as_slice());
-            let wv = push(&mut slices, &mut off, layer.wv.as_slice());
-            let wo = push(&mut slices, &mut off, layer.wo.as_slice());
-            let ffn_norm = if layer.ffn_norm.is_empty() {
-                WeightRef::f32(0, 0)
-            } else {
-                push(&mut slices, &mut off, layer.ffn_norm.as_slice())
-            };
+            let attn_norm = push_f32(&mut pack, layer.attn_norm.as_slice());
+            let wq = push_f32(&mut pack, layer.wq.as_slice());
+            let wk = push_f32(&mut pack, layer.wk.as_slice());
+            let wv = push_f32(&mut pack, layer.wv.as_slice());
+            let wo = push_f32(&mut pack, layer.wo.as_slice());
+            let ffn_norm = push_f32(&mut pack, layer.ffn_norm.as_slice());
             let (w_gate, w_up, w_down) = if layer.w_gate.is_empty() {
                 (
                     WeightRef::f32(0, 0),
@@ -80,17 +108,18 @@ impl CudaResidentModel {
                 )
             } else {
                 (
-                    push(&mut slices, &mut off, layer.w_gate.as_slice()),
-                    push(&mut slices, &mut off, layer.w_up.as_slice()),
-                    push(&mut slices, &mut off, layer.w_down.as_slice()),
+                    push_f32(&mut pack, layer.w_gate.as_slice()),
+                    push_f32(&mut pack, layer.w_up.as_slice()),
+                    push_f32(&mut pack, layer.w_down.as_slice()),
                 )
             };
             let mut experts = Vec::with_capacity(layer.experts.len());
             for expert in &layer.experts {
+                // MoE experts: pack as staged Q8_0 to cut VRAM on 3060-class cards.
                 experts.push(CudaExpertOff {
-                    w_gate: push(&mut slices, &mut off, expert.w_gate.as_slice()),
-                    w_up: push(&mut slices, &mut off, expert.w_up.as_slice()),
-                    w_down: push(&mut slices, &mut off, expert.w_down.as_slice()),
+                    w_gate: push_q8_matrix(&mut pack, expert.w_gate.as_slice(), ff, dim)?,
+                    w_up: push_q8_matrix(&mut pack, expert.w_up.as_slice(), ff, dim)?,
+                    w_down: push_q8_matrix(&mut pack, expert.w_down.as_slice(), dim, ff)?,
                 });
             }
             let shared_expert = if layer.shared_expert.w_up.is_empty() {
@@ -100,14 +129,11 @@ impl CudaResidentModel {
                     w_down: WeightRef::f32(0, 0),
                 }
             } else {
+                // Shared expert stays F32 (gate-less ReLU² / SiLU paths).
                 CudaExpertOff {
-                    w_gate: if layer.shared_expert.w_gate.is_empty() {
-                        WeightRef::f32(0, 0)
-                    } else {
-                        push(&mut slices, &mut off, layer.shared_expert.w_gate.as_slice())
-                    },
-                    w_up: push(&mut slices, &mut off, layer.shared_expert.w_up.as_slice()),
-                    w_down: push(&mut slices, &mut off, layer.shared_expert.w_down.as_slice()),
+                    w_gate: push_f32(&mut pack, layer.shared_expert.w_gate.as_slice()),
+                    w_up: push_f32(&mut pack, layer.shared_expert.w_up.as_slice()),
+                    w_down: push_f32(&mut pack, layer.shared_expert.w_down.as_slice()),
                 }
             };
             layers.push(CudaLayerOff {
@@ -124,9 +150,9 @@ impl CudaResidentModel {
                 shared_expert,
             });
         }
-        let norm = push(&mut slices, &mut off, model.norm.as_slice());
-        let lm_head = push(&mut slices, &mut off, model.lm_head.as_slice());
-        let (weights, packed_h2d) = CudaDeviceWeights::upload(device, &slices)?;
+        let norm = push_f32(&mut pack, model.norm.as_slice());
+        let lm_head = push_f32(&mut pack, model.lm_head.as_slice());
+        let (weights, packed_h2d) = CudaDeviceWeights::upload_bytes(device, &pack)?;
         Ok(Self {
             weights,
             packed_h2d,
@@ -151,7 +177,21 @@ impl CudaResidentModel {
                 "empty CUDA weight ref".into(),
             )));
         }
+        if w.kind != WeightKind::F32 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA F32 ptr requested for non-F32 weight".into(),
+            )));
+        }
         Ok(self.weights.ptr_f32(w.off)? as *const f32)
+    }
+
+    fn ptr_u8(&self, w: WeightRef) -> Result<*const u8, AllpacaError> {
+        if w.n == 0 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "empty CUDA Q8 weight ref".into(),
+            )));
+        }
+        Ok(self.weights.byte_ptr_at(w.off)? as *const u8)
     }
 }
 
@@ -863,6 +903,25 @@ fn apply_ffn_cuda(
     Ok(())
 }
 
+fn gemm_host_a_resident_b(
+    cuda: &CudaWorkspace,
+    resident: &CudaResidentModel,
+    a: &[f32],
+    w: WeightRef,
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    match w.kind {
+        WeightKind::F32 => cuda.gemm_nt_host_a_dev_b(a, resident.ptr(w)?, c, m, n, k),
+        WeightKind::Q8_0 => cuda.gemm_nt_host_a_dev_b_q8(a, resident.ptr_u8(w)?, c, m, n, k),
+        _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA MoE expert weight kind unsupported".into(),
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_moe_cuda(
     cfg: &ModelConfig,
@@ -905,17 +964,21 @@ fn apply_moe_cuda(
     let mut up = vec![0.0f32; ff];
     for &(e, w) in &routed {
         let ex = &layer.experts[e];
-        cuda.gemm_nt_host_a_dev_b(
+        gemm_host_a_resident_b(
+            cuda,
+            resident,
             &scratch[..dim],
-            resident.ptr(ex.w_gate)?,
+            ex.w_gate,
             &mut gate,
             1,
             ff as i32,
             dim as i32,
         )?;
-        cuda.gemm_nt_host_a_dev_b(
+        gemm_host_a_resident_b(
+            cuda,
+            resident,
             &scratch[..dim],
-            resident.ptr(ex.w_up)?,
+            ex.w_up,
             &mut up,
             1,
             ff as i32,
@@ -923,9 +986,11 @@ fn apply_moe_cuda(
         )?;
         cuda.silu_mul_host(&mut gate, &up)?;
         metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-        cuda.gemm_nt_host_a_dev_b(
+        gemm_host_a_resident_b(
+            cuda,
+            resident,
             &gate,
-            resident.ptr(ex.w_down)?,
+            ex.w_down,
             &mut expert_out,
             1,
             dim as i32,

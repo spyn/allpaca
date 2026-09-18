@@ -2205,6 +2205,39 @@ impl CudaWorkspace {
         result
     }
 
+    /// GEMM with host A and device-resident staged Q8_0 B → host C.
+    pub fn gemm_nt_host_a_dev_b_q8(
+        &self,
+        a: &[f32],
+        b_dev: *const u8,
+        c: &mut [f32],
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if b_dev.is_null() || m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA gemm_nt_host_a_dev_b_q8".into(),
+            )));
+        }
+        let a_n = (m as usize).saturating_mul(k as usize);
+        let c_n = (m as usize).saturating_mul(n as usize);
+        if a.len() < a_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q8 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = self.upload_f32(&a[..a_n])?;
+        let dc = device_malloc(c_n * 4, self.device)?;
+        let result = (|| {
+            gemm_nt_q8_0_device(da.cast(), b_dev, dc.cast(), m, n, k)?;
+            self.download_f32(dc.cast(), &mut c[..c_n])
+        })();
+        self.free_ptr(da);
+        self.free_device(dc);
+        result
+    }
+
     /// RMSNorm with host x and device-resident weight → host out.
     pub fn rmsnorm_host_x_dev_w(
         &self,
@@ -2336,44 +2369,38 @@ impl CudaDeviceWeights {
                 "empty CUDA weight upload".into(),
             )));
         }
-        set_device(device)?;
-        let ptr = device_malloc(bytes, device)?;
-        let mut off = 0usize;
-        // Stage through pinned host memory when the packed blob is large.
-        if bytes >= 4096 {
-            let mut pinned = PinnedHostBuffer::new(bytes)?;
-            let dst = pinned.as_mut_slice();
-            for slice in slices {
-                if slice.is_empty() {
-                    continue;
-                }
-                let n = slice.len() * 4;
-                dst[off..off + n].copy_from_slice(unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), n)
-                });
-                off += n;
+        let mut pack = Vec::with_capacity(bytes);
+        for slice in slices {
+            for v in *slice {
+                pack.extend_from_slice(&v.to_le_bytes());
             }
-            memcpy(ptr, pinned.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        }
+        Self::upload_bytes(device, &pack)
+    }
+
+    /// Upload a pre-packed host byte blob (F32 and/or staged Q8_0).
+    pub fn upload_bytes(device: i32, bytes: &[u8]) -> Result<(Self, u64), AllpacaError> {
+        if bytes.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "empty CUDA weight upload".into(),
+            )));
+        }
+        set_device(device)?;
+        let ptr = device_malloc(bytes.len(), device)?;
+        if bytes.len() >= 4096 {
+            let mut pinned = PinnedHostBuffer::new(bytes.len())?;
+            pinned.as_mut_slice().copy_from_slice(bytes);
+            memcpy(ptr, pinned.as_ptr().cast(), bytes.len(), MEMCPY_H2D)?;
         } else {
-            let copies: Vec<(*mut u8, *const u8, usize)> = slices
-                .iter()
-                .filter(|s| !s.is_empty())
-                .map(|slice| {
-                    let n = slice.len() * 4;
-                    let dst = unsafe { ptr.add(off) }.cast();
-                    off += n;
-                    (dst, slice.as_ptr().cast(), n)
-                })
-                .collect();
-            unsafe { memcpy_batch_on(&copies, MEMCPY_H2D, std::ptr::null_mut()) }?;
+            memcpy(ptr, bytes.as_ptr().cast(), bytes.len(), MEMCPY_H2D)?;
         }
         Ok((
             Self {
                 device,
                 ptr: ptr.cast(),
-                bytes,
+                bytes: bytes.len(),
             },
-            bytes as u64,
+            bytes.len() as u64,
         ))
     }
 
@@ -2388,6 +2415,15 @@ impl CudaDeviceWeights {
             )));
         }
         Ok(unsafe { self.ptr.add(byte_off) }.cast())
+    }
+
+    pub fn byte_ptr_at(&self, byte_off: usize) -> Result<*mut u8, AllpacaError> {
+        if byte_off >= self.bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA weight byte ptr out of range".into(),
+            )));
+        }
+        Ok(unsafe { self.ptr.add(byte_off) })
     }
 }
 

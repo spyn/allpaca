@@ -506,6 +506,14 @@ impl WeightRef {
             kind: WeightKind::F32,
         }
     }
+
+    fn q8(off: usize, n: usize) -> Self {
+        Self {
+            off,
+            n,
+            kind: WeightKind::Q8_0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9763,6 +9771,39 @@ mod cuda_softcap_tests {
         assert!(
             max_diff > 1e-3,
             "window=1 SWA should diverge from full attention after 4 tokens; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_moe_q8_experts_pack_smaller_than_f32_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic(ModelConfig::tiny_moe(), 43, "moe-q8-pack");
+        let mut f32_bytes = 0usize;
+        f32_bytes += model.embed.len() * 4;
+        f32_bytes += model.norm.len() * 4;
+        f32_bytes += model.lm_head.len() * 4;
+        for layer in &model.layers {
+            f32_bytes += layer.attn_norm.len() * 4;
+            f32_bytes += layer.wq.len() * 4;
+            f32_bytes += layer.wk.len() * 4;
+            f32_bytes += layer.wv.len() * 4;
+            f32_bytes += layer.wo.len() * 4;
+            f32_bytes += layer.ffn_norm.len() * 4;
+            for expert in &layer.experts {
+                f32_bytes += expert.w_gate.len() * 4;
+                f32_bytes += expert.w_up.len() * 4;
+                f32_bytes += expert.w_down.len() * 4;
+            }
+        }
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        assert!(
+            (resident.packed_h2d_bytes() as usize) < f32_bytes,
+            "Q8 MoE experts should shrink device pack: packed={} f32_est={}",
+            resident.packed_h2d_bytes(),
+            f32_bytes
         );
     }
 }
