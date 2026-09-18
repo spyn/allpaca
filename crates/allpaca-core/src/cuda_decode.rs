@@ -312,6 +312,12 @@ impl TinyModel {
             )?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
         }
+        if cfg.scale_embed {
+            let s = (dim as f32).sqrt();
+            for v in &mut x {
+                *v *= s;
+            }
+        }
 
         let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
         let mut q = vec![0.0f32; dim];
@@ -543,6 +549,10 @@ impl TinyModel {
                 dim as i32,
                 dim as i32,
             )?;
+            if !host_layer.attn_post_norm.is_empty() {
+                let tmp = hidden.clone();
+                allpaca_cpu::rmsnorm(&tmp, &host_layer.attn_post_norm, cfg.eps, &mut hidden)?;
+            }
             cuda.residual_add_host(&mut x, &hidden)?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
@@ -941,6 +951,10 @@ fn apply_ffn_cuda(
         dim as i32,
         ff as i32,
     )?;
+    if !host.ffn_post_norm.is_empty() {
+        let tmp = hidden.to_vec();
+        allpaca_cpu::rmsnorm(&tmp, &host.ffn_post_norm, cfg.eps, hidden)?;
+    }
     cuda.residual_add_host(x, hidden)?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     Ok(())

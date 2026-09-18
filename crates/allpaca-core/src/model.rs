@@ -3712,6 +3712,18 @@ impl TinyModel {
         model
     }
 
+    /// Tiny dense model with Gemma-style embed scale + post-attn/FFN RMSNorms.
+    pub fn synthetic_gemma_norms(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "gemma-norms");
+        model.config.scale_embed = true;
+        let dim = model.config.dim;
+        for layer in &mut model.layers {
+            layer.attn_post_norm = ones(dim);
+            layer.ffn_post_norm = ones(dim);
+        }
+        model
+    }
+
     /// Tiny dense model with sliding-window attention on every layer.
     pub fn synthetic_swa(seed: u64) -> Self {
         let mut model = Self::synthetic(ModelConfig::tiny(), seed, "swa");
@@ -9877,6 +9889,26 @@ mod cuda_softcap_tests {
             "Q8 shared+routed should shrink pack: packed={} f32_est={}",
             resident.packed_h2d_bytes(),
             f32_bytes
+        );
+    }
+
+    #[test]
+    fn cuda_gemma_norms_change_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 59, "gemma-plain");
+        let gemma = TinyModel::synthetic_gemma_norms(59);
+        let a = cuda_decode_n_tokens(&plain, 2);
+        let b = cuda_decode_n_tokens(&gemma, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "scale_embed + post-norms should change logits; max_diff={max_diff}"
         );
     }
 }
