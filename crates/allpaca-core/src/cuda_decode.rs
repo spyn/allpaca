@@ -930,14 +930,7 @@ fn apply_moe_cuda(
                 sff as i32,
             )?;
         } else {
-            // Gate-less shared expert: act(up) @ down (SiLU; ReLU² stays host/HIP).
-            if cfg.moe_relu_sqr {
-                return Err(AllpacaError::Degraded(
-                    allpaca_types::DegradedError::FeatureDisabled(
-                        "CUDA MoE shared expert ReLU² unsupported".into(),
-                    ),
-                ));
-            }
+            // Gate-less shared expert: act(up) @ down (Lightning ReLU² or SiLU).
             cuda.gemm_nt_host_a_dev_b(
                 &scratch[..dim],
                 resident.ptr(layer.shared_expert.w_up)?,
@@ -946,8 +939,14 @@ fn apply_moe_cuda(
                 sff as i32,
                 dim as i32,
             )?;
-            for v in &mut shared_up {
-                *v = *v * (1.0 / (1.0 + (-*v).exp()));
+            if cfg.moe_relu_sqr {
+                for v in &mut shared_up {
+                    *v = super::relu_sqr(*v);
+                }
+            } else {
+                for v in &mut shared_up {
+                    *v = *v * (1.0 / (1.0 + (-*v).exp()));
+                }
             }
             cuda.gemm_nt_host_a_dev_b(
                 &shared_up,

@@ -3641,6 +3641,25 @@ impl TinyModel {
         model
     }
 
+    /// Tiny MoE with gate-less shared expert using Lightning ReLU² activation.
+    pub fn synthetic_moe_shared_relu_sqr(seed: u64) -> Self {
+        let mut cfg = ModelConfig::tiny_moe();
+        cfg.moe_relu_sqr = true;
+        let mut model = Self::synthetic(cfg, seed, "moe-shared-relu2");
+        let dim = model.config.dim;
+        let ff = model.config.ff_dim;
+        let mut rng = Lcg::new(seed.wrapping_add(61));
+        for layer in &mut model.layers {
+            layer.shared_expert = LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate: Vec::new(),
+                w_up: rng.vec(ff * dim),
+                w_down: rng.vec(dim * ff),
+            };
+        }
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
     }

@@ -382,3 +382,29 @@ fn cuda_synthetic_dense_ffn_hybrid_generate_uses_device_when_present() {
         stats.target_gpu_forwards
     );
 }
+
+#[test]
+fn cuda_synthetic_moe_shared_relu_sqr_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_moe_cfg()).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_moe_shared_relu_sqr(23))
+        .expect("load moe shared relu2");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_h2d_bytes > 0,
+        "MoE+shared ReLU² should upload; stats={before:?}"
+    );
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA MoE+shared ReLU² forwards, got gpu={} target={}; stats={stats:?}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
