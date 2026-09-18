@@ -3668,6 +3668,14 @@ impl TinyModel {
         model
     }
 
+    /// Tiny dense model with sliding-window attention on every layer.
+    pub fn synthetic_swa(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "swa");
+        model.config.sliding_window = 2;
+        model.config.swa_pattern = vec![true; model.config.n_layers];
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
     }
@@ -9681,6 +9689,57 @@ mod cuda_softcap_tests {
         assert!(
             max_abs <= 0.05 + 1e-4,
             "final_logit_softcap must bound |logits|, got max_abs={max_abs}"
+        );
+    }
+
+    fn cuda_decode_n_tokens(model: &TinyModel, n: usize) -> Vec<f32> {
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(model, cuda.device).expect("upload");
+        let metrics = Metrics::default();
+        let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 0.5);
+        let mut pages =
+            alloc_pages_for_seq(&mut kv, &model.config, 128, n.max(1), &metrics).expect("pages");
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        for pos in 0..n {
+            ensure_pages(&mut kv, &model.config, 128, &mut pages, pos, &metrics)
+                .expect("ensure pages");
+            model
+                .forward_token_cuda(
+                    (pos as u32) % model.config.vocab_size as u32,
+                    pos,
+                    &pages,
+                    &mut kv,
+                    &metrics,
+                    &mut logits,
+                    &cuda,
+                    &resident,
+                    None,
+                    None,
+                )
+                .expect("forward");
+        }
+        logits
+    }
+
+    #[test]
+    fn cuda_swa_window_changes_logits_vs_full_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let full = TinyModel::synthetic(ModelConfig::tiny(), 41, "swa-cmp-full");
+        let mut swa = TinyModel::synthetic(ModelConfig::tiny(), 41, "swa-cmp-win");
+        swa.config.sliding_window = 1;
+        swa.config.swa_pattern = vec![true; swa.config.n_layers];
+        let a = cuda_decode_n_tokens(&full, 4);
+        let b = cuda_decode_n_tokens(&swa, 4);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "window=1 SWA should diverge from full attention after 4 tokens; max_diff={max_diff}"
         );
     }
 }

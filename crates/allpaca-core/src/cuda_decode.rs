@@ -11,7 +11,7 @@ use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
-use allpaca_cpu::{attention_softcap, matmul_nt};
+use allpaca_cpu::{attention_softcap, attention_with_mask_softcap, matmul_nt};
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
@@ -361,13 +361,14 @@ impl TinyModel {
             )?;
 
             // RoPE on device (interleaved heads, same layout as HIP allpaca_rope).
-            cuda.rope(&mut q, cfg.n_heads as i32, head_dim as i32, pos as i32, cfg.rope_theta)?;
+            let rope_theta = cfg.rope_theta_for_layer(layer_idx);
+            cuda.rope(&mut q, cfg.n_heads as i32, head_dim as i32, pos as i32, rope_theta)?;
             cuda.rope(
                 &mut k,
                 cfg.n_kv_heads as i32,
                 head_dim as i32,
                 pos as i32,
-                cfg.rope_theta,
+                rope_theta,
             )?;
             metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
 
@@ -381,9 +382,29 @@ impl TinyModel {
             kv.write_slot(page_id, slot, cfg.n_kv_heads, head_dim, &k, &v)?;
             kv.touch(page_id, 1.0);
 
-            // Softcap path is host-only until CUDA kernels grow a softcap arg
-            // (same split as HIP `attention_dispatch`).
-            if cfg.attn_logit_softcap > 0.0 {
+            // SWA / softcap paths are host-only (HIP `attention_dispatch` parity).
+            if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+                let n_kv = k_all.len() / kv_dim.max(1);
+                let mut mask = vec![true; n_kv];
+                let start = n_kv.saturating_sub(cfg.sliding_window);
+                for t in 0..start {
+                    mask[t] = false;
+                }
+                attention_with_mask_softcap(
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &mut attn_out,
+                    1,
+                    n_kv,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    &mask,
+                    cfg.attn_logit_softcap,
+                )?;
+            } else if cfg.attn_logit_softcap > 0.0 {
                 let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);
                 attention_softcap(
