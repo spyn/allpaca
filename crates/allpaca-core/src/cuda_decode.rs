@@ -529,7 +529,7 @@ impl TinyModel {
             kv.write_slot(page_id, slot, n_kv_heads, head_dim, &k[..kv_dim], &v[..kv_dim])?;
             kv.touch(page_id, 1.0);
 
-            // SWA / softcap paths are host-only (HIP `attention_dispatch` parity).
+            // SWA: device masked attention when softcap is off; host softcap path otherwise.
             let sinks = &host_layer.attn_sinks;
             let use_sinks = sinks.len() == n_heads;
             if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
@@ -540,19 +540,35 @@ impl TinyModel {
                 for t in 0..start {
                     mask[t] = false;
                 }
-                attention_with_mask_softcap(
-                    &q[..attn_dim],
-                    &k_all,
-                    &v_all,
-                    &mut attn_out[..attn_dim],
-                    1,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    &mask,
-                    cfg.attn_logit_softcap,
-                )?;
+                if cfg.attn_logit_softcap > 0.0 {
+                    attention_with_mask_softcap(
+                        &q[..attn_dim],
+                        &k_all,
+                        &v_all,
+                        &mut attn_out[..attn_dim],
+                        1,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        &mask,
+                        cfg.attn_logit_softcap,
+                    )?;
+                } else {
+                    let mask_u8: Vec<u8> = mask.iter().map(|&m| u8::from(m)).collect();
+                    cuda.attention_masked(
+                        &q[..attn_dim],
+                        &k_all,
+                        &v_all,
+                        &mut attn_out[..attn_dim],
+                        1,
+                        n_kv as i32,
+                        n_heads as i32,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                        &mask_u8,
+                    )?;
+                }
             } else if cfg.attn_logit_softcap > 0.0 {
                 let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);

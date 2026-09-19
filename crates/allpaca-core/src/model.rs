@@ -9877,6 +9877,27 @@ mod cuda_softcap_tests {
     }
 
     #[test]
+    fn cuda_swa_softcap_changes_logits_vs_plain_swa_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic_swa(85);
+        let mut capped = TinyModel::synthetic_swa(85);
+        capped.config.attn_logit_softcap = 1.5;
+        let a = cuda_decode_n_tokens(&plain, 4);
+        let b = cuda_decode_n_tokens(&capped, 4);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "SWA+attn_logit_softcap should change logits vs plain SWA; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
     fn cuda_moe_q8_experts_pack_smaller_than_f32_when_device_present() {
         if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
             return;
