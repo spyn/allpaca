@@ -3743,6 +3743,34 @@ impl TinyModel {
         model
     }
 
+    /// Tiny dense model with Qwen3.5 gated-attention Q (`[Q|gate]` interleaved).
+    /// `attn_dim = 2*dim` so `wo_k > dim` trips the gated layout heuristic.
+    pub fn synthetic_gated_attn(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "gated-attn");
+        let dim = model.config.dim;
+        let attn_dim = dim * 2;
+        let q_out = attn_dim * 2;
+        let mut rng = Lcg::new(seed.wrapping_add(107));
+        for layer in &mut model.layers {
+            layer.wq = rng.vec(q_out * dim);
+            layer.wo = rng.vec(dim * attn_dim);
+        }
+        model
+    }
+
+    /// Zero wq output rows `[dim..]` so a non-gated CUDA path (N=dim) ignores the change.
+    pub fn zero_wq_output_tail(&mut self) {
+        let dim = self.config.dim.max(1);
+        for layer in &mut self.layers {
+            if layer.wq.len() <= dim * dim {
+                continue;
+            }
+            for v in &mut layer.wq[dim * dim..] {
+                *v = 0.0;
+            }
+        }
+    }
+
     /// Tiny dense model with sliding-window attention on every layer.
     pub fn synthetic_swa(seed: u64) -> Self {
         let mut model = Self::synthetic(ModelConfig::tiny(), seed, "swa");
@@ -9968,6 +9996,27 @@ mod cuda_softcap_tests {
         assert!(
             max_diff > 1e-4,
             "q_norm/k_norm should change logits; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_gated_attn_uses_q_tail_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let full = TinyModel::synthetic_gated_attn(71);
+        let mut tailed = TinyModel::synthetic_gated_attn(71);
+        tailed.zero_wq_output_tail();
+        let a = cuda_decode_n_tokens(&full, 2);
+        let b = cuda_decode_n_tokens(&tailed, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "gated Q must consume wq rows beyond dim; max_diff={max_diff}"
         );
     }
 }

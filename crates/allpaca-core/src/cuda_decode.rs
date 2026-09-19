@@ -319,11 +319,22 @@ impl TinyModel {
             }
         }
 
-        let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
-        let mut q = vec![0.0f32; dim];
-        let mut k = vec![0.0f32; kv_dim];
-        let mut v = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; dim];
+        let mut max_q_out = dim;
+        let mut max_attn = dim;
+        let mut max_kv = kv_dim;
+        for layer in &self.layers {
+            let al = super::attn_layout(cfg, layer.wq.len(), layer.wk.len(), layer.wo.len());
+            max_q_out = max_q_out.max(al.q_out);
+            max_attn = max_attn.max(al.attn_dim);
+            max_kv = max_kv.max(al.kv_dim);
+        }
+        let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(max_kv).max(max_q_out)];
+        let mut q_full = vec![0.0f32; max_q_out];
+        let mut q = vec![0.0f32; max_attn];
+        let mut gate = vec![0.0f32; max_attn];
+        let mut k = vec![0.0f32; max_kv];
+        let mut v = vec![0.0f32; max_kv];
+        let mut attn_out = vec![0.0f32; max_attn];
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, host_layer) in self.layers.iter().enumerate() {
@@ -412,18 +423,47 @@ impl TinyModel {
                 continue;
             }
 
-            cuda.gemm_nt_host_a_dev_b(
-                &scratch[..dim],
-                resident.ptr(layer.wq)?,
-                &mut q,
-                1,
-                dim as i32,
-                dim as i32,
-            )?;
+            let al = super::attn_layout(
+                cfg,
+                host_layer.wq.len(),
+                host_layer.wk.len(),
+                host_layer.wo.len(),
+            );
+            let head_dim = al.head_dim;
+            let kv_dim = al.kv_dim;
+            let n_heads = al.n_heads;
+            let n_kv_heads = al.n_kv_heads;
+            let attn_dim = al.attn_dim;
+
+            if al.gated {
+                cuda.gemm_nt_host_a_dev_b(
+                    &scratch[..dim],
+                    resident.ptr(layer.wq)?,
+                    &mut q_full[..al.q_out],
+                    1,
+                    al.q_out as i32,
+                    dim as i32,
+                )?;
+                crate::deltanet::deinterleave_q_gate(
+                    &q_full[..al.q_out],
+                    &mut q[..attn_dim],
+                    &mut gate[..attn_dim],
+                    head_dim,
+                );
+            } else {
+                cuda.gemm_nt_host_a_dev_b(
+                    &scratch[..dim],
+                    resident.ptr(layer.wq)?,
+                    &mut q[..attn_dim],
+                    1,
+                    attn_dim as i32,
+                    dim as i32,
+                )?;
+            }
             cuda.gemm_nt_host_a_dev_b(
                 &scratch[..dim],
                 resident.ptr(layer.wk)?,
-                &mut k,
+                &mut k[..kv_dim],
                 1,
                 kv_dim as i32,
                 dim as i32,
@@ -431,7 +471,7 @@ impl TinyModel {
             cuda.gemm_nt_host_a_dev_b(
                 &scratch[..dim],
                 resident.ptr(layer.wv)?,
-                &mut v,
+                &mut v[..kv_dim],
                 1,
                 kv_dim as i32,
                 dim as i32,
@@ -439,18 +479,34 @@ impl TinyModel {
 
             // Qwen3 / Qwen3.5 per-head Q/K RMSNorm (host; HIP uses rmsnorm_heads_device).
             if host_layer.q_norm.len() == head_dim {
-                crate::deltanet::rmsnorm_heads(&mut q, &host_layer.q_norm, head_dim, cfg.eps);
+                crate::deltanet::rmsnorm_heads(
+                    &mut q[..attn_dim],
+                    &host_layer.q_norm,
+                    head_dim,
+                    cfg.eps,
+                );
             }
             if host_layer.k_norm.len() == head_dim {
-                crate::deltanet::rmsnorm_heads(&mut k, &host_layer.k_norm, head_dim, cfg.eps);
+                crate::deltanet::rmsnorm_heads(
+                    &mut k[..kv_dim],
+                    &host_layer.k_norm,
+                    head_dim,
+                    cfg.eps,
+                );
             }
 
             // RoPE on device (interleaved heads, same layout as HIP allpaca_rope).
             let rope_theta = cfg.rope_theta_for_layer(layer_idx);
-            cuda.rope(&mut q, cfg.n_heads as i32, head_dim as i32, pos as i32, rope_theta)?;
             cuda.rope(
-                &mut k,
-                cfg.n_kv_heads as i32,
+                &mut q[..attn_dim],
+                n_heads as i32,
+                head_dim as i32,
+                pos as i32,
+                rope_theta,
+            )?;
+            cuda.rope(
+                &mut k[..kv_dim],
+                n_kv_heads as i32,
                 head_dim as i32,
                 pos as i32,
                 rope_theta,
@@ -464,12 +520,12 @@ impl TinyModel {
             let page_index = pos / page_tokens as usize;
             let slot = (pos % page_tokens as usize) as u32;
             let page_id = page_ids[layer_idx][page_index];
-            kv.write_slot(page_id, slot, cfg.n_kv_heads, head_dim, &k, &v)?;
+            kv.write_slot(page_id, slot, n_kv_heads, head_dim, &k[..kv_dim], &v[..kv_dim])?;
             kv.touch(page_id, 1.0);
 
             // SWA / softcap paths are host-only (HIP `attention_dispatch` parity).
             if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
-                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);
                 let mut mask = vec![true; n_kv];
                 let start = n_kv.saturating_sub(cfg.sliding_window);
@@ -477,64 +533,71 @@ impl TinyModel {
                     mask[t] = false;
                 }
                 attention_with_mask_softcap(
-                    &q,
+                    &q[..attn_dim],
                     &k_all,
                     &v_all,
-                    &mut attn_out,
+                    &mut attn_out[..attn_dim],
                     1,
                     n_kv,
-                    cfg.n_heads,
-                    cfg.n_kv_heads,
+                    n_heads,
+                    n_kv_heads,
                     head_dim,
                     &mask,
                     cfg.attn_logit_softcap,
                 )?;
             } else if cfg.attn_logit_softcap > 0.0 {
-                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);
                 attention_softcap(
-                    &q,
+                    &q[..attn_dim],
                     &k_all,
                     &v_all,
-                    &mut attn_out,
+                    &mut attn_out[..attn_dim],
                     1,
                     n_kv,
-                    cfg.n_heads,
-                    cfg.n_kv_heads,
+                    n_heads,
+                    n_kv_heads,
                     head_dim,
                     true,
                     cfg.attn_logit_softcap,
                 )?;
             } else if let Some((k_dev, v_dev, n_kv)) =
-                kv.cuda_single_page_view(&page_ids[layer_idx], cfg.n_kv_heads, head_dim)
+                kv.cuda_single_page_view(&page_ids[layer_idx], n_kv_heads, head_dim)
             {
                 cuda.attention_host_q_dev_kv(
-                    &q,
+                    &q[..attn_dim],
                     k_dev,
                     v_dev,
-                    &mut attn_out,
+                    &mut attn_out[..attn_dim],
                     1,
                     n_kv as i32,
-                    cfg.n_heads as i32,
-                    cfg.n_kv_heads as i32,
+                    n_heads as i32,
+                    n_kv_heads as i32,
                     head_dim as i32,
                     true,
                 )?;
             } else {
-                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], cfg.n_kv_heads, head_dim)?;
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);
                 cuda.attention(
-                    &q,
+                    &q[..attn_dim],
                     &k_all,
                     &v_all,
-                    &mut attn_out,
+                    &mut attn_out[..attn_dim],
                     1,
                     n_kv as i32,
-                    cfg.n_heads as i32,
-                    cfg.n_kv_heads as i32,
+                    n_heads as i32,
+                    n_kv_heads as i32,
                     head_dim as i32,
                     true,
                 )?;
+            }
+
+            if al.gated {
+                for i in 0..attn_dim {
+                    let g = gate[i];
+                    attn_out[i] *= 1.0 / (1.0 + (-g).exp());
+                }
             }
 
             // Spark2_5 head-wise sigmoid attention gate (host weights, before wo).
@@ -542,20 +605,20 @@ impl TinyModel {
                 super::apply_headwise_attn_gate(
                     &scratch[..dim],
                     &host_layer.attn_out_gate,
-                    &mut attn_out,
-                    cfg.n_heads,
+                    &mut attn_out[..attn_dim],
+                    n_heads,
                     head_dim,
                     dim,
                 );
             }
 
             cuda.gemm_nt_host_a_dev_b(
-                &attn_out,
+                &attn_out[..attn_dim],
                 resident.ptr(layer.wo)?,
                 &mut hidden,
                 1,
                 dim as i32,
-                dim as i32,
+                al.wo_k as i32,
             )?;
             if !host_layer.attn_post_norm.is_empty() {
                 let tmp = hidden.clone();
