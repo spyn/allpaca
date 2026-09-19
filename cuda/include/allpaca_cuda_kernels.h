@@ -103,6 +103,10 @@ int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, 
 int allpaca_cuda_rmsnorm_rows(const float *x, const float *w, float *out, int32_t rows, int32_t n,
                               float eps, allpaca_cuda_stream_t stream);
 
+/* In-place per-head RMSNorm: x[n_heads, head_dim], weight[head_dim]. HIP allpaca_rmsnorm_heads. */
+int allpaca_cuda_rmsnorm_heads(float *x, const float *weight, int32_t n_heads, int32_t head_dim,
+                               float eps, allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_silu_mul(const float *gate, const float *up, float *out, int32_t n,
                           allpaca_cuda_stream_t stream);
 

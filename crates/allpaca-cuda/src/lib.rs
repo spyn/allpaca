@@ -203,6 +203,14 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_rmsnorm_heads(
+            x: *mut f32,
+            weight: *const f32,
+            n_heads: i32,
+            head_dim: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_silu_mul(
             gate: *const f32,
             up: *const f32,
@@ -1506,6 +1514,67 @@ impl CudaWorkspace {
         self.free_ptr(dx);
         self.free_ptr(dw);
         self.free_device(dout);
+        result
+    }
+
+    pub fn rmsnorm_heads_dev(
+        &self,
+        x: *mut f32,
+        weight: *const f32,
+        n_heads: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA rmsnorm_heads".into(),
+            )));
+        }
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_rmsnorm_heads(x, weight, n_heads, head_dim, eps, self.stream)
+            };
+            status(rc, "rmsnorm_heads")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, weight, n_heads, head_dim, eps);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA rmsnorm_heads unavailable".into(),
+            )))
+        }
+    }
+
+    /// Host roundtrip: in-place per-head RMSNorm via device (HIP `rmsnorm_heads_device` parity).
+    pub fn rmsnorm_heads(
+        &self,
+        x: &mut [f32],
+        weight: &[f32],
+        n_heads: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        if n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA rmsnorm_heads shape".into(),
+            )));
+        }
+        let n = (n_heads as usize).saturating_mul(head_dim as usize);
+        if x.len() < n || weight.len() < head_dim as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "rmsnorm_heads buffer size mismatch".into(),
+            )));
+        }
+        let dx = self.upload_f32(&x[..n])?;
+        let dw = self.upload_f32(&weight[..head_dim as usize])?;
+        let result = (|| {
+            self.rmsnorm_heads_dev(dx, dw, n_heads, head_dim, eps)?;
+            self.download_f32(dx, &mut x[..n])
+        })();
+        self.free_ptr(dx);
+        self.free_ptr(dw);
         result
     }
 
@@ -3169,6 +3238,56 @@ mod tests {
                     cuda_out[i],
                     cpu[i]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn rmsnorm_heads_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let eps = 1e-5f32;
+        let shapes = [(4usize, 8usize), (8, 16), (2, 32)];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        for (si, (n_heads, head_dim)) in shapes.iter().copied().enumerate() {
+            let mut x = vec![0.0f32; n_heads * head_dim];
+            let mut weight = vec![0.0f32; head_dim];
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = ((i * 19 + si * 5) % 47) as f32 * 0.03 - 0.6;
+            }
+            for (i, v) in weight.iter_mut().enumerate() {
+                *v = 0.4 + ((i * 11 + si) % 17) as f32 * 0.06;
+            }
+            let mut cpu = x.clone();
+            allpaca_core_rmsnorm_heads_ref(&mut cpu, &weight, head_dim, eps);
+            ws.rmsnorm_heads(&mut x, &weight, n_heads as i32, head_dim as i32, eps)
+                .expect("cuda rmsnorm_heads");
+            for i in 0..n_heads * head_dim {
+                assert!(
+                    attn_close(x[i], cpu[i]),
+                    "rmsnorm_heads mismatch heads={n_heads} d={head_dim} idx={i}: cuda={} cpu={}",
+                    x[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// Local CPU reference matching `deltanet::rmsnorm_heads` (avoid core dep cycle).
+    fn allpaca_core_rmsnorm_heads_ref(x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
+        assert_eq!(weight.len(), head_dim);
+        assert_eq!(x.len() % head_dim, 0);
+        let n_heads = x.len() / head_dim;
+        for h in 0..n_heads {
+            let row = &mut x[h * head_dim..(h + 1) * head_dim];
+            let mut ss = 0.0f32;
+            for &v in row.iter() {
+                ss += v * v;
+            }
+            let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+            for i in 0..head_dim {
+                row[i] = row[i] * inv * weight[i];
             }
         }
     }

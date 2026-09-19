@@ -477,22 +477,26 @@ impl TinyModel {
                 dim as i32,
             )?;
 
-            // Qwen3 / Qwen3.5 per-head Q/K RMSNorm (host; HIP uses rmsnorm_heads_device).
+            // Qwen3 / Qwen3.5 per-head Q/K RMSNorm (device; HIP rmsnorm_heads_device parity).
             if host_layer.q_norm.len() == head_dim {
-                crate::deltanet::rmsnorm_heads(
+                cuda.rmsnorm_heads(
                     &mut q[..attn_dim],
                     &host_layer.q_norm,
-                    head_dim,
+                    n_heads as i32,
+                    head_dim as i32,
                     cfg.eps,
-                );
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
             if host_layer.k_norm.len() == head_dim {
-                crate::deltanet::rmsnorm_heads(
+                cuda.rmsnorm_heads(
                     &mut k[..kv_dim],
                     &host_layer.k_norm,
-                    head_dim,
+                    n_kv_heads as i32,
+                    head_dim as i32,
                     cfg.eps,
-                );
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
 
             // RoPE on device (interleaved heads, same layout as HIP allpaca_rope).

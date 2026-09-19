@@ -708,6 +708,13 @@ extern "C" int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, 
     return allpaca_cuda_rmsnorm_rows(x, w, out, 1, n, eps, stream);
 }
 
+extern "C" int allpaca_cuda_rmsnorm_heads(float *x, const float *weight, int32_t n_heads,
+                                          int32_t head_dim, float eps,
+                                          allpaca_cuda_stream_t stream) {
+    /* In-place: rmsnorm_kernel finishes the reduction before any store, so x==out is safe. */
+    return allpaca_cuda_rmsnorm_rows(x, weight, x, n_heads, head_dim, eps, stream);
+}
+
 __global__ void embed_gather_kernel(const float *table, int token, float *out, int dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= dim) {
