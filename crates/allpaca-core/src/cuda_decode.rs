@@ -5,7 +5,7 @@ use super::{
     WeightRef,
 };
 use crate::anchors::RecurrentState;
-use crate::deltanet::{conv1d_step, gated_delta_step, rmsnorm_silu_gate};
+use crate::deltanet::{gated_delta_step, rmsnorm_silu_gate};
 use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
@@ -896,13 +896,14 @@ fn apply_gdn_cuda(
     state.ensure_gdn(layer_idx, dims);
 
     let mut conv_out = vec![0.0f32; dims.qkv_dim];
-    conv1d_step(
+    cuda.gdn_conv1d_step_host(
         &qkv,
         &gdn.conv1d,
         &mut state.gdn_conv[layer_idx],
         &mut conv_out,
-        dims.conv_kernel,
-    );
+        dims.conv_kernel as i32,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     let q_raw = &conv_out[..dims.key_dim];
     let k_raw = &conv_out[dims.key_dim..dims.key_dim * 2];
     let v_raw = &conv_out[dims.key_dim * 2..];

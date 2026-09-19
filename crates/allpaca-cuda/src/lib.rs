@@ -264,6 +264,15 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_gdn_conv1d_step(
+            x: *const f32,
+            kernel: *const f32,
+            conv_state: *mut f32,
+            out: *mut f32,
+            qkv_dim: i32,
+            conv_kernel: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -1980,6 +1989,51 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn gdn_conv1d_step_dev(
+        &self,
+        x: *const f32,
+        kernel: *const f32,
+        conv_state: *mut f32,
+        out: *mut f32,
+        qkv_dim: i32,
+        conv_kernel: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if x.is_null()
+                || kernel.is_null()
+                || conv_state.is_null()
+                || out.is_null()
+                || qkv_dim <= 0
+                || conv_kernel <= 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA gdn_conv1d_step".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_gdn_conv1d_step(
+                    x,
+                    kernel,
+                    conv_state,
+                    out,
+                    qkv_dim,
+                    conv_kernel,
+                    self.stream,
+                )
+            };
+            status(rc, "gdn_conv1d_step")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, kernel, conv_state, out, qkv_dim, conv_kernel);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA gdn_conv1d_step unavailable".into(),
+            )))
+        }
+    }
+
     pub fn scale_heads_sigmoid_dev(
         &self,
         attn: *mut f32,
@@ -2548,6 +2602,61 @@ impl CudaWorkspace {
         self.free_ptr(da);
         self.free_device(ddecay);
         self.free_ptr(dbeta);
+        result
+    }
+
+    /// Host roundtrip: GDN depthwise conv1d + SiLU (updates `conv_state` in place).
+    pub fn gdn_conv1d_step_host(
+        &self,
+        x: &[f32],
+        kernel: &[f32],
+        conv_state: &mut [f32],
+        out: &mut [f32],
+        conv_kernel: i32,
+    ) -> Result<(), AllpacaError> {
+        let qkv = x.len();
+        let k = conv_kernel as usize;
+        let hist = k.saturating_sub(1);
+        if k == 0
+            || out.len() != qkv
+            || kernel.len() != k.saturating_mul(qkv)
+            || conv_state.len() != hist.saturating_mul(qkv)
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gdn_conv1d_step length mismatch".into(),
+            )));
+        }
+        let dx = self.upload_f32(x)?;
+        let dk = self.upload_f32(kernel)?;
+        let (ds, free_ds) = if hist == 0 {
+            (device_malloc(4, self.device)?, true)
+        } else {
+            (self.upload_f32(conv_state)?.cast(), false)
+        };
+        let dout = device_malloc(qkv * 4, self.device)?;
+        let result = (|| {
+            self.gdn_conv1d_step_dev(
+                dx,
+                dk,
+                ds.cast(),
+                dout.cast(),
+                qkv as i32,
+                conv_kernel,
+            )?;
+            self.download_f32(dout.cast(), out)?;
+            if hist > 0 {
+                self.download_f32(ds.cast(), conv_state)?;
+            }
+            Ok(())
+        })();
+        self.free_ptr(dx);
+        self.free_ptr(dk);
+        if free_ds {
+            self.free_device(ds);
+        } else {
+            self.free_ptr(ds.cast());
+        }
+        self.free_device(dout);
         result
     }
 
@@ -4340,6 +4449,64 @@ mod tests {
                 "beta mismatch at {i}: cuda={} cpu={}",
                 beta[i],
                 beta_h[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_conv1d_step_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let qkv = 4usize;
+        let k = 3usize;
+        let hist = k - 1;
+        let x = [0.5f32, -1.0, 0.25, 2.0];
+        let mut kernel = vec![0.0f32; k * qkv];
+        for c in 0..qkv {
+            for i in 0..k {
+                kernel[i + c * k] = ((c * 3 + i) as f32) * 0.1 - 0.2;
+            }
+        }
+        let mut state = vec![0.0f32; hist * qkv];
+        for i in 0..hist * qkv {
+            state[i] = ((i % 7) as f32) * 0.05;
+        }
+        let mut cpu_state = state.clone();
+        let mut cpu_out = [0.0f32; 4];
+        for c in 0..qkv {
+            let mut acc = 0.0f32;
+            for i in 0..hist {
+                acc += kernel[i + c * k] * cpu_state[i * qkv + c];
+            }
+            acc += kernel[(k - 1) + c * k] * x[c];
+            cpu_out[c] = acc / (1.0 + (-acc).exp());
+        }
+        for i in 0..hist.saturating_sub(1) {
+            let dst = i * qkv;
+            let src = (i + 1) * qkv;
+            cpu_state.copy_within(src..src + qkv, dst);
+        }
+        let last = (hist - 1) * qkv;
+        cpu_state[last..last + qkv].copy_from_slice(&x);
+        let mut cuda_out = [0.0f32; 4];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        ws.gdn_conv1d_step_host(&x, &kernel, &mut state, &mut cuda_out, k as i32)
+            .expect("cuda gdn_conv1d");
+        for i in 0..qkv {
+            assert!(
+                (cuda_out[i] - cpu_out[i]).abs() < 1e-5,
+                "conv1d out mismatch at {i}: cuda={} cpu={}",
+                cuda_out[i],
+                cpu_out[i]
+            );
+        }
+        for i in 0..hist * qkv {
+            assert!(
+                (state[i] - cpu_state[i]).abs() < 1e-5,
+                "conv1d state mismatch at {i}: cuda={} cpu={}",
+                state[i],
+                cpu_state[i]
             );
         }
     }

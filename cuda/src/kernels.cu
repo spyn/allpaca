@@ -789,6 +789,59 @@ extern "C" int allpaca_cuda_gdn_decay_beta(const float *alpha, const float *dt_b
     return cuda_status(cudaGetLastError());
 }
 
+__device__ inline float gdn_silu(float x) { return x / (1.0f + expf(-x)); }
+
+__global__ void gdn_conv1d_compute_kernel(const float *x, const float *kernel,
+                                          const float *conv_state, float *out, int qkv_dim,
+                                          int conv_kernel) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= qkv_dim) {
+        return;
+    }
+    int hist = conv_kernel - 1;
+    float acc = 0.0f;
+    for (int i = 0; i < hist; ++i) {
+        acc += kernel[i + c * conv_kernel] * conv_state[i * qkv_dim + c];
+    }
+    acc += kernel[(conv_kernel - 1) + c * conv_kernel] * x[c];
+    out[c] = gdn_silu(acc);
+}
+
+__global__ void gdn_conv1d_shift_kernel(const float *x, float *conv_state, int qkv_dim,
+                                        int conv_kernel) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= qkv_dim) {
+        return;
+    }
+    int hist = conv_kernel - 1;
+    if (hist <= 0) {
+        return;
+    }
+    for (int i = 0; i < hist - 1; ++i) {
+        conv_state[i * qkv_dim + c] = conv_state[(i + 1) * qkv_dim + c];
+    }
+    conv_state[(hist - 1) * qkv_dim + c] = x[c];
+}
+
+extern "C" int allpaca_cuda_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state,
+                                            float *out, int32_t qkv_dim, int32_t conv_kernel,
+                                            allpaca_cuda_stream_t stream) {
+    if (!x || !kernel || !conv_state || !out || qkv_dim <= 0 || conv_kernel <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int threads = 256;
+    int blocks = (qkv_dim + threads - 1) / threads;
+    gdn_conv1d_compute_kernel<<<blocks, threads, 0, as_stream(stream)>>>(
+        x, kernel, conv_state, out, qkv_dim, conv_kernel);
+    int rc = cuda_status(cudaGetLastError());
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    gdn_conv1d_shift_kernel<<<blocks, threads, 0, as_stream(stream)>>>(x, conv_state, qkv_dim,
+                                                                       conv_kernel);
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
                                            int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

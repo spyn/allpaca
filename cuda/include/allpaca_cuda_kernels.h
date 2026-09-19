@@ -132,6 +132,11 @@ int allpaca_cuda_gdn_decay_beta(const float *alpha, const float *dt_bias, const 
                                 float *decay, float *beta, int32_t n,
                                 allpaca_cuda_stream_t stream);
 
+/* Depthwise causal conv1d + SiLU for one GDN token. kernel layout [c][k] (HIP allpaca_gdn_conv1d_step). */
+int allpaca_cuda_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state, float *out,
+                                 int32_t qkv_dim, int32_t conv_kernel,
+                                 allpaca_cuda_stream_t stream);
+
 /* Spark2_5 headwise gate: attn[tok,h,d] *= sigmoid(scores[tok,h]) (HIP allpaca_scale_heads_sigmoid). */
 int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
                                      int32_t n_heads, int32_t head_dim,
