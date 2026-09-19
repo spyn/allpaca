@@ -668,6 +668,27 @@ extern "C" int allpaca_cuda_silu_mul(const float *gate, const float *up, float *
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void gelu_mul_kernel(const float *gate, const float *up, float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        /* Exact GELU via erff — matches HIP allpaca_gelu_mul / approx CPU gelu. */
+        float gelu = 0.5f * g * (1.0f + erff(g * 0.7071067811865476f));
+        out[i] = gelu * up[i];
+    }
+}
+
+extern "C" int allpaca_cuda_gelu_mul(const float *gate, const float *up, float *out, int32_t n,
+                                     allpaca_cuda_stream_t stream) {
+    if (!gate || !up || !out || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    gelu_mul_kernel<<<grid, block, 0, as_stream(stream)>>>(gate, up, out, n);
+    return cuda_status(cudaGetLastError());
+}
+
 /* One block per row. Decode uses rows=1. n is reduced in shared memory (256 threads). */
 __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
     const int row = static_cast<int>(blockIdx.x);

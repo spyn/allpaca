@@ -232,6 +232,13 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_gelu_mul(
+            gate: *const f32,
+            up: *const f32,
+            out: *mut f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_embed_gather(
             table: *const f32,
             token: i32,
@@ -1769,6 +1776,33 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn gelu_mul_dev(
+        &self,
+        gate: *const f32,
+        up: *const f32,
+        out: *mut f32,
+        n: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if gate.is_null() || up.is_null() || out.is_null() || n <= 0 {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA gelu_mul".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_gelu_mul(gate, up, out, n, self.stream) };
+            status(rc, "gelu_mul")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (gate, up, out, n);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA gelu_mul unavailable".into(),
+            )))
+        }
+    }
+
     pub fn embed_gather_dev(
         &self,
         table: *const f32,
@@ -2165,6 +2199,23 @@ impl CudaWorkspace {
         let du = self.upload_f32(&up[..n])?;
         let result = (|| {
             self.silu_mul_dev(dg, du, dg, n as i32)?;
+            self.download_f32(dg, &mut gate[..n])
+        })();
+        self.free_ptr(dg);
+        self.free_ptr(du);
+        result
+    }
+
+    /// Host roundtrip: in-place `gate = gelu(gate) * up` via device (erf GELU).
+    pub fn gelu_mul_host(&self, gate: &mut [f32], up: &[f32]) -> Result<(), AllpacaError> {
+        let n = gate.len().min(up.len());
+        if n == 0 {
+            return Ok(());
+        }
+        let dg = self.upload_f32(&gate[..n])?;
+        let du = self.upload_f32(&up[..n])?;
+        let result = (|| {
+            self.gelu_mul_dev(dg, du, dg, n as i32)?;
             self.download_f32(dg, &mut gate[..n])
         })();
         self.free_ptr(dg);
@@ -3775,6 +3826,27 @@ mod tests {
             let s = cpu_g[i] / (1.0 + (-cpu_g[i]).exp());
             cpu_g[i] = s * up[i];
             assert!((gate[i] - cpu_g[i]).abs() < 1e-4, "silu i={i}");
+        }
+    }
+
+    #[test]
+    fn gelu_mul_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let mut gate = [1.0f32, -1.0, 0.5, 2.0, -0.25, 3.0];
+        let up = [2.0f32, 0.5, 1.0, 0.25, 1.5, -0.5];
+        let mut cpu_g = gate;
+        ws.gelu_mul_host(&mut gate, &up).expect("cuda gelu_mul");
+        for i in 0..gate.len() {
+            cpu_g[i] = allpaca_cpu::gelu(cpu_g[i]) * up[i];
+            assert!(
+                (gate[i] - cpu_g[i]).abs() < 1e-3,
+                "gelu_mul mismatch at {i}: cuda={} cpu={}",
+                gate[i],
+                cpu_g[i]
+            );
         }
     }
 

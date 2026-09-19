@@ -110,6 +110,10 @@ int allpaca_cuda_rmsnorm_heads(float *x, const float *weight, int32_t n_heads, i
 int allpaca_cuda_silu_mul(const float *gate, const float *up, float *out, int32_t n,
                           allpaca_cuda_stream_t stream);
 
+/* Spark2_5 / Gemma FFN: out[i] = gelu(gate[i]) * up[i] (erf GELU; HIP allpaca_gelu_mul). */
+int allpaca_cuda_gelu_mul(const float *gate, const float *up, float *out, int32_t n,
+                          allpaca_cuda_stream_t stream);
+
 /* Gather one token row from F32 embed table[vocab, dim] -> out[dim]. */
 int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
                               allpaca_cuda_stream_t stream);

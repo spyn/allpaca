@@ -680,7 +680,15 @@ impl TinyModel {
             )?;
             if !host_layer.attn_post_norm.is_empty() {
                 let tmp = hidden.clone();
-                allpaca_cpu::rmsnorm(&tmp, &host_layer.attn_post_norm, cfg.eps, &mut hidden)?;
+                cuda.rmsnorm_rows(
+                    &tmp,
+                    &host_layer.attn_post_norm,
+                    &mut hidden,
+                    1,
+                    dim as i32,
+                    cfg.eps,
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
             cuda.residual_add_host(&mut x, &hidden)?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
@@ -1071,9 +1079,7 @@ fn apply_ffn_cuda(
         dim as i32,
     )?;
     if cfg.ffn_gelu {
-        for i in 0..gate.len() {
-            gate[i] = allpaca_cpu::gelu(gate[i]) * up[i];
-        }
+        cuda.gelu_mul_host(&mut gate, &up)?;
     } else {
         cuda.silu_mul_host(&mut gate, &up)?;
     }
@@ -1088,7 +1094,8 @@ fn apply_ffn_cuda(
     )?;
     if !host.ffn_post_norm.is_empty() {
         let tmp = hidden.to_vec();
-        allpaca_cpu::rmsnorm(&tmp, &host.ffn_post_norm, cfg.eps, hidden)?;
+        cuda.rmsnorm_rows(&tmp, &host.ffn_post_norm, hidden, 1, dim as i32, cfg.eps)?;
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     }
     cuda.residual_add_host(x, hidden)?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
