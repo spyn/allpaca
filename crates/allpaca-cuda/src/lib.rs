@@ -241,6 +241,20 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_cuda_relu_sqr(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_silu(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_cuda_scale_f32(
+            x: *mut f32,
+            n: i32,
+            scale: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_expand_k_heads(
+            src: *const f32,
+            dst: *mut f32,
+            n_k: i32,
+            n_v: i32,
+            head_k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -1855,6 +1869,63 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn scale_f32_dev(&self, x: *mut f32, n: i32, scale: f32) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if x.is_null() || n <= 0 {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA scale_f32".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_scale_f32(x, n, scale, self.stream) };
+            status(rc, "scale_f32")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, n, scale);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA scale_f32 unavailable".into(),
+            )))
+        }
+    }
+
+    pub fn expand_k_heads_dev(
+        &self,
+        src: *const f32,
+        dst: *mut f32,
+        n_k: i32,
+        n_v: i32,
+        head_k: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if src.is_null()
+                || dst.is_null()
+                || n_k <= 0
+                || n_v <= 0
+                || head_k <= 0
+                || n_v % n_k != 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA expand_k_heads".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_expand_k_heads(src, dst, n_k, n_v, head_k, self.stream)
+            };
+            status(rc, "expand_k_heads")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (src, dst, n_k, n_v, head_k);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA expand_k_heads unavailable".into(),
+            )))
+        }
+    }
+
     pub fn scale_heads_sigmoid_dev(
         &self,
         attn: *mut f32,
@@ -2342,6 +2413,47 @@ impl CudaWorkspace {
             self.download_f32(dx, x)
         })();
         self.free_ptr(dx);
+        result
+    }
+
+    /// Host roundtrip: in-place `x[i] *= scale`.
+    pub fn scale_f32_host(&self, x: &mut [f32], scale: f32) -> Result<(), AllpacaError> {
+        if x.is_empty() {
+            return Ok(());
+        }
+        let dx = self.upload_f32(x)?;
+        let result = (|| {
+            self.scale_f32_dev(dx, x.len() as i32, scale)?;
+            self.download_f32(dx, x)
+        })();
+        self.free_ptr(dx);
+        result
+    }
+
+    /// Host roundtrip: tile K-heads → V-heads (GDN).
+    pub fn expand_k_heads_host(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        n_k: i32,
+        n_v: i32,
+        head_k: i32,
+    ) -> Result<(), AllpacaError> {
+        let src_n = (n_k as usize).saturating_mul(head_k as usize);
+        let dst_n = (n_v as usize).saturating_mul(head_k as usize);
+        if src_n == 0 || dst_n == 0 || src.len() < src_n || dst.len() < dst_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid expand_k_heads shape".into(),
+            )));
+        }
+        let ds = self.upload_f32(&src[..src_n])?;
+        let dd = device_malloc(dst_n * 4, self.device)?;
+        let result = (|| {
+            self.expand_k_heads_dev(ds, dd.cast(), n_k, n_v, head_k)?;
+            self.download_f32(dd.cast(), &mut dst[..dst_n])
+        })();
+        self.free_ptr(ds);
+        self.free_device(dd);
         result
     }
 
@@ -4040,6 +4152,57 @@ mod tests {
                 (x[i] - cpu[i]).abs() < 1e-5,
                 "silu mismatch at {i}: cuda={} cpu={}",
                 x[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn scale_f32_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let mut x = [1.0f32, -2.0, 0.5, 3.0];
+        let scale = 2.5f32;
+        let cpu: Vec<f32> = x.iter().map(|&v| v * scale).collect();
+        ws.scale_f32_host(&mut x, scale).expect("cuda scale_f32");
+        for i in 0..x.len() {
+            assert!(
+                (x[i] - cpu[i]).abs() < 1e-6,
+                "scale_f32 mismatch at {i}: cuda={} cpu={}",
+                x[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn expand_k_heads_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_k = 2i32;
+        let n_v = 4i32;
+        let head_k = 2i32;
+        let src = [1.0f32, 2.0, 3.0, 4.0];
+        let mut dst = [0.0f32; 8];
+        let mut cpu = [0.0f32; 8];
+        // ggml_repeat tiles whole block: [h0,h1, h0,h1]
+        for vh in 0..n_v as usize {
+            let kh = vh % n_k as usize;
+            for j in 0..head_k as usize {
+                cpu[vh * head_k as usize + j] = src[kh * head_k as usize + j];
+            }
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        ws.expand_k_heads_host(&src, &mut dst, n_k, n_v, head_k)
+            .expect("cuda expand_k_heads");
+        for i in 0..8 {
+            assert!(
+                (dst[i] - cpu[i]).abs() < 1e-6,
+                "expand_k_heads mismatch at {i}: cuda={} cpu={}",
+                dst[i],
                 cpu[i]
             );
         }

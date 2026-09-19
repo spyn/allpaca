@@ -120,6 +120,13 @@ int allpaca_cuda_relu_sqr(float *x, int32_t n, allpaca_cuda_stream_t stream);
 /* In-place SiLU: x[i] = x[i] * sigmoid(x[i]) (gate-less MoE / Lightning). */
 int allpaca_cuda_silu(float *x, int32_t n, allpaca_cuda_stream_t stream);
 
+/* In-place x[i] *= scale (Gemma scale_embed; HIP allpaca_scale_f32). */
+int allpaca_cuda_scale_f32(float *x, int32_t n, float scale, allpaca_cuda_stream_t stream);
+
+/* GDN: tile K-heads to V-heads (HIP allpaca_expand_k_heads). n_v must be multiple of n_k. */
+int allpaca_cuda_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v,
+                                int32_t head_k, allpaca_cuda_stream_t stream);
+
 /* Spark2_5 headwise gate: attn[tok,h,d] *= sigmoid(scores[tok,h]) (HIP allpaca_scale_heads_sigmoid). */
 int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
                                      int32_t n_heads, int32_t head_dim,

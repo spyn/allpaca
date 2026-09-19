@@ -6,7 +6,7 @@ use super::{
 };
 use crate::anchors::RecurrentState;
 use crate::deltanet::{
-    conv1d_step, decay_from_alpha, expand_k_heads, gated_delta_step, rmsnorm_silu_gate,
+    conv1d_step, decay_from_alpha, gated_delta_step, rmsnorm_silu_gate,
 };
 use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
@@ -314,9 +314,8 @@ impl TinyModel {
         }
         if cfg.scale_embed {
             let s = (dim as f32).sqrt();
-            for v in &mut x {
-                *v *= s;
-            }
+            cuda.scale_f32_host(&mut x, s)?;
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
         }
 
         let mut max_q_out = dim;
@@ -911,8 +910,21 @@ fn apply_gdn_cuda(
     let v_raw = &conv_out[dims.key_dim * 2..];
     let mut q_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
     let mut k_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
-    expand_k_heads(q_raw, &mut q_exp, dims.n_k_heads, dims.n_v_heads, dims.head_k);
-    expand_k_heads(k_raw, &mut k_exp, dims.n_k_heads, dims.n_v_heads, dims.head_k);
+    cuda.expand_k_heads_host(
+        q_raw,
+        &mut q_exp,
+        dims.n_k_heads as i32,
+        dims.n_v_heads as i32,
+        dims.head_k as i32,
+    )?;
+    cuda.expand_k_heads_host(
+        k_raw,
+        &mut k_exp,
+        dims.n_k_heads as i32,
+        dims.n_v_heads as i32,
+        dims.head_k as i32,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
     let mut decay = vec![0.0f32; dims.n_v_heads];
     decay_from_alpha(&alpha, &gdn.dt_bias, &gdn.a, &mut decay);
     let mut y = vec![0.0f32; dims.value_dim];

@@ -725,6 +725,44 @@ extern "C" int allpaca_cuda_silu(float *x, int32_t n, allpaca_cuda_stream_t stre
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void scale_f32_kernel(float *x, float scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] *= scale;
+    }
+}
+
+extern "C" int allpaca_cuda_scale_f32(float *x, int32_t n, float scale,
+                                      allpaca_cuda_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    scale_f32_kernel<<<grid, block, 0, as_stream(stream)>>>(x, scale, n);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void expand_k_heads_kernel(const float *src, float *dst, int n_k, int n_v, int head_k) {
+    int vh = static_cast<int>(blockIdx.x);
+    int j = static_cast<int>(threadIdx.x);
+    if (vh >= n_v || j >= head_k) {
+        return;
+    }
+    int kh = vh % n_k;
+    dst[vh * head_k + j] = src[kh * head_k + j];
+}
+
+extern "C" int allpaca_cuda_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v,
+                                           int32_t head_k, allpaca_cuda_stream_t stream) {
+    if (!src || !dst || n_k <= 0 || n_v <= 0 || head_k <= 0 || (n_v % n_k) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    expand_k_heads_kernel<<<static_cast<unsigned>(n_v), static_cast<unsigned>(head_k), 0,
+                            as_stream(stream)>>>(src, dst, n_k, n_v, head_k);
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
                                            int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
