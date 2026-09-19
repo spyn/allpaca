@@ -194,6 +194,34 @@ fn cuda_coordinator_rpc_split_keeps_local_layers_on_device() {
 }
 
 #[test]
+fn cuda_batched_prefill_one_forward_per_chunk() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_synthetic();
+    cfg.prefill.chunk_tokens = 16;
+    cfg.kv.page_tokens = 64;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("engine");
+    let prompt = "hello world. ".repeat(40);
+    let out = engine.generate(&prompt, greedy(2)).expect("generate");
+    assert!(
+        out.prompt_tokens >= 16,
+        "need a multi-token prompt, got {}",
+        out.prompt_tokens
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < out.prompt_tokens as u64,
+        "batched prefill must not run one forward per prompt token; gpu_forwards={} prompt_tokens={}",
+        stats.gpu_forwards,
+        out.prompt_tokens
+    );
+    assert!(!out.token_ids.is_empty());
+}
+
+#[test]
 fn cuda_synthetic_moe_generate_uses_device_when_present() {
     if !cuda_device_available() {
         return;

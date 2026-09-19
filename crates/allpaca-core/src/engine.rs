@@ -2780,14 +2780,25 @@ impl Engine {
             )
         };
         let vision_in_chunk = (start..end).any(|p| p < vision_prefix_len);
-        let batch_prefill = !vision_in_chunk
+        let batch_prefill_hip = !vision_in_chunk
             && toks.len() > 1
             && ((self.hip.is_some()
                 && resident.is_some()
                 && !mtp_draft_active(inner)
                 && target.supports_device_batched_prefill())
                 || target.dsv4.is_some());
-        if batch_prefill {
+        #[cfg(feature = "cuda")]
+        let batch_prefill_cuda = !vision_in_chunk
+            && toks.len() > 1
+            && self.hip.is_none()
+            && self.cuda.is_some()
+            && cuda_resident.is_some()
+            && !mtp_draft_active(inner)
+            && target.supports_device_batched_prefill();
+        #[cfg(not(feature = "cuda"))]
+        let batch_prefill_cuda = false;
+        let mut did_batch = false;
+        if batch_prefill_hip {
             target.forward_tokens(
                 &toks,
                 start,
@@ -2805,7 +2816,38 @@ impl Engine {
             )?;
             // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
             // page (growing with seq) and break logits-only decode accounting.
-        } else {
+            did_batch = true;
+        } else if batch_prefill_cuda {
+            #[cfg(feature = "cuda")]
+            {
+                if let (Some(cuda), Some(cres)) =
+                    (self.cuda.as_deref(), cuda_resident.as_deref())
+                {
+                    match target.forward_tokens_cuda(
+                        &toks,
+                        start,
+                        &pages,
+                        &mut inner.kv,
+                        &self.metrics,
+                        &mut logits,
+                        cuda,
+                        cres,
+                        write_logits,
+                    ) {
+                        Ok(()) => did_batch = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                start,
+                                n = toks.len(),
+                                error = %e,
+                                "CUDA batched prefill failed; per-token fallback"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if !did_batch {
             let want_hidden = mtp_draft_active(inner);
             for (i, tok) in toks.iter().enumerate() {
                 let pos = start + i;

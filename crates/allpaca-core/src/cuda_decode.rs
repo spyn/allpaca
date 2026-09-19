@@ -671,6 +671,29 @@ impl CudaResidentModel {
             ))),
         }
     }
+
+    fn embed_gather_dev_row(
+        &self,
+        cuda: &CudaWorkspace,
+        token: i32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if out.is_null() || dim <= 0 || token < 0 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA prefill: invalid embed_gather_dev_row".into(),
+            )));
+        }
+        match self.embed.kind {
+            super::WeightKind::F32 => cuda.embed_gather_dev(self.ptr(self.embed)?, token, out, dim),
+            super::WeightKind::Q8_0 => {
+                cuda.embed_gather_q8_dev(self.byte_ptr(self.embed)?, token, out, dim)
+            }
+            _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "CUDA prefill: unsupported embed kind".into(),
+            ))),
+        }
+    }
 }
 
 impl TinyModel {
@@ -959,6 +982,247 @@ impl TinyModel {
             vocab as i32,
             dim as i32,
         )?;
+
+        metrics.gpu_forwards.fetch_add(1, Ordering::Relaxed);
+        metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Chunked dense prefill: one GPU forward with M=`tokens.len()` GEMM / attention.
+    /// MoE / SSM / GDN / RPC remote layers return Degraded so the engine falls back
+    /// to per-token `forward_token_cuda`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tokens_cuda(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        logits: &mut [f32],
+        cuda: &CudaWorkspace,
+        resident: &CudaResidentModel,
+        write_logits: bool,
+    ) -> Result<(), AllpacaError> {
+        let n_tok = tokens.len();
+        if n_tok == 0 {
+            return Ok(());
+        }
+        if n_tok == 1 {
+            return self.forward_token_cuda(
+                tokens[0], start_pos, page_ids, kv, metrics, logits, cuda, resident, None, None,
+            );
+        }
+        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+            return Err(AllpacaError::Degraded(
+                allpaca_types::DegradedError::FeatureDisabled(
+                    "CUDA batched prefill: RPC layer-split unsupported".into(),
+                ),
+            ));
+        }
+        let cfg = &self.config;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if layer.block != HybridLayerKind::Attention || layer.wq.is_empty() {
+                return Err(AllpacaError::Degraded(
+                    allpaca_types::DegradedError::FeatureDisabled(format!(
+                        "CUDA batched prefill: layer {i} is {:?}; dense attn only",
+                        layer.block
+                    )),
+                ));
+            }
+        }
+        let dim = cfg.dim;
+        let head_dim = cfg.head_dim();
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let vocab = cfg.vocab_size;
+        let ff = cfg.ff_dim;
+        if write_logits && logits.len() < vocab {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "logits buffer smaller than vocab".into(),
+            )));
+        }
+        for tok in tokens {
+            if *tok as usize >= vocab {
+                return Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
+                    "token {tok} out of vocab"
+                ))));
+            }
+        }
+        let page_tokens = page_ids
+            .first()
+            .and_then(|p| p.first())
+            .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
+            .unwrap_or(128);
+        let seq_end = start_pos + n_tok;
+        let max_kv = page_ids
+            .iter()
+            .map(|layer| layer.len().saturating_mul(page_tokens))
+            .max()
+            .unwrap_or(seq_end)
+            .max(seq_end);
+        let acts = cuda.prefill_acts(n_tok, dim, kv_dim, ff)?;
+        let (dest_k, dest_v) = cuda.kv_scratch_pair_after(acts.bytes, max_kv.max(1), kv_dim)?;
+
+        for (t, &tok) in tokens.iter().enumerate() {
+            let out = unsafe { acts.x.add(t * dim) };
+            resident.embed_gather_dev_row(cuda, tok as i32, out, dim as i32)?;
+        }
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+        let m = n_tok as i32;
+        for (layer_idx, host_layer) in self.layers.iter().enumerate() {
+            let layer = &resident.layers[layer_idx];
+            for t in 0..n_tok {
+                cuda.rmsnorm_dev(
+                    unsafe { acts.x.add(t * dim) },
+                    resident.ptr(layer.attn_norm)?,
+                    unsafe { acts.norm.add(t * dim) },
+                    dim as i32,
+                    cfg.eps,
+                )?;
+            }
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+            resident.gemm_dev_a(cuda, acts.norm, layer.wq, acts.q, m, dim as i32, dim as i32)?;
+            resident.gemm_dev_a(
+                cuda,
+                acts.norm,
+                layer.wk,
+                acts.k,
+                m,
+                kv_dim as i32,
+                dim as i32,
+            )?;
+            resident.gemm_dev_a(
+                cuda,
+                acts.norm,
+                layer.wv,
+                acts.v,
+                m,
+                kv_dim as i32,
+                dim as i32,
+            )?;
+
+            for t in 0..n_tok {
+                let pos = (start_pos + t) as i32;
+                cuda.rope_dev(
+                    unsafe { acts.q.add(t * dim) },
+                    cfg.n_heads as i32,
+                    head_dim as i32,
+                    pos,
+                    cfg.rope_theta,
+                )?;
+                cuda.rope_dev(
+                    unsafe { acts.k.add(t * kv_dim) },
+                    cfg.n_kv_heads as i32,
+                    head_dim as i32,
+                    pos,
+                    cfg.rope_theta,
+                )?;
+            }
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+            kv.write_slots_from_device(
+                &page_ids[layer_idx],
+                start_pos,
+                n_tok,
+                page_tokens,
+                cfg.n_kv_heads,
+                head_dim,
+                acts.k,
+                acts.v,
+            )?;
+
+            let (k_dev, v_dev, n_kv) = kv.cuda_kv_views(
+                &page_ids[layer_idx],
+                cfg.n_kv_heads,
+                head_dim,
+                dest_k,
+                dest_v,
+                max_kv,
+            )?;
+            cuda.attention_dev(
+                acts.q,
+                k_dev,
+                v_dev,
+                acts.attn,
+                m,
+                n_kv as i32,
+                cfg.n_heads as i32,
+                cfg.n_kv_heads as i32,
+                head_dim as i32,
+                true,
+            )?;
+
+            resident.gemm_dev_a(
+                cuda, acts.attn, layer.wo, acts.proj, m, dim as i32, dim as i32,
+            )?;
+            cuda.residual_add_dev(acts.x, acts.proj, acts.x, (n_tok * dim) as i32)?;
+            metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+            if host_layer.w_gate.is_empty() || layer.w_gate.n == 0 {
+                continue;
+            }
+            for t in 0..n_tok {
+                cuda.rmsnorm_dev(
+                    unsafe { acts.x.add(t * dim) },
+                    resident.ptr(layer.ffn_norm)?,
+                    unsafe { acts.norm.add(t * dim) },
+                    dim as i32,
+                    cfg.eps,
+                )?;
+            }
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+            resident.gemm_dev_a(
+                cuda,
+                acts.norm,
+                layer.w_gate,
+                acts.gate,
+                m,
+                ff as i32,
+                dim as i32,
+            )?;
+            resident.gemm_dev_a(
+                cuda, acts.norm, layer.w_up, acts.up, m, ff as i32, dim as i32,
+            )?;
+            cuda.silu_mul_dev(acts.gate, acts.up, acts.gate, (n_tok * ff) as i32)?;
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+            resident.gemm_dev_a(
+                cuda,
+                acts.gate,
+                layer.w_down,
+                acts.proj,
+                m,
+                dim as i32,
+                ff as i32,
+            )?;
+            cuda.residual_add_dev(acts.x, acts.proj, acts.x, (n_tok * dim) as i32)?;
+            metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if write_logits {
+            let last = unsafe { acts.x.add((n_tok - 1) * dim) };
+            let mut x_last = vec![0.0f32; dim];
+            let mut normed = vec![0.0f32; dim];
+            cuda.download_f32(last, &mut x_last)?;
+            cuda.rmsnorm_host_x_dev_w(
+                &x_last,
+                resident.ptr(resident.norm)?,
+                &mut normed,
+                dim as i32,
+                cfg.eps,
+            )?;
+            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+            resident.gemm_host_a(
+                cuda,
+                &normed,
+                resident.lm_head,
+                &mut logits[..vocab],
+                1,
+                vocab as i32,
+                dim as i32,
+            )?;
+        }
 
         metrics.gpu_forwards.fetch_add(1, Ordering::Relaxed);
         metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);

@@ -498,6 +498,25 @@ pub struct CudaDecodeActs {
     pub bytes: usize,
 }
 
+/// Multi-token activation region for CUDA chunked prefill (M=N GEMM / attention).
+#[derive(Clone, Copy)]
+pub struct CudaPrefillActs {
+    pub x: *mut f32,
+    pub norm: *mut f32,
+    pub q: *mut f32,
+    pub k: *mut f32,
+    pub v: *mut f32,
+    pub attn: *mut f32,
+    pub proj: *mut f32,
+    pub gate: *mut f32,
+    pub up: *mut f32,
+    pub bytes: usize,
+    pub n_tok: usize,
+    pub dim: usize,
+    pub kv_dim: usize,
+    pub ff_dim: usize,
+}
+
 /// Minimal CUDA workspace: scratch buffer + F32 GEMM. Enough to open when a
 /// device appears; full forward parity grows behind this type (like HipWorkspace).
 pub struct CudaWorkspace {
@@ -568,6 +587,63 @@ impl CudaWorkspace {
             attn: unsafe { base.add(3 * dim + 2 * kv_dim) },
             proj: unsafe { base.add(4 * dim + 2 * kv_dim) },
             bytes,
+        })
+    }
+
+    /// Bytes for dense prefill acts: x/norm/q/attn/proj (`n_tok*dim`), k/v (`n_tok*kv_dim`),
+    /// gate/up (`n_tok*ff_dim`). Packed KV uses the remainder via `kv_scratch_pair_after`.
+    pub fn prefill_act_bytes(n_tok: usize, dim: usize, kv_dim: usize, ff_dim: usize) -> usize {
+        n_tok
+            .saturating_mul(
+                5usize
+                    .saturating_mul(dim)
+                    .saturating_add(2usize.saturating_mul(kv_dim))
+                    .saturating_add(2usize.saturating_mul(ff_dim)),
+            )
+            .saturating_mul(4)
+    }
+
+    /// Multi-token activation region for CUDA M=N prefill.
+    pub fn prefill_acts(
+        &self,
+        n_tok: usize,
+        dim: usize,
+        kv_dim: usize,
+        ff_dim: usize,
+    ) -> Result<CudaPrefillActs, AllpacaError> {
+        let bytes = Self::prefill_act_bytes(n_tok, dim, kv_dim, ff_dim);
+        if n_tok == 0 || dim == 0 || kv_dim == 0 || bytes == 0 {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                "CUDA prefill acts need n_tok>0, dim>0, kv_dim>0".into(),
+            )));
+        }
+        if bytes > self.scratch_bytes {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                format!(
+                    "CUDA prefill acts ({bytes} bytes for n_tok={n_tok}) exceed scratch {}",
+                    self.scratch_bytes
+                ),
+            )));
+        }
+        let base = self.scratch.cast::<f32>();
+        let row_x = n_tok * dim;
+        let row_kv = n_tok * kv_dim;
+        let row_ff = n_tok * ff_dim;
+        Ok(CudaPrefillActs {
+            x: base,
+            norm: unsafe { base.add(row_x) },
+            q: unsafe { base.add(2 * row_x) },
+            k: unsafe { base.add(3 * row_x) },
+            v: unsafe { base.add(3 * row_x + row_kv) },
+            attn: unsafe { base.add(3 * row_x + 2 * row_kv) },
+            proj: unsafe { base.add(4 * row_x + 2 * row_kv) },
+            gate: unsafe { base.add(5 * row_x + 2 * row_kv) },
+            up: unsafe { base.add(5 * row_x + 2 * row_kv + row_ff) },
+            bytes,
+            n_tok,
+            dim,
+            kv_dim,
+            ff_dim,
         })
     }
 
