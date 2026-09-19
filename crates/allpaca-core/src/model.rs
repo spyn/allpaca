@@ -2326,6 +2326,7 @@ fn empty_layer() -> LayerWeights {
         shared_expert: LayerFfn::default(),
         expert_bias: Vec::new(),
         attn_out_gate: Vec::new(),
+        attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
         ffn_post_norm: Vec::new(),
     }
@@ -3313,6 +3314,8 @@ pub struct LayerWeights {
     pub expert_bias: Vec<f32>,
     /// Spark2_5 head-wise attention output gate (`attn_gate.weight`, shape `[n_heads, dim]`).
     pub attn_out_gate: Vec<f32>,
+    /// Per-head attention sink logits (`attn_sinks.weight`, shape `[n_heads]`; empty = none).
+    pub attn_sinks: Vec<f32>,
     /// Gemma post-attention RMSNorm (empty = skip).
     pub attn_post_norm: Vec<f32>,
     /// Gemma post-FFN RMSNorm (empty = skip).
@@ -3509,6 +3512,7 @@ impl TinyModel {
                 shared_expert: LayerFfn::default(),
                 expert_bias: Vec::new(),
                 attn_out_gate: Vec::new(),
+                attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
@@ -3574,6 +3578,7 @@ impl TinyModel {
             shared_expert: LayerFfn::default(),
             expert_bias: Vec::new(),
             attn_out_gate: Vec::new(),
+            attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
             ffn_post_norm: Vec::new(),
         };
@@ -3621,6 +3626,7 @@ impl TinyModel {
             shared_expert: LayerFfn::default(),
             expert_bias: Vec::new(),
             attn_out_gate: Vec::new(),
+            attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
             ffn_post_norm: Vec::new(),
         };
@@ -3769,6 +3775,17 @@ impl TinyModel {
                 *v = 0.0;
             }
         }
+    }
+
+    /// Tiny dense model with per-head attention sink logits.
+    pub fn synthetic_attn_sinks(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "attn-sinks");
+        let n_heads = model.config.n_heads;
+        let mut rng = Lcg::new(seed.wrapping_add(113));
+        for layer in &mut model.layers {
+            layer.attn_sinks = rng.vec(n_heads);
+        }
+        model
     }
 
     /// Tiny dense model with sliding-window attention on every layer.
@@ -5154,6 +5171,7 @@ impl TinyModel {
                         shared_expert: LayerFfn::default(),
                         expert_bias: Vec::new(),
                         attn_out_gate: Vec::new(),
+                        attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
                         ffn_post_norm: Vec::new(),
                     }
@@ -5194,6 +5212,7 @@ impl TinyModel {
                         shared_expert: load_gguf_shared_expert(file, i)?,
                         expert_bias: load_gguf_expert_bias(file, i)?,
                         attn_out_gate: Vec::new(),
+                        attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
                         ffn_post_norm: Vec::new(),
                     }
@@ -5255,6 +5274,14 @@ impl TinyModel {
                     } else {
                         Vec::new()
                     };
+                    let attn_sinks = if file
+                        .tensor(&format!("blk.{i}.attn_sinks.weight"))
+                        .is_some()
+                    {
+                        file.tensor_f32(&format!("blk.{i}.attn_sinks.weight"))?
+                    } else {
+                        Vec::new()
+                    };
                     let wo = if mla.is_some() || gguf_blk_has_mla(file, i) {
                         Vec::new()
                     } else {
@@ -5295,6 +5322,7 @@ impl TinyModel {
                         shared_expert,
                         expert_bias,
                         attn_out_gate,
+                        attn_sinks,
                         attn_post_norm: if file
                             .tensor(&format!("blk.{i}.attn_post_norm.weight"))
                             .is_some()
@@ -5588,6 +5616,7 @@ impl TinyModel {
                 shared_expert: LayerFfn::default(),
                 expert_bias: Vec::new(),
                 attn_out_gate: Vec::new(),
+                attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
@@ -5698,6 +5727,7 @@ impl TinyModel {
                 shared_expert: LayerFfn::default(),
                 expert_bias: Vec::new(),
                 attn_out_gate: Vec::new(),
+                attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
@@ -10017,6 +10047,26 @@ mod cuda_softcap_tests {
         assert!(
             max_diff > 1e-4,
             "gated Q must consume wq rows beyond dim; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_attn_sinks_change_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 79, "sinks-plain");
+        let sinks = TinyModel::synthetic_attn_sinks(79);
+        let a = cuda_decode_n_tokens(&plain, 2);
+        let b = cuda_decode_n_tokens(&sinks, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "attn_sinks should change logits; max_diff={max_diff}"
         );
     }
 }

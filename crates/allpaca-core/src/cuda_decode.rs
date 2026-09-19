@@ -530,6 +530,8 @@ impl TinyModel {
             kv.touch(page_id, 1.0);
 
             // SWA / softcap paths are host-only (HIP `attention_dispatch` parity).
+            let sinks = &host_layer.attn_sinks;
+            let use_sinks = sinks.len() == n_heads;
             if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
                 let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);
@@ -566,6 +568,22 @@ impl TinyModel {
                     head_dim,
                     true,
                     cfg.attn_logit_softcap,
+                )?;
+            } else if use_sinks {
+                let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
+                let n_kv = k_all.len() / kv_dim.max(1);
+                cuda.attention_sinks(
+                    &q[..attn_dim],
+                    &k_all,
+                    &v_all,
+                    sinks,
+                    &mut attn_out[..attn_dim],
+                    1,
+                    n_kv as i32,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    true,
                 )?;
             } else if let Some((k_dev, v_dev, n_kv)) =
                 kv.cuda_single_page_view(&page_ids[layer_idx], n_kv_heads, head_dim)
