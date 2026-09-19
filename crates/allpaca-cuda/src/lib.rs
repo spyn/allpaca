@@ -239,6 +239,7 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_relu_sqr(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_embed_gather(
             table: *const f32,
             token: i32,
@@ -1803,6 +1804,27 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn relu_sqr_dev(&self, x: *mut f32, n: i32) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if x.is_null() || n <= 0 {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA relu_sqr".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_relu_sqr(x, n, self.stream) };
+            status(rc, "relu_sqr")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, n);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA relu_sqr unavailable".into(),
+            )))
+        }
+    }
+
     pub fn embed_gather_dev(
         &self,
         table: *const f32,
@@ -2220,6 +2242,20 @@ impl CudaWorkspace {
         })();
         self.free_ptr(dg);
         self.free_ptr(du);
+        result
+    }
+
+    /// Host roundtrip: in-place ReLU² via device.
+    pub fn relu_sqr_host(&self, x: &mut [f32]) -> Result<(), AllpacaError> {
+        if x.is_empty() {
+            return Ok(());
+        }
+        let dx = self.upload_f32(x)?;
+        let result = (|| {
+            self.relu_sqr_dev(dx, x.len() as i32)?;
+            self.download_f32(dx, x)
+        })();
+        self.free_ptr(dx);
         result
     }
 
@@ -3846,6 +3882,28 @@ mod tests {
                 "gelu_mul mismatch at {i}: cuda={} cpu={}",
                 gate[i],
                 cpu_g[i]
+            );
+        }
+    }
+
+    #[test]
+    fn relu_sqr_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let mut x = [1.0f32, -2.0, 0.5, -0.25, 3.0, 0.0];
+        let cpu: Vec<f32> = x
+            .iter()
+            .map(|&v| if v > 0.0 { v * v } else { 0.0 })
+            .collect();
+        ws.relu_sqr_host(&mut x).expect("cuda relu_sqr");
+        for i in 0..x.len() {
+            assert!(
+                (x[i] - cpu[i]).abs() < 1e-6,
+                "relu_sqr mismatch at {i}: cuda={} cpu={}",
+                x[i],
+                cpu[i]
             );
         }
     }

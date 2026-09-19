@@ -689,6 +689,24 @@ extern "C" int allpaca_cuda_gelu_mul(const float *gate, const float *up, float *
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void relu_sqr_kernel(float *x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v > 0.f ? v * v : 0.f;
+    }
+}
+
+extern "C" int allpaca_cuda_relu_sqr(float *x, int32_t n, allpaca_cuda_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    relu_sqr_kernel<<<grid, block, 0, as_stream(stream)>>>(x, n);
+    return cuda_status(cudaGetLastError());
+}
+
 /* One block per row. Decode uses rows=1. n is reduced in shared memory (256 threads). */
 __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
     const int row = static_cast<int>(blockIdx.x);

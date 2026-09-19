@@ -1254,9 +1254,8 @@ fn apply_moe_cuda(
                 dim as i32,
             )?;
             if cfg.moe_relu_sqr {
-                for v in &mut shared_up {
-                    *v = super::relu_sqr(*v);
-                }
+                cuda.relu_sqr_host(&mut shared_up)?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             } else {
                 for v in &mut shared_up {
                     *v = *v * (1.0 / (1.0 + (-*v).exp()));
