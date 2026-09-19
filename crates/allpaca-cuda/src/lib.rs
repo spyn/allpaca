@@ -255,6 +255,15 @@ mod ffi {
             head_k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_gdn_decay_beta(
+            alpha: *const f32,
+            dt_bias: *const f32,
+            a: *const f32,
+            decay: *mut f32,
+            beta: *mut f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -1926,6 +1935,51 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn gdn_decay_beta_dev(
+        &self,
+        alpha: *const f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        decay: *mut f32,
+        beta: *mut f32,
+        n: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if alpha.is_null()
+                || dt_bias.is_null()
+                || a.is_null()
+                || decay.is_null()
+                || beta.is_null()
+                || n <= 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA gdn_decay_beta".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_gdn_decay_beta(
+                    alpha,
+                    dt_bias,
+                    a,
+                    decay,
+                    beta,
+                    n,
+                    self.stream,
+                )
+            };
+            status(rc, "gdn_decay_beta")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (alpha, dt_bias, a, decay, beta, n);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA gdn_decay_beta unavailable".into(),
+            )))
+        }
+    }
+
     pub fn scale_heads_sigmoid_dev(
         &self,
         attn: *mut f32,
@@ -2454,6 +2508,46 @@ impl CudaWorkspace {
         })();
         self.free_ptr(ds);
         self.free_device(dd);
+        result
+    }
+
+    /// Host roundtrip: GDN decay + β sigmoid (HIP gdn_decay_beta parity).
+    pub fn gdn_decay_beta_host(
+        &self,
+        alpha: &[f32],
+        dt_bias: &[f32],
+        a: &[f32],
+        decay: &mut [f32],
+        beta: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        let n = alpha.len();
+        if n == 0 || dt_bias.len() != n || a.len() != n || decay.len() != n || beta.len() != n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gdn_decay_beta length mismatch".into(),
+            )));
+        }
+        let dalpha = self.upload_f32(alpha)?;
+        let ddt = self.upload_f32(dt_bias)?;
+        let da = self.upload_f32(a)?;
+        let ddecay = device_malloc(n * 4, self.device)?;
+        let dbeta = self.upload_f32(beta)?;
+        let result = (|| {
+            self.gdn_decay_beta_dev(
+                dalpha,
+                ddt,
+                da,
+                ddecay.cast(),
+                dbeta,
+                n as i32,
+            )?;
+            self.download_f32(ddecay.cast(), decay)?;
+            self.download_f32(dbeta, beta)
+        })();
+        self.free_ptr(dalpha);
+        self.free_ptr(ddt);
+        self.free_ptr(da);
+        self.free_device(ddecay);
+        self.free_ptr(dbeta);
         result
     }
 
@@ -4204,6 +4298,48 @@ mod tests {
                 "expand_k_heads mismatch at {i}: cuda={} cpu={}",
                 dst[i],
                 cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_decay_beta_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let alpha = [0.5f32, -1.0, 2.0];
+        let dt_bias = [0.1f32, 0.0, -0.25];
+        let a = [-0.5f32, -1.0, -0.25];
+        let beta0 = [0.0f32, 2.0, -2.0];
+        let mut decay_h = [0.0f32; 3];
+        // softplus(x) = ln(1+e^x) with x>20 clamp
+        for i in 0..3 {
+            let x = alpha[i] + dt_bias[i];
+            let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+            decay_h[i] = (sp * a[i]).exp();
+        }
+        let beta_h = [
+            1.0 / (1.0 + (-beta0[0]).exp()),
+            1.0 / (1.0 + (-beta0[1]).exp()),
+            1.0 / (1.0 + (-beta0[2]).exp()),
+        ];
+        let mut decay = [0.0f32; 3];
+        let mut beta = beta0;
+        let ws = CudaWorkspace::new(0, 8192).expect("workspace");
+        ws.gdn_decay_beta_host(&alpha, &dt_bias, &a, &mut decay, &mut beta)
+            .expect("cuda gdn_decay_beta");
+        for i in 0..3 {
+            assert!(
+                (decay[i] - decay_h[i]).abs() < 1e-5,
+                "decay mismatch at {i}: cuda={} cpu={}",
+                decay[i],
+                decay_h[i]
+            );
+            assert!(
+                (beta[i] - beta_h[i]).abs() < 1e-5,
+                "beta mismatch at {i}: cuda={} cpu={}",
+                beta[i],
+                beta_h[i]
             );
         }
     }

@@ -127,6 +127,11 @@ int allpaca_cuda_scale_f32(float *x, int32_t n, float scale, allpaca_cuda_stream
 int allpaca_cuda_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v,
                                 int32_t head_k, allpaca_cuda_stream_t stream);
 
+/* GDN: decay[i]=exp(softplus(α+dt)*a); beta[i]=sigmoid(beta[i]) (HIP allpaca_gdn_decay_beta). */
+int allpaca_cuda_gdn_decay_beta(const float *alpha, const float *dt_bias, const float *a,
+                                float *decay, float *beta, int32_t n,
+                                allpaca_cuda_stream_t stream);
+
 /* Spark2_5 headwise gate: attn[tok,h,d] *= sigmoid(scores[tok,h]) (HIP allpaca_scale_heads_sigmoid). */
 int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
                                      int32_t n_heads, int32_t head_dim,

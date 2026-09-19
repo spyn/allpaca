@@ -763,6 +763,32 @@ extern "C" int allpaca_cuda_expand_k_heads(const float *src, float *dst, int32_t
     return cuda_status(cudaGetLastError());
 }
 
+__device__ inline float gdn_softplus(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+__global__ void gdn_decay_beta_kernel(const float *alpha, const float *dt_bias, const float *a,
+                                      float *decay, float *beta, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    decay[i] = expf(gdn_softplus(alpha[i] + dt_bias[i]) * a[i]);
+    beta[i] = 1.0f / (1.0f + expf(-beta[i]));
+}
+
+extern "C" int allpaca_cuda_gdn_decay_beta(const float *alpha, const float *dt_bias, const float *a,
+                                           float *decay, float *beta, int32_t n,
+                                           allpaca_cuda_stream_t stream) {
+    if (!alpha || !dt_bias || !a || !decay || !beta || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    gdn_decay_beta_kernel<<<grid, block, 0, as_stream(stream)>>>(alpha, dt_bias, a, decay, beta, n);
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
                                            int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

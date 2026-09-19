@@ -5,9 +5,7 @@ use super::{
     WeightRef,
 };
 use crate::anchors::RecurrentState;
-use crate::deltanet::{
-    conv1d_step, decay_from_alpha, gated_delta_step, rmsnorm_silu_gate,
-};
+use crate::deltanet::{conv1d_step, gated_delta_step, rmsnorm_silu_gate};
 use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
@@ -926,7 +924,8 @@ fn apply_gdn_cuda(
     )?;
     metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
     let mut decay = vec![0.0f32; dims.n_v_heads];
-    decay_from_alpha(&alpha, &gdn.dt_bias, &gdn.a, &mut decay);
+    cuda.gdn_decay_beta_host(&alpha, &gdn.dt_bias, &gdn.a, &mut decay, &mut beta)?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     let mut y = vec![0.0f32; dims.value_dim];
     gated_delta_step(
         &mut q_exp,
