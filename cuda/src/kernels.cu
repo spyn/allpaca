@@ -842,6 +842,67 @@ extern "C" int allpaca_cuda_gdn_conv1d_step(const float *x, const float *kernel,
     return cuda_status(cudaGetLastError());
 }
 
+/* One block per V-head. Thread 0 runs the AR delta step (matches host deltanet). */
+__global__ void gated_delta_step_kernel(float *q, float *k, const float *v, const float *decay,
+                                        const float *beta, float *state, float *out, int n_v_heads,
+                                        int head_v, int head_k, float eps) {
+    int h = static_cast<int>(blockIdx.x);
+    if (h >= n_v_heads || threadIdx.x != 0) {
+        return;
+    }
+    float *q_h = q + h * head_k;
+    float *k_h = k + h * head_k;
+    const float *v_h = v + h * head_v;
+    float *state_h = state + h * head_v * head_k;
+    float *out_h = out + h * head_v;
+
+    float ss_q = 0.0f;
+    float ss_k = 0.0f;
+    for (int j = 0; j < head_k; ++j) {
+        ss_q += q_h[j] * q_h[j];
+        ss_k += k_h[j] * k_h[j];
+    }
+    float inv_q = rsqrtf(ss_q + eps);
+    float inv_k = rsqrtf(ss_k + eps);
+    float q_scale = rsqrtf(static_cast<float>(head_k));
+    for (int j = 0; j < head_k; ++j) {
+        q_h[j] *= inv_q * q_scale;
+        k_h[j] *= inv_k;
+    }
+
+    float g = decay[h];
+    float b = beta[h];
+    for (int i = 0; i < head_v; ++i) {
+        float *row = state_h + i * head_k;
+        float acc = 0.0f;
+        for (int j = 0; j < head_k; ++j) {
+            row[j] *= g;
+            acc += row[j] * k_h[j];
+        }
+        float delta = b * (v_h[i] - acc);
+        float y = 0.0f;
+        for (int j = 0; j < head_k; ++j) {
+            row[j] += delta * k_h[j];
+            y += row[j] * q_h[j];
+        }
+        out_h[i] = y;
+    }
+}
+
+extern "C" int allpaca_cuda_gated_delta_step(float *q, float *k, const float *v,
+                                             const float *decay, const float *beta, float *state,
+                                             float *out, int32_t n_v_heads, int32_t head_v,
+                                             int32_t head_k, float eps,
+                                             allpaca_cuda_stream_t stream) {
+    if (!q || !k || !v || !decay || !beta || !state || !out || n_v_heads <= 0 || head_v <= 0 ||
+        head_k <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    gated_delta_step_kernel<<<static_cast<unsigned>(n_v_heads), 1, 0, as_stream(stream)>>>(
+        q, k, v, decay, beta, state, out, n_v_heads, head_v, head_k, eps);
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
                                            int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

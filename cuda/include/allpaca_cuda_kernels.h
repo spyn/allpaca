@@ -137,6 +137,13 @@ int allpaca_cuda_gdn_conv1d_step(const float *x, const float *kernel, float *con
                                  int32_t qkv_dim, int32_t conv_kernel,
                                  allpaca_cuda_stream_t stream);
 
+/* Qwen3.5 Gated DeltaNet one-token step (HIP allpaca_gated_delta_step).
+ * q/k L2-normalized in place; q scaled by 1/sqrt(head_k); state [n_v][head_v][head_k]. */
+int allpaca_cuda_gated_delta_step(float *q, float *k, const float *v, const float *decay,
+                                  const float *beta, float *state, float *out, int32_t n_v_heads,
+                                  int32_t head_v, int32_t head_k, float eps,
+                                  allpaca_cuda_stream_t stream);
+
 /* Spark2_5 headwise gate: attn[tok,h,d] *= sigmoid(scores[tok,h]) (HIP allpaca_scale_heads_sigmoid). */
 int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
                                      int32_t n_heads, int32_t head_dim,

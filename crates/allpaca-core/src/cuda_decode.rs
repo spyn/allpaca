@@ -5,7 +5,7 @@ use super::{
     WeightRef,
 };
 use crate::anchors::RecurrentState;
-use crate::deltanet::{gated_delta_step, rmsnorm_silu_gate};
+use crate::deltanet::rmsnorm_silu_gate;
 use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
@@ -928,7 +928,7 @@ fn apply_gdn_cuda(
     cuda.gdn_decay_beta_host(&alpha, &gdn.dt_bias, &gdn.a, &mut decay, &mut beta)?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     let mut y = vec![0.0f32; dims.value_dim];
-    gated_delta_step(
+    cuda.gated_delta_step_host(
         &mut q_exp,
         &mut k_exp,
         v_raw,
@@ -936,10 +936,12 @@ fn apply_gdn_cuda(
         &beta,
         &mut state.gdn_state[layer_idx],
         &mut y,
-        dims.n_v_heads,
-        dims.head_v,
-        dims.head_k,
-    );
+        dims.n_v_heads as i32,
+        dims.head_v as i32,
+        dims.head_k as i32,
+        cfg.eps,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     let mut gated = vec![0.0f32; dims.value_dim];
     rmsnorm_silu_gate(&y, &z, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
     matmul_nt(&gated, &gdn.w_out, hidden, 1, dim, dims.value_dim).map_err(|e| {

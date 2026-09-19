@@ -273,6 +273,20 @@ mod ffi {
             conv_kernel: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_gated_delta_step(
+            q: *mut f32,
+            k: *mut f32,
+            v: *const f32,
+            decay: *const f32,
+            beta: *const f32,
+            state: *mut f32,
+            out: *mut f32,
+            n_v_heads: i32,
+            head_v: i32,
+            head_k: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -2034,6 +2048,68 @@ impl CudaWorkspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_step_dev(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        v: *const f32,
+        decay: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        n_v_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if q.is_null()
+                || k.is_null()
+                || v.is_null()
+                || decay.is_null()
+                || beta.is_null()
+                || state.is_null()
+                || out.is_null()
+                || n_v_heads <= 0
+                || head_v <= 0
+                || head_k <= 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA gated_delta_step".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_gated_delta_step(
+                    q,
+                    k,
+                    v,
+                    decay,
+                    beta,
+                    state,
+                    out,
+                    n_v_heads,
+                    head_v,
+                    head_k,
+                    eps,
+                    self.stream,
+                )
+            };
+            status(rc, "gated_delta_step")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (
+                q, k, v, decay, beta, state, out, n_v_heads, head_v, head_k, eps,
+            );
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA gated_delta_step unavailable".into(),
+            )))
+        }
+    }
+
     pub fn scale_heads_sigmoid_dev(
         &self,
         attn: *mut f32,
@@ -2656,6 +2732,69 @@ impl CudaWorkspace {
         } else {
             self.free_ptr(ds.cast());
         }
+        self.free_device(dout);
+        result
+    }
+
+    /// Host roundtrip: one-token Gated DeltaNet (mutates q, k, and state).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_step_host(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        out: &mut [f32],
+        n_v_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        let nv = n_v_heads as usize;
+        let hv = head_v as usize;
+        let hk = head_k as usize;
+        let qk_n = nv.saturating_mul(hk);
+        let v_n = nv.saturating_mul(hv);
+        let st_n = nv.saturating_mul(hv).saturating_mul(hk);
+        if nv == 0
+            || hv == 0
+            || hk == 0
+            || q.len() < qk_n
+            || k.len() < qk_n
+            || v.len() < v_n
+            || decay.len() < nv
+            || beta.len() < nv
+            || state.len() < st_n
+            || out.len() < v_n
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gated_delta_step length mismatch".into(),
+            )));
+        }
+        let dq = self.upload_f32(&q[..qk_n])?;
+        let dk = self.upload_f32(&k[..qk_n])?;
+        let dv = self.upload_f32(&v[..v_n])?;
+        let dd = self.upload_f32(&decay[..nv])?;
+        let db = self.upload_f32(&beta[..nv])?;
+        let ds = self.upload_f32(&state[..st_n])?;
+        let dout = device_malloc(v_n * 4, self.device)?;
+        let result = (|| {
+            self.gated_delta_step_dev(
+                dq, dk, dv, dd, db, ds, dout.cast(), n_v_heads, head_v, head_k, eps,
+            )?;
+            self.download_f32(dout.cast(), &mut out[..v_n])?;
+            self.download_f32(dq, &mut q[..qk_n])?;
+            self.download_f32(dk, &mut k[..qk_n])?;
+            self.download_f32(ds, &mut state[..st_n])
+        })();
+        self.free_ptr(dq);
+        self.free_ptr(dk);
+        self.free_ptr(dv);
+        self.free_ptr(dd);
+        self.free_ptr(db);
+        self.free_ptr(ds);
         self.free_device(dout);
         result
     }
@@ -4505,6 +4644,99 @@ mod tests {
             assert!(
                 (state[i] - cpu_state[i]).abs() < 1e-5,
                 "conv1d state mismatch at {i}: cuda={} cpu={}",
+                state[i],
+                cpu_state[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gated_delta_step_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_v = 1i32;
+        let head_v = 2i32;
+        let head_k = 2i32;
+        let eps = 1e-6f32;
+        let mut q = [1.0f32, 0.5];
+        let mut k = [0.25f32, -0.75];
+        let v = [0.4f32, -0.2];
+        let decay = [0.8f32];
+        let beta = [0.5f32];
+        let mut state = [0.1f32, 0.2, -0.1, 0.3];
+        let mut cpu_q = q;
+        let mut cpu_k = k;
+        let mut cpu_state = state;
+        let mut cpu_out = [0.0f32; 2];
+        let q_scale = 1.0 / (head_k as f32).sqrt();
+        let ss_q: f32 = cpu_q.iter().map(|x| x * x).sum();
+        let ss_k: f32 = cpu_k.iter().map(|x| x * x).sum();
+        let inv_q = 1.0 / (ss_q + eps).sqrt();
+        let inv_k = 1.0 / (ss_k + eps).sqrt();
+        for x in &mut cpu_q {
+            *x *= inv_q * q_scale;
+        }
+        for x in &mut cpu_k {
+            *x *= inv_k;
+        }
+        let g = decay[0];
+        let b = beta[0];
+        for i in 0..head_v as usize {
+            let row = &mut cpu_state[i * 2..(i + 1) * 2];
+            let mut acc = 0.0f32;
+            for j in 0..2 {
+                row[j] *= g;
+                acc += row[j] * cpu_k[j];
+            }
+            let delta = b * (v[i] - acc);
+            let mut y = 0.0f32;
+            for j in 0..2 {
+                row[j] += delta * cpu_k[j];
+                y += row[j] * cpu_q[j];
+            }
+            cpu_out[i] = y;
+        }
+        let mut out = [0.0f32; 2];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        ws.gated_delta_step_host(
+            &mut q,
+            &mut k,
+            &v,
+            &decay,
+            &beta,
+            &mut state,
+            &mut out,
+            n_v,
+            head_v,
+            head_k,
+            eps,
+        )
+        .expect("cuda gated_delta");
+        for i in 0..2 {
+            assert!(
+                (out[i] - cpu_out[i]).abs() < 1e-5,
+                "gated_delta out mismatch at {i}: cuda={} cpu={}",
+                out[i],
+                cpu_out[i]
+            );
+            assert!(
+                (q[i] - cpu_q[i]).abs() < 1e-5,
+                "gated_delta q mismatch at {i}: cuda={} cpu={}",
+                q[i],
+                cpu_q[i]
+            );
+            assert!(
+                (k[i] - cpu_k[i]).abs() < 1e-5,
+                "gated_delta k mismatch at {i}: cuda={} cpu={}",
+                k[i],
+                cpu_k[i]
+            );
+        }
+        for i in 0..4 {
+            assert!(
+                (state[i] - cpu_state[i]).abs() < 1e-5,
+                "gated_delta state mismatch at {i}: cuda={} cpu={}",
                 state[i],
                 cpu_state[i]
             );
