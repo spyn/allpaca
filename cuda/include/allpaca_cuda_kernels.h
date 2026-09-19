@@ -136,6 +136,13 @@ int allpaca_cuda_attention_masked(const float *q, const float *k, const float *v
                                   int32_t head_dim, const uint8_t *mask,
                                   allpaca_cuda_stream_t stream);
 
+/* Deinterleave gated Q: q_full[n_heads, 2*head_dim] → q/gate[n_heads, head_dim]. */
+int allpaca_cuda_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,
+                                     int32_t head_dim, allpaca_cuda_stream_t stream);
+
+/* In-place x[i] *= sigmoid(gate[i]). */
+int allpaca_cuda_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_cuda_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

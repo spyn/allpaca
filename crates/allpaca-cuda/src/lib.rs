@@ -211,6 +211,20 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_deinterleave_q_gate(
+            q_full: *const f32,
+            q: *mut f32,
+            gate: *mut f32,
+            n_heads: i32,
+            head_dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_sigmoid_mul(
+            x: *mut f32,
+            gate: *const f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_silu_mul(
             gate: *const f32,
             up: *const f32,
@@ -1575,6 +1589,121 @@ impl CudaWorkspace {
         })();
         self.free_ptr(dx);
         self.free_ptr(dw);
+        result
+    }
+
+    pub fn deinterleave_q_gate_dev(
+        &self,
+        q_full: *const f32,
+        q: *mut f32,
+        gate: *mut f32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA deinterleave_q_gate".into(),
+            )));
+        }
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_deinterleave_q_gate(
+                    q_full,
+                    q,
+                    gate,
+                    n_heads,
+                    head_dim,
+                    self.stream,
+                )
+            };
+            status(rc, "deinterleave_q_gate")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (q_full, q, gate, n_heads, head_dim);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA deinterleave_q_gate unavailable".into(),
+            )))
+        }
+    }
+
+    /// Host roundtrip: deinterleave gated Q `[Q|gate]` → separate buffers.
+    pub fn deinterleave_q_gate(
+        &self,
+        q_full: &[f32],
+        q: &mut [f32],
+        gate: &mut [f32],
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA deinterleave_q_gate shape".into(),
+            )));
+        }
+        let attn = (n_heads as usize).saturating_mul(head_dim as usize);
+        let full = attn.saturating_mul(2);
+        if q_full.len() < full || q.len() < attn || gate.len() < attn {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "deinterleave_q_gate buffer size mismatch".into(),
+            )));
+        }
+        let d_full = self.upload_f32(&q_full[..full])?;
+        let d_q = device_malloc(attn * 4, self.device)?;
+        let d_gate = device_malloc(attn * 4, self.device)?;
+        let result = (|| {
+            self.deinterleave_q_gate_dev(d_full, d_q.cast(), d_gate.cast(), n_heads, head_dim)?;
+            self.download_f32(d_q.cast(), &mut q[..attn])?;
+            self.download_f32(d_gate.cast(), &mut gate[..attn])
+        })();
+        self.free_ptr(d_full);
+        self.free_device(d_q);
+        self.free_device(d_gate);
+        result
+    }
+
+    pub fn sigmoid_mul_dev(
+        &self,
+        x: *mut f32,
+        gate: *const f32,
+        n: i32,
+    ) -> Result<(), AllpacaError> {
+        if n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid CUDA sigmoid_mul".into(),
+            )));
+        }
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_sigmoid_mul(x, gate, n, self.stream) };
+            status(rc, "sigmoid_mul")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, gate, n);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA sigmoid_mul unavailable".into(),
+            )))
+        }
+    }
+
+    /// Host roundtrip: in-place `x[i] *= sigmoid(gate[i])`.
+    pub fn sigmoid_mul(&self, x: &mut [f32], gate: &[f32]) -> Result<(), AllpacaError> {
+        let n = x.len().min(gate.len());
+        if n == 0 {
+            return Ok(());
+        }
+        let dx = self.upload_f32(&x[..n])?;
+        let dg = self.upload_f32(&gate[..n])?;
+        let result = (|| {
+            self.sigmoid_mul_dev(dx, dg, n as i32)?;
+            self.download_f32(dx, &mut x[..n])
+        })();
+        self.free_ptr(dx);
+        self.free_ptr(dg);
         result
     }
 
@@ -3271,6 +3400,75 @@ mod tests {
                     cpu[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn deinterleave_q_gate_matches_host_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        let n_heads = 4usize;
+        let head_dim = 8usize;
+        let mut full = vec![0.0f32; n_heads * 2 * head_dim];
+        for (i, v) in full.iter_mut().enumerate() {
+            *v = (i as f32) * 0.1 - 1.0;
+        }
+        let mut q_cpu = vec![0.0f32; n_heads * head_dim];
+        let mut gate_cpu = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let src = h * 2 * head_dim;
+            let dst = h * head_dim;
+            q_cpu[dst..dst + head_dim].copy_from_slice(&full[src..src + head_dim]);
+            gate_cpu[dst..dst + head_dim]
+                .copy_from_slice(&full[src + head_dim..src + 2 * head_dim]);
+        }
+        let mut q = vec![0.0f32; n_heads * head_dim];
+        let mut gate = vec![0.0f32; n_heads * head_dim];
+        ws.deinterleave_q_gate(&full, &mut q, &mut gate, n_heads as i32, head_dim as i32)
+            .expect("cuda deinterleave");
+        for i in 0..n_heads * head_dim {
+            assert!(
+                attn_close(q[i], q_cpu[i]),
+                "q mismatch idx={i}: cuda={} cpu={}",
+                q[i],
+                q_cpu[i]
+            );
+            assert!(
+                attn_close(gate[i], gate_cpu[i]),
+                "gate mismatch idx={i}: cuda={} cpu={}",
+                gate[i],
+                gate_cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn sigmoid_mul_matches_host_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        let n = 64usize;
+        let mut x = vec![0.0f32; n];
+        let mut gate = vec![0.0f32; n];
+        for i in 0..n {
+            x[i] = (i as f32) * 0.05 - 1.5;
+            gate[i] = ((i * 3) % 20) as f32 * 0.2 - 2.0;
+        }
+        let mut cpu = x.clone();
+        for i in 0..n {
+            cpu[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+        }
+        ws.sigmoid_mul(&mut x, &gate).expect("cuda sigmoid_mul");
+        for i in 0..n {
+            assert!(
+                attn_close(x[i], cpu[i]),
+                "sigmoid_mul mismatch idx={i}: cuda={} cpu={}",
+                x[i],
+                cpu[i]
+            );
         }
     }
 

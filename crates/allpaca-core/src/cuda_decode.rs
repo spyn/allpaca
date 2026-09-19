@@ -444,12 +444,14 @@ impl TinyModel {
                     al.q_out as i32,
                     dim as i32,
                 )?;
-                crate::deltanet::deinterleave_q_gate(
+                cuda.deinterleave_q_gate(
                     &q_full[..al.q_out],
                     &mut q[..attn_dim],
                     &mut gate[..attn_dim],
-                    head_dim,
-                );
+                    n_heads as i32,
+                    head_dim as i32,
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             } else {
                 cuda.gemm_nt_host_a_dev_b(
                     &scratch[..dim],
@@ -598,10 +600,8 @@ impl TinyModel {
             }
 
             if al.gated {
-                for i in 0..attn_dim {
-                    let g = gate[i];
-                    attn_out[i] *= 1.0 / (1.0 + (-g).exp());
-                }
+                cuda.sigmoid_mul(&mut attn_out[..attn_dim], &gate[..attn_dim])?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
 
             // Spark2_5 head-wise sigmoid attention gate (host weights, before wo).

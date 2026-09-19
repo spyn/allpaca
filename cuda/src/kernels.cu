@@ -883,3 +883,52 @@ extern "C" int allpaca_cuda_attention(const float *q, const float *k, const floa
     return allpaca_cuda_attention_sinks(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim,
                                         causal, nullptr, stream);
 }
+
+__global__ void deinterleave_q_gate_kernel(const float *q_full, float *q, float *gate, int n_heads,
+                                           int head_dim) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int n = n_heads * head_dim;
+    if (idx >= n) {
+        return;
+    }
+    const int h = idx / head_dim;
+    const int d = idx % head_dim;
+    const int src = h * 2 * head_dim + d;
+    q[idx] = q_full[src];
+    gate[idx] = q_full[src + head_dim];
+}
+
+__global__ void sigmoid_mul_kernel(float *x, const float *gate, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    const float g = gate[idx];
+    x[idx] *= 1.0f / (1.0f + expf(-g));
+}
+
+extern "C" int allpaca_cuda_deinterleave_q_gate(const float *q_full, float *q, float *gate,
+                                                int32_t n_heads, int32_t head_dim,
+                                                allpaca_cuda_stream_t stream) {
+    if (!q_full || !q || !gate || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int n = n_heads * head_dim;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    deinterleave_q_gate_kernel<<<static_cast<unsigned>(blocks), static_cast<unsigned>(threads), 0,
+                                 as_stream(stream)>>>(q_full, q, gate, n_heads, head_dim);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_sigmoid_mul(float *x, const float *gate, int32_t n,
+                                        allpaca_cuda_stream_t stream) {
+    if (!x || !gate || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    sigmoid_mul_kernel<<<static_cast<unsigned>(blocks), static_cast<unsigned>(threads), 0,
+                         as_stream(stream)>>>(x, gate, n);
+    return cuda_status(cudaGetLastError());
+}
