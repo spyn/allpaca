@@ -12,7 +12,7 @@ use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
-use allpaca_cpu::{attention_softcap, attention_with_mask_softcap, matmul_nt};
+use allpaca_cpu::matmul_nt;
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
@@ -557,33 +557,32 @@ impl TinyModel {
             kv.write_slot(page_id, slot, n_kv_heads, head_dim, &k[..kv_dim], &v[..kv_dim])?;
             kv.touch(page_id, 1.0);
 
-            // SWA: device masked attention when softcap is off; host softcap path otherwise.
+            // SWA / softcap: device masked (+ softcap) attention; causal softcap on device.
             let sinks = &host_layer.attn_sinks;
             let use_sinks = sinks.len() == n_heads;
             if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
                 let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);
-                let mut mask = vec![true; n_kv];
+                let mut mask = vec![1u8; n_kv];
                 let start = n_kv.saturating_sub(cfg.sliding_window);
                 for t in 0..start {
-                    mask[t] = false;
+                    mask[t] = 0;
                 }
                 if cfg.attn_logit_softcap > 0.0 {
-                    attention_with_mask_softcap(
+                    cuda.attention_masked_softcap(
                         &q[..attn_dim],
                         &k_all,
                         &v_all,
                         &mut attn_out[..attn_dim],
                         1,
-                        n_kv,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
+                        n_kv as i32,
+                        n_heads as i32,
+                        n_kv_heads as i32,
+                        head_dim as i32,
                         &mask,
                         cfg.attn_logit_softcap,
                     )?;
                 } else {
-                    let mask_u8: Vec<u8> = mask.iter().map(|&m| u8::from(m)).collect();
                     cuda.attention_masked(
                         &q[..attn_dim],
                         &k_all,
@@ -594,23 +593,22 @@ impl TinyModel {
                         n_heads as i32,
                         n_kv_heads as i32,
                         head_dim as i32,
-                        &mask_u8,
+                        &mask,
                     )?;
                 }
             } else if cfg.attn_logit_softcap > 0.0 {
                 let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
                 let n_kv = k_all.len() / kv_dim.max(1);
-                attention_softcap(
+                cuda.attention_softcap(
                     &q[..attn_dim],
                     &k_all,
                     &v_all,
                     &mut attn_out[..attn_dim],
                     1,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    true,
+                    n_kv as i32,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
                     cfg.attn_logit_softcap,
                 )?;
             } else if use_sinks {

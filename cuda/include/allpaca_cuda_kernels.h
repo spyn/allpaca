@@ -136,6 +136,18 @@ int allpaca_cuda_attention_masked(const float *q, const float *k, const float *v
                                   int32_t head_dim, const uint8_t *mask,
                                   allpaca_cuda_stream_t stream);
 
+/* Gemma-style attn logit softcap: score = softcap * tanh(score/softcap). softcap<=0 = off. */
+int allpaca_cuda_attention_softcap(const float *q, const float *k, const float *v, float *out,
+                                   int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                   int32_t head_dim, int32_t causal, float softcap,
+                                   allpaca_cuda_stream_t stream);
+
+/* Masked attention with optional softcap (SWA + Gemma softcap). */
+int allpaca_cuda_attention_masked_softcap(const float *q, const float *k, const float *v, float *out,
+                                          int32_t n_q, int32_t n_kv, int32_t n_heads,
+                                          int32_t n_kv_heads, int32_t head_dim, const uint8_t *mask,
+                                          float softcap, allpaca_cuda_stream_t stream);
+
 /* Deinterleave gated Q: q_full[n_heads, 2*head_dim] → q/gate[n_heads, head_dim]. */
 int allpaca_cuda_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,
                                      int32_t head_dim, allpaca_cuda_stream_t stream);

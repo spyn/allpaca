@@ -9918,6 +9918,29 @@ mod cuda_softcap_tests {
     }
 
     #[test]
+    fn cuda_attn_softcap_changes_logits_vs_plain_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 91, "attn-sc-plain");
+        let mut capped = TinyModel::synthetic(ModelConfig::tiny(), 91, "attn-sc-cap");
+        capped.config.attn_logit_softcap = 1.5;
+        // Keep final softcap off so divergence is from attn path only.
+        capped.config.final_logit_softcap = 0.0;
+        let a = cuda_decode_n_tokens(&plain, 3);
+        let b = cuda_decode_n_tokens(&capped, 3);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "attn_logit_softcap should change logits vs plain; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
     fn cuda_moe_q8_experts_pack_smaller_than_f32_when_device_present() {
         if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
             return;
