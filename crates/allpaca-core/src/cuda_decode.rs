@@ -501,23 +501,51 @@ impl TinyModel {
                 metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
 
-            // RoPE on device (interleaved heads, same layout as HIP allpaca_rope).
+            // RoPE: partial / IMRoPE on host (HIP rope_imrope_qk parity); else device full RoPE.
             let rope_theta = cfg.rope_theta_for_layer(layer_idx);
-            cuda.rope(
-                &mut q[..attn_dim],
-                n_heads as i32,
-                head_dim as i32,
-                pos as i32,
-                rope_theta,
-            )?;
-            cuda.rope(
-                &mut k[..kv_dim],
-                n_kv_heads as i32,
-                head_dim as i32,
-                pos as i32,
-                rope_theta,
-            )?;
-            metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
+            let n_rot = cfg.rope_dims_for_layer(layer_idx);
+            if cfg.uses_imrope() || (n_rot > 0 && n_rot < head_dim) {
+                let n_rot_eff = if n_rot > 0 { n_rot } else { head_dim };
+                let sections = if cfg.uses_imrope() {
+                    cfg.rope_sections
+                } else {
+                    [0; 4]
+                };
+                allpaca_cpu::rope_imrope_neox_heads(
+                    &mut q[..attn_dim],
+                    n_heads,
+                    head_dim,
+                    pos,
+                    rope_theta,
+                    n_rot_eff,
+                    sections,
+                )?;
+                allpaca_cpu::rope_imrope_neox_heads(
+                    &mut k[..kv_dim],
+                    n_kv_heads,
+                    head_dim,
+                    pos,
+                    rope_theta,
+                    n_rot_eff,
+                    sections,
+                )?;
+            } else {
+                cuda.rope(
+                    &mut q[..attn_dim],
+                    n_heads as i32,
+                    head_dim as i32,
+                    pos as i32,
+                    rope_theta,
+                )?;
+                cuda.rope(
+                    &mut k[..kv_dim],
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    pos as i32,
+                    rope_theta,
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
+            }
 
             let page_tokens = kv
                 .get(page_ids[layer_idx][0])

@@ -3788,6 +3788,26 @@ impl TinyModel {
         model
     }
 
+    /// Tiny dense model with partial NeoX RoPE (`rope_dims` < head_dim).
+    pub fn synthetic_partial_rope(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "partial-rope");
+        let head_dim = model.config.head_dim();
+        model.config.rope_dims = (head_dim / 2).max(2);
+        if model.config.rope_dims % 2 != 0 {
+            model.config.rope_dims -= 1;
+        }
+        model
+    }
+
+    /// Tiny dense model with Qwen3.5-style IMRoPE sections.
+    pub fn synthetic_imrope(seed: u64) -> Self {
+        let mut model = Self::synthetic_partial_rope(seed);
+        model.name = "imrope".into();
+        // Non-zero sections trip `uses_imrope()` (t,h sectors required).
+        model.config.rope_sections = [1, 1, 0, 0];
+        model
+    }
+
     /// Tiny dense model with sliding-window attention on every layer.
     pub fn synthetic_swa(seed: u64) -> Self {
         let mut model = Self::synthetic(ModelConfig::tiny(), seed, "swa");
@@ -10088,6 +10108,48 @@ mod cuda_softcap_tests {
         assert!(
             max_diff > 1e-4,
             "attn_sinks should change logits; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_partial_rope_changes_logits_vs_full_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let full = TinyModel::synthetic(ModelConfig::tiny(), 89, "rope-full");
+        let partial = TinyModel::synthetic_partial_rope(89);
+        let a = cuda_decode_n_tokens(&full, 2);
+        let b = cuda_decode_n_tokens(&partial, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "partial rope_dims should change logits vs full RoPE; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_imrope_changes_logits_vs_full_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        // Text positions make IMRoPE == plain partial NeoX; both must still
+        // diverge from full-head device RoPE.
+        let full = TinyModel::synthetic(ModelConfig::tiny(), 91, "imrope-full");
+        let imrope = TinyModel::synthetic_imrope(91);
+        let a = cuda_decode_n_tokens(&full, 2);
+        let b = cuda_decode_n_tokens(&imrope, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "IMRoPE partial dims should change logits vs full RoPE; max_diff={max_diff}"
         );
     }
 }

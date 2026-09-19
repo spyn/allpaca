@@ -617,6 +617,58 @@ fn cuda_synthetic_attn_sinks_generate_uses_device_when_present() {
     );
 }
 
+#[test]
+fn cuda_synthetic_partial_rope_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_moe_cfg()).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_partial_rope(67))
+        .expect("load partial rope");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_h2d_bytes > 0,
+        "partial-rope dense should upload; stats={before:?}"
+    );
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA partial-rope forwards, got gpu={} target={}; stats={stats:?}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
+
+#[test]
+fn cuda_synthetic_imrope_generate_uses_device_when_present() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_moe_cfg()).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_imrope(71))
+        .expect("load imrope");
+    let before = engine.stats();
+    assert_eq!(before.backend, "cuda");
+    assert!(
+        before.weight_h2d_bytes > 0,
+        "imrope dense should upload; stats={before:?}"
+    );
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected CUDA imrope forwards, got gpu={} target={}; stats={stats:?}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+}
+
 fn write_tiny_qwen_gdn_gguf(path: &std::path::Path, w: f32) {
     use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
     use std::collections::HashMap;
