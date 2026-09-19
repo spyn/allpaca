@@ -707,6 +707,35 @@ extern "C" int allpaca_cuda_relu_sqr(float *x, int32_t n, allpaca_cuda_stream_t 
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
+                                           int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = n_tok * n_heads * head_dim;
+    if (idx >= n) {
+        return;
+    }
+    int head_elems = n_heads * head_dim;
+    int tok = idx / head_elems;
+    int within = idx % head_elems;
+    int h = within / head_dim;
+    float s = scores[tok * n_heads + h];
+    attn[idx] *= 1.0f / (1.0f + expf(-s));
+}
+
+extern "C" int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
+                                                int32_t n_heads, int32_t head_dim,
+                                                allpaca_cuda_stream_t stream) {
+    if (!attn || !scores || n_tok <= 0 || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int n = n_tok * n_heads * head_dim;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    scale_heads_sigmoid_kernel<<<grid, block, 0, as_stream(stream)>>>(attn, scores, n_tok, n_heads,
+                                                                      head_dim);
+    return cuda_status(cudaGetLastError());
+}
+
 /* One block per row. Decode uses rows=1. n is reduced in shared memory (256 threads). */
 __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
     const int row = static_cast<int>(blockIdx.x);

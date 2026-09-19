@@ -240,6 +240,14 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_cuda_relu_sqr(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_cuda_scale_heads_sigmoid(
+            attn: *mut f32,
+            scores: *const f32,
+            n_tok: i32,
+            n_heads: i32,
+            head_dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_embed_gather(
             table: *const f32,
             token: i32,
@@ -1825,6 +1833,48 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn scale_heads_sigmoid_dev(
+        &self,
+        attn: *mut f32,
+        scores: *const f32,
+        n_tok: i32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if attn.is_null()
+                || scores.is_null()
+                || n_tok <= 0
+                || n_heads <= 0
+                || head_dim <= 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA scale_heads_sigmoid".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_scale_heads_sigmoid(
+                    attn,
+                    scores,
+                    n_tok,
+                    n_heads,
+                    head_dim,
+                    self.stream,
+                )
+            };
+            status(rc, "scale_heads_sigmoid")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (attn, scores, n_tok, n_heads, head_dim);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA scale_heads_sigmoid unavailable".into(),
+            )))
+        }
+    }
+
     pub fn embed_gather_dev(
         &self,
         table: *const f32,
@@ -2256,6 +2306,35 @@ impl CudaWorkspace {
             self.download_f32(dx, x)
         })();
         self.free_ptr(dx);
+        result
+    }
+
+    /// Host roundtrip: `attn[tok,h,d] *= sigmoid(scores[tok,h])`.
+    pub fn scale_heads_sigmoid(
+        &self,
+        attn: &mut [f32],
+        scores: &[f32],
+        n_tok: i32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), AllpacaError> {
+        let attn_n = (n_tok as usize)
+            .saturating_mul(n_heads as usize)
+            .saturating_mul(head_dim as usize);
+        let score_n = (n_tok as usize).saturating_mul(n_heads as usize);
+        if attn_n == 0 || attn.len() < attn_n || scores.len() < score_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid scale_heads_sigmoid shape".into(),
+            )));
+        }
+        let da = self.upload_f32(&attn[..attn_n])?;
+        let ds = self.upload_f32(&scores[..score_n])?;
+        let result = (|| {
+            self.scale_heads_sigmoid_dev(da, ds, n_tok, n_heads, head_dim)?;
+            self.download_f32(da, &mut attn[..attn_n])
+        })();
+        self.free_ptr(da);
+        self.free_ptr(ds);
         result
     }
 
@@ -3903,6 +3982,43 @@ mod tests {
                 (x[i] - cpu[i]).abs() < 1e-6,
                 "relu_sqr mismatch at {i}: cuda={} cpu={}",
                 x[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn scale_heads_sigmoid_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_tok = 2i32;
+        let n_heads = 3i32;
+        let head_dim = 4i32;
+        let attn_n = (n_tok * n_heads * head_dim) as usize;
+        let score_n = (n_tok * n_heads) as usize;
+        let mut attn: Vec<f32> = (0..attn_n).map(|i| (i as f32) * 0.1 + 0.5).collect();
+        let scores: Vec<f32> = (0..score_n)
+            .map(|i| ((i as f32) - 2.0) * 0.5)
+            .collect();
+        let mut cpu = attn.clone();
+        for tok in 0..n_tok as usize {
+            for h in 0..n_heads as usize {
+                let g = 1.0 / (1.0 + (-scores[tok * n_heads as usize + h]).exp());
+                let base = (tok * n_heads as usize + h) * head_dim as usize;
+                for d in 0..head_dim as usize {
+                    cpu[base + d] *= g;
+                }
+            }
+        }
+        let ws = CudaWorkspace::new(0, 8192).expect("workspace");
+        ws.scale_heads_sigmoid(&mut attn, &scores, n_tok, n_heads, head_dim)
+            .expect("cuda scale_heads_sigmoid");
+        for i in 0..attn_n {
+            assert!(
+                (attn[i] - cpu[i]).abs() < 1e-5,
+                "scale_heads_sigmoid mismatch at {i}: cuda={} cpu={}",
+                attn[i],
                 cpu[i]
             );
         }

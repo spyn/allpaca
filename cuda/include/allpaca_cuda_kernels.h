@@ -117,6 +117,11 @@ int allpaca_cuda_gelu_mul(const float *gate, const float *up, float *out, int32_
 /* In-place ReLU²: x[i] = max(x[i], 0)^2 (HIP allpaca_relu_sqr). */
 int allpaca_cuda_relu_sqr(float *x, int32_t n, allpaca_cuda_stream_t stream);
 
+/* Spark2_5 headwise gate: attn[tok,h,d] *= sigmoid(scores[tok,h]) (HIP allpaca_scale_heads_sigmoid). */
+int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
+                                     int32_t n_heads, int32_t head_dim,
+                                     allpaca_cuda_stream_t stream);
+
 /* Gather one token row from F32 embed table[vocab, dim] -> out[dim]. */
 int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
                               allpaca_cuda_stream_t stream);

@@ -658,16 +658,25 @@ impl TinyModel {
                 metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
 
-            // Spark2_5 head-wise sigmoid attention gate (host weights, before wo).
+            // Spark2_5 head-wise sigmoid attention gate (device scale; host score gemm).
             if cfg.headwise_attn_gate && !host_layer.attn_out_gate.is_empty() {
-                super::apply_headwise_attn_gate(
+                let mut scores = vec![0.0f32; n_heads];
+                matmul_nt(
                     &scratch[..dim],
                     &host_layer.attn_out_gate,
-                    &mut attn_out[..attn_dim],
+                    &mut scores,
+                    1,
                     n_heads,
-                    head_dim,
                     dim,
-                );
+                )?;
+                cuda.scale_heads_sigmoid(
+                    &mut attn_out[..attn_dim],
+                    &scores,
+                    1,
+                    n_heads as i32,
+                    head_dim as i32,
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
 
             cuda.gemm_nt_host_a_dev_b(
