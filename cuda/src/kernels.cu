@@ -707,6 +707,24 @@ extern "C" int allpaca_cuda_relu_sqr(float *x, int32_t n, allpaca_cuda_stream_t 
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void silu_kernel(float *x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v / (1.f + expf(-v));
+    }
+}
+
+extern "C" int allpaca_cuda_silu(float *x, int32_t n, allpaca_cuda_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    silu_kernel<<<grid, block, 0, as_stream(stream)>>>(x, n);
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
                                            int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

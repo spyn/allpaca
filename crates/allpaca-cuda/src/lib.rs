@@ -240,6 +240,7 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_cuda_relu_sqr(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_cuda_silu(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_cuda_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -1833,6 +1834,27 @@ impl CudaWorkspace {
         }
     }
 
+    pub fn silu_dev(&self, x: *mut f32, n: i32) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if x.is_null() || n <= 0 {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA silu".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_silu(x, n, self.stream) };
+            status(rc, "silu")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, n);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA silu unavailable".into(),
+            )))
+        }
+    }
+
     pub fn scale_heads_sigmoid_dev(
         &self,
         attn: *mut f32,
@@ -2303,6 +2325,20 @@ impl CudaWorkspace {
         let dx = self.upload_f32(x)?;
         let result = (|| {
             self.relu_sqr_dev(dx, x.len() as i32)?;
+            self.download_f32(dx, x)
+        })();
+        self.free_ptr(dx);
+        result
+    }
+
+    /// Host roundtrip: in-place SiLU via device.
+    pub fn silu_host(&self, x: &mut [f32]) -> Result<(), AllpacaError> {
+        if x.is_empty() {
+            return Ok(());
+        }
+        let dx = self.upload_f32(x)?;
+        let result = (|| {
+            self.silu_dev(dx, x.len() as i32)?;
             self.download_f32(dx, x)
         })();
         self.free_ptr(dx);
@@ -3981,6 +4017,28 @@ mod tests {
             assert!(
                 (x[i] - cpu[i]).abs() < 1e-6,
                 "relu_sqr mismatch at {i}: cuda={} cpu={}",
+                x[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn silu_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 4096).expect("workspace");
+        let mut x = [1.0f32, -1.0, 0.5, 2.0, -0.25, 0.0];
+        let cpu: Vec<f32> = x
+            .iter()
+            .map(|&v| v / (1.0 + (-v).exp()))
+            .collect();
+        ws.silu_host(&mut x).expect("cuda silu");
+        for i in 0..x.len() {
+            assert!(
+                (x[i] - cpu[i]).abs() < 1e-5,
+                "silu mismatch at {i}: cuda={} cpu={}",
                 x[i],
                 cpu[i]
             );

@@ -1266,9 +1266,8 @@ fn apply_moe_cuda(
                 cuda.relu_sqr_host(&mut shared_up)?;
                 metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             } else {
-                for v in &mut shared_up {
-                    *v = *v * (1.0 / (1.0 + (-*v).exp()));
-                }
+                cuda.silu_host(&mut shared_up)?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
             gemm_host_a_resident_b(
                 cuda,
