@@ -501,7 +501,7 @@ impl TinyModel {
                 metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             }
 
-            // RoPE: partial / IMRoPE on host (HIP rope_imrope_qk parity); else device full RoPE.
+            // RoPE: partial / IMRoPE on device (HIP rope_imrope_qk parity); else device full RoPE.
             let rope_theta = cfg.rope_theta_for_layer(layer_idx);
             let n_rot = cfg.rope_dims_for_layer(layer_idx);
             if cfg.uses_imrope() || (n_rot > 0 && n_rot < head_dim) {
@@ -511,24 +511,18 @@ impl TinyModel {
                 } else {
                     [0; 4]
                 };
-                allpaca_cpu::rope_imrope_neox_heads(
+                cuda.rope_imrope_qk(
                     &mut q[..attn_dim],
-                    n_heads,
-                    head_dim,
-                    pos,
-                    rope_theta,
-                    n_rot_eff,
-                    sections,
-                )?;
-                allpaca_cpu::rope_imrope_neox_heads(
                     &mut k[..kv_dim],
-                    n_kv_heads,
-                    head_dim,
-                    pos,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    n_rot_eff as i32,
+                    pos as i32,
                     rope_theta,
-                    n_rot_eff,
                     sections,
                 )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             } else {
                 cuda.rope(
                     &mut q[..attn_dim],

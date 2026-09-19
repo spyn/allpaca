@@ -247,6 +247,18 @@ mod ffi {
             theta: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_rope_imrope_qk(
+            q: *mut f32,
+            k: *mut f32,
+            n_q_heads: i32,
+            n_k_heads: i32,
+            head_dim: i32,
+            n_rot: i32,
+            pos: i32,
+            theta: f32,
+            sections: *const i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_attention(
             q: *const f32,
             k: *const f32,
@@ -1815,6 +1827,60 @@ impl CudaWorkspace {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn rope_imrope_qk_dev(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        n_q_heads: i32,
+        n_k_heads: i32,
+        head_dim: i32,
+        n_rot: i32,
+        pos: i32,
+        theta: f32,
+        sections: [i32; 4],
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if q.is_null()
+                || k.is_null()
+                || n_q_heads <= 0
+                || n_k_heads <= 0
+                || head_dim <= 0
+                || n_rot <= 0
+                || n_rot > head_dim
+                || n_rot % 2 != 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA rope_imrope_qk".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_rope_imrope_qk(
+                    q,
+                    k,
+                    n_q_heads,
+                    n_k_heads,
+                    head_dim,
+                    n_rot,
+                    pos,
+                    theta,
+                    sections.as_ptr(),
+                    self.stream,
+                )
+            };
+            status(rc, "rope_imrope_qk")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (q, k, n_q_heads, n_k_heads, head_dim, n_rot, pos, theta, sections);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA rope_imrope_qk unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_dev(
         &self,
         q: *const f32,
@@ -2010,6 +2076,65 @@ impl CudaWorkspace {
             Ok(())
         })();
         self.free_ptr(d_x);
+        result
+    }
+
+    /// Host roundtrip: fused Q/K IMRoPE / partial NeoX (HIP rope_imrope_qk parity).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_imrope_qk(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        n_q_heads: i32,
+        n_k_heads: i32,
+        head_dim: i32,
+        n_rot: i32,
+        pos: i32,
+        theta: f32,
+        sections: [i32; 4],
+    ) -> Result<(), AllpacaError> {
+        let q_n = (n_q_heads as usize).saturating_mul(head_dim as usize);
+        let k_n = (n_k_heads as usize).saturating_mul(head_dim as usize);
+        if q_n == 0 || k_n == 0 || q.len() < q_n || k.len() < k_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rope_imrope_qk shape".into(),
+            )));
+        }
+        let d_q = self.upload_f32(&q[..q_n])?;
+        let d_k = self.upload_f32(&k[..k_n])?;
+        let result = (|| {
+            self.rope_imrope_qk_dev(
+                d_q,
+                d_k,
+                n_q_heads,
+                n_k_heads,
+                head_dim,
+                n_rot,
+                pos,
+                theta,
+                sections,
+            )?;
+            memcpy_on(
+                q.as_mut_ptr().cast(),
+                d_q.cast(),
+                q_n * 4,
+                MEMCPY_D2H,
+                self.stream,
+            )?;
+            memcpy_on(
+                k.as_mut_ptr().cast(),
+                d_k.cast(),
+                k_n * 4,
+                MEMCPY_D2H,
+                self.stream,
+            )?;
+            self.synchronize()?;
+            self.activation_d2h
+                .fetch_add(((q_n + k_n) * 4) as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+        self.free_ptr(d_q);
+        self.free_ptr(d_k);
         result
     }
 
@@ -3492,6 +3617,138 @@ mod tests {
                 "rope mismatch at {i}: cuda={} cpu={}",
                 cuda_x[i],
                 cpu_x[i]
+            );
+        }
+    }
+
+    /// Device IMRoPE / partial NeoX must match CPU rope_imrope_neox_heads.
+    #[test]
+    fn rope_imrope_qk_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_q = 4i32;
+        let n_k = 2i32;
+        let head_dim = 64i32;
+        let n_rot = 32i32;
+        let pos = 7i32;
+        let theta = 10_000.0f32;
+        let sections = [5i32, 5, 6, 0];
+        let q_n = (n_q * head_dim) as usize;
+        let k_n = (n_k * head_dim) as usize;
+        let mut q: Vec<f32> = (0..q_n)
+            .map(|i| ((i * 13) % 50) as f32 * 0.02 - 0.5)
+            .collect();
+        let mut k: Vec<f32> = (0..k_n)
+            .map(|i| ((i * 17) % 50) as f32 * 0.02 - 0.4)
+            .collect();
+        let mut cpu_q = q.clone();
+        let mut cpu_k = k.clone();
+        allpaca_cpu::rope_imrope_neox_heads(
+            &mut cpu_q,
+            n_q as usize,
+            head_dim as usize,
+            pos as usize,
+            theta,
+            n_rot as usize,
+            sections,
+        )
+        .expect("cpu imrope q");
+        allpaca_cpu::rope_imrope_neox_heads(
+            &mut cpu_k,
+            n_k as usize,
+            head_dim as usize,
+            pos as usize,
+            theta,
+            n_rot as usize,
+            sections,
+        )
+        .expect("cpu imrope k");
+        let ws = CudaWorkspace::new(0, (q_n + k_n) * 4 + 4096).expect("workspace");
+        ws.rope_imrope_qk(
+            &mut q,
+            &mut k,
+            n_q,
+            n_k,
+            head_dim,
+            n_rot,
+            pos,
+            theta,
+            sections,
+        )
+        .expect("cuda rope_imrope_qk");
+        for i in 0..q_n {
+            assert!(
+                (q[i] - cpu_q[i]).abs() < 1e-4,
+                "imrope Q mismatch at {i}: cuda={} cpu={}",
+                q[i],
+                cpu_q[i]
+            );
+        }
+        for i in 0..k_n {
+            assert!(
+                (k[i] - cpu_k[i]).abs() < 1e-4,
+                "imrope K mismatch at {i}: cuda={} cpu={}",
+                k[i],
+                cpu_k[i]
+            );
+        }
+        // Partial-only (sections zero) path.
+        let sections0 = [0i32; 4];
+        let mut q2: Vec<f32> = (0..q_n)
+            .map(|i| ((i * 11) % 50) as f32 * 0.02 - 0.3)
+            .collect();
+        let mut k2: Vec<f32> = (0..k_n)
+            .map(|i| ((i * 19) % 50) as f32 * 0.02 - 0.2)
+            .collect();
+        let mut cpu_q2 = q2.clone();
+        let mut cpu_k2 = k2.clone();
+        allpaca_cpu::rope_imrope_neox_heads(
+            &mut cpu_q2,
+            n_q as usize,
+            head_dim as usize,
+            pos as usize,
+            theta,
+            n_rot as usize,
+            sections0,
+        )
+        .unwrap();
+        allpaca_cpu::rope_imrope_neox_heads(
+            &mut cpu_k2,
+            n_k as usize,
+            head_dim as usize,
+            pos as usize,
+            theta,
+            n_rot as usize,
+            sections0,
+        )
+        .unwrap();
+        ws.rope_imrope_qk(
+            &mut q2,
+            &mut k2,
+            n_q,
+            n_k,
+            head_dim,
+            n_rot,
+            pos,
+            theta,
+            sections0,
+        )
+        .expect("cuda partial rope_imrope_qk");
+        for i in 0..q_n {
+            assert!(
+                (q2[i] - cpu_q2[i]).abs() < 1e-4,
+                "partial Q mismatch at {i}: cuda={} cpu={}",
+                q2[i],
+                cpu_q2[i]
+            );
+        }
+        for i in 0..k_n {
+            assert!(
+                (k2[i] - cpu_k2[i]).abs() < 1e-4,
+                "partial K mismatch at {i}: cuda={} cpu={}",
+                k2[i],
+                cpu_k2[i]
             );
         }
     }

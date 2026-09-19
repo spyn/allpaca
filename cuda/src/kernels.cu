@@ -767,6 +767,85 @@ extern "C" int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, in
     return cuda_status(cudaGetLastError());
 }
 
+/* NeoX pair on first n_rot dims; optional IMRoPE sector angles (CPU rope_imrope_neox). */
+__device__ void rope_imrope_pair(float *hvec, int i, int half, int n_rot, int pos, float theta,
+                                int s0, int s1, int s2, int s3) {
+    const int sect_dims = s0 + s1 + s2 + s3;
+    const bool use_imrope = sect_dims > 0 && s0 > 0 && s1 > 0;
+    const float theta_scale = powf(theta, -2.0f / static_cast<float>(n_rot));
+    float theta_t = static_cast<float>(pos);
+    float theta_h = static_cast<float>(pos);
+    float theta_w = static_cast<float>(pos);
+    float theta_e = 0.0f;
+    float angle = 0.0f;
+    for (int j = 0; j <= i; ++j) {
+        if (use_imrope) {
+            const int sector = j % sect_dims;
+            if (sector % 3 == 1 && sector < 3 * s1) {
+                angle = theta_h;
+            } else if (sector % 3 == 2 && sector < 3 * s2) {
+                angle = theta_w;
+            } else if (sector % 3 == 0 && sector < 3 * s0) {
+                angle = theta_t;
+            } else {
+                angle = theta_e;
+            }
+            theta_t *= theta_scale;
+            theta_h *= theta_scale;
+            theta_w *= theta_scale;
+            theta_e *= theta_scale;
+        } else {
+            angle = theta_t;
+            theta_t *= theta_scale;
+        }
+    }
+    const float s = sinf(angle);
+    const float c = cosf(angle);
+    const float a = hvec[i];
+    const float b = hvec[i + half];
+    hvec[i] = a * c - b * s;
+    hvec[i + half] = a * s + b * c;
+}
+
+__global__ void rope_imrope_qk_kernel(float *q, float *k, int n_q_heads, int n_k_heads, int head_dim,
+                                      int n_rot, int pos, float theta, int s0, int s1, int s2,
+                                      int s3) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = n_rot / 2;
+    const int q_pairs = n_q_heads * half;
+    const int total = q_pairs + n_k_heads * half;
+    if (idx >= total || n_rot <= 0 || n_rot > head_dim || (n_rot & 1) != 0) {
+        return;
+    }
+    if (idx < q_pairs) {
+        const int h = idx / half;
+        const int i = idx % half;
+        rope_imrope_pair(q + h * head_dim, i, half, n_rot, pos, theta, s0, s1, s2, s3);
+    } else {
+        const int j = idx - q_pairs;
+        const int h = j / half;
+        const int i = j % half;
+        rope_imrope_pair(k + h * head_dim, i, half, n_rot, pos, theta, s0, s1, s2, s3);
+    }
+}
+
+extern "C" int allpaca_cuda_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                                           int32_t head_dim, int32_t n_rot, int32_t pos, float theta,
+                                           const int32_t sections[4], allpaca_cuda_stream_t stream) {
+    if (!q || !k || !sections || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 || n_rot <= 0 ||
+        n_rot > head_dim || (n_rot & 1) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int half = n_rot / 2;
+    const int total = (n_q_heads + n_k_heads) * half;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    rope_imrope_qk_kernel<<<blocks, threads, 0, as_stream(stream)>>>(
+        q, k, n_q_heads, n_k_heads, head_dim, n_rot, pos, theta, sections[0], sections[1],
+        sections[2], sections[3]);
+    return cuda_status(cudaGetLastError());
+}
+
 __device__ float warp_sum32(float v) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {

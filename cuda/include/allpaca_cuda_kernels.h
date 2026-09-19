@@ -118,6 +118,12 @@ int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int
 int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
                       allpaca_cuda_stream_t stream);
 
+/* Qwen3.5 IMRoPE / partial NeoX on Q and K (HIP allpaca_rope_imrope_qk).
+ * Rotates first n_rot dims; sections[4] select (t,h,w,e). sections all-zero = plain partial. */
+int allpaca_cuda_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                                int32_t head_dim, int32_t n_rot, int32_t pos, float theta,
+                                const int32_t sections[4], allpaca_cuda_stream_t stream);
+
 /* Online-softmax attention (decode/prefill). q:[n_q,n_heads,d] k/v:[n_kv,n_kv_heads,d].
  * Matches HIP allpaca_attention argument order. */
 int allpaca_cuda_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
