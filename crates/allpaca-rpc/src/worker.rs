@@ -160,6 +160,10 @@ impl CpuWorker {
         Ok(())
     }
 
+    fn sync(&self) -> Result<(), RpcError> {
+        Ok(())
+    }
+
     fn launch_one(
         &mut self,
         op: KernelOp,
@@ -475,8 +479,9 @@ impl HipWorker {
     }
 
     fn clear(&mut self, id: BufId, value: u8) -> Result<(), RpcError> {
-        let zeros = vec![value; self.slot(id)?.bytes];
-        self.h2d(id, 0, &zeros)
+        let s = self.slot(id)?;
+        allpaca_hip::device_memset(s.ptr, value, s.bytes)
+            .map_err(|e| RpcError::Worker(e.to_string()))
     }
 
     fn launch(&mut self, list: &LaunchList) -> Result<(), RpcError> {
@@ -487,6 +492,10 @@ impl HipWorker {
             self.launch_one(item.op, &item.bufs, &item.i32s, &item.f32s)?;
         }
         Ok(())
+    }
+
+    fn sync(&self) -> Result<(), RpcError> {
+        allpaca_hip::stream_synchronize().map_err(|e| RpcError::Worker(e.to_string()))
     }
 
     fn ptr_f32(&self, id: BufId) -> Result<*mut f32, RpcError> {
@@ -574,34 +583,36 @@ impl HipWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::EmbedGather | KernelOp::Memcpy => {
-                // Fall back to host bounce for these less common ops.
-                let src = self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                let mut cpu = CpuWorker::new(1 << 30);
-                let a = cpu.alloc(self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                let b = cpu.alloc(src.len() as u64)?;
-                cpu.h2d(b, 0, &src)?;
                 if op == KernelOp::Memcpy {
-                    cpu.launch_one(op, &[need(bufs, 0)?, need(bufs, 1)?], i32s, f32s)?;
-                    // remap: copy into a from b after swapping ids — simpler host copy:
-                    let tmp = cpu.d2h(b, 0, src.len() as u64)?;
-                    self.h2d(need(bufs, 0)?, 0, &tmp)?;
-                    let _ = a;
-                } else {
-                    let table =
-                        self.d2h(need(bufs, 0)?, 0, self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                    let ids =
-                        self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                    let out_n = self.slot(need(bufs, 2)?)?.bytes as u64;
-                    let t = cpu.alloc(table.len() as u64)?;
-                    let i = cpu.alloc(ids.len() as u64)?;
-                    let o = cpu.alloc(out_n)?;
-                    cpu.h2d(t, 0, &table)?;
-                    cpu.h2d(i, 0, &ids)?;
-                    cpu.launch_one(op, &[t, i, o], i32s, f32s)?;
-                    let out = cpu.d2h(o, 0, out_n)?;
-                    self.h2d(need(bufs, 2)?, 0, &out)?;
-                    let _ = a;
+                    self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+                    return Ok(());
                 }
+                let dim = *i32s
+                    .first()
+                    .ok_or_else(|| RpcError::Worker("embed dim".into()))?;
+                let n_tok = *i32s.get(1).unwrap_or(&1);
+                if n_tok != 1 {
+                    return Err(RpcError::Worker(
+                        "hip embed_gather supports n_tok=1".into(),
+                    ));
+                }
+                let table = self.ptr_f32(need(bufs, 0)?)?;
+                let ids = self.slot(need(bufs, 1)?)?;
+                if ids.bytes < 4 {
+                    return Err(RpcError::Worker("embed id".into()));
+                }
+                let mut tok = 0i32;
+                allpaca_hip::memcpy(
+                    (&mut tok as *mut i32).cast(),
+                    ids.ptr,
+                    4,
+                    allpaca_hip::MEMCPY_D2H,
+                )
+                .map_err(|e| RpcError::Worker(e.to_string()))?;
+                let out = self.ptr_f32(need(bufs, 2)?)?;
+                self.hip
+                    .embed_gather(table, tok as u32, out, dim)
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
         }
         Ok(())
@@ -609,6 +620,9 @@ impl HipWorker {
 }
 
 /// CUDA worker: device arenas + CUDA kernel ABI (feature-gated).
+///
+/// Same `KernelOp` wire layout as [`HipWorker`] so coordinators treat AMD and
+/// NVIDIA RPC workers interchangeably after HELLO.
 #[cfg(feature = "cuda")]
 pub struct CudaWorker {
     cuda: allpaca_cuda::CudaWorkspace,
@@ -623,7 +637,7 @@ pub struct CudaWorker {
 #[cfg(feature = "cuda")]
 struct CudaSlot {
     gen: u32,
-    ptr: *mut u8,
+    ptr: *mut std::ffi::c_void,
     bytes: usize,
 }
 
@@ -633,6 +647,9 @@ unsafe impl Send for CudaWorker {}
 #[cfg(feature = "cuda")]
 impl CudaWorker {
     pub fn new(device: i32) -> Result<Self, RpcError> {
+        if allpaca_cuda::device_count() <= 0 {
+            return Err(RpcError::Worker("no CUDA device".into()));
+        }
         let cuda = allpaca_cuda::CudaWorkspace::new(device, 1 << 20)
             .map_err(|e| RpcError::Worker(e.to_string()))?;
         let memory_bytes = allpaca_cuda::enumerate_devices()
@@ -659,7 +676,10 @@ impl CudaWorker {
             kernel_abi_rev: KERNEL_ABI_REV,
             backend: RpcBackendKind::Cuda,
             dtype_mask: DTYPE_F32,
-            device_name: format!("cuda:{}", self.device),
+            device_name: match allpaca_cuda::device_sm_arch(self.device) {
+                Some((arch, _)) => format!("cuda:{}:{arch}", self.device),
+                None => format!("cuda:{}", self.device),
+            },
             memory_bytes: self.memory_bytes.saturating_sub(self.used),
         }
     }
@@ -684,7 +704,7 @@ impl CudaWorker {
             id,
             CudaSlot {
                 gen: 1,
-                ptr: ptr.cast(),
+                ptr,
                 bytes: bytes as usize,
             },
         );
@@ -694,7 +714,7 @@ impl CudaWorker {
 
     fn free(&mut self, id: BufId) -> Result<(), RpcError> {
         let s = self.slot(id)?;
-        allpaca_cuda::device_free(s.ptr.cast());
+        allpaca_cuda::device_free(s.ptr);
         let n = s.bytes as u64;
         self.slots.remove(&id.id);
         self.used = self.used.saturating_sub(n);
@@ -706,12 +726,13 @@ impl CudaWorker {
         if offset as usize + data.len() > s.bytes {
             return Err(RpcError::Worker("cuda h2d oob".into()));
         }
-        let dst = unsafe { s.ptr.add(offset as usize) };
-        allpaca_cuda::memcpy(
-            dst.cast(),
+        let dst = unsafe { s.ptr.cast::<u8>().add(offset as usize) }.cast();
+        allpaca_cuda::memcpy_on(
+            dst,
             data.as_ptr().cast(),
             data.len(),
             allpaca_cuda::MEMCPY_H2D,
+            self.cuda.raw_stream(),
         )
         .map_err(|e| RpcError::Worker(e.to_string()))?;
         if data.len() > 10 * 1024 * 1024 {
@@ -734,14 +755,18 @@ impl CudaWorker {
             return Err(RpcError::Worker("cuda d2h oob".into()));
         }
         let mut out = vec![0u8; size as usize];
-        let src = unsafe { s.ptr.add(offset as usize) };
-        allpaca_cuda::memcpy(
+        let src = unsafe { s.ptr.cast::<u8>().add(offset as usize) }.cast();
+        allpaca_cuda::memcpy_on(
             out.as_mut_ptr().cast(),
-            src.cast(),
+            src,
             size as usize,
             allpaca_cuda::MEMCPY_D2H,
+            self.cuda.raw_stream(),
         )
         .map_err(|e| RpcError::Worker(e.to_string()))?;
+        self.cuda
+            .synchronize()
+            .map_err(|e| RpcError::Worker(e.to_string()))?;
         Ok(out)
     }
 
@@ -749,19 +774,27 @@ impl CudaWorker {
         let src_s = self.slot(src)?;
         let dst_s = self.slot(dst)?;
         let n = src_s.bytes.min(dst_s.bytes);
-        allpaca_cuda::memcpy(
-            dst_s.ptr.cast(),
-            src_s.ptr.cast(),
+        allpaca_cuda::memcpy_on(
+            dst_s.ptr,
+            src_s.ptr,
             n,
             allpaca_cuda::MEMCPY_D2D,
+            self.cuda.raw_stream(),
         )
         .map_err(|e| RpcError::Worker(e.to_string()))?;
         Ok(())
     }
 
+    fn sync(&self) -> Result<(), RpcError> {
+        self.cuda
+            .synchronize()
+            .map_err(|e| RpcError::Worker(e.to_string()))
+    }
+
     fn clear(&mut self, id: BufId, value: u8) -> Result<(), RpcError> {
-        let zeros = vec![value; self.slot(id)?.bytes];
-        self.h2d(id, 0, &zeros)
+        let s = self.slot(id)?;
+        allpaca_cuda::memset_on(s.ptr, value, s.bytes, self.cuda.raw_stream())
+            .map_err(|e| RpcError::Worker(e.to_string()))
     }
 
     fn launch(&mut self, list: &LaunchList) -> Result<(), RpcError> {
@@ -785,19 +818,17 @@ impl CudaWorker {
     ) -> Result<(), RpcError> {
         match op {
             KernelOp::GemmNt => {
-                if i32s.len() < 3 {
-                    return Err(RpcError::Worker("cuda gemm shape".into()));
-                }
+                let m = i32s[0];
+                let n = i32s[1];
+                let k = i32s[2];
                 let a = self.ptr_f32(need(bufs, 0)?)?;
                 let b = self.ptr_f32(need(bufs, 1)?)?;
                 let c = self.ptr_f32(need(bufs, 2)?)?;
-                allpaca_cuda::gemm_nt_device(a, b, c, i32s[0], i32s[1], i32s[2])
+                self.cuda
+                    .gemm_nt_dev(a, b, c, m, n, k)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::Attention => {
-                if i32s.len() < 5 {
-                    return Err(RpcError::Worker("cuda attn shape".into()));
-                }
                 let n_q = i32s[0];
                 let n_kv = i32s[1];
                 let n_heads = i32s[2];
@@ -830,16 +861,17 @@ impl CudaWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::Rope => {
-                if i32s.len() < 3 {
-                    return Err(RpcError::Worker("cuda rope shape".into()));
-                }
+                let n_heads = i32s[0];
+                let head_dim = i32s[1];
+                let pos = i32s[2];
                 let theta = *f32s.first().unwrap_or(&10_000.0);
                 let x = self.ptr_f32(need(bufs, 0)?)?;
                 self.cuda
-                    .rope_dev(x, i32s[0], i32s[1], i32s[2], theta)
+                    .rope_dev(x, n_heads, head_dim, pos, theta)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::SiluMul => {
+                // Wire ABI matches HIP: in-place silu(gate)*up into buf0.
                 let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
                 let gate = self.ptr_f32(need(bufs, 0)?)?;
                 let up = self.ptr_f32(need(bufs, 1)?)?;
@@ -848,52 +880,51 @@ impl CudaWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::ResidualAdd => {
+                // Wire ABI matches HIP: in-place x += residual into buf0.
                 let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
-                let dst = self.ptr_f32(need(bufs, 0)?)?;
-                let src = self.ptr_f32(need(bufs, 1)?)?;
+                let x = self.ptr_f32(need(bufs, 0)?)?;
+                let y = self.ptr_f32(need(bufs, 1)?)?;
                 self.cuda
-                    .residual_add_dev(dst, src, dst, n)
+                    .residual_add_dev(x, y, x, n)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
-            KernelOp::EmbedGather | KernelOp::Memcpy => {
-                let src = self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                let mut cpu = CpuWorker::new(1 << 30);
-                let a = cpu.alloc(self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                let b = cpu.alloc(src.len() as u64)?;
-                cpu.h2d(b, 0, &src)?;
-                if op == KernelOp::Memcpy {
-                    let tmp = cpu.d2h(b, 0, src.len() as u64)?;
-                    self.h2d(need(bufs, 0)?, 0, &tmp)?;
-                    let _ = a;
-                } else {
-                    let table =
-                        self.d2h(need(bufs, 0)?, 0, self.slot(need(bufs, 0)?)?.bytes as u64)?;
-                    let ids =
-                        self.d2h(need(bufs, 1)?, 0, self.slot(need(bufs, 1)?)?.bytes as u64)?;
-                    let out_n = self.slot(need(bufs, 2)?)?.bytes as u64;
-                    let t = cpu.alloc(table.len() as u64)?;
-                    let i = cpu.alloc(ids.len() as u64)?;
-                    let o = cpu.alloc(out_n)?;
-                    cpu.h2d(t, 0, &table)?;
-                    cpu.h2d(i, 0, &ids)?;
-                    cpu.launch_one(op, &[t, i, o], i32s, f32s)?;
-                    let out = cpu.d2h(o, 0, out_n)?;
-                    self.h2d(need(bufs, 2)?, 0, &out)?;
-                    let _ = a;
+            KernelOp::Memcpy => {
+                self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+            }
+            KernelOp::EmbedGather => {
+                let dim = *i32s
+                    .first()
+                    .ok_or_else(|| RpcError::Worker("embed dim".into()))?;
+                let n_tok = *i32s.get(1).unwrap_or(&1);
+                if n_tok != 1 {
+                    return Err(RpcError::Worker(
+                        "cuda embed_gather supports n_tok=1".into(),
+                    ));
                 }
+                let table = self.ptr_f32(need(bufs, 0)?)?;
+                let ids = self.slot(need(bufs, 1)?)?;
+                if ids.bytes < 4 {
+                    return Err(RpcError::Worker("embed id".into()));
+                }
+                let mut tok = 0i32;
+                allpaca_cuda::memcpy_on(
+                    (&mut tok as *mut i32).cast(),
+                    ids.ptr,
+                    4,
+                    allpaca_cuda::MEMCPY_D2H,
+                    self.cuda.raw_stream(),
+                )
+                .map_err(|e| RpcError::Worker(e.to_string()))?;
+                self.cuda
+                    .synchronize()
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+                let out = self.ptr_f32(need(bufs, 2)?)?;
+                self.cuda
+                    .embed_gather_dev(table, tok, out, dim)
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for CudaWorker {
-    fn drop(&mut self) {
-        for s in self.slots.values() {
-            allpaca_cuda::device_free(s.ptr.cast());
-        }
-        self.slots.clear();
     }
 }
 
@@ -996,13 +1027,31 @@ impl WorkerBackend {
         }
     }
 
+    fn sync(&self) -> Result<(), RpcError> {
+        match self {
+            Self::Cpu(w) => w.sync(),
+            #[cfg(feature = "hip")]
+            Self::Hip(w) => w.sync(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(w) => w.sync(),
+        }
+    }
+
     fn mem_info(&self) -> (u64, u64) {
         match self {
             Self::Cpu(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
             #[cfg(feature = "hip")]
-            Self::Hip(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
+            Self::Hip(w) => {
+                allpaca_hip::device_memory_info(w.device).unwrap_or_else(|_| {
+                    (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)
+                })
+            }
             #[cfg(feature = "cuda")]
-            Self::Cuda(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
+            Self::Cuda(w) => {
+                allpaca_cuda::device_memory_info(w.device).unwrap_or_else(|_| {
+                    (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)
+                })
+            }
         }
     }
 }
@@ -1166,6 +1215,9 @@ fn handle(
             write_u32(&mut out, 1);
             Ok(out)
         }
-        Cmd::Sync => Ok(Vec::new()),
+        Cmd::Sync => {
+            backend.sync()?;
+            Ok(Vec::new())
+        }
     }
 }

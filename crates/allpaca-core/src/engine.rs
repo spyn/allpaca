@@ -246,6 +246,98 @@ fn rpc_hello_token(config: &Config) -> String {
         .unwrap_or_default()
 }
 
+fn scale_kv_vram_from_inventory(config: &mut Config, inventory: &DeviceInventory) {
+    let compiled = allpaca_types::KvSection::default().vram_bytes;
+    if config.kv.vram_bytes != compiled {
+        return;
+    }
+    let gpu_mem = inventory
+        .devices
+        .iter()
+        .filter(|d| d.is_gpu() && !d.is_rpc())
+        .map(|d| d.memory_bytes)
+        .max()
+        .unwrap_or(0);
+    let suggested = crate::suggested_kv_vram_bytes(gpu_mem);
+    if suggested > config.kv.vram_bytes {
+        tracing::info!(
+            suggested,
+            gpu_mem,
+            mode = ?inventory.pipeline_mode,
+            "scaled kv.vram_bytes from GPU capacity"
+        );
+        config.kv.vram_bytes = suggested;
+    }
+}
+
+#[cfg(test)]
+mod scale_kv_tests {
+    use super::scale_kv_vram_from_inventory;
+    use allpaca_types::{
+        Config, DeviceInfo, DeviceKind, PipelineMode, TransferPath,
+    };
+    use crate::device_manager::DeviceInventory;
+
+    fn cuda_12gb_inventory() -> DeviceInventory {
+        DeviceInventory {
+            devices: vec![
+                DeviceInfo::cpu(),
+                DeviceInfo {
+                    id: 0,
+                    kind: DeviceKind::CudaGpu,
+                    name: "RTX 3060".into(),
+                    memory_bytes: 12 << 30,
+                    bandwidth_gbps: 360.0,
+                    peers: vec![],
+                },
+            ],
+            pipeline_mode: PipelineMode::MobileTiered,
+            transfer_path: TransferPath::HostStaging,
+            transfer_benchmark: None,
+            p2p_capable: false,
+            p2p_enabled: false,
+            target_device: 0,
+            draft_device: -1,
+            vision_device: None,
+        }
+    }
+
+    #[test]
+    fn scales_compiled_default_kv_for_12gb_cuda() {
+        let mut cfg = Config::compiled_defaults();
+        assert_eq!(cfg.kv.vram_bytes, 4 * 1024 * 1024);
+        scale_kv_vram_from_inventory(&mut cfg, &cuda_12gb_inventory());
+        assert_eq!(cfg.kv.vram_bytes, 4usize << 30);
+    }
+
+    #[test]
+    fn scales_8gb_laptop_to_half_vram() {
+        let mut inv = cuda_12gb_inventory();
+        inv.devices[1].name = "Ada laptop".into();
+        inv.devices[1].memory_bytes = 8 << 30;
+        let mut cfg = Config::compiled_defaults();
+        scale_kv_vram_from_inventory(&mut cfg, &inv);
+        assert_eq!(cfg.kv.vram_bytes, 4usize << 30);
+    }
+
+    #[test]
+    fn scales_6gb_card_below_cap() {
+        let mut inv = cuda_12gb_inventory();
+        inv.devices[1].memory_bytes = 6 << 30;
+        let mut cfg = Config::compiled_defaults();
+        scale_kv_vram_from_inventory(&mut cfg, &inv);
+        assert_eq!(cfg.kv.vram_bytes, 3usize << 30);
+    }
+
+    #[test]
+    fn preserves_explicit_kv_override() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.kv.vram_bytes = 256 * 1024 * 1024;
+        scale_kv_vram_from_inventory(&mut cfg, &cuda_12gb_inventory());
+        assert_eq!(cfg.kv.vram_bytes, 256 * 1024 * 1024);
+    }
+}
+
 impl Engine {
     pub fn new(config: Config) -> Result<Self, AllpacaError> {
         let mut config = config;
@@ -259,6 +351,7 @@ impl Engine {
         }
         config.validate()?;
         let mut inventory = DeviceInventory::discover(&config);
+        scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
             None
         } else {
@@ -473,52 +566,67 @@ impl Engine {
     /// Refresh driver VRAM and GPU busy into [`Metrics`], at most once per
     /// [`GpuSampler`] window, and hand the busy fraction to `q*`.
     ///
-    /// `hipMemGetInfo` is a driver round-trip, so this belongs to scheduler
-    /// safe points and `/stats` only. Decode must never call it. AMD SMI would
-    /// add per-GPU power here; ROCm does not ship it on Windows, and the busy
-    /// fraction below is measured from HIP events anyway.
+    /// `hipMemGetInfo` / `cudaMemGetInfo` are driver round-trips, so this belongs
+    /// to scheduler safe points and `/stats` only. Decode must never call it.
     fn sample_gpu(&self) {
-        let Some(hip) = self.hip.as_ref() else {
-            return;
-        };
         if !self.gpu_sampler.due() {
             return;
         }
-        let read = |dev: i32| {
-            allpaca_hip::device_memory_info(dev)
-                .map(|(free, total)| (total.saturating_sub(free), total))
-                .unwrap_or((0, 0))
-        };
-        let target_dev = self.inventory.target_device.max(0);
-        let (used, total) = read(target_dev);
-        // Reading a second device forces a rebind, and a rebind costs a
-        // driver-wide lock that decode threads are contending for. Skip it
-        // until the draft GPU has actually run something worth watching.
-        let draft_dev = self.inventory.draft_device;
-        let draft_live = self
-            .metrics
-            .draft_gpu_forwards
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0;
-        let (draft_used, draft_total) =
-            if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
-                read(draft_dev)
-            } else {
-                (0, 0)
+        #[cfg(feature = "hip")]
+        if let Some(hip) = self.hip.as_ref() {
+            let read = |dev: i32| {
+                allpaca_hip::device_memory_info(dev)
+                    .map(|(free, total)| (total.saturating_sub(free), total))
+                    .unwrap_or((0, 0))
             };
-        // Share of decode wall time the GPU spent in allpaca kernels. The
-        // profile is an EMA of the last decode steps, so no differencing.
-        let p = hip.decode_profile();
-        let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
-        let wall_us = gpu_us + p.host_us;
-        let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
-        self.metrics
-            .record_gpu_sample(used, total, draft_used, draft_total, util);
-        if let Ok(g) = self.lock() {
-            if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
-                lru.set_gpu_busy(util);
+            let target_dev = self.inventory.target_device.max(0);
+            let (used, total) = read(target_dev);
+            let draft_dev = self.inventory.draft_device;
+            let draft_live = self
+                .metrics
+                .draft_gpu_forwards
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0;
+            let (draft_used, draft_total) =
+                if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
+                    read(draft_dev)
+                } else {
+                    (0, 0)
+                };
+            let p = hip.decode_profile();
+            let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
+            let wall_us = gpu_us + p.host_us;
+            let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
+            self.metrics
+                .record_gpu_sample(used, total, draft_used, draft_total, util);
+            if let Ok(g) = self.lock() {
+                if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
+                    lru.set_gpu_busy(util);
+                }
             }
+            return;
         }
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() {
+            let target_dev = self.inventory.target_device.max(0);
+            let (used, total) = allpaca_cuda::device_memory_info(target_dev)
+                .map(|(free, total)| (total.saturating_sub(free), total))
+                .unwrap_or((0, 0));
+            let p = self
+                .cuda
+                .as_ref()
+                .map(|c| c.decode_profile())
+                .unwrap_or_default();
+            let wall = p.gpu_us + p.host_us;
+            let util = if wall > 0.0 { p.gpu_us / wall } else { 0.0 };
+            self.metrics
+                .record_gpu_sample(used, total, 0, 0, util);
+        }
+    }
+
+    /// Configured KV VRAM budget after boot-time GPU capacity scaling.
+    pub fn kv_vram_budget_bytes(&self) -> usize {
+        self.config.kv.vram_bytes
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -848,6 +956,26 @@ impl Engine {
         drop(inner);
         self.upload_resident_weights()?;
         self.note_early_exit_gate()?;
+        Ok(())
+    }
+
+    /// Install a ready synthetic `TinyModel` (e.g. SSM hybrid) and upload resident weights.
+    pub fn load_synthetic_model(&self, mut target: TinyModel) -> Result<(), AllpacaError> {
+        let mut inner = self.lock()?;
+        let vocab = target.config.vocab_size;
+        let n_layers = target.config.n_layers;
+        let tokenizer = EngineTokenizer::synthetic(vocab)?;
+        inner.ring.resize_vocab(vocab);
+        self.apply_weight_working_set(&mut target)?;
+        self.apply_expert_lru(&mut target)?;
+        self.attach_rpc(&mut target)?;
+        inner.target = Some(Arc::new(target));
+        set_tokenizer(&mut inner, tokenizer);
+        inner.model_id = "synthetic".into();
+        drop(inner);
+        self.upload_resident_weights()?;
+        self.note_early_exit_gate()?;
+        tracing::info!(vocab, layers = n_layers, "loaded synthetic TinyModel");
         Ok(())
     }
 

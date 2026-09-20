@@ -17,7 +17,7 @@ This bundle contains the deep-research assessment and implementation plan for a 
 
 The engine should be a **heterogeneous scheduler + memory-fabric runtime** rather than another generic single-device transformer implementation.
 
-Operator HIP notes (Debian 13 compiler SDK, `CONFIG_PCI_P2PDMA` kernel, memcpyPeer vs EnablePeerAccess) live in the repo root [`README.md`](../README.md) under **Build → HIP / AMD GPU**.
+Operator HIP notes (Debian 13 compiler SDK, `CONFIG_PCI_P2PDMA` kernel, memcpyPeer vs EnablePeerAccess) live in the repo root [`README.md`](../README.md) under **Build → HIP / AMD GPU**. CUDA 3060 / Blackwell laptop runbook (device tests skipped on toolkit-only hosts) is **Build → CUDA / NVIDIA GPU**.
 
 ## Important corrections
 

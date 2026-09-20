@@ -14,6 +14,10 @@ static int cuda_status(cudaError_t err) {
     if (err == cudaSuccess) {
         return ALLPACA_OK;
     }
+    /* API return already encodes the failure; clear the sticky mirror so a
+     * later cudaGetLastError() after an unrelated launch is not poisoned
+     * (e.g. cudaHostRegister / cudaFreeAsync unsupported on Kepler). */
+    (void)cudaGetLastError();
     return ALLPACA_ERR_DEVICE;
 }
 
@@ -47,15 +51,40 @@ extern "C" int allpaca_cuda_device_props(int32_t id, char *name, int32_t name_le
     }
     std::snprintf(name, static_cast<size_t>(name_len), "%s", prop.name);
     *memory_bytes = static_cast<uint64_t>(prop.totalGlobalMem);
-#if CUDART_VERSION < 12000
-    /* Theoretical peak: 2 * clock(kHz) * bus_width(bits) / 8 → GB/s.
-     * CUDA 12+ removed memoryClockRate; leave 0 and let the scheduler
-     * treat bandwidth as unknown until a real benchmark runs. */
-    *bandwidth_gbps = 2.0 * (static_cast<double>(prop.memoryClockRate) / 1.0e6) *
-                      (static_cast<double>(prop.memoryBusWidth) / 8.0);
-#else
+    /* CUDA 13 dropped memoryClockRate from cudaDeviceProp; query attributes.
+     * Same theoretical peak as HIP: clock (GHz) * bus bytes * 2 (DDR). */
+    int mem_clock_khz = 0;
+    int bus_width_bits = 0;
+    const cudaError_t clk =
+        cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, id);
+    const cudaError_t bus =
+        cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, id);
     *bandwidth_gbps = 0.0;
-#endif
+    if (clk == cudaSuccess && bus == cudaSuccess && mem_clock_khz > 0 && bus_width_bits > 0) {
+        const double clock_ghz = static_cast<double>(mem_clock_khz) / 1.0e6;
+        const double bytes_per_cycle = static_cast<double>(bus_width_bits) / 8.0 * 2.0;
+        *bandwidth_gbps = clock_ghz * bytes_per_cycle;
+    }
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_device_arch(int32_t id, char *arch, int32_t arch_len,
+                                       int32_t *l2_bytes) {
+    if (!arch || arch_len <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaDeviceProp prop;
+    if (cuda_status(cudaGetDeviceProperties(&prop, id)) != ALLPACA_OK) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    /* major.minor → sm_86 / sm_120 (single-digit minor). */
+    if (prop.major <= 0 || prop.minor < 0 || prop.minor > 9) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    std::snprintf(arch, static_cast<size_t>(arch_len), "sm_%d%d", prop.major, prop.minor);
+    if (l2_bytes) {
+        *l2_bytes = prop.l2CacheSize;
+    }
     return ALLPACA_OK;
 }
 
@@ -76,12 +105,57 @@ extern "C" int allpaca_cuda_free(void *ptr) {
     return cuda_status(cudaFree(ptr));
 }
 
+extern "C" int allpaca_cuda_free_async(void *ptr, allpaca_cuda_stream_t stream) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    cudaStream_t s = as_stream(stream);
+    if (s) {
+        cudaError_t err = cudaFreeAsync(ptr, s);
+        if (err == cudaSuccess) {
+            return ALLPACA_OK;
+        }
+        /* Kepler / older drivers: stream-ordered alloc unsupported. */
+        (void)cudaGetLastError();
+    }
+    return cuda_status(cudaFree(ptr));
+}
+
+extern "C" int allpaca_cuda_host_malloc(void **ptr, size_t bytes) {
+    if (!ptr || bytes == 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(cudaHostAlloc(ptr, bytes, cudaHostAllocDefault));
+}
+
+extern "C" int allpaca_cuda_host_free(void *ptr) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaFreeHost(ptr));
+}
+
+extern "C" int allpaca_cuda_host_register(void *ptr, size_t bytes, unsigned int flags) {
+    if (!ptr || bytes == 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(cudaHostRegister(ptr, bytes, flags));
+}
+
+extern "C" int allpaca_cuda_host_unregister(void *ptr) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaHostUnregister(ptr));
+}
+
 extern "C" int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                                    allpaca_cuda_stream_t stream) {
     if ((!dst && bytes) || (!src && bytes)) {
         return ALLPACA_ERR_INVALID;
     }
     cudaMemcpyKind ck = cudaMemcpyDefault;
+    bool force_async = false;
     switch (kind) {
     case ALLPACA_MEMCPY_H2D:
         ck = cudaMemcpyHostToDevice;
@@ -92,19 +166,170 @@ extern "C" int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int
     case ALLPACA_MEMCPY_D2D:
         ck = cudaMemcpyDeviceToDevice;
         break;
+    case ALLPACA_MEMCPY_D2H_ASYNC:
+        ck = cudaMemcpyDeviceToHost;
+        force_async = true;
+        break;
     default:
         ck = cudaMemcpyDefault;
         break;
     }
     cudaStream_t s = as_stream(stream);
-    if (s) {
+    if (s || force_async) {
         return cuda_status(cudaMemcpyAsync(dst, src, bytes, ck, s));
     }
     return cuda_status(cudaMemcpy(dst, src, bytes, ck));
 }
 
+extern "C" int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count,
+                                         int32_t kind, allpaca_cuda_stream_t stream) {
+    if (!dsts || !srcs || !sizes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (count == 0) {
+        return ALLPACA_OK;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!dsts[i] || !srcs[i]) {
+            return ALLPACA_ERR_INVALID;
+        }
+    }
+    cudaMemcpyKind ck = cudaMemcpyDefault;
+    switch (kind) {
+    case ALLPACA_MEMCPY_H2D:
+        ck = cudaMemcpyHostToDevice;
+        break;
+    case ALLPACA_MEMCPY_D2H:
+    case ALLPACA_MEMCPY_D2H_ASYNC:
+        ck = cudaMemcpyDeviceToHost;
+        break;
+    case ALLPACA_MEMCPY_D2D:
+        ck = cudaMemcpyDeviceToDevice;
+        break;
+    default:
+        ck = cudaMemcpyDefault;
+        break;
+    }
+    cudaStream_t s = as_stream(stream);
+    for (size_t i = 0; i < count; ++i) {
+        cudaError_t err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], ck, s);
+        if (err != cudaSuccess) {
+            return ALLPACA_ERR_DEVICE;
+        }
+    }
+    if (kind == ALLPACA_MEMCPY_D2H) {
+        if (s) {
+            return cuda_status(cudaStreamSynchronize(s));
+        }
+        return cuda_status(cudaDeviceSynchronize());
+    }
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_memset(void *dst, int32_t value, size_t bytes,
+                                   allpaca_cuda_stream_t stream) {
+    if (!dst && bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (bytes == 0) {
+        return ALLPACA_OK;
+    }
+    cudaStream_t s = as_stream(stream);
+    const int fill = value & 0xff;
+    if (s) {
+        return cuda_status(cudaMemsetAsync(dst, fill, bytes, s));
+    }
+    return cuda_status(cudaMemset(dst, fill, bytes));
+}
+
 extern "C" int allpaca_cuda_set_device(int32_t device) {
     return cuda_status(cudaSetDevice(device));
+}
+
+extern "C" int allpaca_cuda_can_p2p(int32_t src, int32_t dst, int32_t *can) {
+    if (!can) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int yes = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&yes, src, dst);
+    if (err != cudaSuccess) {
+        *can = 0;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *can = yes;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_enable_peer_access(int32_t src, int32_t dst) {
+    cudaError_t err = cudaSetDevice(src);
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    err = cudaDeviceEnablePeerAccess(dst, 0);
+    if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
+                                        size_t bytes, allpaca_cuda_stream_t stream) {
+    if ((!dst && bytes) || (!src && bytes)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaStream_t s = as_stream(stream);
+    cudaError_t err = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (s) {
+        return cuda_status(cudaStreamSynchronize(s));
+    }
+    return cuda_status(cudaDeviceSynchronize());
+}
+
+extern "C" int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes) {
+    if (!free_bytes || !total_bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int prev = 0;
+    cudaError_t err = cudaGetDevice(&prev);
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    const bool rebind = prev != device;
+    if (rebind) {
+        err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            return ALLPACA_ERR_DEVICE;
+        }
+    }
+    size_t free_b = 0;
+    size_t total_b = 0;
+    err = cudaMemGetInfo(&free_b, &total_b);
+    if (rebind) {
+        (void)cudaSetDevice(prev);
+    }
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *free_bytes = static_cast<uint64_t>(free_b);
+    *total_bytes = static_cast<uint64_t>(total_b);
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_mem_used(int32_t device, uint64_t *used_bytes) {
+    if (!used_bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    uint64_t free_b = 0;
+    uint64_t total_b = 0;
+    int rc = allpaca_cuda_mem_info(device, &free_b, &total_b);
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    *used_bytes = total_b - free_b;
+    return ALLPACA_OK;
 }
 
 extern "C" int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream) {
@@ -113,6 +338,91 @@ extern "C" int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream) {
         return cuda_status(cudaStreamSynchronize(s));
     }
     return cuda_status(cudaDeviceSynchronize());
+}
+
+extern "C" int allpaca_cuda_stream_create(allpaca_cuda_stream_t *stream) {
+    if (!stream) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaStream_t s = nullptr;
+    cudaError_t err = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        *stream = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *stream = s;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_stream_destroy(allpaca_cuda_stream_t stream) {
+    if (!stream) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaStreamDestroy(as_stream(stream)));
+}
+
+extern "C" int allpaca_cuda_event_create(void **event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaEvent_t ev = nullptr;
+    cudaError_t err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        *event = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *event = ev;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_event_create_timing(void **event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    cudaEvent_t ev = nullptr;
+    cudaError_t err = cudaEventCreateWithFlags(&ev, cudaEventDefault);
+    if (err != cudaSuccess) {
+        *event = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *event = ev;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_event_destroy(void *event) {
+    if (!event) {
+        return ALLPACA_OK;
+    }
+    return cuda_status(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
+}
+
+extern "C" int allpaca_cuda_event_record(void *event, allpaca_cuda_stream_t stream) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(cudaEventRecord(static_cast<cudaEvent_t>(event), as_stream(stream)));
+}
+
+extern "C" int allpaca_cuda_event_elapsed_us(void *start, void *stop, double *us) {
+    if (!start || !stop || !us) {
+        return ALLPACA_ERR_INVALID;
+    }
+    float ms = 0.0f;
+    cudaError_t err = cudaEventElapsedTime(
+        &ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(stop));
+    if (err != cudaSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    *us = static_cast<double>(ms) * 1000.0;
+    return ALLPACA_OK;
+}
+
+extern "C" int allpaca_cuda_stream_wait_event(allpaca_cuda_stream_t stream, void *event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return cuda_status(
+        cudaStreamWaitEvent(as_stream(stream), static_cast<cudaEvent_t>(event), 0));
 }
 
 __global__ void gemm_nt_kernel(const float *a, const float *b, float *c, int m, int n, int k) {
@@ -141,11 +451,10 @@ extern "C" int allpaca_cuda_gemm_nt(const float *a, const float *b, float *c, in
     return cuda_status(cudaGetLastError());
 }
 
-/* Staged Q8_0: 36-byte blocks, f32 scale at 0, qs[32] at 4 (matches HIP). */
+/* Staged Q8_0: f32 scale at 0, qs at 4, 36-byte stride (HIP Q8_STAGED_*). */
 constexpr int Q8_STAGED_STRIDE = 36;
 constexpr int Q8_STAGED_QS = 4;
 
-/* Float A × Q8 weight. Decode M≤8 layout: 8 cols/warp, A row in shared memory. */
 __global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                         int k) {
     constexpr int WARPS = 16;
@@ -216,44 +525,121 @@ __global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float 
     }
 }
 
+__global__ void gemm_nt_q8_0_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                          int k) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 32;
+    constexpr int TX = 16;
+    constexpr int TY = 16;
+    constexpr int TM = BM / TY;
+    constexpr int TN = BN / TX;
+
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BN][BK + 1];
+
+    const int row0 = static_cast<int>(blockIdx.y) * BM;
+    const int col0 = static_cast<int>(blockIdx.x) * BN;
+    const int tx = static_cast<int>(threadIdx.x);
+    const int ty = static_cast<int>(threadIdx.y);
+    const int tid = ty * TX + tx;
+    const int nblocks = (k + 31) / 32;
+    const size_t brow_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int k0 = 0; k0 < k; k0 += BK) {
+        const int blk = k0 / BK;
+        for (int t = tid; t < BM * BK; t += TX * TY) {
+            const int r = t / BK;
+            const int p = t % BK;
+            const int gr = row0 + r;
+            const int gp = k0 + p;
+            As[r][p] = (gr < m && gp < k) ? a[static_cast<size_t>(gr) * static_cast<size_t>(k) + gp]
+                                         : 0.0f;
+        }
+        for (int t = tid; t < BN * BK; t += TX * TY) {
+            const int col = t / BK;
+            const int p = t % BK;
+            const int gc = col0 + col;
+            const int gp = k0 + p;
+            float v = 0.0f;
+            if (gc < n && gp < k) {
+                const uint8_t *bp = b + static_cast<size_t>(gc) * brow_stride +
+                                    static_cast<size_t>(blk) * static_cast<size_t>(Q8_STAGED_STRIDE);
+                const float d = *reinterpret_cast<const float *>(bp);
+                v = d * static_cast<float>(static_cast<int8_t>(bp[Q8_STAGED_QS + p]));
+            }
+            Bs[col][p] = v;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BK; ++p) {
+            float av[TM];
+            float bv[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                av[i] = As[ty * TM + i][p];
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                bv[j] = Bs[tx * TN + j][p];
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += av[i] * bv[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gr = row0 + ty * TM + i;
+        if (gr >= m) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int gc = col0 + tx * TN + j;
+            if (gc < n) {
+                c[static_cast<size_t>(gr) * static_cast<size_t>(n) + gc] = acc[i][j];
+            }
+        }
+    }
+}
+
 extern "C" int allpaca_cuda_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m,
                                          int32_t n, int32_t k, allpaca_cuda_stream_t stream) {
     if (!a || !b || !c || m <= 0 || n <= 0 || k <= 0) {
         return ALLPACA_ERR_INVALID;
     }
-    constexpr int warps = 16;
-    constexpr int cols = 8;
-    constexpr int cols_per_block = warps * cols;
-    dim3 block(512);
-    dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
-              static_cast<unsigned>(m));
-    gemv_nt_q8_0_f32_kernel<<<grid, block, 0, as_stream(stream)>>>(a, b, c, m, n, k);
-    return cuda_status(cudaGetLastError());
-}
-
-__global__ void embed_gather_q8_0_kernel(const uint8_t *table, int token, float *out, int dim) {
-    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (i >= dim) {
-        return;
+    if (m > 8) {
+        constexpr int BM = 64;
+        constexpr int BN = 64;
+        dim3 block(16, 16);
+        dim3 grid(static_cast<unsigned>((n + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+        gemm_nt_q8_0_tiled_kernel<<<grid, block, 0, as_stream(stream)>>>(a, b, c, m, n, k);
+    } else {
+        constexpr int warps = 16;
+        constexpr int cols = 8;
+        constexpr int cols_per_block = warps * cols;
+        dim3 block(512);
+        dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
+                  static_cast<unsigned>(m));
+        gemv_nt_q8_0_f32_kernel<<<grid, block, 0, as_stream(stream)>>>(a, b, c, m, n, k);
     }
-    const int blocks_per_row = (dim + 31) / 32;
-    const int b = i / 32;
-    const int j = i % 32;
-    const uint8_t *blk =
-        table + (static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row) +
-                 static_cast<size_t>(b)) *
-                    Q8_STAGED_STRIDE;
-    const float d = *reinterpret_cast<const float *>(blk);
-    out[i] = d * static_cast<float>(static_cast<int8_t>(blk[Q8_STAGED_QS + j]));
-}
-
-extern "C" int allpaca_cuda_embed_gather_q8_0(const uint8_t *table, int32_t token, float *out,
-                                              int32_t dim, allpaca_cuda_stream_t stream) {
-    if (!table || !out || dim <= 0 || token < 0) {
-        return ALLPACA_ERR_INVALID;
-    }
-    const int blocks = (dim + 255) / 256;
-    embed_gather_q8_0_kernel<<<blocks, 256, 0, as_stream(stream)>>>(table, token, out, dim);
     return cuda_status(cudaGetLastError());
 }
 
@@ -295,8 +681,369 @@ extern "C" int allpaca_cuda_silu_mul(const float *gate, const float *up, float *
     return cuda_status(cudaGetLastError());
 }
 
-/* Single-block RMSNorm for decode-sized rows (n fits one reduction). */
+__global__ void gelu_mul_kernel(const float *gate, const float *up, float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        /* Exact GELU via erff — matches HIP allpaca_gelu_mul / approx CPU gelu. */
+        float gelu = 0.5f * g * (1.0f + erff(g * 0.7071067811865476f));
+        out[i] = gelu * up[i];
+    }
+}
+
+extern "C" int allpaca_cuda_gelu_mul(const float *gate, const float *up, float *out, int32_t n,
+                                     allpaca_cuda_stream_t stream) {
+    if (!gate || !up || !out || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    gelu_mul_kernel<<<grid, block, 0, as_stream(stream)>>>(gate, up, out, n);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void relu_sqr_kernel(float *x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v > 0.f ? v * v : 0.f;
+    }
+}
+
+extern "C" int allpaca_cuda_relu_sqr(float *x, int32_t n, allpaca_cuda_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    relu_sqr_kernel<<<grid, block, 0, as_stream(stream)>>>(x, n);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void silu_kernel(float *x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v / (1.f + expf(-v));
+    }
+}
+
+extern "C" int allpaca_cuda_silu(float *x, int32_t n, allpaca_cuda_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    silu_kernel<<<grid, block, 0, as_stream(stream)>>>(x, n);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void scale_f32_kernel(float *x, float scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] *= scale;
+    }
+}
+
+extern "C" int allpaca_cuda_scale_f32(float *x, int32_t n, float scale,
+                                      allpaca_cuda_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    scale_f32_kernel<<<grid, block, 0, as_stream(stream)>>>(x, scale, n);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void expand_k_heads_kernel(const float *src, float *dst, int n_k, int n_v, int head_k) {
+    int vh = static_cast<int>(blockIdx.x);
+    int j = static_cast<int>(threadIdx.x);
+    if (vh >= n_v || j >= head_k) {
+        return;
+    }
+    int kh = vh % n_k;
+    dst[vh * head_k + j] = src[kh * head_k + j];
+}
+
+extern "C" int allpaca_cuda_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v,
+                                           int32_t head_k, allpaca_cuda_stream_t stream) {
+    if (!src || !dst || n_k <= 0 || n_v <= 0 || head_k <= 0 || (n_v % n_k) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    expand_k_heads_kernel<<<static_cast<unsigned>(n_v), static_cast<unsigned>(head_k), 0,
+                            as_stream(stream)>>>(src, dst, n_k, n_v, head_k);
+    return cuda_status(cudaGetLastError());
+}
+
+__device__ inline float gdn_softplus(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+__global__ void gdn_decay_beta_kernel(const float *alpha, const float *dt_bias, const float *a,
+                                      float *decay, float *beta, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    decay[i] = expf(gdn_softplus(alpha[i] + dt_bias[i]) * a[i]);
+    beta[i] = 1.0f / (1.0f + expf(-beta[i]));
+}
+
+extern "C" int allpaca_cuda_gdn_decay_beta(const float *alpha, const float *dt_bias, const float *a,
+                                           float *decay, float *beta, int32_t n,
+                                           allpaca_cuda_stream_t stream) {
+    if (!alpha || !dt_bias || !a || !decay || !beta || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    gdn_decay_beta_kernel<<<grid, block, 0, as_stream(stream)>>>(alpha, dt_bias, a, decay, beta, n);
+    return cuda_status(cudaGetLastError());
+}
+
+__device__ inline float gdn_silu(float x) { return x / (1.0f + expf(-x)); }
+
+__global__ void gdn_conv1d_compute_kernel(const float *x, const float *kernel,
+                                          const float *conv_state, float *out, int qkv_dim,
+                                          int conv_kernel) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= qkv_dim) {
+        return;
+    }
+    int hist = conv_kernel - 1;
+    float acc = 0.0f;
+    for (int i = 0; i < hist; ++i) {
+        acc += kernel[i + c * conv_kernel] * conv_state[i * qkv_dim + c];
+    }
+    acc += kernel[(conv_kernel - 1) + c * conv_kernel] * x[c];
+    out[c] = gdn_silu(acc);
+}
+
+__global__ void gdn_conv1d_shift_kernel(const float *x, float *conv_state, int qkv_dim,
+                                        int conv_kernel) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= qkv_dim) {
+        return;
+    }
+    int hist = conv_kernel - 1;
+    if (hist <= 0) {
+        return;
+    }
+    for (int i = 0; i < hist - 1; ++i) {
+        conv_state[i * qkv_dim + c] = conv_state[(i + 1) * qkv_dim + c];
+    }
+    conv_state[(hist - 1) * qkv_dim + c] = x[c];
+}
+
+extern "C" int allpaca_cuda_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state,
+                                            float *out, int32_t qkv_dim, int32_t conv_kernel,
+                                            allpaca_cuda_stream_t stream) {
+    if (!x || !kernel || !conv_state || !out || qkv_dim <= 0 || conv_kernel <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int threads = 256;
+    int blocks = (qkv_dim + threads - 1) / threads;
+    gdn_conv1d_compute_kernel<<<blocks, threads, 0, as_stream(stream)>>>(
+        x, kernel, conv_state, out, qkv_dim, conv_kernel);
+    int rc = cuda_status(cudaGetLastError());
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    gdn_conv1d_shift_kernel<<<blocks, threads, 0, as_stream(stream)>>>(x, conv_state, qkv_dim,
+                                                                       conv_kernel);
+    return cuda_status(cudaGetLastError());
+}
+
+/* One block per V-head. Thread 0 runs the AR delta step (matches host deltanet). */
+__global__ void gated_delta_step_kernel(float *q, float *k, const float *v, const float *decay,
+                                        const float *beta, float *state, float *out, int n_v_heads,
+                                        int head_v, int head_k, float eps) {
+    int h = static_cast<int>(blockIdx.x);
+    if (h >= n_v_heads || threadIdx.x != 0) {
+        return;
+    }
+    float *q_h = q + h * head_k;
+    float *k_h = k + h * head_k;
+    const float *v_h = v + h * head_v;
+    float *state_h = state + h * head_v * head_k;
+    float *out_h = out + h * head_v;
+
+    float ss_q = 0.0f;
+    float ss_k = 0.0f;
+    for (int j = 0; j < head_k; ++j) {
+        ss_q += q_h[j] * q_h[j];
+        ss_k += k_h[j] * k_h[j];
+    }
+    float inv_q = rsqrtf(ss_q + eps);
+    float inv_k = rsqrtf(ss_k + eps);
+    float q_scale = rsqrtf(static_cast<float>(head_k));
+    for (int j = 0; j < head_k; ++j) {
+        q_h[j] *= inv_q * q_scale;
+        k_h[j] *= inv_k;
+    }
+
+    float g = decay[h];
+    float b = beta[h];
+    for (int i = 0; i < head_v; ++i) {
+        float *row = state_h + i * head_k;
+        float acc = 0.0f;
+        for (int j = 0; j < head_k; ++j) {
+            row[j] *= g;
+            acc += row[j] * k_h[j];
+        }
+        float delta = b * (v_h[i] - acc);
+        float y = 0.0f;
+        for (int j = 0; j < head_k; ++j) {
+            row[j] += delta * k_h[j];
+            y += row[j] * q_h[j];
+        }
+        out_h[i] = y;
+    }
+}
+
+extern "C" int allpaca_cuda_gated_delta_step(float *q, float *k, const float *v,
+                                             const float *decay, const float *beta, float *state,
+                                             float *out, int32_t n_v_heads, int32_t head_v,
+                                             int32_t head_k, float eps,
+                                             allpaca_cuda_stream_t stream) {
+    if (!q || !k || !v || !decay || !beta || !state || !out || n_v_heads <= 0 || head_v <= 0 ||
+        head_k <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    gated_delta_step_kernel<<<static_cast<unsigned>(n_v_heads), 1, 0, as_stream(stream)>>>(
+        q, k, v, decay, beta, state, out, n_v_heads, head_v, head_k, eps);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void mamba2_ssd_kernel(const float *z, const float *xbc, const float *dt,
+                                  const float *a, const float *d, const float *dt_bias,
+                                  const float *norm, float *state, float *out, int d_inner,
+                                  int d_state, int n_heads, int n_groups, float eps) {
+    const int group = static_cast<int>(blockIdx.x);
+    const int group_width = d_inner / n_groups;
+    const int head_dim = d_inner / n_heads;
+    const int heads_per_group = n_heads / n_groups;
+    const int group_start = group * group_width;
+    const int b_off = d_inner + group * d_state;
+    const int c_off = d_inner + n_groups * d_state + group * d_state;
+    __shared__ float sum_sq;
+    if (threadIdx.x == 0) {
+        sum_sq = 0.0f;
+    }
+    __syncthreads();
+    for (int local = static_cast<int>(threadIdx.x); local < group_width;
+         local += static_cast<int>(blockDim.x)) {
+        const int channel = group_start + local;
+        const int head = group * heads_per_group + local / head_dim;
+        const float delta = gdn_softplus(dt[head] + dt_bias[head]);
+        const float decay = expf(delta * a[head]);
+        float acc = 0.0f;
+        float *row = state + channel * d_state;
+        for (int n = 0; n < d_state; ++n) {
+            const float value = decay * row[n] + delta * xbc[b_off + n] * xbc[channel];
+            row[n] = value;
+            acc += xbc[c_off + n] * value;
+        }
+        const float gated = (acc + d[head] * xbc[channel]) * gdn_silu(z[channel]);
+        out[channel] = gated;
+        atomicAdd(&sum_sq, gated * gated);
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sum_sq / static_cast<float>(group_width) + eps);
+    for (int local = static_cast<int>(threadIdx.x); local < group_width;
+         local += static_cast<int>(blockDim.x)) {
+        const int channel = group_start + local;
+        out[channel] *= inv * norm[channel];
+    }
+}
+
+__global__ void mamba2_conv_compute_kernel(const float *x, const float *kernel, const float *bias,
+                                           const float *conv_state, float *out, int conv_dim,
+                                           int conv_kernel) {
+    const int channel = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= conv_dim) {
+        return;
+    }
+    const int hist = conv_kernel - 1;
+    float acc = bias ? bias[channel] : 0.0f;
+    for (int k = 0; k < hist; ++k) {
+        acc += kernel[k + channel * conv_kernel] * conv_state[k * conv_dim + channel];
+    }
+    acc += kernel[hist + channel * conv_kernel] * x[channel];
+    out[channel] = gdn_silu(acc);
+}
+
+extern "C" int allpaca_cuda_mamba2_conv_step(const float *xbc, const float *kernel,
+                                             const float *bias, float *conv_state, float *out,
+                                             int32_t conv_dim, int32_t conv_kernel,
+                                             allpaca_cuda_stream_t stream) {
+    if (!xbc || !kernel || !conv_state || !out || conv_dim <= 0 || conv_kernel <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int threads = 256;
+    int blocks = (conv_dim + threads - 1) / threads;
+    mamba2_conv_compute_kernel<<<blocks, threads, 0, as_stream(stream)>>>(
+        xbc, kernel, bias, conv_state, out, conv_dim, conv_kernel);
+    int rc = cuda_status(cudaGetLastError());
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    gdn_conv1d_shift_kernel<<<blocks, threads, 0, as_stream(stream)>>>(xbc, conv_state, conv_dim,
+                                                                       conv_kernel);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_mamba2_ssd_step(const float *z, const float *xbc, const float *dt,
+                                            const float *a, const float *d, const float *dt_bias,
+                                            const float *norm, float *state, float *out,
+                                            int32_t d_inner, int32_t d_state, int32_t n_heads,
+                                            int32_t n_groups, float eps,
+                                            allpaca_cuda_stream_t stream) {
+    if (!z || !xbc || !dt || !a || !d || !dt_bias || !norm || !state || !out || d_inner <= 0 ||
+        d_state <= 0 || n_heads <= 0 || n_groups <= 0 || d_inner % n_heads != 0 ||
+        n_heads % n_groups != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    mamba2_ssd_kernel<<<static_cast<unsigned>(n_groups), 256, 0, as_stream(stream)>>>(
+        z, xbc, dt, a, d, dt_bias, norm, state, out, d_inner, d_state, n_heads, n_groups, eps);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
+                                           int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = n_tok * n_heads * head_dim;
+    if (idx >= n) {
+        return;
+    }
+    int head_elems = n_heads * head_dim;
+    int tok = idx / head_elems;
+    int within = idx % head_elems;
+    int h = within / head_dim;
+    float s = scores[tok * n_heads + h];
+    attn[idx] *= 1.0f / (1.0f + expf(-s));
+}
+
+extern "C" int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
+                                                int32_t n_heads, int32_t head_dim,
+                                                allpaca_cuda_stream_t stream) {
+    if (!attn || !scores || n_tok <= 0 || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int n = n_tok * n_heads * head_dim;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    scale_heads_sigmoid_kernel<<<grid, block, 0, as_stream(stream)>>>(attn, scores, n_tok, n_heads,
+                                                                      head_dim);
+    return cuda_status(cudaGetLastError());
+}
+
+/* One block per row. Decode uses rows=1. n is reduced in shared memory (256 threads). */
 __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
+    const int row = static_cast<int>(blockIdx.x);
+    x += static_cast<size_t>(row) * static_cast<size_t>(n);
+    out += static_cast<size_t>(row) * static_cast<size_t>(n);
     __shared__ float buf[256];
     int tid = threadIdx.x;
     float acc = 0.f;
@@ -318,13 +1065,25 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int n
     }
 }
 
-extern "C" int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, float eps,
-                                    allpaca_cuda_stream_t stream) {
-    if (!x || !w || !out || n <= 0) {
+extern "C" int allpaca_cuda_rmsnorm_rows(const float *x, const float *w, float *out, int32_t rows,
+                                        int32_t n, float eps, allpaca_cuda_stream_t stream) {
+    if (!x || !w || !out || rows <= 0 || n <= 0) {
         return ALLPACA_ERR_INVALID;
     }
-    rmsnorm_kernel<<<1, 256, 0, as_stream(stream)>>>(x, w, out, n, eps);
+    rmsnorm_kernel<<<static_cast<unsigned>(rows), 256, 0, as_stream(stream)>>>(x, w, out, n, eps);
     return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, float eps,
+                                    allpaca_cuda_stream_t stream) {
+    return allpaca_cuda_rmsnorm_rows(x, w, out, 1, n, eps, stream);
+}
+
+extern "C" int allpaca_cuda_rmsnorm_heads(float *x, const float *weight, int32_t n_heads,
+                                          int32_t head_dim, float eps,
+                                          allpaca_cuda_stream_t stream) {
+    /* In-place: rmsnorm_kernel finishes the reduction before any store, so x==out is safe. */
+    return allpaca_cuda_rmsnorm_rows(x, weight, x, n_heads, head_dim, eps, stream);
 }
 
 __global__ void embed_gather_kernel(const float *table, int token, float *out, int dim) {
@@ -379,6 +1138,85 @@ extern "C" int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, in
     return cuda_status(cudaGetLastError());
 }
 
+/* NeoX pair on first n_rot dims; optional IMRoPE sector angles (CPU rope_imrope_neox). */
+__device__ void rope_imrope_pair(float *hvec, int i, int half, int n_rot, int pos, float theta,
+                                int s0, int s1, int s2, int s3) {
+    const int sect_dims = s0 + s1 + s2 + s3;
+    const bool use_imrope = sect_dims > 0 && s0 > 0 && s1 > 0;
+    const float theta_scale = powf(theta, -2.0f / static_cast<float>(n_rot));
+    float theta_t = static_cast<float>(pos);
+    float theta_h = static_cast<float>(pos);
+    float theta_w = static_cast<float>(pos);
+    float theta_e = 0.0f;
+    float angle = 0.0f;
+    for (int j = 0; j <= i; ++j) {
+        if (use_imrope) {
+            const int sector = j % sect_dims;
+            if (sector % 3 == 1 && sector < 3 * s1) {
+                angle = theta_h;
+            } else if (sector % 3 == 2 && sector < 3 * s2) {
+                angle = theta_w;
+            } else if (sector % 3 == 0 && sector < 3 * s0) {
+                angle = theta_t;
+            } else {
+                angle = theta_e;
+            }
+            theta_t *= theta_scale;
+            theta_h *= theta_scale;
+            theta_w *= theta_scale;
+            theta_e *= theta_scale;
+        } else {
+            angle = theta_t;
+            theta_t *= theta_scale;
+        }
+    }
+    const float s = sinf(angle);
+    const float c = cosf(angle);
+    const float a = hvec[i];
+    const float b = hvec[i + half];
+    hvec[i] = a * c - b * s;
+    hvec[i + half] = a * s + b * c;
+}
+
+__global__ void rope_imrope_qk_kernel(float *q, float *k, int n_q_heads, int n_k_heads, int head_dim,
+                                      int n_rot, int pos, float theta, int s0, int s1, int s2,
+                                      int s3) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = n_rot / 2;
+    const int q_pairs = n_q_heads * half;
+    const int total = q_pairs + n_k_heads * half;
+    if (idx >= total || n_rot <= 0 || n_rot > head_dim || (n_rot & 1) != 0) {
+        return;
+    }
+    if (idx < q_pairs) {
+        const int h = idx / half;
+        const int i = idx % half;
+        rope_imrope_pair(q + h * head_dim, i, half, n_rot, pos, theta, s0, s1, s2, s3);
+    } else {
+        const int j = idx - q_pairs;
+        const int h = j / half;
+        const int i = j % half;
+        rope_imrope_pair(k + h * head_dim, i, half, n_rot, pos, theta, s0, s1, s2, s3);
+    }
+}
+
+extern "C" int allpaca_cuda_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                                           int32_t head_dim, int32_t n_rot, int32_t pos, float theta,
+                                           const int32_t sections[4], allpaca_cuda_stream_t stream) {
+    if (!q || !k || !sections || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 || n_rot <= 0 ||
+        n_rot > head_dim || (n_rot & 1) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int half = n_rot / 2;
+    const int total = (n_q_heads + n_k_heads) * half;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    rope_imrope_qk_kernel<<<blocks, threads, 0, as_stream(stream)>>>(
+        q, k, n_q_heads, n_k_heads, head_dim, n_rot, pos, theta, sections[0], sections[1],
+        sections[2], sections[3]);
+    return cuda_status(cudaGetLastError());
+}
+
 __device__ float warp_sum32(float v) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -394,10 +1232,13 @@ __device__ float warp_sum32(float v) {
     return v;
 }
 
-/* Warp-per-head online softmax. Supports head_dim <= 512 (16 dims/lane × 32). */
+/* Warp-per-head online softmax. Supports head_dim <= 512 (16 dims/lane × 32).
+ * Optional sinks[h] is a virtual logit with no V (HIP attention_flash_kernel).
+ * softcap>0 applies Gemma logit softcap after scale. */
 __global__ void attention_online_kernel(const float *q, const float *k, const float *v, float *out,
                                         int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
-                                        int causal) {
+                                        int causal, const uint8_t *mask, const float *sinks,
+                                        float softcap) {
     const int qi = static_cast<int>(blockIdx.x);
     const int h = static_cast<int>(blockIdx.y);
     if (qi >= n_q || h >= n_heads) {
@@ -424,9 +1265,15 @@ __global__ void attention_online_kernel(const float *q, const float *k, const fl
 
     float m = -1.0e30f;
     float l = 0.f;
+    if (sinks) {
+        m = sinks[h];
+        l = 1.f;
+    }
 
     for (int t = 0; t < n_kv; ++t) {
-        const bool valid = t <= t_max;
+        const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
+                                       static_cast<size_t>(t)] != 0
+                                : t <= t_max;
         const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         float partial = 0.f;
@@ -435,6 +1282,9 @@ __global__ void attention_online_kernel(const float *q, const float *k, const fl
             partial += qreg[i++] * (valid ? kh[d] : 0.f);
         }
         float s = warp_sum32(partial) * scale;
+        if (softcap > 0.f) {
+            s = tanhf(s / softcap) * softcap;
+        }
         if (!valid) {
             s = -1.0e30f;
         }
@@ -457,17 +1307,128 @@ __global__ void attention_online_kernel(const float *q, const float *k, const fl
     }
 }
 
-extern "C" int allpaca_cuda_attention(const float *q, const float *k, const float *v, float *out,
-                                      int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
-                                      int32_t head_dim, int32_t causal,
-                                      allpaca_cuda_stream_t stream) {
+extern "C" int allpaca_cuda_attention_sinks(const float *q, const float *k, const float *v,
+                                            float *out, int32_t n_q, int32_t n_kv, int32_t n_heads,
+                                            int32_t n_kv_heads, int32_t head_dim, int32_t causal,
+                                            const float *sinks, allpaca_cuda_stream_t stream) {
     if (!q || !k || !v || !out || n_q <= 0 || n_kv <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
         head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
         return ALLPACA_ERR_INVALID;
     }
     dim3 block(32);
     dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(q, k, v, out, n_q, n_kv, n_heads,
-                                                                   n_kv_heads, head_dim, causal);
+    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, nullptr, sinks, 0.f);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_attention_masked(const float *q, const float *k, const float *v,
+                                             float *out, int32_t n_q, int32_t n_kv, int32_t n_heads,
+                                             int32_t n_kv_heads, int32_t head_dim,
+                                             const uint8_t *mask, allpaca_cuda_stream_t stream) {
+    if (!q || !k || !v || !out || !mask || n_q <= 0 || n_kv <= 0 || n_heads <= 0 ||
+        n_kv_heads <= 0 || head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
+        return ALLPACA_ERR_INVALID;
+    }
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask, nullptr, 0.f);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_attention(const float *q, const float *k, const float *v, float *out,
+                                      int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                      int32_t head_dim, int32_t causal,
+                                      allpaca_cuda_stream_t stream) {
+    return allpaca_cuda_attention_sinks(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim,
+                                        causal, nullptr, stream);
+}
+
+extern "C" int allpaca_cuda_attention_softcap(const float *q, const float *k, const float *v,
+                                              float *out, int32_t n_q, int32_t n_kv, int32_t n_heads,
+                                              int32_t n_kv_heads, int32_t head_dim, int32_t causal,
+                                              float softcap, allpaca_cuda_stream_t stream) {
+    if (!q || !k || !v || !out || n_q <= 0 || n_kv <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (softcap <= 0.f) {
+        return allpaca_cuda_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+                                      stream);
+    }
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, nullptr, nullptr, softcap);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_attention_masked_softcap(const float *q, const float *k, const float *v,
+                                                     float *out, int32_t n_q, int32_t n_kv,
+                                                     int32_t n_heads, int32_t n_kv_heads,
+                                                     int32_t head_dim, const uint8_t *mask,
+                                                     float softcap, allpaca_cuda_stream_t stream) {
+    if (!q || !k || !v || !out || !mask || n_q <= 0 || n_kv <= 0 || n_heads <= 0 ||
+        n_kv_heads <= 0 || head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (softcap <= 0.f) {
+        return allpaca_cuda_attention_masked(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim,
+                                             mask, stream);
+    }
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask, nullptr, softcap);
+    return cuda_status(cudaGetLastError());
+}
+
+__global__ void deinterleave_q_gate_kernel(const float *q_full, float *q, float *gate, int n_heads,
+                                           int head_dim) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int n = n_heads * head_dim;
+    if (idx >= n) {
+        return;
+    }
+    const int h = idx / head_dim;
+    const int d = idx % head_dim;
+    const int src = h * 2 * head_dim + d;
+    q[idx] = q_full[src];
+    gate[idx] = q_full[src + head_dim];
+}
+
+__global__ void sigmoid_mul_kernel(float *x, const float *gate, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    const float g = gate[idx];
+    x[idx] *= 1.0f / (1.0f + expf(-g));
+}
+
+extern "C" int allpaca_cuda_deinterleave_q_gate(const float *q_full, float *q, float *gate,
+                                                int32_t n_heads, int32_t head_dim,
+                                                allpaca_cuda_stream_t stream) {
+    if (!q_full || !q || !gate || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int n = n_heads * head_dim;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    deinterleave_q_gate_kernel<<<static_cast<unsigned>(blocks), static_cast<unsigned>(threads), 0,
+                                 as_stream(stream)>>>(q_full, q, gate, n_heads, head_dim);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_sigmoid_mul(float *x, const float *gate, int32_t n,
+                                        allpaca_cuda_stream_t stream) {
+    if (!x || !gate || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    sigmoid_mul_kernel<<<static_cast<unsigned>(blocks), static_cast<unsigned>(threads), 0,
+                         as_stream(stream)>>>(x, gate, n);
     return cuda_status(cudaGetLastError());
 }

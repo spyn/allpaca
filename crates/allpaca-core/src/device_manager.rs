@@ -84,10 +84,7 @@ impl DeviceInventory {
 }
 
 pub fn detect_pipeline_mode(devices: &[DeviceInfo]) -> PipelineMode {
-    let gpus: Vec<&DeviceInfo> = devices
-        .iter()
-        .filter(|d| d.kind == DeviceKind::HipGpu && !d.is_rpc())
-        .collect();
+    let gpus = local_gpus(devices);
     match gpus.len() {
         0 | 1 => PipelineMode::MobileTiered,
         _ => {
@@ -106,6 +103,26 @@ pub fn detect_pipeline_mode(devices: &[DeviceInfo]) -> PipelineMode {
             }
         }
     }
+}
+
+/// When `kv.vram_bytes` is still the tiny compiled default, scale from device VRAM.
+/// Leaves ≥50% for weights/workspace and caps KV at 4 GiB (fits RTX 3060 12 GB,
+/// Ada/Blackwell laptop MobileTiered profiles).
+pub fn suggested_kv_vram_bytes(total_vram: u64) -> usize {
+    let floor = allpaca_types::KvSection::default().vram_bytes;
+    if total_vram == 0 {
+        return floor;
+    }
+    let half = (total_vram / 2) as usize;
+    let cap = 4usize << 30;
+    half.min(cap).max(floor)
+}
+
+fn local_gpus(devices: &[DeviceInfo]) -> Vec<&DeviceInfo> {
+    devices
+        .iter()
+        .filter(|d| d.is_gpu() && !d.is_rpc())
+        .collect()
 }
 
 fn peer_flags(devices: &[DeviceInfo], cpu_only: bool) -> (bool, bool) {
@@ -178,6 +195,56 @@ mod tests {
     fn cpu_only_is_mobile_tiered() {
         let devices = vec![DeviceInfo::cpu()];
         assert_eq!(detect_pipeline_mode(&devices), PipelineMode::MobileTiered);
+    }
+
+    #[test]
+    fn single_cuda_3060_is_mobile_tiered() {
+        let devices = vec![
+            DeviceInfo::cpu(),
+            DeviceInfo {
+                id: 0,
+                kind: DeviceKind::CudaGpu,
+                name: "NVIDIA GeForce RTX 3060".into(),
+                memory_bytes: 12 << 30,
+                bandwidth_gbps: 360.0,
+                peers: vec![],
+            },
+        ];
+        assert_eq!(detect_pipeline_mode(&devices), PipelineMode::MobileTiered);
+    }
+
+    #[test]
+    fn two_cuda_gpus_unequal_bandwidth_are_asymmetric() {
+        let devices = vec![
+            DeviceInfo::cpu(),
+            DeviceInfo {
+                id: 0,
+                kind: DeviceKind::CudaGpu,
+                name: "fast".into(),
+                memory_bytes: 12 << 30,
+                bandwidth_gbps: 600.0,
+                peers: vec![],
+            },
+            DeviceInfo {
+                id: 1,
+                kind: DeviceKind::CudaGpu,
+                name: "laptop".into(),
+                memory_bytes: 8 << 30,
+                bandwidth_gbps: 300.0,
+                peers: vec![],
+            },
+        ];
+        assert_eq!(detect_pipeline_mode(&devices), PipelineMode::Asymmetric);
+    }
+
+    #[test]
+    fn suggested_kv_vram_for_12gb_leaves_half_capped_at_4gib() {
+        let twelve = 12u64 << 30;
+        assert_eq!(suggested_kv_vram_bytes(twelve), 4usize << 30);
+        assert_eq!(suggested_kv_vram_bytes(0), 4 * 1024 * 1024);
+        assert_eq!(suggested_kv_vram_bytes(1 << 30), 512 * 1024 * 1024);
+        assert_eq!(suggested_kv_vram_bytes(6 << 30), 3usize << 30);
+        assert_eq!(suggested_kv_vram_bytes(8 << 30), 4usize << 30);
     }
 
     #[test]

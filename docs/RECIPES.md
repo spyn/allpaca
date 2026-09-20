@@ -164,4 +164,5 @@ cargo test -p allpaca-core --features hip --offline --test hip_runtime tiny_deep
 
 - Packed decode Q/K/V/O C feeding attention (lm_head skip on greedy HIP cohort landed).
 - CUDA 7B / MoE / hybrid parity (dense TinyModel CUDA decode + CUDA KV pages landed).
+  GPU-gated tests: root README **CUDA GPU host checklist**. Blackwell TMA/tensor-core GEMM not started.
 - Real CXL.mem / PIM (simulators only).
