@@ -273,7 +273,7 @@ fn cuda_synthetic_ssm_hybrid_generate_uses_device_when_present() {
     let stats = engine.stats();
     assert!(
         stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
-        "expected CUDA SSM-hybrid forwards (device mamba2 conv+ssd), got gpu={} target={}; stats={stats:?}",
+        "expected CUDA SSM-hybrid forwards (resident in/out GEMMs + device conv/ssd), got gpu={} target={}; stats={stats:?}",
         stats.gpu_forwards,
         stats.target_gpu_forwards
     );

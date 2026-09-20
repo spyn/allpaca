@@ -31,11 +31,13 @@ struct CudaLayerOff {
     w_gate: WeightRef,
     w_up: WeightRef,
     w_down: WeightRef,
-    /// Qwen35 GDN projections (zero-sized when unused); out is `ssm_out`.
+    /// Qwen35 GDN / Nemotron Mamba-2 projections (zero-sized when unused).
+    /// GDN out and SSM out share `w_ssm_out`; SSM also uses `w_ssm_in`.
     w_qkv: WeightRef,
     w_z: WeightRef,
     w_alpha: WeightRef,
     w_beta: WeightRef,
+    w_ssm_in: WeightRef,
     w_ssm_out: WeightRef,
     experts: Vec<CudaExpertOff>,
     shared_expert: CudaExpertOff,
@@ -161,23 +163,35 @@ impl CudaResidentModel {
                     )?,
                 }
             };
-            let (w_qkv, w_z, w_alpha, w_beta, w_ssm_out) = if let Some(gdn) = &layer.gdn {
-                (
-                    push_f32(&mut pack, gdn.w_qkv.as_slice()),
-                    push_f32(&mut pack, gdn.w_z.as_slice()),
-                    push_f32(&mut pack, gdn.w_alpha.as_slice()),
-                    push_f32(&mut pack, gdn.w_beta.as_slice()),
-                    push_f32(&mut pack, gdn.w_out.as_slice()),
-                )
-            } else {
-                (
-                    WeightRef::f32(0, 0),
-                    WeightRef::f32(0, 0),
-                    WeightRef::f32(0, 0),
-                    WeightRef::f32(0, 0),
-                    WeightRef::f32(0, 0),
-                )
-            };
+            let (w_qkv, w_z, w_alpha, w_beta, w_ssm_in, w_ssm_out) =
+                if let Some(gdn) = &layer.gdn {
+                    (
+                        push_f32(&mut pack, gdn.w_qkv.as_slice()),
+                        push_f32(&mut pack, gdn.w_z.as_slice()),
+                        push_f32(&mut pack, gdn.w_alpha.as_slice()),
+                        push_f32(&mut pack, gdn.w_beta.as_slice()),
+                        WeightRef::f32(0, 0),
+                        push_f32(&mut pack, gdn.w_out.as_slice()),
+                    )
+                } else if let Some(ssm) = &layer.ssm {
+                    (
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        push_f32(&mut pack, ssm.w_in.as_slice()),
+                        push_f32(&mut pack, ssm.w_out.as_slice()),
+                    )
+                } else {
+                    (
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                        WeightRef::f32(0, 0),
+                    )
+                };
             layers.push(CudaLayerOff {
                 attn_norm,
                 wq,
@@ -192,6 +206,7 @@ impl CudaResidentModel {
                 w_z,
                 w_alpha,
                 w_beta,
+                w_ssm_in,
                 w_ssm_out,
                 experts,
                 shared_expert,
@@ -232,6 +247,14 @@ impl CudaResidentModel {
         self.layers
             .iter()
             .any(|l| l.w_qkv.n > 0 && l.w_z.n > 0 && l.w_ssm_out.n > 0)
+    }
+
+    /// True when any layer packs Mamba-2 in/out projections on device.
+    #[cfg(test)]
+    pub(crate) fn ssm_projections_resident(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.w_ssm_in.n > 0 && l.w_ssm_out.n > 0)
     }
 
     fn ptr(&self, w: WeightRef) -> Result<*const f32, AllpacaError> {
@@ -1101,8 +1124,23 @@ fn apply_ssm_cuda(
         ssm.dims.conv_state_floats(),
     );
     let d = &ssm.dims;
+    if layer.w_ssm_in.n == 0 || layer.w_ssm_out.n == 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA SSM layer {layer_idx} missing resident projections"
+        ))));
+    }
     let mut proj = vec![0.0f32; d.in_proj_dim];
-    matmul_nt(&scratch[..dim], &ssm.w_in, &mut proj, 1, d.in_proj_dim, dim).map_err(|e| {
+    gemm_host_a_resident_b(
+        cuda,
+        resident,
+        &scratch[..dim],
+        layer.w_ssm_in,
+        &mut proj,
+        1,
+        d.in_proj_dim as i32,
+        dim as i32,
+    )
+    .map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
             "CUDA SSM in gemm layer {layer_idx}: {e}"
         )))
@@ -1141,7 +1179,17 @@ fn apply_ssm_cuda(
         cfg.eps,
     )?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-    matmul_nt(&y, &ssm.w_out, hidden, 1, dim, d.d_inner).map_err(|e| {
+    gemm_host_a_resident_b(
+        cuda,
+        resident,
+        &y,
+        layer.w_ssm_out,
+        hidden,
+        1,
+        dim as i32,
+        d.d_inner as i32,
+    )
+    .map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
             "CUDA SSM out gemm layer {layer_idx}: {e}"
         )))
