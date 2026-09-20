@@ -1052,3 +1052,63 @@ fn cuda_dense_batched_prefill_matches_per_token() {
         "dense chunked prefill must match per-token CUDA decode"
     );
 }
+
+#[test]
+fn cuda_ssm_batched_prefill_one_forward_per_chunk() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_moe_cfg();
+    cfg.prefill.chunk_tokens = 16;
+    cfg.kv.page_tokens = 64;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_ssm_hybrid(7))
+        .expect("load ssm hybrid");
+    let prompt = "hello world. ".repeat(40);
+    let out = engine.generate(&prompt, greedy(2)).expect("generate");
+    assert!(
+        out.prompt_tokens >= 16,
+        "need multi-token prompt, got {}",
+        out.prompt_tokens
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < out.prompt_tokens as u64,
+        "SSM chunked prefill must batch gpu_forwards; gpu={} prompt={}",
+        stats.gpu_forwards,
+        out.prompt_tokens
+    );
+}
+
+#[test]
+fn cuda_gdn_batched_prefill_one_forward_per_chunk() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_moe_cfg();
+    cfg.prefill.chunk_tokens = 16;
+    cfg.kv.page_tokens = 64;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_gdn_hybrid(11))
+        .expect("load gdn hybrid");
+    let prompt = "hello world. ".repeat(40);
+    let out = engine.generate(&prompt, greedy(2)).expect("generate");
+    assert!(
+        out.prompt_tokens >= 16,
+        "need multi-token prompt, got {}",
+        out.prompt_tokens
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < out.prompt_tokens as u64,
+        "GDN chunked prefill must batch gpu_forwards; gpu={} prompt={}",
+        stats.gpu_forwards,
+        out.prompt_tokens
+    );
+}

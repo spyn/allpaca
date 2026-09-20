@@ -1425,6 +1425,7 @@ impl TinyModel {
         cuda: &CudaWorkspace,
         resident: &CudaResidentModel,
         write_logits: bool,
+        mut recurrent: Option<&mut RecurrentState>,
     ) -> Result<(), AllpacaError> {
         let n_tok = tokens.len();
         if n_tok == 0 {
@@ -1432,7 +1433,8 @@ impl TinyModel {
         }
         if n_tok == 1 {
             return self.forward_token_cuda(
-                tokens[0], start_pos, page_ids, kv, metrics, logits, cuda, resident, None, None,
+                tokens[0], start_pos, page_ids, kv, metrics, logits, cuda, resident, None,
+                recurrent,
             );
         }
         if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
@@ -1442,18 +1444,9 @@ impl TinyModel {
                 ),
             ));
         }
-        let cfg = &self.config;
-        for (i, layer) in self.layers.iter().enumerate() {
-            if layer.block != HybridLayerKind::Attention || layer.wq.is_empty() {
-                return Err(AllpacaError::Degraded(
-                    allpaca_types::DegradedError::FeatureDisabled(format!(
-                        "CUDA batched prefill: layer {i} is {:?}; dense attn only",
-                        layer.block
-                    )),
-                ));
-            }
-        }
-        let vocab = cfg.vocab_size;
+        // Dense / MoE / SSM / GDN / MLA all share the per-token CUDA path; true
+        // M=N for recurrent layers stays deferred (state is sequential).
+        let vocab = self.config.vocab_size;
         if write_logits && logits.len() < vocab {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
@@ -1467,11 +1460,7 @@ impl TinyModel {
             }
         }
 
-        // Same fused decode path per token (bit-identical to chunk_tokens=1).
-        // Collapse gpu_forward counters to one per chunk for the throughput gate.
         for (t, &tok) in tokens.iter().enumerate() {
-            let last = t + 1 == n_tok;
-            // Always compute into `logits` on the last token; reuse buffer otherwise.
             self.forward_token_cuda(
                 tok,
                 start_pos + t,
@@ -1482,9 +1471,8 @@ impl TinyModel {
                 cuda,
                 resident,
                 None,
-                None,
+                recurrent.as_deref_mut(),
             )?;
-            let _ = last;
             let _ = write_logits;
         }
         let n = n_tok as u64;

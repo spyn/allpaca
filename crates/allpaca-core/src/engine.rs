@@ -2961,6 +2961,7 @@ impl Engine {
                         cuda,
                         cres,
                         write_logits,
+                        recurrent.as_mut(),
                     ) {
                         Ok(()) => did_batch = true,
                         Err(e) => {
