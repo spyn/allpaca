@@ -10034,6 +10034,33 @@ mod cuda_softcap_tests {
     }
 
     #[test]
+    fn cuda_gdn_projections_upload_resident_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic_gdn_hybrid(11);
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 64 * 1024).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        assert!(
+            resident.gdn_projections_resident(),
+            "GDN qkv/z/out should pack onto the device"
+        );
+        let gdn = model.layers[0].gdn.as_ref().expect("gdn");
+        let proj_bytes = (gdn.w_qkv.len()
+            + gdn.w_z.len()
+            + gdn.w_alpha.len()
+            + gdn.w_beta.len()
+            + gdn.w_out.len())
+            * 4;
+        assert!(
+            (resident.packed_h2d_bytes() as usize) >= proj_bytes,
+            "pack should include GDN projections: packed={} proj={}",
+            resident.packed_h2d_bytes(),
+            proj_bytes
+        );
+    }
+
+    #[test]
     fn cuda_gemma_norms_change_logits_when_device_present() {
         if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
             return;

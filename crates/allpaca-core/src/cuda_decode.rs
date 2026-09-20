@@ -32,6 +32,12 @@ struct CudaLayerOff {
     w_gate: WeightRef,
     w_up: WeightRef,
     w_down: WeightRef,
+    /// Qwen35 GDN projections (zero-sized when unused); out is `ssm_out`.
+    w_qkv: WeightRef,
+    w_z: WeightRef,
+    w_alpha: WeightRef,
+    w_beta: WeightRef,
+    w_ssm_out: WeightRef,
     experts: Vec<CudaExpertOff>,
     shared_expert: CudaExpertOff,
 }
@@ -156,6 +162,23 @@ impl CudaResidentModel {
                     )?,
                 }
             };
+            let (w_qkv, w_z, w_alpha, w_beta, w_ssm_out) = if let Some(gdn) = &layer.gdn {
+                (
+                    push_f32(&mut pack, gdn.w_qkv.as_slice()),
+                    push_f32(&mut pack, gdn.w_z.as_slice()),
+                    push_f32(&mut pack, gdn.w_alpha.as_slice()),
+                    push_f32(&mut pack, gdn.w_beta.as_slice()),
+                    push_f32(&mut pack, gdn.w_out.as_slice()),
+                )
+            } else {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                )
+            };
             layers.push(CudaLayerOff {
                 attn_norm,
                 wq,
@@ -166,6 +189,11 @@ impl CudaResidentModel {
                 w_gate,
                 w_up,
                 w_down,
+                w_qkv,
+                w_z,
+                w_alpha,
+                w_beta,
+                w_ssm_out,
                 experts,
                 shared_expert,
             });
@@ -197,6 +225,14 @@ impl CudaResidentModel {
         self.layers
             .iter()
             .any(|l| l.shared_expert.w_up.n > 0 && l.shared_expert.w_up.kind == WeightKind::Q8_0)
+    }
+
+    /// True when any layer packs GDN projection weights on device.
+    #[cfg(test)]
+    pub(crate) fn gdn_projections_resident(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.w_qkv.n > 0 && l.w_z.n > 0 && l.w_ssm_out.n > 0)
     }
 
     fn ptr(&self, w: WeightRef) -> Result<*const f32, AllpacaError> {
@@ -850,36 +886,70 @@ fn apply_gdn_cuda(
     let mut z = vec![0.0f32; dims.value_dim];
     let mut alpha = vec![0.0f32; dims.n_v_heads];
     let mut beta = vec![0.0f32; dims.n_v_heads];
-    matmul_nt(&scratch[..dim], &gdn.w_qkv, &mut qkv, 1, dims.qkv_dim, dim).map_err(|e| {
+    if layer.w_qkv.n == 0
+        || layer.w_z.n == 0
+        || layer.w_alpha.n == 0
+        || layer.w_beta.n == 0
+        || layer.w_ssm_out.n == 0
+    {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA GDN layer {layer_idx} missing resident projections"
+        ))));
+    }
+    gemm_host_a_resident_b(
+        cuda,
+        resident,
+        &scratch[..dim],
+        layer.w_qkv,
+        &mut qkv,
+        1,
+        dims.qkv_dim as i32,
+        dim as i32,
+    )
+    .map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
             "CUDA GDN qkv gemm layer {layer_idx}: {e}"
         )))
     })?;
-    matmul_nt(&scratch[..dim], &gdn.w_z, &mut z, 1, dims.value_dim, dim).map_err(|e| {
+    gemm_host_a_resident_b(
+        cuda,
+        resident,
+        &scratch[..dim],
+        layer.w_z,
+        &mut z,
+        1,
+        dims.value_dim as i32,
+        dim as i32,
+    )
+    .map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
             "CUDA GDN z gemm layer {layer_idx}: {e}"
         )))
     })?;
-    matmul_nt(
+    gemm_host_a_resident_b(
+        cuda,
+        resident,
         &scratch[..dim],
-        &gdn.w_alpha,
+        layer.w_alpha,
         &mut alpha,
         1,
-        dims.n_v_heads,
-        dim,
+        dims.n_v_heads as i32,
+        dim as i32,
     )
     .map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
             "CUDA GDN alpha gemm layer {layer_idx}: {e}"
         )))
     })?;
-    matmul_nt(
+    gemm_host_a_resident_b(
+        cuda,
+        resident,
         &scratch[..dim],
-        &gdn.w_beta,
+        layer.w_beta,
         &mut beta,
         1,
-        dims.n_v_heads,
-        dim,
+        dims.n_v_heads as i32,
+        dim as i32,
     )
     .map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -952,7 +1022,17 @@ fn apply_gdn_cuda(
         cfg.eps,
     )?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-    matmul_nt(&gated, &gdn.w_out, hidden, 1, dim, dims.value_dim).map_err(|e| {
+    gemm_host_a_resident_b(
+        cuda,
+        resident,
+        &gated,
+        layer.w_ssm_out,
+        hidden,
+        1,
+        dim as i32,
+        dims.value_dim as i32,
+    )
+    .map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
             "CUDA GDN out gemm layer {layer_idx}: {e}"
         )))

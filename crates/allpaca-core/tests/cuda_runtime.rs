@@ -292,14 +292,14 @@ fn cuda_synthetic_gdn_hybrid_generate_uses_device_when_present() {
     assert_eq!(before.backend, "cuda");
     assert!(
         before.weight_h2d_bytes > 0,
-        "GDN hybrid should upload attention pack; stats={before:?}"
+        "GDN hybrid should upload projections + pack; stats={before:?}"
     );
     let out = engine.generate("hello", greedy(4)).expect("generate");
     assert!(!out.token_ids.is_empty());
     let stats = engine.stats();
     assert!(
         stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
-        "expected CUDA GDN-hybrid forwards (host gated_delta_step), got gpu={} target={}; stats={stats:?}",
+        "expected CUDA GDN-hybrid forwards (resident projection GEMMs), got gpu={} target={}; stats={stats:?}",
         stats.gpu_forwards,
         stats.target_gpu_forwards
     );
