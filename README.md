@@ -160,12 +160,69 @@ Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH`, PATH `nvcc`, and
 `--features cuda` still compiles (stub). Without an NVIDIA driver/GPU,
 `device_count()` is 0 — you can still compile and link on a toolkit-only machine.
 
+GPU ISAs (same idea as HIP offload): `ALLPACA_CUDA_ARCH` / `CUDAARCHS` /
+`TORCH_CUDA_ARCH_LIST`, else live `nvidia-smi` compute caps, else a fat binary
+for **sm_86** (RTX 3060 / Ampere), **sm_89** (Ada laptop), and **sm_120**
+(Blackwell GeForce laptop).
+Example: `ALLPACA_CUDA_ARCH=sm_86,sm_89,sm_120 cargo test -p allpaca-cuda --features cuda`.
+
 ```bash
 cargo test -p allpaca-cuda --features cuda
 ```
 
 Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexist.
-Engine forwards remain HIP until CUDA parity lands.
+Kepler/K80 (`sm_37`) needs CUDA ≤11.4 and is not part of this fat binary.
+
+Dense TinyModel CUDA decode, KV pages, RPC `KernelOp` workers, P2P probe, memset,
+and theoretical `bandwidth_gbps` are in-tree. **TMA / tensor-core GEMM is not:**
+`allpaca_cuda_gemm_nt` is still the F32 path that also runs on Ampere (`sm_86`).
+Do not enable a Blackwell-only kernel on this branch until a host with `sm_120`
+has run the checklist below.
+
+### CUDA GPU host checklist (3060 or Blackwell laptop)
+
+Toolkit-only machines (`nvcc` but no `nvidia-smi` / driver) compile and skip
+device tests (`device_count() == 0`). On a box with a driver, the same tests
+**must not skip**. Confirm the live arch first:
+
+```bash
+nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv
+# RTX 3060 12GB → compute_cap 8.6 (sm_86), ~360 GB/s theoretical
+# Blackwell GeForce laptop → compute_cap 12.0 (sm_120)
+```
+
+```bash
+# Default fat binary already includes sm_86, sm_89, sm_120.
+cargo test -p allpaca-cuda --features cuda -- --nocapture
+cargo test -p allpaca-core --features cuda --test cuda_runtime -- --nocapture
+cargo test -p allpaca-rpc --features cuda -- --nocapture
+
+# Two-process CUDA RPC worker (needs a device; skip unless env is set):
+ALLPACA_RPC_CUDA=1 cargo test -p allpaca-rpc-server --features cuda -- gated_cuda_two_process -- --nocapture
+
+# Optional: faster compile for one SKU
+ALLPACA_CUDA_ARCH=sm_86 cargo test -p allpaca-cuda --features cuda
+ALLPACA_CUDA_ARCH=sm_120 cargo test -p allpaca-cuda --features cuda
+```
+
+Gates that should **fail** (not skip) when a GPU is present:
+
+| Check | Where |
+| --- | --- |
+| `device_sm_arch` is `sm_86` / `sm_89` / `sm_120` | `allpaca-cuda` |
+| `bandwidth_gbps` in (10, 50000) | `enumerate_devices_reports_theoretical_bandwidth_when_present` |
+| P2P same-device roundtrip; two-GPU peer list | `memcpy_peer_*` |
+| memset / pin / batch H2D | `allpaca-cuda` |
+| Engine `backend=cuda`, MobileTiered, VRAM stats, `gpu_util>0` | `cuda_runtime` |
+| RPC GEMM / residual / SiLU / embed / clear | `allpaca-rpc` loopback_cuda_* |
+
+Blackwell TMA follow-up (other host, later slice): keep the F32 GEMM for `sm_86`,
+add a `sm_90+` / `sm_120` path behind an arch guard, and extend
+`gemm_nt_matches_cpu_when_device_present` plus `loopback_cuda_gemm_nt` so both
+SKUs stay bit-close to CPU F32. Do not drop Ampere from the fat binary.
+
+Server: `cargo run -p allpaca-rpc-server --features cuda -- --device cuda:0`.
+Engine: `gpu_backend = "cuda"` (see `cuda_runtime` synthetic config).
 
 ---
 
@@ -270,7 +327,7 @@ cargo run -p allpaca-rpc-server -- --cpu-only -H 127.0.0.1 -p 50052
 cargo run -p allpaca-server -- --synthetic --cpu-only --rpc 127.0.0.1:50052 --port 8080
 ```
 
-HIP worker on a LAN: `cargo run -p allpaca-rpc-server --features hip -- --device hip:0 -H 0.0.0.0 -p 50052 --insecure-bind --token "$ALLPACA_RPC_TOKEN"`. Coordinator uses the same token (`--rpc-token` or `ALLPACA_RPC_TOKEN`). CUDA workers wait on engine CUDA parity; a CUDA-only box can still run `--cpu-only` for RAM overflow.
+HIP worker on a LAN: `cargo run -p allpaca-rpc-server --features hip -- --device hip:0 -H 0.0.0.0 -p 50052 --insecure-bind --token "$ALLPACA_RPC_TOKEN"`. CUDA worker (same wire ABI, e.g. RTX 3060 / Blackwell laptop): `cargo run -p allpaca-rpc-server --features cuda -- --device cuda:0 -H 0.0.0.0 -p 50052 --insecure-bind --token "$ALLPACA_RPC_TOKEN"`. Coordinator uses the same token (`--rpc-token` or `ALLPACA_RPC_TOKEN`); HIP and CUDA workers are interchangeable after HELLO. A CUDA-only box can still run `--cpu-only` for RAM overflow.
 
 ---
 

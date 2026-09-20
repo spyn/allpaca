@@ -17,6 +17,7 @@ extern "C" {
 #define ALLPACA_MEMCPY_D2H 1
 #define ALLPACA_MEMCPY_D2D 2
 #define ALLPACA_MEMCPY_DEFAULT 3
+#define ALLPACA_MEMCPY_D2H_ASYNC 4
 
 typedef void *allpaca_cuda_stream_t;
 
@@ -28,20 +29,69 @@ int allpaca_cuda_device_count(int32_t *count);
 int allpaca_cuda_device_props(int32_t id, char *name, int32_t name_len, uint64_t *memory_bytes,
                               double *bandwidth_gbps);
 
+/* Compute capability as `sm_86` / `sm_120` plus L2 cache bytes (HIP device_arch). */
+int allpaca_cuda_device_arch(int32_t id, char *arch, int32_t arch_len, int32_t *l2_bytes);
+
 int allpaca_cuda_malloc(void **ptr, size_t bytes, int32_t device);
 
 int allpaca_cuda_free(void *ptr);
 
+/* Stream-ordered free (cudaFreeAsync). Null stream falls back to cudaFree. */
+int allpaca_cuda_free_async(void *ptr, allpaca_cuda_stream_t stream);
+
+int allpaca_cuda_host_malloc(void **ptr, size_t bytes);
+
+int allpaca_cuda_host_free(void *ptr);
+
+/* Pin existing host pages for DMA (HIP host_register). flags: cudaHostRegister* bits. */
+int allpaca_cuda_host_register(void *ptr, size_t bytes, unsigned int flags);
+
+int allpaca_cuda_host_unregister(void *ptr);
+
 int allpaca_cuda_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
                         allpaca_cuda_stream_t stream);
 
+/* Batch of `count` 1D copies, same `kind`, one stream (per-copy cudaMemcpyAsync). */
+int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count, int32_t kind,
+                              allpaca_cuda_stream_t stream);
+
+int allpaca_cuda_memset(void *dst, int32_t value, size_t bytes, allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_set_device(int32_t device);
 
+int allpaca_cuda_can_p2p(int32_t src, int32_t dst, int32_t *can);
+
+int allpaca_cuda_enable_peer_access(int32_t src, int32_t dst);
+
+int allpaca_cuda_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
+                             size_t bytes, allpaca_cuda_stream_t stream);
+
+/* Driver-measured free/total VRAM (includes other processes). */
+int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes);
+
+int allpaca_cuda_mem_used(int32_t device, uint64_t *used_bytes);
+
 int allpaca_cuda_stream_synchronize(allpaca_cuda_stream_t stream);
+
+/* Non-blocking compute/copy stream (mirrors allpaca_hip_stream_create). */
+int allpaca_cuda_stream_create(allpaca_cuda_stream_t *stream);
+int allpaca_cuda_stream_destroy(allpaca_cuda_stream_t stream);
+
+int allpaca_cuda_stream_wait_event(allpaca_cuda_stream_t stream, void *event);
+
+int allpaca_cuda_event_create(void **event);
+int allpaca_cuda_event_create_timing(void **event);
+int allpaca_cuda_event_destroy(void *event);
+int allpaca_cuda_event_record(void *event, allpaca_cuda_stream_t stream);
+int allpaca_cuda_event_elapsed_us(void *start, void *stop, double *us);
 
 /* C[m,n] = A[m,k] * B[n,k]^T (row-major). Device pointers. */
 int allpaca_cuda_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                          allpaca_cuda_stream_t stream);
+
+/* C[m,n] = A[m,k] * dequant(B_q8_0[n,k])^T. B is 36-byte staged Q8_0 (HIP layout). */
+int allpaca_cuda_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                              int32_t k, allpaca_cuda_stream_t stream);
 
 int allpaca_cuda_residual_add(const float *x, const float *y, float *out, int32_t n,
                               allpaca_cuda_stream_t stream);
@@ -49,8 +99,68 @@ int allpaca_cuda_residual_add(const float *x, const float *y, float *out, int32_
 int allpaca_cuda_rmsnorm(const float *x, const float *w, float *out, int32_t n, float eps,
                          allpaca_cuda_stream_t stream);
 
+/* out[rows, n] = RMSNorm(x[rows, n], w[n]). One block per row (HIP allpaca_rmsnorm_rows). */
+int allpaca_cuda_rmsnorm_rows(const float *x, const float *w, float *out, int32_t rows, int32_t n,
+                              float eps, allpaca_cuda_stream_t stream);
+
+/* In-place per-head RMSNorm: x[n_heads, head_dim], weight[head_dim]. HIP allpaca_rmsnorm_heads. */
+int allpaca_cuda_rmsnorm_heads(float *x, const float *weight, int32_t n_heads, int32_t head_dim,
+                               float eps, allpaca_cuda_stream_t stream);
+
 int allpaca_cuda_silu_mul(const float *gate, const float *up, float *out, int32_t n,
                           allpaca_cuda_stream_t stream);
+
+/* Spark2_5 / Gemma FFN: out[i] = gelu(gate[i]) * up[i] (erf GELU; HIP allpaca_gelu_mul). */
+int allpaca_cuda_gelu_mul(const float *gate, const float *up, float *out, int32_t n,
+                          allpaca_cuda_stream_t stream);
+
+/* In-place ReLU²: x[i] = max(x[i], 0)^2 (HIP allpaca_relu_sqr). */
+int allpaca_cuda_relu_sqr(float *x, int32_t n, allpaca_cuda_stream_t stream);
+
+/* In-place SiLU: x[i] = x[i] * sigmoid(x[i]) (gate-less MoE / Lightning). */
+int allpaca_cuda_silu(float *x, int32_t n, allpaca_cuda_stream_t stream);
+
+/* In-place x[i] *= scale (Gemma scale_embed; HIP allpaca_scale_f32). */
+int allpaca_cuda_scale_f32(float *x, int32_t n, float scale, allpaca_cuda_stream_t stream);
+
+/* GDN: tile K-heads to V-heads (HIP allpaca_expand_k_heads). n_v must be multiple of n_k. */
+int allpaca_cuda_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v,
+                                int32_t head_k, allpaca_cuda_stream_t stream);
+
+/* GDN: decay[i]=exp(softplus(α+dt)*a); beta[i]=sigmoid(beta[i]) (HIP allpaca_gdn_decay_beta). */
+int allpaca_cuda_gdn_decay_beta(const float *alpha, const float *dt_bias, const float *a,
+                                float *decay, float *beta, int32_t n,
+                                allpaca_cuda_stream_t stream);
+
+/* Depthwise causal conv1d + SiLU for one GDN token. kernel layout [c][k] (HIP allpaca_gdn_conv1d_step). */
+int allpaca_cuda_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state, float *out,
+                                 int32_t qkv_dim, int32_t conv_kernel,
+                                 allpaca_cuda_stream_t stream);
+
+/* Qwen3.5 Gated DeltaNet one-token step (HIP allpaca_gated_delta_step).
+ * q/k L2-normalized in place; q scaled by 1/sqrt(head_k); state [n_v][head_v][head_k]. */
+int allpaca_cuda_gated_delta_step(float *q, float *k, const float *v, const float *decay,
+                                  const float *beta, float *state, float *out, int32_t n_v_heads,
+                                  int32_t head_v, int32_t head_k, float eps,
+                                  allpaca_cuda_stream_t stream);
+
+/* Nemotron-H Mamba-2 depthwise conv over x|B|C (HIP allpaca_mamba2_conv_step). bias may be null. */
+int allpaca_cuda_mamba2_conv_step(const float *xbc, const float *kernel, const float *bias,
+                                  float *conv_state, float *out, int32_t conv_dim,
+                                  int32_t conv_kernel, allpaca_cuda_stream_t stream);
+
+/* Nemotron-H Mamba-2 selective SSD + D skip + z gate + grouped RMSNorm
+ * (HIP allpaca_mamba2_ssd_step). state is [d_inner][d_state]; xbc is x|B|C. */
+int allpaca_cuda_mamba2_ssd_step(const float *z, const float *xbc, const float *dt, const float *a,
+                                 const float *d, const float *dt_bias, const float *norm,
+                                 float *state, float *out, int32_t d_inner, int32_t d_state,
+                                 int32_t n_heads, int32_t n_groups, float eps,
+                                 allpaca_cuda_stream_t stream);
+
+/* Spark2_5 headwise gate: attn[tok,h,d] *= sigmoid(scores[tok,h]) (HIP allpaca_scale_heads_sigmoid). */
+int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
+                                     int32_t n_heads, int32_t head_dim,
+                                     allpaca_cuda_stream_t stream);
 
 /* Gather one token row from F32 embed table[vocab, dim] -> out[dim]. */
 int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
@@ -60,11 +170,48 @@ int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int
 int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
                       allpaca_cuda_stream_t stream);
 
+/* Qwen3.5 IMRoPE / partial NeoX on Q and K (HIP allpaca_rope_imrope_qk).
+ * Rotates first n_rot dims; sections[4] select (t,h,w,e). sections all-zero = plain partial. */
+int allpaca_cuda_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                                int32_t head_dim, int32_t n_rot, int32_t pos, float theta,
+                                const int32_t sections[4], allpaca_cuda_stream_t stream);
+
 /* Online-softmax attention (decode/prefill). q:[n_q,n_heads,d] k/v:[n_kv,n_kv_heads,d].
  * Matches HIP allpaca_attention argument order. */
 int allpaca_cuda_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                            int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                            int32_t causal, allpaca_cuda_stream_t stream);
+
+/* Online-softmax attention with a virtual sink logit per head (`sinks[n_heads]`; null = none). */
+int allpaca_cuda_attention_sinks(const float *q, const float *k, const float *v, float *out,
+                                 int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                 int32_t head_dim, int32_t causal, const float *sinks,
+                                 allpaca_cuda_stream_t stream);
+
+/* Same layout as allpaca_cuda_attention. mask is [n_q, n_kv] uint8 (nonzero = attend). */
+int allpaca_cuda_attention_masked(const float *q, const float *k, const float *v, float *out,
+                                  int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                  int32_t head_dim, const uint8_t *mask,
+                                  allpaca_cuda_stream_t stream);
+
+/* Gemma-style attn logit softcap: score = softcap * tanh(score/softcap). softcap<=0 = off. */
+int allpaca_cuda_attention_softcap(const float *q, const float *k, const float *v, float *out,
+                                   int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                   int32_t head_dim, int32_t causal, float softcap,
+                                   allpaca_cuda_stream_t stream);
+
+/* Masked attention with optional softcap (SWA + Gemma softcap). */
+int allpaca_cuda_attention_masked_softcap(const float *q, const float *k, const float *v, float *out,
+                                          int32_t n_q, int32_t n_kv, int32_t n_heads,
+                                          int32_t n_kv_heads, int32_t head_dim, const uint8_t *mask,
+                                          float softcap, allpaca_cuda_stream_t stream);
+
+/* Deinterleave gated Q: q_full[n_heads, 2*head_dim] → q/gate[n_heads, head_dim]. */
+int allpaca_cuda_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,
+                                     int32_t head_dim, allpaca_cuda_stream_t stream);
+
+/* In-place x[i] *= sigmoid(gate[i]). */
+int allpaca_cuda_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_cuda_stream_t stream);
 
 #ifdef __cplusplus
 }

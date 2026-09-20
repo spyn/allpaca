@@ -19,7 +19,8 @@ Remote accelerators are **another device**, reached by a versioned kernel-ABI RP
 - Worker (`allpaca-rpc-server`) only `alloc` / `H2D` / `D2H` / batched `LaunchList`.
 - Buffer handles are generation-counted IDs, never raw device pointers on the wire.
 - Layers are split contiguously by advertised memory (or `--tensor-split`).
-- HIP workers ship in v1. CUDA workers reuse the same protocol after engine CUDA parity.
+- HIP and CUDA workers ship the same `KernelOp` ABI. Coordinators treat either
+  backend as a remote device after HELLO (`RpcBackendKind::Hip` / `Cuda`).
 - Tensor-parallel / row-split, worker-to-worker RDMA, and replica load-balance are out of v1.
 
 ## Consequences

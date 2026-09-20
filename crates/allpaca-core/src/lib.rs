@@ -50,7 +50,7 @@ pub use batch_gemm::{
 pub use compute::ComputeDev;
 #[doc(hidden)]
 pub use deepseek4::{write_tiny_deepseek4_gguf, write_tiny_deepseek4_packed_gguf};
-pub use device_manager::{detect_pipeline_mode, DeviceInventory};
+pub use device_manager::{detect_pipeline_mode, suggested_kv_vram_bytes, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{
     accept_exit, has_calibration_data, spec_from_gguf, spec_from_metadata, EarlyExitSpec,

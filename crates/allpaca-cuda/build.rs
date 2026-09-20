@@ -3,15 +3,30 @@
 //! Without a toolkit, `--features cuda` still compiles: Rust uses host stubs and
 //! `device_count() == 0`. A toolkit without an NVIDIA driver also yields 0 devices
 //! at runtime (this machine's case). Set `CUDA_PATH` or rely on PATH `nvcc`.
+//!
+//! GPU ISAs: `ALLPACA_CUDA_ARCH` / `CUDAARCHS` / `TORCH_CUDA_ARCH_LIST`, else live
+//! `nvidia-smi` compute caps, else a fat list for consumer Ampere (RTX 3060 /
+//! sm_86), Ada laptop (sm_89), and Blackwell GeForce laptop (sm_120). Kepler/K80
+//! (sm_37) needs a separate CUDA ≤11.4 toolchain and is not in this fat binary.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "src/cuda_arch.rs"]
+mod cuda_arch;
+
+use cuda_arch::{default_cuda_arches, gencode_flags, parse_cuda_arches};
+
 fn main() {
     println!("cargo:rerun-if-changed=../../cuda/src/kernels.cu");
     println!("cargo:rerun-if-changed=../../cuda/include/allpaca_cuda_kernels.h");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/cuda_arch.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=ALLPACA_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=CUDAARCHS");
+    println!("cargo:rerun-if-env-changed=TORCH_CUDA_ARCH_LIST");
     println!("cargo:rustc-check-cfg=cfg(allpaca_cuda_runtime)");
 
     if env::var("CARGO_FEATURE_CUDA").is_err() {
@@ -25,8 +40,15 @@ fn main() {
         return;
     };
 
+    let arches = cuda_arches();
+    println!(
+        "cargo:warning=CUDA toolkit {} arch={}",
+        cuda_root.display(),
+        arches.join(",")
+    );
+
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    if let Err(e) = build_kernels(&cuda_root, &out) {
+    if let Err(e) = build_kernels(&cuda_root, &out, &arches) {
         println!("cargo:warning=CUDA kernel build failed ({e}); cuda feature is stub-only.");
         return;
     }
@@ -49,6 +71,9 @@ fn main() {
     println!("cargo:rustc-link-lib=cudart");
     if cfg!(windows) {
         println!("cargo:rustc-link-lib=dylib=cudart");
+    } else {
+        // nvcc host objects pull C++ static locals / EH personality.
+        println!("cargo:rustc-link-lib=dylib=stdc++");
     }
     println!("cargo:rustc-cfg=allpaca_cuda_runtime");
 }
@@ -128,7 +153,56 @@ fn manifest_cuda_dir() -> PathBuf {
     PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../cuda")
 }
 
-fn build_kernels(cuda_root: &Path, out: &Path) -> Result<(), String> {
+fn detect_cuda_arches() -> Vec<String> {
+    let candidates = [
+        PathBuf::from("nvidia-smi"),
+        PathBuf::from("/usr/bin/nvidia-smi"),
+        PathBuf::from("/usr/local/bin/nvidia-smi"),
+    ];
+    for bin in candidates {
+        let output = Command::new(&bin)
+            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut arches = Vec::new();
+        for line in stdout.lines() {
+            let Some(sm) = cuda_arch::normalize_cuda_arch(line.trim()) else {
+                continue;
+            };
+            if !arches.contains(&sm) {
+                arches.push(sm);
+            }
+        }
+        if !arches.is_empty() {
+            return arches;
+        }
+    }
+    Vec::new()
+}
+
+fn cuda_arches() -> Vec<String> {
+    for key in ["ALLPACA_CUDA_ARCH", "CUDAARCHS", "TORCH_CUDA_ARCH_LIST"] {
+        if let Ok(raw) = env::var(key) {
+            let parsed = parse_cuda_arches(&raw);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    let detected = detect_cuda_arches();
+    if !detected.is_empty() {
+        return detected;
+    }
+    default_cuda_arches()
+}
+
+fn build_kernels(cuda_root: &Path, out: &Path, arches: &[String]) -> Result<(), String> {
     let nvcc = nvcc_bin(cuda_root);
     let src = manifest_cuda_dir().join("src/kernels.cu");
     let include = manifest_cuda_dir().join("include");
@@ -137,19 +211,24 @@ fn build_kernels(cuda_root: &Path, out: &Path) -> Result<(), String> {
     } else {
         "kernels.o"
     });
+    let gencode = gencode_flags(arches);
+    if gencode.is_empty() {
+        return Err("no CUDA arches resolved for nvcc -gencode".into());
+    }
 
     let output = if cfg!(windows) {
         let vcvars = find_vcvars64()
             .ok_or_else(|| "vcvars64.bat not found (need MSVC for nvcc)".to_string())?;
         let bat = out.join("build_cuda_kernels.bat");
         let script = format!(
-            "@echo off\r\ncall \"{vc}\"\r\n\"{nvcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\" -I\"{cuda_inc}\"\r\n",
+            "@echo off\r\ncall \"{vc}\"\r\n\"{nvcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\" -I\"{cuda_inc}\" {gencode}\r\n",
             vc = vcvars.display(),
             nvcc = nvcc.display(),
             src = src.display(),
             obj = obj.display(),
             inc = include.display(),
             cuda_inc = cuda_root.join("include").display(),
+            gencode = gencode.join(" "),
         );
         std::fs::write(&bat, script).map_err(|e| format!("write bat: {e}"))?;
         Command::new("cmd")
@@ -159,16 +238,19 @@ fn build_kernels(cuda_root: &Path, out: &Path) -> Result<(), String> {
             .output()
             .map_err(|e| format!("spawn nvcc via vcvars: {e}"))?
     } else {
-        Command::new(&nvcc)
-            .arg("-c")
+        let mut cmd = Command::new(&nvcc);
+        cmd.arg("-c")
             .arg(&src)
             .arg("-o")
             .arg(&obj)
             .arg("-O2")
             .arg("-std=c++17")
             .arg(format!("-I{}", include.display()))
-            .arg(format!("-I{}", cuda_root.join("include").display()))
-            .env("CUDA_PATH", cuda_root)
+            .arg(format!("-I{}", cuda_root.join("include").display()));
+        for flag in &gencode {
+            cmd.arg(flag);
+        }
+        cmd.env("CUDA_PATH", cuda_root)
             .output()
             .map_err(|e| format!("spawn nvcc: {e}"))?
     };
