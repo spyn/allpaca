@@ -144,6 +144,19 @@ int allpaca_cuda_gated_delta_step(float *q, float *k, const float *v, const floa
                                   int32_t head_v, int32_t head_k, float eps,
                                   allpaca_cuda_stream_t stream);
 
+/* Nemotron-H Mamba-2 depthwise conv over x|B|C (HIP allpaca_mamba2_conv_step). bias may be null. */
+int allpaca_cuda_mamba2_conv_step(const float *xbc, const float *kernel, const float *bias,
+                                  float *conv_state, float *out, int32_t conv_dim,
+                                  int32_t conv_kernel, allpaca_cuda_stream_t stream);
+
+/* Nemotron-H Mamba-2 selective SSD + D skip + z gate + grouped RMSNorm
+ * (HIP allpaca_mamba2_ssd_step). state is [d_inner][d_state]; xbc is x|B|C. */
+int allpaca_cuda_mamba2_ssd_step(const float *z, const float *xbc, const float *dt, const float *a,
+                                 const float *d, const float *dt_bias, const float *norm,
+                                 float *state, float *out, int32_t d_inner, int32_t d_state,
+                                 int32_t n_heads, int32_t n_groups, float eps,
+                                 allpaca_cuda_stream_t stream);
+
 /* Spark2_5 headwise gate: attn[tok,h,d] *= sigmoid(scores[tok,h]) (HIP allpaca_scale_heads_sigmoid). */
 int allpaca_cuda_scale_heads_sigmoid(float *attn, const float *scores, int32_t n_tok,
                                      int32_t n_heads, int32_t head_dim,

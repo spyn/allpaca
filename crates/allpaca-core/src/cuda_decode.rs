@@ -7,7 +7,6 @@ use super::{
 use crate::anchors::RecurrentState;
 use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
-use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
 use allpaca_cpu::matmul_nt;
 use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
@@ -1101,17 +1100,50 @@ fn apply_ssm_cuda(
         ssm.dims.state_floats(),
         ssm.dims.conv_state_floats(),
     );
-    mamba2_step(
-        &scratch[..dim],
-        &mut state.ssm_h[layer_idx],
-        &mut state.ssm_conv[layer_idx],
-        ssm,
-        cfg.eps,
-        hidden,
-    )
-    .map_err(|e| {
+    let d = &ssm.dims;
+    let mut proj = vec![0.0f32; d.in_proj_dim];
+    matmul_nt(&scratch[..dim], &ssm.w_in, &mut proj, 1, d.in_proj_dim, dim).map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
-            "CUDA SSM layer {layer_idx}: {e}"
+            "CUDA SSM in gemm layer {layer_idx}: {e}"
+        )))
+    })?;
+    let z = &proj[..d.d_inner];
+    let xbc_start = d.d_inner;
+    let dt_start = xbc_start + d.conv_dim;
+    let xbc_raw = &proj[xbc_start..dt_start];
+    let dt_raw = &proj[dt_start..];
+    let mut xbc = vec![0.0f32; d.conv_dim];
+    cuda.mamba2_conv_step_host(
+        xbc_raw,
+        &ssm.conv1d,
+        &ssm.conv_bias,
+        &mut state.ssm_conv[layer_idx],
+        &mut xbc,
+        d.conv_dim as i32,
+        d.conv_kernel as i32,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+    let mut y = vec![0.0f32; d.d_inner];
+    cuda.mamba2_ssd_step_host(
+        z,
+        &xbc,
+        dt_raw,
+        &ssm.a,
+        &ssm.d_skip,
+        &ssm.dt_bias,
+        &ssm.norm,
+        &mut state.ssm_h[layer_idx],
+        &mut y,
+        d.d_inner as i32,
+        d.d_state as i32,
+        d.n_heads as i32,
+        d.n_groups as i32,
+        cfg.eps,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+    matmul_nt(&y, &ssm.w_out, hidden, 1, dim, d.d_inner).map_err(|e| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "CUDA SSM out gemm layer {layer_idx}: {e}"
         )))
     })?;
     cuda.residual_add_host(x, hidden)?;

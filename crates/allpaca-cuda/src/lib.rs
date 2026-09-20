@@ -287,6 +287,33 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_mamba2_conv_step(
+            xbc: *const f32,
+            kernel: *const f32,
+            bias: *const f32,
+            conv_state: *mut f32,
+            out: *mut f32,
+            conv_dim: i32,
+            conv_kernel: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_mamba2_ssd_step(
+            z: *const f32,
+            xbc: *const f32,
+            dt: *const f32,
+            a: *const f32,
+            d: *const f32,
+            dt_bias: *const f32,
+            norm: *const f32,
+            state: *mut f32,
+            out: *mut f32,
+            d_inner: i32,
+            d_state: i32,
+            n_heads: i32,
+            n_groups: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -2110,6 +2137,126 @@ impl CudaWorkspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_conv_step_dev(
+        &self,
+        xbc: *const f32,
+        kernel: *const f32,
+        bias: *const f32,
+        conv_state: *mut f32,
+        out: *mut f32,
+        conv_dim: i32,
+        conv_kernel: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if xbc.is_null()
+                || kernel.is_null()
+                || conv_state.is_null()
+                || out.is_null()
+                || conv_dim <= 0
+                || conv_kernel <= 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA mamba2_conv_step".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_mamba2_conv_step(
+                    xbc,
+                    kernel,
+                    bias,
+                    conv_state,
+                    out,
+                    conv_dim,
+                    conv_kernel,
+                    self.stream,
+                )
+            };
+            status(rc, "mamba2_conv_step")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (xbc, kernel, bias, conv_state, out, conv_dim, conv_kernel);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA mamba2_conv_step unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_ssd_step_dev(
+        &self,
+        z: *const f32,
+        xbc: *const f32,
+        dt: *const f32,
+        a: *const f32,
+        d: *const f32,
+        dt_bias: *const f32,
+        norm: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        d_inner: i32,
+        d_state: i32,
+        n_heads: i32,
+        n_groups: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if z.is_null()
+                || xbc.is_null()
+                || dt.is_null()
+                || a.is_null()
+                || d.is_null()
+                || dt_bias.is_null()
+                || norm.is_null()
+                || state.is_null()
+                || out.is_null()
+                || d_inner <= 0
+                || d_state <= 0
+                || n_heads <= 0
+                || n_groups <= 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA mamba2_ssd_step".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_mamba2_ssd_step(
+                    z,
+                    xbc,
+                    dt,
+                    a,
+                    d,
+                    dt_bias,
+                    norm,
+                    state,
+                    out,
+                    d_inner,
+                    d_state,
+                    n_heads,
+                    n_groups,
+                    eps,
+                    self.stream,
+                )
+            };
+            status(rc, "mamba2_ssd_step")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (
+                z, xbc, dt, a, d, dt_bias, norm, state, out, d_inner, d_state, n_heads, n_groups,
+                eps,
+            );
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA mamba2_ssd_step unavailable".into(),
+            )))
+        }
+    }
+
     pub fn scale_heads_sigmoid_dev(
         &self,
         attn: *mut f32,
@@ -2795,6 +2942,159 @@ impl CudaWorkspace {
         self.free_ptr(dd);
         self.free_ptr(db);
         self.free_ptr(ds);
+        self.free_device(dout);
+        result
+    }
+
+    /// Host roundtrip: Mamba-2 depthwise conv + SiLU (mutates conv_state).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_conv_step_host(
+        &self,
+        xbc: &[f32],
+        kernel: &[f32],
+        bias: &[f32],
+        conv_state: &mut [f32],
+        out: &mut [f32],
+        conv_dim: i32,
+        conv_kernel: i32,
+    ) -> Result<(), AllpacaError> {
+        let cd = conv_dim as usize;
+        let ck = conv_kernel as usize;
+        let hist = ck.saturating_sub(1);
+        if cd == 0
+            || ck == 0
+            || xbc.len() < cd
+            || kernel.len() < cd.saturating_mul(ck)
+            || out.len() < cd
+            || (hist > 0 && conv_state.len() < hist.saturating_mul(cd))
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "mamba2_conv_step length mismatch".into(),
+            )));
+        }
+        let dx = self.upload_f32(&xbc[..cd])?;
+        let dk = self.upload_f32(&kernel[..cd * ck])?;
+        let (ds, free_ds) = if hist == 0 {
+            (device_malloc(4, self.device)?, true)
+        } else {
+            (self.upload_f32(&conv_state[..hist * cd])?.cast(), false)
+        };
+        let db = if bias.len() >= cd {
+            Some(self.upload_f32(&bias[..cd])?)
+        } else {
+            None
+        };
+        let dout = device_malloc(cd * 4, self.device)?;
+        let result = (|| {
+            self.mamba2_conv_step_dev(
+                dx,
+                dk,
+                db.map(|p| p as *const f32).unwrap_or(std::ptr::null()),
+                ds.cast(),
+                dout.cast(),
+                conv_dim,
+                conv_kernel,
+            )?;
+            self.download_f32(dout.cast(), &mut out[..cd])?;
+            if hist > 0 {
+                self.download_f32(ds.cast(), &mut conv_state[..hist * cd])?;
+            }
+            Ok(())
+        })();
+        self.free_ptr(dx);
+        self.free_ptr(dk);
+        if let Some(p) = db {
+            self.free_ptr(p);
+        }
+        if free_ds {
+            self.free_device(ds);
+        } else {
+            self.free_ptr(ds.cast());
+        }
+        self.free_device(dout);
+        result
+    }
+
+    /// Host roundtrip: Mamba-2 SSD + gate + grouped RMSNorm (mutates state).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_ssd_step_host(
+        &self,
+        z: &[f32],
+        xbc: &[f32],
+        dt: &[f32],
+        a: &[f32],
+        d: &[f32],
+        dt_bias: &[f32],
+        norm: &[f32],
+        state: &mut [f32],
+        out: &mut [f32],
+        d_inner: i32,
+        d_state: i32,
+        n_heads: i32,
+        n_groups: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        let inner = d_inner as usize;
+        let ds = d_state as usize;
+        let nh = n_heads as usize;
+        let ng = n_groups as usize;
+        let xbc_n = inner + 2 * ng * ds;
+        let st_n = inner.saturating_mul(ds);
+        if inner == 0
+            || ds == 0
+            || nh == 0
+            || ng == 0
+            || z.len() < inner
+            || xbc.len() < xbc_n
+            || dt.len() < nh
+            || a.len() < nh
+            || d.len() < nh
+            || dt_bias.len() < nh
+            || norm.len() < inner
+            || state.len() < st_n
+            || out.len() < inner
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "mamba2_ssd_step length mismatch".into(),
+            )));
+        }
+        let dz = self.upload_f32(&z[..inner])?;
+        let dxbc = self.upload_f32(&xbc[..xbc_n])?;
+        let ddt = self.upload_f32(&dt[..nh])?;
+        let da = self.upload_f32(&a[..nh])?;
+        let dd = self.upload_f32(&d[..nh])?;
+        let ddtb = self.upload_f32(&dt_bias[..nh])?;
+        let dn = self.upload_f32(&norm[..inner])?;
+        let dst = self.upload_f32(&state[..st_n])?;
+        let dout = device_malloc(inner * 4, self.device)?;
+        let result = (|| {
+            self.mamba2_ssd_step_dev(
+                dz,
+                dxbc,
+                ddt,
+                da,
+                dd,
+                ddtb,
+                dn,
+                dst,
+                dout.cast(),
+                d_inner,
+                d_state,
+                n_heads,
+                n_groups,
+                eps,
+            )?;
+            self.download_f32(dout.cast(), &mut out[..inner])?;
+            self.download_f32(dst, &mut state[..st_n])
+        })();
+        self.free_ptr(dz);
+        self.free_ptr(dxbc);
+        self.free_ptr(ddt);
+        self.free_ptr(da);
+        self.free_ptr(dd);
+        self.free_ptr(ddtb);
+        self.free_ptr(dn);
+        self.free_ptr(dst);
         self.free_device(dout);
         result
     }
@@ -4820,6 +5120,141 @@ mod tests {
                 "gdn_rmsnorm_silu_gate mismatch at {i}: cuda={} cpu={}",
                 out[i],
                 cpu_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn mamba2_conv_step_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let conv_dim = 4usize;
+        let conv_kernel = 2usize;
+        let hist = conv_kernel - 1;
+        let xbc = [1.0f32, -0.5, 0.5, -0.5];
+        let kernel = [0.5f32, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0];
+        let bias = [0.0f32; 4];
+        let mut state = [0.25f32, 0.1, -0.1, 0.2];
+        let mut cpu_state = state;
+        let mut cpu_out = [0.0f32; 4];
+        for c in 0..conv_dim {
+            let mut acc = bias[c];
+            for k in 0..hist {
+                acc += kernel[k + c * conv_kernel] * cpu_state[k * conv_dim + c];
+            }
+            acc += kernel[hist + c * conv_kernel] * xbc[c];
+            cpu_out[c] = acc / (1.0 + (-acc).exp());
+        }
+        for k in 0..hist.saturating_sub(1) {
+            let src = (k + 1) * conv_dim;
+            cpu_state.copy_within(src..src + conv_dim, k * conv_dim);
+        }
+        let last = (hist - 1) * conv_dim;
+        cpu_state[last..last + conv_dim].copy_from_slice(&xbc);
+        let mut out = [0.0f32; 4];
+        let ws = CudaWorkspace::new(0, 8192).expect("workspace");
+        ws.mamba2_conv_step_host(
+            &xbc,
+            &kernel,
+            &bias,
+            &mut state,
+            &mut out,
+            conv_dim as i32,
+            conv_kernel as i32,
+        )
+        .expect("cuda mamba2_conv");
+        for i in 0..4 {
+            assert!(
+                (out[i] - cpu_out[i]).abs() < 1e-5,
+                "mamba2_conv out mismatch at {i}: cuda={} cpu={}",
+                out[i],
+                cpu_out[i]
+            );
+            assert!(
+                (state[i] - cpu_state[i]).abs() < 1e-5,
+                "mamba2_conv state mismatch at {i}: cuda={} cpu={}",
+                state[i],
+                cpu_state[i]
+            );
+        }
+    }
+
+    #[test]
+    fn mamba2_ssd_step_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        // d_inner=2, d_state=1, n_heads=1, n_groups=1 → xbc = x|B|C len 4
+        let d_inner = 2i32;
+        let d_state = 1i32;
+        let n_heads = 1i32;
+        let n_groups = 1i32;
+        let eps = 1e-5f32;
+        let z = [0.5f32, -0.25];
+        let xbc = [1.0f32, -0.5, 0.5, -0.25];
+        let dt = [0.1f32];
+        let a = [-1.0f32];
+        let d = [0.25f32];
+        let dt_bias = [0.0f32];
+        let norm = [1.0f32, 1.0];
+        let mut state = [0.1f32, -0.2];
+        let softplus = |x: f32| {
+            if x > 20.0 {
+                x
+            } else {
+                (1.0 + x.exp()).ln()
+            }
+        };
+        let mut cpu_state = state;
+        let mut cpu_out = [0.0f32; 2];
+        let delta = softplus(dt[0] + dt_bias[0]);
+        let decay = (delta * a[0]).exp();
+        let b = xbc[2];
+        let c_val = xbc[3];
+        for channel in 0..2 {
+            let value = decay * cpu_state[channel] + delta * b * xbc[channel];
+            cpu_state[channel] = value;
+            let acc = c_val * value;
+            let silu = z[channel] / (1.0 + (-z[channel]).exp());
+            cpu_out[channel] = (acc + d[0] * xbc[channel]) * silu;
+        }
+        let ss: f32 = cpu_out.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / 2.0 + eps).sqrt();
+        for i in 0..2 {
+            cpu_out[i] *= inv * norm[i];
+        }
+        let mut out = [0.0f32; 2];
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        ws.mamba2_ssd_step_host(
+            &z,
+            &xbc,
+            &dt,
+            &a,
+            &d,
+            &dt_bias,
+            &norm,
+            &mut state,
+            &mut out,
+            d_inner,
+            d_state,
+            n_heads,
+            n_groups,
+            eps,
+        )
+        .expect("cuda mamba2_ssd");
+        for i in 0..2 {
+            assert!(
+                (out[i] - cpu_out[i]).abs() < 1e-4,
+                "mamba2_ssd out mismatch at {i}: cuda={} cpu={}",
+                out[i],
+                cpu_out[i]
+            );
+            assert!(
+                (state[i] - cpu_state[i]).abs() < 1e-4,
+                "mamba2_ssd state mismatch at {i}: cuda={} cpu={}",
+                state[i],
+                cpu_state[i]
             );
         }
     }

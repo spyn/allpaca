@@ -903,6 +903,100 @@ extern "C" int allpaca_cuda_gated_delta_step(float *q, float *k, const float *v,
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void mamba2_ssd_kernel(const float *z, const float *xbc, const float *dt,
+                                  const float *a, const float *d, const float *dt_bias,
+                                  const float *norm, float *state, float *out, int d_inner,
+                                  int d_state, int n_heads, int n_groups, float eps) {
+    const int group = static_cast<int>(blockIdx.x);
+    const int group_width = d_inner / n_groups;
+    const int head_dim = d_inner / n_heads;
+    const int heads_per_group = n_heads / n_groups;
+    const int group_start = group * group_width;
+    const int b_off = d_inner + group * d_state;
+    const int c_off = d_inner + n_groups * d_state + group * d_state;
+    __shared__ float sum_sq;
+    if (threadIdx.x == 0) {
+        sum_sq = 0.0f;
+    }
+    __syncthreads();
+    for (int local = static_cast<int>(threadIdx.x); local < group_width;
+         local += static_cast<int>(blockDim.x)) {
+        const int channel = group_start + local;
+        const int head = group * heads_per_group + local / head_dim;
+        const float delta = gdn_softplus(dt[head] + dt_bias[head]);
+        const float decay = expf(delta * a[head]);
+        float acc = 0.0f;
+        float *row = state + channel * d_state;
+        for (int n = 0; n < d_state; ++n) {
+            const float value = decay * row[n] + delta * xbc[b_off + n] * xbc[channel];
+            row[n] = value;
+            acc += xbc[c_off + n] * value;
+        }
+        const float gated = (acc + d[head] * xbc[channel]) * gdn_silu(z[channel]);
+        out[channel] = gated;
+        atomicAdd(&sum_sq, gated * gated);
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sum_sq / static_cast<float>(group_width) + eps);
+    for (int local = static_cast<int>(threadIdx.x); local < group_width;
+         local += static_cast<int>(blockDim.x)) {
+        const int channel = group_start + local;
+        out[channel] *= inv * norm[channel];
+    }
+}
+
+__global__ void mamba2_conv_compute_kernel(const float *x, const float *kernel, const float *bias,
+                                           const float *conv_state, float *out, int conv_dim,
+                                           int conv_kernel) {
+    const int channel = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= conv_dim) {
+        return;
+    }
+    const int hist = conv_kernel - 1;
+    float acc = bias ? bias[channel] : 0.0f;
+    for (int k = 0; k < hist; ++k) {
+        acc += kernel[k + channel * conv_kernel] * conv_state[k * conv_dim + channel];
+    }
+    acc += kernel[hist + channel * conv_kernel] * x[channel];
+    out[channel] = gdn_silu(acc);
+}
+
+extern "C" int allpaca_cuda_mamba2_conv_step(const float *xbc, const float *kernel,
+                                             const float *bias, float *conv_state, float *out,
+                                             int32_t conv_dim, int32_t conv_kernel,
+                                             allpaca_cuda_stream_t stream) {
+    if (!xbc || !kernel || !conv_state || !out || conv_dim <= 0 || conv_kernel <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int threads = 256;
+    int blocks = (conv_dim + threads - 1) / threads;
+    mamba2_conv_compute_kernel<<<blocks, threads, 0, as_stream(stream)>>>(
+        xbc, kernel, bias, conv_state, out, conv_dim, conv_kernel);
+    int rc = cuda_status(cudaGetLastError());
+    if (rc != ALLPACA_OK) {
+        return rc;
+    }
+    gdn_conv1d_shift_kernel<<<blocks, threads, 0, as_stream(stream)>>>(xbc, conv_state, conv_dim,
+                                                                       conv_kernel);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_mamba2_ssd_step(const float *z, const float *xbc, const float *dt,
+                                            const float *a, const float *d, const float *dt_bias,
+                                            const float *norm, float *state, float *out,
+                                            int32_t d_inner, int32_t d_state, int32_t n_heads,
+                                            int32_t n_groups, float eps,
+                                            allpaca_cuda_stream_t stream) {
+    if (!z || !xbc || !dt || !a || !d || !dt_bias || !norm || !state || !out || d_inner <= 0 ||
+        d_state <= 0 || n_heads <= 0 || n_groups <= 0 || d_inner % n_heads != 0 ||
+        n_heads % n_groups != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    mamba2_ssd_kernel<<<static_cast<unsigned>(n_groups), 256, 0, as_stream(stream)>>>(
+        z, xbc, dt, a, d, dt_bias, norm, state, out, d_inner, d_state, n_heads, n_groups, eps);
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int n_tok, int n_heads,
                                            int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
