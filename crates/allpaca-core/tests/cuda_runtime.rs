@@ -222,6 +222,55 @@ fn cuda_batched_prefill_one_forward_per_chunk() {
 }
 
 #[test]
+fn cuda_moe_batched_prefill_matches_per_token_and_batches() {
+    if !cuda_device_available() {
+        return;
+    }
+    let prompt = "hello world. ".repeat(40);
+    let params = greedy(4);
+
+    let mut per_cfg = cuda_synthetic();
+    per_cfg.model.synthetic = false;
+    per_cfg.prefill.chunk_tokens = 1;
+    per_cfg.kv.page_tokens = 64;
+    per_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let per = Engine::new(per_cfg).expect("per-token engine");
+    per.load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("load tiny_moe");
+    let per_out = per
+        .generate(&prompt, params.clone())
+        .expect("per-token generate");
+    assert!(
+        per_out.prompt_tokens >= 16,
+        "need a multi-token prompt, got {}",
+        per_out.prompt_tokens
+    );
+
+    let mut batch_cfg = cuda_synthetic();
+    batch_cfg.model.synthetic = false;
+    batch_cfg.prefill.chunk_tokens = 16;
+    batch_cfg.kv.page_tokens = 64;
+    batch_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let batch = Engine::new(batch_cfg).expect("batch engine");
+    batch
+        .load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("load tiny_moe");
+    let batch_out = batch.generate(&prompt, params).expect("batch generate");
+    let stats = batch.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < batch_out.prompt_tokens as u64,
+        "MoE batched prefill must not run one forward per prompt token; gpu_forwards={} prompt_tokens={}",
+        stats.gpu_forwards,
+        batch_out.prompt_tokens
+    );
+    assert_eq!(
+        batch_out.token_ids, per_out.token_ids,
+        "MoE chunked prefill must match per-token CUDA decode"
+    );
+}
+
+#[test]
 fn cuda_synthetic_moe_generate_uses_device_when_present() {
     if !cuda_device_available() {
         return;

@@ -10,7 +10,7 @@ use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
 use crate::telemetry::Metrics;
 use allpaca_cpu::silu;
-use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
+use allpaca_cuda::{CudaDeviceWeights, CudaPrefillActs, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
 use std::sync::atomic::Ordering;
@@ -1160,6 +1160,11 @@ impl TinyModel {
             cuda.residual_add_dev(acts.x, acts.proj, acts.x, (n_tok * dim) as i32)?;
             metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
+            let moe = !host_layer.experts.is_empty() || !layer.experts.is_empty();
+            if moe {
+                apply_moe_prefill_cuda(cfg, host_layer, layer, resident, cuda, &acts, metrics)?;
+                continue;
+            }
             if host_layer.w_gate.is_empty() || layer.w_gate.n == 0 {
                 continue;
             }
@@ -1395,6 +1400,136 @@ fn apply_gdn_cuda(
     for i in 0..dim {
         x[i] += hidden[i];
     }
+    Ok(())
+}
+
+/// MoE FFN for CUDA chunked prefill: rmsnorm on device, host top-k route, then
+/// per-expert GEMM with `M = group size` (tokens sharing that expert).
+fn apply_moe_prefill_cuda(
+    cfg: &ModelConfig,
+    host: &LayerWeights,
+    layer: &CudaLayerOff,
+    resident: &CudaResidentModel,
+    cuda: &CudaWorkspace,
+    acts: &CudaPrefillActs,
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    let dim = cfg.dim;
+    let ff = cfg.ff_dim;
+    let n_tok = acts.n_tok;
+    if layer.ffn_norm.n == 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA MoE prefill missing ffn_norm".into(),
+        )));
+    }
+    for t in 0..n_tok {
+        cuda.rmsnorm_dev(
+            unsafe { acts.x.add(t * dim) },
+            resident.ptr(layer.ffn_norm)?,
+            unsafe { acts.norm.add(t * dim) },
+            dim as i32,
+            cfg.eps,
+        )?;
+    }
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+    let mut x_norm = vec![0.0f32; n_tok * dim];
+    cuda.download_f32(acts.norm, &mut x_norm)?;
+    let n_exp = cfg.n_experts.max(layer.experts.len());
+    let n_act = cfg.n_active.max(1).min(n_exp);
+    let router = if !host.w_router.is_empty() {
+        host.w_router.as_slice()
+    } else if !layer.router_host.is_empty() {
+        layer.router_host.as_slice()
+    } else {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            "CUDA MoE prefill missing router weights".into(),
+        )));
+    };
+
+    let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
+    let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for t in 0..n_tok {
+        let routed = topk_route(&x_norm[t * dim..(t + 1) * dim], router, n_exp, n_act, cfg);
+        for &(e, _) in &routed {
+            union.insert(e);
+        }
+        routes.push(routed);
+    }
+
+    let mut acc = vec![0.0f32; n_tok * dim];
+    for e in union {
+        let Some([w_gate, w_up, w_down]) = layer.experts.get(e).copied() else {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "CUDA MoE prefill missing expert {e}"
+            ))));
+        };
+        let mut idxs: Vec<(usize, f32)> = Vec::new();
+        for (t, routed) in routes.iter().enumerate() {
+            if let Some((_, w)) = routed.iter().find(|(ee, _)| *ee == e) {
+                idxs.push((t, *w));
+            }
+        }
+        if idxs.is_empty() {
+            continue;
+        }
+        let group = idxs.len();
+        let mut a = vec![0.0f32; group * dim];
+        for (i, &(t, _)) in idxs.iter().enumerate() {
+            a[i * dim..(i + 1) * dim].copy_from_slice(&x_norm[t * dim..(t + 1) * dim]);
+        }
+        let mut up = vec![0.0f32; group * ff];
+        resident.gemm_host_a(cuda, &a, w_up, &mut up, group as i32, ff as i32, dim as i32)?;
+        let mut hidden = vec![0.0f32; group * dim];
+        if w_gate.n > 0 {
+            let mut gate = vec![0.0f32; group * ff];
+            resident.gemm_host_a(
+                cuda,
+                &a,
+                w_gate,
+                &mut gate,
+                group as i32,
+                ff as i32,
+                dim as i32,
+            )?;
+            for i in 0..group * ff {
+                gate[i] = silu(gate[i]) * up[i];
+            }
+            resident.gemm_host_a(
+                cuda,
+                &gate,
+                w_down,
+                &mut hidden,
+                group as i32,
+                dim as i32,
+                ff as i32,
+            )?;
+        } else {
+            for v in &mut up {
+                *v = silu(*v);
+            }
+            resident.gemm_host_a(
+                cuda,
+                &up,
+                w_down,
+                &mut hidden,
+                group as i32,
+                dim as i32,
+                ff as i32,
+            )?;
+        }
+        for (i, &(t, w)) in idxs.iter().enumerate() {
+            let src = &hidden[i * dim..(i + 1) * dim];
+            let dst = &mut acc[t * dim..(t + 1) * dim];
+            for j in 0..dim {
+                dst[j] += w * src[j];
+            }
+        }
+    }
+
+    cuda.copy_h2d_f32(acts.proj, &acc)?;
+    cuda.residual_add_dev(acts.x, acts.proj, acts.x, (n_tok * dim) as i32)?;
+    metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
