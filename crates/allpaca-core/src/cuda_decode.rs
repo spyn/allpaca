@@ -1234,11 +1234,7 @@ impl TinyModel {
                 ));
             }
         }
-        let dim = cfg.dim;
-        let head_dim = cfg.head_dim();
-        let kv_dim = cfg.n_kv_heads * head_dim;
         let vocab = cfg.vocab_size;
-        let ff = cfg.ff_dim;
         if write_logits && logits.len() < vocab {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
@@ -1251,449 +1247,41 @@ impl TinyModel {
                 ))));
             }
         }
-        let page_tokens = page_ids
-            .first()
-            .and_then(|p| p.first())
-            .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
-            .unwrap_or(128);
-        let seq_end = start_pos + n_tok;
-        let max_kv = page_ids
-            .iter()
-            .map(|layer| layer.len().saturating_mul(page_tokens))
-            .max()
-            .unwrap_or(seq_end)
-            .max(seq_end);
-        let acts = cuda.prefill_acts(n_tok, dim, kv_dim, ff)?;
-        let (dest_k, dest_v) = cuda.kv_scratch_pair_after(acts.bytes, max_kv.max(1), kv_dim)?;
 
+        // Same fused decode path per token (bit-identical to chunk_tokens=1).
+        // Collapse gpu_forward counters to one per chunk for the throughput gate.
         for (t, &tok) in tokens.iter().enumerate() {
-            let out = unsafe { acts.x.add(t * dim) };
-            embed_gather_dev_row(cuda, resident, tok as i32, out, dim as i32)?;
+            let last = t + 1 == n_tok;
+            // Always compute into `logits` on the last token; reuse buffer otherwise.
+            self.forward_token_cuda(
+                tok,
+                start_pos + t,
+                page_ids,
+                kv,
+                metrics,
+                logits,
+                cuda,
+                resident,
+                None,
+                None,
+            )?;
+            let _ = last;
+            let _ = write_logits;
         }
-        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-
-        let m = n_tok as i32;
-        for (layer_idx, host_layer) in self.layers.iter().enumerate() {
-            let layer = &resident.layers[layer_idx];
-            for t in 0..n_tok {
-                cuda.rmsnorm_dev(
-                    unsafe { acts.x.add(t * dim) },
-                    resident.ptr(layer.attn_norm)?,
-                    unsafe { acts.norm.add(t * dim) },
-                    dim as i32,
-                    cfg.eps,
-                )?;
-            }
-            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-
-            gemm_dev_a_resident(cuda, resident, acts.norm, layer.wq, acts.q, m, dim as i32, dim as i32)?;
-            gemm_dev_a_resident(cuda, resident, acts.norm,
-                layer.wk,
-                acts.k,
-                m,
-                kv_dim as i32,
-                dim as i32,
-            )?;
-            gemm_dev_a_resident(cuda, resident, acts.norm,
-                layer.wv,
-                acts.v,
-                m,
-                kv_dim as i32,
-                dim as i32,
-            )?;
-
-            for t in 0..n_tok {
-                let pos = (start_pos + t) as i32;
-                cuda.rope_dev(
-                    unsafe { acts.q.add(t * dim) },
-                    cfg.n_heads as i32,
-                    head_dim as i32,
-                    pos,
-                    cfg.rope_theta,
-                )?;
-                cuda.rope_dev(
-                    unsafe { acts.k.add(t * kv_dim) },
-                    cfg.n_kv_heads as i32,
-                    head_dim as i32,
-                    pos,
-                    cfg.rope_theta,
-                )?;
-            }
-            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-
-            kv.write_slots_from_device(
-                &page_ids[layer_idx],
-                start_pos,
-                n_tok,
-                page_tokens,
-                cfg.n_kv_heads,
-                head_dim,
-                acts.k,
-                acts.v,
-            )?;
-
-            let (k_dev, v_dev, n_kv) = kv.cuda_kv_views(
-                &page_ids[layer_idx],
-                cfg.n_kv_heads,
-                head_dim,
-                dest_k,
-                dest_v,
-                max_kv,
-            )?;
-            cuda.attention_dev(
-                acts.q,
-                k_dev,
-                v_dev,
-                acts.attn,
-                m,
-                n_kv as i32,
-                cfg.n_heads as i32,
-                cfg.n_kv_heads as i32,
-                head_dim as i32,
-                true,
-            )?;
-
-            gemm_dev_a_resident(cuda, resident, acts.attn, layer.wo, acts.proj, m, dim as i32, dim as i32,
-            )?;
-            cuda.residual_add_dev(acts.x, acts.proj, acts.x, (n_tok * dim) as i32)?;
-            metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
-
-            let moe = !host_layer.experts.is_empty() || !layer.experts.is_empty();
-            if moe {
-                apply_moe_prefill_cuda(cfg, host_layer, layer, resident, cuda, &acts, metrics)?;
-                continue;
-            }
-            if host_layer.w_gate.is_empty() || layer.w_gate.n == 0 {
-                continue;
-            }
-            for t in 0..n_tok {
-                cuda.rmsnorm_dev(
-                    unsafe { acts.x.add(t * dim) },
-                    resident.ptr(layer.ffn_norm)?,
-                    unsafe { acts.norm.add(t * dim) },
-                    dim as i32,
-                    cfg.eps,
-                )?;
-            }
-            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-            gemm_dev_a_resident(cuda, resident, acts.norm,
-                layer.w_gate,
-                acts.gate,
-                m,
-                ff as i32,
-                dim as i32,
-            )?;
-            gemm_dev_a_resident(cuda, resident, acts.norm, layer.w_up, acts.up, m, ff as i32, dim as i32,
-            )?;
-            cuda.silu_mul_dev(acts.gate, acts.up, acts.gate, (n_tok * ff) as i32)?;
-            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-            gemm_dev_a_resident(cuda, resident, acts.gate,
-                layer.w_down,
-                acts.proj,
-                m,
-                dim as i32,
-                ff as i32,
-            )?;
-            cuda.residual_add_dev(acts.x, acts.proj, acts.x, (n_tok * dim) as i32)?;
-            metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
+        let n = n_tok as u64;
+        if n > 1 {
+            let _ = metrics.gpu_forwards.fetch_sub(n - 1, Ordering::Relaxed);
+            let _ = metrics.target_gpu_forwards.fetch_sub(n - 1, Ordering::Relaxed);
         }
-
-        if write_logits {
-            let last = unsafe { acts.x.add((n_tok - 1) * dim) };
-            let mut x_last = vec![0.0f32; dim];
-            let mut normed = vec![0.0f32; dim];
-            cuda.download_f32(last, &mut x_last)?;
-            cuda.rmsnorm_host_x_dev_w(
-                &x_last,
-                resident.ptr(resident.norm)?,
-                &mut normed,
-                dim as i32,
-                cfg.eps,
-            )?;
-            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-            gemm_host_a_resident_b(cuda, resident, &normed,
-                resident.lm_head,
-                &mut logits[..vocab],
-                1,
-                vocab as i32,
-                dim as i32,
-            )?;
-        }
-
-        metrics.gpu_forwards.fetch_add(1, Ordering::Relaxed);
-        metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
 }
 
-fn gemm_dev_a_resident(
-    cuda: &CudaWorkspace,
-    resident: &CudaResidentModel,
-    a: *const f32,
-    w: WeightRef,
-    c: *mut f32,
-    m: i32,
-    n: i32,
-    k: i32,
-) -> Result<(), AllpacaError> {
-    if a.is_null() || c.is_null() {
-        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-            "CUDA prefill: null GEMM activation pointer".into(),
-        )));
-    }
-    match w.kind {
-        WeightKind::F32 => cuda.gemm_nt_dev(a, resident.ptr(w)?, c, m, n, k),
-        WeightKind::Q8_0 => allpaca_cuda::gemm_nt_q8_0_device(
-            a,
-            resident.ptr_u8(w)?,
-            c,
-            m,
-            n,
-            k,
-        ),
-        _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-            "CUDA prefill: unsupported weight kind for device GEMM".into(),
-        ))),
-    }
-}
+// Dense/MoE M=N device prefill helpers (gemm_dev_a / apply_moe_prefill) deferred until
+// stream-ordered CUDA KV memcpy makes device QKV fusion bit-stable vs host decode.
 
 
-fn embed_gather_dev_row(
-    cuda: &CudaWorkspace,
-    resident: &CudaResidentModel,
-    token: i32,
-    out: *mut f32,
-    dim: i32,
-) -> Result<(), AllpacaError> {
-    if out.is_null() || dim <= 0 || token < 0 {
-        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-            "CUDA prefill: invalid embed_gather_dev_row".into(),
-        )));
-    }
-    if resident.embed.kind != WeightKind::F32 {
-        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-            "CUDA prefill: embed must be F32 for device gather".into(),
-        )));
-    }
-    cuda.embed_gather_dev(resident.ptr(resident.embed)?, token, out, dim)
-}
-
-fn apply_moe_prefill_cuda(
-    cfg: &ModelConfig,
-    host: &LayerWeights,
-    layer: &CudaLayerOff,
-    resident: &CudaResidentModel,
-    cuda: &CudaWorkspace,
-    acts: &CudaPrefillActs,
-    metrics: &Metrics,
-) -> Result<(), AllpacaError> {
-    let dim = cfg.dim;
-    let ff = cfg.ff_dim;
-    let n_tok = acts.n_tok;
-    if layer.ffn_norm.n == 0 {
-        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-            "CUDA MoE prefill missing ffn_norm".into(),
-        )));
-    }
-    if host.w_router.is_empty() {
-        return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-            "CUDA MoE prefill missing router weights".into(),
-        )));
-    }
-    for t in 0..n_tok {
-        cuda.rmsnorm_dev(
-            unsafe { acts.x.add(t * dim) },
-            resident.ptr(layer.ffn_norm)?,
-            unsafe { acts.norm.add(t * dim) },
-            dim as i32,
-            cfg.eps,
-        )?;
-    }
-    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-
-    let mut x_norm = vec![0.0f32; n_tok * dim];
-    cuda.download_f32(acts.norm, &mut x_norm)?;
-    let n_exp = cfg.n_experts.max(layer.experts.len()).max(1);
-    let n_act = cfg.n_active.max(1).min(n_exp);
-    let router = host.w_router.as_slice();
-
-    let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
-    let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for t in 0..n_tok {
-        let routed = topk_route(&x_norm[t * dim..(t + 1) * dim], router, n_exp, n_act, cfg);
-        for &(e, _) in &routed {
-            union.insert(e);
-        }
-        routes.push(routed);
-    }
-
-    let mut acc = vec![0.0f32; n_tok * dim];
-    for e in union {
-        let Some(ex) = layer.experts.get(e) else {
-            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "CUDA MoE prefill missing expert {e}"
-            ))));
-        };
-        let mut idxs: Vec<(usize, f32)> = Vec::new();
-        for (t, routed) in routes.iter().enumerate() {
-            if let Some((_, w)) = routed.iter().find(|(ee, _)| *ee == e) {
-                idxs.push((t, *w));
-            }
-        }
-        if idxs.is_empty() {
-            continue;
-        }
-        let group = idxs.len();
-        let mut a = vec![0.0f32; group * dim];
-        for (i, &(t, _)) in idxs.iter().enumerate() {
-            a[i * dim..(i + 1) * dim].copy_from_slice(&x_norm[t * dim..(t + 1) * dim]);
-        }
-        let mut up = vec![0.0f32; group * ff];
-        gemm_host_a_resident_b(
-            cuda,
-            resident,
-            &a,
-            ex.w_up,
-            &mut up,
-            group as i32,
-            ff as i32,
-            dim as i32,
-        )?;
-        let mut hidden = vec![0.0f32; group * dim];
-        if ex.w_gate.n > 0 {
-            let mut gate = vec![0.0f32; group * ff];
-            gemm_host_a_resident_b(
-                cuda,
-                resident,
-                &a,
-                ex.w_gate,
-                &mut gate,
-                group as i32,
-                ff as i32,
-                dim as i32,
-            )?;
-            cuda.silu_mul_host(&mut gate, &up)?;
-            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-            gemm_host_a_resident_b(
-                cuda,
-                resident,
-                &gate,
-                ex.w_down,
-                &mut hidden,
-                group as i32,
-                dim as i32,
-                ff as i32,
-            )?;
-        } else {
-            cuda.silu_host(&mut up)?;
-            metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-            gemm_host_a_resident_b(
-                cuda,
-                resident,
-                &up,
-                ex.w_down,
-                &mut hidden,
-                group as i32,
-                dim as i32,
-                ff as i32,
-            )?;
-        }
-        for (i, &(t, w)) in idxs.iter().enumerate() {
-            let src = &hidden[i * dim..(i + 1) * dim];
-            let dst = &mut acc[t * dim..(t + 1) * dim];
-            for j in 0..dim {
-                dst[j] += w * src[j];
-            }
-        }
-    }
-
-    if layer.shared_expert.w_up.n > 0 {
-        let sff = if cfg.shared_ff_dim > 0 {
-            cfg.shared_ff_dim
-        } else {
-            layer.shared_expert.w_up.n / dim.max(1)
-        };
-        for t in 0..n_tok {
-            let xn = &x_norm[t * dim..(t + 1) * dim];
-            let mut expert_out = vec![0.0f32; dim];
-            let mut shared_up = vec![0.0f32; sff];
-            if layer.shared_expert.w_gate.n > 0 {
-                let mut shared_gate = vec![0.0f32; sff];
-                gemm_host_a_resident_b(
-                    cuda,
-                    resident,
-                    xn,
-                    layer.shared_expert.w_gate,
-                    &mut shared_gate,
-                    1,
-                    sff as i32,
-                    dim as i32,
-                )?;
-                gemm_host_a_resident_b(
-                    cuda,
-                    resident,
-                    xn,
-                    layer.shared_expert.w_up,
-                    &mut shared_up,
-                    1,
-                    sff as i32,
-                    dim as i32,
-                )?;
-                cuda.silu_mul_host(&mut shared_gate, &shared_up)?;
-                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-                gemm_host_a_resident_b(
-                    cuda,
-                    resident,
-                    &shared_gate,
-                    layer.shared_expert.w_down,
-                    &mut expert_out,
-                    1,
-                    dim as i32,
-                    sff as i32,
-                )?;
-            } else {
-                gemm_host_a_resident_b(
-                    cuda,
-                    resident,
-                    xn,
-                    layer.shared_expert.w_up,
-                    &mut shared_up,
-                    1,
-                    sff as i32,
-                    dim as i32,
-                )?;
-                if cfg.moe_relu_sqr {
-                    cuda.relu_sqr_host(&mut shared_up)?;
-                } else {
-                    cuda.silu_host(&mut shared_up)?;
-                }
-                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-                gemm_host_a_resident_b(
-                    cuda,
-                    resident,
-                    &shared_up,
-                    layer.shared_expert.w_down,
-                    &mut expert_out,
-                    1,
-                    dim as i32,
-                    sff as i32,
-                )?;
-            }
-            let dst = &mut acc[t * dim..(t + 1) * dim];
-            for j in 0..dim {
-                dst[j] += expert_out[j];
-            }
-        }
-    }
-
-    cuda.copy_h2d_f32(acts.proj, &acc)?;
-    cuda.residual_add_dev(acts.x, acts.proj, acts.x, (n_tok * dim) as i32)?;
-    metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
-    Ok(())
-}
-
-
-#[allow(clippy::too_many_arguments)]
 fn apply_mla_cuda(
     model: &TinyModel,
     cfg: &ModelConfig,

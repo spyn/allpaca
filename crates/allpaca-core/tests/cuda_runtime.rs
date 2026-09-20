@@ -930,6 +930,41 @@ fn cuda_moe_batched_prefill_matches_per_token_and_batches() {
         stats.gpu_forwards,
         batch_out.prompt_tokens
     );
-    assert!(!batch_out.token_ids.is_empty());
-    let _ = per_out; // prompt length already checked; token parity vs host-decode deferred
+    assert_eq!(
+        batch_out.token_ids, per_out.token_ids,
+        "MoE chunked prefill must match per-token CUDA decode"
+    );
+}
+
+#[test]
+fn cuda_dense_batched_prefill_matches_per_token() {
+    if !cuda_device_available() {
+        return;
+    }
+    let prompt = "hello world. ".repeat(40);
+    let params = greedy(4);
+    let mut per_cfg = cuda_synthetic();
+    per_cfg.prefill.chunk_tokens = 1;
+    per_cfg.kv.page_tokens = 64;
+    per_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let per = Engine::new(per_cfg).expect("per");
+    let per_out = per.generate(&prompt, params.clone()).expect("per");
+    assert!(per_out.prompt_tokens >= 16);
+    let mut batch_cfg = cuda_synthetic();
+    batch_cfg.prefill.chunk_tokens = 16;
+    batch_cfg.kv.page_tokens = 64;
+    batch_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let batch = Engine::new(batch_cfg).expect("batch");
+    let batch_out = batch.generate(&prompt, params).expect("batch");
+    let stats = batch.stats();
+    assert!(
+        stats.gpu_forwards < batch_out.prompt_tokens as u64,
+        "dense batched prefill must batch; gpu_forwards={} prompt_tokens={}",
+        stats.gpu_forwards,
+        batch_out.prompt_tokens
+    );
+    assert_eq!(
+        batch_out.token_ids, per_out.token_ids,
+        "dense chunked prefill must match per-token CUDA decode"
+    );
 }

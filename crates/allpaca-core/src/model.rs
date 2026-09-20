@@ -9853,6 +9853,84 @@ mod cuda_softcap_tests {
         );
     }
 
+    #[test]
+    fn cuda_prefill_loop_matches_token_loop_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic(ModelConfig::tiny(), 7, "parity-loop");
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8 * 1024 * 1024).expect("ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        let n = 8usize;
+        let tokens: Vec<u32> = (0..n)
+            .map(|pos| (pos as u32) % model.config.vocab_size as u32)
+            .collect();
+
+        let run = |label: &str| -> Vec<f32> {
+            let metrics = Metrics::default();
+            let mut kv = crate::kv_tier::KvTierManager::with_devices(
+                8 << 20,
+                8 << 20,
+                0.5,
+                None,
+                Some(cuda.device),
+            );
+            let pages =
+                alloc_pages_for_seq(&mut kv, &model.config, 128, n, &metrics).expect("pages");
+            let mut logits = vec![0.0f32; model.config.vocab_size];
+            if label == "batch" {
+                model
+                    .forward_tokens_cuda(
+                        &tokens,
+                        0,
+                        &pages,
+                        &mut kv,
+                        &metrics,
+                        &mut logits,
+                        &cuda,
+                        &resident,
+                        true,
+                    )
+                    .expect("batch");
+            } else {
+                for (pos, &tok) in tokens.iter().enumerate() {
+                    model
+                        .forward_token_cuda(
+                            tok,
+                            pos,
+                            &pages,
+                            &mut kv,
+                            &metrics,
+                            &mut logits,
+                            &cuda,
+                            &resident,
+                            None,
+                            None,
+                        )
+                        .expect("tok");
+                }
+            }
+            logits
+        };
+
+        let a = run("tok");
+        let b = run("tok");
+        let det = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(det < 1e-5, "token loop not deterministic max_diff={det}");
+
+        let c = run("batch");
+        let diff = a
+            .iter()
+            .zip(c.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff < 1e-4, "batch vs tok max_diff={diff}");
+    }
+
     fn cuda_decode_n_tokens(model: &TinyModel, n: usize) -> Vec<f32> {
         let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
         let resident = CudaResidentModel::upload(model, cuda.device).expect("upload");
