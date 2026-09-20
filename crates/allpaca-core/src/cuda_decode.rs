@@ -9,7 +9,7 @@ use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
 use allpaca_cpu::matmul_nt;
-use allpaca_cuda::{CudaDeviceWeights, CudaPrefillActs, CudaWorkspace};
+use allpaca_cuda::{CudaDeviceWeights, CudaWorkspace};
 use allpaca_gguf::HybridLayerKind;
 use allpaca_types::{AllpacaError, FatalError};
 use std::sync::atomic::Ordering;
@@ -68,7 +68,12 @@ impl CudaResidentModel {
             WeightRef::f32(o, s.len())
         }
         /// Quantize row-major `n × k` F32 into staged Q8_0 GEMV blocks.
-        fn push_q8_matrix(pack: &mut Vec<u8>, data: &[f32], n: usize, k: usize) -> Result<WeightRef, AllpacaError> {
+        fn push_q8_matrix(
+            pack: &mut Vec<u8>,
+            data: &[f32],
+            n: usize,
+            k: usize,
+        ) -> Result<WeightRef, AllpacaError> {
             if data.is_empty() || n == 0 || k == 0 {
                 return Ok(WeightRef::f32(0, 0));
             }
@@ -142,19 +147,9 @@ impl CudaResidentModel {
                     w_gate: if layer.shared_expert.w_gate.is_empty() {
                         WeightRef::f32(0, 0)
                     } else {
-                        push_q8_matrix(
-                            &mut pack,
-                            layer.shared_expert.w_gate.as_slice(),
-                            sff,
-                            dim,
-                        )?
+                        push_q8_matrix(&mut pack, layer.shared_expert.w_gate.as_slice(), sff, dim)?
                     },
-                    w_up: push_q8_matrix(
-                        &mut pack,
-                        layer.shared_expert.w_up.as_slice(),
-                        sff,
-                        dim,
-                    )?,
+                    w_up: push_q8_matrix(&mut pack, layer.shared_expert.w_up.as_slice(), sff, dim)?,
                     w_down: push_q8_matrix(
                         &mut pack,
                         layer.shared_expert.w_down.as_slice(),
@@ -163,35 +158,34 @@ impl CudaResidentModel {
                     )?,
                 }
             };
-            let (w_qkv, w_z, w_alpha, w_beta, w_ssm_in, w_ssm_out) =
-                if let Some(gdn) = &layer.gdn {
-                    (
-                        push_f32(&mut pack, gdn.w_qkv.as_slice()),
-                        push_f32(&mut pack, gdn.w_z.as_slice()),
-                        push_f32(&mut pack, gdn.w_alpha.as_slice()),
-                        push_f32(&mut pack, gdn.w_beta.as_slice()),
-                        WeightRef::f32(0, 0),
-                        push_f32(&mut pack, gdn.w_out.as_slice()),
-                    )
-                } else if let Some(ssm) = &layer.ssm {
-                    (
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                        push_f32(&mut pack, ssm.w_in.as_slice()),
-                        push_f32(&mut pack, ssm.w_out.as_slice()),
-                    )
-                } else {
-                    (
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                        WeightRef::f32(0, 0),
-                    )
-                };
+            let (w_qkv, w_z, w_alpha, w_beta, w_ssm_in, w_ssm_out) = if let Some(gdn) = &layer.gdn {
+                (
+                    push_f32(&mut pack, gdn.w_qkv.as_slice()),
+                    push_f32(&mut pack, gdn.w_z.as_slice()),
+                    push_f32(&mut pack, gdn.w_alpha.as_slice()),
+                    push_f32(&mut pack, gdn.w_beta.as_slice()),
+                    WeightRef::f32(0, 0),
+                    push_f32(&mut pack, gdn.w_out.as_slice()),
+                )
+            } else if let Some(ssm) = &layer.ssm {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    push_f32(&mut pack, ssm.w_in.as_slice()),
+                    push_f32(&mut pack, ssm.w_out.as_slice()),
+                )
+            } else {
+                (
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                    WeightRef::f32(0, 0),
+                )
+            };
             layers.push(CudaLayerOff {
                 attn_norm,
                 wq,
@@ -716,6 +710,13 @@ impl TinyModel {
         soft_x: Option<&[f32]>,
         mut recurrent: Option<&mut RecurrentState>,
     ) -> Result<(), AllpacaError> {
+        // RPC split: keep activations device-resident across local layers; bounce
+        // only at remote boundaries (ADR 0003). Complex local blocks fall back.
+        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+            return self.forward_token_cuda_rpc_resident(
+                token, pos, page_ids, kv, metrics, logits, cuda, resident, soft_x, recurrent,
+            );
+        }
         let cfg = &self.config;
         cuda_reject_unsupported_layers(self)?;
         let dim = cfg.dim;
@@ -1004,7 +1005,14 @@ impl TinyModel {
             let page_index = pos / page_tokens as usize;
             let slot = (pos % page_tokens as usize) as u32;
             let page_id = page_ids[layer_idx][page_index];
-            kv.write_slot(page_id, slot, n_kv_heads, head_dim, &k[..kv_dim], &v[..kv_dim])?;
+            kv.write_slot(
+                page_id,
+                slot,
+                n_kv_heads,
+                head_dim,
+                &k[..kv_dim],
+                &v[..kv_dim],
+            )?;
             kv.touch(page_id, 1.0);
 
             // SWA / softcap: device masked (+ softcap) attention; causal softcap on device.
@@ -1195,6 +1203,217 @@ impl TinyModel {
         Ok(())
     }
 
+    /// CUDA coordinator decode with device-resident activations across local
+    /// layers. Remote layers host-bounce `x` once at the device boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_token_cuda_rpc_resident(
+        &self,
+        token: u32,
+        pos: usize,
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        logits: &mut [f32],
+        cuda: &CudaWorkspace,
+        resident: &CudaResidentModel,
+        soft_x: Option<&[f32]>,
+        mut recurrent: Option<&mut RecurrentState>,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        cuda_reject_unsupported_layers(self)?;
+        let dim = cfg.dim;
+        let vocab = cfg.vocab_size;
+        if logits.len() < vocab {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "logits buffer smaller than vocab".into(),
+            )));
+        }
+        if soft_x.is_none() && token as usize >= vocab {
+            return Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
+                "token {token} out of vocab"
+            ))));
+        }
+
+        struct ProfileGuard<'a> {
+            cuda: &'a CudaWorkspace,
+        }
+        impl Drop for ProfileGuard<'_> {
+            fn drop(&mut self) {
+                self.cuda.end_decode_profile();
+            }
+        }
+        cuda.begin_decode_profile();
+        let _profile = ProfileGuard { cuda };
+
+        let dx = allpaca_cuda::device_malloc(dim * 4, cuda.device)?;
+        let cleanup_dx = |cuda: &CudaWorkspace, dx: *mut std::ffi::c_void| {
+            cuda.free_device(dx);
+        };
+        let result = (|| {
+            if let Some(x0) = soft_x {
+                if x0.len() != dim {
+                    return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                        "soft embed len {} != dim {dim}",
+                        x0.len()
+                    ))));
+                }
+                cuda.copy_h2d_f32(dx.cast(), x0)?;
+            } else {
+                cuda.embed_gather_dev(
+                    resident.ptr(resident.embed)?,
+                    token as i32,
+                    dx.cast(),
+                    dim as i32,
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+            }
+            if cfg.scale_embed {
+                // scale on device via download/scale/upload is a host bounce; rare path.
+                let mut x = vec![0.0f32; dim];
+                cuda.download_f32(dx.cast(), &mut x)?;
+                let s = (dim as f32).sqrt();
+                cuda.scale_f32_host(&mut x, s)?;
+                cuda.copy_h2d_f32(dx.cast(), &x)?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let mut x_host = vec![0.0f32; dim];
+            let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim)];
+            let mut hidden = vec![0.0f32; dim];
+
+            for (layer_idx, host_layer) in self.layers.iter().enumerate() {
+                if let Some(rpc) = &self.rpc {
+                    if rpc.is_remote(layer_idx) {
+                        cuda.download_f32(dx.cast(), &mut x_host)?;
+                        rpc.run_layer(layer_idx, pos, &mut x_host)?;
+                        cuda.copy_h2d_f32(dx.cast(), &x_host)?;
+                        continue;
+                    }
+                }
+
+                let layer = &resident.layers[layer_idx];
+                if rpc_local_layer_is_simple_dense(cfg, host_layer) {
+                    apply_simple_dense_layer_cuda_dev(
+                        cfg,
+                        layer_idx,
+                        host_layer,
+                        layer,
+                        resident,
+                        cuda,
+                        kv,
+                        &page_ids[layer_idx],
+                        pos,
+                        dx.cast(),
+                        metrics,
+                    )?;
+                    continue;
+                }
+
+                // Complex local block: bounce to host path for this layer only.
+                cuda.download_f32(dx.cast(), &mut x_host)?;
+                if host_layer.gdn.is_some() {
+                    apply_gdn_cuda(
+                        cfg,
+                        layer_idx,
+                        host_layer,
+                        layer,
+                        resident,
+                        cuda,
+                        &mut x_host,
+                        &mut scratch,
+                        &mut hidden,
+                        metrics,
+                        recurrent.as_deref_mut(),
+                    )?;
+                } else if host_layer.block == HybridLayerKind::Ssm {
+                    apply_ssm_cuda(
+                        cfg,
+                        layer_idx,
+                        host_layer,
+                        layer,
+                        resident,
+                        cuda,
+                        &mut x_host,
+                        &mut scratch,
+                        &mut hidden,
+                        metrics,
+                        recurrent.as_deref_mut(),
+                    )?;
+                } else if matches!(
+                    host_layer.block,
+                    HybridLayerKind::DenseFfn | HybridLayerKind::Moe
+                ) {
+                    apply_ffn_cuda(
+                        cfg,
+                        layer_idx,
+                        host_layer,
+                        layer,
+                        resident,
+                        cuda,
+                        &mut x_host,
+                        &mut scratch,
+                        &mut hidden,
+                        metrics,
+                    )?;
+                } else if host_layer.mla.is_some() {
+                    apply_mla_cuda(
+                        self,
+                        cfg,
+                        layer_idx,
+                        host_layer,
+                        layer,
+                        resident,
+                        cuda,
+                        &mut x_host,
+                        &mut scratch,
+                        &mut hidden,
+                        metrics,
+                    )?;
+                } else {
+                    return Err(AllpacaError::Degraded(
+                        allpaca_types::DegradedError::FeatureDisabled(
+                            "CUDA RPC resident: unsupported local layer shape".into(),
+                        ),
+                    ));
+                }
+                cuda.copy_h2d_f32(dx.cast(), &x_host)?;
+            }
+
+            // Final norm + lm_head: one D2H of x into host scratch via device norm.
+            let d_norm = allpaca_cuda::device_malloc(dim * 4, cuda.device)?;
+            let lm: Result<(), AllpacaError> = (|| {
+                cuda.rmsnorm_dev(
+                    dx.cast(),
+                    resident.ptr(resident.norm)?,
+                    d_norm.cast(),
+                    dim as i32,
+                    cfg.eps,
+                )?;
+                metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+                let mut norm_host = vec![0.0f32; dim];
+                cuda.download_f32(d_norm.cast(), &mut norm_host)?;
+                cuda.gemm_nt_host_a_dev_b(
+                    &norm_host,
+                    resident.ptr(resident.lm_head)?,
+                    &mut logits[..vocab],
+                    1,
+                    vocab as i32,
+                    dim as i32,
+                )?;
+                softcap_inplace(&mut logits[..vocab], cfg.final_logit_softcap);
+                Ok(())
+            })();
+            cuda.free_device(d_norm);
+            lm?;
+
+            metrics.gpu_forwards.fetch_add(1, Ordering::Relaxed);
+            metrics.target_gpu_forwards.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })();
+        cleanup_dx(cuda, dx);
+        result
+    }
+
     pub fn forward_tokens_cuda(
         &self,
         tokens: &[u32],
@@ -1271,16 +1490,16 @@ impl TinyModel {
         let n = n_tok as u64;
         if n > 1 {
             let _ = metrics.gpu_forwards.fetch_sub(n - 1, Ordering::Relaxed);
-            let _ = metrics.target_gpu_forwards.fetch_sub(n - 1, Ordering::Relaxed);
+            let _ = metrics
+                .target_gpu_forwards
+                .fetch_sub(n - 1, Ordering::Relaxed);
         }
         Ok(())
     }
-
 }
 
 // Dense/MoE M=N device prefill helpers (gemm_dev_a / apply_moe_prefill) deferred until
 // stream-ordered CUDA KV memcpy makes device QKV fusion bit-stable vs host decode.
-
 
 fn apply_mla_cuda(
     model: &TinyModel,
@@ -1332,16 +1551,7 @@ fn apply_mla_cuda(
     cuda.residual_add_host(x, hidden)?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     apply_ffn_cuda(
-        cfg,
-        layer_idx,
-        host,
-        layer,
-        resident,
-        cuda,
-        x,
-        scratch,
-        hidden,
-        metrics,
+        cfg, layer_idx, host, layer, resident, cuda, x, scratch, hidden, metrics,
     )?;
     Ok(())
 }
@@ -1551,16 +1761,7 @@ fn apply_gdn_cuda(
 
     if !host.w_gate.is_empty() || !host.experts.is_empty() {
         apply_ffn_cuda(
-            cfg,
-            layer_idx,
-            host,
-            layer,
-            resident,
-            cuda,
-            x,
-            scratch,
-            hidden,
-            metrics,
+            cfg, layer_idx, host, layer, resident, cuda, x, scratch, hidden, metrics,
         )?;
     }
     Ok(())
@@ -1686,16 +1887,7 @@ fn apply_ssm_cuda(
 
     if !host.w_gate.is_empty() || !host.experts.is_empty() {
         apply_ffn_cuda(
-            cfg,
-            layer_idx,
-            host,
-            layer,
-            resident,
-            cuda,
-            x,
-            scratch,
-            hidden,
-            metrics,
+            cfg, layer_idx, host, layer, resident, cuda, x, scratch, hidden, metrics,
         )?;
     }
     Ok(())
@@ -1778,6 +1970,214 @@ fn apply_ffn_cuda(
     cuda.residual_add_host(x, hidden)?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// True when a local RPC layer can run fully device-resident (no host QKV bounce).
+fn rpc_local_layer_is_simple_dense(cfg: &ModelConfig, host: &LayerWeights) -> bool {
+    host.block == HybridLayerKind::Attention
+        && host.gdn.is_none()
+        && host.mla.is_none()
+        && host.experts.is_empty()
+        && !cfg.ffn_gelu
+        && cfg.attn_logit_softcap == 0.0
+        && cfg.sliding_window == 0
+        && !cfg.headwise_attn_gate
+        && host.q_norm.is_empty()
+        && host.k_norm.is_empty()
+        && host.attn_sinks.is_empty()
+        && host.attn_post_norm.is_empty()
+        && host.ffn_post_norm.is_empty()
+        && host.attn_out_gate.is_empty()
+        && !host.wq.is_empty()
+        && !host.w_gate.is_empty()
+}
+
+/// Dense Attention+FFN on device-resident `dx` (RPC local layers).
+#[allow(clippy::too_many_arguments)]
+fn apply_simple_dense_layer_cuda_dev(
+    cfg: &ModelConfig,
+    layer_idx: usize,
+    host: &LayerWeights,
+    layer: &CudaLayerOff,
+    resident: &CudaResidentModel,
+    cuda: &CudaWorkspace,
+    kv: &mut KvTierManager,
+    page_ids: &[u64],
+    pos: usize,
+    dx: *mut f32,
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    let dim = cfg.dim;
+    let al = super::attn_layout(cfg, host.wq.len(), host.wk.len(), host.wo.len());
+    if al.gated {
+        return Err(AllpacaError::Degraded(
+            allpaca_types::DegradedError::FeatureDisabled(
+                "CUDA RPC resident: gated attention unsupported".into(),
+            ),
+        ));
+    }
+    let head_dim = al.head_dim;
+    let kv_dim = al.kv_dim;
+    let n_heads = al.n_heads;
+    let n_kv_heads = al.n_kv_heads;
+    let attn_dim = al.attn_dim;
+    let ff = cfg.ff_dim;
+
+    let d_norm = allpaca_cuda::device_malloc(dim * 4, cuda.device)?;
+    let d_q = allpaca_cuda::device_malloc(attn_dim * 4, cuda.device)?;
+    let d_k = allpaca_cuda::device_malloc(kv_dim * 4, cuda.device)?;
+    let d_v = allpaca_cuda::device_malloc(kv_dim * 4, cuda.device)?;
+    let d_attn = allpaca_cuda::device_malloc(attn_dim * 4, cuda.device)?;
+    let d_hidden = allpaca_cuda::device_malloc(dim * 4, cuda.device)?;
+    let d_gate = allpaca_cuda::device_malloc(ff * 4, cuda.device)?;
+    let d_up = allpaca_cuda::device_malloc(ff * 4, cuda.device)?;
+
+    let result = (|| {
+        cuda.rmsnorm_dev(
+            dx,
+            resident.ptr(layer.attn_norm)?,
+            d_norm.cast(),
+            dim as i32,
+            cfg.eps,
+        )?;
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+        cuda.gemm_nt_dev(
+            d_norm.cast(),
+            resident.ptr(layer.wq)?,
+            d_q.cast(),
+            1,
+            attn_dim as i32,
+            dim as i32,
+        )?;
+        cuda.gemm_nt_dev(
+            d_norm.cast(),
+            resident.ptr(layer.wk)?,
+            d_k.cast(),
+            1,
+            kv_dim as i32,
+            dim as i32,
+        )?;
+        cuda.gemm_nt_dev(
+            d_norm.cast(),
+            resident.ptr(layer.wv)?,
+            d_v.cast(),
+            1,
+            kv_dim as i32,
+            dim as i32,
+        )?;
+
+        let rope_theta = cfg.rope_theta_for_layer(layer_idx);
+        cuda.rope_dev(
+            d_q.cast(),
+            n_heads as i32,
+            head_dim as i32,
+            pos as i32,
+            rope_theta,
+        )?;
+        cuda.rope_dev(
+            d_k.cast(),
+            n_kv_heads as i32,
+            head_dim as i32,
+            pos as i32,
+            rope_theta,
+        )?;
+        metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
+
+        // Order device GEMM/RoPE before default-stream KV memcpy.
+        cuda.synchronize()?;
+        let page_tokens = kv
+            .get(page_ids[0])
+            .map(|p| p.capacity_tokens)
+            .unwrap_or(128);
+        let page_index = pos / page_tokens as usize;
+        let slot = (pos % page_tokens as usize) as u32;
+        let page_id = page_ids[page_index];
+        kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, d_k.cast(), d_v.cast())?;
+        kv.touch(page_id, 1.0);
+
+        if let Some((k_dev, v_dev, n_kv)) = kv.cuda_single_page_view(page_ids, n_kv_heads, head_dim)
+        {
+            cuda.attention_dev(
+                d_q.cast(),
+                k_dev,
+                v_dev,
+                d_attn.cast(),
+                1,
+                n_kv as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
+                head_dim as i32,
+                true,
+            )?;
+        } else {
+            return Err(AllpacaError::Degraded(
+                allpaca_types::DegradedError::FeatureDisabled(
+                    "CUDA RPC resident: multi-page KV pack unsupported".into(),
+                ),
+            ));
+        }
+
+        cuda.gemm_nt_dev(
+            d_attn.cast(),
+            resident.ptr(layer.wo)?,
+            d_hidden.cast(),
+            1,
+            dim as i32,
+            al.wo_k as i32,
+        )?;
+        cuda.residual_add_dev(dx, d_hidden.cast(), dx, dim as i32)?;
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+
+        // FFN
+        cuda.rmsnorm_dev(
+            dx,
+            resident.ptr(layer.ffn_norm)?,
+            d_norm.cast(),
+            dim as i32,
+            cfg.eps,
+        )?;
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+        cuda.gemm_nt_dev(
+            d_norm.cast(),
+            resident.ptr(layer.w_gate)?,
+            d_gate.cast(),
+            1,
+            ff as i32,
+            dim as i32,
+        )?;
+        cuda.gemm_nt_dev(
+            d_norm.cast(),
+            resident.ptr(layer.w_up)?,
+            d_up.cast(),
+            1,
+            ff as i32,
+            dim as i32,
+        )?;
+        cuda.silu_mul_dev(d_gate.cast(), d_up.cast(), d_gate.cast(), ff as i32)?;
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+        cuda.gemm_nt_dev(
+            d_gate.cast(),
+            resident.ptr(layer.w_down)?,
+            d_hidden.cast(),
+            1,
+            dim as i32,
+            ff as i32,
+        )?;
+        cuda.residual_add_dev(dx, d_hidden.cast(), dx, dim as i32)?;
+        metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })();
+
+    cuda.free_device(d_norm);
+    cuda.free_device(d_q);
+    cuda.free_device(d_k);
+    cuda.free_device(d_v);
+    cuda.free_device(d_attn);
+    cuda.free_device(d_hidden);
+    cuda.free_device(d_gate);
+    cuda.free_device(d_up);
+    result
 }
 
 fn gemm_host_a_resident_b(
