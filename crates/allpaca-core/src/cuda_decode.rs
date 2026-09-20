@@ -5,7 +5,6 @@ use super::{
     WeightRef,
 };
 use crate::anchors::RecurrentState;
-use crate::deltanet::rmsnorm_silu_gate;
 use crate::edge0::mla::mla_attend_cpu;
 use crate::kv_tier::KvTierManager;
 use crate::ssm::mamba2_step;
@@ -943,7 +942,16 @@ fn apply_gdn_cuda(
     )?;
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     let mut gated = vec![0.0f32; dims.value_dim];
-    rmsnorm_silu_gate(&y, &z, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
+    cuda.gdn_rmsnorm_silu_gate_host(
+        &y,
+        &z,
+        &gdn.norm,
+        &mut gated,
+        dims.n_v_heads as i32,
+        dims.head_v as i32,
+        cfg.eps,
+    )?;
+    metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     matmul_nt(&gated, &gdn.w_out, hidden, 1, dim, dims.value_dim).map_err(|e| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!(
             "CUDA GDN out gemm layer {layer_idx}: {e}"

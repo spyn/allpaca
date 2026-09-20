@@ -2799,6 +2799,48 @@ impl CudaWorkspace {
         result
     }
 
+    /// Host roundtrip: `out = silu(z) * rmsnorm(y)` per V-head (HIP `gdn_rmsnorm_silu_gate`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_rmsnorm_silu_gate_host(
+        &self,
+        y: &[f32],
+        z: &[f32],
+        weight: &[f32],
+        out: &mut [f32],
+        n_heads: i32,
+        head_v: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        let nh = n_heads as usize;
+        let hv = head_v as usize;
+        let n = nh.saturating_mul(hv);
+        if nh == 0
+            || hv == 0
+            || y.len() < n
+            || z.len() < n
+            || weight.len() < hv
+            || out.len() < n
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "gdn_rmsnorm_silu_gate length mismatch".into(),
+            )));
+        }
+        let dy = self.upload_f32(&y[..n])?;
+        let dz = self.upload_f32(&z[..n])?;
+        let dw = self.upload_f32(&weight[..hv])?;
+        let dout = device_malloc(n * 4, self.device)?;
+        let result = (|| {
+            self.rmsnorm_heads_dev(dy, dw, n_heads, head_v, eps)?;
+            self.silu_mul_dev(dz, dy, dout.cast(), n as i32)?;
+            self.download_f32(dout.cast(), &mut out[..n])
+        })();
+        self.free_ptr(dy);
+        self.free_ptr(dz);
+        self.free_ptr(dw);
+        self.free_device(dout);
+        result
+    }
+
     /// Host roundtrip: `attn[tok,h,d] *= sigmoid(scores[tok,h])`.
     pub fn scale_heads_sigmoid(
         &self,
@@ -4739,6 +4781,45 @@ mod tests {
                 "gated_delta state mismatch at {i}: cuda={} cpu={}",
                 state[i],
                 cpu_state[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_rmsnorm_silu_gate_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let n_heads = 2i32;
+        let head_v = 2i32;
+        let eps = 1e-6f32;
+        let y = [1.0f32, 2.0, -1.0, 0.5];
+        let z = [0.5f32, -0.5, 1.5, 0.0];
+        let weight = [1.0f32, 0.5];
+        let mut cpu_out = [0.0f32; 4];
+        for h in 0..n_heads as usize {
+            let y_h = &y[h * 2..(h + 1) * 2];
+            let z_h = &z[h * 2..(h + 1) * 2];
+            let mut ss = 0.0f32;
+            for &v in y_h {
+                ss += v * v;
+            }
+            let inv = 1.0 / (ss / head_v as f32 + eps).sqrt();
+            for i in 0..2 {
+                let silu = z_h[i] / (1.0 + (-z_h[i]).exp());
+                cpu_out[h * 2 + i] = silu * (y_h[i] * inv * weight[i]);
+            }
+        }
+        let mut out = [0.0f32; 4];
+        let ws = CudaWorkspace::new(0, 8192).expect("workspace");
+        ws.gdn_rmsnorm_silu_gate_host(&y, &z, &weight, &mut out, n_heads, head_v, eps)
+            .expect("cuda gdn_rmsnorm_silu_gate");
+        for i in 0..4 {
+            assert!(
+                (out[i] - cpu_out[i]).abs() < 1e-4,
+                "gdn_rmsnorm_silu_gate mismatch at {i}: cuda={} cpu={}",
+                out[i],
+                cpu_out[i]
             );
         }
     }
