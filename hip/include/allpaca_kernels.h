@@ -321,6 +321,12 @@ int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads, in
 int allpaca_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads, int32_t n_k_heads,
                          int32_t head_dim, int32_t start_pos, float theta, allpaca_stream_t stream);
 
+/* DeepSeek-V4 partial RoPE on x[n_tok, n_heads, head_dim]: rotate [offset, offset+n_rot).
+ * n_rot==0 means full-head RoPE. back!=0 is ggml rope_ext_back (negated sine). */
+int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                             int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
+                             int32_t back, allpaca_stream_t stream);
+
 /* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e). */
 int allpaca_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
                            int32_t head_dim, int32_t n_rot, int32_t pos, float theta,

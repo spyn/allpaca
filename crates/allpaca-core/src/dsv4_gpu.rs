@@ -1578,6 +1578,34 @@ impl Dsv4Gpu {
         if n_tok == 0 {
             return Ok(Vec::new());
         }
+        let (dq, q_n) = self.mla_q_into_device(
+            file, blk, cur, q_a_norm, eps, q_lora, q_out, dim, n_tok, metrics,
+        )?;
+        let hip = self.hip.clone();
+        let mut q = vec![0.0f32; q_n];
+        let t = Instant::now();
+        hip.copy_d2h_f32(dq, &mut q)?;
+        add_ns(metrics, |m| &m.dsv4_d2h_ns, t);
+        Ok(q)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mla_q_into_device(
+        &mut self,
+        file: &GgufFile,
+        blk: usize,
+        cur: &[f32],
+        q_a_norm: &[f32],
+        eps: f32,
+        q_lora: usize,
+        q_out: usize,
+        dim: usize,
+        n_tok: usize,
+        metrics: Option<&Metrics>,
+    ) -> Result<(*mut f32, usize), AllpacaError> {
+        if n_tok == 0 {
+            return Ok((std::ptr::null_mut(), 0));
+        }
         if n_tok > i32::MAX as usize
             || q_lora > i32::MAX as usize
             || q_out > i32::MAX as usize
@@ -1615,7 +1643,6 @@ impl Dsv4Gpu {
         let qr_n = n_tok.saturating_mul(q_lora);
         let q_n = n_tok.saturating_mul(q_out);
         let mi = n_tok as i32;
-        let mut q = vec![0.0f32; q_n];
         if n_tok == 1
             && q_out <= ACT_SLOT_FLOATS
             && q_lora <= ACT_SLOT_FLOATS
@@ -1646,11 +1673,8 @@ impl Dsv4Gpu {
             let t = Instant::now();
             hip.gemm_nt_bf16_from_device_a_into(s1, qb, s0, 1, q_out as i32, q_lora as i32)?;
             add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
-            let t = Instant::now();
-            hip.copy_d2h_f32(s0, &mut q)?;
-            add_ns(metrics, |m| &m.dsv4_d2h_ns, t);
             self.used.store(true, Ordering::Relaxed);
-            return Ok(q);
+            return Ok((s0, q_n));
         }
         let a_n = if da.is_some() { 0 } else { a_need };
         let nw_n = if q_a_norm.is_empty() { 0 } else { q_lora };
@@ -1690,11 +1714,109 @@ impl Dsv4Gpu {
         let t = Instant::now();
         hip.gemm_nt_bf16_from_device_a_into(dqr, qb, dq, mi, q_out as i32, q_lora as i32)?;
         add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
-        let t = Instant::now();
-        hip.copy_d2h_f32(dq, &mut q)?;
-        add_ns(metrics, |m| &m.dsv4_d2h_ns, t);
         self.used.store(true, Ordering::Relaxed);
-        Ok(q)
+        Ok((dq, q_n))
+    }
+
+    /// Q projection + per-head ones-RMSNorm + partial RoPE, left on device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_q_norm_rope_device(
+        &mut self,
+        file: &GgufFile,
+        blk: usize,
+        cur: &[f32],
+        q_a_norm: &[f32],
+        eps: f32,
+        q_lora: usize,
+        q_out: usize,
+        dim: usize,
+        n_tok: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+        theta: f32,
+        n_rot: usize,
+        rope_off: usize,
+        metrics: Option<&Metrics>,
+    ) -> Result<*const f32, AllpacaError> {
+        if n_heads == 0
+            || head_dim == 0
+            || q_out != n_heads.saturating_mul(head_dim)
+            || n_tok > i32::MAX as usize
+            || n_heads > i32::MAX as usize
+            || head_dim > i32::MAX as usize
+            || start_pos > i32::MAX as usize
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "MLA Q rope device shape mismatch".into(),
+            )));
+        }
+        let (dq, q_n) = self.mla_q_into_device(
+            file, blk, cur, q_a_norm, eps, q_lora, q_out, dim, n_tok, metrics,
+        )?;
+        if dq.is_null() || q_n != n_tok.saturating_mul(q_out) {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "MLA Q device pointer missing".into(),
+            )));
+        }
+        let hip = self.hip.clone();
+        hip.bind()?;
+        let ones = vec![1.0f32; head_dim];
+        let dones = if n_tok == 1 && q_out <= ACT_SLOT_FLOATS {
+            let p = self.act_ptr(2)?;
+            hip.copy_h2d_f32(p, &ones)?;
+            p
+        } else {
+            let qr_n = n_tok.saturating_mul(q_lora);
+            if qr_n < head_dim {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "MLA Q workspace too small for ones".into(),
+                )));
+            }
+            let base = self.ensure_q_ws((qr_n.saturating_add(q_n)).saturating_mul(4))?;
+            let p = base.cast::<f32>();
+            hip.copy_h2d_f32(p, &ones)?;
+            p
+        };
+        let rows = n_tok.saturating_mul(n_heads);
+        let t = Instant::now();
+        hip.rmsnorm_device_rows(dq, dones, dq, rows as i32, head_dim as i32, eps)?;
+        add_ns(metrics, |m| &m.dsv4_norm_ns, t);
+        hip.rope_offset_device_rows(
+            dq,
+            n_tok as i32,
+            n_heads as i32,
+            head_dim as i32,
+            n_rot as i32,
+            rope_off as i32,
+            start_pos as i32,
+            theta,
+            false,
+        )?;
+        Ok(dq as *const f32)
+    }
+
+    pub fn copy_d2h_f32(&self, src: *const f32, dst: &mut [f32]) -> Result<(), AllpacaError> {
+        self.hip.copy_d2h_f32(src, dst)
+    }
+
+    pub fn attention_sinks_from_device_q(
+        &self,
+        q: *const f32,
+        k: &[f32],
+        v: &[f32],
+        sinks: &[f32],
+        out: &mut [f32],
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        self.hip.attention_sinks_from_device_q(
+            q, k, v, sinks, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+        )
     }
 
     pub fn mla_kv_proj(
