@@ -36,4 +36,5 @@ reqwest.workspace = true
 [dev-dependencies]
 allpaca-gguf.workspace = true
 allpaca-types.workspace = true
+memmap2.workspace = true
 reqwest.workspace = true

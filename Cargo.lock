@@ -57,6 +57,7 @@ dependencies = [
  "futures",
  "image",
  "llguidance",
+ "memmap2",
  "rand 0.8.7",
  "reqwest",
  "serde",

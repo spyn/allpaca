@@ -348,49 +348,109 @@ __global__ void gemv_nt_bf16_untiled_kernel(const float *a, const uint16_t *b, f
     }
 }
 
+/* gfx906 Triton sidecar won M=1 with BLOCK 1x64x32 / 4 warps. HIP GEMV used to
+ * give each of 64 columns the whole K loop on one thread (TILE=256). Split K
+ * across 2 threads/column, BK=32, vec4 A + uint2 B — same math, no Triton in
+ * generate(). */
 __global__ void gemv_nt_bf16_tiled_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
                                           int k) {
     constexpr int COLS = 64;
-    constexpr int TILE = 256;
+    constexpr int KSPLIT = 2;
+    constexpr int TILE = 32;
+    constexpr int PER = TILE / KSPLIT;
     __shared__ float As[TILE];
     const int row = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x);
-    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    const int col_local = tid / KSPLIT;
+    const int kt = tid % KSPLIT;
+    const int col = static_cast<int>(blockIdx.x) * COLS + col_local;
     if (row >= m) {
         return;
     }
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
     const uint16_t *brow =
-        (tid < COLS && col < n) ? b + static_cast<size_t>(col) * static_cast<size_t>(k) : nullptr;
+        (col < n) ? b + static_cast<size_t>(col) * static_cast<size_t>(k) : nullptr;
     float acc = 0.f;
     for (int k0 = 0; k0 < k; k0 += TILE) {
         const int chunk = (k0 + TILE <= k) ? TILE : (k - k0);
-        if (tid < TILE) {
-            As[tid] = (k0 + tid < k) ? arow[k0 + tid] : 0.f;
+        if (tid < TILE / 4) {
+            const int p = tid * 4;
+            const int gp = k0 + p;
+            const int nvalid = (gp < k) ? (k - gp) : 0;
+            const size_t off = static_cast<size_t>(gp);
+            if (nvalid >= 4 && (off & 3u) == 0) {
+                const float4 v = *reinterpret_cast<const float4 *>(arow + off);
+                As[p] = v.x;
+                As[p + 1] = v.y;
+                As[p + 2] = v.z;
+                As[p + 3] = v.w;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    As[p + i] = (gp + i < k) ? arow[off + static_cast<size_t>(i)] : 0.f;
+                }
+            }
         }
         __syncthreads();
         if (brow) {
-            const uint16_t *bchunk = brow + k0;
-            for (int p = 0; p < chunk; ++p) {
-                acc += As[p] * allpaca_bf16_bits_to_f32(bchunk[p]);
+            const int p0 = kt * PER;
+            if (p0 < chunk) {
+                const int take = chunk - p0 < PER ? chunk - p0 : PER;
+                const uint16_t *bp = brow + k0 + p0;
+                const float *ap = As + p0;
+                int i = 0;
+                for (; i + 4 <= take; i += 4) {
+                    const size_t boff = static_cast<size_t>(k0 + p0 + i);
+                    uint16_t bits[4];
+                    if ((boff & 3u) == 0) {
+                        const uint2 v = *reinterpret_cast<const uint2 *>(bp + i);
+                        bits[0] = static_cast<uint16_t>(v.x);
+                        bits[1] = static_cast<uint16_t>(v.x >> 16);
+                        bits[2] = static_cast<uint16_t>(v.y);
+                        bits[3] = static_cast<uint16_t>(v.y >> 16);
+                    } else {
+#pragma unroll
+                        for (int t = 0; t < 4; ++t) {
+                            bits[t] = bp[i + t];
+                        }
+                    }
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        acc += ap[i + t] * allpaca_bf16_bits_to_f32(bits[t]);
+                    }
+                }
+                for (; i < take; ++i) {
+                    acc += ap[i] * allpaca_bf16_bits_to_f32(bp[i]);
+                }
             }
         }
         __syncthreads();
     }
-    if (brow) {
+#pragma unroll
+    for (int off = KSPLIT / 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, KSPLIT);
+    }
+    if (brow && kt == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
     }
 }
 
+/* gfx906 Triton sidecar (nlzy/triton-gfx906) beat 64x64x16 on DSV4 shexp:
+ * BM=64 wastes half the FMAs at M=32/40; BK=32 + vec4 K-loads closed most of
+ * the 1.8x gap without taking Triton into generate(). */
+template <int BM, int BN, int BK>
 __global__ void gemm_nt_bf16_tiled_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
                                           int k) {
-    constexpr int BM = 64;
-    constexpr int BN = 64;
-    constexpr int BK = 16;
     constexpr int TX = 16;
     constexpr int TY = 16;
     constexpr int TM = BM / TY;
     constexpr int TN = BN / TX;
+    constexpr int NTHR = TX * TY;
+    constexpr int A_VEC_PER_THREAD = (BM * BK) / (4 * NTHR);
+    constexpr int B_VEC_PER_THREAD = (BN * BK) / (4 * NTHR);
+    static_assert(BM % TY == 0 && BN % TX == 0, "tile not divisible by 16x16");
+    static_assert(BK % 4 == 0, "BK must be float4-wide");
+    static_assert((BM * BK) % (4 * NTHR) == 0 && (BN * BK) % (4 * NTHR) == 0, "vec mapping");
     __shared__ float As[BM][BK + 1];
     __shared__ float Bs[BN][BK + 1];
     const int row0 = static_cast<int>(blockIdx.y) * BM;
@@ -408,24 +468,57 @@ __global__ void gemm_nt_bf16_tiled_kernel(const float *a, const uint16_t *b, flo
     }
     for (int k0 = 0; k0 < k; k0 += BK) {
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const int idx = tid + t * (TX * TY);
-            const int r = idx / BK;
-            const int p = idx % BK;
+        for (int t = 0; t < A_VEC_PER_THREAD; ++t) {
+            const int elem = (tid + t * NTHR) * 4;
+            const int r = elem / BK;
+            const int p = elem % BK;
             const int gr = row0 + r;
             const int gp = k0 + p;
-            As[r][p] = (gr < m && gp < k) ? a[static_cast<size_t>(gr) * k + gp] : 0.0f;
+            const int nvalid = (gr < m && gp < k) ? (k - gp) : 0;
+            const size_t off = static_cast<size_t>(gr) * static_cast<size_t>(k) +
+                               static_cast<size_t>(gp);
+            if (nvalid >= 4 && (off & 3u) == 0) {
+                const float4 v = *reinterpret_cast<const float4 *>(a + off);
+                As[r][p] = v.x;
+                As[r][p + 1] = v.y;
+                As[r][p + 2] = v.z;
+                As[r][p + 3] = v.w;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    As[r][p + i] = (gr < m && gp + i < k) ? a[off + static_cast<size_t>(i)] : 0.0f;
+                }
+            }
         }
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const int idx = tid + t * (TX * TY);
-            const int col = idx / BK;
-            const int p = idx % BK;
+        for (int t = 0; t < B_VEC_PER_THREAD; ++t) {
+            const int elem = (tid + t * NTHR) * 4;
+            const int col = elem / BK;
+            const int p = elem % BK;
             const int gc = col0 + col;
             const int gp = k0 + p;
-            Bs[col][p] = (gc < n && gp < k)
-                             ? allpaca_bf16_bits_to_f32(b[static_cast<size_t>(gc) * k + gp])
-                             : 0.0f;
+            const int nvalid = (gc < n && gp < k) ? (k - gp) : 0;
+            const size_t off = static_cast<size_t>(gc) * static_cast<size_t>(k) +
+                               static_cast<size_t>(gp);
+            uint16_t bits[4] = {0, 0, 0, 0};
+            if (nvalid >= 4 && (off & 3u) == 0) {
+                const uint2 v = *reinterpret_cast<const uint2 *>(b + off);
+                bits[0] = static_cast<uint16_t>(v.x);
+                bits[1] = static_cast<uint16_t>(v.x >> 16);
+                bits[2] = static_cast<uint16_t>(v.y);
+                bits[3] = static_cast<uint16_t>(v.y >> 16);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    if (gc < n && gp + i < k) {
+                        bits[i] = b[off + static_cast<size_t>(i)];
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                Bs[col][p + i] = allpaca_bf16_bits_to_f32(bits[i]);
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -1458,17 +1551,28 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
     }
     clear_last_error();
     if (m > 8) {
-        constexpr int BM = 64;
-        constexpr int BN = 64;
+        /* M<=40: 32x64x32 (DSV4 shexp prefill 32/40). Wider M: 64x64x32. */
         dim3 block(16, 16);
-        dim3 grid(static_cast<unsigned>((n + BN - 1) / BN),
-                  static_cast<unsigned>((m + BM - 1) / BM));
-        hipLaunchKernelGGL(gemm_nt_bf16_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        if (m <= 40) {
+            constexpr int BM = 32;
+            constexpr int BN = 64;
+            dim3 grid(static_cast<unsigned>((n + BN - 1) / BN),
+                      static_cast<unsigned>((m + BM - 1) / BM));
+            hipLaunchKernelGGL((gemm_nt_bf16_tiled_kernel<32, 64, 32>), grid, block, 0, stream, a, b,
+                               c, m, n, k);
+        } else {
+            constexpr int BM = 64;
+            constexpr int BN = 64;
+            dim3 grid(static_cast<unsigned>((n + BN - 1) / BN),
+                      static_cast<unsigned>((m + BM - 1) / BM));
+            hipLaunchKernelGGL((gemm_nt_bf16_tiled_kernel<64, 64, 32>), grid, block, 0, stream, a, b,
+                               c, m, n, k);
+        }
         return hip_status(hipGetLastError());
     }
     if (tiled) {
         constexpr int COLS = 64;
-        dim3 block(256);
+        dim3 block(128);
         dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
         hipLaunchKernelGGL(gemv_nt_bf16_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     } else {
@@ -1976,15 +2080,22 @@ __global__ void gemv_nt_mxfp4_untiled_kernel(const float *a, const uint8_t *b, f
     c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
 }
 
+/* ChatML keeps COLS=64 so the grid stays n/64 blocks per row. Widening COLS
+ * to 256 underfilled gfx906. M=1 uses this GEMV; M>1 uses the B-reuse GEMM.
+ * Same K-split as BF16 GEMV: 2 threads/column, whole MXFP4 blocks per thread. */
 __global__ void gemv_nt_mxfp4_tiled_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                            int k) {
     constexpr int COLS = 64;
+    constexpr int KSPLIT = 2;
     constexpr int TILE = 256;
     constexpr int BLOCKS_PER_TILE = TILE / 32;
+    constexpr int BLOCKS_PER_THREAD = BLOCKS_PER_TILE / KSPLIT;
     __shared__ float As[TILE];
     const int row = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x);
-    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    const int col_local = tid / KSPLIT;
+    const int kt = tid % KSPLIT;
+    const int col = static_cast<int>(blockIdx.x) * COLS + col_local;
     if (row >= m) {
         return;
     }
@@ -1992,13 +2103,115 @@ __global__ void gemv_nt_mxfp4_tiled_kernel(const float *a, const uint8_t *b, flo
     const int ntiles = (k + TILE - 1) / TILE;
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
     const uint8_t *brow =
-        (tid < COLS && col < n)
-            ? b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17
-            : nullptr;
+        (col < n) ? b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17 : nullptr;
     float acc = 0.f;
     for (int it = 0; it < ntiles; ++it) {
         const int k0 = it * TILE;
-        As[tid] = (k0 + tid < k) ? arow[k0 + tid] : 0.f;
+        if (tid < TILE / 4) {
+            const int p = tid * 4;
+            const int gp = k0 + p;
+            const int nvalid = (gp < k) ? (k - gp) : 0;
+            const size_t off = static_cast<size_t>(gp);
+            if (nvalid >= 4 && (off & 3u) == 0) {
+                const float4 v = *reinterpret_cast<const float4 *>(arow + off);
+                As[p] = v.x;
+                As[p + 1] = v.y;
+                As[p + 2] = v.z;
+                As[p + 3] = v.w;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    As[p + i] = (gp + i < k) ? arow[off + static_cast<size_t>(i)] : 0.f;
+                }
+            }
+        }
+        __syncthreads();
+        if (brow) {
+#pragma unroll
+            for (int t = 0; t < BLOCKS_PER_THREAD; ++t) {
+                const int ib = it * BLOCKS_PER_TILE + kt * BLOCKS_PER_THREAD + t;
+                if (ib >= nblocks) {
+                    break;
+                }
+                const uint8_t *blk = brow + static_cast<size_t>(ib) * 17;
+                const float d = mxfp4_e8m0_half(blk[0]);
+                const int base = (kt * BLOCKS_PER_THREAD + t) * 32;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t packed = blk[1 + j];
+                    acc += As[base + j] * static_cast<float>(k_mxfp4_codebook[packed & 0x0F]) * d;
+                    acc += As[base + 16 + j] * static_cast<float>(k_mxfp4_codebook[packed >> 4]) * d;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int off = KSPLIT / 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, KSPLIT);
+    }
+    if (brow && kt == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+/* COLS=64 / TILE_K=256: one float4 A load per thread per row. */
+template <int TILE_M>
+__device__ inline void mxfp4_load_a_tile(float *As, const float *a, int row0, int m, int k, int k0,
+                                         int tid) {
+    constexpr int TILE_K = 256;
+#pragma unroll 8
+    for (int r = 0; r < TILE_M; ++r) {
+        const int row = row0 + r;
+        const int p = tid * 4;
+        const int gp = k0 + p;
+        float *dst = As + r * TILE_K + p;
+        const int nvalid = (row < m && gp < k) ? (k - gp) : 0;
+        const size_t off =
+            static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(gp);
+        if (nvalid >= 4 && (off & 3u) == 0) {
+            const float4 v = *reinterpret_cast<const float4 *>(a + off);
+            dst[0] = v.x;
+            dst[1] = v.y;
+            dst[2] = v.z;
+            dst[3] = v.w;
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                dst[i] = (row < m && gp + i < k) ? a[off + static_cast<size_t>(i)] : 0.f;
+            }
+        }
+    }
+}
+
+/* Reuse each MXFP4 B column across TILE_M A rows. ChatML ~20–30 uses TILE_M=16
+ * (TILE_M=32 was 32KiB LDS / acc[32] and lost on gfx906). COLS stays 64. */
+template <int TILE_M>
+__global__ void gemm_nt_mxfp4_tiled_m_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                             int n, int k) {
+    constexpr int COLS = 64;
+    constexpr int TILE_K = 256;
+    constexpr int BLOCKS_PER_TILE = TILE_K / 32;
+    static_assert(TILE_M >= 1 && (TILE_M * TILE_K) % (4 * COLS) == 0, "mxfp4 M-tile mapping");
+    __shared__ float As[TILE_M * TILE_K];
+    const int row0 = static_cast<int>(blockIdx.y) * TILE_M;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    if (row0 >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const int ntiles = (k + TILE_K - 1) / TILE_K;
+    const uint8_t *brow =
+        (col < n) ? b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17 : nullptr;
+    float acc[TILE_M];
+#pragma unroll 8
+    for (int r = 0; r < TILE_M; ++r) {
+        acc[r] = 0.f;
+    }
+    for (int it = 0; it < ntiles; ++it) {
+        const int k0 = it * TILE_K;
+        mxfp4_load_a_tile<TILE_M>(As, a, row0, m, k, k0, tid);
         __syncthreads();
         if (brow) {
             for (int t = 0; t < BLOCKS_PER_TILE; ++t) {
@@ -2009,17 +2222,31 @@ __global__ void gemv_nt_mxfp4_tiled_kernel(const float *a, const uint8_t *b, flo
                 const uint8_t *blk = brow + static_cast<size_t>(ib) * 17;
                 const float d = mxfp4_e8m0_half(blk[0]);
                 const int base = t * 32;
+#pragma unroll
                 for (int j = 0; j < 16; ++j) {
                     const uint8_t packed = blk[1 + j];
-                    acc += As[base + j] * static_cast<float>(k_mxfp4_codebook[packed & 0x0F]) * d;
-                    acc += As[base + 16 + j] * static_cast<float>(k_mxfp4_codebook[packed >> 4]) * d;
+                    const float c0 = static_cast<float>(k_mxfp4_codebook[packed & 0x0F]) * d;
+                    const float c1 = static_cast<float>(k_mxfp4_codebook[packed >> 4]) * d;
+#pragma unroll 8
+                    for (int r = 0; r < TILE_M; ++r) {
+                        const float *ar = As + r * TILE_K + base;
+                        acc[r] += ar[j] * c0;
+                        acc[r] += ar[16 + j] * c1;
+                    }
                 }
             }
         }
         __syncthreads();
     }
     if (brow) {
-        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+#pragma unroll 8
+        for (int r = 0; r < TILE_M; ++r) {
+            const int row = row0 + r;
+            if (row < m) {
+                c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+                    acc[r];
+            }
+        }
     }
 }
 
@@ -2031,9 +2258,27 @@ static int launch_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c, int3
     clear_last_error();
     if (tiled) {
         constexpr int COLS = 64;
-        dim3 block(256);
-        dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_mxfp4_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        if (m > 1) {
+            dim3 block(64);
+            if (m > 8) {
+                constexpr int TILE_M = 16;
+                dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
+                          static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
+                hipLaunchKernelGGL((gemm_nt_mxfp4_tiled_m_kernel<16>), grid, block, 0, stream, a, b,
+                                   c, m, n, k);
+            } else {
+                constexpr int TILE_M = 8;
+                dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
+                          static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
+                hipLaunchKernelGGL((gemm_nt_mxfp4_tiled_m_kernel<8>), grid, block, 0, stream, a, b,
+                                   c, m, n, k);
+            }
+        } else {
+            dim3 block(128);
+            dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
+            hipLaunchKernelGGL(gemv_nt_mxfp4_tiled_kernel, grid, block, 0, stream, a, b, c, m, n,
+                               k);
+        }
     } else {
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
@@ -2050,6 +2295,179 @@ extern "C" int allpaca_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c,
 extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m,
                                              int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_mxfp4(a, b, c, m, n, k, as_stream(stream), 0);
+}
+
+__device__ inline float mxfp4_silu(float x) { return x / (1.0f + expf(-x)); }
+
+/* One A-tile load, two MXFP4 B rows, write silu(gate)*up. */
+__global__ void mxfp4_swiglu_gate_up_tiled_kernel(const float *a, const uint8_t *bg,
+                                                  const uint8_t *bu, float *c, int m, int n,
+                                                  int k) {
+    constexpr int COLS = 64;
+    constexpr int TILE = 256;
+    constexpr int BLOCKS_PER_TILE = TILE / 32;
+    __shared__ float As[TILE];
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const int ntiles = (k + TILE - 1) / TILE;
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const bool live = tid < COLS && col < n;
+    const uint8_t *grow =
+        live ? bg + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17 : nullptr;
+    const uint8_t *urow =
+        live ? bu + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17 : nullptr;
+    float acc_g = 0.f;
+    float acc_u = 0.f;
+    for (int it = 0; it < ntiles; ++it) {
+        const int k0 = it * TILE;
+        As[tid] = (k0 + tid < k) ? arow[k0 + tid] : 0.f;
+        __syncthreads();
+        if (grow) {
+#pragma unroll
+            for (int t = 0; t < BLOCKS_PER_TILE; ++t) {
+                const int ib = it * BLOCKS_PER_TILE + t;
+                if (ib >= nblocks) {
+                    break;
+                }
+                const uint8_t *blk_g = grow + static_cast<size_t>(ib) * 17;
+                const uint8_t *blk_u = urow + static_cast<size_t>(ib) * 17;
+                const float dg = mxfp4_e8m0_half(blk_g[0]);
+                const float du = mxfp4_e8m0_half(blk_u[0]);
+                const int base = t * 32;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t pg = blk_g[1 + j];
+                    const uint8_t pu = blk_u[1 + j];
+                    const float a0 = As[base + j];
+                    const float a1 = As[base + 16 + j];
+                    acc_g += a0 * static_cast<float>(k_mxfp4_codebook[pg & 0x0F]) * dg;
+                    acc_g += a1 * static_cast<float>(k_mxfp4_codebook[pg >> 4]) * dg;
+                    acc_u += a0 * static_cast<float>(k_mxfp4_codebook[pu & 0x0F]) * du;
+                    acc_u += a1 * static_cast<float>(k_mxfp4_codebook[pu >> 4]) * du;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (grow) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+            mxfp4_silu(acc_g) * acc_u;
+    }
+}
+
+/* Same B-reuse as tiled-M GEMM: dequant gate/up once per column across TILE_M rows. */
+template <int TILE_M>
+__global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_t *bg,
+                                                    const uint8_t *bu, float *c, int m, int n,
+                                                    int k) {
+    constexpr int COLS = 64;
+    constexpr int TILE_K = 256;
+    constexpr int BLOCKS_PER_TILE = TILE_K / 32;
+    static_assert(TILE_M >= 1 && (TILE_M * TILE_K) % (4 * COLS) == 0, "mxfp4 fused M-tile mapping");
+    __shared__ float As[TILE_M * TILE_K];
+    const int row0 = static_cast<int>(blockIdx.y) * TILE_M;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid;
+    if (row0 >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    const int ntiles = (k + TILE_K - 1) / TILE_K;
+    const bool live = col < n;
+    const uint8_t *grow =
+        live ? bg + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17 : nullptr;
+    const uint8_t *urow =
+        live ? bu + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17 : nullptr;
+    float acc_g[TILE_M];
+    float acc_u[TILE_M];
+#pragma unroll 8
+    for (int r = 0; r < TILE_M; ++r) {
+        acc_g[r] = 0.f;
+        acc_u[r] = 0.f;
+    }
+    for (int it = 0; it < ntiles; ++it) {
+        const int k0 = it * TILE_K;
+        mxfp4_load_a_tile<TILE_M>(As, a, row0, m, k, k0, tid);
+        __syncthreads();
+        if (grow) {
+            for (int t = 0; t < BLOCKS_PER_TILE; ++t) {
+                const int ib = it * BLOCKS_PER_TILE + t;
+                if (ib >= nblocks) {
+                    break;
+                }
+                const uint8_t *blk_g = grow + static_cast<size_t>(ib) * 17;
+                const uint8_t *blk_u = urow + static_cast<size_t>(ib) * 17;
+                const float dg = mxfp4_e8m0_half(blk_g[0]);
+                const float du = mxfp4_e8m0_half(blk_u[0]);
+                const int base = t * 32;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t pg = blk_g[1 + j];
+                    const uint8_t pu = blk_u[1 + j];
+                    const float g0 = static_cast<float>(k_mxfp4_codebook[pg & 0x0F]) * dg;
+                    const float g1 = static_cast<float>(k_mxfp4_codebook[pg >> 4]) * dg;
+                    const float u0 = static_cast<float>(k_mxfp4_codebook[pu & 0x0F]) * du;
+                    const float u1 = static_cast<float>(k_mxfp4_codebook[pu >> 4]) * du;
+#pragma unroll 8
+                    for (int r = 0; r < TILE_M; ++r) {
+                        const float *ar = As + r * TILE_K + base;
+                        acc_g[r] += ar[j] * g0;
+                        acc_g[r] += ar[16 + j] * g1;
+                        acc_u[r] += ar[j] * u0;
+                        acc_u[r] += ar[16 + j] * u1;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (grow) {
+#pragma unroll 8
+        for (int r = 0; r < TILE_M; ++r) {
+            const int row = row0 + r;
+            if (row < m) {
+                c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+                    mxfp4_silu(acc_g[r]) * acc_u[r];
+            }
+        }
+    }
+}
+
+extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_t *bu,
+                                            float *c, int32_t m, int32_t n, int32_t k,
+                                            allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !bg || !bu || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int COLS = 64;
+    if (m > 1) {
+        dim3 block(64);
+        if (m > 8) {
+            constexpr int TILE_M = 16;
+            dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
+                      static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
+            hipLaunchKernelGGL((mxfp4_swiglu_gate_up_tiled_m_kernel<16>), grid, block, 0,
+                               as_stream(stream), a, bg, bu, c, m, n, k);
+        } else {
+            constexpr int TILE_M = 8;
+            dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
+                      static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
+            hipLaunchKernelGGL((mxfp4_swiglu_gate_up_tiled_m_kernel<8>), grid, block, 0,
+                               as_stream(stream), a, bg, bu, c, m, n, k);
+        }
+    } else {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(mxfp4_swiglu_gate_up_tiled_kernel, grid, block, 0, as_stream(stream), a,
+                           bg, bu, c, m, n, k);
+    }
+    return hip_status(hipGetLastError());
 }
 
 /* Fused Q6_K GEMV (GEM mixed-precision): 210-byte super-blocks, A tile in LDS.
@@ -2494,6 +2912,16 @@ extern "C" int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device) {
         return ALLPACA_ERR_DEVICE;
     }
     return hip_status(hipMalloc(ptr, bytes));
+}
+
+extern "C" int allpaca_hip_memset(void *ptr, int value, size_t bytes, allpaca_stream_t stream) {
+    if (!ptr) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (bytes == 0) {
+        return ALLPACA_OK;
+    }
+    return hip_status(hipMemsetAsync(ptr, value, bytes, as_stream(stream)));
 }
 
 extern "C" int allpaca_hip_free(void *ptr) {
@@ -3030,6 +3458,13 @@ extern "C" int allpaca_hip_event_record(void *event, allpaca_stream_t stream) {
         return ALLPACA_ERR_INVALID;
     }
     return hip_status(hipEventRecord(static_cast<hipEvent_t>(event), as_stream(stream)));
+}
+
+extern "C" int allpaca_hip_event_synchronize(void *event) {
+    if (!event) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return hip_status(hipEventSynchronize(static_cast<hipEvent_t>(event)));
 }
 
 extern "C" int allpaca_hip_event_elapsed_us(void *start, void *stop, double *us) {
@@ -3940,6 +4375,66 @@ __global__ void residual_add_kernel(float *x, const float *residual, int n) {
     x[idx] += residual[idx];
 }
 
+__global__ void scatter_add_scale_rows_kernel(const float *src, const int32_t *idx, const float *w,
+                                              float *acc, int m, int dim, int n_tok) {
+    const int row = static_cast<int>(blockIdx.y);
+    const int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= m || j >= dim) {
+        return;
+    }
+    const int t = idx[row];
+    if (t < 0 || t >= n_tok) {
+        return;
+    }
+    atomicAdd(&acc[static_cast<size_t>(t) * static_cast<size_t>(dim) + static_cast<size_t>(j)],
+              src[static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(j)] *
+                  w[row]);
+}
+
+/* curs[t, i] = sum_s packed[t, s, i] * pre[t, s] */
+__global__ void hc_mix_pre_kernel(const float *packed, const float *pre, float *curs, int n_tok,
+                                  int hc, int dim) {
+    const int t = static_cast<int>(blockIdx.y);
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= n_tok || i >= dim) {
+        return;
+    }
+    float acc = 0.0f;
+    const float *pre_t = pre + static_cast<size_t>(t) * static_cast<size_t>(hc);
+    for (int s = 0; s < hc; ++s) {
+        const size_t off = (static_cast<size_t>(t) * static_cast<size_t>(hc) + static_cast<size_t>(s)) *
+                               static_cast<size_t>(dim) +
+                           static_cast<size_t>(i);
+        acc += packed[off] * pre_t[s];
+    }
+    curs[static_cast<size_t>(t) * static_cast<size_t>(dim) + static_cast<size_t>(i)] = acc;
+}
+
+/* out[t, dst, i] = x[t, i] * post[t, dst] + sum_src residual[t, src, i] * comb[t, src, dst] */
+__global__ void hc_post_kernel(const float *x, const float *residual, const float *post,
+                               const float *comb, float *out, int n_tok, int hc, int dim) {
+    const int t = static_cast<int>(blockIdx.y);
+    const int dst = static_cast<int>(blockIdx.z);
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= n_tok || dst >= hc || i >= dim) {
+        return;
+    }
+    const size_t td = static_cast<size_t>(t) * static_cast<size_t>(dim) + static_cast<size_t>(i);
+    float acc = x[td] * post[static_cast<size_t>(t) * static_cast<size_t>(hc) + static_cast<size_t>(dst)];
+    const float *comb_t = comb + static_cast<size_t>(t) * static_cast<size_t>(hc) * static_cast<size_t>(hc);
+    for (int src = 0; src < hc; ++src) {
+        const size_t roff =
+            (static_cast<size_t>(t) * static_cast<size_t>(hc) + static_cast<size_t>(src)) *
+                static_cast<size_t>(dim) +
+            static_cast<size_t>(i);
+        acc += residual[roff] * comb_t[static_cast<size_t>(dst) + static_cast<size_t>(src) * static_cast<size_t>(hc)];
+    }
+    const size_t ooff = (static_cast<size_t>(t) * static_cast<size_t>(hc) + static_cast<size_t>(dst)) *
+                            static_cast<size_t>(dim) +
+                        static_cast<size_t>(i);
+    out[ooff] = acc;
+}
+
 __global__ void scale_f32_kernel(float *x, float scale, int n) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= n) {
@@ -4244,6 +4739,57 @@ extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
     return hip_status(hipGetLastError());
 }
 
+extern "C" int allpaca_scatter_add_scale_rows(const float *src, const int32_t *idx, const float *w,
+                                              float *acc, int32_t m, int32_t dim, int32_t n_tok,
+                                              allpaca_stream_t stream) {
+    if (!src || !idx || !w || !acc || m <= 0 || dim <= 0 || n_tok <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(scatter_add_scale_rows_kernel,
+                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(m)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), src, idx, w, acc,
+                       m, dim, n_tok);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_hc_mix_pre(const float *packed, const float *pre, float *curs, int32_t n_tok,
+                                  int32_t hc, int32_t dim, allpaca_stream_t stream) {
+    if (!packed || !pre || !curs || n_tok <= 0 || hc <= 0 || hc > 8 || dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int xblocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(hc_mix_pre_kernel,
+                       dim3(static_cast<unsigned>(xblocks), static_cast<unsigned>(n_tok)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), packed, pre, curs,
+                       n_tok, hc, dim);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_hc_post(const float *x, const float *residual, const float *post,
+                               const float *comb, float *out, int32_t n_tok, int32_t hc, int32_t dim,
+                               allpaca_stream_t stream) {
+    if (!x || !residual || !post || !comb || !out || n_tok <= 0 || hc <= 0 || hc > 8 || dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (residual == out) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int xblocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(hc_post_kernel,
+                       dim3(static_cast<unsigned>(xblocks), static_cast<unsigned>(n_tok),
+                            static_cast<unsigned>(hc)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, residual, post,
+                       comb, out, n_tok, hc, dim);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_scale_f32(float *x, int32_t n, float scale, allpaca_stream_t stream) {
     if (!x || n <= 0) {
         return ALLPACA_ERR_INVALID;
@@ -4297,6 +4843,10 @@ extern "C" int allpaca_hip_enable_peer_access(int32_t, int32_t) {
 }
 
 extern "C" int allpaca_hip_malloc(void **, size_t, int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
+extern "C" int allpaca_hip_memset(void *, int, size_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
 
 extern "C" int allpaca_hip_free(void *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
@@ -4361,6 +4911,8 @@ extern "C" int allpaca_hip_event_destroy(void *) { return ALLPACA_ERR_NOT_IMPLEM
 extern "C" int allpaca_hip_event_record(void *, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
+
+extern "C" int allpaca_hip_event_synchronize(void *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_event_elapsed_us(void *, void *, double *) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -4428,6 +4980,11 @@ extern "C" int allpaca_gemm_nt_mxfp4(const float *, const uint8_t *, float *, in
 
 extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *, const uint8_t *, float *, int32_t,
                                              int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *, const uint8_t *, const uint8_t *,
+                                            float *, int32_t, int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
@@ -4572,6 +5129,21 @@ extern "C" int allpaca_embed_gather_f16_rows(const uint16_t *, const int32_t *, 
 }
 
 extern "C" int allpaca_residual_add(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scatter_add_scale_rows(const float *, const int32_t *, const float *, float *,
+                                              int32_t, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hc_mix_pre(const float *, const float *, float *, int32_t, int32_t, int32_t,
+                                  allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hc_post(const float *, const float *, const float *, const float *, float *,
+                               int32_t, int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
