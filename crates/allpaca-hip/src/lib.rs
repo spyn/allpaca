@@ -5818,6 +5818,44 @@ impl HipWorkspace {
         Ok(())
     }
 
+    /// Device `xs` on `src_dev`; same-GPU D2D or peer into `moe_x` (no activation H2D).
+    pub fn moe_begin_from_peer(
+        &self,
+        xs: *const f32,
+        src_dev: i32,
+        n_tok: usize,
+        dim: usize,
+    ) -> Result<(), AllpacaError> {
+        if src_dev == self.device {
+            return self.moe_begin_from_device(xs, n_tok, dim);
+        }
+        if n_tok == 0 || dim == 0 {
+            return Ok(());
+        }
+        let floats = n_tok.saturating_mul(dim);
+        if xs.is_null() || floats > i32::MAX as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid peer moe xs".into(),
+            )));
+        }
+        self.ensure_moe(n_tok, dim)?;
+        let (x, acc, bytes) = {
+            let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
+            let s = g.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
+            })?;
+            (s.x, s.acc, floats * 4)
+        };
+        memcpy_peer(x, self.device, xs.cast(), src_dev, bytes)?;
+        self.bind()?;
+        device_memset(acc, 0, bytes, std::ptr::null_mut())?;
+        stream_synchronize()?;
+        if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            s.active = true;
+        }
+        Ok(())
+    }
+
     pub fn moe_active(&self) -> bool {
         self.moe
             .lock()
@@ -11084,6 +11122,46 @@ mod tests {
                 xs[i]
             );
         }
+        device_free(dx, xs.len() * 4);
+    }
+
+    /// GPU0 `xs` seeds GPU1 `moe_x` via peer D2D (no activation H2D).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn moe_begin_from_peer_device_skips_activation_h2d() {
+        if device_count() < 2 {
+            return;
+        }
+        let n_tok = 3usize;
+        let dim = 8usize;
+        let xs: Vec<f32> = (0..n_tok * dim).map(|i| 0.03 * i as f32 - 0.1).collect();
+        let src = HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("gpu0");
+        let dst = HipWorkspace::new(1, 8 * 1024 * 1024, 64).expect("gpu1");
+        src.bind().expect("bind gpu0");
+        let dx = device_malloc(xs.len() * 4, 0).expect("gpu0 xs");
+        memcpy(dx, xs.as_ptr().cast(), xs.len() * 4, MEMCPY_H2D).expect("seed gpu0 xs");
+        let h2d_before = dst.activation_h2d_bytes();
+        dst.moe_begin_from_peer(dx.cast(), src.device, n_tok, dim)
+            .expect("moe_begin_from_peer");
+        assert_eq!(
+            dst.activation_h2d_bytes(),
+            h2d_before,
+            "peer moe_begin must not H2D xs"
+        );
+        dst.bind().expect("bind gpu1");
+        let mut got = vec![0.0f32; xs.len()];
+        dst.copy_d2h_f32(dst.moe_x_device().expect("moe_x"), &mut got)
+            .expect("d2h gpu1 moe_x");
+        for i in 0..xs.len() {
+            let diff = (got[i] - xs[i]).abs();
+            assert!(
+                diff < 1e-6,
+                "gpu1 moe_x[{i}] got={} xs={} diff={diff}",
+                got[i],
+                xs[i]
+            );
+        }
+        src.bind().expect("bind gpu0 free");
         device_free(dx, xs.len() * 4);
     }
 

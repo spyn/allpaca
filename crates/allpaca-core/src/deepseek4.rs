@@ -2724,7 +2724,16 @@ fn dsv4_apply_moe_rows(
     }
     if !jobs1_ready.is_empty() || !jobs1_wait.is_empty() {
         if let Some(h) = hip1.as_ref() {
-            let _ = h.moe_begin(&xs, n_tok, dim);
+            let peer = match gpu.as_ref().and_then(|g| g.hc_curs_device()) {
+                Some((ptr, n)) if n == xs.len() => {
+                    let src_dev = hip0.as_ref().map(|h0| h0.device).unwrap_or(0);
+                    h.moe_begin_from_peer(ptr, src_dev, n_tok, dim).is_ok()
+                }
+                _ => false,
+            };
+            if !peer {
+                let _ = h.moe_begin(&xs, n_tok, dim);
+            }
         }
     }
     let ff = cfg.ff_dim.max(1);
