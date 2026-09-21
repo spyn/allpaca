@@ -1688,61 +1688,85 @@ fn dsv4_attn_and_route(
         kv.touch(page_id, 1.0);
         let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
         let n_kv = k_all.len() / kv_dim.max(1);
-        let mut attn_raw = vec![0.0f32; q_out];
+        let mut attn_raw = Vec::new();
         let t_attn = Instant::now();
-        let attn_ok = match (dq, gpu.as_deref_mut()) {
+        let dattn = match (dq, gpu.as_deref_mut()) {
             (Some(p), Some(g)) => g
-                .attention_sinks_from_device_q(
+                .attention_rope_back_from_device_q(
                     p,
+                    &k_all,
+                    &v_all,
+                    &meta.sinks,
+                    1,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    pos,
+                    cfg.rope_theta,
+                    cfg.rope_dims,
+                    spec.rope_offset,
+                )
+                .ok(),
+            _ => None,
+        };
+        if dattn.is_none() {
+            attn_raw = vec![0.0f32; q_out];
+            let attn_ok = match (dq, gpu.as_deref_mut()) {
+                (Some(p), Some(g)) => g
+                    .attention_sinks_from_device_q(
+                        p,
+                        &k_all,
+                        &v_all,
+                        &meta.sinks,
+                        &mut attn_raw,
+                        1,
+                        n_kv as i32,
+                        n_heads as i32,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                        true,
+                    )
+                    .is_ok(),
+                _ => false,
+            };
+            if !attn_ok {
+                if !have_host_q {
+                    if let (Some(p), Some(g)) = (dq, gpu.as_deref_mut()) {
+                        g.copy_d2h_f32(p, &mut q)?;
+                    } else {
+                        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                            "MLA Q is empty after device-path miss".into(),
+                        )));
+                    }
+                }
+                dsv4_attention_sinks_maybe_gpu(
+                    skip_mla,
+                    gpu.as_deref_mut(),
+                    hip,
+                    &q,
                     &k_all,
                     &v_all,
                     &meta.sinks,
                     &mut attn_raw,
                     1,
-                    n_kv as i32,
-                    n_heads as i32,
-                    n_kv_heads as i32,
-                    head_dim as i32,
-                    true,
-                )
-                .is_ok(),
-            _ => false,
-        };
-        if !attn_ok {
-            if !have_host_q {
-                if let (Some(p), Some(g)) = (dq, gpu.as_deref_mut()) {
-                    g.copy_d2h_f32(p, &mut q)?;
-                } else {
-                    return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-                        "MLA Q is empty after device-path miss".into(),
-                    )));
-                }
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                )?;
             }
-            dsv4_attention_sinks_maybe_gpu(
-                skip_mla,
-                gpu.as_deref_mut(),
-                hip,
-                &q,
-                &k_all,
-                &v_all,
-                &meta.sinks,
-                &mut attn_raw,
-                1,
-                n_kv,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-            )?;
+            for h in 0..n_heads {
+                let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
+                rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+            }
         }
         metrics
             .dsv4_attn_ns
             .fetch_add(t_attn.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        for h in 0..n_heads {
-            let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
-            rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
-        }
         dsv4_mla_o_rows(
-            &mut gpu, file, mla, &attn_raw, blk, 1, q_out, n_heads, head_dim, spec, dim, metrics,
+            &mut gpu, file, mla, &attn_raw, dattn, blk, 1, q_out, n_heads, head_dim, spec, dim,
+            metrics,
         )
     })?;
     let t_hc = Instant::now();
@@ -1905,6 +1929,7 @@ fn dsv4_mla_o_rows(
     file: Option<&GgufFile>,
     mla: &MlaHost,
     attn_raws: &[f32],
+    dattn: Option<*const f32>,
     blk: usize,
     n_tok: usize,
     q_out: usize,
@@ -1920,22 +1945,52 @@ fn dsv4_mla_o_rows(
     let per = spec.o_lora_rank.max(1);
     let oa_out = per.saturating_mul(groups);
     if let (Some(g), Some(f)) = (gpu.as_deref_mut(), file) {
-        if let Ok(out) = g.mla_o_rows(
-            f,
-            blk,
-            attn_raws,
-            n_tok,
-            q_out,
-            n_heads,
-            head_dim,
-            groups,
-            per,
-            dim,
-            Some(metrics),
-        ) {
-            return Ok(out);
+        if let Some(p) = dattn {
+            if let Ok(out) = g.mla_o_rows_from_device(
+                f,
+                blk,
+                p,
+                n_tok,
+                q_out,
+                n_heads,
+                head_dim,
+                groups,
+                per,
+                dim,
+                Some(metrics),
+            ) {
+                return Ok(out);
+            }
+        }
+        if !attn_raws.is_empty() {
+            if let Ok(out) = g.mla_o_rows(
+                f,
+                blk,
+                attn_raws,
+                n_tok,
+                q_out,
+                n_heads,
+                head_dim,
+                groups,
+                per,
+                dim,
+                Some(metrics),
+            ) {
+                return Ok(out);
+            }
         }
     }
+    let mut owned = None;
+    let attn_raws = if !attn_raws.is_empty() {
+        attn_raws
+    } else if let (Some(p), Some(g)) = (dattn, gpu.as_deref_mut()) {
+        let mut buf = vec![0.0f32; n_tok.saturating_mul(q_out)];
+        g.copy_d2h_f32(p, &mut buf)?;
+        owned = Some(buf);
+        owned.as_deref().unwrap_or(&[])
+    } else {
+        attn_raws
+    };
     let mut oa = vec![0.0f32; n_tok.saturating_mul(oa_out)];
     for g in 0..groups {
         let mut xs = vec![0.0f32; n_tok.saturating_mul(o_group_dim)];
@@ -2146,67 +2201,90 @@ fn dsv4_attn_and_route_rows(
         }
         let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
         let n_kv = k_all.len() / kv_dim.max(1);
-        let mut attn_raws = vec![0.0f32; n_tok.saturating_mul(q_out)];
+        let mut attn_raws = Vec::new();
         let t_attn = Instant::now();
-        let attn_ok = match (dq, gpu.as_deref_mut()) {
+        let dattn = match (dq, gpu.as_deref_mut()) {
             (Some(p), Some(g)) => g
-                .attention_sinks_from_device_q(
+                .attention_rope_back_from_device_q(
                     p,
                     &k_all,
                     &v_all,
                     &meta.sinks,
-                    &mut attn_raws,
-                    n_tok as i32,
-                    n_kv as i32,
-                    n_heads as i32,
-                    n_kv_heads as i32,
-                    head_dim as i32,
-                    true,
+                    n_tok,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    start_pos,
+                    cfg.rope_theta,
+                    cfg.rope_dims,
+                    spec.rope_offset,
                 )
-                .is_ok(),
-            _ => false,
+                .ok(),
+            _ => None,
         };
-        if !attn_ok {
-            if q.is_empty() {
-                if let (Some(p), Some(g)) = (dq, gpu.as_deref_mut()) {
-                    q = vec![0.0f32; n_tok.saturating_mul(q_out)];
-                    g.copy_d2h_f32(p, &mut q)?;
-                } else {
-                    return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-                        "MLA Q is empty after device-path miss".into(),
-                    )));
+        if dattn.is_none() {
+            attn_raws = vec![0.0f32; n_tok.saturating_mul(q_out)];
+            let attn_ok = match (dq, gpu.as_deref_mut()) {
+                (Some(p), Some(g)) => g
+                    .attention_sinks_from_device_q(
+                        p,
+                        &k_all,
+                        &v_all,
+                        &meta.sinks,
+                        &mut attn_raws,
+                        n_tok as i32,
+                        n_kv as i32,
+                        n_heads as i32,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                        true,
+                    )
+                    .is_ok(),
+                _ => false,
+            };
+            if !attn_ok {
+                if q.is_empty() {
+                    if let (Some(p), Some(g)) = (dq, gpu.as_deref_mut()) {
+                        q = vec![0.0f32; n_tok.saturating_mul(q_out)];
+                        g.copy_d2h_f32(p, &mut q)?;
+                    } else {
+                        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                            "MLA Q is empty after device-path miss".into(),
+                        )));
+                    }
+                }
+                dsv4_attention_sinks_maybe_gpu(
+                    skip_mla,
+                    gpu.as_deref_mut(),
+                    hip,
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &meta.sinks,
+                    &mut attn_raws,
+                    n_tok,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                )?;
+            }
+            for t in 0..n_tok {
+                let pos = start_pos + t;
+                let attn_raw = &mut attn_raws[t * q_out..(t + 1) * q_out];
+                for h in 0..n_heads {
+                    let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
+                    rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
                 }
             }
-            dsv4_attention_sinks_maybe_gpu(
-                skip_mla,
-                gpu.as_deref_mut(),
-                hip,
-                &q,
-                &k_all,
-                &v_all,
-                &meta.sinks,
-                &mut attn_raws,
-                n_tok,
-                n_kv,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-            )?;
         }
         metrics
             .dsv4_attn_ns
             .fetch_add(t_attn.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        for t in 0..n_tok {
-            let pos = start_pos + t;
-            let attn_raw = &mut attn_raws[t * q_out..(t + 1) * q_out];
-            for h in 0..n_heads {
-                let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
-                rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
-            }
-        }
         dsv4_mla_o_rows(
-            &mut gpu, file, mla, &attn_raws, blk, n_tok, q_out, n_heads, head_dim, spec, dim,
-            metrics,
+            &mut gpu, file, mla, &attn_raws, dattn, blk, n_tok, q_out, n_heads, head_dim, spec,
+            dim, metrics,
         )
     })?;
     let ffn_norm = if !meta.ffn_norm.is_empty() {

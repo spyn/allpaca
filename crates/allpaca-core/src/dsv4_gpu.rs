@@ -311,6 +311,7 @@ pub struct Dsv4Gpu {
     h2d_reg: RegisteredMmap,
     act: Option<DeviceWeights>,
     q_ws: Option<DeviceWeights>,
+    attn_ws: Option<DeviceWeights>,
     hc_ones: Option<DeviceWeights>,
     hc_act: Option<DeviceWeights>,
     hc_live: usize,
@@ -441,6 +442,7 @@ impl Dsv4Gpu {
             h2d_reg: RegisteredMmap { ptrs: Vec::new() },
             act: DeviceWeights::alloc(hip.device, ACT_SLOTS * ACT_SLOT_FLOATS * 4).ok(),
             q_ws: None,
+            attn_ws: None,
             hc_ones: None,
             hc_act: None,
             hc_live: 0,
@@ -1491,6 +1493,25 @@ impl Dsv4Gpu {
             })
     }
 
+    fn ensure_attn_ws(&mut self, bytes: usize) -> Result<*mut u8, AllpacaError> {
+        let bytes = bytes.max(4);
+        let reuse = self
+            .attn_ws
+            .as_ref()
+            .is_some_and(|blob| blob.bytes() as usize >= bytes);
+        if !reuse {
+            self.attn_ws = Some(DeviceWeights::alloc(self.hip.device, bytes)?);
+        }
+        self.attn_ws
+            .as_ref()
+            .map(|blob| blob.byte_ptr_at(0) as *mut u8)
+            .ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "MLA attn workspace missing".into(),
+                ))
+            })
+    }
+
     fn dense_bf16_ptr(
         &mut self,
         file: &GgufFile,
@@ -1819,6 +1840,70 @@ impl Dsv4Gpu {
         )
     }
 
+    /// Attention + inverse RoPE, left on device for `mla_o_rows_from_device`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_rope_back_from_device_q(
+        &mut self,
+        q: *const f32,
+        k: &[f32],
+        v: &[f32],
+        sinks: &[f32],
+        n_tok: usize,
+        n_kv: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+        theta: f32,
+        n_rot: usize,
+        rope_off: usize,
+    ) -> Result<*const f32, AllpacaError> {
+        if q.is_null()
+            || n_tok == 0
+            || n_heads == 0
+            || head_dim == 0
+            || n_tok > i32::MAX as usize
+            || n_kv > i32::MAX as usize
+            || n_heads > i32::MAX as usize
+            || n_kv_heads > i32::MAX as usize
+            || head_dim > i32::MAX as usize
+            || start_pos > i32::MAX as usize
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "device attn rope_back shape mismatch".into(),
+            )));
+        }
+        let q_n = n_tok.saturating_mul(n_heads).saturating_mul(head_dim);
+        let base = self.ensure_attn_ws(q_n.saturating_mul(4))?;
+        let dout = base.cast::<f32>();
+        self.hip.attention_sinks_from_device_q_into(
+            q,
+            k,
+            v,
+            sinks,
+            dout,
+            n_tok as i32,
+            n_kv as i32,
+            n_heads as i32,
+            n_kv_heads as i32,
+            head_dim as i32,
+            true,
+        )?;
+        self.hip.rope_offset_device_rows(
+            dout,
+            n_tok as i32,
+            n_heads as i32,
+            head_dim as i32,
+            n_rot as i32,
+            rope_off as i32,
+            start_pos as i32,
+            theta,
+            true,
+        )?;
+        self.used.store(true, Ordering::Relaxed);
+        Ok(dout as *const f32)
+    }
+
     pub fn mla_kv_proj(
         &mut self,
         file: &GgufFile,
@@ -1892,6 +1977,52 @@ impl Dsv4Gpu {
         let ob_name = format!("blk.{blk}.attn_output_b.weight");
         self.mla_o_rows_core(
             attn_raws,
+            None,
+            n_tok,
+            q_out,
+            o_group_dim,
+            groups,
+            per,
+            dim,
+            metrics,
+            |gpu, g| {
+                gpu.dense_bf16_ptr(
+                    file,
+                    &oa_name,
+                    per,
+                    o_group_dim,
+                    g.saturating_mul(per).saturating_mul(o_group_dim),
+                    metrics,
+                )
+            },
+            |gpu| gpu.dense_bf16_ptr(file, &ob_name, dim, per.saturating_mul(groups), 0, metrics),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_o_rows_from_device(
+        &mut self,
+        file: &GgufFile,
+        blk: usize,
+        dattn: *const f32,
+        n_tok: usize,
+        q_out: usize,
+        n_heads: usize,
+        head_dim: usize,
+        groups: usize,
+        per: usize,
+        dim: usize,
+        metrics: Option<&Metrics>,
+    ) -> Result<Vec<f32>, AllpacaError> {
+        let groups = groups.max(1);
+        let per = per.max(1);
+        let heads_g = (n_heads / groups).max(1);
+        let o_group_dim = heads_g.saturating_mul(head_dim);
+        let oa_name = format!("blk.{blk}.attn_output_a.weight");
+        let ob_name = format!("blk.{blk}.attn_output_b.weight");
+        self.mla_o_rows_core(
+            &[],
+            Some(dattn),
             n_tok,
             q_out,
             o_group_dim,
@@ -1934,6 +2065,41 @@ impl Dsv4Gpu {
         }
         self.mla_o_rows_core(
             attn_raws,
+            None,
+            n_tok,
+            q_out,
+            o_group_dim,
+            groups,
+            per,
+            dim,
+            metrics,
+            |_, g| Ok(o_a[g]),
+            |_| Ok(o_b),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mla_o_rows_with_ptrs_from_device(
+        &mut self,
+        dattn: *const f32,
+        n_tok: usize,
+        q_out: usize,
+        o_group_dim: usize,
+        groups: usize,
+        per: usize,
+        dim: usize,
+        o_a: &[*const u16],
+        o_b: *const u16,
+        metrics: Option<&Metrics>,
+    ) -> Result<Vec<f32>, AllpacaError> {
+        if o_a.len() != groups || o_b.is_null() || o_a.iter().any(|p| p.is_null()) {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "MLA O rows weight pointer mismatch".into(),
+            )));
+        }
+        self.mla_o_rows_core(
+            &[],
+            Some(dattn),
             n_tok,
             q_out,
             o_group_dim,
@@ -1950,6 +2116,7 @@ impl Dsv4Gpu {
     fn mla_o_rows_core<Fa, Fb>(
         &mut self,
         attn_raws: &[f32],
+        dattn: Option<*const f32>,
         n_tok: usize,
         q_out: usize,
         o_group_dim: usize,
@@ -1978,10 +2145,9 @@ impl Dsv4Gpu {
                 "MLA O rows shape exceeds i32".into(),
             )));
         }
-        if groups == 0
-            || attn_raws.len() < n_tok.saturating_mul(q_out)
-            || q_out < groups.saturating_mul(o_group_dim)
-        {
+        let host_ok = attn_raws.len() >= n_tok.saturating_mul(q_out);
+        let dev_ok = dattn.is_some_and(|p| !p.is_null());
+        if groups == 0 || q_out < groups.saturating_mul(o_group_dim) || !(host_ok || dev_ok) {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "MLA O rows buffer size mismatch".into(),
             )));
@@ -2014,20 +2180,35 @@ impl Dsv4Gpu {
                     "MLA O rows o_a pointer is null".into(),
                 )));
             }
-            let mut xs = vec![0.0f32; xs_n];
-            for t in 0..n_tok {
-                let src = t
-                    .saturating_mul(q_out)
-                    .saturating_add(g.saturating_mul(o_group_dim));
-                let dst = t.saturating_mul(o_group_dim);
-                if src + o_group_dim <= attn_raws.len() && dst + o_group_dim <= xs.len() {
-                    xs[dst..dst + o_group_dim].copy_from_slice(&attn_raws[src..src + o_group_dim]);
+            if let Some(p) = dattn {
+                for t in 0..n_tok {
+                    // SAFETY: `p` is `[n_tok, q_out]` on device; `dxs` is `[n_tok, o_group_dim]`.
+                    let src = unsafe {
+                        p.add(
+                            t.saturating_mul(q_out)
+                                .saturating_add(g.saturating_mul(o_group_dim)),
+                        )
+                    };
+                    let dst = unsafe { dxs.add(t.saturating_mul(o_group_dim)) };
+                    hip.copy_d2d_f32(dst, src, o_group_dim)?;
                 }
+            } else {
+                let mut xs = vec![0.0f32; xs_n];
+                for t in 0..n_tok {
+                    let src = t
+                        .saturating_mul(q_out)
+                        .saturating_add(g.saturating_mul(o_group_dim));
+                    let dst = t.saturating_mul(o_group_dim);
+                    if src + o_group_dim <= attn_raws.len() && dst + o_group_dim <= xs.len() {
+                        xs[dst..dst + o_group_dim]
+                            .copy_from_slice(&attn_raws[src..src + o_group_dim]);
+                    }
+                }
+                let t = Instant::now();
+                hip.copy_h2d_f32(dxs, &xs)?;
+                add_ns(metrics, |m| &m.dsv4_h2d_ns, t);
+                add_bytes(metrics, (xs_n * 4) as u64);
             }
-            let t = Instant::now();
-            hip.copy_h2d_f32(dxs, &xs)?;
-            add_ns(metrics, |m| &m.dsv4_h2d_ns, t);
-            add_bytes(metrics, (xs_n * 4) as u64);
             let t = Instant::now();
             hip.gemm_nt_bf16_from_device_a_into(
                 dxs as *const f32,
@@ -2729,6 +2910,7 @@ impl Dsv4Gpu {
             h2d_reg: RegisteredMmap { ptrs: Vec::new() },
             act: None,
             q_ws: None,
+            attn_ws: None,
             hc_ones: None,
             hc_act: None,
             hc_live: 0,
@@ -4244,6 +4426,155 @@ mod tests {
                 cpu_out[i]
             );
         }
+        for p in doa_w {
+            allpaca_hip::device_free(p, per * o_group_dim * 2);
+        }
+        allpaca_hip::device_free(dob, ob_bf16.len() * 2);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mla_o_rows_from_device_attn_skips_xs_h2d() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let hip = std::sync::Arc::new(
+            allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace"),
+        );
+        let mut gpu = super::Dsv4Gpu::for_hc_test(hip.clone());
+        let n_tok = 3usize;
+        let groups = 2usize;
+        let o_group_dim = 8usize;
+        let per = 4usize;
+        let dim = 16usize;
+        let q_out = groups * o_group_dim;
+        let oa_out = per * groups;
+        let mut attn = vec![0.0f32; n_tok * q_out];
+        let mut oa_f = vec![0.0f32; groups * per * o_group_dim];
+        let mut ob_f = vec![0.0f32; dim * oa_out];
+        for (i, v) in attn.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in oa_f.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in ob_f.iter_mut().enumerate() {
+            *v = ((i * 11) % 50) as f32 * 0.02 - 0.5;
+        }
+        let oa_bf16: Vec<u16> = oa_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let ob_bf16: Vec<u16> = ob_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let oa_deq: Vec<f32> = oa_bf16
+            .iter()
+            .copied()
+            .map(allpaca_cpu::bf16_to_f32)
+            .collect();
+        let ob_deq: Vec<f32> = ob_bf16
+            .iter()
+            .copied()
+            .map(allpaca_cpu::bf16_to_f32)
+            .collect();
+        let mut cpu_oa = vec![0.0f32; n_tok * oa_out];
+        for g in 0..groups {
+            let mut xs = vec![0.0f32; n_tok * o_group_dim];
+            for t in 0..n_tok {
+                let src = t * q_out + g * o_group_dim;
+                let dst = t * o_group_dim;
+                xs[dst..dst + o_group_dim].copy_from_slice(&attn[src..src + o_group_dim]);
+            }
+            let w = &oa_deq[g * per * o_group_dim..(g + 1) * per * o_group_dim];
+            let mut ys = vec![0.0f32; n_tok * per];
+            for t in 0..n_tok {
+                for n in 0..per {
+                    let mut acc = 0.0f32;
+                    for k in 0..o_group_dim {
+                        acc += xs[t * o_group_dim + k] * w[n * o_group_dim + k];
+                    }
+                    ys[t * per + n] = acc;
+                }
+            }
+            for t in 0..n_tok {
+                let src = t * per;
+                let dst = t * oa_out + g * per;
+                cpu_oa[dst..dst + per].copy_from_slice(&ys[src..src + per]);
+            }
+        }
+        let mut cpu_out = vec![0.0f32; n_tok * dim];
+        for t in 0..n_tok {
+            for n in 0..dim {
+                let mut acc = 0.0f32;
+                for k in 0..oa_out {
+                    acc += cpu_oa[t * oa_out + k] * ob_deq[n * oa_out + k];
+                }
+                cpu_out[t * dim + n] = acc;
+            }
+        }
+        hip.bind().expect("bind");
+        let dattn = allpaca_hip::device_malloc(attn.len() * 4, hip.device).expect("dattn");
+        allpaca_hip::memcpy(
+            dattn,
+            attn.as_ptr().cast(),
+            attn.len() * 4,
+            allpaca_hip::MEMCPY_H2D,
+        )
+        .expect("h2d attn");
+        let doa_w: Vec<*mut u8> = (0..groups)
+            .map(|_| allpaca_hip::device_malloc(per * o_group_dim * 2, hip.device).expect("doa_w"))
+            .collect();
+        let dob = allpaca_hip::device_malloc(ob_bf16.len() * 2, hip.device).expect("dob");
+        allpaca_hip::memcpy(
+            dob,
+            ob_bf16.as_ptr().cast(),
+            ob_bf16.len() * 2,
+            allpaca_hip::MEMCPY_H2D,
+        )
+        .expect("h2d ob");
+        for g in 0..groups {
+            let w_off = g * per * o_group_dim;
+            allpaca_hip::memcpy(
+                doa_w[g],
+                oa_bf16[w_off..].as_ptr().cast(),
+                per * o_group_dim * 2,
+                allpaca_hip::MEMCPY_H2D,
+            )
+            .expect("h2d oa_w");
+        }
+        let o_a: Vec<*const u16> = doa_w.iter().map(|p| (*p) as *const u16).collect();
+        let h2d_before = hip.activation_h2d_bytes();
+        let d2h_before = hip.activation_d2h_bytes();
+        let got = gpu
+            .mla_o_rows_with_ptrs_from_device(
+                dattn.cast(),
+                n_tok,
+                q_out,
+                o_group_dim,
+                groups,
+                per,
+                dim,
+                &o_a,
+                dob.cast(),
+                None,
+            )
+            .expect("mla o from device attn");
+        assert_eq!(
+            hip.activation_h2d_bytes().saturating_sub(h2d_before),
+            0,
+            "MLA O from device attn must not H2D grouped xs"
+        );
+        assert_eq!(
+            hip.activation_d2h_bytes().saturating_sub(d2h_before),
+            (n_tok * dim * 4) as u64,
+            "MLA O must D2H attn_out only"
+        );
+        for i in 0..cpu_out.len() {
+            let diff = (got[i] - cpu_out[i]).abs();
+            assert!(
+                diff < 2e-3,
+                "mla o device[{i}] gpu={} cpu={} diff={diff}",
+                got[i],
+                cpu_out[i]
+            );
+        }
+        allpaca_hip::device_free(dattn, attn.len() * 4);
         for p in doa_w {
             allpaca_hip::device_free(p, per * o_group_dim * 2);
         }

@@ -6689,6 +6689,91 @@ impl HipWorkspace {
         result
     }
 
+    /// Device `q` and device `out`; H2D `k`/`v`/`sinks` only (no out D2H).
+    pub fn attention_sinks_from_device_q_into(
+        &self,
+        q: *const f32,
+        k: &[f32],
+        v: &[f32],
+        sinks: &[f32],
+        dout: *mut f32,
+        n_q: i32,
+        n_kv: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        causal: bool,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || dout.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device-Q/out attention".into(),
+            )));
+        }
+        if sinks.is_empty() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "device-Q attention requires sinks".into(),
+            )));
+        }
+        let k_bytes = k.len() * 4;
+        let v_bytes = v.len() * 4;
+        let s_bytes = sinks.len() * 4;
+        let need = k_bytes.saturating_add(v_bytes).saturating_add(s_bytes);
+        let launch = |dk: *mut u8, dv: *mut u8, ds: *mut u8| -> Result<(), AllpacaError> {
+            memcpy(dk, k.as_ptr().cast(), k_bytes, MEMCPY_H2D)?;
+            memcpy(dv, v.as_ptr().cast(), v_bytes, MEMCPY_H2D)?;
+            memcpy(ds, sinks.as_ptr().cast(), s_bytes, MEMCPY_H2D)?;
+            self.add_h2d(k_bytes + v_bytes + s_bytes);
+            #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+            {
+                // SAFETY: `q` and `dout` are live device buffers; `dk`/`dv`/`ds`
+                // were allocated for `need` bytes.
+                let rc = unsafe {
+                    ffi::allpaca_attention_sinks(
+                        q.cast_mut().cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        ds.cast(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "attention_sinks")
+            }
+            #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+            {
+                let _ = (causal, n_q, n_kv, n_heads, n_kv_heads, head_dim);
+                Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "HIP attention_sinks unavailable".into(),
+                )))
+            }
+        };
+        if need > 0 && need <= self.scratch_bytes {
+            self.bind()?;
+            let dk = self.scratch;
+            // SAFETY: `need` fits in scratch; layout is k | v | sinks.
+            let dv = unsafe { self.scratch.add(k_bytes) };
+            let ds = unsafe { self.scratch.add(k_bytes + v_bytes) };
+            return launch(dk, dv, ds);
+        }
+        let blob = device_malloc(need.max(4), self.device)?;
+        let result = (|| {
+            self.bind()?;
+            let dk = blob;
+            // SAFETY: `device_malloc` returned `need` bytes; layout is k | v | sinks.
+            let dv = unsafe { blob.add(k_bytes) };
+            let ds = unsafe { blob.add(k_bytes + v_bytes) };
+            launch(dk, dv, ds)
+        })();
+        device_free(blob, need.max(4));
+        result
+    }
+
     pub fn rmsnorm(
         &self,
         x: &[f32],
@@ -13530,6 +13615,91 @@ mod tests {
             );
         }
         device_free(dq, q.len() * 4);
+    }
+
+    /// Device-Q attention into a device out buffer must skip out D2H.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn attention_sinks_from_device_q_into_skips_out_d2h() {
+        if device_count() == 0 {
+            return;
+        }
+        let n_q = 3usize;
+        let n_kv = 5usize;
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 8usize;
+        let qn = n_q * n_heads * head_dim;
+        let kn = n_kv * n_kv_heads * head_dim;
+        let mut q = vec![0.0f32; qn];
+        let mut k = vec![0.0f32; kn];
+        let mut v = vec![0.0f32; kn];
+        let sinks = vec![0.1f32, -0.2];
+        for (i, x) in q.iter_mut().enumerate() {
+            *x = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, x) in k.iter_mut().enumerate() {
+            *x = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = ((i * 11) % 50) as f32 * 0.02 - 0.5;
+        }
+        let hip = HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace");
+        let mut host = vec![0.0f32; qn];
+        hip.attention_sinks(
+            &q,
+            &k,
+            &v,
+            &sinks,
+            &mut host,
+            n_q as i32,
+            n_kv as i32,
+            n_heads as i32,
+            n_kv_heads as i32,
+            head_dim as i32,
+            true,
+        )
+        .expect("host-Q attention");
+        hip.bind().expect("bind");
+        let dq = device_malloc(q.len() * 4, 0).expect("dq");
+        let dout = device_malloc(host.len() * 4, 0).expect("dout");
+        memcpy(dq, q.as_ptr().cast(), q.len() * 4, MEMCPY_H2D).expect("seed q");
+        let h2d_before = hip.activation_h2d_bytes();
+        let d2h_before = hip.activation_d2h_bytes();
+        hip.attention_sinks_from_device_q_into(
+            dq.cast(),
+            &k,
+            &v,
+            &sinks,
+            dout.cast(),
+            n_q as i32,
+            n_kv as i32,
+            n_heads as i32,
+            n_kv_heads as i32,
+            head_dim as i32,
+            true,
+        )
+        .expect("device-Q into device out");
+        let h2d_delta = hip.activation_h2d_bytes().saturating_sub(h2d_before);
+        let d2h_delta = hip.activation_d2h_bytes().saturating_sub(d2h_before);
+        assert_eq!(
+            h2d_delta,
+            ((k.len() + v.len() + sinks.len()) * 4) as u64,
+            "device-out attention H2D should be k+v+sinks only"
+        );
+        assert_eq!(d2h_delta, 0, "device-out attention must not D2H out");
+        let mut got = vec![0.0f32; host.len()];
+        memcpy(got.as_mut_ptr().cast(), dout, got.len() * 4, MEMCPY_D2H).expect("d2h check");
+        for i in 0..host.len() {
+            assert!(
+                gemm_close(got[i], host[i]),
+                "device-out attention mismatch idx={i} hip={} host={}",
+                got[i],
+                host[i]
+            );
+        }
+        device_free(dq, q.len() * 4);
+        device_free(dout, host.len() * 4);
     }
 
     /// Device IMRoPE must match CPU `rope_imrope_neox_heads` (partial + sections).
