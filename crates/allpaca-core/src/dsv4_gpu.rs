@@ -310,6 +310,7 @@ pub struct Dsv4Gpu {
     h2d1_inflight: bool,
     h2d_reg: RegisteredMmap,
     act: Option<DeviceWeights>,
+    q_ws: Option<DeviceWeights>,
     hc_ones: Option<DeviceWeights>,
     hc_act: Option<DeviceWeights>,
     hc_live: usize,
@@ -439,6 +440,7 @@ impl Dsv4Gpu {
             h2d1_inflight: false,
             h2d_reg: RegisteredMmap { ptrs: Vec::new() },
             act: DeviceWeights::alloc(hip.device, ACT_SLOTS * ACT_SLOT_FLOATS * 4).ok(),
+            q_ws: None,
             hc_ones: None,
             hc_act: None,
             hc_live: 0,
@@ -1470,6 +1472,25 @@ impl Dsv4Gpu {
         Ok(blob.byte_ptr_at(slot * ACT_SLOT_FLOATS * 4) as *mut f32)
     }
 
+    fn ensure_q_ws(&mut self, bytes: usize) -> Result<*mut u8, AllpacaError> {
+        let bytes = bytes.max(4);
+        let reuse = self
+            .q_ws
+            .as_ref()
+            .is_some_and(|blob| blob.bytes() as usize >= bytes);
+        if !reuse {
+            self.q_ws = Some(DeviceWeights::alloc(self.hip.device, bytes)?);
+        }
+        self.q_ws
+            .as_ref()
+            .map(|blob| blob.byte_ptr_at(0) as *mut u8)
+            .ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "MLA Q workspace missing".into(),
+                ))
+            })
+    }
+
     fn dense_bf16_ptr(
         &mut self,
         file: &GgufFile,
@@ -1535,19 +1556,44 @@ impl Dsv4Gpu {
         dim: usize,
         metrics: Option<&Metrics>,
     ) -> Result<Vec<f32>, AllpacaError> {
-        if q_out > ACT_SLOT_FLOATS || q_lora > ACT_SLOT_FLOATS || dim > ACT_SLOT_FLOATS {
+        self.mla_q_rows(
+            file, blk, cur, q_a_norm, eps, q_lora, q_out, dim, 1, metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_q_rows(
+        &mut self,
+        file: &GgufFile,
+        blk: usize,
+        cur: &[f32],
+        q_a_norm: &[f32],
+        eps: f32,
+        q_lora: usize,
+        q_out: usize,
+        dim: usize,
+        n_tok: usize,
+        metrics: Option<&Metrics>,
+    ) -> Result<Vec<f32>, AllpacaError> {
+        if n_tok == 0 {
+            return Ok(Vec::new());
+        }
+        if n_tok > i32::MAX as usize
+            || q_lora > i32::MAX as usize
+            || q_out > i32::MAX as usize
+            || dim > i32::MAX as usize
+        {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
-                "MLA Q exceeds act slot".into(),
+                "MLA Q rows shape exceeds i32".into(),
             )));
         }
-        let hip = self.hip.clone();
-        let s0 = self.act_ptr(0)?;
-        let s1 = self.act_ptr(1)?;
-        hip.bind()?;
-        let t = Instant::now();
-        hip.copy_h2d_f32(s0, cur)?;
-        add_ns(metrics, |m| &m.dsv4_h2d_ns, t);
-        add_bytes(metrics, (cur.len() * 4) as u64);
+        let a_need = n_tok.saturating_mul(dim);
+        if cur.len() < a_need {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "MLA Q rows buffer size mismatch".into(),
+            )));
+        }
+        let da = self.device_a_if_curs(cur, n_tok, dim);
         let qa = self.dense_bf16_ptr(
             file,
             &format!("blk.{blk}.attn_q_a.weight"),
@@ -1556,16 +1602,6 @@ impl Dsv4Gpu {
             0,
             metrics,
         )?;
-        let t = Instant::now();
-        hip.gemm_nt_bf16_dev(s0, qa, s1, 1, q_lora as i32, dim as i32)?;
-        add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
-        if !q_a_norm.is_empty() {
-            let nw = self.act_ptr(2)?;
-            hip.copy_h2d_f32(nw, q_a_norm)?;
-            let t = Instant::now();
-            hip.rmsnorm_device(s1, nw, s1, q_lora as i32, eps)?;
-            add_ns(metrics, |m| &m.dsv4_norm_ns, t);
-        }
         let qb = self.dense_bf16_ptr(
             file,
             &format!("blk.{blk}.attn_q_b.weight"),
@@ -1574,12 +1610,88 @@ impl Dsv4Gpu {
             0,
             metrics,
         )?;
+        let hip = self.hip.clone();
+        hip.bind()?;
+        let qr_n = n_tok.saturating_mul(q_lora);
+        let q_n = n_tok.saturating_mul(q_out);
+        let mi = n_tok as i32;
+        let mut q = vec![0.0f32; q_n];
+        if n_tok == 1
+            && q_out <= ACT_SLOT_FLOATS
+            && q_lora <= ACT_SLOT_FLOATS
+            && dim <= ACT_SLOT_FLOATS
+        {
+            let s0 = self.act_ptr(0)?;
+            let s1 = self.act_ptr(1)?;
+            let dcur = match da {
+                Some(p) => p,
+                None => {
+                    let t = Instant::now();
+                    hip.copy_h2d_f32(s0, cur)?;
+                    add_ns(metrics, |m| &m.dsv4_h2d_ns, t);
+                    add_bytes(metrics, (cur.len() * 4) as u64);
+                    s0 as *const f32
+                }
+            };
+            let t = Instant::now();
+            hip.gemm_nt_bf16_from_device_a_into(dcur, qa, s1, 1, q_lora as i32, dim as i32)?;
+            add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
+            if !q_a_norm.is_empty() {
+                let nw = self.act_ptr(2)?;
+                hip.copy_h2d_f32(nw, q_a_norm)?;
+                let t = Instant::now();
+                hip.rmsnorm_device_rows(s1, nw, s1, 1, q_lora as i32, eps)?;
+                add_ns(metrics, |m| &m.dsv4_norm_ns, t);
+            }
+            let t = Instant::now();
+            hip.gemm_nt_bf16_from_device_a_into(s1, qb, s0, 1, q_out as i32, q_lora as i32)?;
+            add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
+            let t = Instant::now();
+            hip.copy_d2h_f32(s0, &mut q)?;
+            add_ns(metrics, |m| &m.dsv4_d2h_ns, t);
+            self.used.store(true, Ordering::Relaxed);
+            return Ok(q);
+        }
+        let a_n = if da.is_some() { 0 } else { a_need };
+        let nw_n = if q_a_norm.is_empty() { 0 } else { q_lora };
+        let need = (qr_n
+            .saturating_add(q_n)
+            .saturating_add(nw_n)
+            .saturating_add(a_n))
+        .saturating_mul(4);
+        let base = self.ensure_q_ws(need)?;
+        // SAFETY: `ensure_q_ws` allocated at least `need` bytes; offsets are
+        // qr | q | norm | optional host-A staging.
+        let dqr = base.cast::<f32>();
+        let dq = unsafe { base.add(qr_n.saturating_mul(4)) }.cast::<f32>();
+        let dnw = unsafe { base.add((qr_n.saturating_add(q_n)).saturating_mul(4)) }.cast::<f32>();
+        let dcur =
+            unsafe { base.add((qr_n.saturating_add(q_n).saturating_add(nw_n)).saturating_mul(4)) }
+                .cast::<f32>();
+        let a_ptr = match da {
+            Some(p) => p,
+            None => {
+                let t = Instant::now();
+                hip.copy_h2d_f32(dcur, &cur[..a_need])?;
+                add_ns(metrics, |m| &m.dsv4_h2d_ns, t);
+                add_bytes(metrics, (a_need * 4) as u64);
+                dcur as *const f32
+            }
+        };
         let t = Instant::now();
-        hip.gemm_nt_bf16_dev(s1, qb, s0, 1, q_out as i32, q_lora as i32)?;
+        hip.gemm_nt_bf16_from_device_a_into(a_ptr, qa, dqr, mi, q_lora as i32, dim as i32)?;
         add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
-        let mut q = vec![0.0f32; q_out];
+        if nw_n > 0 {
+            hip.copy_h2d_f32(dnw, &q_a_norm[..q_lora])?;
+            let t = Instant::now();
+            hip.rmsnorm_device_rows(dqr, dnw, dqr, mi, q_lora as i32, eps)?;
+            add_ns(metrics, |m| &m.dsv4_norm_ns, t);
+        }
         let t = Instant::now();
-        hip.copy_d2h_f32(s0, &mut q)?;
+        hip.gemm_nt_bf16_from_device_a_into(dqr, qb, dq, mi, q_out as i32, q_lora as i32)?;
+        add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
+        let t = Instant::now();
+        hip.copy_d2h_f32(dq, &mut q)?;
         add_ns(metrics, |m| &m.dsv4_d2h_ns, t);
         self.used.store(true, Ordering::Relaxed);
         Ok(q)
@@ -2289,6 +2401,7 @@ impl Dsv4Gpu {
             h2d1_inflight: false,
             h2d_reg: RegisteredMmap { ptrs: Vec::new() },
             act: None,
+            q_ws: None,
             hc_ones: None,
             hc_act: None,
             hc_live: 0,

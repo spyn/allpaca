@@ -5314,6 +5314,25 @@ impl HipWorkspace {
         Ok(())
     }
 
+    /// Packed BF16 `b` on device; `a` and `c` are device pointers (no activation copies).
+    pub fn gemm_nt_bf16_from_device_a_into(
+        &self,
+        a: *const f32,
+        b: *const u16,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if m <= 0 || n <= 0 || k <= 0 || a.is_null() || b.is_null() || c.is_null() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device-A/C BF16 GEMM".into(),
+            )));
+        }
+        self.bind()?;
+        self.gemm_nt_bf16_dev(a, b, c, m, n, k)
+    }
+
     /// Packed MXFP4 `b` already on device; activations H2D / D2H via scratch.
     pub fn gemm_nt_mxfp4_dev_b(
         &self,
@@ -11961,6 +11980,190 @@ mod tests {
         }
         device_free(da, a.len() * 4);
         device_free(db, b_bf16.len() * 2);
+    }
+
+    /// Device C from device A skips activation H2D and D2H.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_bf16_from_device_a_into_device_c_skips_activation_copies() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 3usize;
+        let n = 16usize;
+        let k = 32usize;
+        let mut a = vec![0.0f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        let b_bf16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let b_deq: Vec<f32> = b_bf16
+            .iter()
+            .copied()
+            .map(allpaca_cpu::bf16_to_f32)
+            .collect();
+        let mut cpu = vec![0.0f32; m * n];
+        cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+        let hip = HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace");
+        hip.bind().expect("bind");
+        let da = device_malloc(a.len() * 4, 0).expect("device a");
+        let db = device_malloc(b_bf16.len() * 2, 0).expect("device b");
+        let dc = device_malloc(cpu.len() * 4, 0).expect("device c");
+        memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).expect("h2d a");
+        memcpy(db, b_bf16.as_ptr().cast(), b_bf16.len() * 2, MEMCPY_H2D).expect("h2d b");
+        let h2d_before = hip.activation_h2d_bytes();
+        let d2h_before = hip.activation_d2h_bytes();
+        hip.gemm_nt_bf16_from_device_a_into(
+            da.cast(),
+            db.cast(),
+            dc.cast(),
+            m as i32,
+            n as i32,
+            k as i32,
+        )
+        .expect("device A into C");
+        assert_eq!(hip.activation_h2d_bytes(), h2d_before);
+        assert_eq!(hip.activation_d2h_bytes(), d2h_before);
+        let mut got = vec![0.0f32; cpu.len()];
+        memcpy(got.as_mut_ptr().cast(), dc, got.len() * 4, MEMCPY_D2H).expect("d2h c");
+        for i in 0..cpu.len() {
+            assert!(
+                gemm_close(got[i], cpu[i]),
+                "device-C mismatch idx={i} hip={} cpu={}",
+                got[i],
+                cpu[i]
+            );
+        }
+        device_free(da, a.len() * 4);
+        device_free(db, b_bf16.len() * 2);
+        device_free(dc, cpu.len() * 4);
+    }
+
+    /// MLA Q-style q_a → rmsnorm → q_b on device must not H2D intermediate qr.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mla_q_chain_from_device_skips_intermediate_qr_h2d() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 3usize;
+        let dim = 32usize;
+        let q_lora = 16usize;
+        let q_out = 24usize;
+        let eps = 1e-5f32;
+        let mut a = vec![0.0f32; m * dim];
+        let mut qa_f = vec![0.0f32; q_lora * dim];
+        let mut qb_f = vec![0.0f32; q_out * q_lora];
+        let mut nw = vec![0.0f32; q_lora];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in qa_f.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in qb_f.iter_mut().enumerate() {
+            *v = ((i * 11) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in nw.iter_mut().enumerate() {
+            *v = 0.8 + 0.01 * i as f32;
+        }
+        let qa_bf16: Vec<u16> = qa_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let qb_bf16: Vec<u16> = qb_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let qa_deq: Vec<f32> = qa_bf16
+            .iter()
+            .copied()
+            .map(allpaca_cpu::bf16_to_f32)
+            .collect();
+        let qb_deq: Vec<f32> = qb_bf16
+            .iter()
+            .copied()
+            .map(allpaca_cpu::bf16_to_f32)
+            .collect();
+        let mut qr = vec![0.0f32; m * q_lora];
+        cpu_gemm_nt(&a, &qa_deq, &mut qr, m, q_lora, dim);
+        let mut qr_n = vec![0.0f32; m * q_lora];
+        for t in 0..m {
+            allpaca_cpu::rmsnorm(
+                &qr[t * q_lora..(t + 1) * q_lora],
+                &nw,
+                eps,
+                &mut qr_n[t * q_lora..(t + 1) * q_lora],
+            )
+            .expect("cpu rmsnorm");
+        }
+        let mut cpu_q = vec![0.0f32; m * q_out];
+        cpu_gemm_nt(&qr_n, &qb_deq, &mut cpu_q, m, q_out, q_lora);
+        let hip = HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace");
+        hip.bind().expect("bind");
+        let da = device_malloc(a.len() * 4, 0).expect("da");
+        let dqa = device_malloc(qa_bf16.len() * 2, 0).expect("dqa");
+        let dqb = device_malloc(qb_bf16.len() * 2, 0).expect("dqb");
+        let dqr = device_malloc(qr.len() * 4, 0).expect("dqr");
+        let dq = device_malloc(cpu_q.len() * 4, 0).expect("dq");
+        let dnw = device_malloc(nw.len() * 4, 0).expect("dnw");
+        memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).expect("h2d a");
+        memcpy(dqa, qa_bf16.as_ptr().cast(), qa_bf16.len() * 2, MEMCPY_H2D).expect("h2d qa");
+        memcpy(dqb, qb_bf16.as_ptr().cast(), qb_bf16.len() * 2, MEMCPY_H2D).expect("h2d qb");
+        memcpy(dnw, nw.as_ptr().cast(), nw.len() * 4, MEMCPY_H2D).expect("h2d nw");
+        let h2d_before = hip.activation_h2d_bytes();
+        let d2h_before = hip.activation_d2h_bytes();
+        hip.gemm_nt_bf16_from_device_a_into(
+            da.cast(),
+            dqa.cast(),
+            dqr.cast(),
+            m as i32,
+            q_lora as i32,
+            dim as i32,
+        )
+        .expect("q_a");
+        hip.rmsnorm_device_rows(
+            dqr.cast(),
+            dnw.cast(),
+            dqr.cast(),
+            m as i32,
+            q_lora as i32,
+            eps,
+        )
+        .expect("q_a rmsnorm");
+        hip.gemm_nt_bf16_from_device_a_into(
+            dqr.cast(),
+            dqb.cast(),
+            dq.cast(),
+            m as i32,
+            q_out as i32,
+            q_lora as i32,
+        )
+        .expect("q_b");
+        assert_eq!(
+            hip.activation_h2d_bytes(),
+            h2d_before,
+            "MLA Q chain must not H2D qr"
+        );
+        assert_eq!(
+            hip.activation_d2h_bytes(),
+            d2h_before,
+            "MLA Q chain must not D2H qr"
+        );
+        let mut got = vec![0.0f32; cpu_q.len()];
+        memcpy(got.as_mut_ptr().cast(), dq, got.len() * 4, MEMCPY_D2H).expect("d2h q");
+        for i in 0..cpu_q.len() {
+            assert!(
+                gemm_close(got[i], cpu_q[i]),
+                "MLA Q chain mismatch idx={i} hip={} cpu={}",
+                got[i],
+                cpu_q[i]
+            );
+        }
+        device_free(da, a.len() * 4);
+        device_free(dqa, qa_bf16.len() * 2);
+        device_free(dqb, qb_bf16.len() * 2);
+        device_free(dqr, qr.len() * 4);
+        device_free(dq, cpu_q.len() * 4);
+        device_free(dnw, nw.len() * 4);
     }
 
     /// Token-parallel BF16 SwiGLU (`M>1`) must match repeated `M=1` GEMVs.

@@ -1797,6 +1797,22 @@ fn dsv4_mla_q_rows(
     eps: f32,
     metrics: &Metrics,
 ) -> Result<Vec<f32>, AllpacaError> {
+    if let (Some(g), Some(f)) = (gpu.as_deref_mut(), file) {
+        if let Ok(q) = g.mla_q_rows(
+            f,
+            blk,
+            curs,
+            &mla.q_a_norm,
+            eps,
+            q_lora,
+            q_out,
+            dim,
+            n_tok,
+            Some(metrics),
+        ) {
+            return Ok(q);
+        }
+    }
     let mut qr = vec![0.0f32; n_tok.saturating_mul(q_lora)];
     dsv4_gemm(
         gpu.as_deref_mut(),
