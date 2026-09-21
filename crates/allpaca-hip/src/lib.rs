@@ -12166,6 +12166,153 @@ mod tests {
         device_free(dnw, nw.len() * 4);
     }
 
+    /// Grouped o_a → device oa → o_b must not H2D/D2H the oa intermediate.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mla_o_chain_from_device_skips_intermediate_oa_h2d() {
+        if device_count() == 0 {
+            return;
+        }
+        let m = 3usize;
+        let groups = 2usize;
+        let o_group_dim = 8usize;
+        let per = 4usize;
+        let dim = 16usize;
+        let oa_out = per * groups;
+        let q_out = groups * o_group_dim;
+        let mut attn = vec![0.0f32; m * q_out];
+        let mut oa_f = vec![0.0f32; groups * per * o_group_dim];
+        let mut ob_f = vec![0.0f32; dim * oa_out];
+        for (i, v) in attn.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in oa_f.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in ob_f.iter_mut().enumerate() {
+            *v = ((i * 11) % 50) as f32 * 0.02 - 0.5;
+        }
+        let oa_bf16: Vec<u16> = oa_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let ob_bf16: Vec<u16> = ob_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let oa_deq: Vec<f32> = oa_bf16
+            .iter()
+            .copied()
+            .map(allpaca_cpu::bf16_to_f32)
+            .collect();
+        let ob_deq: Vec<f32> = ob_bf16
+            .iter()
+            .copied()
+            .map(allpaca_cpu::bf16_to_f32)
+            .collect();
+        let mut cpu_oa = vec![0.0f32; m * oa_out];
+        for g in 0..groups {
+            let mut xs = vec![0.0f32; m * o_group_dim];
+            for t in 0..m {
+                let src = t * q_out + g * o_group_dim;
+                let dst = t * o_group_dim;
+                xs[dst..dst + o_group_dim].copy_from_slice(&attn[src..src + o_group_dim]);
+            }
+            let w = &oa_deq[g * per * o_group_dim..(g + 1) * per * o_group_dim];
+            let mut ys = vec![0.0f32; m * per];
+            cpu_gemm_nt(&xs, w, &mut ys, m, per, o_group_dim);
+            for t in 0..m {
+                let src = t * per;
+                let dst = t * oa_out + g * per;
+                cpu_oa[dst..dst + per].copy_from_slice(&ys[src..src + per]);
+            }
+        }
+        let mut cpu_out = vec![0.0f32; m * dim];
+        cpu_gemm_nt(&cpu_oa, &ob_deq, &mut cpu_out, m, dim, oa_out);
+        let hip = HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace");
+        hip.bind().expect("bind");
+        let dxs: Vec<*mut u8> = (0..groups)
+            .map(|_| device_malloc(m * o_group_dim * 4, 0).expect("dxs"))
+            .collect();
+        let doa_w: Vec<*mut u8> = (0..groups)
+            .map(|_| device_malloc(per * o_group_dim * 2, 0).expect("doa_w"))
+            .collect();
+        let dob = device_malloc(ob_bf16.len() * 2, 0).expect("dob");
+        let dys = device_malloc(m * per * 4, 0).expect("dys");
+        let doa = device_malloc(m * oa_out * 4, 0).expect("doa");
+        let dout = device_malloc(m * dim * 4, 0).expect("dout");
+        memcpy(dob, ob_bf16.as_ptr().cast(), ob_bf16.len() * 2, MEMCPY_H2D).expect("h2d ob");
+        for g in 0..groups {
+            let mut xs = vec![0.0f32; m * o_group_dim];
+            for t in 0..m {
+                let src = t * q_out + g * o_group_dim;
+                let dst = t * o_group_dim;
+                xs[dst..dst + o_group_dim].copy_from_slice(&attn[src..src + o_group_dim]);
+            }
+            memcpy(dxs[g], xs.as_ptr().cast(), xs.len() * 4, MEMCPY_H2D).expect("h2d xs");
+            let w_off = g * per * o_group_dim;
+            memcpy(
+                doa_w[g],
+                oa_bf16[w_off..].as_ptr().cast(),
+                per * o_group_dim * 2,
+                MEMCPY_H2D,
+            )
+            .expect("h2d oa_w");
+        }
+        let h2d_before = hip.activation_h2d_bytes();
+        let d2h_before = hip.activation_d2h_bytes();
+        for g in 0..groups {
+            hip.gemm_nt_bf16_from_device_a_into(
+                dxs[g].cast(),
+                doa_w[g].cast(),
+                dys.cast(),
+                m as i32,
+                per as i32,
+                o_group_dim as i32,
+            )
+            .expect("o_a group");
+            for t in 0..m {
+                // SAFETY: `doa` is `[m, oa_out]`; `dys` is `[m, per]`; both live.
+                let dst = unsafe { doa.cast::<f32>().add(t * oa_out + g * per) };
+                let src = unsafe { dys.cast::<f32>().add(t * per) };
+                hip.copy_d2d_f32(dst, src, per).expect("scatter oa");
+            }
+        }
+        hip.gemm_nt_bf16_from_device_a_into(
+            doa.cast(),
+            dob.cast(),
+            dout.cast(),
+            m as i32,
+            dim as i32,
+            oa_out as i32,
+        )
+        .expect("o_b");
+        assert_eq!(
+            hip.activation_h2d_bytes(),
+            h2d_before,
+            "MLA O chain must not H2D oa"
+        );
+        assert_eq!(
+            hip.activation_d2h_bytes(),
+            d2h_before,
+            "MLA O chain must not D2H oa"
+        );
+        let mut got = vec![0.0f32; cpu_out.len()];
+        memcpy(got.as_mut_ptr().cast(), dout, got.len() * 4, MEMCPY_D2H).expect("d2h out");
+        for i in 0..cpu_out.len() {
+            assert!(
+                gemm_close(got[i], cpu_out[i]),
+                "MLA O chain mismatch idx={i} hip={} cpu={}",
+                got[i],
+                cpu_out[i]
+            );
+        }
+        for p in dxs {
+            device_free(p, m * o_group_dim * 4);
+        }
+        for p in doa_w {
+            device_free(p, per * o_group_dim * 2);
+        }
+        device_free(dob, ob_bf16.len() * 2);
+        device_free(dys, m * per * 4);
+        device_free(doa, m * oa_out * 4);
+        device_free(dout, m * dim * 4);
+    }
+
     /// Token-parallel BF16 SwiGLU (`M>1`) must match repeated `M=1` GEMVs.
     #[cfg(feature = "hip")]
     #[test]

@@ -1681,60 +1681,9 @@ fn dsv4_attn_and_route(
             let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
             rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
         }
-        let groups = spec.o_group_count.max(1);
-        let heads_g = (n_heads / groups).max(1);
-        let o_group_dim = heads_g * head_dim;
-        let oa_out = spec.o_lora_rank * groups;
-        let per = spec.o_lora_rank.max(1);
-        let mut oa = vec![0.0f32; oa_out];
-        for g in 0..groups {
-            let mut slice = vec![0.0f32; o_group_dim];
-            for hg in 0..heads_g {
-                let src = (g * heads_g + hg) * head_dim;
-                let dst = hg * head_dim;
-                if src + head_dim <= attn_raw.len() && dst + head_dim <= slice.len() {
-                    slice[dst..dst + head_dim].copy_from_slice(&attn_raw[src..src + head_dim]);
-                }
-            }
-            let w_off = g.saturating_mul(per).saturating_mul(o_group_dim);
-            let w_end = w_off + per * o_group_dim;
-            if !mla.o_a.is_empty() && w_end > mla.o_a.len() {
-                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-                    "attn_output_a grouped slice OOB".into(),
-                )));
-            }
-            let cpu = if mla.o_a.is_empty() {
-                &[][..]
-            } else {
-                &mla.o_a[w_off..w_end]
-            };
-            dsv4_gemv(
-                gpu.as_deref_mut(),
-                file,
-                &format!("blk.{blk}.attn_output_a.weight"),
-                &slice,
-                cpu,
-                &mut oa[g * per..(g + 1) * per],
-                per,
-                o_group_dim,
-                w_off,
-                Some(metrics),
-            )?;
-        }
-        let mut attn_out = vec![0.0f32; dim];
-        dsv4_gemv(
-            gpu.as_deref_mut(),
-            file,
-            &format!("blk.{blk}.attn_output_b.weight"),
-            &oa,
-            &mla.o_b,
-            &mut attn_out,
-            dim,
-            oa_out,
-            0,
-            Some(metrics),
-        )?;
-        Ok(attn_out)
+        dsv4_mla_o_rows(
+            &mut gpu, file, mla, &attn_raw, blk, 1, q_out, n_heads, head_dim, spec, dim, metrics,
+        )
     })?;
     let t_hc = Instant::now();
     let streams = hc_post(&attn_out, streams, &post, &comb, spec, dim);
@@ -1910,6 +1859,23 @@ fn dsv4_mla_o_rows(
     let o_group_dim = heads_g.saturating_mul(head_dim);
     let per = spec.o_lora_rank.max(1);
     let oa_out = per.saturating_mul(groups);
+    if let (Some(g), Some(f)) = (gpu.as_deref_mut(), file) {
+        if let Ok(out) = g.mla_o_rows(
+            f,
+            blk,
+            attn_raws,
+            n_tok,
+            q_out,
+            n_heads,
+            head_dim,
+            groups,
+            per,
+            dim,
+            Some(metrics),
+        ) {
+            return Ok(out);
+        }
+    }
     let mut oa = vec![0.0f32; n_tok.saturating_mul(oa_out)];
     for g in 0..groups {
         let mut xs = vec![0.0f32; n_tok.saturating_mul(o_group_dim)];
