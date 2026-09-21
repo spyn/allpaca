@@ -177,6 +177,57 @@ fn cuda_stats_gpu_util_after_generate_when_device_present() {
 }
 
 #[test]
+fn cuda_qkv_fusion_keeps_qkv_on_device() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    let after_load = engine.stats().activation_h2d_bytes;
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    let forwards = stats.gpu_forwards.max(stats.target_gpu_forwards);
+    assert!(
+        forwards > 0,
+        "expected CUDA forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    let cfg = allpaca_core::ModelConfig::tiny();
+    let dim = cfg.dim as u64;
+    let n_layers = cfg.n_layers as u64;
+    let activation_delta = stats.activation_h2d_bytes.saturating_sub(after_load);
+    // Host QKV H2Ds GEMM A (×3), Q for attention, and K/V slot writes.
+    // Device fusion uploads residual once per attn layer; FFN still host-A.
+    let ceiling = forwards * n_layers * dim * 4 * 8;
+    assert!(
+        activation_delta < ceiling,
+        "QKV must stay on device after GEMM; activation H2D {activation_delta} >= ceiling {ceiling} (forwards={forwards})"
+    );
+}
+
+#[test]
+fn cuda_qkv_fusion_decode_is_deterministic() {
+    if !cuda_device_available() {
+        return;
+    }
+    let prompt = "hello";
+    let params = greedy(6);
+    let a = Engine::new(cuda_synthetic())
+        .expect("a")
+        .generate(prompt, params.clone())
+        .expect("gen a");
+    let b = Engine::new(cuda_synthetic())
+        .expect("b")
+        .generate(prompt, params)
+        .expect("gen b");
+    assert_eq!(
+        a.token_ids, b.token_ids,
+        "stream-ordered QKV fusion must be deterministic across runs"
+    );
+}
+
+#[test]
 fn cuda_coordinator_rpc_split_keeps_local_layers_on_device() {
     if !cuda_device_available() {
         return;

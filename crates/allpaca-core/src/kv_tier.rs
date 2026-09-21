@@ -504,6 +504,9 @@ impl KvTierManager {
     }
 
     /// D2D write of a K/V slot from device pointers (no host bounce).
+    ///
+    /// `cuda_stream`: when `Some`, CUDA copies enqueue on that stream so they
+    /// order with prior workspace GEMM/RoPE. `None` uses the default stream.
     pub(crate) fn write_slot_from_device(
         &mut self,
         id: PageId,
@@ -512,6 +515,7 @@ impl KvTierManager {
         head_dim: usize,
         k_dev: *const f32,
         v_dev: *const f32,
+        cuda_stream: Option<*mut std::ffi::c_void>,
     ) -> Result<(), AllpacaError> {
         if k_dev.is_null() || v_dev.is_null() {
             return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
@@ -548,35 +552,45 @@ impl KvTierManager {
                 })?;
                 let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
                 let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
-                allpaca_cuda::memcpy(
+                let stream = cuda_stream.unwrap_or(std::ptr::null_mut());
+                allpaca_cuda::memcpy_on(
                     k_ptr.cast(),
                     k_dev.cast(),
                     k_bytes,
                     allpaca_cuda::MEMCPY_D2D,
+                    stream,
                 )?;
-                allpaca_cuda::memcpy(
+                allpaca_cuda::memcpy_on(
                     v_ptr.cast(),
                     v_dev.cast(),
                     k_bytes,
                     allpaca_cuda::MEMCPY_D2D,
+                    stream,
                 )?;
             }
             DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
                 let mut k = vec![0.0f32; kv_width];
                 let mut v = vec![0.0f32; kv_width];
                 if self.cuda_device.is_some() {
-                    allpaca_cuda::memcpy(
+                    let stream = cuda_stream.unwrap_or(std::ptr::null_mut());
+                    allpaca_cuda::memcpy_on(
                         k.as_mut_ptr().cast(),
                         k_dev.cast(),
                         k_bytes,
                         allpaca_cuda::MEMCPY_D2H,
+                        stream,
                     )?;
-                    allpaca_cuda::memcpy(
+                    allpaca_cuda::memcpy_on(
                         v.as_mut_ptr().cast(),
                         v_dev.cast(),
                         k_bytes,
                         allpaca_cuda::MEMCPY_D2H,
+                        stream,
                     )?;
+                    if !stream.is_null() {
+                        // Host needs the bytes before write_slot; wait this stream only.
+                        unsafe { allpaca_cuda::stream_synchronize_on(stream)? };
+                    }
                 } else {
                     allpaca_hip::memcpy(
                         k.as_mut_ptr().cast(),
@@ -619,6 +633,7 @@ impl KvTierManager {
         head_dim: usize,
         k_dev: *const f32,
         v_dev: *const f32,
+        cuda_stream: Option<*mut std::ffi::c_void>,
     ) -> Result<(), AllpacaError> {
         if n_tok == 0 {
             return Ok(());
@@ -691,17 +706,20 @@ impl KvTierManager {
                     let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
                     let k_src = unsafe { k_dev.add(i * kv_width) };
                     let v_src = unsafe { v_dev.add(i * kv_width) };
-                    allpaca_cuda::memcpy(
+                    let stream = cuda_stream.unwrap_or(std::ptr::null_mut());
+                    allpaca_cuda::memcpy_on(
                         k_ptr.cast(),
                         k_src.cast(),
                         run_bytes,
                         allpaca_cuda::MEMCPY_D2D,
+                        stream,
                     )?;
-                    allpaca_cuda::memcpy(
+                    allpaca_cuda::memcpy_on(
                         v_ptr.cast(),
                         v_src.cast(),
                         run_bytes,
                         allpaca_cuda::MEMCPY_D2D,
+                        stream,
                     )?;
                     if let Some(page) = self.pages.get_mut(&page_id) {
                         page.filled = page.filled.max((slot + run) as u32);
@@ -716,6 +734,7 @@ impl KvTierManager {
                             head_dim,
                             unsafe { k_dev.add((i + t) * kv_width) },
                             unsafe { v_dev.add((i + t) * kv_width) },
+                            cuda_stream,
                         )?;
                     }
                 }
@@ -1769,6 +1788,7 @@ mod tests {
                 head_dim,
                 dk.cast(),
                 dv.cast(),
+                None,
             )
             .expect("batched KV write");
         for i in 0..n_tok {
@@ -1783,6 +1803,7 @@ mod tests {
                     head_dim,
                     unsafe { dk.cast::<f32>().add(i * kv_width) },
                     unsafe { dv.cast::<f32>().add(i * kv_width) },
+                    None,
                 )
                 .expect("per-slot KV write");
         }
@@ -1817,5 +1838,51 @@ mod tests {
                 "V page {page_i} written slots mismatch"
             );
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_write_slot_from_device_orders_on_workspace_stream() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        let metrics = Metrics::default();
+        let mut kv = KvTierManager::with_devices(1 << 20, 1 << 20, 0.9, None, Some(0));
+        let id = kv.alloc_page(0, 0, 4, 1, 4, &metrics).unwrap();
+        if kv.get(id).map(|p| p.location.kind) != Some(DeviceBufferKind::Cuda) {
+            kv.release(id, &metrics);
+            return;
+        }
+        let ws = allpaca_cuda::CudaWorkspace::new(0, 1 << 16).expect("workspace");
+        let stream = ws.raw_stream();
+        let pattern = [1.0f32, 2.0, 3.0, 4.0];
+        // Async H2D on workspace stream, then stream-ordered slot write (no mid sync).
+        let dk = allpaca_cuda::device_malloc(16, 0).unwrap();
+        let dv = allpaca_cuda::device_malloc(16, 0).unwrap();
+        allpaca_cuda::memcpy_on(
+            dk,
+            pattern.as_ptr().cast(),
+            16,
+            allpaca_cuda::MEMCPY_H2D,
+            stream,
+        )
+        .unwrap();
+        allpaca_cuda::memcpy_on(
+            dv,
+            pattern.as_ptr().cast(),
+            16,
+            allpaca_cuda::MEMCPY_H2D,
+            stream,
+        )
+        .unwrap();
+        kv.write_slot_from_device(id, 0, 1, 4, dk.cast(), dv.cast(), Some(stream))
+            .expect("stream-ordered KV write");
+        ws.synchronize().unwrap();
+        let (k, v) = kv.read_kv(id, 1, 4).unwrap();
+        assert_eq!(&k[..4], &pattern);
+        assert_eq!(&v[..4], &pattern);
+        allpaca_cuda::device_free(dk);
+        allpaca_cuda::device_free(dv);
+        kv.release(id, &metrics);
     }
 }

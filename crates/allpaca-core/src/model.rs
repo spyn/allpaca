@@ -7256,7 +7256,7 @@ impl TinyModel {
                 let page_index = pos / page_tokens;
                 let slot = (pos % page_tokens) as u32;
                 let page_id = page_ids[layer_idx][page_index];
-                kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v)?;
+                kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v, None)?;
                 kv.touch(page_id, 1.0);
 
                 let (packed_k, packed_v, n_kv) = kv.kv_device_views(
@@ -7746,6 +7746,7 @@ impl TinyModel {
                     al.head_dim,
                     buf.k,
                     buf.v,
+                    None,
                 )?;
 
                 let (packed_k, packed_v, n_kv) = kv.kv_device_views(

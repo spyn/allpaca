@@ -854,6 +854,32 @@ impl TinyModel {
                     ),
                 ));
             }
+
+            // Simple dense: keep QKV on device (stream-ordered KV D2D).
+            if rpc_local_layer_is_simple_dense(cfg, host_layer) {
+                let dx = allpaca_cuda::device_malloc(dim * 4, cuda.device)?;
+                let fused = (|| {
+                    cuda.copy_h2d_f32(dx.cast(), &x)?;
+                    apply_simple_dense_layer_cuda_dev(
+                        cfg,
+                        layer_idx,
+                        host_layer,
+                        layer,
+                        resident,
+                        cuda,
+                        kv,
+                        &page_ids[layer_idx],
+                        pos,
+                        dx.cast(),
+                        metrics,
+                    )?;
+                    cuda.download_f32(dx.cast(), &mut x)
+                })();
+                cuda.free_device(dx);
+                fused?;
+                continue;
+            }
+
             cuda.rmsnorm_host_x_dev_w(
                 &x,
                 resident.ptr(layer.attn_norm)?,
@@ -1962,22 +1988,27 @@ fn apply_ffn_cuda(
 
 /// True when a local RPC layer can run fully device-resident (no host QKV bounce).
 fn rpc_local_layer_is_simple_dense(cfg: &ModelConfig, host: &LayerWeights) -> bool {
-    host.block == HybridLayerKind::Attention
-        && host.gdn.is_none()
-        && host.mla.is_none()
-        && host.experts.is_empty()
-        && !cfg.ffn_gelu
-        && cfg.attn_logit_softcap == 0.0
-        && cfg.sliding_window == 0
-        && !cfg.headwise_attn_gate
-        && host.q_norm.is_empty()
-        && host.k_norm.is_empty()
-        && host.attn_sinks.is_empty()
-        && host.attn_post_norm.is_empty()
-        && host.ffn_post_norm.is_empty()
-        && host.attn_out_gate.is_empty()
-        && !host.wq.is_empty()
-        && !host.w_gate.is_empty()
+    if host.block != HybridLayerKind::Attention
+        || host.gdn.is_some()
+        || host.mla.is_some()
+        || !host.experts.is_empty()
+        || cfg.ffn_gelu
+        || cfg.attn_logit_softcap != 0.0
+        || cfg.sliding_window != 0
+        || cfg.headwise_attn_gate
+        || !host.q_norm.is_empty()
+        || !host.k_norm.is_empty()
+        || !host.attn_sinks.is_empty()
+        || !host.attn_post_norm.is_empty()
+        || !host.ffn_post_norm.is_empty()
+        || !host.attn_out_gate.is_empty()
+        || host.wq.is_empty()
+        || host.w_gate.is_empty()
+    {
+        return false;
+    }
+    let al = super::attn_layout(cfg, host.wq.len(), host.wk.len(), host.wo.len());
+    !al.gated
 }
 
 /// Dense Attention+FFN on device-resident `dx` (RPC local layers).
@@ -2072,8 +2103,7 @@ fn apply_simple_dense_layer_cuda_dev(
         )?;
         metrics.elementwise_gpu_ops.fetch_add(2, Ordering::Relaxed);
 
-        // Order device GEMM/RoPE before default-stream KV memcpy.
-        cuda.synchronize()?;
+        // Stream-ordered KV write: same workspace stream as GEMM/RoPE.
         let page_tokens = kv
             .get(page_ids[0])
             .map(|p| p.capacity_tokens)
@@ -2081,11 +2111,27 @@ fn apply_simple_dense_layer_cuda_dev(
         let page_index = pos / page_tokens as usize;
         let slot = (pos % page_tokens as usize) as u32;
         let page_id = page_ids[page_index];
-        kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, d_k.cast(), d_v.cast())?;
+        kv.write_slot_from_device(
+            page_id,
+            slot,
+            n_kv_heads,
+            head_dim,
+            d_k.cast(),
+            d_v.cast(),
+            Some(cuda.raw_stream()),
+        )?;
         kv.touch(page_id, 1.0);
 
-        if let Some((k_dev, v_dev, n_kv)) = kv.cuda_single_page_view(page_ids, n_kv_heads, head_dim)
-        {
+        // Pack may use default-stream D2D; wait workspace writes first.
+        cuda.synchronize()?;
+        let n_kv_max = pos + 1;
+        let pack_bytes = n_kv_max * kv_dim * 4;
+        let dest = allpaca_cuda::device_malloc(pack_bytes.saturating_mul(2), cuda.device)?;
+        let dest_k = dest.cast::<f32>();
+        let dest_v = unsafe { dest_k.add(n_kv_max * kv_dim) };
+        let attn = (|| {
+            let (k_dev, v_dev, n_kv) =
+                kv.cuda_kv_views(page_ids, n_kv_heads, head_dim, dest_k, dest_v, n_kv_max)?;
             cuda.attention_dev(
                 d_q.cast(),
                 k_dev,
@@ -2097,14 +2143,10 @@ fn apply_simple_dense_layer_cuda_dev(
                 n_kv_heads as i32,
                 head_dim as i32,
                 true,
-            )?;
-        } else {
-            return Err(AllpacaError::Degraded(
-                allpaca_types::DegradedError::FeatureDisabled(
-                    "CUDA RPC resident: multi-page KV pack unsupported".into(),
-                ),
-            ));
-        }
+            )
+        })();
+        cuda.free_device(dest);
+        attn?;
 
         cuda.gemm_nt_dev(
             d_attn.cast(),
