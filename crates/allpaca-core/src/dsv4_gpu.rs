@@ -321,6 +321,7 @@ pub struct Dsv4Gpu {
     hc_curs: usize,
     hc_curs_n: usize,
     hc_curs_host: usize,
+    hc_curs_synced: bool,
     o_out: usize,
     o_out_n: usize,
     warmup_miss: Vec<(usize, usize)>,
@@ -454,6 +455,7 @@ impl Dsv4Gpu {
             hc_curs: 0,
             hc_curs_n: 0,
             hc_curs_host: 0,
+            hc_curs_synced: false,
             o_out: 0,
             o_out_n: 0,
             warmup_miss: Vec::new(),
@@ -2537,6 +2539,22 @@ impl Dsv4Gpu {
         self.hc_curs = 0;
         self.hc_curs_n = 0;
         self.hc_curs_host = 0;
+        self.hc_curs_synced = false;
+    }
+
+    /// D2H mix_pre `curs` once when a host reader needs the bytes.
+    pub fn ensure_hc_curs_host(&mut self, curs: &mut [f32]) -> Result<(), AllpacaError> {
+        if self.hc_curs == 0 || self.hc_curs_n == 0 || self.hc_curs_synced {
+            return Ok(());
+        }
+        if curs.as_ptr() as usize != self.hc_curs_host || curs.len() < self.hc_curs_n {
+            return Ok(());
+        }
+        let p = self.hc_curs as *const f32;
+        let n = self.hc_curs_n;
+        self.hip.copy_d2h_f32(p, &mut curs[..n])?;
+        self.hc_curs_synced = true;
+        Ok(())
     }
 
     pub(crate) fn hc_curs_device(&self) -> Option<(*const f32, usize)> {
@@ -2734,6 +2752,7 @@ impl Dsv4Gpu {
         curs: &mut [f32],
         norm_w: Option<&[f32]>,
         eps: f32,
+        copy_host: bool,
     ) -> Result<(), AllpacaError> {
         if n_tok == 0 {
             return Ok(());
@@ -2780,10 +2799,15 @@ impl Dsv4Gpu {
                 hip.rmsnorm_device_rows(dcurs, dw, dcurs, n_tok as i32, dim as i32, eps)?;
             }
         }
-        hip.copy_d2h_f32(dcurs, &mut curs[..curs_n])?;
         self.hc_curs = dcurs as usize;
         self.hc_curs_n = curs_n;
         self.hc_curs_host = curs.as_ptr() as usize;
+        if copy_host {
+            hip.copy_d2h_f32(dcurs, &mut curs[..curs_n])?;
+            self.hc_curs_synced = true;
+        } else {
+            self.hc_curs_synced = false;
+        }
         self.used.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -2945,6 +2969,7 @@ impl Dsv4Gpu {
             hc_curs: 0,
             hc_curs_n: 0,
             hc_curs_host: 0,
+            hc_curs_synced: false,
             o_out: 0,
             o_out_n: 0,
             warmup_miss: Vec::new(),
@@ -4122,7 +4147,7 @@ mod tests {
         .expect("gpu hc mix");
         let pre: Vec<f32> = (0..n_tok * hc).map(|i| 0.1 + 0.02 * i as f32).collect();
         let mut gpu_curs = vec![0.0f32; n_tok * dim];
-        gpu.hc_mix_pre(&pre, n_tok, hc, dim, &mut gpu_curs, None, eps)
+        gpu.hc_mix_pre(&pre, n_tok, hc, dim, &mut gpu_curs, None, eps, true)
             .expect("gpu mix_pre");
         let mut cpu_curs = vec![0.0f32; n_tok * dim];
         for t in 0..n_tok {
@@ -4202,6 +4227,66 @@ mod tests {
 
     #[cfg(feature = "hip")]
     #[test]
+    fn hc_mix_pre_skip_host_copy_still_materializes_on_ensure() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let hip = std::sync::Arc::new(
+            allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace"),
+        );
+        let mut gpu = super::Dsv4Gpu::for_hc_test(hip.clone());
+        let n_tok = 3usize;
+        let hc = 4usize;
+        let dim = 8usize;
+        let hc_dim = hc * dim;
+        let packed: Vec<f32> = (0..n_tok * hc_dim)
+            .map(|i| 0.05 * (i as f32 % 11.0) - 0.2)
+            .collect();
+        let mix_dim = (2 + hc) * hc;
+        let fn_w: Vec<f32> = (0..mix_dim * hc_dim)
+            .map(|i| 0.01 * (i as f32 % 7.0) - 0.03)
+            .collect();
+        let mut mixes = vec![0.0f32; n_tok * mix_dim];
+        gpu.hc_mix_logits(
+            &packed, &fn_w, None, n_tok, hc_dim, mix_dim, 1e-5, &mut mixes,
+        )
+        .expect("install packed");
+        let pre: Vec<f32> = (0..n_tok * hc).map(|i| 0.1 + 0.02 * i as f32).collect();
+        let mut curs = vec![0.0f32; n_tok * dim];
+        let d2h_before = hip.activation_d2h_bytes();
+        gpu.hc_mix_pre(&pre, n_tok, hc, dim, &mut curs, None, 1e-5, false)
+            .expect("mix_pre skip host");
+        assert_eq!(
+            hip.activation_d2h_bytes().saturating_sub(d2h_before),
+            0,
+            "mix_pre skip must not D2H curs"
+        );
+        assert!(curs.iter().all(|v| *v == 0.0), "host curs stays untouched");
+        gpu.ensure_hc_curs_host(&mut curs).expect("materialize");
+        let mut cpu = vec![0.0f32; n_tok * dim];
+        for t in 0..n_tok {
+            let dst = &mut cpu[t * dim..(t + 1) * dim];
+            let tok = &packed[t * hc_dim..(t + 1) * hc_dim];
+            for s in 0..hc {
+                let w = pre[t * hc + s];
+                for i in 0..dim {
+                    dst[i] += tok[s * dim + i] * w;
+                }
+            }
+        }
+        for i in 0..cpu.len() {
+            let diff = (curs[i] - cpu[i]).abs();
+            assert!(
+                diff < 2e-3,
+                "curs[{i}] {} vs {} diff={diff}",
+                curs[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
     fn hc_mix_pre_device_curs_feeds_bf16_gemm_and_moe_without_activation_h2d() {
         if allpaca_hip::device_count() == 0 {
             return;
@@ -4229,7 +4314,7 @@ mod tests {
         .expect("gpu hc mix");
         let pre: Vec<f32> = (0..n_tok * hc).map(|i| 0.1 + 0.02 * i as f32).collect();
         let mut gpu_curs = vec![0.0f32; n_tok * dim];
-        gpu.hc_mix_pre(&pre, n_tok, hc, dim, &mut gpu_curs, None, eps)
+        gpu.hc_mix_pre(&pre, n_tok, hc, dim, &mut gpu_curs, None, eps, true)
             .expect("gpu mix_pre");
         let (curs_dev, curs_n) = gpu
             .hc_curs_device()

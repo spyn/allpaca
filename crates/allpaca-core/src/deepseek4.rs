@@ -448,6 +448,7 @@ fn hc_pre_rows(
         None,
         None,
         None,
+        true,
     )
 }
 
@@ -463,6 +464,7 @@ fn hc_pre_packed(
     mix_name: Option<&str>,
     norm_w: Option<&[f32]>,
     metrics: Option<&Metrics>,
+    copy_curs: bool,
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>), AllpacaError> {
     let hc = spec.hc_mult.max(1);
     if n_tok == 0 {
@@ -545,7 +547,7 @@ fn hc_pre_packed(
     if used_gpu {
         if let Some(g) = gpu.as_mut() {
             mixed_gpu = g
-                .hc_mix_pre(&pres, n_tok, hc, dim, &mut curs, norm_w, eps)
+                .hc_mix_pre(&pres, n_tok, hc, dim, &mut curs, norm_w, eps, copy_curs)
                 .is_ok();
             if !mixed_gpu {
                 let _ = g.download_hc_packed(packed);
@@ -561,6 +563,11 @@ fn hc_pre_packed(
     }
     let gpu_normed = mixed_gpu && norm_w.is_some_and(|w| w.len() >= dim);
     if !gpu_normed {
+        if !copy_curs {
+            if let Some(g) = gpu.as_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
+        }
         apply_curs_norm(
             &mut curs,
             n_tok,
@@ -2108,7 +2115,7 @@ fn dsv4_attn_and_route_rows(
     };
     let t_hc = Instant::now();
     let attn_mix = format!("blk.{blk}.hc_attn_fn.weight");
-    let (curs, posts, combs) = hc_pre_packed(
+    let (mut curs, posts, combs) = hc_pre_packed(
         &mut states.data,
         n_tok,
         &meta.hc_attn,
@@ -2119,6 +2126,7 @@ fn dsv4_attn_and_route_rows(
         Some(attn_mix.as_str()),
         Some(attn_norm),
         Some(metrics),
+        false,
     )?;
     metrics
         .dsv4_hc_ns
@@ -2153,6 +2161,9 @@ fn dsv4_attn_and_route_rows(
             None
         };
         if dq.is_none() {
+            if let Some(g) = gpu.as_deref_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
             q = dsv4_mla_q_rows(
                 &mut gpu,
                 file,
@@ -2227,6 +2238,9 @@ fn dsv4_attn_and_route_rows(
             _ => None,
         };
         if dattn.is_none() {
+            if let Some(g) = gpu.as_deref_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
             attn_raws = vec![0.0f32; n_tok.saturating_mul(q_out)];
             let attn_ok = match (dq, gpu.as_deref_mut()) {
                 (Some(p), Some(g)) => g
@@ -2311,7 +2325,7 @@ fn dsv4_attn_and_route_rows(
         },
         xs_dev,
     );
-    let (xs, fposts, fcombs) = {
+    let (mut xs, fposts, fcombs) = {
         let ffn_mix = format!("blk.{blk}.hc_ffn_fn.weight");
         hc_pre_packed(
             &mut states.data,
@@ -2324,6 +2338,7 @@ fn dsv4_attn_and_route_rows(
             Some(ffn_mix.as_str()),
             Some(ffn_norm),
             Some(metrics),
+            true,
         )?
     };
     metrics
