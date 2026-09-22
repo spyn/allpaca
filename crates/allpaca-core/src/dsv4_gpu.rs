@@ -8,16 +8,17 @@
 //! the CPU gemv path.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::Instant;
 
 use allpaca_cpu::{MXFP4_BLOCK_BYTES, MXFP4_BLOCK_ELEMS};
 use allpaca_gguf::{GgmlType, GgufFile};
 use allpaca_hip::{
+    DeviceWeights, H2D_READY_RING, H2dStream, HipWorkspace, MEMCPY_D2H, MEMCPY_H2D,
     device_memory_info, gemm_nt_device, host_free, host_malloc, host_register, host_unregister,
-    memcpy, DeviceWeights, H2dStream, HipWorkspace, H2D_READY_RING, MEMCPY_D2H, MEMCPY_H2D,
+    memcpy,
 };
 use allpaca_types::{AllpacaError, DegradedError, FatalError};
 
@@ -3326,6 +3327,100 @@ fn prefault_parts_until(parts: &[(usize, &[u8])], stop: &AtomicBool) {
     }
 }
 
+/// Bytes of one bounce slot gathered from GGUF slices. Two threads copy when
+/// the slot is large enough that a spawn is cheaper than one serial memcpy.
+const PIN_GATHER_PARALLEL_BYTES: usize = 32 * 1024;
+
+struct PinSpan {
+    /// Host address stored as `usize` so the span is `Send` (Rust 2024 pointers are not).
+    src: usize,
+    pin_off: usize,
+    len: usize,
+}
+
+fn pin_gather_spans(
+    parts: &[(usize, &[u8])],
+    mut pi: usize,
+    mut poff: usize,
+    n: usize,
+) -> Result<(Vec<PinSpan>, usize, usize), AllpacaError> {
+    let mut spans = Vec::new();
+    let mut packed = 0usize;
+    while packed < n {
+        if pi >= parts.len() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "packed H2D host run underrun".into(),
+            )));
+        }
+        let sl = parts[pi].1;
+        if poff > sl.len() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "packed H2D host cursor past slice".into(),
+            )));
+        }
+        let take = (sl.len() - poff).min(n - packed);
+        if take == 0 {
+            pi += 1;
+            poff = 0;
+            continue;
+        }
+        // SAFETY: `poff < sl.len()` because `take > 0`. The address is only
+        // read for `take` bytes, and `poff + take <= sl.len()`.
+        let src = unsafe { sl.as_ptr().add(poff) as usize };
+        spans.push(PinSpan {
+            src,
+            pin_off: packed,
+            len: take,
+        });
+        packed += take;
+        poff += take;
+        if poff == sl.len() {
+            pi += 1;
+            poff = 0;
+        }
+    }
+    Ok((spans, pi, poff))
+}
+
+fn copy_spans_to_pin(dst: *mut u8, spans: &[PinSpan]) {
+    let total: usize = spans.iter().map(|s| s.len).sum();
+    if total == 0 {
+        return;
+    }
+    let dst = dst as usize;
+    if total < PIN_GATHER_PARALLEL_BYTES {
+        copy_span_range(dst, spans, 0, total);
+        return;
+    }
+    let mid = total / 2;
+    std::thread::scope(|scope| {
+        scope.spawn(|| copy_span_range(dst, spans, 0, mid));
+        copy_span_range(dst, spans, mid, total);
+    });
+}
+
+fn copy_span_range(dst: usize, spans: &[PinSpan], from: usize, to: usize) {
+    for s in spans {
+        let s_end = s.pin_off + s.len;
+        if s_end <= from {
+            continue;
+        }
+        if s.pin_off >= to {
+            break;
+        }
+        let lo = from.max(s.pin_off);
+        let hi = to.min(s_end);
+        let off = lo - s.pin_off;
+        let len = hi - lo;
+        // SAFETY: `s.src` addresses `s.len` bytes of the GGUF slice that built
+        // this span. `off + len <= s.len`. `dst + lo` lies in the idle bounce
+        // slot. Callers split `[from, to)` so concurrent copies do not alias.
+        unsafe {
+            std::ptr::copy_nonoverlapping((s.src + off) as *const u8, (dst + lo) as *mut u8, len);
+        }
+    }
+}
+
 /// Length of the contiguous device-offset run starting at `start`.
 fn packed_run_parts(parts: &[(usize, &[u8])], start: usize) -> usize {
     if start >= parts.len() {
@@ -3374,27 +3469,10 @@ fn copy_pinned_run(
         }
         let n = (total - done).min(pin.bytes);
         let src_ptr = if which == 0 { pin.a } else { pin.b };
-        let mut packed = 0usize;
-        while packed < n {
-            if pi >= parts.len() {
-                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
-                    "packed H2D host run underrun".into(),
-                )));
-            }
-            let sl = parts[pi].1;
-            let take = (sl.len() - poff).min(n - packed);
-            // SAFETY: `poff + take <= sl.len()`, `packed + take <= n <= pin.bytes`,
-            // and `src_ptr` is a live `hipHostMalloc` buffer of `pin.bytes`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(sl.as_ptr().add(poff), src_ptr.add(packed), take);
-            }
-            packed += take;
-            poff += take;
-            if poff == sl.len() {
-                pi += 1;
-                poff = 0;
-            }
-        }
+        let (spans, npi, npoff) = pin_gather_spans(parts, pi, poff, n)?;
+        copy_spans_to_pin(src_ptr, &spans);
+        pi = npi;
+        poff = npoff;
         let dst_off = dst0 + done;
         // SAFETY: `src_ptr` is pin slot `which`, not in flight (`synchronize_slot`
         // above). `n <= pin.bytes`. Device range `[dst_off, dst_off+n)` was
@@ -3905,8 +3983,8 @@ fn prefault_mmap(bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        expert_lru_slots, want_full_layer_prefetch, want_hint_prefetch, EXPERT_LRU_MAX_BYTES,
-        HBM_RESERVE,
+        EXPERT_LRU_MAX_BYTES, HBM_RESERVE, expert_lru_slots, want_full_layer_prefetch,
+        want_hint_prefetch,
     };
     use crate::model::ModelConfig;
 
@@ -3937,6 +4015,28 @@ mod tests {
         assert_eq!(merged, vec![(0, 3 * page)]);
         let split = super::merge_page_ranges(vec![(0, page), (3 * page, page)]);
         assert_eq!(split, vec![(0, page), (3 * page, page)]);
+    }
+
+    #[test]
+    fn pin_gather_spans_tile_one_slot_across_slices() {
+        let a = vec![1u8; 40_000];
+        let b = vec![2u8; 40_000];
+        let parts = [(0usize, a.as_slice()), (40_000usize, b.as_slice())];
+        let (spans, pi, poff) = super::pin_gather_spans(&parts, 0, 3, 70_000).expect("spans");
+        assert_eq!(pi, 1);
+        assert_eq!(poff, 30_003);
+        let mut covered = 0usize;
+        for w in spans.windows(2) {
+            assert_eq!(w[0].pin_off + w[0].len, w[1].pin_off);
+            covered += w[0].len;
+        }
+        covered += spans.last().map(|s| s.len).unwrap_or(0);
+        assert_eq!(covered, 70_000);
+        assert_eq!(spans[0].pin_off, 0);
+        let mut buf = vec![0u8; 70_000];
+        super::copy_spans_to_pin(buf.as_mut_ptr(), &spans);
+        assert!(buf[..39_997].iter().all(|&x| x == 1));
+        assert!(buf[39_997..].iter().all(|&x| x == 2));
     }
 
     #[test]
