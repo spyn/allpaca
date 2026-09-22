@@ -2325,7 +2325,7 @@ fn dsv4_attn_and_route_rows(
         },
         xs_dev,
     );
-    let (mut xs, fposts, fcombs) = {
+    let (xs, fposts, fcombs) = {
         let ffn_mix = format!("blk.{blk}.hc_ffn_fn.weight");
         hc_pre_packed(
             &mut states.data,
@@ -2338,7 +2338,7 @@ fn dsv4_attn_and_route_rows(
             Some(ffn_mix.as_str()),
             Some(ffn_norm),
             Some(metrics),
-            true,
+            false,
         )?
     };
     metrics
@@ -2784,6 +2784,12 @@ fn run_expert_job_pair(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// CPU shexp loads are skipped when the BF16 tensors are already resident.
+/// Device accumulate still runs from `moe_x`.
+fn should_run_device_shexp(weights_resident: bool, moe_active: bool) -> bool {
+    weights_resident && moe_active
+}
+
 fn dsv4_apply_moe_rows(
     model: &TinyModel,
     dsv4: &Dsv4Weights,
@@ -2970,10 +2976,11 @@ fn dsv4_apply_moe_rows(
             _ => None,
         };
         drop(tx);
-        if !shexp_done && !skip_shexp {
+        if !shexp_done {
             if let Some(g) = gpu.as_ref() {
                 if let Some((gate, up, down)) = g.shexp_resident_ptrs(blk, dim, sff_hint) {
-                    if hip0.as_ref().is_some_and(|h| h.moe_active()) {
+                    let moe_live = hip0.as_ref().is_some_and(|h| h.moe_active());
+                    if should_run_device_shexp(true, moe_live) {
                         match g.shexp_accumulate_into_moe(
                             n_tok,
                             dim,
@@ -4406,6 +4413,17 @@ pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_shexp_runs_when_cpu_shexp_loader_is_skipped() {
+        let skip_cpu_shexp = true;
+        assert!(
+            skip_cpu_shexp && should_run_device_shexp(true, true),
+            "resident BF16 shexp still accumulates from device moe_x"
+        );
+        assert!(!should_run_device_shexp(false, true));
+        assert!(!should_run_device_shexp(true, false));
+    }
 
     #[test]
     fn sinkhorn_rows_and_cols_normalized() {
