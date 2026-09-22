@@ -1958,6 +1958,7 @@ fn dsv4_mla_o_rows(
                 per,
                 dim,
                 Some(metrics),
+                true,
             ) {
                 return Ok(out);
             }
@@ -1975,22 +1976,24 @@ fn dsv4_mla_o_rows(
                 per,
                 dim,
                 Some(metrics),
+                true,
             ) {
                 return Ok(out);
             }
         }
     }
-    let mut owned = None;
-    let attn_raws = if !attn_raws.is_empty() {
-        attn_raws
-    } else if let (Some(p), Some(g)) = (dattn, gpu.as_deref_mut()) {
-        let mut buf = vec![0.0f32; n_tok.saturating_mul(q_out)];
-        g.copy_d2h_f32(p, &mut buf)?;
-        owned = Some(buf);
-        owned.as_deref().unwrap_or(&[])
+    let owned = if attn_raws.is_empty() {
+        if let (Some(p), Some(g)) = (dattn, gpu.as_deref_mut()) {
+            let mut buf = vec![0.0f32; n_tok.saturating_mul(q_out)];
+            g.copy_d2h_f32(p, &mut buf)?;
+            Some(buf)
+        } else {
+            None
+        }
     } else {
-        attn_raws
+        None
     };
+    let attn_raws = owned.as_deref().unwrap_or(attn_raws);
     let mut oa = vec![0.0f32; n_tok.saturating_mul(oa_out)];
     for g in 0..groups {
         let mut xs = vec![0.0f32; n_tok.saturating_mul(o_group_dim)];
@@ -2293,6 +2296,7 @@ fn dsv4_attn_and_route_rows(
         &host.ffn_norm
     };
     let t_hc = Instant::now();
+    let xs_dev = gpu.as_ref().and_then(|g| g.last_o_device());
     let _ = hc_post_batch(
         &attn_outs,
         states,
@@ -2305,7 +2309,7 @@ fn dsv4_attn_and_route_rows(
                 combs.get(t).map(Vec::as_slice).unwrap_or(&[]),
             )
         },
-        None,
+        xs_dev,
     );
     let (xs, fposts, fcombs) = {
         let ffn_mix = format!("blk.{blk}.hc_ffn_fn.weight");

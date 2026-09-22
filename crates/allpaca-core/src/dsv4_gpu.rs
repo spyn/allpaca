@@ -321,6 +321,8 @@ pub struct Dsv4Gpu {
     hc_curs: usize,
     hc_curs_n: usize,
     hc_curs_host: usize,
+    o_out: usize,
+    o_out_n: usize,
     warmup_miss: Vec<(usize, usize)>,
     pub used: AtomicBool,
 }
@@ -452,6 +454,8 @@ impl Dsv4Gpu {
             hc_curs: 0,
             hc_curs_n: 0,
             hc_curs_host: 0,
+            o_out: 0,
+            o_out_n: 0,
             warmup_miss: Vec::new(),
             used: AtomicBool::new(false),
         };
@@ -1968,6 +1972,7 @@ impl Dsv4Gpu {
         per: usize,
         dim: usize,
         metrics: Option<&Metrics>,
+        skip_d2h: bool,
     ) -> Result<Vec<f32>, AllpacaError> {
         let groups = groups.max(1);
         let per = per.max(1);
@@ -1996,7 +2001,16 @@ impl Dsv4Gpu {
                 )
             },
             |gpu| gpu.dense_bf16_ptr(file, &ob_name, dim, per.saturating_mul(groups), 0, metrics),
+            skip_d2h,
         )
+    }
+
+    pub fn last_o_device(&self) -> Option<*const f32> {
+        if self.o_out == 0 || self.o_out_n == 0 {
+            None
+        } else {
+            Some(self.o_out as *const f32)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2013,6 +2027,7 @@ impl Dsv4Gpu {
         per: usize,
         dim: usize,
         metrics: Option<&Metrics>,
+        skip_d2h: bool,
     ) -> Result<Vec<f32>, AllpacaError> {
         let groups = groups.max(1);
         let per = per.max(1);
@@ -2041,6 +2056,7 @@ impl Dsv4Gpu {
                 )
             },
             |gpu| gpu.dense_bf16_ptr(file, &ob_name, dim, per.saturating_mul(groups), 0, metrics),
+            skip_d2h,
         )
     }
 
@@ -2075,6 +2091,7 @@ impl Dsv4Gpu {
             metrics,
             |_, g| Ok(o_a[g]),
             |_| Ok(o_b),
+            false,
         )
     }
 
@@ -2091,6 +2108,7 @@ impl Dsv4Gpu {
         o_a: &[*const u16],
         o_b: *const u16,
         metrics: Option<&Metrics>,
+        skip_d2h: bool,
     ) -> Result<Vec<f32>, AllpacaError> {
         if o_a.len() != groups || o_b.is_null() || o_a.iter().any(|p| p.is_null()) {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -2109,6 +2127,7 @@ impl Dsv4Gpu {
             metrics,
             |_, g| Ok(o_a[g]),
             |_| Ok(o_b),
+            skip_d2h,
         )
     }
 
@@ -2126,6 +2145,7 @@ impl Dsv4Gpu {
         metrics: Option<&Metrics>,
         mut o_a_at: Fa,
         mut o_b_at: Fb,
+        skip_d2h: bool,
     ) -> Result<Vec<f32>, AllpacaError>
     where
         Fa: FnMut(&mut Self, usize) -> Result<*const u16, AllpacaError>,
@@ -2247,11 +2267,16 @@ impl Dsv4Gpu {
             oa_out as i32,
         )?;
         add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
+        self.o_out = dout as usize;
+        self.o_out_n = out_n;
+        self.used.store(true, Ordering::Relaxed);
+        if skip_d2h {
+            return Ok(Vec::new());
+        }
         let mut out = vec![0.0f32; out_n];
         let t = Instant::now();
         hip.copy_d2h_f32(dout, &mut out)?;
         add_ns(metrics, |m| &m.dsv4_d2h_ns, t);
-        self.used.store(true, Ordering::Relaxed);
         Ok(out)
     }
 
@@ -2920,6 +2945,8 @@ impl Dsv4Gpu {
             hc_curs: 0,
             hc_curs_n: 0,
             hc_curs_host: 0,
+            o_out: 0,
+            o_out_n: 0,
             warmup_miss: Vec::new(),
             used: AtomicBool::new(false),
         }
@@ -4553,6 +4580,7 @@ mod tests {
                 &o_a,
                 dob.cast(),
                 None,
+                false,
             )
             .expect("mla o from device attn");
         assert_eq!(
@@ -4579,6 +4607,200 @@ mod tests {
             allpaca_hip::device_free(p, per * o_group_dim * 2);
         }
         allpaca_hip::device_free(dob, ob_bf16.len() * 2);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mla_o_rows_from_device_keep_skips_out_d2h() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let hip = std::sync::Arc::new(
+            allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace"),
+        );
+        let mut gpu = super::Dsv4Gpu::for_hc_test(hip.clone());
+        let n_tok = 3usize;
+        let groups = 2usize;
+        let o_group_dim = 8usize;
+        let per = 4usize;
+        let dim = 16usize;
+        let q_out = groups * o_group_dim;
+        let oa_out = per * groups;
+        let mut attn = vec![0.0f32; n_tok * q_out];
+        let mut oa_f = vec![0.0f32; groups * per * o_group_dim];
+        let mut ob_f = vec![0.0f32; dim * oa_out];
+        for (i, v) in attn.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in oa_f.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        for (i, v) in ob_f.iter_mut().enumerate() {
+            *v = ((i * 11) % 50) as f32 * 0.02 - 0.5;
+        }
+        let oa_bf16: Vec<u16> = oa_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        let ob_bf16: Vec<u16> = ob_f.iter().copied().map(allpaca_cpu::f32_to_bf16).collect();
+        hip.bind().expect("bind");
+        let dattn = allpaca_hip::device_malloc(attn.len() * 4, hip.device).expect("dattn");
+        allpaca_hip::memcpy(
+            dattn,
+            attn.as_ptr().cast(),
+            attn.len() * 4,
+            allpaca_hip::MEMCPY_H2D,
+        )
+        .expect("h2d attn");
+        let doa_w: Vec<*mut u8> = (0..groups)
+            .map(|_| allpaca_hip::device_malloc(per * o_group_dim * 2, hip.device).expect("doa_w"))
+            .collect();
+        let dob = allpaca_hip::device_malloc(ob_bf16.len() * 2, hip.device).expect("dob");
+        allpaca_hip::memcpy(
+            dob,
+            ob_bf16.as_ptr().cast(),
+            ob_bf16.len() * 2,
+            allpaca_hip::MEMCPY_H2D,
+        )
+        .expect("h2d ob");
+        for g in 0..groups {
+            let w_off = g * per * o_group_dim;
+            allpaca_hip::memcpy(
+                doa_w[g],
+                oa_bf16[w_off..].as_ptr().cast(),
+                per * o_group_dim * 2,
+                allpaca_hip::MEMCPY_H2D,
+            )
+            .expect("h2d oa_w");
+        }
+        let o_a: Vec<*const u16> = doa_w.iter().map(|p| (*p) as *const u16).collect();
+        let d2h_before = hip.activation_d2h_bytes();
+        let got = gpu
+            .mla_o_rows_with_ptrs_from_device(
+                dattn.cast(),
+                n_tok,
+                q_out,
+                o_group_dim,
+                groups,
+                per,
+                dim,
+                &o_a,
+                dob.cast(),
+                None,
+                true,
+            )
+            .expect("mla o keep");
+        assert!(got.is_empty(), "keep-out must skip host Vec");
+        assert_eq!(
+            hip.activation_d2h_bytes().saturating_sub(d2h_before),
+            0,
+            "keep-out must not D2H attn_out"
+        );
+        let p = gpu.last_o_device().expect("device O pointer");
+        let mut pulled = vec![0.0f32; n_tok * dim];
+        gpu.copy_d2h_f32(p, &mut pulled).expect("d2h check");
+        let host = gpu
+            .mla_o_rows_with_ptrs_from_device(
+                dattn.cast(),
+                n_tok,
+                q_out,
+                o_group_dim,
+                groups,
+                per,
+                dim,
+                &o_a,
+                dob.cast(),
+                None,
+                false,
+            )
+            .expect("mla o host");
+        for i in 0..host.len() {
+            let diff = (pulled[i] - host[i]).abs();
+            assert!(
+                diff < 2e-3,
+                "keep-out[{i}] {} vs {} diff={diff}",
+                pulled[i],
+                host[i]
+            );
+        }
+        allpaca_hip::device_free(dattn, attn.len() * 4);
+        for p in doa_w {
+            allpaca_hip::device_free(p, per * o_group_dim * 2);
+        }
+        allpaca_hip::device_free(dob, ob_bf16.len() * 2);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hc_post_packed_from_device_xs_skips_xs_h2d() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let hip = std::sync::Arc::new(
+            allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace"),
+        );
+        let mut gpu = super::Dsv4Gpu::for_hc_test(hip.clone());
+        let n_tok = 3usize;
+        let hc = 4usize;
+        let dim = 8usize;
+        let hc_dim = hc * dim;
+        let packed: Vec<f32> = (0..n_tok * hc_dim)
+            .map(|i| 0.05 * (i as f32 % 11.0) - 0.2)
+            .collect();
+        let xs: Vec<f32> = (0..n_tok * dim).map(|i| 0.03 * i as f32).collect();
+        let posts: Vec<f32> = (0..n_tok * hc).map(|i| 0.4 + 0.05 * i as f32).collect();
+        let combs: Vec<f32> = (0..n_tok * hc * hc)
+            .map(|i| 0.02 * ((i % 7) as f32) - 0.05)
+            .collect();
+        hip.bind().expect("bind");
+        let dxs = allpaca_hip::device_malloc(xs.len() * 4, hip.device).expect("dxs");
+        allpaca_hip::memcpy(
+            dxs,
+            xs.as_ptr().cast(),
+            xs.len() * 4,
+            allpaca_hip::MEMCPY_H2D,
+        )
+        .expect("seed xs");
+        let h2d_before = hip.activation_h2d_bytes();
+        gpu.hc_post_packed(
+            &packed,
+            &[],
+            &posts,
+            &combs,
+            n_tok,
+            hc,
+            dim,
+            Some(dxs.cast()),
+        )
+        .expect("device xs post");
+        let h2d_delta = hip.activation_h2d_bytes().saturating_sub(h2d_before);
+        assert_eq!(
+            h2d_delta,
+            ((packed.len() + posts.len() + combs.len()) * 4) as u64,
+            "hc_post from device xs H2D should be residual+posts+combs, not xs"
+        );
+        let mut got = vec![0.0f32; packed.len()];
+        gpu.download_hc_packed(&mut got).expect("download post");
+        let mut expect = vec![0.0f32; packed.len()];
+        for t in 0..n_tok {
+            for dst in 0..hc {
+                for i in 0..dim {
+                    let mut acc = xs[t * dim + i] * posts[t * hc + dst];
+                    for src in 0..hc {
+                        let w = combs[t * hc * hc + dst + src * hc];
+                        acc += packed[t * hc_dim + src * dim + i] * w;
+                    }
+                    expect[t * hc_dim + dst * dim + i] = acc;
+                }
+            }
+        }
+        for i in 0..packed.len() {
+            let diff = (got[i] - expect[i]).abs();
+            assert!(
+                diff < 2e-4,
+                "device-xs post[{i}] gpu={} cpu={} diff={diff}",
+                got[i],
+                expect[i]
+            );
+        }
+        allpaca_hip::device_free(dxs, xs.len() * 4);
     }
 
     #[cfg(feature = "hip")]
