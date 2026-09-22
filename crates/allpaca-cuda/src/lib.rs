@@ -337,6 +337,19 @@ mod ffi {
             theta: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_rope_qk_rows(
+            q: *mut f32,
+            k: *mut f32,
+            n_tok: i32,
+            n_q_heads: i32,
+            n_k_heads: i32,
+            head_dim: i32,
+            q_stride: i32,
+            k_stride: i32,
+            start_pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_rope_imrope_qk(
             q: *mut f32,
             k: *mut f32,
@@ -2434,6 +2447,74 @@ impl CudaWorkspace {
             let _ = (table, token, out, dim);
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "CUDA embed_gather unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_qk_dev_rows(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        n_tok: i32,
+        n_q_heads: i32,
+        n_k_heads: i32,
+        head_dim: i32,
+        q_stride: i32,
+        k_stride: i32,
+        start_pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if q.is_null()
+                || k.is_null()
+                || n_tok <= 0
+                || n_q_heads <= 0
+                || n_k_heads <= 0
+                || head_dim <= 0
+                || q_stride <= 0
+                || k_stride <= 0
+                || head_dim % 2 != 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA rope_qk_rows".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_rope_qk_rows(
+                    q,
+                    k,
+                    n_tok,
+                    n_q_heads,
+                    n_k_heads,
+                    head_dim,
+                    q_stride,
+                    k_stride,
+                    start_pos,
+                    theta,
+                    self.stream,
+                )
+            };
+            status(rc, "rope_qk_rows")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (
+                q,
+                k,
+                n_tok,
+                n_q_heads,
+                n_k_heads,
+                head_dim,
+                q_stride,
+                k_stride,
+                start_pos,
+                theta,
+            );
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA rope_qk_rows unavailable".into(),
             )))
         }
     }

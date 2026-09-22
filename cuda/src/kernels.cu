@@ -1138,6 +1138,50 @@ extern "C" int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, in
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void rope_qk_kernel(float *q, float *k, int n_q_heads, int n_k_heads, int head_dim,
+                               int q_stride, int k_stride, int start_pos, float theta) {
+    const int tok = static_cast<int>(blockIdx.y);
+    const int pos = start_pos + tok;
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = head_dim / 2;
+    const int q_pairs = n_q_heads * half;
+    const int total = q_pairs + n_k_heads * half;
+    if (idx >= total || head_dim % 2 != 0) {
+        return;
+    }
+    q += static_cast<size_t>(tok) * static_cast<size_t>(q_stride);
+    k += static_cast<size_t>(tok) * static_cast<size_t>(k_stride);
+    if (idx < q_pairs) {
+        rope_pair(q + (idx / half) * head_dim, idx % half, half, pos, theta);
+    } else {
+        const int j = idx - q_pairs;
+        rope_pair(k + (j / half) * head_dim, j % half, half, pos, theta);
+    }
+}
+
+extern "C" int allpaca_cuda_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads,
+                                         int32_t n_k_heads, int32_t head_dim, int32_t q_stride,
+                                         int32_t k_stride, int32_t start_pos, float theta,
+                                         allpaca_cuda_stream_t stream) {
+    if (!q || !k || n_tok <= 0 || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 ||
+        q_stride <= 0 || k_stride <= 0 || (head_dim % 2) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int total = (n_q_heads + n_k_heads) * (head_dim / 2);
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    rope_qk_kernel<<<dim3(blocks, n_tok), threads, 0, as_stream(stream)>>>(
+        q, k, n_q_heads, n_k_heads, head_dim, q_stride, k_stride, start_pos, theta);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                                    int32_t head_dim, int32_t q_stride, int32_t k_stride, int32_t pos,
+                                    float theta, allpaca_cuda_stream_t stream) {
+    return allpaca_cuda_rope_qk_rows(q, k, 1, n_q_heads, n_k_heads, head_dim, q_stride, k_stride,
+                                     pos, theta, stream);
+}
+
 /* NeoX pair on first n_rot dims; optional IMRoPE sector angles (CPU rope_imrope_neox). */
 __device__ void rope_imrope_pair(float *hvec, int i, int half, int n_rot, int pos, float theta,
                                 int s0, int s1, int s2, int s3) {

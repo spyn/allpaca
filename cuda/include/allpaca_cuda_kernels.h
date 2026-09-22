@@ -170,6 +170,15 @@ int allpaca_cuda_embed_gather(const float *table, int32_t token, float *out, int
 int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float theta,
                       allpaca_cuda_stream_t stream);
 
+/* RoPE on Q and K in one launch. q/k rows may be strided (prefill acts use dim/kv_dim). */
+int allpaca_cuda_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads,
+                              int32_t n_k_heads, int32_t head_dim, int32_t q_stride,
+                              int32_t k_stride, int32_t start_pos, float theta,
+                              allpaca_cuda_stream_t stream);
+int allpaca_cuda_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                         int32_t head_dim, int32_t q_stride, int32_t k_stride, int32_t pos,
+                         float theta, allpaca_cuda_stream_t stream);
+
 /* Qwen3.5 IMRoPE / partial NeoX on Q and K (HIP allpaca_rope_imrope_qk).
  * Rotates first n_rot dims; sections[4] select (t,h,w,e). sections all-zero = plain partial. */
 int allpaca_cuda_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
