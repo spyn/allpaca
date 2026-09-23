@@ -103,6 +103,12 @@ fn otlp_metric_list(s: &StatsSnapshot, t: u64) -> Vec<Value> {
             true,
         ),
         sum_metric(
+            "allpaca_batch_gemm_residual_hidden_total",
+            s.batch_gemm_residual_hidden,
+            t,
+            true,
+        ),
+        sum_metric(
             "allpaca_micro_batch_plans_total",
             s.micro_batch_plans,
             t,
@@ -201,6 +207,7 @@ mod tests {
             "allpaca_batch_gemm_hip_kernels_total",
             "allpaca_batch_gemm_hip_applied_total",
             "allpaca_batch_gemm_lm_head_skipped_total",
+            "allpaca_batch_gemm_residual_hidden_total",
             "allpaca_gpu_util",
         ] {
             assert!(body.contains(name), "missing {name} in {body}");

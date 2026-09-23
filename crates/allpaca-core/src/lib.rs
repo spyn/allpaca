@@ -37,14 +37,16 @@ mod ssm;
 mod telemetry;
 mod tokenizer;
 mod transfer;
+pub mod tune;
 mod vision;
 mod weight_set;
 
 pub use batch_gemm::{
-    apply_packed_ffn, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
-    decode_layer_attn_shared_a_weights, decode_layer_shared_a_weights, packed_ffn_shared_a,
-    packed_gemm_nt, packed_gemm_nt_cpu, packed_gemm_nt_hip, packed_gemm_nt_hip_diagnostic,
-    plan_batch_gemm, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    apply_packed_attn, apply_packed_attn_hip, apply_packed_ffn, apply_packed_ffn_hip,
+    apply_packed_lm_head, batch_gemm_other_ids, decode_layer_attn_shared_a_weights,
+    decode_layer_shared_a_weights, packed_ffn_shared_a, packed_gemm_nt, packed_gemm_nt_cpu,
+    packed_gemm_nt_hip, packed_gemm_nt_hip_diagnostic, plan_batch_gemm, residual_add_rows,
+    write_residual_into_hidden, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
     PackedFfnWeights, PackedGemmWeight,
 };
 pub use compute::ComputeDev;
@@ -69,6 +71,8 @@ pub use memory_tier::{
 pub use modality::{EncoderPlacement, ImageInput, NoopVisionEncoder, VisionEncoder, VisionTokens};
 #[cfg(feature = "cuda")]
 pub use model::CudaResidentModel;
+#[cfg(feature = "vulkan")]
+pub use model::VulkanResidentModel;
 pub use model::{LayerWeights, ModelConfig, MtpNextnWeights, TinyModel};
 pub use otel::export_otlp_json;
 pub use packed::{HostExpertPool, PackedStore};
@@ -76,6 +80,12 @@ pub use scheduler::Scheduler;
 pub use telemetry::Metrics;
 pub use tokenizer::{format_chat_colon, format_chatml, EngineTokenizer};
 pub use transfer::{select_transfer_path, select_transfer_path_with_bench};
+pub use tune::{
+    available_groups, available_profiles, cache_bytes_for, discover_models, estimate_budget,
+    expand_groups, keep_experts_from_ids, keep_ids_for_entry, load_catalog_beside, probe_checkpoint,
+    DiscoveredModel, KeepsetCatalog, MoeProbe, MoeShape, ResourceSnapshot, TuneBudget, TuneGroup,
+    TuneProfile, CTX_STEPS,
+};
 pub use vision::PatchVisionEncoder;
 pub use weight_set::{
     expert_lru_slots, host_pool_slots, qstar_fill_count, DenseTrunkPlan, ExpertId, ExpertLru,

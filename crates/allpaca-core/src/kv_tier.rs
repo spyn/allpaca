@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use allpaca_cpu::copy_async;
 use allpaca_types::{
@@ -83,6 +84,7 @@ unsafe impl Sync for CudaPageAlloc {}
 /// Three-tier KV manager: VRAM (hot) <-> Pinned DRAM (warm) <-> NVMe (cold).
 /// NVMe is off until [`Self::open_nvme`]. When `hip_device` is set, VRAM pages
 /// are real `hipMalloc` buffers. CUDA-only engines use `cudaMalloc` pages.
+/// Vulkan-only engines use `VulkanKvPage` buffers.
 pub struct KvTierManager {
     pages: HashMap<PageId, KvPage>,
     vram: BufferPool,
@@ -92,6 +94,8 @@ pub struct KvTierManager {
     hip_device: Option<i32>,
     cuda_pages: HashMap<PageId, CudaPageAlloc>,
     cuda_device: Option<i32>,
+    vulkan_pages: HashMap<PageId, allpaca_vulkan::VulkanKvPage>,
+    vulkan: Option<Arc<allpaca_vulkan::VulkanWorkspace>>,
     activation_h2d_bytes: AtomicU64,
     activation_d2h_bytes: AtomicU64,
     nvme_prefetches: AtomicU64,
@@ -112,7 +116,7 @@ impl KvTierManager {
         hot_fraction: f32,
         hip_device: Option<i32>,
     ) -> Self {
-        Self::with_devices(vram_bytes, dram_bytes, hot_fraction, hip_device, None)
+        Self::with_devices(vram_bytes, dram_bytes, hot_fraction, hip_device, None, None)
     }
 
     pub fn with_devices(
@@ -121,6 +125,7 @@ impl KvTierManager {
         hot_fraction: f32,
         hip_device: Option<i32>,
         cuda_device: Option<i32>,
+        vulkan: Option<Arc<allpaca_vulkan::VulkanWorkspace>>,
     ) -> Self {
         Self {
             pages: HashMap::new(),
@@ -134,6 +139,12 @@ impl KvTierManager {
                 None
             } else {
                 cuda_device
+            },
+            vulkan_pages: HashMap::new(),
+            vulkan: if hip_device.is_some() || cuda_device.is_some() {
+                None
+            } else {
+                vulkan
             },
             activation_h2d_bytes: AtomicU64::new(0),
             activation_d2h_bytes: AtomicU64::new(0),
@@ -217,6 +228,28 @@ impl KvTierManager {
                     let off = self.dram_alloc(len, metrics).map_err(|_| {
                         AllpacaError::Fatal(FatalError::OutOfMemory(
                             "CUDA KV alloc failed and pinned DRAM is full".into(),
+                        ))
+                    })?;
+                    (
+                        KvResidency::PinnedDram,
+                        off,
+                        DeviceBufferKind::CpuPinnedDram,
+                        -1,
+                    )
+                }
+            }
+        } else if let Some(ws) = self.vulkan.as_ref() {
+            let bytes = len * 4;
+            match ws.alloc_kv_page(bytes) {
+                Ok(page) => {
+                    let dev = ws.device;
+                    self.vulkan_pages.insert(id, page);
+                    (KvResidency::Vram, 0, DeviceBufferKind::Vulkan, dev)
+                }
+                Err(_) => {
+                    let off = self.dram_alloc(len, metrics).map_err(|_| {
+                        AllpacaError::Fatal(FatalError::OutOfMemory(
+                            "Vulkan KV alloc failed and pinned DRAM is full".into(),
                         ))
                     })?;
                     (
@@ -313,6 +346,9 @@ impl KvTierManager {
                     allpaca_cuda::device_free(alloc.ptr.cast());
                 }
             }
+            DeviceBufferKind::Vulkan => {
+                let _ = self.vulkan_pages.remove(&id);
+            }
             DeviceBufferKind::CpuVram => self.vram.free(loc.offset, loc.len),
             DeviceBufferKind::CpuPinnedDram => self.dram.free(loc.offset, loc.len),
             DeviceBufferKind::Nvme => {
@@ -381,6 +417,22 @@ impl KvTierManager {
                 )?;
                 self.activation_h2d_bytes
                     .fetch_add((k_bytes * 2) as u64, Ordering::Relaxed);
+            }
+            DeviceBufferKind::Vulkan => {
+                let page_buf = self.vulkan_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "Vulkan KV page {id} missing device buffer"
+                    )))
+                })?;
+                let ws = self.vulkan.as_ref().ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "Vulkan KV page with no workspace".into(),
+                    ))
+                })?;
+                ws.kv_write_f32(page_buf, k_off, k)?;
+                ws.kv_write_f32(page_buf, v_off, v)?;
+                self.activation_h2d_bytes
+                    .fetch_add((k.len() * 8) as u64, Ordering::Relaxed);
             }
             DeviceBufferKind::CpuVram => {
                 self.vram.slice_mut(k_off, kv_width).copy_from_slice(k);
@@ -463,6 +515,25 @@ impl KvTierManager {
                     n * 4,
                     allpaca_cuda::MEMCPY_D2H,
                 )?;
+                self.activation_d2h_bytes
+                    .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                (k, v)
+            }
+            DeviceBufferKind::Vulkan => {
+                let page_buf = self.vulkan_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "Vulkan KV page {id} missing device buffer"
+                    )))
+                })?;
+                let ws = self.vulkan.as_ref().ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "Vulkan KV page with no workspace".into(),
+                    ))
+                })?;
+                let mut k = vec![0.0f32; n];
+                let mut v = vec![0.0f32; n];
+                ws.kv_read_f32(page_buf, k_off, &mut k)?;
+                ws.kv_read_f32(page_buf, v_off, &mut v)?;
                 self.activation_d2h_bytes
                     .fetch_add((n * 8) as u64, Ordering::Relaxed);
                 (k, v)
@@ -567,6 +638,11 @@ impl KvTierManager {
                     allpaca_cuda::MEMCPY_D2D,
                     stream,
                 )?;
+            }
+            DeviceBufferKind::Vulkan => {
+                return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                    "Vulkan KV D2D from raw device pointers is not wired".into(),
+                )));
             }
             DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
                 let mut k = vec![0.0f32; kv_width];
@@ -724,6 +800,11 @@ impl KvTierManager {
                     if let Some(page) = self.pages.get_mut(&page_id) {
                         page.filled = page.filled.max((slot + run) as u32);
                     }
+                }
+                DeviceBufferKind::Vulkan => {
+                    return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "Vulkan KV D2D from raw device pointers is not wired".into(),
+                    )));
                 }
                 DeviceBufferKind::CpuVram | DeviceBufferKind::CpuPinnedDram => {
                     for t in 0..run {
@@ -952,10 +1033,42 @@ impl KvTierManager {
                         "CUDA KV pack cannot read HIP/NVMe pages".into(),
                     )));
                 }
+                DeviceBufferKind::Vulkan => {
+                    return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "CUDA KV pack cannot read Vulkan pages".into(),
+                    )));
+                }
             }
             n_kv += filled;
         }
         Ok(n_kv)
+    }
+
+    /// In-place Vulkan K/V for a single resident page (no D2H pack).
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn vulkan_single_page_view(
+        &self,
+        pages: &[u64],
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Option<(allpaca_vulkan::DeviceSlice, allpaca_vulkan::DeviceSlice, usize)> {
+        if pages.len() != 1 {
+            return None;
+        }
+        let id = pages[0];
+        let page = self.pages.get(&id)?;
+        if page.location.kind != DeviceBufferKind::Vulkan || page.filled == 0 {
+            return None;
+        }
+        let page_buf = self.vulkan_pages.get(&id)?;
+        let ws = self.vulkan.as_ref()?;
+        let kv_width = n_kv_heads * head_dim;
+        let k_off = page.location.offset;
+        let v_off = page.location.offset + page.capacity_tokens as usize * kv_width;
+        let n = page.filled as usize * kv_width;
+        let k = ws.kv_slice(page_buf, k_off, n).ok()?;
+        let v = ws.kv_slice(page_buf, v_off, n).ok()?;
+        Some((k, v, page.filled as usize))
     }
 
     /// Pack filled tokens from `pages` into device K/V buffers (D2D when resident).
@@ -1039,6 +1152,11 @@ impl KvTierManager {
                         .fetch_add((n * 8) as u64, Ordering::Relaxed);
                     self.activation_d2h_bytes
                         .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                }
+                DeviceBufferKind::Vulkan => {
+                    return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "Vulkan KV pack into raw device pointers is not wired".into(),
+                    )));
                 }
                 DeviceBufferKind::CpuVram => {
                     allpaca_hip::memcpy(
@@ -1129,6 +1247,13 @@ impl KvTierManager {
                     allpaca_cuda::device_free(alloc.ptr.cast());
                 }
             }
+            DeviceBufferKind::Vulkan => {
+                if let Some(page_buf) = self.vulkan_pages.remove(&id) {
+                    if let Some(ws) = self.vulkan.clone() {
+                        ws.kv_read_f32(&page_buf, 0, self.dram.slice_mut(dst, len))?;
+                    }
+                }
+            }
             DeviceBufferKind::CpuVram => {
                 copy_f32(
                     self.dram.slice_mut(dst, len),
@@ -1217,6 +1342,19 @@ impl KvTierManager {
             if let Some(page) = self.pages.get_mut(&id) {
                 page.tier = KvResidency::Vram;
                 page.location.kind = DeviceBufferKind::Cuda;
+                page.location.device_id = dev;
+                page.location.offset = 0;
+            }
+        } else if let Some(ws) = self.vulkan.clone() {
+            let bytes = len * 4;
+            let page_buf = ws.alloc_kv_page(bytes)?;
+            ws.kv_write_f32(&page_buf, 0, self.dram.slice(page.location.offset, len))?;
+            self.dram.free(page.location.offset, len);
+            let dev = ws.device;
+            self.vulkan_pages.insert(id, page_buf);
+            if let Some(page) = self.pages.get_mut(&id) {
+                page.tier = KvResidency::Vram;
+                page.location.kind = DeviceBufferKind::Vulkan;
                 page.location.device_id = dev;
                 page.location.offset = 0;
             }
@@ -1345,6 +1483,8 @@ impl KvTierManager {
             self.hip_pages.values().map(|p| p.bytes / 4).sum()
         } else if self.cuda_device.is_some() {
             self.cuda_pages.values().map(|p| p.bytes / 4).sum()
+        } else if self.vulkan.is_some() {
+            self.vulkan_pages.values().map(|p| p.bytes() / 4).sum()
         } else {
             self.vram.live
         }
@@ -1470,6 +1610,11 @@ impl KvTierManager {
                 .cuda_pages
                 .values()
                 .map(|p| p.bytes as u64)
+                .sum::<u64>()
+            + self
+                .vulkan_pages
+                .values()
+                .map(|p| p.bytes() as u64)
                 .sum::<u64>();
         metrics
             .kv_bytes_on_device
@@ -1554,7 +1699,7 @@ mod tests {
     #[test]
     fn cuda_kv_alloc_write_read_or_dram_fallback() {
         let metrics = Metrics::default();
-        let mut kv = KvTierManager::with_devices(1 << 20, 1 << 20, 0.9, None, Some(0));
+        let mut kv = KvTierManager::with_devices(1 << 20, 1 << 20, 0.9, None, Some(0), None);
         let id = kv.alloc_page(0, 0, 8, 1, 4, &metrics).unwrap();
         let page = kv.get(id).expect("page");
         assert!(
@@ -1620,6 +1765,33 @@ mod tests {
         allpaca_cuda::device_free(dest);
         kv.release(a, &metrics);
         kv.release(b, &metrics);
+    }
+
+    #[test]
+    fn vulkan_kv_alloc_write_read_or_dram_fallback() {
+        let metrics = Metrics::default();
+        let vulkan = allpaca_vulkan::VulkanWorkspace::new(0, 4096)
+            .ok()
+            .map(std::sync::Arc::new);
+        let mut kv = KvTierManager::with_devices(1 << 20, 1 << 20, 0.9, None, None, vulkan);
+        let id = kv.alloc_page(0, 0, 8, 1, 4, &metrics).unwrap();
+        let page = kv.get(id).expect("page");
+        assert!(
+            matches!(
+                page.location.kind,
+                DeviceBufferKind::Vulkan
+                    | DeviceBufferKind::CpuPinnedDram
+                    | DeviceBufferKind::CpuVram
+            ),
+            "Vulkan runtime uses device pages; no device falls back to host; kind={:?}",
+            page.location.kind
+        );
+        let marker = vec![1.5f32, -0.25, 0.5, 2.0];
+        kv.write_slot(id, 0, 1, 4, &marker, &marker).unwrap();
+        let (k, v) = kv.read_kv(id, 1, 4).unwrap();
+        assert_eq!(k, marker);
+        assert_eq!(v, marker);
+        kv.release(id, &metrics);
     }
 
     #[test]

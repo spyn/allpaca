@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,9 @@ pub struct Config {
     pub rpc: RpcSection,
     #[serde(default)]
     pub telemetry: TelemetrySection,
+    /// Per-model MoE pin-prefer keep-sets, keyed by unresolved model spec.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tunes: BTreeMap<String, TuneEntry>,
 }
 
 impl Default for Config {
@@ -53,6 +57,7 @@ impl Config {
             features: FeatureFlagOverlay::default(),
             rpc: RpcSection::default(),
             telemetry: TelemetrySection::default(),
+            tunes: BTreeMap::new(),
         }
     }
 
@@ -155,6 +160,110 @@ impl Config {
         }
     }
 
+    /// Slash-normalized lookup key for [`Self::tunes`].
+    pub fn normalize_tune_key(spec: &str) -> String {
+        spec.trim().replace('\\', "/")
+    }
+
+    /// Matching `[tunes]` entry for `spec` (path, Hub id, or filename).
+    pub fn tune_for_spec(&self, spec: &str) -> Option<&TuneEntry> {
+        lookup_tune(&self.tunes, spec)
+    }
+
+    /// Matching `[tunes]` entry for the configured `model.path`.
+    pub fn tune_for_model(&self) -> Option<&TuneEntry> {
+        let path = self.model.path.as_ref()?;
+        self.tune_for_spec(&path.to_string_lossy())
+    }
+
+    /// Overlay a matching tune onto `weights.cache_bytes`. No-op when unset.
+    pub fn apply_tune_overlay(&mut self) {
+        let Some(entry) = self.tune_for_model().cloned() else {
+            return;
+        };
+        if entry.cache_bytes > 0 {
+            self.weights.cache_bytes = entry.cache_bytes;
+        }
+    }
+
+    /// Insert or replace the tune for `spec`.
+    pub fn upsert_tune(&mut self, spec: &str, entry: TuneEntry) {
+        self.tunes.insert(Self::normalize_tune_key(spec), entry);
+    }
+
+    /// Write this config as TOML (used by `--tune` save when creating a new file).
+    pub fn to_toml_string(&self) -> Result<String, AllpacaError> {
+        toml::to_string_pretty(self).map_err(|e| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!("TOML serialize: {e}")))
+        })
+    }
+
+    /// Patch `path` with `entry` under `[tunes."<spec>"]`, creating the file if needed.
+    pub fn write_tune_file(
+        path: &Path,
+        spec: &str,
+        entry: &TuneEntry,
+        model_path: Option<&Path>,
+    ) -> Result<(), AllpacaError> {
+        let key = Self::normalize_tune_key(spec);
+        let mut root: toml::Value = if path.exists() {
+            let src = std::fs::read_to_string(path).map_err(|e| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "read {}: {e}",
+                    path.display()
+                )))
+            })?;
+            toml::from_str(&src).map_err(|e| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "TOML parse {}: {e}",
+                    path.display()
+                )))
+            })?
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+        let table = root.as_table_mut().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(
+                "tune config root must be a table".into(),
+            ))
+        })?;
+        if let Some(model_path) = model_path {
+            let model = table
+                .entry("model".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            if let Some(m) = model.as_table_mut() {
+                m.insert(
+                    "path".into(),
+                    toml::Value::String(model_path.to_string_lossy().replace('\\', "/")),
+                );
+            }
+        }
+        let tunes = table
+            .entry("tunes".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        let tunes = tunes.as_table_mut().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(
+                "[tunes] must be a table".into(),
+            ))
+        })?;
+        let value = toml::Value::try_from(entry).map_err(|e| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "serialize tune entry: {e}"
+            )))
+        })?;
+        tunes.insert(key, value);
+        let serialized = toml::to_string_pretty(&root).map_err(|e| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!("TOML serialize: {e}")))
+        })?;
+        std::fs::write(path, serialized).map_err(|e| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "write {}: {e}",
+                path.display()
+            )))
+        })?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), AllpacaError> {
         if self.kv.page_tokens == 0 {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
@@ -228,7 +337,7 @@ pub struct EngineSection {
     /// When `poll_schedule = prefill_budget`, max consecutive prefill picks before a
     /// decode Request must be served (0 = unlimited). Ignored for other schedules.
     pub max_consecutive_prefill_picks: usize,
-    /// `"auto"` (HIP when the `hip` feature sees devices), `"hip"`, or `"cpu"`.
+    /// `"auto"` (HIP, else CUDA, else Vulkan), `"hip"`, `"cuda"`, `"vulkan"`, or `"cpu"`.
     pub gpu_backend: String,
 }
 
@@ -440,6 +549,43 @@ impl Default for WeightsSection {
             host_bytes: 0,
         }
     }
+}
+
+/// Pin-prefer keep-set saved by `allpaca-server --tune` for one model spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TuneEntry {
+    /// Named bundle applied in the TUI (`late_layers`, catalog profile, …).
+    pub profile: String,
+    /// Selected group ids (`early`, `group_0`, catalog topic names).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// Context length the budget was computed at (tokens).
+    pub ctx_tokens: u32,
+    /// GPU/hot expert cache overlay; 0 leaves `weights.cache_bytes` unchanged.
+    pub cache_bytes: usize,
+    /// Compact keep-set: per-layer expert indices to pin. Empty = expand `groups` at load.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keep_experts: Vec<Vec<u32>>,
+}
+
+fn lookup_tune<'a>(tunes: &'a BTreeMap<String, TuneEntry>, spec: &str) -> Option<&'a TuneEntry> {
+    let key = Config::normalize_tune_key(spec);
+    if let Some(entry) = tunes.get(&key) {
+        return Some(entry);
+    }
+    let path = Path::new(&key);
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        if let Some(entry) = tunes.get(name) {
+            return Some(entry);
+        }
+        for (k, entry) in tunes {
+            if Path::new(k).file_name().and_then(|s| s.to_str()) == Some(name) {
+                return Some(entry);
+            }
+        }
+    }
+    None
 }
 
 /// Recurrent-state checkpoints at special-token boundaries. Independent of KV.
@@ -980,5 +1126,86 @@ mod tests {
         });
         assert_eq!(cfg.rpc.endpoints, vec!["10.0.0.2:9"]);
         assert_eq!(cfg.rpc.tensor_split.as_deref(), Some(&[3.0, 1.0][..]));
+    }
+
+    #[test]
+    fn tune_entry_round_trip_and_overlay() {
+        let toml = r#"
+            [model]
+            path = "models/DeepSeek-V4-Flash.gguf"
+            [tunes."models/DeepSeek-V4-Flash.gguf"]
+            profile = "late_layers"
+            groups = ["late"]
+            ctx_tokens = 32768
+            cache_bytes = 8589934592
+            keep_experts = [[0, 1], [2]]
+        "#;
+        let mut cfg = Config::from_toml_str(toml).unwrap();
+        let entry = cfg.tune_for_model().expect("tune for model.path");
+        assert_eq!(entry.profile, "late_layers");
+        assert_eq!(entry.groups, vec!["late"]);
+        assert_eq!(entry.ctx_tokens, 32768);
+        assert_eq!(entry.cache_bytes, 8589934592);
+        assert_eq!(entry.keep_experts, vec![vec![0, 1], vec![2]]);
+        assert_eq!(cfg.weights.cache_bytes, 0, "overlay is explicit");
+        cfg.apply_tune_overlay();
+        assert_eq!(cfg.weights.cache_bytes, 8589934592);
+
+        let by_name = cfg
+            .tune_for_spec("DeepSeek-V4-Flash.gguf")
+            .expect("filename lookup");
+        assert_eq!(by_name.profile, "late_layers");
+
+        cfg.upsert_tune(
+            r"models\other.gguf",
+            TuneEntry {
+                profile: "balanced".into(),
+                ctx_tokens: 65536,
+                cache_bytes: 1024,
+                ..TuneEntry::default()
+            },
+        );
+        assert!(cfg.tunes.contains_key("models/other.gguf"));
+        let dumped = cfg.to_toml_string().unwrap();
+        let reparsed = Config::from_toml_str(&dumped).unwrap();
+        assert_eq!(
+            reparsed.tune_for_spec("models/other.gguf").unwrap().cache_bytes,
+            1024
+        );
+    }
+
+    #[test]
+    fn write_tune_file_patches_existing_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "allpaca_tune_write_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("allpaca.toml");
+        std::fs::write(&path, "[http]\nport = 9090\n").unwrap();
+        let entry = TuneEntry {
+            profile: "balanced".into(),
+            groups: vec!["early".into()],
+            ctx_tokens: 32768,
+            cache_bytes: 4096,
+            keep_experts: vec![vec![0]],
+        };
+        Config::write_tune_file(
+            &path,
+            "models/foo.gguf",
+            &entry,
+            Some(Path::new("models/foo.gguf")),
+        )
+        .unwrap();
+        let cfg = Config::from_toml_file(&path).unwrap();
+        assert_eq!(cfg.http.port, 9090);
+        assert_eq!(
+            cfg.model.path.as_deref(),
+            Some(Path::new("models/foo.gguf"))
+        );
+        let saved = cfg.tune_for_spec("models/foo.gguf").unwrap();
+        assert_eq!(saved.cache_bytes, 4096);
+        assert_eq!(saved.groups, vec!["early"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

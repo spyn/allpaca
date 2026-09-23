@@ -514,7 +514,19 @@ impl WeightRef {
         }
     }
 
+    fn f16(off: usize, n: usize) -> Self {
+        Self {
+            off,
+            n,
+            kind: WeightKind::F16,
+        }
+    }
+
     fn q8(off: usize, n: usize) -> Self {
+        Self::q8_0(off, n)
+    }
+
+    fn q8_0(off: usize, n: usize) -> Self {
         Self {
             off,
             n,
@@ -2560,12 +2572,13 @@ fn load_gguf_mla_host(
     layer: usize,
     cfg: &ModelConfig,
 ) -> Result<Option<MlaHostWeights>, AllpacaError> {
-    if file
-        .tensor(&format!("blk.{layer}.attn_q_a.weight"))
-        .is_none()
-        && file
-            .tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight"))
-            .is_none()
+    // DeepSeek-V4 MLA lives in `Dsv4Weights` (`attn_kv.weight` + output LoRA).
+    // The DeepSeek-V2 host pack (`attn_kv_a_mqa` + dense `attn_output`) is absent.
+    if matches!(file.architecture(), Some("deepseek4" | "deepseek_v4")) {
+        return Ok(None);
+    }
+    if file.tensor(&format!("blk.{layer}.attn_q_a.weight")).is_none()
+        && file.tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight")).is_none()
     {
         return Ok(None);
     }
@@ -9473,6 +9486,13 @@ mod cuda_decode;
 
 #[cfg(feature = "cuda")]
 pub use cuda_decode::CudaResidentModel;
+
+#[cfg(feature = "vulkan")]
+#[path = "vulkan_decode.rs"]
+mod vulkan_decode;
+
+#[cfg(feature = "vulkan")]
+pub use vulkan_decode::VulkanResidentModel;
 
 struct Lcg {
     state: u64,

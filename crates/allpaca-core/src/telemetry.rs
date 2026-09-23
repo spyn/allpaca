@@ -150,6 +150,8 @@ pub struct Metrics {
     pub batch_gemm_hip_applied: AtomicU64,
     /// Per-request lm_head GEMMs skipped because a HIP decode cohort will pack them.
     pub batch_gemm_lm_head_skipped: AtomicU64,
+    /// Packed residual stream (`x+WO+FFN`) written into Request `last_hidden`.
+    pub batch_gemm_residual_hidden: AtomicU64,
     pub radix_evictions: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
@@ -338,6 +340,7 @@ impl Metrics {
             batch_gemm_hip_kernels: self.batch_gemm_hip_kernels.load(Ordering::Relaxed),
             batch_gemm_hip_applied: self.batch_gemm_hip_applied.load(Ordering::Relaxed),
             batch_gemm_lm_head_skipped: self.batch_gemm_lm_head_skipped.load(Ordering::Relaxed),
+            batch_gemm_residual_hidden: self.batch_gemm_residual_hidden.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
