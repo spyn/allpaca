@@ -163,6 +163,8 @@ cargo test -p allpaca-core --features hip --offline --test hip_runtime tiny_deep
 ## Ideas still out (next slices)
 
 - Packed residual stream: lm_head still reads original `output_norm` (fused `x+WO+FFN` already written into `last_hidden` except MTP).
-- CUDA 7B packed-quant GGUF / on-device SSM/GDN/MLA.
+- Packed decode Q/K/V/O C feeding attention (lm_head skip on greedy HIP cohort landed).
+- CUDA 7B packed-quant GGUF / on-device SSM/GDN/MLA; dense TinyModel CUDA decode + CUDA KV pages landed.
+  GPU-gated tests: root README **CUDA GPU host checklist**. Blackwell TMA/tensor-core GEMM not started.
 - Vulkan Q4_K GEMV / SSM/GDN/MLA / packed prefill.
 - Real CXL.mem / PIM (simulators only).

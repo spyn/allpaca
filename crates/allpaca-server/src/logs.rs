@@ -79,9 +79,7 @@ impl LogRing {
     }
 
     pub fn layer(&self) -> LogRingLayer {
-        LogRingLayer {
-            ring: self.clone(),
-        }
+        LogRingLayer { ring: self.clone() }
     }
 }
 
@@ -101,11 +99,8 @@ where
         if visitor.message.is_empty() {
             return;
         }
-        self.ring.push(
-            meta.level().as_str(),
-            meta.target(),
-            visitor.message,
-        );
+        self.ring
+            .push(meta.level().as_str(), meta.target(), visitor.message);
     }
 }
 
@@ -118,7 +113,9 @@ impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{value:?}");
-            if self.message.starts_with('"') && self.message.ends_with('"') && self.message.len() >= 2
+            if self.message.starts_with('"')
+                && self.message.ends_with('"')
+                && self.message.len() >= 2
             {
                 self.message = self.message[1..self.message.len() - 1].to_string();
             }

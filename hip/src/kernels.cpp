@@ -2507,6 +2507,17 @@ extern "C" int allpaca_hip_free(void *ptr) {
     return hip_status(hipFree(ptr));
 }
 
+extern "C" int allpaca_hip_free_async(void *ptr, allpaca_stream_t stream) {
+    if (!ptr) {
+        return ALLPACA_OK;
+    }
+    hipStream_t s = as_stream(stream);
+    if (s) {
+        return hip_status(hipFreeAsync(ptr, s));
+    }
+    return allpaca_hip_free(ptr);
+}
+
 extern "C" int allpaca_hip_host_malloc(void **ptr, size_t bytes) {
     if (!ptr || bytes == 0) {
         return ALLPACA_ERR_INVALID;
@@ -2884,6 +2895,21 @@ extern "C" int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int3
         return hip_status(hipStreamSynchronize(as_stream(stream)));
     }
     return ALLPACA_OK;
+}
+
+extern "C" int allpaca_hip_memset(void *dst, int32_t value, size_t bytes, allpaca_stream_t stream) {
+    if (!dst && bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (bytes == 0) {
+        return ALLPACA_OK;
+    }
+    hipStream_t s = as_stream(stream);
+    const int fill = value & 0xff;
+    if (s) {
+        return hip_status(hipMemsetAsync(dst, fill, bytes, s));
+    }
+    return hip_status(hipMemset(dst, fill, bytes));
 }
 
 extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
@@ -4300,6 +4326,10 @@ extern "C" int allpaca_hip_malloc(void **, size_t, int32_t) { return ALLPACA_ERR
 
 extern "C" int allpaca_hip_free(void *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
+extern "C" int allpaca_hip_free_async(void *, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_hip_host_malloc(void **, size_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_host_free(void *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
@@ -4316,6 +4346,10 @@ extern "C" int allpaca_hip_memcpy(void *, const void *, size_t, int32_t, allpaca
 
 extern "C" int allpaca_hip_memcpy_batch(void **, void **, size_t *, size_t, int32_t,
                                         allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_memset(void *, int32_t, size_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

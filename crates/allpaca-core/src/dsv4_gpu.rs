@@ -37,6 +37,35 @@ struct ExpertSlot {
     pinned: bool,
 }
 
+pub(crate) struct ExpertCopyPlan<'a> {
+    parts0: Vec<(usize, &'a [u8])>,
+    parts1: Vec<(usize, &'a [u8])>,
+    n0: usize,
+    n1: usize,
+    prefetch: bool,
+}
+
+impl ExpertCopyPlan<'_> {
+    fn empty() -> Self {
+        Self {
+            parts0: Vec::new(),
+            parts1: Vec::new(),
+            n0: 0,
+            n1: 0,
+            prefetch: false,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.parts0.is_empty() && self.parts1.is_empty()
+    }
+}
+
+enum PlanMode {
+    Warmup,
+    Prefetch { keep_layer: usize },
+}
+
 struct RegisteredMmap {
     ptrs: Vec<*mut u8>,
 }
@@ -85,6 +114,7 @@ pub struct Dsv4Gpu {
     h2d1_inflight: bool,
     h2d_reg: RegisteredMmap,
     act: Option<DeviceWeights>,
+    warmup_miss: Vec<(usize, usize)>,
     pub used: AtomicBool,
     keep_set: HashSet<(usize, usize)>,
 }
@@ -164,6 +194,7 @@ impl Dsv4Gpu {
             h2d1_inflight: false,
             h2d_reg: RegisteredMmap { ptrs: Vec::new() },
             act: DeviceWeights::alloc(hip.device, ACT_SLOTS * ACT_SLOT_FLOATS * 4).ok(),
+            warmup_miss: Vec::new(),
             used: AtomicBool::new(false),
             keep_set: HashSet::new(),
         };
@@ -651,44 +682,94 @@ impl Dsv4Gpu {
         Ok(())
     }
 
-    /// Pin resident routed experts and batch-H2D misses from GGUF mmap (no host pack Vec).
-    /// Copies stay on the side stream until [`Self::join_expert_h2d`].
-    pub fn warmup_experts(
+    fn reset_expert_h2d_host(&mut self) {
+        self.join_expert_h2d();
+        self.h2d_keep.clear();
+        self.h2d_reg.clear();
+    }
+
+    fn admit_expert_slot(
         &mut self,
-        file: &GgufFile,
+        key: (usize, usize),
+        n0: &mut usize,
+        n1: &mut usize,
+        pin: bool,
+        keep_layer: Option<usize>,
+    ) -> Option<(bool, usize)> {
+        let prefer_gpu1 = assign_miss_gpu1(self.slots.len(), self.gpu1_slots.len(), *n0, *n1);
+        let order = if prefer_gpu1 {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for use_gpu1 in order {
+            if use_gpu1 {
+                let Some(victim) = lru_victim_keep(&self.gpu1_slots, keep_layer) else {
+                    continue;
+                };
+                self.gpu1_slots[victim].key = Some(key);
+                self.gpu1_slots[victim].used = self.clock;
+                self.gpu1_slots[victim].pinned = pin || self.pin_keep(key);
+                *n1 = n1.saturating_add(1);
+                return Some((true, victim));
+            }
+            let Some(victim) = lru_victim_keep(&self.slots, keep_layer) else {
+                continue;
+            };
+            self.slots[victim].key = Some(key);
+            self.slots[victim].used = self.clock;
+            self.slots[victim].pinned = pin || self.pin_keep(key);
+            *n0 = n0.saturating_add(1);
+            return Some((false, victim));
+        }
+        None
+    }
+
+    fn plan_expert_copies<'a>(
+        &mut self,
+        file: &'a GgufFile,
         layer: usize,
         ids: &[usize],
         cfg: &ModelConfig,
         metrics: Option<&Metrics>,
-    ) -> Result<(), AllpacaError> {
-        self.h2d_keep.clear();
-        self.h2d_inflight = false;
-        self.h2d_reg.clear();
-        if ids.is_empty() || self.has_prefill_layer(layer) {
-            return Ok(());
+        mode: PlanMode,
+    ) -> Result<ExpertCopyPlan<'a>, AllpacaError> {
+        let (pin, count_misses, keep_layer, prefetch) = match mode {
+            PlanMode::Warmup => (true, true, None, false),
+            PlanMode::Prefetch { keep_layer } => (false, false, Some(keep_layer), true),
+        };
+        let mut plan = ExpertCopyPlan {
+            prefetch,
+            ..ExpertCopyPlan::empty()
+        };
+        if !prefetch {
+            self.warmup_miss.clear();
         }
-        let hip = self.hip.clone();
-        let draft = self.draft.clone();
-        let mut n0 = 0usize;
-        let mut n1 = 0usize;
-        let mut parts0: Vec<(usize, &[u8])> = Vec::new();
-        let mut parts1: Vec<(usize, &[u8])> = Vec::new();
+        if ids.is_empty() || self.has_prefill_layer(layer) {
+            return Ok(plan);
+        }
         let t_pack = Instant::now();
         for &expert in ids {
             let key = (layer, expert);
             self.clock = self.clock.saturating_add(1);
             if let Some(i) = self.slots.iter().position(|s| s.key == Some(key)) {
                 self.slots[i].used = self.clock;
-                self.slots[i].pinned = self.pin_keep(key);
+                if pin || self.pin_keep(key) {
+                    self.slots[i].pinned = true;
+                }
                 continue;
             }
             if let Some(i) = self.gpu1_slots.iter().position(|s| s.key == Some(key)) {
                 self.gpu1_slots[i].used = self.clock;
-                self.gpu1_slots[i].pinned = self.pin_keep(key);
+                if pin || self.pin_keep(key) {
+                    self.gpu1_slots[i].pinned = true;
+                }
                 continue;
             }
-            if let Some(m) = metrics {
-                m.expert_lru_misses.fetch_add(1, Ordering::Relaxed);
+            if count_misses {
+                if let Some(m) = metrics {
+                    m.expert_lru_misses.fetch_add(1, Ordering::Relaxed);
+                }
             }
             let slices = expert_mxfp4_parts(file, layer, expert, cfg)?;
             let packed_len: usize = slices.iter().map(|(_, s)| s.len()).sum();
@@ -697,68 +778,83 @@ impl Dsv4Gpu {
                     "expert packed larger than slot".into(),
                 )));
             }
-            let use_gpu1 = assign_miss_gpu1(self.slots.len(), self.gpu1_slots.len(), n0, n1);
-            if use_gpu1 {
-                let victim = lru_victim(&self.gpu1_slots);
-                self.gpu1_slots[victim].key = Some(key);
-                self.gpu1_slots[victim].used = self.clock;
-                self.gpu1_slots[victim].pinned = self.pin_keep(key);
-                let base = victim * self.expert_slot;
-                for (rel, sl) in slices {
-                    parts1.push((base + rel, sl));
+            let Some((use_gpu1, victim)) =
+                self.admit_expert_slot(key, &mut plan.n0, &mut plan.n1, pin, keep_layer)
+            else {
+                if matches!(mode, PlanMode::Warmup)
+                    && self.slots.is_empty()
+                    && self.gpu1_slots.is_empty()
+                {
+                    return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                        "no expert GPU slot".into(),
+                    )));
                 }
-                n1 += 1;
                 continue;
+            };
+            if !prefetch {
+                self.warmup_miss.push(key);
             }
-            if self.slots.is_empty() {
-                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
-                    "no expert GPU slot".into(),
-                )));
-            }
-            let victim = lru_victim(&self.slots);
-            self.slots[victim].key = Some(key);
-            self.slots[victim].used = self.clock;
-            self.slots[victim].pinned = self.pin_keep(key);
             let base = victim * self.expert_slot;
+            let dest = if use_gpu1 {
+                &mut plan.parts1
+            } else {
+                &mut plan.parts0
+            };
             for (rel, sl) in slices {
-                parts0.push((base + rel, sl));
+                dest.push((base + rel, sl));
             }
-            n0 += 1;
         }
         add_ns(metrics, |m| &m.dsv4_pack_ns, t_pack);
-        let mut all_parts = Vec::with_capacity(parts0.len() + parts1.len());
-        all_parts.extend_from_slice(&parts0);
-        all_parts.extend_from_slice(&parts1);
-        if !all_parts.is_empty() {
-            let t_pin = Instant::now();
-            let registered = register_mmap_parts(&all_parts);
-            if registered.is_ok() {
-                add_ns(metrics, |m| &m.dsv4_pack_ns, t_pin);
-            } else {
-                static REG_WARN: AtomicBool = AtomicBool::new(false);
-                if !REG_WARN.swap(true, Ordering::Relaxed) {
-                    tracing::warn!("hipHostRegister on GGUF mmap failed; pageable expert H2D");
-                }
-                for (_, sl) in &all_parts {
-                    prefault_mmap(sl);
-                }
-                add_ns(metrics, |m| &m.dsv4_pack_ns, t_pin);
-            }
-            if let Ok(ptrs) = registered {
-                self.h2d_reg.ptrs = ptrs;
-            }
+        Ok(plan)
+    }
+
+    fn register_copy_plan(&mut self, plan: &ExpertCopyPlan<'_>, metrics: Option<&Metrics>) {
+        let mut all_parts = Vec::with_capacity(plan.parts0.len() + plan.parts1.len());
+        all_parts.extend_from_slice(&plan.parts0);
+        all_parts.extend_from_slice(&plan.parts1);
+        if all_parts.is_empty() {
+            return;
         }
-        let nbytes0: u64 = parts0.iter().map(|(_, s)| s.len() as u64).sum();
-        let nbytes1: u64 = parts1.iter().map(|(_, s)| s.len() as u64).sum();
+        let t_pin = Instant::now();
+        let registered = register_mmap_parts(&all_parts);
+        if registered.is_ok() {
+            add_ns(metrics, |m| &m.dsv4_pack_ns, t_pin);
+        } else {
+            static REG_WARN: AtomicBool = AtomicBool::new(false);
+            if !REG_WARN.swap(true, Ordering::Relaxed) {
+                tracing::warn!("hipHostRegister on GGUF mmap failed; pageable expert H2D");
+            }
+            for (_, sl) in &all_parts {
+                prefault_mmap(sl);
+            }
+            add_ns(metrics, |m| &m.dsv4_pack_ns, t_pin);
+        }
+        if let Ok(ptrs) = registered {
+            self.h2d_reg.ptrs = ptrs;
+        }
+    }
+
+    pub(crate) fn submit_copy_plan(
+        &self,
+        plan: &ExpertCopyPlan<'_>,
+        metrics: Option<&Metrics>,
+    ) -> (bool, bool) {
+        if plan.is_empty() {
+            return (false, false);
+        }
+        let hip = self.hip.clone();
+        let draft = self.draft.clone();
+        let nbytes0: u64 = plan.parts0.iter().map(|(_, s)| s.len() as u64).sum();
+        let nbytes1: u64 = plan.parts1.iter().map(|(_, s)| s.len() as u64).sum();
         let t_h2d = Instant::now();
         let mut inflight0 = false;
         let mut inflight1 = false;
         std::thread::scope(|s| {
-            let j0 = (!parts0.is_empty()).then(|| {
+            let j0 = (!plan.parts0.is_empty()).then(|| {
                 let blob = self.experts.as_ref();
                 let stream = self.h2d.as_ref();
                 let hip = hip.clone();
-                let parts = &parts0;
+                let parts = &plan.parts0;
                 s.spawn(move || {
                     let blob = blob.ok_or_else(|| {
                         AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -769,11 +865,11 @@ impl Dsv4Gpu {
                     copy_expert_parts(blob, parts, stream)
                 })
             });
-            let j1 = (!parts1.is_empty()).then(|| {
+            let j1 = (!plan.parts1.is_empty()).then(|| {
                 let blob = self.gpu1.as_ref();
                 let stream = self.h2d1.as_ref();
                 let draft = draft.clone();
-                let parts = &parts1;
+                let parts = &plan.parts1;
                 s.spawn(move || {
                     let blob = blob.ok_or_else(|| {
                         AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -807,28 +903,101 @@ impl Dsv4Gpu {
         let _ = hip.bind();
         add_ns(metrics, |m| &m.dsv4_h2d_ns, t_h2d);
         add_bytes(metrics, nbytes0.saturating_add(nbytes1));
-        self.h2d_inflight = inflight0;
-        self.h2d1_inflight = inflight1;
         if let Some(m) = metrics {
-            if n0 > 0 {
-                m.expert_lru_fills.fetch_add(n0 as u64, Ordering::Relaxed);
+            if plan.n0 > 0 {
+                m.expert_lru_fills
+                    .fetch_add(plan.n0 as u64, Ordering::Relaxed);
                 m.expert_bulk_fills.fetch_add(1, Ordering::Relaxed);
                 m.expert_bulk_bytes.fetch_add(nbytes0, Ordering::Relaxed);
                 m.expert_h2d_batched_copies
-                    .fetch_add(parts0.len() as u64, Ordering::Relaxed);
+                    .fetch_add(plan.parts0.len() as u64, Ordering::Relaxed);
             }
-            if n1 > 0 {
-                m.expert_lru_fills.fetch_add(n1 as u64, Ordering::Relaxed);
+            if plan.n1 > 0 {
+                m.expert_lru_fills
+                    .fetch_add(plan.n1 as u64, Ordering::Relaxed);
                 m.expert_bulk_fills.fetch_add(1, Ordering::Relaxed);
                 m.expert_bulk_bytes.fetch_add(nbytes1, Ordering::Relaxed);
                 m.expert_h2d_batched_copies
-                    .fetch_add(parts1.len() as u64, Ordering::Relaxed);
+                    .fetch_add(plan.parts1.len() as u64, Ordering::Relaxed);
             }
+            if plan.prefetch && (plan.n0 > 0 || plan.n1 > 0) {
+                m.draft_expert_prefetches.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        (inflight0, inflight1)
+    }
+
+    pub(crate) fn mark_expert_h2d(&mut self, inflight0: bool, inflight1: bool) {
+        self.h2d_inflight = inflight0;
+        self.h2d1_inflight = inflight1;
+    }
+
+    pub(crate) fn unpin_layer(&mut self, layer: usize) {
+        for slot in self.slots.iter_mut().chain(self.gpu1_slots.iter_mut()) {
+            if slot.key.is_some_and(|(l, _)| l == layer) {
+                slot.pinned = false;
+            }
+        }
+    }
+
+    pub(crate) fn expert_copy_pending(&self, layer: usize, expert: usize) -> bool {
+        self.warmup_miss
+            .iter()
+            .any(|&(l, e)| l == layer && e == expert)
+    }
+
+    /// Pin resident routed experts and batch-H2D misses from GGUF mmap (no host pack Vec).
+    /// Copies stay on the side stream until [`Self::join_expert_h2d`].
+    pub fn warmup_experts(
+        &mut self,
+        file: &GgufFile,
+        layer: usize,
+        ids: &[usize],
+        cfg: &ModelConfig,
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
+        self.reset_expert_h2d_host();
+        self.warmup_miss.clear();
+        if ids.is_empty() || self.has_prefill_layer(layer) {
+            return Ok(());
+        }
+        let plan = self.plan_expert_copies(file, layer, ids, cfg, metrics, PlanMode::Warmup)?;
+        self.register_copy_plan(&plan, metrics);
+        let (inflight0, inflight1) = self.submit_copy_plan(&plan, metrics);
+        self.mark_expert_h2d(inflight0, inflight1);
+        if let Some(m) = metrics {
             if inflight0 || inflight1 {
                 m.expert_prefill_overlaps.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
+    }
+
+    /// Assign L+1 hint IDs into slots that are not `keep_layer`, register mmap, do not copy.
+    /// Caller issues [`Self::submit_copy_plan`] on a side thread overlapping L compute.
+    pub(crate) fn begin_hint_prefetch<'a>(
+        &mut self,
+        file: &'a GgufFile,
+        layer: usize,
+        ids: &[usize],
+        cfg: &ModelConfig,
+        metrics: Option<&Metrics>,
+        keep_layer: usize,
+    ) -> Result<ExpertCopyPlan<'a>, AllpacaError> {
+        self.reset_expert_h2d_host();
+        if ids.is_empty() || self.has_prefill_layer(layer) {
+            return Ok(ExpertCopyPlan::empty());
+        }
+        let plan = self.plan_expert_copies(
+            file,
+            layer,
+            ids,
+            cfg,
+            metrics,
+            PlanMode::Prefetch { keep_layer },
+        )?;
+        self.register_copy_plan(&plan, metrics);
+        Ok(plan)
     }
 
     pub fn join_expert_h2d(&mut self) {
@@ -1145,6 +1314,12 @@ impl Dsv4Gpu {
 /// Full-layer expert H2D is cheaper than 6-of-256 only when most experts fire.
 pub(crate) fn want_full_layer_prefetch(prefill: bool, cfg: &ModelConfig) -> bool {
     prefill && cfg.n_experts > 0 && cfg.n_active.saturating_mul(8) >= cfg.n_experts
+}
+
+/// Hint-prefetch L's routed IDs as L+1 only when the active set is dense enough
+/// that consecutive layers are likely to overlap. Unsloth 6/256 stays off.
+pub(crate) fn want_hint_prefetch(cfg: &ModelConfig) -> bool {
+    cfg.n_experts > 0 && cfg.n_active.saturating_mul(8) >= cfg.n_experts
 }
 
 fn upload_named(
@@ -1469,16 +1644,23 @@ fn add_bytes(metrics: Option<&Metrics>, n: u64) {
 }
 
 fn lru_victim(slots: &[ExpertSlot]) -> usize {
+    lru_victim_keep(slots, None).unwrap_or(0)
+}
+
+fn lru_victim_keep(slots: &[ExpertSlot], keep_layer: Option<usize>) -> Option<usize> {
     slots
         .iter()
         .enumerate()
+        .filter(|(_, s)| match (keep_layer, s.key) {
+            (Some(keep), Some((layer, _))) if layer == keep => false,
+            _ => true,
+        })
         .min_by_key(|(_, s)| {
             let empty = u8::from(s.key.is_some());
             let pin = u8::from(s.pinned);
             (empty, pin, s.used)
         })
         .map(|(i, _)| i)
-        .unwrap_or(0)
 }
 
 /// Fault GGUF mmap pages into DRAM before HIP DMA. Cold mmap H2D runs at
@@ -1506,7 +1688,7 @@ fn prefault_mmap(bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::want_full_layer_prefetch;
+    use super::{want_full_layer_prefetch, want_hint_prefetch};
     use crate::model::ModelConfig;
 
     #[test]
@@ -1518,6 +1700,7 @@ mod tests {
         };
         assert!(!want_full_layer_prefetch(true, &cfg));
         assert!(!want_full_layer_prefetch(false, &cfg));
+        assert!(!want_hint_prefetch(&cfg));
     }
 
     #[test]
@@ -1525,6 +1708,7 @@ mod tests {
         let cfg = ModelConfig::tiny_moe();
         assert!(want_full_layer_prefetch(true, &cfg));
         assert!(!want_full_layer_prefetch(false, &cfg));
+        assert!(want_hint_prefetch(&cfg));
     }
 
     #[test]
@@ -1545,5 +1729,46 @@ mod tests {
         assert!(!super::assign_miss_gpu1(8, 8, 1, 1));
         assert!(!super::assign_miss_gpu1(2, 2, 1, 2));
         assert!(super::assign_miss_gpu1(2, 2, 2, 1));
+    }
+
+    #[test]
+    fn lru_victim_keep_skips_current_layer() {
+        let slots = [
+            super::ExpertSlot {
+                key: Some((3, 1)),
+                used: 9,
+                pinned: true,
+            },
+            super::ExpertSlot {
+                key: Some((3, 2)),
+                used: 8,
+                pinned: true,
+            },
+            super::ExpertSlot {
+                key: Some((1, 0)),
+                used: 1,
+                pinned: false,
+            },
+            super::ExpertSlot {
+                key: None,
+                used: 0,
+                pinned: false,
+            },
+        ];
+        assert_eq!(super::lru_victim_keep(&slots, Some(3)), Some(3));
+        let full_keep = [
+            super::ExpertSlot {
+                key: Some((4, 0)),
+                used: 1,
+                pinned: true,
+            },
+            super::ExpertSlot {
+                key: Some((4, 1)),
+                used: 2,
+                pinned: true,
+            },
+        ];
+        assert_eq!(super::lru_victim_keep(&full_keep, Some(4)), None);
+        assert_eq!(super::lru_victim_keep(&full_keep, Some(3)), Some(0));
     }
 }

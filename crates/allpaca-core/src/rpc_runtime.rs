@@ -63,11 +63,12 @@ struct RemoteLayer {
 }
 
 impl RpcRuntime {
-    pub fn connect(endpoints: &[String]) -> Result<Self, AllpacaError> {
+    pub fn connect(endpoints: &[String], token: Option<&str>) -> Result<Self, AllpacaError> {
         let mut sessions = Vec::new();
+        let token = token.unwrap_or("");
         for ep in endpoints {
             tracing::info!(endpoint = %ep, "rpc HELLO");
-            let session = RpcSession::connect_addr(ep).map_err(map_rpc)?;
+            let session = RpcSession::connect_addr_with_token(ep, token).map_err(map_rpc)?;
             sessions.push(session);
         }
         Ok(Self {

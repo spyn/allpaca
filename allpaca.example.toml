@@ -9,9 +9,12 @@
 host = "127.0.0.1"
 port = 8080
 # Shared WebUI login and Authorization: Bearer. If omitted, the server prints
-# `webui password: …` once at boot. LAN bind needs a password (no TLS in v1).
+# `webui password: …` once to stderr (not tracing / GET /v1/logs). LAN bind
+# needs a password (no TLS in v1).
 # host = "0.0.0.0"
 password = "changeme"
+# HTTP API clamp; WebUI slider already maxes at 4096.
+# max_tokens = 4096
 
 [model]
 id = "allpaca"
@@ -100,6 +103,8 @@ endpoints = []
 # endpoints = ["127.0.0.1:50052"]
 # tensor_split = [1.0, 1.0]
 max_seq = 2048
+# Shared HELLO secret for non-loopback workers (`--rpc-token` / ALLPACA_RPC_TOKEN).
+# token = "changeme"
 
 [telemetry]
 # otlp_endpoint = "http://127.0.0.1:4318"

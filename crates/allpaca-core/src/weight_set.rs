@@ -912,6 +912,7 @@ mod tests {
             shared_expert: LayerFfn::default(),
             expert_bias: vec![],
             attn_out_gate: vec![],
+            attn_sinks: vec![],
             attn_post_norm: vec![],
             ffn_post_norm: vec![],
         }

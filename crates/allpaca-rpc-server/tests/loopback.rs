@@ -126,3 +126,69 @@ fn gated_hip_two_process() {
     }
 }
 
+#[test]
+fn gated_cuda_two_process() {
+    if std::env::var("ALLPACA_RPC_CUDA").ok().as_deref() != Some("1") {
+        eprintln!("skip gated_cuda_two_process: set ALLPACA_RPC_CUDA=1");
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    panic!("ALLPACA_RPC_CUDA=1 requires cargo test -p allpaca-rpc-server --features cuda");
+
+    #[cfg(feature = "cuda")]
+    {
+        let port = free_port();
+        let bin = env!("CARGO_BIN_EXE_allpaca-rpc-server");
+        let mut child = Command::new(bin)
+            .args([
+                "--device",
+                "cuda:0",
+                "-H",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn allpaca-rpc-server");
+        thread::sleep(Duration::from_millis(200));
+        if let Ok(Some(status)) = child.try_wait() {
+            eprintln!(
+                "skip gated_cuda_two_process: cuda worker exited {status} (need a CUDA device)"
+            );
+            return;
+        }
+
+        let mut cfg = Config::compiled_defaults();
+        cfg.model.synthetic = true;
+        cfg.engine.cpu_only = true;
+        cfg.speculative.enabled = false;
+        cfg.rpc.endpoints = vec![format!("127.0.0.1:{port}")];
+        cfg.rpc.max_seq = 64;
+        cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+
+        let result = (|| {
+            let engine = Engine::new(cfg)?;
+            let out = engine.generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )?;
+            Ok::<_, allpaca_types::AllpacaError>((out, engine.stats().rpc_roundtrips))
+        })();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let (out, roundtrips) = result.expect("cuda rpc generate");
+        assert!(!out.token_ids.is_empty());
+        assert!(
+            roundtrips > 0,
+            "CUDA Rpc Server must run remote layers, rpc_roundtrips={roundtrips}"
+        );
+    }
+}
