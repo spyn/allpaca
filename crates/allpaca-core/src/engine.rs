@@ -5427,6 +5427,7 @@ mod tests {
             dtype_mask: 1,
             device_name: "mismatch-stub".into(),
             memory_bytes: 64 << 20,
+            devices: Vec::new(),
         }
     }
 

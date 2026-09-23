@@ -46,6 +46,7 @@ impl CpuWorker {
             dtype_mask: DTYPE_F32,
             device_name: "cpu".into(),
             memory_bytes: self.memory_bytes.saturating_sub(self.used),
+            devices: Vec::new(),
         }
     }
 
@@ -350,16 +351,24 @@ fn map_kernel(e: allpaca_types::AllpacaError) -> RpcError {
     RpcError::Worker(e.to_string())
 }
 
-/// HIP worker: device arenas + HIP kernel ABI (feature-gated).
+/// One HIP device inside a pooled worker.
+#[cfg(feature = "hip")]
+struct HipGpu {
+    device: i32,
+    hip: allpaca_hip::HipWorkspace,
+    total: u64,
+    used: u64,
+}
+
+/// HIP worker: every visible device, or one pinned ordinal.
 #[cfg(feature = "hip")]
 pub struct HipWorker {
-    hip: allpaca_hip::HipWorkspace,
-    device: i32,
+    gpus: Vec<HipGpu>,
     next_id: u32,
     slots: HashMap<u32, HipSlot>,
     hash_cache: HashMap<u64, Vec<u8>>,
-    memory_bytes: u64,
-    used: u64,
+    /// Device used for allocs that do not name one, so a layer stays together.
+    sticky: usize,
 }
 
 #[cfg(feature = "hip")]
@@ -367,30 +376,106 @@ struct HipSlot {
     gen: u32,
     ptr: *mut u8,
     bytes: usize,
+    gpu: usize,
+}
+
+/// Pick a device for `bytes`. A hint must fit. Otherwise stay on `sticky` until it
+/// cannot, then the device with the most free space.
+#[cfg_attr(not(feature = "hip"), allow(dead_code))]
+pub(crate) fn place_sticky(
+    free: &[u64],
+    sticky: usize,
+    bytes: u64,
+    hint: Option<usize>,
+) -> Result<usize, &'static str> {
+    if free.is_empty() {
+        return Err("rpc worker has no device");
+    }
+    if let Some(h) = hint {
+        if h >= free.len() {
+            return Err("rpc device index");
+        }
+        if free[h] < bytes {
+            return Err("rpc device full");
+        }
+        return Ok(h);
+    }
+    let sticky = sticky.min(free.len() - 1);
+    if free[sticky] >= bytes {
+        return Ok(sticky);
+    }
+    let mut best: Option<(usize, u64)> = None;
+    for (i, &room) in free.iter().enumerate() {
+        if room >= bytes && best.map(|(_, b)| room > b).unwrap_or(true) {
+            best = Some((i, room));
+        }
+    }
+    best.map(|(i, _)| i).ok_or("rpc worker out of memory")
 }
 
 #[cfg(feature = "hip")]
 unsafe impl Send for HipWorker {}
 
 #[cfg(feature = "hip")]
-impl HipWorker {
-    pub fn new(device: i32) -> Result<Self, RpcError> {
+impl HipGpu {
+    fn open(device: i32) -> Result<Self, RpcError> {
         let hip = allpaca_hip::HipWorkspace::new(device, 1 << 20, 64)
             .map_err(|e| RpcError::Worker(e.to_string()))?;
-        let (free, total) = allpaca_hip::device_memory_info(device).unwrap_or((0, 0));
-        let _ = free;
+        let (_free, total) = allpaca_hip::device_memory_info(device).unwrap_or((0, 0));
         Ok(Self {
-            hip,
             device,
-            next_id: 1,
-            slots: HashMap::new(),
-            hash_cache: HashMap::new(),
-            memory_bytes: total,
+            hip,
+            total,
             used: 0,
         })
     }
 
+    fn free_bytes(&self) -> u64 {
+        self.total.saturating_sub(self.used)
+    }
+}
+
+#[cfg(feature = "hip")]
+impl HipWorker {
+    pub fn new(device: i32) -> Result<Self, RpcError> {
+        Self::from_gpus(vec![HipGpu::open(device)?])
+    }
+
+    /// One worker, every visible HIP device.
+    pub fn open_all() -> Result<Self, RpcError> {
+        let n = allpaca_hip::device_count();
+        if n <= 0 {
+            return Err(RpcError::Worker("no HIP device".into()));
+        }
+        let mut gpus = Vec::with_capacity(n as usize);
+        for id in 0..n {
+            gpus.push(HipGpu::open(id)?);
+        }
+        Self::from_gpus(gpus)
+    }
+
+    fn from_gpus(gpus: Vec<HipGpu>) -> Result<Self, RpcError> {
+        if gpus.is_empty() {
+            return Err(RpcError::Worker("no HIP device".into()));
+        }
+        Ok(Self {
+            gpus,
+            next_id: 1,
+            slots: HashMap::new(),
+            hash_cache: HashMap::new(),
+            sticky: 0,
+        })
+    }
+
     fn hello(&self) -> HelloReply {
+        let devices: Vec<u64> = self.gpus.iter().map(HipGpu::free_bytes).collect();
+        let memory_bytes = devices.iter().copied().sum();
+        let device_name = self
+            .gpus
+            .iter()
+            .map(|g| format!("hip:{}", g.device))
+            .collect::<Vec<_>>()
+            .join("+");
         HelloReply {
             major: PROTO_MAJOR,
             minor: PROTO_MINOR,
@@ -398,9 +483,20 @@ impl HipWorker {
             kernel_abi_rev: KERNEL_ABI_REV,
             backend: RpcBackendKind::Hip,
             dtype_mask: DTYPE_F32,
-            device_name: format!("hip:{}", self.device),
-            memory_bytes: self.memory_bytes.saturating_sub(self.used),
+            device_name,
+            memory_bytes,
+            devices,
         }
+    }
+
+    fn mem_info(&self) -> (u64, u64) {
+        let free = self.gpus.iter().map(HipGpu::free_bytes).sum();
+        let total = self.gpus.iter().map(|g| g.total).sum();
+        (free, total)
+    }
+
+    fn device_count(&self) -> u32 {
+        self.gpus.len() as u32
     }
 
     fn slot(&self, id: BufId) -> Result<&HipSlot, RpcError> {
@@ -414,8 +510,12 @@ impl HipWorker {
         Ok(s)
     }
 
-    fn alloc(&mut self, bytes: u64) -> Result<BufId, RpcError> {
-        let ptr = allpaca_hip::device_malloc(bytes as usize, self.device)
+    fn alloc(&mut self, bytes: u64, hint: Option<usize>) -> Result<BufId, RpcError> {
+        let free: Vec<u64> = self.gpus.iter().map(HipGpu::free_bytes).collect();
+        let gpu = place_sticky(&free, self.sticky, bytes, hint)
+            .map_err(|e| RpcError::Worker(e.into()))?;
+        let device = self.gpus[gpu].device;
+        let ptr = allpaca_hip::device_malloc(bytes as usize, device)
             .map_err(|e| RpcError::Worker(e.to_string()))?;
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -425,22 +525,38 @@ impl HipWorker {
                 gen: 1,
                 ptr,
                 bytes: bytes as usize,
+                gpu,
             },
         );
-        self.used = self.used.saturating_add(bytes);
+        self.gpus[gpu].used = self.gpus[gpu].used.saturating_add(bytes);
+        self.sticky = gpu;
         Ok(BufId { id, gen: 1 })
+    }
+
+    fn bind_gpu(&self, gpu: usize) -> Result<(), RpcError> {
+        self.gpus
+            .get(gpu)
+            .ok_or_else(|| RpcError::Worker("rpc device index".into()))?
+            .hip
+            .bind()
+            .map_err(|e| RpcError::Worker(e.to_string()))
     }
 
     fn free(&mut self, id: BufId) -> Result<(), RpcError> {
         let s = self.slot(id)?;
-        allpaca_hip::device_free(s.ptr, s.bytes);
-        let n = s.bytes as u64;
+        let gpu = s.gpu;
+        let ptr = s.ptr;
+        let bytes = s.bytes;
+        self.bind_gpu(gpu)?;
+        allpaca_hip::device_free(ptr, bytes);
         self.slots.remove(&id.id);
-        self.used = self.used.saturating_sub(n);
+        self.gpus[gpu].used = self.gpus[gpu].used.saturating_sub(bytes as u64);
         Ok(())
     }
 
     fn h2d(&mut self, id: BufId, offset: u64, data: &[u8]) -> Result<(), RpcError> {
+        let gpu = self.slot(id)?.gpu;
+        self.bind_gpu(gpu)?;
         let s = self.slot(id)?;
         if offset as usize + data.len() > s.bytes {
             return Err(RpcError::Worker("hip h2d oob".into()));
@@ -463,6 +579,8 @@ impl HipWorker {
     }
 
     fn d2h(&self, id: BufId, offset: u64, size: u64) -> Result<Vec<u8>, RpcError> {
+        let gpu = self.slot(id)?.gpu;
+        self.bind_gpu(gpu)?;
         let s = self.slot(id)?;
         if offset as usize + size as usize > s.bytes {
             return Err(RpcError::Worker("hip d2h oob".into()));
@@ -482,8 +600,17 @@ impl HipWorker {
     fn copy(&mut self, src: BufId, dst: BufId) -> Result<(), RpcError> {
         let src_s = self.slot(src)?;
         let dst_s = self.slot(dst)?;
+        if src_s.gpu != dst_s.gpu {
+            return Err(RpcError::Worker(
+                "rpc copy across HIP devices is not supported".into(),
+            ));
+        }
+        let gpu = src_s.gpu;
         let n = src_s.bytes.min(dst_s.bytes);
-        allpaca_hip::memcpy(dst_s.ptr, src_s.ptr, n, allpaca_hip::MEMCPY_D2D)
+        let dst_ptr = dst_s.ptr;
+        let src_ptr = src_s.ptr;
+        self.bind_gpu(gpu)?;
+        allpaca_hip::memcpy(dst_ptr, src_ptr, n, allpaca_hip::MEMCPY_D2D)
             .map_err(|e| RpcError::Worker(e.to_string()))?;
         Ok(())
     }
@@ -516,13 +643,25 @@ impl HipWorker {
     }
 
     fn launch(&mut self, list: &LaunchList) -> Result<(), RpcError> {
-        self.hip
-            .bind()
-            .map_err(|e| RpcError::Worker(e.to_string()))?;
         for item in &list.items {
-            self.launch_one(item.op, &item.bufs, &item.i32s, &item.f32s)?;
+            let gpu = self.launch_gpu(&item.bufs)?;
+            self.bind_gpu(gpu)?;
+            self.launch_one(gpu, item.op, &item.bufs, &item.i32s, &item.f32s)?;
         }
         Ok(())
+    }
+
+    fn launch_gpu(&self, bufs: &[BufId]) -> Result<usize, RpcError> {
+        let first = need(bufs, 0)?;
+        let gpu = self.slot(first)?.gpu;
+        for id in bufs {
+            if self.slot(*id)?.gpu != gpu {
+                return Err(RpcError::Worker(
+                    "rpc launch buffers span HIP devices".into(),
+                ));
+            }
+        }
+        Ok(gpu)
     }
 
     fn sync(&self) -> Result<(), RpcError> {
@@ -535,6 +674,7 @@ impl HipWorker {
 
     fn launch_one(
         &mut self,
+        gpu: usize,
         op: KernelOp,
         bufs: &[BufId],
         i32s: &[i32],
@@ -558,7 +698,8 @@ impl HipWorker {
                 let n_kv_heads = *i32s.get(3).unwrap_or(&n_heads);
                 let head_dim = i32s[4];
                 let causal = *i32s.get(5).unwrap_or(&1) != 0;
-                self.hip
+                self.gpus[gpu]
+                    .hip
                     .attention_device(
                         self.ptr_f32(need(bufs, 0)?)?,
                         self.ptr_f32(need(bufs, 1)?)?,
@@ -579,7 +720,8 @@ impl HipWorker {
                 let w = self.ptr_f32(need(bufs, 1)?)?;
                 let out = self.ptr_f32(need(bufs, 2)?)?;
                 let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
-                self.hip
+                self.gpus[gpu]
+                    .hip
                     .rmsnorm_device(x, w, out, n, eps)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
@@ -589,13 +731,15 @@ impl HipWorker {
                 let pos = i32s[2];
                 let theta = *f32s.first().unwrap_or(&10_000.0);
                 let x = self.ptr_f32(need(bufs, 0)?)?;
-                self.hip
+                self.gpus[gpu]
+                    .hip
                     .rope_device(x, n_heads, head_dim, pos, theta)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::SiluMul => {
                 let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
-                self.hip
+                self.gpus[gpu]
+                    .hip
                     .silu_mul_device(
                         self.ptr_f32(need(bufs, 0)?)?,
                         self.ptr_f32(need(bufs, 1)?)?,
@@ -605,7 +749,8 @@ impl HipWorker {
             }
             KernelOp::ResidualAdd => {
                 let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
-                self.hip
+                self.gpus[gpu]
+                    .hip
                     .residual_add(
                         self.ptr_f32(need(bufs, 0)?)?,
                         self.ptr_f32(need(bufs, 1)?)?,
@@ -719,6 +864,7 @@ impl CudaWorker {
                 None => format!("cuda:{}", self.device),
             },
             memory_bytes: self.memory_bytes.saturating_sub(self.used),
+            devices: Vec::new(),
         }
     }
 
@@ -1021,13 +1167,33 @@ impl WorkerBackend {
         }
     }
 
-    fn alloc(&mut self, bytes: u64) -> Result<BufId, RpcError> {
+    fn alloc(&mut self, bytes: u64, gpu: Option<u32>) -> Result<BufId, RpcError> {
         match self {
-            Self::Cpu(w) => w.alloc(bytes),
+            Self::Cpu(w) => {
+                if gpu.unwrap_or(0) != 0 {
+                    return Err(RpcError::Worker("cpu worker has one device".into()));
+                }
+                w.alloc(bytes)
+            }
             #[cfg(feature = "hip")]
-            Self::Hip(w) => w.alloc(bytes),
+            Self::Hip(w) => w.alloc(bytes, gpu.map(|g| g as usize)),
             #[cfg(feature = "cuda")]
-            Self::Cuda(w) => w.alloc(bytes),
+            Self::Cuda(w) => {
+                if gpu.unwrap_or(0) != 0 {
+                    return Err(RpcError::Worker("cuda worker has one device".into()));
+                }
+                w.alloc(bytes)
+            }
+        }
+    }
+
+    fn device_count(&self) -> u32 {
+        match self {
+            Self::Cpu(_) => 1,
+            #[cfg(feature = "hip")]
+            Self::Hip(w) => w.device_count(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => 1,
         }
     }
 
@@ -1115,8 +1281,7 @@ impl WorkerBackend {
         match self {
             Self::Cpu(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
             #[cfg(feature = "hip")]
-            Self::Hip(w) => allpaca_hip::device_memory_info(w.device)
-                .unwrap_or_else(|_| (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)),
+            Self::Hip(w) => w.mem_info(),
             #[cfg(feature = "cuda")]
             Self::Cuda(w) => allpaca_cuda::device_memory_info(w.device)
                 .unwrap_or_else(|_| (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)),
@@ -1217,7 +1382,12 @@ fn handle(
         Cmd::Alloc => {
             let mut c = Cursor::new(payload);
             let bytes = c.u64()?;
-            let id = backend.alloc(bytes)?;
+            let gpu = if c.has_remaining() {
+                Some(c.u32()?)
+            } else {
+                None
+            };
+            let id = backend.alloc(bytes, gpu)?;
             let mut out = Vec::new();
             crate::protocol::write_buf_id(&mut out, id);
             Ok(out)
@@ -1280,12 +1450,26 @@ fn handle(
         }
         Cmd::DeviceCount => {
             let mut out = Vec::new();
-            write_u32(&mut out, 1);
+            write_u32(&mut out, backend.device_count());
             Ok(out)
         }
         Cmd::Sync => {
             backend.sync()?;
             Ok(Vec::new())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::place_sticky;
+
+    #[test]
+    fn sticky_stays_until_the_device_cannot_fit() {
+        assert_eq!(place_sticky(&[100, 100], 0, 40, None).unwrap(), 0);
+        assert_eq!(place_sticky(&[30, 80], 0, 40, None).unwrap(), 1);
+        assert_eq!(place_sticky(&[10, 10], 1, 4, Some(0)).unwrap(), 0);
+        assert!(place_sticky(&[10, 80], 0, 40, Some(0)).is_err());
+        assert!(place_sticky(&[10, 10], 0, 40, None).is_err());
     }
 }

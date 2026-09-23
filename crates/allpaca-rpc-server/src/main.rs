@@ -16,7 +16,7 @@ struct Cli {
     /// Listen port.
     #[arg(short = 'p', long = "port", default_value_t = 50052)]
     port: u16,
-    /// Device selector: `cpu`, `hip:N`, `cuda:N`.
+    /// Device selector: `cpu`, `hip` (every HIP device), `hip:N`, or `cuda:N`.
     #[arg(short = 'd', long = "device", default_value = "cpu")]
     device: String,
     /// Force the CPU kernel backend.
@@ -91,6 +91,16 @@ fn open_backend(cli: &Cli) -> Result<WorkerBackend, Box<dyn std::error::Error>> 
         };
         return Ok(WorkerBackend::Cpu(CpuWorker::new(bytes)));
     }
+    if cli.device.eq_ignore_ascii_case("hip") || cli.device.eq_ignore_ascii_case("all") {
+        #[cfg(feature = "hip")]
+        {
+            return Ok(WorkerBackend::Hip(allpaca_rpc::HipWorker::open_all()?));
+        }
+        #[cfg(not(feature = "hip"))]
+        {
+            return Err("rebuild with --features hip to pool HIP devices".into());
+        }
+    }
     if let Some(rest) = cli
         .device
         .strip_prefix("hip:")
@@ -124,7 +134,7 @@ fn open_backend(cli: &Cli) -> Result<WorkerBackend, Box<dyn std::error::Error>> 
         }
     }
     Err(format!(
-        "unknown --device {} (expected cpu, hip:N, or cuda:N)",
+        "unknown --device {} (expected cpu, hip, hip:N, or cuda:N)",
         cli.device
     )
     .into())

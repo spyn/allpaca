@@ -43,6 +43,7 @@ impl RpcSession {
                 dtype_mask: 0,
                 device_name: String::new(),
                 memory_bytes: 0,
+                devices: Vec::new(),
             },
             endpoint: endpoint.to_string(),
             token: token.to_string(),
@@ -97,8 +98,16 @@ impl RpcSession {
     }
 
     pub fn alloc(&mut self, bytes: u64) -> Result<BufId, RpcError> {
+        self.alloc_on(bytes, None)
+    }
+
+    /// `device` selects a GPU on a multi-device worker. `None` lets the worker place it.
+    pub fn alloc_on(&mut self, bytes: u64, device: Option<u32>) -> Result<BufId, RpcError> {
         let mut p = Vec::new();
         crate::protocol::write_u64(&mut p, bytes);
+        if let Some(device) = device {
+            crate::protocol::write_u32(&mut p, device);
+        }
         let body = self.rpc(Cmd::Alloc, &p)?;
         let mut c = crate::protocol::Cursor::new(&body);
         c.buf_id()

@@ -2574,11 +2574,20 @@ fn load_gguf_mla_host(
 ) -> Result<Option<MlaHostWeights>, AllpacaError> {
     // DeepSeek-V4 MLA lives in `Dsv4Weights` (`attn_kv.weight` + output LoRA).
     // The DeepSeek-V2 host pack (`attn_kv_a_mqa` + dense `attn_output`) is absent.
-    if matches!(file.architecture(), Some("deepseek4" | "deepseek_v4")) {
+    if matches!(file.architecture(), Some("deepseek4" | "deepseek_v4"))
+        || (crate::deepseek4::file_is_deepseek4(file)
+            && file
+                .tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight"))
+                .is_none())
+    {
         return Ok(None);
     }
-    if file.tensor(&format!("blk.{layer}.attn_q_a.weight")).is_none()
-        && file.tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight")).is_none()
+    if file
+        .tensor(&format!("blk.{layer}.attn_q_a.weight"))
+        .is_none()
+        && file
+            .tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight"))
+            .is_none()
     {
         return Ok(None);
     }
@@ -6363,6 +6372,7 @@ impl TinyModel {
                 metrics,
                 hip,
                 write_logits,
+                true,
             );
         }
         if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {

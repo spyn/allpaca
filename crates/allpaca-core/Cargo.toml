@@ -39,4 +39,5 @@ reqwest.workspace = true
 allpaca-gguf.workspace = true
 allpaca-types.workspace = true
 allpaca-vulkan.workspace = true
+memmap2.workspace = true
 reqwest.workspace = true

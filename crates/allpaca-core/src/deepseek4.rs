@@ -436,17 +436,35 @@ fn hc_pre_rows(
     eps: f32,
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>), AllpacaError> {
     let hc = spec.hc_mult.max(1);
-    let packed = pack_hc_states(states, hc, dim);
-    hc_pre_packed(&packed, states.len(), mix, spec, dim, eps)
+    let mut packed = pack_hc_states(states, hc, dim);
+    hc_pre_packed(
+        &mut packed,
+        states.len(),
+        mix,
+        spec,
+        dim,
+        eps,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hc_pre_packed(
-    packed: &[f32],
+    packed: &mut [f32],
     n_tok: usize,
     mix: &HcMix,
     spec: &Dsv4Spec,
     dim: usize,
     eps: f32,
+    mut gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    mix_name: Option<&str>,
+    norm_w: Option<&[f32]>,
+    metrics: Option<&Metrics>,
+    copy_curs: bool,
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>), AllpacaError> {
     let hc = spec.hc_mult.max(1);
     if n_tok == 0 {
@@ -466,22 +484,45 @@ fn hc_pre_packed(
             posts.push(post);
             combs.push(comb);
         }
+        apply_curs_norm(
+            &mut curs,
+            n_tok,
+            dim,
+            eps,
+            gpu.as_deref_mut(),
+            norm_w,
+            metrics,
+        )?;
         return Ok((curs, posts, combs));
     }
     let mix_dim = (2 + hc).saturating_mul(hc);
-    let mut normed = vec![0.0f32; need];
-    for t in 0..n_tok {
-        let a = t.saturating_mul(hc_dim);
-        rmsnorm_unit(&packed[a..a + hc_dim], eps, &mut normed[a..a + hc_dim])?;
-    }
     let mut mixes = vec![0.0f32; n_tok.saturating_mul(mix_dim)];
-    matmul_nt(&normed, &mix.fn_w, &mut mixes, n_tok, mix_dim, hc_dim)?;
+    let mut used_gpu = false;
+    if let Some(g) = gpu.as_mut() {
+        used_gpu = g
+            .hc_mix_logits(
+                packed, &mix.fn_w, mix_name, n_tok, hc_dim, mix_dim, eps, &mut mixes,
+            )
+            .is_ok();
+        if !used_gpu {
+            let _ = g.download_hc_packed(packed);
+        }
+    }
+    if !used_gpu {
+        let mut normed = vec![0.0f32; need];
+        for t in 0..n_tok {
+            let a = t.saturating_mul(hc_dim);
+            rmsnorm_unit(&packed[a..a + hc_dim], eps, &mut normed[a..a + hc_dim])?;
+        }
+        matmul_nt(&normed, &mix.fn_w, &mut mixes, n_tok, mix_dim, hc_dim)?;
+    }
     let scale_pre = mix.scale.first().copied().unwrap_or(1.0);
     let scale_post = mix.scale.get(1).copied().unwrap_or(1.0);
     let scale_comb = mix.scale.get(2).copied().unwrap_or(1.0);
     let mut curs = vec![0.0f32; n_tok.saturating_mul(dim)];
     let mut posts = Vec::with_capacity(n_tok);
     let mut combs = Vec::with_capacity(n_tok);
+    let mut pres = vec![0.0f32; n_tok.saturating_mul(hc)];
     for t in 0..n_tok {
         let row = &mixes[t * mix_dim..(t + 1) * mix_dim];
         let mut pre = vec![0.0f32; hc];
@@ -492,19 +533,80 @@ fn hc_pre_packed(
             let b2 = mix.base.get(hc + i).copied().unwrap_or(0.0);
             post[i] = sigmoid(row[hc + i] * scale_post + b2) * 2.0;
         }
+        pres[t * hc..t * hc + hc].copy_from_slice(&pre);
         let mut comb = vec![0.0f32; hc.saturating_mul(hc)];
         for i in 0..hc.saturating_mul(hc) {
             let b = mix.base.get(2 * hc + i).copied().unwrap_or(0.0);
             comb[i] = row[2 * hc + i] * scale_comb + b;
         }
         sinkhorn(&mut comb, hc, spec.hc_sinkhorn_iters, spec.hc_eps);
-        let dst = &mut curs[t * dim..(t + 1) * dim];
-        let tok = &packed[t * hc_dim..(t + 1) * hc_dim];
-        hc_mix_packed(dst, tok, &pre, hc, dim);
         posts.push(post);
         combs.push(comb);
     }
+    let mut mixed_gpu = false;
+    if used_gpu {
+        if let Some(g) = gpu.as_mut() {
+            mixed_gpu = g
+                .hc_mix_pre(&pres, n_tok, hc, dim, &mut curs, norm_w, eps, copy_curs)
+                .is_ok();
+            if !mixed_gpu {
+                let _ = g.download_hc_packed(packed);
+            }
+        }
+    }
+    if !mixed_gpu {
+        for t in 0..n_tok {
+            let dst = &mut curs[t * dim..(t + 1) * dim];
+            let tok = &packed[t * hc_dim..(t + 1) * hc_dim];
+            hc_mix_packed(dst, tok, &pres[t * hc..t * hc + hc], hc, dim);
+        }
+    }
+    let gpu_normed = mixed_gpu && norm_w.is_some_and(|w| w.len() >= dim);
+    if !gpu_normed {
+        if !copy_curs {
+            if let Some(g) = gpu.as_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
+        }
+        apply_curs_norm(
+            &mut curs,
+            n_tok,
+            dim,
+            eps,
+            gpu.as_deref_mut(),
+            norm_w,
+            metrics,
+        )?;
+    }
     Ok((curs, posts, combs))
+}
+
+fn apply_curs_norm(
+    curs: &mut [f32],
+    n_tok: usize,
+    dim: usize,
+    eps: f32,
+    gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    norm_w: Option<&[f32]>,
+    metrics: Option<&Metrics>,
+) -> Result<(), AllpacaError> {
+    let Some(w) = norm_w.filter(|w| w.len() >= dim) else {
+        return Ok(());
+    };
+    if n_tok == 0 {
+        return Ok(());
+    }
+    if let Some(m) = metrics {
+        rmsnorm_rows_maybe_gpu(gpu, curs, w, n_tok, dim, eps, m)?;
+        return Ok(());
+    }
+    let mut tmp = vec![0.0f32; dim];
+    for t in 0..n_tok {
+        let row = &mut curs[t * dim..(t + 1) * dim];
+        rmsnorm(row, w, eps, &mut tmp)?;
+        row.copy_from_slice(&tmp);
+    }
+    Ok(())
 }
 
 fn ensure_hc_buf(buf: &mut Vec<Vec<f32>>, hc: usize, dim: usize) {
@@ -886,11 +988,40 @@ fn hc_post_batch<'p>(
     batch: &mut HcBatch,
     spec: &Dsv4Spec,
     dim: usize,
+    mut gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
     mut post_comb: impl FnMut(usize) -> (&'p [f32], &'p [f32]),
-) {
+    xs_dev: Option<*const f32>,
+) -> bool {
     let hc = spec.hc_mult.max(1);
     let hcd = hc.saturating_mul(dim);
     let n_tok = batch.n_tok;
+    let mut posts = vec![0.0f32; n_tok.saturating_mul(hc)];
+    let mut combs = vec![0.0f32; n_tok.saturating_mul(hc).saturating_mul(hc)];
+    for t in 0..n_tok {
+        let (post, comb) = post_comb(t);
+        let po = t.saturating_mul(hc);
+        let co = t.saturating_mul(hc).saturating_mul(hc);
+        for i in 0..hc.min(post.len()) {
+            posts[po + i] = post[i];
+        }
+        for i in 0..(hc.saturating_mul(hc)).min(comb.len()) {
+            combs[co + i] = comb[i];
+        }
+    }
+    if let Some(g) = gpu.as_mut() {
+        if g.hc_post_packed(&batch.data, xs, &posts, &combs, n_tok, hc, dim, xs_dev)
+            .is_ok()
+        {
+            return true;
+        }
+        if xs.len() >= n_tok.saturating_mul(dim) {
+            let _ = g.download_hc_packed(&mut batch.data);
+            g.invalidate_hc_device();
+        }
+    }
+    if xs.len() < n_tok.saturating_mul(dim) {
+        return false;
+    }
     for t in 0..n_tok {
         let start = t.saturating_mul(dim);
         let x = if start < xs.len() {
@@ -898,13 +1029,15 @@ fn hc_post_batch<'p>(
         } else {
             &[]
         };
-        let (post, comb) = post_comb(t);
+        let post = &posts[t.saturating_mul(hc)..t.saturating_mul(hc).saturating_add(hc)];
+        let comb = &combs[t * hc * hc..(t + 1) * hc * hc];
         let off = t.saturating_mul(hcd);
         let residual = &batch.data[off..off + hcd];
         let out = &mut batch.scratch[off..off + hcd];
         hc_post_into_flat(x, residual, post, comb, spec, dim, out);
     }
     std::mem::swap(&mut batch.data, &mut batch.scratch);
+    true
 }
 
 fn hc_head(
@@ -1023,57 +1156,173 @@ fn timed_rmsnorm(
     r
 }
 
+fn rmsnorm_rows_maybe_gpu(
+    gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    rows: &mut [f32],
+    weight: &[f32],
+    n_tok: usize,
+    dim: usize,
+    eps: f32,
+    metrics: &Metrics,
+) -> Result<(), AllpacaError> {
+    if n_tok == 0 || weight.is_empty() {
+        return Ok(());
+    }
+    let need = n_tok.saturating_mul(dim);
+    if rows.len() < need {
+        return Ok(());
+    }
+    let mut tmp = vec![0.0f32; need];
+    let t = Instant::now();
+    if let Some(g) = gpu {
+        if g.rmsnorm_rows(rows, weight, &mut tmp, n_tok, dim, eps)
+            .is_ok()
+        {
+            rows[..need].copy_from_slice(&tmp);
+            metrics.dsv4_norm_ns.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return Ok(());
+        }
+    }
+    drop(tmp);
+    let mut row_tmp = vec![0.0f32; dim];
+    for i in 0..n_tok {
+        let row = &mut rows[i * dim..(i + 1) * dim];
+        timed_rmsnorm(row, weight, eps, &mut row_tmp, metrics)?;
+        row.copy_from_slice(&row_tmp);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attention_sinks(
     q: &[f32],
     k: &[f32],
     v: &[f32],
     sinks: &[f32],
     out: &mut [f32],
+    n_q: usize,
     n_kv: usize,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
 ) -> Result<(), AllpacaError> {
     if sinks.is_empty() {
-        return attention(q, k, v, out, 1, n_kv, n_heads, n_kv_heads, head_dim, true);
+        return attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, true);
     }
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let kv_dim = n_kv_heads * head_dim;
+    let kv_dim = n_kv_heads.saturating_mul(head_dim);
+    let q_stride = n_heads.saturating_mul(head_dim);
+    let prefix = n_kv.saturating_sub(n_q);
     out.fill(0.0);
-    for h in 0..n_heads {
-        let qh = &q[h * head_dim..(h + 1) * head_dim];
-        let kv_h = (h * n_kv_heads) / n_heads.max(1);
-        let sink = sinks.get(h).copied().unwrap_or(0.0);
-        let mut scores = vec![0.0f32; n_kv];
-        let mut max = sink;
-        for t in 0..n_kv {
-            let kh = &k[t * kv_dim + kv_h * head_dim..t * kv_dim + (kv_h + 1) * head_dim];
-            let mut s = 0.0f32;
-            for i in 0..head_dim {
-                s += qh[i] * kh[i];
+    let mut scores = vec![0.0f32; n_kv];
+    for qi in 0..n_q {
+        let t_end = (qi + prefix + 1).min(n_kv);
+        let q_base = qi.saturating_mul(q_stride);
+        for h in 0..n_heads {
+            let qh = &q[q_base + h * head_dim..q_base + (h + 1) * head_dim];
+            let kv_h = (h * n_kv_heads) / n_heads.max(1);
+            let sink = sinks.get(h).copied().unwrap_or(0.0);
+            let mut max = sink;
+            for t in 0..t_end {
+                let k_off = t * kv_dim + kv_h * head_dim;
+                let kh = &k[k_off..k_off + head_dim];
+                let mut s = 0.0f32;
+                for i in 0..head_dim {
+                    s += qh[i] * kh[i];
+                }
+                s *= scale;
+                scores[t] = s;
+                if s > max {
+                    max = s;
+                }
             }
-            s *= scale;
-            scores[t] = s;
-            if s > max {
-                max = s;
+            let mut acc = (sink - max).exp();
+            for s in &mut scores[..t_end] {
+                *s = (*s - max).exp();
+                acc += *s;
             }
-        }
-        let mut acc = (sink - max).exp();
-        for s in &mut scores {
-            *s = (*s - max).exp();
-            acc += *s;
-        }
-        let inv = 1.0 / acc.max(1e-9);
-        let oh = &mut out[h * head_dim..(h + 1) * head_dim];
-        for t in 0..n_kv {
-            let w = scores[t] * inv;
-            let vh = &v[t * kv_dim + kv_h * head_dim..t * kv_dim + (kv_h + 1) * head_dim];
-            for i in 0..head_dim {
-                oh[i] += w * vh[i];
+            let inv = 1.0 / acc.max(1e-9);
+            let oh = &mut out[q_base + h * head_dim..q_base + (h + 1) * head_dim];
+            for t in 0..t_end {
+                let w = scores[t] * inv;
+                let v_off = t * kv_dim + kv_h * head_dim;
+                let vh = &v[v_off..v_off + head_dim];
+                for i in 0..head_dim {
+                    oh[i] += w * vh[i];
+                }
             }
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dsv4_attention_sinks_maybe_gpu(
+    skip_mla: bool,
+    gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    hip: Option<&allpaca_hip::HipWorkspace>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    sinks: &[f32],
+    out: &mut [f32],
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<(), AllpacaError> {
+    if skip_mla {
+        let n_q_i = n_q as i32;
+        let n_kv_i = n_kv as i32;
+        let n_heads_i = n_heads as i32;
+        let n_kv_heads_i = n_kv_heads as i32;
+        let head_dim_i = head_dim as i32;
+        if let Some(g) = gpu {
+            if g.attention_sinks(
+                q,
+                k,
+                v,
+                sinks,
+                out,
+                n_q_i,
+                n_kv_i,
+                n_heads_i,
+                n_kv_heads_i,
+                head_dim_i,
+                true,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        } else if let Some(ws) = hip {
+            if ws
+                .attention_sinks(
+                    q,
+                    k,
+                    v,
+                    sinks,
+                    out,
+                    n_q_i,
+                    n_kv_i,
+                    n_heads_i,
+                    n_kv_heads_i,
+                    head_dim_i,
+                    true,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+    attention_sinks(
+        q, k, v, sinks, out, n_q, n_kv, n_heads, n_kv_heads, head_dim,
+    )
 }
 
 fn gemv(x: &[f32], w: &[f32], out: &mut [f32], n: usize, k: usize) -> Result<(), AllpacaError> {
@@ -1305,61 +1554,92 @@ fn dsv4_attn_and_route(
     }
     let attn_out = with_mla(dsv4, layer_idx, blk, skip_mla, |mla| {
         let mut q = vec![0.0f32; q_out];
-        let mut used_gpu_q = false;
-        if let (Some(g), Some(f)) = (gpu.as_deref_mut(), file) {
-            if let Ok(gq) = g.mla_q_proj(
-                f,
-                blk,
-                &cur,
-                &mla.q_a_norm,
-                eps,
-                spec.q_lora_rank,
-                q_out,
-                dim,
-                Some(metrics),
-            ) {
-                q = gq;
-                used_gpu_q = true;
+        let mut have_host_q = false;
+        let dq = if !meta.sinks.is_empty() {
+            match (gpu.as_deref_mut(), file) {
+                (Some(g), Some(f)) => g
+                    .mla_q_norm_rope_device(
+                        f,
+                        blk,
+                        &cur,
+                        &mla.q_a_norm,
+                        eps,
+                        spec.q_lora_rank,
+                        q_out,
+                        dim,
+                        1,
+                        n_heads,
+                        head_dim,
+                        pos,
+                        cfg.rope_theta,
+                        cfg.rope_dims,
+                        spec.rope_offset,
+                        Some(metrics),
+                    )
+                    .ok(),
+                _ => None,
             }
-        }
-        if !used_gpu_q {
-            let mut qr = vec![0.0f32; spec.q_lora_rank];
-            dsv4_gemv(
-                gpu.as_deref_mut(),
-                file,
-                &format!("blk.{blk}.attn_q_a.weight"),
-                &cur,
-                &mla.q_a,
-                &mut qr,
-                spec.q_lora_rank,
-                dim,
-                0,
-                Some(metrics),
-            )?;
-            if !mla.q_a_norm.is_empty() {
-                let mut n = vec![0.0f32; spec.q_lora_rank];
-                timed_rmsnorm(&qr, &mla.q_a_norm, eps, &mut n, metrics)?;
-                qr = n;
+        } else {
+            None
+        };
+        if dq.is_none() {
+            let mut used_gpu_q = false;
+            if let (Some(g), Some(f)) = (gpu.as_deref_mut(), file) {
+                if let Ok(gq) = g.mla_q_proj(
+                    f,
+                    blk,
+                    &cur,
+                    &mla.q_a_norm,
+                    eps,
+                    spec.q_lora_rank,
+                    q_out,
+                    dim,
+                    Some(metrics),
+                ) {
+                    q = gq;
+                    used_gpu_q = true;
+                }
             }
-            dsv4_gemv(
-                gpu.as_deref_mut(),
-                file,
-                &format!("blk.{blk}.attn_q_b.weight"),
-                &qr,
-                &mla.q_b,
-                &mut q,
-                q_out,
-                spec.q_lora_rank,
-                0,
-                Some(metrics),
-            )?;
-        }
-        for h in 0..n_heads {
-            let row = &mut q[h * head_dim..(h + 1) * head_dim];
-            let mut n = vec![0.0f32; head_dim];
-            timed_rmsnorm(row, &vec![1.0; head_dim], eps, &mut n, metrics)?;
-            row.copy_from_slice(&n);
-            rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+            if !used_gpu_q {
+                let mut qr = vec![0.0f32; spec.q_lora_rank];
+                dsv4_gemv(
+                    gpu.as_deref_mut(),
+                    file,
+                    &format!("blk.{blk}.attn_q_a.weight"),
+                    &cur,
+                    &mla.q_a,
+                    &mut qr,
+                    spec.q_lora_rank,
+                    dim,
+                    0,
+                    Some(metrics),
+                )?;
+                if !mla.q_a_norm.is_empty() {
+                    let mut n = vec![0.0f32; spec.q_lora_rank];
+                    timed_rmsnorm(&qr, &mla.q_a_norm, eps, &mut n, metrics)?;
+                    qr = n;
+                }
+                dsv4_gemv(
+                    gpu.as_deref_mut(),
+                    file,
+                    &format!("blk.{blk}.attn_q_b.weight"),
+                    &qr,
+                    &mla.q_b,
+                    &mut q,
+                    q_out,
+                    spec.q_lora_rank,
+                    0,
+                    Some(metrics),
+                )?;
+            }
+            for h in 0..n_heads {
+                let row = &mut q[h * head_dim..(h + 1) * head_dim];
+                let mut n = vec![0.0f32; head_dim];
+                timed_rmsnorm(row, &vec![1.0; head_dim], eps, &mut n, metrics)?;
+                row.copy_from_slice(&n);
+                rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+            }
+            have_host_q = true;
         }
         let mut kv_lat = vec![0.0f32; head_dim];
         let mut used_gpu_kv = false;
@@ -1415,32 +1695,34 @@ fn dsv4_attn_and_route(
         kv.touch(page_id, 1.0);
         let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
         let n_kv = k_all.len() / kv_dim.max(1);
-        let mut attn_raw = vec![0.0f32; q_out];
+        let mut attn_raw = Vec::new();
         let t_attn = Instant::now();
-        let mut gpu_attn = false;
-        if skip_mla {
-            if let Some(g) = gpu.as_deref_mut() {
-                if g.attention_sinks(
-                    &q,
+        let dattn = match (dq, gpu.as_deref_mut()) {
+            (Some(p), Some(g)) => g
+                .attention_rope_back_from_device_q(
+                    p,
                     &k_all,
                     &v_all,
                     &meta.sinks,
-                    &mut attn_raw,
                     1,
-                    n_kv as i32,
-                    n_heads as i32,
-                    n_kv_heads as i32,
-                    head_dim as i32,
-                    true,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    pos,
+                    cfg.rope_theta,
+                    cfg.rope_dims,
+                    spec.rope_offset,
                 )
-                .is_ok()
-                {
-                    gpu_attn = true;
-                }
-            } else if let Some(ws) = hip {
-                if ws
-                    .attention_sinks(
-                        &q,
+                .ok(),
+            _ => None,
+        };
+        if dattn.is_none() {
+            attn_raw = vec![0.0f32; q_out];
+            let attn_ok = match (dq, gpu.as_deref_mut()) {
+                (Some(p), Some(g)) => g
+                    .attention_sinks_from_device_q(
+                        p,
                         &k_all,
                         &v_all,
                         &meta.sinks,
@@ -1452,86 +1734,47 @@ fn dsv4_attn_and_route(
                         head_dim as i32,
                         true,
                     )
-                    .is_ok()
-                {
-                    gpu_attn = true;
+                    .is_ok(),
+                _ => false,
+            };
+            if !attn_ok {
+                if !have_host_q {
+                    if let (Some(p), Some(g)) = (dq, gpu.as_deref_mut()) {
+                        g.copy_d2h_f32(p, &mut q)?;
+                    } else {
+                        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                            "MLA Q is empty after device-path miss".into(),
+                        )));
+                    }
                 }
+                dsv4_attention_sinks_maybe_gpu(
+                    skip_mla,
+                    gpu.as_deref_mut(),
+                    hip,
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &meta.sinks,
+                    &mut attn_raw,
+                    1,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                )?;
             }
-        }
-        if !gpu_attn {
-            attention_sinks(
-                &q,
-                &k_all,
-                &v_all,
-                &meta.sinks,
-                &mut attn_raw,
-                n_kv,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-            )?;
+            for h in 0..n_heads {
+                let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
+                rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+            }
         }
         metrics
             .dsv4_attn_ns
             .fetch_add(t_attn.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        for h in 0..n_heads {
-            let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
-            rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
-        }
-        let groups = spec.o_group_count.max(1);
-        let heads_g = (n_heads / groups).max(1);
-        let o_group_dim = heads_g * head_dim;
-        let oa_out = spec.o_lora_rank * groups;
-        let per = spec.o_lora_rank.max(1);
-        let mut oa = vec![0.0f32; oa_out];
-        for g in 0..groups {
-            let mut slice = vec![0.0f32; o_group_dim];
-            for hg in 0..heads_g {
-                let src = (g * heads_g + hg) * head_dim;
-                let dst = hg * head_dim;
-                if src + head_dim <= attn_raw.len() && dst + head_dim <= slice.len() {
-                    slice[dst..dst + head_dim].copy_from_slice(&attn_raw[src..src + head_dim]);
-                }
-            }
-            let w_off = g.saturating_mul(per).saturating_mul(o_group_dim);
-            let w_end = w_off + per * o_group_dim;
-            if !mla.o_a.is_empty() && w_end > mla.o_a.len() {
-                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-                    "attn_output_a grouped slice OOB".into(),
-                )));
-            }
-            let cpu = if mla.o_a.is_empty() {
-                &[][..]
-            } else {
-                &mla.o_a[w_off..w_end]
-            };
-            dsv4_gemv(
-                gpu.as_deref_mut(),
-                file,
-                &format!("blk.{blk}.attn_output_a.weight"),
-                &slice,
-                cpu,
-                &mut oa[g * per..(g + 1) * per],
-                per,
-                o_group_dim,
-                w_off,
-                Some(metrics),
-            )?;
-        }
-        let mut attn_out = vec![0.0f32; dim];
-        dsv4_gemv(
-            gpu.as_deref_mut(),
-            file,
-            &format!("blk.{blk}.attn_output_b.weight"),
-            &oa,
-            &mla.o_b,
-            &mut attn_out,
-            dim,
-            oa_out,
-            0,
-            Some(metrics),
-        )?;
-        Ok(attn_out)
+        dsv4_mla_o_rows(
+            &mut gpu, file, mla, &attn_raw, dattn, blk, 1, q_out, n_heads, head_dim, spec, dim,
+            metrics,
+        )
     })?;
     let t_hc = Instant::now();
     let streams = hc_post(&attn_out, streams, &post, &comb, spec, dim);
@@ -1594,6 +1837,22 @@ fn dsv4_mla_q_rows(
     eps: f32,
     metrics: &Metrics,
 ) -> Result<Vec<f32>, AllpacaError> {
+    if let (Some(g), Some(f)) = (gpu.as_deref_mut(), file) {
+        if let Ok(q) = g.mla_q_rows(
+            f,
+            blk,
+            curs,
+            &mla.q_a_norm,
+            eps,
+            q_lora,
+            q_out,
+            dim,
+            n_tok,
+            Some(metrics),
+        ) {
+            return Ok(q);
+        }
+    }
     let mut qr = vec![0.0f32; n_tok.saturating_mul(q_lora)];
     dsv4_gemm(
         gpu.as_deref_mut(),
@@ -1677,6 +1936,7 @@ fn dsv4_mla_o_rows(
     file: Option<&GgufFile>,
     mla: &MlaHost,
     attn_raws: &[f32],
+    dattn: Option<*const f32>,
     blk: usize,
     n_tok: usize,
     q_out: usize,
@@ -1691,6 +1951,56 @@ fn dsv4_mla_o_rows(
     let o_group_dim = heads_g.saturating_mul(head_dim);
     let per = spec.o_lora_rank.max(1);
     let oa_out = per.saturating_mul(groups);
+    if let (Some(g), Some(f)) = (gpu.as_deref_mut(), file) {
+        if let Some(p) = dattn {
+            if let Ok(out) = g.mla_o_rows_from_device(
+                f,
+                blk,
+                p,
+                n_tok,
+                q_out,
+                n_heads,
+                head_dim,
+                groups,
+                per,
+                dim,
+                Some(metrics),
+                true,
+            ) {
+                return Ok(out);
+            }
+        }
+        if !attn_raws.is_empty() {
+            if let Ok(out) = g.mla_o_rows(
+                f,
+                blk,
+                attn_raws,
+                n_tok,
+                q_out,
+                n_heads,
+                head_dim,
+                groups,
+                per,
+                dim,
+                Some(metrics),
+                true,
+            ) {
+                return Ok(out);
+            }
+        }
+    }
+    let owned = if attn_raws.is_empty() {
+        if let (Some(p), Some(g)) = (dattn, gpu.as_deref_mut()) {
+            let mut buf = vec![0.0f32; n_tok.saturating_mul(q_out)];
+            g.copy_d2h_f32(p, &mut buf)?;
+            Some(buf)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let attn_raws = owned.as_deref().unwrap_or(attn_raws);
     let mut oa = vec![0.0f32; n_tok.saturating_mul(oa_out)];
     for g in 0..groups {
         let mut xs = vec![0.0f32; n_tok.saturating_mul(o_group_dim)];
@@ -1804,132 +2114,194 @@ fn dsv4_attn_and_route_rows(
         &host.attn_norm
     };
     let t_hc = Instant::now();
-    let (curs, posts, combs) = hc_pre_packed(&states.data, n_tok, &meta.hc_attn, spec, dim, eps)?;
-    let mut curs = curs;
-    if !attn_norm.is_empty() {
-        let mut tmp = vec![0.0f32; dim];
-        for t in 0..n_tok {
-            let row = &mut curs[t * dim..(t + 1) * dim];
-            timed_rmsnorm(row, attn_norm, eps, &mut tmp, metrics)?;
-            row.copy_from_slice(&tmp);
-        }
-    }
+    let attn_mix = format!("blk.{blk}.hc_attn_fn.weight");
+    let (mut curs, posts, combs) = hc_pre_packed(
+        &mut states.data,
+        n_tok,
+        &meta.hc_attn,
+        spec,
+        dim,
+        eps,
+        gpu.as_deref_mut(),
+        Some(attn_mix.as_str()),
+        Some(attn_norm),
+        Some(metrics),
+        false,
+    )?;
     metrics
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let attn_outs = with_mla(dsv4, layer_idx, blk, skip_mla, |mla| {
-        let mut q = dsv4_mla_q_rows(
-            &mut gpu,
-            file,
-            mla,
-            &curs,
-            blk,
-            n_tok,
-            spec.q_lora_rank,
-            q_out,
-            dim,
-            eps,
-            metrics,
-        )?;
-        let ones = vec![1.0f32; head_dim];
-        for t in 0..n_tok {
-            let pos = start_pos + t;
-            let qrow = &mut q[t * q_out..(t + 1) * q_out];
-            for h in 0..n_heads {
-                let row = &mut qrow[h * head_dim..(h + 1) * head_dim];
-                let mut n = vec![0.0f32; head_dim];
-                timed_rmsnorm(row, &ones, eps, &mut n, metrics)?;
-                row.copy_from_slice(&n);
-                rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+        let mut q = Vec::new();
+        let dq = if !meta.sinks.is_empty() {
+            match (gpu.as_deref_mut(), file) {
+                (Some(g), Some(f)) => g
+                    .mla_q_norm_rope_device(
+                        f,
+                        blk,
+                        &curs,
+                        &mla.q_a_norm,
+                        eps,
+                        spec.q_lora_rank,
+                        q_out,
+                        dim,
+                        n_tok,
+                        n_heads,
+                        head_dim,
+                        start_pos,
+                        cfg.rope_theta,
+                        cfg.rope_dims,
+                        spec.rope_offset,
+                        Some(metrics),
+                    )
+                    .ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if dq.is_none() {
+            if let Some(g) = gpu.as_deref_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
+            q = dsv4_mla_q_rows(
+                &mut gpu,
+                file,
+                mla,
+                &curs,
+                blk,
+                n_tok,
+                spec.q_lora_rank,
+                q_out,
+                dim,
+                eps,
+                metrics,
+            )?;
+            let ones = vec![1.0f32; head_dim];
+            rmsnorm_rows_maybe_gpu(
+                gpu.as_deref_mut(),
+                &mut q,
+                &ones,
+                n_tok.saturating_mul(n_heads),
+                head_dim,
+                eps,
+                metrics,
+            )?;
+            for t in 0..n_tok {
+                let pos = start_pos + t;
+                let qrow = &mut q[t * q_out..(t + 1) * q_out];
+                for h in 0..n_heads {
+                    let row = &mut qrow[h * head_dim..(h + 1) * head_dim];
+                    rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                }
             }
         }
         let mut kv_lat = dsv4_mla_kv_rows(
             &mut gpu, file, mla, &curs, blk, n_tok, head_dim, dim, eps, metrics,
         )?;
-        let mut attn_raws = vec![0.0f32; n_tok.saturating_mul(q_out)];
+        let page_tokens = kv
+            .get(page_ids[layer_idx][0])
+            .map(|p| p.capacity_tokens)
+            .unwrap_or(128);
         for t in 0..n_tok {
             let pos = start_pos + t;
             let kv_row = &mut kv_lat[t * head_dim..(t + 1) * head_dim];
             rope_offset(kv_row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
-            let page_tokens = kv
-                .get(page_ids[layer_idx][0])
-                .map(|p| p.capacity_tokens)
-                .unwrap_or(128);
             let page_index = pos / page_tokens as usize;
             let slot = (pos % page_tokens as usize) as u32;
             let page_id = page_ids[layer_idx][page_index];
             kv.write_slot(page_id, slot, n_kv_heads, head_dim, kv_row, kv_row)?;
             kv.touch(page_id, 1.0);
-            let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
-            let n_kv = k_all.len() / kv_dim.max(1);
-            let qrow = &q[t * q_out..(t + 1) * q_out];
-            let attn_raw = &mut attn_raws[t * q_out..(t + 1) * q_out];
-            let t_attn = Instant::now();
-            let mut gpu_attn = false;
-            if skip_mla {
-                if let Some(g) = gpu.as_deref_mut() {
-                    if g.attention_sinks(
-                        qrow,
+        }
+        let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
+        let n_kv = k_all.len() / kv_dim.max(1);
+        let mut attn_raws = Vec::new();
+        let t_attn = Instant::now();
+        let dattn = match (dq, gpu.as_deref_mut()) {
+            (Some(p), Some(g)) => g
+                .attention_rope_back_from_device_q(
+                    p,
+                    &k_all,
+                    &v_all,
+                    &meta.sinks,
+                    n_tok,
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    start_pos,
+                    cfg.rope_theta,
+                    cfg.rope_dims,
+                    spec.rope_offset,
+                )
+                .ok(),
+            _ => None,
+        };
+        if dattn.is_none() {
+            if let Some(g) = gpu.as_deref_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
+            attn_raws = vec![0.0f32; n_tok.saturating_mul(q_out)];
+            let attn_ok = match (dq, gpu.as_deref_mut()) {
+                (Some(p), Some(g)) => g
+                    .attention_sinks_from_device_q(
+                        p,
                         &k_all,
                         &v_all,
                         &meta.sinks,
-                        attn_raw,
-                        1,
+                        &mut attn_raws,
+                        n_tok as i32,
                         n_kv as i32,
                         n_heads as i32,
                         n_kv_heads as i32,
                         head_dim as i32,
                         true,
                     )
-                    .is_ok()
-                    {
-                        gpu_attn = true;
-                    }
-                } else if let Some(ws) = hip {
-                    if ws
-                        .attention_sinks(
-                            qrow,
-                            &k_all,
-                            &v_all,
-                            &meta.sinks,
-                            attn_raw,
-                            1,
-                            n_kv as i32,
-                            n_heads as i32,
-                            n_kv_heads as i32,
-                            head_dim as i32,
-                            true,
-                        )
-                        .is_ok()
-                    {
-                        gpu_attn = true;
+                    .is_ok(),
+                _ => false,
+            };
+            if !attn_ok {
+                if q.is_empty() {
+                    if let (Some(p), Some(g)) = (dq, gpu.as_deref_mut()) {
+                        q = vec![0.0f32; n_tok.saturating_mul(q_out)];
+                        g.copy_d2h_f32(p, &mut q)?;
+                    } else {
+                        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                            "MLA Q is empty after device-path miss".into(),
+                        )));
                     }
                 }
-            }
-            if !gpu_attn {
-                attention_sinks(
-                    qrow,
+                dsv4_attention_sinks_maybe_gpu(
+                    skip_mla,
+                    gpu.as_deref_mut(),
+                    hip,
+                    &q,
                     &k_all,
                     &v_all,
                     &meta.sinks,
-                    attn_raw,
+                    &mut attn_raws,
+                    n_tok,
                     n_kv,
                     n_heads,
                     n_kv_heads,
                     head_dim,
                 )?;
             }
-            metrics
-                .dsv4_attn_ns
-                .fetch_add(t_attn.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            for h in 0..n_heads {
-                let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
-                rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+            for t in 0..n_tok {
+                let pos = start_pos + t;
+                let attn_raw = &mut attn_raws[t * q_out..(t + 1) * q_out];
+                for h in 0..n_heads {
+                    let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
+                    rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                }
             }
         }
+        metrics
+            .dsv4_attn_ns
+            .fetch_add(t_attn.elapsed().as_nanos() as u64, Ordering::Relaxed);
         dsv4_mla_o_rows(
-            &mut gpu, file, mla, &attn_raws, blk, n_tok, q_out, n_heads, head_dim, spec, dim,
-            metrics,
+            &mut gpu, file, mla, &attn_raws, dattn, blk, n_tok, q_out, n_heads, head_dim, spec,
+            dim, metrics,
         )
     })?;
     let ffn_norm = if !meta.ffn_norm.is_empty() {
@@ -1938,25 +2310,40 @@ fn dsv4_attn_and_route_rows(
         &host.ffn_norm
     };
     let t_hc = Instant::now();
-    hc_post_batch(&attn_outs, states, spec, dim, |t| {
-        (
-            posts.get(t).map(Vec::as_slice).unwrap_or(&[]),
-            combs.get(t).map(Vec::as_slice).unwrap_or(&[]),
-        )
-    });
-    let (mut xs, fposts, fcombs) =
-        hc_pre_packed(&states.data, n_tok, &meta.hc_ffn, spec, dim, eps)?;
+    let xs_dev = gpu.as_ref().and_then(|g| g.last_o_device());
+    let _ = hc_post_batch(
+        &attn_outs,
+        states,
+        spec,
+        dim,
+        gpu.as_deref_mut(),
+        |t| {
+            (
+                posts.get(t).map(Vec::as_slice).unwrap_or(&[]),
+                combs.get(t).map(Vec::as_slice).unwrap_or(&[]),
+            )
+        },
+        xs_dev,
+    );
+    let (xs, fposts, fcombs) = {
+        let ffn_mix = format!("blk.{blk}.hc_ffn_fn.weight");
+        hc_pre_packed(
+            &mut states.data,
+            n_tok,
+            &meta.hc_ffn,
+            spec,
+            dim,
+            eps,
+            gpu.as_deref_mut(),
+            Some(ffn_mix.as_str()),
+            Some(ffn_norm),
+            Some(metrics),
+            false,
+        )?
+    };
     metrics
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    if !ffn_norm.is_empty() {
-        let mut tmp = vec![0.0f32; dim];
-        for t in 0..n_tok {
-            let row = &mut xs[t * dim..(t + 1) * dim];
-            timed_rmsnorm(row, ffn_norm, eps, &mut tmp, metrics)?;
-            row.copy_from_slice(&tmp);
-        }
-    }
     let mut fcurs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
     for t in 0..n_tok {
         fcurs.push(xs[t * dim..(t + 1) * dim].to_vec());
@@ -2131,7 +2518,17 @@ fn dsv4_apply_moe(
     let ids: Vec<usize> = picks.iter().map(|(e, _)| *e).collect();
     if warmup {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
-            let _ = g.warmup_experts(f, blk, &ids, cfg, Some(metrics));
+            if let Ok(plan) = g.warmup_experts(f, blk, &ids, cfg, Some(metrics)) {
+                if !plan.is_empty() {
+                    let inf = g.submit_copy_plan(&plan, Some(metrics));
+                    g.mark_expert_h2d(inf.0, inf.1);
+                    if inf.0 || inf.1 {
+                        metrics
+                            .expert_prefill_overlaps
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
         }
     }
     let shexp_y = dsv4_shexp(
@@ -2265,6 +2662,67 @@ fn scatter_expert_rows(routed: &mut [f32], y: &[f32], group: &[(usize, f32)], di
     }
 }
 
+fn add_acc_slice(routed: &mut [f32], acc: &[f32]) {
+    for (dst, src) in routed.iter_mut().zip(acc.iter()) {
+        *dst += *src;
+    }
+}
+
+fn add_moe_acc(
+    hip: Option<&std::sync::Arc<allpaca_hip::HipWorkspace>>,
+    routed: &mut [f32],
+    n_tok: usize,
+    dim: usize,
+) {
+    let Some(h) = hip else {
+        return;
+    };
+    if !h.moe_active() {
+        return;
+    }
+    let mut acc = vec![0.0f32; n_tok.saturating_mul(dim)];
+    if h.moe_finish(&mut acc).is_err() {
+        tracing::warn!("device moe accumulate download failed");
+        return;
+    }
+    add_acc_slice(routed, &acc);
+}
+
+fn take_wait_job(
+    expert: usize,
+    jobs0: &mut Vec<crate::dsv4_gpu::ExpertSwigluJob>,
+    jobs1: &mut Vec<crate::dsv4_gpu::ExpertSwigluJob>,
+    buf0: &mut Vec<crate::dsv4_gpu::ExpertSwigluJob>,
+    buf1: &mut Vec<crate::dsv4_gpu::ExpertSwigluJob>,
+) -> Option<bool> {
+    if let Some(i) = jobs0.iter().position(|j| j.expert == expert) {
+        buf0.push(jobs0.swap_remove(i));
+        Some(false)
+    } else if let Some(i) = jobs1.iter().position(|j| j.expert == expert) {
+        buf1.push(jobs1.swap_remove(i));
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn wait_miss_ready_bufs(gpu: Option<&crate::dsv4_gpu::Dsv4Gpu>, ev0: &[usize], ev1: &[usize]) {
+    let Some(g) = gpu else {
+        return;
+    };
+    for &idx in ev0 {
+        if let Err(e) = g.wait_miss_ready(false, idx) {
+            tracing::warn!(error = %e, "GPU0 miss ready wait failed");
+        }
+    }
+    for &idx in ev1 {
+        if let Err(e) = g.wait_miss_ready(true, idx) {
+            tracing::warn!(error = %e, "GPU1 miss ready wait failed");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_expert_job_pair(
     hip0: Option<&std::sync::Arc<allpaca_hip::HipWorkspace>>,
     hip1: Option<&std::sync::Arc<allpaca_hip::HipWorkspace>>,
@@ -2326,6 +2784,12 @@ fn run_expert_job_pair(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// CPU shexp loads are skipped when the BF16 tensors are already resident.
+/// Device accumulate still runs from `moe_x`.
+fn should_run_device_shexp(weights_resident: bool, moe_active: bool) -> bool {
+    weights_resident && moe_active
+}
+
 fn dsv4_apply_moe_rows(
     model: &TinyModel,
     dsv4: &Dsv4Weights,
@@ -2358,6 +2822,11 @@ fn dsv4_apply_moe_rows(
         let n = prep.fcur.len().min(dim);
         xs[dst..dst + n].copy_from_slice(&prep.fcur[..n]);
     }
+    let sff_hint = if cfg.shared_ff_dim > 0 {
+        cfg.shared_ff_dim
+    } else {
+        cfg.ff_dim.max(1)
+    };
     let mut shexp_y = vec![0.0f32; n_tok.saturating_mul(dim)];
     let mut shexp_done = false;
     if !host.shared_expert.w_up.is_empty() {
@@ -2376,29 +2845,22 @@ fn dsv4_apply_moe_rows(
             false,
         )?;
         shexp_done = true;
-    } else {
-        let sff_hint = if cfg.shared_ff_dim > 0 {
-            cfg.shared_ff_dim
-        } else {
-            cfg.ff_dim.max(1)
-        };
-        if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
-            if let Ok(y) = g.shexp_swiglu_rows(f, blk, &xs, n_tok, dim, sff_hint, Some(metrics)) {
-                shexp_y = y;
-                shexp_done = true;
+    }
+    let hint: Vec<usize> = {
+        let mut u = Vec::new();
+        for prep in &preps {
+            for (e, _) in &prep.picks {
+                if !u.contains(e) {
+                    u.push(*e);
+                }
             }
         }
-    }
-    if !shexp_done {
-        for t in 0..n_tok {
-            let row = &xs[t * dim..(t + 1) * dim];
-            let y = dsv4_shexp(
-                model, dsv4, row, layer_idx, metrics, &mut gpu, file, skip_shexp,
-            )?;
-            let n = y.len().min(dim);
-            shexp_y[t * dim..t * dim + n].copy_from_slice(&y[..n]);
-        }
-    }
+        u
+    };
+    let warmup_plan = match (gpu.as_mut(), file) {
+        (Some(g), Some(f)) => g.warmup_experts(f, blk, &hint, cfg, Some(metrics)).ok(),
+        _ => None,
+    };
     let gpu_slots = gpu.as_ref().is_some_and(|g| g.has_expert_slots());
     let mut groups: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
     for (t, prep) in preps.iter().enumerate() {
@@ -2471,31 +2933,175 @@ fn dsv4_apply_moe_rows(
             _ => cpu_work.push((e, gx, group)),
         }
     }
-    let hint: Vec<usize> = {
-        let mut u = Vec::new();
-        for prep in &preps {
-            for (e, _) in &prep.picks {
-                if !u.contains(e) {
-                    u.push(*e);
+    if gpu.is_some() {
+        if let Some(h) = hip0.as_ref() {
+            match gpu.as_ref().and_then(|g| g.hc_curs_device()) {
+                Some((ptr, n)) if n == xs.len() => {
+                    let _ = h.moe_begin_from_device(ptr, n_tok, dim);
+                }
+                _ => {
+                    let _ = h.moe_begin(&xs, n_tok, dim);
                 }
             }
         }
-        u
-    };
+    }
+    if !jobs1_ready.is_empty() || !jobs1_wait.is_empty() {
+        if let Some(h) = hip1.as_ref() {
+            let peer = match gpu.as_ref().and_then(|g| g.hc_curs_device()) {
+                Some((ptr, n)) if n == xs.len() => {
+                    let src_dev = hip0.as_ref().map(|h0| h0.device).unwrap_or(0);
+                    h.moe_begin_from_peer(ptr, src_dev, n_tok, dim).is_ok()
+                }
+                _ => false,
+            };
+            if !peer {
+                let _ = h.moe_begin(&xs, n_tok, dim);
+            }
+        }
+    }
     let ff = cfg.ff_dim.max(1);
     let mut gpu_out: Vec<(Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
-    let mut gpu_compute = run_expert_job_pair(
-        hip0.as_ref(),
-        hip1.as_ref(),
-        jobs0_ready,
-        jobs1_ready,
-        dim,
-        ff,
-        metrics,
-        &mut gpu_out,
-        &mut cpu_work,
-    );
+    let mut inflight = (false, false);
+    let mut gpu_compute = false;
+    let mut shexp_dev = false;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut bounced = false;
+    std::thread::scope(|s| {
+        let bounce = match (gpu.as_ref(), warmup_plan.as_ref()) {
+            (Some(g), Some(plan)) if !plan.is_empty() => {
+                bounced = true;
+                let tx = tx.clone();
+                Some(s.spawn(move || g.submit_copy_plan_notifying(plan, Some(metrics), Some(tx))))
+            }
+            _ => None,
+        };
+        drop(tx);
+        if !shexp_done {
+            if let Some(g) = gpu.as_ref() {
+                if let Some((gate, up, down)) = g.shexp_resident_ptrs(blk, dim, sff_hint) {
+                    let moe_live = hip0.as_ref().is_some_and(|h| h.moe_active());
+                    if should_run_device_shexp(true, moe_live) {
+                        match g.shexp_accumulate_into_moe(
+                            n_tok,
+                            dim,
+                            sff_hint,
+                            gate,
+                            up,
+                            down,
+                            Some(metrics),
+                        ) {
+                            Ok(()) => {
+                                shexp_done = true;
+                                shexp_dev = true;
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "shexp device accumulate failed");
+                            }
+                        }
+                    }
+                    if !shexp_done {
+                        if let Ok(y) = g.shexp_swiglu_with_ptrs(
+                            &xs,
+                            n_tok,
+                            dim,
+                            sff_hint,
+                            gate,
+                            up,
+                            down,
+                            Some(metrics),
+                        ) {
+                            shexp_y = y;
+                            shexp_done = true;
+                        }
+                    }
+                }
+            }
+        }
+        gpu_compute = run_expert_job_pair(
+            hip0.as_ref(),
+            hip1.as_ref(),
+            jobs0_ready,
+            jobs1_ready,
+            dim,
+            ff,
+            metrics,
+            &mut gpu_out,
+            &mut cpu_work,
+        );
+        let mut buf0 = Vec::new();
+        let mut buf1 = Vec::new();
+        let mut ev0 = Vec::new();
+        let mut ev1 = Vec::new();
+        loop {
+            let (expert, idx) = match rx.recv() {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            match take_wait_job(
+                expert,
+                &mut jobs0_wait,
+                &mut jobs1_wait,
+                &mut buf0,
+                &mut buf1,
+            ) {
+                Some(false) => ev0.push(idx),
+                Some(true) => ev1.push(idx),
+                None => {}
+            }
+            while let Ok((e, eidx)) = rx.try_recv() {
+                match take_wait_job(e, &mut jobs0_wait, &mut jobs1_wait, &mut buf0, &mut buf1) {
+                    Some(false) => ev0.push(eidx),
+                    Some(true) => ev1.push(eidx),
+                    None => {}
+                }
+            }
+            wait_miss_ready_bufs(gpu.as_deref(), &ev0, &ev1);
+            ev0.clear();
+            ev1.clear();
+            gpu_compute |= run_expert_job_pair(
+                hip0.as_ref(),
+                hip1.as_ref(),
+                std::mem::take(&mut buf0),
+                std::mem::take(&mut buf1),
+                dim,
+                ff,
+                metrics,
+                &mut gpu_out,
+                &mut cpu_work,
+            );
+        }
+        if let Some(jh) = bounce {
+            match jh.join() {
+                Ok(pair) => inflight = pair,
+                Err(_) => tracing::warn!("expert miss H2D thread panicked"),
+            }
+        }
+    });
+    if !shexp_done {
+        if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
+            if let Ok(y) = g.shexp_swiglu_rows(f, blk, &xs, n_tok, dim, sff_hint, Some(metrics)) {
+                shexp_y = y;
+                shexp_done = true;
+            }
+        }
+    }
+    if !shexp_done {
+        for t in 0..n_tok {
+            let row = &xs[t * dim..(t + 1) * dim];
+            let y = dsv4_shexp(
+                model, dsv4, row, layer_idx, metrics, &mut gpu, file, skip_shexp,
+            )?;
+            let n = y.len().min(dim);
+            shexp_y[t * dim..t * dim + n].copy_from_slice(&y[..n]);
+        }
+    }
     if let Some(g) = gpu.as_mut() {
+        g.mark_expert_h2d(inflight.0, inflight.1);
+        if bounced || inflight.0 || inflight.1 {
+            metrics
+                .expert_prefill_overlaps
+                .fetch_add(1, Ordering::Relaxed);
+        }
         g.join_expert_h2d();
     }
     gpu_compute |= run_expert_job_pair(
@@ -2526,56 +3132,115 @@ fn dsv4_apply_moe_rows(
         }
         let _ = hip0.as_ref().map(|h| h.bind());
     }
-    let mut inflight = (false, false);
-    for (y, group) in gpu_out {
-        scatter_expert_rows(&mut routed, &y, &group, dim);
+    if let Some(h0) = hip0.as_ref() {
+        if h0.moe_active() {
+            let _ = h0.moe_join_compute();
+        }
     }
-    for (e, gx, group) in cpu_work {
-        let m = group.len();
-        let mut gy = vec![0.0f32; m.saturating_mul(dim)];
-        let mut did = false;
-        if gpu_slots {
-            if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
-                if g.expert_mlp_gpu_rows(f, blk, e, cfg, &gx, &mut gy, m, Some(metrics))
-                    .is_ok()
-                {
-                    did = true;
+    let mut gpu1_host: Option<Vec<f32>> = None;
+    if !gpu.as_ref().is_some_and(|g| g.fold_gpu1_moe_into_gpu0()) {
+        if let Some(h1) = hip1.as_ref() {
+            if h1.moe_active() {
+                let mut tmp = vec![0.0f32; n_tok.saturating_mul(dim)];
+                if h1.moe_finish(&mut tmp).is_ok() {
+                    gpu1_host = Some(tmp);
                 }
             }
         }
-        if !did {
-            let ffn = if !host.experts.is_empty() {
-                model.host_expert(layer_idx, e)?
-            } else if let Some(f) = file {
-                load_mxfp4_expert(f, blk, e, cfg.n_experts, dim, cfg.ff_dim)?
-            } else {
-                continue;
-            };
-            expert_mlp_rows(&gx, &ffn, cfg.ff_dim, dim, m, &mut gy, false)?;
-        }
-        scatter_expert_rows(&mut routed, &gy, &group, dim);
     }
+    let leftover = !gpu_out.is_empty() || !cpu_work.is_empty();
+    let mut device_hc = false;
     let t_hc = Instant::now();
-    std::thread::scope(|s| {
-        let pref_jh = match (gpu.as_ref(), prefetch.as_ref()) {
-            (Some(g), Some(plan)) if !plan.is_empty() => {
-                Some(s.spawn(|| g.submit_copy_plan(plan, Some(metrics))))
+    if !leftover {
+        if let Some(h0) = hip0.as_ref() {
+            if h0.moe_active() {
+                let mut folded = true;
+                if let Some(tmp) = gpu1_host.as_ref() {
+                    if h0.moe_add_from_host(tmp).is_ok() {
+                        gpu1_host = None;
+                    } else {
+                        folded = false;
+                    }
+                }
+                if folded && !shexp_dev {
+                    if h0.moe_add_from_host(&shexp_y).is_ok() {
+                        shexp_dev = true;
+                    } else {
+                        folded = false;
+                    }
+                }
+                if folded {
+                    if let Ok(acc) = h0.moe_acc_device() {
+                        if hc_post_batch(
+                            &[],
+                            states,
+                            spec,
+                            dim,
+                            gpu.as_deref_mut(),
+                            |t| (preps[t].fpost.as_slice(), preps[t].fcomb.as_slice()),
+                            Some(acc as *const f32),
+                        ) {
+                            h0.moe_release();
+                            device_hc = true;
+                        }
+                    }
+                }
             }
-            _ => None,
-        };
-        for i in 0..routed.len().min(shexp_y.len()) {
-            routed[i] += shexp_y[i];
         }
-        hc_post_batch(&routed, states, spec, dim, |t| {
-            (preps[t].fpost.as_slice(), preps[t].fcomb.as_slice())
-        });
-        if let Some(jh) = pref_jh {
-            match jh.join() {
-                Ok(pair) => inflight = pair,
-                Err(_) => tracing::warn!("L+1 expert prefetch H2D panicked"),
+    }
+    if !device_hc {
+        add_moe_acc(hip0.as_ref(), &mut routed, n_tok, dim);
+        if let Some(tmp) = gpu1_host.as_ref() {
+            add_acc_slice(&mut routed, tmp);
+        }
+        let _ = hip0.as_ref().map(|h| h.bind());
+        for (y, group) in gpu_out {
+            scatter_expert_rows(&mut routed, &y, &group, dim);
+        }
+        for (e, gx, group) in cpu_work {
+            let m = group.len();
+            let mut gy = vec![0.0f32; m.saturating_mul(dim)];
+            let mut did = false;
+            if gpu_slots {
+                if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
+                    if g.expert_mlp_gpu_rows(f, blk, e, cfg, &gx, &mut gy, m, Some(metrics))
+                        .is_ok()
+                    {
+                        did = true;
+                    }
+                }
             }
+            if !did {
+                let ffn = if !host.experts.is_empty() {
+                    model.host_expert(layer_idx, e)?
+                } else if let Some(f) = file {
+                    load_mxfp4_expert(f, blk, e, cfg.n_experts, dim, cfg.ff_dim)?
+                } else {
+                    continue;
+                };
+                expert_mlp_rows(&gx, &ffn, cfg.ff_dim, dim, m, &mut gy, false)?;
+            }
+            scatter_expert_rows(&mut routed, &gy, &group, dim);
         }
-    });
+        if !shexp_dev {
+            add_acc_slice(&mut routed, &shexp_y);
+        }
+        let _ = hc_post_batch(
+            &routed,
+            states,
+            spec,
+            dim,
+            gpu.as_deref_mut(),
+            |t| (preps[t].fpost.as_slice(), preps[t].fcomb.as_slice()),
+            None,
+        );
+    }
+    let mut inflight = (false, false);
+    if let (Some(g), Some(plan)) = (gpu.as_ref(), prefetch.as_ref()) {
+        if !plan.is_empty() {
+            inflight = g.submit_copy_plan(plan, Some(metrics));
+        }
+    }
     if let Some(g) = gpu.as_mut() {
         g.finish_h2d_keep();
         g.unpin_layer(blk);
@@ -2750,6 +3415,20 @@ pub(crate) fn load_mxfp4_expert(
     })
 }
 
+fn dsv4_packed_gpu_live(model: &TinyModel) -> bool {
+    let Some(dsv4) = model.dsv4.as_ref() else {
+        return false;
+    };
+    let Ok(g) = dsv4.gpu.lock() else {
+        return false;
+    };
+    g.as_ref().is_some()
+        && dsv4.gguf.as_ref().is_some_and(|f| {
+            f.tensor("blk.0.attn_q_a.weight")
+                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn forward_dsv4_token(
     model: &TinyModel,
@@ -2763,6 +3442,20 @@ pub fn forward_dsv4_token(
     hip: Option<&allpaca_hip::HipWorkspace>,
     prefill: bool,
 ) -> Result<(), AllpacaError> {
+    if dsv4_packed_gpu_live(model) {
+        return forward_dsv4_tokens(
+            model,
+            &[token],
+            pos,
+            page_ids,
+            kv,
+            logits,
+            metrics,
+            hip,
+            true,
+            prefill,
+        );
+    }
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad("missing DeepSeek-V4 weights".into()))
     })?;
@@ -2787,6 +3480,9 @@ pub fn forward_dsv4_token(
     let file = dsv4.gguf.as_deref();
     let mut gpu_guard = dsv4.gpu.lock().ok();
     let mut gpu = gpu_guard.as_mut().and_then(|g| g.as_mut());
+    if let Some(g) = gpu.as_mut() {
+        g.invalidate_hc_device();
+    }
     let skip_mla = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
@@ -2856,13 +3552,9 @@ pub fn forward_dsv4_tokens(
     metrics: &Metrics,
     hip: Option<&allpaca_hip::HipWorkspace>,
     write_logits: bool,
+    prefill: bool,
 ) -> Result<(), AllpacaError> {
-    if tokens.len() <= 1 {
-        if let Some(&tok) = tokens.first() {
-            return forward_dsv4_token(
-                model, tok, start_pos, page_ids, kv, logits, metrics, None, hip, true,
-            );
-        }
+    if tokens.is_empty() {
         return Ok(());
     }
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
@@ -2874,6 +3566,9 @@ pub fn forward_dsv4_tokens(
     let file = dsv4.gguf.as_deref();
     let mut gpu_guard = dsv4.gpu.lock().ok();
     let mut gpu = gpu_guard.as_mut().and_then(|g| g.as_mut());
+    if let Some(g) = gpu.as_mut() {
+        g.invalidate_hc_device();
+    }
     let skip_mla = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
@@ -2903,7 +3598,6 @@ pub fn forward_dsv4_tokens(
     }
     for layer_idx in 0..cfg.n_layers {
         tracing::debug!(layer_idx, n_layers = cfg.n_layers, "dsv4 chunk layer");
-        let blk = cfg.gguf_blk(layer_idx);
         let preps = dsv4_attn_and_route_rows(
             model,
             dsv4,
@@ -2918,19 +3612,8 @@ pub fn forward_dsv4_tokens(
             file,
             hip,
             skip_mla,
-            true,
+            prefill,
         )?;
-        let mut union = Vec::new();
-        for prep in &preps {
-            for (e, _) in &prep.picks {
-                if !union.contains(e) {
-                    union.push(*e);
-                }
-            }
-        }
-        if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
-            let _ = g.warmup_experts(f, blk, &union, cfg, Some(metrics));
-        }
         dsv4_apply_moe_rows(
             model,
             dsv4,
@@ -2945,6 +3628,9 @@ pub fn forward_dsv4_tokens(
     }
     if write_logits {
         if states.n_tok > 0 {
+            if let Some(g) = gpu.as_mut() {
+                let _ = g.download_hc_packed(&mut states.data);
+            }
             let last = states.last_streams();
             let used = dsv4_lm_head(
                 model,
@@ -3729,6 +4415,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_shexp_runs_when_cpu_shexp_loader_is_skipped() {
+        let skip_cpu_shexp = true;
+        assert!(
+            skip_cpu_shexp && should_run_device_shexp(true, true),
+            "resident BF16 shexp still accumulates from device moe_x"
+        );
+        assert!(!should_run_device_shexp(false, true));
+        assert!(!should_run_device_shexp(true, false));
+    }
+
+    #[test]
     fn sinkhorn_rows_and_cols_normalized() {
         let hc = 2;
         let mut comb = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -3878,6 +4575,64 @@ mod tests {
     }
 
     #[test]
+    fn hc_post_batch_matches_rows() {
+        for hc in [2usize, 4] {
+            let spec = Dsv4Spec {
+                q_lora_rank: 8,
+                o_lora_rank: 8,
+                o_group_count: 2,
+                hc_mult: hc,
+                hc_sinkhorn_iters: 4,
+                hc_eps: 1e-6,
+                hash_layer_count: 0,
+                rope_offset: 0,
+            };
+            let dim = 8;
+            let n_tok = 3;
+            let xs: Vec<f32> = (0..n_tok * dim).map(|i| 0.01 * i as f32).collect();
+            let posts: Vec<Vec<f32>> = (0..n_tok)
+                .map(|t| (0..hc).map(|i| 0.2 + 0.1 * (t + i) as f32).collect())
+                .collect();
+            let combs: Vec<Vec<f32>> = (0..n_tok)
+                .map(|t| (0..hc * hc).map(|i| 0.05 * ((t + i) % 5) as f32).collect())
+                .collect();
+            let nested: Vec<Vec<Vec<f32>>> = (0..n_tok)
+                .map(|t| {
+                    (0..hc)
+                        .map(|s| (0..dim).map(|i| 0.1 * (t + s + i) as f32).collect())
+                        .collect()
+                })
+                .collect();
+            let mut rows = nested.clone();
+            hc_post_rows(&xs, &mut rows, &posts, &combs, &spec, dim);
+            let mut batch = HcBatch::new(n_tok, hc, dim);
+            batch.data = pack_hc_states(&nested, hc, dim);
+            let _ = hc_post_batch(
+                &xs,
+                &mut batch,
+                &spec,
+                dim,
+                None,
+                |t| (posts[t].as_slice(), combs[t].as_slice()),
+                None,
+            );
+            let got = unpack_hc_states(&batch.data, n_tok, hc, dim);
+            for t in 0..n_tok {
+                for s in 0..hc {
+                    for i in 0..dim {
+                        let a = got[t][s][i];
+                        let b = rows[t][s][i];
+                        assert!(
+                            (a - b).abs() < 1e-5,
+                            "hc={hc} token {t} stream {s} dim {i} batch={a} rows={b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sqrt_softplus_positive() {
         assert!(sqrt_softplus(0.0) >= 0.0);
         assert!(sqrt_softplus(4.0) > sqrt_softplus(0.0));
@@ -3905,6 +4660,61 @@ mod tests {
         model.bind_gguf(file);
         assert!(model.dsv4.is_some());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attention_sinks_batched_causal_matches_growing_kv() {
+        let n_q = 3usize;
+        let prefix = 2usize;
+        let n_kv = prefix + n_q;
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let qn = n_q * n_heads * head_dim;
+        let kn = n_kv * n_kv_heads * head_dim;
+        let q: Vec<f32> = (0..qn).map(|i| 0.02 * i as f32 - 0.3).collect();
+        let k: Vec<f32> = (0..kn).map(|i| 0.01 * i as f32 - 0.2).collect();
+        let v: Vec<f32> = (0..kn).map(|i| 0.015 * i as f32 - 0.1).collect();
+        let sinks: Vec<f32> = (0..n_heads).map(|h| 0.1 * h as f32 - 0.4).collect();
+        let mut batched = vec![0.0f32; qn];
+        super::attention_sinks(
+            &q,
+            &k,
+            &v,
+            &sinks,
+            &mut batched,
+            n_q,
+            n_kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )
+        .expect("batched sinks");
+        let mut seq = vec![0.0f32; qn];
+        let kv_stride = n_kv_heads * head_dim;
+        let q_stride = n_heads * head_dim;
+        for qi in 0..n_q {
+            let t_end = prefix + qi + 1;
+            let q_off = qi * q_stride;
+            super::attention_sinks(
+                &q[q_off..q_off + q_stride],
+                &k[..t_end * kv_stride],
+                &v[..t_end * kv_stride],
+                &sinks,
+                &mut seq[q_off..q_off + q_stride],
+                1,
+                t_end,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            )
+            .expect("sequential sinks");
+        }
+        for i in 0..qn {
+            let a = batched[i];
+            let b = seq[i];
+            assert!((a - b).abs() < 1e-5, "idx {i} batched={a} sequential={b}");
+        }
     }
 
     #[test]
@@ -3971,6 +4781,7 @@ mod tests {
             &mut logits_chunk,
             &metrics,
             None,
+            true,
             true,
         )
         .expect("chunk tokens");

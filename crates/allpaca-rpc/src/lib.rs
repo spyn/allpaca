@@ -61,6 +61,27 @@ mod tests {
         let enc = encode_launch_list(&list);
         let dec = decode_launch_list(&enc).unwrap();
         assert_eq!(list, dec);
+
+        let reply = HelloReply {
+            major: PROTO_MAJOR,
+            minor: PROTO_MINOR,
+            patch: PROTO_PATCH,
+            kernel_abi_rev: KERNEL_ABI_REV,
+            backend: RpcBackendKind::Hip,
+            dtype_mask: 1,
+            device_name: "hip:0+hip:1".into(),
+            memory_bytes: 24,
+            devices: vec![8, 16],
+        };
+        let enc = encode_hello_reply(&reply);
+        let dec = crate::protocol::decode_hello_reply(&enc).unwrap();
+        assert_eq!(dec, reply);
+        assert_eq!(dec.device_memories(), vec![8, 16]);
+        let legacy = &enc[..enc.len() - 4 - 16];
+        let old = crate::protocol::decode_hello_reply(legacy).unwrap();
+        assert!(old.devices.is_empty());
+        assert_eq!(old.memory_bytes, 24);
+        assert_eq!(old.device_memories(), vec![24]);
     }
 
     #[test]
@@ -200,6 +221,7 @@ mod tests {
             dtype_mask: 1,
             device_name: "cuda:0".into(),
             memory_bytes: 12 << 30,
+            devices: Vec::new(),
         };
         let hip_hello = HelloReply {
             backend: RpcBackendKind::Hip,
@@ -371,9 +393,7 @@ mod tests {
         let g_host = [1.0f32, 2.0, -1.0, 0.5];
         let r_host = [0.5f32, 0.5, 0.5, 0.5];
         let u_host = [2.0f32, 1.0, 1.0, 3.0];
-        let to_bytes = |v: &[f32]| -> Vec<u8> {
-            v.iter().flat_map(|x| x.to_le_bytes()).collect()
-        };
+        let to_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         client.h2d(gate, 0, &to_bytes(&g_host)).unwrap();
         client.h2d(residual, 0, &to_bytes(&r_host)).unwrap();
         client.h2d(up, 0, &to_bytes(&u_host)).unwrap();
@@ -542,7 +562,10 @@ mod tests {
             })
             .unwrap();
         client.sync().unwrap();
-        assert_eq!(client.d2h(dst, 0, 8).unwrap(), vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            client.d2h(dst, 0, 8).unwrap(),
+            vec![1u8, 2, 3, 4, 5, 6, 7, 8]
+        );
 
         let dim = 4i32;
         let table_host = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];

@@ -41,6 +41,43 @@ impl LayerPlan {
     }
 }
 
+/// Expand a per-endpoint `--tensor-split` across each worker's GPUs.
+///
+/// `split[0]` is the local device. Each later entry is one RPC endpoint.
+/// When `split` already has one weight per device (local + every remote GPU), it is returned as-is.
+pub fn expand_rpc_split(
+    split: &[f64],
+    remote_groups: &[Vec<u64>],
+) -> Result<Vec<f64>, AllpacaError> {
+    let n_remote: usize = remote_groups.iter().map(|g| g.len().max(1)).sum();
+    let n_dev = 1 + n_remote;
+    if split.len() == n_dev {
+        return Ok(split.to_vec());
+    }
+    if split.len() != 1 + remote_groups.len() {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+            "tensor_split has {} entries but {} split devices ({} RPC endpoints)",
+            split.len(),
+            n_dev,
+            remote_groups.len()
+        ))));
+    }
+    let mut out = Vec::with_capacity(n_dev);
+    out.push(split[0]);
+    for (group, weight) in remote_groups.iter().zip(split.iter().skip(1)) {
+        let mems: Vec<u64> = if group.is_empty() {
+            vec![1]
+        } else {
+            group.clone()
+        };
+        let sum = mems.iter().sum::<u64>().max(1) as f64;
+        for mem in mems {
+            out.push(*weight * (mem as f64) / sum);
+        }
+    }
+    Ok(out)
+}
+
 /// Assign contiguous layer ranges by relative weights (VRAM or `--tensor-split`).
 pub fn plan_layer_owners(
     n_layers: usize,
@@ -118,5 +155,17 @@ mod tests {
     #[test]
     fn split_len_mismatch_is_fatal() {
         assert!(plan_layer_owners(2, &[1, 1], Some(&[1.0])).is_err());
+    }
+
+    #[test]
+    fn endpoint_split_spreads_across_worker_gpus() {
+        let split = expand_rpc_split(&[1.0, 2.0], &[vec![8, 24]]).unwrap();
+        assert_eq!(split.len(), 3);
+        assert!((split[0] - 1.0).abs() < 1e-9);
+        assert!((split[1] - 0.5).abs() < 1e-9);
+        assert!((split[2] - 1.5).abs() < 1e-9);
+        let already = expand_rpc_split(&[1.0, 2.0, 3.0], &[vec![8, 24]]).unwrap();
+        assert_eq!(already, vec![1.0, 2.0, 3.0]);
+        assert!(expand_rpc_split(&[1.0], &[vec![8, 24]]).is_err());
     }
 }

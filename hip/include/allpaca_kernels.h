@@ -36,6 +36,8 @@ int allpaca_hip_enable_peer_access(int32_t src, int32_t dst);
 
 int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device);
 
+int allpaca_hip_memset(void *ptr, int value, size_t bytes, allpaca_stream_t stream);
+
 int allpaca_hip_free(void *ptr);
 
 /* Stream-ordered free (hipFreeAsync). Null stream falls back to hipFree. */
@@ -101,6 +103,7 @@ int allpaca_hip_stream_wait_event(allpaca_stream_t stream, void *event);
 int allpaca_hip_event_create(void **event);
 int allpaca_hip_event_destroy(void *event);
 int allpaca_hip_event_record(void *event, allpaca_stream_t stream);
+int allpaca_hip_event_synchronize(void *event);
 int allpaca_hip_event_elapsed_us(void *start, void *stop, double *us);
 
 int allpaca_gemm(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
@@ -192,6 +195,10 @@ int allpaca_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c, int32_t m,
 int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                   int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = silu(A * dequant(Bg)^T) * (A * dequant(Bu)^T). Same MXFP4 layout. */
+int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_t *bu, float *c,
+                                 int32_t m, int32_t n, int32_t k, allpaca_stream_t stream);
+
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);
@@ -260,6 +267,20 @@ int allpaca_embed_gather_f16_rows(const uint16_t *table, const int32_t *tokens, 
 
 int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
 
+/* acc[idx[i], :] += src[i, :] * w[i]. Concurrent rows (and dual streams) use
+ * atomicAdd so two experts can land on the same token. */
+int allpaca_scatter_add_scale_rows(const float *src, const int32_t *idx, const float *w,
+                                   float *acc, int32_t m, int32_t dim, int32_t n_tok,
+                                   allpaca_stream_t stream);
+
+/* Packed HC residual layout `[n_tok][hc][dim]`. `pre`/`post` are `[n_tok][hc]`;
+ * `comb` is `[n_tok][src][dst]` with `comb[t, src, dst] = comb[t*hc*hc + dst + src*hc]`.
+ * `hc` is 1..=8. */
+int allpaca_hc_mix_pre(const float *packed, const float *pre, float *curs, int32_t n_tok,
+                       int32_t hc, int32_t dim, allpaca_stream_t stream);
+int allpaca_hc_post(const float *x, const float *residual, const float *post, const float *comb,
+                    float *out, int32_t n_tok, int32_t hc, int32_t dim, allpaca_stream_t stream);
+
 int allpaca_scale_f32(float *x, int32_t n, float scale, allpaca_stream_t stream);
 
 /* x += residual, then RMSNorm(x) -> out. One launch for the decode epilogue. */
@@ -304,6 +325,12 @@ int allpaca_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads, in
 /* Prefill: Q/K are [n_tok, heads*head_dim]; position is start_pos + token. One launch. */
 int allpaca_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads, int32_t n_k_heads,
                          int32_t head_dim, int32_t start_pos, float theta, allpaca_stream_t stream);
+
+/* DeepSeek-V4 partial RoPE on x[n_tok, n_heads, head_dim]: rotate [offset, offset+n_rot).
+ * n_rot==0 means full-head RoPE. back!=0 is ggml rope_ext_back (negated sine). */
+int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                             int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
+                             int32_t back, allpaca_stream_t stream);
 
 /* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e). */
 int allpaca_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
