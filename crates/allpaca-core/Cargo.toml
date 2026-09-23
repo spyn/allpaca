@@ -9,6 +9,7 @@ description = "Engine, scheduler, memory tiers, and draft providers"
 default = []
 hip = ["allpaca-hip/hip"]
 cuda = ["allpaca-cuda/cuda"]
+vulkan = ["allpaca-vulkan/vulkan"]
 
 [dependencies]
 ahash.workspace = true
@@ -18,6 +19,7 @@ allpaca-safetensors.workspace = true
 allpaca-onnx.workspace = true
 allpaca-hip.workspace = true
 allpaca-cuda.workspace = true
+allpaca-vulkan.workspace = true
 allpaca-rpc.workspace = true
 allpaca-types.workspace = true
 async-stream.workspace = true
@@ -36,4 +38,5 @@ reqwest.workspace = true
 [dev-dependencies]
 allpaca-gguf.workspace = true
 allpaca-types.workspace = true
+allpaca-vulkan.workspace = true
 reqwest.workspace = true

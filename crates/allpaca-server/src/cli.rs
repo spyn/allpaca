@@ -62,6 +62,9 @@ pub struct Cli {
     /// Edge0: disable prerouter (reactive expert fill).
     #[arg(long)]
     pub no_prerouter: bool,
+    /// Open the MoE keep-set TUI (does not start the HTTP server).
+    #[arg(long)]
+    pub tune: bool,
 }
 
 impl Cli {

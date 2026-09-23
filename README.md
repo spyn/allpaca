@@ -171,6 +171,9 @@ cargo test -p allpaca-cuda --features cuda
 ```
 
 Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexist.
+TinyModel F32 decode (KV pages + device attention, tiny F32/Q4_K/F16 GGUF)
+runs on CUDA when a device is present. 7B packed-quant still HIP.
+
 Kepler/K80 (`sm_37`) needs CUDA ≤11.4 and is not part of this fat binary.
 
 Dense TinyModel CUDA decode, KV pages, RPC `KernelOp` workers, P2P probe, memset,
@@ -223,6 +226,30 @@ SKUs stay bit-close to CPU F32. Do not drop Ampere from the fat binary.
 
 Server: `cargo run -p allpaca-rpc-server --features cuda -- --device cuda:0`.
 Engine: `gpu_backend = "cuda"` (see `cuda_runtime` synthetic config).
+
+### Vulkan (optional rust-gpu scaffold)
+
+Needs a Vulkan 1.3 loader/device. `--features vulkan` compiles first-party
+compute shaders with [rust-gpu](https://rust-gpu.github.io/) (nested nightly via
+`cargo-gpu-install`) and dispatches them with `ash`. Without a successful SPIR-V
+build or GPU, `device_count()` is 0 and the crate still compiles (stub).
+
+GGUF F16 and Q8_0 GEMM weights stay packed on device (rust-gpu unpack + F32 MAC).
+When `glslangValidator` is on `PATH` / `GLSLANG_VALIDATOR` / `VULKAN_SDK` (or
+`C:\VulkanSDK\*\Bin` on Windows) and the GPU has `shaderFloat16`, F16 GEMV uses
+a GLSL native-`float16_t` pipe instead. Q4_K is still host-dequant then F32.
+
+```bash
+cargo test -p allpaca-vulkan --features vulkan
+cargo test -p allpaca-core --features vulkan --test vulkan_runtime
+```
+
+Set `ALLPACA_SKIP_VULKAN_SHADERS=1` to skip the rust-gpu nested build (stub
+only). Auto backend order is HIP, then CUDA, then Vulkan, then CPU. Explicit
+`gpu_backend = "vulkan"` / `vulkan:N` selects Vulkan. This is a TinyModel
+scaffold (KV pages + device attention, tiny F32 / packed F16/Q8_0 / host-dequant
+Q4_K GGUF), not HIP Q4_K / SSM / GDN / MLA parity
+([ADR 0005](docs/adr/0005-vulkan-rust-gpu.md)).
 
 ---
 
@@ -370,6 +397,8 @@ Or edit `docker-compose.yml` `command` / `volumes` accordingly.
 | `allpaca-safetensors` / `allpaca-onnx` | HuggingFace SafeTensors (BF16/F16/F32, shards, Llama-family names) / ONNX importers |
 | `allpaca-hip` | HIP FFI (`--features hip`) |
 | `allpaca-cuda` | CUDA FFI (`--features cuda`; toolkit builds without a GPU) |
+| `allpaca-vulkan` | Vulkan/`ash` host (`--features vulkan`; rust-gpu SPIR-V + optional glslang f16) |
+| `allpaca-shaders` | rust-gpu compute crate (not a workspace member; built from `allpaca-vulkan`) |
 | `allpaca-cpu` | CPU kernels + dequant |
 | `allpaca-server` | OpenAI-compatible HTTP |
 | `tools/bench` | Lightweight bench binary |

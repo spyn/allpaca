@@ -1,0 +1,23 @@
+[package]
+name = "allpaca-shaders"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "rust-gpu compute kernels for the allpaca Vulkan scaffold"
+publish = false
+
+# Standalone so cargo-gpu-install can `cargo metadata` without the parent workspace.
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[dependencies]
+spirv-std = { version = "0.10.0-alpha.1" }
+# spirv-std enables glam with `default-features = false` on SPIR-V. glam 0.33
+# then omits UVec*/IVec* unless `all-types` is unified in from this crate.
+glam = { version = "0.33", default-features = false, features = ["libm", "all-types"] }
+
+[package.metadata.rust-gpu.build]
+target = "spirv-unknown-vulkan1.3"
+release = true

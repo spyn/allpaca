@@ -9,6 +9,7 @@ description = "OpenAI-compatible HTTP server wrapper around the Engine"
 default = []
 hip = ["allpaca-core/hip"]
 cuda = ["allpaca-core/cuda"]
+vulkan = ["allpaca-core/vulkan"]
 
 [dependencies]
 allpaca-core.workspace = true
@@ -28,6 +29,8 @@ tracing-subscriber.workspace = true
 rand.workspace = true
 rust-embed.workspace = true
 sysinfo.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
