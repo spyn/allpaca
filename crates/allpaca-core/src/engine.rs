@@ -984,11 +984,25 @@ impl Engine {
     }
 
     pub fn load_synthetic(&self, cfg: ModelConfig) -> Result<(), AllpacaError> {
+        let seed = self.config.engine.determinism_seed.unwrap_or(42);
+        let vocab = cfg.vocab_size;
+        let layers = cfg.n_layers;
+        let target = TinyModel::synthetic(cfg, seed, "synthetic");
+        self.load_tiny_model(target, "synthetic")?;
+        tracing::info!(vocab, layers, "loaded synthetic model");
+        Ok(())
+    }
+
+    /// Load a host-ready TinyModel (tests / synthetic variants).
+    pub fn load_tiny_model(
+        &self,
+        mut target: TinyModel,
+        model_id: &str,
+    ) -> Result<(), AllpacaError> {
         let mut inner = self.lock()?;
         let seed = self.config.engine.determinism_seed.unwrap_or(42);
-        let tokenizer = EngineTokenizer::synthetic(cfg.vocab_size)?;
-        inner.ring.resize_vocab(cfg.vocab_size);
-        let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
+        let tokenizer = EngineTokenizer::synthetic(target.config.vocab_size)?;
+        inner.ring.resize_vocab(target.config.vocab_size);
         self.apply_weight_working_set(&mut target)?;
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target)?;
@@ -1004,15 +1018,10 @@ impl Engine {
             inner.draft_model = Some(Arc::new(draft));
         }
         set_tokenizer(&mut inner, tokenizer);
-        inner.model_id = "synthetic".into();
+        inner.model_id = model_id.into();
         drop(inner);
         self.upload_resident_weights()?;
         self.note_early_exit_gate()?;
-        tracing::info!(
-            vocab = cfg.vocab_size,
-            layers = cfg.n_layers,
-            "loaded synthetic model"
-        );
         Ok(())
     }
 
@@ -1303,11 +1312,8 @@ impl Engine {
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model)?;
-        let tokenizer = EngineTokenizer::from_vocab(
-            loaded.vocab_tokens,
-            loaded.bos_id,
-            loaded.eos_id,
-        )?;
+        let tokenizer =
+            EngineTokenizer::from_vocab(loaded.vocab_tokens, loaded.bos_id, loaded.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, tokenizer);
@@ -1382,9 +1388,14 @@ impl Engine {
         let tok = extract_tokenizer(&file)?;
         let mut model = TinyModel::from_gguf(&file)?;
         model.bind_gguf(file.clone());
-        if !model.host_weights_ready() && self.hip.is_none() && model.dsv4.is_none() {
+        #[cfg(feature = "cuda")]
+        let has_cuda = self.cuda.is_some();
+        #[cfg(not(feature = "cuda"))]
+        let has_cuda = false;
+        if !model.host_weights_ready() && self.hip.is_none() && !has_cuda && model.dsv4.is_none() {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "large GGUF requires HIP (host F32 materialize is skipped to avoid OOM)".into(),
+                "large GGUF requires HIP or CUDA (host F32 materialize is skipped to avoid OOM)"
+                    .into(),
             )));
         }
         let skip_hip = model.dsv4.is_some();
@@ -1656,31 +1667,41 @@ impl Engine {
             let target = inner.target.clone();
             inner.target_cuda_resident = if self.hip.is_none() {
                 if let (Some(cuda), Some(target)) = (&self.cuda, target) {
-                    if target.host_weights_ready() {
-                        match crate::CudaResidentModel::upload(&target, cuda.device) {
-                            Ok(resident) => {
-                                weight_bytes += resident.bytes();
-                                h2d += resident.packed_h2d_bytes();
-                                tracing::info!(
-                                    device = cuda.device,
-                                    bytes = resident.bytes(),
-                                    "CUDA target weight upload"
-                                );
-                                Some(Arc::new(resident))
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "CUDA target weight upload failed; CPU forward"
-                                );
-                                self.metrics
-                                    .degraded_events
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                None
-                            }
-                        }
+                    let host_ready = target.host_weights_ready();
+                    let gdn_device = target.gdn_needs_device_projections();
+                    let uploaded = if host_ready && !gdn_device {
+                        crate::CudaResidentModel::upload(&target, cuda.device)
+                    } else if let Some(file) = target_gguf {
+                        crate::CudaResidentModel::upload_gguf(file, &target.config, cuda.device)
                     } else {
-                        None
+                        Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                            "large GGUF missing file handle for CUDA upload".into(),
+                        )))
+                    };
+                    match uploaded {
+                        Ok(resident) => {
+                            weight_bytes += resident.bytes();
+                            h2d += resident.packed_h2d_bytes();
+                            tracing::info!(
+                                device = cuda.device,
+                                bytes = resident.bytes(),
+                                "CUDA target weight upload"
+                            );
+                            Some(Arc::new(resident))
+                        }
+                        Err(e) => {
+                            if !host_ready || gdn_device {
+                                return Err(e);
+                            }
+                            tracing::warn!(
+                                error = %e,
+                                "CUDA target weight upload failed; CPU forward"
+                            );
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            None
+                        }
                     }
                 } else {
                     None
@@ -3148,14 +3169,25 @@ impl Engine {
             )
         };
         let vision_in_chunk = (start..end).any(|p| p < vision_prefix_len);
-        let batch_prefill = !vision_in_chunk
+        let batch_prefill_hip = !vision_in_chunk
             && toks.len() > 1
             && ((self.hip.is_some()
                 && resident.is_some()
                 && !mtp_draft_active(inner)
                 && target.supports_device_batched_prefill())
                 || target.dsv4.is_some());
-        if batch_prefill {
+        #[cfg(feature = "cuda")]
+        let batch_prefill_cuda = !vision_in_chunk
+            && toks.len() > 1
+            && self.hip.is_none()
+            && self.cuda.is_some()
+            && cuda_resident.is_some()
+            && !mtp_draft_active(inner)
+            && target.supports_device_batched_prefill();
+        #[cfg(not(feature = "cuda"))]
+        let batch_prefill_cuda = false;
+        let mut did_batch = false;
+        if batch_prefill_hip {
             target.forward_tokens(
                 &toks,
                 start,
@@ -3173,7 +3205,39 @@ impl Engine {
             )?;
             // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
             // page (growing with seq) and break logits-only decode accounting.
-        } else {
+            did_batch = true;
+        } else if batch_prefill_cuda {
+            #[cfg(feature = "cuda")]
+            {
+                if let (Some(cuda), Some(cres)) =
+                    (self.cuda.as_deref(), cuda_resident.as_deref())
+                {
+                    match target.forward_tokens_cuda(
+                        &toks,
+                        start,
+                        &pages,
+                        &mut inner.kv,
+                        &self.metrics,
+                        &mut logits,
+                        cuda,
+                        cres,
+                        write_logits,
+                        recurrent.as_mut(),
+                    ) {
+                        Ok(()) => did_batch = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                start,
+                                n = toks.len(),
+                                error = %e,
+                                "CUDA batched prefill failed; per-token fallback"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if !did_batch {
             let want_hidden = mtp_draft_active(inner);
             for (i, tok) in toks.iter().enumerate() {
                 let pos = start + i;
@@ -5402,6 +5466,53 @@ mod tests {
         assert!(
             stats.rpc_roundtrips > 0,
             "expected remote layer launches, got {}",
+            stats.rpc_roundtrips
+        );
+        drop(engine);
+        worker.join().unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn rpc_loopback_cuda_worker_synthetic_generate() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CudaWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Cuda(CudaWorker::new(0).expect("cuda worker"));
+            serve_connection(stream, backend).unwrap();
+        });
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.rpc.endpoints = vec![addr.to_string()];
+        cfg.rpc.max_seq = 64;
+        cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.rpc_roundtrips > 0,
+            "expected CUDA RPC layer launches, got {}",
             stats.rpc_roundtrips
         );
         drop(engine);

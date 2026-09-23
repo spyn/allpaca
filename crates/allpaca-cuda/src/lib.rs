@@ -337,6 +337,19 @@ mod ffi {
             theta: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_cuda_rope_qk_rows(
+            q: *mut f32,
+            k: *mut f32,
+            n_tok: i32,
+            n_q_heads: i32,
+            n_k_heads: i32,
+            head_dim: i32,
+            q_stride: i32,
+            k_stride: i32,
+            start_pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_rope_imrope_qk(
             q: *mut f32,
             k: *mut f32,
@@ -1385,6 +1398,26 @@ pub fn gemm_nt_q8_0(
 }
 /// Kernels enqueue on the workspace stream; call [`CudaWorkspace::synchronize`]
 /// (or a host roundtrip) to batch-wait — no per-op device sync.
+
+/// Multi-token activation region for CUDA chunked prefill (M=N GEMM / attention).
+#[derive(Clone, Copy)]
+pub struct CudaPrefillActs {
+    pub x: *mut f32,
+    pub norm: *mut f32,
+    pub q: *mut f32,
+    pub k: *mut f32,
+    pub v: *mut f32,
+    pub attn: *mut f32,
+    pub proj: *mut f32,
+    pub gate: *mut f32,
+    pub up: *mut f32,
+    pub bytes: usize,
+    pub n_tok: usize,
+    pub dim: usize,
+    pub kv_dim: usize,
+    pub ff_dim: usize,
+}
+
 pub struct CudaWorkspace {
     pub device: i32,
     scratch: *mut std::ffi::c_void,
@@ -1454,6 +1487,97 @@ impl CudaWorkspace {
     pub fn allocated_bytes(&self) -> u64 {
         self.scratch_bytes as u64
     }
+
+    /// Bytes for dense prefill acts: x/norm/q/attn/proj (`n_tok*dim`), k/v (`n_tok*kv_dim`),
+    /// gate/up (`n_tok*ff_dim`). Packed KV uses the remainder via `kv_scratch_pair_after`.
+    pub fn prefill_act_bytes(n_tok: usize, dim: usize, kv_dim: usize, ff_dim: usize) -> usize {
+        n_tok
+            .saturating_mul(
+                5usize
+                    .saturating_mul(dim)
+                    .saturating_add(2usize.saturating_mul(kv_dim))
+                    .saturating_add(2usize.saturating_mul(ff_dim)),
+            )
+            .saturating_mul(4)
+    }
+
+    /// Multi-token activation region for CUDA M=N prefill.
+    pub fn prefill_acts(
+        &self,
+        n_tok: usize,
+        dim: usize,
+        kv_dim: usize,
+        ff_dim: usize,
+    ) -> Result<CudaPrefillActs, AllpacaError> {
+        let bytes = Self::prefill_act_bytes(n_tok, dim, kv_dim, ff_dim);
+        if n_tok == 0 || dim == 0 || kv_dim == 0 || bytes == 0 {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                "CUDA prefill acts need n_tok>0, dim>0, kv_dim>0".into(),
+            )));
+        }
+        if bytes > self.scratch_bytes {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                format!(
+                    "CUDA prefill acts ({bytes} bytes for n_tok={n_tok}) exceed scratch {}",
+                    self.scratch_bytes
+                ),
+            )));
+        }
+        let base = self.scratch.cast::<f32>();
+        let row_x = n_tok * dim;
+        let row_kv = n_tok * kv_dim;
+        let row_ff = n_tok * ff_dim;
+        Ok(CudaPrefillActs {
+            x: base,
+            norm: unsafe { base.add(row_x) },
+            q: unsafe { base.add(2 * row_x) },
+            k: unsafe { base.add(3 * row_x) },
+            v: unsafe { base.add(3 * row_x + row_kv) },
+            attn: unsafe { base.add(3 * row_x + 2 * row_kv) },
+            proj: unsafe { base.add(4 * row_x + 2 * row_kv) },
+            gate: unsafe { base.add(5 * row_x + 2 * row_kv) },
+            up: unsafe { base.add(5 * row_x + 2 * row_kv + row_ff) },
+            bytes,
+            n_tok,
+            dim,
+            kv_dim,
+            ff_dim,
+        })
+    }
+
+    /// Scratch K/V pair after a byte prefix (prefill acts live in `[0, prefix)`).
+    pub fn kv_scratch_pair_after(
+        &self,
+        prefix_bytes: usize,
+        n_kv: usize,
+        kv_width: usize,
+    ) -> Result<(*mut f32, *mut f32), AllpacaError> {
+        let k_n = n_kv.saturating_mul(kv_width);
+        let need = k_n.saturating_mul(8);
+        if k_n == 0 {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                "CUDA KV scratch needs n_kv>0".into(),
+            )));
+        }
+        if prefix_bytes % 4 != 0 {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                "CUDA KV scratch prefix must be 4-byte aligned".into(),
+            )));
+        }
+        let total = prefix_bytes.saturating_add(need);
+        if total > self.scratch_bytes {
+            return Err(AllpacaError::Fatal(allpaca_types::FatalError::OutOfMemory(
+                format!(
+                    "packed CUDA KV ({need} bytes after {prefix_bytes}) exceeds scratch {}",
+                    self.scratch_bytes
+                ),
+            )));
+        }
+        let k = unsafe { self.scratch.add(prefix_bytes).cast::<f32>() };
+        let v = unsafe { self.scratch.add(prefix_bytes + k_n * 4).cast::<f32>() };
+        Ok((k, v))
+    }
+
 
     pub fn activation_h2d_bytes(&self) -> u64 {
         self.activation_h2d.load(Ordering::Relaxed)
@@ -2323,6 +2447,74 @@ impl CudaWorkspace {
             let _ = (table, token, out, dim);
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "CUDA embed_gather unavailable".into(),
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_qk_dev_rows(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        n_tok: i32,
+        n_q_heads: i32,
+        n_k_heads: i32,
+        head_dim: i32,
+        q_stride: i32,
+        k_stride: i32,
+        start_pos: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            if q.is_null()
+                || k.is_null()
+                || n_tok <= 0
+                || n_q_heads <= 0
+                || n_k_heads <= 0
+                || head_dim <= 0
+                || q_stride <= 0
+                || k_stride <= 0
+                || head_dim % 2 != 0
+            {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "invalid CUDA rope_qk_rows".into(),
+                )));
+            }
+            set_device(self.device)?;
+            let rc = unsafe {
+                ffi::allpaca_cuda_rope_qk_rows(
+                    q,
+                    k,
+                    n_tok,
+                    n_q_heads,
+                    n_k_heads,
+                    head_dim,
+                    q_stride,
+                    k_stride,
+                    start_pos,
+                    theta,
+                    self.stream,
+                )
+            };
+            status(rc, "rope_qk_rows")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (
+                q,
+                k,
+                n_tok,
+                n_q_heads,
+                n_k_heads,
+                head_dim,
+                q_stride,
+                k_stride,
+                start_pos,
+                theta,
+            );
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA rope_qk_rows unavailable".into(),
             )))
         }
     }

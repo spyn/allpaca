@@ -294,10 +294,20 @@ impl CpuWorker {
                 write_f32(self.slot_mut(need(bufs, 2)?)?, &out)?;
             }
             KernelOp::Memcpy => {
+                // i32s empty → full buffer copy; [dst_off, nbytes] → partial into dst.
                 let src = self.slot(need(bufs, 1)?)?.data.clone();
                 let dst = self.slot_mut(need(bufs, 0)?)?;
-                let n = src.len().min(dst.data.len());
-                dst.data[..n].copy_from_slice(&src[..n]);
+                if i32s.len() >= 2 {
+                    let dst_off = i32s[0] as usize;
+                    let nbytes = i32s[1] as usize;
+                    if dst_off.saturating_add(nbytes) > dst.data.len() || nbytes > src.len() {
+                        return Err(RpcError::Worker("memcpy offset/oob".into()));
+                    }
+                    dst.data[dst_off..dst_off + nbytes].copy_from_slice(&src[..nbytes]);
+                } else {
+                    let n = src.len().min(dst.data.len());
+                    dst.data[..n].copy_from_slice(&src[..n]);
+                }
             }
         }
         Ok(())
@@ -478,6 +488,27 @@ impl HipWorker {
         Ok(())
     }
 
+    /// Device-resident partial copy: `src[0..nbytes]` → `dst[dst_off..]`.
+    fn copy_at(
+        &mut self,
+        src: BufId,
+        dst: BufId,
+        dst_off: u64,
+        nbytes: u64,
+    ) -> Result<(), RpcError> {
+        let src_s = self.slot(src)?;
+        let dst_s = self.slot(dst)?;
+        let n = nbytes as usize;
+        let off = dst_off as usize;
+        if n > src_s.bytes || off.saturating_add(n) > dst_s.bytes {
+            return Err(RpcError::Worker("hip memcpy_at oob".into()));
+        }
+        let dst_ptr = unsafe { dst_s.ptr.add(off) };
+        allpaca_hip::memcpy(dst_ptr, src_s.ptr, n, allpaca_hip::MEMCPY_D2D)
+            .map_err(|e| RpcError::Worker(e.to_string()))?;
+        Ok(())
+    }
+
     fn clear(&mut self, id: BufId, value: u8) -> Result<(), RpcError> {
         let s = self.slot(id)?;
         allpaca_hip::device_memset(s.ptr, value, s.bytes)
@@ -584,7 +615,16 @@ impl HipWorker {
             }
             KernelOp::EmbedGather | KernelOp::Memcpy => {
                 if op == KernelOp::Memcpy {
-                    self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+                    if i32s.len() >= 2 {
+                        self.copy_at(
+                            need(bufs, 1)?,
+                            need(bufs, 0)?,
+                            i32s[0] as u64,
+                            i32s[1] as u64,
+                        )?;
+                    } else {
+                        self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+                    }
                     return Ok(());
                 }
                 let dim = *i32s
@@ -592,9 +632,7 @@ impl HipWorker {
                     .ok_or_else(|| RpcError::Worker("embed dim".into()))?;
                 let n_tok = *i32s.get(1).unwrap_or(&1);
                 if n_tok != 1 {
-                    return Err(RpcError::Worker(
-                        "hip embed_gather supports n_tok=1".into(),
-                    ));
+                    return Err(RpcError::Worker("hip embed_gather supports n_tok=1".into()));
                 }
                 let table = self.ptr_f32(need(bufs, 0)?)?;
                 let ids = self.slot(need(bufs, 1)?)?;
@@ -785,6 +823,33 @@ impl CudaWorker {
         Ok(())
     }
 
+    /// Device-resident partial copy: `src[0..nbytes]` → `dst[dst_off..]`.
+    fn copy_at(
+        &mut self,
+        src: BufId,
+        dst: BufId,
+        dst_off: u64,
+        nbytes: u64,
+    ) -> Result<(), RpcError> {
+        let src_s = self.slot(src)?;
+        let dst_s = self.slot(dst)?;
+        let n = nbytes as usize;
+        let off = dst_off as usize;
+        if n > src_s.bytes || off.saturating_add(n) > dst_s.bytes {
+            return Err(RpcError::Worker("cuda memcpy_at oob".into()));
+        }
+        let dst_ptr = unsafe { dst_s.ptr.cast::<u8>().add(off) }.cast();
+        allpaca_cuda::memcpy_on(
+            dst_ptr,
+            src_s.ptr,
+            n,
+            allpaca_cuda::MEMCPY_D2D,
+            self.cuda.raw_stream(),
+        )
+        .map_err(|e| RpcError::Worker(e.to_string()))?;
+        Ok(())
+    }
+
     fn sync(&self) -> Result<(), RpcError> {
         self.cuda
             .synchronize()
@@ -889,7 +954,16 @@ impl CudaWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::Memcpy => {
-                self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+                if i32s.len() >= 2 {
+                    self.copy_at(
+                        need(bufs, 1)?,
+                        need(bufs, 0)?,
+                        i32s[0] as u64,
+                        i32s[1] as u64,
+                    )?;
+                } else {
+                    self.copy(need(bufs, 1)?, need(bufs, 0)?)?;
+                }
             }
             KernelOp::EmbedGather => {
                 let dim = *i32s
@@ -1041,17 +1115,11 @@ impl WorkerBackend {
         match self {
             Self::Cpu(w) => (w.memory_bytes.saturating_sub(w.used), w.memory_bytes),
             #[cfg(feature = "hip")]
-            Self::Hip(w) => {
-                allpaca_hip::device_memory_info(w.device).unwrap_or_else(|_| {
-                    (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)
-                })
-            }
+            Self::Hip(w) => allpaca_hip::device_memory_info(w.device)
+                .unwrap_or_else(|_| (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)),
             #[cfg(feature = "cuda")]
-            Self::Cuda(w) => {
-                allpaca_cuda::device_memory_info(w.device).unwrap_or_else(|_| {
-                    (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)
-                })
-            }
+            Self::Cuda(w) => allpaca_cuda::device_memory_info(w.device)
+                .unwrap_or_else(|_| (w.memory_bytes.saturating_sub(w.used), w.memory_bytes)),
         }
     }
 }

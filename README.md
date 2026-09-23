@@ -155,16 +155,37 @@ Kernels live in `hip/` (CMake + hipcc). `allpaca-hip/build.rs` compiles them whe
 
 ### CUDA / NVIDIA GPU (optional scaffold)
 
-Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH`, PATH `nvcc`, and
+Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH` / `CUDA_HOME`, PATH `nvcc`,
+`~/.cache/allpaca/cuda-sdk/cuda-*` (from `scripts/fetch-cuda-toolkit.sh`),
+`/usr/local/cuda*`, and
 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*`. Without a toolkit,
 `--features cuda` still compiles (stub). Without an NVIDIA driver/GPU,
 `device_count()` is 0 — you can still compile and link on a toolkit-only machine.
 
-GPU ISAs (same idea as HIP offload): `ALLPACA_CUDA_ARCH` / `CUDAARCHS` /
-`TORCH_CUDA_ARCH_LIST`, else live `nvidia-smi` compute caps, else a fat binary
-for **sm_86** (RTX 3060 / Ampere), **sm_89** (Ada laptop), and **sm_120**
-(Blackwell GeForce laptop).
-Example: `ALLPACA_CUDA_ARCH=sm_86,sm_89,sm_120 cargo test -p allpaca-cuda --features cuda`.
+**GPU arches (dual toolchain):** `ALLPACA_CUDA_ARCH` / `CUDA_ARCHES` /
+`CUDAARCHS` / `TORCH_CUDA_ARCH_LIST`, else live `nvidia-smi` (product-name map
+covers **Tesla K80 → sm_37** when `compute_cap` is missing on driver 470), else
+a toolkit-aware fat default: **CUDA ≤11.4** includes `sm_37`; **CUDA 12+**
+defaults to **sm_86** / **sm_89** / **sm_120** and filters Kepler out.
+Attention uses all-lane `__shfl_xor` (pre-Volta) on `sm < 70`.
+
+Example (modern): `ALLPACA_CUDA_ARCH=sm_86,sm_89,sm_120 cargo test -p allpaca-cuda --features cuda`.
+
+#### Tesla K80 / driver 470 (Kepler)
+
+K80 is **sm_37**. Driver 470 advertises CUDA **11.4** max; CUDA **12** removed
+Kepler. Stage a matching toolkit without root:
+
+```bash
+./scripts/fetch-cuda-toolkit.sh   # ~50 MiB redistributables → ~/.cache/allpaca/cuda-sdk/cuda-11.4
+# Ubuntu 22.04: CUDA 11.4 prefers g++-10
+sudo apt install g++-10
+export CUDA_PATH="$HOME/.cache/allpaca/cuda-sdk/cuda-11.4"
+export PATH="$CUDA_PATH/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_PATH/lib64:${LD_LIBRARY_PATH:-}"
+export CXX=g++-10
+ALLPACA_CUDA_ARCH=sm_37 cargo test -p allpaca-cuda --features cuda
+```
 
 ```bash
 cargo test -p allpaca-cuda --features cuda
@@ -174,7 +195,9 @@ Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexis
 TinyModel F32 decode (KV pages + device attention, tiny F32/Q4_K/F16 GGUF)
 runs on CUDA when a device is present. 7B packed-quant still HIP.
 
-Kepler/K80 (`sm_37`) needs CUDA ≤11.4 and is not part of this fat binary.
+Kepler/K80 (`sm_37`) needs CUDA ≤11.4 (`scripts/fetch-cuda-toolkit.sh`); it is in the fat default only on CUDA ≤11.x toolkits.
+
+Dual K80 (two compute devices in one board) shows up as two ordinals; prefer `cpu_only` coordinator + `cuda:0` worker (or CUDA coordinator + CPU worker) to avoid two concurrent CUDA contexts.
 
 Dense TinyModel CUDA decode, KV pages, RPC `KernelOp` workers, P2P probe, memset,
 and theoretical `bandwidth_gbps` are in-tree. **TMA / tensor-core GEMM is not:**

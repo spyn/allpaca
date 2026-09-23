@@ -14,6 +14,10 @@ static int cuda_status(cudaError_t err) {
     if (err == cudaSuccess) {
         return ALLPACA_OK;
     }
+    /* API return already encodes the failure; clear the sticky mirror so a
+     * later cudaGetLastError() after an unrelated launch is not poisoned
+     * (e.g. cudaHostRegister / cudaFreeAsync unsupported on Kepler). */
+    (void)cudaGetLastError();
     return ALLPACA_ERR_DEVICE;
 }
 
@@ -107,7 +111,12 @@ extern "C" int allpaca_cuda_free_async(void *ptr, allpaca_cuda_stream_t stream) 
     }
     cudaStream_t s = as_stream(stream);
     if (s) {
-        return cuda_status(cudaFreeAsync(ptr, s));
+        cudaError_t err = cudaFreeAsync(ptr, s);
+        if (err == cudaSuccess) {
+            return ALLPACA_OK;
+        }
+        /* Kepler / older drivers: stream-ordered alloc unsupported. */
+        (void)cudaGetLastError();
     }
     return cuda_status(cudaFree(ptr));
 }
@@ -505,7 +514,11 @@ __global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float 
 
 #pragma unroll
     for (int off = 2; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+        acc += __shfl_down(acc, off, 4);
+#else
+        acc += __shfl_down_sync(0xffffffffu, acc, off, 4);
+#endif
     }
     if (col < n && sublane == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
@@ -1125,6 +1138,50 @@ extern "C" int allpaca_cuda_rope(float *x, int32_t n_heads, int32_t head_dim, in
     return cuda_status(cudaGetLastError());
 }
 
+__global__ void rope_qk_kernel(float *q, float *k, int n_q_heads, int n_k_heads, int head_dim,
+                               int q_stride, int k_stride, int start_pos, float theta) {
+    const int tok = static_cast<int>(blockIdx.y);
+    const int pos = start_pos + tok;
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = head_dim / 2;
+    const int q_pairs = n_q_heads * half;
+    const int total = q_pairs + n_k_heads * half;
+    if (idx >= total || head_dim % 2 != 0) {
+        return;
+    }
+    q += static_cast<size_t>(tok) * static_cast<size_t>(q_stride);
+    k += static_cast<size_t>(tok) * static_cast<size_t>(k_stride);
+    if (idx < q_pairs) {
+        rope_pair(q + (idx / half) * head_dim, idx % half, half, pos, theta);
+    } else {
+        const int j = idx - q_pairs;
+        rope_pair(k + (j / half) * head_dim, j % half, half, pos, theta);
+    }
+}
+
+extern "C" int allpaca_cuda_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads,
+                                         int32_t n_k_heads, int32_t head_dim, int32_t q_stride,
+                                         int32_t k_stride, int32_t start_pos, float theta,
+                                         allpaca_cuda_stream_t stream) {
+    if (!q || !k || n_tok <= 0 || n_q_heads <= 0 || n_k_heads <= 0 || head_dim <= 0 ||
+        q_stride <= 0 || k_stride <= 0 || (head_dim % 2) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const int total = (n_q_heads + n_k_heads) * (head_dim / 2);
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    rope_qk_kernel<<<dim3(blocks, n_tok), threads, 0, as_stream(stream)>>>(
+        q, k, n_q_heads, n_k_heads, head_dim, q_stride, k_stride, start_pos, theta);
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_rope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
+                                    int32_t head_dim, int32_t q_stride, int32_t k_stride, int32_t pos,
+                                    float theta, allpaca_cuda_stream_t stream) {
+    return allpaca_cuda_rope_qk_rows(q, k, 1, n_q_heads, n_k_heads, head_dim, q_stride, k_stride,
+                                     pos, theta, stream);
+}
+
 /* NeoX pair on first n_rot dims; optional IMRoPE sector angles (CPU rope_imrope_neox). */
 __device__ void rope_imrope_pair(float *hvec, int i, int half, int n_rot, int pos, float theta,
                                 int s0, int s1, int s2, int s3) {
@@ -1207,10 +1264,16 @@ extern "C" int allpaca_cuda_rope_imrope_qk(float *q, float *k, int32_t n_q_heads
 __device__ float warp_sum32(float v) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
+        /* XOR butterfly leaves the full sum on every lane (needed: all 32
+         * threads share one attention score). Down-shuffle only fills lane 0.
+         * Kepler/Maxwell/Pascal lack *_sync; Tesla K80 is sm_37. */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+        v += __shfl_xor(v, offset);
+#else
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+#endif
     }
-    /* shfl_down leaves the full sum on lane 0; broadcast so every lane uses it. */
-    return __shfl_sync(0xffffffffu, v, 0);
+    return v;
 }
 
 /* Warp-per-head online softmax. Supports head_dim <= 512 (16 dims/lane × 32).

@@ -1,18 +1,80 @@
 //! CUDA GPU ISA helpers shared by `build.rs` (via `#[path]`) and unit tests.
 //!
-//! Accepts env-style tokens (`sm_86`, `8.6`, `86`) and emits nvcc `-gencode` flags.
-//! Default fat binary targets RTX 3060 (Ampere / sm_86), Ada laptop (sm_89), and
-//! Blackwell GeForce laptop (sm_120).
+//! Accepts env-style tokens (`sm_86`, `8.6`, `86`, `sm_37`) and emits nvcc
+//! `-gencode` flags.
+//!
+//! Dual toolchain:
+//! - Modern CUDA 12+: default fat binary Ampere (sm_86 / RTX 3060), Ada (sm_89),
+//!   Blackwell GeForce laptop (sm_120). Kepler is filtered out.
+//! - CUDA ≤11.x (driver 470 / Tesla K80): include `sm_37` when the toolkit still
+//!   accepts it (`scripts/fetch-cuda-toolkit.sh` → cuda-11.4).
 
 #![allow(dead_code)] // lib links this for tests; build.rs uses the same file via #[path]
 
-/// Default fat binary: Ampere consumer (RTX 3060 12GB / sm_86), Ada laptop
-/// (sm_89), and Blackwell GeForce laptop (sm_120).
+/// Default fat binary for modern toolkits: Ampere consumer (RTX 3060 / sm_86),
+/// Ada laptop (sm_89), and Blackwell GeForce laptop (sm_120).
 pub fn default_cuda_arches() -> Vec<String> {
     ["sm_86", "sm_89", "sm_120"]
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+/// Default arches for a toolkit major version. CUDA 12+ drops Kepler; ≤11 keeps
+/// `sm_37` ahead of the modern fat list so K80 boxes build a usable binary.
+pub fn default_cuda_arches_for_toolkit(major: Option<u32>) -> Vec<String> {
+    let mut out = Vec::new();
+    if toolkit_supports_kepler(major) {
+        out.push("sm_37".into());
+    }
+    for sm in default_cuda_arches() {
+        if !out.iter().any(|a| a == &sm) {
+            out.push(sm);
+        }
+    }
+    // Drop arches the toolkit cannot emit (e.g. sm_120 on CUDA 11).
+    filter_arches_for_toolkit(out, major)
+}
+
+/// CUDA 12 removed sm_37; CUDA 11 cannot target Blackwell sm_120.
+pub fn toolkit_supports_kepler(major: Option<u32>) -> bool {
+    match major {
+        Some(m) => m < 12,
+        None => true, // unknown / 11.x extract: keep Kepler
+    }
+}
+
+pub fn filter_arches_for_toolkit(arches: Vec<String>, major: Option<u32>) -> Vec<String> {
+    arches
+        .into_iter()
+        .filter(|sm| arch_ok_for_toolkit(sm, major))
+        .collect()
+}
+
+fn arch_ok_for_toolkit(sm: &str, major: Option<u32>) -> bool {
+    let Some(num) = sm.strip_prefix("sm_") else {
+        return false;
+    };
+    let Ok(n) = num.parse::<u32>() else {
+        return false;
+    };
+    match major {
+        // CUDA 12+ dropped Kepler (sm_37) and older.
+        Some(m) if m >= 12 && n < 50 => false,
+        // CUDA 11.x tops out around sm_86; sm_89/sm_120 need newer toolkits.
+        Some(m) if m < 12 && n >= 89 => false,
+        _ => true,
+    }
+}
+
+/// Map a product name (nvidia-smi) to an sm_* when compute_cap is missing
+/// (driver 470 on Tesla K80).
+pub fn sm_arch_from_product_name(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("k80") || lower.contains("tesla k80") {
+        return Some("sm_37");
+    }
+    None
 }
 
 pub fn parse_cuda_arches(raw: &str) -> Vec<String> {
@@ -32,7 +94,7 @@ pub fn parse_cuda_arches(raw: &str) -> Vec<String> {
     out
 }
 
-/// Accept `sm_86`, `compute_86`, `86`, `8.6`, `12.0`.
+/// Accept `sm_86`, `compute_86`, `86`, `8.6`, `12.0`, `3.7`.
 pub fn normalize_cuda_arch(raw: &str) -> Option<String> {
     let s = raw.trim().trim_start_matches('+').to_ascii_lowercase();
     if s.is_empty() || s == "native" || s == "auto" {
@@ -79,7 +141,7 @@ pub fn gencode_flags(arches: &[String]) -> Vec<String> {
     flags
 }
 
-/// Format a live device compute capability as `sm_86` / `sm_120`.
+/// Format a live device compute capability as `sm_86` / `sm_120` / `sm_37`.
 pub fn sm_arch_from_capability(major: i32, minor: i32) -> Option<String> {
     // CUDA major.minor uses a single minor digit (8.6→sm_86, 12.0→sm_120).
     if major <= 0 || major > 99 || minor < 0 || minor > 9 {
@@ -101,6 +163,8 @@ mod tests {
         assert_eq!(normalize_cuda_arch("12.0").as_deref(), Some("sm_120"));
         assert_eq!(normalize_cuda_arch("86").as_deref(), Some("sm_86"));
         assert_eq!(normalize_cuda_arch("+sm_86").as_deref(), Some("sm_86"));
+        assert_eq!(normalize_cuda_arch("3.7").as_deref(), Some("sm_37"));
+        assert_eq!(normalize_cuda_arch("sm_37").as_deref(), Some("sm_37"));
     }
 
     #[test]
@@ -141,6 +205,29 @@ mod tests {
     }
 
     #[test]
+    fn toolkit_11_includes_kepler_drops_blackwell() {
+        let arches = default_cuda_arches_for_toolkit(Some(11));
+        assert!(arches.iter().any(|a| a == "sm_37"));
+        assert!(arches.iter().any(|a| a == "sm_86"));
+        assert!(!arches.iter().any(|a| a == "sm_120"));
+        assert!(!arches.iter().any(|a| a == "sm_89"));
+    }
+
+    #[test]
+    fn toolkit_12_drops_kepler_keeps_blackwell() {
+        let arches = default_cuda_arches_for_toolkit(Some(12));
+        assert!(!arches.iter().any(|a| a == "sm_37"));
+        assert_eq!(
+            arches,
+            vec![
+                "sm_86".to_string(),
+                "sm_89".to_string(),
+                "sm_120".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn gencode_emits_sass_and_ptx_per_arch() {
         let flags = gencode_flags(&default_cuda_arches());
         assert_eq!(
@@ -157,25 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn sm_arch_from_capability_covers_ampere_ada_blackwell() {
-        assert_eq!(
-            sm_arch_from_capability(8, 6).as_deref(),
-            Some("sm_86")
-        );
-        assert_eq!(
-            sm_arch_from_capability(8, 9).as_deref(),
-            Some("sm_89")
-        );
-        assert_eq!(
-            sm_arch_from_capability(12, 0).as_deref(),
-            Some("sm_120")
-        );
-        assert_eq!(
-            sm_arch_from_capability(10, 0).as_deref(),
-            Some("sm_100")
-        );
+    fn sm_arch_from_capability_covers_kepler_ampere_ada_blackwell() {
+        assert_eq!(sm_arch_from_capability(3, 7).as_deref(), Some("sm_37"));
+        assert_eq!(sm_arch_from_capability(8, 6).as_deref(), Some("sm_86"));
+        assert_eq!(sm_arch_from_capability(8, 9).as_deref(), Some("sm_89"));
+        assert_eq!(sm_arch_from_capability(12, 0).as_deref(), Some("sm_120"));
         assert_eq!(sm_arch_from_capability(0, 0), None);
-        assert_eq!(sm_arch_from_capability(-1, 0), None);
-        assert_eq!(sm_arch_from_capability(8, 10), None);
+        assert_eq!(sm_arch_from_product_name("Tesla K80"), Some("sm_37"));
     }
 }

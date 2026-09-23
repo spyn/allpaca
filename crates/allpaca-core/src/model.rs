@@ -1,8 +1,6 @@
 use crate::deltanet::{rmsnorm_silu_gate, GdnDims};
 use crate::early_exit::EarlyExitSpec;
-use crate::edge0::{
-    CrossTokenStager, Edge0Tier, MlaDims, MlaHostWeights, RecoverLora, RouterKind,
-};
+use crate::edge0::{CrossTokenStager, Edge0Tier, MlaDims, MlaHostWeights, RecoverLora, RouterKind};
 use crate::forest::TokenForest;
 use crate::ssm::{
     mamba2_step, validate_weights as validate_mamba2_weights, Mamba2Dims, SsmLayerWeights,
@@ -325,7 +323,10 @@ impl ModelConfig {
             nextn_predict_layers: nextn,
             gguf_layer_base: 0,
             router_kind: if arch == "deepseek2"
-                && file.meta_u32(&format!("{arch}.expert_gating_func")).unwrap_or(0) == 2
+                && file
+                    .meta_u32(&format!("{arch}.expert_gating_func"))
+                    .unwrap_or(0)
+                    == 2
             {
                 RouterKind::SigmoidGroup
             } else {
@@ -447,13 +448,19 @@ impl ModelConfig {
 
 fn read_swa_pattern(file: &GgufFile, arch: &str, n_layers: usize) -> Vec<bool> {
     let key = format!("{arch}.attention.sliding_window_pattern");
-    if let Some(arr) = file.metadata.get(&key).and_then(allpaca_gguf::GgufValue::as_u32_array)
+    if let Some(arr) = file
+        .metadata
+        .get(&key)
+        .and_then(allpaca_gguf::GgufValue::as_u32_array)
     {
         let mut out: Vec<bool> = arr.into_iter().take(n_layers).map(|v| v != 0).collect();
         out.resize(n_layers, false);
         return out;
     }
-    if let Some(arr) = file.metadata.get(&key).and_then(allpaca_gguf::GgufValue::as_i32_array)
+    if let Some(arr) = file
+        .metadata
+        .get(&key)
+        .and_then(allpaca_gguf::GgufValue::as_i32_array)
     {
         let mut out: Vec<bool> = arr.into_iter().take(n_layers).map(|v| v != 0).collect();
         out.resize(n_layers, false);
@@ -1566,14 +1573,11 @@ impl ResidentModel {
                 WeightRef::f32(0, 0)
             };
             let attn_out_gate = if cfg.headwise_attn_gate
-                && file
-                    .tensor(&format!("blk.{i}.attn_gate.weight"))
-                    .is_some()
+                && file.tensor(&format!("blk.{i}.attn_gate.weight")).is_some()
                 && matches!(
                     block,
                     HybridLayerKind::Attention | HybridLayerKind::DenseFfn | HybridLayerKind::Moe
-                )
-            {
+                ) {
                 append_gguf_tensor(
                     file,
                     &format!("blk.{i}.attn_gate.weight"),
@@ -2178,11 +2182,7 @@ fn sqrt_softplus_moe(x: f32) -> f32 {
     sp.max(0.0).sqrt()
 }
 
-fn moe_route(
-    x: &[f32],
-    layer: &LayerWeights,
-    cfg: &ModelConfig,
-) -> Vec<(usize, f32)> {
+fn moe_route(x: &[f32], layer: &LayerWeights, cfg: &ModelConfig) -> Vec<(usize, f32)> {
     let n_exp = cfg.n_experts.max(1);
     let n_act = cfg.n_active.max(1).min(n_exp);
     moe_route_logits(
@@ -2192,7 +2192,11 @@ fn moe_route(
         n_act,
         cfg.router_kind,
         cfg.moe_norm_topk,
-        if cfg.n_group > 0 { Some(cfg.n_group) } else { None },
+        if cfg.n_group > 0 {
+            Some(cfg.n_group)
+        } else {
+            None
+        },
         if cfg.topk_group > 0 {
             Some(cfg.topk_group)
         } else {
@@ -2321,7 +2325,7 @@ fn empty_layer() -> LayerWeights {
         block: HybridLayerKind::Attention,
         ssm: None,
         gdn: None,
-       mla: None,
+        mla: None,
         attn_norm: Vec::new(),
         q_norm: Vec::new(),
         k_norm: Vec::new(),
@@ -2625,7 +2629,10 @@ fn load_gguf_mla_host(
     let wdq = file.tensor_f32(&format!("blk.{layer}.attn_q_a.weight"))?;
     let wuq = file.tensor_f32(&format!("blk.{layer}.attn_q_b.weight"))?;
     let wdkv = file.tensor_f32(&format!("blk.{layer}.attn_kv_a_mqa.weight"))?;
-    let wukv = if file.tensor(&format!("blk.{layer}.attn_kv_b.weight")).is_some() {
+    let wukv = if file
+        .tensor(&format!("blk.{layer}.attn_kv_b.weight"))
+        .is_some()
+    {
         file.tensor_f32(&format!("blk.{layer}.attn_kv_b.weight"))?
     } else {
         let k_b = file.tensor_f32(&format!("blk.{layer}.attn_k_b.weight"))?;
@@ -3352,10 +3359,7 @@ impl Clone for Edge0Runtime {
         Self {
             lora: self.lora.clone(),
             stager: self.stager.as_ref().map(|m| {
-                let inner = m
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let inner = m.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 std::sync::Mutex::new(inner)
             }),
         }
@@ -3559,8 +3563,7 @@ impl TinyModel {
     pub fn synthetic_ssm_hybrid(seed: u64) -> Self {
         let mut model = Self::synthetic(ModelConfig::tiny_hybrid(), seed, "ssm-hybrid");
         let dim = model.config.dim;
-        let dims = crate::ssm::Mamba2Dims::new(dim, dim, 2, 4, 2, 2)
-            .expect("tiny SSM dims");
+        let dims = crate::ssm::Mamba2Dims::new(dim, dim, 2, 4, 2, 2).expect("tiny SSM dims");
         let mut rng = Lcg::new(seed.wrapping_add(99));
         // Mildly negative A so selective scan stays stable under random inputs.
         let a: Vec<f32> = (0..dims.n_heads).map(|_| -0.5 + rng.next_f32()).collect();
@@ -3660,9 +3663,13 @@ impl TinyModel {
         model.layers[0].wk.clear();
         model.layers[0].wv.clear();
         model.layers[0].wo.clear();
-        model.mla_cache = Some(Arc::new(std::sync::Mutex::new(
-            vec![(Vec::new(), Vec::new()); model.layers.len()],
-        )));
+        model.mla_cache = Some(Arc::new(std::sync::Mutex::new(vec![
+            (
+                Vec::new(),
+                Vec::new()
+            );
+            model.layers.len()
+        ])));
         model
     }
 
@@ -3835,6 +3842,14 @@ impl TinyModel {
 
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
+    }
+
+    /// True when a GDN layer has scalars/conv but no host F32 projections
+    /// (Q8 / large GGUF — CUDA must `upload_gguf`).
+    pub fn gdn_needs_device_projections(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.gdn.as_ref().is_some_and(|g| g.w_qkv.is_empty()))
     }
 
     /// Keep a GGUF handle for lazy DeepSeek-V4 MLA / expert / lm_head gathers.
@@ -4167,11 +4182,7 @@ impl TinyModel {
     fn apply_edge0_lora(&self, layer_idx: usize, proj: &str, x: &[f32], y: &mut [f32]) {
         if let Some(e0) = &self.edge0 {
             if let Some(lora) = &e0.lora {
-                lora.apply_named(
-                    &format!("layers.{layer_idx}.self_attn.{proj}"),
-                    x,
-                    y,
-                );
+                lora.apply_named(&format!("layers.{layer_idx}.self_attn.{proj}"), x, y);
             }
         }
     }
@@ -5304,16 +5315,15 @@ impl TinyModel {
                     } else {
                         Vec::new()
                     };
-                    let attn_out_gate = if file.tensor(&format!("blk.{i}.attn_gate.weight")).is_some()
-                        && cfg.headwise_attn_gate
-                    {
-                        file.tensor_f32(&format!("blk.{i}.attn_gate.weight"))?
-                    } else {
-                        Vec::new()
-                    };
-                    let attn_sinks = if file
-                        .tensor(&format!("blk.{i}.attn_sinks.weight"))
-                        .is_some()
+                    let attn_out_gate =
+                        if file.tensor(&format!("blk.{i}.attn_gate.weight")).is_some()
+                            && cfg.headwise_attn_gate
+                        {
+                            file.tensor_f32(&format!("blk.{i}.attn_gate.weight"))?
+                        } else {
+                            Vec::new()
+                        };
+                    let attn_sinks = if file.tensor(&format!("blk.{i}.attn_sinks.weight")).is_some()
                     {
                         file.tensor_f32(&format!("blk.{i}.attn_sinks.weight"))?
                     } else {
@@ -5403,7 +5413,10 @@ impl TinyModel {
         }
         let mla_cache = if layers.iter().any(|l| l.mla.is_some()) {
             Some(Arc::new(std::sync::Mutex::new(vec![
-                (Vec::new(), Vec::new());
+                (
+                    Vec::new(),
+                    Vec::new()
+                );
                 layers.len()
             ])))
         } else {
@@ -6104,7 +6117,15 @@ impl TinyModel {
                     rope_imrope_neox(slice, pos, theta, n_rot, [0; 4])?;
                 }
             } else {
-                rope_dispatch(hip, &mut q, cfg.n_heads, head_dim, pos, theta, Some(metrics))?;
+                rope_dispatch(
+                    hip,
+                    &mut q,
+                    cfg.n_heads,
+                    head_dim,
+                    pos,
+                    theta,
+                    Some(metrics),
+                )?;
                 rope_dispatch(
                     hip,
                     &mut k,
@@ -7248,7 +7269,7 @@ impl TinyModel {
                 let page_index = pos / page_tokens;
                 let slot = (pos % page_tokens) as u32;
                 let page_id = page_ids[layer_idx][page_index];
-                kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v)?;
+                kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v, None)?;
                 kv.touch(page_id, 1.0);
 
                 let (packed_k, packed_v, n_kv) = kv.kv_device_views(
@@ -7738,6 +7759,7 @@ impl TinyModel {
                     al.head_dim,
                     buf.k,
                     buf.v,
+                    None,
                 )?;
 
                 let (packed_k, packed_v, n_kv) = kv.kv_device_views(
@@ -8686,9 +8708,7 @@ impl TinyModel {
             if gated {
                 hip.sigmoid_mul_device(buf.attn, buf.gate, attn_dim as i32)?;
             }
-            self.device_headwise_attn_gate(
-                hip, resident, layer, buf, 1, n_heads, head_dim, dim,
-            )?;
+            self.device_headwise_attn_gate(hip, resident, layer, buf, 1, n_heads, head_dim, dim)?;
             resident.gemm_nt(
                 hip,
                 buf.attn,
@@ -9562,10 +9582,7 @@ mod spark2_5_tests {
         );
         meta.insert("spark2_5.block_count".into(), GgufValue::Uint32(8));
         meta.insert("spark2_5.embedding_length".into(), GgufValue::Uint32(64));
-        meta.insert(
-            "spark2_5.attention.head_count".into(),
-            GgufValue::Uint32(4),
-        );
+        meta.insert("spark2_5.attention.head_count".into(), GgufValue::Uint32(4));
         meta.insert(
             "spark2_5.attention.head_count_kv".into(),
             GgufValue::Uint32(2),
@@ -9678,14 +9695,8 @@ mod spark2_5_tests {
             "deepseek2.leading_dense_block_count".into(),
             GgufValue::Uint32(1),
         );
-        meta.insert(
-            "deepseek2.expert_shared_count".into(),
-            GgufValue::Uint32(2),
-        );
-        meta.insert(
-            "deepseek2.expert_gating_func".into(),
-            GgufValue::Uint32(2),
-        );
+        meta.insert("deepseek2.expert_shared_count".into(), GgufValue::Uint32(2));
+        meta.insert("deepseek2.expert_gating_func".into(), GgufValue::Uint32(2));
         meta.insert(
             "tokenizer.ggml.tokens".into(),
             GgufValue::Array(vec![GgufValue::String("<unk>".into())]),
@@ -9845,8 +9856,7 @@ mod cuda_softcap_tests {
         let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
         let metrics = Metrics::default();
         let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 0.5);
-        let pages =
-            alloc_pages_for_seq(&mut kv, &model.config, 128, 1, &metrics).expect("pages");
+        let pages = alloc_pages_for_seq(&mut kv, &model.config, 128, 1, &metrics).expect("pages");
         let mut logits = vec![0.0f32; model.config.vocab_size];
         model
             .forward_token_cuda(
@@ -9867,6 +9877,85 @@ mod cuda_softcap_tests {
             max_abs <= 0.05 + 1e-4,
             "final_logit_softcap must bound |logits|, got max_abs={max_abs}"
         );
+    }
+
+    #[test]
+    fn cuda_prefill_loop_matches_token_loop_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic(ModelConfig::tiny(), 7, "parity-loop");
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8 * 1024 * 1024).expect("ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        let n = 8usize;
+        let tokens: Vec<u32> = (0..n)
+            .map(|pos| (pos as u32) % model.config.vocab_size as u32)
+            .collect();
+
+        let run = |label: &str| -> Vec<f32> {
+            let metrics = Metrics::default();
+            let mut kv = crate::kv_tier::KvTierManager::with_devices(
+                8 << 20,
+                8 << 20,
+                0.5,
+                None,
+                Some(cuda.device),
+            );
+            let pages =
+                alloc_pages_for_seq(&mut kv, &model.config, 128, n, &metrics).expect("pages");
+            let mut logits = vec![0.0f32; model.config.vocab_size];
+            if label == "batch" {
+                model
+                    .forward_tokens_cuda(
+                        &tokens,
+                        0,
+                        &pages,
+                        &mut kv,
+                        &metrics,
+                        &mut logits,
+                        &cuda,
+                        &resident,
+                        true,
+                        None,
+                    )
+                    .expect("batch");
+            } else {
+                for (pos, &tok) in tokens.iter().enumerate() {
+                    model
+                        .forward_token_cuda(
+                            tok,
+                            pos,
+                            &pages,
+                            &mut kv,
+                            &metrics,
+                            &mut logits,
+                            &cuda,
+                            &resident,
+                            None,
+                            None,
+                        )
+                        .expect("tok");
+                }
+            }
+            logits
+        };
+
+        let a = run("tok");
+        let b = run("tok");
+        let det = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(det < 1e-5, "token loop not deterministic max_diff={det}");
+
+        let c = run("batch");
+        let diff = a
+            .iter()
+            .zip(c.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff < 1e-4, "batch vs tok max_diff={diff}");
     }
 
     fn cuda_decode_n_tokens(model: &TinyModel, n: usize) -> Vec<f32> {

@@ -176,6 +176,141 @@ fn cuda_stats_gpu_util_after_generate_when_device_present() {
     );
 }
 
+#[test]
+fn cuda_qkv_fusion_keeps_qkv_on_device() {
+    if !cuda_device_available() {
+        return;
+    }
+    let engine = Engine::new(cuda_synthetic()).expect("engine");
+    let after_load = engine.stats().activation_h2d_bytes;
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    let forwards = stats.gpu_forwards.max(stats.target_gpu_forwards);
+    assert!(
+        forwards > 0,
+        "expected CUDA forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    let cfg = allpaca_core::ModelConfig::tiny();
+    let dim = cfg.dim as u64;
+    let n_layers = cfg.n_layers as u64;
+    let activation_delta = stats.activation_h2d_bytes.saturating_sub(after_load);
+    // Host QKV H2Ds GEMM A (×3), Q for attention, and K/V slot writes.
+    // Device fusion uploads residual once per attn layer; FFN still host-A.
+    let ceiling = forwards * n_layers * dim * 4 * 8;
+    assert!(
+        activation_delta < ceiling,
+        "QKV must stay on device after GEMM; activation H2D {activation_delta} >= ceiling {ceiling} (forwards={forwards})"
+    );
+}
+
+#[test]
+fn cuda_qkv_fusion_decode_is_deterministic() {
+    if !cuda_device_available() {
+        return;
+    }
+    let prompt = "hello";
+    let params = greedy(6);
+    let a = Engine::new(cuda_synthetic())
+        .expect("a")
+        .generate(prompt, params.clone())
+        .expect("gen a");
+    let b = Engine::new(cuda_synthetic())
+        .expect("b")
+        .generate(prompt, params)
+        .expect("gen b");
+    assert_eq!(
+        a.token_ids, b.token_ids,
+        "stream-ordered QKV fusion must be deterministic across runs"
+    );
+}
+
+#[test]
+fn cuda_coordinator_rpc_split_keeps_local_layers_on_device() {
+    if !cuda_device_available() {
+        return;
+    }
+    use std::net::TcpListener;
+    use std::thread;
+
+    use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+    });
+
+    let mut cfg = cuda_synthetic();
+    cfg.rpc.endpoints = vec![addr.to_string()];
+    cfg.rpc.max_seq = 64;
+    cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+    let engine = Engine::new(cfg).expect("engine");
+    let out = engine.generate("hello", greedy(4)).expect("generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.rpc_roundtrips > 0,
+        "expected remote layer launches, got {}",
+        stats.rpc_roundtrips
+    );
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "CUDA coordinator should keep local layers on device, gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    drop(engine);
+    worker.join().unwrap();
+}
+
+#[test]
+fn cuda_rpc_activations_stay_device_resident_across_local_layers() {
+    if !cuda_device_available() {
+        return;
+    }
+    use std::net::TcpListener;
+    use std::thread;
+
+    use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+    });
+
+    let mut cfg = cuda_synthetic();
+    cfg.rpc.endpoints = vec![addr.to_string()];
+    cfg.rpc.max_seq = 64;
+    cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+    let engine = Engine::new(cfg).expect("engine");
+    let _ = engine.generate("hello", greedy(4)).expect("generate");
+    let stats = engine.stats();
+    assert!(
+        stats.rpc_roundtrips > 0 && stats.rpc_activation_bytes > 0,
+        "expected RPC activation bounce at remote boundaries; trips={} bytes={}",
+        stats.rpc_roundtrips,
+        stats.rpc_activation_bytes
+    );
+    // Local layers keep x on CUDA; coordinator activation H2D should stay near the
+    // remote-boundary bounce (plus a small embed/logits allowance), not per-GEMM.
+    let bound = stats.rpc_activation_bytes.saturating_mul(4).max(8 * 1024);
+    assert!(
+        stats.activation_h2d_bytes <= bound,
+        "local-layer activations must stay device-resident; h2d={} rpc_act={} bound={}",
+        stats.activation_h2d_bytes,
+        stats.rpc_activation_bytes,
+        bound
+    );
+    drop(engine);
+    worker.join().unwrap();
+}
+
 fn cuda_moe_cfg() -> Config {
     let mut cfg = cuda_synthetic();
     // Engine::new auto-loads dense tiny when synthetic; load MoE explicitly.
@@ -856,5 +991,175 @@ fn cuda_tiny_gdn_gguf_generate_uses_device_when_present() {
         "expected CUDA GDN GGUF forwards, got gpu={} target={}; stats={stats:?}",
         stats.gpu_forwards,
         stats.target_gpu_forwards
+    );
+}
+
+#[test]
+fn cuda_batched_prefill_one_forward_per_chunk() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_synthetic();
+    cfg.prefill.chunk_tokens = 16;
+    cfg.kv.page_tokens = 64;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("engine");
+    let prompt = "hello world. ".repeat(40);
+    let out = engine.generate(&prompt, greedy(2)).expect("generate");
+    assert!(
+        out.prompt_tokens >= 16,
+        "need a multi-token prompt, got {}",
+        out.prompt_tokens
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < out.prompt_tokens as u64,
+        "batched prefill must not run one forward per prompt token; gpu_forwards={} prompt_tokens={}",
+        stats.gpu_forwards,
+        out.prompt_tokens
+    );
+    assert!(!out.token_ids.is_empty());
+}
+
+#[test]
+fn cuda_moe_batched_prefill_matches_per_token_and_batches() {
+    if !cuda_device_available() {
+        return;
+    }
+    let prompt = "hello world. ".repeat(40);
+    let params = greedy(4);
+
+    let mut per_cfg = cuda_synthetic();
+    per_cfg.model.synthetic = false;
+    per_cfg.prefill.chunk_tokens = 1;
+    per_cfg.kv.page_tokens = 64;
+    per_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let per = Engine::new(per_cfg).expect("per-token engine");
+    per.load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("load tiny_moe");
+    let per_out = per
+        .generate(&prompt, params.clone())
+        .expect("per-token generate");
+    assert!(
+        per_out.prompt_tokens >= 16,
+        "need a multi-token prompt, got {}",
+        per_out.prompt_tokens
+    );
+
+    let mut batch_cfg = cuda_synthetic();
+    batch_cfg.model.synthetic = false;
+    batch_cfg.prefill.chunk_tokens = 16;
+    batch_cfg.kv.page_tokens = 64;
+    batch_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let batch = Engine::new(batch_cfg).expect("batch engine");
+    batch
+        .load_synthetic(allpaca_core::ModelConfig::tiny_moe())
+        .expect("load tiny_moe");
+    let batch_out = batch.generate(&prompt, params).expect("batch generate");
+    let stats = batch.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < batch_out.prompt_tokens as u64,
+        "MoE batched prefill must not run one forward per prompt token; gpu_forwards={} prompt_tokens={}",
+        stats.gpu_forwards,
+        batch_out.prompt_tokens
+    );
+    assert_eq!(
+        batch_out.token_ids, per_out.token_ids,
+        "MoE chunked prefill must match per-token CUDA decode"
+    );
+}
+
+#[test]
+fn cuda_dense_batched_prefill_matches_per_token() {
+    if !cuda_device_available() {
+        return;
+    }
+    let prompt = "hello world. ".repeat(40);
+    let params = greedy(4);
+    let mut per_cfg = cuda_synthetic();
+    per_cfg.prefill.chunk_tokens = 1;
+    per_cfg.kv.page_tokens = 64;
+    per_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let per = Engine::new(per_cfg).expect("per");
+    let per_out = per.generate(&prompt, params.clone()).expect("per");
+    assert!(per_out.prompt_tokens >= 16);
+    let mut batch_cfg = cuda_synthetic();
+    batch_cfg.prefill.chunk_tokens = 16;
+    batch_cfg.kv.page_tokens = 64;
+    batch_cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let batch = Engine::new(batch_cfg).expect("batch");
+    let batch_out = batch.generate(&prompt, params).expect("batch");
+    let stats = batch.stats();
+    assert!(
+        stats.gpu_forwards < batch_out.prompt_tokens as u64,
+        "dense batched prefill must batch; gpu_forwards={} prompt_tokens={}",
+        stats.gpu_forwards,
+        batch_out.prompt_tokens
+    );
+    assert_eq!(
+        batch_out.token_ids, per_out.token_ids,
+        "dense chunked prefill must match per-token CUDA decode"
+    );
+}
+
+#[test]
+fn cuda_ssm_batched_prefill_one_forward_per_chunk() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_moe_cfg();
+    cfg.prefill.chunk_tokens = 16;
+    cfg.kv.page_tokens = 64;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_ssm_hybrid(7))
+        .expect("load ssm hybrid");
+    let prompt = "hello world. ".repeat(40);
+    let out = engine.generate(&prompt, greedy(2)).expect("generate");
+    assert!(
+        out.prompt_tokens >= 16,
+        "need multi-token prompt, got {}",
+        out.prompt_tokens
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < out.prompt_tokens as u64,
+        "SSM chunked prefill must batch gpu_forwards; gpu={} prompt={}",
+        stats.gpu_forwards,
+        out.prompt_tokens
+    );
+}
+
+#[test]
+fn cuda_gdn_batched_prefill_one_forward_per_chunk() {
+    if !cuda_device_available() {
+        return;
+    }
+    let mut cfg = cuda_moe_cfg();
+    cfg.prefill.chunk_tokens = 16;
+    cfg.kv.page_tokens = 64;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .load_synthetic_model(allpaca_core::TinyModel::synthetic_gdn_hybrid(11))
+        .expect("load gdn hybrid");
+    let prompt = "hello world. ".repeat(40);
+    let out = engine.generate(&prompt, greedy(2)).expect("generate");
+    assert!(
+        out.prompt_tokens >= 16,
+        "need multi-token prompt, got {}",
+        out.prompt_tokens
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.backend, "cuda");
+    assert!(
+        stats.gpu_forwards < out.prompt_tokens as u64,
+        "GDN chunked prefill must batch gpu_forwards; gpu={} prompt={}",
+        stats.gpu_forwards,
+        out.prompt_tokens
     );
 }
