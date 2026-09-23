@@ -40,6 +40,9 @@ int allpaca_hip_memset(void *ptr, int value, size_t bytes, allpaca_stream_t stre
 
 int allpaca_hip_free(void *ptr);
 
+/* Stream-ordered free (hipFreeAsync). Null stream falls back to hipFree. */
+int allpaca_hip_free_async(void *ptr, allpaca_stream_t stream);
+
 int allpaca_hip_host_malloc(void **ptr, size_t bytes);
 
 int allpaca_hip_host_free(void *ptr);
@@ -66,6 +69,8 @@ int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int32_t kind,
  * observable ordering is identical either way. */
 int allpaca_hip_memcpy_batch(void **dsts, void **srcs, size_t *sizes, size_t count, int32_t kind,
                              allpaca_stream_t stream);
+
+int allpaca_hip_memset(void *dst, int32_t value, size_t bytes, allpaca_stream_t stream);
 
 /* Non-zero when the runtime exports hipMemcpyBatchAsync (telemetry / tests). */
 int allpaca_hip_has_memcpy_batch(void);

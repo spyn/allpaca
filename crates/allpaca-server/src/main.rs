@@ -5,6 +5,7 @@ mod host;
 mod image_url;
 mod logs;
 mod otlp_push;
+mod tune;
 mod ui;
 
 use std::net::SocketAddr;
@@ -43,6 +44,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     config.merge_cli(&cli.to_overrides());
     config.validate()?;
+
+    if cli.tune {
+        let config_path = cli.config.clone();
+        return crate::tune::run(cli.model.clone(), config, config_path);
+    }
 
     let password = match config
         .http

@@ -513,6 +513,26 @@ impl WeightRef {
             kind: WeightKind::F32,
         }
     }
+
+    fn f16(off: usize, n: usize) -> Self {
+        Self {
+            off,
+            n,
+            kind: WeightKind::F16,
+        }
+    }
+
+    fn q8(off: usize, n: usize) -> Self {
+        Self::q8_0(off, n)
+    }
+
+    fn q8_0(off: usize, n: usize) -> Self {
+        Self {
+            off,
+            n,
+            kind: WeightKind::Q8_0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2322,6 +2342,7 @@ fn empty_layer() -> LayerWeights {
         shared_expert: LayerFfn::default(),
         expert_bias: Vec::new(),
         attn_out_gate: Vec::new(),
+        attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
         ffn_post_norm: Vec::new(),
     }
@@ -2402,12 +2423,40 @@ fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, A
             conv1d.len()
         ))));
     }
+    // Host projections for CUDA / CPU host-step GDN (HIP also uploads these on-device).
+    let w_qkv = file.tensor_f32(&format!("blk.{layer}.attn_qkv.weight"))?;
+    let w_z = file.tensor_f32(&format!("blk.{layer}.attn_gate.weight"))?;
+    let w_alpha = file.tensor_f32(&format!("blk.{layer}.ssm_alpha.weight"))?;
+    let w_beta = file.tensor_f32(&format!("blk.{layer}.ssm_beta.weight"))?;
+    let w_out = file.tensor_f32(&format!("blk.{layer}.ssm_out.weight"))?;
+    let dim_in = w_qkv.len() / dims.qkv_dim.max(1);
+    if dim_in == 0
+        || w_qkv.len() != dims.qkv_dim.saturating_mul(dim_in)
+        || w_z.len() != dims.value_dim.saturating_mul(dim_in)
+        || w_alpha.len() != dims.n_v_heads.saturating_mul(dim_in)
+        || w_beta.len() != dims.n_v_heads.saturating_mul(dim_in)
+        || w_out.len() != dim_in.saturating_mul(dims.value_dim)
+    {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: GDN projection sizes mismatch dims={dims:?} qkv={} z={} alpha={} beta={} out={}",
+            w_qkv.len(),
+            w_z.len(),
+            w_alpha.len(),
+            w_beta.len(),
+            w_out.len()
+        ))));
+    }
     Ok(GdnHostWeights {
         dims,
         a,
         dt_bias,
         norm,
         conv1d,
+        w_qkv,
+        w_z,
+        w_alpha,
+        w_beta,
+        w_out,
     })
 }
 
@@ -2523,17 +2572,19 @@ fn load_gguf_mla_host(
     layer: usize,
     cfg: &ModelConfig,
 ) -> Result<Option<MlaHostWeights>, AllpacaError> {
-    if file
-        .tensor(&format!("blk.{layer}.attn_q_a.weight"))
-        .is_none()
-        && file
-            .tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight"))
-            .is_none()
+    // DeepSeek-V4 MLA lives in `Dsv4Weights` (`attn_kv.weight` + output LoRA).
+    // The DeepSeek-V2 host pack (`attn_kv_a_mqa` + dense `attn_output`) is absent.
+    if matches!(file.architecture(), Some("deepseek4" | "deepseek_v4"))
+        || (crate::deepseek4::file_is_deepseek4(file)
+            && file
+                .tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight"))
+                .is_none())
     {
         return Ok(None);
     }
-    // DeepSeek-V4 MLA lives in `Dsv4Weights` (`attn_kv.weight`), not the V2 MQA pack.
-    if crate::deepseek4::file_is_deepseek4(file)
+    if file
+        .tensor(&format!("blk.{layer}.attn_q_a.weight"))
+        .is_none()
         && file
             .tensor(&format!("blk.{layer}.attn_kv_a_mqa.weight"))
             .is_none()
@@ -3259,6 +3310,13 @@ pub struct GdnHostWeights {
     pub dt_bias: Vec<f32>,
     pub norm: Vec<f32>,
     pub conv1d: Vec<f32>,
+    /// Optional host projections for synthetic / CUDA host-step path.
+    /// Empty when HIP keeps projections on-device only.
+    pub w_qkv: Vec<f32>,
+    pub w_z: Vec<f32>,
+    pub w_alpha: Vec<f32>,
+    pub w_beta: Vec<f32>,
+    pub w_out: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -3289,6 +3347,8 @@ pub struct LayerWeights {
     pub expert_bias: Vec<f32>,
     /// Spark2_5 head-wise attention output gate (`attn_gate.weight`, shape `[n_heads, dim]`).
     pub attn_out_gate: Vec<f32>,
+    /// Per-head attention sink logits (`attn_sinks.weight`, shape `[n_heads]`; empty = none).
+    pub attn_sinks: Vec<f32>,
     /// Gemma post-attention RMSNorm (empty = skip).
     pub attn_post_norm: Vec<f32>,
     /// Gemma post-FFN RMSNorm (empty = skip).
@@ -3482,6 +3542,7 @@ impl TinyModel {
                 shared_expert: LayerFfn::default(),
                 expert_bias: Vec::new(),
                 attn_out_gate: Vec::new(),
+                attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
@@ -3506,8 +3567,298 @@ impl TinyModel {
         }
     }
 
+    /// Attention + Mamba-2 SSM hybrid for CUDA/host decode tracers.
+    /// Layer 0 is SSM; remaining layers stay dense attention.
+    pub fn synthetic_ssm_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny_hybrid(), seed, "ssm-hybrid");
+        let dim = model.config.dim;
+        let dims = crate::ssm::Mamba2Dims::new(dim, dim, 2, 4, 2, 2).expect("tiny SSM dims");
+        let mut rng = Lcg::new(seed.wrapping_add(99));
+        // Mildly negative A so selective scan stays stable under random inputs.
+        let a: Vec<f32> = (0..dims.n_heads).map(|_| -0.5 + rng.next_f32()).collect();
+        model.layers[0] = LayerWeights {
+            block: HybridLayerKind::Ssm,
+            ssm: Some(crate::ssm::SsmLayerWeights {
+                dims,
+                w_in: rng.vec(dims.in_proj_dim * dim),
+                w_out: rng.vec(dim * dims.d_inner),
+                a,
+                d_skip: rng.vec(dims.n_heads),
+                dt_bias: rng.vec(dims.n_heads),
+                conv1d: rng.vec(dims.conv_dim * dims.conv_kernel),
+                conv_bias: rng.vec(dims.conv_dim),
+                norm: ones(dims.d_inner),
+            }),
+            gdn: None,
+            mla: None,
+            attn_norm: ones(dim),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            wq: Vec::new(),
+            wk: Vec::new(),
+            wv: Vec::new(),
+            wo: Vec::new(),
+            ffn_norm: Vec::new(),
+            w_gate: Vec::new(),
+            w_up: Vec::new(),
+            w_down: Vec::new(),
+            w_router: Vec::new(),
+            experts: Vec::new(),
+            shared_expert: LayerFfn::default(),
+            expert_bias: Vec::new(),
+            attn_out_gate: Vec::new(),
+            attn_sinks: Vec::new(),
+            attn_post_norm: Vec::new(),
+            ffn_post_norm: Vec::new(),
+        };
+        model
+    }
+
+    /// Attention + Gated DeltaNet hybrid for CUDA/host decode tracers.
+    /// Layer 0 is GDN (SSM block kind); remaining layers stay dense attention.
+    pub fn synthetic_gdn_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny_hybrid(), seed, "gdn-hybrid");
+        let dim = model.config.dim;
+        // head_v=4, n_v=4 → inner=16; n_k=2 → key_dim=8; qkv_dim=32 (=dim).
+        let dims = GdnDims::from_meta(4, 16, 4, 2, 2).expect("tiny GDN dims");
+        let mut rng = Lcg::new(seed.wrapping_add(77));
+        let a: Vec<f32> = (0..dims.n_v_heads).map(|_| -0.5 + rng.next_f32()).collect();
+        model.layers[0] = LayerWeights {
+            block: HybridLayerKind::Ssm,
+            ssm: None,
+            gdn: Some(GdnHostWeights {
+                dims,
+                a,
+                dt_bias: rng.vec(dims.n_v_heads),
+                norm: ones(dims.head_v),
+                conv1d: rng.vec(dims.conv_kernel * dims.qkv_dim),
+                w_qkv: rng.vec(dims.qkv_dim * dim),
+                w_z: rng.vec(dims.value_dim * dim),
+                w_alpha: rng.vec(dims.n_v_heads * dim),
+                w_beta: rng.vec(dims.n_v_heads * dim),
+                w_out: rng.vec(dim * dims.value_dim),
+            }),
+            mla: None,
+            attn_norm: ones(dim),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            wq: Vec::new(),
+            wk: Vec::new(),
+            wv: Vec::new(),
+            wo: Vec::new(),
+            ffn_norm: Vec::new(),
+            w_gate: Vec::new(),
+            w_up: Vec::new(),
+            w_down: Vec::new(),
+            w_router: Vec::new(),
+            experts: Vec::new(),
+            shared_expert: LayerFfn::default(),
+            expert_bias: Vec::new(),
+            attn_out_gate: Vec::new(),
+            attn_sinks: Vec::new(),
+            attn_post_norm: Vec::new(),
+            ffn_post_norm: Vec::new(),
+        };
+        model
+    }
+
+    /// Attention layers with Multi-head Latent Attention on layer 0 (host MLA step).
+    pub fn synthetic_mla_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "mla-hybrid");
+        let dims = crate::edge0::MlaDims::from_hidden(model.config.dim, model.config.n_heads);
+        model.layers[0].mla = Some(crate::edge0::MlaHostWeights::synthetic(dims, 0.01));
+        // Prefer MLA over dense QKV on layer 0.
+        model.layers[0].wq.clear();
+        model.layers[0].wk.clear();
+        model.layers[0].wv.clear();
+        model.layers[0].wo.clear();
+        model.mla_cache = Some(Arc::new(std::sync::Mutex::new(vec![
+            (
+                Vec::new(),
+                Vec::new()
+            );
+            model.layers.len()
+        ])));
+        model
+    }
+
+    /// Tiny MoE with an always-on shared expert (SwiGLU) on every layer.
+    pub fn synthetic_moe_shared(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny_moe(), seed, "moe-shared");
+        let dim = model.config.dim;
+        let ff = model.config.ff_dim;
+        let mut rng = Lcg::new(seed.wrapping_add(55));
+        for layer in &mut model.layers {
+            layer.shared_expert = LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate: rng.vec(ff * dim),
+                w_up: rng.vec(ff * dim),
+                w_down: rng.vec(dim * ff),
+            };
+        }
+        model
+    }
+
+    /// Layer 0 is DenseFfn-only (no attention); remaining layers stay dense attention.
+    pub fn synthetic_dense_ffn_hybrid(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "dense-ffn-hybrid");
+        let layer = &mut model.layers[0];
+        layer.block = HybridLayerKind::DenseFfn;
+        layer.wq.clear();
+        layer.wk.clear();
+        layer.wv.clear();
+        layer.wo.clear();
+        model
+    }
+
+    /// Tiny MoE with gate-less shared expert using Lightning ReLU² activation.
+    pub fn synthetic_moe_shared_relu_sqr(seed: u64) -> Self {
+        let mut cfg = ModelConfig::tiny_moe();
+        cfg.moe_relu_sqr = true;
+        let mut model = Self::synthetic(cfg, seed, "moe-shared-relu2");
+        let dim = model.config.dim;
+        let ff = model.config.ff_dim;
+        let mut rng = Lcg::new(seed.wrapping_add(61));
+        for layer in &mut model.layers {
+            layer.shared_expert = LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate: Vec::new(),
+                w_up: rng.vec(ff * dim),
+                w_down: rng.vec(dim * ff),
+            };
+        }
+        model
+    }
+
+    /// Tiny dense model with Gemma-style attn + final logit softcaps.
+    pub fn synthetic_softcap(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "softcap");
+        model.config.attn_logit_softcap = 50.0;
+        model.config.final_logit_softcap = 30.0;
+        model
+    }
+
+    /// Tiny dense model with Spark2_5 head-wise sigmoid attention gate.
+    pub fn synthetic_headwise_gate(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "headwise-gate");
+        model.config.headwise_attn_gate = true;
+        let dim = model.config.dim;
+        let n_heads = model.config.n_heads;
+        let mut rng = Lcg::new(seed.wrapping_add(91));
+        for layer in &mut model.layers {
+            layer.attn_out_gate = rng.vec(n_heads * dim);
+        }
+        model
+    }
+
+    /// Tiny dense model with Gemma-style embed scale + post-attn/FFN RMSNorms.
+    pub fn synthetic_gemma_norms(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "gemma-norms");
+        model.config.scale_embed = true;
+        let dim = model.config.dim;
+        for layer in &mut model.layers {
+            layer.attn_post_norm = ones(dim);
+            layer.ffn_post_norm = ones(dim);
+        }
+        model
+    }
+
+    /// Tiny dense model with Gemma/Spark GELU FFN activation.
+    pub fn synthetic_gelu_ffn(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "gelu-ffn");
+        model.config.ffn_gelu = true;
+        model
+    }
+
+    /// Tiny dense model with per-head Q/K RMSNorm (Qwen3-style).
+    pub fn synthetic_qk_norms(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "qk-norms");
+        let head_dim = model.config.head_dim();
+        let mut rng = Lcg::new(seed.wrapping_add(73));
+        for layer in &mut model.layers {
+            layer.q_norm = rng.vec(head_dim);
+            layer.k_norm = rng.vec(head_dim);
+        }
+        model
+    }
+
+    /// Tiny dense model with Qwen3.5 gated-attention Q (`[Q|gate]` interleaved).
+    /// `attn_dim = 2*dim` so `wo_k > dim` trips the gated layout heuristic.
+    pub fn synthetic_gated_attn(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "gated-attn");
+        let dim = model.config.dim;
+        let attn_dim = dim * 2;
+        let q_out = attn_dim * 2;
+        let mut rng = Lcg::new(seed.wrapping_add(107));
+        for layer in &mut model.layers {
+            layer.wq = rng.vec(q_out * dim);
+            layer.wo = rng.vec(dim * attn_dim);
+        }
+        model
+    }
+
+    /// Zero wq output rows `[dim..]` so a non-gated CUDA path (N=dim) ignores the change.
+    pub fn zero_wq_output_tail(&mut self) {
+        let dim = self.config.dim.max(1);
+        for layer in &mut self.layers {
+            if layer.wq.len() <= dim * dim {
+                continue;
+            }
+            for v in &mut layer.wq[dim * dim..] {
+                *v = 0.0;
+            }
+        }
+    }
+
+    /// Tiny dense model with per-head attention sink logits.
+    pub fn synthetic_attn_sinks(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "attn-sinks");
+        let n_heads = model.config.n_heads;
+        let mut rng = Lcg::new(seed.wrapping_add(113));
+        for layer in &mut model.layers {
+            layer.attn_sinks = rng.vec(n_heads);
+        }
+        model
+    }
+
+    /// Tiny dense model with partial NeoX RoPE (`rope_dims` < head_dim).
+    pub fn synthetic_partial_rope(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "partial-rope");
+        let head_dim = model.config.head_dim();
+        model.config.rope_dims = (head_dim / 2).max(2);
+        if model.config.rope_dims % 2 != 0 {
+            model.config.rope_dims -= 1;
+        }
+        model
+    }
+
+    /// Tiny dense model with Qwen3.5-style IMRoPE sections.
+    pub fn synthetic_imrope(seed: u64) -> Self {
+        let mut model = Self::synthetic_partial_rope(seed);
+        model.name = "imrope".into();
+        // Non-zero sections trip `uses_imrope()` (t,h sectors required).
+        model.config.rope_sections = [1, 1, 0, 0];
+        model
+    }
+
+    /// Tiny dense model with sliding-window attention on every layer.
+    pub fn synthetic_swa(seed: u64) -> Self {
+        let mut model = Self::synthetic(ModelConfig::tiny(), seed, "swa");
+        model.config.sliding_window = 2;
+        model.config.swa_pattern = vec![true; model.config.n_layers];
+        model
+    }
+
     pub fn host_weights_ready(&self) -> bool {
         !self.embed.is_empty()
+    }
+
+    /// True when a GDN layer has scalars/conv but no host F32 projections
+    /// (Q8 / large GGUF — CUDA must `upload_gguf`).
+    pub fn gdn_needs_device_projections(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.gdn.as_ref().is_some_and(|g| g.w_qkv.is_empty()))
     }
 
     /// Keep a GGUF handle for lazy DeepSeek-V4 MLA / expert / lm_head gathers.
@@ -4877,6 +5228,7 @@ impl TinyModel {
                         shared_expert: LayerFfn::default(),
                         expert_bias: Vec::new(),
                         attn_out_gate: Vec::new(),
+                        attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
                         ffn_post_norm: Vec::new(),
                     }
@@ -4917,6 +5269,7 @@ impl TinyModel {
                         shared_expert: load_gguf_shared_expert(file, i)?,
                         expert_bias: load_gguf_expert_bias(file, i)?,
                         attn_out_gate: Vec::new(),
+                        attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
                         ffn_post_norm: Vec::new(),
                     }
@@ -4979,6 +5332,12 @@ impl TinyModel {
                         } else {
                             Vec::new()
                         };
+                    let attn_sinks = if file.tensor(&format!("blk.{i}.attn_sinks.weight")).is_some()
+                    {
+                        file.tensor_f32(&format!("blk.{i}.attn_sinks.weight"))?
+                    } else {
+                        Vec::new()
+                    };
                     let wo = if mla.is_some() || gguf_blk_has_mla(file, i) {
                         Vec::new()
                     } else {
@@ -5019,6 +5378,7 @@ impl TinyModel {
                         shared_expert,
                         expert_bias,
                         attn_out_gate,
+                        attn_sinks,
                         attn_post_norm: if file
                             .tensor(&format!("blk.{i}.attn_post_norm.weight"))
                             .is_some()
@@ -5315,6 +5675,7 @@ impl TinyModel {
                 shared_expert: LayerFfn::default(),
                 expert_bias: Vec::new(),
                 attn_out_gate: Vec::new(),
+                attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
@@ -5425,6 +5786,7 @@ impl TinyModel {
                 shared_expert: LayerFfn::default(),
                 expert_bias: Vec::new(),
                 attn_out_gate: Vec::new(),
+                attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
@@ -6917,7 +7279,7 @@ impl TinyModel {
                 let page_index = pos / page_tokens;
                 let slot = (pos % page_tokens) as u32;
                 let page_id = page_ids[layer_idx][page_index];
-                kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v)?;
+                kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v, None)?;
                 kv.touch(page_id, 1.0);
 
                 let (packed_k, packed_v, n_kv) = kv.kv_device_views(
@@ -7407,6 +7769,7 @@ impl TinyModel {
                     al.head_dim,
                     buf.k,
                     buf.v,
+                    None,
                 )?;
 
                 let (packed_k, packed_v, n_kv) = kv.kv_device_views(
@@ -9134,6 +9497,13 @@ mod cuda_decode;
 #[cfg(feature = "cuda")]
 pub use cuda_decode::CudaResidentModel;
 
+#[cfg(feature = "vulkan")]
+#[path = "vulkan_decode.rs"]
+mod vulkan_decode;
+
+#[cfg(feature = "vulkan")]
+pub use vulkan_decode::VulkanResidentModel;
+
 struct Lcg {
     state: u64,
 }
@@ -9477,5 +9847,504 @@ mod lightning_moe_tests {
         expert_mlp(&x, &ffn, ff, dim, &mut out, true).unwrap();
         assert!((out[0] - 4.0).abs() < 1e-5, "{out:?}");
         assert!(out[1].abs() < 1e-5, "{out:?}");
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_softcap_tests {
+    use super::*;
+
+    #[test]
+    fn cuda_final_logit_softcap_bounds_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let mut model = TinyModel::synthetic_softcap(31);
+        // Tight cap so raw tiny-model logits exceed it without softcap.
+        model.config.final_logit_softcap = 0.05;
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        let metrics = Metrics::default();
+        let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 0.5);
+        let pages = alloc_pages_for_seq(&mut kv, &model.config, 128, 1, &metrics).expect("pages");
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        model
+            .forward_token_cuda(
+                0,
+                0,
+                &pages,
+                &mut kv,
+                &metrics,
+                &mut logits,
+                &cuda,
+                &resident,
+                None,
+                None,
+            )
+            .expect("forward");
+        let max_abs = logits.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.05 + 1e-4,
+            "final_logit_softcap must bound |logits|, got max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn cuda_prefill_loop_matches_token_loop_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic(ModelConfig::tiny(), 7, "parity-loop");
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8 * 1024 * 1024).expect("ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        let n = 8usize;
+        let tokens: Vec<u32> = (0..n)
+            .map(|pos| (pos as u32) % model.config.vocab_size as u32)
+            .collect();
+
+        let run = |label: &str| -> Vec<f32> {
+            let metrics = Metrics::default();
+            let mut kv = crate::kv_tier::KvTierManager::with_devices(
+                8 << 20,
+                8 << 20,
+                0.5,
+                None,
+                Some(cuda.device),
+            );
+            let pages =
+                alloc_pages_for_seq(&mut kv, &model.config, 128, n, &metrics).expect("pages");
+            let mut logits = vec![0.0f32; model.config.vocab_size];
+            if label == "batch" {
+                model
+                    .forward_tokens_cuda(
+                        &tokens,
+                        0,
+                        &pages,
+                        &mut kv,
+                        &metrics,
+                        &mut logits,
+                        &cuda,
+                        &resident,
+                        true,
+                        None,
+                    )
+                    .expect("batch");
+            } else {
+                for (pos, &tok) in tokens.iter().enumerate() {
+                    model
+                        .forward_token_cuda(
+                            tok,
+                            pos,
+                            &pages,
+                            &mut kv,
+                            &metrics,
+                            &mut logits,
+                            &cuda,
+                            &resident,
+                            None,
+                            None,
+                        )
+                        .expect("tok");
+                }
+            }
+            logits
+        };
+
+        let a = run("tok");
+        let b = run("tok");
+        let det = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(det < 1e-5, "token loop not deterministic max_diff={det}");
+
+        let c = run("batch");
+        let diff = a
+            .iter()
+            .zip(c.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff < 1e-4, "batch vs tok max_diff={diff}");
+    }
+
+    fn cuda_decode_n_tokens(model: &TinyModel, n: usize) -> Vec<f32> {
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(model, cuda.device).expect("upload");
+        let metrics = Metrics::default();
+        let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 0.5);
+        let mut pages =
+            alloc_pages_for_seq(&mut kv, &model.config, 128, n.max(1), &metrics).expect("pages");
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        for pos in 0..n {
+            ensure_pages(&mut kv, &model.config, 128, &mut pages, pos, &metrics)
+                .expect("ensure pages");
+            model
+                .forward_token_cuda(
+                    (pos as u32) % model.config.vocab_size as u32,
+                    pos,
+                    &pages,
+                    &mut kv,
+                    &metrics,
+                    &mut logits,
+                    &cuda,
+                    &resident,
+                    None,
+                    None,
+                )
+                .expect("forward");
+        }
+        logits
+    }
+
+    #[test]
+    fn cuda_swa_window_changes_logits_vs_full_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let full = TinyModel::synthetic(ModelConfig::tiny(), 41, "swa-cmp-full");
+        let mut swa = TinyModel::synthetic(ModelConfig::tiny(), 41, "swa-cmp-win");
+        swa.config.sliding_window = 1;
+        swa.config.swa_pattern = vec![true; swa.config.n_layers];
+        let a = cuda_decode_n_tokens(&full, 4);
+        let b = cuda_decode_n_tokens(&swa, 4);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "window=1 SWA should diverge from full attention after 4 tokens; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_swa_softcap_changes_logits_vs_plain_swa_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic_swa(85);
+        let mut capped = TinyModel::synthetic_swa(85);
+        capped.config.attn_logit_softcap = 1.5;
+        let a = cuda_decode_n_tokens(&plain, 4);
+        let b = cuda_decode_n_tokens(&capped, 4);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "SWA+attn_logit_softcap should change logits vs plain SWA; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_attn_softcap_changes_logits_vs_plain_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 91, "attn-sc-plain");
+        let mut capped = TinyModel::synthetic(ModelConfig::tiny(), 91, "attn-sc-cap");
+        capped.config.attn_logit_softcap = 1.5;
+        // Keep final softcap off so divergence is from attn path only.
+        capped.config.final_logit_softcap = 0.0;
+        let a = cuda_decode_n_tokens(&plain, 3);
+        let b = cuda_decode_n_tokens(&capped, 3);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "attn_logit_softcap should change logits vs plain; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_moe_q8_experts_pack_smaller_than_f32_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic(ModelConfig::tiny_moe(), 43, "moe-q8-pack");
+        let mut f32_bytes = 0usize;
+        f32_bytes += model.embed.len() * 4;
+        f32_bytes += model.norm.len() * 4;
+        f32_bytes += model.lm_head.len() * 4;
+        for layer in &model.layers {
+            f32_bytes += layer.attn_norm.len() * 4;
+            f32_bytes += layer.wq.len() * 4;
+            f32_bytes += layer.wk.len() * 4;
+            f32_bytes += layer.wv.len() * 4;
+            f32_bytes += layer.wo.len() * 4;
+            f32_bytes += layer.ffn_norm.len() * 4;
+            for expert in &layer.experts {
+                f32_bytes += expert.w_gate.len() * 4;
+                f32_bytes += expert.w_up.len() * 4;
+                f32_bytes += expert.w_down.len() * 4;
+            }
+        }
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        assert!(
+            (resident.packed_h2d_bytes() as usize) < f32_bytes,
+            "Q8 MoE experts should shrink device pack: packed={} f32_est={}",
+            resident.packed_h2d_bytes(),
+            f32_bytes
+        );
+    }
+
+    #[test]
+    fn cuda_headwise_gate_changes_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 53, "hw-plain");
+        let gated = TinyModel::synthetic_headwise_gate(53);
+        let a = cuda_decode_n_tokens(&plain, 2);
+        let b = cuda_decode_n_tokens(&gated, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "headwise attn gate should change logits; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_moe_shared_expert_uploads_as_q8_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic_moe_shared(47);
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 8192).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        assert!(
+            resident.shared_expert_is_q8(),
+            "shared expert up should be staged Q8_0"
+        );
+        let mut f32_bytes = 0usize;
+        f32_bytes += model.embed.len() * 4;
+        f32_bytes += model.norm.len() * 4;
+        f32_bytes += model.lm_head.len() * 4;
+        for layer in &model.layers {
+            f32_bytes += layer.attn_norm.len() * 4;
+            f32_bytes += layer.wq.len() * 4;
+            f32_bytes += layer.wk.len() * 4;
+            f32_bytes += layer.wv.len() * 4;
+            f32_bytes += layer.wo.len() * 4;
+            f32_bytes += layer.ffn_norm.len() * 4;
+            for expert in &layer.experts {
+                f32_bytes += expert.w_gate.len() * 4;
+                f32_bytes += expert.w_up.len() * 4;
+                f32_bytes += expert.w_down.len() * 4;
+            }
+            f32_bytes += layer.shared_expert.w_gate.len() * 4;
+            f32_bytes += layer.shared_expert.w_up.len() * 4;
+            f32_bytes += layer.shared_expert.w_down.len() * 4;
+        }
+        assert!(
+            (resident.packed_h2d_bytes() as usize) < f32_bytes,
+            "Q8 shared+routed should shrink pack: packed={} f32_est={}",
+            resident.packed_h2d_bytes(),
+            f32_bytes
+        );
+    }
+
+    #[test]
+    fn cuda_gdn_projections_upload_resident_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic_gdn_hybrid(11);
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 64 * 1024).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        assert!(
+            resident.gdn_projections_resident(),
+            "GDN qkv/z/out should pack onto the device"
+        );
+        let gdn = model.layers[0].gdn.as_ref().expect("gdn");
+        let proj_bytes = (gdn.w_qkv.len()
+            + gdn.w_z.len()
+            + gdn.w_alpha.len()
+            + gdn.w_beta.len()
+            + gdn.w_out.len())
+            * 4;
+        assert!(
+            (resident.packed_h2d_bytes() as usize) >= proj_bytes,
+            "pack should include GDN projections: packed={} proj={}",
+            resident.packed_h2d_bytes(),
+            proj_bytes
+        );
+    }
+
+    #[test]
+    fn cuda_ssm_projections_upload_resident_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let model = TinyModel::synthetic_ssm_hybrid(7);
+        let cuda = allpaca_cuda::CudaWorkspace::new(0, 64 * 1024).expect("cuda ws");
+        let resident = CudaResidentModel::upload(&model, cuda.device).expect("upload");
+        assert!(
+            resident.ssm_projections_resident(),
+            "SSM w_in/w_out should pack onto the device"
+        );
+        let ssm = model.layers[0].ssm.as_ref().expect("ssm");
+        let proj_bytes = (ssm.w_in.len() + ssm.w_out.len()) * 4;
+        assert!(
+            (resident.packed_h2d_bytes() as usize) >= proj_bytes,
+            "pack should include SSM projections: packed={} proj={}",
+            resident.packed_h2d_bytes(),
+            proj_bytes
+        );
+    }
+
+    #[test]
+    fn cuda_gemma_norms_change_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 59, "gemma-plain");
+        let gemma = TinyModel::synthetic_gemma_norms(59);
+        let a = cuda_decode_n_tokens(&plain, 2);
+        let b = cuda_decode_n_tokens(&gemma, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "scale_embed + post-norms should change logits; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_gelu_ffn_changes_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let silu = TinyModel::synthetic(ModelConfig::tiny(), 61, "silu-ffn");
+        let gelu = TinyModel::synthetic_gelu_ffn(61);
+        let a = cuda_decode_n_tokens(&silu, 2);
+        let b = cuda_decode_n_tokens(&gelu, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "ffn_gelu should change logits vs SiLU; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_qk_norms_change_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 67, "qk-plain");
+        let qk = TinyModel::synthetic_qk_norms(67);
+        let a = cuda_decode_n_tokens(&plain, 2);
+        let b = cuda_decode_n_tokens(&qk, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "q_norm/k_norm should change logits; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_gated_attn_uses_q_tail_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let full = TinyModel::synthetic_gated_attn(71);
+        let mut tailed = TinyModel::synthetic_gated_attn(71);
+        tailed.zero_wq_output_tail();
+        let a = cuda_decode_n_tokens(&full, 2);
+        let b = cuda_decode_n_tokens(&tailed, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "gated Q must consume wq rows beyond dim; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_attn_sinks_change_logits_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 79, "sinks-plain");
+        let sinks = TinyModel::synthetic_attn_sinks(79);
+        let a = cuda_decode_n_tokens(&plain, 2);
+        let b = cuda_decode_n_tokens(&sinks, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "attn_sinks should change logits; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_partial_rope_changes_logits_vs_full_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        let full = TinyModel::synthetic(ModelConfig::tiny(), 89, "rope-full");
+        let partial = TinyModel::synthetic_partial_rope(89);
+        let a = cuda_decode_n_tokens(&full, 2);
+        let b = cuda_decode_n_tokens(&partial, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "partial rope_dims should change logits vs full RoPE; max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn cuda_imrope_changes_logits_vs_full_when_device_present() {
+        if !allpaca_cuda::runtime_linked() || allpaca_cuda::device_count() == 0 {
+            return;
+        }
+        // Text positions make IMRoPE == plain partial NeoX; both must still
+        // diverge from full-head device RoPE.
+        let full = TinyModel::synthetic(ModelConfig::tiny(), 91, "imrope-full");
+        let imrope = TinyModel::synthetic_imrope(91);
+        let a = cuda_decode_n_tokens(&full, 2);
+        let b = cuda_decode_n_tokens(&imrope, 2);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "IMRoPE partial dims should change logits vs full RoPE; max_diff={max_diff}"
+        );
     }
 }

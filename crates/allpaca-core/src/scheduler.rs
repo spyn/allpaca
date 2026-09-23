@@ -80,7 +80,7 @@ impl Scheduler {
     pub fn placement(&self, devices: &[DeviceInfo], vision_device: Option<i32>) -> Placement {
         let mut gpus: Vec<&DeviceInfo> = devices
             .iter()
-            .filter(|d| d.kind == DeviceKind::HipGpu)
+            .filter(|d| d.is_gpu() && !d.is_rpc())
             .collect();
         gpus.sort_by(|a, b| {
             b.bandwidth_gbps
@@ -273,6 +273,27 @@ mod tests {
         let p = s.placement(&devices, Some(1));
         assert_eq!(p.vision_device, Some(1));
         assert_eq!(p.target_device, 0);
+    }
+
+    #[test]
+    fn placement_targets_single_cuda_gpu() {
+        let devices = vec![
+            DeviceInfo::cpu(),
+            DeviceInfo {
+                id: 0,
+                kind: DeviceKind::CudaGpu,
+                name: "RTX 3060".into(),
+                memory_bytes: 12 << 30,
+                bandwidth_gbps: 360.0,
+                peers: vec![],
+            },
+        ];
+        let flags = FeatureFlags::from_mode(PipelineMode::MobileTiered);
+        let spec = SpeculativeSection::default();
+        let s = Scheduler::new(PipelineMode::MobileTiered, flags, &spec);
+        let p = s.placement(&devices, None);
+        assert_eq!(p.target_device, 0);
+        assert_eq!(p.draft_device, -1);
     }
 
     #[test]

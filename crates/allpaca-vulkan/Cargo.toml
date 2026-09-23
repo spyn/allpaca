@@ -1,0 +1,21 @@
+[package]
+name = "allpaca-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vulkan/ash workspace for rust-gpu kernels (feature-gated; compiles without a GPU)"
+
+[features]
+default = []
+vulkan = []
+
+[dependencies]
+allpaca-types.workspace = true
+ash = "0.38"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+
+[build-dependencies]
+cargo-gpu-install = "0.10.0-alpha.1"
+
+[dev-dependencies]
+allpaca-cpu.workspace = true

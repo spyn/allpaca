@@ -18,9 +18,9 @@ use rand::rngs::StdRng;
 
 use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
 use crate::batch_gemm::{
-    apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
-    decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, BatchGemmCandidate,
-    BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
+    apply_packed_attn_hip, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
+    decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, residual_add_rows,
+    write_residual_into_hidden, BatchGemmCandidate, BatchGemmPhase, BatchGemmPlan, ModelShapeKey,
 };
 use crate::constraint::JsonConstraint;
 use crate::device_manager::DeviceInventory;
@@ -78,7 +78,8 @@ struct ActiveRequest {
     decode_step: u64,
     /// Last MoE router input (FFN RMSNorm) from the most recent decode forward.
     moe_norm: Vec<f32>,
-    /// Target `output_norm` hidden for MTP draft `h_nextn` handoff.
+    /// Target hidden: `output_norm` after decode; packed HIP residual may
+    /// overwrite with `x+WO+FFN` when MTP is off (`h_nextn` stays `output_norm`).
     last_hidden: Vec<f32>,
     /// `last_hidden` was written by the most recent decode forward.
     last_hidden_fresh: bool,
@@ -109,6 +110,8 @@ struct EngineInner {
     draft_resident: Option<Arc<ResidentModel>>,
     #[cfg(feature = "cuda")]
     target_cuda_resident: Option<Arc<crate::CudaResidentModel>>,
+    #[cfg(feature = "vulkan")]
+    target_vulkan_resident: Option<Arc<crate::VulkanResidentModel>>,
     draft_kv: DenseKv,
     draft_ahead: Option<DraftAhead>,
     anchors: AnchorCache,
@@ -144,6 +147,8 @@ struct DecodePollHooks<'a> {
     ds_queue: &'a DirectStorageQueue,
     #[cfg(feature = "cuda")]
     cuda: Option<&'a allpaca_cuda::CudaWorkspace>,
+    #[cfg(feature = "vulkan")]
+    vulkan: Option<&'a allpaca_vulkan::VulkanWorkspace>,
 }
 
 #[derive(Clone)]
@@ -156,6 +161,8 @@ pub struct Engine {
     draft_hip: Option<Arc<HipWorkspace>>,
     #[cfg(feature = "cuda")]
     cuda: Option<Arc<allpaca_cuda::CudaWorkspace>>,
+    #[cfg(feature = "vulkan")]
+    vulkan: Option<Arc<allpaca_vulkan::VulkanWorkspace>>,
     /// Shared DirectStorage enqueue ledger (file-coordinate + staged H2D).
     ds_queue: Arc<DirectStorageQueue>,
     ds_probe: DirectStorageProbe,
@@ -246,6 +253,98 @@ fn rpc_hello_token(config: &Config) -> String {
         .unwrap_or_default()
 }
 
+fn scale_kv_vram_from_inventory(config: &mut Config, inventory: &DeviceInventory) {
+    let compiled = allpaca_types::KvSection::default().vram_bytes;
+    if config.kv.vram_bytes != compiled {
+        return;
+    }
+    let gpu_mem = inventory
+        .devices
+        .iter()
+        .filter(|d| d.is_gpu() && !d.is_rpc())
+        .map(|d| d.memory_bytes)
+        .max()
+        .unwrap_or(0);
+    let suggested = crate::suggested_kv_vram_bytes(gpu_mem);
+    if suggested > config.kv.vram_bytes {
+        tracing::info!(
+            suggested,
+            gpu_mem,
+            mode = ?inventory.pipeline_mode,
+            "scaled kv.vram_bytes from GPU capacity"
+        );
+        config.kv.vram_bytes = suggested;
+    }
+}
+
+#[cfg(test)]
+mod scale_kv_tests {
+    use super::scale_kv_vram_from_inventory;
+    use allpaca_types::{
+        Config, DeviceInfo, DeviceKind, PipelineMode, TransferPath,
+    };
+    use crate::device_manager::DeviceInventory;
+
+    fn cuda_12gb_inventory() -> DeviceInventory {
+        DeviceInventory {
+            devices: vec![
+                DeviceInfo::cpu(),
+                DeviceInfo {
+                    id: 0,
+                    kind: DeviceKind::CudaGpu,
+                    name: "RTX 3060".into(),
+                    memory_bytes: 12 << 30,
+                    bandwidth_gbps: 360.0,
+                    peers: vec![],
+                },
+            ],
+            pipeline_mode: PipelineMode::MobileTiered,
+            transfer_path: TransferPath::HostStaging,
+            transfer_benchmark: None,
+            p2p_capable: false,
+            p2p_enabled: false,
+            target_device: 0,
+            draft_device: -1,
+            vision_device: None,
+        }
+    }
+
+    #[test]
+    fn scales_compiled_default_kv_for_12gb_cuda() {
+        let mut cfg = Config::compiled_defaults();
+        assert_eq!(cfg.kv.vram_bytes, 4 * 1024 * 1024);
+        scale_kv_vram_from_inventory(&mut cfg, &cuda_12gb_inventory());
+        assert_eq!(cfg.kv.vram_bytes, 4usize << 30);
+    }
+
+    #[test]
+    fn scales_8gb_laptop_to_half_vram() {
+        let mut inv = cuda_12gb_inventory();
+        inv.devices[1].name = "Ada laptop".into();
+        inv.devices[1].memory_bytes = 8 << 30;
+        let mut cfg = Config::compiled_defaults();
+        scale_kv_vram_from_inventory(&mut cfg, &inv);
+        assert_eq!(cfg.kv.vram_bytes, 4usize << 30);
+    }
+
+    #[test]
+    fn scales_6gb_card_below_cap() {
+        let mut inv = cuda_12gb_inventory();
+        inv.devices[1].memory_bytes = 6 << 30;
+        let mut cfg = Config::compiled_defaults();
+        scale_kv_vram_from_inventory(&mut cfg, &inv);
+        assert_eq!(cfg.kv.vram_bytes, 3usize << 30);
+    }
+
+    #[test]
+    fn preserves_explicit_kv_override() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.kv.vram_bytes = 256 * 1024 * 1024;
+        scale_kv_vram_from_inventory(&mut cfg, &cuda_12gb_inventory());
+        assert_eq!(cfg.kv.vram_bytes, 256 * 1024 * 1024);
+    }
+}
+
 impl Engine {
     pub fn new(config: Config) -> Result<Self, AllpacaError> {
         let mut config = config;
@@ -257,8 +356,10 @@ impl Engine {
                 }
             }
         }
+        config.apply_tune_overlay();
         config.validate()?;
         let mut inventory = DeviceInventory::discover(&config);
+        scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
             None
         } else {
@@ -282,6 +383,8 @@ impl Engine {
         let draft_hip = open_draft_hip_workspace(&config, &inventory).map(Arc::new);
         #[cfg(feature = "cuda")]
         let cuda = open_cuda_workspace(&config, &inventory).map(Arc::new);
+        #[cfg(feature = "vulkan")]
+        let vulkan = open_vulkan_workspace(&config, &inventory).map(Arc::new);
         let cuda_kv = {
             #[cfg(feature = "cuda")]
             {
@@ -302,6 +405,28 @@ impl Engine {
             config.kv.hot_fraction,
             hip.as_ref().map(|h| h.device),
             cuda_kv,
+            {
+                #[cfg(feature = "vulkan")]
+                {
+                    if hip.is_none() {
+                        #[cfg(feature = "cuda")]
+                        let skip = cuda.is_some();
+                        #[cfg(not(feature = "cuda"))]
+                        let skip = false;
+                        if skip {
+                            None
+                        } else {
+                            vulkan.clone()
+                        }
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    None
+                }
+            },
         );
         kv.open_nvme(config.kv.nvme_bytes, config.kv.nvme_path.as_deref())?;
         let ring = LogitRing::new(config.sampling.pinned_ring_slots, 64);
@@ -324,6 +449,8 @@ impl Engine {
             draft_resident: None,
             #[cfg(feature = "cuda")]
             target_cuda_resident: None,
+            #[cfg(feature = "vulkan")]
+            target_vulkan_resident: None,
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
@@ -347,6 +474,8 @@ impl Engine {
             draft_hip,
             #[cfg(feature = "cuda")]
             cuda,
+            #[cfg(feature = "vulkan")]
+            vulkan,
             ds_queue,
             ds_probe,
             micro_batch: Arc::new(MicroBatchExpertUnion::new()),
@@ -473,52 +602,67 @@ impl Engine {
     /// Refresh driver VRAM and GPU busy into [`Metrics`], at most once per
     /// [`GpuSampler`] window, and hand the busy fraction to `q*`.
     ///
-    /// `hipMemGetInfo` is a driver round-trip, so this belongs to scheduler
-    /// safe points and `/stats` only. Decode must never call it. AMD SMI would
-    /// add per-GPU power here; ROCm does not ship it on Windows, and the busy
-    /// fraction below is measured from HIP events anyway.
+    /// `hipMemGetInfo` / `cudaMemGetInfo` are driver round-trips, so this belongs
+    /// to scheduler safe points and `/stats` only. Decode must never call it.
     fn sample_gpu(&self) {
-        let Some(hip) = self.hip.as_ref() else {
-            return;
-        };
         if !self.gpu_sampler.due() {
             return;
         }
-        let read = |dev: i32| {
-            allpaca_hip::device_memory_info(dev)
-                .map(|(free, total)| (total.saturating_sub(free), total))
-                .unwrap_or((0, 0))
-        };
-        let target_dev = self.inventory.target_device.max(0);
-        let (used, total) = read(target_dev);
-        // Reading a second device forces a rebind, and a rebind costs a
-        // driver-wide lock that decode threads are contending for. Skip it
-        // until the draft GPU has actually run something worth watching.
-        let draft_dev = self.inventory.draft_device;
-        let draft_live = self
-            .metrics
-            .draft_gpu_forwards
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0;
-        let (draft_used, draft_total) =
-            if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
-                read(draft_dev)
-            } else {
-                (0, 0)
+        #[cfg(feature = "hip")]
+        if let Some(hip) = self.hip.as_ref() {
+            let read = |dev: i32| {
+                allpaca_hip::device_memory_info(dev)
+                    .map(|(free, total)| (total.saturating_sub(free), total))
+                    .unwrap_or((0, 0))
             };
-        // Share of decode wall time the GPU spent in allpaca kernels. The
-        // profile is an EMA of the last decode steps, so no differencing.
-        let p = hip.decode_profile();
-        let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
-        let wall_us = gpu_us + p.host_us;
-        let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
-        self.metrics
-            .record_gpu_sample(used, total, draft_used, draft_total, util);
-        if let Ok(g) = self.lock() {
-            if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
-                lru.set_gpu_busy(util);
+            let target_dev = self.inventory.target_device.max(0);
+            let (used, total) = read(target_dev);
+            let draft_dev = self.inventory.draft_device;
+            let draft_live = self
+                .metrics
+                .draft_gpu_forwards
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0;
+            let (draft_used, draft_total) =
+                if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
+                    read(draft_dev)
+                } else {
+                    (0, 0)
+                };
+            let p = hip.decode_profile();
+            let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
+            let wall_us = gpu_us + p.host_us;
+            let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
+            self.metrics
+                .record_gpu_sample(used, total, draft_used, draft_total, util);
+            if let Ok(g) = self.lock() {
+                if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
+                    lru.set_gpu_busy(util);
+                }
             }
+            return;
         }
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() {
+            let target_dev = self.inventory.target_device.max(0);
+            let (used, total) = allpaca_cuda::device_memory_info(target_dev)
+                .map(|(free, total)| (total.saturating_sub(free), total))
+                .unwrap_or((0, 0));
+            let p = self
+                .cuda
+                .as_ref()
+                .map(|c| c.decode_profile())
+                .unwrap_or_default();
+            let wall = p.gpu_us + p.host_us;
+            let util = if wall > 0.0 { p.gpu_us / wall } else { 0.0 };
+            self.metrics
+                .record_gpu_sample(used, total, 0, 0, util);
+        }
+    }
+
+    /// Configured KV VRAM budget after boot-time GPU capacity scaling.
+    pub fn kv_vram_budget_bytes(&self) -> usize {
+        self.config.kv.vram_bytes
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -682,12 +826,34 @@ impl Engine {
                     if let Some(cuda) = &self.cuda {
                         ("cuda".into(), cuda.allocated_bytes())
                     } else {
-                        ("cpu".into(), 0)
+                        #[cfg(feature = "vulkan")]
+                        {
+                            if let Some(vk) = &self.vulkan {
+                                ("vulkan".into(), vk.allocated_bytes())
+                            } else {
+                                ("cpu".into(), 0)
+                            }
+                        }
+                        #[cfg(not(feature = "vulkan"))]
+                        {
+                            ("cpu".into(), 0)
+                        }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    ("cpu".into(), 0)
+                    #[cfg(feature = "vulkan")]
+                    {
+                        if let Some(vk) = &self.vulkan {
+                            ("vulkan".into(), vk.allocated_bytes())
+                        } else {
+                            ("cpu".into(), 0)
+                        }
+                    }
+                    #[cfg(not(feature = "vulkan"))]
+                    {
+                        ("cpu".into(), 0)
+                    }
                 }
             };
         let hip_h2d = self
@@ -718,6 +884,14 @@ impl Engine {
             .unwrap_or((0, 0));
         #[cfg(not(feature = "cuda"))]
         let (cuda_h2d, cuda_d2h) = (0u64, 0u64);
+        #[cfg(feature = "vulkan")]
+        let (vk_h2d, vk_d2h) = self
+            .vulkan
+            .as_ref()
+            .map(|c| (c.activation_h2d_bytes(), c.activation_d2h_bytes()))
+            .unwrap_or((0, 0));
+        #[cfg(not(feature = "vulkan"))]
+        let (vk_h2d, vk_d2h) = (0u64, 0u64);
         self.metrics
             .device_memory_bytes
             .store(device_memory_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -725,11 +899,11 @@ impl Engine {
             .draft_kv_bytes_on_device
             .store(draft_kv_bytes, std::sync::atomic::Ordering::Relaxed);
         self.metrics.activation_h2d_bytes.store(
-            hip_h2d + kv_h2d + draft_h2d + cuda_h2d,
+            hip_h2d + kv_h2d + draft_h2d + cuda_h2d + vk_h2d,
             std::sync::atomic::Ordering::Relaxed,
         );
         self.metrics.activation_d2h_bytes.store(
-            hip_d2h + kv_d2h + draft_d2h + cuda_d2h,
+            hip_d2h + kv_d2h + draft_d2h + cuda_d2h + vk_d2h,
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(hip) = &self.hip {
@@ -810,11 +984,25 @@ impl Engine {
     }
 
     pub fn load_synthetic(&self, cfg: ModelConfig) -> Result<(), AllpacaError> {
+        let seed = self.config.engine.determinism_seed.unwrap_or(42);
+        let vocab = cfg.vocab_size;
+        let layers = cfg.n_layers;
+        let target = TinyModel::synthetic(cfg, seed, "synthetic");
+        self.load_tiny_model(target, "synthetic")?;
+        tracing::info!(vocab, layers, "loaded synthetic model");
+        Ok(())
+    }
+
+    /// Load a host-ready TinyModel (tests / synthetic variants).
+    pub fn load_tiny_model(
+        &self,
+        mut target: TinyModel,
+        model_id: &str,
+    ) -> Result<(), AllpacaError> {
         let mut inner = self.lock()?;
         let seed = self.config.engine.determinism_seed.unwrap_or(42);
-        let tokenizer = EngineTokenizer::synthetic(cfg.vocab_size)?;
-        inner.ring.resize_vocab(cfg.vocab_size);
-        let mut target = TinyModel::synthetic(cfg.clone(), seed, "synthetic");
+        let tokenizer = EngineTokenizer::synthetic(target.config.vocab_size)?;
+        inner.ring.resize_vocab(target.config.vocab_size);
         self.apply_weight_working_set(&mut target)?;
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target)?;
@@ -830,15 +1018,30 @@ impl Engine {
             inner.draft_model = Some(Arc::new(draft));
         }
         set_tokenizer(&mut inner, tokenizer);
+        inner.model_id = model_id.into();
+        drop(inner);
+        self.upload_resident_weights()?;
+        self.note_early_exit_gate()?;
+        Ok(())
+    }
+
+    /// Install a ready synthetic `TinyModel` (e.g. SSM hybrid) and upload resident weights.
+    pub fn load_synthetic_model(&self, mut target: TinyModel) -> Result<(), AllpacaError> {
+        let mut inner = self.lock()?;
+        let vocab = target.config.vocab_size;
+        let n_layers = target.config.n_layers;
+        let tokenizer = EngineTokenizer::synthetic(vocab)?;
+        inner.ring.resize_vocab(vocab);
+        self.apply_weight_working_set(&mut target)?;
+        self.apply_expert_lru(&mut target)?;
+        self.attach_rpc(&mut target)?;
+        inner.target = Some(Arc::new(target));
+        set_tokenizer(&mut inner, tokenizer);
         inner.model_id = "synthetic".into();
         drop(inner);
         self.upload_resident_weights()?;
         self.note_early_exit_gate()?;
-        tracing::info!(
-            vocab = cfg.vocab_size,
-            layers = cfg.n_layers,
-            "loaded synthetic model"
-        );
+        tracing::info!(vocab, layers = n_layers, "loaded synthetic TinyModel");
         Ok(())
     }
 
@@ -998,7 +1201,14 @@ impl Engine {
             model.expert_host = Some(HostExpertPool::with_direct_storage(store, n_host, ds));
         }
 
-        let n_slots = expert_lru_slots(expert_bytes, self.config.weights.cache_bytes);
+        let keep = self.tune_keep_ids(model);
+        let pin_bytes = keep.len().saturating_mul(expert_bytes);
+        let cache_bytes = if keep.is_empty() {
+            self.config.weights.cache_bytes
+        } else {
+            self.config.weights.cache_bytes.max(pin_bytes)
+        };
+        let n_slots = expert_lru_slots(expert_bytes, cache_bytes);
         ExpertLru::record_slots(&self.metrics, n_slots);
         if n_slots == 0 {
             return Ok(());
@@ -1016,7 +1226,41 @@ impl Engine {
         if let Some(pool) = &model.expert_host {
             HostExpertPool::record_numa(&self.metrics, pool.numa());
         }
+        self.warmup_expert_keep_set(model)?;
         Ok(())
+    }
+
+    fn tune_keep_ids(&self, model: &TinyModel) -> Vec<ExpertId> {
+        let Some(entry) = self.config.tune_for_model() else {
+            return Vec::new();
+        };
+        let shape = crate::tune::MoeShape::from_model_config(&model.config);
+        let catalog = self
+            .config
+            .model
+            .path
+            .as_ref()
+            .and_then(|p| crate::tune::load_catalog_beside(p));
+        crate::tune::keep_ids_for_entry(entry, &shape, catalog.as_ref())
+    }
+
+    fn warmup_expert_keep_set(&self, model: &TinyModel) -> Result<(), AllpacaError> {
+        let Some(lru) = model.expert_lru.as_ref() else {
+            return Ok(());
+        };
+        let keep = self.tune_keep_ids(model);
+        lru.set_keep_set(&keep);
+        let hosts: Vec<(ExpertId, LayerFfn)> = keep
+            .iter()
+            .filter_map(|id| {
+                model
+                    .host_expert(id.layer as usize, id.expert as usize)
+                    .ok()
+                    .map(|ffn| (*id, ffn))
+            })
+            .collect();
+        let refs: Vec<(ExpertId, &LayerFfn)> = hosts.iter().map(|(id, ffn)| (*id, ffn)).collect();
+        lru.warmup_keep_set(&refs)
     }
 
     fn resolve_configured_path(
@@ -1144,9 +1388,14 @@ impl Engine {
         let tok = extract_tokenizer(&file)?;
         let mut model = TinyModel::from_gguf(&file)?;
         model.bind_gguf(file.clone());
-        if !model.host_weights_ready() && self.hip.is_none() && model.dsv4.is_none() {
+        #[cfg(feature = "cuda")]
+        let has_cuda = self.cuda.is_some();
+        #[cfg(not(feature = "cuda"))]
+        let has_cuda = false;
+        if !model.host_weights_ready() && self.hip.is_none() && !has_cuda && model.dsv4.is_none() {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "large GGUF requires HIP (host F32 materialize is skipped to avoid OOM)".into(),
+                "large GGUF requires HIP or CUDA (host F32 materialize is skipped to avoid OOM)"
+                    .into(),
             )));
         }
         let skip_hip = model.dsv4.is_some();
@@ -1279,9 +1528,15 @@ impl Engine {
                 };
                 if let Some(target) = target {
                     match crate::dsv4_gpu::attach(&target, hip, self.draft_hip.as_ref()) {
-                        Ok(()) => tracing::info!(
-                            "DeepSeek-V4: HIP BF16 MLA + MXFP4 expert LRU (no generic GGUF upload)"
-                        ),
+                        Ok(()) => {
+                            let keep = self.tune_keep_ids(&target);
+                            if let Err(e) = crate::dsv4_gpu::apply_keep_set(&target, &keep) {
+                                tracing::warn!(error = %e, "DeepSeek-V4 keep-set warmup failed");
+                            }
+                            tracing::info!(
+                                "DeepSeek-V4: HIP BF16 MLA + MXFP4 expert LRU (no generic GGUF upload)"
+                            );
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "DeepSeek-V4 HIP working set failed; CPU MLA/MoE");
                             self.metrics
@@ -1297,6 +1552,22 @@ impl Engine {
                 let mut g = self.lock()?;
                 if let Some(p) = g.dspark.as_mut() {
                     p.attach_hip(hip.clone());
+                }
+            }
+            // DSV4 skips generic HIP GGUF upload (`dsv4_gpu::attach` above). CUDA-only
+            // still attempts resident upload so MLA/DSV4 is explicitly rejected.
+            #[cfg(feature = "cuda")]
+            if self.hip.is_none() {
+                self.upload_resident_from_gguf(None, None)?;
+            }
+            #[cfg(feature = "vulkan")]
+            if self.hip.is_none() {
+                #[cfg(feature = "cuda")]
+                let skip = self.cuda.is_some();
+                #[cfg(not(feature = "cuda"))]
+                let skip = false;
+                if !skip {
+                    self.upload_resident_from_gguf(None, None)?;
                 }
             }
             return self.note_early_exit_gate();
@@ -1396,22 +1667,81 @@ impl Engine {
             let target = inner.target.clone();
             inner.target_cuda_resident = if self.hip.is_none() {
                 if let (Some(cuda), Some(target)) = (&self.cuda, target) {
+                    let host_ready = target.host_weights_ready();
+                    let gdn_device = target.gdn_needs_device_projections();
+                    let uploaded = if host_ready && !gdn_device {
+                        crate::CudaResidentModel::upload(&target, cuda.device)
+                    } else if let Some(file) = target_gguf {
+                        crate::CudaResidentModel::upload_gguf(file, &target.config, cuda.device)
+                    } else {
+                        Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                            "large GGUF missing file handle for CUDA upload".into(),
+                        )))
+                    };
+                    match uploaded {
+                        Ok(resident) => {
+                            weight_bytes += resident.bytes();
+                            h2d += resident.packed_h2d_bytes();
+                            tracing::info!(
+                                device = cuda.device,
+                                bytes = resident.bytes(),
+                                "CUDA target weight upload"
+                            );
+                            Some(Arc::new(resident))
+                        }
+                        Err(e) => {
+                            if !host_ready || gdn_device {
+                                return Err(e);
+                            }
+                            tracing::warn!(
+                                error = %e,
+                                "CUDA target weight upload failed; CPU forward"
+                            );
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        }
+        #[cfg(feature = "vulkan")]
+        {
+            let target = inner.target.clone();
+            inner.target_vulkan_resident = if self.hip.is_none() {
+                #[cfg(feature = "cuda")]
+                let cuda_busy = self.cuda.is_some();
+                #[cfg(not(feature = "cuda"))]
+                let cuda_busy = false;
+                if cuda_busy {
+                    None
+                } else if let (Some(vk), Some(target)) = (&self.vulkan, target) {
                     if target.host_weights_ready() {
-                        match crate::CudaResidentModel::upload(&target, cuda.device) {
+                        let uploaded = if let Some(file) = target_gguf {
+                            crate::VulkanResidentModel::upload_gguf(&target, file, vk)
+                        } else {
+                            crate::VulkanResidentModel::upload(&target, vk)
+                        };
+                        match uploaded {
                             Ok(resident) => {
                                 weight_bytes += resident.bytes();
                                 h2d += resident.packed_h2d_bytes();
                                 tracing::info!(
-                                    device = cuda.device,
+                                    device = vk.device,
                                     bytes = resident.bytes(),
-                                    "CUDA target weight upload"
+                                    "Vulkan target weight upload"
                                 );
                                 Some(Arc::new(resident))
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
-                                    "CUDA target weight upload failed; CPU forward"
+                                    "Vulkan target weight upload failed; CPU forward"
                                 );
                                 self.metrics
                                     .degraded_events
@@ -2206,7 +2536,8 @@ impl Engine {
                     let m = batch_gemm_plan.as_ref().map(|p| p.m_tokens).unwrap_or(0);
                     if m >= 2 {
                         if let Some(plan) = batch_gemm_plan.as_ref() {
-                            let (launched, applied) = self.try_packed_batch_gemm_hip(hip, plan);
+                            let (launched, applied, hidden) =
+                                self.try_packed_batch_gemm_hip(hip, plan);
                             if launched > 0 {
                                 self.metrics
                                     .batch_gemm_hip_kernels
@@ -2218,6 +2549,12 @@ impl Engine {
                                     .fetch_add(applied, std::sync::atomic::Ordering::Relaxed);
                             } else {
                                 self.fallback_deferred_lm_head(plan);
+                            }
+                            if hidden > 0 {
+                                self.metrics.batch_gemm_residual_hidden.fetch_add(
+                                    hidden,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                             self.clear_cohort_defer_lm_head(plan);
                         }
@@ -2318,23 +2655,34 @@ impl Engine {
         }
     }
 
-    /// Packed HIP `gemm_nt` for attn shared-A weights + FFN (incl w_down) + lm_head.
-    ///
-    /// Returns `(kernels_launched, applied)` where `applied` is 1 when packed
-    /// lm_head logits were written into at least one Request's `pending_logits`
-    /// (consumed by the next sample). Only uses fresh `output_norm` rows.
-    fn try_packed_batch_gemm_hip(&self, hip: &HipWorkspace, plan: &BatchGemmPlan) -> (u64, u64) {
+    /// Returns `(kernels_launched, applied, residual_hidden)` where `applied`
+    /// is 1 when packed lm_head logits were written into at least one Request's
+    /// `pending_logits` (consumed by the next sample). Only uses fresh
+    /// `output_norm` rows for lm_head. `residual_hidden` counts Requests whose
+    /// `last_hidden` was overwritten with the packed `x+WO+FFN` stream.
+    fn try_packed_batch_gemm_hip(&self, hip: &HipWorkspace, plan: &BatchGemmPlan) -> (u64, u64, u64) {
         let Ok(inner) = self.lock() else {
-            return (0, 0);
+            return (0, 0, 0);
         };
         let Some(target) = inner.target.clone() else {
-            return (0, 0);
+            return (0, 0, 0);
         };
         let dim = target.config.dim;
         let vocab = target.config.vocab_size;
+        let n_heads = target.config.n_heads;
+        let n_kv_heads = target.config.n_kv_heads.max(1);
+        let head_dim = target.config.head_dim();
         if dim == 0 || plan.request_ids.len() < 2 {
-            return (0, 0);
+            return (0, 0, 0);
         }
+        let attn_w = target.layers.first().map(|layer| {
+            (
+                layer.wq.as_slice().to_vec(),
+                layer.wk.as_slice().to_vec(),
+                layer.wv.as_slice().to_vec(),
+                layer.wo.as_slice().to_vec(),
+            )
+        });
         let weights: Vec<(Vec<f32>, usize, usize)> = if let Some(layer) = target.layers.first() {
             decode_layer_attn_shared_a_weights(
                 dim,
@@ -2366,7 +2714,7 @@ impl Engine {
             .as_ref()
             .is_some_and(|(g, u, d)| !g.is_empty() && !u.is_empty() && !d.is_empty());
         if weights.is_empty() && !has_ffn && lm_head.is_none() {
-            return (0, 0);
+            return (0, 0, 0);
         }
         let mut apply_ids: Vec<u64> = Vec::new();
         let mut a_rows: Vec<Vec<f32>> = Vec::new();
@@ -2381,40 +2729,83 @@ impl Engine {
         }
         drop(inner);
         if a_rows.len() < 2 {
-            return (0, 0);
+            return (0, 0, 0);
         }
 
         let a_refs: Vec<&[f32]> = a_rows.iter().map(|v| v.as_slice()).collect();
+        let mut fused_rows = a_rows.clone();
         let mut launched = 0u64;
-        for (b, n, k) in &weights {
-            let mut c_rows: Vec<Vec<f32>> = a_rows
+        let mut attn_fused = false;
+        if let Some((wq, wk, wv, wo)) = attn_w.as_ref() {
+            let mut attn_out: Vec<Vec<f32>> = a_rows
                 .iter()
-                .map(|a| vec![0.0f32; (a.len() / k) * n])
+                .map(|a| {
+                    let m = a.len() / dim;
+                    vec![0.0f32; m.saturating_mul(dim)]
+                })
                 .collect();
-            let mut c_refs: Vec<&mut [f32]> = c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
-            if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
-                launched += 1;
+            let mut out_refs: Vec<&mut [f32]> =
+                attn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
+            if let Ok(n) = apply_packed_attn_hip(
+                hip,
+                &a_refs,
+                wq,
+                wk,
+                wv,
+                wo,
+                dim,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &mut out_refs,
+            ) {
+                launched += n;
+                attn_fused = true;
+                let y_refs: Vec<&[f32]> = attn_out.iter().map(|v| v.as_slice()).collect();
+                let mut x_refs: Vec<&mut [f32]> =
+                    fused_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+                let _ = residual_add_rows(&mut x_refs, &y_refs);
+            }
+        }
+        if !attn_fused {
+            for (b, n, k) in &weights {
+                let mut c_rows: Vec<Vec<f32>> = a_rows
+                    .iter()
+                    .map(|a| vec![0.0f32; (a.len() / k) * n])
+                    .collect();
+                let mut c_refs: Vec<&mut [f32]> =
+                    c_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+                if packed_gemm_nt_hip(hip, &a_refs, b, &mut c_refs, *n, *k).is_ok() {
+                    launched += 1;
+                }
             }
         }
 
         if let Some((w_gate, w_up, w_down)) = ffn_weights {
-            let mut ffn_out: Vec<Vec<f32>> = a_rows
+            let mut ffn_out: Vec<Vec<f32>> = fused_rows
                 .iter()
                 .map(|a| {
                     let m = a.len() / dim;
                     vec![0.0f32; m * dim]
                 })
                 .collect();
-            let mut out_refs: Vec<&mut [f32]> =
-                ffn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
-            if let Ok(n) =
-                apply_packed_ffn_hip(hip, &a_refs, &w_gate, &w_up, &w_down, dim, &mut out_refs)
-            {
+            let ffn_ok = {
+                let ffn_a: Vec<&[f32]> = fused_rows.iter().map(|v| v.as_slice()).collect();
+                let mut out_refs: Vec<&mut [f32]> =
+                    ffn_out.iter_mut().map(|v| v.as_mut_slice()).collect();
+                apply_packed_ffn_hip(hip, &ffn_a, &w_gate, &w_up, &w_down, dim, &mut out_refs)
+            };
+            if let Ok(n) = ffn_ok {
                 launched += n;
+                let y_refs: Vec<&[f32]> = ffn_out.iter().map(|v| v.as_slice()).collect();
+                let mut x_refs: Vec<&mut [f32]> =
+                    fused_rows.iter_mut().map(|v| v.as_mut_slice()).collect();
+                let _ = residual_add_rows(&mut x_refs, &y_refs);
             }
         }
 
         let mut applied = 0u64;
+        let mut hidden_writes = 0u64;
         if let Some((b, n, k)) = lm_head {
             let mut c_rows: Vec<Vec<f32>> = a_rows
                 .iter()
@@ -2443,11 +2834,29 @@ impl Engine {
                     }
                     if wrote {
                         applied = 1;
+                        // lm_head already consumed `a_rows` (`output_norm`). Persist
+                        // fused `x+WO+FFN` into decode hidden unless MTP needs
+                        // the original output_norm for `h_nextn`.
+                        if !mtp_draft_active(&inner) {
+                            for (i, &rid) in apply_ids.iter().enumerate() {
+                                let Some(req) = inner.active.get_mut(&rid) else {
+                                    continue;
+                                };
+                                if write_residual_into_hidden(
+                                    &mut [req.last_hidden.as_mut_slice()],
+                                    &[fused_rows[i].as_slice()],
+                                )
+                                .is_ok()
+                                {
+                                    hidden_writes += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        (launched, applied)
+        (launched, applied, hidden_writes)
     }
 
     fn step_id(&self, id: u64) -> Result<StepResult, AllpacaError> {
@@ -2551,6 +2960,8 @@ impl Engine {
             ds_queue: &self.ds_queue,
             #[cfg(feature = "cuda")]
             cuda: self.cuda.as_deref(),
+            #[cfg(feature = "vulkan")]
+            vulkan: self.vulkan.as_deref(),
         };
         let produced = if use_tree {
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
@@ -2733,6 +3144,8 @@ impl Engine {
         let resident = inner.target_resident.clone();
         #[cfg(feature = "cuda")]
         let cuda_resident = inner.target_cuda_resident.clone();
+        #[cfg(feature = "vulkan")]
+        let vulkan_resident = inner.target_vulkan_resident.clone();
         let mut logits = {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.pending_logits)
@@ -2756,14 +3169,25 @@ impl Engine {
             )
         };
         let vision_in_chunk = (start..end).any(|p| p < vision_prefix_len);
-        let batch_prefill = !vision_in_chunk
+        let batch_prefill_hip = !vision_in_chunk
             && toks.len() > 1
             && ((self.hip.is_some()
                 && resident.is_some()
                 && !mtp_draft_active(inner)
                 && target.supports_device_batched_prefill())
                 || target.dsv4.is_some());
-        if batch_prefill {
+        #[cfg(feature = "cuda")]
+        let batch_prefill_cuda = !vision_in_chunk
+            && toks.len() > 1
+            && self.hip.is_none()
+            && self.cuda.is_some()
+            && cuda_resident.is_some()
+            && !mtp_draft_active(inner)
+            && target.supports_device_batched_prefill();
+        #[cfg(not(feature = "cuda"))]
+        let batch_prefill_cuda = false;
+        let mut did_batch = false;
+        if batch_prefill_hip {
             target.forward_tokens(
                 &toks,
                 start,
@@ -2781,7 +3205,39 @@ impl Engine {
             )?;
             // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
             // page (growing with seq) and break logits-only decode accounting.
-        } else {
+            did_batch = true;
+        } else if batch_prefill_cuda {
+            #[cfg(feature = "cuda")]
+            {
+                if let (Some(cuda), Some(cres)) =
+                    (self.cuda.as_deref(), cuda_resident.as_deref())
+                {
+                    match target.forward_tokens_cuda(
+                        &toks,
+                        start,
+                        &pages,
+                        &mut inner.kv,
+                        &self.metrics,
+                        &mut logits,
+                        cuda,
+                        cres,
+                        write_logits,
+                        recurrent.as_mut(),
+                    ) {
+                        Ok(()) => did_batch = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                start,
+                                n = toks.len(),
+                                error = %e,
+                                "CUDA batched prefill failed; per-token fallback"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if !did_batch {
             let want_hidden = mtp_draft_active(inner);
             for (i, tok) in toks.iter().enumerate() {
                 let pos = start + i;
@@ -2826,6 +3282,7 @@ impl Engine {
                                     cuda,
                                     cres,
                                     soft,
+                                    recurrent.as_mut(),
                                 ) {
                                     Ok(()) => used = true,
                                     Err(e) => {
@@ -2846,7 +3303,45 @@ impl Engine {
                         false
                     }
                 };
-                if !used_cuda {
+                let used_vulkan = {
+                    #[cfg(feature = "vulkan")]
+                    {
+                        let mut used = false;
+                        if self.hip.is_none() && !used_cuda {
+                            if let (Some(vk), Some(vres)) =
+                                (self.vulkan.as_deref(), vulkan_resident.as_deref())
+                            {
+                                match target.forward_token_vulkan(
+                                    *tok,
+                                    pos,
+                                    &pages,
+                                    &mut inner.kv,
+                                    &self.metrics,
+                                    &mut logits,
+                                    vk,
+                                    vres,
+                                    soft,
+                                ) {
+                                    Ok(()) => used = true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            pos,
+                                            token = *tok,
+                                            error = %e,
+                                            "Vulkan on-device decode failed; host fallback"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        used
+                    }
+                    #[cfg(not(feature = "vulkan"))]
+                    {
+                        false
+                    }
+                };
+                if !used_cuda && !used_vulkan {
                     target.forward_token(
                         *tok,
                         pos,
@@ -3160,6 +3655,10 @@ impl Engine {
             t_dispatch,
             expert_bytes as f64,
         ));
+        let keep = self.tune_keep_ids(model);
+        if let Some(lru) = model.expert_lru.as_ref() {
+            lru.set_keep_set(&keep);
+        }
     }
 }
 
@@ -3290,6 +3789,66 @@ fn open_cuda_workspace(
         }
         Err(e) => {
             tracing::warn!(error = %e, "CUDA workspace failed; CPU fallback");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn open_vulkan_workspace(
+    config: &Config,
+    inventory: &DeviceInventory,
+) -> Option<allpaca_vulkan::VulkanWorkspace> {
+    if config.engine.cpu_only || config.engine.gpu_backend == "cpu" {
+        return None;
+    }
+    if !allpaca_vulkan::runtime_linked() {
+        return None;
+    }
+    if config.engine.gpu_backend != "auto" && config.engine.gpu_backend != "vulkan" {
+        return None;
+    }
+    if config.engine.gpu_backend == "auto"
+        && inventory
+            .devices
+            .iter()
+            .any(|d| d.kind == allpaca_types::DeviceKind::HipGpu)
+    {
+        return None;
+    }
+    if config.engine.gpu_backend == "auto"
+        && inventory
+            .devices
+            .iter()
+            .any(|d| d.kind == allpaca_types::DeviceKind::CudaGpu)
+    {
+        return None;
+    }
+    let gpus: Vec<_> = inventory
+        .devices
+        .iter()
+        .filter(|d| d.kind == allpaca_types::DeviceKind::VulkanGpu)
+        .collect();
+    if gpus.is_empty() {
+        return None;
+    }
+    let device =
+        if inventory.target_device >= 0 && gpus.iter().any(|d| d.id == inventory.target_device) {
+            inventory.target_device
+        } else {
+            gpus[0].id
+        };
+    match allpaca_vulkan::VulkanWorkspace::new(device, 8 * 1024 * 1024) {
+        Ok(ws) => {
+            tracing::info!(
+                device,
+                bytes = ws.allocated_bytes(),
+                "Vulkan workspace allocated"
+            );
+            Some(ws)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Vulkan workspace failed; CPU fallback");
             None
         }
     }
@@ -3816,6 +4375,8 @@ fn verify_and_sample(
         Some(hooks.ds_queue),
         #[cfg(feature = "cuda")]
         hooks.cuda,
+        #[cfg(feature = "vulkan")]
+        hooks.vulkan,
     )?;
     if stop || !first_match || draft_iter.peek().is_none() {
         return finish_linear_verify(
@@ -3865,6 +4426,8 @@ fn verify_and_sample(
             Some(hooks.ds_queue),
             #[cfg(feature = "cuda")]
             hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
         )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || !matched || draft_iter.peek().is_none() {
@@ -4482,6 +5045,8 @@ fn packed_linear_verify_span(
             Some(hooks.ds_queue),
             #[cfg(feature = "cuda")]
             hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
         )?;
     } else {
         let off = keep.saturating_sub(1) * vocab;
@@ -4579,6 +5144,8 @@ fn verify_forest(
             Some(hooks.ds_queue),
             #[cfg(feature = "cuda")]
             hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
         )?;
         let stop = is_stop(sampled, &request(inner, id)?.params);
         if stop || child.is_none() || forest.children(parent).next().is_none() {
@@ -4618,6 +5185,7 @@ fn append_and_forward(
     ds_probe: Option<&DirectStorageProbe>,
     ds_queue: Option<&DirectStorageQueue>,
     #[cfg(feature = "cuda")] cuda: Option<&allpaca_cuda::CudaWorkspace>,
+    #[cfg(feature = "vulkan")] vulkan: Option<&allpaca_vulkan::VulkanWorkspace>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
     let page_tokens = request(inner, id)?
@@ -4654,6 +5222,8 @@ fn append_and_forward(
     let resident = inner.target_resident.clone();
     #[cfg(feature = "cuda")]
     let cuda_resident = inner.target_cuda_resident.clone();
+    #[cfg(feature = "vulkan")]
+    let vulkan_resident = inner.target_vulkan_resident.clone();
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     let mut moe_norm = std::mem::take(&mut request_mut(inner, id)?.moe_norm);
     let mut last_hidden = std::mem::take(&mut request_mut(inner, id)?.last_hidden);
@@ -4689,6 +5259,7 @@ fn append_and_forward(
                         cuda,
                         cres,
                         None,
+                        recurrent.as_mut(),
                     ) {
                         Ok(()) => used = true,
                         Err(e) => {
@@ -4709,7 +5280,43 @@ fn append_and_forward(
             false
         }
     };
-    if !used_cuda {
+    let used_vulkan = {
+        #[cfg(feature = "vulkan")]
+        {
+            let mut used = false;
+            if hip.is_none() && !used_cuda {
+                if let (Some(vk), Some(vres)) = (vulkan, vulkan_resident.as_deref()) {
+                    match target.forward_token_vulkan(
+                        token,
+                        pos,
+                        &pages,
+                        &mut inner.kv,
+                        metrics,
+                        &mut logits,
+                        vk,
+                        vres,
+                        None,
+                    ) {
+                        Ok(()) => used = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                pos,
+                                token,
+                                error = %e,
+                                "Vulkan on-device decode failed; host fallback"
+                            );
+                        }
+                    }
+                }
+            }
+            used
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            false
+        }
+    };
+    if !used_cuda && !used_vulkan {
         target.forward_token(
             token,
             pos,
@@ -4860,6 +5467,53 @@ mod tests {
         assert!(
             stats.rpc_roundtrips > 0,
             "expected remote layer launches, got {}",
+            stats.rpc_roundtrips
+        );
+        drop(engine);
+        worker.join().unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn rpc_loopback_cuda_worker_synthetic_generate() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CudaWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Cuda(CudaWorker::new(0).expect("cuda worker"));
+            serve_connection(stream, backend).unwrap();
+        });
+
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        cfg.rpc.endpoints = vec![addr.to_string()];
+        cfg.rpc.max_seq = 64;
+        cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let engine = Engine::new(cfg).unwrap();
+        let out = engine
+            .generate(
+                "hello",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(2),
+                    ..GenerationParams::default()
+                },
+            )
+            .unwrap();
+        assert!(!out.token_ids.is_empty());
+        let stats = engine.stats();
+        assert!(
+            stats.rpc_roundtrips > 0,
+            "expected CUDA RPC layer launches, got {}",
             stats.rpc_roundtrips
         );
         drop(engine);
@@ -6783,6 +7437,10 @@ mod tests {
                     stats.batch_gemm_executes >= 1,
                     "HIP packed kernel implies soft execute; stats={stats:?}"
                 );
+                assert!(
+                    stats.batch_gemm_residual_hidden >= 1,
+                    "fused residual must land in last_hidden; stats={stats:?}"
+                );
                 drop(a);
                 drop(b);
                 return;
@@ -6791,11 +7449,15 @@ mod tests {
         let stats = engine.stats();
         assert!(
             stats.batch_gemm_hip_kernels >= 7,
-            "layer-fused HIP must launch QKV/O + FFN(gate/up/down); stats={stats:?}"
+            "packed Q/K/V C must feed attention then WO plus FFN(gate/up/down); stats={stats:?}"
         );
         assert!(
             stats.batch_gemm_hip_applied >= 1,
             "packed lm_head logits must be applied to pending_logits; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_residual_hidden >= 1,
+            "fused residual must land in last_hidden; stats={stats:?}"
         );
         drop(a);
         drop(b);
@@ -6842,6 +7504,10 @@ mod tests {
                     stats.batch_gemm_hip_kernels >= 1,
                     "applied implies at least one packed HIP kernel; stats={stats:?}"
                 );
+                assert!(
+                    stats.batch_gemm_residual_hidden >= 1,
+                    "applied must write fused residual into last_hidden; stats={stats:?}"
+                );
                 drop(a);
                 drop(b);
                 return;
@@ -6855,6 +7521,10 @@ mod tests {
         assert!(
             stats.batch_gemm_lm_head_skipped >= 1,
             "cohort decode must skip per-request lm_head; stats={stats:?}"
+        );
+        assert!(
+            stats.batch_gemm_residual_hidden >= 1,
+            "packed residual must land in last_hidden; stats={stats:?}"
         );
         drop(a);
         drop(b);
@@ -8674,6 +9344,92 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_tiny_deepseek4_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_cuda_tiny_dsv4-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: false,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg.engine.gpu_backend = "cuda".into();
+        cfg.speculative.enabled = false;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny DeepSeek-V4 GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "cuda" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "MLA/DSV4 must not CUDA-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "CUDA MLA upload reject must degrade; stats={stats:?}"
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_tiny_deepseek4_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_vulkan_tiny_dsv4-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            cpu_only: false,
+            ..CliOverrides::default()
+        });
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg.engine.gpu_backend = "vulkan".into();
+        cfg.speculative.enabled = false;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny DeepSeek-V4 GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "vulkan" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "MLA/DSV4 must not Vulkan-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "Vulkan MLA upload reject must degrade; stats={stats:?}"
+        );
+    }
+
     #[cfg(feature = "hip")]
     fn dsv4_generate_tokens(path: &std::path::Path, cpu_only: bool) -> (Vec<u32>, StatsSnapshot) {
         let mut cfg = Config::compiled_defaults();
@@ -9184,6 +9940,83 @@ mod tests {
             })
             .collect();
         write_gguf(path, &meta, &views).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_tiny_gdn_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join("allpaca_cuda_tiny_gdn.gguf");
+        write_tiny_qwen_gdn_gguf(&path, 0.02);
+        let mut cfg = Config::compiled_defaults();
+        cfg.model.path = Some(path.clone());
+        cfg.model.synthetic = false;
+        cfg.engine.cpu_only = false;
+        cfg.engine.gpu_backend = "cuda".into();
+        cfg.engine.determinism_seed = Some(7);
+        cfg.speculative.enabled = false;
+        cfg.kv.page_tokens = 8;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny GDN GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "cuda" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "GDN/SSM must not CUDA-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "CUDA GDN upload reject must degrade; stats={stats:?}"
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_tiny_gdn_gguf_rejects_upload() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_vulkan_tiny_gdn-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_tiny_qwen_gdn_gguf(&path, 0.02);
+        let mut cfg = Config::compiled_defaults();
+        cfg.model.path = Some(path.clone());
+        cfg.model.synthetic = false;
+        cfg.engine.cpu_only = false;
+        cfg.engine.gpu_backend = "vulkan".into();
+        cfg.engine.determinism_seed = Some(7);
+        cfg.speculative.enabled = false;
+        cfg.kv.page_tokens = 8;
+        let engine = match Engine::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                panic!("tiny GDN GGUF must load: {e}");
+            }
+        };
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(&path);
+        if stats.backend != "vulkan" {
+            return;
+        }
+        assert_eq!(
+            stats.weight_bytes_on_device, 0,
+            "GDN/SSM must not Vulkan-upload; stats={stats:?}"
+        );
+        assert!(
+            stats.degraded_events >= 1,
+            "Vulkan GDN upload reject must degrade; stats={stats:?}"
+        );
     }
 
     #[cfg(feature = "hip")]

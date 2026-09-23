@@ -495,6 +495,7 @@ fn load_qwen35_layer(
         shared_expert,
         expert_bias: Vec::new(),
         attn_out_gate: Vec::new(),
+        attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
         ffn_post_norm: Vec::new(),
     })
@@ -547,6 +548,7 @@ fn load_ling8_layer(
             shared_expert: LayerFfn::default(),
             expert_bias: Vec::new(),
             attn_out_gate: Vec::new(),
+        attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
             ffn_post_norm: Vec::new(),
         });
@@ -602,6 +604,7 @@ fn load_ling8_layer(
         expert_bias: get_f32(&format!("{prefix}.mlp.gate.e_score_correction_bias"))?
             .unwrap_or_default(),
         attn_out_gate: Vec::new(),
+        attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
         ffn_post_norm: Vec::new(),
     })

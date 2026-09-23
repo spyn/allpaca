@@ -7,24 +7,23 @@
 //! dense enough that they would be used. F32 tensors other than HC mix stay on
 //! the CPU gemv path.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::Instant;
 
 use allpaca_cpu::{MXFP4_BLOCK_BYTES, MXFP4_BLOCK_ELEMS};
 use allpaca_gguf::{GgmlType, GgufFile};
 use allpaca_hip::{
-    DeviceWeights, H2D_READY_RING, H2dStream, HipWorkspace, MEMCPY_D2H, MEMCPY_H2D,
     device_memory_info, gemm_nt_device, host_free, host_malloc, host_register, host_unregister,
-    memcpy,
+    memcpy, DeviceWeights, H2dStream, HipWorkspace, H2D_READY_RING, MEMCPY_D2H, MEMCPY_H2D,
 };
 use allpaca_types::{AllpacaError, DegradedError, FatalError};
 
 use crate::model::{ModelConfig, TinyModel};
 use crate::telemetry::Metrics;
-use crate::weight_set::qstar_fill_count;
+use crate::weight_set::{qstar_fill_count, ExpertId};
 
 const STREAM_SLOT_BYTES: usize = 128 * 1024 * 1024;
 const PREFILL_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
@@ -327,6 +326,7 @@ pub struct Dsv4Gpu {
     o_out_n: usize,
     warmup_miss: Vec<(usize, usize)>,
     pub used: AtomicBool,
+    keep_set: HashSet<(usize, usize)>,
 }
 
 impl Dsv4Gpu {
@@ -461,6 +461,7 @@ impl Dsv4Gpu {
             o_out_n: 0,
             warmup_miss: Vec::new(),
             used: AtomicBool::new(false),
+            keep_set: HashSet::new(),
         };
         if gpu.h2d.is_some() {
             gpu.pin0 = try_expert_pin(file);
@@ -479,6 +480,21 @@ impl Dsv4Gpu {
         }
         gpu.alloc_expert_pools(cfg)?;
         Ok(gpu)
+    }
+
+    fn pin_keep(&self, key: (usize, usize)) -> bool {
+        self.keep_set.contains(&key)
+    }
+
+    /// Durable pin-prefer keep-set. Empty means no reserved slots (true LRU).
+    pub fn set_keep_set(&mut self, ids: &[ExpertId]) {
+        self.keep_set = ids
+            .iter()
+            .map(|id| (id.layer as usize, id.expert as usize))
+            .collect();
+        for slot in self.slots.iter_mut().chain(self.gpu1_slots.iter_mut()) {
+            slot.pinned = slot.key.is_some_and(|k| self.keep_set.contains(&k));
+        }
     }
 
     fn alloc_expert_pools(&mut self, cfg: &ModelConfig) -> Result<(), AllpacaError> {
@@ -782,7 +798,7 @@ impl Dsv4Gpu {
         self.clock = self.clock.saturating_add(1);
         if let Some(i) = self.slots.iter().position(|s| s.key == Some(key)) {
             self.slots[i].used = self.clock;
-            self.slots[i].pinned = true;
+            self.slots[i].pinned = self.pin_keep(key);
             if let Some(m) = metrics {
                 m.expert_lru_hits.fetch_add(1, Ordering::Relaxed);
             }
@@ -792,7 +808,7 @@ impl Dsv4Gpu {
         }
         if let Some(i) = self.gpu1_slots.iter().position(|s| s.key == Some(key)) {
             self.gpu1_slots[i].used = self.clock;
-            self.gpu1_slots[i].pinned = true;
+            self.gpu1_slots[i].pinned = self.pin_keep(key);
             if let Some(m) = metrics {
                 m.expert_lru_hits.fetch_add(1, Ordering::Relaxed);
             }
@@ -837,7 +853,7 @@ impl Dsv4Gpu {
             }
             self.slots[victim].key = Some(key);
             self.slots[victim].used = self.clock;
-            self.slots[victim].pinned = true;
+            self.slots[victim].pinned = self.pin_keep(key);
             return Ok((blob.byte_ptr_at(off), hip.device));
         }
         if !self.gpu1_slots.is_empty() {
@@ -856,7 +872,7 @@ impl Dsv4Gpu {
             }
             self.gpu1_slots[victim].key = Some(key);
             self.gpu1_slots[victim].used = self.clock;
-            self.gpu1_slots[victim].pinned = true;
+            self.gpu1_slots[victim].pinned = self.pin_keep(key);
             hip.bind()?;
             return Ok((blob.byte_ptr_at(off), self.gpu1_device));
         }
@@ -980,7 +996,7 @@ impl Dsv4Gpu {
                 };
                 self.gpu1_slots[victim].key = Some(key);
                 self.gpu1_slots[victim].used = self.clock;
-                self.gpu1_slots[victim].pinned = pin;
+                self.gpu1_slots[victim].pinned = pin || self.pin_keep(key);
                 *n1 = n1.saturating_add(1);
                 return Some((true, victim));
             }
@@ -989,7 +1005,7 @@ impl Dsv4Gpu {
             };
             self.slots[victim].key = Some(key);
             self.slots[victim].used = self.clock;
-            self.slots[victim].pinned = pin;
+            self.slots[victim].pinned = pin || self.pin_keep(key);
             *n0 = n0.saturating_add(1);
             return Some((false, victim));
         }
@@ -1025,14 +1041,14 @@ impl Dsv4Gpu {
             self.clock = self.clock.saturating_add(1);
             if let Some(i) = self.slots.iter().position(|s| s.key == Some(key)) {
                 self.slots[i].used = self.clock;
-                if pin {
+                if pin || self.pin_keep(key) {
                     self.slots[i].pinned = true;
                 }
                 continue;
             }
             if let Some(i) = self.gpu1_slots.iter().position(|s| s.key == Some(key)) {
                 self.gpu1_slots[i].used = self.clock;
-                if pin {
+                if pin || self.pin_keep(key) {
                     self.gpu1_slots[i].pinned = true;
                 }
                 continue;
@@ -3925,6 +3941,40 @@ pub fn attach(
     Ok(())
 }
 
+/// Apply a pin-prefer keep-set to an attached DeepSeek-V4 HIP working set.
+pub fn apply_keep_set(model: &TinyModel, ids: &[ExpertId]) -> Result<(), AllpacaError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let Some(dsv4) = model.dsv4.as_ref() else {
+        return Ok(());
+    };
+    let file = dsv4.gguf.clone();
+    let mut guard = dsv4
+        .gpu
+        .lock()
+        .map_err(|_| AllpacaError::Fatal(FatalError::ModelLoad("dsv4 gpu lock poisoned".into())))?;
+    let Some(gpu) = guard.as_mut() else {
+        return Ok(());
+    };
+    gpu.set_keep_set(ids);
+    let Some(file) = file else {
+        return Ok(());
+    };
+    let mut by_layer: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for id in ids {
+        by_layer
+            .entry(id.layer as usize)
+            .or_default()
+            .push(id.expert as usize);
+    }
+    for (layer, experts) in by_layer {
+        gpu.warmup_experts(file.as_ref(), layer, &experts, &model.config, None)?;
+    }
+    Ok(())
+}
+
 fn add_ns(metrics: Option<&Metrics>, field: impl Fn(&Metrics) -> &AtomicU64, t: Instant) {
     if let Some(m) = metrics {
         field(m).fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3983,8 +4033,8 @@ fn prefault_mmap(bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPERT_LRU_MAX_BYTES, HBM_RESERVE, expert_lru_slots, want_full_layer_prefetch,
-        want_hint_prefetch,
+        expert_lru_slots, want_full_layer_prefetch, want_hint_prefetch, EXPERT_LRU_MAX_BYTES,
+        HBM_RESERVE,
     };
     use crate::model::ModelConfig;
 

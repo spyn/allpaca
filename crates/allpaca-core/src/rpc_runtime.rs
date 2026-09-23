@@ -353,7 +353,8 @@ impl RpcRuntime {
         self.activation_bytes
             .fetch_add((x.len() * 4) as u64, Ordering::Relaxed);
         let n_kv = pos + 1;
-        let kv_off = (pos * layer.kv_dim * 4) as u64;
+        let kv_off = (pos * layer.kv_dim * 4) as i32;
+        let kv_bytes = (layer.kv_dim * 4) as i32;
         let list = LaunchList {
             items: vec![
                 rms(layer.x, layer.attn_norm, layer.norm_out, layer.eps),
@@ -383,8 +384,9 @@ impl RpcRuntime {
                 ),
                 rope_op(layer.q, layer.n_heads, layer.head_dim, pos, layer.theta),
                 rope_op(layer.k, layer.n_kv_heads, layer.head_dim, pos, layer.theta),
-                memcpy_at(layer.k_cache, layer.k),
-                memcpy_at(layer.v_cache, layer.v),
+                // Device-resident KV slot write (no host bounce).
+                memcpy_at(layer.k_cache, layer.k, kv_off, kv_bytes),
+                memcpy_at(layer.v_cache, layer.v, kv_off, kv_bytes),
                 attn(
                     layer.q,
                     layer.k_cache,
@@ -433,30 +435,7 @@ impl RpcRuntime {
                 residual(layer.x, layer.hidden),
             ],
         };
-        // KV slot write: copy k/v into cache at pos. Memcpy copies whole buffers;
-        // use H2D of k/v after rope into cache offset instead.
-        session
-            .launch(&LaunchList {
-                items: list.items[..6].to_vec(),
-            })
-            .map_err(map_rpc)?;
-        let k_bytes = session
-            .d2h(layer.k, 0, (layer.kv_dim * 4) as u64)
-            .map_err(map_rpc)?;
-        let v_bytes = session
-            .d2h(layer.v, 0, (layer.kv_dim * 4) as u64)
-            .map_err(map_rpc)?;
-        session
-            .h2d(layer.k_cache, kv_off, &k_bytes)
-            .map_err(map_rpc)?;
-        session
-            .h2d(layer.v_cache, kv_off, &v_bytes)
-            .map_err(map_rpc)?;
-        session
-            .launch(&LaunchList {
-                items: list.items[8..].to_vec(),
-            })
-            .map_err(map_rpc)?;
+        session.launch(&list).map_err(map_rpc)?;
         session.sync().map_err(map_rpc)?;
         let out = session
             .d2h(layer.x, 0, (layer.dim * 4) as u64)
@@ -567,11 +546,11 @@ fn silu(gate: BufId, up: BufId) -> LaunchItem {
     }
 }
 
-fn memcpy_at(_dst: BufId, _src: BufId) -> LaunchItem {
+fn memcpy_at(dst: BufId, src: BufId, dst_off: i32, nbytes: i32) -> LaunchItem {
     LaunchItem {
         op: KernelOp::Memcpy,
-        bufs: vec![_dst, _src],
-        i32s: vec![],
+        bufs: vec![dst, src],
+        i32s: vec![dst_off, nbytes],
         f32s: vec![],
     }
 }

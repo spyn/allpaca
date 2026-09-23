@@ -356,6 +356,7 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_hip_free(ptr: *mut c_void) -> i32;
+        pub fn allpaca_hip_free_async(ptr: *mut c_void, stream: *mut c_void) -> i32;
         pub fn allpaca_hip_host_malloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn allpaca_hip_host_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_hip_host_register(ptr: *mut c_void, bytes: usize, flags: u32) -> i32;
@@ -379,6 +380,12 @@ mod ffi {
             src: *const c_void,
             bytes: usize,
             kind: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_hip_memset(
+            dst: *mut c_void,
+            value: i32,
+            bytes: usize,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_hip_memcpy_peer(
@@ -1348,6 +1355,22 @@ pub fn device_free(ptr: *mut u8, bytes: usize) {
     }
 }
 
+/// Stream-ordered free. Null `stream` falls back to synchronous [`device_free`].
+pub fn device_free_async(ptr: *mut u8, bytes: usize, stream: *mut std::ffi::c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    unsafe {
+        let _ = ffi::allpaca_hip_free_async(ptr.cast(), stream);
+        ALLOCATED_BYTES.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (bytes, stream);
+    }
+}
+
 pub fn host_malloc(bytes: usize) -> Result<*mut u8, AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -1445,23 +1468,29 @@ pub fn memcpy_on(
     }
 }
 
-fn device_memset(
-    ptr: *mut u8,
-    value: i32,
+/// Fill `bytes` of device memory with `value` (low 8 bits). Null stream is synchronous.
+pub fn device_memset(dst: *mut u8, value: u8, bytes: usize) -> Result<(), AllpacaError> {
+    memset_on(dst, value, bytes, std::ptr::null_mut())
+}
+
+/// Fill on `stream` (`hipMemsetAsync`). Null stream uses synchronous `hipMemset`.
+pub fn memset_on(
+    dst: *mut u8,
+    value: u8,
     bytes: usize,
     stream: *mut std::ffi::c_void,
 ) -> Result<(), AllpacaError> {
-    if ptr.is_null() || bytes == 0 {
+    if bytes == 0 {
         return Ok(());
     }
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_hip_memset(ptr.cast(), value, bytes, stream) };
+        let rc = unsafe { ffi::allpaca_hip_memset(dst.cast(), i32::from(value), bytes, stream) };
         status(rc, "memset")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
-        let _ = (ptr, value, bytes, stream);
+        let _ = (dst, value, bytes, stream);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP memset unavailable".into(),
         )))
@@ -5787,7 +5816,7 @@ impl HipWorkspace {
         };
         memcpy(x, xs.as_ptr().cast(), bytes, MEMCPY_H2D)?;
         self.add_h2d(bytes);
-        device_memset(acc, 0, bytes, std::ptr::null_mut())?;
+        memset_on(acc, 0, bytes, std::ptr::null_mut())?;
         stream_synchronize()?;
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             s.active = true;
@@ -5822,7 +5851,7 @@ impl HipWorkspace {
         if x as *const f32 != xs {
             self.copy_d2d_f32(x.cast(), xs, floats)?;
         }
-        device_memset(acc, 0, bytes, std::ptr::null_mut())?;
+        memset_on(acc, 0, bytes, std::ptr::null_mut())?;
         stream_synchronize()?;
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             s.active = true;
@@ -5860,7 +5889,7 @@ impl HipWorkspace {
         };
         memcpy_peer(x, self.device, xs.cast(), src_dev, bytes)?;
         self.bind()?;
-        device_memset(acc, 0, bytes, std::ptr::null_mut())?;
+        memset_on(acc, 0, bytes, std::ptr::null_mut())?;
         stream_synchronize()?;
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             s.active = true;
@@ -10173,6 +10202,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn memset_empty_is_ok() {
+        device_memset(std::ptr::null_mut(), 0xAB, 0).expect("empty memset");
+    }
+
+    #[test]
+    fn memset_rejects_null_payload() {
+        assert!(device_memset(std::ptr::null_mut(), 0xAB, 64).is_err());
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn memset_fills_device_buffer_when_present() {
+        if device_count() == 0 {
+            return;
+        }
+        let n = 256usize;
+        let d = device_malloc(n, 0).expect("malloc");
+        device_memset(d, 0xAB, n).expect("memset");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr(), d, n, MEMCPY_D2H).expect("d2h");
+        device_free(d, n);
+        assert_eq!(back, vec![0xAB; n]);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn memset_on_side_stream_when_device_present() {
+        if device_count() == 0 {
+            return;
+        }
+        let n = 128usize;
+        let d = device_malloc(n, 0).expect("malloc");
+        let h2d = H2dStream::new().expect("side stream");
+        memset_on(d, 0x3C, n, h2d.raw()).expect("memset_on");
+        h2d.synchronize().expect("sync");
+        let mut back = vec![0u8; n];
+        memcpy(back.as_mut_ptr(), d, n, MEMCPY_D2H).expect("d2h");
+        device_free(d, n);
+        assert_eq!(back, vec![0x3C; n]);
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn memcpy_peer_is_capable_even_when_access_api_denies() {
@@ -11216,7 +11287,7 @@ mod tests {
         memcpy(src_d, src.as_ptr().cast(), src.len() * 4, MEMCPY_H2D).expect("h2d src");
         memcpy(idx_d, idx.as_ptr().cast(), idx.len() * 4, MEMCPY_H2D).expect("h2d idx");
         memcpy(w_d, w.as_ptr().cast(), w.len() * 4, MEMCPY_H2D).expect("h2d w");
-        super::device_memset(acc_d, 0, expect.len() * 4, std::ptr::null_mut()).expect("zero");
+        super::memset_on(acc_d, 0, expect.len() * 4, std::ptr::null_mut()).expect("zero");
         stream_synchronize().expect("sync zero");
         let rc = unsafe {
             super::ffi::allpaca_scatter_add_scale_rows(
