@@ -5,7 +5,7 @@ use allpaca_rpc::{BufId, KernelOp, LaunchItem, LaunchList, RpcBackendKind, RpcSe
 use allpaca_types::{AllpacaError, DeviceKind, FatalError, RPC_DEVICE_ID_BASE};
 
 use crate::compute::ComputeDev;
-use crate::layer_split::{plan_layer_owners, LayerPlan};
+use crate::layer_split::{expand_rpc_split, plan_layer_owners, LayerPlan};
 use crate::model::{LayerWeights, ModelConfig, TinyModel};
 
 /// Connected RPC workers plus the layer assignment used at decode.
@@ -83,21 +83,34 @@ impl RpcRuntime {
 
     pub fn apply_hello_to_inventory(
         &self,
-        devices: &mut [allpaca_types::DeviceInfo],
+        devices: &mut Vec<allpaca_types::DeviceInfo>,
     ) -> Result<(), AllpacaError> {
         let sessions = self.sessions.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
         })?;
+        let endpoints: Vec<String> = devices
+            .iter()
+            .filter(|d| d.is_rpc())
+            .filter_map(|d| d.rpc_endpoint().map(str::to_string))
+            .collect();
+        devices.retain(|d| !d.is_rpc());
+        let mut id = RPC_DEVICE_ID_BASE;
         for (i, session) in sessions.iter().enumerate() {
-            let id = RPC_DEVICE_ID_BASE + i as i32;
-            if let Some(dev) = devices.iter_mut().find(|d| d.id == id) {
-                let hello = session.hello();
-                dev.memory_bytes = hello.memory_bytes;
-                dev.kind = match hello.backend {
-                    RpcBackendKind::Hip => DeviceKind::HipGpu,
-                    RpcBackendKind::Cuda => DeviceKind::CudaGpu,
-                    RpcBackendKind::Cpu => DeviceKind::Cpu,
-                };
+            let hello = session.hello();
+            let endpoint = endpoints.get(i).map(String::as_str).unwrap_or("rpc");
+            let kind = match hello.backend {
+                RpcBackendKind::Hip => DeviceKind::HipGpu,
+                RpcBackendKind::Cuda => DeviceKind::CudaGpu,
+                RpcBackendKind::Cpu => DeviceKind::Cpu,
+            };
+            let mems = hello.device_memories();
+            for (dev_i, mem) in mems.iter().copied().enumerate() {
+                let mut dev = allpaca_types::DeviceInfo::rpc(id, endpoint, mem, kind);
+                if mems.len() > 1 {
+                    dev.name = format!("rpc[{endpoint}#{dev_i}]");
+                }
+                devices.push(dev);
+                id += 1;
             }
         }
         Ok(())
@@ -120,15 +133,28 @@ impl RpcRuntime {
         max_seq: usize,
     ) -> Result<(), AllpacaError> {
         let mut device_bytes = vec![local_bytes.max(1)];
-        {
+        let mut owners = Vec::new();
+        let groups = {
             let sessions = self.sessions.lock().map_err(|_| {
                 AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
             })?;
-            for s in sessions.iter() {
-                device_bytes.push(s.hello().memory_bytes.max(1));
+            let mut groups = Vec::new();
+            for (session_idx, s) in sessions.iter().enumerate() {
+                let mems = s.hello().device_memories();
+                for (device, mem) in mems.iter().copied().enumerate() {
+                    let mem = mem.max(1);
+                    device_bytes.push(mem);
+                    owners.push((session_idx, device as u32));
+                }
+                groups.push(mems);
             }
-        }
-        let plan = plan_layer_owners(model.config.n_layers, &device_bytes, tensor_split)?;
+            groups
+        };
+        let expanded = match tensor_split {
+            Some(split) => Some(expand_rpc_split(split, &groups)?),
+            None => None,
+        };
+        let plan = plan_layer_owners(model.config.n_layers, &device_bytes, expanded.as_deref())?;
         let mut remote = vec![None; model.layers.len()];
         let cfg = &model.config;
         let max_seq = max_seq.max(1);
@@ -141,8 +167,12 @@ impl RpcRuntime {
                 tracing::warn!(layer_idx, "rpc owner skipped; layer is not dense attn+ffn");
                 continue;
             }
-            let session_idx = owner - 1;
-            let uploaded = self.upload_layer(session_idx, cfg, layer, max_seq)?;
+            let (session_idx, device) = owners.get(owner - 1).copied().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "rpc layer owner has no device".into(),
+                ))
+            })?;
+            let uploaded = self.upload_layer(session_idx, device, cfg, layer, max_seq)?;
             remote[layer_idx] = Some(uploaded);
         }
         *self.plan.lock().map_err(|_| {
@@ -157,6 +187,7 @@ impl RpcRuntime {
     fn upload_layer(
         &self,
         session_idx: usize,
+        device: u32,
         cfg: &ModelConfig,
         layer: &LayerWeights,
         max_seq: usize,
@@ -172,7 +203,7 @@ impl RpcRuntime {
         let kv_dim = cfg.n_kv_heads * head_dim;
         let ff = cfg.ff_dim;
         let alloc_f32 = |s: &mut RpcSession, n: usize| -> Result<BufId, AllpacaError> {
-            s.alloc((n * 4) as u64).map_err(map_rpc)
+            s.alloc_on((n * 4) as u64, Some(device)).map_err(map_rpc)
         };
         let put = |s: &mut RpcSession, id: BufId, data: &[f32]| -> Result<(), AllpacaError> {
             s.h2d(id, 0, &f32_bytes(data)).map_err(map_rpc)

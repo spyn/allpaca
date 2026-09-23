@@ -1068,11 +1068,8 @@ impl Engine {
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model)?;
-        let tokenizer = EngineTokenizer::from_vocab(
-            loaded.vocab_tokens,
-            loaded.bos_id,
-            loaded.eos_id,
-        )?;
+        let tokenizer =
+            EngineTokenizer::from_vocab(loaded.vocab_tokens, loaded.bos_id, loaded.eos_id)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, tokenizer);
@@ -4823,6 +4820,7 @@ mod tests {
             dtype_mask: 1,
             device_name: "mismatch-stub".into(),
             memory_bytes: 64 << 20,
+            devices: Vec::new(),
         }
     }
 

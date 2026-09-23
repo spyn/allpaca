@@ -53,7 +53,11 @@ impl DeviceInfo {
     }
 
     pub fn rpc_endpoint(&self) -> Option<&str> {
-        self.name.strip_prefix("rpc[")?.strip_suffix(']')
+        let inner = self.name.strip_prefix("rpc[")?.strip_suffix(']')?;
+        Some(match inner.split_once('#') {
+            Some((endpoint, _)) => endpoint,
+            None => inner,
+        })
     }
 }
 

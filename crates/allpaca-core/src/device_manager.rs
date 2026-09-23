@@ -252,5 +252,8 @@ mod tests {
                 .rpc_endpoint(),
             Some("127.0.0.1:50052")
         );
+        let mut named = DeviceInfo::rpc(1001, "10.0.0.2:50052", 1, DeviceKind::HipGpu);
+        named.name = "rpc[10.0.0.2:50052#1]".into();
+        assert_eq!(named.rpc_endpoint(), Some("10.0.0.2:50052"));
     }
 }

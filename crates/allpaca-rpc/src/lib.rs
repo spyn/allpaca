@@ -56,6 +56,27 @@ mod tests {
         let enc = encode_launch_list(&list);
         let dec = decode_launch_list(&enc).unwrap();
         assert_eq!(list, dec);
+
+        let reply = HelloReply {
+            major: PROTO_MAJOR,
+            minor: PROTO_MINOR,
+            patch: PROTO_PATCH,
+            kernel_abi_rev: KERNEL_ABI_REV,
+            backend: RpcBackendKind::Hip,
+            dtype_mask: 1,
+            device_name: "hip:0+hip:1".into(),
+            memory_bytes: 24,
+            devices: vec![8, 16],
+        };
+        let enc = encode_hello_reply(&reply);
+        let dec = crate::protocol::decode_hello_reply(&enc).unwrap();
+        assert_eq!(dec, reply);
+        assert_eq!(dec.device_memories(), vec![8, 16]);
+        let legacy = &enc[..enc.len() - 4 - 16];
+        let old = crate::protocol::decode_hello_reply(legacy).unwrap();
+        assert!(old.devices.is_empty());
+        assert_eq!(old.memory_bytes, 24);
+        assert_eq!(old.device_memories(), vec![24]);
     }
 
     #[test]

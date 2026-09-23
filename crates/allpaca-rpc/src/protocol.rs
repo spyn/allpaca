@@ -131,7 +131,22 @@ pub struct HelloReply {
     pub backend: RpcBackendKind,
     pub dtype_mask: u32,
     pub device_name: String,
+    /// Sum of [`Self::devices`] when that list is non-empty.
     pub memory_bytes: u64,
+    /// Free bytes per local device. Empty means one device of `memory_bytes`
+    /// (older workers that do not append the list).
+    pub devices: Vec<u64>,
+}
+
+impl HelloReply {
+    /// One entry per device this worker can place buffers on.
+    pub fn device_memories(&self) -> Vec<u64> {
+        if self.devices.is_empty() {
+            vec![self.memory_bytes]
+        } else {
+            self.devices.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -371,6 +386,10 @@ pub fn encode_hello_reply(r: &HelloReply) -> Vec<u8> {
     write_u32(&mut w, r.dtype_mask);
     write_str(&mut w, &r.device_name);
     write_u64(&mut w, r.memory_bytes);
+    write_u32(&mut w, r.devices.len() as u32);
+    for bytes in &r.devices {
+        write_u64(&mut w, *bytes);
+    }
     w
 }
 
@@ -385,6 +404,17 @@ pub fn decode_hello_reply(data: &[u8]) -> Result<HelloReply, RpcError> {
     let dtype_mask = c.u32()?;
     let device_name = c.str()?;
     let memory_bytes = c.u64()?;
+    let mut devices = Vec::new();
+    if c.has_remaining() {
+        let n = c.u32()? as usize;
+        if n > 64 {
+            return Err(RpcError::Protocol("too many rpc devices".into()));
+        }
+        devices.reserve(n);
+        for _ in 0..n {
+            devices.push(c.u64()?);
+        }
+    }
     Ok(HelloReply {
         major,
         minor,
@@ -394,6 +424,7 @@ pub fn decode_hello_reply(data: &[u8]) -> Result<HelloReply, RpcError> {
         dtype_mask,
         device_name,
         memory_bytes,
+        devices,
     })
 }
 
