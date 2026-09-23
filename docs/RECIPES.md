@@ -164,5 +164,5 @@ cargo test -p allpaca-core --features hip --offline --test hip_runtime tiny_deep
 
 - Packed residual stream: lm_head still reads original `output_norm` (fused `x+WO+FFN` already written into `last_hidden` except MTP).
 - CUDA 7B packed-quant GGUF / on-device SSM/GDN/MLA.
-- Vulkan quant GEMV / SSM/GDN/MLA / packed prefill.
+- Vulkan Q4_K GEMV / SSM/GDN/MLA / packed prefill.
 - Real CXL.mem / PIM (simulators only).

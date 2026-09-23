@@ -1548,7 +1548,12 @@ impl Engine {
                     None
                 } else if let (Some(vk), Some(target)) = (&self.vulkan, target) {
                     if target.host_weights_ready() {
-                        match crate::VulkanResidentModel::upload(&target, vk) {
+                        let uploaded = if let Some(file) = target_gguf {
+                            crate::VulkanResidentModel::upload_gguf(&target, file, vk)
+                        } else {
+                            crate::VulkanResidentModel::upload(&target, vk)
+                        };
+                        match uploaded {
                             Ok(resident) => {
                                 weight_bytes += resident.bytes();
                                 h2d += resident.packed_h2d_bytes();

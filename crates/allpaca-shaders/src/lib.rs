@@ -118,6 +118,161 @@ pub fn gemm_f32(
     }
 }
 
+fn f16_bits_to_f32(h: u32) -> f32 {
+    let h = h & 0xffff;
+    let sign = (h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut e = 127u32 - 14;
+            let mut m = mant;
+            while (m & 0x400) == 0 {
+                m = m << 1;
+                e = e - 1;
+            }
+            sign | (e << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((exp + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+fn load_f16(b: &[u32], elem: u32) -> f32 {
+    let word = b[(elem >> 1) as usize];
+    let bits = if (elem & 1) == 0 {
+        word & 0xffff
+    } else {
+        word >> 16
+    };
+    f16_bits_to_f32(bits)
+}
+
+fn load_u8(b: &[u32], byte: u32) -> u32 {
+    let word = b[(byte >> 2) as usize];
+    let shift = (byte & 3) * 8;
+    (word >> shift) & 255
+}
+
+fn load_q8(b: &[u32], elem: u32) -> f32 {
+    let block = elem / 32;
+    let i = elem - block * 32;
+    let off = block * 34;
+    let d0 = load_u8(b, off);
+    let d1 = load_u8(b, off + 1);
+    let d = f16_bits_to_f32(d0 | (d1 << 8));
+    let q = load_u8(b, off + 2 + i);
+    let qs = if q >= 128 { (q as i32) - 256 } else { q as i32 };
+    d * (qs as f32)
+}
+
+/// Packed IEEE F16 B (`n×k`), unpack to F32, then the same tiled NT MAC as `gemm_f32`.
+#[spirv(compute(threads(16, 16), entry_point_name = "gemm_f16"))]
+pub fn gemm_f16(
+    #[spirv(global_invocation_id)] gid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] a: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] b: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] c: &mut [f32],
+    #[spirv(push_constant)] dims: &GemmPush,
+    #[spirv(workgroup)] tile_a: &mut [f32; 256],
+    #[spirv(workgroup)] tile_b: &mut [f32; 256],
+) {
+    let row = gid.y;
+    let col = gid.x;
+    let tx = lid.x;
+    let ty = lid.y;
+    let m = dims.m;
+    let n = dims.n;
+    let k = dims.k;
+    let mut acc = 0.0f32;
+    let n_tiles = (k + GEMM_TILE - 1) / GEMM_TILE;
+    let mut t = 0u32;
+    while t < n_tiles {
+        let a_col = t * GEMM_TILE + tx;
+        let a_idx = (ty * GEMM_TILE + tx) as usize;
+        tile_a[a_idx] = if row < m && a_col < k {
+            a[(row * k + a_col) as usize]
+        } else {
+            0.0
+        };
+        let b_k = t * GEMM_TILE + ty;
+        let b_idx = (tx * GEMM_TILE + ty) as usize;
+        tile_b[b_idx] = if col < n && b_k < k {
+            load_f16(b, col * k + b_k)
+        } else {
+            0.0
+        };
+        spirv_std::arch::workgroup_memory_barrier_with_group_sync();
+        let mut kk = 0u32;
+        while kk < GEMM_TILE {
+            acc += tile_a[(ty * GEMM_TILE + kk) as usize] * tile_b[(tx * GEMM_TILE + kk) as usize];
+            kk += 1;
+        }
+        spirv_std::arch::workgroup_memory_barrier_with_group_sync();
+        t += 1;
+    }
+    if row < m && col < n {
+        c[(row * n + col) as usize] = acc;
+    }
+}
+
+/// GGUF Q8_0 B (34-byte blocks, 32 elems), unpack to F32, then tiled NT MAC.
+#[spirv(compute(threads(16, 16), entry_point_name = "gemm_q8_0"))]
+pub fn gemm_q8_0(
+    #[spirv(global_invocation_id)] gid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] a: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] b: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] c: &mut [f32],
+    #[spirv(push_constant)] dims: &GemmPush,
+    #[spirv(workgroup)] tile_a: &mut [f32; 256],
+    #[spirv(workgroup)] tile_b: &mut [f32; 256],
+) {
+    let row = gid.y;
+    let col = gid.x;
+    let tx = lid.x;
+    let ty = lid.y;
+    let m = dims.m;
+    let n = dims.n;
+    let k = dims.k;
+    let mut acc = 0.0f32;
+    let n_tiles = (k + GEMM_TILE - 1) / GEMM_TILE;
+    let mut t = 0u32;
+    while t < n_tiles {
+        let a_col = t * GEMM_TILE + tx;
+        let a_idx = (ty * GEMM_TILE + tx) as usize;
+        tile_a[a_idx] = if row < m && a_col < k {
+            a[(row * k + a_col) as usize]
+        } else {
+            0.0
+        };
+        let b_k = t * GEMM_TILE + ty;
+        let b_idx = (tx * GEMM_TILE + ty) as usize;
+        tile_b[b_idx] = if col < n && b_k < k {
+            load_q8(b, col * k + b_k)
+        } else {
+            0.0
+        };
+        spirv_std::arch::workgroup_memory_barrier_with_group_sync();
+        let mut kk = 0u32;
+        while kk < GEMM_TILE {
+            acc += tile_a[(ty * GEMM_TILE + kk) as usize] * tile_b[(tx * GEMM_TILE + kk) as usize];
+            kk += 1;
+        }
+        spirv_std::arch::workgroup_memory_barrier_with_group_sync();
+        t += 1;
+    }
+    if row < m && col < n {
+        c[(row * n + col) as usize] = acc;
+    }
+}
+
 #[spirv(compute(threads(256), entry_point_name = "residual_add"))]
 pub fn residual_add(
     #[spirv(global_invocation_id)] gid: UVec3,

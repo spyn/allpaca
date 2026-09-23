@@ -13,6 +13,10 @@ use std::mem::{size_of, ManuallyDrop};
 use std::sync::{Arc, Mutex};
 
 const SPV_GEMM: &[u8] = include_bytes!(env!("ALLPACA_SPV_GEMM_F32"));
+const SPV_GEMM_F16: &[u8] = include_bytes!(env!("ALLPACA_SPV_GEMM_F16"));
+const SPV_GEMM_Q8: &[u8] = include_bytes!(env!("ALLPACA_SPV_GEMM_Q8_0"));
+#[cfg(allpaca_vulkan_glsl_f16)]
+const SPV_GEMM_F16_GLSL: &[u8] = include_bytes!(env!("ALLPACA_SPV_GEMM_F16_GLSL"));
 const SPV_RESIDUAL: &[u8] = include_bytes!(env!("ALLPACA_SPV_RESIDUAL_ADD"));
 const SPV_RMSNORM: &[u8] = include_bytes!(env!("ALLPACA_SPV_RMSNORM"));
 const SPV_SILU: &[u8] = include_bytes!(env!("ALLPACA_SPV_SILU_MUL"));
@@ -86,6 +90,9 @@ pub(crate) struct Shared {
     fence: vk::Fence,
     desc_pool: Mutex<vk::DescriptorPool>,
     gemm: Pipe,
+    gemm_f16: Pipe,
+    gemm_q8: Pipe,
+    gemm_f16_glsl: Option<Pipe>,
     residual: Pipe,
     rmsnorm: Pipe,
     silu: Pipe,
@@ -100,6 +107,12 @@ pub(crate) struct Inner {
     pub device_index: i32,
     pub shared: Arc<Shared>,
     submit: Mutex<()>,
+}
+
+impl Inner {
+    pub(crate) fn uses_glsl_f16_gemm(&self) -> bool {
+        self.shared.gemm_f16_glsl.is_some()
+    }
 }
 
 fn vk_err(op: &str, e: vk::Result) -> AllpacaError {
@@ -333,6 +346,28 @@ fn destroy_pipe(device: &Device, pipe: &Pipe) {
     }
 }
 
+fn optional_glsl_f16_pipe(device: &Device, shader_float16: bool) -> Option<Pipe> {
+    if !shader_float16 {
+        return None;
+    }
+    #[cfg(allpaca_vulkan_glsl_f16)]
+    {
+        make_pipe(
+            device,
+            SPV_GEMM_F16_GLSL,
+            c"main",
+            3,
+            size_of::<GemmPush>() as u32,
+        )
+        .ok()
+    }
+    #[cfg(not(allpaca_vulkan_glsl_f16))]
+    {
+        let _ = device;
+        None
+    }
+}
+
 impl Inner {
     pub(crate) fn new(device_index: i32) -> Result<Self, AllpacaError> {
         let entry = load_entry()?;
@@ -365,6 +400,7 @@ impl Inner {
         let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
             .vulkan_memory_model(true)
             .vulkan_memory_model_device_scope(true)
+            .shader_float16(q12.shader_float16 == vk::TRUE)
             .shader_int8(q12.shader_int8 == vk::TRUE)
             .storage_buffer8_bit_access(q12.storage_buffer8_bit_access == vk::TRUE)
             .uniform_and_storage_buffer8_bit_access(
@@ -412,8 +448,10 @@ impl Inner {
             alloc_err("allocator", e)
         })?;
 
-        let specs: [(&[u8], &CStr, u32, u32); 7] = [
+        let specs: [(&[u8], &CStr, u32, u32); 9] = [
             (SPV_GEMM, c"gemm_f32", 3, size_of::<GemmPush>() as u32),
+            (SPV_GEMM_F16, c"gemm_f16", 3, size_of::<GemmPush>() as u32),
+            (SPV_GEMM_Q8, c"gemm_q8_0", 3, size_of::<GemmPush>() as u32),
             (
                 SPV_RESIDUAL,
                 c"residual_add",
@@ -443,7 +481,7 @@ impl Inner {
                 }
             }
         }
-        let pipes: [Pipe; 7] = match pipes.try_into() {
+        let pipes: [Pipe; 9] = match pipes.try_into() {
             Ok(arr) => arr,
             Err(leftover) => {
                 for pipe in leftover {
@@ -454,10 +492,11 @@ impl Inner {
                     device.destroy_device(None);
                     instance.destroy_instance(None);
                 }
-                return Err(degraded("internal: expected 7 vulkan pipelines"));
+                    return Err(degraded("internal: expected 9 vulkan pipelines"));
             }
         };
-        let [gemm, residual, rmsnorm, silu, embed, rope, attention] = pipes;
+        let [gemm, gemm_f16, gemm_q8, residual, rmsnorm, silu, embed, rope, attention] = pipes;
+        let gemm_f16_glsl = optional_glsl_f16_pipe(&device, q12.shader_float16 == vk::TRUE);
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
@@ -521,6 +560,9 @@ impl Inner {
             fence,
             desc_pool: Mutex::new(desc_pool),
             gemm,
+            gemm_f16,
+            gemm_q8,
+            gemm_f16_glsl,
             residual,
             rmsnorm,
             silu,
@@ -683,6 +725,15 @@ impl Inner {
         Self::mapped_copy(buf, offset, raw)
     }
 
+    pub(crate) fn write_bytes(
+        &self,
+        buf: &DeviceBuf,
+        offset: u64,
+        src: &[u8],
+    ) -> Result<(), AllpacaError> {
+        Self::mapped_copy(buf, offset, src)
+    }
+
     fn wait(&self) -> Result<(), AllpacaError> {
         let _g = self
             .submit
@@ -836,6 +887,57 @@ impl Inner {
         let gx = (n as u32 + 15) / 16;
         let gy = (m as u32 + 15) / 16;
         self.dispatch(&self.shared.gemm, &[a, b, c], bytes_of(&push), gx, gy, 1)
+    }
+
+    pub(crate) fn gemm_nt_f16(
+        &self,
+        a: DeviceSlice,
+        b: DeviceSlice,
+        c: DeviceSlice,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(degraded("invalid Vulkan gemm_nt_f16"));
+        }
+        let push = GemmPush {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            _pad: 0,
+        };
+        let gx = (n as u32 + 15) / 16;
+        let gy = (m as u32 + 15) / 16;
+        let pipe = self
+            .shared
+            .gemm_f16_glsl
+            .as_ref()
+            .unwrap_or(&self.shared.gemm_f16);
+        self.dispatch(pipe, &[a, b, c], bytes_of(&push), gx, gy, 1)
+    }
+
+    pub(crate) fn gemm_nt_q8(
+        &self,
+        a: DeviceSlice,
+        b: DeviceSlice,
+        c: DeviceSlice,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(degraded("invalid Vulkan gemm_nt_q8"));
+        }
+        let push = GemmPush {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            _pad: 0,
+        };
+        let gx = (n as u32 + 15) / 16;
+        let gy = (m as u32 + 15) / 16;
+        self.dispatch(&self.shared.gemm_q8, &[a, b, c], bytes_of(&push), gx, gy, 1)
     }
 
     pub(crate) fn residual_add(
@@ -1022,6 +1124,11 @@ impl Drop for Shared {
             }
         }
         destroy_pipe(&self.device, &self.gemm);
+        destroy_pipe(&self.device, &self.gemm_f16);
+        destroy_pipe(&self.device, &self.gemm_q8);
+        if let Some(pipe) = self.gemm_f16_glsl.as_ref() {
+            destroy_pipe(&self.device, pipe);
+        }
         destroy_pipe(&self.device, &self.residual);
         destroy_pipe(&self.device, &self.rmsnorm);
         destroy_pipe(&self.device, &self.silu);

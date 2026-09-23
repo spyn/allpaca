@@ -49,7 +49,10 @@ library is linked.
 - First rust-gpu build compiles `rustc_codegen_spirv` and is slow; CI without
   the feature is unchanged.
 - rust-gpu has no first-class f16 ALU and is not a CUDA/HIP replacement.
-  Quant GEMV, SSM/GDN/MLA, and packed prefill stay HIP-first. F32 KV pages
-  and `attention_host_q_dev_kv` match the CUDA scaffold.
+  GGUF F16/Q8_0 GEMM uploads packed; rust-gpu kernels unpack to f32 then MAC.
+  When `glslangValidator` emits `glsl/gemm_f16.comp` and the device has
+  `shaderFloat16`, F16 GEMV prefers that native-`float16_t` pipe (same `ash`
+  dispatch). Q4_K stays host-dequant. SSM/GDN/MLA and packed prefill stay
+  HIP-first. F32 KV pages and `attention_host_q_dev_kv` match the CUDA scaffold.
 - Workspace `[profile.*.build-override] opt-level = 3` keeps the codegen
   backend from building in debug.

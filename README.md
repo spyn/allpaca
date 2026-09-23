@@ -175,6 +175,11 @@ compute shaders with [rust-gpu](https://rust-gpu.github.io/) (nested nightly via
 `cargo-gpu-install`) and dispatches them with `ash`. Without a successful SPIR-V
 build or GPU, `device_count()` is 0 and the crate still compiles (stub).
 
+GGUF F16 and Q8_0 GEMM weights stay packed on device (rust-gpu unpack + F32 MAC).
+When `glslangValidator` is on `PATH` / `GLSLANG_VALIDATOR` / `VULKAN_SDK` (or
+`C:\VulkanSDK\*\Bin` on Windows) and the GPU has `shaderFloat16`, F16 GEMV uses
+a GLSL native-`float16_t` pipe instead. Q4_K is still host-dequant then F32.
+
 ```bash
 cargo test -p allpaca-vulkan --features vulkan
 cargo test -p allpaca-core --features vulkan --test vulkan_runtime
@@ -182,9 +187,10 @@ cargo test -p allpaca-core --features vulkan --test vulkan_runtime
 
 Set `ALLPACA_SKIP_VULKAN_SHADERS=1` to skip the rust-gpu nested build (stub
 only). Auto backend order is HIP, then CUDA, then Vulkan, then CPU. Explicit
-`gpu_backend = "vulkan"` / `vulkan:N` selects Vulkan. This is an F32 TinyModel
-scaffold (KV pages + device attention, tiny F32 / host-dequant Q4_K / F16 GGUF),
-not HIP packed-quant parity ([ADR 0005](docs/adr/0005-vulkan-rust-gpu.md)).
+`gpu_backend = "vulkan"` / `vulkan:N` selects Vulkan. This is a TinyModel
+scaffold (KV pages + device attention, tiny F32 / packed F16/Q8_0 / host-dequant
+Q4_K GGUF), not HIP Q4_K / SSM / GDN / MLA parity
+([ADR 0005](docs/adr/0005-vulkan-rust-gpu.md)).
 
 ---
 
@@ -331,7 +337,7 @@ Or edit `docker-compose.yml` `command` / `volumes` accordingly.
 | `allpaca-safetensors` / `allpaca-onnx` | HuggingFace SafeTensors (BF16/F16/F32, shards, Llama-family names) / ONNX importers |
 | `allpaca-hip` | HIP FFI (`--features hip`) |
 | `allpaca-cuda` | CUDA FFI (`--features cuda`; toolkit builds without a GPU) |
-| `allpaca-vulkan` | Vulkan/`ash` host (`--features vulkan`; rust-gpu SPIR-V at build) |
+| `allpaca-vulkan` | Vulkan/`ash` host (`--features vulkan`; rust-gpu SPIR-V + optional glslang f16) |
 | `allpaca-shaders` | rust-gpu compute crate (not a workspace member; built from `allpaca-vulkan`) |
 | `allpaca-cpu` | CPU kernels + dequant |
 | `allpaca-server` | OpenAI-compatible HTTP |

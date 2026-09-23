@@ -155,7 +155,7 @@ fn write_tiny_f32_gguf(path: &Path) {
     write_gguf(path, &meta, &views).expect("write tiny F32 GGUF");
 }
 
-/// Tiny packed GGUF (Q4_K / F16). Host dequants under `HOST_F32_LIMIT`, then Vulkan F32 upload.
+/// Tiny packed GGUF (Q4_K / F16 / Q8_0). F16/Q8 GEMM stays packed; Q4_K still host-dequants.
 fn write_tiny_quant_gguf(
     path: &Path,
     quantize: fn(&[f32]) -> Vec<u8>,
@@ -265,6 +265,14 @@ fn write_tiny_f16_gguf(path: &Path) {
         path,
         allpaca_gguf::quantize_f16,
         allpaca_gguf::GgmlType::F16,
+    );
+}
+
+fn write_tiny_q8_gguf(path: &Path) {
+    write_tiny_quant_gguf(
+        path,
+        allpaca_gguf::quantize_q8_0,
+        allpaca_gguf::GgmlType::Q8_0,
     );
 }
 
@@ -679,4 +687,77 @@ fn vulkan_tiny_f16_gguf_absent_falls_back_to_cpu() {
     assert_eq!(stats.backend, "cpu");
     assert_eq!(stats.gpu_forwards, 0);
     assert_eq!(stats.weight_h2d_bytes, 0);
+}
+
+#[test]
+fn vulkan_tiny_q8_gguf_generate_uses_device_when_present() {
+    if !vulkan_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_vulkan_tiny_q8.gguf");
+    write_tiny_q8_gguf(&path);
+    let engine = match Engine::new(vulkan_gguf(path.clone())) {
+        Ok(e) if e.stats().backend == "vulkan" => e,
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            panic!("tiny Q8_0 GGUF must load on Vulkan: {e}");
+        }
+    };
+    let before = engine.stats();
+    assert!(
+        before.weight_bytes_on_device > 0,
+        "Q8_0 GGUF should pack and upload; stats={before:?}"
+    );
+    let h2d_after_load = before.weight_h2d_bytes;
+    let out = engine
+        .generate("hello", greedy(4))
+        .expect("tiny Q8 Vulkan generate");
+    assert!(!out.token_ids.is_empty());
+    let stats = engine.stats();
+    assert!(
+        stats.gpu_forwards > 0 || stats.target_gpu_forwards > 0,
+        "expected Vulkan Q8 forwards, got gpu={} target={}",
+        stats.gpu_forwards,
+        stats.target_gpu_forwards
+    );
+    assert_eq!(
+        stats.weight_h2d_bytes, h2d_after_load,
+        "weight_h2d must not grow during Q8 generate"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn vulkan_tiny_q8_gguf_matches_cpu_when_present() {
+    if !vulkan_device_available() {
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_vulkan_tiny_q8_match.gguf");
+    write_tiny_q8_gguf(&path);
+    let mut cpu_cfg = vulkan_gguf(path.clone());
+    cpu_cfg.engine.cpu_only = true;
+    cpu_cfg.engine.gpu_backend = "cpu".into();
+    let cpu = Engine::new(cpu_cfg).expect("cpu q8 engine");
+    let want = cpu.generate("hello", greedy(4)).expect("cpu generate");
+    let gpu = match Engine::new(vulkan_gguf(path.clone())) {
+        Ok(e) if e.stats().backend == "vulkan" => e,
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            panic!("tiny Q8_0 GGUF must load on Vulkan: {e}");
+        }
+    };
+    let got = gpu.generate("hello", greedy(4)).expect("vulkan generate");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        got.token_ids, want.token_ids,
+        "Vulkan Q8_0 GGUF greedy tokens must match CPU"
+    );
 }

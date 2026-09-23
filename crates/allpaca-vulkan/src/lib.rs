@@ -35,6 +35,11 @@ pub fn runtime_linked() -> bool {
     cfg!(all(feature = "vulkan", allpaca_vulkan_runtime))
 }
 
+/// True when this build embedded the glslang native-f16 GEMV (`gemm_f16.comp`).
+pub fn glsl_f16_linked() -> bool {
+    cfg!(allpaca_vulkan_glsl_f16)
+}
+
 pub fn device_count() -> i32 {
     #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
     {
@@ -113,6 +118,18 @@ impl VulkanWorkspace {
         self.activation_d2h.load(Ordering::Relaxed)
     }
 
+    /// True when dispatch uses the glslang `float16_t` GEMV instead of rust-gpu unpack.
+    pub fn uses_glsl_f16_gemm(&self) -> bool {
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            self.inner.uses_glsl_f16_gemm()
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            false
+        }
+    }
+
     #[cfg_attr(not(all(feature = "vulkan", allpaca_vulkan_runtime)), allow(dead_code))]
     fn account_h2d(&self, bytes: u64) {
         self.activation_h2d.fetch_add(bytes, Ordering::Relaxed);
@@ -168,6 +185,78 @@ impl VulkanWorkspace {
             let sa = runtime::Inner::slice_of(&da, 0, (a_n * 4) as u64);
             let sc = runtime::Inner::slice_of(&dc, 0, (c_n * 4) as u64);
             self.inner.gemm_nt(sa, b, sc, m, n, k)?;
+            self.inner.download_f32(&dc, &mut c[..c_n])?;
+            self.account_d2h((c_n * 4) as u64);
+            Ok(())
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            let _ = (a, b, c, m, n, k);
+            Err(degraded("Vulkan gemm unavailable"))
+        }
+    }
+
+    pub fn gemm_nt_f16_host_a_dev_b(
+        &self,
+        a: &[f32],
+        b: DeviceSlice,
+        c: &mut [f32],
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(degraded("invalid Vulkan gemm_nt_f16_host_a_dev_b"));
+        }
+        let a_n = (m as usize).saturating_mul(k as usize);
+        let c_n = (m as usize).saturating_mul(n as usize);
+        if a.len() < a_n || c.len() < c_n {
+            return Err(degraded("GEMM buffer size mismatch"));
+        }
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            let da = self.inner.upload_f32(&a[..a_n])?;
+            self.account_h2d((a_n * 4) as u64);
+            let dc = self.inner.alloc((c_n * 4) as u64, "gemm_c")?;
+            let sa = runtime::Inner::slice_of(&da, 0, (a_n * 4) as u64);
+            let sc = runtime::Inner::slice_of(&dc, 0, (c_n * 4) as u64);
+            self.inner.gemm_nt_f16(sa, b, sc, m, n, k)?;
+            self.inner.download_f32(&dc, &mut c[..c_n])?;
+            self.account_d2h((c_n * 4) as u64);
+            Ok(())
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            let _ = (a, b, c, m, n, k);
+            Err(degraded("Vulkan gemm unavailable"))
+        }
+    }
+
+    pub fn gemm_nt_q8_host_a_dev_b(
+        &self,
+        a: &[f32],
+        b: DeviceSlice,
+        c: &mut [f32],
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(degraded("invalid Vulkan gemm_nt_q8_host_a_dev_b"));
+        }
+        let a_n = (m as usize).saturating_mul(k as usize);
+        let c_n = (m as usize).saturating_mul(n as usize);
+        if a.len() < a_n || c.len() < c_n {
+            return Err(degraded("GEMM buffer size mismatch"));
+        }
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            let da = self.inner.upload_f32(&a[..a_n])?;
+            self.account_h2d((a_n * 4) as u64);
+            let dc = self.inner.alloc((c_n * 4) as u64, "gemm_c")?;
+            let sa = runtime::Inner::slice_of(&da, 0, (a_n * 4) as u64);
+            let sc = runtime::Inner::slice_of(&dc, 0, (c_n * 4) as u64);
+            self.inner.gemm_nt_q8(sa, b, sc, m, n, k)?;
             self.inner.download_f32(&dc, &mut c[..c_n])?;
             self.account_d2h((c_n * 4) as u64);
             Ok(())
@@ -689,15 +778,33 @@ pub struct VulkanDeviceWeights {
 unsafe impl Send for VulkanDeviceWeights {}
 unsafe impl Sync for VulkanDeviceWeights {}
 
+/// Host bytes for a packed Vulkan weight upload (F32 or packed F16/Q8).
+pub enum WeightBytes<'a> {
+    F32(&'a [f32]),
+    Packed(&'a [u8]),
+}
+
 impl VulkanDeviceWeights {
     /// Concatenate host F32 slices with 256-byte padding between tensors.
     pub fn upload(ws: &VulkanWorkspace, slices: &[&[f32]]) -> Result<(Self, u64), AllpacaError> {
+        let parts: Vec<WeightBytes<'_>> = slices.iter().copied().map(WeightBytes::F32).collect();
+        Self::upload_parts(ws, &parts)
+    }
+
+    /// Concatenate F32 and packed (F16/Q8) tensors with 256-byte padding.
+    pub fn upload_parts(
+        ws: &VulkanWorkspace,
+        parts: &[WeightBytes<'_>],
+    ) -> Result<(Self, u64), AllpacaError> {
         let mut packed: Vec<u8> = Vec::new();
-        for slice in slices {
-            // SAFETY: `f32` is POD; reading the same bytes as `u8` for a packed upload.
-            packed.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), slice.len() * 4)
-            });
+        for part in parts {
+            match part {
+                // SAFETY: `f32` is POD; the byte length is `len * 4`.
+                WeightBytes::F32(slice) => packed.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), slice.len() * 4)
+                }),
+                WeightBytes::Packed(bytes) => packed.extend_from_slice(bytes),
+            }
             while packed.len() % 256 != 0 {
                 packed.push(0);
             }
@@ -708,11 +815,7 @@ impl VulkanDeviceWeights {
         #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
         {
             let buf = ws.inner.alloc(packed.len() as u64, "weights")?;
-            // SAFETY: `packed` length is a multiple of 4 (F32 tensors + 256-byte pads).
-            let f32s = unsafe {
-                std::slice::from_raw_parts(packed.as_ptr().cast::<f32>(), packed.len() / 4)
-            };
-            ws.inner.write_into(&buf, 0, f32s)?;
+            ws.inner.write_bytes(&buf, 0, &packed)?;
             let bytes = packed.len();
             Ok((Self { buf, bytes }, bytes as u64))
         }
@@ -729,6 +832,24 @@ impl VulkanDeviceWeights {
 
     pub fn slice_f32(&self, byte_off: usize, n: usize) -> Result<DeviceSlice, AllpacaError> {
         let bytes = n.saturating_mul(4);
+        if byte_off.saturating_add(bytes) > self.bytes {
+            return Err(degraded("Vulkan weight slice out of range"));
+        }
+        #[cfg(all(feature = "vulkan", allpaca_vulkan_runtime))]
+        {
+            Ok(runtime::Inner::slice_of(
+                &self.buf,
+                byte_off as u64,
+                bytes as u64,
+            ))
+        }
+        #[cfg(not(all(feature = "vulkan", allpaca_vulkan_runtime)))]
+        {
+            Ok(DeviceSlice::dummy(byte_off as u64, bytes as u64))
+        }
+    }
+
+    pub fn slice_bytes(&self, byte_off: usize, bytes: usize) -> Result<DeviceSlice, AllpacaError> {
         if byte_off.saturating_add(bytes) > self.bytes {
             return Err(degraded("Vulkan weight slice out of range"));
         }
@@ -808,6 +929,101 @@ mod tests {
         }
         let ws = VulkanWorkspace::new(0, 8192).expect("workspace");
         assert!(ws.allocated_bytes() >= 8192);
+    }
+
+    fn pack_f16_bytes(b: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(b.len() * 2 + 4);
+        for v in b {
+            out.extend_from_slice(&allpaca_cpu::f32_to_f16(*v).to_le_bytes());
+        }
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out
+    }
+
+    #[test]
+    fn glsl_f16_link_status_is_stable() {
+        let linked = glsl_f16_linked();
+        if linked {
+            assert!(
+                runtime_linked(),
+                "glslang f16 SPIR-V is only embedded when rust-gpu runtime linked"
+            );
+        }
+    }
+
+    #[test]
+    fn gemm_nt_f16_unpack_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let m = 1i32;
+        let n = 8i32;
+        let k = 16i32;
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.05).collect();
+        let b: Vec<f32> = (0..(n * k)).map(|i| (i as f32 + 1.0) * 0.02).collect();
+        let packed = pack_f16_bytes(&b);
+        let mut gpu = vec![0.0f32; (m * n) as usize];
+        let mut cpu = vec![0.0f32; (m * n) as usize];
+        let mut b_deq = vec![0.0f32; b.len()];
+        for (i, v) in b.iter().enumerate() {
+            b_deq[i] = allpaca_cpu::f16_to_f32(allpaca_cpu::f32_to_f16(*v));
+        }
+        allpaca_cpu::matmul_nt(&a, &b_deq, &mut cpu, m as usize, n as usize, k as usize)
+            .expect("cpu gemm");
+        let ws = VulkanWorkspace::new(0, 64 * 1024).expect("workspace");
+        let (weights, _) =
+            VulkanDeviceWeights::upload_parts(&ws, &[WeightBytes::Packed(&packed)]).expect("upload");
+        let bs = weights.slice_bytes(0, packed.len()).expect("slice");
+        ws.gemm_nt_f16_host_a_dev_b(&a, bs, &mut gpu, m, n, k)
+            .expect("vulkan f16 gemm");
+        let _ = (glsl_f16_linked(), ws.uses_glsl_f16_gemm());
+        for i in 0..cpu.len() {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 2e-3,
+                "f16 unpack mismatch at {i}: vulkan={} cpu={}",
+                gpu[i],
+                cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gemm_nt_q8_unpack_matches_cpu_when_device_present() {
+        if device_count() <= 0 {
+            return;
+        }
+        let m = 1i32;
+        let n = 4i32;
+        let k = 32i32;
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.04).collect();
+        let b: Vec<f32> = (0..(n * k)).map(|i| ((i as f32) - 8.0) * 0.03).collect();
+        let packed = allpaca_cpu::quantize_q8_0(&b);
+        let mut b_deq = vec![0.0f32; b.len()];
+        allpaca_cpu::dequant_q8_0(&packed, b.len(), &mut b_deq).expect("dequant");
+        let mut cpu = vec![0.0f32; (m * n) as usize];
+        allpaca_cpu::matmul_nt(&a, &b_deq, &mut cpu, m as usize, n as usize, k as usize)
+            .expect("cpu gemm");
+        let mut gpu = vec![0.0f32; (m * n) as usize];
+        let mut bytes = packed.clone();
+        while bytes.len() % 4 != 0 {
+            bytes.push(0);
+        }
+        let ws = VulkanWorkspace::new(0, 64 * 1024).expect("workspace");
+        let (weights, _) =
+            VulkanDeviceWeights::upload_parts(&ws, &[WeightBytes::Packed(&bytes)]).expect("upload");
+        let bs = weights.slice_bytes(0, bytes.len()).expect("slice");
+        ws.gemm_nt_q8_host_a_dev_b(&a, bs, &mut gpu, m, n, k)
+            .expect("vulkan q8 gemm");
+        for i in 0..cpu.len() {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 2e-3,
+                "q8 unpack mismatch at {i}: vulkan={} cpu={}",
+                gpu[i],
+                cpu[i]
+            );
+        }
     }
 
     #[test]

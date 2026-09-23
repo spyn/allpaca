@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 const ENTRIES: &[&str] = &[
     "gemm_f32",
+    "gemm_f16",
+    "gemm_q8_0",
     "residual_add",
     "rmsnorm",
     "silu_mul",
@@ -19,8 +21,12 @@ const ENTRIES: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-changed=../allpaca-shaders/src/lib.rs");
     println!("cargo:rerun-if-changed=../allpaca-shaders/Cargo.toml");
+    println!("cargo:rerun-if-changed=glsl/gemm_f16.comp");
     println!("cargo:rerun-if-env-changed=ALLPACA_SKIP_VULKAN_SHADERS");
+    println!("cargo:rerun-if-env-changed=GLSLANG_VALIDATOR");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     println!("cargo:rustc-check-cfg=cfg(allpaca_vulkan_runtime)");
+    println!("cargo:rustc-check-cfg=cfg(allpaca_vulkan_glsl_f16)");
 
     if env::var("CARGO_FEATURE_VULKAN").is_err() {
         return;
@@ -86,5 +92,84 @@ fn compile_shaders() -> Result<(), String> {
         let dest = dest.display().to_string().replace('\\', "/");
         println!("cargo:rustc-env={}={dest}", env_name(entry));
     }
+    try_compile_glsl_f16(&out);
     Ok(())
+}
+
+fn try_compile_glsl_f16(out: &std::path::Path) {
+    let manifest = match env::var("CARGO_MANIFEST_DIR") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => return,
+    };
+    let src = manifest.join("glsl/gemm_f16.comp");
+    if !src.is_file() {
+        return;
+    }
+    let dest = out.join("gemm_f16_glsl.spv");
+    let glslang = find_glslang();
+    let output = std::process::Command::new(&glslang)
+        .arg("-V")
+        .arg("-S")
+        .arg("comp")
+        .arg("-e")
+        .arg("main")
+        .arg("-o")
+        .arg(&dest)
+        .arg(&src)
+        .output();
+    match output {
+        Ok(o) if o.status.success() && dest.is_file() => {
+            let dest = dest.display().to_string().replace('\\', "/");
+            println!("cargo:rustc-cfg=allpaca_vulkan_glsl_f16");
+            println!("cargo:rustc-env=ALLPACA_SPV_GEMM_F16_GLSL={dest}");
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            println!(
+                "cargo:warning=glslangValidator failed ({}); using rust-gpu F16 unpack: {err}",
+                o.status
+            );
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=glslangValidator not found ({}: {e}); using rust-gpu F16 unpack",
+                glslang.display()
+            );
+        }
+    }
+}
+
+fn find_glslang() -> PathBuf {
+    if let Ok(p) = env::var("GLSLANG_VALIDATOR") {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = vulkan_sdk_glslang() {
+        return p;
+    }
+    PathBuf::from("glslangValidator")
+}
+
+fn vulkan_sdk_glslang() -> Option<PathBuf> {
+    let mut sdks = Vec::new();
+    if let Ok(sdk) = env::var("VULKAN_SDK") {
+        sdks.push(PathBuf::from(sdk));
+    }
+    if let Ok(entries) = std::fs::read_dir(r"C:\VulkanSDK") {
+        let mut vers: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        vers.sort_by_key(|e| e.file_name());
+        for e in vers.into_iter().rev() {
+            sdks.push(e.path());
+        }
+    }
+    for sdk in sdks {
+        let win = sdk.join("Bin/glslangValidator.exe");
+        if win.is_file() {
+            return Some(win);
+        }
+        let unix = sdk.join("bin/glslangValidator");
+        if unix.is_file() {
+            return Some(unix);
+        }
+    }
+    None
 }

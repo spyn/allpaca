@@ -1,12 +1,12 @@
 //! Vulkan decode path: dense + synthetic MoE TinyModel token forwards on VulkanWorkspace.
 
-use super::{gather_kv, topk_route, LayerWeights, ModelConfig, TinyModel, WeightRef};
+use super::{gather_kv, topk_route, LayerWeights, ModelConfig, TinyModel, WeightKind, WeightRef};
 use crate::kv_tier::KvTierManager;
 use crate::telemetry::Metrics;
 use allpaca_cpu::{rope, silu};
-use allpaca_gguf::HybridLayerKind;
+use allpaca_gguf::{GgmlType, GgufFile, HybridLayerKind};
 use allpaca_types::{AllpacaError, FatalError};
-use allpaca_vulkan::{DeviceSlice, VulkanDeviceWeights, VulkanWorkspace};
+use allpaca_vulkan::{DeviceSlice, VulkanDeviceWeights, VulkanWorkspace, WeightBytes};
 use std::sync::atomic::Ordering;
 
 fn vulkan_decode_blocks_ok(model: &TinyModel) -> bool {
@@ -61,6 +61,22 @@ pub struct VulkanResidentModel {
 
 impl VulkanResidentModel {
     pub fn upload(model: &TinyModel, ws: &VulkanWorkspace) -> Result<Self, AllpacaError> {
+        Self::upload_inner(model, None, ws)
+    }
+
+    pub fn upload_gguf(
+        model: &TinyModel,
+        file: &GgufFile,
+        ws: &VulkanWorkspace,
+    ) -> Result<Self, AllpacaError> {
+        Self::upload_inner(model, Some(file), ws)
+    }
+
+    fn upload_inner(
+        model: &TinyModel,
+        file: Option<&GgufFile>,
+        ws: &VulkanWorkspace,
+    ) -> Result<Self, AllpacaError> {
         if !vulkan_decode_blocks_ok(model) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
@@ -68,42 +84,141 @@ impl VulkanResidentModel {
                 ),
             ));
         }
-        let mut slices: Vec<&[f32]> = Vec::new();
+        let mut parts: Vec<WeightBytes<'_>> = Vec::new();
         let mut off = 0usize;
-        fn push<'a>(slices: &mut Vec<&'a [f32]>, off: &mut usize, s: &'a [f32]) -> WeightRef {
+        fn push_f32<'a>(
+            parts: &mut Vec<WeightBytes<'a>>,
+            off: &mut usize,
+            s: &'a [f32],
+        ) -> WeightRef {
             let o = *off;
-            slices.push(s);
+            parts.push(WeightBytes::F32(s));
             *off = align256(*off + s.len() * 4);
             WeightRef::f32(o, s.len())
         }
-        let embed = push(&mut slices, &mut off, model.embed.as_slice());
+        fn push_gemm<'a>(
+            parts: &mut Vec<WeightBytes<'a>>,
+            off: &mut usize,
+            file: Option<&'a GgufFile>,
+            name: &str,
+            host: &'a [f32],
+        ) -> WeightRef {
+            if let Some(file) = file {
+                if let Some(info) = file.tensor(name) {
+                    if let Ok(bytes) = file.tensor_bytes(name) {
+                        if info.ggml_type == GgmlType::F16 && !bytes.is_empty() {
+                            let o = *off;
+                            parts.push(WeightBytes::Packed(bytes));
+                            *off = align256(*off + bytes.len());
+                            return WeightRef::f16(o, host.len());
+                        }
+                        if info.ggml_type == GgmlType::Q8_0 && !bytes.is_empty() {
+                            let o = *off;
+                            parts.push(WeightBytes::Packed(bytes));
+                            *off = align256(*off + bytes.len());
+                            return WeightRef::q8_0(o, host.len());
+                        }
+                    }
+                }
+            }
+            push_f32(parts, off, host)
+        }
+        let embed = push_f32(&mut parts, &mut off, model.embed.as_slice());
         let mut layers = Vec::with_capacity(model.layers.len());
-        for layer in &model.layers {
+        for (layer_idx, layer) in model.layers.iter().enumerate() {
+            let blk = model.config.gguf_blk(layer_idx);
             layers.push(VulkanLayerOff {
-                attn_norm: push(&mut slices, &mut off, layer.attn_norm.as_slice()),
-                wq: push(&mut slices, &mut off, layer.wq.as_slice()),
-                wk: push(&mut slices, &mut off, layer.wk.as_slice()),
-                wv: push(&mut slices, &mut off, layer.wv.as_slice()),
-                wo: push(&mut slices, &mut off, layer.wo.as_slice()),
-                ffn_norm: push(&mut slices, &mut off, layer.ffn_norm.as_slice()),
-                w_gate: push(&mut slices, &mut off, layer.w_gate.as_slice()),
-                w_up: push(&mut slices, &mut off, layer.w_up.as_slice()),
-                w_down: push(&mut slices, &mut off, layer.w_down.as_slice()),
-                w_router: push(&mut slices, &mut off, layer.w_router.as_slice()),
+                attn_norm: push_f32(&mut parts, &mut off, layer.attn_norm.as_slice()),
+                wq: push_gemm(
+                    &mut parts,
+                    &mut off,
+                    file,
+                    &format!("blk.{blk}.attn_q.weight"),
+                    layer.wq.as_slice(),
+                ),
+                wk: push_gemm(
+                    &mut parts,
+                    &mut off,
+                    file,
+                    &format!("blk.{blk}.attn_k.weight"),
+                    layer.wk.as_slice(),
+                ),
+                wv: push_gemm(
+                    &mut parts,
+                    &mut off,
+                    file,
+                    &format!("blk.{blk}.attn_v.weight"),
+                    layer.wv.as_slice(),
+                ),
+                wo: push_gemm(
+                    &mut parts,
+                    &mut off,
+                    file,
+                    &format!("blk.{blk}.attn_output.weight"),
+                    layer.wo.as_slice(),
+                ),
+                ffn_norm: push_f32(&mut parts, &mut off, layer.ffn_norm.as_slice()),
+                w_gate: push_gemm(
+                    &mut parts,
+                    &mut off,
+                    file,
+                    &format!("blk.{blk}.ffn_gate.weight"),
+                    layer.w_gate.as_slice(),
+                ),
+                w_up: push_gemm(
+                    &mut parts,
+                    &mut off,
+                    file,
+                    &format!("blk.{blk}.ffn_up.weight"),
+                    layer.w_up.as_slice(),
+                ),
+                w_down: push_gemm(
+                    &mut parts,
+                    &mut off,
+                    file,
+                    &format!("blk.{blk}.ffn_down.weight"),
+                    layer.w_down.as_slice(),
+                ),
+                w_router: push_f32(&mut parts, &mut off, layer.w_router.as_slice()),
                 experts: layer
                     .experts
                     .iter()
-                    .map(|e| VulkanExpertOff {
-                        w_gate: push(&mut slices, &mut off, e.w_gate.as_slice()),
-                        w_up: push(&mut slices, &mut off, e.w_up.as_slice()),
-                        w_down: push(&mut slices, &mut off, e.w_down.as_slice()),
+                    .enumerate()
+                    .map(|(ei, e)| VulkanExpertOff {
+                        w_gate: push_gemm(
+                            &mut parts,
+                            &mut off,
+                            file,
+                            &format!("blk.{blk}.ffn_gate_exps.{ei}.weight"),
+                            e.w_gate.as_slice(),
+                        ),
+                        w_up: push_gemm(
+                            &mut parts,
+                            &mut off,
+                            file,
+                            &format!("blk.{blk}.ffn_up_exps.{ei}.weight"),
+                            e.w_up.as_slice(),
+                        ),
+                        w_down: push_gemm(
+                            &mut parts,
+                            &mut off,
+                            file,
+                            &format!("blk.{blk}.ffn_down_exps.{ei}.weight"),
+                            e.w_down.as_slice(),
+                        ),
                     })
                     .collect(),
             });
         }
-        let norm = push(&mut slices, &mut off, model.norm.as_slice());
-        let lm_head = push(&mut slices, &mut off, model.lm_head.as_slice());
-        let (weights, packed_h2d) = VulkanDeviceWeights::upload(ws, &slices)?;
+        let norm = push_f32(&mut parts, &mut off, model.norm.as_slice());
+        let lm_head = push_gemm(
+            &mut parts,
+            &mut off,
+            file,
+            "output.weight",
+            model.lm_head.as_slice(),
+        );
+        let (weights, packed_h2d) = VulkanDeviceWeights::upload_parts(ws, &parts)?;
         Ok(Self {
             weights,
             packed_h2d,
@@ -128,7 +243,35 @@ impl VulkanResidentModel {
                 "empty Vulkan weight ref".into(),
             )));
         }
-        self.weights.slice_f32(w.off, w.n)
+        let bytes = match w.kind {
+            WeightKind::F16 => w.n.saturating_mul(2).div_ceil(4).saturating_mul(4).max(4),
+            WeightKind::Q8_0 => w
+                .n
+                .div_ceil(32)
+                .saturating_mul(34)
+                .div_ceil(4)
+                .saturating_mul(4),
+            _ => w.n.saturating_mul(4),
+        };
+        self.weights.slice_bytes(w.off, bytes)
+    }
+}
+
+fn gemm_weight(
+    vulkan: &VulkanWorkspace,
+    a: &[f32],
+    resident: &VulkanResidentModel,
+    w: WeightRef,
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    let b = resident.slice(w)?;
+    match w.kind {
+        WeightKind::F16 => vulkan.gemm_nt_f16_host_a_dev_b(a, b, c, m, n, k),
+        WeightKind::Q8_0 => vulkan.gemm_nt_q8_host_a_dev_b(a, b, c, m, n, k),
+        _ => vulkan.gemm_nt_host_a_dev_b(a, b, c, m, n, k),
     }
 }
 
@@ -238,25 +381,31 @@ impl TinyModel {
             )?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
 
-            vulkan.gemm_nt_host_a_dev_b(
+            gemm_weight(
+                vulkan,
                 &scratch[..dim],
-                resident.slice(layer.wq)?,
+                resident,
+                layer.wq,
                 &mut q,
                 1,
                 dim as i32,
                 dim as i32,
             )?;
-            vulkan.gemm_nt_host_a_dev_b(
+            gemm_weight(
+                vulkan,
                 &scratch[..dim],
-                resident.slice(layer.wk)?,
+                resident,
+                layer.wk,
                 &mut k,
                 1,
                 kv_dim as i32,
                 dim as i32,
             )?;
-            vulkan.gemm_nt_host_a_dev_b(
+            gemm_weight(
+                vulkan,
                 &scratch[..dim],
-                resident.slice(layer.wv)?,
+                resident,
+                layer.wv,
                 &mut v,
                 1,
                 kv_dim as i32,
@@ -320,9 +469,11 @@ impl TinyModel {
                 )?;
             }
 
-            vulkan.gemm_nt_host_a_dev_b(
+            gemm_weight(
+                vulkan,
                 &attn_out,
-                resident.slice(layer.wo)?,
+                resident,
+                layer.wo,
                 &mut hidden,
                 1,
                 dim as i32,
@@ -353,9 +504,11 @@ impl TinyModel {
             cfg.eps,
         )?;
         metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
-        vulkan.gemm_nt_host_a_dev_b(
+        gemm_weight(
+            vulkan,
             &scratch[..dim],
-            resident.slice(resident.lm_head)?,
+            resident,
+            resident.lm_head,
             &mut logits[..vocab],
             1,
             vocab as i32,
@@ -401,17 +554,21 @@ fn apply_ffn_vulkan(
 
     let mut gate = vec![0.0f32; ff];
     let mut up = vec![0.0f32; ff];
-    vulkan.gemm_nt_host_a_dev_b(
+    gemm_weight(
+        vulkan,
         &scratch[..dim],
-        resident.slice(layer.w_gate)?,
+        resident,
+        layer.w_gate,
         &mut gate,
         1,
         ff as i32,
         dim as i32,
     )?;
-    vulkan.gemm_nt_host_a_dev_b(
+    gemm_weight(
+        vulkan,
         &scratch[..dim],
-        resident.slice(layer.w_up)?,
+        resident,
+        layer.w_up,
         &mut up,
         1,
         ff as i32,
@@ -420,9 +577,11 @@ fn apply_ffn_vulkan(
     for i in 0..ff {
         gate[i] = silu(gate[i]) * up[i];
     }
-    vulkan.gemm_nt_host_a_dev_b(
+    gemm_weight(
+        vulkan,
         &gate,
-        resident.slice(layer.w_down)?,
+        resident,
+        layer.w_down,
         hidden,
         1,
         dim as i32,
@@ -476,17 +635,21 @@ fn apply_moe_vulkan(
         let Some(ex) = layer.experts.get(eid) else {
             continue;
         };
-        vulkan.gemm_nt_host_a_dev_b(
+        gemm_weight(
+            vulkan,
             &scratch[..dim],
-            resident.slice(ex.w_gate)?,
+            resident,
+            ex.w_gate,
             &mut gate,
             1,
             ff as i32,
             dim as i32,
         )?;
-        vulkan.gemm_nt_host_a_dev_b(
+        gemm_weight(
+            vulkan,
             &scratch[..dim],
-            resident.slice(ex.w_up)?,
+            resident,
+            ex.w_up,
             &mut up,
             1,
             ff as i32,
@@ -495,9 +658,11 @@ fn apply_moe_vulkan(
         for i in 0..ff {
             gate[i] = silu(gate[i]) * up[i];
         }
-        vulkan.gemm_nt_host_a_dev_b(
+        gemm_weight(
+            vulkan,
             &gate,
-            resident.slice(ex.w_down)?,
+            resident,
+            ex.w_down,
             &mut down,
             1,
             dim as i32,
