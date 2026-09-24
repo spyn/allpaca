@@ -793,7 +793,8 @@ impl HipWorker {
                 )
                 .map_err(|e| RpcError::Worker(e.to_string()))?;
                 let out = self.ptr_f32(need(bufs, 2)?)?;
-                self.hip
+                self.gpus[gpu]
+                    .hip
                     .embed_gather(table, tok as u32, out, dim)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }

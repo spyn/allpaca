@@ -2914,16 +2914,6 @@ extern "C" int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device) {
     return hip_status(hipMalloc(ptr, bytes));
 }
 
-extern "C" int allpaca_hip_memset(void *ptr, int value, size_t bytes, allpaca_stream_t stream) {
-    if (!ptr) {
-        return ALLPACA_ERR_INVALID;
-    }
-    if (bytes == 0) {
-        return ALLPACA_OK;
-    }
-    return hip_status(hipMemsetAsync(ptr, value, bytes, as_stream(stream)));
-}
-
 extern "C" int allpaca_hip_free(void *ptr) {
     if (!ptr) {
         return ALLPACA_OK;
