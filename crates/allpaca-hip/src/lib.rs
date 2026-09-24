@@ -382,12 +382,6 @@ mod ffi {
             kind: i32,
             stream: *mut c_void,
         ) -> i32;
-        pub fn allpaca_hip_memset(
-            dst: *mut c_void,
-            value: i32,
-            bytes: usize,
-            stream: *mut c_void,
-        ) -> i32;
         pub fn allpaca_hip_memcpy_peer(
             dst: *mut c_void,
             dst_dev: i32,
