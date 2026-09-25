@@ -13,6 +13,8 @@ use crate::protocol::{
 
 struct Slot {
     gen: u32,
+    /// ggml type id of a `PutTensor` blob. `0` is raw F32.
+    ggml_type: u32,
     data: Vec<u8>,
 }
 
@@ -89,11 +91,17 @@ impl CpuWorker {
             id,
             Slot {
                 gen,
+                ggml_type: 0,
                 data: vec![0u8; bytes as usize],
             },
         );
         self.used = self.used.saturating_add(bytes);
         Ok(BufId { id, gen })
+    }
+
+    fn set_ggml_type(&mut self, id: BufId, ggml_type: u32) -> Result<(), RpcError> {
+        self.slot_mut(id)?.ggml_type = ggml_type;
+        Ok(())
     }
 
     fn free(&mut self, id: BufId) -> Result<(), RpcError> {
@@ -294,6 +302,70 @@ impl CpuWorker {
                 let _ = ids;
                 write_f32(self.slot_mut(need(bufs, 2)?)?, &out)?;
             }
+            KernelOp::GemmNtQuant => {
+                let m = *i32s.first().ok_or_else(|| RpcError::Worker("gemm m".into()))? as usize;
+                let n = *i32s.get(1).ok_or_else(|| RpcError::Worker("gemm n".into()))? as usize;
+                let k = *i32s.get(2).ok_or_else(|| RpcError::Worker("gemm k".into()))? as usize;
+                let a = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
+                let ty = self.slot(need(bufs, 1)?)?.ggml_type;
+                let mut w = vec![0.0f32; n.saturating_mul(k)];
+                dequant_weight(ty, &self.slot(need(bufs, 1)?)?.data, n * k, &mut w)?;
+                let mut y = vec![0.0f32; m.saturating_mul(n)];
+                matmul_nt(&a, &w, &mut y, m, n, k).map_err(map_kernel)?;
+                write_f32(self.slot_mut(need(bufs, 2)?)?, &y)?;
+            }
+            KernelOp::DeinterleaveQGate => {
+                let n_heads = *i32s.first().ok_or_else(|| RpcError::Worker("deinterleave heads".into()))? as usize;
+                let head_dim = *i32s.get(1).ok_or_else(|| RpcError::Worker("deinterleave head".into()))? as usize;
+                let full = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
+                let mut q = vec![0.0f32; n_heads * head_dim];
+                let mut gate = vec![0.0f32; n_heads * head_dim];
+                deinterleave_q_gate(&full, &mut q, &mut gate, head_dim)?;
+                write_f32(self.slot_mut(need(bufs, 1)?)?, &q)?;
+                write_f32(self.slot_mut(need(bufs, 2)?)?, &gate)?;
+            }
+            KernelOp::RmsNormHeads => {
+                let n_heads = *i32s.first().ok_or_else(|| RpcError::Worker("rmsnorm heads".into()))? as usize;
+                let head_dim = *i32s.get(1).ok_or_else(|| RpcError::Worker("rmsnorm head".into()))? as usize;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                let mut x = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
+                let w = f32_buf(self.slot(need(bufs, 1)?)?)?.to_vec();
+                rmsnorm_heads(&mut x, &w, n_heads, head_dim, eps)?;
+                write_f32(self.slot_mut(need(bufs, 0)?)?, &x)?;
+            }
+            KernelOp::SigmoidMul => {
+                let n = *i32s.first().ok_or_else(|| RpcError::Worker("sigmoid n".into()))? as usize;
+                let mut x = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
+                let gate = f32_buf(self.slot(need(bufs, 1)?)?)?;
+                let n = n.min(x.len()).min(gate.len());
+                for i in 0..n {
+                    let s = 1.0 / (1.0 + (-gate[i]).exp());
+                    x[i] *= s;
+                }
+                write_f32(self.slot_mut(need(bufs, 0)?)?, &x)?;
+            }
+            KernelOp::RopePartial => {
+                let n_heads = *i32s.first().ok_or_else(|| RpcError::Worker("rope heads".into()))? as usize;
+                let n_kv = *i32s.get(1).ok_or_else(|| RpcError::Worker("rope kv heads".into()))? as usize;
+                let head_dim = *i32s.get(2).ok_or_else(|| RpcError::Worker("rope head".into()))? as usize;
+                let pos = *i32s.get(3).ok_or_else(|| RpcError::Worker("rope pos".into()))? as usize;
+                let n_rot = *i32s.get(4).unwrap_or(&(head_dim as i32)) as usize;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let sections = [
+                    *f32s.get(1).unwrap_or(&0.0) as i32,
+                    *f32s.get(2).unwrap_or(&0.0) as i32,
+                    *f32s.get(3).unwrap_or(&0.0) as i32,
+                    *f32s.get(4).unwrap_or(&0.0) as i32,
+                ];
+                let mut q = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
+                let mut k = f32_buf(self.slot(need(bufs, 1)?)?)?.to_vec();
+                allpaca_cpu::rope_imrope_neox_heads(&mut q, n_heads, head_dim, pos, theta, n_rot, sections)
+                    .map_err(map_kernel)?;
+                allpaca_cpu::rope_imrope_neox_heads(&mut k, n_kv, head_dim, pos, theta, n_rot, sections)
+                    .map_err(map_kernel)?;
+                write_f32(self.slot_mut(need(bufs, 0)?)?, &q)?;
+                write_f32(self.slot_mut(need(bufs, 1)?)?, &k)?;
+            }
             KernelOp::Memcpy => {
                 // i32s empty → full buffer copy; [dst_off, nbytes] → partial into dst.
                 let src = self.slot(need(bufs, 1)?)?.data.clone();
@@ -351,6 +423,97 @@ fn map_kernel(e: allpaca_types::AllpacaError) -> RpcError {
     RpcError::Worker(e.to_string())
 }
 
+fn deinterleave_q_gate(q_full: &[f32], q: &mut [f32], gate: &mut [f32], head_dim: usize) -> Result<(), RpcError> {
+    if head_dim == 0 || q.len() != gate.len() || q_full.len() != q.len().saturating_mul(2) || q.len() % head_dim != 0 {
+        return Err(RpcError::Worker("deinterleave shape".into()));
+    }
+    let n_heads = q.len() / head_dim;
+    for h in 0..n_heads {
+        let src = h * 2 * head_dim;
+        let dst = h * head_dim;
+        q[dst..dst + head_dim].copy_from_slice(&q_full[src..src + head_dim]);
+        gate[dst..dst + head_dim].copy_from_slice(&q_full[src + head_dim..src + 2 * head_dim]);
+    }
+    Ok(())
+}
+
+fn rmsnorm_heads(x: &mut [f32], weight: &[f32], n_heads: usize, head_dim: usize, eps: f32) -> Result<(), RpcError> {
+    if head_dim == 0 || weight.len() != head_dim || x.len() != n_heads.saturating_mul(head_dim) {
+        return Err(RpcError::Worker("rmsnorm heads shape".into()));
+    }
+    for h in 0..n_heads {
+        let row = &mut x[h * head_dim..(h + 1) * head_dim];
+        let mut ss = 0.0f32;
+        for &v in row.iter() {
+            ss += v * v;
+        }
+        let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+        for i in 0..head_dim {
+            row[i] *= inv * weight[i];
+        }
+    }
+    Ok(())
+}
+
+/// Expand a packed GGUF weight to F32 for the CPU worker. HIP uses device GEMM instead.
+fn dequant_weight(ty: u32, bytes: &[u8], n: usize, out: &mut [f32]) -> Result<(), RpcError> {
+    if out.len() < n {
+        return Err(RpcError::Worker("dequant output too small".into()));
+    }
+    let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+    match ty {
+        0 => {
+            if bytes.len() < n.saturating_mul(4) {
+                return Err(RpcError::Worker("f32 weight short".into()));
+            }
+            for i in 0..n {
+                let b: [u8; 4] = bytes[i * 4..i * 4 + 4]
+                    .try_into()
+                    .map_err(|_| RpcError::Worker("f32 weight".into()))?;
+                out[i] = f32::from_le_bytes(b);
+            }
+            Ok(())
+        }
+        1 | 30 => {
+            if bytes.len() < n.saturating_mul(2) {
+                return Err(RpcError::Worker("f16 weight short".into()));
+            }
+            for i in 0..n {
+                let b: [u8; 2] = bytes[i * 2..i * 2 + 2]
+                    .try_into()
+                    .map_err(|_| RpcError::Worker("f16 weight".into()))?;
+                let h = u16::from_le_bytes(b);
+                out[i] = if ty == 1 {
+                    allpaca_cpu::f16_to_f32(h)
+                } else {
+                    allpaca_cpu::bf16_to_f32(h)
+                };
+            }
+            Ok(())
+        }
+        2 => allpaca_cpu::dequant_q4_0(bytes, n, out).map_err(bad),
+        3 => allpaca_cpu::dequant_q4_1(bytes, n, out).map_err(bad),
+        6 => allpaca_cpu::dequant_q5_0(bytes, n, out).map_err(bad),
+        7 => allpaca_cpu::dequant_q5_1(bytes, n, out).map_err(bad),
+        8 => allpaca_cpu::dequant_q8_0(bytes, n, out).map_err(bad),
+        9 => allpaca_cpu::dequant_q8_1(bytes, n, out).map_err(bad),
+        10 => allpaca_cpu::dequant_q2_k(bytes, n, out).map_err(bad),
+        11 => allpaca_cpu::dequant_q3_k(bytes, n, out).map_err(bad),
+        12 => allpaca_cpu::dequant_q4_k(bytes, n, out).map_err(bad),
+        13 => allpaca_cpu::dequant_q5_k(bytes, n, out).map_err(bad),
+        14 => allpaca_cpu::dequant_q6_k(bytes, n, out).map_err(bad),
+        20 => allpaca_cpu::dequant_iq4_nl(bytes, n, out).map_err(bad),
+        23 => allpaca_cpu::dequant_iq4_xs(bytes, n, out).map_err(bad),
+        34 => allpaca_cpu::dequant_tq1_0(bytes, n, out).map_err(bad),
+        35 => allpaca_cpu::dequant_tq2_0(bytes, n, out).map_err(bad),
+        39 => allpaca_cpu::dequant_mxfp4(bytes, n, out).map_err(bad),
+        100 => allpaca_cpu::dequant_rocmfp4(bytes, n, out).map_err(bad),
+        other => Err(RpcError::Worker(format!(
+            "ggml type {other} has no cpu dequant"
+        ))),
+    }
+}
+
 /// One HIP device inside a pooled worker.
 #[cfg(feature = "hip")]
 struct HipGpu {
@@ -358,6 +521,8 @@ struct HipGpu {
     hip: allpaca_hip::HipWorkspace,
     total: u64,
     used: u64,
+    /// Vega 20. Decode GEMV uses the vectorized kernel, not the scalar tile.
+    gfx906: bool,
 }
 
 /// HIP worker: every visible device, or one pinned ordinal.
@@ -374,9 +539,40 @@ pub struct HipWorker {
 #[cfg(feature = "hip")]
 struct HipSlot {
     gen: u32,
+    /// ggml type id of a `PutTensor` blob. `0` is raw F32.
+    ggml_type: u32,
     ptr: *mut u8,
     bytes: usize,
     gpu: usize,
+}
+
+#[cfg(feature = "hip")]
+fn hip_quant_gemm(
+    ty: u32,
+    a: *const f32,
+    b: *mut u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), RpcError> {
+    let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+    match ty {
+        0 => allpaca_hip::gemm_nt_device(a, b.cast(), c, m, n, k).map_err(bad),
+        1 => allpaca_hip::gemm_nt_f16_device(a, b.cast(), c, m, n, k).map_err(bad),
+        8 => allpaca_hip::gemm_nt_q8_0_device(a, b, c, m, n, k).map_err(bad),
+        12 => allpaca_hip::gemm_nt_q4_k_device(a, b, c, m, n, k).map_err(bad),
+        13 => allpaca_hip::gemm_nt_q5_k_device(a, b, c, m, n, k).map_err(bad),
+        14 => allpaca_hip::gemm_nt_q6_k_device(a, b, c, m, n, k).map_err(bad),
+        30 => allpaca_hip::gemm_nt_bf16_device(a, b.cast(), c, m, n, k).map_err(bad),
+        34 => allpaca_hip::gemm_nt_tq1_0_device(a, b, c, m, n, k).map_err(bad),
+        35 => allpaca_hip::gemm_nt_tq2_0_device(a, b, c, m, n, k).map_err(bad),
+        39 => allpaca_hip::gemm_nt_mxfp4_device(a, b, c, m, n, k).map_err(bad),
+        100 => allpaca_hip::gemm_nt_rocmfp4_device(a, b, c, m, n, k).map_err(bad),
+        other => Err(RpcError::Worker(format!(
+            "hip worker has no gemm for ggml type {other}"
+        ))),
+    }
 }
 
 /// Pick a device for `bytes`. A hint must fit. Otherwise stay on `sticky` until it
@@ -413,6 +609,28 @@ pub(crate) fn place_sticky(
     best.map(|(i, _)| i).ok_or("rpc worker out of memory")
 }
 
+/// True for Vega 20. Its ROCmFP4 GEMV is one thread per column; F32 GEMV is vectorized.
+pub(crate) fn gfx906_expands_rocmfp4(arch: &str) -> bool {
+    arch.split(':').next() == Some("gfx906")
+}
+
+/// Whole-block ROCmFP4 bytes to little-endian F32. `None` is not returned; a
+/// truncated blob is an error.
+pub(crate) fn expand_rocmfp4_f32(bytes: &[u8]) -> Result<Vec<u8>, RpcError> {
+    if bytes.is_empty() || bytes.len() % allpaca_cpu::ROCMFP4_BLOCK_BYTES != 0 {
+        return Err(RpcError::Worker("rocmfp4 blob is not whole blocks".into()));
+    }
+    let n = bytes.len() / allpaca_cpu::ROCMFP4_BLOCK_BYTES * allpaca_cpu::ROCMFP4_BLOCK_ELEMS;
+    let mut weights = vec![0.0f32; n];
+    allpaca_cpu::dequant_rocmfp4(bytes, n, &mut weights)
+        .map_err(|e| RpcError::Worker(e.to_string()))?;
+    let mut out = Vec::with_capacity(n * 4);
+    for v in weights {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(out)
+}
+
 #[cfg(feature = "hip")]
 unsafe impl Send for HipWorker {}
 
@@ -422,11 +640,14 @@ impl HipGpu {
         let hip = allpaca_hip::HipWorkspace::new(device, 1 << 20, 64)
             .map_err(|e| RpcError::Worker(e.to_string()))?;
         let (_free, total) = allpaca_hip::device_memory_info(device).unwrap_or((0, 0));
+        let gfx906 = allpaca_hip::device_gcn_arch(device)
+            .is_some_and(|(arch, _)| gfx906_expands_rocmfp4(&arch));
         Ok(Self {
             device,
             hip,
             total,
             used: 0,
+            gfx906,
         })
     }
 
@@ -523,6 +744,7 @@ impl HipWorker {
             id,
             HipSlot {
                 gen: 1,
+                ggml_type: 0,
                 ptr,
                 bytes: bytes as usize,
                 gpu,
@@ -531,6 +753,18 @@ impl HipWorker {
         self.gpus[gpu].used = self.gpus[gpu].used.saturating_add(bytes);
         self.sticky = gpu;
         Ok(BufId { id, gen: 1 })
+    }
+
+    fn set_ggml_type(&mut self, id: BufId, ggml_type: u32) -> Result<(), RpcError> {
+        let s = self
+            .slots
+            .get_mut(&id.id)
+            .ok_or_else(|| RpcError::Worker(format!("unknown buf {}", id.id)))?;
+        if s.gen != id.gen {
+            return Err(RpcError::Worker("stale hip buf".into()));
+        }
+        s.ggml_type = ggml_type;
+        Ok(())
     }
 
     fn bind_gpu(&self, gpu: usize) -> Result<(), RpcError> {
@@ -691,6 +925,90 @@ impl HipWorker {
                 allpaca_hip::gemm_nt_device(a, b, c, m, n, k)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
+            KernelOp::GemmNtQuant => {
+                let m = *i32s.first().ok_or_else(|| RpcError::Worker("gemm m".into()))?;
+                let n = *i32s.get(1).ok_or_else(|| RpcError::Worker("gemm n".into()))?;
+                let k = *i32s.get(2).ok_or_else(|| RpcError::Worker("gemm k".into()))?;
+                let a = self.ptr_f32(need(bufs, 0)?)?;
+                let b_id = need(bufs, 1)?;
+                let ty = self.slot(b_id)?.ggml_type;
+                let b = self.slot(b_id)?.ptr;
+                let c = self.ptr_f32(need(bufs, 2)?)?;
+                if self.gpus[gpu].gfx906 && ty == 0 && m <= 8 {
+                    allpaca_hip::gemm_nt_untiled_device(a, b.cast(), c, m, n, k)
+                        .map_err(|e| RpcError::Worker(e.to_string()))?;
+                } else {
+                    hip_quant_gemm(ty, a, b, c, m, n, k)?;
+                }
+            }
+            KernelOp::DeinterleaveQGate => {
+                let n_heads = *i32s.first().ok_or_else(|| RpcError::Worker("deinterleave heads".into()))?;
+                let head_dim = *i32s.get(1).ok_or_else(|| RpcError::Worker("deinterleave head".into()))?;
+                self.gpus[gpu]
+                    .hip
+                    .deinterleave_q_gate_device(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        self.ptr_f32(need(bufs, 2)?)?,
+                        n_heads,
+                        head_dim,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RmsNormHeads => {
+                let n_heads = *i32s.first().ok_or_else(|| RpcError::Worker("rmsnorm heads".into()))?;
+                let head_dim = *i32s.get(1).ok_or_else(|| RpcError::Worker("rmsnorm head".into()))?;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                self.gpus[gpu]
+                    .hip
+                    .rmsnorm_heads_device(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        n_heads,
+                        head_dim,
+                        eps,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::SigmoidMul => {
+                let n = *i32s.first().ok_or_else(|| RpcError::Worker("sigmoid n".into()))?;
+                self.gpus[gpu]
+                    .hip
+                    .sigmoid_mul_device(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        n,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopePartial => {
+                let n_heads = *i32s.first().ok_or_else(|| RpcError::Worker("rope heads".into()))?;
+                let n_kv = *i32s.get(1).ok_or_else(|| RpcError::Worker("rope kv heads".into()))?;
+                let head_dim = *i32s.get(2).ok_or_else(|| RpcError::Worker("rope head".into()))?;
+                let pos = *i32s.get(3).ok_or_else(|| RpcError::Worker("rope pos".into()))?;
+                let n_rot = *i32s.get(4).unwrap_or(&head_dim);
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let sections = [
+                    *f32s.get(1).unwrap_or(&0.0) as i32,
+                    *f32s.get(2).unwrap_or(&0.0) as i32,
+                    *f32s.get(3).unwrap_or(&0.0) as i32,
+                    *f32s.get(4).unwrap_or(&0.0) as i32,
+                ];
+                self.gpus[gpu]
+                    .hip
+                    .rope_imrope_qk_device(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        n_rot,
+                        pos,
+                        theta,
+                        sections,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
             KernelOp::Attention => {
                 let n_q = i32s[0];
                 let n_kv = i32s[1];
@@ -821,6 +1139,8 @@ pub struct CudaWorker {
 #[cfg(feature = "cuda")]
 struct CudaSlot {
     gen: u32,
+    /// ggml type id of a `PutTensor` blob. `0` is raw F32.
+    ggml_type: u32,
     ptr: *mut std::ffi::c_void,
     bytes: usize,
 }
@@ -889,12 +1209,25 @@ impl CudaWorker {
             id,
             CudaSlot {
                 gen: 1,
+                ggml_type: 0,
                 ptr,
                 bytes: bytes as usize,
             },
         );
         self.used = self.used.saturating_add(bytes);
         Ok(BufId { id, gen: 1 })
+    }
+
+    fn set_ggml_type(&mut self, id: BufId, ggml_type: u32) -> Result<(), RpcError> {
+        let s = self
+            .slots
+            .get_mut(&id.id)
+            .ok_or_else(|| RpcError::Worker(format!("unknown buf {}", id.id)))?;
+        if s.gen != id.gen {
+            return Err(RpcError::Worker("stale cuda buf".into()));
+        }
+        s.ggml_type = ggml_type;
+        Ok(())
     }
 
     fn free(&mut self, id: BufId) -> Result<(), RpcError> {
@@ -1100,6 +1433,15 @@ impl CudaWorker {
                     .residual_add_dev(x, y, x, n)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
+            KernelOp::GemmNtQuant
+            | KernelOp::DeinterleaveQGate
+            | KernelOp::RmsNormHeads
+            | KernelOp::SigmoidMul
+            | KernelOp::RopePartial => {
+                return Err(RpcError::Worker(
+                    "quant gemm and gated attention are implemented on CPU and HIP workers".into(),
+                ));
+            }
             KernelOp::Memcpy => {
                 if i32s.len() >= 2 {
                     self.copy_at(
@@ -1166,6 +1508,59 @@ impl WorkerBackend {
             #[cfg(feature = "cuda")]
             Self::Cuda(w) => w.hello(),
         }
+    }
+
+    fn put_tensor(
+        &mut self,
+        ggml_type: u32,
+        bytes: &[u8],
+        device: Option<u32>,
+    ) -> Result<BufId, RpcError> {
+        let repacked = self.repack_rocmfp4(ggml_type, bytes, device)?;
+        let (payload, stored_ty) = match repacked.as_deref() {
+            Some(f32_bytes) => (f32_bytes, 0),
+            None => (bytes, ggml_type),
+        };
+        let id = self.alloc(payload.len() as u64, device)?;
+        self.h2d(id, 0, payload)?;
+        match self {
+            Self::Cpu(w) => w.set_ggml_type(id, stored_ty)?,
+            #[cfg(feature = "hip")]
+            Self::Hip(w) => w.set_ggml_type(id, stored_ty)?,
+            #[cfg(feature = "cuda")]
+            Self::Cuda(w) => w.set_ggml_type(id, stored_ty)?,
+        }
+        Ok(id)
+    }
+
+    /// gfx906 runs the scalar ROCmFP4 GEMV. Expand those weights to F32 once
+    /// so decode uses the vectorized GEMV. Other arches keep the packed blob.
+    fn repack_rocmfp4(
+        &self,
+        ggml_type: u32,
+        bytes: &[u8],
+        device: Option<u32>,
+    ) -> Result<Option<Vec<u8>>, RpcError> {
+        if ggml_type != 100 {
+            return Ok(None);
+        }
+        #[cfg(feature = "hip")]
+        if let Self::Hip(w) = self {
+            let idx = device.unwrap_or(w.sticky as u32) as usize;
+            let dev = w
+                .gpus
+                .get(idx)
+                .or_else(|| w.gpus.first())
+                .map(|g| g.device)
+                .unwrap_or(0);
+            let expand = allpaca_hip::device_gcn_arch(dev)
+                .is_some_and(|(arch, _)| gfx906_expands_rocmfp4(&arch));
+            if expand {
+                return expand_rocmfp4_f32(bytes).map(Some);
+            }
+        }
+        let _ = (bytes, device);
+        Ok(None)
     }
 
     fn alloc(&mut self, bytes: u64, gpu: Option<u32>) -> Result<BufId, RpcError> {
@@ -1458,7 +1853,62 @@ fn handle(
             backend.sync()?;
             Ok(Vec::new())
         }
+        Cmd::RunSpan => run_span(backend, payload),
+        Cmd::PutTensor => {
+            let mut c = Cursor::new(payload);
+            let ggml_type = c.u32()?;
+            let n_dims = c.u32()?;
+            if n_dims > 4 {
+                return Err(RpcError::Protocol("put tensor rank".into()));
+            }
+            for _ in 0..n_dims {
+                let _ = c.u32()?;
+            }
+            let data = c.bytes()?;
+            let device = if c.has_remaining() {
+                Some(c.u32()?)
+            } else {
+                None
+            };
+            let id = backend.put_tensor(ggml_type, data, device)?;
+            let mut out = Vec::new();
+            crate::protocol::write_buf_id(&mut out, id);
+            Ok(out)
+        }
     }
+}
+
+/// H2D the activation, run each launch list, D2H the last activation. One reply.
+fn run_span(backend: &mut WorkerBackend, payload: &[u8]) -> Result<Vec<u8>, RpcError> {
+    let t0 = std::time::Instant::now();
+    let (steps, activation) = crate::protocol::decode_run_span(payload)?;
+    let nbytes = activation.len() as u64;
+    let first = steps[0].0;
+    backend.h2d(first, 0, &activation)?;
+    let t_h2d = t0.elapsed();
+    backend.launch(&steps[0].1)?;
+    for i in 1..steps.len() {
+        let src = steps[i - 1].0;
+        let dst = steps[i].0;
+        if backend.copy(src, dst).is_err() {
+            let mid = backend.d2h(src, 0, nbytes)?;
+            backend.h2d(dst, 0, &mid)?;
+        }
+        backend.launch(&steps[i].1)?;
+    }
+    let t_launch = t0.elapsed();
+    backend.sync()?;
+    let t_sync = t0.elapsed();
+    let out = backend.d2h(steps[steps.len() - 1].0, 0, nbytes)?;
+    tracing::debug!(
+        steps = steps.len(),
+        h2d_us = t_h2d.as_micros() as u64,
+        launch_us = t_launch.saturating_sub(t_h2d).as_micros() as u64,
+        sync_us = t_sync.saturating_sub(t_launch).as_micros() as u64,
+        d2h_us = t0.elapsed().saturating_sub(t_sync).as_micros() as u64,
+        "run_span"
+    );
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1472,5 +1922,24 @@ mod tests {
         assert_eq!(place_sticky(&[10, 10], 1, 4, Some(0)).unwrap(), 0);
         assert!(place_sticky(&[10, 80], 0, 40, Some(0)).is_err());
         assert!(place_sticky(&[10, 10], 0, 40, None).is_err());
+    }
+
+    #[test]
+    fn gfx906_repacks_rocmfp4_other_arch_keeps_it() {
+        use super::{expand_rocmfp4_f32, gfx906_expands_rocmfp4};
+
+        assert!(gfx906_expands_rocmfp4("gfx906"));
+        assert!(gfx906_expands_rocmfp4("gfx906:sramecc+:xnack-"));
+        assert!(!gfx906_expands_rocmfp4("gfx1201"));
+        assert!(!gfx906_expands_rocmfp4("gfx908"));
+        let mut block = vec![0u8; allpaca_cpu::ROCMFP4_BLOCK_BYTES];
+        block[0] = 0x21;
+        block[16] = 0x38;
+        block[17] = 0x38;
+        let f32_bytes = expand_rocmfp4_f32(&block).unwrap();
+        assert_eq!(
+            f32_bytes.len(),
+            allpaca_cpu::ROCMFP4_BLOCK_ELEMS * 4
+        );
     }
 }

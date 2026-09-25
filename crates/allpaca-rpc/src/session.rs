@@ -168,6 +168,43 @@ impl RpcSession {
         Ok(())
     }
 
+    /// Upload packed GGUF bytes. The worker records `ggml_type` on the new buffer.
+    pub fn put_tensor(
+        &mut self,
+        ggml_type: u32,
+        dims: &[u32],
+        bytes: &[u8],
+        device: Option<u32>,
+    ) -> Result<BufId, RpcError> {
+        if dims.len() > 4 {
+            return Err(RpcError::Protocol("put tensor rank".into()));
+        }
+        let mut p = Vec::new();
+        crate::protocol::write_u32(&mut p, ggml_type);
+        crate::protocol::write_u32(&mut p, dims.len() as u32);
+        for d in dims {
+            crate::protocol::write_u32(&mut p, *d);
+        }
+        crate::protocol::write_bytes(&mut p, bytes);
+        if let Some(device) = device {
+            crate::protocol::write_u32(&mut p, device);
+        }
+        let body = self.rpc(Cmd::PutTensor, &p)?;
+        let mut c = crate::protocol::Cursor::new(&body);
+        c.buf_id()
+    }
+
+    /// Upload `activation` into the first buffer, run every list, return the last buffer.
+    pub fn run_span(
+        &mut self,
+        xs: &[BufId],
+        lists: &[LaunchList],
+        activation: &[u8],
+    ) -> Result<Vec<u8>, RpcError> {
+        let payload = crate::protocol::encode_run_span(xs, lists, activation)?;
+        self.rpc(Cmd::RunSpan, &payload)
+    }
+
     pub fn mem_info(&mut self) -> Result<(u64, u64), RpcError> {
         let body = self.rpc(Cmd::MemInfo, &[])?;
         let mut c = crate::protocol::Cursor::new(&body);

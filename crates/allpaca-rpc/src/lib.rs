@@ -2,7 +2,8 @@
 //!
 //! This is the llama.cpp RPC analogue without a ggml graph. The coordinator
 //! owns scheduling; a worker only allocates buffers and runs the existing
-//! CPU/HIP/CUDA kernel ABI. HIP and CUDA workers speak the same `KernelOp`
+//! CPU/HIP/CUDA kernel ABI. Weights may be packed GGUF blobs (`PutTensor`);
+//! `GemmNtQuant` keeps that ggml type. HIP and CUDA workers speak the same `KernelOp`
 //! wire protocol so an AMD coordinator can drive an NVIDIA worker (and vice
 //! versa) as long as HELLO majors match.
 
@@ -134,6 +135,57 @@ mod tests {
         client.free(a).unwrap();
         client.free(b).unwrap();
         client.free(c).unwrap();
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn loopback_quant_gemm_q8_0() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let m = 1i32;
+        let n = 32i32;
+        let k = 32i32;
+        let weight: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+            .collect();
+        let packed = allpaca_cpu::quantize_q8_0(&weight);
+        let a_f: Vec<f32> = (0..k).map(|i| (i as f32) * 0.05).collect();
+        let a = client.alloc((k as usize * 4) as u64).unwrap();
+        let c = client.alloc((n as usize * 4) as u64).unwrap();
+        let b = client
+            .put_tensor(8, &[k as u32, n as u32], &packed, None)
+            .unwrap();
+        let a_bytes: Vec<u8> = a_f.iter().flat_map(|v| v.to_le_bytes()).collect();
+        client.h2d(a, 0, &a_bytes).unwrap();
+        client
+            .launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::GemmNtQuant,
+                    bufs: vec![a, b, c],
+                    i32s: vec![m, n, k],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+        let raw = client.d2h(c, 0, (n as u64) * 4).unwrap();
+        let mut got = vec![0.0f32; n as usize];
+        for i in 0..n as usize {
+            got[i] = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        let mut w = vec![0.0f32; (n * k) as usize];
+        allpaca_cpu::dequant_q8_0(&packed, w.len(), &mut w).unwrap();
+        let mut expect = vec![0.0f32; n as usize];
+        allpaca_cpu::matmul_nt(&a_f, &w, &mut expect, 1, n as usize, k as usize).unwrap();
+        for (g, e) in got.iter().zip(&expect) {
+            assert!((g - e).abs() < 1e-4, "{g} vs {e}");
+        }
         drop(client);
         worker.join().unwrap();
     }

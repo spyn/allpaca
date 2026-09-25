@@ -7,7 +7,8 @@ pub const PROTO_MAJOR: u16 = 1;
 pub const PROTO_MINOR: u16 = 0;
 pub const PROTO_PATCH: u16 = 0;
 /// Bump when the named kernel set or C ABI revision changes.
-pub const KERNEL_ABI_REV: u32 = 1;
+/// 2 adds `PutTensor` and `GemmNtQuant` (packed GGUF weights).
+pub const KERNEL_ABI_REV: u32 = 2;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
@@ -42,6 +43,10 @@ pub enum Cmd {
     MemInfo = 9,
     DeviceCount = 10,
     Sync = 11,
+    /// One activation upload, one or more launch lists, one activation download.
+    RunSpan = 12,
+    /// Store one packed GGUF tensor (ggml type + dims + raw bytes). Reply is a BufId.
+    PutTensor = 13,
 }
 
 impl Cmd {
@@ -59,6 +64,8 @@ impl Cmd {
             9 => Self::MemInfo,
             10 => Self::DeviceCount,
             11 => Self::Sync,
+            12 => Self::RunSpan,
+            13 => Self::PutTensor,
             _ => return None,
         })
     }
@@ -94,6 +101,18 @@ pub enum KernelOp {
     ResidualAdd = 6,
     EmbedGather = 7,
     Memcpy = 8,
+    /// `C = A @ B^T` where `B` is the packed tensor from `PutTensor`.
+    /// `i32s` are `[m, n, k]`. The ggml type lives on the weight buffer.
+    GemmNtQuant = 9,
+    /// Split per-head `[Q|gate]` into separate buffers. `i32s`: `[n_heads, head_dim]`.
+    DeinterleaveQGate = 10,
+    /// Per-head RMSNorm. `i32s`: `[n_heads, head_dim]`. `f32s`: `[eps]`.
+    RmsNormHeads = 11,
+    /// `x *= sigmoid(gate)`. `i32s`: `[n]`.
+    SigmoidMul = 12,
+    /// Partial or sectioned RoPE on Q and K. `i32s`: `[n_heads, n_kv_heads, head_dim, pos, n_rot]`.
+    /// `f32s`: `[theta, section0, section1, section2, section3]`.
+    RopePartial = 13,
 }
 
 impl KernelOp {
@@ -107,6 +126,11 @@ impl KernelOp {
             6 => Self::ResidualAdd,
             7 => Self::EmbedGather,
             8 => Self::Memcpy,
+            9 => Self::GemmNtQuant,
+            10 => Self::DeinterleaveQGate,
+            11 => Self::RmsNormHeads,
+            12 => Self::SigmoidMul,
+            13 => Self::RopePartial,
             _ => return None,
         })
     }
@@ -449,6 +473,41 @@ pub fn encode_launch_list(list: &LaunchList) -> Vec<u8> {
     w
 }
 
+/// `xs[i]` is the activation buffer for `lists[i]`. `activation` is written into `xs[0]`.
+pub fn encode_run_span(
+    xs: &[BufId],
+    lists: &[LaunchList],
+    activation: &[u8],
+) -> Result<Vec<u8>, RpcError> {
+    if xs.is_empty() || xs.len() != lists.len() {
+        return Err(RpcError::Protocol("run span length".into()));
+    }
+    let mut w = Vec::new();
+    write_u32(&mut w, xs.len() as u32);
+    for (x, list) in xs.iter().zip(lists) {
+        write_buf_id(&mut w, *x);
+        write_bytes(&mut w, &encode_launch_list(list));
+    }
+    write_bytes(&mut w, activation);
+    Ok(w)
+}
+
+pub fn decode_run_span(data: &[u8]) -> Result<(Vec<(BufId, LaunchList)>, Vec<u8>), RpcError> {
+    let mut c = Cursor::new(data);
+    let n = c.u32()? as usize;
+    if n == 0 {
+        return Err(RpcError::Protocol("empty run span".into()));
+    }
+    let mut steps = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x = c.buf_id()?;
+        let encoded = c.bytes()?;
+        steps.push((x, decode_launch_list(encoded)?));
+    }
+    let activation = c.bytes()?.to_vec();
+    Ok((steps, activation))
+}
+
 pub fn decode_launch_list(data: &[u8]) -> Result<LaunchList, RpcError> {
     let mut c = Cursor::new(data);
     let n = c.u32()? as usize;
@@ -544,9 +603,9 @@ pub fn check_hello(reply: &HelloReply) -> Result<(), RpcError> {
             patch: reply.patch,
         });
     }
-    if reply.kernel_abi_rev > KERNEL_ABI_REV {
+    if reply.kernel_abi_rev != KERNEL_ABI_REV {
         return Err(RpcError::Protocol(format!(
-            "worker kernel abi {} newer than client {}",
+            "worker kernel abi {} != client {}",
             reply.kernel_abi_rev, KERNEL_ABI_REV
         )));
     }
