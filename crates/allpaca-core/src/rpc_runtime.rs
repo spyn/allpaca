@@ -1,18 +1,26 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use allpaca_gguf::{GgufFile, HybridLayerKind};
 use allpaca_rpc::{BufId, KernelOp, LaunchItem, LaunchList, RpcBackendKind, RpcSession};
 use allpaca_types::{AllpacaError, DeviceKind, FatalError, RPC_DEVICE_ID_BASE};
 
 use crate::compute::ComputeDev;
-use crate::layer_split::{expand_rpc_split, plan_layer_owners, LayerPlan};
-use crate::model::{LayerWeights, ModelConfig, TinyModel};
+use crate::layer_split::{
+    expand_rpc_split, packed_fits_local, plan_layer_owners, plan_local_hybrid_peer,
+    plan_local_peer_window, LayerPlan,
+};
+use crate::model::{LayerWeights, ModelConfig, ResidentModel, TinyModel};
 
 /// Connected RPC workers plus the layer assignment used at decode.
 pub struct RpcRuntime {
     sessions: Mutex<Vec<RpcSession>>,
     plan: Mutex<LayerPlan>,
     remote: Mutex<Vec<Option<RemoteLayer>>>,
+    /// HIP device for each local layer. `-1` means the layer was placed on RPC.
+    layer_device: Mutex<Vec<i32>>,
+    /// Second local GPU: device id, workspace, and the layers that live there.
+    local_peer: Mutex<Option<(i32, Arc<allpaca_hip::HipWorkspace>, Arc<ResidentModel>)>>,
     pub roundtrips: AtomicU64,
     pub activation_bytes: AtomicU64,
     pub h2d_bytes: AtomicU64,
@@ -60,6 +68,27 @@ struct RemoteLayer {
     eps: f32,
     theta: f32,
     max_seq: usize,
+    /// Weight GEMMs are `GemmNtQuant` against packed GGUF bytes.
+    packed: bool,
+    /// Q projection output length. Equals `dim` for the square F32 path.
+    q_len: usize,
+    /// `wo` K. Equals `dim` for the square F32 path.
+    o_in: usize,
+    /// Q RoPE head size. `0` means use `head_dim`.
+    q_head_dim: usize,
+    /// Qwen3.5 full attention: Q GEMM is per-head `[Q|gate]`.
+    gated: bool,
+    attn_dim: usize,
+    /// Destination of the Q GEMM. Equals `q` when `gated` is false.
+    q_proj: BufId,
+    q_gate: BufId,
+    q_norm: BufId,
+    k_norm: BufId,
+    has_q_norm: bool,
+    has_k_norm: bool,
+    /// `0` uses full-head RoPE. Otherwise partial / sectioned RoPE.
+    n_rot: usize,
+    rope_sections: [i32; 4],
 }
 
 impl RpcRuntime {
@@ -75,6 +104,8 @@ impl RpcRuntime {
             sessions: Mutex::new(sessions),
             plan: Mutex::new(LayerPlan::all_local(0)),
             remote: Mutex::new(Vec::new()),
+            layer_device: Mutex::new(Vec::new()),
+            local_peer: Mutex::new(None),
             roundtrips: AtomicU64::new(0),
             activation_bytes: AtomicU64::new(0),
             h2d_bytes: AtomicU64::new(0),
@@ -120,19 +151,87 @@ impl RpcRuntime {
         self.plan.lock().map(|p| p.has_remote()).unwrap_or(false)
     }
 
+    /// A layer was uploaded to a worker. A split plan alone does not count:
+    /// large GGUFs skip host-F32 layers and stay on the local device.
+    pub fn placed_remote(&self) -> bool {
+        self.remote
+            .lock()
+            .map(|layers| layers.iter().any(|layer| layer.is_some()))
+            .unwrap_or(false)
+    }
+
     pub fn session_count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
     }
 
-    /// Split devices: local target (index 0) then each RPC session.
+    /// HIP device that runs a local layer. `-1` when the layer is on RPC.
+    pub fn local_device(&self, layer: usize) -> i32 {
+        self.layer_device
+            .lock()
+            .ok()
+            .and_then(|d| d.get(layer).copied())
+            .unwrap_or(0)
+    }
+
+    /// Local layers occupy more than one HIP device.
+    pub fn splits_local(&self) -> bool {
+        let Ok(devs) = self.layer_device.lock() else {
+            return false;
+        };
+        let mut first = None;
+        for d in devs.iter().copied() {
+            if d < 0 {
+                continue;
+            }
+            match first {
+                None => first = Some(d),
+                Some(found) if found != d => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Install the second local GPU's workspace and the layers uploaded there.
+    pub fn set_local_peer(
+        &self,
+        device: i32,
+        hip: Arc<allpaca_hip::HipWorkspace>,
+        resident: Arc<ResidentModel>,
+    ) {
+        if let Ok(mut slot) = self.local_peer.lock() {
+            *slot = Some((device, hip, resident));
+        }
+    }
+
+    pub fn local_peer(
+        &self,
+    ) -> Option<(i32, Arc<allpaca_hip::HipWorkspace>, Arc<ResidentModel>)> {
+        self.local_peer.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Split devices: local GPU pool first, then each RPC GPU.
     pub fn prepare(
         &self,
         model: &TinyModel,
-        local_bytes: u64,
+        local_devices: &[(i32, u64)],
         tensor_split: Option<&[f64]>,
         max_seq: usize,
+        gguf: Option<&GgufFile>,
     ) -> Result<(), AllpacaError> {
-        let mut device_bytes = vec![local_bytes.max(1)];
+        let local_devices = if local_devices.is_empty() {
+            vec![(0, 1u64 << 30)]
+        } else {
+            local_devices.to_vec()
+        };
+        let n_local = local_devices.len();
+        let mut device_bytes = Vec::with_capacity(n_local);
+        let mut local_ids = Vec::with_capacity(n_local);
+        for (dev, mem) in &local_devices {
+            local_ids.push(*dev);
+            device_bytes.push((*mem).max(1));
+        }
+        let local_mems: Vec<u64> = device_bytes.clone();
         let mut owners = Vec::new();
         let groups = {
             let sessions = self.sessions.lock().map_err(|_| {
@@ -151,36 +250,114 @@ impl RpcRuntime {
             groups
         };
         let expanded = match tensor_split {
-            Some(split) => Some(expand_rpc_split(split, &groups)?),
+            Some(split) => Some(expand_rpc_split(split, &local_mems, &groups)?),
             None => None,
         };
-        let plan = plan_layer_owners(model.config.n_layers, &device_bytes, expanded.as_deref())?;
+        let packed_bytes = gguf
+            .map(|file| file.tensors.iter().map(|t| t.nbytes() as u64).sum::<u64>())
+            .unwrap_or(0);
+        if packed_fits_local(packed_bytes, &local_mems) {
+            tracing::info!(
+                packed_bytes,
+                local_vram = local_mems.iter().copied().sum::<u64>(),
+                rpc = !groups.is_empty(),
+                "packed weights fit in the local GPU pool"
+            );
+        }
+        let plan = if groups.is_empty() && n_local > 1 {
+            let attn: Vec<bool> = model
+                .layers
+                .iter()
+                .map(|l| l.block == HybridLayerKind::Attention)
+                .collect();
+            let hybrid = attn.iter().any(|full| !*full);
+            let window = if hybrid {
+                plan_local_hybrid_peer(model.config.n_layers, &local_mems, &attn)
+            } else {
+                plan_local_peer_window(model.config.n_layers, &local_mems)
+            };
+            tracing::info!(
+                peer_layers = window.owners.iter().filter(|&&o| o != 0).count(),
+                hybrid,
+                "local-only HIP pool: hybrid peer (middle window + later GDN)"
+            );
+            window
+        } else {
+            plan_layer_owners(model.config.n_layers, &device_bytes, expanded.as_deref())?
+        };
         let mut remote = vec![None; model.layers.len()];
+        let mut layer_device = vec![local_ids[0]; model.layers.len()];
+        let mut local_load = vec![0u64; n_local];
         let cfg = &model.config;
         let max_seq = max_seq.max(1);
         for (layer_idx, layer) in model.layers.iter().enumerate() {
             let owner = plan.owner(layer_idx);
-            if owner == 0 {
+            if owner < n_local {
+                layer_device[layer_idx] = local_ids[owner];
+                local_load[owner] += 1;
                 continue;
             }
-            if !is_dense_attn_ffn(layer) {
-                tracing::warn!(layer_idx, "rpc owner skipped; layer is not dense attn+ffn");
-                continue;
-            }
-            let (session_idx, device) = owners.get(owner - 1).copied().ok_or_else(|| {
+            let (session_idx, device) = owners.get(owner - n_local).copied().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::InvalidConfig(
                     "rpc layer owner has no device".into(),
                 ))
             })?;
-            let uploaded = self.upload_layer(session_idx, device, cfg, layer, max_seq)?;
-            remote[layer_idx] = Some(uploaded);
+            if let Some(file) = gguf {
+                if let Some(uploaded) =
+                    self.upload_packed_layer(file, layer_idx, session_idx, device, cfg, max_seq)?
+                {
+                    remote[layer_idx] = Some(uploaded);
+                    layer_device[layer_idx] = -1;
+                    continue;
+                }
+            }
+            if is_dense_attn_ffn(layer) {
+                let uploaded = self.upload_layer(session_idx, device, cfg, layer, max_seq)?;
+                remote[layer_idx] = Some(uploaded);
+                layer_device[layer_idx] = -1;
+                continue;
+            }
+            let pick = 0usize;
+            layer_device[layer_idx] = local_ids[pick];
+            local_load[pick] += 1;
+            tracing::warn!(
+                layer_idx,
+                device = local_ids[pick],
+                "rpc owner skipped; layer stays on the local target GPU"
+            );
         }
+        let placed = remote.iter().any(|layer| layer.is_some());
+        let remote_planned = plan.owners.iter().any(|&o| o >= n_local);
+        if remote_planned && !placed {
+            tracing::warn!(
+                "rpc layer plan names remote owners but no dense layer was uploaded; decode stays on the local GPUs"
+            );
+        }
+        for (slot, id) in local_ids.iter().copied().enumerate() {
+            let layers = layer_device.iter().filter(|d| **d == id).count();
+            tracing::info!(
+                slot,
+                hip = id,
+                layers,
+                "local GPU pool occupancy"
+            );
+        }
+        let rpc_layers = layer_device.iter().filter(|d| **d < 0).count();
+        tracing::info!(
+            local_devices = n_local,
+            rpc_layers,
+            remote_layers = placed,
+            "layer split: local GPU pool, then RPC if any"
+        );
         *self.plan.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc plan lock".into()))
         })? = plan;
         *self.remote.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
         })? = remote;
+        *self.layer_device.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc layer device lock".into()))
+        })? = layer_device;
         Ok(())
     }
 
@@ -279,172 +456,541 @@ impl RpcRuntime {
             eps: cfg.eps,
             theta: cfg.rope_theta,
             max_seq,
+            packed: false,
+            q_len: dim,
+            o_in: dim,
+            q_head_dim: 0,
+            gated: false,
+            attn_dim: dim,
+            q_proj: q,
+            q_gate: q,
+            q_norm: q,
+            k_norm: q,
+            has_q_norm: false,
+            has_k_norm: false,
+            n_rot: 0,
+            rope_sections: [0; 4],
         })
     }
 
+    /// Upload one dense GGUF block as packed tensors. `None` when the block is
+    /// GDN, MoE, split-head, or a ggml type this worker cannot GEMM.
+    fn upload_packed_layer(
+        &self,
+        file: &GgufFile,
+        layer_idx: usize,
+        session_idx: usize,
+        device: u32,
+        cfg: &ModelConfig,
+        max_seq: usize,
+    ) -> Result<Option<RemoteLayer>, AllpacaError> {
+        let blk = cfg.gguf_blk(layer_idx);
+        let name = |suffix: &str| format!("blk.{blk}.{suffix}");
+        if cfg.headwise_attn_gate
+            || file.tensor(&name("attn_q.weight")).is_none()
+            || file.tensor(&name("ffn_gate.weight")).is_none()
+            || file.tensor(&name("ffn_gate_exps.weight")).is_some()
+            || file.tensor(&name("ffn_up_exps.weight")).is_some()
+        {
+            return Ok(None);
+        }
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
+        })?;
+        let session = sessions.get_mut(session_idx).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc session missing".into()))
+        })?;
+        let backend = session.hello().backend;
+        let weight_names = [
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        ];
+        let mut infos = Vec::with_capacity(weight_names.len());
+        for suffix in weight_names {
+            let Some(info) = file.tensor(&name(suffix)).cloned() else {
+                return Ok(None);
+            };
+            if !worker_accepts_type(backend, info.ggml_type_id) {
+                tracing::warn!(
+                    layer_idx,
+                    tensor = suffix,
+                    ggml_type = info.ggml_type_id,
+                    "rpc packed layer skipped; worker has no gemm for this ggml type"
+                );
+                return Ok(None);
+            }
+            infos.push(info);
+        }
+        let dim = cfg.dim;
+        let Some((q_n, q_k)) = gemm_nk(&infos[0]) else {
+            return Ok(None);
+        };
+        let Some((k_n, k_k)) = gemm_nk(&infos[1]) else {
+            return Ok(None);
+        };
+        let Some((v_n, v_k)) = gemm_nk(&infos[2]) else {
+            return Ok(None);
+        };
+        let Some((o_n, o_k)) = gemm_nk(&infos[3]) else {
+            return Ok(None);
+        };
+        let Some((gate_n, gate_k)) = gemm_nk(&infos[4]) else {
+            return Ok(None);
+        };
+        let Some((up_n, up_k)) = gemm_nk(&infos[5]) else {
+            return Ok(None);
+        };
+        let Some((down_n, down_k)) = gemm_nk(&infos[6]) else {
+            return Ok(None);
+        };
+        let al = crate::model::attn_layout(
+            cfg,
+            infos[0].n_elements() as usize,
+            infos[1].n_elements() as usize,
+            infos[3].n_elements() as usize,
+        );
+        let n_rot = cfg.rope_dims_for_layer(layer_idx);
+        if q_k != dim
+            || k_k != dim
+            || v_k != dim
+            || o_n != dim
+            || gate_k != dim
+            || up_k != dim
+            || up_n != gate_n
+            || down_n != dim
+            || down_k != gate_n
+            || k_n != v_n
+            || al.q_out != q_n
+            || al.kv_dim != k_n
+            || al.wo_k != o_k
+            || al.head_dim == 0
+            || al.attn_dim % al.head_dim != 0
+            || k_n % al.head_dim != 0
+            || (n_rot > 0 && (n_rot > al.head_dim || n_rot % 2 != 0))
+        {
+            tracing::warn!(layer_idx, "rpc packed layer skipped; tensor shape is not dense attn+ffn");
+            return Ok(None);
+        }
+        let attn_norm = file.tensor_f32(&name("attn_norm.weight"))?;
+        // Qwen GGUF stores the FFN RMSNorm as `post_attention_norm`.
+        let ffn_norm = if file.tensor(&name("ffn_norm.weight")).is_some() {
+            file.tensor_f32(&name("ffn_norm.weight"))?
+        } else {
+            file.tensor_f32(&name("post_attention_norm.weight"))?
+        };
+        if attn_norm.len() != dim || ffn_norm.len() != dim {
+            tracing::warn!(layer_idx, "rpc packed layer skipped; norm rank is not dim");
+            return Ok(None);
+        }
+        let alloc_f32 = |s: &mut RpcSession, n: usize| -> Result<BufId, AllpacaError> {
+            s.alloc_on((n * 4) as u64, Some(device)).map_err(map_rpc)
+        };
+        let put_f32 = |s: &mut RpcSession, id: BufId, data: &[f32]| -> Result<(), AllpacaError> {
+            s.h2d(id, 0, &f32_bytes(data)).map_err(map_rpc)
+        };
+        let attn_norm_id = alloc_f32(session, dim)?;
+        put_f32(session, attn_norm_id, &attn_norm)?;
+        let ffn_norm_id = alloc_f32(session, dim)?;
+        put_f32(session, ffn_norm_id, &ffn_norm)?;
+        let q_norm_name = name("attn_q_norm.weight");
+        let k_norm_name = name("attn_k_norm.weight");
+        let q_norm_f = if file.tensor(&q_norm_name).is_some() {
+            Some(file.tensor_f32(&q_norm_name)?)
+        } else {
+            None
+        };
+        let k_norm_f = if file.tensor(&k_norm_name).is_some() {
+            Some(file.tensor_f32(&k_norm_name)?)
+        } else {
+            None
+        };
+        if q_norm_f.as_ref().is_some_and(|w| w.len() != al.head_dim)
+            || k_norm_f.as_ref().is_some_and(|w| w.len() != al.head_dim)
+        {
+            tracing::warn!(layer_idx, "rpc packed layer skipped; q/k norm is not head_dim");
+            return Ok(None);
+        }
+        let put_w = |s: &mut RpcSession,
+                     info: &allpaca_gguf::TensorInfo|
+         -> Result<(BufId, usize), AllpacaError> {
+            let bytes = file.tensor_bytes(&info.name)?;
+            let mut dims = Vec::with_capacity(info.dims.len());
+            for d in &info.dims {
+                dims.push(u32::try_from(*d).map_err(|_| {
+                    AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "tensor {} dim does not fit u32",
+                        info.name
+                    )))
+                })?);
+            }
+            let id = s
+                .put_tensor(info.ggml_type_id, &dims, bytes, Some(device))
+                .map_err(map_rpc)?;
+            Ok((id, bytes.len()))
+        };
+        let (wq, q_bytes) = put_w(session, &infos[0])?;
+        let (wk, k_bytes) = put_w(session, &infos[1])?;
+        let (wv, v_bytes) = put_w(session, &infos[2])?;
+        let (wo, o_bytes) = put_w(session, &infos[3])?;
+        let (w_gate, gate_bytes) = put_w(session, &infos[4])?;
+        let (w_up, up_bytes) = put_w(session, &infos[5])?;
+        let (w_down, down_bytes) = put_w(session, &infos[6])?;
+        let packed_bytes = q_bytes + k_bytes + v_bytes + o_bytes + gate_bytes + up_bytes + down_bytes;
+        let x = alloc_f32(session, dim)?;
+        let norm_out = alloc_f32(session, dim)?;
+        let q_proj = alloc_f32(session, q_n)?;
+        let q = alloc_f32(session, if al.gated { al.attn_dim } else { q_n })?;
+        let q_gate = alloc_f32(session, if al.gated { al.attn_dim } else { 1 })?;
+        let q_norm = if let Some(w) = &q_norm_f {
+            let id = alloc_f32(session, w.len())?;
+            put_f32(session, id, w)?;
+            id
+        } else {
+            q
+        };
+        let k = alloc_f32(session, k_n)?;
+        let k_norm = if let Some(w) = &k_norm_f {
+            let id = alloc_f32(session, w.len())?;
+            put_f32(session, id, w)?;
+            id
+        } else {
+            k
+        };
+        let v = alloc_f32(session, k_n)?;
+        let attn_out = alloc_f32(session, o_k)?;
+        let hidden = alloc_f32(session, dim)?;
+        let gate = alloc_f32(session, gate_n)?;
+        let up = alloc_f32(session, gate_n)?;
+        let k_cache = alloc_f32(session, max_seq * k_n)?;
+        let v_cache = alloc_f32(session, max_seq * k_n)?;
+        let norm_bytes = (attn_norm.len()
+            + ffn_norm.len()
+            + q_norm_f.as_ref().map(|w| w.len()).unwrap_or(0)
+            + k_norm_f.as_ref().map(|w| w.len()).unwrap_or(0))
+            * 4;
+        self.h2d_bytes
+            .fetch_add((packed_bytes + norm_bytes) as u64, Ordering::Relaxed);
+        tracing::info!(
+            layer_idx,
+            blk,
+            ggml_type = infos[0].ggml_type_id,
+            "rpc packed dense layer uploaded"
+        );
+        Ok(Some(RemoteLayer {
+            session: session_idx,
+            attn_norm: attn_norm_id,
+            wq,
+            wk,
+            wv,
+            wo,
+            ffn_norm: ffn_norm_id,
+            w_gate,
+            w_up,
+            w_down,
+            x,
+            norm_out,
+            q,
+            k,
+            v,
+            attn_out,
+            hidden,
+            gate,
+            up,
+            k_cache,
+            v_cache,
+            dim,
+            kv_dim: k_n,
+            ff_dim: gate_n,
+            n_heads: al.n_heads,
+            n_kv_heads: al.n_kv_heads,
+            head_dim: al.head_dim,
+            eps: cfg.eps,
+            theta: cfg.rope_theta_for_layer(layer_idx),
+            max_seq,
+            packed: true,
+            q_len: q_n,
+            o_in: o_k,
+            q_head_dim: al.head_dim,
+            gated: al.gated,
+            attn_dim: al.attn_dim,
+            q_proj,
+            q_gate,
+            q_norm,
+            k_norm,
+            has_q_norm: q_norm_f.is_some(),
+            has_k_norm: k_norm_f.is_some(),
+            n_rot,
+            rope_sections: cfg.rope_sections,
+        }))
+    }
+
     pub fn is_remote(&self, layer_idx: usize) -> bool {
+        self.remote_session(layer_idx).is_some()
+    }
+
+    /// First layer of a contiguous same-worker remote run.
+    pub fn is_span_start(&self, layer_idx: usize) -> bool {
+        let Some(session) = self.remote_session(layer_idx) else {
+            return false;
+        };
+        self.remote_session(layer_idx.wrapping_sub(1)) != Some(session)
+    }
+
+    fn remote_session(&self, layer_idx: usize) -> Option<usize> {
         self.remote
             .lock()
             .ok()
-            .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|_| ()))
-            .is_some()
+            .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|l| l.session))
     }
 
-    /// Run one remote layer; hidden state `x` is host-side f32.
+    /// Run one remote layer. A call on the first layer of a contiguous same-worker
+    /// run executes that whole span in one RPC. Later layers in the span are no-ops;
+    /// `x` already holds the span output.
     pub fn run_layer(
         &self,
         layer_idx: usize,
         pos: usize,
         x: &mut [f32],
     ) -> Result<(), AllpacaError> {
-        let guard = self.remote.lock().map_err(|_| {
-            AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
-        })?;
-        let Some(Some(layer)) = guard.get(layer_idx) else {
+        if !self.is_span_start(layer_idx) {
             return Ok(());
-        };
-        if pos >= layer.max_seq {
-            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-                "rpc kv pos {pos} >= max_seq {}",
-                layer.max_seq
-            ))));
         }
-        let layer = RemoteLayer {
-            session: layer.session,
-            attn_norm: layer.attn_norm,
-            wq: layer.wq,
-            wk: layer.wk,
-            wv: layer.wv,
-            wo: layer.wo,
-            ffn_norm: layer.ffn_norm,
-            w_gate: layer.w_gate,
-            w_up: layer.w_up,
-            w_down: layer.w_down,
-            x: layer.x,
-            norm_out: layer.norm_out,
-            q: layer.q,
-            k: layer.k,
-            v: layer.v,
-            attn_out: layer.attn_out,
-            hidden: layer.hidden,
-            gate: layer.gate,
-            up: layer.up,
-            k_cache: layer.k_cache,
-            v_cache: layer.v_cache,
-            dim: layer.dim,
-            kv_dim: layer.kv_dim,
-            ff_dim: layer.ff_dim,
-            n_heads: layer.n_heads,
-            n_kv_heads: layer.n_kv_heads,
-            head_dim: layer.head_dim,
-            eps: layer.eps,
-            theta: layer.theta,
-            max_seq: layer.max_seq,
+        let span = {
+            let guard = self.remote.lock().map_err(|_| {
+                AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
+            })?;
+            let session = guard
+                .get(layer_idx)
+                .and_then(|layer| layer.as_ref())
+                .map(|layer| layer.session)
+                .ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig("rpc layer missing".into()))
+                })?;
+            let mut span = Vec::new();
+            for idx in layer_idx..guard.len() {
+                match guard.get(idx).and_then(|layer| layer.as_ref()) {
+                    Some(layer) if layer.session == session => span.push(*layer),
+                    _ => break,
+                }
+            }
+            span
         };
-        drop(guard);
+        if span.is_empty() {
+            return Ok(());
+        }
+        let mut lists = Vec::with_capacity(span.len());
+        let mut xs = Vec::with_capacity(span.len());
+        for layer in &span {
+            if pos >= layer.max_seq {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "rpc kv pos {pos} >= max_seq {}",
+                    layer.max_seq
+                ))));
+            }
+            xs.push(layer.x);
+            lists.push(layer_launch(layer, pos));
+        }
         let mut sessions = self.sessions.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
         })?;
-        let session = sessions.get_mut(layer.session).ok_or_else(|| {
+        let session = sessions.get_mut(span[0].session).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc session missing".into()))
         })?;
         let _ = ComputeDev::Rpc(session);
-        session.h2d(layer.x, 0, &f32_bytes(x)).map_err(map_rpc)?;
+        let activation = f32_bytes(x);
         self.activation_bytes
-            .fetch_add((x.len() * 4) as u64, Ordering::Relaxed);
-        let n_kv = pos + 1;
-        let kv_off = (pos * layer.kv_dim * 4) as i32;
-        let kv_bytes = (layer.kv_dim * 4) as i32;
-        let list = LaunchList {
-            items: vec![
-                rms(layer.x, layer.attn_norm, layer.norm_out, layer.eps),
-                gemm(
-                    layer.norm_out,
-                    layer.wq,
-                    layer.q,
-                    1,
-                    layer.dim as i32,
-                    layer.dim as i32,
-                ),
-                gemm(
-                    layer.norm_out,
-                    layer.wk,
-                    layer.k,
-                    1,
-                    layer.kv_dim as i32,
-                    layer.dim as i32,
-                ),
-                gemm(
-                    layer.norm_out,
-                    layer.wv,
-                    layer.v,
-                    1,
-                    layer.kv_dim as i32,
-                    layer.dim as i32,
-                ),
-                rope_op(layer.q, layer.n_heads, layer.head_dim, pos, layer.theta),
-                rope_op(layer.k, layer.n_kv_heads, layer.head_dim, pos, layer.theta),
-                // Device-resident KV slot write (no host bounce).
-                memcpy_at(layer.k_cache, layer.k, kv_off, kv_bytes),
-                memcpy_at(layer.v_cache, layer.v, kv_off, kv_bytes),
-                attn(
-                    layer.q,
-                    layer.k_cache,
-                    layer.v_cache,
-                    layer.attn_out,
-                    n_kv,
-                    layer.n_heads,
-                    layer.n_kv_heads,
-                    layer.head_dim,
-                ),
-                gemm(
-                    layer.attn_out,
-                    layer.wo,
-                    layer.hidden,
-                    1,
-                    layer.dim as i32,
-                    layer.dim as i32,
-                ),
-                residual(layer.x, layer.hidden),
-                rms(layer.x, layer.ffn_norm, layer.norm_out, layer.eps),
-                gemm(
-                    layer.norm_out,
-                    layer.w_gate,
-                    layer.gate,
-                    1,
-                    layer.ff_dim as i32,
-                    layer.dim as i32,
-                ),
-                gemm(
-                    layer.norm_out,
-                    layer.w_up,
-                    layer.up,
-                    1,
-                    layer.ff_dim as i32,
-                    layer.dim as i32,
-                ),
-                silu(layer.gate, layer.up),
-                gemm(
-                    layer.gate,
-                    layer.w_down,
-                    layer.hidden,
-                    1,
-                    layer.dim as i32,
-                    layer.ff_dim as i32,
-                ),
-                residual(layer.x, layer.hidden),
-            ],
-        };
-        session.launch(&list).map_err(map_rpc)?;
-        session.sync().map_err(map_rpc)?;
+            .fetch_add(activation.len() as u64, Ordering::Relaxed);
         let out = session
-            .d2h(layer.x, 0, (layer.dim * 4) as u64)
+            .run_span(&xs, &lists, &activation)
             .map_err(map_rpc)?;
         self.activation_bytes
             .fetch_add(out.len() as u64, Ordering::Relaxed);
         self.roundtrips.fetch_add(1, Ordering::Relaxed);
         from_f32_bytes(&out, x)?;
         Ok(())
+    }
+}
+
+fn layer_launch(layer: &RemoteLayer, pos: usize) -> LaunchList {
+    let n_kv = pos + 1;
+    let kv_off = (pos * layer.kv_dim * 4) as i32;
+    let kv_bytes = (layer.kv_dim * 4) as i32;
+    let q_head = if layer.q_head_dim == 0 {
+        layer.head_dim
+    } else {
+        layer.q_head_dim
+    };
+    let packed = layer.packed;
+    let q_dst = if layer.gated { layer.q_proj } else { layer.q };
+    let mut items = vec![
+        rms(layer.x, layer.attn_norm, layer.norm_out, layer.eps),
+        gemm(
+            packed,
+            layer.norm_out,
+            layer.wq,
+            q_dst,
+            1,
+            layer.q_len as i32,
+            layer.dim as i32,
+        ),
+        gemm(
+            packed,
+            layer.norm_out,
+            layer.wk,
+            layer.k,
+            1,
+            layer.kv_dim as i32,
+            layer.dim as i32,
+        ),
+        gemm(
+            packed,
+            layer.norm_out,
+            layer.wv,
+            layer.v,
+            1,
+            layer.kv_dim as i32,
+            layer.dim as i32,
+        ),
+    ];
+    if layer.gated {
+        items.push(LaunchItem {
+            op: KernelOp::DeinterleaveQGate,
+            bufs: vec![layer.q_proj, layer.q, layer.q_gate],
+            i32s: vec![layer.n_heads as i32, layer.head_dim as i32],
+            f32s: vec![],
+        });
+    }
+    if layer.has_q_norm {
+        items.push(LaunchItem {
+            op: KernelOp::RmsNormHeads,
+            bufs: vec![layer.q, layer.q_norm],
+            i32s: vec![layer.n_heads as i32, layer.head_dim as i32],
+            f32s: vec![layer.eps],
+        });
+    }
+    if layer.has_k_norm {
+        items.push(LaunchItem {
+            op: KernelOp::RmsNormHeads,
+            bufs: vec![layer.k, layer.k_norm],
+            i32s: vec![layer.n_kv_heads as i32, layer.head_dim as i32],
+            f32s: vec![layer.eps],
+        });
+    }
+    if layer.n_rot > 0 {
+        items.push(LaunchItem {
+            op: KernelOp::RopePartial,
+            bufs: vec![layer.q, layer.k],
+            i32s: vec![
+                layer.n_heads as i32,
+                layer.n_kv_heads as i32,
+                layer.head_dim as i32,
+                pos as i32,
+                layer.n_rot as i32,
+            ],
+            f32s: vec![
+                layer.theta,
+                layer.rope_sections[0] as f32,
+                layer.rope_sections[1] as f32,
+                layer.rope_sections[2] as f32,
+                layer.rope_sections[3] as f32,
+            ],
+        });
+    } else {
+        items.push(rope_op(layer.q, layer.n_heads, q_head, pos, layer.theta));
+        items.push(rope_op(
+            layer.k,
+            layer.n_kv_heads,
+            layer.head_dim,
+            pos,
+            layer.theta,
+        ));
+    }
+    items.push(memcpy_at(layer.k_cache, layer.k, kv_off, kv_bytes));
+    items.push(memcpy_at(layer.v_cache, layer.v, kv_off, kv_bytes));
+    items.push(attn(
+        layer.q,
+        layer.k_cache,
+        layer.v_cache,
+        layer.attn_out,
+        n_kv,
+        layer.n_heads,
+        layer.n_kv_heads,
+        layer.head_dim,
+    ));
+    if layer.gated {
+        items.push(LaunchItem {
+            op: KernelOp::SigmoidMul,
+            bufs: vec![layer.attn_out, layer.q_gate],
+            i32s: vec![layer.attn_dim as i32],
+            f32s: vec![],
+        });
+    }
+    items.push(gemm(
+        packed,
+        layer.attn_out,
+        layer.wo,
+        layer.hidden,
+        1,
+        layer.dim as i32,
+        layer.o_in as i32,
+    ));
+    items.push(residual(layer.x, layer.hidden));
+    items.push(rms(layer.x, layer.ffn_norm, layer.norm_out, layer.eps));
+    items.push(gemm(
+        packed,
+        layer.norm_out,
+        layer.w_gate,
+        layer.gate,
+        1,
+        layer.ff_dim as i32,
+        layer.dim as i32,
+    ));
+    items.push(gemm(
+        packed,
+        layer.norm_out,
+        layer.w_up,
+        layer.up,
+        1,
+        layer.ff_dim as i32,
+        layer.dim as i32,
+    ));
+    items.push(silu(layer.gate, layer.up));
+    items.push(gemm(
+        packed,
+        layer.gate,
+        layer.w_down,
+        layer.hidden,
+        1,
+        layer.dim as i32,
+        layer.ff_dim as i32,
+    ));
+    items.push(residual(layer.x, layer.hidden));
+    LaunchList { items }
+}
+
+fn gemm_nk(info: &allpaca_gguf::TensorInfo) -> Option<(usize, usize)> {
+    let k = *info.dims.first()? as usize;
+    if k == 0 {
+        return None;
+    }
+    let n_el = info.n_elements() as usize;
+    if n_el % k != 0 {
+        return None;
+    }
+    Some((n_el / k, k))
+}
+
+fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
+    let hip = matches!(ty, 0 | 1 | 8 | 12 | 13 | 14 | 30 | 34 | 35 | 39 | 100);
+    match backend {
+        RpcBackendKind::Hip => hip,
+        RpcBackendKind::Cpu => hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 20 | 23),
+        RpcBackendKind::Cuda => false,
     }
 }
 
@@ -485,9 +1031,13 @@ fn rms(x: BufId, w: BufId, out: BufId, eps: f32) -> LaunchItem {
     }
 }
 
-fn gemm(a: BufId, b: BufId, c: BufId, m: i32, n: i32, k: i32) -> LaunchItem {
+fn gemm(packed: bool, a: BufId, b: BufId, c: BufId, m: i32, n: i32, k: i32) -> LaunchItem {
     LaunchItem {
-        op: KernelOp::GemmNt,
+        op: if packed {
+            KernelOp::GemmNtQuant
+        } else {
+            KernelOp::GemmNt
+        },
         bufs: vec![a, b, c],
         i32s: vec![m, n, k],
         f32s: vec![],

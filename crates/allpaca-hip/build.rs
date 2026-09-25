@@ -95,6 +95,9 @@ fn main() {
         println!("cargo:rustc-link-lib=hipblaslt");
         println!("cargo:rustc-cfg=allpaca_hipblaslt");
     }
+    if cfg!(windows) {
+        println!("cargo:rustc-link-lib=dxgi");
+    }
     if let Some(sdk) = direct_storage {
         println!(
             "cargo:rustc-link-search=native={}",

@@ -280,10 +280,8 @@ fn scale_kv_vram_from_inventory(config: &mut Config, inventory: &DeviceInventory
 #[cfg(test)]
 mod scale_kv_tests {
     use super::scale_kv_vram_from_inventory;
-    use allpaca_types::{
-        Config, DeviceInfo, DeviceKind, PipelineMode, TransferPath,
-    };
     use crate::device_manager::DeviceInventory;
+    use allpaca_types::{Config, DeviceInfo, DeviceKind, PipelineMode, TransferPath};
 
     fn cuda_12gb_inventory() -> DeviceInventory {
         DeviceInventory {
@@ -618,13 +616,11 @@ impl Engine {
             let target_dev = self.inventory.target_device.max(0);
             let (used, total) = read(target_dev);
             let draft_dev = self.inventory.draft_device;
-            let draft_live = self
-                .metrics
-                .draft_gpu_forwards
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0;
+            // GPU 1 is the draft card *and* the local layer-split peer. Sample
+            // it whenever that workspace exists — not only after an MTP draft
+            // forward — so the UI shows 9060 VRAM during `--speculative false`.
             let (draft_used, draft_total) =
-                if draft_live && self.draft_hip.is_some() && draft_dev != target_dev {
+                if self.draft_hip.is_some() && draft_dev >= 0 && draft_dev != target_dev {
                     read(draft_dev)
                 } else {
                     (0, 0)
@@ -655,8 +651,7 @@ impl Engine {
                 .unwrap_or_default();
             let wall = p.gpu_us + p.host_us;
             let util = if wall > 0.0 { p.gpu_us / wall } else { 0.0 };
-            self.metrics
-                .record_gpu_sample(used, total, 0, 0, util);
+            self.metrics.record_gpu_sample(used, total, 0, 0, util);
         }
     }
 
@@ -801,7 +796,7 @@ impl Engine {
             Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
         let (backend, device_memory_bytes) =
-            if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+            if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
                 if let Some(rt) = &self.rpc {
                     self.metrics.rpc_roundtrips.store(
                         rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
@@ -1005,7 +1000,7 @@ impl Engine {
         inner.ring.resize_vocab(target.config.vocab_size);
         self.apply_weight_working_set(&mut target)?;
         self.apply_expert_lru(&mut target)?;
-        self.attach_rpc(&mut target)?;
+        self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
         if inner.flags.draft_model_speculation {
             let mut draft = TinyModel::synthetic(
@@ -1034,7 +1029,7 @@ impl Engine {
         inner.ring.resize_vocab(vocab);
         self.apply_weight_working_set(&mut target)?;
         self.apply_expert_lru(&mut target)?;
-        self.attach_rpc(&mut target)?;
+        self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
         set_tokenizer(&mut inner, tokenizer);
         inner.model_id = "synthetic".into();
@@ -1045,29 +1040,58 @@ impl Engine {
         Ok(())
     }
 
-    fn attach_rpc(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
-        let Some(rt) = &self.rpc else {
-            return Ok(());
-        };
-        let local_bytes = if let Some(hip) = &self.hip {
-            allpaca_hip::device_memory_info(hip.device)
+    fn attach_rpc(
+        &self,
+        model: &mut TinyModel,
+        gguf: Option<&GgufFile>,
+    ) -> Result<(), AllpacaError> {
+        let mut local_devices = Vec::new();
+        if let Some(hip) = &self.hip {
+            let total = allpaca_hip::device_memory_info(hip.device)
                 .map(|(_, total)| total)
-                .unwrap_or(1 << 30)
-        } else {
-            8 << 30
-        };
-        rt.prepare(
-            model,
-            local_bytes,
-            self.config.rpc.tensor_split.as_deref(),
-            self.config.rpc.max_seq,
-        )?;
-        model.rpc = Some(Arc::clone(rt));
-        tracing::info!(
-            remote_layers = rt.plan_has_remote().then_some("yes").unwrap_or("no"),
-            sessions = rt.session_count(),
-            "rpc layer plan ready"
-        );
+                .unwrap_or(1 << 30);
+            local_devices.push((hip.device, total));
+        }
+        if let Some(hip) = &self.draft_hip {
+            let total = allpaca_hip::device_memory_info(hip.device)
+                .map(|(_, total)| total)
+                .unwrap_or(1 << 30);
+            local_devices.push((hip.device, total));
+        }
+        if local_devices.is_empty() {
+            local_devices.push((0, 8 << 30));
+        }
+        if let Some(rt) = &self.rpc {
+            rt.prepare(
+                model,
+                &local_devices,
+                self.config.rpc.tensor_split.as_deref(),
+                self.config.rpc.max_seq,
+                gguf,
+            )?;
+            model.rpc = Some(Arc::clone(rt));
+            tracing::info!(
+                remote_layers = rt.plan_has_remote().then_some("yes").unwrap_or("no"),
+                sessions = rt.session_count(),
+                "rpc layer plan ready"
+            );
+            return Ok(());
+        }
+        if local_devices.len() > 1 {
+            let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[], None)?);
+            rt.prepare(
+                model,
+                &local_devices,
+                self.config.rpc.tensor_split.as_deref(),
+                self.config.rpc.max_seq,
+                gguf,
+            )?;
+            tracing::info!(
+                local_gpus = local_devices.len(),
+                "local GPU pool layer plan ready"
+            );
+            model.rpc = Some(rt);
+        }
         Ok(())
     }
 
@@ -1311,7 +1335,7 @@ impl Engine {
         model.name = loaded.tier.name().into();
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
-        self.attach_rpc(&mut model)?;
+        self.attach_rpc(&mut model, None)?;
         let tokenizer =
             EngineTokenizer::from_vocab(loaded.vocab_tokens, loaded.bos_id, loaded.eos_id)?;
         let mut inner = self.lock()?;
@@ -1341,7 +1365,7 @@ impl Engine {
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
-        self.attach_rpc(&mut model)?;
+        self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -1371,7 +1395,7 @@ impl Engine {
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
-        self.attach_rpc(&mut model)?;
+        self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
@@ -1516,7 +1540,7 @@ impl Engine {
             model.early_exit.min_confidence = self.config.early_exit.min_confidence;
             model.early_exit.min_calibration_margin = self.config.early_exit.min_calibration_margin;
         }
-        self.attach_rpc(&mut model)?;
+        self.attach_rpc(&mut model, Some(file.as_ref()))?;
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
@@ -1593,6 +1617,46 @@ impl Engine {
         let mut inner = self.lock()?;
         let mut weight_bytes = 0u64;
         let mut h2d = 0u64;
+        let target_for_peer = inner.target.clone();
+        let mut peer_uploaded = None;
+        if let (Some(peer_hip), Some(target_m), Some(file)) =
+            (self.draft_hip.as_ref(), target_for_peer, target_gguf)
+        {
+            if let Some(rpc) = target_m.rpc.as_ref() {
+                let dev = peer_hip.device;
+                let any = (0..target_m.config.n_layers).any(|i| rpc.local_device(i) == dev);
+                if any {
+                    let skip: Vec<bool> = (0..target_m.config.n_layers)
+                        .map(|i| rpc.is_remote(i) || rpc.local_device(i) != dev)
+                        .collect();
+                    match ResidentModel::upload_gguf_filtered(file, &target_m.config, dev, &skip) {
+                        Ok(resident) => {
+                            let hip_used = allpaca_hip::device_memory_info(dev)
+                                .ok()
+                                .map(|(free, total)| total.saturating_sub(free));
+                            tracing::info!(
+                                device = dev,
+                                bytes = resident.bytes(),
+                                hip_used,
+                                "local GPU pool: second device layers uploaded"
+                            );
+                            weight_bytes += resident.bytes();
+                            h2d += resident.packed_h2d_bytes();
+                            peer_uploaded = Some(resident);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                device = dev,
+                                "second local GPU layer upload failed; those layers stay on the target GPU"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let peer_ok = peer_uploaded.is_some();
+        let peer_dev = self.draft_hip.as_ref().map(|h| h.device);
         let target = inner.target.clone();
         let draft = inner.draft_model.clone();
         inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
@@ -1600,7 +1664,15 @@ impl Engine {
             let uploaded = if target.config.n_experts > 0 && host_ready {
                 ResidentModel::upload(&target, hip.device)
             } else if let Some(file) = target_gguf {
-                ResidentModel::upload_gguf(file, &target.config, hip.device)
+                let skip: Vec<bool> = (0..target.config.n_layers)
+                    .map(|i| {
+                        target.rpc.as_ref().is_some_and(|r| {
+                            r.is_remote(i)
+                                || (peer_ok && peer_dev.is_some_and(|d| r.local_device(i) == d))
+                        })
+                    })
+                    .collect();
+                ResidentModel::upload_gguf_filtered(file, &target.config, hip.device, &skip)
             } else if host_ready {
                 ResidentModel::upload(&target, hip.device)
             } else {
@@ -1613,6 +1685,17 @@ impl Engine {
                     let n = resident.bytes();
                     weight_bytes += n;
                     h2d += resident.packed_h2d_bytes();
+                    let hip_used = self.hip.as_ref().and_then(|h| {
+                        allpaca_hip::device_memory_info(h.device)
+                            .ok()
+                            .map(|(free, total)| total.saturating_sub(free))
+                    });
+                    tracing::info!(
+                        device = self.hip.as_ref().map(|h| h.device),
+                        bytes = n,
+                        hip_used,
+                        "local GPU pool: target device layers uploaded"
+                    );
                     Some(Arc::new(resident))
                 }
                 Err(e) => {
@@ -1631,7 +1714,31 @@ impl Engine {
         } else {
             None
         };
-        inner.draft_resident = if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
+        if let (Some(resident), Some(hip)) = (peer_uploaded, self.draft_hip.clone()) {
+            if let Some(rpc) = inner.target.as_ref().and_then(|m| m.rpc.clone()) {
+                let _ = resident.touch_resident();
+                let _ = hip.bind();
+                let _ = allpaca_hip::stream_synchronize();
+                if let Some(t) = inner.target.as_ref() {
+                    let dim = t.config.dim.max(1);
+                    let kv = t.config.n_kv_heads * t.config.head_dim().max(1);
+                    let _ = hip.ensure_decode(
+                        dim,
+                        kv,
+                        t.config.moe_workspace(),
+                        t.config.vocab_size.max(1),
+                        256,
+                    );
+                }
+                rpc.set_local_peer(hip.device, hip, Arc::new(resident));
+            }
+        }
+        inner.draft_resident = if peer_ok {
+            tracing::info!(
+                "skipping draft HIP upload; GPU 1 holds target layer-split weights"
+            );
+            None
+        } else if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
             tracing::info!(device = hip.device, "HIP draft weight upload start");
             let uploaded = if draft.config.n_experts > 0 && draft.host_weights_ready() {
                 ResidentModel::upload(&draft, hip.device)
@@ -1801,6 +1908,13 @@ impl Engine {
             token_ids.push(ev.token_id);
             ev.finish_reason
         })?;
+        tracing::info!(
+            n = token_ids.len(),
+            first = token_ids.first().copied(),
+            last = token_ids.last().copied(),
+            ?finish,
+            "generate tokens"
+        );
         let text = {
             let inner = self.lock()?;
             inner
@@ -2067,6 +2181,12 @@ impl Engine {
             .clone()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
         let page_tokens = self.config.kv.page_tokens;
+        if let Some(rpc) = target.rpc.as_ref() {
+            let devs: Vec<i32> = (0..target.config.n_layers)
+                .map(|i| rpc.local_device(i))
+                .collect();
+            inner.kv.set_layer_devices(&devs);
+        }
         let pages = alloc_pages_for_seq(
             &mut inner.kv,
             &target.config,
@@ -2551,10 +2671,9 @@ impl Engine {
                                 self.fallback_deferred_lm_head(plan);
                             }
                             if hidden > 0 {
-                                self.metrics.batch_gemm_residual_hidden.fetch_add(
-                                    hidden,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                self.metrics
+                                    .batch_gemm_residual_hidden
+                                    .fetch_add(hidden, std::sync::atomic::Ordering::Relaxed);
                             }
                             self.clear_cohort_defer_lm_head(plan);
                         }
@@ -2660,7 +2779,11 @@ impl Engine {
     /// `pending_logits` (consumed by the next sample). Only uses fresh
     /// `output_norm` rows for lm_head. `residual_hidden` counts Requests whose
     /// `last_hidden` was overwritten with the packed `x+WO+FFN` stream.
-    fn try_packed_batch_gemm_hip(&self, hip: &HipWorkspace, plan: &BatchGemmPlan) -> (u64, u64, u64) {
+    fn try_packed_batch_gemm_hip(
+        &self,
+        hip: &HipWorkspace,
+        plan: &BatchGemmPlan,
+    ) -> (u64, u64, u64) {
         let Ok(inner) = self.lock() else {
             return (0, 0, 0);
         };
@@ -3209,9 +3332,7 @@ impl Engine {
         } else if batch_prefill_cuda {
             #[cfg(feature = "cuda")]
             {
-                if let (Some(cuda), Some(cres)) =
-                    (self.cuda.as_deref(), cuda_resident.as_deref())
-                {
+                if let (Some(cuda), Some(cres)) = (self.cuda.as_deref(), cuda_resident.as_deref()) {
                     match target.forward_tokens_cuda(
                         &toks,
                         start,
@@ -5561,6 +5682,238 @@ mod tests {
             "parity test must exercise remote layers, rpc_roundtrips={trips}"
         );
         assert_eq!(rpc_out.token_ids, cpu_ids);
+    }
+
+    #[test]
+    fn rpc_packed_q8_layer_matches_cpu() {
+        use std::collections::HashMap;
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_gguf::{
+            quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
+            GgufWriteTensor,
+        };
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let dim = 32usize;
+        let vocab = 8usize;
+        let ff = 64usize;
+        let n_kv = 16usize;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert(
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(dim as u32),
+        );
+        meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
+        meta.insert(
+            "llama.attention.head_count".into(),
+            GgufValue::Uint32(4),
+        );
+        meta.insert(
+            "llama.attention.head_count_kv".into(),
+            GgufValue::Uint32(2),
+        );
+        meta.insert(
+            "llama.feed_forward_length".into(),
+            GgufValue::Uint32(ff as u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            GgufValue::String("wordlevel".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(
+                ["<unk>", "<s>", "</s>", "hello", "a", "b", "c", "d"]
+                    .into_iter()
+                    .map(|s| GgufValue::String(s.into()))
+                    .collect(),
+            ),
+        );
+        meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+        meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+        let mut quant = Vec::new();
+        let mut f32s: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
+        let embd = vec![0.02f32; vocab * dim];
+        quant.push((
+            "token_embd.weight".to_string(),
+            vec![vocab as u64, dim as u64],
+            quantize_q8_0(&embd),
+        ));
+        for layer in 0..2 {
+            let q = vec![0.01f32; dim * dim];
+            let kv = vec![0.01f32; n_kv * dim];
+            let ffn_up = vec![0.01f32; ff * dim];
+            let ffn_down = vec![0.01f32; dim * ff];
+            let mut push = |suffix: &str, dims: Vec<u64>, data: &[f32]| {
+                quant.push((
+                    format!("blk.{layer}.{suffix}"),
+                    dims,
+                    quantize_q8_0(data),
+                ));
+            };
+            push("attn_q.weight", vec![dim as u64, dim as u64], &q);
+            push("attn_k.weight", vec![dim as u64, n_kv as u64], &kv);
+            push("attn_v.weight", vec![dim as u64, n_kv as u64], &kv);
+            push("attn_output.weight", vec![dim as u64, dim as u64], &q);
+            push("ffn_gate.weight", vec![dim as u64, ff as u64], &ffn_up);
+            push("ffn_up.weight", vec![dim as u64, ff as u64], &ffn_up);
+            push("ffn_down.weight", vec![ff as u64, dim as u64], &ffn_down);
+            f32s.push((
+                format!("blk.{layer}.attn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ));
+            f32s.push((
+                format!("blk.{layer}.ffn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ));
+        }
+        f32s.push((
+            "output_norm.weight".into(),
+            vec![dim as u64],
+            vec![1.0; dim],
+        ));
+        let head = vec![0.02f32; vocab * dim];
+        quant.push((
+            "output.weight".into(),
+            vec![vocab as u64, dim as u64],
+            quantize_q8_0(&head),
+        ));
+        let f32_tensors: Vec<GgufWriteTensor> = f32s
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data: data.as_slice(),
+            })
+            .collect();
+        let quant_tensors: Vec<GgufWriteQuantTensor> = quant
+            .iter()
+            .map(|(name, dims, bytes)| GgufWriteQuantTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                ggml_type: GgmlType::Q8_0,
+                bytes: bytes.as_slice(),
+            })
+            .collect();
+        let path = std::env::temp_dir().join("allpaca_rpc_packed_q8.gguf");
+        write_gguf_quant(&path, &meta, &f32_tensors, &quant_tensors).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let mut cpu_cfg = Config::compiled_defaults();
+        cpu_cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(2),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        cpu_cfg.model.synthetic = false;
+        cpu_cfg.model.path = Some(path.clone());
+        cpu_cfg.kv.page_tokens = 8;
+        let cpu = Engine::new(cpu_cfg).unwrap();
+        let cpu_ids = cpu.generate("hello", params.clone()).unwrap().token_ids;
+
+        let mut rpc_cfg = Config::compiled_defaults();
+        rpc_cfg.merge_cli(&CliOverrides {
+            cpu_only: true,
+            seed: Some(2),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        rpc_cfg.model.synthetic = false;
+        rpc_cfg.model.path = Some(path);
+        rpc_cfg.kv.page_tokens = 8;
+        rpc_cfg.rpc.endpoints = vec![addr.to_string()];
+        rpc_cfg.rpc.max_seq = 32;
+        rpc_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let rpc = Engine::new(rpc_cfg).unwrap();
+        let rpc_out = rpc.generate("hello", params).unwrap();
+        let stats = rpc.stats();
+        drop(rpc);
+        worker.join().unwrap();
+        assert!(
+            stats.rpc_roundtrips > 0,
+            "packed layer must run, trips={}",
+            stats.rpc_roundtrips
+        );
+        assert!(stats.rpc_h2d_bytes > 0, "packed upload missing");
+        assert!(
+            stats.rpc_h2d_bytes < 20_000,
+            "packed Q8 upload should stay under the F32 size, got {}",
+            stats.rpc_h2d_bytes
+        );
+        assert_eq!(rpc_out.token_ids, cpu_ids);
+    }
+
+    #[test]
+    fn rpc_run_span_fuses_contiguous_remote_layers() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let mut wide = ModelConfig::tiny();
+        wide.n_layers = 4;
+
+        let mut cpu_cfg = test_config();
+        cpu_cfg.model.synthetic = false;
+        cpu_cfg.speculative.enabled = false;
+        let cpu = Engine::new(cpu_cfg).unwrap();
+        cpu.load_synthetic(wide.clone()).unwrap();
+        let cpu_ids = cpu.generate("hello", params.clone()).unwrap().token_ids;
+
+        let mut rpc_cfg = test_config();
+        rpc_cfg.model.synthetic = false;
+        rpc_cfg.speculative.enabled = false;
+        rpc_cfg.rpc.endpoints = vec![addr.to_string()];
+        rpc_cfg.rpc.max_seq = 64;
+        rpc_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+        let rpc = Engine::new(rpc_cfg).unwrap();
+        rpc.load_synthetic(wide).unwrap();
+        let rpc_out = rpc.generate("hello", params).unwrap();
+        let stats = rpc.stats();
+        drop(rpc);
+        worker.join().unwrap();
+
+        assert_eq!(rpc_out.token_ids, cpu_ids);
+        assert_eq!(
+            stats.rpc_roundtrips, 6,
+            "two contiguous remote layers must be one RunSpan per forward"
+        );
+        assert_eq!(stats.rpc_activation_bytes, 1536);
     }
 
     #[test]

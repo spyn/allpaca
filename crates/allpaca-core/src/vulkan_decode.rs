@@ -245,12 +245,12 @@ impl VulkanResidentModel {
         }
         let bytes = match w.kind {
             WeightKind::F16 => w.n.saturating_mul(2).div_ceil(4).saturating_mul(4).max(4),
-            WeightKind::Q8_0 => w
-                .n
-                .div_ceil(32)
-                .saturating_mul(34)
-                .div_ceil(4)
-                .saturating_mul(4),
+            WeightKind::Q8_0 => {
+                w.n.div_ceil(32)
+                    .saturating_mul(34)
+                    .div_ceil(4)
+                    .saturating_mul(4)
+            }
             _ => w.n.saturating_mul(4),
         };
         self.weights.slice_bytes(w.off, bytes)
@@ -298,7 +298,7 @@ impl TinyModel {
                 ),
             ));
         }
-        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+        if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
                     "Vulkan decode: RPC layer-split unsupported".into(),
@@ -659,14 +659,7 @@ fn apply_moe_vulkan(
             gate[i] = silu(gate[i]) * up[i];
         }
         gemm_weight(
-            vulkan,
-            &gate,
-            resident,
-            ex.w_down,
-            &mut down,
-            1,
-            dim as i32,
-            ff as i32,
+            vulkan, &gate, resident, ex.w_down, &mut down, 1, dim as i32, ff as i32,
         )?;
         for i in 0..dim {
             acc[i] += weight * down[i];

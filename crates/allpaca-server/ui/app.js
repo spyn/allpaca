@@ -64,12 +64,17 @@ function renderDashboard(data) {
   const draftFrac = s.draft_gpu_vram_total_bytes
     ? s.draft_gpu_vram_used_bytes / s.draft_gpu_vram_total_bytes
     : 0;
+  const gpuLabel = (id, fallback) => {
+    const d = (data.devices || []).find((x) => x.id === id);
+    if (d && d.name) return d.name.replace(/^AMD Radeon /, "");
+    return fallback;
+  };
   $("dash-cards").innerHTML = [
     card("Model", escapeHtml(s.model_id || "—"), `<p class="muted">${escapeHtml(s.backend || "")} · ${s.active_requests || 0} active</p>`),
     card("Host CPU", `${(h.cpu_usage || 0).toFixed(0)}%`, meter((h.cpu_usage || 0) / 100)),
     card("Host RAM", `${bytes(h.ram_used_bytes)} / ${bytes(h.ram_total_bytes)}`, meter(ramFrac)),
-    card("Target VRAM", s.gpu_vram_total_bytes ? `${bytes(s.gpu_vram_used_bytes)} / ${bytes(s.gpu_vram_total_bytes)}` : "n/a", meter(vramFrac)),
-    card("Draft VRAM", s.draft_gpu_vram_total_bytes ? `${bytes(s.draft_gpu_vram_used_bytes)} / ${bytes(s.draft_gpu_vram_total_bytes)}` : "n/a", meter(draftFrac)),
+    card(`${escapeHtml(gpuLabel(s.target_device, "GPU 0"))} VRAM`, s.gpu_vram_total_bytes ? `${bytes(s.gpu_vram_used_bytes)} / ${bytes(s.gpu_vram_total_bytes)}` : "n/a", meter(vramFrac)),
+    card(`${escapeHtml(gpuLabel(s.draft_device, "GPU 1"))} VRAM`, s.draft_gpu_vram_total_bytes ? `${bytes(s.draft_gpu_vram_used_bytes)} / ${bytes(s.draft_gpu_vram_total_bytes)}` : "n/a", meter(draftFrac)),
     card("GPU util", `${((s.gpu_util || 0) * 100).toFixed(0)}%`),
     card("TTFT / ITL", `${s.ttft_ms_last || 0} ms / ${(s.itl_ms_ema || 0).toFixed(1)} ms`),
     card("KV pages", `VRAM ${s.vram_pages || 0} · DRAM ${s.dram_pages || 0}`),

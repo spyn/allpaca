@@ -18,6 +18,6 @@ pub use prerouter::{CrossTokenStager, PrerouterHeads, PrerouterPrediction};
 pub use quant::{dequant_affine4, Affine4Tensor};
 pub use routing::{group_select_from_logits, route_logits, select_from_logits};
 pub use spec::{
-    Edge0Tier, MoESpec, PrerouterSpec, QuantSpec, RouterKind, WeightLayout, EDGE0_8B_NAME,
-    EDGE0_35B_NAME,
+    Edge0Tier, MoESpec, PrerouterSpec, QuantSpec, RouterKind, WeightLayout, EDGE0_35B_NAME,
+    EDGE0_8B_NAME,
 };

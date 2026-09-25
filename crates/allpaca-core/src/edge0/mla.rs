@@ -210,9 +210,8 @@ fn expand_kv(
         nope[j] = s;
     }
     for j in 0..d.v_head_dim {
-        let row = &w.wukv
-            [base + (d.qk_nope_head_dim + j) * d.kv_lora_rank
-                ..base + (d.qk_nope_head_dim + j + 1) * d.kv_lora_rank];
+        let row = &w.wukv[base + (d.qk_nope_head_dim + j) * d.kv_lora_rank
+            ..base + (d.qk_nope_head_dim + j + 1) * d.kv_lora_rank];
         let mut s = 0.0f32;
         for r in 0..d.kv_lora_rank {
             s += c_kv[r] * row[r];

@@ -25,9 +25,15 @@
 
 #if ALLPACA_HAS_HIP
 
-#if defined(ALLPACA_HAS_ROCBLAS) || defined(ALLPACA_HAS_HIPBLASLT)
 #include <mutex>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
+#include <windows.h>
+#include <dxgi1_6.h>
+#endif
+
 #ifdef ALLPACA_HAS_ROCBLAS
 #include <rocblas/rocblas.h>
 #endif
@@ -1951,6 +1957,58 @@ __global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b,
     c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
 }
 
+// Decode GEMV: 32 lanes split K for each column. One thread walking all of K
+// made the local ROCmFP4 projections the largest remaining per-token cost.
+__global__ void gemv_nt_rocmfp4_ksplit_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                              int n, int k) {
+    constexpr int LANES = 32;
+    constexpr int GROUPS = 8;
+    const int lane = static_cast<int>(threadIdx.x) % LANES;
+    const int group = static_cast<int>(threadIdx.x) / LANES;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + group;
+    const int row = static_cast<int>(blockIdx.y);
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = (k + 31) / 32;
+    float acc = 0.f;
+    if (col < n) {
+        const uint8_t *row_blocks =
+            b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        for (int ib = lane; ib < nblocks; ib += LANES) {
+            const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * 18;
+            const float d0 = rocmfp4_scale(blk[16]);
+            const float d1 = rocmfp4_scale(blk[17]);
+            const int k0 = ib * 32;
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t packed = blk[j];
+                const int i0 = k0 + j;
+                const int i1 = i0 + 16;
+                if (i0 < k) {
+                    acc += arow[i0] * static_cast<float>(k_rocmfp4_codebook[packed & 0x0F]) * d0;
+                }
+                if (i1 < k) {
+                    acc += arow[i1] * static_cast<float>(k_rocmfp4_codebook[packed >> 4]) * d1;
+                }
+            }
+        }
+    }
+    __shared__ float smem[GROUPS * LANES];
+    smem[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = LANES >> 1; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            smem[group * LANES + lane] += smem[group * LANES + lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0 && col < n) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+            smem[group * LANES];
+    }
+}
+
 /* Cache-aware decode tile (§12): a 256-float A slab in LDS, reused by COLS
  * columns. Each slab covers 8 ROCmFP4 blocks so the LDS shape matches the
  * Q4_K/Q6_K kernels and one __syncthreads pair amortizes over 8 blocks. */
@@ -2010,10 +2068,13 @@ static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, in
     }
     clear_last_error();
     if (tiled) {
-        constexpr int COLS = 64;
+        /* ksplit is the proven decode kernel (row = blockIdx.y). The COLS=64
+         * tiled path was built for large-M prefill and is not trusted for
+         * Qwen gated/IMRoPE short prompts (M~11 produced garbage tokens). */
+        constexpr int GROUPS = 8;
         dim3 block(256);
-        dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_rocmfp4_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        dim3 grid(static_cast<unsigned>((n + GROUPS - 1) / GROUPS), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_rocmfp4_ksplit_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     } else {
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
@@ -2903,6 +2964,77 @@ extern "C" int allpaca_hip_enable_peer_access(int32_t src, int32_t dst) {
     return ALLPACA_OK;
 }
 
+#if defined(_WIN32)
+static std::mutex g_win_vram_mu;
+static IDXGIAdapter3 *g_win_adapter[8];
+static uint64_t g_win_reserved[8];
+
+static IDXGIAdapter3 *dxgi_adapter_for_hip(int32_t device) {
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
+        return nullptr;
+    }
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))) ||
+        factory == nullptr) {
+        return nullptr;
+    }
+    IDXGIAdapter3 *found = nullptr;
+    for (UINT i = 0; found == nullptr; ++i) {
+        IDXGIAdapter1 *ad = nullptr;
+        HRESULT hr = factory->EnumAdapters1(i, &ad);
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(hr) || ad == nullptr) {
+            continue;
+        }
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(ad->GetDesc1(&desc))) {
+            char utf8[256]{};
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, utf8, sizeof(utf8), nullptr,
+                                nullptr);
+            const bool same = utf8[0] != '\0' && prop.name[0] != '\0' &&
+                              (std::strstr(utf8, prop.name) != nullptr ||
+                               std::strstr(prop.name, utf8) != nullptr);
+            const bool rx9060 = std::strstr(prop.name, "9060") && std::strstr(utf8, "9060");
+            const bool rx9070 = std::strstr(prop.name, "9070") && std::strstr(utf8, "9070");
+            if (same || rx9060 || rx9070) {
+                (void)ad->QueryInterface(__uuidof(IDXGIAdapter3),
+                                         reinterpret_cast<void **>(&found));
+            }
+        }
+        ad->Release();
+    }
+    factory->Release();
+    return found;
+}
+
+static void win_reserve_hip_device(int32_t device, size_t bytes) {
+    if (device < 0 || device >= 8) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_win_vram_mu);
+    g_win_reserved[device] += bytes;
+    if (g_win_adapter[device] == nullptr) {
+        g_win_adapter[device] = dxgi_adapter_for_hip(device);
+    }
+    if (g_win_adapter[device] != nullptr) {
+        (void)g_win_adapter[device]->SetVideoMemoryReservation(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, g_win_reserved[device]);
+    }
+}
+#endif
+
+static void retain_default_pool(int32_t device) {
+    hipMemPool_t pool = nullptr;
+    if (hipDeviceGetDefaultMemPool(&pool, device) != hipSuccess || pool == nullptr) {
+        return;
+    }
+    uint64_t thresh = ~uint64_t{0};
+    (void)hipMemPoolSetAttribute(pool, hipMemPoolAttrReleaseThreshold, &thresh);
+}
+
 extern "C" int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device) {
     if (!ptr || bytes == 0) {
         return ALLPACA_ERR_INVALID;
@@ -2911,7 +3043,19 @@ extern "C" int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device) {
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
     }
-    return hip_status(hipMalloc(ptr, bytes));
+    retain_default_pool(device);
+    *ptr = nullptr;
+    err = hipExtMallocWithFlags(ptr, bytes, hipDeviceMallocContiguous);
+    if (err != hipSuccess || *ptr == nullptr) {
+        err = hipMalloc(ptr, bytes);
+    }
+    if (err != hipSuccess || *ptr == nullptr) {
+        return hip_status(err != hipSuccess ? err : hipErrorOutOfMemory);
+    }
+#if defined(_WIN32)
+    win_reserve_hip_device(device, bytes);
+#endif
+    return ALLPACA_OK;
 }
 
 extern "C" int allpaca_hip_free(void *ptr) {
@@ -3330,17 +3474,70 @@ extern "C" int allpaca_hip_memset(void *dst, int32_t value, size_t bytes, allpac
     return hip_status(hipMemset(dst, fill, bytes));
 }
 
+__device__ unsigned int g_touch_sink;
+
+__global__ void touch_resident_kernel(const uint8_t *p, size_t bytes) {
+    constexpr size_t kStride = 4096;
+    const size_t n = (bytes + kStride - 1) / kStride;
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t step = static_cast<size_t>(gridDim.x) * blockDim.x;
+    unsigned int acc = 0;
+    for (; i < n; i += step) {
+        const size_t off = i * kStride;
+        if (off + sizeof(unsigned int) <= bytes) {
+            acc += *reinterpret_cast<const volatile unsigned int *>(p + off);
+        }
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&g_touch_sink, acc);
+    }
+}
+
+extern "C" int allpaca_hip_touch_resident(void *ptr, size_t bytes, int32_t device) {
+    if (!ptr || bytes == 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipError_t err = hipSetDevice(device);
+    if (err != hipSuccess) {
+        return hip_status(err);
+    }
+    constexpr int kThreads = 256;
+    const int blocks = 512;
+    hipLaunchKernelGGL(touch_resident_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(kThreads)), 0, nullptr,
+                       static_cast<const uint8_t *>(ptr), bytes);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
                                       size_t bytes, allpaca_stream_t stream) {
     if (!dst || !src) {
         return ALLPACA_ERR_INVALID;
     }
-    hipError_t err =
-        hipMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, as_stream(stream));
-    if (err != hipSuccess) {
+    int prev = 0;
+    if (hipGetDevice(&prev) != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
     }
-    return hip_status(hipStreamSynchronize(as_stream(stream)));
+    /* Drain src compute. hipMemcpyPeerAsync on the dst stream does not wait
+       for kernels on the src device; ping-pong layer splits copied a stale x. */
+    if (hipSetDevice(src_dev) != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    hipError_t err = hipStreamSynchronize(nullptr);
+    if (err != hipSuccess) {
+        (void)hipSetDevice(prev);
+        return ALLPACA_ERR_DEVICE;
+    }
+    hipStream_t s = as_stream(stream);
+    err = hipMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
+    if (err != hipSuccess) {
+        (void)hipSetDevice(prev);
+        return ALLPACA_ERR_DEVICE;
+    }
+    err = hipStreamSynchronize(s);
+    (void)hipSetDevice(prev);
+    return hip_status(err);
 }
 
 extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, double *p2p_gbps,
@@ -3716,7 +3913,83 @@ __global__ void residual_rmsnorm_kernel(float *x, const float *residual, const f
     }
 }
 
-/* One block per V-head. Thread 0 runs the AR delta step (matches host deltanet). */
+/* One block per V-head. Warp shuffle, then one smem reduce across warps. */
+__device__ float gdn_block_sum(float v, float *smem) {
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down(v, offset);
+    }
+    if (lane == 0) {
+        smem[warp] = v;
+    }
+    __syncthreads();
+    float sum = 0.f;
+    if (tid == 0) {
+        const int nwarps = (static_cast<int>(blockDim.x) + 31) >> 5;
+        for (int w = 0; w < nwarps; ++w) {
+            sum += smem[w];
+        }
+        smem[0] = sum;
+    }
+    __syncthreads();
+    sum = smem[0];
+    __syncthreads();
+    return sum;
+}
+
+// One block per V-head, one thread per K-lane. The scalar kernel used a single
+// thread for the whole head_v x head_k state and dominated decode.
+__global__ void gated_delta_step_parallel_kernel(float *q, float *k, const float *v,
+                                                 const float *decay, const float *beta, float *state,
+                                                 float *out, int n_v_heads, int head_v, int head_k,
+                                                 float eps) {
+    const int h = static_cast<int>(blockIdx.x);
+    const int j = static_cast<int>(threadIdx.x);
+    if (h >= n_v_heads) {
+        return;
+    }
+    __shared__ float smem[256];
+    float *q_h = q + h * head_k;
+    float *k_h = k + h * head_k;
+    const float *v_h = v + h * head_v;
+    float *state_h = state + static_cast<int>(static_cast<long long>(h) * head_v * head_k);
+    float *out_h = out + h * head_v;
+
+    const float qv0 = (j < head_k) ? q_h[j] : 0.f;
+    const float kv0 = (j < head_k) ? k_h[j] : 0.f;
+    const float ss_q = gdn_block_sum(qv0 * qv0, smem);
+    const float ss_k = gdn_block_sum(kv0 * kv0, smem);
+    const float inv_q = rsqrtf(ss_q + eps);
+    const float inv_k = rsqrtf(ss_k + eps);
+    const float q_scale = rsqrtf(static_cast<float>(head_k));
+    const float qv = qv0 * inv_q * q_scale;
+    const float kv = kv0 * inv_k;
+    if (j < head_k) {
+        q_h[j] = qv;
+        k_h[j] = kv;
+    }
+    __syncthreads();
+
+    const float g = decay[h];
+    const float b = beta[h];
+    for (int i = 0; i < head_v; ++i) {
+        float *row = state_h + i * head_k;
+        const float rj0 = (j < head_k) ? row[j] * g : 0.f;
+        const float acc = gdn_block_sum(rj0 * kv, smem);
+        const float delta = b * (v_h[i] - acc);
+        const float rj = rj0 + delta * kv;
+        if (j < head_k) {
+            row[j] = rj;
+        }
+        const float y = gdn_block_sum(rj * qv, smem);
+        if (j == 0) {
+            out_h[i] = y;
+        }
+    }
+}
+
 __global__ void gated_delta_step_kernel(float *q, float *k, const float *v, const float *decay,
                                         const float *beta, float *state, float *out, int n_v_heads,
                                         int head_v, int head_k, float eps) {
@@ -3976,9 +4249,16 @@ extern "C" int allpaca_gated_delta_step(float *q, float *k, const float *v, cons
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    hipLaunchKernelGGL(gated_delta_step_kernel, dim3(static_cast<unsigned>(n_v_heads)), dim3(1), 0,
-                       as_stream(stream), q, k, v, decay, beta, state, out, n_v_heads, head_v,
-                       head_k, eps);
+    const bool parallel = head_k > 0 && head_k <= 256 && (head_k & (head_k - 1)) == 0;
+    if (parallel) {
+        hipLaunchKernelGGL(gated_delta_step_parallel_kernel, dim3(static_cast<unsigned>(n_v_heads)),
+                           dim3(static_cast<unsigned>(head_k)), 0, as_stream(stream), q, k, v, decay,
+                           beta, state, out, n_v_heads, head_v, head_k, eps);
+    } else {
+        hipLaunchKernelGGL(gated_delta_step_kernel, dim3(static_cast<unsigned>(n_v_heads)), dim3(1),
+                           0, as_stream(stream), q, k, v, decay, beta, state, out, n_v_heads, head_v,
+                           head_k, eps);
+    }
     return hip_status(hipGetLastError());
 }
 
@@ -4956,6 +5236,10 @@ extern "C" int allpaca_hip_has_memcpy_batch(void) { return 0; }
 
 extern "C" int allpaca_hip_memcpy_peer(void *, int32_t, const void *, int32_t, size_t,
                                       allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_touch_resident(void *, size_t, int32_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

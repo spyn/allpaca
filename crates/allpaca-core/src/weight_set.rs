@@ -687,10 +687,7 @@ impl ExpertLru {
     }
 
     fn is_keep(&self, id: ExpertId) -> bool {
-        self.keep
-            .lock()
-            .map(|k| k.contains(&id))
-            .unwrap_or(false)
+        self.keep.lock().map(|k| k.contains(&id)).unwrap_or(false)
     }
 
     /// Durable pin-prefer keep-set. Empty means no reserved slots (true LRU).
@@ -707,10 +704,7 @@ impl ExpertLru {
     }
 
     /// Admit keep-set experts first so they occupy reserved slots.
-    pub fn warmup_keep_set(
-        &self,
-        experts: &[(ExpertId, &LayerFfn)],
-    ) -> Result<(), AllpacaError> {
+    pub fn warmup_keep_set(&self, experts: &[(ExpertId, &LayerFfn)]) -> Result<(), AllpacaError> {
         for &(id, host) in experts {
             self.admit(id, host)?;
         }
@@ -763,19 +757,15 @@ impl ExpertLru {
             inner.pinned[slot] = is_keep;
             return Ok(());
         }
-        let victim = inner
-            .bound
-            .iter()
-            .position(|b| b.is_none())
-            .or_else(|| {
-                inner
-                    .bound
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, b)| b.is_some() && !inner.pinned[*i])
-                    .min_by_key(|(i, _)| inner.used_at[*i])
-                    .map(|(i, _)| i)
-            });
+        let victim = inner.bound.iter().position(|b| b.is_none()).or_else(|| {
+            inner
+                .bound
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| b.is_some() && !inner.pinned[*i])
+                .min_by_key(|(i, _)| inner.used_at[*i])
+                .map(|(i, _)| i)
+        });
         let Some(victim) = victim else {
             return Ok(());
         };
@@ -1184,7 +1174,11 @@ mod tests {
         lru.admit(keep, &k).unwrap();
         lru.admit(cold_a, &a).unwrap();
         lru.admit(cold_b, &b).unwrap();
-        assert_eq!(lru.plan(&[keep]).hits.len(), 1, "keep-set must stay resident");
+        assert_eq!(
+            lru.plan(&[keep]).hits.len(),
+            1,
+            "keep-set must stay resident"
+        );
         assert_eq!(
             lru.plan(&[cold_a]).hits.len(),
             0,

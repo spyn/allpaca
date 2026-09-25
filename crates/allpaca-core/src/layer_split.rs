@@ -41,39 +41,42 @@ impl LayerPlan {
     }
 }
 
-/// Expand a per-endpoint `--tensor-split` across each worker's GPUs.
+fn portion(weight: f64, mems: &[u64]) -> Vec<f64> {
+    let mems = if mems.is_empty() { vec![1] } else { mems.to_vec() };
+    let sum = mems.iter().sum::<u64>().max(1) as f64;
+    mems.iter()
+        .map(|mem| weight * (*mem as f64) / sum)
+        .collect()
+}
+
+/// Expand `--tensor-split` across local GPUs, then each worker's GPUs.
 ///
-/// `split[0]` is the local device. Each later entry is one RPC endpoint.
-/// When `split` already has one weight per device (local + every remote GPU), it is returned as-is.
+/// `split[0]` is the local pool (every local HIP device, by VRAM). Each later
+/// entry is one RPC endpoint. When `split` already has one weight per device
+/// (every local GPU + every remote GPU), it is returned as-is.
 pub fn expand_rpc_split(
     split: &[f64],
+    local_mems: &[u64],
     remote_groups: &[Vec<u64>],
 ) -> Result<Vec<f64>, AllpacaError> {
+    let n_local = local_mems.len().max(1);
     let n_remote: usize = remote_groups.iter().map(|g| g.len().max(1)).sum();
-    let n_dev = 1 + n_remote;
+    let n_dev = n_local + n_remote;
     if split.len() == n_dev {
         return Ok(split.to_vec());
     }
     if split.len() != 1 + remote_groups.len() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-            "tensor_split has {} entries but {} split devices ({} RPC endpoints)",
+            "tensor_split has {} entries but {} split devices (1 local pool + {} RPC endpoints)",
             split.len(),
             n_dev,
             remote_groups.len()
         ))));
     }
     let mut out = Vec::with_capacity(n_dev);
-    out.push(split[0]);
+    out.extend(portion(split[0], local_mems));
     for (group, weight) in remote_groups.iter().zip(split.iter().skip(1)) {
-        let mems: Vec<u64> = if group.is_empty() {
-            vec![1]
-        } else {
-            group.clone()
-        };
-        let sum = mems.iter().sum::<u64>().max(1) as f64;
-        for mem in mems {
-            out.push(*weight * (mem as f64) / sum);
-        }
+        out.extend(portion(*weight, group));
     }
     Ok(out)
 }
@@ -127,6 +130,85 @@ pub fn plan_layer_owners(
     Ok(LayerPlan { owners })
 }
 
+/// Packed weights fit in the local GPU pool (KV / scratch headroom reserved).
+/// RPC is then overflow-only instead of taking a mandatory layer cut.
+pub fn packed_fits_local(packed_bytes: u64, local_mems: &[u64]) -> bool {
+    const HEADROOM: f64 = 0.82;
+    let local: u64 = local_mems.iter().copied().sum();
+    packed_bytes > 0 && packed_bytes <= ((local as f64) * HEADROOM) as u64
+}
+
+/// Local-only two-GPU plan: the peer owns a contiguous *suffix*.
+///
+/// Used when every layer is full-attn (no GDN). Hybrid Qwen uses
+/// [`plan_local_hybrid_peer`] instead.
+pub fn plan_local_peer_window(n_layers: usize, local_mems: &[u64]) -> LayerPlan {
+    if n_layers == 0 || local_mems.len() < 2 {
+        return LayerPlan::all_local(n_layers);
+    }
+    let m0 = local_mems[0].max(1) as f64;
+    let m1 = local_mems[1].max(1) as f64;
+    let total = m0 + m1;
+    let gpu0_n = ((n_layers as f64) * m0 / total * 1.25).round() as usize;
+    let gpu0_n = gpu0_n.clamp((n_layers + 1) / 2, n_layers.saturating_sub(1));
+    let mut owners = vec![0usize; n_layers];
+    for slot in owners.iter_mut().skip(gpu0_n) {
+        *slot = 1;
+    }
+    LayerPlan { owners }
+}
+
+/// Local-only hybrid plan: GPU1 gets the proven middle window plus later GDN
+/// up to half the layers, so both cards stay near 12 GB.
+///
+/// Later full-attn stays on GPU0. Dumping every later GDN on GPU1 packed the
+/// 9060 to 14.4/16 GB (garbage). Parking them all on GPU0 packed the 9070
+/// the same way. Cap GPU1 at `n/2` layers: middle window + as many later
+/// GDN blocks as fit.
+pub fn plan_local_hybrid_peer(
+    n_layers: usize,
+    local_mems: &[u64],
+    is_full_attn: &[bool],
+) -> LayerPlan {
+    if n_layers == 0 || local_mems.len() < 2 {
+        return LayerPlan::all_local(n_layers);
+    }
+    let m0 = local_mems[0].max(1) as f64;
+    let m1 = local_mems[1].max(1) as f64;
+    let total = m0 + m1;
+    let peer_n = ((n_layers as f64) * m1 / total / 2.0).round() as usize;
+    let peer_n = peer_n.clamp(1, n_layers.saturating_sub(1));
+    let start = ((n_layers as f64) * m0 / total / 2.0).round() as usize;
+    let start = start.min(n_layers.saturating_sub(peer_n));
+    let end = start + peer_n;
+    let cap = (n_layers / 2).max(end);
+    let mut owners = vec![0usize; n_layers];
+    let mut peer = 0usize;
+    for (i, slot) in owners.iter_mut().enumerate() {
+        if i >= start && i < end {
+            *slot = 1;
+            peer += 1;
+        } else if i >= end && peer < cap && !is_full_attn.get(i).copied().unwrap_or(true) {
+            *slot = 1;
+            peer += 1;
+        }
+    }
+    LayerPlan { owners }
+}
+
+/// Keep full-attention layers on the target HIP device.
+///
+/// A VRAM-even local split puts later Qwen full-attn blocks on the peer GPU.
+/// That path has produced garbage tokens; GDN on the peer is the proven split.
+#[allow(dead_code)]
+pub fn pin_full_attn_to_target(layer_device: &mut [i32], target: i32, is_full_attn: &[bool]) {
+    for (slot, want) in layer_device.iter_mut().zip(is_full_attn.iter().copied()) {
+        if want && *slot >= 0 && *slot != target {
+            *slot = target;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,13 +241,62 @@ mod tests {
 
     #[test]
     fn endpoint_split_spreads_across_worker_gpus() {
-        let split = expand_rpc_split(&[1.0, 2.0], &[vec![8, 24]]).unwrap();
+        let split = expand_rpc_split(&[1.0, 2.0], &[16], &[vec![8, 24]]).unwrap();
         assert_eq!(split.len(), 3);
         assert!((split[0] - 1.0).abs() < 1e-9);
         assert!((split[1] - 0.5).abs() < 1e-9);
         assert!((split[2] - 1.5).abs() < 1e-9);
-        let already = expand_rpc_split(&[1.0, 2.0, 3.0], &[vec![8, 24]]).unwrap();
+        let already = expand_rpc_split(&[1.0, 2.0, 3.0], &[16], &[vec![8, 24]]).unwrap();
         assert_eq!(already, vec![1.0, 2.0, 3.0]);
-        assert!(expand_rpc_split(&[1.0], &[vec![8, 24]]).is_err());
+        assert!(expand_rpc_split(&[1.0], &[16], &[vec![8, 24]]).is_err());
+    }
+
+    #[test]
+    fn local_pool_splits_before_rpc() {
+        let split = expand_rpc_split(&[1.0, 1.0], &[16, 16], &[vec![32, 32]]).unwrap();
+        assert_eq!(split.len(), 4);
+        assert!((split[0] - 0.5).abs() < 1e-9);
+        assert!((split[1] - 0.5).abs() < 1e-9);
+        assert!((split[2] - 0.5).abs() < 1e-9);
+        assert!((split[3] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn packed_27b_fits_two_16gb_local_gpus() {
+        let local = [16u64 << 30, 16u64 << 30];
+        assert!(packed_fits_local(20u64 << 30, &local));
+        assert!(!packed_fits_local(40u64 << 30, &local));
+        assert!(!packed_fits_local(0, &local));
+    }
+
+    #[test]
+    fn pin_full_attn_moves_peer_attention_to_target() {
+        let mut devices = vec![0, 1, 1, 1, 0];
+        let attn = vec![true, false, true, false, false];
+        pin_full_attn_to_target(&mut devices, 0, &attn);
+        assert_eq!(devices, vec![0, 1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn local_hybrid_peer_keeps_later_attn_on_target() {
+        let attn: Vec<bool> = (0..64).map(|i| i % 4 == 0).collect();
+        let plan = plan_local_hybrid_peer(64, &[16 << 30, 16 << 30], &attn);
+        assert_eq!(&plan.owners[..16], &[0; 16]);
+        assert_eq!(&plan.owners[16..32], &[1; 16]);
+        for i in 32..64 {
+            if attn[i] {
+                assert_eq!(plan.owners[i], 0, "later attn {i}");
+            }
+        }
+        assert_eq!(plan.owners.iter().filter(|&&o| o == 0).count(), 32);
+        assert_eq!(plan.owners.iter().filter(|&&o| o == 1).count(), 32);
+        let later_attn_on_peer = (32..64).filter(|&i| attn[i] && plan.owners[i] == 1).count();
+        assert_eq!(later_attn_on_peer, 0);
+    }
+
+    #[test]
+    fn local_peer_window_single_device_stays_target() {
+        let plan = plan_local_peer_window(8, &[16 << 30]);
+        assert_eq!(plan.owners, vec![0; 8]);
     }
 }
