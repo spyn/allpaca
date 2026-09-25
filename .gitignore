@@ -63,3 +63,8 @@ graphify-out/
 *.cubin
 *.fatbin
 
+
+*.log
+*.logs
+_tmp_*
+
