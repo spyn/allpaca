@@ -1785,6 +1785,117 @@ fn write_tiny_f32_gguf(path: &std::path::Path) {
 }
 
 #[cfg(feature = "hip")]
+fn write_tiny_f32_two_layer_gguf(path: &std::path::Path) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 8usize;
+    let vocab = 4usize;
+    let ff = 16usize;
+    let mut meta = HashMap::new();
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("llama".into()),
+    );
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert(
+        "llama.embedding_length".into(),
+        GgufValue::Uint32(dim as u32),
+    );
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+    meta.insert(
+        "llama.feed_forward_length".into(),
+        GgufValue::Uint32(ff as u32),
+    );
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(vec![
+            GgufValue::String("<unk>".into()),
+            GgufValue::String("<s>".into()),
+            GgufValue::String("</s>".into()),
+            GgufValue::String("hello".into()),
+        ]),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![(
+        "token_embd.weight".into(),
+        vec![vocab as u64, dim as u64],
+        vec![0.01; vocab * dim],
+    )];
+    for blk in 0..2u32 {
+        let p = format!("blk.{blk}");
+        owned.extend([
+            (
+                format!("{p}.attn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                format!("{p}.attn_q.weight"),
+                vec![dim as u64, dim as u64],
+                vec![0.01; dim * dim],
+            ),
+            (
+                format!("{p}.attn_k.weight"),
+                vec![2, dim as u64],
+                vec![0.01; 2 * dim],
+            ),
+            (
+                format!("{p}.attn_v.weight"),
+                vec![2, dim as u64],
+                vec![0.01; 2 * dim],
+            ),
+            (
+                format!("{p}.attn_output.weight"),
+                vec![dim as u64, dim as u64],
+                vec![0.01; dim * dim],
+            ),
+            (
+                format!("{p}.ffn_norm.weight"),
+                vec![dim as u64],
+                vec![1.0; dim],
+            ),
+            (
+                format!("{p}.ffn_gate.weight"),
+                vec![ff as u64, dim as u64],
+                vec![0.01; ff * dim],
+            ),
+            (
+                format!("{p}.ffn_up.weight"),
+                vec![ff as u64, dim as u64],
+                vec![0.01; ff * dim],
+            ),
+            (
+                format!("{p}.ffn_down.weight"),
+                vec![dim as u64, ff as u64],
+                vec![0.01; dim * ff],
+            ),
+        ]);
+    }
+    owned.push((
+        "output_norm.weight".into(),
+        vec![dim as u64],
+        vec![1.0; dim],
+    ));
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).unwrap();
+}
+
+#[cfg(feature = "hip")]
 fn write_tiny_fused_qkv_f32_gguf(path: &std::path::Path) {
     use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
     use std::collections::HashMap;
@@ -2398,6 +2509,43 @@ fn hip_greedy_long_prompt_matches_cpu_on_tiny_written_ggufs() {
         );
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Layer 0 on HIP:0, layer 1 on HIP:1. Logits must land on the target workspace
+/// Engine waits on — a peer-GPU lm_head used to emit `!` tokens.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_local_gpu_pool_two_layer_matches_cpu() {
+    if allpaca_hip::device_count() < 2 {
+        eprintln!("skip hip_local_gpu_pool_two_layer_matches_cpu: need 2 HIP devices");
+        return;
+    }
+    let path = std::env::temp_dir().join("allpaca_hip_tiny_two_layer_pool.gguf");
+    write_tiny_f32_two_layer_gguf(&path);
+    let cpu = Engine::new(tiny_written_cfg(path.clone(), true)).expect("two-layer CPU load");
+    let hip = Engine::new(tiny_written_cfg(path.clone(), false)).expect("two-layer HIP load");
+    if hip_gpus(&hip).len() < 2 {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("skip hip_local_gpu_pool_two_layer_matches_cpu: inventory has <2 HIP GPUs");
+        return;
+    }
+    let cpu_out = cpu
+        .generate("hello", greedy(4))
+        .unwrap_or_else(|e| panic!("two-layer CPU generate: {e}"));
+    let hip_out = hip
+        .generate("hello", greedy(4))
+        .unwrap_or_else(|e| panic!("two-layer HIP generate: {e}"));
+    assert_eq!(
+        hip_out.token_ids, cpu_out.token_ids,
+        "local GPU pool must match CPU; hip={:?} cpu={:?} text={:?}",
+        hip_out.token_ids, cpu_out.token_ids, hip_out.text
+    );
+    let stats = hip.stats();
+    assert!(
+        stats.draft_gpu_vram_used_bytes > 0 && stats.draft_gpu_vram_total_bytes > 0,
+        "second local GPU must report VRAM after a pool split; stats={stats:?}"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[cfg(feature = "hip")]
@@ -5124,6 +5272,222 @@ fn hip_gated_delta_step_matches_host_after_expand_k() {
     for i in 0..state.len() {
         assert!(
             (state[i] - state_h[i]).abs() < 1e-4,
+            "state[{i}] device={} host={}",
+            state[i],
+            state_h[i]
+        );
+    }
+}
+
+/// Warp-per-(head, v-row) kernel: head_k=32 fills a wave, head_v>1 is parallel.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gated_delta_step_matches_host_warp_k32() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gated_delta_warp_k32: no HIP device");
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 4096, 8).expect("HipWorkspace");
+    let n_v = 4usize;
+    let head_k = 32usize;
+    let head_v = 16usize;
+    let mut q = vec![0.0f32; n_v * head_k];
+    let mut k = vec![0.0f32; n_v * head_k];
+    for i in 0..q.len() {
+        q[i] = (i as f32).mul_add(0.01, 0.1);
+        k[i] = (i as f32).mul_add(-0.02, 0.3);
+    }
+    let v: Vec<f32> = (0..n_v * head_v)
+        .map(|i| (i as f32) * 0.05)
+        .collect();
+    let decay = vec![0.7f32; n_v];
+    let beta = vec![0.4f32; n_v];
+    let state0: Vec<f32> = (0..n_v * head_v * head_k)
+        .map(|i| (i as f32) * 0.001)
+        .collect();
+
+    let mut q_h = q.clone();
+    let mut k_h = k.clone();
+    let mut state_h = state0.clone();
+    let mut out_h = vec![0.0f32; n_v * head_v];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q_h,
+        &mut k_h,
+        &v,
+        &decay,
+        &beta,
+        &mut state_h,
+        &mut out_h,
+        n_v,
+        head_v,
+        head_k,
+        1e-6,
+    );
+
+    let floats = q.len() + k.len() + v.len() + decay.len() + beta.len() + state0.len() + out_h.len();
+    let blob = allpaca_hip::DeviceWeights::alloc(0, floats * 4).expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let q_d = put(&hip, &blob, &mut off, &q);
+    let k_d = put(&hip, &blob, &mut off, &k);
+    let v_d = put(&hip, &blob, &mut off, &v);
+    let decay_d = put(&hip, &blob, &mut off, &decay);
+    let beta_d = put(&hip, &blob, &mut off, &beta);
+    let state_d = put(&hip, &blob, &mut off, &state0);
+    let out_d = put(&hip, &blob, &mut off, &out_h);
+
+    hip.gated_delta_step(
+        q_d,
+        k_d,
+        v_d,
+        decay_d,
+        beta_d,
+        state_d,
+        out_d,
+        n_v as i32,
+        head_v as i32,
+        head_k as i32,
+        1e-6,
+    )
+    .expect("device gated_delta_step warp k32");
+
+    let mut out = vec![0.0f32; out_h.len()];
+    let mut state = vec![0.0f32; state_h.len()];
+    let mut q_dev = vec![0.0f32; q_h.len()];
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    hip.copy_d2h_f32(state_d, &mut state).unwrap();
+    hip.copy_d2h_f32(q_d, &mut q_dev).unwrap();
+    for i in 0..out.len() {
+        assert!(
+            (out[i] - out_h[i]).abs() < 1e-4,
+            "out[{i}] device={} host={}",
+            out[i],
+            out_h[i]
+        );
+    }
+    for i in 0..state.len() {
+        assert!(
+            (state[i] - state_h[i]).abs() < 1e-4,
+            "state[{i}] device={} host={}",
+            state[i],
+            state_h[i]
+        );
+    }
+    for i in 0..q_dev.len() {
+        assert!(
+            (q_dev[i] - q_h[i]).abs() < 1e-4,
+            "q[{i}] device={} host={}",
+            q_dev[i],
+            q_h[i]
+        );
+    }
+}
+
+/// Qwen3.5-27B GDN is head_k=128, head_v=128, 48 V-heads. Exercise the K loop.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gated_delta_step_matches_host_warp_k128() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gated_delta_warp_k128: no HIP device");
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 4096, 8).expect("HipWorkspace");
+    let n_v = 2usize;
+    let head_k = 128usize;
+    let head_v = 32usize;
+    let mut q = vec![0.0f32; n_v * head_k];
+    let mut k = vec![0.0f32; n_v * head_k];
+    for i in 0..q.len() {
+        q[i] = (i as f32).mul_add(0.01, 0.1);
+        k[i] = (i as f32).mul_add(-0.02, 0.3);
+    }
+    let v: Vec<f32> = (0..n_v * head_v)
+        .map(|i| (i as f32) * 0.05)
+        .collect();
+    let decay = vec![0.7f32; n_v];
+    let beta = vec![0.4f32; n_v];
+    let state0: Vec<f32> = (0..n_v * head_v * head_k)
+        .map(|i| (i as f32) * 0.001)
+        .collect();
+
+    let mut q_h = q.clone();
+    let mut k_h = k.clone();
+    let mut state_h = state0.clone();
+    let mut out_h = vec![0.0f32; n_v * head_v];
+    allpaca_core::deltanet::gated_delta_step_eps(
+        &mut q_h,
+        &mut k_h,
+        &v,
+        &decay,
+        &beta,
+        &mut state_h,
+        &mut out_h,
+        n_v,
+        head_v,
+        head_k,
+        1e-6,
+    );
+
+    let floats = q.len() + k.len() + v.len() + decay.len() + beta.len() + state0.len() + out_h.len();
+    let blob = allpaca_hip::DeviceWeights::alloc(0, floats * 4).expect("alloc");
+    let mut off = 0usize;
+    let put = |hip: &allpaca_hip::HipWorkspace,
+               blob: &allpaca_hip::DeviceWeights,
+               off: &mut usize,
+               src: &[f32]|
+     -> *mut f32 {
+        let p = blob.ptr_at(*off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        *off += src.len() * 4;
+        p
+    };
+    let q_d = put(&hip, &blob, &mut off, &q);
+    let k_d = put(&hip, &blob, &mut off, &k);
+    let v_d = put(&hip, &blob, &mut off, &v);
+    let decay_d = put(&hip, &blob, &mut off, &decay);
+    let beta_d = put(&hip, &blob, &mut off, &beta);
+    let state_d = put(&hip, &blob, &mut off, &state0);
+    let out_d = put(&hip, &blob, &mut off, &out_h);
+
+    hip.gated_delta_step(
+        q_d,
+        k_d,
+        v_d,
+        decay_d,
+        beta_d,
+        state_d,
+        out_d,
+        n_v as i32,
+        head_v as i32,
+        head_k as i32,
+        1e-6,
+    )
+    .expect("device gated_delta_step warp k128");
+
+    let mut out = vec![0.0f32; out_h.len()];
+    let mut state = vec![0.0f32; state_h.len()];
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    hip.copy_d2h_f32(state_d, &mut state).unwrap();
+    for i in 0..out.len() {
+        assert!(
+            (out[i] - out_h[i]).abs() < 2e-4,
+            "out[{i}] device={} host={}",
+            out[i],
+            out_h[i]
+        );
+    }
+    for i in 0..state.len() {
+        assert!(
+            (state[i] - state_h[i]).abs() < 2e-4,
             "state[{i}] device={} host={}",
             state[i],
             state_h[i]

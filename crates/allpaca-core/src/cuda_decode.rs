@@ -713,9 +713,7 @@ impl CudaResidentModel {
         }
         match w.kind {
             WeightKind::F32 => cuda.gemm_nt_dev(a, self.ptr(w)?, c, m, n, k),
-            WeightKind::Q8_0 => {
-                allpaca_cuda::gemm_nt_q8_0_device(a, self.ptr_u8(w)?, c, m, n, k)
-            }
+            WeightKind::Q8_0 => allpaca_cuda::gemm_nt_q8_0_device(a, self.ptr_u8(w)?, c, m, n, k),
             _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "CUDA decode: unsupported weight kind for device GEMM".into(),
             ))),
@@ -795,7 +793,7 @@ impl TinyModel {
     ) -> Result<(), AllpacaError> {
         // RPC split: keep activations device-resident across local layers; bounce
         // only at remote boundaries (ADR 0003). Complex local blocks fall back.
-        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+        if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
             return self.forward_token_cuda_rpc_resident(
                 token, pos, page_ids, kv, metrics, logits, cuda, resident, soft_x, recurrent,
             );
@@ -873,7 +871,9 @@ impl TinyModel {
         for (layer_idx, host_layer) in self.layers.iter().enumerate() {
             if let Some(rpc) = &self.rpc {
                 if rpc.is_remote(layer_idx) {
-                    rpc.run_layer(layer_idx, pos, &mut x)?;
+                    if rpc.is_span_start(layer_idx) {
+                        rpc.run_layer(layer_idx, pos, &mut x)?;
+                    }
                     continue;
                 }
             }
@@ -1393,9 +1393,11 @@ impl TinyModel {
             for (layer_idx, host_layer) in self.layers.iter().enumerate() {
                 if let Some(rpc) = &self.rpc {
                     if rpc.is_remote(layer_idx) {
-                        cuda.download_f32(dx.cast(), &mut x_host)?;
-                        rpc.run_layer(layer_idx, pos, &mut x_host)?;
-                        cuda.copy_h2d_f32(dx.cast(), &x_host)?;
+                        if rpc.is_span_start(layer_idx) {
+                            cuda.download_f32(dx.cast(), &mut x_host)?;
+                            rpc.run_layer(layer_idx, pos, &mut x_host)?;
+                            cuda.copy_h2d_f32(dx.cast(), &x_host)?;
+                        }
                         continue;
                     }
                 }
@@ -1546,7 +1548,7 @@ impl TinyModel {
                 recurrent,
             );
         }
-        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+        if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
             return Err(AllpacaError::Degraded(
                 allpaca_types::DegradedError::FeatureDisabled(
                     "CUDA batched prefill: RPC layer-split unsupported".into(),
@@ -1788,7 +1790,9 @@ impl TinyModel {
                 ff as i32,
                 dim as i32,
             )?;
-            resident.gemm_dev_a(cuda, acts.norm, layer.w_up, acts.up, m, ff as i32, dim as i32)?;
+            resident.gemm_dev_a(
+                cuda, acts.norm, layer.w_up, acts.up, m, ff as i32, dim as i32,
+            )?;
             cuda.silu_mul_dev(acts.gate, acts.up, acts.gate, (n_tok * ff) as i32)?;
             metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
             resident.gemm_dev_a(

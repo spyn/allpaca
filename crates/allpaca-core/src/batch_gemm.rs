@@ -405,9 +405,7 @@ pub fn apply_packed_attn(
         out_rows,
         |a, b, c, n, k| packed_gemm_nt_cpu(a, b, c, n, k),
         |q, k, v, out, n_q, n_kv| {
-            allpaca_cpu::attention(
-                q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, true,
-            )
+            allpaca_cpu::attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, true)
         },
     )
     .map(|_| ())
@@ -549,10 +547,7 @@ where
 }
 
 /// In-place residual: `x_rows[i] += y_rows[i]` (same row lengths).
-pub fn residual_add_rows(
-    x_rows: &mut [&mut [f32]],
-    y_rows: &[&[f32]],
-) -> Result<(), AllpacaError> {
+pub fn residual_add_rows(x_rows: &mut [&mut [f32]], y_rows: &[&[f32]]) -> Result<(), AllpacaError> {
     if x_rows.len() != y_rows.len() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "residual_add_rows: x/y row count mismatch".into(),
@@ -1092,9 +1087,7 @@ mod tests {
         let w_gate: Vec<f32> = (0..ff * dim)
             .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
             .collect();
-        let w_up: Vec<f32> = (0..ff * dim)
-            .map(|i| ((i % 5) as f32) * 0.05)
-            .collect();
+        let w_up: Vec<f32> = (0..ff * dim).map(|i| ((i % 5) as f32) * 0.05).collect();
         let w_down: Vec<f32> = (0..dim * ff)
             .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
             .collect();
@@ -1170,9 +1163,7 @@ mod tests {
         let wq: Vec<f32> = (0..q_dim * dim)
             .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
             .collect();
-        let wk: Vec<f32> = (0..kv_dim * dim)
-            .map(|i| ((i % 5) as f32) * 0.05)
-            .collect();
+        let wk: Vec<f32> = (0..kv_dim * dim).map(|i| ((i % 5) as f32) * 0.05).collect();
         let wv: Vec<f32> = (0..kv_dim * dim)
             .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
             .collect();
@@ -1262,9 +1253,7 @@ mod tests {
         let wq: Vec<f32> = (0..q_dim * dim)
             .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
             .collect();
-        let wk: Vec<f32> = (0..kv_dim * dim)
-            .map(|i| ((i % 5) as f32) * 0.05)
-            .collect();
+        let wk: Vec<f32> = (0..kv_dim * dim).map(|i| ((i % 5) as f32) * 0.05).collect();
         let wv: Vec<f32> = (0..kv_dim * dim)
             .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
             .collect();

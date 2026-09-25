@@ -390,6 +390,7 @@ mod ffi {
             bytes: usize,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_hip_touch_resident(ptr: *mut c_void, bytes: usize, device: i32) -> i32;
         #[allow(dead_code)]
         pub fn allpaca_hip_benchmark(
             src: i32,
@@ -1196,6 +1197,62 @@ pub fn memcpy_peer(
         Err(AllpacaError::Degraded(DegradedError::HostStagingFallback(
             "HIP peer copy unavailable".into(),
         )))
+    }
+}
+
+/// Copy `n` f32s between HIP devices. Peer DMA first; `stage` is the host bounce.
+pub fn copy_dev_f32(
+    dst: *mut f32,
+    dst_dev: i32,
+    src: *const f32,
+    src_dev: i32,
+    n: usize,
+    stage: &mut [f32],
+) -> Result<(), AllpacaError> {
+    if n == 0 {
+        return Ok(());
+    }
+    if dst.is_null() || src.is_null() {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "invalid device activation copy".into(),
+        )));
+    }
+    if stage.len() < n {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            format!("activation staging too small: need {n} have {}", stage.len()),
+        )));
+    }
+    let bytes = n * 4;
+    if src_dev == dst_dev {
+        set_device(dst_dev)?;
+        return memcpy(dst.cast(), src.cast(), bytes, MEMCPY_D2D);
+    }
+    set_device(src_dev)?;
+    stream_synchronize()?;
+    if memcpy_peer(dst.cast(), dst_dev, src.cast(), src_dev, bytes).is_ok() {
+        set_device(dst_dev)?;
+        return Ok(());
+    }
+    set_device(src_dev)?;
+    memcpy(stage.as_mut_ptr().cast(), src.cast(), bytes, MEMCPY_D2H)?;
+    set_device(dst_dev)?;
+    memcpy(dst.cast(), stage.as_ptr().cast(), bytes, MEMCPY_H2D)
+}
+
+/// Fault-in `bytes` of device memory without a host-side stream sync.
+pub fn touch_resident(ptr: *mut u8, bytes: usize, device: i32) -> Result<(), AllpacaError> {
+    if ptr.is_null() || bytes == 0 {
+        return Ok(());
+    }
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_touch_resident(ptr.cast(), bytes, device) };
+        status(rc, "touch_resident")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (ptr, bytes, device);
+        Ok(())
     }
 }
 
@@ -4231,6 +4288,11 @@ impl DeviceWeights {
         unsafe { self.ptr.add(byte_offset) }
     }
 
+    /// Queue a read-only touch so WDDM pages this blob in. Does not host-sync.
+    pub fn touch(&self) -> Result<(), AllpacaError> {
+        touch_resident(self.ptr, self.bytes, self.device)
+    }
+
     /// Fill a region directly from a file when this allocation is backed by an
     /// imported D3D12 resource. Returns `false` for ordinary `hipMalloc`.
     pub fn read_file_direct(
@@ -4325,6 +4387,16 @@ impl DeviceDecode {
     pub fn attn_row(&self, i: usize, dim: usize) -> *mut f32 {
         // SAFETY: caller sizes `attn` as at least `(i + 1) * dim` floats.
         unsafe { self.attn.add(i * dim) }
+    }
+
+    pub fn gate_row(&self, i: usize, stride: usize) -> *mut f32 {
+        // SAFETY: caller sizes `gate` as at least `(i + 1) * stride` floats.
+        unsafe { self.gate.add(i * stride) }
+    }
+
+    pub fn up_row(&self, i: usize, stride: usize) -> *mut f32 {
+        // SAFETY: caller sizes `up` as at least `(i + 1) * stride` floats.
+        unsafe { self.up.add(i * stride) }
     }
 }
 
@@ -4687,6 +4759,7 @@ impl HipWorkspace {
         op: DecodeOp,
         f: impl FnOnce() -> Result<T, AllpacaError>,
     ) -> Result<T, AllpacaError> {
+        self.bind()?;
         if self.profile_span.load(Ordering::Relaxed) != 0 {
             return f();
         }
@@ -10977,6 +11050,61 @@ mod tests {
                 "ROCmFP4 tiled/untiled mismatch idx={i} tiled={} untiled={}",
                 tiled[i],
                 untiled[i]
+            );
+        }
+    }
+
+    /// FFN-sized decode GEMV must match untiled and beat it.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rocmfp4_decode_gemv_matches_and_beats_untiled() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, n, k) = (1usize, 4096usize, 5120usize);
+        let (a, b_q) = fill_rocmfp4_gemm_case(9, m, n, k);
+        let mut got = vec![0.0f32; n];
+        let mut expect = vec![0.0f32; n];
+        gemm_nt_rocmfp4(&a, &b_q, &mut got, 1, n as i32, k as i32).expect("lds");
+        gemm_nt_rocmfp4_untiled(&a, &b_q, &mut expect, 1, n as i32, k as i32).expect("untiled");
+        for i in 0..n {
+            assert!(
+                gemm_close(got[i], expect[i]),
+                "lds mismatch idx={i} lds={} untiled={}",
+                got[i],
+                expect[i]
+            );
+        }
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let a_n = m * k;
+            let nblocks = k.div_ceil(32);
+            let packed = n * nblocks * 18;
+            let da = device_malloc(a_n * 4, 0).unwrap();
+            let db = device_malloc(packed, 0).unwrap();
+            let dc = device_malloc(n * 4, 0).unwrap();
+            set_device(0).unwrap();
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, b_q.as_ptr(), packed, MEMCPY_H2D).unwrap();
+            let time = |kernel: fn(*const f32, *const u8, *mut f32, i32, i32, i32) -> Result<(), AllpacaError>| {
+                kernel(da.cast(), db, dc.cast(), 1, n as i32, k as i32).unwrap();
+                stream_synchronize().unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    kernel(da.cast(), db, dc.cast(), 1, n as i32, k as i32).unwrap();
+                }
+                stream_synchronize().unwrap();
+                t.elapsed().as_micros() / 20
+            };
+            let lds_us = time(gemm_nt_rocmfp4_device);
+            let old_us = time(gemm_nt_rocmfp4_untiled_device);
+            device_free(da, a_n * 4);
+            device_free(db, packed);
+            device_free(dc, n * 4);
+            eprintln!("rocmfp4 gemv n={n} k={k} decode_us={lds_us} untiled_us={old_us}");
+            assert!(
+                lds_us * 10 < old_us * 8,
+                "decode GEMV {lds_us}us not faster than untiled {old_us}us"
             );
         }
     }

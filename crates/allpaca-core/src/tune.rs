@@ -216,7 +216,9 @@ pub fn expand_groups(groups: &[String], shape: &MoeShape) -> Vec<ExpertId> {
                 }
             }
             other if other.starts_with("group_") => {
-                if let Some(idx) = other.strip_prefix("group_").and_then(|s| s.parse::<usize>().ok())
+                if let Some(idx) = other
+                    .strip_prefix("group_")
+                    .and_then(|s| s.parse::<usize>().ok())
                 {
                     for layer in shape.moe_layers() {
                         for expert in router_group_experts(idx, shape) {
@@ -292,8 +294,11 @@ pub fn available_groups(probe: &MoeProbe, catalog: Option<&KeepsetCatalog>) -> V
             });
         }
     }
-    for (id, title) in [("early", "Early layers"), ("mid", "Mid layers"), ("late", "Late layers")]
-    {
+    for (id, title) in [
+        ("early", "Early layers"),
+        ("mid", "Mid layers"),
+        ("late", "Late layers"),
+    ] {
         let n = expand_groups(&[id.to_string()], &probe.shape).len();
         out.push(TuneGroup {
             id: id.to_string(),
@@ -416,7 +421,12 @@ pub fn rank_keep_set(
 }
 
 fn catalog_topic_ids(catalog: &KeepsetCatalog, topic: &str) -> Vec<ExpertId> {
-    rank_keep_set(catalog, &[topic.to_string()], catalog.n_experts.max(1), RankRule::Sum)
+    rank_keep_set(
+        catalog,
+        &[topic.to_string()],
+        catalog.n_experts.max(1),
+        RankRule::Sum,
+    )
 }
 
 fn normalize(row: &[f64], n_experts: usize) -> Vec<f64> {
@@ -694,9 +704,8 @@ fn scan_hf_cache(out: &mut Vec<DiscoveredModel>, seen: &mut HashSet<String>, cac
                 for rev in revs.flatten() {
                     let snap = rev.path();
                     if snap.is_dir() && looks_like_checkpoint_dir(&snap) {
-                        let spec = hub_spec_from_cache_dir(&path).unwrap_or_else(|| {
-                            snap.to_string_lossy().into_owned()
-                        });
+                        let spec = hub_spec_from_cache_dir(&path)
+                            .unwrap_or_else(|| snap.to_string_lossy().into_owned());
                         push_discovered(out, seen, &snap, &spec);
                     }
                 }
@@ -869,7 +878,10 @@ fn probe_safetensors(
     let dim = text.hidden_size.max(1);
     let head_dim = text.head_dim.unwrap_or(dim / n_heads).max(1);
     let n_group = text.n_group.or(hf.n_group).unwrap_or(1).max(1);
-    let ff = text.moe_intermediate_size.or(text.intermediate_size).unwrap_or(dim * 4);
+    let ff = text
+        .moe_intermediate_size
+        .or(text.intermediate_size)
+        .unwrap_or(dim * 4);
     let shape = MoeShape {
         n_layers,
         n_experts,
@@ -885,9 +897,8 @@ fn probe_safetensors(
     } else {
         0
     };
-    let dense_bytes = file_bytes.saturating_sub(
-        expert_bytes.saturating_mul(n_experts as u64) * n_layers as u64,
-    );
+    let dense_bytes =
+        file_bytes.saturating_sub(expert_bytes.saturating_mul(n_experts as u64) * n_layers as u64);
     Ok(MoeProbe {
         spec: normalize_spec(spec),
         path: root.to_path_buf(),
@@ -944,12 +955,7 @@ mod tests {
             ]),
             profiles: BTreeMap::new(),
         };
-        let ids = rank_keep_set(
-            &catalog,
-            &["t1".into(), "t2".into()],
-            3,
-            RankRule::MaxMin,
-        );
+        let ids = rank_keep_set(&catalog, &["t1".into(), "t2".into()], 3, RankRule::MaxMin);
         let experts: Vec<u32> = ids.iter().map(|id| id.expert).collect();
         assert_eq!(experts, vec![0, 1, 3]);
     }
@@ -1001,8 +1007,14 @@ mod tests {
     #[test]
     fn keep_experts_round_trip() {
         let ids = vec![
-            ExpertId { layer: 0, expert: 1 },
-            ExpertId { layer: 2, expert: 0 },
+            ExpertId {
+                layer: 0,
+                expert: 1,
+            },
+            ExpertId {
+                layer: 2,
+                expert: 0,
+            },
         ];
         let compact = keep_experts_from_ids(&ids, 3);
         assert_eq!(compact, vec![vec![1], vec![], vec![0]]);

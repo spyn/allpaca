@@ -92,6 +92,8 @@ pub struct KvTierManager {
     nvme: Option<NvmeKvStore>,
     hip_pages: HashMap<PageId, HipPageAlloc>,
     hip_device: Option<i32>,
+    /// Per-layer HIP device. Empty uses `hip_device`. `-1` uses `hip_device`.
+    layer_hip: Vec<i32>,
     cuda_pages: HashMap<PageId, CudaPageAlloc>,
     cuda_device: Option<i32>,
     vulkan_pages: HashMap<PageId, allpaca_vulkan::VulkanKvPage>,
@@ -134,6 +136,7 @@ impl KvTierManager {
             nvme: None,
             hip_pages: HashMap::new(),
             hip_device,
+            layer_hip: Vec::new(),
             cuda_pages: HashMap::new(),
             cuda_device: if hip_device.is_some() {
                 None
@@ -154,6 +157,11 @@ impl KvTierManager {
             hot_fraction,
             vram_capacity: (vram_bytes / 4).max(1),
         }
+    }
+
+    /// Place later KV pages for `layer` on that HIP device.
+    pub fn set_layer_devices(&mut self, devices: &[i32]) {
+        self.layer_hip = devices.to_vec();
     }
 
     /// Enable the NVMe cold tier. `path = None` uses a temp file removed on drop.
@@ -190,7 +198,16 @@ impl KvTierManager {
         let len = Self::page_floats(page_tokens, n_kv_heads, head_dim);
         self.evict_if_needed(len, metrics)?;
         let id = self.next_id;
-        let (tier, offset, kind, device_id) = if let Some(dev) = self.hip_device {
+        let hip_dev = if self.hip_device.is_some() {
+            self.layer_hip
+                .get(layer as usize)
+                .copied()
+                .filter(|d| *d >= 0)
+                .or(self.hip_device)
+        } else {
+            None
+        };
+        let (tier, offset, kind, device_id) = if let Some(dev) = hip_dev {
             let bytes = len * 4;
             match allpaca_hip::device_malloc(bytes, dev) {
                 Ok(ptr) => {
@@ -1051,7 +1068,11 @@ impl KvTierManager {
         pages: &[u64],
         n_kv_heads: usize,
         head_dim: usize,
-    ) -> Option<(allpaca_vulkan::DeviceSlice, allpaca_vulkan::DeviceSlice, usize)> {
+    ) -> Option<(
+        allpaca_vulkan::DeviceSlice,
+        allpaca_vulkan::DeviceSlice,
+        usize,
+    )> {
         if pages.len() != 1 {
             return None;
         }

@@ -10,11 +10,11 @@ use allpaca_cpu::{
     rope_imrope_neox, silu,
 };
 use allpaca_gguf::{GgufCompatReport, GgufFile, HybridLayerInfo, HybridLayerKind};
-use allpaca_hip::{DeviceDecode, DeviceWeights, HipWorkspace};
+use allpaca_hip::{copy_dev_f32, DeviceDecode, DeviceWeights, HipWorkspace};
 use allpaca_onnx::OnnxFile;
 use allpaca_safetensors::{HfConfig, SafetensorsCatalog};
 use allpaca_types::{AllpacaError, FatalError};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::anchors::RecurrentState;
@@ -1263,14 +1263,51 @@ impl ResidentModel {
         cfg: &ModelConfig,
         device: i32,
     ) -> Result<Self, AllpacaError> {
+        Self::upload_gguf_filtered(file, cfg, device, &[])
+    }
+
+    /// `skip_remote[local]` leaves that layer's weights on the RPC worker.
+    pub fn upload_gguf_filtered(
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        device: i32,
+        skip_remote: &[bool],
+    ) -> Result<Self, AllpacaError> {
         let report = file.compat_report();
         let mut parts: Vec<UploadPart<'_>> = Vec::new();
         let mut off = 0usize;
         let embed = append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut expert_offs = Vec::with_capacity(cfg.n_layers);
-        for i in 0..cfg.n_layers {
-            let i = cfg.gguf_blk(i);
+        for local in 0..cfg.n_layers {
+            let i = cfg.gguf_blk(local);
+            if skip_remote.get(local).copied().unwrap_or(false) {
+                expert_offs.push(Vec::new());
+                layers.push(LayerOff {
+                    attn_norm: WeightRef::f32(0, 0),
+                    wq: WeightRef::f32(0, 0),
+                    wk: WeightRef::f32(0, 0),
+                    wv: WeightRef::f32(0, 0),
+                    wo: WeightRef::f32(0, 0),
+                    ffn_norm: WeightRef::f32(0, 0),
+                    w_gate: WeightRef::f32(0, 0),
+                    w_up: WeightRef::f32(0, 0),
+                    w_down: WeightRef::f32(0, 0),
+                    w_router: WeightRef::f32(0, 0),
+                    w_qkv: WeightRef::f32(0, 0),
+                    w_z: WeightRef::f32(0, 0),
+                    w_alpha: WeightRef::f32(0, 0),
+                    w_beta: WeightRef::f32(0, 0),
+                    w_ssm_in: WeightRef::f32(0, 0),
+                    w_ssm_out: WeightRef::f32(0, 0),
+                    q_norm: WeightRef::f32(0, 0),
+                    k_norm: WeightRef::f32(0, 0),
+                    attn_out_gate: WeightRef::f32(0, 0),
+                    w_shared_up: WeightRef::f32(0, 0),
+                    w_shared_down: WeightRef::f32(0, 0),
+                });
+                continue;
+            }
             let reported = report
                 .layers
                 .get(i)
@@ -1683,6 +1720,10 @@ impl ResidentModel {
 
     pub fn packed_h2d_bytes(&self) -> u64 {
         self.packed_h2d
+    }
+
+    pub fn touch_resident(&self) -> Result<(), AllpacaError> {
+        self.weights.touch()
     }
 
     pub fn has_mtp_nextn(&self) -> bool {
@@ -3412,18 +3453,18 @@ pub struct TinyModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AttnLayout {
-    q_out: usize,
-    kv_dim: usize,
-    wo_k: usize,
-    gated: bool,
-    attn_dim: usize,
-    head_dim: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
+pub(crate) struct AttnLayout {
+    pub(crate) q_out: usize,
+    pub(crate) kv_dim: usize,
+    pub(crate) wo_k: usize,
+    pub(crate) gated: bool,
+    pub(crate) attn_dim: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) n_heads: usize,
+    pub(crate) n_kv_heads: usize,
 }
 
-fn attn_layout(cfg: &ModelConfig, wq_n: usize, wk_n: usize, wo_n: usize) -> AttnLayout {
+pub(crate) fn attn_layout(cfg: &ModelConfig, wq_n: usize, wk_n: usize, wo_n: usize) -> AttnLayout {
     let dim = cfg.dim.max(1);
     let q_out = if wq_n > 0 && wq_n % dim == 0 {
         wq_n / dim
@@ -3469,11 +3510,8 @@ fn attn_layout(cfg: &ModelConfig, wq_n: usize, wk_n: usize, wo_n: usize) -> Attn
 }
 
 impl TinyModel {
-    /// HIP `forward_tokens_device` is one GEMM with M=N on attention layers.
-    /// MoE groups tokens that share an expert (`M` = group size); shared expert
-    /// is `M = n_tok`. Mamba-2 / GDN blocks still walk token rows. One
-    /// `gpu_forward` per chunk. Partial NeoX RoPE uses the same Q/K `q_out` /
-    /// `n_heads` layout as decode. Gated-Q and IMRoPE stay per-token.
+    /// CUDA MN prefill still rejects IMRoPE / gated-Q. HIP `forward_tokens_device`
+    /// handles those per row after a batched Q/K/V GEMM.
     pub fn supports_device_batched_prefill(&self) -> bool {
         if self.config.uses_imrope() {
             return false;
@@ -5884,14 +5922,11 @@ impl TinyModel {
         }
         // Prefer on-device decode whenever resident weights exist — including hybrid
         // models that carry recurrent SSM/DeltaNet state (host stub inside device path).
-        // RPC layer-split keeps activations on the host and bounces at device boundaries.
-        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) && !self.host_weights_ready() {
-            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "RPC layer-split requires host F32 weights in v1".into(),
-            )));
-        }
+        // RPC layer-split bounces activations only when the owner changes. A contiguous
+        // remote span stays on the worker for one RunSpan RPC. Remote layers are skipped
+        // inside the device loop.
         if let (Some(hip), Some(resident)) = (hip, resident) {
-            if !self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+            {
                 match self.forward_token_device(
                     token,
                     pos,
@@ -5943,7 +5978,9 @@ impl TinyModel {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             if let Some(rpc) = &self.rpc {
                 if rpc.is_remote(layer_idx) {
-                    rpc.run_layer(layer_idx, pos, &mut x)?;
+                    if rpc.is_span_start(layer_idx) {
+                        rpc.run_layer(layer_idx, pos, &mut x)?;
+                    }
                     continue;
                 }
             }
@@ -6375,7 +6412,7 @@ impl TinyModel {
                 true,
             );
         }
-        if self.rpc.as_ref().is_some_and(|r| r.plan_has_remote()) {
+        if self.rpc.as_ref().is_some_and(|r| r.placed_remote() || r.splits_local()) {
             for (i, tok) in tokens.iter().enumerate() {
                 let last = i + 1 == tokens.len();
                 let mut side = DeviceDecodeSide {
@@ -6446,33 +6483,33 @@ impl TinyModel {
         if self.supports_device_batched_prefill() {
             if let (Some(hip), Some(resident)) = (hip, resident) {
                 match self.forward_tokens_device(
-                    tokens,
-                    start_pos,
-                    page_ids,
-                    kv,
-                    metrics,
-                    logits,
-                    hip,
-                    resident,
-                    write_logits,
-                    row_logits.as_deref_mut(),
-                    recurrent.as_deref_mut(),
-                    out_row_hiddens.as_deref_mut(),
-                    request_id,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        if !self.host_weights_ready() {
-                            return Err(e);
-                        }
-                        tracing::warn!(
-                            start_pos,
-                            n = tokens.len(),
-                            error = %e,
-                            "HIP batched prefill failed; per-token host fallback"
-                        );
+                tokens,
+                start_pos,
+                page_ids,
+                kv,
+                metrics,
+                logits,
+                hip,
+                resident,
+                write_logits,
+                row_logits.as_deref_mut(),
+                recurrent.as_deref_mut(),
+                out_row_hiddens.as_deref_mut(),
+                request_id,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !self.host_weights_ready() {
+                        return Err(e);
                     }
+                    tracing::warn!(
+                        start_pos,
+                        n = tokens.len(),
+                        error = %e,
+                        "HIP batched prefill failed; per-token host fallback"
+                    );
                 }
+            }
             }
         }
         let vocab = self.config.vocab_size;
@@ -6674,7 +6711,7 @@ impl TinyModel {
                 dim as i32,
                 dims.d_inner as i32,
             )?;
-            if layer_idx + 1 < resident.layers.len() {
+            if self.fuse_next_attn_norm(layer_idx, hip.device) {
                 hip.residual_rmsnorm(
                     buf.x,
                     buf.proj,
@@ -6764,6 +6801,14 @@ impl TinyModel {
                 )
             })();
             if let Err(e) = device_gdn {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        layer_idx,
+                        error = %e,
+                        "GDN device step fell back to host"
+                    );
+                }
                 let mut qkv = vec![0.0f32; dims.qkv_dim];
                 let mut z = vec![0.0f32; dims.value_dim];
                 let mut alpha = vec![0.0f32; dims.n_v_heads];
@@ -6875,7 +6920,7 @@ impl TinyModel {
                 )?;
                 drop(ffn);
             }
-            if layer_idx + 1 < resident.layers.len() {
+            if self.fuse_next_attn_norm(layer_idx, hip.device) {
                 hip.residual_rmsnorm(
                     buf.x,
                     buf.proj,
@@ -7036,8 +7081,328 @@ impl TinyModel {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn device_gdn_rows(
+        &self,
+        layer_idx: usize,
+        host_layer: &LayerWeights,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        buf: DeviceDecode,
+        n_tok: usize,
+        metrics: &Metrics,
+        request_id: u64,
+        mut recurrent: Option<&mut RecurrentState>,
+    ) -> Result<bool, AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let layer = &resident.layers[layer_idx];
+        let Some(gdn) = host_layer.gdn.as_ref() else {
+            return Ok(false);
+        };
+        if layer.w_qkv.n == 0 || n_tok == 0 {
+            return Ok(false);
+        }
+        let dims = &gdn.dims;
+        let m = n_tok as i32;
+        resident.gemm_nt(
+            hip,
+            buf.normed,
+            layer.w_qkv,
+            buf.q,
+            m,
+            dims.qkv_dim as i32,
+            dim as i32,
+        )?;
+        resident.gemm_nt(
+            hip,
+            buf.normed,
+            layer.w_z,
+            buf.attn,
+            m,
+            dims.value_dim as i32,
+            dim as i32,
+        )?;
+        resident.gemm_nt(
+            hip,
+            buf.normed,
+            layer.w_alpha,
+            buf.gate,
+            m,
+            dims.n_v_heads as i32,
+            dim as i32,
+        )?;
+        resident.gemm_nt(
+            hip,
+            buf.normed,
+            layer.w_beta,
+            buf.up,
+            m,
+            dims.n_v_heads as i32,
+            dim as i32,
+        )?;
+        let state = recurrent.as_deref_mut().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(
+                "Gated DeltaNet layer requires recurrent state".into(),
+            ))
+        })?;
+        state.ensure_gdn(layer_idx, dims);
+        let (conv_w, dt, a, norm) = hip.ensure_gdn_weights(
+            layer_idx,
+            &gdn.conv1d,
+            &gdn.dt_bias,
+            &gdn.a,
+            &gdn.norm,
+        )?;
+        for t in 0..n_tok {
+            let q = buf.q_row(t, dims.qkv_dim);
+            let z = buf.attn_row(t, dims.value_dim);
+            let alpha = buf.gate_row(t, dims.n_v_heads);
+            let beta = buf.up_row(t, dims.n_v_heads);
+            if let Err(e) = hip.gdn_decode_step_resident(
+                request_id,
+                layer_idx,
+                &mut state.gdn_state[layer_idx],
+                &mut state.gdn_conv[layer_idx],
+                q,
+                z,
+                alpha,
+                beta,
+                conv_w,
+                dt,
+                a,
+                norm,
+                z,
+                dims.n_v_heads as i32,
+                dims.n_k_heads as i32,
+                dims.head_v as i32,
+                dims.head_k as i32,
+                dims.conv_kernel as i32,
+                cfg.eps,
+            ) {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(layer_idx, error = %e, "GDN batched step fell back to host");
+                }
+                let mut qkv = vec![0.0f32; dims.qkv_dim];
+                let mut z_h = vec![0.0f32; dims.value_dim];
+                let mut alpha_h = vec![0.0f32; dims.n_v_heads];
+                let mut beta_h = vec![0.0f32; dims.n_v_heads];
+                hip.copy_d2h_f32(q, &mut qkv)?;
+                hip.copy_d2h_f32(z, &mut z_h)?;
+                hip.copy_d2h_f32(alpha, &mut alpha_h)?;
+                hip.copy_d2h_f32(beta, &mut beta_h)?;
+                let mut conv_out = vec![0.0f32; dims.qkv_dim];
+                hip.gdn_conv1d_step_host(
+                    &qkv,
+                    &gdn.conv1d,
+                    &mut state.gdn_conv[layer_idx],
+                    &mut conv_out,
+                    dims.conv_kernel as i32,
+                )?;
+                let q_raw = &conv_out[..dims.key_dim];
+                let k_raw = &conv_out[dims.key_dim..dims.key_dim * 2];
+                let v_raw = &conv_out[dims.key_dim * 2..];
+                let mut q_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                let mut k_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                hip.expand_k_heads_host(
+                    q_raw,
+                    &mut q_exp,
+                    dims.n_k_heads as i32,
+                    dims.n_v_heads as i32,
+                    dims.head_k as i32,
+                )?;
+                hip.expand_k_heads_host(
+                    k_raw,
+                    &mut k_exp,
+                    dims.n_k_heads as i32,
+                    dims.n_v_heads as i32,
+                    dims.head_k as i32,
+                )?;
+                let mut decay = vec![0.0f32; dims.n_v_heads];
+                hip.gdn_decay_beta_host(&alpha_h, &gdn.dt_bias, &gdn.a, &mut decay, &mut beta_h)?;
+                let mut y = vec![0.0f32; dims.value_dim];
+                hip.gated_delta_step_resident(
+                    request_id,
+                    layer_idx,
+                    &mut state.gdn_state[layer_idx],
+                    &mut q_exp,
+                    &mut k_exp,
+                    v_raw,
+                    &decay,
+                    &beta_h,
+                    &mut y,
+                    dims.n_v_heads as i32,
+                    dims.head_v as i32,
+                    dims.head_k as i32,
+                    cfg.eps,
+                )?;
+                let mut gated = vec![0.0f32; dims.value_dim];
+                rmsnorm_silu_gate(&y, &z_h, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
+                hip.copy_h2d_f32(z, &gated)?;
+            }
+        }
+        resident.gemm_nt(
+            hip,
+            buf.attn,
+            layer.w_ssm_out,
+            buf.proj,
+            m,
+            dim as i32,
+            dims.value_dim as i32,
+        )?;
+        if layer.w_gate.n > 0 {
+            let ffn = self.device_ffn(resident, layer_idx, Some(metrics))?;
+            let ffn_norm = ffn.ffn_norm();
+            let w_gate = ffn.w_gate();
+            let w_up = ffn.w_up();
+            let w_down = ffn.w_down();
+            hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+            rmsnorm_device_rows(
+                hip,
+                buf.x,
+                resident.f32_or_dequant(hip, ffn_norm)?,
+                buf.normed,
+                n_tok,
+                dim,
+                cfg.eps,
+            )?;
+            resident.gemm_nt(
+                hip,
+                buf.normed,
+                w_gate,
+                buf.gate,
+                m,
+                cfg.ff_dim as i32,
+                dim as i32,
+            )?;
+            resident.gemm_nt(
+                hip,
+                buf.normed,
+                w_up,
+                buf.up,
+                m,
+                cfg.ff_dim as i32,
+                dim as i32,
+            )?;
+            hip.silu_mul_device(buf.gate, buf.up, (n_tok * cfg.ff_dim) as i32)?;
+            resident.gemm_nt(
+                hip,
+                buf.gate,
+                w_down,
+                buf.proj,
+                m,
+                dim as i32,
+                cfg.ff_dim as i32,
+            )?;
+            drop(ffn);
+        }
+        hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+        if self.fuse_next_attn_norm(layer_idx, hip.device) {
+            rmsnorm_device_rows(
+                hip,
+                buf.x,
+                resident.f32_or_dequant(hip, resident.layers[layer_idx + 1].attn_norm)?,
+                buf.normed,
+                n_tok,
+                dim,
+                cfg.eps,
+            )?;
+        }
+        Ok(true)
+    }
+
     /// Sequential target decode with device-resident hidden state and KV.
     #[allow(clippy::too_many_arguments)]
+    fn fuse_next_attn_norm(&self, layer_idx: usize, device: i32) -> bool {
+        let next = layer_idx + 1;
+        if next >= self.layers.len() {
+            return false;
+        }
+        match self.rpc.as_ref() {
+            Some(rpc) => !rpc.is_remote(next) && rpc.local_device(next) == device,
+            None => true,
+        }
+    }
+
+    fn layer_has_device_weights(layer: &LayerOff) -> bool {
+        layer.attn_norm.n > 0 || layer.wq.n > 0 || layer.w_qkv.n > 0 || layer.w_ssm_in.n > 0
+    }
+
+    /// Copy `buf.x` onto `want` and retarget the decode workspace.
+    ///
+    /// Engine later waits for logits on the target HIP workspace (`primary`).
+    /// Layers may run on a peer GPU; lm_head must return here first.
+    fn switch_local_gpu<'a>(
+        want: i32,
+        hip: &mut &'a HipWorkspace,
+        resident: &mut &'a ResidentModel,
+        buf: &mut DeviceDecode,
+        xfer: &mut [f32],
+        primary_hip: &'a HipWorkspace,
+        primary_resident: &'a ResidentModel,
+        peer: &'a Option<(i32, Arc<HipWorkspace>, Arc<ResidentModel>)>,
+        cfg: &ModelConfig,
+        vocab: usize,
+        max_kv: usize,
+        primary_q: usize,
+        primary_kv: usize,
+        n_tok: usize,
+        logits_rows: usize,
+    ) -> Result<bool, AllpacaError> {
+        if want < 0 || want == hip.device {
+            return Ok(false);
+        }
+        let src_x = buf.x;
+        let src_dev = hip.device;
+        if want == primary_hip.device {
+            *hip = primary_hip;
+            *resident = primary_resident;
+        } else {
+            let Some((dev, ph, pr)) = peer else {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "layer wants HIP {want} but no peer workspace was uploaded"
+                ))));
+            };
+            if *dev != want {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "layer wants HIP {want} but peer workspace is {dev}"
+                ))));
+            }
+            *hip = ph.as_ref();
+            *resident = pr.as_ref();
+        }
+        hip.bind()?;
+        let (qw, kw) = if hip.device == primary_hip.device {
+            (primary_q, primary_kv)
+        } else {
+            Self::decode_workspaces(cfg, resident)
+        };
+        *buf = if n_tok > 1 {
+            hip.ensure_decode_batch(
+                cfg.dim,
+                kw,
+                cfg.moe_workspace(),
+                vocab,
+                max_kv,
+                n_tok,
+                logits_rows.max(1),
+                qw,
+            )?
+        } else {
+            hip.ensure_decode(qw, kw, cfg.moe_workspace(), vocab, max_kv)?
+        };
+        copy_dev_f32(
+            buf.x,
+            hip.device,
+            src_x,
+            src_dev,
+            n_tok.max(1) * cfg.dim,
+            xfer,
+        )?;
+        Ok(true)
+    }
+
     fn forward_token_device(
         &self,
         token: u32,
@@ -7096,6 +7461,14 @@ impl TinyModel {
             }
         }
         let result = (|| {
+            let primary_hip = hip;
+            let primary_resident = resident;
+            let peer = self.rpc.as_ref().and_then(|r| r.local_peer());
+            let mut hip = primary_hip;
+            let mut resident = primary_resident;
+            let mut buf = buf;
+            let mut xfer = vec![0.0f32; dim];
+            let mut normed_ready = false;
             if let Some(x0) = soft_x {
                 hip.copy_h2d_f32(buf.x, x0)?;
             } else {
@@ -7117,8 +7490,46 @@ impl TinyModel {
                         }
                     }
                 }
+                if let Some(rpc) = &self.rpc {
+                    if rpc.is_remote(layer_idx) {
+                        if rpc.is_span_start(layer_idx) {
+                            let mut host_x = vec![0.0f32; dim];
+                            hip.copy_d2h_f32(buf.x, &mut host_x)?;
+                            rpc.run_layer(layer_idx, pos, &mut host_x)?;
+                            hip.copy_h2d_f32(buf.x, &host_x)?;
+                        }
+                        normed_ready = false;
+                        continue;
+                    }
+                    let want = rpc.local_device(layer_idx);
+                    if Self::switch_local_gpu(
+                        want,
+                        &mut hip,
+                        &mut resident,
+                        &mut buf,
+                        &mut xfer,
+                        primary_hip,
+                        primary_resident,
+                        &peer,
+                        cfg,
+                        vocab,
+                        max_kv,
+                        q_workspace,
+                        kv_workspace,
+                        1,
+                        1,
+                    )? {
+                        normed_ready = false;
+                    }
+                }
                 let layer = &resident.layers[layer_idx];
-                if layer_idx == 0 {
+                if !Self::layer_has_device_weights(layer) {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "layer {layer_idx} has no weights on HIP {}",
+                        hip.device
+                    ))));
+                }
+                if !normed_ready {
                     hip.rmsnorm_device(
                         buf.x,
                         resident.f32_or_dequant(hip, layer.attn_norm)?,
@@ -7141,6 +7552,7 @@ impl TinyModel {
                     side.as_deref_mut(),
                     recurrent.as_deref_mut(),
                 )? {
+                    normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
                     continue;
                 }
 
@@ -7470,7 +7882,7 @@ impl TinyModel {
                     drop(ffn);
                 }
                 // else: attention-only hybrid block — `buf.proj` still holds attn out.
-                if layer_idx + 1 < resident.layers.len() {
+                if self.fuse_next_attn_norm(layer_idx, hip.device) {
                     hip.residual_rmsnorm(
                         buf.x,
                         buf.proj,
@@ -7482,12 +7894,30 @@ impl TinyModel {
                 } else {
                     hip.residual_add(buf.x, buf.proj, dim as i32)?;
                 }
+                normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
                 metrics
                     .residual_gpu_ops
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 record_elementwise(Some(metrics));
             }
 
+            Self::switch_local_gpu(
+                primary_hip.device,
+                &mut hip,
+                &mut resident,
+                &mut buf,
+                &mut xfer,
+                primary_hip,
+                primary_resident,
+                &peer,
+                cfg,
+                vocab,
+                max_kv,
+                q_workspace,
+                kv_workspace,
+                1,
+                1,
+            )?;
             hip.rmsnorm_device(
                 buf.x,
                 resident.f32_or_dequant(hip, resident.norm)?,
@@ -7583,6 +8013,7 @@ impl TinyModel {
             .unwrap_or(seq_end)
             .max(seq_end);
         hip.bind()?;
+        let logits_rows = if row_logits.is_some() { n_tok } else { 1 };
         let buf = hip.ensure_decode_batch(
             dim,
             kv_dim,
@@ -7590,18 +8021,67 @@ impl TinyModel {
             vocab,
             max_kv,
             n_tok,
-            if row_logits.is_some() { n_tok } else { 1 },
+            logits_rows,
             q_workspace,
         )?;
         hip.begin_decode_profile();
         let result = (|| {
+            let primary_hip = hip;
+            let primary_resident = resident;
+            let peer = self.rpc.as_ref().and_then(|r| r.local_peer());
+            let mut hip = primary_hip;
+            let mut resident = primary_resident;
+            let mut buf = buf;
+            let mut xfer = vec![0.0f32; n_tok * dim];
+            let mut normed_ready = false;
             resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
             record_elementwise(Some(metrics));
 
             let m = n_tok as i32;
             for (layer_idx, host_layer) in self.layers.iter().enumerate() {
+                if let Some(rpc) = &self.rpc {
+                    if rpc.is_remote(layer_idx) {
+                        if rpc.is_span_start(layer_idx) {
+                            let mut host_x = vec![0.0f32; n_tok * dim];
+                            hip.copy_d2h_f32(buf.x, &mut host_x)?;
+                            for t in 0..n_tok {
+                                let row = &mut host_x[t * dim..(t + 1) * dim];
+                                rpc.run_layer(layer_idx, start_pos + t, row)?;
+                            }
+                            hip.copy_h2d_f32(buf.x, &host_x)?;
+                        }
+                        normed_ready = false;
+                        continue;
+                    }
+                    let want = rpc.local_device(layer_idx);
+                    if Self::switch_local_gpu(
+                        want,
+                        &mut hip,
+                        &mut resident,
+                        &mut buf,
+                        &mut xfer,
+                        primary_hip,
+                        primary_resident,
+                        &peer,
+                        cfg,
+                        vocab,
+                        max_kv,
+                        q_workspace,
+                        kv_workspace,
+                        n_tok,
+                        logits_rows,
+                    )? {
+                        normed_ready = false;
+                    }
+                }
                 let layer = &resident.layers[layer_idx];
-                if layer_idx == 0 {
+                if !Self::layer_has_device_weights(layer) {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                        "layer {layer_idx} has no weights on HIP {}",
+                        hip.device
+                    ))));
+                }
+                if !normed_ready {
                     rmsnorm_device_rows(
                         hip,
                         buf.x,
@@ -7626,8 +8106,9 @@ impl TinyModel {
                         self.device_moe_rows(
                             layer_idx, hip, resident, buf, n_tok, metrics, request_id,
                         )?;
-                        if layer_idx + 1 < resident.layers.len() {
-                            hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+                        hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+                        normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
+                        if normed_ready {
                             rmsnorm_device_rows(
                                 hip,
                                 buf.x,
@@ -7640,9 +8121,21 @@ impl TinyModel {
                                 dim,
                                 cfg.eps,
                             )?;
-                        } else {
-                            hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
                         }
+                        continue;
+                    }
+                    if self.device_gdn_rows(
+                        layer_idx,
+                        host_layer,
+                        hip,
+                        resident,
+                        buf,
+                        n_tok,
+                        metrics,
+                        request_id,
+                        recurrent.as_deref_mut(),
+                    )? {
+                        normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
                         continue;
                     }
                     for t in 0..n_tok {
@@ -7666,6 +8159,7 @@ impl TinyModel {
                             ))));
                         }
                     }
+                    normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
                     continue;
                 }
                 let al = Self::layer_attn_layout(cfg, layer);
@@ -7729,13 +8223,44 @@ impl TinyModel {
                         dim as i32,
                     )?;
                 }
+                if al.gated {
+                    for t in 0..n_tok {
+                        hip.deinterleave_q_gate_device(
+                            buf.q_row(t, al.q_out),
+                            buf.attn_row(t, al.attn_dim),
+                            buf.gate_row(t, al.attn_dim),
+                            al.n_heads as i32,
+                            al.head_dim as i32,
+                        )?;
+                        if layer.q_norm.n == al.head_dim {
+                            hip.rmsnorm_heads_device(
+                                buf.attn_row(t, al.attn_dim),
+                                resident.f32_or_dequant(hip, layer.q_norm)?,
+                                al.n_heads as i32,
+                                al.head_dim as i32,
+                                cfg.eps,
+                            )?;
+                        }
+                    }
+                    hip.copy_d2d_f32(buf.q, buf.attn, n_tok * al.attn_dim)?;
+                    if layer.k_norm.n == al.head_dim {
+                        hip.rmsnorm_heads_device(
+                            buf.k,
+                            resident.f32_or_dequant(hip, layer.k_norm)?,
+                            (n_tok * al.n_kv_heads) as i32,
+                            al.head_dim as i32,
+                            cfg.eps,
+                        )?;
+                    }
+                }
+                let q_stride = if al.gated { al.attn_dim } else { al.q_out };
                 let theta = cfg.rope_theta_for_layer(layer_idx);
                 let n_rot = cfg.rope_dims_for_layer(layer_idx);
                 if cfg.uses_imrope() || n_rot > 0 {
                     let n_rot = if n_rot > 0 { n_rot } else { al.head_dim };
                     for t in 0..n_tok {
                         hip.rope_imrope_qk_device(
-                            buf.q_row(t, al.q_out),
+                            buf.q_row(t, q_stride),
                             buf.k_row(t, al.kv_dim),
                             al.n_heads as i32,
                             al.n_kv_heads as i32,
@@ -7815,6 +8340,9 @@ impl TinyModel {
                         true,
                     )?;
                 }
+                if al.gated {
+                    hip.sigmoid_mul_device(buf.attn, buf.gate, (n_tok * al.attn_dim) as i32)?;
+                }
                 self.device_headwise_attn_gate(
                     hip,
                     resident,
@@ -7856,8 +8384,9 @@ impl TinyModel {
                     self.device_moe_rows(
                         layer_idx, hip, resident, buf, n_tok, metrics, request_id,
                     )?;
-                    if layer_idx + 1 < resident.layers.len() {
-                        hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+                    hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
+                    normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
+                    if normed_ready {
                         rmsnorm_device_rows(
                             hip,
                             buf.x,
@@ -7868,8 +8397,6 @@ impl TinyModel {
                             dim,
                             cfg.eps,
                         )?;
-                    } else {
-                        hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
                     }
                     continue;
                 }
@@ -7879,7 +8406,8 @@ impl TinyModel {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 record_elementwise(Some(metrics));
                 if !dense_ffn {
-                    if layer_idx + 1 < resident.layers.len() {
+                    normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
+                    if normed_ready {
                         rmsnorm_device_rows(
                             hip,
                             buf.x,
@@ -7982,7 +8510,8 @@ impl TinyModel {
                     .residual_gpu_ops
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 record_elementwise(Some(metrics));
-                if layer_idx + 1 < resident.layers.len() {
+                normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
+                if normed_ready {
                     rmsnorm_device_rows(
                         hip,
                         buf.x,
@@ -7995,6 +8524,24 @@ impl TinyModel {
                     record_elementwise(Some(metrics));
                 }
             }
+
+            Self::switch_local_gpu(
+                primary_hip.device,
+                &mut hip,
+                &mut resident,
+                &mut buf,
+                &mut xfer,
+                primary_hip,
+                primary_resident,
+                &peer,
+                cfg,
+                vocab,
+                max_kv,
+                q_workspace,
+                kv_workspace,
+                n_tok,
+                logits_rows,
+            )?;
 
             if row_logits.is_some() {
                 rmsnorm_device_rows(
@@ -8750,7 +9297,7 @@ impl TinyModel {
                     None,
                 )?;
                 // device_moe leaves MoE out in buf.proj; fold into residual like target.
-                if layer_idx + 1 < resident.layers.len() {
+                if self.fuse_next_attn_norm(layer_idx, hip.device) {
                     hip.residual_rmsnorm(
                         buf.x,
                         buf.proj,
@@ -8819,7 +9366,7 @@ impl TinyModel {
                     cfg.ff_dim as i32,
                 )?;
                 drop(ffn);
-                if layer_idx + 1 < resident.layers.len() {
+                if self.fuse_next_attn_norm(layer_idx, hip.device) {
                     hip.residual_rmsnorm(
                         buf.x,
                         buf.proj,

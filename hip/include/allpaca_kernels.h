@@ -78,6 +78,9 @@ int allpaca_hip_has_memcpy_batch(void);
 int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
                             size_t bytes, allpaca_stream_t stream);
 
+/* Read-only stride touch so WDDM faults peer-GPU weights in before decode. */
+int allpaca_hip_touch_resident(void *ptr, size_t bytes, int32_t device);
+
 int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, double *p2p_gbps,
                           double *host_gbps);
 
