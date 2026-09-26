@@ -215,6 +215,65 @@ pub enum GgmlType {
     Other = 255,
 }
 
+/// Dequantize a packed slice of `ty` (whole blocks, `n` elements) into `out`.
+///
+/// Row-granular counterpart of [`GgufFile::tensor_f32`]: callers pass one row's
+/// bytes (e.g. a single `token_embd` row) instead of the whole tensor.
+pub fn dequant_packed(
+    ty: GgmlType,
+    bytes: &[u8],
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "dequant {ty:?}: out holds {} of {n}",
+            out.len()
+        ))));
+    }
+    let out = &mut out[..n];
+    match ty {
+        GgmlType::F32 => {
+            for (slot, c) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+            Ok(())
+        }
+        GgmlType::F16 => {
+            for (slot, c) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                *slot = allpaca_cpu::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            }
+            Ok(())
+        }
+        GgmlType::BF16 => {
+            for (slot, c) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                *slot = allpaca_cpu::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            }
+            Ok(())
+        }
+        GgmlType::Q4_0 => allpaca_cpu::dequant_q4_0(bytes, n, out),
+        GgmlType::Q4_1 => allpaca_cpu::dequant_q4_1(bytes, n, out),
+        GgmlType::Q5_0 => allpaca_cpu::dequant_q5_0(bytes, n, out),
+        GgmlType::Q5_1 => allpaca_cpu::dequant_q5_1(bytes, n, out),
+        GgmlType::Q8_0 => allpaca_cpu::dequant_q8_0(bytes, n, out),
+        GgmlType::Q8_1 => allpaca_cpu::dequant_q8_1(bytes, n, out),
+        GgmlType::Q2_K => allpaca_cpu::dequant_q2_k(bytes, n, out),
+        GgmlType::Q3_K => allpaca_cpu::dequant_q3_k(bytes, n, out),
+        GgmlType::Q4_K => allpaca_cpu::dequant_q4_k(bytes, n, out),
+        GgmlType::Q5_K => allpaca_cpu::dequant_q5_k(bytes, n, out),
+        GgmlType::Q6_K => allpaca_cpu::dequant_q6_k(bytes, n, out),
+        GgmlType::IQ4_NL => allpaca_cpu::dequant_iq4_nl(bytes, n, out),
+        GgmlType::IQ4_XS => allpaca_cpu::dequant_iq4_xs(bytes, n, out),
+        GgmlType::TQ1_0 => allpaca_cpu::dequant_tq1_0(bytes, n, out),
+        GgmlType::TQ2_0 => allpaca_cpu::dequant_tq2_0(bytes, n, out),
+        GgmlType::MXFP4 => allpaca_cpu::dequant_mxfp4(bytes, n, out),
+        GgmlType::RocmFp4 => allpaca_cpu::dequant_rocmfp4(bytes, n, out),
+        GgmlType::I32 | GgmlType::Other => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            format!("dequant {ty:?} unsupported"),
+        ))),
+    }
+}
+
 impl GgmlType {
     fn from_u32(v: u32) -> Self {
         match v {

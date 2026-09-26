@@ -39,6 +39,8 @@ pub struct DeviceDecodeSide<'a> {
     pub last_hidden: Option<&'a mut Vec<f32>>,
     /// When false, skip lm_head GEMM / logits D2H (HIP decode cohort packs it).
     pub write_logits: bool,
+    /// M-RoPE layout of a Request with images (rotary position != KV position).
+    pub mrope: Option<&'a MropeLayout>,
 }
 
 impl<'a> DeviceDecodeSide<'a> {
@@ -51,7 +53,111 @@ impl<'a> DeviceDecodeSide<'a> {
             ds_queue: None,
             last_hidden: None,
             write_logits: true,
+            mrope: None,
         }
+    }
+}
+
+/// One image's soft tokens in a Request: `cols * rows` tokens from KV
+/// position `start`, row-major over the merged patch grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl ImageSpan {
+    pub fn len(&self) -> usize {
+        self.cols * self.rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// M-RoPE positions for a Request with images (llama.cpp `MTMD_POS_TYPE_MROPE`).
+/// Image token `i` sits at `(base, base + i / cols, base + i % cols)`, and the
+/// image advances the text position by `max(cols, rows)` rather than its token
+/// count, so later tokens rotate at their KV position minus the saved span.
+/// Attention still indexes KV slots by KV position.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MropeLayout {
+    spans: Vec<ImageSpan>,
+}
+
+impl MropeLayout {
+    /// `spans` in KV order, non-overlapping.
+    pub fn new(mut spans: Vec<ImageSpan>) -> Self {
+        spans.retain(|s| !s.is_empty());
+        spans.sort_by_key(|s| s.start);
+        Self { spans }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn spans(&self) -> &[ImageSpan] {
+        &self.spans
+    }
+
+    /// `(t, h, w)` rotary position for the token at KV position `kv`.
+    pub fn rope_pos(&self, kv: usize) -> [usize; 3] {
+        let mut shift = 0usize;
+        for s in &self.spans {
+            if kv < s.start {
+                break;
+            }
+            let base = s.start - shift;
+            if kv < s.start + s.len() {
+                let i = kv - s.start;
+                return [base, base + i / s.cols, base + i % s.cols];
+            }
+            shift += s.len() - s.cols.max(s.rows);
+        }
+        [kv - shift; 3]
+    }
+}
+
+/// A Request's soft (vision) tokens: which positions take encoder rows
+/// instead of token embeddings, and the M-RoPE layout they imply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VisionSeq {
+    /// Soft token spans in KV order.
+    pub spans: Vec<ImageSpan>,
+    /// `[soft tokens][dim]` encoder rows, spans in order.
+    pub embeds: Vec<f32>,
+    /// Empty when the soft tokens use ordinary sequential positions.
+    pub mrope: MropeLayout,
+}
+
+impl VisionSeq {
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Encoder row replacing the token embedding at KV position `pos`.
+    pub fn soft_row(&self, pos: usize, dim: usize) -> Option<&[f32]> {
+        let mut row = 0usize;
+        for span in &self.spans {
+            if (span.start..span.start + span.len()).contains(&pos) {
+                let r = row + pos - span.start;
+                return self.embeds.get(r * dim..(r + 1) * dim);
+            }
+            row += span.len();
+        }
+        None
+    }
+
+    pub fn mrope(&self) -> Option<&MropeLayout> {
+        (!self.mrope.is_empty()).then_some(&self.mrope)
+    }
+
+    /// Whether any soft token falls in KV positions `start..end`.
+    pub fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.spans.iter().any(|s| s.start < end && start < s.start + s.len())
     }
 }
 
@@ -490,6 +596,7 @@ enum WeightKind {
     F32,
     F16,
     Q8_0,
+    Q3_K,
     Q4_K,
     Q5_K,
     Q6_K,
@@ -714,6 +821,67 @@ fn slot_ffn_refs(base: usize, slot_bytes: usize, slot: usize, host: &LayerFfn) -
     ]
 }
 
+/// Packed `token_embd` held in host RAM for quant types with no HIP gather
+/// kernel (K-quants, IQ4, TQ, ...). A gather dequantizes `dim` floats per token
+/// on the CPU and H2Ds them, instead of parking a vocab×dim F32 table in VRAM
+/// (5 GiB for a 248k×5120 Q6_K embed) on every GPU.
+struct HostEmbed {
+    bytes: Vec<u8>,
+    ty: allpaca_gguf::GgmlType,
+    dim: usize,
+    rows: usize,
+    row_bytes: usize,
+}
+
+impl HostEmbed {
+    /// `token_embd` types the HIP upload would otherwise expand to F32.
+    fn wanted(ty: allpaca_gguf::GgmlType) -> bool {
+        use allpaca_gguf::GgmlType as T;
+        !matches!(ty, T::F32 | T::F16 | T::Q8_0 | T::RocmFp4 | T::I32 | T::Other)
+    }
+
+    fn from_gguf(file: &GgufFile, name: &str) -> Result<Self, AllpacaError> {
+        let info = file.tensor(name).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
+        })?;
+        let dim = *info.dims.first().unwrap_or(&0) as usize;
+        let n = info.n_elements() as usize;
+        let bytes = file.tensor_bytes(name)?;
+        if dim == 0 || n % dim != 0 || bytes.len() % (n / dim).max(1) != 0 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "host embed {name} dims {:?} do not tile {} bytes",
+                info.dims,
+                bytes.len()
+            ))));
+        }
+        let rows = n / dim;
+        Ok(Self {
+            row_bytes: bytes.len() / rows,
+            bytes: bytes.to_vec(),
+            ty: info.ggml_type,
+            dim,
+            rows,
+        })
+    }
+
+    fn gather(&self, tokens: &[u32], out: &mut Vec<f32>) -> Result<(), AllpacaError> {
+        out.clear();
+        out.resize(tokens.len() * self.dim, 0.0);
+        for (t, row) in tokens.iter().zip(out.chunks_exact_mut(self.dim)) {
+            let r = *t as usize;
+            if r >= self.rows {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "token {r} outside embed rows {}",
+                    self.rows
+                ))));
+            }
+            let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
+            allpaca_gguf::dequant_packed(self.ty, src, self.dim, row)?;
+        }
+        Ok(())
+    }
+}
+
 /// Host-layout map onto a once-uploaded [`DeviceWeights`] blob.
 pub struct ResidentModel {
     weights: DeviceWeights,
@@ -730,6 +898,8 @@ pub struct ResidentModel {
     /// stream is drained so the DMA source cannot be freed underneath it.
     h2d_pending: Mutex<Vec<Vec<u8>>>,
     embed: WeightRef,
+    /// Set when `token_embd` stays packed on the host (see [`HostEmbed`]).
+    host_embed: Option<HostEmbed>,
     layers: Vec<LayerOff>,
     norm: WeightRef,
     lm_head: WeightRef,
@@ -902,6 +1072,7 @@ impl ResidentModel {
             h2d: allpaca_hip::H2dStream::new().ok(),
             h2d_pending: Mutex::new(Vec::new()),
             embed,
+            host_embed: None,
             layers,
             norm,
             lm_head,
@@ -1273,10 +1444,46 @@ impl ResidentModel {
         device: i32,
         skip_remote: &[bool],
     ) -> Result<Self, AllpacaError> {
+        Self::upload_gguf_split(file, cfg, device, skip_remote, true)
+    }
+
+    /// Layer weights only, for a second local GPU in the layer split.
+    ///
+    /// Embed, final norm, lm_head, and MTP NextN stay on the target GPU:
+    /// decode switches back there before `output_norm`, so a copy here is
+    /// VRAM the peer's layers cannot use.
+    pub fn upload_gguf_peer_layers(
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        device: i32,
+        skip: &[bool],
+    ) -> Result<Self, AllpacaError> {
+        Self::upload_gguf_split(file, cfg, device, skip, false)
+    }
+
+    fn upload_gguf_split(
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        device: i32,
+        skip_remote: &[bool],
+        globals: bool,
+    ) -> Result<Self, AllpacaError> {
         let report = file.compat_report();
         let mut parts: Vec<UploadPart<'_>> = Vec::new();
         let mut off = 0usize;
-        let embed = append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?;
+        let none = WeightRef::f32(0, 0);
+        let embed_ty = file.tensor("token_embd.weight").map(|t| t.ggml_type);
+        let host_embed = match embed_ty {
+            Some(ty) if globals && HostEmbed::wanted(ty) => {
+                Some(HostEmbed::from_gguf(file, "token_embd.weight")?)
+            }
+            _ => None,
+        };
+        let embed = if !globals || host_embed.is_some() {
+            none
+        } else {
+            append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?
+        };
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut expert_offs = Vec::with_capacity(cfg.n_layers);
         for local in 0..cfg.n_layers {
@@ -1650,7 +1857,9 @@ impl ResidentModel {
                 w_shared_down,
             });
         }
-        let norm = if file.tensor("output_norm.weight").is_some() {
+        let norm = if !globals {
+            none
+        } else if file.tensor("output_norm.weight").is_some() {
             append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?
         } else {
             let b = cfg.gguf_blk(0);
@@ -1661,15 +1870,22 @@ impl ResidentModel {
                 &mut off,
             )?
         };
-        let lm_head = if file.tensor("output.weight").is_some() {
+        let lm_head = if !globals {
+            none
+        } else if file.tensor("output.weight").is_some() {
             append_gguf_tensor(file, "output.weight", &mut parts, &mut off)?
+        } else if host_embed.is_some() {
+            // Tied weights, host gather: lm_head still needs the table on
+            // device, packed in GEMV layout rather than an F32 expand.
+            append_gguf_tensor_as(file, "token_embd.weight", &mut parts, &mut off, false)?
         } else {
             embed
         };
         let mtp_base = cfg.gguf_blk(0);
-        let mtp_nextn = if file
-            .tensor(&format!("blk.{mtp_base}.nextn.eh_proj.weight"))
-            .is_some()
+        let mtp_nextn = if globals
+            && file
+                .tensor(&format!("blk.{mtp_base}.nextn.eh_proj.weight"))
+                .is_some()
         {
             Some(MtpNextnOff {
                 eh_proj: append_gguf_tensor(
@@ -1707,6 +1923,7 @@ impl ResidentModel {
             h2d_pending: Mutex::new(Vec::new()),
             weights,
             embed,
+            host_embed,
             layers,
             norm,
             lm_head,
@@ -1914,13 +2131,14 @@ impl ResidentModel {
                 Ok(out as *const f32)
             }
             WeightKind::F16
+            | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0
             | WeightKind::RocmFp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "F16/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
+                "F16/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
         }
     }
@@ -1941,6 +2159,9 @@ impl ResidentModel {
                 hip.gemm_nt_f16_dev(a, self.weights.byte_ptr_at(w.off) as *const u16, c, m, n, k)
             }
             WeightKind::Q8_0 => hip.gemm_nt_q8_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k),
+            WeightKind::Q3_K => {
+                hip.gemm_nt_q3_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
             WeightKind::Q4_K => {
                 hip.gemm_nt_q4_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
@@ -1969,6 +2190,11 @@ impl ResidentModel {
         out: *mut f32,
         dim: i32,
     ) -> Result<(), AllpacaError> {
+        if let Some(host) = &self.host_embed {
+            let mut row = Vec::new();
+            host.gather(&[token], &mut row)?;
+            return hip.copy_h2d_f32(out, &row);
+        }
         match self.embed.kind {
             WeightKind::F32 => hip.embed_gather(self.embed(), token, out, dim),
             WeightKind::F16 => hip.embed_gather_f16(
@@ -1983,12 +2209,13 @@ impl ResidentModel {
             WeightKind::RocmFp4 => {
                 hip.embed_gather_rocmfp4(self.weights.byte_ptr_at(self.embed.off), token, out, dim)
             }
-            WeightKind::Q4_K
+            WeightKind::Q3_K
+            | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+                "Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
             ))),
         }
     }
@@ -2000,6 +2227,11 @@ impl ResidentModel {
         out: *mut f32,
         dim: i32,
     ) -> Result<(), AllpacaError> {
+        if let Some(host) = &self.host_embed {
+            let mut rows = Vec::new();
+            host.gather(tokens, &mut rows)?;
+            return hip.copy_h2d_f32(out, &rows);
+        }
         match self.embed.kind {
             WeightKind::F32 => hip.embed_gather_rows(self.embed(), tokens, out, dim),
             WeightKind::F16 => hip.embed_gather_f16_rows(
@@ -2020,12 +2252,13 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K
+            WeightKind::Q3_K
+            | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+                "Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
             ))),
         }
     }
@@ -2410,7 +2643,14 @@ fn split_fused_qkv_host(
     Ok((q, k, v))
 }
 
-fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, AllpacaError> {
+/// `materialize_projections` expands qkv/z/alpha/beta/out to host F32 (CPU
+/// and host-weight CUDA paths). Device-resident loads upload them from the
+/// file instead, so they stay empty (`gdn_needs_device_projections`).
+fn load_gguf_gdn_host(
+    file: &GgufFile,
+    layer: usize,
+    materialize_projections: bool,
+) -> Result<GdnHostWeights, AllpacaError> {
     let arch = file.architecture().unwrap_or("qwen35");
     let dims = GdnDims::from_meta(
         file.meta_u32(&format!("{arch}.ssm.state_size"))
@@ -2463,6 +2703,20 @@ fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, A
             norm.len(),
             conv1d.len()
         ))));
+    }
+    if !materialize_projections {
+        return Ok(GdnHostWeights {
+            dims,
+            a,
+            dt_bias,
+            norm,
+            conv1d,
+            w_qkv: Vec::new(),
+            w_z: Vec::new(),
+            w_alpha: Vec::new(),
+            w_beta: Vec::new(),
+            w_out: Vec::new(),
+        });
     }
     // Host projections for CUDA / CPU host-step GDN (HIP also uploads these on-device).
     let w_qkv = file.tensor_f32(&format!("blk.{layer}.attn_qkv.weight"))?;
@@ -2940,6 +3194,74 @@ fn append_gguf_tensor<'a>(
     parts: &mut Vec<UploadPart<'a>>,
     off: &mut usize,
 ) -> Result<WeightRef, AllpacaError> {
+    append_gguf_tensor_as(file, name, parts, off, name == "token_embd.weight")
+}
+
+/// Low-bit ggml types with no fused HIP GEMV. Large GEMM weights of these
+/// types re-pack to Q8_0 at load: every value lands on (or within half a step
+/// of) the Q8_0 grid, at ~1.1 B/elem instead of a 4 B/elem F32 expand.
+fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
+    use allpaca_gguf::GgmlType as T;
+    matches!(
+        ty,
+        T::IQ4_NL | T::IQ4_XS | T::Q4_0 | T::Q4_1 | T::Q5_0 | T::Q5_1 | T::Q2_K | T::Q3_K
+    )
+}
+
+/// Q3_K GEMM weights with whole 256-value rows run on the native int8 GEMV
+/// (the MTP draft lm_head: 0.55 GB instead of a 1.43 GB Q8_0 re-pack).
+fn q3_k_native(info: &allpaca_gguf::TensorInfo) -> bool {
+    let k = info.dims.first().copied().unwrap_or(0);
+    k > 0 && k % 256 == 0 && info.n_elements() > 65_536
+}
+
+/// VRAM bytes [`append_gguf_tensor_as`] stages for one tensor (not `gather`).
+fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
+    use allpaca_gguf::GgmlType as T;
+    let n = info.n_elements();
+    let q8_staged = n.div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
+    match info.ggml_type {
+        T::F32 => n * 4,
+        _ if n <= 65_536 => n * 4,
+        T::F16 => n * 2,
+        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 => info.nbytes() as u64,
+        T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
+        T::Q8_0 => q8_staged,
+        ty if requant_q8_0_on_load(ty) => q8_staged,
+        _ => n * 4,
+    }
+}
+
+/// Per-layer VRAM footprint of a GGUF upload, plus the target-only globals
+/// (device embed, `output_norm`, lm_head). Used to place layers by bytes.
+pub fn gguf_device_bytes(file: &GgufFile, cfg: &ModelConfig) -> (Vec<u64>, u64) {
+    let prefixes: Vec<String> = (0..cfg.n_layers)
+        .map(|l| format!("blk.{}.", cfg.gguf_blk(l)))
+        .collect();
+    let tied = file.tensor("output.weight").is_none();
+    let mut layers = vec![0u64; cfg.n_layers];
+    let mut globals = 0u64;
+    for t in &file.tensors {
+        if let Some(l) = prefixes.iter().position(|p| t.name.starts_with(p.as_str())) {
+            layers[l] += staged_device_bytes(t);
+        } else if t.name == "output.weight" || t.name == "output_norm.weight" {
+            globals += staged_device_bytes(t);
+        } else if t.name == "token_embd.weight" && (tied || !HostEmbed::wanted(t.ggml_type)) {
+            globals += staged_device_bytes(t);
+        }
+    }
+    (layers, globals)
+}
+
+/// `gather` stages `token_embd` for row gathers (F32 expand for K-quants,
+/// linear Q8_0 blocks) instead of the GEMV layout.
+fn append_gguf_tensor_as<'a>(
+    file: &'a GgufFile,
+    name: &str,
+    parts: &mut Vec<UploadPart<'a>>,
+    off: &mut usize,
+    gather: bool,
+) -> Result<WeightRef, AllpacaError> {
     let info = file.tensor(name).ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
     })?;
@@ -2964,7 +3286,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::Q4_K => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_q4_k(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -2985,7 +3307,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::TQ2_0 => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_tq2_0(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3006,7 +3328,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::TQ1_0 => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_tq1_0(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3049,7 +3371,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::Q5_K => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_q5_k(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3070,7 +3392,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::Q6_K => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_q6_k(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3099,7 +3421,7 @@ fn append_gguf_tensor<'a>(
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
                 (UploadPart::Owned(bytes), WeightKind::F32)
-            } else if name == "token_embd.weight" {
+            } else if gather {
                 let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
                     AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
                 })?;
@@ -3120,6 +3442,25 @@ fn append_gguf_tensor<'a>(
                 })?;
                 (UploadPart::Owned(staged), WeightKind::Q8_0)
             }
+        }
+        allpaca_gguf::GgmlType::Q3_K if !gather && q3_k_native(info) => {
+            (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::Q3_K)
+        }
+        ty if !gather && n > 65_536 && requant_q8_0_on_load(ty) => {
+            let k = *info.dims.first().unwrap_or(&1) as usize;
+            if k == 0 || k % 32 != 0 || n % k != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{ty:?} -> Q8_0 {name} dims {:?} do not tile n={n}",
+                    info.dims
+                ))));
+            }
+            let q8 = allpaca_cpu::quantize_q8_0(&file.tensor_f32(name)?);
+            let staged = allpaca_hip::stage_q8_0_gemv(&q8, n / k, k).map_err(|e| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "Q8_0 GEMV stage {name}: {e}"
+                )))
+            })?;
+            (UploadPart::Owned(staged), WeightKind::Q8_0)
         }
         _ => {
             let f32s = file.tensor_f32(name)?;
@@ -3224,6 +3565,15 @@ fn split_packed_experts(
             }
             (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES)
+        }
+        WeightKind::Q3_K => {
+            if n_per % allpaca_cpu::Q3_K_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} Q3_K expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::Q3_K_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::Q3_K_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q3_K_BLOCK_BYTES)
         }
         WeightKind::Q4_K => {
             if n_per % allpaca_cpu::Q4_K_BLOCK_ELEMS != 0 {
@@ -3512,6 +3862,23 @@ pub(crate) fn attn_layout(cfg: &ModelConfig, wq_n: usize, wk_n: usize, wo_n: usi
 impl TinyModel {
     /// CUDA MN prefill still rejects IMRoPE / gated-Q. HIP `forward_tokens_device`
     /// handles those per row after a batched Q/K/V GEMM.
+    /// HIP M=N forward ([`Self::forward_tokens_device`]). Unlike the CUDA /
+    /// Vulkan M=N paths it runs IMRoPE and gated `[Q|gate]` attention per row,
+    /// so Qwen3.5/3.8 hybrids batch too. A `[Q|gate]` projection is only
+    /// recognised when n_heads * head_dim > dim; below that the per-token and
+    /// M=N paths read an ambiguous Q differently, so it stays per-token.
+    pub fn supports_hip_batched_prefill(&self) -> bool {
+        let dim = self.config.dim.max(1);
+        !self.layers.iter().any(|l| {
+            if l.wq.is_empty() || l.wo.is_empty() {
+                return false;
+            }
+            let q_out = l.wq.len() / dim;
+            let wo_k = l.wo.len() / dim;
+            q_out == wo_k.saturating_mul(2) && wo_k <= dim
+        })
+    }
+
     pub fn supports_device_batched_prefill(&self) -> bool {
         if self.config.uses_imrope() {
             return false;
@@ -4545,6 +4912,7 @@ impl TinyModel {
         let ds_queue = side.as_ref().and_then(|s| s.ds_queue);
         let nvme_side = side.as_ref().map(|s| DeviceDecodeSide {
             request_id: s.request_id,
+            mrope: s.mrope,
             moe_norm: None,
             layer_stagger: s.layer_stagger,
             ds_probe,
@@ -5245,7 +5613,7 @@ impl TinyModel {
                             Some(load_gguf_ssm_layer(file, i, cfg.dim, true)?)
                         },
                         gdn: if file.architecture() == Some("qwen35") {
-                            load_gguf_gdn_host(file, i).ok()
+                            load_gguf_gdn_host(file, i, true).ok()
                         } else {
                             None
                         },
@@ -5537,7 +5905,7 @@ impl TinyModel {
                 if block == HybridLayerKind::Ssm {
                     if let Some(f) = file {
                         if f.architecture() == Some("qwen35") {
-                            if let Ok(gdn) = load_gguf_gdn_host(f, i) {
+                            if let Ok(gdn) = load_gguf_gdn_host(f, i, false) {
                                 layer.gdn = Some(gdn);
                             }
                         }
@@ -6394,10 +6762,13 @@ impl TinyModel {
         mut recurrent: Option<&mut RecurrentState>,
         mut out_row_hiddens: Option<&mut Vec<f32>>,
         request_id: u64,
+        vision: Option<&VisionSeq>,
     ) -> Result<(), AllpacaError> {
         if tokens.is_empty() {
             return Ok(());
         }
+        let mrope = vision.and_then(VisionSeq::mrope);
+        let dim = self.config.dim;
         if self.dsv4.is_some() && tokens.len() > 1 {
             return crate::deepseek4::forward_dsv4_tokens(
                 self,
@@ -6412,7 +6783,7 @@ impl TinyModel {
                 true,
             );
         }
-        if self.rpc.as_ref().is_some_and(|r| r.placed_remote() || r.splits_local()) {
+        if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
             for (i, tok) in tokens.iter().enumerate() {
                 let last = i + 1 == tokens.len();
                 let mut side = DeviceDecodeSide {
@@ -6421,6 +6792,7 @@ impl TinyModel {
                     } else {
                         None
                     },
+                    mrope,
                     ..DeviceDecodeSide::new(request_id)
                 };
                 self.forward_token(
@@ -6436,7 +6808,7 @@ impl TinyModel {
                     recurrent.as_deref_mut(),
                     None,
                     Some(&mut side),
-                    None,
+                    vision.and_then(|v| v.soft_row(start_pos + i, dim)),
                 )?;
             }
             return Ok(());
@@ -6444,6 +6816,7 @@ impl TinyModel {
         if tokens.len() == 1 {
             let mut side = DeviceDecodeSide {
                 last_hidden: out_row_hiddens.as_deref_mut(),
+                mrope,
                 ..DeviceDecodeSide::new(request_id)
             };
             self.forward_token(
@@ -6459,7 +6832,7 @@ impl TinyModel {
                 recurrent,
                 None,
                 Some(&mut side),
-                None,
+                vision.and_then(|v| v.soft_row(start_pos, dim)),
             )?;
             if let Some(rows) = row_logits {
                 let vocab = self.config.vocab_size;
@@ -6480,7 +6853,7 @@ impl TinyModel {
                 ))));
             }
         }
-        if self.supports_device_batched_prefill() {
+        if self.supports_hip_batched_prefill() {
             if let (Some(hip), Some(resident)) = (hip, resident) {
                 match self.forward_tokens_device(
                 tokens,
@@ -6496,6 +6869,7 @@ impl TinyModel {
                 recurrent.as_deref_mut(),
                 out_row_hiddens.as_deref_mut(),
                 request_id,
+                vision,
             ) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -7428,6 +7802,11 @@ impl TinyModel {
             )));
         }
         let (q_workspace, kv_workspace) = Self::decode_workspaces(cfg, resident);
+        let rope_pos = side
+            .as_ref()
+            .and_then(|s| s.mrope)
+            .map_or([pos; 3], |m| m.rope_pos(pos))
+            .map(|p| p as i32);
         let page_tokens = page_ids
             .first()
             .and_then(|p| p.first())
@@ -7671,7 +8050,7 @@ impl TinyModel {
                         n_kv_heads as i32,
                         head_dim as i32,
                         n_rot as i32,
-                        pos as i32,
+                        rope_pos,
                         cfg.rope_theta_for_layer(layer_idx),
                         cfg.rope_sections,
                     )?;
@@ -7979,6 +8358,7 @@ impl TinyModel {
         mut recurrent: Option<&mut RecurrentState>,
         mut out_row_hiddens: Option<&mut Vec<f32>>,
         request_id: u64,
+        vision: Option<&VisionSeq>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -7986,6 +8366,7 @@ impl TinyModel {
         let kv_dim = cfg.n_kv_heads * head_dim;
         let vocab = cfg.vocab_size;
         let n_tok = tokens.len();
+        let mrope = vision.and_then(VisionSeq::mrope);
         let (q_workspace, kv_workspace) = Self::decode_workspaces(cfg, resident);
         let kv_dim = kv_dim.max(kv_workspace);
         if write_logits && logits.len() < vocab {
@@ -8036,6 +8417,14 @@ impl TinyModel {
             let mut normed_ready = false;
             resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
             record_elementwise(Some(metrics));
+            if let Some(v) = vision {
+                // Soft (image) rows replace their placeholder token embeddings.
+                for t in 0..n_tok {
+                    if let Some(row) = v.soft_row(start_pos + t, dim) {
+                        hip.copy_h2d_f32(buf.x_row(t, dim), row)?;
+                    }
+                }
+            }
 
             let m = n_tok as i32;
             for (layer_idx, host_layer) in self.layers.iter().enumerate() {
@@ -8266,7 +8655,9 @@ impl TinyModel {
                             al.n_kv_heads as i32,
                             al.head_dim as i32,
                             n_rot as i32,
-                            (start_pos + t) as i32,
+                            mrope
+                                .map_or([start_pos + t; 3], |m| m.rope_pos(start_pos + t))
+                                .map(|p| p as i32),
                             theta,
                             cfg.rope_sections,
                         )?;
@@ -8571,6 +8962,34 @@ impl TinyModel {
                     )?;
                 }
                 hip.start_logits_d2h(buf.logits, n_tok * vocab)?;
+            } else if let Some(out) = out_row_hiddens.as_mut() {
+                // Every row's output_norm hidden (an MTP draft's process KV is
+                // built from them), plus last-row logits when asked.
+                rmsnorm_device_rows(
+                    hip,
+                    buf.x,
+                    resident.f32_or_dequant(hip, resident.norm)?,
+                    buf.normed,
+                    n_tok,
+                    dim,
+                    cfg.eps,
+                )?;
+                record_elementwise(Some(metrics));
+                out.resize(n_tok * dim, 0.0);
+                hip.copy_d2h_f32(buf.normed, out)?;
+                if write_logits {
+                    let _lm = hip.lm_head_scope();
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed_row(n_tok - 1, dim),
+                        resident.lm_head,
+                        buf.logits,
+                        1,
+                        vocab as i32,
+                        dim as i32,
+                    )?;
+                    hip.start_logits_d2h(buf.logits, vocab)?;
+                }
             } else if write_logits {
                 let x_last = buf.x_row(n_tok - 1, dim);
                 hip.rmsnorm_device(
@@ -8581,10 +9000,6 @@ impl TinyModel {
                     cfg.eps,
                 )?;
                 record_elementwise(Some(metrics));
-                if let Some(out) = out_row_hiddens.as_mut() {
-                    out.resize(dim, 0.0);
-                    hip.copy_d2h_f32(buf.normed, out)?;
-                }
                 {
                     let _lm = hip.lm_head_scope();
                     resident.gemm_nt(
@@ -8598,17 +9013,6 @@ impl TinyModel {
                     )?;
                 }
                 hip.start_logits_d2h(buf.logits, vocab)?;
-            } else if let Some(out) = out_row_hiddens.as_mut() {
-                let x_last = buf.x_row(n_tok - 1, dim);
-                hip.rmsnorm_device(
-                    x_last,
-                    resident.f32_or_dequant(hip, resident.norm)?,
-                    buf.normed,
-                    dim as i32,
-                    cfg.eps,
-                )?;
-                out.resize(dim, 0.0);
-                hip.copy_d2h_f32(buf.normed, out)?;
             }
             metrics
                 .gpu_forwards
@@ -8833,7 +9237,7 @@ impl TinyModel {
         cache.forwards = cache.forwards.saturating_add(1);
         // Prefer on-device draft whenever resident weights exist (incl. MTP / MoE).
         if let (Some(hip), Some(resident)) = (hip, resident) {
-            match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
+            match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics, true) {
                 Ok(()) => return Ok(()),
                 Err(e) if !self.host_weights_ready() => {
                     // ROCmFP4 / packed drafts are device-only skeletons — no host embed.
@@ -8843,6 +9247,13 @@ impl TinyModel {
                     tracing::warn!(pos, token, error = %e, "HIP draft on-device decode failed; host fallback");
                 }
             }
+        }
+        if !self.host_weights_ready() {
+            // Large GGUF drafts skip the host F32 copy; without a resident
+            // upload there is nothing to run on the host.
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "draft has no HIP resident weights and no host weights".into(),
+            )));
         }
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -9011,6 +9422,32 @@ impl TinyModel {
 
     /// Sequential draft decode with device-resident hidden state and DenseKv.
     #[allow(clippy::too_many_arguments)]
+    /// MTP process step: append `token` to the draft KV (and roll `h_nextn`)
+    /// without the vocab-wide lm_head. Only proposals need draft logits.
+    pub fn process_dense_on(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut DenseKv,
+        hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            cache.forwards = cache.forwards.saturating_add(1);
+            self.forward_dense_device(token, pos, cache, &mut [], hip, resident, metrics, false)?;
+            if let Some(metrics) = metrics {
+                metrics
+                    .draft_logits_skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.forward_dense_on(token, pos, cache, &mut logits, hip, resident, metrics)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_dense_device(
         &self,
         token: u32,
@@ -9020,11 +9457,12 @@ impl TinyModel {
         hip: &HipWorkspace,
         resident: &ResidentModel,
         metrics: Option<&Metrics>,
+        write_logits: bool,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
         let vocab = cfg.vocab_size;
-        if logits.len() < vocab {
+        if write_logits && logits.len() < vocab {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
             )));
@@ -9212,7 +9650,7 @@ impl TinyModel {
                     n_kv_heads as i32,
                     head_dim as i32,
                     n_rot as i32,
-                    pos as i32,
+                    [pos as i32; 3],
                     cfg.rope_theta_for_layer(layer_idx),
                     cfg.rope_sections,
                 )?;
@@ -9398,19 +9836,21 @@ impl TinyModel {
         if resident.mtp_nextn.is_some() || self.mtp_nextn.is_some() {
             cache.store_h_nextn_from_device(buf.normed, dim)?;
         }
-        {
-            let _lm = hip.lm_head_scope();
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                resident.lm_head,
-                buf.logits,
-                1,
-                vocab as i32,
-                dim as i32,
-            )?;
+        if write_logits {
+            {
+                let _lm = hip.lm_head_scope();
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    resident.lm_head,
+                    buf.logits,
+                    1,
+                    vocab as i32,
+                    dim as i32,
+                )?;
+            }
+            hip.publish_logits(buf.logits, &mut logits[..vocab])?;
         }
-        hip.publish_logits(buf.logits, &mut logits[..vocab])?;
         if let Some(metrics) = metrics {
             metrics
                 .gpu_forwards
@@ -10339,6 +10779,131 @@ mod lightning_moe_tests {
         let sum: f32 = routed.iter().map(|(_, wt)| *wt).sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
         assert!(routed[0].1 > routed[1].1);
+    }
+
+    /// One Qwen3.5-style Gated DeltaNet layer (dim 16, 2 V heads of 4).
+    fn write_one_gdn_layer_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{GgufValue, GgufWriteTensor};
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("general.architecture".into(), GgufValue::String("qwen35".into()));
+        for (k, v) in [
+            ("state_size", 4u32),
+            ("inner_size", 8),
+            ("time_step_rank", 2),
+            ("group_count", 1),
+            ("conv_kernel", 4),
+        ] {
+            meta.insert(format!("qwen35.ssm.{k}"), GgufValue::Uint32(v));
+        }
+        let (dim, qkv, value, heads) = (16u64, 16u64, 8u64, 2u64);
+        let data: Vec<Vec<f32>> = [heads, heads, 4, 4 * qkv, dim * qkv, dim * value, dim * heads, dim * heads, value * dim]
+            .iter()
+            .map(|&n| (0..n).map(|i| i as f32 * 0.01).collect())
+            .collect();
+        let shapes: [(&str, Vec<u64>); 9] = [
+            ("ssm_a", vec![heads]),
+            ("ssm_dt.bias", vec![heads]),
+            ("ssm_norm.weight", vec![4]),
+            ("ssm_conv1d.weight", vec![4, qkv]),
+            ("attn_qkv.weight", vec![dim, qkv]),
+            ("attn_gate.weight", vec![dim, value]),
+            ("ssm_alpha.weight", vec![dim, heads]),
+            ("ssm_beta.weight", vec![dim, heads]),
+            ("ssm_out.weight", vec![value, dim]),
+        ];
+        let tensors: Vec<GgufWriteTensor<'_>> = shapes
+            .into_iter()
+            .zip(&data)
+            .map(|((name, dims), d)| GgufWriteTensor {
+                name: format!("blk.0.{name}"),
+                dims,
+                data: d,
+            })
+            .collect();
+        allpaca_gguf::write_gguf(path, &meta, &tensors).unwrap();
+    }
+
+    #[test]
+    fn device_resident_gdn_layers_skip_host_f32_projections() {
+        // A large GGUF loads as a skeleton whose GDN projections are uploaded
+        // from the file; expanding them to host F32 held ~22 GB for the 27B.
+        let dir = std::env::temp_dir().join(format!("allpaca-gdn-lean-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gdn.gguf");
+        write_one_gdn_layer_gguf(&path);
+        let file = GgufFile::open(&path).unwrap();
+
+        let lean = load_gguf_gdn_host(&file, 0, false).unwrap();
+        assert!(
+            lean.w_qkv.is_empty()
+                && lean.w_z.is_empty()
+                && lean.w_alpha.is_empty()
+                && lean.w_beta.is_empty()
+                && lean.w_out.is_empty(),
+            "lean GDN layer must not hold host projections"
+        );
+        assert_eq!((lean.a.len(), lean.norm.len(), lean.conv1d.len()), (2, 4, 64));
+
+        let host = load_gguf_gdn_host(&file, 0, true).unwrap();
+        assert_eq!((host.w_qkv.len(), host.w_out.len()), (256, 128));
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mrope_layout_positions_image_grid_and_shifts_later_text() {
+        // Two images: 2 cols x 3 rows at KV 5, then 4 x 1 at KV 13.
+        let layout = MropeLayout::new(vec![
+            ImageSpan { start: 5, cols: 2, rows: 3 },
+            ImageSpan { start: 13, cols: 4, rows: 1 },
+        ]);
+        assert_eq!(layout.rope_pos(4), [4, 4, 4], "text before the image");
+        assert_eq!(layout.rope_pos(5), [5, 5, 5]);
+        assert_eq!(layout.rope_pos(6), [5, 5, 6], "row 0, column 1");
+        assert_eq!(layout.rope_pos(10), [5, 7, 6], "row 2, column 1");
+        // The image spans max(cols, rows) = 3 positions, not 6 tokens.
+        assert_eq!(layout.rope_pos(11), [8, 8, 8]);
+        assert_eq!(layout.rope_pos(12), [9, 9, 9]);
+        assert_eq!(layout.rope_pos(13), [10, 10, 10]);
+        assert_eq!(layout.rope_pos(16), [10, 10, 13]);
+        // Second image: 4 tokens over max(4, 1) = 4 positions (no extra shift).
+        assert_eq!(layout.rope_pos(17), [14, 14, 14]);
+        assert_eq!(MropeLayout::default().rope_pos(9), [9, 9, 9]);
+    }
+
+    #[test]
+    fn q3_k_gemm_weights_stay_native_on_device() {
+        let info = |k: u64| allpaca_gguf::TensorInfo {
+            name: "output.weight".into(),
+            dims: vec![k, 248_320],
+            ggml_type: allpaca_gguf::GgmlType::Q3_K,
+            ggml_type_id: 11,
+            offset: 0,
+            shard: 0,
+        };
+        // The MTP draft lm_head: 110 B per 256 values, not a 36 B/32 Q8_0 re-pack.
+        let native = info(5120);
+        assert_eq!(staged_device_bytes(&native), native.nbytes() as u64);
+        // Rows that are not whole super-blocks still re-pack to Q8_0.
+        let ragged = info(5120 + 32);
+        let q8 = ragged.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
+        assert_eq!(staged_device_bytes(&ragged), q8);
+    }
+
+    #[test]
+    fn hip_batched_prefill_takes_imrope_but_not_undetectable_gated_q() {
+        let mut imrope = ModelConfig::tiny();
+        imrope.rope_sections = [16, 16, 16, 16];
+        let plain = TinyModel::synthetic(imrope.clone(), 1, "imrope");
+        assert!(plain.supports_hip_batched_prefill(), "HIP batches IMRoPE rows");
+        // `[Q|gate]` with n_heads * head_dim == dim: q_out == 2 * wo_k cannot
+        // be told apart from a wider plain Q, so keep it per-token.
+        let mut ambiguous = TinyModel::synthetic(imrope, 1, "gated-q-eq-dim");
+        let dim = ambiguous.config.dim;
+        for layer in &mut ambiguous.layers {
+            layer.wq = vec![0.0; 2 * dim * dim];
+        }
+        assert!(!ambiguous.supports_hip_batched_prefill());
     }
 
     #[test]

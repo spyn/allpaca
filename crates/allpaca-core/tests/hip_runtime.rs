@@ -2523,7 +2523,11 @@ fn hip_local_gpu_pool_two_layer_matches_cpu() {
     let path = std::env::temp_dir().join("allpaca_hip_tiny_two_layer_pool.gguf");
     write_tiny_f32_two_layer_gguf(&path);
     let cpu = Engine::new(tiny_written_cfg(path.clone(), true)).expect("two-layer CPU load");
-    let hip = Engine::new(tiny_written_cfg(path.clone(), false)).expect("two-layer HIP load");
+    // The byte-aware planner keeps a model this small on the target GPU; an
+    // even split forces one layer onto the peer so the hand-off is exercised.
+    let mut hip_cfg = tiny_written_cfg(path.clone(), false);
+    hip_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+    let hip = Engine::new(hip_cfg).expect("two-layer HIP load");
     if hip_gpus(&hip).len() < 2 {
         let _ = std::fs::remove_file(&path);
         eprintln!("skip hip_local_gpu_pool_two_layer_matches_cpu: inventory has <2 HIP GPUs");
@@ -6477,6 +6481,432 @@ fn write_tiny_qwen_gdn_gguf_w(path: &std::path::Path, w: f32) {
         })
         .collect();
     write_gguf(path, &meta, &views).unwrap();
+}
+
+/// Tiny Qwen3.8-shaped hybrid: GDN blocks with gated full attention every 4th
+/// layer (`[Q|gate]`, Q/K norm, partial sectioned RoPE), an FFN on every
+/// block, and seeded pseudo-random weights so greedy tokens are not all ties.
+#[cfg(feature = "hip")]
+fn write_tiny_qwen_hybrid_gguf(path: &std::path::Path) {
+    write_tiny_qwen_hybrid_gguf_opts(path, false);
+}
+
+/// `mtp` appends a NextN block (`blk.{n_layers}`, gated attention + FFN +
+/// `nextn.eh_proj` / norms) like Qwen3.8's in-file MTP head.
+#[cfg(feature = "hip")]
+fn write_tiny_qwen_hybrid_gguf_opts(path: &std::path::Path, mtp: bool) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let dim = 32usize;
+    let vocab = 16usize;
+    let n_layers = 8usize;
+    let ff = 64usize;
+    // n_heads * head_dim > dim, as in Qwen3.8 (24 * 256 > 5120): that is how
+    // the loader tells a gated `[Q|gate]` projection from a plain one.
+    let (n_heads, n_kv, head_dim) = (4usize, 1usize, 16usize);
+    let (n_v, n_k, state) = (2usize, 2usize, 8usize);
+    let inner = n_v * state;
+    let qkv_dim = n_k * state * 2 + inner;
+    let conv_k = 4usize;
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rand = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+            })
+            .collect()
+    };
+    let u32v = |v: usize| GgufValue::Uint32(v as u32);
+    let mut meta = HashMap::new();
+    meta.insert("general.architecture".into(), GgufValue::String("qwen35".into()));
+    for (k, v) in [
+        ("vocab_size", vocab),
+        ("embedding_length", dim),
+        ("block_count", n_layers + usize::from(mtp)),
+        ("nextn_predict_layers", usize::from(mtp)),
+        ("feed_forward_length", ff),
+        ("attention.head_count", n_heads),
+        ("attention.head_count_kv", n_kv),
+        ("attention.key_length", head_dim),
+        ("attention.value_length", head_dim),
+        ("rope.dimension_count", head_dim / 2),
+        ("full_attention_interval", 4),
+        ("ssm.state_size", state),
+        ("ssm.inner_size", inner),
+        ("ssm.time_step_rank", n_v),
+        ("ssm.group_count", n_k),
+        ("ssm.conv_kernel", conv_k),
+    ] {
+        meta.insert(format!("qwen35.{k}"), u32v(v));
+    }
+    meta.insert(
+        "qwen35.rope.dimension_sections".into(),
+        GgufValue::Array([2i32, 1, 1, 0].map(GgufValue::Int32).to_vec()),
+    );
+    meta.insert("tokenizer.ggml.model".into(), GgufValue::String("wordlevel".into()));
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(
+            (0..vocab)
+                .map(|i| {
+                    GgufValue::String(match i {
+                        0 => "<unk>".into(),
+                        1 => "<s>".into(),
+                        2 => "</s>".into(),
+                        _ => format!("t{i}"),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), u32v(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), u32v(2));
+
+    let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<usize>, data: Vec<f32>| {
+        owned.push((name, dims.into_iter().map(|d| d as u64).collect(), data));
+    };
+    let embed = rand(vocab * dim, 1.0);
+    push("token_embd.weight".into(), vec![dim, vocab], embed.clone());
+    for i in 0..n_layers + usize::from(mtp) {
+        let b = |t: &str| format!("blk.{i}.{t}.weight");
+        push(b("attn_norm"), vec![dim], vec![1.0; dim]);
+        if i == n_layers {
+            push(b("nextn.eh_proj"), vec![2 * dim, dim], rand(dim * 2 * dim, 0.3));
+            push(b("nextn.enorm"), vec![dim], vec![1.0; dim]);
+            push(b("nextn.hnorm"), vec![dim], vec![1.0; dim]);
+            push(b("nextn.shared_head_norm"), vec![dim], vec![1.0; dim]);
+        }
+        if i % 4 == 3 || i == n_layers {
+            push(b("attn_q"), vec![dim, 2 * n_heads * head_dim], rand(2 * n_heads * head_dim * dim, 0.3));
+            push(b("attn_k"), vec![dim, n_kv * head_dim], rand(n_kv * head_dim * dim, 0.3));
+            push(b("attn_v"), vec![dim, n_kv * head_dim], rand(n_kv * head_dim * dim, 0.3));
+            push(b("attn_output"), vec![n_heads * head_dim, dim], rand(dim * n_heads * head_dim, 0.3));
+            push(b("attn_q_norm"), vec![head_dim], vec![1.0; head_dim]);
+            push(b("attn_k_norm"), vec![head_dim], vec![1.0; head_dim]);
+        } else {
+            push(b("attn_qkv"), vec![dim, qkv_dim], rand(qkv_dim * dim, 0.3));
+            push(b("attn_gate"), vec![dim, inner], rand(inner * dim, 0.3));
+            push(b("ssm_alpha"), vec![dim, n_v], rand(n_v * dim, 0.3));
+            push(b("ssm_beta"), vec![dim, n_v], rand(n_v * dim, 0.3));
+            push(b("ssm_out"), vec![inner, dim], rand(dim * inner, 0.3));
+            push(format!("blk.{i}.ssm_a"), vec![n_v], vec![-0.5; n_v]);
+            push(format!("blk.{i}.ssm_dt.bias"), vec![n_v], vec![0.0; n_v]);
+            push(b("ssm_norm"), vec![state], vec![1.0; state]);
+            push(b("ssm_conv1d"), vec![conv_k * qkv_dim], rand(conv_k * qkv_dim, 0.5));
+        }
+        push(b("post_attention_norm"), vec![dim], vec![1.0; dim]);
+        push(b("ffn_gate"), vec![dim, ff], rand(ff * dim, 0.3));
+        push(b("ffn_up"), vec![dim, ff], rand(ff * dim, 0.3));
+        push(b("ffn_down"), vec![ff, dim], rand(dim * ff, 0.3));
+    }
+    push("output_norm.weight".into(), vec![dim], vec![1.0; dim]);
+    // Unembed row t(i+1) = embed(t i) over the cycle t3 -> t4 -> t5 -> t6 -> t3,
+    // so greedy loops and n-gram drafts get accepted; the blocks still perturb
+    // the residual enough that a wrong verify forward shows up as a token diff.
+    let mut output = rand(vocab * dim, 0.3);
+    for (from, to) in [(3usize, 4usize), (4, 5), (5, 6), (6, 3)] {
+        output[to * dim..(to + 1) * dim].copy_from_slice(&embed[from * dim..(from + 1) * dim]);
+    }
+    push("output.weight".into(), vec![dim, vocab], output);
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).unwrap();
+}
+
+/// Greedy generate on the tiny hybrid; returns ids plus the target forwards and
+/// draft counters it cost. `None` when the engine finds no HIP GPU.
+/// `prefill_chunk = 1` keeps prefill on the per-token decode path.
+#[cfg(feature = "hip")]
+fn tiny_hybrid_generate(
+    path: &std::path::Path,
+    prefill_chunk: usize,
+    speculative: bool,
+    tensor_split: Option<Vec<f64>>,
+) -> Option<(Vec<u32>, u64, u64, u64)> {
+    let mut cfg = tiny_written_cfg(path.to_path_buf(), false);
+    cfg.prefill.chunk_tokens = prefill_chunk;
+    cfg.speculative.enabled = speculative;
+    cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Ngram];
+    cfg.speculative.max_depth = 4;
+    cfg.features.ngram_speculation = Some(speculative);
+    cfg.rpc.tensor_split = tensor_split;
+    let engine = Engine::new(cfg).expect("tiny hybrid Engine::new");
+    if hip_gpus(&engine).is_empty() {
+        return None;
+    }
+    let before = engine.stats();
+    let out = engine
+        .generate("t3 t4 t5 t6 t3 t4 t5 t6 t3 t4 t5 t6", greedy(40))
+        .expect("tiny hybrid generate");
+    let after = engine.stats();
+    Some((
+        out.token_ids,
+        after.target_gpu_forwards - before.target_gpu_forwards,
+        after.draft_proposed - before.draft_proposed,
+        after.draft_accepted - before.draft_accepted,
+    ))
+}
+
+/// Qwen3.8-shaped hybrid (GDN + gated IMRoPE attention) on HIP, one GPU and
+/// split across two: greedy output matches per-token prefill + decode (the
+/// host path has no GDN, so that is the reference), and speculative
+/// verify packs each drafted span into one target forward, so accepted
+/// drafts cost fewer target forwards than plain decode.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_hybrid_speculative_verify_batches_and_matches_greedy() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_hybrid_speculative_verify: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_tiny_qwen_hybrid-{}.gguf",
+        std::process::id()
+    ));
+    write_tiny_qwen_hybrid_gguf(&path);
+    let Some((reference, ..)) = tiny_hybrid_generate(&path, 1, false, None) else {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("skip hip_gdn_hybrid_speculative_verify: no HIP in engine");
+        return;
+    };
+    let mut splits = vec![None];
+    if allpaca_hip::device_count() >= 2 {
+        splits.push(Some(vec![1.0, 1.0]));
+    }
+    for split in splits {
+        let (plain, plain_fwd, _, _) =
+            tiny_hybrid_generate(&path, 512, false, split.clone()).expect("plain engine");
+        let (spec, spec_fwd, proposed, accepted) =
+            tiny_hybrid_generate(&path, 512, true, split.clone()).expect("spec engine");
+        eprintln!(
+            "tiny hybrid split={split:?}: target forwards plain={plain_fwd} spec={spec_fwd}, drafts accepted {accepted}/{proposed}"
+        );
+        assert_eq!(plain, reference, "batched prefill must match per-token (split {split:?})");
+        assert_eq!(spec, reference, "speculative greedy must match per-token (split {split:?})");
+        assert!(
+            accepted > 0,
+            "fixture must get drafts accepted to exercise verify; proposed={proposed}"
+        );
+        assert!(
+            spec_fwd < plain_fwd,
+            "accepted drafts must save target forwards (split {split:?}): spec={spec_fwd} plain={plain_fwd} accepted={accepted}/{proposed}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Greedy MTP generate on the tiny hybrid with its in-file NextN head.
+/// Returns ids, target forwards, drafts accepted / proposed.
+#[cfg(feature = "hip")]
+fn tiny_hybrid_mtp_generate(
+    path: &std::path::Path,
+    prefill_chunk: usize,
+    tensor_split: Option<Vec<f64>>,
+) -> Option<(Vec<u32>, u64, u64, u64)> {
+    let mut cfg = tiny_written_cfg(path.to_path_buf(), false);
+    cfg.prefill.chunk_tokens = prefill_chunk;
+    cfg.speculative.enabled = true;
+    cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Mtp];
+    cfg.speculative.max_depth = 3;
+    cfg.rpc.tensor_split = tensor_split;
+    let engine = Engine::new(cfg).expect("tiny hybrid MTP Engine::new");
+    if hip_gpus(&engine).is_empty() {
+        return None;
+    }
+    let before = engine.stats();
+    let out = engine
+        .generate("t3 t4 t5 t6 t3 t4 t5 t6 t3 t4 t5 t6", greedy(24))
+        .expect("tiny hybrid MTP generate");
+    let after = engine.stats();
+    Some((
+        out.token_ids,
+        after.target_gpu_forwards - before.target_gpu_forwards,
+        after.draft_accepted - before.draft_accepted,
+        after.draft_proposed - before.draft_proposed,
+    ))
+}
+
+/// Fixed soft tokens on a 2x2 grid (M-RoPE placement, like the Qwen3-VL mmproj).
+struct GridVision {
+    dim: usize,
+}
+
+impl allpaca_core::EncoderPlacement for GridVision {
+    fn device(&self) -> Option<i32> {
+        None
+    }
+}
+
+impl allpaca_core::VisionEncoder for GridVision {
+    fn encode(
+        &self,
+        images: &[allpaca_core::ImageInput],
+    ) -> Result<allpaca_core::VisionTokens, allpaca_types::AllpacaError> {
+        let n = 4 * images.len();
+        Ok(allpaca_core::VisionTokens {
+            embeddings: (0..n * self.dim).map(|i| ((i * 29) % 17) as f32 * 0.05 - 0.4).collect(),
+            n_tokens: n,
+            device: None,
+            grids: vec![(2, 2); images.len()],
+        })
+    }
+}
+
+fn tiny_hybrid_image_generate(path: &std::path::Path, prefill_chunk: usize) -> Option<(Vec<u32>, u64)> {
+    let mut cfg = tiny_written_cfg(path.to_path_buf(), false);
+    cfg.prefill.chunk_tokens = prefill_chunk;
+    cfg.speculative.enabled = false;
+    let engine = Engine::new(cfg).expect("tiny hybrid Engine::new");
+    if hip_gpus(&engine).is_empty() {
+        return None;
+    }
+    engine
+        .set_vision_encoder(std::sync::Arc::new(GridVision { dim: 32 }))
+        .expect("vision encoder");
+    let before = engine.stats();
+    let image = allpaca_core::ImageInput::new(vec![0u8; 4], "image/png");
+    let out = engine
+        .generate_multimodal("t3 t4 t5 t6 t3 t4 t5 t6", &[image], greedy(12))
+        .expect("tiny hybrid image generate");
+    let after = engine.stats();
+    Some((out.token_ids, after.target_gpu_forwards - before.target_gpu_forwards))
+}
+
+/// Image soft tokens prefill in the same batched forward as the text around
+/// them, and match one-token-at-a-time prefill.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_image_prompt_prefills_in_one_forward() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_image_prompt_prefills_in_one_forward: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("allpaca_tiny_qwen_image-{}.gguf", std::process::id()));
+    write_tiny_qwen_hybrid_gguf_opts(&path, false);
+    let Some((reference, ref_fwd)) = tiny_hybrid_image_generate(&path, 1) else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    let (ids, fwd) = tiny_hybrid_image_generate(&path, 512).expect("batched");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(ids, reference, "batched image prefill must match per-token");
+    // 4 image + 8 text prompt tokens: one chunk forward instead of 12.
+    assert_eq!(fwd + 11, ref_fwd, "image prompt must prefill in one target forward");
+}
+
+/// With an MTP draft the prompt still prefills as one target forward per
+/// chunk; the draft's process KV is built from the chunk's row hiddens, so
+/// drafts, acceptance and greedy output match one-token-at-a-time prefill.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_mtp_prefill_batches_and_keeps_drafts() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_mtp_prefill_batches: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_tiny_qwen_hybrid_mtp-{}.gguf",
+        std::process::id()
+    ));
+    write_tiny_qwen_hybrid_gguf_opts(&path, true);
+    let mut splits = vec![None];
+    if allpaca_hip::device_count() >= 2 {
+        splits.push(Some(vec![1.0, 1.0]));
+    }
+    for split in splits {
+        let Some((reference, ref_fwd, ref_acc, ref_prop)) =
+            tiny_hybrid_mtp_generate(&path, 1, split.clone())
+        else {
+            eprintln!("skip hip_mtp_prefill_batches: no HIP in engine");
+            break;
+        };
+        let (ids, fwd, acc, prop) =
+            tiny_hybrid_mtp_generate(&path, 512, split.clone()).expect("batched MTP engine");
+        eprintln!(
+            "tiny MTP split={split:?}: forwards per-token={ref_fwd} batched={fwd}, accepted {ref_acc}/{ref_prop} vs {acc}/{prop}"
+        );
+        assert!(ref_prop > 0, "fixture must exercise MTP drafts");
+        assert_eq!(ids, reference, "batched MTP prefill must match per-token (split {split:?})");
+        assert_eq!((acc, prop), (ref_acc, ref_prop), "draft KV must match per-token process");
+        // 12 prompt tokens: one chunk forward instead of 12.
+        assert_eq!(fwd + 11, ref_fwd, "prompt must prefill in one target forward");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// MTP process steps (pairing an accepted token with the target hidden) only
+/// write the draft KV; they must not run the vocab-wide draft lm_head, and
+/// greedy output must still match plain decode.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_mtp_process_skips_draft_lm_head() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_mtp_process_skips_draft_lm_head: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_tiny_qwen_hybrid_mtp_lm-{}.gguf",
+        std::process::id()
+    ));
+    write_tiny_qwen_hybrid_gguf_opts(&path, true);
+    let mut plain_cfg = tiny_written_cfg(path.clone(), false);
+    plain_cfg.speculative.enabled = false;
+    let plain = Engine::new(plain_cfg).expect("plain engine");
+    if hip_gpus(&plain).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let prompt = "t3 t4 t5 t6 t3 t4 t5 t6 t3 t4 t5 t6";
+    let want = plain.generate(prompt, greedy(24)).expect("plain").token_ids;
+    let mut cfg = tiny_written_cfg(path.clone(), false);
+    cfg.speculative.enabled = true;
+    cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Mtp];
+    cfg.speculative.max_depth = 3;
+    let engine = Engine::new(cfg).expect("MTP engine");
+    let got = engine.generate(prompt, greedy(24)).expect("MTP").token_ids;
+    let stats = engine.stats();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, want, "MTP greedy must match plain greedy");
+    assert!(
+        stats.draft_logits_skipped > 0,
+        "process steps must skip the draft lm_head; draft_gpu_forwards={}",
+        stats.draft_gpu_forwards
+    );
+    // A span of d drafts needs d vocab projections: the forward after the
+    // last draft token only extends the draft KV.
+    let lm_head_passes = stats.draft_gpu_forwards - stats.draft_logits_skipped;
+    assert!(stats.draft_tokens_drafted >= stats.draft_proposed);
+    assert_eq!(
+        lm_head_passes, stats.draft_tokens_drafted,
+        "one draft lm_head pass per drafted token"
+    );
+    // Draft-ahead only runs after a full accept, so at most the final step's
+    // ahead span goes unverified.
+    assert!(
+        stats.draft_tokens_drafted <= stats.draft_proposed + 3,
+        "drafted {} but proposed {}",
+        stats.draft_tokens_drafted,
+        stats.draft_proposed
+    );
+    // A rejected verify's correction token rides in the next packed span
+    // (the draft predicts that slot) instead of its own target forward.
+    assert!(
+        stats.deferred_corrections_packed > 0,
+        "corrections must pack into the next verify; accepted {}/{}",
+        stats.draft_accepted,
+        stats.draft_proposed
+    );
 }
 
 /// Prefill with device GDN must not D2H state+conv on every prompt token.

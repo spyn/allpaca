@@ -127,6 +127,39 @@ impl DraftModelProvider {
         resident: Option<&ResidentModel>,
         metrics: Option<&Metrics>,
     ) -> Result<Vec<u32>, AllpacaError> {
+        self.propose_inner(ctx, None, max_tokens, temperature, cache, hip, resident, metrics)
+    }
+
+    /// Draft after `ctx` with the next token already known (`forced`, e.g. a
+    /// rejected verify's correction that the target has not run yet). Returns
+    /// `[forced, d1, ..]`, `max_tokens` long; only `d1..` are drafted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_after(
+        &mut self,
+        ctx: &[u32],
+        forced: u32,
+        max_tokens: usize,
+        temperature: f32,
+        cache: &mut DenseKv,
+        hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
+        metrics: Option<&Metrics>,
+    ) -> Result<Vec<u32>, AllpacaError> {
+        self.propose_inner(ctx, Some(forced), max_tokens, temperature, cache, hip, resident, metrics)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propose_inner(
+        &mut self,
+        ctx: &[u32],
+        forced: Option<u32>,
+        max_tokens: usize,
+        temperature: f32,
+        cache: &mut DenseKv,
+        hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
+        metrics: Option<&Metrics>,
+    ) -> Result<Vec<u32>, AllpacaError> {
         if ctx.is_empty() {
             return Ok(Vec::new());
         }
@@ -142,7 +175,12 @@ impl DraftModelProvider {
             // If KV is cold/out-of-sync, fall back to a single last-token seed.
             let n_past = ctx.len();
             let id_last = ctx[n_past - 1];
-            if cache.seq_matches(ctx) {
+            if cache.seq_matches(ctx) && forced.is_some() {
+                // The seed step's logits would only predict `forced`.
+                self.model
+                    .process_dense_on(id_last, n_past, cache, hip, resident, metrics)?;
+                cache.record(id_last);
+            } else if cache.seq_matches(ctx) {
                 self.model.forward_dense_on(
                     id_last,
                     n_past,
@@ -198,24 +236,37 @@ impl DraftModelProvider {
             ..GenerationParams::default()
         };
         let mut rng = rng_from_params(&params, Some(1));
-        for _ in 0..max_tokens {
-            let next = if temperature <= 1e-5 {
+        for i in 0..max_tokens {
+            let next = if let (0, Some(tok)) = (i, forced) {
+                tok
+            } else if temperature <= 1e-5 {
                 argmax(&logits)
             } else {
                 sample(&mut logits, None, &params, &mut rng)
             };
             out.push(next);
             window.push(next);
-            self.model.forward_dense_on(
-                next,
-                window.len() - 1,
-                cache,
-                &mut logits,
-                hip,
-                resident,
-                metrics,
-            )?;
+            if i + 1 == max_tokens {
+                // Nothing samples after the last draft: extend the KV only.
+                self.model
+                    .process_dense_on(next, window.len() - 1, cache, hip, resident, metrics)?;
+            } else {
+                self.model.forward_dense_on(
+                    next,
+                    window.len() - 1,
+                    cache,
+                    &mut logits,
+                    hip,
+                    resident,
+                    metrics,
+                )?;
+            }
             cache.record(next);
+        }
+        if let Some(metrics) = metrics {
+            metrics
+                .draft_tokens_drafted
+                .fetch_add((out.len() - usize::from(forced.is_some())) as u64, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(out)
     }

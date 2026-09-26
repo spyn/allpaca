@@ -85,10 +85,13 @@ struct ActiveRequest {
     last_hidden_fresh: bool,
     /// This tick's HIP decode cohort will pack lm_head; skip the per-request GEMM.
     defer_lm_head: bool,
-    /// Soft vision positions at the start of `tokens` (pre-text).
-    vision_prefix_len: usize,
-    /// Row-major `vision_prefix_len * dim` embeddings for soft prefill.
-    vision_embeds: Vec<f32>,
+    /// Correction token from a rejected packed verify: already emitted, not yet
+    /// forwarded (`pending_logits` are stale while set). The next step verifies
+    /// it at the head of the drafted span, or forwards it alone.
+    deferred: Option<u32>,
+    /// Soft vision tokens (image rows instead of token embeddings) and their
+    /// M-RoPE layout; empty for text-only Requests.
+    vision: Arc<crate::model::VisionSeq>,
     /// When vision encode landed on the draft GPU, skip draft propose for this Request.
     suppress_draft: bool,
 }
@@ -214,7 +217,11 @@ impl std::fmt::Debug for RequestHandle {
 impl Drop for RequestHandle {
     fn drop(&mut self) {
         if let Some(hip) = self.hip.as_ref() {
-            hip.gdn_clear_request(self.id);
+            let target = self.inner.lock().ok().and_then(|g| g.target.clone());
+            let _ = for_each_gdn_workspace(hip, target.as_deref(), |ws| {
+                ws.gdn_clear_request(self.id);
+                Ok(())
+            });
         }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(active) = guard.active.remove(&self.id) {
@@ -511,7 +518,26 @@ impl Engine {
             mm.vision_patch
         };
         let n_blocks = mm.vision_n_blocks;
-        if let Some(path) = &mm.vision_path {
+        let is_gguf = mm
+            .vision_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        if let (Some(path), true) = (&mm.vision_path, is_gguf) {
+            let mut enc = crate::Qwen3VlVision::load_gguf(path)?;
+            if mm.vision_max_tokens > 0 {
+                enc = enc.with_max_image_tokens(mm.vision_max_tokens as usize);
+            }
+            if enc.config().proj_dim != out_dim {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "mmproj {} projects to {} but the model width is {out_dim}",
+                    path.display(),
+                    enc.config().proj_dim
+                ))));
+            }
+            tracing::info!(path = %path.display(), cfg = ?enc.config(), "loaded Qwen3-VL mmproj vision encoder");
+            self.set_vision_encoder(Arc::new(enc))?;
+        } else if let Some(path) = &mm.vision_path {
             let enc = crate::PatchVisionEncoder::load(
                 path, device, out_dim, image_size, patch, n_blocks,
             )?;
@@ -569,6 +595,11 @@ impl Engine {
         }
         self.lock()?.vision_encoder = Some(encoder);
         Ok(())
+    }
+
+    /// The installed vision encoder's in-prompt image placeholder, if it uses one.
+    pub fn image_marker(&self) -> Option<&'static str> {
+        self.lock().ok()?.vision_encoder.as_ref()?.image_marker()
     }
 
     /// Start a Request with optional images. Empty images match [`Self::begin_request`].
@@ -1045,6 +1076,17 @@ impl Engine {
         model: &mut TinyModel,
         gguf: Option<&GgufFile>,
     ) -> Result<(), AllpacaError> {
+        self.attach_rpc_with_draft(model, gguf, 0)
+    }
+
+    /// `draft_bytes` is the draft model's VRAM footprint; the local layer
+    /// planner keeps it free on the draft GPU.
+    fn attach_rpc_with_draft(
+        &self,
+        model: &mut TinyModel,
+        gguf: Option<&GgufFile>,
+        draft_bytes: u64,
+    ) -> Result<(), AllpacaError> {
         let mut local_devices = Vec::new();
         if let Some(hip) = &self.hip {
             let total = allpaca_hip::device_memory_info(hip.device)
@@ -1068,6 +1110,8 @@ impl Engine {
                 self.config.rpc.tensor_split.as_deref(),
                 self.config.rpc.max_seq,
                 gguf,
+                self.config.kv.vram_bytes as u64,
+                draft_bytes,
             )?;
             model.rpc = Some(Arc::clone(rt));
             tracing::info!(
@@ -1085,6 +1129,8 @@ impl Engine {
                 self.config.rpc.tensor_split.as_deref(),
                 self.config.rpc.max_seq,
                 gguf,
+                self.config.kv.vram_bytes as u64,
+                draft_bytes,
             )?;
             tracing::info!(
                 local_gpus = local_devices.len(),
@@ -1442,8 +1488,15 @@ impl Engine {
                                 .and_then(|d| GgufFile::open(&d.weights))
                         });
                 match opened {
-                    Ok(f) => match TinyModel::from_gguf(&f) {
+                    Ok(f) => match load_draft_gguf(&f) {
                         Ok(draft) => {
+                            if draft.config.gguf_layer_base > 0 {
+                                tracing::info!(
+                                    layers = draft.config.n_layers,
+                                    base = draft.config.gguf_layer_base,
+                                    "loaded MTP/NextN sidecar as draft model"
+                                );
+                            }
                             inner.draft_model = Some(Arc::new(draft));
                             draft_file = Some(f);
                         }
@@ -1540,7 +1593,18 @@ impl Engine {
             model.early_exit.min_confidence = self.config.early_exit.min_confidence;
             model.early_exit.min_calibration_margin = self.config.early_exit.min_calibration_margin;
         }
-        self.attach_rpc(&mut model, Some(file.as_ref()))?;
+        let draft_bytes = inner.draft_model.as_ref().map_or(0, |draft| {
+            let draft_gguf = if draft_reuses_target_gguf {
+                Some(file.as_ref())
+            } else {
+                draft_file.as_ref()
+            };
+            draft_gguf.map_or(0, |f| {
+                let (layers, globals) = crate::model::gguf_device_bytes(f, &draft.config);
+                layers.iter().sum::<u64>() + globals
+            })
+        });
+        self.attach_rpc_with_draft(&mut model, Some(file.as_ref()), draft_bytes)?;
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
@@ -1629,7 +1693,7 @@ impl Engine {
                     let skip: Vec<bool> = (0..target_m.config.n_layers)
                         .map(|i| rpc.is_remote(i) || rpc.local_device(i) != dev)
                         .collect();
-                    match ResidentModel::upload_gguf_filtered(file, &target_m.config, dev, &skip) {
+                    match ResidentModel::upload_gguf_peer_layers(file, &target_m.config, dev, &skip) {
                         Ok(resident) => {
                             let hip_used = allpaca_hip::device_memory_info(dev)
                                 .ok()
@@ -1714,8 +1778,19 @@ impl Engine {
         } else {
             None
         };
-        if let (Some(resident), Some(hip)) = (peer_uploaded, self.draft_hip.clone()) {
+        if let (Some(resident), Some(draft_hip)) = (peer_uploaded, self.draft_hip.as_ref()) {
             if let Some(rpc) = inner.target.as_ref().and_then(|m| m.rpc.clone()) {
+                // Own workspace for the target's layers on this GPU: the draft
+                // model keeps `draft_hip`, and draft-ahead runs it on a worker
+                // thread while the target verifies, so sharing decode buffers
+                // would race.
+                let hip = match HipWorkspace::new(draft_hip.device, 8 * 1024 * 1024, 256) {
+                    Ok(ws) => Arc::new(ws),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "peer HIP workspace failed; sharing the draft workspace");
+                        Arc::clone(draft_hip)
+                    }
+                };
                 let _ = resident.touch_resident();
                 let _ = hip.bind();
                 let _ = allpaca_hip::stream_synchronize();
@@ -1733,13 +1808,12 @@ impl Engine {
                 rpc.set_local_peer(hip.device, hip, Arc::new(resident));
             }
         }
-        inner.draft_resident = if peer_ok {
+        inner.draft_resident = if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
             tracing::info!(
-                "skipping draft HIP upload; GPU 1 holds target layer-split weights"
+                device = hip.device,
+                shares_target_layers = peer_ok,
+                "HIP draft weight upload start"
             );
-            None
-        } else if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
-            tracing::info!(device = hip.device, "HIP draft weight upload start");
             let uploaded = if draft.config.n_experts > 0 && draft.host_weights_ready() {
                 ResidentModel::upload(&draft, hip.device)
             } else if let Some(file) = draft_gguf {
@@ -2128,8 +2202,8 @@ impl Engine {
             .map(|m| m.config.dim)
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
         let mut suppress_draft = false;
-        let (vision_prefix_len, vision_embeds) = match vision {
-            None => (0, Vec::new()),
+        let vision_seq = match vision {
+            None => crate::model::VisionSeq::default(),
             Some(v) => {
                 let need = v.n_tokens.checked_mul(dim).ok_or_else(|| {
                     AllpacaError::Fatal(FatalError::InvalidConfig(
@@ -2164,10 +2238,32 @@ impl Engine {
                         }
                     }
                 }
-                let mut prefixed = vec![0u32; v.n_tokens];
-                prefixed.append(&mut tokens);
-                tokens = prefixed;
-                (v.n_tokens, v.embeddings)
+                let grids = if v.grids.is_empty() {
+                    vec![(v.n_tokens, 1)]
+                } else {
+                    v.grids.clone()
+                };
+                if grids.iter().map(|(c, r)| c * r).sum::<usize>() != v.n_tokens {
+                    return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                        "vision grids {grids:?} do not cover {} tokens",
+                        v.n_tokens
+                    ))));
+                }
+                let pad = (!v.grids.is_empty())
+                    .then(|| tokenizer.token_id("<|image_pad|>"))
+                    .flatten();
+                let (expanded, spans) = expand_image_pads(&tokens, pad, &grids);
+                tokens = expanded;
+                let mrope = if v.grids.is_empty() {
+                    crate::model::MropeLayout::default()
+                } else {
+                    crate::model::MropeLayout::new(spans.clone())
+                };
+                crate::model::VisionSeq {
+                    spans,
+                    embeds: v.embeddings,
+                    mrope,
+                }
             }
         };
         for id in tokenizer.stop_token_ids() {
@@ -2203,8 +2299,8 @@ impl Engine {
             None
         };
         let mut prefill_pos = 0;
-        // Soft vision prefixes are not text anchors / radix keys yet.
-        if vision_prefix_len == 0 {
+        // Soft vision tokens are not text anchors / radix keys yet.
+        if vision_seq.is_empty() {
             if let Some((state, rows, n)) = inner.anchors.lookup(&tokens) {
                 restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
                 if let Some(dst) = recurrent.as_mut() {
@@ -2282,8 +2378,8 @@ impl Engine {
                 last_hidden: vec![0.0f32; dim],
                 last_hidden_fresh: false,
                 defer_lm_head: false,
-                vision_prefix_len,
-                vision_embeds,
+                deferred: None,
+                vision: Arc::new(vision_seq),
                 suppress_draft,
             },
         );
@@ -3283,21 +3379,17 @@ impl Engine {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.last_hidden)
         };
-        let (vision_prefix_len, vision_embeds, dim) = {
-            let active = request(inner, id)?;
-            (
-                active.vision_prefix_len,
-                active.vision_embeds.clone(),
-                target.config.dim,
-            )
-        };
-        let vision_in_chunk = (start..end).any(|p| p < vision_prefix_len);
-        let batch_prefill_hip = !vision_in_chunk
+        let (vision, dim) = (request(inner, id)?.vision.clone(), target.config.dim);
+        let vision_ref = (!vision.is_empty()).then_some(&*vision);
+        let mrope_ref = vision.mrope();
+        let soft_row = |pos: usize| vision.soft_row(pos, dim);
+        let vision_in_chunk = vision.overlaps(start, end);
+        // The HIP batched forward writes soft rows itself; CUDA and DSv4 do not.
+        let batch_prefill_hip = !(vision_in_chunk && target.dsv4.is_some())
             && toks.len() > 1
             && ((self.hip.is_some()
                 && resident.is_some()
-                && !mtp_draft_active(inner)
-                && target.supports_device_batched_prefill())
+                && target.supports_hip_batched_prefill())
                 || target.dsv4.is_some());
         #[cfg(feature = "cuda")]
         let batch_prefill_cuda = !vision_in_chunk
@@ -3311,6 +3403,8 @@ impl Engine {
         let batch_prefill_cuda = false;
         let mut did_batch = false;
         if batch_prefill_hip {
+            let mtp = mtp_draft_active(inner);
+            let mut row_hiddens = Vec::new();
             target.forward_tokens(
                 &toks,
                 start,
@@ -3323,9 +3417,29 @@ impl Engine {
                 write_logits,
                 None,
                 recurrent.as_mut(),
-                None,
+                mtp.then_some(&mut row_hiddens),
                 id,
+                vision_ref,
             )?;
+            if mtp && row_hiddens.len() == toks.len() * dim {
+                // Same pairing as per-token prefill: token `pos` with h_{pos-1}.
+                for (i, tok) in toks.iter().enumerate() {
+                    let h_prev = if i == 0 {
+                        std::mem::take(&mut last_hidden)
+                    } else {
+                        row_hiddens[(i - 1) * dim..i * dim].to_vec()
+                    };
+                    mtp_process_token(
+                        inner,
+                        *tok,
+                        start + i,
+                        &h_prev,
+                        self.draft_hip.as_deref(),
+                        &self.metrics,
+                    )?;
+                }
+                last_hidden = row_hiddens[(toks.len() - 1) * dim..].to_vec();
+            }
             // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
             // page (growing with seq) and break logits-only decode accounting.
             did_batch = true;
@@ -3378,13 +3492,10 @@ impl Engine {
                     } else {
                         None
                     },
+                    mrope: mrope_ref,
                     ..DeviceDecodeSide::new(id)
                 };
-                let soft = if pos < vision_prefix_len {
-                    Some(&vision_embeds[pos * dim..(pos + 1) * dim])
-                } else {
-                    None
-                };
+                let soft = soft_row(pos);
                 let used_cuda = {
                     #[cfg(feature = "cuda")]
                     {
@@ -3489,9 +3600,11 @@ impl Engine {
                 let sync_host_gdn = !device_gdn || last || is_anchor;
                 if sync_host_gdn {
                     if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
-                        hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
-                        hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
-                        hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
+                        for_each_gdn_workspace(hip, Some(&target), |ws| {
+                            ws.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                            ws.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                            ws.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)
+                        })?;
                     }
                 }
                 if sync_host_gdn && self.hip.is_none() {
@@ -4119,6 +4232,51 @@ fn mtp_text_has_dropped_words(text: &str) -> bool {
     t.contains("let me about ") || t.contains("let me words ")
 }
 
+/// Run `f` on every HIP workspace that holds device GDN / Mamba-2 state for
+/// the target: the target GPU, then the local layer-split peer. Recurrent
+/// slots live on the workspace that ran the layer, so clone / rewind / clear
+/// must reach both or the peer's layers keep state from rejected tokens (and
+/// leak it per request).
+fn for_each_gdn_workspace(
+    hip: &HipWorkspace,
+    target: Option<&TinyModel>,
+    mut f: impl FnMut(&HipWorkspace) -> Result<(), AllpacaError>,
+) -> Result<(), AllpacaError> {
+    f(hip)?;
+    let peer = target
+        .and_then(|t| t.rpc.as_ref())
+        .and_then(|rpc| rpc.local_peer());
+    if let Some((_, peer_hip, _)) = peer {
+        if !std::ptr::eq(peer_hip.as_ref(), hip) {
+            f(&peer_hip)?;
+        }
+    }
+    Ok(())
+}
+
+/// Every workspace holding the target's GDN state can roll a clone forward
+/// `keep` journaled steps (see [`HipWorkspace::gdn_rewind_request_to`]).
+fn gdn_all_can_replay(hip: &HipWorkspace, target: &TinyModel, id: u64, keep: usize) -> bool {
+    let mut all = true;
+    let _ = for_each_gdn_workspace(hip, Some(target), |ws| {
+        all &= ws.gdn_can_replay(id, keep);
+        Ok(())
+    });
+    all
+}
+
+
+/// Load a `--draft-model` GGUF. MTP sidecars (`mtp-*.gguf`) ship only the
+/// trailing NextN block (`blk.{n_layers}`), so they load as an MTP draft.
+fn load_draft_gguf(file: &GgufFile) -> Result<TinyModel, AllpacaError> {
+    if file.tensor("blk.0.attn_norm.weight").is_none() {
+        if let Ok(mtp) = TinyModel::from_gguf_mtp(file) {
+            return Ok(mtp);
+        }
+    }
+    TinyModel::from_gguf(file)
+}
+
 fn mtp_draft_active(inner: &EngineInner) -> bool {
     let Some(model) = inner.draft_model.as_ref() else {
         return false;
@@ -4170,14 +4328,11 @@ fn mtp_process_token(
         return Ok(());
     }
     inner.draft_kv.seed_h_nextn_from_target(h_prev);
-    let vocab = model.config.vocab_size;
-    let mut logits = vec![0.0f32; vocab];
     let resident = inner.draft_resident.clone();
-    model.forward_dense_on(
+    model.process_dense_on(
         token,
         pos,
         &mut inner.draft_kv,
-        &mut logits,
         draft_hip,
         resident.as_deref(),
         Some(metrics),
@@ -4207,14 +4362,12 @@ fn mtp_process_assumed_span(
     }
     let kv_dim = model.config.n_kv_heads * model.config.head_dim();
     let dim = model.config.dim;
-    let vocab = model.config.vocab_size;
     if cache.seq_len() > start_pos {
         cache.truncate(start_pos, kv_dim);
     }
     if cache.seq_len() != start_pos {
         return Ok(());
     }
-    let mut logits = vec![0.0f32; vocab];
     for (i, &token) in span.iter().enumerate() {
         let h_prev = if i == 0 {
             pending_h
@@ -4229,18 +4382,71 @@ fn mtp_process_assumed_span(
         if h_prev.len() == dim {
             cache.seed_h_nextn_from_target(h_prev);
         }
-        model.forward_dense_on(
-            token,
-            start_pos + i,
-            cache,
-            &mut logits,
-            draft_hip,
-            resident,
-            metrics,
-        )?;
+        model.process_dense_on(token, start_pos + i, cache, draft_hip, resident, metrics)?;
         cache.record(token);
     }
     Ok(())
+}
+
+/// Drafts after a deferred correction `tok`: `[tok, d1, ..]`, or empty when no
+/// provider can continue past it. Any draft-ahead span predicted `tok`'s slot
+/// from the pre-correction context and is dropped.
+#[allow(clippy::too_many_arguments)]
+fn propose_after_deferred(
+    inner: &mut EngineInner,
+    id: u64,
+    ctx: &[u32],
+    tok: u32,
+    depth: usize,
+    temperature: f32,
+    draft_hip: Option<&HipWorkspace>,
+    metrics: &Metrics,
+) -> Result<Vec<u32>, AllpacaError> {
+    inner.draft_ahead = None;
+    if inner.flags.draft_model_speculation {
+        if let Some(model) = inner.draft_model.clone() {
+            let mtp = mtp_draft_active(inner);
+            let seed = request(inner, id)?.last_hidden.clone();
+            if mtp && seed.len() == model.config.dim {
+                inner.draft_kv.seed_h_nextn_from_target(&seed);
+            }
+            let mut provider = DraftModelProvider::new((*model).clone());
+            let resident = inner.draft_resident.clone();
+            let draft = provider.propose_after(
+                ctx,
+                tok,
+                depth + 1,
+                temperature,
+                &mut inner.draft_kv,
+                draft_hip,
+                resident.as_deref(),
+                Some(metrics),
+            )?;
+            if mtp {
+                // Draft AR writes are speculative; process() owns the prompt KV.
+                let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+                inner.draft_kv.truncate(ctx.len(), kv_dim);
+                if seed.len() == model.config.dim {
+                    inner.draft_kv.seed_h_nextn_from_target(&seed);
+                }
+            }
+            if draft.len() >= 2 {
+                host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
+                return Ok(draft);
+            }
+        }
+    }
+    if inner.flags.ngram_speculation {
+        let mut after = ctx.to_vec();
+        after.push(tok);
+        let more = inner.ngram.propose(&after, depth, temperature)?;
+        if !more.is_empty() {
+            let mut draft = vec![tok];
+            draft.extend(more);
+            return Ok(draft);
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn propose_drafts(
@@ -4255,6 +4461,9 @@ fn propose_drafts(
         return Ok(Vec::new());
     }
     let ctx = request(inner, id)?.tokens.clone();
+    if let Some(tok) = request(inner, id)?.deferred {
+        return propose_after_deferred(inner, id, &ctx, tok, depth, temperature, draft_hip, metrics);
+    }
     if let Some(ahead) = inner.draft_ahead.take() {
         if ahead.ctx == ctx && !ahead.tokens.is_empty() {
             metrics
@@ -4421,7 +4630,56 @@ fn verify_and_sample(
     micro_batch: Option<&MicroBatchExpertUnion>,
     hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
+    let mut drafts = drafts;
     let drafts_len = drafts.len() as u64;
+    if let Some(tok) = request_mut(inner, id)?.deferred.take() {
+        // Drafts were proposed from the forwarded context, so drafts[0]
+        // predicts this slot. On a match the correction heads the packed span
+        // (it was already emitted, so it is not produced again).
+        if drafts.len() >= 2 && drafts[0] == tok && remaining > 0 {
+            metrics
+                .deferred_corrections_packed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            prefetch_draft_expert_union(inner, &drafts, metrics, hip, hooks)?;
+            let mut out = packed_linear_verify(
+                inner,
+                id,
+                drafts,
+                tok,
+                mask,
+                remaining + 1,
+                metrics,
+                hip,
+                draft_hip,
+                depth,
+                temperature,
+                hooks,
+            )?;
+            // The correction was already emitted and is not a drafted token.
+            out.tokens.remove(0);
+            out.accepted = out.accepted.saturating_sub(1);
+            out.proposed = out.proposed.saturating_sub(1);
+            return Ok(out);
+        }
+        append_and_forward(
+            inner,
+            id,
+            tok,
+            metrics,
+            hip,
+            draft_hip,
+            micro_batch,
+            hooks.layer_stagger,
+            Some(hooks.ds_probe),
+            Some(hooks.ds_queue),
+            #[cfg(feature = "cuda")]
+            hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
+        )?;
+        // They were aligned one slot behind the context that now includes `tok`.
+        drafts.clear();
+    }
     if remaining == 0 {
         return Ok(Produced {
             tokens: Vec::new(),
@@ -4741,7 +4999,7 @@ fn packed_mtp_verify_ahead(
                 let _ = h.bind();
             }
             let rows = row_rx.recv().unwrap_or_default();
-            if rows.is_empty() && span_worker.len() > 1 {
+            if rows.is_empty() {
                 return Ok(Vec::new());
             }
             let mut cache = snap;
@@ -4844,7 +5102,9 @@ fn store_draft_ahead_from_ctx(
     draft_hip: Option<&HipWorkspace>,
     metrics: &Metrics,
 ) -> Result<(), AllpacaError> {
-    if depth == 0 || ctx.is_empty() {
+    // A deferred correction occupies the next slot; a span drafted from `ctx`
+    // would predict that slot and is never used (`propose_after_deferred`).
+    if depth == 0 || ctx.is_empty() || request(inner, id)?.deferred.is_some() {
         return Ok(());
     }
     let Some(model) = inner.draft_model.clone() else {
@@ -4908,6 +5168,8 @@ fn packed_linear_verify_span(
     let drafts_len = span.len() as u64;
     let vocab = request(inner, id)?.pending_logits.len();
     let start_pos = request(inner, id)?.tokens.len();
+    let vision = request(inner, id)?.vision.clone();
+    let vision_ref = (!vision.is_empty()).then_some(&*vision);
     let page_tokens = request(inner, id)?
         .pages
         .first()
@@ -4938,17 +5200,27 @@ fn packed_linear_verify_span(
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     let mut device_gdn_cloned = 0usize;
     if let (Some(hip), Some(state)) = (hip, recurrent.as_mut()) {
-        device_gdn_cloned = hip.gdn_clone_request(id)?;
+        for_each_gdn_workspace(hip, Some(&target), |ws| {
+            device_gdn_cloned += ws.gdn_clone_request(id)?;
+            Ok(())
+        })?;
         if device_gdn_cloned == 0 {
-            hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
-            hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
-            hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
+            for_each_gdn_workspace(hip, Some(&target), |ws| {
+                ws.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                ws.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                ws.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)
+            })?;
         }
     }
     let rec_before = recurrent.clone();
     let dim = target.config.dim;
     let pending_h = request(inner, id)?.last_hidden.clone();
-    let incremental_gdn = recurrent.is_some();
+    // One packed forward over the span when a partial accept can be rewound
+    // from the device GDN journal. Otherwise (host GDN state, Mamba-2 slots)
+    // forward one token at a time and stop at the reject, so no rewind is needed.
+    let journal_rewind = device_gdn_cloned > 0
+        && hip.is_some_and(|h| gdn_all_can_replay(h, &target, id, 0));
+    let incremental_gdn = recurrent.is_some() && !journal_rewind;
     let mut produced = vec![first];
     let mut accepted = 1u64;
     let mut keep = 1usize;
@@ -4972,6 +5244,7 @@ fn packed_linear_verify_span(
             recurrent.as_mut(),
             Some(&mut one_hidden),
             id,
+            vision_ref,
         )?;
         if let Some(hip) = hip {
             hip.wait_logits_d2h(&mut one_logits)?;
@@ -5013,6 +5286,7 @@ fn packed_linear_verify_span(
                 recurrent.as_mut(),
                 Some(&mut one_hidden),
                 id,
+                vision_ref,
             )?;
             if let Some(hip) = hip {
                 hip.wait_logits_d2h(&mut one_logits)?;
@@ -5036,6 +5310,7 @@ fn packed_linear_verify_span(
             recurrent.as_mut(),
             Some(&mut row_hiddens),
             id,
+            vision_ref,
         )?;
         if let Some(hip) = hip {
             hip.bind()?;
@@ -5065,7 +5340,9 @@ fn packed_linear_verify_span(
         }
     }
     if let Some(send) = after_row_hiddens {
-        send(&row_hiddens);
+        // Draft-ahead assumes the whole span lands; after a reject its work
+        // would be discarded, so hand it nothing and let it exit.
+        send(if keep == span.len() { &row_hiddens } else { &[] });
     }
     request_mut(inner, id)?.pending_logits = last_logits;
     metrics
@@ -5076,15 +5353,27 @@ fn packed_linear_verify_span(
     inner
         .kv
         .rewind_filled(&pages, start_pos + keep, page_tokens as usize);
-    if !incremental_gdn && keep < span.len() {
+    if journal_rewind && keep < span.len() {
+        let hip = hip.expect("journal rewind needs HIP");
+        if gdn_all_can_replay(hip, &target, id, keep) {
+            for_each_gdn_workspace(hip, Some(&target), |ws| ws.gdn_rewind_request_to(id, keep))?;
+        } else {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "GDN journal lost rows mid-verify".into(),
+            )));
+        }
+    } else if !incremental_gdn && keep < span.len() {
         if let Some(saved) = rec_before {
             recurrent = Some(saved);
             if let Some(hip) = hip {
-                if device_gdn_cloned > 0 {
-                    hip.gdn_rewind_request(id)?;
-                } else {
-                    hip.gdn_invalidate_request(id);
-                }
+                for_each_gdn_workspace(hip, Some(&target), |ws| {
+                    if device_gdn_cloned > 0 {
+                        ws.gdn_rewind_request(id)
+                    } else {
+                        ws.gdn_invalidate_request(id);
+                        Ok(())
+                    }
+                })?;
             }
             let mut replay_logits = vec![0.0f32; vocab];
             target.forward_tokens(
@@ -5101,6 +5390,7 @@ fn packed_linear_verify_span(
                 recurrent.as_mut(),
                 None,
                 id,
+                vision_ref,
             )?;
             if let Some(hip) = hip {
                 let _ = hip.wait_logits_d2h(&mut replay_logits);
@@ -5108,7 +5398,10 @@ fn packed_linear_verify_span(
         }
     }
     if let Some(hip) = hip {
-        hip.gdn_drop_clone(id);
+        let _ = for_each_gdn_workspace(hip, Some(&target), |ws| {
+            ws.gdn_drop_clone(id);
+            Ok(())
+        });
     }
     request_mut(inner, id)?.recurrent = recurrent;
     if let Some(join) = before_draft_gpu {
@@ -5149,7 +5442,18 @@ fn packed_linear_verify_span(
         inner.ngram.observe(&ctx);
     }
 
-    if produced.len() > keep {
+    let correction = produced.get(keep).copied();
+    let params_end = request(inner, id)?.params.clone();
+    let defer = correction.is_some_and(|tok| {
+        !is_stop(tok, &params_end)
+            && produced.len() < remaining
+            && !inner.flags.tree_speculation
+            && (inner.flags.draft_model_speculation || inner.flags.ngram_speculation)
+    });
+    if defer {
+        // Forwarded next step at the head of the drafted span (or alone).
+        request_mut(inner, id)?.deferred = correction;
+    } else if produced.len() > keep {
         if let Some(join) = before_draft_gpu {
             join();
         }
@@ -5351,6 +5655,7 @@ fn append_and_forward(
     let defer_lm_head = request(inner, id)?.defer_lm_head;
     mtp_process_token(inner, token, pos, &last_hidden, draft_hip, metrics)?;
     let want_hidden = mtp_draft_active(inner) || defer_lm_head;
+    let vision = request(inner, id)?.vision.clone();
     let mut side = DeviceDecodeSide {
         moe_norm: Some(&mut moe_norm),
         layer_stagger,
@@ -5362,6 +5667,7 @@ fn append_and_forward(
             None
         },
         write_logits: !defer_lm_head,
+        mrope: vision.mrope(),
         ..DeviceDecodeSide::new(id)
     };
     let used_cuda = {
@@ -5468,6 +5774,36 @@ fn append_and_forward(
         }
     }
     Ok(())
+}
+
+/// Replaces the i-th `pad` token in `tokens` with `grids[i]` = `(cols, rows)`
+/// image tokens and returns the spans they occupy. Images without a pad
+/// (none left, or no pad token in the vocab) go first, before the prompt.
+fn expand_image_pads(
+    tokens: &[u32],
+    pad: Option<u32>,
+    grids: &[(usize, usize)],
+) -> (Vec<u32>, Vec<crate::model::ImageSpan>) {
+    let fill = pad.unwrap_or(0);
+    let n_pads = pad.map_or(0, |p| tokens.iter().filter(|&&t| t == p).count());
+    let (front, inline) = grids.split_at(grids.len().saturating_sub(n_pads));
+    let mut out = Vec::with_capacity(tokens.len() + grids.iter().map(|(c, r)| c * r).sum::<usize>());
+    let mut spans = Vec::with_capacity(grids.len());
+    let mut push_image = |out: &mut Vec<u32>, &(cols, rows): &(usize, usize)| {
+        spans.push(crate::model::ImageSpan { start: out.len(), cols, rows });
+        out.extend(std::iter::repeat_n(fill, cols * rows));
+    };
+    for g in front {
+        push_image(&mut out, g);
+    }
+    let mut inline = inline.iter();
+    for &t in tokens {
+        match (Some(t) == pad).then(|| inline.next()).flatten() {
+            Some(g) => push_image(&mut out, g),
+            None => out.push(t),
+        }
+    }
+    (out, spans)
 }
 
 fn is_stop(token: u32, params: &GenerationParams) -> bool {
@@ -6499,6 +6835,7 @@ mod tests {
                 embeddings: vec![self.fill; self.n_tokens * self.dim],
                 n_tokens: self.n_tokens,
                 device: self.device,
+                grids: Vec::new(),
             })
         }
     }
@@ -8016,6 +8353,26 @@ mod tests {
     }
 
     #[test]
+    fn image_pads_expand_in_place_into_image_tokens() {
+        const PAD: u32 = 99;
+        // "a <vs> <pad> <ve> b <vs> <pad> <ve>" with a 2x1 and a 1x3 image.
+        let tokens = [1, 50, PAD, 51, 2, 50, PAD, 51];
+        let (out, spans) = expand_image_pads(&tokens, Some(PAD), &[(2, 1), (1, 3)]);
+        assert_eq!(out, [1, 50, PAD, PAD, 51, 2, 50, PAD, PAD, PAD, 51]);
+        assert_eq!(
+            spans,
+            [
+                crate::model::ImageSpan { start: 2, cols: 2, rows: 1 },
+                crate::model::ImageSpan { start: 7, cols: 1, rows: 3 },
+            ]
+        );
+        // No pads in the prompt: images go first, in order.
+        let (out, spans) = expand_image_pads(&[7, 8], Some(PAD), &[(2, 2)]);
+        assert_eq!(out, [PAD, PAD, PAD, PAD, 7, 8]);
+        assert_eq!(spans, [crate::model::ImageSpan { start: 0, cols: 2, rows: 2 }]);
+    }
+
+    #[test]
     fn queue_pressure_shrinks_draft_depth() {
         let mut cfg = test_config();
         cfg.speculative.enabled = true;
@@ -8025,7 +8382,9 @@ mod tests {
         let engine = Engine::new(cfg).unwrap();
         {
             let mut inner = engine.lock().unwrap();
-            inner.scheduler.record_acceptance(9, 10);
+            for _ in 0..10 {
+                inner.scheduler.record_acceptance(9, 10);
+            }
             let raised = inner.scheduler.draft_depth;
             assert!(raised > 2);
             // Neutral acceptance keeps depth; queue pressure alone must shrink.
@@ -8088,22 +8447,27 @@ mod tests {
             "initial draft depth from min_depth; stats={initial}"
         );
         {
+            // Depth follows sustained acceptance, not one span.
             let mut inner = engine.lock().unwrap();
-            inner.scheduler.record_acceptance(9, 10);
+            for _ in 0..10 {
+                inner.scheduler.record_acceptance(9, 10);
+            }
         }
         let raised = engine.stats().draft_depth;
         assert!(
             raised > initial,
-            "high acceptance must raise draft_depth; before={initial} after={raised}"
+            "sustained high acceptance must raise draft_depth; before={initial} after={raised}"
         );
         {
             let mut inner = engine.lock().unwrap();
-            inner.scheduler.record_acceptance(1, 10);
+            for _ in 0..30 {
+                inner.scheduler.record_acceptance(1, 10);
+            }
         }
         let lowered = engine.stats().draft_depth;
         assert!(
             lowered < raised,
-            "low acceptance must shrink draft_depth; raised={raised} lowered={lowered}"
+            "sustained low acceptance must shrink draft_depth; raised={raised} lowered={lowered}"
         );
     }
 
@@ -10519,7 +10883,14 @@ mod tests {
             device_conv, snapshot_conv,
             "D2D rewind must restore conv history"
         );
+        // Every verify clones and drops; the snapshot slots must be reused.
+        hip.gdn_drop_clone(77);
+        let held = hip.allocated_bytes();
+        assert_eq!(hip.gdn_clone_request(77).unwrap(), 1);
+        assert_eq!(hip.allocated_bytes(), held, "re-clone must not allocate");
+        hip.gdn_drop_clone(77);
         hip.gdn_clear_request(77);
+        assert!(hip.allocated_bytes() < held, "clear must free the snapshot");
     }
 
     #[cfg(feature = "hip")]

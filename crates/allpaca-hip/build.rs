@@ -97,6 +97,8 @@ fn main() {
     }
     if cfg!(windows) {
         println!("cargo:rustc-link-lib=dxgi");
+        // PDH reads adapter-wide dedicated VRAM use (other processes included).
+        println!("cargo:rustc-link-lib=pdh");
     }
     if let Some(sdk) = direct_storage {
         println!(

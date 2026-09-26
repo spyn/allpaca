@@ -456,6 +456,19 @@ pub fn rope_imrope_neox(
     n_rot: usize,
     sections: [i32; 4],
 ) -> Result<(), AllpacaError> {
+    rope_imrope_neox_at(x, [pos; 3], theta, n_rot, sections)
+}
+
+/// [`rope_imrope_neox`] at an M-RoPE position `[t, h, w]` (llama.cpp
+/// sections 0..2): image tokens use `(base, base + row, base + column)`.
+/// Without IMRoPE sections every pair turns by `t`.
+pub fn rope_imrope_neox_at(
+    x: &mut [f32],
+    pos: [usize; 3],
+    theta: f32,
+    n_rot: usize,
+    sections: [i32; 4],
+) -> Result<(), AllpacaError> {
     let head_dim = x.len();
     if head_dim == 0 || head_dim % 2 != 0 {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
@@ -473,9 +486,9 @@ pub fn rope_imrope_neox(
     let sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
     let use_imrope = sect_dims > 0 && sections[0] > 0 && sections[1] > 0;
 
-    let mut theta_t = pos as f32;
-    let mut theta_h = pos as f32;
-    let mut theta_w = pos as f32;
+    let mut theta_t = pos[0] as f32;
+    let mut theta_h = pos[1] as f32;
+    let mut theta_w = pos[2] as f32;
     let mut theta_e = 0.0f32;
 
     for i in 0..half {
@@ -519,6 +532,19 @@ pub fn rope_imrope_neox_heads(
     n_rot: usize,
     sections: [i32; 4],
 ) -> Result<(), AllpacaError> {
+    rope_imrope_neox_heads_at(x, n_heads, head_dim, [pos; 3], theta, n_rot, sections)
+}
+
+/// [`rope_imrope_neox_heads`] at an M-RoPE position `[t, h, w]`.
+pub fn rope_imrope_neox_heads_at(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: [usize; 3],
+    theta: f32,
+    n_rot: usize,
+    sections: [i32; 4],
+) -> Result<(), AllpacaError> {
     if n_heads == 0 || head_dim == 0 || x.len() != n_heads.saturating_mul(head_dim) {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "imrope heads length mismatch".into(),
@@ -526,7 +552,7 @@ pub fn rope_imrope_neox_heads(
     }
     for h in 0..n_heads {
         let row = &mut x[h * head_dim..(h + 1) * head_dim];
-        rope_imrope_neox(row, pos, theta, n_rot, sections)?;
+        rope_imrope_neox_at(row, pos, theta, n_rot, sections)?;
     }
     Ok(())
 }
@@ -2080,6 +2106,30 @@ mod tests {
         for i in 0..256 {
             assert!((a[i] - b[i]).abs() < 1e-4, "i={i} a={} b={}", a[i], b[i]);
         }
+    }
+
+    #[test]
+    fn imrope_thw_turns_each_sector_by_its_own_position() {
+        // Image tokens rotate by (t, row, column): sector % 3 picks the axis.
+        let sections = [2, 2, 2, 0];
+        let (n_rot, theta) = (12usize, 10_000.0f32);
+        let half = n_rot / 2;
+        let pos = [7usize, 3, 11];
+        let mut x = vec![0.0f32; n_rot];
+        x[..half].fill(1.0);
+        rope_imrope_neox_at(&mut x, pos, theta, n_rot, sections).unwrap();
+        let scale = theta.powf(-2.0 / n_rot as f32);
+        for i in 0..half {
+            let angle = pos[i % 3] as f32 * scale.powi(i as i32);
+            assert!((x[i] - angle.cos()).abs() < 1e-5, "pair {i}: {} vs cos {}", x[i], angle.cos());
+            assert!((x[i + half] - angle.sin()).abs() < 1e-5, "pair {i}");
+        }
+        // Text (pos, pos, pos) is the single-position form.
+        let mut a: Vec<f32> = (0..n_rot).map(|i| i as f32 * 0.1).collect();
+        let mut b = a.clone();
+        rope_imrope_neox(&mut a, 5, theta, n_rot, sections).unwrap();
+        rope_imrope_neox_at(&mut b, [5; 3], theta, n_rot, sections).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]

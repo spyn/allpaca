@@ -2966,6 +2966,7 @@ impl Dsv4Gpu {
             prefill_used: [0, 0],
             prefill_device: 0,
             clock: 0,
+            keep_set: HashSet::new(),
             h2d: None,
             h2d1: None,
             pin0: None,

@@ -42,6 +42,15 @@ pub struct StatsSnapshot {
     /// Next-span Draft Model proposes that were reused after overlapping packed verify.
     #[serde(default)]
     pub draft_ahead_hits: u64,
+    /// MTP process forwards that skipped the draft lm_head.
+    #[serde(default)]
+    pub draft_logits_skipped: u64,
+    /// Tokens a draft provider drafted, including discarded draft-ahead spans.
+    #[serde(default)]
+    pub draft_tokens_drafted: u64,
+    /// Rejected-verify corrections verified inside the next packed span.
+    #[serde(default)]
+    pub deferred_corrections_packed: u64,
     pub accepted_tokens_per_target_eval: f64,
     pub model_id: String,
     /// `"cpu"` or `"hip"` — which kernel backend ran target forwards.

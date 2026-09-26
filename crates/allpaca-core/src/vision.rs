@@ -470,6 +470,7 @@ impl VisionEncoder for PatchVisionEncoder {
             embeddings,
             n_tokens,
             device: self.device,
+            grids: Vec::new(),
         })
     }
 
@@ -1106,14 +1107,14 @@ fn softmax_inplace(x: &mut [f32]) {
 }
 
 #[derive(Debug, Clone)]
-struct RgbImage {
-    width: u32,
-    height: u32,
+pub(crate) struct RgbImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Row-major RGB8.
-    pixels: Vec<u8>,
+    pub(crate) pixels: Vec<u8>,
 }
 
-fn decode_rgb8(input: &ImageInput) -> Result<RgbImage, AllpacaError> {
+pub(crate) fn decode_rgb8(input: &ImageInput) -> Result<RgbImage, AllpacaError> {
     match image::load_from_memory(&input.bytes) {
         Ok(dyn_img) => {
             let rgb = dyn_img.to_rgb8();

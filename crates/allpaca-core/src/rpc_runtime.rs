@@ -91,6 +91,76 @@ struct RemoteLayer {
     rope_sections: [i32; 4],
 }
 
+/// VRAM a local GPU keeps back from layer weights: HIP context, decode and
+/// prefill workspaces, hipBLASLt scratch, and desktop churn on a display GPU.
+fn local_reserve_bytes(total: u64) -> u64 {
+    (768u64 << 20) + total / 32
+}
+
+/// Place GGUF layers on the local GPUs by measured free VRAM and per-layer bytes.
+///
+/// The target GPU (first) also carries lm_head / `output_norm`; the second
+/// keeps room for the draft model. Free VRAM is
+/// read now, not the card's total: on Windows a display GPU can have several
+/// GiB taken by the desktop, and WDDM silently spills past-capacity
+/// allocations to shared system memory, which reads over PCIe at decode.
+fn plan_local_by_bytes(
+    model: &TinyModel,
+    file: &GgufFile,
+    local_ids: &[i32],
+    is_full_attn: &[bool],
+    kv_vram_bytes: u64,
+    draft_bytes: u64,
+) -> LayerPlan {
+    let (mut layer_bytes, globals) = crate::model::gguf_device_bytes(file, &model.config);
+    let n_attn = is_full_attn.iter().filter(|a| **a).count().max(1) as u64;
+    let kv_share = kv_vram_bytes / n_attn;
+    for (bytes, attn) in layer_bytes.iter_mut().zip(is_full_attn) {
+        if *attn {
+            *bytes += kv_share;
+        }
+    }
+    let mut budgets = Vec::with_capacity(local_ids.len());
+    for (slot, dev) in local_ids.iter().copied().enumerate() {
+        let (hip_free, total) = allpaca_hip::device_memory_info(dev).unwrap_or((0, 0));
+        let free = allpaca_hip::device_local_headroom(dev).map_or(hip_free, |h| h.min(hip_free));
+        let mut budget = free.saturating_sub(local_reserve_bytes(total));
+        if slot == 0 {
+            budget = budget.saturating_sub(globals);
+        } else if slot == 1 {
+            budget = budget.saturating_sub(draft_bytes);
+        }
+        tracing::info!(
+            hip = dev,
+            free_mib = free >> 20,
+            total_mib = total >> 20,
+            budget_mib = budget >> 20,
+            "local GPU pool budget"
+        );
+        budgets.push(budget);
+    }
+    let plan = crate::layer_split::plan_local_fill(&layer_bytes, &budgets);
+    let need: u64 = layer_bytes.iter().sum::<u64>() + globals;
+    let have: u64 = budgets.iter().sum::<u64>() + globals;
+    if need > have {
+        tracing::warn!(
+            need_mib = need >> 20,
+            budget_mib = have >> 20,
+            "GGUF layers exceed local GPU budgets; the last GPU is oversubscribed"
+        );
+    }
+    for (owner, start, end) in plan.runs() {
+        let bytes: u64 = layer_bytes[start..end].iter().sum();
+        tracing::info!(
+            hip = local_ids.get(owner).copied().unwrap_or(-1),
+            layers = format!("{start}..{end}"),
+            mib = bytes >> 20,
+            "local-only HIP pool: contiguous layer range"
+        );
+    }
+    plan
+}
+
 impl RpcRuntime {
     pub fn connect(endpoints: &[String], token: Option<&str>) -> Result<Self, AllpacaError> {
         let mut sessions = Vec::new();
@@ -211,6 +281,11 @@ impl RpcRuntime {
     }
 
     /// Split devices: local GPU pool first, then each RPC GPU.
+    ///
+    /// `kv_vram_bytes` is the KV VRAM budget; attention layers reserve a share
+    /// of it on whichever local GPU they land. `draft_bytes` stays free on the
+    /// second local GPU, where the draft model is uploaded.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
         model: &TinyModel,
@@ -218,6 +293,8 @@ impl RpcRuntime {
         tensor_split: Option<&[f64]>,
         max_seq: usize,
         gguf: Option<&GgufFile>,
+        kv_vram_bytes: u64,
+        draft_bytes: u64,
     ) -> Result<(), AllpacaError> {
         let local_devices = if local_devices.is_empty() {
             vec![(0, 1u64 << 30)]
@@ -264,24 +341,28 @@ impl RpcRuntime {
                 "packed weights fit in the local GPU pool"
             );
         }
-        let plan = if groups.is_empty() && n_local > 1 {
+        let plan = if groups.is_empty() && n_local > 1 && tensor_split.is_none() {
             let attn: Vec<bool> = model
                 .layers
                 .iter()
                 .map(|l| l.block == HybridLayerKind::Attention)
                 .collect();
-            let hybrid = attn.iter().any(|full| !*full);
-            let window = if hybrid {
-                plan_local_hybrid_peer(model.config.n_layers, &local_mems, &attn)
+            if let Some(file) = gguf {
+                plan_local_by_bytes(model, file, &local_ids, &attn, kv_vram_bytes, draft_bytes)
             } else {
-                plan_local_peer_window(model.config.n_layers, &local_mems)
-            };
-            tracing::info!(
-                peer_layers = window.owners.iter().filter(|&&o| o != 0).count(),
-                hybrid,
-                "local-only HIP pool: hybrid peer (middle window + later GDN)"
-            );
-            window
+                let hybrid = attn.iter().any(|full| !*full);
+                let window = if hybrid {
+                    plan_local_hybrid_peer(model.config.n_layers, &local_mems, &attn)
+                } else {
+                    plan_local_peer_window(model.config.n_layers, &local_mems)
+                };
+                tracing::info!(
+                    peer_layers = window.owners.iter().filter(|&&o| o != 0).count(),
+                    hybrid,
+                    "local-only HIP pool: hybrid peer (middle window + later GDN)"
+                );
+                window
+            }
         } else {
             plan_layer_owners(model.config.n_layers, &device_bytes, expanded.as_deref())?
         };

@@ -91,6 +91,13 @@ int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes);
  * the scheduler needs before it grows the expert pool. */
 int allpaca_hip_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes);
 
+/* Windows: dedicated VRAM on `device` not resident for any process (PDH
+ * "GPU Adapter Memory" Dedicated Usage vs the adapter's DedicatedVideoMemory).
+ * hipMemGetInfo there does not see the desktop's share, and WDDM demotes
+ * allocations past what is really left to shared system memory. Other
+ * platforms: ALLPACA_ERR_NOT_IMPLEMENTED. */
+int allpaca_hip_local_headroom(int32_t device, uint64_t *bytes);
+
 int allpaca_hip_set_device(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);
@@ -165,6 +172,10 @@ int allpaca_gemm_nt_q6_k_cols(const float *a, const uint8_t *b, float *c, int32_
                               int32_t k, int32_t cols, allpaca_stream_t stream);
 int allpaca_gemm_nt_q6_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
+
+/* C[m,n] = A[m,k] * dequant(B_q3_k[n,k])^T. Native 110-byte Q3_K super-blocks, k % 256 == 0. */
+int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                         int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
 int allpaca_gemm_nt_q5_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -335,9 +346,19 @@ int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t h
                              int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
                              int32_t back, allpaca_stream_t stream);
 
-/* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e). */
+/* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e).
+ * pos[3] is the M-RoPE (t, h, w) position; text tokens use (p, p, p). */
+/* x[r][c] = act(x[r][c] + bias[c]) on device rows; act 0 = none, 1 = tanh GELU. */
+int allpaca_bias_act_rows(float *x, const float *bias, int32_t rows, int32_t n, int32_t act,
+                          allpaca_stream_t stream);
+
+/* Qwen-VL vision 2D RoPE on [n_tok][n_heads * head_dim] (ggml ROPE_TYPE_VISION). */
+int allpaca_vision_rope_rows(float *x, const int32_t *pos_row, const int32_t *pos_col,
+                             int32_t n_tok, int32_t n_heads, int32_t head_dim, float theta,
+                             allpaca_stream_t stream);
+
 int allpaca_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
-                           int32_t head_dim, int32_t n_rot, int32_t pos, float theta,
+                           int32_t head_dim, int32_t n_rot, const int32_t pos[3], float theta,
                            const int32_t sections[4], allpaca_stream_t stream);
 
 int allpaca_dequant_q8_0(const uint8_t *blocks, float *out, int32_t n, allpaca_stream_t stream);
