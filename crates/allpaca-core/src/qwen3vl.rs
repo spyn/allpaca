@@ -7,7 +7,10 @@
 //! with LayerNorm, vision M-RoPE over (row, column) and tanh GELU, a final
 //! LayerNorm, then each 2x2 group concatenated through a GELU MLP to the LLM
 //! width. Deepstack layers are rejected (the Qwen3.5 / 3.8 mmproj has none).
-//! This is the CPU reference encoder.
+//! Large matrices stay F16 on the host (as in the file). [`Qwen3VlVision::encode`]
+//! is the CPU reference; [`Qwen3VlVision::encode_on`] runs the same graph on a
+//! HIP device, uploading the weights for the call and freeing them after, so
+//! the encoder never holds VRAM the LLM's layer plan did not budget for.
 
 use std::path::Path;
 
@@ -16,6 +19,12 @@ use allpaca_types::{AllpacaError, FatalError};
 
 const PROJECTOR: &str = "qwen3vl_merger";
 const ROPE_THETA: f32 = 10_000.0;
+/// Fewest merged tokens per image (llama.cpp Qwen-VL limit).
+const MIN_IMAGE_TOKENS: usize = 8;
+/// Default token budget per image. llama.cpp allows 4096 (~2048 px square);
+/// 1024 (~1024 px square) keeps encode time reasonable and is what llama.cpp
+/// recommends as the floor for grounding.
+pub const DEFAULT_MAX_IMAGE_TOKENS: usize = 1024;
 
 /// Shape of a Qwen3-VL vision tower.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,18 +51,19 @@ impl Qwen3VlConfig {
     }
 }
 
+/// Weight matrices are F16 bits `[out][in]`; norms and biases F32.
 struct Block {
     ln1_w: Vec<f32>,
     ln1_b: Vec<f32>,
-    qkv_w: Vec<f32>,
+    qkv_w: Vec<u16>,
     qkv_b: Vec<f32>,
-    out_w: Vec<f32>,
+    out_w: Vec<u16>,
     out_b: Vec<f32>,
     ln2_w: Vec<f32>,
     ln2_b: Vec<f32>,
-    up_w: Vec<f32>,
+    up_w: Vec<u16>,
     up_b: Vec<f32>,
-    down_w: Vec<f32>,
+    down_w: Vec<u16>,
     down_b: Vec<f32>,
 }
 
@@ -68,10 +78,15 @@ pub struct Qwen3VlVision {
     blocks: Vec<Block>,
     post_w: Vec<f32>,
     post_b: Vec<f32>,
-    mm0_w: Vec<f32>,
+    mm0_w: Vec<u16>,
     mm0_b: Vec<f32>,
-    mm2_w: Vec<f32>,
+    mm2_w: Vec<u16>,
     mm2_b: Vec<f32>,
+    max_image_tokens: usize,
+    /// Fixed HIP device for encode (`None`: the GPU with most free memory).
+    hip_device: Option<i32>,
+    #[allow(clippy::type_complexity)]
+    hip: std::sync::Mutex<Vec<(i32, std::sync::Arc<allpaca_hip::HipWorkspace>)>>,
 }
 
 fn load_err(msg: impl Into<String>) -> AllpacaError {
@@ -143,6 +158,17 @@ impl Qwen3VlVision {
             return Err(load_err(format!("unsupported qwen3vl mmproj shape {cfg:?}")));
         }
         let t = |name: &str| file.tensor_f32(name);
+        let f16 = |name: &str| -> Result<Vec<u16>, AllpacaError> {
+            let info = file
+                .tensor(name)
+                .ok_or_else(|| load_err(format!("mmproj missing {name}")))?;
+            if info.ggml_type == allpaca_gguf::GgmlType::F16 {
+                let bytes = file.tensor_bytes(name)?;
+                Ok(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect())
+            } else {
+                Ok(t(name)?.into_iter().map(allpaca_cpu::f32_to_f16).collect())
+            }
+        };
         let mut patch_w = t("v.patch_embd.weight")?;
         if file.tensor("v.patch_embd.weight.1").is_some() {
             // A still image fills both temporal slots, so the two kernels add.
@@ -153,18 +179,19 @@ impl Qwen3VlVision {
         let blocks = (0..cfg.n_layer)
             .map(|i| {
                 let b = |s: &str| t(&format!("v.blk.{i}.{s}"));
+                let w = |s: &str| f16(&format!("v.blk.{i}.{s}"));
                 Ok(Block {
                     ln1_w: b("ln1.weight")?,
                     ln1_b: b("ln1.bias")?,
-                    qkv_w: b("attn_qkv.weight")?,
+                    qkv_w: w("attn_qkv.weight")?,
                     qkv_b: b("attn_qkv.bias")?,
-                    out_w: b("attn_out.weight")?,
+                    out_w: w("attn_out.weight")?,
                     out_b: b("attn_out.bias")?,
                     ln2_w: b("ln2.weight")?,
                     ln2_b: b("ln2.bias")?,
-                    up_w: b("ffn_up.weight")?,
+                    up_w: w("ffn_up.weight")?,
                     up_b: b("ffn_up.bias")?,
-                    down_w: b("ffn_down.weight")?,
+                    down_w: w("ffn_down.weight")?,
                     down_b: b("ffn_down.bias")?,
                 })
             })
@@ -176,10 +203,13 @@ impl Qwen3VlVision {
             blocks,
             post_w: t("v.post_ln.weight")?,
             post_b: t("v.post_ln.bias")?,
-            mm0_w: t("mm.0.weight")?,
+            mm0_w: f16("mm.0.weight")?,
             mm0_b: t("mm.0.bias")?,
-            mm2_w: t("mm.2.weight")?,
+            mm2_w: f16("mm.2.weight")?,
             mm2_b: t("mm.2.bias")?,
+            max_image_tokens: DEFAULT_MAX_IMAGE_TOKENS,
+            hip_device: None,
+            hip: std::sync::Mutex::new(Vec::new()),
             cfg,
         };
         vision.check_shapes()?;
@@ -211,6 +241,37 @@ impl Qwen3VlVision {
         &self.cfg
     }
 
+    /// Cap each image at `max` merged tokens (at least the llama.cpp minimum).
+    pub fn with_max_image_tokens(mut self, max: usize) -> Self {
+        self.max_image_tokens = max.max(MIN_IMAGE_TOKENS);
+        self
+    }
+
+    /// Resize (bilinear, aspect preserved, sides multiples of `patch * merge`,
+    /// within the token budget) and normalize to planar RGB, as llama.cpp's
+    /// Qwen-VL `dyn_size` preprocessor does. Returns `(pixels, width, height)`.
+    pub fn preprocess(&self, img: &image::RgbImage) -> (Vec<f32>, usize, usize) {
+        let c = &self.cfg;
+        let unit = c.patch_size * c.merge;
+        let area = unit * unit;
+        let (w, h) = smart_size(
+            img.width() as usize,
+            img.height() as usize,
+            unit,
+            MIN_IMAGE_TOKENS * area,
+            self.max_image_tokens * area,
+        );
+        let resized = image::imageops::resize(img, w as u32, h as u32, image::imageops::FilterType::Triangle);
+        let plane = w * h;
+        let mut px = vec![0.0f32; 3 * plane];
+        for (i, p) in resized.pixels().enumerate() {
+            for ch in 0..3 {
+                px[ch * plane + i] = (f32::from(p[ch]) / 255.0 - c.image_mean[ch]) / c.image_std[ch];
+            }
+        }
+        (px, w, h)
+    }
+
     /// Merged token grid `(columns, rows)` for an image of `width` x `height` px.
     pub fn token_grid(&self, width: usize, height: usize) -> (usize, usize) {
         let unit = self.cfg.patch_size * self.cfg.merge;
@@ -221,8 +282,35 @@ impl Qwen3VlVision {
     /// `[tokens][proj_dim]` LLM embeddings, tokens in row-major merged-grid
     /// order. Both sides must be multiples of `patch_size * merge`.
     pub fn encode(&self, pixels: &[f32], width: usize, height: usize) -> Result<Vec<f32>, AllpacaError> {
+        self.check_image(pixels, width, height)?;
         let c = &self.cfg;
-        let unit = c.patch_size * c.merge;
+        let (px, py) = (width / c.patch_size, height / c.patch_size);
+        let order = merged_patch_order(px, py);
+        let (n, e) = (order.len(), c.n_embd);
+        let patches = self.im2col(pixels, width, &order);
+        let mut x = linear(&patches, &self.patch_w, &self.patch_b, n, e, patches.len() / n)?;
+        add_into(&mut x, &self.position_embedding(px, py, &order));
+        let mut normed = vec![0.0f32; n * e];
+        for b in &self.blocks {
+            layer_norm_rows(&x, &b.ln1_w, &b.ln1_b, &mut normed, e, c.eps);
+            let attn = self.attention(b, &normed, &order)?;
+            add_into(&mut x, &attn);
+            layer_norm_rows(&x, &b.ln2_w, &b.ln2_b, &mut normed, e, c.eps);
+            let mut up = linear_f16(&normed, &b.up_w, &b.up_b, n, c.n_ff, e)?;
+            up.iter_mut().for_each(|v| *v = gelu_tanh(*v));
+            add_into(&mut x, &linear_f16(&up, &b.down_w, &b.down_b, n, e, c.n_ff)?);
+        }
+        layer_norm_rows(&x, &self.post_w, &self.post_b, &mut normed, e, c.eps);
+        // Each run of 4 patches is one 2x2 group, so concatenating them is a
+        // reinterpretation as [n / 4][4 * n_embd].
+        let tokens = n / 4;
+        let mut h = linear_f16(&normed, &self.mm0_w, &self.mm0_b, tokens, 4 * e, 4 * e)?;
+        h.iter_mut().for_each(|v| *v = gelu_tanh(*v));
+        linear_f16(&h, &self.mm2_w, &self.mm2_b, tokens, c.proj_dim, 4 * e)
+    }
+
+    fn check_image(&self, pixels: &[f32], width: usize, height: usize) -> Result<(), AllpacaError> {
+        let unit = self.cfg.patch_size * self.cfg.merge;
         if width == 0 || height == 0 || width % unit != 0 || height % unit != 0 {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
                 "qwen3vl image {width}x{height} is not a multiple of {unit}"
@@ -233,36 +321,143 @@ impl Qwen3VlVision {
                 "qwen3vl pixels are not [3][height][width]".into(),
             )));
         }
-        let (px, py) = (width / c.patch_size, height / c.patch_size);
-        let order = merged_patch_order(px, py);
-        let (n, e) = (order.len(), c.n_embd);
-        let mut x = self.embed_patches(pixels, width, &order)?;
-        self.add_position_embedding(&mut x, px, py, &order);
-        let mut normed = vec![0.0f32; n * e];
-        for b in &self.blocks {
-            layer_norm_rows(&x, &b.ln1_w, &b.ln1_b, &mut normed, e, c.eps);
-            let attn = self.attention(b, &normed, &order)?;
-            add_into(&mut x, &attn);
-            layer_norm_rows(&x, &b.ln2_w, &b.ln2_b, &mut normed, e, c.eps);
-            let mut up = linear(&normed, &b.up_w, &b.up_b, n, c.n_ff, e)?;
-            up.iter_mut().for_each(|v| *v = gelu_tanh(*v));
-            add_into(&mut x, &linear(&up, &b.down_w, &b.down_b, n, e, c.n_ff)?);
-        }
-        layer_norm_rows(&x, &self.post_w, &self.post_b, &mut normed, e, c.eps);
-        // Each run of 4 patches is one 2x2 group, so concatenating them is a
-        // reinterpretation as [n / 4][4 * n_embd].
-        let tokens = n / 4;
-        let mut h = linear(&normed, &self.mm0_w, &self.mm0_b, tokens, 4 * e, 4 * e)?;
-        h.iter_mut().for_each(|v| *v = gelu_tanh(*v));
-        linear(&h, &self.mm2_w, &self.mm2_b, tokens, c.proj_dim, 4 * e)
+        Ok(())
     }
 
-    fn embed_patches(
+    /// [`Self::encode`] on a HIP device; same inputs and output.
+    pub fn encode_on(
         &self,
+        hip: &allpaca_hip::HipWorkspace,
         pixels: &[f32],
         width: usize,
-        order: &[(usize, usize)],
+        height: usize,
     ) -> Result<Vec<f32>, AllpacaError> {
+        self.check_image(pixels, width, height)?;
+        let c = &self.cfg;
+        let (px, py) = (width / c.patch_size, height / c.patch_size);
+        let order = merged_patch_order(px, py);
+        let (n, e, ff, hd) = (order.len(), c.n_embd, c.n_ff, c.head_dim());
+        let (tokens, pp) = (n / 4, 3 * c.patch_size * c.patch_size);
+        let patches = self.im2col(pixels, width, &order);
+        let pos = self.position_embedding(px, py, &order);
+        let rows: Vec<i32> = order.iter().map(|&(y, _)| y as i32).collect();
+        let cols: Vec<i32> = order.iter().map(|&(_, x)| x as i32).collect();
+
+        // One transient upload: inputs + every weight, 256-byte aligned parts.
+        let mut staged = Staged::default();
+        let in_patches = staged.f32(&patches);
+        let in_pos = staged.f32(&pos);
+        let in_rows = staged.bytes(bytemuck_i32(&rows));
+        let in_cols = staged.bytes(bytemuck_i32(&cols));
+        let patch_w = staged.f32(&self.patch_w);
+        let patch_b = staged.f32(&self.patch_b);
+        let blocks: Vec<[usize; 12]> = self
+            .blocks
+            .iter()
+            .map(|b| {
+                [
+                    staged.f32(&b.ln1_w),
+                    staged.f32(&b.ln1_b),
+                    staged.f16(&b.qkv_w),
+                    staged.f32(&b.qkv_b),
+                    staged.f16(&b.out_w),
+                    staged.f32(&b.out_b),
+                    staged.f32(&b.ln2_w),
+                    staged.f32(&b.ln2_b),
+                    staged.f16(&b.up_w),
+                    staged.f32(&b.up_b),
+                    staged.f16(&b.down_w),
+                    staged.f32(&b.down_b),
+                ]
+            })
+            .collect();
+        let post = [staged.f32(&self.post_w), staged.f32(&self.post_b)];
+        let mm = [
+            staged.f16(&self.mm0_w),
+            staged.f32(&self.mm0_b),
+            staged.f16(&self.mm2_w),
+            staged.f32(&self.mm2_b),
+        ];
+        let dev = hip.device;
+        let wts = allpaca_hip::DeviceWeights::upload_bytes(dev, &staged.views())?;
+        let f = |off: usize| wts.ptr_at(off) as *mut f32;
+        let h = |off: usize| wts.ptr_at(off) as *const u16;
+
+        // Activations.
+        let acts = allpaca_hip::DeviceWeights::alloc(dev, 4 * (7 * n * e + n * ff + tokens * c.proj_dim))?;
+        let act = |i: usize| unsafe { (acts.ptr_at(0) as *mut f32).add(i) };
+        let (x, normed, q, k, v, attn, proj) = (act(0), act(n * e), act(2 * n * e), act(3 * n * e), act(4 * n * e), act(5 * n * e), act(6 * n * e));
+        let up = act(7 * n * e);
+        let out = act(7 * n * e + n * ff);
+        let (ni, ei, ffi) = (n as i32, e as i32, ff as i32);
+
+        hip.gemm_nt_dev(f(in_patches), f(patch_w), x, ni, ei, pp as i32)?;
+        hip.bias_act_rows_dev(x, f(patch_b), ni, ei, false)?;
+        hip.residual_add(x, f(in_pos), ni * ei)?;
+        let (prow, pcol) = (wts.ptr_at(in_rows) as *const i32, wts.ptr_at(in_cols) as *const i32);
+        for bw in &blocks {
+            let [ln1_w, ln1_b, qkv_w, qkv_b, out_w, out_b, ln2_w, ln2_b, up_w, up_b, down_w, down_b] = *bw;
+            hip.layernorm_rows_dev(x, f(ln1_w), f(ln1_b), normed, ni, ei, c.eps)?;
+            for (part, dst) in [q, k, v].into_iter().enumerate() {
+                let w_part = unsafe { h(qkv_w).add(part * e * e) };
+                hip.gemm_nt_f16_dev(normed, w_part, dst, ni, ei, ei)?;
+                hip.bias_act_rows_dev(dst, unsafe { f(qkv_b).add(part * e) }, ni, ei, false)?;
+            }
+            for dst in [q, k] {
+                hip.vision_rope_rows_dev(dst, prow, pcol, ni, c.n_head as i32, hd as i32, ROPE_THETA)?;
+            }
+            hip.attention_device(q, k, v, attn, ni, ni, c.n_head as i32, c.n_head as i32, hd as i32, false)?;
+            hip.gemm_nt_f16_dev(attn, h(out_w), proj, ni, ei, ei)?;
+            hip.bias_act_rows_dev(proj, f(out_b), ni, ei, false)?;
+            hip.residual_add(x, proj, ni * ei)?;
+            hip.layernorm_rows_dev(x, f(ln2_w), f(ln2_b), normed, ni, ei, c.eps)?;
+            hip.gemm_nt_f16_dev(normed, h(up_w), up, ni, ffi, ei)?;
+            hip.bias_act_rows_dev(up, f(up_b), ni, ffi, true)?;
+            hip.gemm_nt_f16_dev(up, h(down_w), proj, ni, ei, ffi)?;
+            hip.bias_act_rows_dev(proj, f(down_b), ni, ei, false)?;
+            hip.residual_add(x, proj, ni * ei)?;
+        }
+        hip.layernorm_rows_dev(x, f(post[0]), f(post[1]), normed, ni, ei, c.eps)?;
+        // [n][e] rows read as [n / 4][4e]; the merger's hidden reuses `up`.
+        let (ti, e4, pd) = (tokens as i32, 4 * ei, c.proj_dim as i32);
+        hip.gemm_nt_f16_dev(normed, h(mm[0]), up, ti, e4, e4)?;
+        hip.bias_act_rows_dev(up, f(mm[1]), ti, e4, true)?;
+        hip.gemm_nt_f16_dev(up, h(mm[2]), out, ti, pd, e4)?;
+        hip.bias_act_rows_dev(out, f(mm[3]), ti, pd, false)?;
+        let mut result = vec![0.0f32; tokens * c.proj_dim];
+        hip.copy_d2h_f32(out, &mut result)?;
+        Ok(result)
+    }
+
+    /// Workspace on the configured vision device, or the HIP GPU with the
+    /// most free memory right now (`None` without a usable GPU).
+    fn pick_hip(&self) -> Option<std::sync::Arc<allpaca_hip::HipWorkspace>> {
+        if !allpaca_hip::runtime_linked() || allpaca_hip::device_count() == 0 {
+            return None;
+        }
+        let dev = self.hip_device.or_else(|| {
+            (0..allpaca_hip::device_count() as i32)
+                .filter_map(|d| allpaca_hip::device_memory_info(d).ok().map(|(free, _)| (d, free)))
+                .max_by_key(|&(_, free)| free)
+                .map(|(d, _)| d)
+        })?;
+        let mut cache = self.hip.lock().ok()?;
+        if let Some((_, ws)) = cache.iter().find(|(d, _)| *d == dev) {
+            return Some(ws.clone());
+        }
+        let ws = std::sync::Arc::new(allpaca_hip::HipWorkspace::new(dev, 8 << 20, 64).ok()?);
+        cache.push((dev, ws.clone()));
+        Some(ws)
+    }
+
+    /// Run encode on HIP device `device` instead of picking one per call.
+    pub fn with_hip_device(mut self, device: Option<i32>) -> Self {
+        self.hip_device = device;
+        self
+    }
+
+    /// Patch pixels `[n][3 * p * p]` (channel, row, column) in `order`.
+    fn im2col(&self, pixels: &[f32], width: usize, order: &[(usize, usize)]) -> Vec<f32> {
         let p = self.cfg.patch_size;
         let pp = 3 * p * p;
         let plane = pixels.len() / 3;
@@ -276,11 +471,12 @@ impl Qwen3VlVision {
                 }
             }
         }
-        linear(&patches, &self.patch_w, &self.patch_b, order.len(), self.cfg.n_embd, pp)
+        patches
     }
 
-    /// Adds the learned grid, bilinearly resized (align corners) to `px` x `py`.
-    fn add_position_embedding(&self, x: &mut [f32], px: usize, py: usize, order: &[(usize, usize)]) {
+    /// The learned grid, bilinearly resized (align corners) to `px` x `py`, in `order`.
+    fn position_embedding(&self, px: usize, py: usize, order: &[(usize, usize)]) -> Vec<f32> {
+        let mut x = vec![0.0f32; order.len() * self.cfg.n_embd];
         let (side, e) = (self.cfg.pos_side, self.cfg.n_embd);
         let scale = |out: usize| {
             if out > 1 {
@@ -300,15 +496,16 @@ impl Qwen3VlVision {
             for (k, v) in x[i * e..(i + 1) * e].iter_mut().enumerate() {
                 let top = a[k] * (1.0 - wx) + b[k] * wx;
                 let bot = cc[k] * (1.0 - wx) + d[k] * wx;
-                *v += top * (1.0 - wy) + bot * wy;
+                *v = top * (1.0 - wy) + bot * wy;
             }
         }
+        x
     }
 
     fn attention(&self, b: &Block, normed: &[f32], order: &[(usize, usize)]) -> Result<Vec<f32>, AllpacaError> {
         let c = &self.cfg;
         let (n, e, hd, nh) = (order.len(), c.n_embd, c.head_dim(), c.n_head);
-        let mut qkv = linear(normed, &b.qkv_w, &b.qkv_b, n, 3 * e, e)?;
+        let mut qkv = linear_f16(normed, &b.qkv_w, &b.qkv_b, n, 3 * e, e)?;
         for (i, &(y, x)) in order.iter().enumerate() {
             let row = &mut qkv[i * 3 * e..(i + 1) * 3 * e];
             for h in 0..nh {
@@ -338,8 +535,61 @@ impl Qwen3VlVision {
                 }
             }
         }
-        linear(&out, &b.out_w, &b.out_b, n, e, e)
+        linear_f16(&out, &b.out_w, &b.out_b, n, e, e)
     }
+}
+
+impl crate::EncoderPlacement for Qwen3VlVision {
+    fn device(&self) -> Option<i32> {
+        None
+    }
+}
+
+impl crate::VisionEncoder for Qwen3VlVision {
+    fn image_marker(&self) -> Option<&'static str> {
+        Some("<|vision_start|><|image_pad|><|vision_end|>")
+    }
+
+    fn encode(&self, images: &[crate::ImageInput]) -> Result<crate::VisionTokens, AllpacaError> {
+        let mut out = crate::VisionTokens::empty(None);
+        for input in images {
+            let raw = crate::vision::decode_rgb8(input)?;
+            let rgb = image::RgbImage::from_raw(raw.width, raw.height, raw.pixels).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig("decoded image size mismatch".into()))
+            })?;
+            let (px, w, h) = self.preprocess(&rgb);
+            let embeds = match self.pick_hip() {
+                Some(hip) => self.encode_on(&hip, &px, w, h)?,
+                None => Qwen3VlVision::encode(self, &px, w, h)?,
+            };
+            let grid = self.token_grid(w, h);
+            out.n_tokens += grid.0 * grid.1;
+            out.embeddings.extend_from_slice(&embeds);
+            out.grids.push(grid);
+        }
+        Ok(out)
+    }
+}
+
+/// llama.cpp `calc_size_preserved_ratio` (transformers `smart_resize`): the
+/// nearest `align` multiples, scaled down to `max_pixels` or up to `min_pixels`.
+fn smart_size(width: usize, height: usize, align: usize, min_pixels: usize, max_pixels: usize) -> (usize, usize) {
+    let f = align as f32;
+    let (wf, hf) = (width as f32, height as f32);
+    let round = |x: f32| (x / f).round() as usize * align;
+    let ceil = |x: f32| (x / f).ceil() as usize * align;
+    let floor = |x: f32| (x / f).floor() as usize * align;
+    let (mut w, mut h) = (round(wf).max(align), round(hf).max(align));
+    if w * h > max_pixels {
+        let beta = (hf * wf / max_pixels as f32).sqrt();
+        h = floor(hf / beta).max(align);
+        w = floor(wf / beta).max(align);
+    } else if w * h < min_pixels {
+        let beta = (min_pixels as f32 / (hf * wf)).sqrt();
+        h = ceil(hf * beta);
+        w = ceil(wf * beta);
+    }
+    (w, h)
 }
 
 /// Patches `(row, column)` in llama.cpp's 2x2 spatial-merge order: each merged
@@ -384,6 +634,48 @@ fn layer_norm_rows(x: &[f32], w: &[f32], b: &[f32], out: &mut [f32], n: usize, e
             dst[i] = (src[i] - mean) * inv * w[i] + b[i];
         }
     }
+}
+
+/// Host staging for one contiguous device upload; parts start 256-byte aligned.
+#[derive(Default)]
+struct Staged {
+    buf: Vec<u8>,
+}
+
+impl Staged {
+    fn bytes(&mut self, b: &[u8]) -> usize {
+        let off = self.buf.len().div_ceil(256) * 256;
+        self.buf.resize(off, 0);
+        self.buf.extend_from_slice(b);
+        off
+    }
+
+    fn f32(&mut self, v: &[f32]) -> usize {
+        let off = self.bytes(&[]);
+        self.buf.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+        off
+    }
+
+    fn f16(&mut self, v: &[u16]) -> usize {
+        let off = self.bytes(&[]);
+        self.buf.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+        off
+    }
+
+    fn views(&self) -> Vec<&[u8]> {
+        vec![&self.buf]
+    }
+}
+
+fn bytemuck_i32(v: &[i32]) -> &[u8] {
+    // SAFETY: i32 has no padding and any byte pattern of u8 is valid.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
+/// [`linear`] with F16 weights (converted for the call).
+fn linear_f16(x: &[f32], w: &[u16], bias: &[f32], rows: usize, n: usize, k: usize) -> Result<Vec<f32>, AllpacaError> {
+    let w: Vec<f32> = w.iter().map(|&b| allpaca_cpu::f16_to_f32(b)).collect();
+    linear(x, &w, bias, rows, n, k)
 }
 
 /// `y[rows][n] = x[rows][k] * w[n][k]^T + bias`.
@@ -455,6 +747,58 @@ mod tests {
             }
         }
         img
+    }
+
+    #[test]
+    fn smart_size_matches_llama_cpp_dyn_size_preprocessor() {
+        // align 32, 8..=1024 tokens of 32x32 px (llama.cpp calc_size_preserved_ratio).
+        let (min_px, max_px) = (8 * 1024, 1024 * 1024);
+        assert_eq!(smart_size(1000, 600, 32, min_px, max_px), (992, 608));
+        assert_eq!(smart_size(4000, 3000, 32, min_px, max_px), (1152, 864));
+        assert_eq!(smart_size(10, 10, 32, min_px, max_px), (96, 96));
+    }
+
+    #[test]
+    fn qwen3vl_encoder_reports_each_image_grid() {
+        let Some(path) = mmproj_path() else {
+            eprintln!("skip: no Qwen3.8 mmproj GGUF");
+            return;
+        };
+        let vision = Qwen3VlVision::load_gguf(&path).unwrap();
+        let img = image::RgbImage::from_fn(64, 64, |x, y| image::Rgb([x as u8 * 4, y as u8 * 4, 128]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let out = crate::VisionEncoder::encode(&vision, &[crate::ImageInput::new(png, "image/png")]).unwrap();
+        // 64x64 is below the 8-token minimum, so it is upscaled to 96x96: 3x3 tokens.
+        assert_eq!(out.grids, vec![(3, 3)]);
+        assert_eq!(out.n_tokens, 9);
+        assert_eq!(out.embeddings.len(), 9 * 5120);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen3vl_hip_encode_matches_cpu() {
+        let Some(path) = mmproj_path() else {
+            eprintln!("skip: no Qwen3.8 mmproj GGUF");
+            return;
+        };
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip: no HIP device");
+            return;
+        }
+        let vision = Qwen3VlVision::load_gguf(&path).unwrap();
+        // Non-square 96x64 px: 6x4 patches, 3x2 merged tokens.
+        let (w, h) = (96usize, 64usize);
+        let px: Vec<f32> = (0..3 * w * h).map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0).collect();
+        let cpu = vision.encode(&px, w, h).unwrap();
+        let hip = allpaca_hip::HipWorkspace::new(0, 8 << 20, 64).unwrap();
+        let gpu = vision.encode_on(&hip, &px, w, h).unwrap();
+        assert_eq!(gpu.len(), 6 * 5120);
+        let scale = cpu.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let worst = cpu.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 2e-3 * scale.max(1.0), "max |cpu - hip| {worst} (scale {scale})");
     }
 
     #[test]

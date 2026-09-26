@@ -759,7 +759,8 @@ impl Default for TelemetrySection {
 pub struct MultimodalSection {
     /// Device for the vision encoder (`hip:N`, `cuda:N`, `cpu`, or unset/`auto`).
     pub vision_device: Option<DeviceSelector>,
-    /// SafeTensors with `patch_proj.weight` / optional `patch_proj.bias`.
+    /// SafeTensors with `patch_proj.weight` / optional `patch_proj.bias`, or a
+    /// llama.cpp `mmproj` `.gguf` (Qwen3-VL `qwen3vl_merger` projector).
     /// When unset and `model.synthetic`, Engine installs deterministic patch weights.
     pub vision_path: Option<PathBuf>,
     /// Square resize before patching (must be multiple of `vision_patch`).
@@ -769,6 +770,9 @@ pub struct MultimodalSection {
     /// Optional ViT-lite transformer blocks after patch embed (0 = patch-only).
     #[serde(default)]
     pub vision_n_blocks: u32,
+    /// mmproj encoders: most LLM tokens per image (0 = encoder default, 1024).
+    #[serde(default)]
+    pub vision_max_tokens: u32,
 }
 
 impl Default for MultimodalSection {
@@ -779,6 +783,7 @@ impl Default for MultimodalSection {
             vision_image_size: 64,
             vision_patch: 16,
             vision_n_blocks: 0,
+            vision_max_tokens: 0,
         }
     }
 }

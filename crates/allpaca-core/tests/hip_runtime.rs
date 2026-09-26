@@ -6737,6 +6737,74 @@ fn tiny_hybrid_mtp_generate(
     ))
 }
 
+/// Fixed soft tokens on a 2x2 grid (M-RoPE placement, like the Qwen3-VL mmproj).
+struct GridVision {
+    dim: usize,
+}
+
+impl allpaca_core::EncoderPlacement for GridVision {
+    fn device(&self) -> Option<i32> {
+        None
+    }
+}
+
+impl allpaca_core::VisionEncoder for GridVision {
+    fn encode(
+        &self,
+        images: &[allpaca_core::ImageInput],
+    ) -> Result<allpaca_core::VisionTokens, allpaca_types::AllpacaError> {
+        let n = 4 * images.len();
+        Ok(allpaca_core::VisionTokens {
+            embeddings: (0..n * self.dim).map(|i| ((i * 29) % 17) as f32 * 0.05 - 0.4).collect(),
+            n_tokens: n,
+            device: None,
+            grids: vec![(2, 2); images.len()],
+        })
+    }
+}
+
+fn tiny_hybrid_image_generate(path: &std::path::Path, prefill_chunk: usize) -> Option<(Vec<u32>, u64)> {
+    let mut cfg = tiny_written_cfg(path.to_path_buf(), false);
+    cfg.prefill.chunk_tokens = prefill_chunk;
+    cfg.speculative.enabled = false;
+    let engine = Engine::new(cfg).expect("tiny hybrid Engine::new");
+    if hip_gpus(&engine).is_empty() {
+        return None;
+    }
+    engine
+        .set_vision_encoder(std::sync::Arc::new(GridVision { dim: 32 }))
+        .expect("vision encoder");
+    let before = engine.stats();
+    let image = allpaca_core::ImageInput::new(vec![0u8; 4], "image/png");
+    let out = engine
+        .generate_multimodal("t3 t4 t5 t6 t3 t4 t5 t6", &[image], greedy(12))
+        .expect("tiny hybrid image generate");
+    let after = engine.stats();
+    Some((out.token_ids, after.target_gpu_forwards - before.target_gpu_forwards))
+}
+
+/// Image soft tokens prefill in the same batched forward as the text around
+/// them, and match one-token-at-a-time prefill.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_image_prompt_prefills_in_one_forward() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_image_prompt_prefills_in_one_forward: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("allpaca_tiny_qwen_image-{}.gguf", std::process::id()));
+    write_tiny_qwen_hybrid_gguf_opts(&path, false);
+    let Some((reference, ref_fwd)) = tiny_hybrid_image_generate(&path, 1) else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    let (ids, fwd) = tiny_hybrid_image_generate(&path, 512).expect("batched");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(ids, reference, "batched image prefill must match per-token");
+    // 4 image + 8 text prompt tokens: one chunk forward instead of 12.
+    assert_eq!(fwd + 11, ref_fwd, "image prompt must prefill in one target forward");
+}
+
 /// With an MTP draft the prompt still prefills as one target forward per
 /// chunk; the draft's process KV is built from the chunk's row hiddens, so
 /// drafts, acceptance and greedy output match one-token-at-a-time prefill.

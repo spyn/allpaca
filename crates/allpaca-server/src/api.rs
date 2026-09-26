@@ -203,8 +203,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Chat turns plus images. With an `image_marker` (the vision encoder's
+/// in-prompt placeholder, e.g. Qwen-VL `<|vision_start|><|image_pad|><|vision_end|>`)
+/// each image part becomes the marker in place and parts concatenate as the
+/// model's chat template does; without one, images are separate and text
+/// parts join with spaces.
 fn flatten_chat_messages(
     messages: &[ChatMessage],
+    image_marker: Option<&str>,
 ) -> Result<(Vec<(String, String)>, Vec<ImageInput>), AllpacaError> {
     let mut turns = Vec::new();
     let mut images = Vec::new();
@@ -218,10 +224,13 @@ fn flatten_chat_messages(
                         ContentPart::Text { text } => texts.push(text.as_str()),
                         ContentPart::ImageUrl { image_url } => {
                             images.push(load_image_url(&image_url.url)?);
+                            if let Some(marker) = image_marker {
+                                texts.push(marker);
+                            }
                         }
                     }
                 }
-                texts.join(" ")
+                texts.join(if image_marker.is_some() { "" } else { " " })
             }
         };
         turns.push((msg.role.clone(), text));
@@ -232,7 +241,7 @@ fn flatten_chat_messages(
 fn messages_to_prompt_and_images(
     messages: &[ChatMessage],
 ) -> Result<(String, Vec<ImageInput>), AllpacaError> {
-    let (turns, images) = flatten_chat_messages(messages)?;
+    let (turns, images) = flatten_chat_messages(messages, None)?;
     let pairs: Vec<(&str, &str)> = turns
         .iter()
         .map(|(r, c)| (r.as_str(), c.as_str()))
@@ -290,7 +299,7 @@ async fn chat_completions(
     let messages = req.messages.clone();
     let engine = state.engine.clone();
     let (prompt, images) = match tokio::task::spawn_blocking(move || {
-        let (turns, images) = flatten_chat_messages(&messages)?;
+        let (turns, images) = flatten_chat_messages(&messages, engine.image_marker())?;
         let pairs: Vec<(&str, &str)> = turns
             .iter()
             .map(|(r, c)| (r.as_str(), c.as_str()))
@@ -1117,6 +1126,33 @@ mod tests {
     }
 
     #[test]
+    fn image_marker_sits_where_the_image_part_was() {
+        let raw = [0xFFu8, 0xD8, 0xFF, 0xD9];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
+        let image = || ContentPart::ImageUrl {
+            image_url: ImageUrlSpec {
+                url: format!("data:image/jpeg;base64,{b64}"),
+            },
+        };
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart::Text { text: "Compare ".into() },
+                image(),
+                ContentPart::Text { text: " and ".into() },
+                image(),
+            ]),
+        }];
+        let (turns, images) = flatten_chat_messages(&messages, Some("<IMG>")).unwrap();
+        // Qwen-VL chat templates concatenate content parts with no separator.
+        assert_eq!(turns, vec![("user".to_string(), "Compare <IMG> and <IMG>".to_string())]);
+        assert_eq!(images.len(), 2);
+        // Without a marker (prefix encoders), parts join as before.
+        let (turns, _) = flatten_chat_messages(&messages, None).unwrap();
+        assert_eq!(turns[0].1, "Compare   and ");
+    }
+
+    #[test]
     fn image_url_rejects_local_path() {
         let path = repo_models_jpg();
         if !path.is_file() {
@@ -1225,6 +1261,7 @@ mod tests {
                     embeddings: vec![0.1; 2 * 32],
                     n_tokens: 2,
                     device: Some(1),
+                    grids: Vec::new(),
                 })
             }
         }
@@ -1410,6 +1447,7 @@ mod tests {
                     embeddings: vec![0.2; 2 * 32],
                     n_tokens: 2,
                     device: Some(1),
+                    grids: Vec::new(),
                 })
             }
         }

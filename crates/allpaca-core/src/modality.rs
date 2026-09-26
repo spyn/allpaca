@@ -32,6 +32,9 @@ pub struct VisionTokens {
     pub embeddings: Vec<f32>,
     pub n_tokens: usize,
     pub device: Option<i32>,
+    /// Merged patch grid `(cols, rows)` of each image, in order, for encoders
+    /// whose LM uses M-RoPE (Qwen-VL). Empty: the tokens are one plain prefix.
+    pub grids: Vec<(usize, usize)>,
 }
 
 impl VisionTokens {
@@ -40,6 +43,7 @@ impl VisionTokens {
             embeddings: Vec::new(),
             n_tokens: 0,
             device,
+            grids: Vec::new(),
         }
     }
 }
@@ -57,6 +61,12 @@ pub trait VisionEncoder: EncoderPlacement {
     /// Resident weight bytes in device memory (0 until upload).
     fn weight_bytes_on_device(&self) -> u64 {
         0
+    }
+
+    /// Text that marks an image's place in a prompt, when the model expects
+    /// images inline (Qwen-VL). `None`: images are a prefix before the prompt.
+    fn image_marker(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -123,6 +133,7 @@ mod tests {
                     embeddings: vec![0.0; images.len()],
                     n_tokens: images.len(),
                     device: self.0,
+                    grids: Vec::new(),
                 })
             }
         }

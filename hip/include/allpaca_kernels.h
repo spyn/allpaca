@@ -346,9 +346,19 @@ int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t h
                              int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
                              int32_t back, allpaca_stream_t stream);
 
-/* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e). */
+/* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e).
+ * pos[3] is the M-RoPE (t, h, w) position; text tokens use (p, p, p). */
+/* x[r][c] = act(x[r][c] + bias[c]) on device rows; act 0 = none, 1 = tanh GELU. */
+int allpaca_bias_act_rows(float *x, const float *bias, int32_t rows, int32_t n, int32_t act,
+                          allpaca_stream_t stream);
+
+/* Qwen-VL vision 2D RoPE on [n_tok][n_heads * head_dim] (ggml ROPE_TYPE_VISION). */
+int allpaca_vision_rope_rows(float *x, const int32_t *pos_row, const int32_t *pos_col,
+                             int32_t n_tok, int32_t n_heads, int32_t head_dim, float theta,
+                             allpaca_stream_t stream);
+
 int allpaca_rope_imrope_qk(float *q, float *k, int32_t n_q_heads, int32_t n_k_heads,
-                           int32_t head_dim, int32_t n_rot, int32_t pos, float theta,
+                           int32_t head_dim, int32_t n_rot, const int32_t pos[3], float theta,
                            const int32_t sections[4], allpaca_stream_t stream);
 
 int allpaca_dequant_q8_0(const uint8_t *blocks, float *out, int32_t n, allpaca_stream_t stream);

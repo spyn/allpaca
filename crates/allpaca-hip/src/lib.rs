@@ -821,6 +821,24 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_bias_act_rows(
+            x: *mut f32,
+            bias: *const f32,
+            rows: i32,
+            n: i32,
+            act: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_vision_rope_rows(
+            x: *mut f32,
+            pos_row: *const i32,
+            pos_col: *const i32,
+            n_tok: i32,
+            n_heads: i32,
+            head_dim: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_scatter_add_scale_rows(
             src: *const f32,
             idx: *const i32,
@@ -969,7 +987,7 @@ mod ffi {
             n_k_heads: i32,
             head_dim: i32,
             n_rot: i32,
-            pos: i32,
+            pos: *const i32,
             theta: f32,
             sections: *const i32,
             stream: *mut c_void,
@@ -7784,6 +7802,99 @@ impl HipWorkspace {
         }
     }
 
+    /// `x[r][c] += bias[c]` on device rows, then tanh GELU when `gelu`.
+    pub fn bias_act_rows_dev(
+        &self,
+        x: *mut f32,
+        bias: *const f32,
+        rows: i32,
+        n: i32,
+        gelu: bool,
+    ) -> Result<(), AllpacaError> {
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_bias_act_rows(x, bias, rows, n, i32::from(gelu), std::ptr::null_mut())
+            };
+            status(rc, "bias_act_rows")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (x, bias, rows, n, gelu);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP bias_act_rows unavailable".into(),
+            )))
+        }
+    }
+
+    /// Qwen-VL vision 2D RoPE in place on device `[n_tok][n_heads * head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vision_rope_rows_dev(
+        &self,
+        x: *mut f32,
+        pos_row: *const i32,
+        pos_col: *const i32,
+        n_tok: i32,
+        n_heads: i32,
+        head_dim: i32,
+        theta: f32,
+    ) -> Result<(), AllpacaError> {
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_vision_rope_rows(
+                    x,
+                    pos_row,
+                    pos_col,
+                    n_tok,
+                    n_heads,
+                    head_dim,
+                    theta,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "vision_rope_rows")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (x, pos_row, pos_col, n_tok, n_heads, head_dim, theta);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP vision_rope_rows unavailable".into(),
+            )))
+        }
+    }
+
+    /// Mean/variance LayerNorm of device rows: `out = (x - mean) / sqrt(var + eps) * w + b`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layernorm_rows_dev(
+        &self,
+        x: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_layernorm_rows(x, weight, bias, out, rows, n, eps, std::ptr::null_mut())
+            };
+            status(rc, "layernorm_rows")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (x, weight, bias, out, rows, n, eps);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP layernorm_rows unavailable".into(),
+            )))
+        }
+    }
+
     pub fn hc_mix_pre_device(
         &self,
         packed: *const f32,
@@ -9766,7 +9877,7 @@ impl HipWorkspace {
         n_k_heads: i32,
         head_dim: i32,
         n_rot: i32,
-        pos: i32,
+        pos: [i32; 3],
         theta: f32,
         sections: [i32; 4],
     ) -> Result<(), AllpacaError> {
@@ -9793,7 +9904,7 @@ impl HipWorkspace {
                         n_k_heads,
                         head_dim,
                         n_rot,
-                        pos,
+                        pos.as_ptr(),
                         theta,
                         sections.as_ptr(),
                         std::ptr::null_mut(),
@@ -14412,7 +14523,8 @@ mod tests {
         let n_k = 2usize;
         let head_dim = 64usize;
         let n_rot = 32usize;
-        let pos = 7usize;
+        // Image-token (t, row, column) positions.
+        let pos = [7usize, 3, 11];
         let theta = 10_000.0f32;
         let sections = [5i32, 5, 6, 0];
         let mut q = vec![0.0f32; n_q * head_dim];
@@ -14425,9 +14537,9 @@ mod tests {
         }
         let mut cpu_q = q.clone();
         let mut cpu_k = k.clone();
-        allpaca_cpu::rope_imrope_neox_heads(&mut cpu_q, n_q, head_dim, pos, theta, n_rot, sections)
+        allpaca_cpu::rope_imrope_neox_heads_at(&mut cpu_q, n_q, head_dim, pos, theta, n_rot, sections)
             .unwrap();
-        allpaca_cpu::rope_imrope_neox_heads(&mut cpu_k, n_k, head_dim, pos, theta, n_rot, sections)
+        allpaca_cpu::rope_imrope_neox_heads_at(&mut cpu_k, n_k, head_dim, pos, theta, n_rot, sections)
             .unwrap();
         let hip = HipWorkspace::new(0, (n_q + n_k) * head_dim * 4 + 4096, 8).expect("hip");
         let q_bytes = q.len() * 4;
@@ -14443,7 +14555,7 @@ mod tests {
             n_k as i32,
             head_dim as i32,
             n_rot as i32,
-            pos as i32,
+            pos.map(|p| p as i32),
             theta,
             sections,
         )

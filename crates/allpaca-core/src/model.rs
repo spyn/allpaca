@@ -39,6 +39,8 @@ pub struct DeviceDecodeSide<'a> {
     pub last_hidden: Option<&'a mut Vec<f32>>,
     /// When false, skip lm_head GEMM / logits D2H (HIP decode cohort packs it).
     pub write_logits: bool,
+    /// M-RoPE layout of a Request with images (rotary position != KV position).
+    pub mrope: Option<&'a MropeLayout>,
 }
 
 impl<'a> DeviceDecodeSide<'a> {
@@ -51,7 +53,111 @@ impl<'a> DeviceDecodeSide<'a> {
             ds_queue: None,
             last_hidden: None,
             write_logits: true,
+            mrope: None,
         }
+    }
+}
+
+/// One image's soft tokens in a Request: `cols * rows` tokens from KV
+/// position `start`, row-major over the merged patch grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl ImageSpan {
+    pub fn len(&self) -> usize {
+        self.cols * self.rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// M-RoPE positions for a Request with images (llama.cpp `MTMD_POS_TYPE_MROPE`).
+/// Image token `i` sits at `(base, base + i / cols, base + i % cols)`, and the
+/// image advances the text position by `max(cols, rows)` rather than its token
+/// count, so later tokens rotate at their KV position minus the saved span.
+/// Attention still indexes KV slots by KV position.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MropeLayout {
+    spans: Vec<ImageSpan>,
+}
+
+impl MropeLayout {
+    /// `spans` in KV order, non-overlapping.
+    pub fn new(mut spans: Vec<ImageSpan>) -> Self {
+        spans.retain(|s| !s.is_empty());
+        spans.sort_by_key(|s| s.start);
+        Self { spans }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn spans(&self) -> &[ImageSpan] {
+        &self.spans
+    }
+
+    /// `(t, h, w)` rotary position for the token at KV position `kv`.
+    pub fn rope_pos(&self, kv: usize) -> [usize; 3] {
+        let mut shift = 0usize;
+        for s in &self.spans {
+            if kv < s.start {
+                break;
+            }
+            let base = s.start - shift;
+            if kv < s.start + s.len() {
+                let i = kv - s.start;
+                return [base, base + i / s.cols, base + i % s.cols];
+            }
+            shift += s.len() - s.cols.max(s.rows);
+        }
+        [kv - shift; 3]
+    }
+}
+
+/// A Request's soft (vision) tokens: which positions take encoder rows
+/// instead of token embeddings, and the M-RoPE layout they imply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VisionSeq {
+    /// Soft token spans in KV order.
+    pub spans: Vec<ImageSpan>,
+    /// `[soft tokens][dim]` encoder rows, spans in order.
+    pub embeds: Vec<f32>,
+    /// Empty when the soft tokens use ordinary sequential positions.
+    pub mrope: MropeLayout,
+}
+
+impl VisionSeq {
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Encoder row replacing the token embedding at KV position `pos`.
+    pub fn soft_row(&self, pos: usize, dim: usize) -> Option<&[f32]> {
+        let mut row = 0usize;
+        for span in &self.spans {
+            if (span.start..span.start + span.len()).contains(&pos) {
+                let r = row + pos - span.start;
+                return self.embeds.get(r * dim..(r + 1) * dim);
+            }
+            row += span.len();
+        }
+        None
+    }
+
+    pub fn mrope(&self) -> Option<&MropeLayout> {
+        (!self.mrope.is_empty()).then_some(&self.mrope)
+    }
+
+    /// Whether any soft token falls in KV positions `start..end`.
+    pub fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.spans.iter().any(|s| s.start < end && start < s.start + s.len())
     }
 }
 
@@ -4806,6 +4912,7 @@ impl TinyModel {
         let ds_queue = side.as_ref().and_then(|s| s.ds_queue);
         let nvme_side = side.as_ref().map(|s| DeviceDecodeSide {
             request_id: s.request_id,
+            mrope: s.mrope,
             moe_norm: None,
             layer_stagger: s.layer_stagger,
             ds_probe,
@@ -6655,10 +6762,13 @@ impl TinyModel {
         mut recurrent: Option<&mut RecurrentState>,
         mut out_row_hiddens: Option<&mut Vec<f32>>,
         request_id: u64,
+        vision: Option<&VisionSeq>,
     ) -> Result<(), AllpacaError> {
         if tokens.is_empty() {
             return Ok(());
         }
+        let mrope = vision.and_then(VisionSeq::mrope);
+        let dim = self.config.dim;
         if self.dsv4.is_some() && tokens.len() > 1 {
             return crate::deepseek4::forward_dsv4_tokens(
                 self,
@@ -6682,6 +6792,7 @@ impl TinyModel {
                     } else {
                         None
                     },
+                    mrope,
                     ..DeviceDecodeSide::new(request_id)
                 };
                 self.forward_token(
@@ -6697,7 +6808,7 @@ impl TinyModel {
                     recurrent.as_deref_mut(),
                     None,
                     Some(&mut side),
-                    None,
+                    vision.and_then(|v| v.soft_row(start_pos + i, dim)),
                 )?;
             }
             return Ok(());
@@ -6705,6 +6816,7 @@ impl TinyModel {
         if tokens.len() == 1 {
             let mut side = DeviceDecodeSide {
                 last_hidden: out_row_hiddens.as_deref_mut(),
+                mrope,
                 ..DeviceDecodeSide::new(request_id)
             };
             self.forward_token(
@@ -6720,7 +6832,7 @@ impl TinyModel {
                 recurrent,
                 None,
                 Some(&mut side),
-                None,
+                vision.and_then(|v| v.soft_row(start_pos, dim)),
             )?;
             if let Some(rows) = row_logits {
                 let vocab = self.config.vocab_size;
@@ -6757,6 +6869,7 @@ impl TinyModel {
                 recurrent.as_deref_mut(),
                 out_row_hiddens.as_deref_mut(),
                 request_id,
+                vision,
             ) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -7689,6 +7802,11 @@ impl TinyModel {
             )));
         }
         let (q_workspace, kv_workspace) = Self::decode_workspaces(cfg, resident);
+        let rope_pos = side
+            .as_ref()
+            .and_then(|s| s.mrope)
+            .map_or([pos; 3], |m| m.rope_pos(pos))
+            .map(|p| p as i32);
         let page_tokens = page_ids
             .first()
             .and_then(|p| p.first())
@@ -7932,7 +8050,7 @@ impl TinyModel {
                         n_kv_heads as i32,
                         head_dim as i32,
                         n_rot as i32,
-                        pos as i32,
+                        rope_pos,
                         cfg.rope_theta_for_layer(layer_idx),
                         cfg.rope_sections,
                     )?;
@@ -8240,6 +8358,7 @@ impl TinyModel {
         mut recurrent: Option<&mut RecurrentState>,
         mut out_row_hiddens: Option<&mut Vec<f32>>,
         request_id: u64,
+        vision: Option<&VisionSeq>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -8247,6 +8366,7 @@ impl TinyModel {
         let kv_dim = cfg.n_kv_heads * head_dim;
         let vocab = cfg.vocab_size;
         let n_tok = tokens.len();
+        let mrope = vision.and_then(VisionSeq::mrope);
         let (q_workspace, kv_workspace) = Self::decode_workspaces(cfg, resident);
         let kv_dim = kv_dim.max(kv_workspace);
         if write_logits && logits.len() < vocab {
@@ -8297,6 +8417,14 @@ impl TinyModel {
             let mut normed_ready = false;
             resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
             record_elementwise(Some(metrics));
+            if let Some(v) = vision {
+                // Soft (image) rows replace their placeholder token embeddings.
+                for t in 0..n_tok {
+                    if let Some(row) = v.soft_row(start_pos + t, dim) {
+                        hip.copy_h2d_f32(buf.x_row(t, dim), row)?;
+                    }
+                }
+            }
 
             let m = n_tok as i32;
             for (layer_idx, host_layer) in self.layers.iter().enumerate() {
@@ -8527,7 +8655,9 @@ impl TinyModel {
                             al.n_kv_heads as i32,
                             al.head_dim as i32,
                             n_rot as i32,
-                            (start_pos + t) as i32,
+                            mrope
+                                .map_or([start_pos + t; 3], |m| m.rope_pos(start_pos + t))
+                                .map(|p| p as i32),
                             theta,
                             cfg.rope_sections,
                         )?;
@@ -9520,7 +9650,7 @@ impl TinyModel {
                     n_kv_heads as i32,
                     head_dim as i32,
                     n_rot as i32,
-                    pos as i32,
+                    [pos as i32; 3],
                     cfg.rope_theta_for_layer(layer_idx),
                     cfg.rope_sections,
                 )?;
@@ -10718,6 +10848,27 @@ mod lightning_moe_tests {
         assert_eq!((host.w_qkv.len(), host.w_out.len()), (256, 128));
         drop(file);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mrope_layout_positions_image_grid_and_shifts_later_text() {
+        // Two images: 2 cols x 3 rows at KV 5, then 4 x 1 at KV 13.
+        let layout = MropeLayout::new(vec![
+            ImageSpan { start: 5, cols: 2, rows: 3 },
+            ImageSpan { start: 13, cols: 4, rows: 1 },
+        ]);
+        assert_eq!(layout.rope_pos(4), [4, 4, 4], "text before the image");
+        assert_eq!(layout.rope_pos(5), [5, 5, 5]);
+        assert_eq!(layout.rope_pos(6), [5, 5, 6], "row 0, column 1");
+        assert_eq!(layout.rope_pos(10), [5, 7, 6], "row 2, column 1");
+        // The image spans max(cols, rows) = 3 positions, not 6 tokens.
+        assert_eq!(layout.rope_pos(11), [8, 8, 8]);
+        assert_eq!(layout.rope_pos(12), [9, 9, 9]);
+        assert_eq!(layout.rope_pos(13), [10, 10, 10]);
+        assert_eq!(layout.rope_pos(16), [10, 10, 13]);
+        // Second image: 4 tokens over max(4, 1) = 4 positions (no extra shift).
+        assert_eq!(layout.rope_pos(17), [14, 14, 14]);
+        assert_eq!(MropeLayout::default().rope_pos(9), [9, 9, 9]);
     }
 
     #[test]

@@ -10,7 +10,7 @@ pub use kernels::{
     e8m0_to_fp32, e8m0_to_fp32_half, f16_to_f32, f32_to_bf16, f32_to_f16, gelu, gemm, matmul,
     matmul_nt, quantize_mxfp4, quantize_q4_0, quantize_q4_k, quantize_q5_k, quantize_q6_k,
     quantize_q8_0, quantize_rocmfp4, quantize_tq2_0, rmsnorm, rocmfp4_scale, rocmfp4_scale_is_valid,
-    rope, rope_imrope_neox, rope_imrope_neox_heads, rope_offset, rope_offset_back, silu, softmax,
+    rope, rope_imrope_neox, rope_imrope_neox_at, rope_imrope_neox_heads, rope_imrope_neox_heads_at, rope_offset, rope_offset_back, silu, softmax,
     CpuBackend, IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMS, IQ4_XS_BLOCK_BYTES, IQ4_XS_BLOCK_ELEMS,
     KVALUES_IQ4NL, KVALUES_MXFP4, MXFP4_BLOCK_BYTES, MXFP4_BLOCK_ELEMS, Q2_K_BLOCK_BYTES,
     Q2_K_BLOCK_ELEMS, Q3_K_BLOCK_BYTES, Q3_K_BLOCK_ELEMS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS,

@@ -89,10 +89,9 @@ struct ActiveRequest {
     /// forwarded (`pending_logits` are stale while set). The next step verifies
     /// it at the head of the drafted span, or forwards it alone.
     deferred: Option<u32>,
-    /// Soft vision positions at the start of `tokens` (pre-text).
-    vision_prefix_len: usize,
-    /// Row-major `vision_prefix_len * dim` embeddings for soft prefill.
-    vision_embeds: Vec<f32>,
+    /// Soft vision tokens (image rows instead of token embeddings) and their
+    /// M-RoPE layout; empty for text-only Requests.
+    vision: Arc<crate::model::VisionSeq>,
     /// When vision encode landed on the draft GPU, skip draft propose for this Request.
     suppress_draft: bool,
 }
@@ -519,7 +518,26 @@ impl Engine {
             mm.vision_patch
         };
         let n_blocks = mm.vision_n_blocks;
-        if let Some(path) = &mm.vision_path {
+        let is_gguf = mm
+            .vision_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        if let (Some(path), true) = (&mm.vision_path, is_gguf) {
+            let mut enc = crate::Qwen3VlVision::load_gguf(path)?;
+            if mm.vision_max_tokens > 0 {
+                enc = enc.with_max_image_tokens(mm.vision_max_tokens as usize);
+            }
+            if enc.config().proj_dim != out_dim {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "mmproj {} projects to {} but the model width is {out_dim}",
+                    path.display(),
+                    enc.config().proj_dim
+                ))));
+            }
+            tracing::info!(path = %path.display(), cfg = ?enc.config(), "loaded Qwen3-VL mmproj vision encoder");
+            self.set_vision_encoder(Arc::new(enc))?;
+        } else if let Some(path) = &mm.vision_path {
             let enc = crate::PatchVisionEncoder::load(
                 path, device, out_dim, image_size, patch, n_blocks,
             )?;
@@ -577,6 +595,11 @@ impl Engine {
         }
         self.lock()?.vision_encoder = Some(encoder);
         Ok(())
+    }
+
+    /// The installed vision encoder's in-prompt image placeholder, if it uses one.
+    pub fn image_marker(&self) -> Option<&'static str> {
+        self.lock().ok()?.vision_encoder.as_ref()?.image_marker()
     }
 
     /// Start a Request with optional images. Empty images match [`Self::begin_request`].
@@ -2179,8 +2202,8 @@ impl Engine {
             .map(|m| m.config.dim)
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
         let mut suppress_draft = false;
-        let (vision_prefix_len, vision_embeds) = match vision {
-            None => (0, Vec::new()),
+        let vision_seq = match vision {
+            None => crate::model::VisionSeq::default(),
             Some(v) => {
                 let need = v.n_tokens.checked_mul(dim).ok_or_else(|| {
                     AllpacaError::Fatal(FatalError::InvalidConfig(
@@ -2215,10 +2238,32 @@ impl Engine {
                         }
                     }
                 }
-                let mut prefixed = vec![0u32; v.n_tokens];
-                prefixed.append(&mut tokens);
-                tokens = prefixed;
-                (v.n_tokens, v.embeddings)
+                let grids = if v.grids.is_empty() {
+                    vec![(v.n_tokens, 1)]
+                } else {
+                    v.grids.clone()
+                };
+                if grids.iter().map(|(c, r)| c * r).sum::<usize>() != v.n_tokens {
+                    return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                        "vision grids {grids:?} do not cover {} tokens",
+                        v.n_tokens
+                    ))));
+                }
+                let pad = (!v.grids.is_empty())
+                    .then(|| tokenizer.token_id("<|image_pad|>"))
+                    .flatten();
+                let (expanded, spans) = expand_image_pads(&tokens, pad, &grids);
+                tokens = expanded;
+                let mrope = if v.grids.is_empty() {
+                    crate::model::MropeLayout::default()
+                } else {
+                    crate::model::MropeLayout::new(spans.clone())
+                };
+                crate::model::VisionSeq {
+                    spans,
+                    embeds: v.embeddings,
+                    mrope,
+                }
             }
         };
         for id in tokenizer.stop_token_ids() {
@@ -2254,8 +2299,8 @@ impl Engine {
             None
         };
         let mut prefill_pos = 0;
-        // Soft vision prefixes are not text anchors / radix keys yet.
-        if vision_prefix_len == 0 {
+        // Soft vision tokens are not text anchors / radix keys yet.
+        if vision_seq.is_empty() {
             if let Some((state, rows, n)) = inner.anchors.lookup(&tokens) {
                 restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
                 if let Some(dst) = recurrent.as_mut() {
@@ -2334,8 +2379,7 @@ impl Engine {
                 last_hidden_fresh: false,
                 defer_lm_head: false,
                 deferred: None,
-                vision_prefix_len,
-                vision_embeds,
+                vision: Arc::new(vision_seq),
                 suppress_draft,
             },
         );
@@ -3335,16 +3379,13 @@ impl Engine {
             let active = request_mut(inner, id)?;
             std::mem::take(&mut active.last_hidden)
         };
-        let (vision_prefix_len, vision_embeds, dim) = {
-            let active = request(inner, id)?;
-            (
-                active.vision_prefix_len,
-                active.vision_embeds.clone(),
-                target.config.dim,
-            )
-        };
-        let vision_in_chunk = (start..end).any(|p| p < vision_prefix_len);
-        let batch_prefill_hip = !vision_in_chunk
+        let (vision, dim) = (request(inner, id)?.vision.clone(), target.config.dim);
+        let vision_ref = (!vision.is_empty()).then_some(&*vision);
+        let mrope_ref = vision.mrope();
+        let soft_row = |pos: usize| vision.soft_row(pos, dim);
+        let vision_in_chunk = vision.overlaps(start, end);
+        // The HIP batched forward writes soft rows itself; CUDA and DSv4 do not.
+        let batch_prefill_hip = !(vision_in_chunk && target.dsv4.is_some())
             && toks.len() > 1
             && ((self.hip.is_some()
                 && resident.is_some()
@@ -3378,6 +3419,7 @@ impl Engine {
                 recurrent.as_mut(),
                 mtp.then_some(&mut row_hiddens),
                 id,
+                vision_ref,
             )?;
             if mtp && row_hiddens.len() == toks.len() * dim {
                 // Same pairing as per-token prefill: token `pos` with h_{pos-1}.
@@ -3450,13 +3492,10 @@ impl Engine {
                     } else {
                         None
                     },
+                    mrope: mrope_ref,
                     ..DeviceDecodeSide::new(id)
                 };
-                let soft = if pos < vision_prefix_len {
-                    Some(&vision_embeds[pos * dim..(pos + 1) * dim])
-                } else {
-                    None
-                };
+                let soft = soft_row(pos);
                 let used_cuda = {
                     #[cfg(feature = "cuda")]
                     {
@@ -5129,6 +5168,8 @@ fn packed_linear_verify_span(
     let drafts_len = span.len() as u64;
     let vocab = request(inner, id)?.pending_logits.len();
     let start_pos = request(inner, id)?.tokens.len();
+    let vision = request(inner, id)?.vision.clone();
+    let vision_ref = (!vision.is_empty()).then_some(&*vision);
     let page_tokens = request(inner, id)?
         .pages
         .first()
@@ -5203,6 +5244,7 @@ fn packed_linear_verify_span(
             recurrent.as_mut(),
             Some(&mut one_hidden),
             id,
+            vision_ref,
         )?;
         if let Some(hip) = hip {
             hip.wait_logits_d2h(&mut one_logits)?;
@@ -5244,6 +5286,7 @@ fn packed_linear_verify_span(
                 recurrent.as_mut(),
                 Some(&mut one_hidden),
                 id,
+                vision_ref,
             )?;
             if let Some(hip) = hip {
                 hip.wait_logits_d2h(&mut one_logits)?;
@@ -5267,6 +5310,7 @@ fn packed_linear_verify_span(
             recurrent.as_mut(),
             Some(&mut row_hiddens),
             id,
+            vision_ref,
         )?;
         if let Some(hip) = hip {
             hip.bind()?;
@@ -5346,6 +5390,7 @@ fn packed_linear_verify_span(
                 recurrent.as_mut(),
                 None,
                 id,
+                vision_ref,
             )?;
             if let Some(hip) = hip {
                 let _ = hip.wait_logits_d2h(&mut replay_logits);
@@ -5610,6 +5655,7 @@ fn append_and_forward(
     let defer_lm_head = request(inner, id)?.defer_lm_head;
     mtp_process_token(inner, token, pos, &last_hidden, draft_hip, metrics)?;
     let want_hidden = mtp_draft_active(inner) || defer_lm_head;
+    let vision = request(inner, id)?.vision.clone();
     let mut side = DeviceDecodeSide {
         moe_norm: Some(&mut moe_norm),
         layer_stagger,
@@ -5621,6 +5667,7 @@ fn append_and_forward(
             None
         },
         write_logits: !defer_lm_head,
+        mrope: vision.mrope(),
         ..DeviceDecodeSide::new(id)
     };
     let used_cuda = {
@@ -5727,6 +5774,36 @@ fn append_and_forward(
         }
     }
     Ok(())
+}
+
+/// Replaces the i-th `pad` token in `tokens` with `grids[i]` = `(cols, rows)`
+/// image tokens and returns the spans they occupy. Images without a pad
+/// (none left, or no pad token in the vocab) go first, before the prompt.
+fn expand_image_pads(
+    tokens: &[u32],
+    pad: Option<u32>,
+    grids: &[(usize, usize)],
+) -> (Vec<u32>, Vec<crate::model::ImageSpan>) {
+    let fill = pad.unwrap_or(0);
+    let n_pads = pad.map_or(0, |p| tokens.iter().filter(|&&t| t == p).count());
+    let (front, inline) = grids.split_at(grids.len().saturating_sub(n_pads));
+    let mut out = Vec::with_capacity(tokens.len() + grids.iter().map(|(c, r)| c * r).sum::<usize>());
+    let mut spans = Vec::with_capacity(grids.len());
+    let mut push_image = |out: &mut Vec<u32>, &(cols, rows): &(usize, usize)| {
+        spans.push(crate::model::ImageSpan { start: out.len(), cols, rows });
+        out.extend(std::iter::repeat_n(fill, cols * rows));
+    };
+    for g in front {
+        push_image(&mut out, g);
+    }
+    let mut inline = inline.iter();
+    for &t in tokens {
+        match (Some(t) == pad).then(|| inline.next()).flatten() {
+            Some(g) => push_image(&mut out, g),
+            None => out.push(t),
+        }
+    }
+    (out, spans)
 }
 
 fn is_stop(token: u32, params: &GenerationParams) -> bool {
@@ -6758,6 +6835,7 @@ mod tests {
                 embeddings: vec![self.fill; self.n_tokens * self.dim],
                 n_tokens: self.n_tokens,
                 device: self.device,
+                grids: Vec::new(),
             })
         }
     }
@@ -8272,6 +8350,26 @@ mod tests {
             short_tokens >= 1 && saw_prefill,
             "prefill_budget must still serve decode after a prefill streak; tokens={short_tokens} saw_prefill={saw_prefill}"
         );
+    }
+
+    #[test]
+    fn image_pads_expand_in_place_into_image_tokens() {
+        const PAD: u32 = 99;
+        // "a <vs> <pad> <ve> b <vs> <pad> <ve>" with a 2x1 and a 1x3 image.
+        let tokens = [1, 50, PAD, 51, 2, 50, PAD, 51];
+        let (out, spans) = expand_image_pads(&tokens, Some(PAD), &[(2, 1), (1, 3)]);
+        assert_eq!(out, [1, 50, PAD, PAD, 51, 2, 50, PAD, PAD, PAD, 51]);
+        assert_eq!(
+            spans,
+            [
+                crate::model::ImageSpan { start: 2, cols: 2, rows: 1 },
+                crate::model::ImageSpan { start: 7, cols: 1, rows: 3 },
+            ]
+        );
+        // No pads in the prompt: images go first, in order.
+        let (out, spans) = expand_image_pads(&[7, 8], Some(PAD), &[(2, 2)]);
+        assert_eq!(out, [PAD, PAD, PAD, PAD, 7, 8]);
+        assert_eq!(spans, [crate::model::ImageSpan { start: 0, cols: 2, rows: 2 }]);
     }
 
     #[test]

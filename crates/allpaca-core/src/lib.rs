@@ -69,6 +69,7 @@ pub use layer_split::{plan_layer_owners, LayerPlan};
 pub use memory_tier::{
     CxlMemBackend, MemoryTierBackend, PimBackend, PinnedDramBackend, ReadTicket,
 };
+pub use qwen3vl::{Qwen3VlConfig, Qwen3VlVision};
 pub use modality::{EncoderPlacement, ImageInput, NoopVisionEncoder, VisionEncoder, VisionTokens};
 #[cfg(feature = "cuda")]
 pub use model::CudaResidentModel;
