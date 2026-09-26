@@ -38,6 +38,7 @@ mod telemetry;
 mod tokenizer;
 mod transfer;
 pub mod tune;
+pub mod qwen3vl;
 mod vision;
 mod weight_set;
 
