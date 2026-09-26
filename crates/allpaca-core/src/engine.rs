@@ -214,7 +214,11 @@ impl std::fmt::Debug for RequestHandle {
 impl Drop for RequestHandle {
     fn drop(&mut self) {
         if let Some(hip) = self.hip.as_ref() {
-            hip.gdn_clear_request(self.id);
+            let target = self.inner.lock().ok().and_then(|g| g.target.clone());
+            let _ = for_each_gdn_workspace(hip, target.as_deref(), |ws| {
+                ws.gdn_clear_request(self.id);
+                Ok(())
+            });
         }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(active) = guard.active.remove(&self.id) {
@@ -1045,6 +1049,17 @@ impl Engine {
         model: &mut TinyModel,
         gguf: Option<&GgufFile>,
     ) -> Result<(), AllpacaError> {
+        self.attach_rpc_with_draft(model, gguf, 0)
+    }
+
+    /// `draft_bytes` is the draft model's VRAM footprint; the local layer
+    /// planner keeps it free on the draft GPU.
+    fn attach_rpc_with_draft(
+        &self,
+        model: &mut TinyModel,
+        gguf: Option<&GgufFile>,
+        draft_bytes: u64,
+    ) -> Result<(), AllpacaError> {
         let mut local_devices = Vec::new();
         if let Some(hip) = &self.hip {
             let total = allpaca_hip::device_memory_info(hip.device)
@@ -1068,6 +1083,8 @@ impl Engine {
                 self.config.rpc.tensor_split.as_deref(),
                 self.config.rpc.max_seq,
                 gguf,
+                self.config.kv.vram_bytes as u64,
+                draft_bytes,
             )?;
             model.rpc = Some(Arc::clone(rt));
             tracing::info!(
@@ -1085,6 +1102,8 @@ impl Engine {
                 self.config.rpc.tensor_split.as_deref(),
                 self.config.rpc.max_seq,
                 gguf,
+                self.config.kv.vram_bytes as u64,
+                draft_bytes,
             )?;
             tracing::info!(
                 local_gpus = local_devices.len(),
@@ -1442,8 +1461,15 @@ impl Engine {
                                 .and_then(|d| GgufFile::open(&d.weights))
                         });
                 match opened {
-                    Ok(f) => match TinyModel::from_gguf(&f) {
+                    Ok(f) => match load_draft_gguf(&f) {
                         Ok(draft) => {
+                            if draft.config.gguf_layer_base > 0 {
+                                tracing::info!(
+                                    layers = draft.config.n_layers,
+                                    base = draft.config.gguf_layer_base,
+                                    "loaded MTP/NextN sidecar as draft model"
+                                );
+                            }
                             inner.draft_model = Some(Arc::new(draft));
                             draft_file = Some(f);
                         }
@@ -1540,7 +1566,18 @@ impl Engine {
             model.early_exit.min_confidence = self.config.early_exit.min_confidence;
             model.early_exit.min_calibration_margin = self.config.early_exit.min_calibration_margin;
         }
-        self.attach_rpc(&mut model, Some(file.as_ref()))?;
+        let draft_bytes = inner.draft_model.as_ref().map_or(0, |draft| {
+            let draft_gguf = if draft_reuses_target_gguf {
+                Some(file.as_ref())
+            } else {
+                draft_file.as_ref()
+            };
+            draft_gguf.map_or(0, |f| {
+                let (layers, globals) = crate::model::gguf_device_bytes(f, &draft.config);
+                layers.iter().sum::<u64>() + globals
+            })
+        });
+        self.attach_rpc_with_draft(&mut model, Some(file.as_ref()), draft_bytes)?;
         inner.model_id = model.name.clone();
         inner.target = Some(Arc::new(model));
         drop(inner);
@@ -1629,7 +1666,7 @@ impl Engine {
                     let skip: Vec<bool> = (0..target_m.config.n_layers)
                         .map(|i| rpc.is_remote(i) || rpc.local_device(i) != dev)
                         .collect();
-                    match ResidentModel::upload_gguf_filtered(file, &target_m.config, dev, &skip) {
+                    match ResidentModel::upload_gguf_peer_layers(file, &target_m.config, dev, &skip) {
                         Ok(resident) => {
                             let hip_used = allpaca_hip::device_memory_info(dev)
                                 .ok()
@@ -1714,8 +1751,19 @@ impl Engine {
         } else {
             None
         };
-        if let (Some(resident), Some(hip)) = (peer_uploaded, self.draft_hip.clone()) {
+        if let (Some(resident), Some(draft_hip)) = (peer_uploaded, self.draft_hip.as_ref()) {
             if let Some(rpc) = inner.target.as_ref().and_then(|m| m.rpc.clone()) {
+                // Own workspace for the target's layers on this GPU: the draft
+                // model keeps `draft_hip`, and draft-ahead runs it on a worker
+                // thread while the target verifies, so sharing decode buffers
+                // would race.
+                let hip = match HipWorkspace::new(draft_hip.device, 8 * 1024 * 1024, 256) {
+                    Ok(ws) => Arc::new(ws),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "peer HIP workspace failed; sharing the draft workspace");
+                        Arc::clone(draft_hip)
+                    }
+                };
                 let _ = resident.touch_resident();
                 let _ = hip.bind();
                 let _ = allpaca_hip::stream_synchronize();
@@ -1733,13 +1781,12 @@ impl Engine {
                 rpc.set_local_peer(hip.device, hip, Arc::new(resident));
             }
         }
-        inner.draft_resident = if peer_ok {
+        inner.draft_resident = if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
             tracing::info!(
-                "skipping draft HIP upload; GPU 1 holds target layer-split weights"
+                device = hip.device,
+                shares_target_layers = peer_ok,
+                "HIP draft weight upload start"
             );
-            None
-        } else if let (Some(hip), Some(draft)) = (&self.draft_hip, draft) {
-            tracing::info!(device = hip.device, "HIP draft weight upload start");
             let uploaded = if draft.config.n_experts > 0 && draft.host_weights_ready() {
                 ResidentModel::upload(&draft, hip.device)
             } else if let Some(file) = draft_gguf {
@@ -3489,9 +3536,11 @@ impl Engine {
                 let sync_host_gdn = !device_gdn || last || is_anchor;
                 if sync_host_gdn {
                     if let (Some(hip), Some(state)) = (self.hip.as_deref(), recurrent.as_mut()) {
-                        hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
-                        hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
-                        hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
+                        for_each_gdn_workspace(hip, Some(&target), |ws| {
+                            ws.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                            ws.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                            ws.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)
+                        })?;
                     }
                 }
                 if sync_host_gdn && self.hip.is_none() {
@@ -4117,6 +4166,39 @@ fn mtp_text_has_dropped_words(text: &str) -> bool {
     }
     // "Let me" with the verb dropped ("Let me about", "Let me words").
     t.contains("let me about ") || t.contains("let me words ")
+}
+
+/// Run `f` on every HIP workspace that holds device GDN / Mamba-2 state for
+/// the target: the target GPU, then the local layer-split peer. Recurrent
+/// slots live on the workspace that ran the layer, so clone / rewind / clear
+/// must reach both or the peer's layers keep state from rejected tokens (and
+/// leak it per request).
+fn for_each_gdn_workspace(
+    hip: &HipWorkspace,
+    target: Option<&TinyModel>,
+    mut f: impl FnMut(&HipWorkspace) -> Result<(), AllpacaError>,
+) -> Result<(), AllpacaError> {
+    f(hip)?;
+    let peer = target
+        .and_then(|t| t.rpc.as_ref())
+        .and_then(|rpc| rpc.local_peer());
+    if let Some((_, peer_hip, _)) = peer {
+        if !std::ptr::eq(peer_hip.as_ref(), hip) {
+            f(&peer_hip)?;
+        }
+    }
+    Ok(())
+}
+
+/// Load a `--draft-model` GGUF. MTP sidecars (`mtp-*.gguf`) ship only the
+/// trailing NextN block (`blk.{n_layers}`), so they load as an MTP draft.
+fn load_draft_gguf(file: &GgufFile) -> Result<TinyModel, AllpacaError> {
+    if file.tensor("blk.0.attn_norm.weight").is_none() {
+        if let Ok(mtp) = TinyModel::from_gguf_mtp(file) {
+            return Ok(mtp);
+        }
+    }
+    TinyModel::from_gguf(file)
 }
 
 fn mtp_draft_active(inner: &EngineInner) -> bool {
@@ -4938,11 +5020,16 @@ fn packed_linear_verify_span(
     let mut recurrent = std::mem::take(&mut request_mut(inner, id)?.recurrent);
     let mut device_gdn_cloned = 0usize;
     if let (Some(hip), Some(state)) = (hip, recurrent.as_mut()) {
-        device_gdn_cloned = hip.gdn_clone_request(id)?;
+        for_each_gdn_workspace(hip, Some(&target), |ws| {
+            device_gdn_cloned += ws.gdn_clone_request(id)?;
+            Ok(())
+        })?;
         if device_gdn_cloned == 0 {
-            hip.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
-            hip.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
-            hip.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)?;
+            for_each_gdn_workspace(hip, Some(&target), |ws| {
+                ws.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                ws.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                ws.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)
+            })?;
         }
     }
     let rec_before = recurrent.clone();
@@ -5080,11 +5167,14 @@ fn packed_linear_verify_span(
         if let Some(saved) = rec_before {
             recurrent = Some(saved);
             if let Some(hip) = hip {
-                if device_gdn_cloned > 0 {
-                    hip.gdn_rewind_request(id)?;
-                } else {
-                    hip.gdn_invalidate_request(id);
-                }
+                for_each_gdn_workspace(hip, Some(&target), |ws| {
+                    if device_gdn_cloned > 0 {
+                        ws.gdn_rewind_request(id)
+                    } else {
+                        ws.gdn_invalidate_request(id);
+                        Ok(())
+                    }
+                })?;
             }
             let mut replay_logits = vec![0.0f32; vocab];
             target.forward_tokens(
@@ -5108,7 +5198,10 @@ fn packed_linear_verify_span(
         }
     }
     if let Some(hip) = hip {
-        hip.gdn_drop_clone(id);
+        let _ = for_each_gdn_workspace(hip, Some(&target), |ws| {
+            ws.gdn_drop_clone(id);
+            Ok(())
+        });
     }
     request_mut(inner, id)?.recurrent = recurrent;
     if let Some(join) = before_draft_gpu {

@@ -157,3 +157,31 @@ Each generate **Result** lists **tokens** (`prompt_tokens` / `gen`), **prefill**
 - Qwen3.8-27B UD-Q5_K_XL — IQ4 load path exists; no successful timed generate on this host.
 - NVIDIA-Nemotron-3.5-Lightning-30B-A3B ChatML + `<think>` — do not open think on Nemotron (Qwen-only). ChatML without think answers Perth (logged above). `<|im_end|>` is now a default stop when present in vocab. Tick 4 `hello` ChatML (`greedy(16)`, debug): no-think `assistant\\n` role-loops `hello user` (unique=3); official no-think `assistant\\n<think></think>` (with or without empty `system`) stops the role-loop but emits document junk (`1999` / YAML), not a greeting. Not a successful generate — no table row.
 - Other `--release` HIP generate on this host (Llama/Qwen/Nemotron rows above are debug). DeepSeek-V4-Flash HIP `--release` 1-token smoke is logged above.
+
+## Host: xeres (Windows 11 / RX 9070 + RX 9060 XT)
+
+| Field | Value |
+|---|---|
+| Environment | Windows 11 Pro 10.0.26200 |
+| Setup | RX 9070 16 GB (HIP 0, gfx1201, 256-bit, drives the desktop) + RX 9060 XT 16 GB (HIP 1, gfx1200, 128-bit), 98 GB DDR4 |
+| Runtime | AMD HIP SDK 7.1 (`C:\Program Files\AMD\ROCm\7.1`), stock `amdhip64_7.dll` (no CLR #10553) |
+| Notes | The desktop (dwm, browsers) holds ~5 GB of the 9070. `hipMemGetInfo` does not show it, and past it WDDM demotes allocations to shared system RAM. Check with `Get-Counter '\GPU Process Memory(pid_<pid>*)\Non Local Usage'`. |
+
+### Generate
+
+Harness (all rows): `cargo build --release -p allpaca-server --features hip`, then `allpaca-server --config <toml>` with `engine.gpu_backend=hip`, target/draft `auto` (target HIP 0, draft HIP 1), `sampling.temperature=0`. One `/v1/chat/completions` request (ChatML, 34 prompt tokens): "Write a detailed 300-word essay explaining why Perth, Western Australia has a Mediterranean climate. Do not stop early.", `max_tokens=128`. **Decode tok/s = (completion_tokens − 1) / (request wall − `ttft_ms_last`)**. Do not use `itl_ms_ema` with speculation on: it read 72 ms while wall-clock decode was ~126 ms. The first request after load is warm-up; later repeats are listed.
+
+| Date | Setup | Model | Params | Quant | Run parameters | Result |
+|---|---|---|---|---|---|---|
+| 2026-09-26 | 9070 + 9060 XT local pool | Qwen3.8-27B (`Qwen3.8-27B-UD-Q5_K_XL.gguf`) | 27B (hybrid GDN + full attn, 64 layers) | UD-Q5_K_XL (Q5_K/Q6_K/Q8_0 + IQ4_XS/IQ4_NL) | Commit `8949535` (before the load/split fixes). `speculative.enabled=false`. | **tokens** prompt=34 gen=128. **prefill** TTFT **21.8 s** warm (60.3 s first). **generate** **0.88–1.23 tok/s** (815–1134 ms/token). `weight_bytes_on_device=34.06 GB` (Q6_K `token_embd` expanded to F32 on both GPUs, IQ4 as F32), hybrid interleaved split (32/32 layers). **6.90 GB** non-local (spilled) on the 9070, 0.39 GB on the 9060 XT. |
+| 2026-09-26 | 9070 + 9060 XT local pool | same | 27B | same | `8949535` + byte-aware contiguous split, host `token_embd`, layers-only peer, IQ4→Q8_0 repack, warp K-quant GEMV, sampled decode profiling. `speculative.enabled=false`. | **tokens** prompt=34 gen=128. **prefill** TTFT **3.25 s**. **generate** **10.85–11.0 tok/s** (91–92 ms/token), 3 repeats. `weight_bytes_on_device=20.06 GB`. Split: HIP 0 layers 0..23 (7.7 GB), HIP 1 layers 23..64 (14.2 GB incl. KV reserve). Non-local 0.09 GB on each GPU (no spill). Same greedy text prefix as the `8949535` row. |
+| 2026-09-26 | same | same + MTP sidecar `mtp-Qwen3.8-27B-Q4_0.gguf` (`model.draft_path`) | 27B + NextN | same + Q4_K/Q6_K/Q3_K MTP head | Same build. `speculative.enabled=true`, `providers=["mtp"]`. The draft is uploaded to HIP 1 next to the target's layers. | **tokens** prompt=34 gen=128. **prefill** TTFT **3.44–3.56 s**. **generate** **7.04–7.26 tok/s** (138–142 ms/token), acceptance **0.475**. Slower than no-spec: GDN hybrids verify one token per target forward (`incremental_gdn`), so accepted drafts save no target work. Greedy text matches no-spec. |
+
+### Kernel microbench
+
+`cargo test -p allpaca-hip --features hip --release --test gemv_bandwidth -- --ignored --nocapture` (warmup 5, iters 50, filler weights). Numbers below are from the 9060 XT, which is stable. The 9070 is noisy while it drives the desktop.
+
+| Date | What | Result (9060 XT, m=1; n×k = 17408×5120 / 5120×17408 / 10240×5120) |
+|---|---|---|
+| 2026-09-26 | K-quant GEMV, per-thread-column kernel (`8949535`) | Q4_K **~150 GB/s**, Q5_K **~155 GB/s**, Q6_K **~285 GB/s**. Q8_0 (36-byte staged) **~300 GB/s**. |
+| 2026-09-26 | Warp-per-column v2 (u32/u16 weight loads, float4/float2 A, 2–4 scales per lane, branch-free Q4_K/Q5_K scales, 2× unroll) | Q4_K **181–191 GB/s**, Q5_K **214–219 GB/s**, Q6_K **282–300 GB/s**. m=4 reads weights once, at 105–181 GB/s. |

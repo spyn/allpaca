@@ -138,7 +138,16 @@ struct ProfileState {
     full: bool,
     wall_start: Option<std::time::Instant>,
     ema_ns: [u64; 5],
+    /// Decode forwards seen; every [`PROFILE_EVERY`]th is event-timed.
+    forwards: u64,
 }
+
+/// Event-time one decode forward in this many. Timing every forward cost two
+/// `hipEventRecord`s per kernel (~2.6k per token on a 64-layer model) plus a
+/// full sync and ~1.3k elapsed-time queries at token end; on Windows each
+/// marker can also split the command buffer. Buckets are EMAs, so a sample
+/// every few tokens tracks them just as well.
+const PROFILE_EVERY: u64 = 16;
 
 impl Default for ProfileState {
     fn default() -> Self {
@@ -149,6 +158,7 @@ impl Default for ProfileState {
             full: false,
             wall_start: None,
             ema_ns: [0; 5],
+            forwards: 0,
         }
     }
 }
@@ -400,6 +410,7 @@ mod ffi {
             host_gbps: *mut f64,
         ) -> i32;
         pub fn allpaca_hip_mem_used(device: i32, used_bytes: *mut u64) -> i32;
+        pub fn allpaca_hip_local_headroom(device: i32, bytes: *mut u64) -> i32;
         pub fn allpaca_hip_mem_info(
             device: i32,
             free_bytes: *mut u64,
@@ -1931,6 +1942,24 @@ pub fn device_memory_info(device: i32) -> Result<(u64, u64), AllpacaError> {
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP mem_info unavailable".into(),
         )))
+    }
+}
+
+/// Dedicated VRAM on `device` that no process holds, when the OS reports it
+/// (Windows PDH). `None` elsewhere. Use it with [`device_memory_info`] before
+/// sizing large placements: on Windows `hipMemGetInfo` ignores the desktop's
+/// share, and WDDM silently demotes over-budget allocations to system RAM.
+pub fn device_local_headroom(device: i32) -> Option<u64> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let mut bytes = 0u64;
+        let rc = unsafe { ffi::allpaca_hip_local_headroom(device, &mut bytes) };
+        (rc == 0).then_some(bytes)
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = device;
+        None
     }
 }
 
@@ -4670,15 +4699,18 @@ impl HipWorkspace {
         self.activation_d2h.load(Ordering::Relaxed)
     }
 
-    /// Start a HIP decode sample. Kernel ABI calls until [`end_decode_profile`] are timed.
+    /// Start a HIP decode sample. On a sampled forward (one in [`PROFILE_EVERY`])
+    /// kernel ABI calls until [`end_decode_profile`] are event-timed; the rest
+    /// only record wall time.
     pub fn begin_decode_profile(&self) {
-        self.profiling.store(1, Ordering::Relaxed);
         self.lm_head.store(0, Ordering::Relaxed);
         self.profile_span.store(0, Ordering::Relaxed);
         let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
         g.used = 0;
         g.ops.clear();
-        g.full = true;
+        g.full = g.forwards % PROFILE_EVERY == 0;
+        g.forwards = g.forwards.wrapping_add(1);
+        self.profiling.store(u64::from(g.full), Ordering::Relaxed);
         g.wall_start = Some(std::time::Instant::now());
     }
 
@@ -10637,7 +10669,16 @@ mod tests {
         if device_count() == 0 {
             return;
         }
-        let shapes = [(1, 4, 256), (1, 8, 256), (2, 3, 256), (1, 4, 512)];
+        // Covers every warp-kernel row batch (1, 2, <=4, 8, >8) and n % 8 != 0.
+        let shapes = [
+            (1, 4, 256),
+            (1, 8, 256),
+            (2, 3, 256),
+            (1, 4, 512),
+            (3, 13, 512),
+            (8, 9, 256),
+            (11, 5, 768),
+        ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let (a, b_q, _) = fill_q4k_gemm_case(si, m, n, k);
             let b_deq = dequant_q4k_matrix(&b_q, n, k);
@@ -11810,7 +11851,16 @@ mod tests {
         if device_count() == 0 {
             return;
         }
-        let shapes = [(1, 4, 256), (1, 8, 256), (2, 3, 256), (1, 4, 512)];
+        // Covers every warp-kernel row batch (1, 2, <=4, 8, >8) and n % 8 != 0.
+        let shapes = [
+            (1, 4, 256),
+            (1, 8, 256),
+            (2, 3, 256),
+            (1, 4, 512),
+            (3, 13, 512),
+            (8, 9, 256),
+            (11, 5, 768),
+        ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let (a, b_q, _) = fill_q6k_gemm_case(si, m, n, k);
             let b_deq = dequant_q6k_matrix(&b_q, n, k);
@@ -11873,7 +11923,16 @@ mod tests {
         if device_count() == 0 {
             return;
         }
-        let shapes = [(1, 4, 256), (1, 8, 256), (2, 3, 256), (1, 4, 512)];
+        // Covers every warp-kernel row batch (1, 2, <=4, 8, >8) and n % 8 != 0.
+        let shapes = [
+            (1, 4, 256),
+            (1, 8, 256),
+            (2, 3, 256),
+            (1, 4, 512),
+            (3, 13, 512),
+            (8, 9, 256),
+            (11, 5, 768),
+        ];
         for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
             let (a, b_q, _) = fill_q5k_gemm_case(si, m, n, k);
             let b_deq = dequant_q5k_matrix(&b_q, n, k);

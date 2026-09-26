@@ -32,6 +32,8 @@
 #endif
 #include <windows.h>
 #include <dxgi1_6.h>
+#include <pdh.h>
+#include <cwchar>
 #endif
 
 #ifdef ALLPACA_HAS_ROCBLAS
@@ -1633,6 +1635,345 @@ __device__ void q4k_scale_min(int j, const uint8_t *scales, uint8_t *sc, uint8_t
     }
 }
 
+/* Warp-per-column K-quant GEMV (Q4_K / Q5_K / Q6_K).
+ *
+ * The per-thread-column kernels below stream a whole weight row per thread:
+ * adjacent lanes read addresses a row (~4 KiB) apart, so no load coalesces
+ * and a 5120x17408 Q6_K GEMV ran at ~15% of VRAM bandwidth on RDNA4. Here a
+ * 32-lane group owns one output column and every lane dequantizes 8 of each
+ * 256-weight super-block, laid out so lane-adjacent bytes (and A floats) are
+ * contiguous. Up to MR rows of A reuse each weight load, so small verify
+ * batches and prefill chunks re-read B ceil(m/MR) times instead of m times.
+ * Lane groups are 32 wide on wave32 and wave64 alike (warp_sum32 width 32). */
+constexpr int KQ_LANES = 32;
+constexpr int KQ_COLS_PER_BLOCK = 8;
+
+__device__ inline void kq_lane_q4_k(const uint8_t *blk, int l, float *w, int *off) {
+    const float d = allpaca_f16le_to_f32(blk);
+    const float dmin = allpaca_f16le_to_f32(blk + 2);
+    const uint8_t *scales = blk + 4;
+    const uint8_t *qs = blk + 16;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        uint8_t sc1 = 0, m1 = 0, sc2 = 0, m2 = 0;
+        q4k_scale_min(2 * g, scales, &sc1, &m1);
+        q4k_scale_min(2 * g + 1, scales, &sc2, &m2);
+        const uint8_t q = qs[g * 32 + l];
+        w[2 * g] = d * static_cast<float>(sc1) * static_cast<float>(q & 0x0F) -
+                   dmin * static_cast<float>(m1);
+        w[2 * g + 1] = d * static_cast<float>(sc2) * static_cast<float>(q >> 4) -
+                       dmin * static_cast<float>(m2);
+        off[2 * g] = g * 64 + l;
+        off[2 * g + 1] = g * 64 + 32 + l;
+    }
+}
+
+__device__ inline void kq_lane_q5_k(const uint8_t *blk, int l, float *w, int *off) {
+    const float d = allpaca_f16le_to_f32(blk);
+    const float dmin = allpaca_f16le_to_f32(blk + 2);
+    const uint8_t *scales = blk + 4;
+    const uint8_t qh = blk[16 + l];
+    const uint8_t *qs = blk + 48;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        uint8_t sc1 = 0, m1 = 0, sc2 = 0, m2 = 0;
+        q4k_scale_min(2 * g, scales, &sc1, &m1);
+        q4k_scale_min(2 * g + 1, scales, &sc2, &m2);
+        const uint8_t q = qs[g * 32 + l];
+        const float lo = static_cast<float>(q & 0x0F) + (((qh >> (2 * g)) & 1) ? 16.f : 0.f);
+        const float hi = static_cast<float>(q >> 4) + (((qh >> (2 * g + 1)) & 1) ? 16.f : 0.f);
+        w[2 * g] = d * static_cast<float>(sc1) * lo - dmin * static_cast<float>(m1);
+        w[2 * g + 1] = d * static_cast<float>(sc2) * hi - dmin * static_cast<float>(m2);
+        off[2 * g] = g * 64 + l;
+        off[2 * g + 1] = g * 64 + 32 + l;
+    }
+}
+
+__device__ inline void kq_lane_q6_k(const uint8_t *blk, int l, float *w, int *off) {
+    const float d = allpaca_f16le_to_f32(blk + 208);
+    const int8_t *sc = reinterpret_cast<const int8_t *>(blk + 192);
+    const int is = l / 16;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const uint8_t ql0 = blk[h * 64 + l];
+        const uint8_t ql1 = blk[h * 64 + 32 + l];
+        const uint8_t qh = blk[128 + h * 32 + l];
+        const int8_t *s = sc + h * 8 + is;
+        const int q1 = static_cast<int>((ql0 & 0x0F) | ((qh & 3) << 4)) - 32;
+        const int q2 = static_cast<int>((ql1 & 0x0F) | (((qh >> 2) & 3) << 4)) - 32;
+        const int q3 = static_cast<int>((ql0 >> 4) | (((qh >> 4) & 3) << 4)) - 32;
+        const int q4 = static_cast<int>((ql1 >> 4) | (((qh >> 6) & 3) << 4)) - 32;
+        w[4 * h + 0] = d * static_cast<float>(s[0]) * static_cast<float>(q1);
+        w[4 * h + 1] = d * static_cast<float>(s[2]) * static_cast<float>(q2);
+        w[4 * h + 2] = d * static_cast<float>(s[4]) * static_cast<float>(q3);
+        w[4 * h + 3] = d * static_cast<float>(s[6]) * static_cast<float>(q4);
+        off[4 * h + 0] = h * 128 + l;
+        off[4 * h + 1] = h * 128 + 32 + l;
+        off[4 * h + 2] = h * 128 + 64 + l;
+        off[4 * h + 3] = h * 128 + 96 + l;
+    }
+}
+
+/* v2 lane maps: fewer, wider loads and 2-4 scales per lane instead of 8.
+ *
+ * Q4_K / Q5_K: 8 lanes share one 64-weight group g = l/8. Lane l loads the
+ * 4 qs bytes at j0 = 4*(l%8) as one u32: low nibbles are weights g*64+j0..+3
+ * (sub-block 2g), high nibbles g*64+32+j0..+3 (sub-block 2g+1). Each half is
+ * d*sum(a*q) - m*sum(a), with A read as float4. Needs 4-byte aligned blocks
+ * and 16-byte aligned A rows (the launcher checks both). */
+/* Q4_K/Q5_K 6-bit scale/min pair for sub-blocks 2g and 2g+1, branch-free.
+ * `q4k_scale_min` branches on j < 4; in the v2 map j differs across 8-lane
+ * groups, so a branch diverges the warp. Bytes: s[0..3] low scales,
+ * s[4..7] low mins, s[8..11] packed nibbles + the 2 high bits in s[0..7]. */
+__device__ inline void kq_scale_min_pair(const uint8_t *scales, int g, uint32_t &sc1,
+                                         uint32_t &m1, uint32_t &sc2, uint32_t &m2) {
+    const uint32_t w0 = *reinterpret_cast<const uint32_t *>(scales);
+    const uint32_t w1 = *reinterpret_cast<const uint32_t *>(scales + 4);
+    const uint32_t w2 = *reinterpret_cast<const uint32_t *>(scales + 8);
+    const int j1 = 2 * g;
+    const int j2 = 2 * g + 1;
+    auto byte = [](uint32_t w, int i) { return (w >> (8 * (i & 3))) & 0xFFu; };
+    // j < 4: sc = s[j] & 63, m = s[j+4] & 63.
+    // j >= 4: sc = (s[j+4] & 15) | ((s[j-4] >> 6) << 4),
+    //         m = (s[j+4] >> 4) | ((s[j] >> 6) << 4).
+    const bool hi = g >= 2;
+    const uint32_t a1 = byte(w0, j1), b1 = byte(w1, j1), c1 = byte(w2, j1);
+    const uint32_t a2 = byte(w0, j2), b2 = byte(w1, j2), c2 = byte(w2, j2);
+    sc1 = hi ? ((c1 & 15) | ((a1 >> 6) << 4)) : (a1 & 63);
+    m1 = hi ? ((c1 >> 4) | ((b1 >> 6) << 4)) : (b1 & 63);
+    sc2 = hi ? ((c2 & 15) | ((a2 >> 6) << 4)) : (a2 & 63);
+    m2 = hi ? ((c2 >> 4) | ((b2 >> 6) << 4)) : (b2 & 63);
+}
+
+struct Kq45Lane {
+    float dl, ml, dh, mh;
+    float lo[4], hi[4];
+    int off;
+};
+
+template <bool Q5>
+__device__ inline void kq_lane_q45_v2(const uint8_t *blk, int l, Kq45Lane &w) {
+    const int g = l >> 3;
+    const int j0 = (l & 7) * 4;
+    const float d = allpaca_f16le_to_f32(blk);
+    const float dmin = allpaca_f16le_to_f32(blk + 2);
+    uint32_t sc1 = 0, m1 = 0, sc2 = 0, m2 = 0;
+    kq_scale_min_pair(blk + 4, g, sc1, m1, sc2, m2);
+    const uint8_t *qs = blk + (Q5 ? 48 : 16);
+    const uint32_t q = *reinterpret_cast<const uint32_t *>(qs + g * 32 + j0);
+    uint32_t hb_lo = 0, hb_hi = 0;
+    if constexpr (Q5) {
+        const uint32_t qh = *reinterpret_cast<const uint32_t *>(blk + 16 + j0);
+        hb_lo = (qh >> (2 * g)) & 0x01010101u;
+        hb_hi = (qh >> (2 * g + 1)) & 0x01010101u;
+    }
+    const uint32_t lo = (q & 0x0F0F0F0Fu) | (hb_lo << 4);
+    const uint32_t hi = ((q >> 4) & 0x0F0F0F0Fu) | (hb_hi << 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        w.lo[i] = static_cast<float>((lo >> (8 * i)) & 0xFF);
+        w.hi[i] = static_cast<float>((hi >> (8 * i)) & 0xFF);
+    }
+    w.dl = d * static_cast<float>(sc1);
+    w.ml = dmin * static_cast<float>(m1);
+    w.dh = d * static_cast<float>(sc2);
+    w.mh = dmin * static_cast<float>(m2);
+    w.off = g * 64 + j0;
+}
+
+__device__ inline float kq_apply_q45_v2(const Kq45Lane &w, const float *ab) {
+    const float4 alo = *reinterpret_cast<const float4 *>(ab + w.off);
+    const float4 ahi = *reinterpret_cast<const float4 *>(ab + w.off + 32);
+    const float dot_lo = alo.x * w.lo[0] + alo.y * w.lo[1] + alo.z * w.lo[2] + alo.w * w.lo[3];
+    const float dot_hi = ahi.x * w.hi[0] + ahi.y * w.hi[1] + ahi.z * w.hi[2] + ahi.w * w.hi[3];
+    const float sum_lo = alo.x + alo.y + alo.z + alo.w;
+    const float sum_hi = ahi.x + ahi.y + ahi.z + ahi.w;
+    return w.dl * dot_lo - w.ml * sum_lo + w.dh * dot_hi - w.mh * sum_hi;
+}
+
+/* Q6_K (210-byte blocks, only 2-byte aligned): lane l owns the ql byte pair
+ * p = 2l of each 64-byte half h. p < 32 holds weights h*128+p (low nibble,
+ * qh bits 0-1) and h*128+64+p (high, bits 4-5); p >= 32 holds h*128+p (low,
+ * bits 2-3) and h*128+64+p (high, bits 6-7), with p' = p-32 indexing qh.
+ * Both weights of a pair share one scale. A is read as float2. */
+struct Kq6Lane {
+    float s_lo[2], s_hi[2];
+    float q[2][4];
+    int p;
+};
+
+__device__ inline void kq_lane_q6_k_v2(const uint8_t *blk, int l, Kq6Lane &w) {
+    const float d = allpaca_f16le_to_f32(blk + 208);
+    const int8_t *sc = reinterpret_cast<const int8_t *>(blk + 192);
+    const int p = 2 * l;
+    const bool second = p >= 32;
+    const int pp = second ? p - 32 : p;
+    const int sh_lo = second ? 2 : 0;
+    const int sh_hi = second ? 6 : 4;
+    const int is = pp / 16 + (second ? 2 : 0);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const uint32_t ql = *reinterpret_cast<const uint16_t *>(blk + h * 64 + p);
+        const uint32_t qh = *reinterpret_cast<const uint16_t *>(blk + 128 + h * 32 + pp);
+        w.q[h][0] = static_cast<float>(
+            static_cast<int>((ql & 0x0F) | (((qh >> sh_lo) & 3) << 4)) - 32);
+        w.q[h][1] = static_cast<float>(
+            static_cast<int>(((ql >> 8) & 0x0F) | (((qh >> (8 + sh_lo)) & 3) << 4)) - 32);
+        w.q[h][2] = static_cast<float>(
+            static_cast<int>(((ql >> 4) & 0x0F) | (((qh >> sh_hi) & 3) << 4)) - 32);
+        w.q[h][3] = static_cast<float>(
+            static_cast<int>(((ql >> 12) & 0x0F) | (((qh >> (8 + sh_hi)) & 3) << 4)) - 32);
+        w.s_lo[h] = d * static_cast<float>(sc[h * 8 + is]);
+        w.s_hi[h] = d * static_cast<float>(sc[h * 8 + is + 4]);
+    }
+    w.p = p;
+}
+
+__device__ inline float kq_apply_q6_k_v2(const Kq6Lane &w, const float *ab) {
+    float acc = 0.f;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const float2 alo = *reinterpret_cast<const float2 *>(ab + h * 128 + w.p);
+        const float2 ahi = *reinterpret_cast<const float2 *>(ab + h * 128 + 64 + w.p);
+        acc += w.s_lo[h] * (alo.x * w.q[h][0] + alo.y * w.q[h][1]) +
+               w.s_hi[h] * (ahi.x * w.q[h][2] + ahi.y * w.q[h][3]);
+    }
+    return acc;
+}
+
+template <int QT>
+struct KqBlock;
+template <>
+struct KqBlock<4> {
+    static constexpr int bytes = 144;
+};
+template <>
+struct KqBlock<5> {
+    static constexpr int bytes = 176;
+};
+template <>
+struct KqBlock<6> {
+    static constexpr int bytes = 210;
+};
+
+template <int QT, int MR, bool V2>
+__global__ void gemv_nt_kquant_warp_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                           int n, int k) {
+    constexpr int BB = KqBlock<QT>::bytes;
+    const int lane = static_cast<int>(threadIdx.x) % KQ_LANES;
+    const int col = static_cast<int>(blockIdx.x) * KQ_COLS_PER_BLOCK +
+                    static_cast<int>(threadIdx.x) / KQ_LANES;
+    const int row0 = static_cast<int>(blockIdx.y) * MR;
+    if (col >= n) {
+        return;
+    }
+    const int nblocks = k / 256;
+    const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * BB;
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.f;
+    }
+#pragma unroll 2
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
+        const float *ab = a + static_cast<size_t>(ib) * 256;
+        if constexpr (V2) {
+            if constexpr (QT == 6) {
+                Kq6Lane w;
+                kq_lane_q6_k_v2(blk, lane, w);
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    if (row0 + r < m) {
+                        acc[r] += kq_apply_q6_k_v2(
+                            w, ab + static_cast<size_t>(row0 + r) * static_cast<size_t>(k));
+                    }
+                }
+            } else {
+                Kq45Lane w;
+                kq_lane_q45_v2<QT == 5>(blk, lane, w);
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    if (row0 + r < m) {
+                        acc[r] += kq_apply_q45_v2(
+                            w, ab + static_cast<size_t>(row0 + r) * static_cast<size_t>(k));
+                    }
+                }
+            }
+            continue;
+        }
+        float w[8];
+        int off[8];
+        if constexpr (QT == 4) {
+            kq_lane_q4_k(blk, lane, w, off);
+        } else if constexpr (QT == 5) {
+            kq_lane_q5_k(blk, lane, w, off);
+        } else {
+            kq_lane_q6_k(blk, lane, w, off);
+        }
+#pragma unroll
+        for (int r = 0; r < MR; ++r) {
+            if (row0 + r < m) {
+                const float *ar = ab + static_cast<size_t>(row0 + r) * static_cast<size_t>(k);
+                float s = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    s += ar[off[j]] * w[j];
+                }
+                acc[r] += s;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        const float s = warp_sum32(acc[r]);
+        if (lane == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+                s;
+        }
+    }
+}
+
+template <int QT, bool V2>
+static int launch_kquant_rows(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                              int32_t k, hipStream_t stream) {
+    dim3 block(KQ_LANES * KQ_COLS_PER_BLOCK);
+    const unsigned gx = static_cast<unsigned>((n + KQ_COLS_PER_BLOCK - 1) / KQ_COLS_PER_BLOCK);
+    if (m == 1) {
+        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 1, V2>), dim3(gx, 1), block, 0, stream,
+                           a, b, c, m, n, k);
+    } else if (m == 2) {
+        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 2, V2>), dim3(gx, 1), block, 0, stream,
+                           a, b, c, m, n, k);
+    } else if (m <= 4) {
+        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 4, V2>), dim3(gx, 1), block, 0, stream,
+                           a, b, c, m, n, k);
+    } else {
+        const unsigned gy = static_cast<unsigned>((m + 7) / 8);
+        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 8, V2>), dim3(gx, gy), block, 0,
+                           stream, a, b, c, m, n, k);
+    }
+    return hip_status(hipGetLastError());
+}
+
+/* Returns ALLPACA_ERR_INVALID when k is not whole super-blocks (caller falls back). */
+template <int QT>
+static int launch_gemm_nt_kquant_warp(const float *a, const uint8_t *b, float *c, int32_t m,
+                                      int32_t n, int32_t k, hipStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || k % 256 != 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    // v2 reads B as u32 (Q4_K/Q5_K) or u16 (Q6_K) and A as float4/float2.
+    const uintptr_t ba = reinterpret_cast<uintptr_t>(b);
+    const bool v2 = (reinterpret_cast<uintptr_t>(a) % 16 == 0) &&
+                    (QT == 6 ? ba % 2 == 0 : ba % 4 == 0);
+    if (v2) {
+        return launch_kquant_rows<QT, true>(a, b, c, m, n, k, stream);
+    }
+    return launch_kquant_rows<QT, false>(a, b, c, m, n, k, stream);
+}
+
 /* One thread per output column. Native 144-byte Q4_K super-blocks along K.
  * Baseline: each column re-reads A from global (no LDS tile). */
 __global__ void gemv_nt_q4_k_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
@@ -1749,6 +2090,9 @@ static int launch_gemm_nt_q4_k(const float *a, const uint8_t *b, float *c, int32
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    if (tiled && k % 256 == 0) {
+        return launch_gemm_nt_kquant_warp<4>(a, b, c, m, n, k, stream);
+    }
     if (tiled) {
         constexpr int COLS = 64;
         dim3 block(256);
@@ -2660,6 +3004,10 @@ static int launch_gemm_nt_q6_k_cols(const float *a, const uint8_t *b, float *c, 
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
+    if (k % 256 == 0) {
+        // `cols` tiled the per-thread kernel; the warp kernel has no column tile.
+        return launch_gemm_nt_kquant_warp<6>(a, b, c, m, n, k, stream);
+    }
     clear_last_error();
     int use = cols;
     if (use != 32 && use != 64 && use != 128) {
@@ -2832,6 +3180,10 @@ static int launch_gemm_nt_q5_k_cols(const float *a, const uint8_t *b, float *c, 
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
+    if (k % 256 == 0) {
+        // `cols` tiled the per-thread kernel; the warp kernel has no column tile.
+        return launch_gemm_nt_kquant_warp<5>(a, b, c, m, n, k, stream);
+    }
     clear_last_error();
     int use = cols;
     if (use != 32 && use != 64 && use != 128) {
@@ -2994,12 +3346,19 @@ static IDXGIAdapter3 *dxgi_adapter_for_hip(int32_t device) {
             char utf8[256]{};
             WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, utf8, sizeof(utf8), nullptr,
                                 nullptr);
+            // LUID identifies the adapter even with two identical boards;
+            // the name match is the fallback when HIP leaves it zeroed.
+            char luid[8]{};
+            std::memcpy(luid, &desc.AdapterLuid.LowPart, 4);
+            std::memcpy(luid + 4, &desc.AdapterLuid.HighPart, 4);
+            const bool has_luid = std::memcmp(prop.luid, "\0\0\0\0\0\0\0\0", 8) != 0;
+            const bool same_luid = has_luid && std::memcmp(prop.luid, luid, 8) == 0;
             const bool same = utf8[0] != '\0' && prop.name[0] != '\0' &&
                               (std::strstr(utf8, prop.name) != nullptr ||
                                std::strstr(prop.name, utf8) != nullptr);
             const bool rx9060 = std::strstr(prop.name, "9060") && std::strstr(utf8, "9060");
             const bool rx9070 = std::strstr(prop.name, "9070") && std::strstr(utf8, "9070");
-            if (same || rx9060 || rx9070) {
+            if (same_luid || (!has_luid && (same || rx9060 || rx9070))) {
                 (void)ad->QueryInterface(__uuidof(IDXGIAdapter3),
                                          reinterpret_cast<void **>(&found));
             }
@@ -3023,6 +3382,60 @@ static void win_reserve_hip_device(int32_t device, size_t bytes) {
         (void)g_win_adapter[device]->SetVideoMemoryReservation(
             0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, g_win_reserved[device]);
     }
+}
+
+static PDH_HQUERY g_win_pdh_query[8];
+static PDH_HCOUNTER g_win_pdh_dedicated[8];
+
+/* Dedicated VRAM on `device` not resident for any process, as Task Manager
+ * shows it. hipMemGetInfo and the per-process DXGI budget on Windows both
+ * report the board as nearly free while the desktop (dwm, browsers) holds
+ * several GiB of it; allocations past what is really left are demoted by WDDM
+ * to shared system memory and then read over PCIe on every kernel. */
+static bool win_local_headroom(int32_t device, uint64_t *headroom) {
+    if (device < 0 || device >= 8) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_win_vram_mu);
+    if (g_win_adapter[device] == nullptr) {
+        g_win_adapter[device] = dxgi_adapter_for_hip(device);
+    }
+    if (g_win_adapter[device] == nullptr) {
+        return false;
+    }
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(g_win_adapter[device]->GetDesc1(&desc)) || desc.DedicatedVideoMemory == 0) {
+        return false;
+    }
+    if (g_win_pdh_query[device] == nullptr) {
+        wchar_t path[160];
+        std::swprintf(path, sizeof(path) / sizeof(path[0]),
+                      L"\\GPU Adapter Memory(luid_0x%08X_0x%08X_phys_0)\\Dedicated Usage",
+                      static_cast<unsigned>(desc.AdapterLuid.HighPart),
+                      static_cast<unsigned>(desc.AdapterLuid.LowPart));
+        PDH_HQUERY q = nullptr;
+        PDH_HCOUNTER c = nullptr;
+        if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS) {
+            return false;
+        }
+        if (PdhAddEnglishCounterW(q, path, 0, &c) != ERROR_SUCCESS) {
+            PdhCloseQuery(q);
+            return false;
+        }
+        g_win_pdh_query[device] = q;
+        g_win_pdh_dedicated[device] = c;
+    }
+    PDH_FMT_COUNTERVALUE v{};
+    if (PdhCollectQueryData(g_win_pdh_query[device]) != ERROR_SUCCESS ||
+        PdhGetFormattedCounterValue(g_win_pdh_dedicated[device], PDH_FMT_LARGE, nullptr, &v) !=
+            ERROR_SUCCESS ||
+        v.largeValue < 0) {
+        return false;
+    }
+    const uint64_t used = static_cast<uint64_t>(v.largeValue);
+    const uint64_t total = static_cast<uint64_t>(desc.DedicatedVideoMemory);
+    *headroom = total > used ? total - used : 0;
+    return true;
 }
 #endif
 
@@ -3747,6 +4160,18 @@ extern "C" int allpaca_hip_mem_info(int32_t device, uint64_t *free_bytes, uint64
     *free_bytes = static_cast<uint64_t>(free_b);
     *total_bytes = static_cast<uint64_t>(total_b);
     return ALLPACA_OK;
+}
+
+extern "C" int allpaca_hip_local_headroom(int32_t device, uint64_t *bytes) {
+    if (!bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+#if defined(_WIN32)
+    return win_local_headroom(device, bytes) ? ALLPACA_OK : ALLPACA_ERR_NOT_IMPLEMENTED;
+#else
+    (void)device;
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+#endif
 }
 
 extern "C" int allpaca_gemm(const float *a, const float *b, float *c, int32_t m, int32_t n,
@@ -5250,6 +5675,10 @@ extern "C" int allpaca_hip_benchmark(int32_t, int32_t, size_t, double *, double 
 extern "C" int allpaca_hip_mem_used(int32_t, uint64_t *) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_mem_info(int32_t, uint64_t *, uint64_t *) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_local_headroom(int32_t, uint64_t *) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

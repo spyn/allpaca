@@ -714,6 +714,67 @@ fn slot_ffn_refs(base: usize, slot_bytes: usize, slot: usize, host: &LayerFfn) -
     ]
 }
 
+/// Packed `token_embd` held in host RAM for quant types with no HIP gather
+/// kernel (K-quants, IQ4, TQ, ...). A gather dequantizes `dim` floats per token
+/// on the CPU and H2Ds them, instead of parking a vocab×dim F32 table in VRAM
+/// (5 GiB for a 248k×5120 Q6_K embed) on every GPU.
+struct HostEmbed {
+    bytes: Vec<u8>,
+    ty: allpaca_gguf::GgmlType,
+    dim: usize,
+    rows: usize,
+    row_bytes: usize,
+}
+
+impl HostEmbed {
+    /// `token_embd` types the HIP upload would otherwise expand to F32.
+    fn wanted(ty: allpaca_gguf::GgmlType) -> bool {
+        use allpaca_gguf::GgmlType as T;
+        !matches!(ty, T::F32 | T::F16 | T::Q8_0 | T::RocmFp4 | T::I32 | T::Other)
+    }
+
+    fn from_gguf(file: &GgufFile, name: &str) -> Result<Self, AllpacaError> {
+        let info = file.tensor(name).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
+        })?;
+        let dim = *info.dims.first().unwrap_or(&0) as usize;
+        let n = info.n_elements() as usize;
+        let bytes = file.tensor_bytes(name)?;
+        if dim == 0 || n % dim != 0 || bytes.len() % (n / dim).max(1) != 0 {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "host embed {name} dims {:?} do not tile {} bytes",
+                info.dims,
+                bytes.len()
+            ))));
+        }
+        let rows = n / dim;
+        Ok(Self {
+            row_bytes: bytes.len() / rows,
+            bytes: bytes.to_vec(),
+            ty: info.ggml_type,
+            dim,
+            rows,
+        })
+    }
+
+    fn gather(&self, tokens: &[u32], out: &mut Vec<f32>) -> Result<(), AllpacaError> {
+        out.clear();
+        out.resize(tokens.len() * self.dim, 0.0);
+        for (t, row) in tokens.iter().zip(out.chunks_exact_mut(self.dim)) {
+            let r = *t as usize;
+            if r >= self.rows {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "token {r} outside embed rows {}",
+                    self.rows
+                ))));
+            }
+            let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
+            allpaca_gguf::dequant_packed(self.ty, src, self.dim, row)?;
+        }
+        Ok(())
+    }
+}
+
 /// Host-layout map onto a once-uploaded [`DeviceWeights`] blob.
 pub struct ResidentModel {
     weights: DeviceWeights,
@@ -730,6 +791,8 @@ pub struct ResidentModel {
     /// stream is drained so the DMA source cannot be freed underneath it.
     h2d_pending: Mutex<Vec<Vec<u8>>>,
     embed: WeightRef,
+    /// Set when `token_embd` stays packed on the host (see [`HostEmbed`]).
+    host_embed: Option<HostEmbed>,
     layers: Vec<LayerOff>,
     norm: WeightRef,
     lm_head: WeightRef,
@@ -902,6 +965,7 @@ impl ResidentModel {
             h2d: allpaca_hip::H2dStream::new().ok(),
             h2d_pending: Mutex::new(Vec::new()),
             embed,
+            host_embed: None,
             layers,
             norm,
             lm_head,
@@ -1273,10 +1337,46 @@ impl ResidentModel {
         device: i32,
         skip_remote: &[bool],
     ) -> Result<Self, AllpacaError> {
+        Self::upload_gguf_split(file, cfg, device, skip_remote, true)
+    }
+
+    /// Layer weights only, for a second local GPU in the layer split.
+    ///
+    /// Embed, final norm, lm_head, and MTP NextN stay on the target GPU:
+    /// decode switches back there before `output_norm`, so a copy here is
+    /// VRAM the peer's layers cannot use.
+    pub fn upload_gguf_peer_layers(
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        device: i32,
+        skip: &[bool],
+    ) -> Result<Self, AllpacaError> {
+        Self::upload_gguf_split(file, cfg, device, skip, false)
+    }
+
+    fn upload_gguf_split(
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        device: i32,
+        skip_remote: &[bool],
+        globals: bool,
+    ) -> Result<Self, AllpacaError> {
         let report = file.compat_report();
         let mut parts: Vec<UploadPart<'_>> = Vec::new();
         let mut off = 0usize;
-        let embed = append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?;
+        let none = WeightRef::f32(0, 0);
+        let embed_ty = file.tensor("token_embd.weight").map(|t| t.ggml_type);
+        let host_embed = match embed_ty {
+            Some(ty) if globals && HostEmbed::wanted(ty) => {
+                Some(HostEmbed::from_gguf(file, "token_embd.weight")?)
+            }
+            _ => None,
+        };
+        let embed = if !globals || host_embed.is_some() {
+            none
+        } else {
+            append_gguf_tensor(file, "token_embd.weight", &mut parts, &mut off)?
+        };
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut expert_offs = Vec::with_capacity(cfg.n_layers);
         for local in 0..cfg.n_layers {
@@ -1650,7 +1750,9 @@ impl ResidentModel {
                 w_shared_down,
             });
         }
-        let norm = if file.tensor("output_norm.weight").is_some() {
+        let norm = if !globals {
+            none
+        } else if file.tensor("output_norm.weight").is_some() {
             append_gguf_tensor(file, "output_norm.weight", &mut parts, &mut off)?
         } else {
             let b = cfg.gguf_blk(0);
@@ -1661,15 +1763,22 @@ impl ResidentModel {
                 &mut off,
             )?
         };
-        let lm_head = if file.tensor("output.weight").is_some() {
+        let lm_head = if !globals {
+            none
+        } else if file.tensor("output.weight").is_some() {
             append_gguf_tensor(file, "output.weight", &mut parts, &mut off)?
+        } else if host_embed.is_some() {
+            // Tied weights, host gather: lm_head still needs the table on
+            // device, packed in GEMV layout rather than an F32 expand.
+            append_gguf_tensor_as(file, "token_embd.weight", &mut parts, &mut off, false)?
         } else {
             embed
         };
         let mtp_base = cfg.gguf_blk(0);
-        let mtp_nextn = if file
-            .tensor(&format!("blk.{mtp_base}.nextn.eh_proj.weight"))
-            .is_some()
+        let mtp_nextn = if globals
+            && file
+                .tensor(&format!("blk.{mtp_base}.nextn.eh_proj.weight"))
+                .is_some()
         {
             Some(MtpNextnOff {
                 eh_proj: append_gguf_tensor(
@@ -1707,6 +1816,7 @@ impl ResidentModel {
             h2d_pending: Mutex::new(Vec::new()),
             weights,
             embed,
+            host_embed,
             layers,
             norm,
             lm_head,
@@ -1969,6 +2079,11 @@ impl ResidentModel {
         out: *mut f32,
         dim: i32,
     ) -> Result<(), AllpacaError> {
+        if let Some(host) = &self.host_embed {
+            let mut row = Vec::new();
+            host.gather(&[token], &mut row)?;
+            return hip.copy_h2d_f32(out, &row);
+        }
         match self.embed.kind {
             WeightKind::F32 => hip.embed_gather(self.embed(), token, out, dim),
             WeightKind::F16 => hip.embed_gather_f16(
@@ -2000,6 +2115,11 @@ impl ResidentModel {
         out: *mut f32,
         dim: i32,
     ) -> Result<(), AllpacaError> {
+        if let Some(host) = &self.host_embed {
+            let mut rows = Vec::new();
+            host.gather(tokens, &mut rows)?;
+            return hip.copy_h2d_f32(out, &rows);
+        }
         match self.embed.kind {
             WeightKind::F32 => hip.embed_gather_rows(self.embed(), tokens, out, dim),
             WeightKind::F16 => hip.embed_gather_f16_rows(
@@ -2940,6 +3060,66 @@ fn append_gguf_tensor<'a>(
     parts: &mut Vec<UploadPart<'a>>,
     off: &mut usize,
 ) -> Result<WeightRef, AllpacaError> {
+    append_gguf_tensor_as(file, name, parts, off, name == "token_embd.weight")
+}
+
+/// Low-bit ggml types with no fused HIP GEMV. Large GEMM weights of these
+/// types re-pack to Q8_0 at load: every value lands on (or within half a step
+/// of) the Q8_0 grid, at ~1.1 B/elem instead of a 4 B/elem F32 expand.
+fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
+    use allpaca_gguf::GgmlType as T;
+    matches!(
+        ty,
+        T::IQ4_NL | T::IQ4_XS | T::Q4_0 | T::Q4_1 | T::Q5_0 | T::Q5_1 | T::Q2_K | T::Q3_K
+    )
+}
+
+/// VRAM bytes [`append_gguf_tensor_as`] stages for one tensor (not `gather`).
+fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
+    use allpaca_gguf::GgmlType as T;
+    let n = info.n_elements();
+    let q8_staged = n.div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
+    match info.ggml_type {
+        T::F32 => n * 4,
+        _ if n <= 65_536 => n * 4,
+        T::F16 => n * 2,
+        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 => info.nbytes() as u64,
+        T::Q8_0 => q8_staged,
+        ty if requant_q8_0_on_load(ty) => q8_staged,
+        _ => n * 4,
+    }
+}
+
+/// Per-layer VRAM footprint of a GGUF upload, plus the target-only globals
+/// (device embed, `output_norm`, lm_head). Used to place layers by bytes.
+pub fn gguf_device_bytes(file: &GgufFile, cfg: &ModelConfig) -> (Vec<u64>, u64) {
+    let prefixes: Vec<String> = (0..cfg.n_layers)
+        .map(|l| format!("blk.{}.", cfg.gguf_blk(l)))
+        .collect();
+    let tied = file.tensor("output.weight").is_none();
+    let mut layers = vec![0u64; cfg.n_layers];
+    let mut globals = 0u64;
+    for t in &file.tensors {
+        if let Some(l) = prefixes.iter().position(|p| t.name.starts_with(p.as_str())) {
+            layers[l] += staged_device_bytes(t);
+        } else if t.name == "output.weight" || t.name == "output_norm.weight" {
+            globals += staged_device_bytes(t);
+        } else if t.name == "token_embd.weight" && (tied || !HostEmbed::wanted(t.ggml_type)) {
+            globals += staged_device_bytes(t);
+        }
+    }
+    (layers, globals)
+}
+
+/// `gather` stages `token_embd` for row gathers (F32 expand for K-quants,
+/// linear Q8_0 blocks) instead of the GEMV layout.
+fn append_gguf_tensor_as<'a>(
+    file: &'a GgufFile,
+    name: &str,
+    parts: &mut Vec<UploadPart<'a>>,
+    off: &mut usize,
+    gather: bool,
+) -> Result<WeightRef, AllpacaError> {
     let info = file.tensor(name).ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
     })?;
@@ -2964,7 +3144,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::Q4_K => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_q4_k(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -2985,7 +3165,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::TQ2_0 => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_tq2_0(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3006,7 +3186,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::TQ1_0 => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_tq1_0(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3049,7 +3229,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::Q5_K => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_q5_k(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3070,7 +3250,7 @@ fn append_gguf_tensor<'a>(
         }
         allpaca_gguf::GgmlType::Q6_K => {
             let packed = file.tensor_bytes(name)?;
-            if n <= 65_536 || name == "token_embd.weight" {
+            if n <= 65_536 || gather {
                 let mut f32s = vec![0.0f32; n];
                 allpaca_cpu::dequant_q6_k(packed, n, &mut f32s)?;
                 let mut bytes = Vec::with_capacity(n * 4);
@@ -3099,7 +3279,7 @@ fn append_gguf_tensor<'a>(
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
                 (UploadPart::Owned(bytes), WeightKind::F32)
-            } else if name == "token_embd.weight" {
+            } else if gather {
                 let staged = allpaca_hip::stage_q8_0_blocks(packed).map_err(|e| {
                     AllpacaError::Fatal(FatalError::ModelLoad(format!("Q8_0 stage {name}: {e}")))
                 })?;
@@ -3120,6 +3300,22 @@ fn append_gguf_tensor<'a>(
                 })?;
                 (UploadPart::Owned(staged), WeightKind::Q8_0)
             }
+        }
+        ty if !gather && n > 65_536 && requant_q8_0_on_load(ty) => {
+            let k = *info.dims.first().unwrap_or(&1) as usize;
+            if k == 0 || k % 32 != 0 || n % k != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{ty:?} -> Q8_0 {name} dims {:?} do not tile n={n}",
+                    info.dims
+                ))));
+            }
+            let q8 = allpaca_cpu::quantize_q8_0(&file.tensor_f32(name)?);
+            let staged = allpaca_hip::stage_q8_0_gemv(&q8, n / k, k).map_err(|e| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "Q8_0 GEMV stage {name}: {e}"
+                )))
+            })?;
+            (UploadPart::Owned(staged), WeightKind::Q8_0)
         }
         _ => {
             let f32s = file.tensor_f32(name)?;
@@ -8843,6 +9039,13 @@ impl TinyModel {
                     tracing::warn!(pos, token, error = %e, "HIP draft on-device decode failed; host fallback");
                 }
             }
+        }
+        if !self.host_weights_ready() {
+            // Large GGUF drafts skip the host F32 copy; without a resident
+            // upload there is nothing to run on the host.
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "draft has no HIP resident weights and no host weights".into(),
+            )));
         }
         let cfg = &self.config;
         let dim = cfg.dim;

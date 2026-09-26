@@ -2523,7 +2523,11 @@ fn hip_local_gpu_pool_two_layer_matches_cpu() {
     let path = std::env::temp_dir().join("allpaca_hip_tiny_two_layer_pool.gguf");
     write_tiny_f32_two_layer_gguf(&path);
     let cpu = Engine::new(tiny_written_cfg(path.clone(), true)).expect("two-layer CPU load");
-    let hip = Engine::new(tiny_written_cfg(path.clone(), false)).expect("two-layer HIP load");
+    // The byte-aware planner keeps a model this small on the target GPU; an
+    // even split forces one layer onto the peer so the hand-off is exercised.
+    let mut hip_cfg = tiny_written_cfg(path.clone(), false);
+    hip_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+    let hip = Engine::new(hip_cfg).expect("two-layer HIP load");
     if hip_gpus(&hip).len() < 2 {
         let _ = std::fs::remove_file(&path);
         eprintln!("skip hip_local_gpu_pool_two_layer_matches_cpu: inventory has <2 HIP GPUs");

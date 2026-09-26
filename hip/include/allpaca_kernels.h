@@ -91,6 +91,13 @@ int allpaca_hip_mem_used(int32_t device, uint64_t *used_bytes);
  * the scheduler needs before it grows the expert pool. */
 int allpaca_hip_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_bytes);
 
+/* Windows: dedicated VRAM on `device` not resident for any process (PDH
+ * "GPU Adapter Memory" Dedicated Usage vs the adapter's DedicatedVideoMemory).
+ * hipMemGetInfo there does not see the desktop's share, and WDDM demotes
+ * allocations past what is really left to shared system memory. Other
+ * platforms: ALLPACA_ERR_NOT_IMPLEMENTED. */
+int allpaca_hip_local_headroom(int32_t device, uint64_t *bytes);
+
 int allpaca_hip_set_device(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);

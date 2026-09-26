@@ -138,6 +138,34 @@ pub fn packed_fits_local(packed_bytes: u64, local_mems: &[u64]) -> bool {
     packed_bytes > 0 && packed_bytes <= ((local as f64) * HEADROOM) as u64
 }
 
+/// Local-only multi-GPU plan: one contiguous layer range per device, filled in
+/// device order (target GPU first).
+///
+/// `layer_bytes[i]` is layer i's VRAM footprint (weights plus its KV share) and
+/// `budgets[d]` is what device d can hold for layers. Decode walks layers in
+/// order, so a byte parked on the faster target GPU costs less than one on the
+/// peer, and contiguous ranges keep the activation hand-off to one hop per
+/// boundary. A later device only takes what does not fit the earlier ones.
+/// Layers that fit nowhere land on the last device.
+pub fn plan_local_fill(layer_bytes: &[u64], budgets: &[u64]) -> LayerPlan {
+    let n = layer_bytes.len();
+    if n == 0 || budgets.len() < 2 {
+        return LayerPlan::all_local(n);
+    }
+    let mut owners = vec![0usize; n];
+    let mut dev = 0usize;
+    let mut used = 0u64;
+    for (slot, &bytes) in owners.iter_mut().zip(layer_bytes) {
+        while dev + 1 < budgets.len() && used + bytes > budgets[dev] {
+            dev += 1;
+            used = 0;
+        }
+        *slot = dev;
+        used += bytes;
+    }
+    LayerPlan { owners }
+}
+
 /// Local-only two-GPU plan: the peer owns a contiguous *suffix*.
 ///
 /// Used when every layer is full-attn (no GDN). Hybrid Qwen uses
@@ -292,6 +320,33 @@ mod tests {
         assert_eq!(plan.owners.iter().filter(|&&o| o == 1).count(), 32);
         let later_attn_on_peer = (32..64).filter(|&i| attn[i] && plan.owners[i] == 1).count();
         assert_eq!(later_attn_on_peer, 0);
+    }
+
+    #[test]
+    fn local_fill_keeps_everything_on_target_when_it_fits() {
+        let plan = plan_local_fill(&[10; 8], &[100, 100]);
+        assert_eq!(plan.owners, vec![0; 8]);
+        assert!(!plan.has_remote());
+    }
+
+    #[test]
+    fn local_fill_spills_contiguous_suffix_to_peer() {
+        let plan = plan_local_fill(&[10; 8], &[35, 100]);
+        assert_eq!(plan.owners, vec![0, 0, 0, 1, 1, 1, 1, 1]);
+        assert_eq!(plan.runs(), vec![(0, 0, 3), (1, 3, 8)]);
+    }
+
+    #[test]
+    fn local_fill_overflow_lands_on_last_device() {
+        let plan = plan_local_fill(&[10; 6], &[20, 20]);
+        assert_eq!(plan.owners, vec![0, 0, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn local_fill_uneven_layers_respect_budget() {
+        // Heavier later layers must not push the target past its budget.
+        let plan = plan_local_fill(&[5, 5, 30, 5], &[20, 100]);
+        assert_eq!(plan.owners, vec![0, 0, 1, 1]);
     }
 
     #[test]
