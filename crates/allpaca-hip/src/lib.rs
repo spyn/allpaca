@@ -12770,15 +12770,23 @@ mod tests {
         }
         // Multi-row GEMV batches (verify spans): 4-row and 8-row blocks, n and
         // k off the tile grid.
-        let extra = [(4, 130, 96), (5, 20, 96), (8, 33, 64), (7, 129, 33)];
+        let extra = [(4, 130, 96), (5, 20, 96), (8, 33, 64), (7, 129, 33), (9, 21, 64), (16, 9, 96)];
         for (si, (m, n, k)) in q8_intdot_shapes().iter().chain(extra.iter()).copied().enumerate() {
             let (a, b_q8, _) = fill_q8_gemm_case(si, m, n, k);
             let b_deq = dequant_q8_matrix(&b_q8, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
             cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
-            gemm_nt_q8_0(&a, &b_q8, &mut hip, m as i32, n as i32, k as i32)
-                .expect("HIP gemm_nt_q8_0 must run when a device is present");
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q8_0(a, &b_q8, c, rows, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q8_0 must run when a device is present")
+            };
+            run(&a, &mut hip, m as i32);
+            if m <= 16 {
+                // Decode and verify spans (up to max_depth 8 + a deferred
+                // correction) must agree with a single row bit for bit.
+                assert_rows_match_single("q8_0", run, &a, &hip, m, n, k);
+            }
             for i in 0..m * n {
                 assert!(
                     gemm_close(hip[i], cpu[i]),

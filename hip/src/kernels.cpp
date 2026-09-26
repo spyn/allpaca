@@ -596,6 +596,26 @@ __device__ inline int32_t i8dot4(uint32_t a, uint32_t b, int32_t c) {
 #endif
 }
 
+/* One lane's 8-weight Q8_0 dot, with explicitly rounded ops so the 1-row and
+ * multi-row kernels compute every row bit-identically (free FMA contraction
+ * fused them differently, and a speculative verify row then drifted from
+ * decode). */
+__device__ inline float q8_dot8(const float *as, uint32_t qlo, uint32_t qhi) {
+    const auto q = [](uint32_t w, int i) {
+        return static_cast<float>(static_cast<int8_t>((w >> (8 * i)) & 0xff));
+    };
+    float dot = __fmul_rn(as[0], q(qlo, 0));
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
+        dot = __fmaf_rn(as[i], q(qlo, i), dot);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        dot = __fmaf_rn(as[4 + i], q(qhi, i), dot);
+    }
+    return dot;
+}
+
 /* Float A × Q8 weight (fallback if integer MAC is slower). */
 __global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                         int k) {
@@ -639,16 +659,7 @@ __global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float 
                 const uint8_t *qp = bp + Q8_STAGED_QS + qbase;
                 const uint32_t qlo = *reinterpret_cast<const uint32_t *>(qp);
                 const uint32_t qhi = *reinterpret_cast<const uint32_t *>(qp + 4);
-                const float *as = As + t * 32 + qbase;
-                float dot = as[0] * static_cast<float>(static_cast<int8_t>(qlo & 0xff));
-                dot += as[1] * static_cast<float>(static_cast<int8_t>((qlo >> 8) & 0xff));
-                dot += as[2] * static_cast<float>(static_cast<int8_t>((qlo >> 16) & 0xff));
-                dot += as[3] * static_cast<float>(static_cast<int8_t>((qlo >> 24) & 0xff));
-                dot += as[4] * static_cast<float>(static_cast<int8_t>(qhi & 0xff));
-                dot += as[5] * static_cast<float>(static_cast<int8_t>((qhi >> 8) & 0xff));
-                dot += as[6] * static_cast<float>(static_cast<int8_t>((qhi >> 16) & 0xff));
-                dot += as[7] * static_cast<float>(static_cast<int8_t>((qhi >> 24) & 0xff));
-                acc += d * dot;
+                acc = __fmaf_rn(d, q8_dot8(As + t * 32 + qbase, qlo, qhi), acc);
             }
         }
         __syncthreads();
@@ -714,21 +725,9 @@ __global__ void gemv_nt_q8_0_f32_rows_kernel(const float *a, const uint8_t *b, f
                 const uint8_t *qp = bp + Q8_STAGED_QS + qbase;
                 const uint32_t qlo = *reinterpret_cast<const uint32_t *>(qp);
                 const uint32_t qhi = *reinterpret_cast<const uint32_t *>(qp + 4);
-                float q[8];
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    q[i] = static_cast<float>(static_cast<int8_t>((qlo >> (8 * i)) & 0xff));
-                    q[4 + i] = static_cast<float>(static_cast<int8_t>((qhi >> (8 * i)) & 0xff));
-                }
 #pragma unroll
                 for (int r = 0; r < MR; ++r) {
-                    const float *as = &As[r][t * 32 + qbase];
-                    float dot = 0.0f;
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        dot += as[i] * q[i];
-                    }
-                    acc[r] += d * dot;
+                    acc[r] = __fmaf_rn(d, q8_dot8(&As[r][t * 32 + qbase], qlo, qhi), acc[r]);
                 }
             }
         }
@@ -1687,7 +1686,10 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     }
     clear_last_error();
     /* M=1 decode stays on the 36-byte GEMV. Prefill M>8 reuses Q8 B tiles across A rows. */
-    if (!intdot && m > 8) {
+    // Up to 16 rows stay on the GEMV kernels: a verify span (max_depth 8 plus
+    // a deferred correction) must match decode bit for bit, and the tiled
+    // prefill GEMM sums in another order.
+    if (!intdot && m > 16) {
         constexpr int BM = 64;
         constexpr int BN = 64;
         dim3 block(16, 16);
@@ -1702,7 +1704,7 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     dim3 block(512);
     const unsigned gx = static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block);
     if (!intdot && m > 1) {
-        // 2..8 rows share each weight block load (verify spans).
+        // 2..16 rows share each weight block load (verify spans).
         if (m == 2) {
             hipLaunchKernelGGL(gemv_nt_q8_0_f32_rows_kernel<2>, dim3(gx, 1), block, 0, stream, a,
                                b, c, m, n, k);
@@ -1710,7 +1712,8 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
             hipLaunchKernelGGL(gemv_nt_q8_0_f32_rows_kernel<4>, dim3(gx, 1), block, 0, stream, a,
                                b, c, m, n, k);
         } else {
-            hipLaunchKernelGGL(gemv_nt_q8_0_f32_rows_kernel<8>, dim3(gx, 1), block, 0, stream, a,
+            hipLaunchKernelGGL(gemv_nt_q8_0_f32_rows_kernel<8>,
+                               dim3(gx, static_cast<unsigned>((m + 7) / 8)), block, 0, stream, a,
                                b, c, m, n, k);
         }
         return hip_status(hipGetLastError());
