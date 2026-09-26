@@ -38,6 +38,8 @@ pub const TQ1_0_BLOCK_BYTES: usize = 54;
 pub const Q6_K_BLOCK_ELEMS: usize = 256;
 pub const Q6_K_BLOCK_BYTES: usize = 210;
 /// GGUF Q5_K super-block (f16 d + f16 dmin + 12 scales + 32 qh + 128 qs).
+pub const Q3_K_BLOCK_ELEMS: usize = 256;
+pub const Q3_K_BLOCK_BYTES: usize = 110;
 pub const Q5_K_BLOCK_ELEMS: usize = 256;
 pub const Q5_K_BLOCK_BYTES: usize = 176;
 /// ROCmFP4 block (ggml_type_id=100): 16 packed nibble bytes + 2 UE4M3 scales.
@@ -586,6 +588,15 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gemm_nt_q6_k_untiled(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_q3_k(
             a: *const f32,
             b: *const u8,
             c: *mut f32,
@@ -2548,6 +2559,30 @@ pub fn gemm_nt_q6_k_untiled_device(
     }
 }
 
+/// Device-pointer NT GEMM with native GGUF Q3_K `b` (`C = A * dequant(B)^T`);
+/// `k` must be whole 256-value super-blocks.
+pub fn gemm_nt_q3_k_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_q3_k(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q3_k")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q3_k unavailable".into(),
+        )))
+    }
+}
+
 /// Device-pointer NT GEMM with native GGUF Q5_K `b` (`C = A * dequant(B)^T`).
 pub fn gemm_nt_q5_k_device(
     a: *const f32,
@@ -3148,6 +3183,55 @@ pub fn gemm_nt_q6_k_untiled(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q6_k_untiled unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer Q3_K NT GEMM: copies native GGUF blocks, runs the fused kernel, copies back.
+pub fn gemm_nt_q3_k(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(Q3_K_BLOCK_ELEMS);
+        let packed_bytes = (n as usize) * nblocks * Q3_K_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q3_K GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            gemm_nt_q3_k_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q3_k unavailable".into(),
         )))
     }
 }
@@ -4529,6 +4613,32 @@ struct GdnLayerResident {
     ssm: bool,
 }
 
+/// GDN step inputs recorded while a request's state is cloned for verify.
+///
+/// Each row is `[qkv | alpha | beta]` as the step saw it (pre-conv qkv, beta
+/// before its in-place sigmoid). Rewinding a partial accept restores the clone
+/// and re-runs only the recurrent kernels over the accepted rows, instead of a
+/// second full forward through every weight.
+struct GdnJournal {
+    rows_buf: DeviceWeights,
+    cap: usize,
+    rows: usize,
+    overflow: bool,
+    qkv_dim: usize,
+    n_v: usize,
+    n_k: usize,
+    head_v: usize,
+    head_k: usize,
+    conv_kernel: usize,
+    eps: f32,
+    conv_w: *const f32,
+    dt_bias: *const f32,
+    a: *const f32,
+}
+
+/// Rows a journal holds before it gives up (verify spans are max_depth + 1).
+const GDN_JOURNAL_ROWS: usize = 16;
+
 /// Per-layer GDN extras (conv / dt / a / norm) uploaded once on the Target workspace.
 struct GdnWeightResident {
     conv: DeviceWeights,
@@ -4581,6 +4691,10 @@ pub struct HipWorkspace {
     dequant: Mutex<Option<DequantAlloc>>,
     gdn: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
     gdn_snap: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
+    /// Requests whose `gdn_snap` slots hold a live clone. Dropping a clone only
+    /// leaves this set, so the next verify reuses the slots without hipMalloc.
+    gdn_clone_live: Mutex<std::collections::HashSet<u64>>,
+    gdn_journal: Mutex<std::collections::HashMap<(u64, usize), GdnJournal>>,
     gdn_w: Mutex<std::collections::HashMap<usize, GdnWeightResident>>,
     mamba2_w: Mutex<std::collections::HashMap<usize, Mamba2WeightResident>>,
     moe: Mutex<Option<MoeStage>>,
@@ -4624,6 +4738,8 @@ impl HipWorkspace {
             dequant: Mutex::new(None),
             gdn: Mutex::new(std::collections::HashMap::new()),
             gdn_snap: Mutex::new(std::collections::HashMap::new()),
+            gdn_clone_live: Mutex::new(std::collections::HashSet::new()),
+            gdn_journal: Mutex::new(std::collections::HashMap::new()),
             gdn_w: Mutex::new(std::collections::HashMap::new()),
             mamba2_w: Mutex::new(std::collections::HashMap::new()),
             moe: Mutex::new(None),
@@ -4957,6 +5073,18 @@ impl HipWorkspace {
         k: i32,
     ) -> Result<(), AllpacaError> {
         self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q6_k_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_q3_k_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q3_k_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q5_k_dev(
@@ -7964,6 +8092,191 @@ impl HipWorkspace {
             g.retain(|&(rid, _), _| rid != request_id);
         }
         self.gdn_drop_clone(request_id);
+        if let Ok(mut g) = self.gdn_snap.lock() {
+            g.retain(|&(rid, _), _| rid != request_id);
+        }
+        if let Ok(mut j) = self.gdn_journal.lock() {
+            j.retain(|&(rid, _), _| rid != request_id);
+        }
+    }
+
+    fn gdn_clone_is_live(&self, request_id: u64) -> bool {
+        self.gdn_clone_live
+            .lock()
+            .is_ok_and(|l| l.contains(&request_id))
+    }
+
+    fn gdn_journal_reset(&self, request_id: u64) {
+        if let Ok(mut j) = self.gdn_journal.lock() {
+            for ((rid, _), journal) in j.iter_mut() {
+                if *rid == request_id {
+                    journal.rows = 0;
+                    journal.overflow = false;
+                }
+            }
+        }
+    }
+
+    /// Append one step's inputs while `key` has a clone (a verify is in flight).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_journal_record(
+        &self,
+        key: (u64, usize),
+        qkv: *const f32,
+        alpha: *const f32,
+        beta: *const f32,
+        conv_w: *const f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        dims: [usize; 6],
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        let cloned = self.gdn_clone_is_live(key.0)
+            && self
+                .gdn_snap
+                .lock()
+                .map_err(|_| Self::gdn_mutex_err())?
+                .contains_key(&key);
+        if !cloned {
+            return Ok(());
+        }
+        let [qkv_dim, n_v, n_k, head_v, head_k, conv_kernel] = dims;
+        let row_floats = qkv_dim + 2 * n_v;
+        let mut j = self.gdn_journal.lock().map_err(|_| Self::gdn_mutex_err())?;
+        let fits = j
+            .get(&key)
+            .is_some_and(|jr| jr.qkv_dim == qkv_dim && jr.n_v == n_v);
+        if !fits {
+            j.insert(
+                key,
+                GdnJournal {
+                    rows_buf: DeviceWeights::alloc(
+                        self.device,
+                        GDN_JOURNAL_ROWS * row_floats * 4,
+                    )?,
+                    cap: GDN_JOURNAL_ROWS,
+                    rows: 0,
+                    overflow: false,
+                    qkv_dim,
+                    n_v,
+                    n_k,
+                    head_v,
+                    head_k,
+                    conv_kernel,
+                    eps,
+                    conv_w,
+                    dt_bias,
+                    a,
+                },
+            );
+        }
+        let jr = j.get_mut(&key).expect("journal present");
+        if jr.rows >= jr.cap {
+            jr.overflow = true;
+            return Ok(());
+        }
+        let row = unsafe { (jr.rows_buf.ptr_at(0) as *mut f32).add(jr.rows * row_floats) };
+        self.copy_d2d_f32(row, qkv, qkv_dim)?;
+        self.copy_d2d_f32(unsafe { row.add(qkv_dim) }, alpha, n_v)?;
+        self.copy_d2d_f32(unsafe { row.add(qkv_dim + n_v) }, beta, n_v)?;
+        jr.rows += 1;
+        Ok(())
+    }
+
+    /// Every cloned GDN slot of `request_id` can be rolled forward `keep`
+    /// steps from its journal (no Mamba-2 slots, no overflowed journal).
+    pub fn gdn_can_replay(&self, request_id: u64, keep: usize) -> bool {
+        if !self.gdn_clone_is_live(request_id) {
+            return true;
+        }
+        let (Ok(snap), Ok(j)) = (self.gdn_snap.lock(), self.gdn_journal.lock()) else {
+            return false;
+        };
+        snap.iter()
+            .filter(|((rid, _), _)| *rid == request_id)
+            .all(|(key, slot)| {
+                !slot.ssm
+                    && match j.get(key) {
+                        Some(jr) => !jr.overflow && jr.rows >= keep,
+                        None => keep == 0,
+                    }
+            })
+    }
+
+    /// Restore the clone, then replay the first `keep` journaled steps of every
+    /// GDN layer: recurrent kernels only, no projection GEMMs.
+    pub fn gdn_rewind_request_to(&self, request_id: u64, keep: usize) -> Result<(), AllpacaError> {
+        self.gdn_rewind_request(request_id)?;
+        // (slot, journal rows, dims, eps, [conv_w, dt_bias, a])
+        type Replay = ((u64, usize), *const f32, [usize; 6], f32, [*const f32; 3]);
+        let journals: Vec<Replay> = {
+            let j = self.gdn_journal.lock().map_err(|_| Self::gdn_mutex_err())?;
+            j.iter()
+                .filter(|((rid, _), jr)| *rid == request_id && jr.rows >= keep && keep > 0)
+                .map(|(key, jr)| {
+                    (
+                        *key,
+                        jr.rows_buf.ptr_at(0),
+                        [jr.qkv_dim, jr.n_v, jr.n_k, jr.head_v, jr.head_k, jr.conv_kernel],
+                        jr.eps,
+                        [jr.conv_w, jr.dt_bias, jr.a],
+                    )
+                })
+                .collect()
+        };
+        for (key, rows, dims, eps, [conv_w, dt_bias, a]) in journals {
+            let [qkv_dim, n_v, n_k, head_v, head_k, conv_kernel] = dims;
+            let (dstate, dconv) = {
+                let g = self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?;
+                let slot = g.get(&key).ok_or_else(|| {
+                    AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                        "gdn replay missing live slot".into(),
+                    ))
+                })?;
+                (
+                    slot.state.ptr_at(0) as *mut f32,
+                    slot.conv
+                        .as_ref()
+                        .map(|c| c.ptr_at(0) as *mut f32)
+                        .unwrap_or(std::ptr::null_mut()),
+                )
+            };
+            let value_dim = n_v * head_v;
+            let q_exp_n = n_v * head_k;
+            let layer_scratch = qkv_dim + 2 * q_exp_n + n_v;
+            if (layer_scratch + value_dim + n_v) * 4 > self.scratch_bytes {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "gdn replay scratch too small".into(),
+                )));
+            }
+            let y = unsafe { self.scratch.add(layer_scratch * 4).cast::<f32>() };
+            let beta = unsafe { self.scratch.add((layer_scratch + value_dim) * 4).cast::<f32>() };
+            let row_floats = qkv_dim + 2 * n_v;
+            for t in 0..keep {
+                let row = unsafe { rows.add(t * row_floats) };
+                // The step sigmoids beta in place; replay from a scratch copy.
+                self.copy_d2d_f32(beta, unsafe { row.add(qkv_dim + n_v) }, n_v)?;
+                self.gdn_layer_step(
+                    row,
+                    unsafe { row.add(qkv_dim) },
+                    beta,
+                    conv_w,
+                    dconv,
+                    dt_bias,
+                    a,
+                    dstate,
+                    y,
+                    n_v as i32,
+                    n_k as i32,
+                    head_v as i32,
+                    head_k as i32,
+                    conv_kernel as i32,
+                    eps,
+                )?;
+            }
+        }
+        self.gdn_journal_reset(request_id);
+        Ok(())
     }
 
     /// Snapshot device GDN state+conv for `request_id` (D2D). Returns layers cloned.
@@ -7974,11 +8287,19 @@ impl HipWorkspace {
         }
         self.gdn_ensure_slots(request_id, &layers, true)?;
         self.gdn_copy_slots(request_id, &layers, false)?;
+        self.gdn_journal_reset(request_id);
+        self.gdn_clone_live
+            .lock()
+            .map_err(|_| Self::gdn_mutex_err())?
+            .insert(request_id);
         Ok(layers.len())
     }
 
     /// Restore live device GDN slots from the last [`Self::gdn_clone_request`].
     pub fn gdn_rewind_request(&self, request_id: u64) -> Result<(), AllpacaError> {
+        if !self.gdn_clone_is_live(request_id) {
+            return Ok(());
+        }
         let layers = self.gdn_layer_sizes(request_id, true)?;
         if layers.is_empty() {
             return Ok(());
@@ -8121,11 +8442,13 @@ impl HipWorkspace {
         Ok(())
     }
 
-    /// Free the device GDN snapshot for `request_id`.
+    /// End `request_id`'s clone. The snapshot slots stay allocated for the
+    /// next verify; [`Self::gdn_clear_request`] frees them.
     pub fn gdn_drop_clone(&self, request_id: u64) {
-        if let Ok(mut g) = self.gdn_snap.lock() {
-            g.retain(|&(rid, _), _| rid != request_id);
+        if let Ok(mut l) = self.gdn_clone_live.lock() {
+            l.remove(&request_id);
         }
+        self.gdn_journal_reset(request_id);
     }
 
     /// Force re-seed from host on next step (after recurrent restore).
@@ -8827,6 +9150,17 @@ impl HipWorkspace {
             )));
         }
         let y = unsafe { self.scratch.add(layer_scratch * 4).cast::<f32>() };
+        self.gdn_journal_record(
+            key,
+            qkv,
+            alpha,
+            beta,
+            conv_w,
+            dt_bias,
+            a,
+            [qkv_dim, n_v, n_k, hv, hk, conv_kernel as usize],
+            eps,
+        )?;
         self.gdn_layer_step(
             qkv,
             alpha,
@@ -10385,6 +10719,43 @@ mod tests {
     }
 
     #[cfg(feature = "hip")]
+    /// A as the K-quant GEMV sees it: each 32-float block quantized to int8
+    /// with scale amax/127 (llama.cpp q8_1), then dequantized.
+    fn q8_activations(a: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; a.len()];
+        for (src, dst) in a.chunks(32).zip(out.chunks_mut(32)) {
+            let amax = src.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+            for (s, o) in src.iter().zip(dst.iter_mut()) {
+                *o = d * (s * inv).round().clamp(-127.0, 127.0);
+            }
+        }
+        out
+    }
+
+    /// Every row of a K-quant GEMV batch equals that row run alone, bit for
+    /// bit: speculative verify rows must reproduce decode exactly.
+    fn assert_rows_match_single(
+        name: &str,
+        run: impl Fn(&[f32], &mut [f32], i32),
+        a: &[f32],
+        batched: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        for r in 0..m {
+            let mut one = vec![0.0f32; n];
+            run(&a[r * k..(r + 1) * k], &mut one, 1);
+            assert_eq!(
+                &batched[r * n..(r + 1) * n],
+                &one[..],
+                "{name} row {r} of {m}x{n}x{k} differs from the single-row GEMV"
+            );
+        }
+    }
+
     fn cpu_gemm_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         for r in 0..m {
             for j in 0..n {
@@ -10684,9 +11055,13 @@ mod tests {
             let b_deq = dequant_q4k_matrix(&b_q, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
-            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
-            gemm_nt_q4_k(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
-                .expect("HIP gemm_nt_q4_k must run when a device is present");
+            cpu_gemm_nt(&q8_activations(&a), &b_deq, &mut cpu, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q4_k(a, &b_q, c, rows, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q4_k must run when a device is present")
+            };
+            run(&a, &mut hip, m as i32);
+            assert_rows_match_single("q4_k", run, &a, &hip, m, n, k);
             for i in 0..m * n {
                 assert!(
                     gemm_close(hip[i], cpu[i]),
@@ -11844,6 +12219,59 @@ mod tests {
         out
     }
 
+    /// Pseudo-random Q3_K rows (every hmask/qs/scale bit pattern is valid).
+    #[cfg(feature = "hip")]
+    fn fill_q3k_blocks(si: usize, n: usize, k: usize) -> Vec<u8> {
+        let nblocks = k / Q3_K_BLOCK_ELEMS;
+        let mut b = vec![0u8; n * nblocks * Q3_K_BLOCK_BYTES];
+        let mut x = 0x9e37_79b9u32 ^ si as u32;
+        for (i, v) in b.iter_mut().enumerate() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *v = if i % Q3_K_BLOCK_BYTES >= 108 { 0 } else { x as u8 };
+        }
+        for blk in b.chunks_mut(Q3_K_BLOCK_BYTES) {
+            let d = 0.01 + (blk[0] as f32) * 1e-4;
+            blk[108..110].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        }
+        b
+    }
+
+    /// The draft lm_head's Q3_K runs natively: fused GEMV must match CPU
+    /// dequant x q8 activations, and batch rows must equal single rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q3_k_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1, 4, 256), (1, 33, 512), (2, 3, 256), (3, 13, 512), (4, 9, 768), (8, 9, 256), (11, 5, 768)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, _, _) = fill_q5k_gemm_case(si, m, n, k);
+            let b_q = fill_q3k_blocks(si, n, k);
+            let mut b_deq = vec![0.0f32; n * k];
+            allpaca_cpu::dequant_q3_k(&b_q, n * k, &mut b_deq).unwrap();
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&q8_activations(&a), &b_deq, &mut cpu, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q3_k(a, &b_q, c, rows, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q3_k must run when a device is present")
+            };
+            run(&a, &mut hip, m as i32);
+            assert_rows_match_single("q3_k", run, &a, &hip, m, n, k);
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_q3_k mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
     /// GEM mixed-quant: fused Q6_K GEMV must match CPU dequant + NT GEMM.
     #[cfg(feature = "hip")]
     #[test]
@@ -11866,9 +12294,13 @@ mod tests {
             let b_deq = dequant_q6k_matrix(&b_q, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
-            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
-            gemm_nt_q6_k(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
-                .expect("HIP gemm_nt_q6_k must run when a device is present");
+            cpu_gemm_nt(&q8_activations(&a), &b_deq, &mut cpu, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q6_k(a, &b_q, c, rows, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q6_k must run when a device is present")
+            };
+            run(&a, &mut hip, m as i32);
+            assert_rows_match_single("q6_k", run, &a, &hip, m, n, k);
             for i in 0..m * n {
                 assert!(
                     gemm_close(hip[i], cpu[i]),
@@ -11938,9 +12370,13 @@ mod tests {
             let b_deq = dequant_q5k_matrix(&b_q, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
-            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
-            gemm_nt_q5_k(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
-                .expect("HIP gemm_nt_q5_k must run when a device is present");
+            cpu_gemm_nt(&q8_activations(&a), &b_deq, &mut cpu, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q5_k(a, &b_q, c, rows, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q5_k must run when a device is present")
+            };
+            run(&a, &mut hip, m as i32);
+            assert_rows_match_single("q5_k", run, &a, &hip, m, n, k);
             for i in 0..m * n {
                 assert!(
                     gemm_close(hip[i], cpu[i]),
@@ -11966,7 +12402,7 @@ mod tests {
         let mut tiled = vec![0.0f32; m * n];
         let mut untiled = vec![0.0f32; m * n];
         gemm_nt_q4_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).expect("tiled Q4_K");
-        gemm_nt_q4_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32)
+        gemm_nt_q4_k_untiled(&q8_activations(&a), &b_q, &mut untiled, m as i32, n as i32, k as i32)
             .expect("untiled Q4_K");
         for i in 0..m * n {
             assert!(
@@ -12016,7 +12452,7 @@ mod tests {
         let mut tiled = vec![0.0f32; m * n];
         let mut untiled = vec![0.0f32; m * n];
         gemm_nt_q5_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).expect("tiled Q5_K");
-        gemm_nt_q5_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32)
+        gemm_nt_q5_k_untiled(&q8_activations(&a), &b_q, &mut untiled, m as i32, n as i32, k as i32)
             .expect("untiled Q5_K");
         for i in 0..m * n {
             assert!(
@@ -12069,7 +12505,7 @@ mod tests {
         let mut tiled = vec![0.0f32; m * n];
         let mut untiled = vec![0.0f32; m * n];
         gemm_nt_q6_k(&a, &b_q, &mut tiled, m as i32, n as i32, k as i32).expect("tiled Q6_K");
-        gemm_nt_q6_k_untiled(&a, &b_q, &mut untiled, m as i32, n as i32, k as i32)
+        gemm_nt_q6_k_untiled(&q8_activations(&a), &b_q, &mut untiled, m as i32, n as i32, k as i32)
             .expect("untiled Q6_K");
         for i in 0..m * n {
             assert!(
@@ -12332,7 +12768,10 @@ mod tests {
         if device_count() == 0 {
             return;
         }
-        for (si, (m, n, k)) in q8_intdot_shapes().iter().copied().enumerate() {
+        // Multi-row GEMV batches (verify spans): 4-row and 8-row blocks, n and
+        // k off the tile grid.
+        let extra = [(4, 130, 96), (5, 20, 96), (8, 33, 64), (7, 129, 33)];
+        for (si, (m, n, k)) in q8_intdot_shapes().iter().chain(extra.iter()).copied().enumerate() {
             let (a, b_q8, _) = fill_q8_gemm_case(si, m, n, k);
             let b_deq = dequant_q8_matrix(&b_q8, n, k);
             let mut cpu = vec![0.0f32; m * n];

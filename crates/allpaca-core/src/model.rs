@@ -490,6 +490,7 @@ enum WeightKind {
     F32,
     F16,
     Q8_0,
+    Q3_K,
     Q4_K,
     Q5_K,
     Q6_K,
@@ -2024,13 +2025,14 @@ impl ResidentModel {
                 Ok(out as *const f32)
             }
             WeightKind::F16
+            | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0
             | WeightKind::RocmFp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "F16/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
+                "F16/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
         }
     }
@@ -2051,6 +2053,9 @@ impl ResidentModel {
                 hip.gemm_nt_f16_dev(a, self.weights.byte_ptr_at(w.off) as *const u16, c, m, n, k)
             }
             WeightKind::Q8_0 => hip.gemm_nt_q8_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k),
+            WeightKind::Q3_K => {
+                hip.gemm_nt_q3_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
             WeightKind::Q4_K => {
                 hip.gemm_nt_q4_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
@@ -2098,12 +2103,13 @@ impl ResidentModel {
             WeightKind::RocmFp4 => {
                 hip.embed_gather_rocmfp4(self.weights.byte_ptr_at(self.embed.off), token, out, dim)
             }
-            WeightKind::Q4_K
+            WeightKind::Q3_K
+            | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+                "Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
             ))),
         }
     }
@@ -2140,12 +2146,13 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q4_K
+            WeightKind::Q3_K
+            | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+                "Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
             ))),
         }
     }
@@ -3074,6 +3081,13 @@ fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
     )
 }
 
+/// Q3_K GEMM weights with whole 256-value rows run on the native int8 GEMV
+/// (the MTP draft lm_head: 0.55 GB instead of a 1.43 GB Q8_0 re-pack).
+fn q3_k_native(info: &allpaca_gguf::TensorInfo) -> bool {
+    let k = info.dims.first().copied().unwrap_or(0);
+    k > 0 && k % 256 == 0 && info.n_elements() > 65_536
+}
+
 /// VRAM bytes [`append_gguf_tensor_as`] stages for one tensor (not `gather`).
 fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
     use allpaca_gguf::GgmlType as T;
@@ -3084,6 +3098,7 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         _ if n <= 65_536 => n * 4,
         T::F16 => n * 2,
         T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 => info.nbytes() as u64,
+        T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
         T::Q8_0 => q8_staged,
         ty if requant_q8_0_on_load(ty) => q8_staged,
         _ => n * 4,
@@ -3301,6 +3316,9 @@ fn append_gguf_tensor_as<'a>(
                 (UploadPart::Owned(staged), WeightKind::Q8_0)
             }
         }
+        allpaca_gguf::GgmlType::Q3_K if !gather && q3_k_native(info) => {
+            (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::Q3_K)
+        }
         ty if !gather && n > 65_536 && requant_q8_0_on_load(ty) => {
             let k = *info.dims.first().unwrap_or(&1) as usize;
             if k == 0 || k % 32 != 0 || n % k != 0 {
@@ -3420,6 +3438,15 @@ fn split_packed_experts(
             }
             (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES)
+        }
+        WeightKind::Q3_K => {
+            if n_per % allpaca_cpu::Q3_K_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} Q3_K expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::Q3_K_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::Q3_K_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q3_K_BLOCK_BYTES)
         }
         WeightKind::Q4_K => {
             if n_per % allpaca_cpu::Q4_K_BLOCK_ELEMS != 0 {
@@ -3708,6 +3735,23 @@ pub(crate) fn attn_layout(cfg: &ModelConfig, wq_n: usize, wk_n: usize, wo_n: usi
 impl TinyModel {
     /// CUDA MN prefill still rejects IMRoPE / gated-Q. HIP `forward_tokens_device`
     /// handles those per row after a batched Q/K/V GEMM.
+    /// HIP M=N forward ([`Self::forward_tokens_device`]). Unlike the CUDA /
+    /// Vulkan M=N paths it runs IMRoPE and gated `[Q|gate]` attention per row,
+    /// so Qwen3.5/3.8 hybrids batch too. A `[Q|gate]` projection is only
+    /// recognised when n_heads * head_dim > dim; below that the per-token and
+    /// M=N paths read an ambiguous Q differently, so it stays per-token.
+    pub fn supports_hip_batched_prefill(&self) -> bool {
+        let dim = self.config.dim.max(1);
+        !self.layers.iter().any(|l| {
+            if l.wq.is_empty() || l.wo.is_empty() {
+                return false;
+            }
+            let q_out = l.wq.len() / dim;
+            let wo_k = l.wo.len() / dim;
+            q_out == wo_k.saturating_mul(2) && wo_k <= dim
+        })
+    }
+
     pub fn supports_device_batched_prefill(&self) -> bool {
         if self.config.uses_imrope() {
             return false;
@@ -6608,7 +6652,7 @@ impl TinyModel {
                 true,
             );
         }
-        if self.rpc.as_ref().is_some_and(|r| r.placed_remote() || r.splits_local()) {
+        if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
             for (i, tok) in tokens.iter().enumerate() {
                 let last = i + 1 == tokens.len();
                 let mut side = DeviceDecodeSide {
@@ -6676,7 +6720,7 @@ impl TinyModel {
                 ))));
             }
         }
-        if self.supports_device_batched_prefill() {
+        if self.supports_hip_batched_prefill() {
             if let (Some(hip), Some(resident)) = (hip, resident) {
                 match self.forward_tokens_device(
                 tokens,
@@ -8767,6 +8811,34 @@ impl TinyModel {
                     )?;
                 }
                 hip.start_logits_d2h(buf.logits, n_tok * vocab)?;
+            } else if let Some(out) = out_row_hiddens.as_mut() {
+                // Every row's output_norm hidden (an MTP draft's process KV is
+                // built from them), plus last-row logits when asked.
+                rmsnorm_device_rows(
+                    hip,
+                    buf.x,
+                    resident.f32_or_dequant(hip, resident.norm)?,
+                    buf.normed,
+                    n_tok,
+                    dim,
+                    cfg.eps,
+                )?;
+                record_elementwise(Some(metrics));
+                out.resize(n_tok * dim, 0.0);
+                hip.copy_d2h_f32(buf.normed, out)?;
+                if write_logits {
+                    let _lm = hip.lm_head_scope();
+                    resident.gemm_nt(
+                        hip,
+                        buf.normed_row(n_tok - 1, dim),
+                        resident.lm_head,
+                        buf.logits,
+                        1,
+                        vocab as i32,
+                        dim as i32,
+                    )?;
+                    hip.start_logits_d2h(buf.logits, vocab)?;
+                }
             } else if write_logits {
                 let x_last = buf.x_row(n_tok - 1, dim);
                 hip.rmsnorm_device(
@@ -8777,10 +8849,6 @@ impl TinyModel {
                     cfg.eps,
                 )?;
                 record_elementwise(Some(metrics));
-                if let Some(out) = out_row_hiddens.as_mut() {
-                    out.resize(dim, 0.0);
-                    hip.copy_d2h_f32(buf.normed, out)?;
-                }
                 {
                     let _lm = hip.lm_head_scope();
                     resident.gemm_nt(
@@ -8794,17 +8862,6 @@ impl TinyModel {
                     )?;
                 }
                 hip.start_logits_d2h(buf.logits, vocab)?;
-            } else if let Some(out) = out_row_hiddens.as_mut() {
-                let x_last = buf.x_row(n_tok - 1, dim);
-                hip.rmsnorm_device(
-                    x_last,
-                    resident.f32_or_dequant(hip, resident.norm)?,
-                    buf.normed,
-                    dim as i32,
-                    cfg.eps,
-                )?;
-                out.resize(dim, 0.0);
-                hip.copy_d2h_f32(buf.normed, out)?;
             }
             metrics
                 .gpu_forwards
@@ -9029,7 +9086,7 @@ impl TinyModel {
         cache.forwards = cache.forwards.saturating_add(1);
         // Prefer on-device draft whenever resident weights exist (incl. MTP / MoE).
         if let (Some(hip), Some(resident)) = (hip, resident) {
-            match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics) {
+            match self.forward_dense_device(token, pos, cache, logits, hip, resident, metrics, true) {
                 Ok(()) => return Ok(()),
                 Err(e) if !self.host_weights_ready() => {
                     // ROCmFP4 / packed drafts are device-only skeletons — no host embed.
@@ -9214,6 +9271,32 @@ impl TinyModel {
 
     /// Sequential draft decode with device-resident hidden state and DenseKv.
     #[allow(clippy::too_many_arguments)]
+    /// MTP process step: append `token` to the draft KV (and roll `h_nextn`)
+    /// without the vocab-wide lm_head. Only proposals need draft logits.
+    pub fn process_dense_on(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut DenseKv,
+        hip: Option<&HipWorkspace>,
+        resident: Option<&ResidentModel>,
+        metrics: Option<&Metrics>,
+    ) -> Result<(), AllpacaError> {
+        if let (Some(hip), Some(resident)) = (hip, resident) {
+            cache.forwards = cache.forwards.saturating_add(1);
+            self.forward_dense_device(token, pos, cache, &mut [], hip, resident, metrics, false)?;
+            if let Some(metrics) = metrics {
+                metrics
+                    .draft_logits_skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.forward_dense_on(token, pos, cache, &mut logits, hip, resident, metrics)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_dense_device(
         &self,
         token: u32,
@@ -9223,11 +9306,12 @@ impl TinyModel {
         hip: &HipWorkspace,
         resident: &ResidentModel,
         metrics: Option<&Metrics>,
+        write_logits: bool,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
         let vocab = cfg.vocab_size;
-        if logits.len() < vocab {
+        if write_logits && logits.len() < vocab {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
                 "logits buffer smaller than vocab".into(),
             )));
@@ -9601,19 +9685,21 @@ impl TinyModel {
         if resident.mtp_nextn.is_some() || self.mtp_nextn.is_some() {
             cache.store_h_nextn_from_device(buf.normed, dim)?;
         }
-        {
-            let _lm = hip.lm_head_scope();
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                resident.lm_head,
-                buf.logits,
-                1,
-                vocab as i32,
-                dim as i32,
-            )?;
+        if write_logits {
+            {
+                let _lm = hip.lm_head_scope();
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    resident.lm_head,
+                    buf.logits,
+                    1,
+                    vocab as i32,
+                    dim as i32,
+                )?;
+            }
+            hip.publish_logits(buf.logits, &mut logits[..vocab])?;
         }
-        hip.publish_logits(buf.logits, &mut logits[..vocab])?;
         if let Some(metrics) = metrics {
             metrics
                 .gpu_forwards
@@ -10542,6 +10628,41 @@ mod lightning_moe_tests {
         let sum: f32 = routed.iter().map(|(_, wt)| *wt).sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
         assert!(routed[0].1 > routed[1].1);
+    }
+
+    #[test]
+    fn q3_k_gemm_weights_stay_native_on_device() {
+        let info = |k: u64| allpaca_gguf::TensorInfo {
+            name: "output.weight".into(),
+            dims: vec![k, 248_320],
+            ggml_type: allpaca_gguf::GgmlType::Q3_K,
+            ggml_type_id: 11,
+            offset: 0,
+            shard: 0,
+        };
+        // The MTP draft lm_head: 110 B per 256 values, not a 36 B/32 Q8_0 re-pack.
+        let native = info(5120);
+        assert_eq!(staged_device_bytes(&native), native.nbytes() as u64);
+        // Rows that are not whole super-blocks still re-pack to Q8_0.
+        let ragged = info(5120 + 32);
+        let q8 = ragged.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
+        assert_eq!(staged_device_bytes(&ragged), q8);
+    }
+
+    #[test]
+    fn hip_batched_prefill_takes_imrope_but_not_undetectable_gated_q() {
+        let mut imrope = ModelConfig::tiny();
+        imrope.rope_sections = [16, 16, 16, 16];
+        let plain = TinyModel::synthetic(imrope.clone(), 1, "imrope");
+        assert!(plain.supports_hip_batched_prefill(), "HIP batches IMRoPE rows");
+        // `[Q|gate]` with n_heads * head_dim == dim: q_out == 2 * wo_k cannot
+        // be told apart from a wider plain Q, so keep it per-token.
+        let mut ambiguous = TinyModel::synthetic(imrope, 1, "gated-q-eq-dim");
+        let dim = ambiguous.config.dim;
+        for layer in &mut ambiguous.layers {
+            layer.wq = vec![0.0; 2 * dim * dim];
+        }
+        assert!(!ambiguous.supports_hip_batched_prefill());
     }
 
     #[test]

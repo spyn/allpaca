@@ -74,6 +74,14 @@ pub struct Metrics {
     pub tree_gpu_verifies: AtomicU64,
     pub linear_packed_verifies: AtomicU64,
     pub draft_ahead_hits: AtomicU64,
+    /// MTP process forwards that wrote draft KV without the vocab-wide lm_head.
+    pub draft_logits_skipped: AtomicU64,
+    /// Tokens a Draft Model / MTP provider drafted, including draft-ahead spans
+    /// discarded before verify (`draft_proposed` counts only verified ones).
+    pub draft_tokens_drafted: AtomicU64,
+    /// Rejected-verify corrections verified inside the next packed span
+    /// instead of costing a target forward of their own.
+    pub deferred_corrections_packed: AtomicU64,
     pub target_evals: AtomicU64,
     pub gpu_forwards: AtomicU64,
     pub target_gpu_forwards: AtomicU64,
@@ -273,6 +281,9 @@ impl Metrics {
             tree_gpu_verifies: self.tree_gpu_verifies.load(Ordering::Relaxed),
             linear_packed_verifies: self.linear_packed_verifies.load(Ordering::Relaxed),
             draft_ahead_hits: self.draft_ahead_hits.load(Ordering::Relaxed),
+            draft_logits_skipped: self.draft_logits_skipped.load(Ordering::Relaxed),
+            draft_tokens_drafted: self.draft_tokens_drafted.load(Ordering::Relaxed),
+            deferred_corrections_packed: self.deferred_corrections_packed.load(Ordering::Relaxed),
             accepted_tokens_per_target_eval,
             model_id,
             backend,

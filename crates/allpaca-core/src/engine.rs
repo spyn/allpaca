@@ -85,6 +85,10 @@ struct ActiveRequest {
     last_hidden_fresh: bool,
     /// This tick's HIP decode cohort will pack lm_head; skip the per-request GEMM.
     defer_lm_head: bool,
+    /// Correction token from a rejected packed verify: already emitted, not yet
+    /// forwarded (`pending_logits` are stale while set). The next step verifies
+    /// it at the head of the drafted span, or forwards it alone.
+    deferred: Option<u32>,
     /// Soft vision positions at the start of `tokens` (pre-text).
     vision_prefix_len: usize,
     /// Row-major `vision_prefix_len * dim` embeddings for soft prefill.
@@ -2329,6 +2333,7 @@ impl Engine {
                 last_hidden: vec![0.0f32; dim],
                 last_hidden_fresh: false,
                 defer_lm_head: false,
+                deferred: None,
                 vision_prefix_len,
                 vision_embeds,
                 suppress_draft,
@@ -3343,8 +3348,7 @@ impl Engine {
             && toks.len() > 1
             && ((self.hip.is_some()
                 && resident.is_some()
-                && !mtp_draft_active(inner)
-                && target.supports_device_batched_prefill())
+                && target.supports_hip_batched_prefill())
                 || target.dsv4.is_some());
         #[cfg(feature = "cuda")]
         let batch_prefill_cuda = !vision_in_chunk
@@ -3358,6 +3362,8 @@ impl Engine {
         let batch_prefill_cuda = false;
         let mut did_batch = false;
         if batch_prefill_hip {
+            let mtp = mtp_draft_active(inner);
+            let mut row_hiddens = Vec::new();
             target.forward_tokens(
                 &toks,
                 start,
@@ -3370,9 +3376,28 @@ impl Engine {
                 write_logits,
                 None,
                 recurrent.as_mut(),
-                None,
+                mtp.then_some(&mut row_hiddens),
                 id,
             )?;
+            if mtp && row_hiddens.len() == toks.len() * dim {
+                // Same pairing as per-token prefill: token `pos` with h_{pos-1}.
+                for (i, tok) in toks.iter().enumerate() {
+                    let h_prev = if i == 0 {
+                        std::mem::take(&mut last_hidden)
+                    } else {
+                        row_hiddens[(i - 1) * dim..i * dim].to_vec()
+                    };
+                    mtp_process_token(
+                        inner,
+                        *tok,
+                        start + i,
+                        &h_prev,
+                        self.draft_hip.as_deref(),
+                        &self.metrics,
+                    )?;
+                }
+                last_hidden = row_hiddens[(toks.len() - 1) * dim..].to_vec();
+            }
             // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
             // page (growing with seq) and break logits-only decode accounting.
             did_batch = true;
@@ -4190,6 +4215,18 @@ fn for_each_gdn_workspace(
     Ok(())
 }
 
+/// Every workspace holding the target's GDN state can roll a clone forward
+/// `keep` journaled steps (see [`HipWorkspace::gdn_rewind_request_to`]).
+fn gdn_all_can_replay(hip: &HipWorkspace, target: &TinyModel, id: u64, keep: usize) -> bool {
+    let mut all = true;
+    let _ = for_each_gdn_workspace(hip, Some(target), |ws| {
+        all &= ws.gdn_can_replay(id, keep);
+        Ok(())
+    });
+    all
+}
+
+
 /// Load a `--draft-model` GGUF. MTP sidecars (`mtp-*.gguf`) ship only the
 /// trailing NextN block (`blk.{n_layers}`), so they load as an MTP draft.
 fn load_draft_gguf(file: &GgufFile) -> Result<TinyModel, AllpacaError> {
@@ -4252,14 +4289,11 @@ fn mtp_process_token(
         return Ok(());
     }
     inner.draft_kv.seed_h_nextn_from_target(h_prev);
-    let vocab = model.config.vocab_size;
-    let mut logits = vec![0.0f32; vocab];
     let resident = inner.draft_resident.clone();
-    model.forward_dense_on(
+    model.process_dense_on(
         token,
         pos,
         &mut inner.draft_kv,
-        &mut logits,
         draft_hip,
         resident.as_deref(),
         Some(metrics),
@@ -4289,14 +4323,12 @@ fn mtp_process_assumed_span(
     }
     let kv_dim = model.config.n_kv_heads * model.config.head_dim();
     let dim = model.config.dim;
-    let vocab = model.config.vocab_size;
     if cache.seq_len() > start_pos {
         cache.truncate(start_pos, kv_dim);
     }
     if cache.seq_len() != start_pos {
         return Ok(());
     }
-    let mut logits = vec![0.0f32; vocab];
     for (i, &token) in span.iter().enumerate() {
         let h_prev = if i == 0 {
             pending_h
@@ -4311,18 +4343,71 @@ fn mtp_process_assumed_span(
         if h_prev.len() == dim {
             cache.seed_h_nextn_from_target(h_prev);
         }
-        model.forward_dense_on(
-            token,
-            start_pos + i,
-            cache,
-            &mut logits,
-            draft_hip,
-            resident,
-            metrics,
-        )?;
+        model.process_dense_on(token, start_pos + i, cache, draft_hip, resident, metrics)?;
         cache.record(token);
     }
     Ok(())
+}
+
+/// Drafts after a deferred correction `tok`: `[tok, d1, ..]`, or empty when no
+/// provider can continue past it. Any draft-ahead span predicted `tok`'s slot
+/// from the pre-correction context and is dropped.
+#[allow(clippy::too_many_arguments)]
+fn propose_after_deferred(
+    inner: &mut EngineInner,
+    id: u64,
+    ctx: &[u32],
+    tok: u32,
+    depth: usize,
+    temperature: f32,
+    draft_hip: Option<&HipWorkspace>,
+    metrics: &Metrics,
+) -> Result<Vec<u32>, AllpacaError> {
+    inner.draft_ahead = None;
+    if inner.flags.draft_model_speculation {
+        if let Some(model) = inner.draft_model.clone() {
+            let mtp = mtp_draft_active(inner);
+            let seed = request(inner, id)?.last_hidden.clone();
+            if mtp && seed.len() == model.config.dim {
+                inner.draft_kv.seed_h_nextn_from_target(&seed);
+            }
+            let mut provider = DraftModelProvider::new((*model).clone());
+            let resident = inner.draft_resident.clone();
+            let draft = provider.propose_after(
+                ctx,
+                tok,
+                depth + 1,
+                temperature,
+                &mut inner.draft_kv,
+                draft_hip,
+                resident.as_deref(),
+                Some(metrics),
+            )?;
+            if mtp {
+                // Draft AR writes are speculative; process() owns the prompt KV.
+                let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+                inner.draft_kv.truncate(ctx.len(), kv_dim);
+                if seed.len() == model.config.dim {
+                    inner.draft_kv.seed_h_nextn_from_target(&seed);
+                }
+            }
+            if draft.len() >= 2 {
+                host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
+                return Ok(draft);
+            }
+        }
+    }
+    if inner.flags.ngram_speculation {
+        let mut after = ctx.to_vec();
+        after.push(tok);
+        let more = inner.ngram.propose(&after, depth, temperature)?;
+        if !more.is_empty() {
+            let mut draft = vec![tok];
+            draft.extend(more);
+            return Ok(draft);
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn propose_drafts(
@@ -4337,6 +4422,9 @@ fn propose_drafts(
         return Ok(Vec::new());
     }
     let ctx = request(inner, id)?.tokens.clone();
+    if let Some(tok) = request(inner, id)?.deferred {
+        return propose_after_deferred(inner, id, &ctx, tok, depth, temperature, draft_hip, metrics);
+    }
     if let Some(ahead) = inner.draft_ahead.take() {
         if ahead.ctx == ctx && !ahead.tokens.is_empty() {
             metrics
@@ -4503,7 +4591,56 @@ fn verify_and_sample(
     micro_batch: Option<&MicroBatchExpertUnion>,
     hooks: &DecodePollHooks<'_>,
 ) -> Result<Produced, AllpacaError> {
+    let mut drafts = drafts;
     let drafts_len = drafts.len() as u64;
+    if let Some(tok) = request_mut(inner, id)?.deferred.take() {
+        // Drafts were proposed from the forwarded context, so drafts[0]
+        // predicts this slot. On a match the correction heads the packed span
+        // (it was already emitted, so it is not produced again).
+        if drafts.len() >= 2 && drafts[0] == tok && remaining > 0 {
+            metrics
+                .deferred_corrections_packed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            prefetch_draft_expert_union(inner, &drafts, metrics, hip, hooks)?;
+            let mut out = packed_linear_verify(
+                inner,
+                id,
+                drafts,
+                tok,
+                mask,
+                remaining + 1,
+                metrics,
+                hip,
+                draft_hip,
+                depth,
+                temperature,
+                hooks,
+            )?;
+            // The correction was already emitted and is not a drafted token.
+            out.tokens.remove(0);
+            out.accepted = out.accepted.saturating_sub(1);
+            out.proposed = out.proposed.saturating_sub(1);
+            return Ok(out);
+        }
+        append_and_forward(
+            inner,
+            id,
+            tok,
+            metrics,
+            hip,
+            draft_hip,
+            micro_batch,
+            hooks.layer_stagger,
+            Some(hooks.ds_probe),
+            Some(hooks.ds_queue),
+            #[cfg(feature = "cuda")]
+            hooks.cuda,
+            #[cfg(feature = "vulkan")]
+            hooks.vulkan,
+        )?;
+        // They were aligned one slot behind the context that now includes `tok`.
+        drafts.clear();
+    }
     if remaining == 0 {
         return Ok(Produced {
             tokens: Vec::new(),
@@ -4823,7 +4960,7 @@ fn packed_mtp_verify_ahead(
                 let _ = h.bind();
             }
             let rows = row_rx.recv().unwrap_or_default();
-            if rows.is_empty() && span_worker.len() > 1 {
+            if rows.is_empty() {
                 return Ok(Vec::new());
             }
             let mut cache = snap;
@@ -4926,7 +5063,9 @@ fn store_draft_ahead_from_ctx(
     draft_hip: Option<&HipWorkspace>,
     metrics: &Metrics,
 ) -> Result<(), AllpacaError> {
-    if depth == 0 || ctx.is_empty() {
+    // A deferred correction occupies the next slot; a span drafted from `ctx`
+    // would predict that slot and is never used (`propose_after_deferred`).
+    if depth == 0 || ctx.is_empty() || request(inner, id)?.deferred.is_some() {
         return Ok(());
     }
     let Some(model) = inner.draft_model.clone() else {
@@ -5035,7 +5174,12 @@ fn packed_linear_verify_span(
     let rec_before = recurrent.clone();
     let dim = target.config.dim;
     let pending_h = request(inner, id)?.last_hidden.clone();
-    let incremental_gdn = recurrent.is_some();
+    // One packed forward over the span when a partial accept can be rewound
+    // from the device GDN journal. Otherwise (host GDN state, Mamba-2 slots)
+    // forward one token at a time and stop at the reject, so no rewind is needed.
+    let journal_rewind = device_gdn_cloned > 0
+        && hip.is_some_and(|h| gdn_all_can_replay(h, &target, id, 0));
+    let incremental_gdn = recurrent.is_some() && !journal_rewind;
     let mut produced = vec![first];
     let mut accepted = 1u64;
     let mut keep = 1usize;
@@ -5152,7 +5296,9 @@ fn packed_linear_verify_span(
         }
     }
     if let Some(send) = after_row_hiddens {
-        send(&row_hiddens);
+        // Draft-ahead assumes the whole span lands; after a reject its work
+        // would be discarded, so hand it nothing and let it exit.
+        send(if keep == span.len() { &row_hiddens } else { &[] });
     }
     request_mut(inner, id)?.pending_logits = last_logits;
     metrics
@@ -5163,7 +5309,16 @@ fn packed_linear_verify_span(
     inner
         .kv
         .rewind_filled(&pages, start_pos + keep, page_tokens as usize);
-    if !incremental_gdn && keep < span.len() {
+    if journal_rewind && keep < span.len() {
+        let hip = hip.expect("journal rewind needs HIP");
+        if gdn_all_can_replay(hip, &target, id, keep) {
+            for_each_gdn_workspace(hip, Some(&target), |ws| ws.gdn_rewind_request_to(id, keep))?;
+        } else {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "GDN journal lost rows mid-verify".into(),
+            )));
+        }
+    } else if !incremental_gdn && keep < span.len() {
         if let Some(saved) = rec_before {
             recurrent = Some(saved);
             if let Some(hip) = hip {
@@ -5242,7 +5397,18 @@ fn packed_linear_verify_span(
         inner.ngram.observe(&ctx);
     }
 
-    if produced.len() > keep {
+    let correction = produced.get(keep).copied();
+    let params_end = request(inner, id)?.params.clone();
+    let defer = correction.is_some_and(|tok| {
+        !is_stop(tok, &params_end)
+            && produced.len() < remaining
+            && !inner.flags.tree_speculation
+            && (inner.flags.draft_model_speculation || inner.flags.ngram_speculation)
+    });
+    if defer {
+        // Forwarded next step at the head of the drafted span (or alone).
+        request_mut(inner, id)?.deferred = correction;
+    } else if produced.len() > keep {
         if let Some(join) = before_draft_gpu {
             join();
         }
@@ -10612,7 +10778,14 @@ mod tests {
             device_conv, snapshot_conv,
             "D2D rewind must restore conv history"
         );
+        // Every verify clones and drops; the snapshot slots must be reused.
+        hip.gdn_drop_clone(77);
+        let held = hip.allocated_bytes();
+        assert_eq!(hip.gdn_clone_request(77).unwrap(), 1);
+        assert_eq!(hip.allocated_bytes(), held, "re-clone must not allocate");
+        hip.gdn_drop_clone(77);
         hip.gdn_clear_request(77);
+        assert!(hip.allocated_bytes() < held, "clear must free the snapshot");
     }
 
     #[cfg(feature = "hip")]

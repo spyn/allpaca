@@ -663,6 +663,91 @@ __global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float 
     }
 }
 
+/* Q8 GEMV for 2..8 A rows (speculative verify spans, short chunks).
+ * Same 36-byte staged layout and lane map as `gemv_nt_q8_0_f32_kernel`, but a
+ * block owns MR rows: each weight block is loaded and decoded once and feeds
+ * MR accumulators, instead of a grid row per A row re-reading all of B. */
+template <int MR>
+__global__ void gemv_nt_q8_0_f32_rows_kernel(const float *a, const uint8_t *b, float *c, int m,
+                                             int n, int k) {
+    constexpr int WARPS = 16;
+    constexpr int COLS = 8;
+    constexpr int SUB = 4;
+    constexpr int TILE = 8;
+    __shared__ float As[MR][TILE * 32];
+
+    const int row0 = static_cast<int>(blockIdx.y) * MR;
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int sub = lane / SUB;
+    const int sublane = lane % SUB;
+    const int col = (static_cast<int>(blockIdx.x) * WARPS + warp) * COLS + sub;
+    const int nblocks = (k + 31) / 32;
+    const size_t row_stride = static_cast<size_t>(nblocks) * static_cast<size_t>(Q8_STAGED_STRIDE);
+    const uint8_t *brow = (col < n) ? b + static_cast<size_t>(col) * row_stride : nullptr;
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.0f;
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+
+    for (int blk0 = 0; blk0 < nblocks; blk0 += TILE) {
+        const int ntile = (blk0 + TILE <= nblocks) ? TILE : (nblocks - blk0);
+        const int a0 = blk0 * 32;
+        const int nfloat = ntile * 32;
+        for (int i = tid; i < MR * nfloat; i += static_cast<int>(blockDim.x)) {
+            const int r = i / nfloat;
+            const int j = i % nfloat;
+            const int gi = a0 + j;
+            As[r][j] = (row0 + r < m && gi < k)
+                           ? a[static_cast<size_t>(row0 + r) * static_cast<size_t>(k) + gi]
+                           : 0.0f;
+        }
+        __syncthreads();
+
+        if (brow) {
+            for (int t = 0; t < ntile; ++t) {
+                const uint8_t *bp = brow + static_cast<size_t>(blk0 + t) * Q8_STAGED_STRIDE;
+                const float d = *reinterpret_cast<const float *>(bp);
+                const int qbase = sublane * 8;
+                const uint8_t *qp = bp + Q8_STAGED_QS + qbase;
+                const uint32_t qlo = *reinterpret_cast<const uint32_t *>(qp);
+                const uint32_t qhi = *reinterpret_cast<const uint32_t *>(qp + 4);
+                float q[8];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    q[i] = static_cast<float>(static_cast<int8_t>((qlo >> (8 * i)) & 0xff));
+                    q[4 + i] = static_cast<float>(static_cast<int8_t>((qhi >> (8 * i)) & 0xff));
+                }
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    const float *as = &As[r][t * 32 + qbase];
+                    float dot = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        dot += as[i] * q[i];
+                    }
+                    acc[r] += d * dot;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 2; off > 0; off >>= 1) {
+            v += __shfl_down(v, off, 4);
+        }
+        if (col < n && sublane == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + col] = v;
+        }
+    }
+}
+
 /* Decode Q8 GEMV: quantize A tiles to int8, int32 MAC with Q8 weights (ggml vec_dot_q8 idea). */
 __global__ void gemv_nt_q8_0_intdot_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
                                            int k) {
@@ -1615,8 +1700,22 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     constexpr int cols = 8;
     constexpr int cols_per_block = warps * cols;
     dim3 block(512);
-    dim3 grid(static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block),
-              static_cast<unsigned>(m));
+    const unsigned gx = static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block);
+    if (!intdot && m > 1) {
+        // 2..8 rows share each weight block load (verify spans).
+        if (m == 2) {
+            hipLaunchKernelGGL(gemv_nt_q8_0_f32_rows_kernel<2>, dim3(gx, 1), block, 0, stream, a,
+                               b, c, m, n, k);
+        } else if (m <= 4) {
+            hipLaunchKernelGGL(gemv_nt_q8_0_f32_rows_kernel<4>, dim3(gx, 1), block, 0, stream, a,
+                               b, c, m, n, k);
+        } else {
+            hipLaunchKernelGGL(gemv_nt_q8_0_f32_rows_kernel<8>, dim3(gx, 1), block, 0, stream, a,
+                               b, c, m, n, k);
+        }
+        return hip_status(hipGetLastError());
+    }
+    dim3 grid(gx, static_cast<unsigned>(m));
     if (intdot) {
         hipLaunchKernelGGL(gemv_nt_q8_0_intdot_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     } else {
@@ -1844,6 +1943,10 @@ __device__ inline float kq_apply_q6_k_v2(const Kq6Lane &w, const float *ab) {
 template <int QT>
 struct KqBlock;
 template <>
+struct KqBlock<3> {
+    static constexpr int bytes = 110;
+};
+template <>
 struct KqBlock<4> {
     static constexpr int bytes = 144;
 };
@@ -1856,7 +1959,7 @@ struct KqBlock<6> {
     static constexpr int bytes = 210;
 };
 
-template <int QT, int MR, bool V2>
+template <int QT, int MR>
 __global__ void gemv_nt_kquant_warp_kernel(const float *a, const uint8_t *b, float *c, int m,
                                            int n, int k) {
     constexpr int BB = KqBlock<QT>::bytes;
@@ -1878,30 +1981,6 @@ __global__ void gemv_nt_kquant_warp_kernel(const float *a, const uint8_t *b, flo
     for (int ib = 0; ib < nblocks; ++ib) {
         const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
         const float *ab = a + static_cast<size_t>(ib) * 256;
-        if constexpr (V2) {
-            if constexpr (QT == 6) {
-                Kq6Lane w;
-                kq_lane_q6_k_v2(blk, lane, w);
-#pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    if (row0 + r < m) {
-                        acc[r] += kq_apply_q6_k_v2(
-                            w, ab + static_cast<size_t>(row0 + r) * static_cast<size_t>(k));
-                    }
-                }
-            } else {
-                Kq45Lane w;
-                kq_lane_q45_v2<QT == 5>(blk, lane, w);
-#pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    if (row0 + r < m) {
-                        acc[r] += kq_apply_q45_v2(
-                            w, ab + static_cast<size_t>(row0 + r) * static_cast<size_t>(k));
-                    }
-                }
-            }
-            continue;
-        }
         float w[8];
         int off[8];
         if constexpr (QT == 4) {
@@ -1934,25 +2013,401 @@ __global__ void gemv_nt_kquant_warp_kernel(const float *a, const uint8_t *b, flo
     }
 }
 
+/* v2 lane maps (see `kq_lane_q45_v2` / `kq_lane_q6_k_v2`) for 1..MR A rows
+ * read straight from global; L1/L2 serve the reuse across a block's column
+ * warps. Staging A in LDS was tried: a barrier per super-block cost single-row
+ * decode ~30%, and multi-row stays arithmetic-bound either way. */
+template <int QT, int MR>
+__global__ void gemv_nt_kquant_v2_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                         int k) {
+    constexpr int BB = KqBlock<QT>::bytes;
+    const int lane = static_cast<int>(threadIdx.x) % KQ_LANES;
+    const int col = static_cast<int>(blockIdx.x) * KQ_COLS_PER_BLOCK +
+                    static_cast<int>(threadIdx.x) / KQ_LANES;
+    const int row0 = static_cast<int>(blockIdx.y) * MR;
+    if (col >= n) {
+        return;
+    }
+    const int nblocks = k / 256;
+    const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * BB;
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.f;
+    }
+#pragma unroll 2
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
+        const float *ab = a + static_cast<size_t>(ib) * 256;
+        if constexpr (QT == 6) {
+            Kq6Lane w;
+            kq_lane_q6_k_v2(blk, lane, w);
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                if (row0 + r < m) {
+                    acc[r] += kq_apply_q6_k_v2(
+                        w, ab + static_cast<size_t>(row0 + r) * static_cast<size_t>(k));
+                }
+            }
+        } else {
+            Kq45Lane w;
+            kq_lane_q45_v2<QT == 5>(blk, lane, w);
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                if (row0 + r < m) {
+                    acc[r] += kq_apply_q45_v2(
+                        w, ab + static_cast<size_t>(row0 + r) * static_cast<size_t>(k));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        const float s = warp_sum32(acc[r]);
+        if (lane == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+                s;
+        }
+    }
+}
+
+/* K-quant GEMV on int8 activations (llama.cpp mmvq): A is quantized once
+ * per GEMV to int8 with one f32 scale per 32 values, and every row is a
+ * signed dot4 against the unpacked weight bytes. With each lane owning 32
+ * weights, a row costs a few dot4s and one scale FMA per lane, so 1..4 rows
+ * run at weight bandwidth. Every m uses this path so a verify row reproduces
+ * the decode (m == 1) result bit for bit. */
+__global__ void quantize_rows_q8_kernel(const float *a, int8_t *aq, float *ad, int m, int k) {
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int blk = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / 32) + warp;
+    const int row = static_cast<int>(blockIdx.y);
+    const int kb = k / 32;
+    if (row >= m || blk >= kb) {
+        return;
+    }
+    const size_t i = static_cast<size_t>(row) * static_cast<size_t>(k) + blk * 32 + lane;
+    const float v = a[i];
+    float amax = fabsf(v);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    }
+    const float d = amax == 0.f ? 0.f : amax / 127.f;
+    const float inv = d == 0.f ? 0.f : 1.f / d;
+    int q = static_cast<int>(roundf(v * inv));
+    q = q > 127 ? 127 : (q < -127 ? -127 : q);
+    aq[i] = static_cast<int8_t>(q);
+    if (lane == 0) {
+        ad[static_cast<size_t>(row) * kb + blk] = d;
+    }
+}
+
+__device__ inline uint32_t kq_u32_from_u16(const uint8_t *p) {
+    const uint16_t *h = reinterpret_cast<const uint16_t *>(p);
+    return static_cast<uint32_t>(h[0]) | (static_cast<uint32_t>(h[1]) << 16);
+}
+
+/* Lane maps: LPC lanes per column, W = 128 / LPC contiguous weights per lane
+ * in each of two places. Q4_K/Q5_K: sub-blocks 2g (low nibbles) and 2g+1
+ * (high) of group g = sl / (LPC / 4), from j0 = W * (sl % (LPC / 4)). Q6_K:
+ * and Q3_K: weights g*32 + j0 .. +W-1 of each 128-half, one scale (W <= 16),
+ * values offset by -32 (Q6_K) or -4 (Q3_K). Integer
+ * dots accumulate across a lane's W weights; the scales apply once per row. */
+template <int NC>
+__device__ inline void kq_load_u32s(const void *p, uint32_t (&v)[NC]) {
+    if constexpr (NC == 4) {
+        const uint4 x = *reinterpret_cast<const uint4 *>(p);
+        v[0] = x.x, v[1] = x.y, v[2] = x.z, v[3] = x.w;
+    } else if constexpr (NC == 2) {
+        const uint2 x = *reinterpret_cast<const uint2 *>(p);
+        v[0] = x.x, v[1] = x.y;
+    } else {
+        v[0] = *reinterpret_cast<const uint32_t *>(p);
+    }
+}
+
+template <int QT, int MR, int LPC>
+__global__ void gemv_nt_kquant_i8_kernel(const int8_t *aq, const float *ad, const uint8_t *b,
+                                         float *c, int m, int n, int k) {
+    constexpr int BB = KqBlock<QT>::bytes;
+    constexpr int W = 128 / LPC;
+    constexpr int NC = W / 4;
+    constexpr int LPG = LPC / 4;
+    constexpr uint32_t ONES = 0x01010101u;
+    const int sl = static_cast<int>(threadIdx.x) % LPC;
+    const int col = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / LPC) +
+                    static_cast<int>(threadIdx.x) / LPC;
+    const int row0 = static_cast<int>(blockIdx.y) * MR;
+    const bool live = col < n;
+    const int nblocks = k / 256;
+    const int kb = k / 32;
+    const uint8_t *brow =
+        b + static_cast<size_t>(live ? col : 0) * static_cast<size_t>(nblocks) * BB;
+    const int g = sl / LPG;
+    const int j0 = (sl % LPG) * W;
+    const int8_t *arow[MR];
+    const float *drow[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        const size_t ar = static_cast<size_t>(row0 + r < m ? row0 + r : row0);
+        arow[r] = aq + ar * static_cast<size_t>(k);
+        drow[r] = ad + ar * static_cast<size_t>(kb);
+    }
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.f;
+    }
+    if (live) {
+        for (int ib = 0; ib < nblocks; ++ib) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
+            if constexpr (QT == 3) {
+                // hmask[32] qs[64] scales[12] d: weight = d * (sc - 32) * (q2 | h << 2 - 4).
+                const float d = allpaca_f16le_to_f32(blk + 108);
+                const uint8_t *sc = blk + 96;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    uint32_t q[NC];
+#pragma unroll
+                    for (int t = 0; t < NC; ++t) {
+                        const uint32_t qs = kq_u32_from_u16(blk + 32 + h * 32 + j0 + 4 * t);
+                        const uint32_t hm = kq_u32_from_u16(blk + j0 + 4 * t);
+                        q[t] = ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
+                    }
+                    const int is = h * 8 + 2 * g + j0 / 16;
+                    const int s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) |
+                                   (((sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3) << 4);
+                    const float s = d * static_cast<float>(s6 - 32);
+                    const int bi = ib * 8 + h * 4 + g;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        uint32_t av[NC];
+                        kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av);
+                        int32_t dot = 0, sum = 0;
+#pragma unroll
+                        for (int t = 0; t < NC; ++t) {
+                            dot = i8dot4(av[t], q[t], dot);
+                            sum = i8dot4(av[t], ONES, sum);
+                        }
+                        acc[r] += s * drow[r][bi] * static_cast<float>(dot - 4 * sum);
+                    }
+                }
+            } else if constexpr (QT == 6) {
+                const float d = allpaca_f16le_to_f32(blk + 208);
+                const int8_t *sc = reinterpret_cast<const int8_t *>(blk + 192);
+                const int lo_off = (g & 1) * 32 + j0;
+                const int nib = (g >> 1) * 4;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    uint32_t q[NC];
+#pragma unroll
+                    for (int t = 0; t < NC; ++t) {
+                        const uint32_t ql = kq_u32_from_u16(blk + h * 64 + lo_off + 4 * t);
+                        const uint32_t qh = kq_u32_from_u16(blk + 128 + h * 32 + j0 + 4 * t);
+                        q[t] = ((ql >> nib) & 0x0F0F0F0Fu) | (((qh >> (2 * g)) & 0x03030303u) << 4);
+                    }
+                    const float s = d * static_cast<float>(sc[h * 8 + j0 / 16 + 2 * g]);
+                    const int bi = ib * 8 + h * 4 + g;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        uint32_t av[NC];
+                        kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av);
+                        int32_t dot = 0, sum = 0;
+#pragma unroll
+                        for (int t = 0; t < NC; ++t) {
+                            dot = i8dot4(av[t], q[t], dot);
+                            sum = i8dot4(av[t], ONES, sum);
+                        }
+                        acc[r] += s * drow[r][bi] * static_cast<float>(dot - 32 * sum);
+                    }
+                }
+            } else {
+                const float d = allpaca_f16le_to_f32(blk);
+                const float dmin = allpaca_f16le_to_f32(blk + 2);
+                uint32_t sc1 = 0, m1 = 0, sc2 = 0, m2 = 0;
+                kq_scale_min_pair(blk + 4, g, sc1, m1, sc2, m2);
+                // Weight blocks are only 4-byte aligned.
+                const uint32_t *qp = reinterpret_cast<const uint32_t *>(
+                    blk + (QT == 5 ? 48 : 16) + g * 32 + j0);
+                uint32_t qv[NC];
+#pragma unroll
+                for (int t = 0; t < NC; ++t) {
+                    qv[t] = qp[t];
+                }
+                uint32_t lo[NC], hi[NC];
+#pragma unroll
+                for (int t = 0; t < NC; ++t) {
+                    uint32_t hb_lo = 0, hb_hi = 0;
+                    if constexpr (QT == 5) {
+                        const uint32_t qh =
+                            *reinterpret_cast<const uint32_t *>(blk + 16 + j0 + 4 * t);
+                        hb_lo = (qh >> (2 * g)) & ONES;
+                        hb_hi = (qh >> (2 * g + 1)) & ONES;
+                    }
+                    lo[t] = (qv[t] & 0x0F0F0F0Fu) | (hb_lo << 4);
+                    hi[t] = ((qv[t] >> 4) & 0x0F0F0F0Fu) | (hb_hi << 4);
+                }
+                const float dl = d * static_cast<float>(sc1);
+                const float ml = dmin * static_cast<float>(m1);
+                const float dh = d * static_cast<float>(sc2);
+                const float mh = dmin * static_cast<float>(m2);
+                const int bl = ib * 8 + 2 * g;
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    uint32_t alo[NC], ahi[NC];
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo);
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi);
+                    int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
+#pragma unroll
+                    for (int t = 0; t < NC; ++t) {
+                        il = i8dot4(alo[t], lo[t], il);
+                        sl_ = i8dot4(alo[t], ONES, sl_);
+                        ih = i8dot4(ahi[t], hi[t], ih);
+                        sh = i8dot4(ahi[t], ONES, sh);
+                    }
+                    acc[r] += drow[r][bl] * (dl * static_cast<float>(il) -
+                                             ml * static_cast<float>(sl_)) +
+                              drow[r][bl + 1] * (dh * static_cast<float>(ih) -
+                                                 mh * static_cast<float>(sh));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = LPC / 2; off > 0; off >>= 1) {
+            v += __shfl_down(v, off, LPC);
+        }
+        if (live && sl == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+                v;
+        }
+    }
+}
+
+/* Per-device int8 activation scratch, grow-only. The lock is held from
+ * quantize through GEMV enqueue, so on one stream (the legacy null stream is
+ * shared by every host thread) no other GEMV's quantize can land between
+ * them. A switch to another stream first waits, on the GPU, for all work
+ * already queued on the previous one. */
+constexpr int KQ_ACT_DEVICES = 16;
+struct KqActScratch {
+    std::mutex mu;
+    void *p = nullptr;
+    size_t cap = 0;
+    hipStream_t stream = nullptr;
+    hipEvent_t handoff = nullptr;
+};
+static KqActScratch g_kq_act[KQ_ACT_DEVICES];
+
+/* Locks the device's scratch for `stream`; null when unavailable. */
+static KqActScratch *kq_act_acquire(hipStream_t stream, size_t need,
+                                    std::unique_lock<std::mutex> &lock) {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= KQ_ACT_DEVICES) {
+        return nullptr;
+    }
+    KqActScratch &s = g_kq_act[dev];
+    lock = std::unique_lock<std::mutex>(s.mu);
+    if (s.p && s.stream != stream) {
+        if (!s.handoff &&
+            hipEventCreateWithFlags(&s.handoff, hipEventDisableTiming) != hipSuccess) {
+            s.handoff = nullptr;
+            return nullptr;
+        }
+        if (hipEventRecord(s.handoff, s.stream) != hipSuccess ||
+            hipStreamWaitEvent(stream, s.handoff, 0) != hipSuccess) {
+            return nullptr;
+        }
+    }
+    if (s.cap < need) {
+        if (s.p) {
+            (void)hipStreamSynchronize(stream);
+            (void)hipFree(s.p);
+            s.p = nullptr;
+            s.cap = 0;
+        }
+        const size_t cap = need > (size_t(1) << 20) ? need : (size_t(1) << 20);
+        if (hipMalloc(&s.p, cap) != hipSuccess) {
+            s.p = nullptr;
+            return nullptr;
+        }
+        s.cap = cap;
+    }
+    s.stream = stream;
+    return &s;
+}
+
+/* Returns ALLPACA_ERR_INVALID when the int8 path cannot run (caller falls back). */
+template <int QT>
+static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                            int32_t k, hipStream_t stream) {
+    const size_t aq_bytes = (static_cast<size_t>(m) * k + 255) & ~size_t(255);
+    const size_t need = aq_bytes + static_cast<size_t>(m) * (k / 32) * sizeof(float);
+    std::unique_lock<std::mutex> lock;
+    KqActScratch *scratch = kq_act_acquire(stream, need, lock);
+    if (!scratch) {
+        return ALLPACA_ERR_INVALID;
+    }
+    uint8_t *base = static_cast<uint8_t *>(scratch->p);
+    int8_t *aq = reinterpret_cast<int8_t *>(base);
+    float *ad = reinterpret_cast<float *>(base + aq_bytes);
+    const int kb = k / 32;
+    hipLaunchKernelGGL(quantize_rows_q8_kernel,
+                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
+                       dim3(256), 0, stream, a, aq, ad, m, k);
+    // 8 lanes x 32 weights per column: at 32 lanes x 8 weights the per-row
+    // A loads and scale math dominated (Q5_K m=4 cost 1.7x m=1; now ~1.05x).
+    constexpr int LPC = 8;
+    dim3 block(256);
+    const int cols = 256 / LPC;
+    const unsigned gx = static_cast<unsigned>((n + cols - 1) / cols);
+    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
+#define KQ_I8_LAUNCH(MRV, LPCV)                                                                    \
+    hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPCV>), grid, block, 0, stream, aq, ad, \
+                       b, c, m, n, k)
+    if (mr == 1) {
+        KQ_I8_LAUNCH(1, LPC);
+    } else if (mr == 2) {
+        KQ_I8_LAUNCH(2, LPC);
+    } else if (mr == 4) {
+        KQ_I8_LAUNCH(4, LPC);
+    } else {
+        KQ_I8_LAUNCH(8, LPC);
+    }
+#undef KQ_I8_LAUNCH
+    return hip_status(hipGetLastError());
+}
+
 template <int QT, bool V2>
 static int launch_kquant_rows(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                               int32_t k, hipStream_t stream) {
     dim3 block(KQ_LANES * KQ_COLS_PER_BLOCK);
     const unsigned gx = static_cast<unsigned>((n + KQ_COLS_PER_BLOCK - 1) / KQ_COLS_PER_BLOCK);
-    if (m == 1) {
-        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 1, V2>), dim3(gx, 1), block, 0, stream,
-                           a, b, c, m, n, k);
-    } else if (m == 2) {
-        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 2, V2>), dim3(gx, 1), block, 0, stream,
-                           a, b, c, m, n, k);
-    } else if (m <= 4) {
-        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 4, V2>), dim3(gx, 1), block, 0, stream,
-                           a, b, c, m, n, k);
-    } else {
-        const unsigned gy = static_cast<unsigned>((m + 7) / 8);
-        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, 8, V2>), dim3(gx, gy), block, 0,
-                           stream, a, b, c, m, n, k);
+    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
+#define KQ_LAUNCH(MRV)                                                                              \
+    if (V2) {                                                                                       \
+        hipLaunchKernelGGL((gemv_nt_kquant_v2_kernel<QT, MRV>), grid, block, 0, stream, a, b, c,  \
+                           m, n, k);                                                               \
+    } else {                                                                                        \
+        hipLaunchKernelGGL((gemv_nt_kquant_warp_kernel<QT, MRV>), grid, block, 0, stream, a, b,   \
+                           c, m, n, k);                                                            \
     }
+    if (mr == 1) {
+        KQ_LAUNCH(1)
+    } else if (mr == 2) {
+        KQ_LAUNCH(2)
+    } else if (mr == 4) {
+        KQ_LAUNCH(4)
+    } else {
+        KQ_LAUNCH(8)
+    }
+#undef KQ_LAUNCH
     return hip_status(hipGetLastError());
 }
 
@@ -1968,10 +2423,32 @@ static int launch_gemm_nt_kquant_warp(const float *a, const uint8_t *b, float *c
     const uintptr_t ba = reinterpret_cast<uintptr_t>(b);
     const bool v2 = (reinterpret_cast<uintptr_t>(a) % 16 == 0) &&
                     (QT == 6 ? ba % 2 == 0 : ba % 4 == 0);
+    if (QT == 6 ? ba % 2 == 0 : ba % 4 == 0) {
+        const int rc = launch_kquant_i8<QT>(a, b, c, m, n, k, stream);
+        if (rc != ALLPACA_ERR_INVALID) {
+            return rc;
+        }
+    }
     if (v2) {
         return launch_kquant_rows<QT, true>(a, b, c, m, n, k, stream);
     }
     return launch_kquant_rows<QT, false>(a, b, c, m, n, k, stream);
+}
+
+/* Q3_K has only the int8 kernel (its 110-byte blocks are 2-byte aligned). */
+static int launch_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                               int32_t k, hipStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || k % 256 != 0 || !a || !b || !c ||
+        reinterpret_cast<uintptr_t>(b) % 2 != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    return launch_kquant_i8<3>(a, b, c, m, n, k, stream);
+}
+
+extern "C" int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                    int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_q3_k(a, b, c, m, n, k, as_stream(stream));
 }
 
 /* One thread per output column. Native 144-byte Q4_K super-blocks along K.
@@ -5800,6 +6277,11 @@ extern "C" int allpaca_gemm_nt_q6_k_untiled(const float *, const uint8_t *, floa
 }
 
 extern "C" int allpaca_gemm_nt_q5_k(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                    int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q3_k(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }

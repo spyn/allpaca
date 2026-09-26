@@ -173,6 +173,10 @@ int allpaca_gemm_nt_q6_k_cols(const float *a, const uint8_t *b, float *c, int32_
 int allpaca_gemm_nt_q6_k_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_q3_k[n,k])^T. Native 110-byte Q3_K super-blocks, k % 256 == 0. */
+int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                         int32_t k, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
 int allpaca_gemm_nt_q5_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);

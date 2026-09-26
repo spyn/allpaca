@@ -23,7 +23,7 @@ fn gemv_bandwidth_at_qwen_shapes() {
         allpaca_hip::set_device(dev).unwrap();
         for (name, block_bytes, block_elems) in kinds {
             for (n, k) in shapes {
-                for m in [1usize, 4] {
+                for m in [1usize, 2, 4, 8] {
                     let b_bytes = n * (k / block_elems) * block_bytes;
                     let b = allpaca_hip::device_malloc(b_bytes, dev).unwrap();
                     let filler: Vec<u8> = (0..b_bytes).map(|i| (i * 131 % 251) as u8 & 0x3f).collect();
