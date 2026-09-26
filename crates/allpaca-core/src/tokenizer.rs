@@ -27,6 +27,9 @@ pub struct EngineTokenizer {
     pub add_bos: bool,
     /// HuggingFace `tokenizer.json` decoder (ByteLevel / BPE), not piece-concat.
     hf_native_decode: bool,
+    /// GGUF `gpt2` vocab: pieces are GPT-2 byte-level strings (`Ġ` space,
+    /// `Ċ` newline, UTF-8 split across pieces), not text.
+    byte_level: bool,
 }
 
 impl EngineTokenizer {
@@ -50,6 +53,7 @@ impl EngineTokenizer {
             fim_sep_id: tok.fim_sep_id,
             add_bos: tok.add_bos,
             hf_native_decode: false,
+            byte_level: tok.model_kind == "gpt2",
         }
     }
 
@@ -141,6 +145,7 @@ impl EngineTokenizer {
             fim_sep_id: None,
             add_bos: bos_id.is_some(),
             hf_native_decode: false,
+            byte_level: false,
         })
     }
 
@@ -251,6 +256,7 @@ impl EngineTokenizer {
             fim_sep_id: None,
             add_bos,
             hf_native_decode: true,
+            byte_level: false,
         })
     }
 
@@ -260,6 +266,18 @@ impl EngineTokenizer {
                 .inner
                 .decode(ids, true)
                 .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())));
+        }
+        if self.byte_level {
+            // Collect bytes first: one UTF-8 char can span several pieces.
+            let mut bytes = Vec::new();
+            for &id in ids {
+                match self.tokens.get(id as usize) {
+                    Some(piece) if is_special_piece(piece) => {}
+                    Some(piece) => push_gpt2_piece_bytes(piece, &mut bytes),
+                    None => bytes.extend_from_slice(format!("<{id}>").as_bytes()),
+                }
+            }
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
         }
         let mut out = String::new();
         for &id in ids {
@@ -273,10 +291,15 @@ impl EngineTokenizer {
     }
 
     pub fn decode_one(&self, id: u32) -> String {
-        self.tokens
-            .get(id as usize)
-            .map(|piece| normalize_piece(piece))
-            .unwrap_or_else(|| format!("<{id}>"))
+        let Some(piece) = self.tokens.get(id as usize) else {
+            return format!("<{id}>");
+        };
+        if self.byte_level && !is_special_piece(piece) {
+            let mut bytes = Vec::new();
+            push_gpt2_piece_bytes(piece, &mut bytes);
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+        normalize_piece(piece)
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -370,6 +393,37 @@ const GPT2_SPACE: char = '\u{0120}';
 /// SentencePiece / Llama-2 underline space marker (U+2581).
 const SPM_SPACE: char = '\u{2581}';
 
+/// Invert GPT-2 `bytes_to_unicode`: printable Latin-1 bytes map to their own
+/// code point, the other 68 bytes (0..=32, 127..=160, 173) to U+0100.. in
+/// order. Chars outside that alphabet (added tokens) pass through as UTF-8.
+fn gpt2_shifted_bytes() -> &'static [u8; 68] {
+    static TABLE: std::sync::OnceLock<[u8; 68]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0u8; 68];
+        let shifted = (0u8..=255).filter(|b| matches!(b, 0..=32 | 127..=160 | 173));
+        for (slot, byte) in table.iter_mut().zip(shifted) {
+            *slot = byte;
+        }
+        table
+    })
+}
+
+fn push_gpt2_piece_bytes(piece: &str, out: &mut Vec<u8>) {
+    for ch in piece.chars() {
+        let c = ch as u32;
+        let printable =
+            (33..=126).contains(&c) || (161..=172).contains(&c) || (174..=255).contains(&c);
+        if printable {
+            out.push(c as u8);
+        } else if (256..256 + 68).contains(&c) {
+            out.push(gpt2_shifted_bytes()[(c - 256) as usize]);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+}
+
 fn normalize_piece(piece: &str) -> String {
     if let Some(byte) = parse_hex_byte_token(piece) {
         return byte_to_string(byte);
@@ -456,6 +510,17 @@ mod tests {
         let ids = tok.encode("hello").unwrap();
         assert!(ids.contains(&3));
         assert_eq!(tok.decode_one(3), "hello");
+    }
+
+    #[test]
+    fn gpt2_byte_level_pieces_decode_to_utf8() {
+        let mut bytes = Vec::new();
+        // "Ċ" newline, "Ġ" space, "Ã©" is 'é' split into two byte chars.
+        push_gpt2_piece_bytes("\u{010A}", &mut bytes);
+        push_gpt2_piece_bytes("\u{0120}caf", &mut bytes);
+        push_gpt2_piece_bytes("\u{00C3}", &mut bytes);
+        push_gpt2_piece_bytes("\u{00A9}\u{0109}!", &mut bytes);
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\n caf\u{e9}\t!");
     }
 
     #[test]
