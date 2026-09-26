@@ -2537,7 +2537,14 @@ fn split_fused_qkv_host(
     Ok((q, k, v))
 }
 
-fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, AllpacaError> {
+/// `materialize_projections` expands qkv/z/alpha/beta/out to host F32 (CPU
+/// and host-weight CUDA paths). Device-resident loads upload them from the
+/// file instead, so they stay empty (`gdn_needs_device_projections`).
+fn load_gguf_gdn_host(
+    file: &GgufFile,
+    layer: usize,
+    materialize_projections: bool,
+) -> Result<GdnHostWeights, AllpacaError> {
     let arch = file.architecture().unwrap_or("qwen35");
     let dims = GdnDims::from_meta(
         file.meta_u32(&format!("{arch}.ssm.state_size"))
@@ -2590,6 +2597,20 @@ fn load_gguf_gdn_host(file: &GgufFile, layer: usize) -> Result<GdnHostWeights, A
             norm.len(),
             conv1d.len()
         ))));
+    }
+    if !materialize_projections {
+        return Ok(GdnHostWeights {
+            dims,
+            a,
+            dt_bias,
+            norm,
+            conv1d,
+            w_qkv: Vec::new(),
+            w_z: Vec::new(),
+            w_alpha: Vec::new(),
+            w_beta: Vec::new(),
+            w_out: Vec::new(),
+        });
     }
     // Host projections for CUDA / CPU host-step GDN (HIP also uploads these on-device).
     let w_qkv = file.tensor_f32(&format!("blk.{layer}.attn_qkv.weight"))?;
@@ -5485,7 +5506,7 @@ impl TinyModel {
                             Some(load_gguf_ssm_layer(file, i, cfg.dim, true)?)
                         },
                         gdn: if file.architecture() == Some("qwen35") {
-                            load_gguf_gdn_host(file, i).ok()
+                            load_gguf_gdn_host(file, i, true).ok()
                         } else {
                             None
                         },
@@ -5777,7 +5798,7 @@ impl TinyModel {
                 if block == HybridLayerKind::Ssm {
                     if let Some(f) = file {
                         if f.architecture() == Some("qwen35") {
-                            if let Ok(gdn) = load_gguf_gdn_host(f, i) {
+                            if let Ok(gdn) = load_gguf_gdn_host(f, i, false) {
                                 layer.gdn = Some(gdn);
                             }
                         }
@@ -10628,6 +10649,75 @@ mod lightning_moe_tests {
         let sum: f32 = routed.iter().map(|(_, wt)| *wt).sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
         assert!(routed[0].1 > routed[1].1);
+    }
+
+    /// One Qwen3.5-style Gated DeltaNet layer (dim 16, 2 V heads of 4).
+    fn write_one_gdn_layer_gguf(path: &std::path::Path) {
+        use allpaca_gguf::{GgufValue, GgufWriteTensor};
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("general.architecture".into(), GgufValue::String("qwen35".into()));
+        for (k, v) in [
+            ("state_size", 4u32),
+            ("inner_size", 8),
+            ("time_step_rank", 2),
+            ("group_count", 1),
+            ("conv_kernel", 4),
+        ] {
+            meta.insert(format!("qwen35.ssm.{k}"), GgufValue::Uint32(v));
+        }
+        let (dim, qkv, value, heads) = (16u64, 16u64, 8u64, 2u64);
+        let data: Vec<Vec<f32>> = [heads, heads, 4, 4 * qkv, dim * qkv, dim * value, dim * heads, dim * heads, value * dim]
+            .iter()
+            .map(|&n| (0..n).map(|i| i as f32 * 0.01).collect())
+            .collect();
+        let shapes: [(&str, Vec<u64>); 9] = [
+            ("ssm_a", vec![heads]),
+            ("ssm_dt.bias", vec![heads]),
+            ("ssm_norm.weight", vec![4]),
+            ("ssm_conv1d.weight", vec![4, qkv]),
+            ("attn_qkv.weight", vec![dim, qkv]),
+            ("attn_gate.weight", vec![dim, value]),
+            ("ssm_alpha.weight", vec![dim, heads]),
+            ("ssm_beta.weight", vec![dim, heads]),
+            ("ssm_out.weight", vec![value, dim]),
+        ];
+        let tensors: Vec<GgufWriteTensor<'_>> = shapes
+            .into_iter()
+            .zip(&data)
+            .map(|((name, dims), d)| GgufWriteTensor {
+                name: format!("blk.0.{name}"),
+                dims,
+                data: d,
+            })
+            .collect();
+        allpaca_gguf::write_gguf(path, &meta, &tensors).unwrap();
+    }
+
+    #[test]
+    fn device_resident_gdn_layers_skip_host_f32_projections() {
+        // A large GGUF loads as a skeleton whose GDN projections are uploaded
+        // from the file; expanding them to host F32 held ~22 GB for the 27B.
+        let dir = std::env::temp_dir().join(format!("allpaca-gdn-lean-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gdn.gguf");
+        write_one_gdn_layer_gguf(&path);
+        let file = GgufFile::open(&path).unwrap();
+
+        let lean = load_gguf_gdn_host(&file, 0, false).unwrap();
+        assert!(
+            lean.w_qkv.is_empty()
+                && lean.w_z.is_empty()
+                && lean.w_alpha.is_empty()
+                && lean.w_beta.is_empty()
+                && lean.w_out.is_empty(),
+            "lean GDN layer must not hold host projections"
+        );
+        assert_eq!((lean.a.len(), lean.norm.len(), lean.conv1d.len()), (2, 4, 64));
+
+        let host = load_gguf_gdn_host(&file, 0, true).unwrap();
+        assert_eq!((host.w_qkv.len(), host.w_out.len()), (256, 128));
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
