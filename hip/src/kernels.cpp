@@ -4892,6 +4892,97 @@ __global__ void gated_delta_step_parallel_kernel(float *q, float *k, const float
     }
 }
 
+/* In-place per-head L2 norm of q (times 1/sqrt(head_k)) and k: one warp per head. */
+__global__ void gdn_qk_l2norm_kernel(float *q, float *k, int n_heads, int head_k, float eps) {
+    const int h = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (h >= n_heads) {
+        return;
+    }
+    float *q_h = q + static_cast<size_t>(h) * head_k;
+    float *k_h = k + static_cast<size_t>(h) * head_k;
+    float ss_q = 0.f, ss_k = 0.f;
+    for (int j = lane; j < head_k; j += 32) {
+        ss_q += q_h[j] * q_h[j];
+        ss_k += k_h[j] * k_h[j];
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ss_q += __shfl_xor(ss_q, off, 32);
+        ss_k += __shfl_xor(ss_k, off, 32);
+    }
+    const float sq = rsqrtf(ss_q + eps) * rsqrtf(static_cast<float>(head_k));
+    const float sk = rsqrtf(ss_k + eps);
+    for (int j = lane; j < head_k; j += 32) {
+        q_h[j] *= sq;
+        k_h[j] *= sk;
+    }
+}
+
+/* Delta-rule state update on already-normalized q/k. One warp per state row
+ * (each lane holds NJ = head_k / 32 contiguous columns), reductions are warp
+ * shuffles, and a head's rows spread over several blocks. The block-per-head
+ * kernel walked all head_v rows with two block-wide reductions each (~768
+ * barriers per call on n_v_heads blocks) and was pure latency. */
+constexpr int GDN_ROWS_PER_WARP = 4;
+constexpr int GDN_WARPS = 4;
+template <int NJ>
+__global__ void gated_delta_step_warp_kernel(const float *q, const float *k, const float *v,
+                                             const float *decay, const float *beta, float *state,
+                                             float *out, int n_v_heads, int head_v, int head_k) {
+    const int h = static_cast<int>(blockIdx.x);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    if (h >= n_v_heads) {
+        return;
+    }
+    const float *q_h = q + static_cast<size_t>(h) * head_k + lane * NJ;
+    const float *k_h = k + static_cast<size_t>(h) * head_k + lane * NJ;
+    float qv[NJ], kv[NJ];
+#pragma unroll
+    for (int t = 0; t < NJ; ++t) {
+        qv[t] = q_h[t];
+        kv[t] = k_h[t];
+    }
+    const float g = decay[h];
+    const float b = beta[h];
+    const int row0 = (static_cast<int>(blockIdx.y) * GDN_WARPS + warp) * GDN_ROWS_PER_WARP;
+#pragma unroll
+    for (int r = 0; r < GDN_ROWS_PER_WARP; ++r) {
+        const int i = row0 + r;
+        if (i >= head_v) {
+            break;
+        }
+        float *row = state + (static_cast<size_t>(h) * head_v + i) * head_k + lane * NJ;
+        float s[NJ];
+        float acc = 0.f;
+#pragma unroll
+        for (int t = 0; t < NJ; ++t) {
+            s[t] = row[t] * g;
+            acc += s[t] * kv[t];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_xor(acc, off, 32);
+        }
+        const float delta = b * (v[static_cast<size_t>(h) * head_v + i] - acc);
+        float y = 0.f;
+#pragma unroll
+        for (int t = 0; t < NJ; ++t) {
+            s[t] += delta * kv[t];
+            row[t] = s[t];
+            y += s[t] * qv[t];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            y += __shfl_xor(y, off, 32);
+        }
+        if (lane == 0) {
+            out[static_cast<size_t>(h) * head_v + i] = y;
+        }
+    }
+}
+
 __global__ void gated_delta_step_kernel(float *q, float *k, const float *v, const float *decay,
                                         const float *beta, float *state, float *out, int n_v_heads,
                                         int head_v, int head_k, float eps) {
@@ -5151,6 +5242,30 @@ extern "C" int allpaca_gated_delta_step(float *q, float *k, const float *v, cons
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    const int nj = head_k % 32 == 0 ? head_k / 32 : 0;
+    if (nj == 1 || nj == 2 || nj == 4 || nj == 8) {
+        hipStream_t s = as_stream(stream);
+        hipLaunchKernelGGL(gdn_qk_l2norm_kernel, dim3(static_cast<unsigned>(n_v_heads)), dim3(32), 0,
+                           s, q, k, n_v_heads, head_k, eps);
+        constexpr int rows_per_block = GDN_WARPS * GDN_ROWS_PER_WARP;
+        const dim3 grid(static_cast<unsigned>(n_v_heads),
+                        static_cast<unsigned>((head_v + rows_per_block - 1) / rows_per_block));
+        const dim3 block(32 * GDN_WARPS);
+#define GDN_WARP_LAUNCH(NJV)                                                                       \
+    hipLaunchKernelGGL(gated_delta_step_warp_kernel<NJV>, grid, block, 0, s, q, k, v, decay, beta, \
+                       state, out, n_v_heads, head_v, head_k)
+        if (nj == 1) {
+            GDN_WARP_LAUNCH(1);
+        } else if (nj == 2) {
+            GDN_WARP_LAUNCH(2);
+        } else if (nj == 4) {
+            GDN_WARP_LAUNCH(4);
+        } else {
+            GDN_WARP_LAUNCH(8);
+        }
+#undef GDN_WARP_LAUNCH
+        return hip_status(hipGetLastError());
+    }
     const bool parallel = head_k > 0 && head_k <= 256 && (head_k & (head_k - 1)) == 0;
     if (parallel) {
         hipLaunchKernelGGL(gated_delta_step_parallel_kernel, dim3(static_cast<unsigned>(n_v_heads)),
