@@ -8284,7 +8284,9 @@ mod tests {
         let engine = Engine::new(cfg).unwrap();
         {
             let mut inner = engine.lock().unwrap();
-            inner.scheduler.record_acceptance(9, 10);
+            for _ in 0..10 {
+                inner.scheduler.record_acceptance(9, 10);
+            }
             let raised = inner.scheduler.draft_depth;
             assert!(raised > 2);
             // Neutral acceptance keeps depth; queue pressure alone must shrink.
@@ -8347,22 +8349,27 @@ mod tests {
             "initial draft depth from min_depth; stats={initial}"
         );
         {
+            // Depth follows sustained acceptance, not one span.
             let mut inner = engine.lock().unwrap();
-            inner.scheduler.record_acceptance(9, 10);
+            for _ in 0..10 {
+                inner.scheduler.record_acceptance(9, 10);
+            }
         }
         let raised = engine.stats().draft_depth;
         assert!(
             raised > initial,
-            "high acceptance must raise draft_depth; before={initial} after={raised}"
+            "sustained high acceptance must raise draft_depth; before={initial} after={raised}"
         );
         {
             let mut inner = engine.lock().unwrap();
-            inner.scheduler.record_acceptance(1, 10);
+            for _ in 0..30 {
+                inner.scheduler.record_acceptance(1, 10);
+            }
         }
         let lowered = engine.stats().draft_depth;
         assert!(
             lowered < raised,
-            "low acceptance must shrink draft_depth; raised={raised} lowered={lowered}"
+            "sustained low acceptance must shrink draft_depth; raised={raised} lowered={lowered}"
         );
     }
 
