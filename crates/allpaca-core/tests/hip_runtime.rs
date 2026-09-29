@@ -7151,18 +7151,24 @@ fn hip_concurrent_requests_match_solo_greedy() {
         eprintln!("skip hip_concurrent_requests_match_solo_greedy: no Qwen2.5-Coder-0.5B or HIP");
         return;
     }
-    for batch_decode in [true, false] {
+    // (batched decode, n-gram speculation): n-gram verify spans ride in the
+    // batched forward too.
+    for (batch_decode, ngram) in [(true, false), (false, false), (true, true)] {
         let mut cfg = hip_7b_config(path.clone());
         cfg.engine.max_active_requests = 3;
         cfg.engine.batch_decode = batch_decode;
         // Small pages: sequences span several, as long chats do.
         cfg.kv.page_tokens = 16;
-        concurrent_matches_solo(cfg, batch_decode);
+        if ngram {
+            cfg.speculative.enabled = true;
+            cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Ngram];
+        }
+        concurrent_matches_solo(cfg, batch_decode, ngram);
     }
 }
 
 #[cfg(feature = "hip")]
-fn concurrent_matches_solo(cfg: Config, batch_decode: bool) {
+fn concurrent_matches_solo(cfg: Config, batch_decode: bool, ngram: bool) {
     let engine = Engine::new(cfg).expect("Qwen2.5-Coder-0.5B must load");
     if hip_gpus(&engine).is_empty() {
         eprintln!("skip hip_concurrent_requests_match_solo_greedy: no HIP device");
@@ -7184,7 +7190,7 @@ User: SELECT name, email FROM users WHERE",
         .collect();
     let together = poll_concurrently(&engine, &prompts, &params);
     for (i, p) in prompts.iter().enumerate() {
-        assert_eq!(together[i], solo[i], "request {i} ({p:?}) diverged when run concurrently (batch_decode={batch_decode})");
+        assert_eq!(together[i], solo[i], "request {i} ({p:?}) diverged when run concurrently (batch_decode={batch_decode} ngram={ngram})");
     }
     // One thread per request, as the HTTP server drives them.
     let threaded: Vec<Vec<u32>> = std::thread::scope(|scope| {
@@ -7198,7 +7204,7 @@ User: SELECT name, email FROM users WHERE",
         handles.into_iter().map(|h| h.join().expect("thread")).collect()
     });
     for (i, p) in prompts.iter().enumerate() {
-        assert_eq!(threaded[i], solo[i], "request {i} ({p:?}) diverged on its own thread (batch_decode={batch_decode})");
+        assert_eq!(threaded[i], solo[i], "request {i} ({p:?}) diverged on its own thread (batch_decode={batch_decode} ngram={ngram})");
     }
     let stats = engine.stats();
     assert_eq!(
@@ -7206,8 +7212,14 @@ User: SELECT name, email FROM users WHERE",
         batch_decode,
         "batched forwards must run exactly when batch_decode is on; stats={stats:?}"
     );
+    if ngram {
+        assert!(
+            stats.linear_packed_verifies > 0,
+            "n-gram pass must verify drafted spans; stats={stats:?}"
+        );
+    }
     eprintln!(
-        "batched decode: {} forwards, {} rows",
-        stats.batched_decode_steps, stats.batched_decode_rows
+        "batched decode (ngram={ngram}): {} forwards, {} rows, {} packed verifies",
+        stats.batched_decode_steps, stats.batched_decode_rows, stats.linear_packed_verifies
     );
 }
