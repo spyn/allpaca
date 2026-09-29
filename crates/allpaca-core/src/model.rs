@@ -177,6 +177,10 @@ pub struct ModelConfig {
     pub head_dim_explicit: usize,
     /// Partial RoPE width (`rope.dimension_count`). 0 → full head.
     pub rope_dims: usize,
+    /// RoPE pairing for full-head rotation: NeoX (`i`, `i + half`) or NORM
+    /// (adjacent pairs), per llama.cpp's rope type for the GGUF architecture.
+    /// Hugging Face checkpoints (unpermuted Q/K) are always NeoX.
+    pub rope_neox: bool,
     /// Qwen3.5 MRoPE/IMRoPE sections; zeros → classic RoPE.
     pub rope_sections: [i32; 4],
     /// Synthetic recurrent mix (semantic-anchor tracer). Not a KDA/FLA kernel.
@@ -257,6 +261,7 @@ impl ModelConfig {
             head_dim_explicit: 0,
             rope_dims: 0,
             rope_sections: [0; 4],
+            rope_neox: false,
             recurrent: false,
             nextn_predict_layers: 0,
             gguf_layer_base: 0,
@@ -425,6 +430,7 @@ impl ModelConfig {
             head_dim_explicit,
             rope_dims,
             rope_sections,
+            rope_neox: gguf_rope_neox(&arch),
             recurrent: file.tensors.iter().any(|t| t.name.contains(".ssm_")),
             nextn_predict_layers: nextn,
             gguf_layer_base: 0,
@@ -533,6 +539,15 @@ impl ModelConfig {
 
     pub fn layer_is_swa(&self, layer: usize) -> bool {
         self.swa_pattern.get(layer).copied().unwrap_or(false)
+    }
+
+    /// Rotary width when `layer` rotates NeoX-style (`i`, `i + half`), or
+    /// `None` for a full-head NORM rotation. Partial rotation and IMRoPE are
+    /// always NeoX.
+    pub fn neox_rot_dims(&self, layer: usize, head_dim: usize) -> Option<usize> {
+        let r = self.rope_dims_for_layer(layer);
+        (self.uses_imrope() || (r > 0 && r < head_dim) || self.rope_neox)
+            .then_some(if r > 0 { r } else { head_dim })
     }
 
     pub fn rope_dims_for_layer(&self, layer: usize) -> usize {
@@ -672,6 +687,10 @@ struct LayerOff {
     w_shared_down: WeightRef,
     /// Qwen3-Next shared-expert gate `ffn_gate_inp_shexp` (`[dim]`).
     shared_gate_inp: WeightRef,
+    /// Qwen2 Q/K/V projection biases (zero-sized when absent).
+    bq: WeightRef,
+    bk: WeightRef,
+    bv: WeightRef,
 }
 
 /// Device-resident NextN/MTP seed weights (`blk.{i}.nextn.*`).
@@ -1055,6 +1074,21 @@ impl ResidentModel {
                     WeightRef::f32(0, 0)
                 } else {
                     push(&mut slices, &mut off, layer.shared_gate_inp.as_slice())
+                },
+                bq: if layer.attn_bias[0].is_empty() {
+                    WeightRef::f32(0, 0)
+                } else {
+                    push(&mut slices, &mut off, layer.attn_bias[0].as_slice())
+                },
+                bk: if layer.attn_bias[1].is_empty() {
+                    WeightRef::f32(0, 0)
+                } else {
+                    push(&mut slices, &mut off, layer.attn_bias[1].as_slice())
+                },
+                bv: if layer.attn_bias[2].is_empty() {
+                    WeightRef::f32(0, 0)
+                } else {
+                    push(&mut slices, &mut off, layer.attn_bias[2].as_slice())
                 },
             });
         }
@@ -1575,6 +1609,9 @@ impl ResidentModel {
                     w_shared_up: WeightRef::f32(0, 0),
                     w_shared_down: WeightRef::f32(0, 0),
                     shared_gate_inp: WeightRef::f32(0, 0),
+                    bq: WeightRef::f32(0, 0),
+                    bk: WeightRef::f32(0, 0),
+                    bv: WeightRef::f32(0, 0),
                 });
                 continue;
             }
@@ -1892,6 +1929,11 @@ impl ResidentModel {
             };
             let (w_shared_gate, w_shared_up, w_shared_down) =
                 append_gguf_shared_expert(file, i, &mut parts, &mut off)?;
+            let (bq, bk, bv) = (
+                append_gguf_bias(file, i, "attn_q", &mut parts, &mut off)?,
+                append_gguf_bias(file, i, "attn_k", &mut parts, &mut off)?,
+                append_gguf_bias(file, i, "attn_v", &mut parts, &mut off)?,
+            );
             let shexp_gate_name = format!("blk.{i}.ffn_gate_inp_shexp.weight");
             let shared_gate_inp = if file.tensor(&shexp_gate_name).is_some() {
                 append_gguf_tensor(file, &shexp_gate_name, &mut parts, &mut off)?
@@ -1922,6 +1964,9 @@ impl ResidentModel {
                 w_shared_up,
                 w_shared_down,
                 shared_gate_inp,
+                bq,
+                bk,
+                bv,
             });
         }
         let norm = if !globals {
@@ -2688,6 +2733,7 @@ fn empty_layer() -> LayerWeights {
         attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
         shared_gate_inp: Vec::new(),
+        attn_bias: Default::default(),
         ffn_post_norm: Vec::new(),
     }
 }
@@ -2715,6 +2761,65 @@ fn split_fused_qkv_host(
 
 
 
+
+/// llama.cpp's NeoX rope architectures (`LLAMA_ROPE_TYPE_NEOX`). GGUF
+/// conversion permutes Q/K for the others (Llama, DeepSeek2, ...) so their
+/// adjacent-pair NORM rotation matches.
+fn gguf_rope_neox(arch: &str) -> bool {
+    matches!(
+        arch,
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen3next" | "phi2" | "phi3"
+            | "gemma" | "gemma2" | "gemma3" | "starcoder2" | "stablelm" | "gptneox" | "falcon"
+            | "olmo2" | "nemotron"
+    )
+}
+
+/// Qwen2-family Q/K/V projection biases (`blk.N.attn_{q,k,v}.bias`) onto
+/// host layers. Without them every Qwen2/Qwen2.5 GGUF decoded garbage.
+fn attach_gguf_attn_bias(
+    layers: &mut [LayerWeights],
+    file: &GgufFile,
+    cfg: &ModelConfig,
+) -> Result<(), AllpacaError> {
+    for (local, layer) in layers.iter_mut().enumerate() {
+        let i = cfg.gguf_blk(local);
+        for (slot, part) in ["attn_q", "attn_k", "attn_v"].iter().enumerate() {
+            let name = format!("blk.{i}.{part}.bias");
+            if file.tensor(&name).is_some() {
+                layer.attn_bias[slot] = file.tensor_f32(&name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Upload `blk.{layer}.{part}.bias` when present (zero-sized ref otherwise).
+fn append_gguf_bias<'a>(
+    file: &'a GgufFile,
+    layer: usize,
+    part: &str,
+    parts: &mut Vec<UploadPart<'a>>,
+    off: &mut usize,
+) -> Result<WeightRef, AllpacaError> {
+    let name = format!("blk.{layer}.{part}.bias");
+    if file.tensor(&name).is_some() {
+        append_gguf_tensor(file, &name, parts, off)
+    } else {
+        Ok(WeightRef::f32(0, 0))
+    }
+}
+
+/// Add a projection bias to each `bias.len()`-wide row of `x` (no-op when empty).
+fn add_row_bias(x: &mut [f32], bias: &[f32]) {
+    if bias.is_empty() {
+        return;
+    }
+    for row in x.chunks_exact_mut(bias.len()) {
+        for (v, b) in row.iter_mut().zip(bias) {
+            *v += b;
+        }
+    }
+}
 
 /// Qwen Gated DeltaNet checkpoints: Qwen3.5 (`qwen35`) and Qwen3-Next (`qwen3next`).
 pub(crate) fn is_qwen_gdn_arch(arch: &str) -> bool {
@@ -3945,6 +4050,8 @@ pub struct LayerWeights {
     pub attn_post_norm: Vec<f32>,
     /// Gemma post-FFN RMSNorm (empty = skip).
     pub ffn_post_norm: Vec<f32>,
+    /// Qwen2-style Q/K/V projection biases (`attn_{q,k,v}.bias`); empty = none.
+    pub attn_bias: [Vec<f32>; 3],
 }
 
 /// Runtime Edge0 adapters attached after load.
@@ -4151,6 +4258,7 @@ impl TinyModel {
                 attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 shared_gate_inp: Vec::new(),
+                attn_bias: Default::default(),
                 ffn_post_norm: Vec::new(),
             });
         }
@@ -4217,6 +4325,7 @@ impl TinyModel {
             attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
             shared_gate_inp: Vec::new(),
+            attn_bias: Default::default(),
             ffn_post_norm: Vec::new(),
         };
         model
@@ -4266,6 +4375,7 @@ impl TinyModel {
             attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
             shared_gate_inp: Vec::new(),
+            attn_bias: Default::default(),
             ffn_post_norm: Vec::new(),
         };
         model
@@ -5436,6 +5546,27 @@ impl TinyModel {
         Ok(true)
     }
 
+    /// Qwen2 Q/K/V projection biases on `rows` rows of `buf.q` / `buf.k` /
+    /// `buf.v` (no-op for layers without them).
+    #[allow(clippy::too_many_arguments)]
+    fn device_qkv_bias(
+        &self,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        layer: &LayerOff,
+        buf: DeviceDecode,
+        rows: usize,
+        q_out: usize,
+        kv_dim: usize,
+    ) -> Result<(), AllpacaError> {
+        for (bias, x, n) in [(layer.bq, buf.q, q_out), (layer.bk, buf.k, kv_dim), (layer.bv, buf.v, kv_dim)] {
+            if bias.n == n {
+                hip.bias_act_rows_dev(x, resident.f32_or_dequant(hip, bias)?, rows as i32, n as i32, false)?;
+            }
+        }
+        Ok(())
+    }
+
     /// `n_tok` rows' MoE entirely on the GPU for a layer whose experts are
     /// local stacked K-quants: router GEMV, softmax top-k into a device pair
     /// table, fused experts, shared expert scaled by its on-device gate. No
@@ -6156,6 +6287,7 @@ impl TinyModel {
                         attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
                         shared_gate_inp: Vec::new(),
+                        attn_bias: Default::default(),
                         ffn_post_norm: Vec::new(),
                     }
                 }
@@ -6198,6 +6330,7 @@ impl TinyModel {
                         attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
                         shared_gate_inp: Vec::new(),
+                        attn_bias: Default::default(),
                         ffn_post_norm: Vec::new(),
                     }
                 }
@@ -6315,6 +6448,7 @@ impl TinyModel {
                             Vec::new()
                         },
                         shared_gate_inp: Vec::new(),
+                        attn_bias: Default::default(),
                         ffn_post_norm: if file
                             .tensor(&format!("blk.{i}.ffn_post_norm.weight"))
                             .is_some()
@@ -6328,6 +6462,7 @@ impl TinyModel {
             };
             layers.push(layer);
         }
+        attach_gguf_attn_bias(&mut layers, file, &cfg)?;
         let norm = file.tensor_f32("output_norm.weight")?;
         let lm_head = match file.tensor_f32("output.weight") {
             Ok(w) => w,
@@ -6565,6 +6700,7 @@ impl TinyModel {
             head_dim_explicit: hf.head_dim.unwrap_or(0),
             rope_dims: 0,
             rope_sections: [0; 4],
+            rope_neox: true,
             recurrent: false,
             nextn_predict_layers: 0,
             gguf_layer_base: 0,
@@ -6625,6 +6761,7 @@ impl TinyModel {
                 attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 shared_gate_inp: Vec::new(),
+                attn_bias: Default::default(),
                 ffn_post_norm: Vec::new(),
             });
         }
@@ -6677,6 +6814,7 @@ impl TinyModel {
             head_dim_explicit: 0,
             rope_dims: 0,
             rope_sections: [0; 4],
+            rope_neox: true,
             recurrent: false,
             nextn_predict_layers: 0,
             gguf_layer_base: 0,
@@ -6737,6 +6875,7 @@ impl TinyModel {
                 attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
                 shared_gate_inp: Vec::new(),
+                attn_bias: Default::default(),
                 ffn_post_norm: Vec::new(),
             });
         }
@@ -7062,9 +7201,12 @@ impl TinyModel {
                 dim,
             )?;
             self.apply_edge0_lora(layer_idx, "v_proj", &scratch[..dim], &mut v);
-            let n_rot = cfg.rope_dims_for_layer(layer_idx);
+            add_row_bias(&mut q, &layer.attn_bias[0]);
+            add_row_bias(&mut k, &layer.attn_bias[1]);
+            add_row_bias(&mut v, &layer.attn_bias[2]);
             let theta = cfg.rope_theta_for_layer(layer_idx);
-            if n_rot > 0 && n_rot < head_dim && !cfg.uses_imrope() {
+            let neox = cfg.neox_rot_dims(layer_idx, head_dim).filter(|_| !cfg.uses_imrope());
+            if let Some(n_rot) = neox {
                 for h in 0..cfg.n_heads {
                     let slice = &mut q[h * head_dim..(h + 1) * head_dim];
                     rope_imrope_neox(slice, pos, theta, n_rot, [0; 4])?;
@@ -8581,6 +8723,7 @@ impl TinyModel {
                         dim as i32,
                     )?;
                 }
+                self.device_qkv_bias(hip, resident, layer, buf, 1, q_out, kv_dim)?;
                 // Qwen3.5 gated attention: Q projection is per-head interleaved [Q|gate].
                 if gated {
                     hip.deinterleave_q_gate_device(
@@ -8610,15 +8753,7 @@ impl TinyModel {
                         )?;
                     }
                 }
-                if cfg.uses_imrope() || cfg.rope_dims_for_layer(layer_idx) > 0 {
-                    let n_rot = {
-                        let r = cfg.rope_dims_for_layer(layer_idx);
-                        if r > 0 {
-                            r
-                        } else {
-                            head_dim
-                        }
-                    };
+                if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
                     hip.rope_imrope_qk_device(
                         buf.q,
                         buf.k,
@@ -9188,6 +9323,7 @@ impl TinyModel {
                         dim as i32,
                     )?;
                 }
+                self.device_qkv_bias(hip, resident, layer, buf, n_tok, al.q_out, al.kv_dim)?;
                 if al.gated {
                     for t in 0..n_tok {
                         hip.deinterleave_q_gate_device(
@@ -9220,9 +9356,7 @@ impl TinyModel {
                 }
                 let q_stride = if al.gated { al.attn_dim } else { al.q_out };
                 let theta = cfg.rope_theta_for_layer(layer_idx);
-                let n_rot = cfg.rope_dims_for_layer(layer_idx);
-                if cfg.uses_imrope() || n_rot > 0 {
-                    let n_rot = if n_rot > 0 { n_rot } else { al.head_dim };
+                if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, al.head_dim) {
                     for t in 0..n_tok {
                         hip.rope_imrope_qk_device(
                             buf.q_row(t, q_stride),
@@ -9670,6 +9804,9 @@ impl TinyModel {
                     kv_dim,
                     dim,
                 )?;
+                add_row_bias(&mut qs[i * dim..(i + 1) * dim], &layer.attn_bias[0]);
+                add_row_bias(&mut ks[i * kv_dim..(i + 1) * kv_dim], &layer.attn_bias[1]);
+                add_row_bias(&mut vs[i * kv_dim..(i + 1) * kv_dim], &layer.attn_bias[2]);
                 let pos = prompt_len + forest.nodes[i].depth as usize - 1;
                 for h in 0..cfg.n_heads {
                     rope(
@@ -9901,24 +10038,33 @@ impl TinyModel {
                 kv_dim,
                 dim,
             )?;
-            rope_dispatch(
-                hip,
-                &mut q,
-                cfg.n_heads,
-                head_dim,
-                pos,
-                cfg.rope_theta,
-                metrics,
-            )?;
-            rope_dispatch(
-                hip,
-                &mut k,
-                cfg.n_kv_heads,
-                head_dim,
-                pos,
-                cfg.rope_theta,
-                metrics,
-            )?;
+            add_row_bias(&mut q, &layer.attn_bias[0]);
+            add_row_bias(&mut k, &layer.attn_bias[1]);
+            add_row_bias(&mut v, &layer.attn_bias[2]);
+            if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
+                for h in q.chunks_exact_mut(head_dim).chain(k.chunks_exact_mut(head_dim)) {
+                    rope_imrope_neox(h, pos, cfg.rope_theta, n_rot, [0; 4])?;
+                }
+            } else {
+                rope_dispatch(
+                    hip,
+                    &mut q,
+                    cfg.n_heads,
+                    head_dim,
+                    pos,
+                    cfg.rope_theta,
+                    metrics,
+                )?;
+                rope_dispatch(
+                    hip,
+                    &mut k,
+                    cfg.n_kv_heads,
+                    head_dim,
+                    pos,
+                    cfg.rope_theta,
+                    metrics,
+                )?;
+            }
             cache.layers[layer_idx].k.extend_from_slice(&k);
             cache.layers[layer_idx].v.extend_from_slice(&v);
             let n_kv = cache.layers[layer_idx].k.len() / kv_dim;
@@ -10180,6 +10326,7 @@ impl TinyModel {
                 kv_dim as i32,
                 dim as i32,
             )?;
+            self.device_qkv_bias(hip, resident, layer, buf, 1, q_out, kv_dim)?;
 
             if gated {
                 // q_full in buf.q → compact q into buf.proj, gate into buf.gate; then q → buf.q.
@@ -10210,15 +10357,7 @@ impl TinyModel {
                     )?;
                 }
             }
-            if cfg.uses_imrope() || cfg.rope_dims_for_layer(layer_idx) > 0 {
-                let n_rot = {
-                    let r = cfg.rope_dims_for_layer(layer_idx);
-                    if r > 0 {
-                        r
-                    } else {
-                        head_dim
-                    }
-                };
+            if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
                 hip.rope_imrope_qk_device(
                     buf.q,
                     buf.k,
@@ -11397,6 +11536,39 @@ mod lightning_moe_tests {
             })
             .collect();
         allpaca_gguf::write_gguf(path, &meta, &tensors).unwrap();
+    }
+
+    /// GGUF conversion permutes Llama's Q/K for adjacent-pair (NORM) RoPE;
+    /// Qwen2-family GGUFs keep NeoX pairing. Picking the wrong one garbled
+    /// both Llama-3.2 and Qwen2.5 on HIP.
+    #[test]
+    fn rope_style_follows_gguf_architecture() {
+        assert!(!super::gguf_rope_neox("llama"));
+        assert!(!super::gguf_rope_neox("deepseek2"));
+        assert!(super::gguf_rope_neox("qwen2"));
+        assert!(super::gguf_rope_neox("qwen3next"));
+        let mut cfg = ModelConfig::tiny();
+        let hd = cfg.head_dim();
+        // Llama GGUFs set rope.dimension_count == head_dim: still NORM.
+        cfg.rope_dims = hd;
+        assert_eq!(cfg.neox_rot_dims(0, hd), None);
+        cfg.rope_neox = true;
+        assert_eq!(cfg.neox_rot_dims(0, hd), Some(hd));
+        cfg.rope_neox = false;
+        cfg.rope_dims = 0;
+        assert_eq!(cfg.neox_rot_dims(0, hd), None);
+        // Partial rotation is NeoX whatever the architecture.
+        cfg.rope_dims = 2;
+        assert_eq!(cfg.neox_rot_dims(0, hd), Some(2));
+    }
+
+    #[test]
+    fn qkv_bias_adds_per_row() {
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        super::add_row_bias(&mut x, &[10.0, 20.0]);
+        assert_eq!(x, [11.0, 22.0, 13.0, 24.0]);
+        super::add_row_bias(&mut x, &[]);
+        assert_eq!(x, [11.0, 22.0, 13.0, 24.0]);
     }
 
     /// The GPU router picks the host's experts in the host's order, with its

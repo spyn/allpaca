@@ -219,6 +219,7 @@ fn model_config_from_hf(tier: Edge0Tier, hf: &HfConfig, moe: &MoESpec) -> ModelC
         head_dim_explicit: head_dim,
         rope_dims: ((head_dim as f32) * text.partial_rotary_factor) as usize,
         rope_sections,
+        rope_neox: false,
         router_kind: moe.router,
         shared_experts: moe.shared_experts,
         n_group: moe.n_group.unwrap_or(0),
@@ -497,6 +498,7 @@ fn load_qwen35_layer(
         attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
         shared_gate_inp: Vec::new(),
+        attn_bias: Default::default(),
         ffn_post_norm: Vec::new(),
     })
 }
@@ -551,6 +553,7 @@ fn load_ling8_layer(
             attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
             shared_gate_inp: Vec::new(),
+            attn_bias: Default::default(),
             ffn_post_norm: Vec::new(),
         });
     }
@@ -607,6 +610,7 @@ fn load_ling8_layer(
         attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
         shared_gate_inp: Vec::new(),
+        attn_bias: Default::default(),
         ffn_post_norm: Vec::new(),
     })
 }
