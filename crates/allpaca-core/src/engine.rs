@@ -3182,7 +3182,20 @@ impl Engine {
             .draft_ahead
             .as_ref()
             .is_some_and(|a| a.ctx == ctx_now && !a.tokens.is_empty());
-        let use_tree = speculate && inner.flags.tree_speculation && depth > 0 && !ahead_ready;
+        let forest_ok = inner
+            .target
+            .as_ref()
+            .is_some_and(|t| t.supports_forest_verify());
+        if inner.flags.tree_speculation && !forest_ok {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "speculative.tree needs host weights and no recurrent layers; using linear verify"
+                );
+            }
+        }
+        let use_tree =
+            speculate && inner.flags.tree_speculation && forest_ok && depth > 0 && !ahead_ready;
         self.metrics
             .target_evals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

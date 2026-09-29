@@ -4462,6 +4462,17 @@ impl TinyModel {
         !self.embed.is_empty()
     }
 
+    /// [`Self::forward_forest`] runs on host F32 weights with attention-only
+    /// branch state: a device-resident load has no host weights, and a
+    /// recurrent (SSM/GDN) layer would need its state forked per branch.
+    pub fn supports_forest_verify(&self) -> bool {
+        self.host_weights_ready()
+            && !self
+                .layers
+                .iter()
+                .any(|l| l.block == HybridLayerKind::Ssm || l.gdn.is_some() || l.ssm.is_some())
+    }
+
     /// True when a GDN layer has scalars/conv but no host F32 projections
     /// (Q8 / large GGUF — CUDA must `upload_gguf`).
     pub fn gdn_needs_device_projections(&self) -> bool {
