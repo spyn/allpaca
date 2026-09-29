@@ -606,6 +606,7 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
+        pub fn allpaca_hip_set_exact_rows(on: i32);
         pub fn allpaca_copy_f32_kernel(dst: *mut f32, src: *const f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_moe_route_softmax_topk(
             logits: *const f32,
@@ -2992,6 +2993,31 @@ impl MoeGroups {
             group_start: std::ptr::null(),
             row_pairs: std::ptr::null(),
             max_group: 1,
+        }
+    }
+}
+
+/// Row-exact GEMMs on this thread while the guard lives: every row of an
+/// M-row GEMM equals that row computed alone (wide M runs as row chunks on
+/// the small-M GEMV kernels instead of the tiled / BLAS GEMMs). For batched
+/// forwards over several sequences, whose rows must match their solo runs.
+pub struct ExactRows(());
+
+impl ExactRows {
+    pub fn enable() -> Self {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        unsafe {
+            ffi::allpaca_hip_set_exact_rows(1);
+        }
+        ExactRows(())
+    }
+}
+
+impl Drop for ExactRows {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        unsafe {
+            ffi::allpaca_hip_set_exact_rows(0);
         }
     }
 }

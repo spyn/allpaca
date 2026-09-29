@@ -1592,10 +1592,36 @@ static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, in
 }
 #endif
 
+/* Row-exact mode (batched decode over several Requests): each row of an
+ * M-row GEMM must equal that row computed alone. The small-M GEMV kernels
+ * compute rows independently; the tiled / BLAS GEMMs used above them sum in
+ * another order. With the mode on, wider M runs as row chunks on the GEMV
+ * kernels. Host-side and per calling thread, like the launches it steers. */
+static thread_local int g_exact_rows = 0;
+
+extern "C" void allpaca_hip_set_exact_rows(int32_t on) { g_exact_rows = on != 0; }
+
+template <typename F>
+static int exact_row_chunks(int32_t m, int32_t chunk, F &&launch) {
+    for (int32_t r0 = 0; r0 < m; r0 += chunk) {
+        const int rc = launch(r0, m - r0 < chunk ? m - r0 : chunk);
+        if (rc != ALLPACA_OK) {
+            return rc;
+        }
+    }
+    return ALLPACA_OK;
+}
+
 static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                           hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
+    }
+    if (g_exact_rows && m > 8) {
+        return exact_row_chunks(m, 8, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt(a + static_cast<size_t>(r0) * k, b,
+                                  c + static_cast<size_t>(r0) * n, rows, n, k, stream, tiled);
+        });
     }
     clear_last_error();
 #ifdef ALLPACA_HAS_HIPBLASLT
@@ -1652,6 +1678,12 @@ static int launch_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
+    if (g_exact_rows && m > 8) {
+        return exact_row_chunks(m, 8, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt_f16(a + static_cast<size_t>(r0) * k, b,
+                                      c + static_cast<size_t>(r0) * n, rows, n, k, stream, tiled);
+        });
+    }
     clear_last_error();
     /* Decode M<=8 stays on GEMV. Prefill M>8 reuses F16 B tiles across A rows. */
     if (m > 8) {
@@ -1684,6 +1716,12 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
                                int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
+    }
+    if (g_exact_rows && m > 8) {
+        return exact_row_chunks(m, 8, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt_bf16(a + static_cast<size_t>(r0) * k, b,
+                                       c + static_cast<size_t>(r0) * n, rows, n, k, stream, tiled);
+        });
     }
     clear_last_error();
     if (m > 8) {
@@ -1727,6 +1765,12 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
                                int32_t k, hipStream_t stream, int intdot) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
+    }
+    if (g_exact_rows && m > 16) {
+        return exact_row_chunks(m, 16, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt_q8_0(a + static_cast<size_t>(r0) * k, b,
+                                       c + static_cast<size_t>(r0) * n, rows, n, k, stream, intdot);
+        });
     }
     clear_last_error();
     /* M=1 decode stays on the 36-byte GEMV. Prefill M>8 reuses Q8 B tiles across A rows. */
@@ -6811,6 +6855,8 @@ extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const fl
 extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t, int32_t, int32_t, int32_t) {
     return 0;
 }
+
+extern "C" void allpaca_hip_set_exact_rows(int32_t) {}
 
 extern "C" int allpaca_moe_ffn_kquant(const float *, const int8_t *, const float *, int32_t, int32_t, int32_t, int32_t,
                                       const int32_t *, const int32_t *, const float *,

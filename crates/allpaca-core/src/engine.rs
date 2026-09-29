@@ -115,11 +115,12 @@ struct StagedDecode {
     span: Option<Box<SpanTail>>,
 }
 
-/// Rows one batched decode forward may carry. Up to 8 rows the GEMM kernels
-/// reproduce a single row bit for bit; above that they switch to tiled /
-/// hipBLASLt paths that round differently, so a batched Request's tokens
-/// could differ from its solo run.
-const BATCH_EXACT_ROWS: usize = 8;
+/// Rows one batched decode forward may carry. `forward_batch` runs its GEMMs
+/// row-exact (`allpaca_hip::ExactRows`: wide M as chunks on the small-M
+/// kernels), so any count reproduces solo rows; this bounds the per-tick
+/// workspace and keeps four Requests' n-gram spans (up to 8 rows each) in
+/// one forward.
+const BATCH_EXACT_ROWS: usize = 32;
 
 /// Whether `rows` more fit in the batched forward being staged (`None`: not
 /// staging at all).

@@ -7483,6 +7483,8 @@ impl TinyModel {
             ))));
         }
         let mut last = vec![0.0f32; vocab];
+        // Each sequence's rows must match its solo run bit for bit.
+        let _exact = allpaca_hip::ExactRows::enable();
         self.forward_tokens_device(
             tokens,
             segs,
