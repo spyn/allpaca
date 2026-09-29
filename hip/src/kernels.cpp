@@ -6633,25 +6633,28 @@ __global__ void moe_gate_up_kernel(const float *x, const int8_t *xq, const float
     }
 }
 
-/* Down for every group: SiLU(gate) * up per pair, quantized into LDS, times
- * expert[g] for all the group's rows. */
-template <int QD, int LPC, int MR>
-__global__ void moe_down_kernel(const float *g, const float *u, const int32_t *group_start,
-                                const int32_t *expert, const uint8_t *down,
-                                unsigned long long down_stride, float *y, int dim, int ff) {
+/* SiLU(gate) * up per pair, int8-quantized once into `hq` / `hd` for the
+ * down GEMV (each down block used to redo it for its pair's row). */
+__global__ void moe_silu_quant_kernel(const float *g, const float *u, int8_t *hq, float *hd,
+                                      int ff) {
     extern __shared__ unsigned char moe_lds[];
     float *tmp = reinterpret_cast<float *>(moe_lds);
-    int8_t *aq = reinterpret_cast<int8_t *>(moe_lds + static_cast<size_t>(ff) * 4);
-    float *ad = reinterpret_cast<float *>(moe_lds + static_cast<size_t>(ff) * 4 +
-                                          ((static_cast<size_t>(MR) * ff + 15) & ~size_t(15)));
+    const size_t p = blockIdx.x;
+    moe_silu_quantize_lds(g + p * ff, u + p * ff, ff, tmp, hq + p * ff, hd + p * (ff / 32));
+}
+
+/* Down for every group: the group's quantized hidden rows (adjacent, since a
+ * group's pairs are) times expert[g]. */
+template <int QD, int LPC, int MR>
+__global__ void moe_down_kernel(const int8_t *hq, const float *hd, const int32_t *group_start,
+                                const int32_t *expert, const uint8_t *down,
+                                unsigned long long down_stride, float *y, int dim, int ff) {
     const int gi = static_cast<int>(blockIdx.y);
     int p0, mr;
     moe_group(group_start, gi, p0, mr);
-    for (int r = 0; r < mr; ++r) {
-        const size_t p = static_cast<size_t>(p0 + r);
-        moe_silu_quantize_lds(g + p * ff, u + p * ff, ff, tmp, aq + r * ff, ad + r * (ff / 32));
-    }
-    kquant_i8_block<QD, MR, LPC>(aq, ad, down + static_cast<size_t>(expert[gi]) * down_stride,
+    kquant_i8_block<QD, MR, LPC>(hq + static_cast<size_t>(p0) * ff,
+                                 hd + static_cast<size_t>(p0) * (ff / 32),
+                                 down + static_cast<size_t>(expert[gi]) * down_stride,
                                  y + static_cast<size_t>(p0) * dim, mr, dim, ff,
                                  static_cast<int>(blockIdx.x), 0);
 }
@@ -6675,14 +6678,16 @@ __global__ void moe_combine_kernel(const float *y, const float *w, const int32_t
 }
 
 
+constexpr int MOE_LPC = 8; // lanes per column; 16 cut 1-row calls 10% but slowed grouped rows 40%
+
 template <int QG, int QU, int MR>
 static void moe_gate_up_launch(dim3 grid, size_t lds, hipStream_t st, const float *x,
                                const int8_t *xq, const float *xd, const int32_t *pair_row,
                                const int32_t *group_start, const int32_t *expert,
                                const uint8_t *gate, unsigned long long gs, const uint8_t *up,
                                unsigned long long us, float *g, float *u, int ff, int dim) {
-    hipLaunchKernelGGL((moe_gate_up_kernel<QG, QU, 8, MR>), grid, dim3(256), lds, st, x, xq, xd,
-                       pair_row, group_start, expert, gate, gs, up, us, g, u, ff, dim);
+    hipLaunchKernelGGL((moe_gate_up_kernel<QG, QU, MOE_LPC, MR>), grid, dim3(256), lds, st, x, xq,
+                       xd, pair_row, group_start, expert, gate, gs, up, us, g, u, ff, dim);
 }
 
 template <int MR>
@@ -6706,12 +6711,12 @@ static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, hipStream_t
 }
 
 template <int MR>
-static bool moe_down_types(int qd, dim3 grid, size_t lds, hipStream_t st, const float *g,
-                           const float *u, const int32_t *group_start, const int32_t *expert,
+static bool moe_down_types(int qd, dim3 grid, hipStream_t st, const int8_t *hq,
+                           const float *hd, const int32_t *group_start, const int32_t *expert,
                            const uint8_t *down, unsigned long long ds, float *y, int dim, int ff) {
 #define MOE_D(Q)                                                                                   \
     if (qd == Q) {                                                                                 \
-        hipLaunchKernelGGL((moe_down_kernel<Q, 8, MR>), grid, dim3(256), lds, st, g, u,           \
+        hipLaunchKernelGGL((moe_down_kernel<Q, MOE_LPC, MR>), grid, dim3(256), 0, st, hq, hd,     \
                            group_start, expert, down, ds, y, dim, ff);                            \
         return true;                                                                               \
     }
@@ -6727,7 +6732,8 @@ extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t rows, int32_t dim, int
                                                   int32_t pairs) {
     (void)rows;
     const size_t p = static_cast<size_t>(pairs);
-    return 2 * moe_align(p * ff * 4) + moe_align(p * dim * 4);
+    return 2 * moe_align(p * ff * 4) + moe_align(p * dim * 4) + moe_align(p * ff) +
+           moe_align(p * (ff / 32) * 4);
 }
 
 /* Expert-parallel MoE FFN over stacked K-quant experts (`qt` 4/5/6 = Q4_K/Q5_K/Q6_K):
@@ -6763,22 +6769,27 @@ extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const fl
     float *u = reinterpret_cast<float *>(base);
     base += moe_align(p * ff * 4);
     float *y = reinterpret_cast<float *>(base);
-    constexpr int COLS = 256 / 8;
+    base += moe_align(p * dim * 4);
+    int8_t *hq = reinterpret_cast<int8_t *>(base);
+    base += moe_align(p * ff);
+    float *hd = reinterpret_cast<float *>(base);
+    constexpr int COLS = 256 / MOE_LPC;
     const int mrc = max_group <= 1 ? 1 : (max_group <= 2 ? 2 : (max_group <= 4 ? 4 : 8));
     const size_t lds_up = ((static_cast<size_t>(mrc) * dim + 15) & ~size_t(15)) +
                           static_cast<size_t>(mrc) * (dim / 32) * 4;
     const dim3 grid_up(static_cast<unsigned>((ff + COLS - 1) / COLS), static_cast<unsigned>(groups), 2);
-    const size_t lds_down = static_cast<size_t>(ff) * 4 +
-                            ((static_cast<size_t>(mrc) * ff + 15) & ~size_t(15)) +
-                            static_cast<size_t>(mrc) * (ff / 32) * 4;
     const dim3 grid_down(static_cast<unsigned>((dim + COLS - 1) / COLS), static_cast<unsigned>(groups));
     bool ok = false;
 #define MOE_MR(M)                                                                                  \
-    ok = moe_gate_up_types<M>(gate_qt, up_qt, grid_up, lds_up, st, x, xq, xd, pair_row,          \
-                              group_start, expert, gate, gate_stride, up, up_stride, g, u, ff,    \
-                              dim) &&                                                              \
-         moe_down_types<M>(down_qt, grid_down, lds_down, st, g, u, group_start, expert, down,     \
-                           down_stride, y, dim, ff)
+    ok = moe_gate_up_types<M>(gate_qt, up_qt, grid_up, lds_up, st, x, xq, xd, pair_row,            \
+                              group_start, expert, gate, gate_stride, up, up_stride, g, u, ff,     \
+                              dim);                                                                \
+    if (ok) {                                                                                      \
+        hipLaunchKernelGGL(moe_silu_quant_kernel, dim3(static_cast<unsigned>(pairs)), dim3(256),   \
+                           static_cast<size_t>(ff) * 4, st, g, u, hq, hd, ff);                     \
+    }                                                                                              \
+    ok = ok && moe_down_types<M>(down_qt, grid_down, st, hq, hd, group_start, expert, down,        \
+                                 down_stride, y, dim, ff)
     switch (mrc) {
     case 1: MOE_MR(1); break;
     case 2: MOE_MR(2); break;
