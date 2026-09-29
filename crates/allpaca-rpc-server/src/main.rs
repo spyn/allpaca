@@ -61,8 +61,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let token = if token.is_empty() { None } else { Some(token) };
     loop {
         let backend = open_backend(&cli)?;
-        allpaca_rpc::serve_listener_with_token(&listener, backend, token.as_deref())?;
-        tracing::info!("rpc client disconnected; waiting for next");
+        // A coordinator that dies mid-session resets the socket. Its buffers
+        // go with the backend; keep serving the next client.
+        match allpaca_rpc::serve_listener_with_token(&listener, backend, token.as_deref()) {
+            Ok(()) => tracing::info!("rpc client disconnected; waiting for next"),
+            Err(e) => tracing::warn!(error = %e, "rpc client dropped; waiting for next"),
+        }
     }
 }
 
