@@ -137,6 +137,9 @@ pub struct Metrics {
     pub micro_batch_plans: AtomicU64,
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     pub micro_batch_dual_steps: AtomicU64,
+    /// Batched decode forwards (`engine.batch_decode`) and the rows they ran.
+    pub batched_decode_steps: AtomicU64,
+    pub batched_decode_rows: AtomicU64,
     /// MoE prefill: next-layer expert H2D queued while current layer computes.
     pub expert_prefill_overlaps: AtomicU64,
     /// Decode/micro-batch: expert miss fills merged into one contiguous DMA.
@@ -340,6 +343,8 @@ impl Metrics {
             ds_available: self.ds_available.load(Ordering::Relaxed) != 0,
             micro_batch_plans: self.micro_batch_plans.load(Ordering::Relaxed),
             micro_batch_dual_steps: self.micro_batch_dual_steps.load(Ordering::Relaxed),
+            batched_decode_steps: self.batched_decode_steps.load(Ordering::Relaxed),
+            batched_decode_rows: self.batched_decode_rows.load(Ordering::Relaxed),
             expert_prefill_overlaps: self.expert_prefill_overlaps.load(Ordering::Relaxed),
             expert_bulk_fills: self.expert_bulk_fills.load(Ordering::Relaxed),
             expert_bulk_bytes: self.expert_bulk_bytes.load(Ordering::Relaxed),

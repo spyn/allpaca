@@ -7104,3 +7104,110 @@ fn tiny_deepseek4_hip_matches_cpu() {
         );
     }
 }
+
+/// Decode `prompts` concurrently through `poll` (all admitted at once) and
+/// return each request's token ids in prompt order.
+#[cfg(feature = "hip")]
+fn poll_concurrently(engine: &Engine, prompts: &[&str], params: &GenerationParams) -> Vec<Vec<u32>> {
+    use allpaca_types::StepResult;
+    let handles: Vec<_> = prompts
+        .iter()
+        .map(|p| engine.begin_request(p, params.clone()).expect("begin_request"))
+        .collect();
+    let ids: Vec<u64> = handles.iter().map(|h| h.id()).collect();
+    let mut out = vec![Vec::new(); ids.len()];
+    let mut done = vec![false; ids.len()];
+    for _ in 0..10_000 {
+        let Some(ev) = engine.poll().expect("poll") else {
+            break;
+        };
+        let i = ids.iter().position(|&id| id == ev.request_id).expect("known request");
+        match ev.result {
+            StepResult::Token(tok) => {
+                out[i].push(tok.token_id);
+                done[i] |= tok.finish_reason.is_some();
+            }
+            StepResult::Finished(_) => done[i] = true,
+            StepResult::Prefill { .. } => {}
+        }
+        if done.iter().all(|&d| d) {
+            break;
+        }
+    }
+    assert!(done.iter().all(|&d| d), "every request must finish; got {out:?}");
+    out
+}
+
+/// Requests decoded side by side must produce exactly what each produces
+/// alone: per-request state (KV pages, logits, sampling) never leaks across.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_concurrent_requests_match_solo_greedy() {
+    let _guard = large_gguf_lock();
+    let path = local_models_dir()
+        .join("Qwen2.5-Coder-0.5B")
+        .join("qwen2.5-coder-0.5b-instruct-q8_0.gguf");
+    if !path.is_file() || allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_concurrent_requests_match_solo_greedy: no Qwen2.5-Coder-0.5B or HIP");
+        return;
+    }
+    for batch_decode in [true, false] {
+        let mut cfg = hip_7b_config(path.clone());
+        cfg.engine.max_active_requests = 3;
+        cfg.engine.batch_decode = batch_decode;
+        // Small pages: sequences span several, as long chats do.
+        cfg.kv.page_tokens = 16;
+        concurrent_matches_solo(cfg, batch_decode);
+    }
+}
+
+#[cfg(feature = "hip")]
+fn concurrent_matches_solo(cfg: Config, batch_decode: bool) {
+    let engine = Engine::new(cfg).expect("Qwen2.5-Coder-0.5B must load");
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_concurrent_requests_match_solo_greedy: no HIP device");
+        return;
+    }
+    // A shared preamble, as a chat template gives every request.
+    let prompts = [
+        "You are a helpful assistant. Answer briefly.
+User: def fibonacci(n):",
+        "You are a helpful assistant. Answer briefly.
+User: The three largest cities in France are",
+        "You are a helpful assistant. Answer briefly.
+User: SELECT name, email FROM users WHERE",
+    ];
+    let params = greedy(24);
+    let solo: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| poll_concurrently(&engine, &[p], &params).remove(0))
+        .collect();
+    let together = poll_concurrently(&engine, &prompts, &params);
+    for (i, p) in prompts.iter().enumerate() {
+        assert_eq!(together[i], solo[i], "request {i} ({p:?}) diverged when run concurrently (batch_decode={batch_decode})");
+    }
+    // One thread per request, as the HTTP server drives them.
+    let threaded: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                let (engine, params) = (engine.clone(), params.clone());
+                scope.spawn(move || engine.generate(p, params).expect("generate").token_ids)
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("thread")).collect()
+    });
+    for (i, p) in prompts.iter().enumerate() {
+        assert_eq!(threaded[i], solo[i], "request {i} ({p:?}) diverged on its own thread (batch_decode={batch_decode})");
+    }
+    let stats = engine.stats();
+    assert_eq!(
+        stats.batched_decode_steps > 0 && stats.batched_decode_rows > stats.batched_decode_steps,
+        batch_decode,
+        "batched forwards must run exactly when batch_decode is on; stats={stats:?}"
+    );
+    eprintln!(
+        "batched decode: {} forwards, {} rows",
+        stats.batched_decode_steps, stats.batched_decode_rows
+    );
+}

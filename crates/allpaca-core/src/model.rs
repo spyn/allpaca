@@ -28,6 +28,18 @@ use crate::weight_set::{
     align_up, ExpertId, ExpertLru, FfnRefs, LayerFfn, MissPlan, WeightWorkingSet, DIRECT_ALIGN,
 };
 
+/// One sequence's rows in a multi-sequence device forward: `n_rows`
+/// consecutive positions from `start_pos`, with the sequence's own KV pages
+/// and recurrent (GDN) state. Rows of all sequences share every GEMM and MoE
+/// call; RoPE, KV writes, attention and recurrences stay per sequence.
+pub struct SeqRows<'a> {
+    pub start_pos: usize,
+    pub n_rows: usize,
+    pub page_ids: &'a [Vec<u64>],
+    pub request_id: u64,
+    pub recurrent: Option<&'a mut RecurrentState>,
+}
+
 /// Optional decode-side hooks (layer stagger, elastic norm snapshot, NVMe→VRAM).
 pub struct DeviceDecodeSide<'a> {
     pub request_id: u64,
@@ -5237,14 +5249,12 @@ impl TinyModel {
         )?;
         metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
         record_elementwise(Some(metrics));
-        // `moe_norm` only feeds layer staggering, which needs an expert LRU
-        // with CPU runs (never true on the GPU-routed path).
-        let staggering = side
-            .as_ref()
-            .and_then(|s| s.layer_stagger)
-            .is_some_and(|ls| ls.active().is_some());
-        if !staggering && self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, 1)?
-        {
+        // GPU routing whenever this layer has it, stagger or not: the stagger
+        // only warms a partner's CPU experts, and switching this Request to
+        // host routing for it changed its tokens (the two routings round
+        // differently), so concurrent output drifted from solo output.
+        // `moe_norm` snapshots then come only from host-routed layers.
+        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, 1)? {
             record_elementwise(Some(metrics));
             return Ok(());
         }
@@ -7425,6 +7435,70 @@ impl TinyModel {
         Ok(())
     }
 
+    /// Whether [`Self::forward_batch`] can run several sequences in one pass
+    /// on `hip`: the multi-row device path, with every local layer on `hip`
+    /// or on the uploaded peer GPU.
+    pub fn supports_forward_batch(&self, hip: &HipWorkspace) -> bool {
+        if self.dsv4.is_some() || !self.supports_hip_batched_prefill() {
+            return false;
+        }
+        let Some(rpc) = self.rpc.as_ref() else {
+            return true;
+        };
+        if rpc.placed_remote() {
+            return false;
+        }
+        let peer = rpc.local_peer().map(|(dev, _, _)| dev);
+        (0..self.layers.len()).all(|layer| {
+            let want = rpc.local_device(layer);
+            want < 0 || want == hip.device || Some(want) == peer
+        })
+    }
+
+    /// One HIP forward over the rows of several sequences (continuous
+    /// batching): `tokens` holds each sequence's rows in `segs` order, and
+    /// `row_logits` receives `tokens.len() * vocab` logits. Weights, and the
+    /// remote expert calls of expert-parallel MoE layers, are paid once for
+    /// all rows instead of once per sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch(
+        &self,
+        tokens: &[u32],
+        segs: &mut [SeqRows<'_>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        row_logits: &mut [f32],
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+    ) -> Result<(), AllpacaError> {
+        let vocab = self.config.vocab_size;
+        if !self.supports_forward_batch(hip) || row_logits.len() < tokens.len() * vocab {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "batched forward unsupported for this model or buffer".into(),
+            )));
+        }
+        if let Some(tok) = tokens.iter().find(|&&t| t as usize >= vocab) {
+            return Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
+                "token {tok} out of vocab"
+            ))));
+        }
+        let mut last = vec![0.0f32; vocab];
+        self.forward_tokens_device(
+            tokens,
+            segs,
+            kv,
+            metrics,
+            &mut last,
+            hip,
+            resident,
+            false,
+            Some(&mut *row_logits),
+            None,
+            None,
+        )?;
+        hip.wait_logits_d2h(&mut row_logits[..tokens.len() * vocab])
+    }
+
     /// Prefill a token chunk. HIP runs one forward with M=N (hipBLASLt when N>8 on F32).
     /// Decode stays on [`forward_token`]. CPU loops per token. Last-chunk logits are
     /// written for the last position only when `write_logits` is set. Packed linear
@@ -7540,10 +7614,16 @@ impl TinyModel {
         }
         if self.supports_hip_batched_prefill() {
             if let (Some(hip), Some(resident)) = (hip, resident) {
+                let mut segs = [SeqRows {
+                    start_pos,
+                    n_rows: tokens.len(),
+                    page_ids,
+                    request_id,
+                    recurrent: recurrent.as_deref_mut(),
+                }];
                 match self.forward_tokens_device(
                 tokens,
-                start_pos,
-                page_ids,
+                &mut segs,
                 kv,
                 metrics,
                 logits,
@@ -7551,9 +7631,7 @@ impl TinyModel {
                 resident,
                 write_logits,
                 row_logits.as_deref_mut(),
-                recurrent.as_deref_mut(),
                 out_row_hiddens.as_deref_mut(),
-                request_id,
                 vision,
             ) {
                 Ok(()) => return Ok(()),
@@ -8178,8 +8256,7 @@ impl TinyModel {
         buf: DeviceDecode,
         n_tok: usize,
         metrics: &Metrics,
-        request_id: u64,
-        mut recurrent: Option<&mut RecurrentState>,
+        segs: &mut [SeqRows<'_>],
     ) -> Result<bool, AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -8228,12 +8305,6 @@ impl TinyModel {
             dims.n_v_heads as i32,
             dim as i32,
         )?;
-        let state = recurrent.as_deref_mut().ok_or_else(|| {
-            AllpacaError::Fatal(FatalError::ModelLoad(
-                "Gated DeltaNet layer requires recurrent state".into(),
-            ))
-        })?;
-        state.ensure_gdn(layer_idx, dims);
         let (conv_w, dt, a, norm) = hip.ensure_gdn_weights(
             layer_idx,
             &gdn.conv1d,
@@ -8241,95 +8312,107 @@ impl TinyModel {
             &gdn.a,
             &gdn.norm,
         )?;
-        for t in 0..n_tok {
-            let q = buf.q_row(t, dims.qkv_dim);
-            let z = buf.attn_row(t, dims.value_dim);
-            let alpha = buf.gate_row(t, dims.n_v_heads);
-            let beta = buf.up_row(t, dims.n_v_heads);
-            if let Err(e) = hip.gdn_decode_step_resident(
-                request_id,
-                layer_idx,
-                &mut state.gdn_state[layer_idx],
-                &mut state.gdn_conv[layer_idx],
-                q,
-                z,
-                alpha,
-                beta,
-                conv_w,
-                dt,
-                a,
-                norm,
-                z,
-                dims.n_v_heads as i32,
-                dims.n_k_heads as i32,
-                dims.head_v as i32,
-                dims.head_k as i32,
-                dims.conv_kernel as i32,
-                cfg.eps,
-                dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
-            ) {
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(layer_idx, error = %e, "GDN batched step fell back to host");
-                }
-                let mut qkv = vec![0.0f32; dims.qkv_dim];
-                let mut z_h = vec![0.0f32; dims.value_dim];
-                let mut alpha_h = vec![0.0f32; dims.n_v_heads];
-                let mut beta_h = vec![0.0f32; dims.n_v_heads];
-                hip.copy_d2h_f32(q, &mut qkv)?;
-                hip.copy_d2h_f32(z, &mut z_h)?;
-                hip.copy_d2h_f32(alpha, &mut alpha_h)?;
-                hip.copy_d2h_f32(beta, &mut beta_h)?;
-                let mut conv_out = vec![0.0f32; dims.qkv_dim];
-                hip.gdn_conv1d_step_host(
-                    &qkv,
-                    &gdn.conv1d,
-                    &mut state.gdn_conv[layer_idx],
-                    &mut conv_out,
-                    dims.conv_kernel as i32,
-                )?;
-                let q_raw = &conv_out[..dims.key_dim];
-                let k_raw = &conv_out[dims.key_dim..dims.key_dim * 2];
-                let v_raw = &conv_out[dims.key_dim * 2..];
-                let mut q_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
-                let mut k_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
-                hip.expand_k_heads_host(
-                    q_raw,
-                    &mut q_exp,
-                    dims.n_k_heads as i32,
-                    dims.n_v_heads as i32,
-                    dims.head_k as i32,
-                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
-                )?;
-                hip.expand_k_heads_host(
-                    k_raw,
-                    &mut k_exp,
-                    dims.n_k_heads as i32,
-                    dims.n_v_heads as i32,
-                    dims.head_k as i32,
-                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
-                )?;
-                let mut decay = vec![0.0f32; dims.n_v_heads];
-                hip.gdn_decay_beta_host(&alpha_h, &gdn.dt_bias, &gdn.a, &mut decay, &mut beta_h)?;
-                let mut y = vec![0.0f32; dims.value_dim];
-                hip.gated_delta_step_resident(
+        let mut row0 = 0;
+        for seg in segs.iter_mut() {
+            let request_id = seg.request_id;
+            let state = seg.recurrent.as_deref_mut().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(
+                    "Gated DeltaNet layer requires recurrent state".into(),
+                ))
+            })?;
+            state.ensure_gdn(layer_idx, dims);
+            let rows = row0..row0 + seg.n_rows;
+            row0 += seg.n_rows;
+            for t in rows {
+                let q = buf.q_row(t, dims.qkv_dim);
+                let z = buf.attn_row(t, dims.value_dim);
+                let alpha = buf.gate_row(t, dims.n_v_heads);
+                let beta = buf.up_row(t, dims.n_v_heads);
+                if let Err(e) = hip.gdn_decode_step_resident(
                     request_id,
                     layer_idx,
                     &mut state.gdn_state[layer_idx],
-                    &mut q_exp,
-                    &mut k_exp,
-                    v_raw,
-                    &decay,
-                    &beta_h,
-                    &mut y,
+                    &mut state.gdn_conv[layer_idx],
+                    q,
+                    z,
+                    alpha,
+                    beta,
+                    conv_w,
+                    dt,
+                    a,
+                    norm,
+                    z,
                     dims.n_v_heads as i32,
+                    dims.n_k_heads as i32,
                     dims.head_v as i32,
                     dims.head_k as i32,
+                    dims.conv_kernel as i32,
                     cfg.eps,
-                )?;
-                let mut gated = vec![0.0f32; dims.value_dim];
-                rmsnorm_silu_gate(&y, &z_h, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
-                hip.copy_h2d_f32(z, &gated)?;
+                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
+                ) {
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(layer_idx, error = %e, "GDN batched step fell back to host");
+                    }
+                    let mut qkv = vec![0.0f32; dims.qkv_dim];
+                    let mut z_h = vec![0.0f32; dims.value_dim];
+                    let mut alpha_h = vec![0.0f32; dims.n_v_heads];
+                    let mut beta_h = vec![0.0f32; dims.n_v_heads];
+                    hip.copy_d2h_f32(q, &mut qkv)?;
+                    hip.copy_d2h_f32(z, &mut z_h)?;
+                    hip.copy_d2h_f32(alpha, &mut alpha_h)?;
+                    hip.copy_d2h_f32(beta, &mut beta_h)?;
+                    let mut conv_out = vec![0.0f32; dims.qkv_dim];
+                    hip.gdn_conv1d_step_host(
+                        &qkv,
+                        &gdn.conv1d,
+                        &mut state.gdn_conv[layer_idx],
+                        &mut conv_out,
+                        dims.conv_kernel as i32,
+                    )?;
+                    let q_raw = &conv_out[..dims.key_dim];
+                    let k_raw = &conv_out[dims.key_dim..dims.key_dim * 2];
+                    let v_raw = &conv_out[dims.key_dim * 2..];
+                    let mut q_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                    let mut k_exp = vec![0.0f32; dims.n_v_heads * dims.head_k];
+                    hip.expand_k_heads_host(
+                        q_raw,
+                        &mut q_exp,
+                        dims.n_k_heads as i32,
+                        dims.n_v_heads as i32,
+                        dims.head_k as i32,
+                        dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
+                    )?;
+                    hip.expand_k_heads_host(
+                        k_raw,
+                        &mut k_exp,
+                        dims.n_k_heads as i32,
+                        dims.n_v_heads as i32,
+                        dims.head_k as i32,
+                        dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
+                    )?;
+                    let mut decay = vec![0.0f32; dims.n_v_heads];
+                    hip.gdn_decay_beta_host(&alpha_h, &gdn.dt_bias, &gdn.a, &mut decay, &mut beta_h)?;
+                    let mut y = vec![0.0f32; dims.value_dim];
+                    hip.gated_delta_step_resident(
+                        request_id,
+                        layer_idx,
+                        &mut state.gdn_state[layer_idx],
+                        &mut q_exp,
+                        &mut k_exp,
+                        v_raw,
+                        &decay,
+                        &beta_h,
+                        &mut y,
+                        dims.n_v_heads as i32,
+                        dims.head_v as i32,
+                        dims.head_k as i32,
+                        cfg.eps,
+                    )?;
+                    let mut gated = vec![0.0f32; dims.value_dim];
+                    rmsnorm_silu_gate(&y, &z_h, &gdn.norm, &mut gated, dims.head_v, cfg.eps);
+                    hip.copy_h2d_f32(z, &gated)?;
+                }
             }
         }
         resident.gemm_nt(
@@ -8387,6 +8470,7 @@ impl TinyModel {
             )?;
             drop(ffn);
         } else if Self::layer_has_device_moe(layer, resident, layer_idx) {
+            let request_id = segs.first().map_or(0, |s| s.request_id);
             self.device_moe_rows(layer_idx, hip, resident, buf, n_tok, metrics, request_id)?;
         }
         hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
@@ -9057,8 +9141,7 @@ impl TinyModel {
     fn forward_tokens_device(
         &self,
         tokens: &[u32],
-        start_pos: usize,
-        page_ids: &[Vec<u64>],
+        segs: &mut [SeqRows<'_>],
         kv: &mut KvTierManager,
         metrics: &Metrics,
         logits: &mut [f32],
@@ -9066,12 +9149,33 @@ impl TinyModel {
         resident: &ResidentModel,
         write_logits: bool,
         row_logits: Option<&mut [f32]>,
-        mut recurrent: Option<&mut RecurrentState>,
         mut out_row_hiddens: Option<&mut Vec<f32>>,
-        request_id: u64,
         vision: Option<&VisionSeq>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
+        if segs.is_empty()
+            || segs.iter().map(|s| s.n_rows).sum::<usize>() != tokens.len()
+            || (vision.is_some() && segs.len() > 1)
+        {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "sequence rows do not cover the batch".into(),
+            )));
+        }
+        // Row r's absolute position, and each sequence's first row.
+        let row_pos: Vec<usize> = segs
+            .iter()
+            .flat_map(|s| s.start_pos..s.start_pos + s.n_rows)
+            .collect();
+        let seg_row0: Vec<usize> = segs
+            .iter()
+            .scan(0, |r, s| {
+                let r0 = *r;
+                *r += s.n_rows;
+                Some(r0)
+            })
+            .collect();
+        let start_pos = segs[0].start_pos;
+        let request_id = segs[0].request_id;
         let dim = cfg.dim;
         let head_dim = cfg.head_dim();
         let kv_dim = cfg.n_kv_heads * head_dim;
@@ -9092,18 +9196,25 @@ impl TinyModel {
                 )));
             }
         }
-        let page_tokens = page_ids
+        let page_tokens = segs[0]
+            .page_ids
             .first()
             .and_then(|p| p.first())
             .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
             .unwrap_or(128);
-        let seq_end = start_pos + n_tok;
-        let max_kv = page_ids
+        let max_kv = segs
             .iter()
-            .map(|layer| layer.len().saturating_mul(page_tokens))
+            .map(|s| {
+                let seq_end = s.start_pos + s.n_rows;
+                s.page_ids
+                    .iter()
+                    .map(|layer| layer.len().saturating_mul(page_tokens))
+                    .max()
+                    .unwrap_or(seq_end)
+                    .max(seq_end)
+            })
             .max()
-            .unwrap_or(seq_end)
-            .max(seq_end);
+            .unwrap_or(0);
         hip.bind()?;
         let logits_rows = if row_logits.is_some() { n_tok } else { 1 };
         let buf = hip.ensure_decode_batch(
@@ -9146,7 +9257,7 @@ impl TinyModel {
                             hip.copy_d2h_f32(buf.x, &mut host_x)?;
                             for t in 0..n_tok {
                                 let row = &mut host_x[t * dim..(t + 1) * dim];
-                                rpc.run_layer(layer_idx, start_pos + t, row)?;
+                                rpc.run_layer(layer_idx, row_pos[t], row)?;
                             }
                             hip.copy_h2d_f32(buf.x, &host_x)?;
                         }
@@ -9232,31 +9343,32 @@ impl TinyModel {
                         buf,
                         n_tok,
                         metrics,
-                        request_id,
-                        recurrent.as_deref_mut(),
+                        segs,
                     )? {
                         normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
                         continue;
                     }
-                    for t in 0..n_tok {
-                        let row = Self::decode_row_view(buf, t, dim);
-                        let mut side = DeviceDecodeSide::new(request_id);
-                        let handled = self.device_hybrid_no_attn_layer(
-                            layer_idx,
-                            host_layer,
-                            hip,
-                            resident,
-                            row,
-                            metrics,
-                            true,
-                            None,
-                            Some(&mut side),
-                            recurrent.as_deref_mut(),
-                        )?;
-                        if !handled {
-                            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                                "hybrid prefill layer {layer_idx} was not handled"
-                            ))));
+                    for (si, seg) in segs.iter_mut().enumerate() {
+                        for t in seg_row0[si]..seg_row0[si] + seg.n_rows {
+                            let row = Self::decode_row_view(buf, t, dim);
+                            let mut side = DeviceDecodeSide::new(seg.request_id);
+                            let handled = self.device_hybrid_no_attn_layer(
+                                layer_idx,
+                                host_layer,
+                                hip,
+                                resident,
+                                row,
+                                metrics,
+                                true,
+                                None,
+                                Some(&mut side),
+                                seg.recurrent.as_deref_mut(),
+                            )?;
+                            if !handled {
+                                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                                    "hybrid prefill layer {layer_idx} was not handled"
+                                ))));
+                            }
                         }
                     }
                     normed_ready = self.fuse_next_attn_norm(layer_idx, hip.device);
@@ -9366,80 +9478,86 @@ impl TinyModel {
                             al.head_dim as i32,
                             n_rot as i32,
                             mrope
-                                .map_or([start_pos + t; 3], |m| m.rope_pos(start_pos + t))
+                                .map_or([row_pos[t]; 3], |m| m.rope_pos(row_pos[t]))
                                 .map(|p| p as i32),
                             theta,
                             cfg.rope_sections,
                         )?;
                     }
                 } else {
-                    hip.rope_qk_device_rows(
-                        buf.q,
-                        buf.k,
-                        n_tok as i32,
-                        al.n_heads as i32,
-                        al.n_kv_heads as i32,
-                        al.head_dim as i32,
-                        start_pos as i32,
-                        theta,
-                    )?;
+                    for (si, seg) in segs.iter().enumerate() {
+                        hip.rope_qk_device_rows(
+                            buf.q_row(seg_row0[si], q_stride),
+                            buf.k_row(seg_row0[si], al.kv_dim),
+                            seg.n_rows as i32,
+                            al.n_heads as i32,
+                            al.n_kv_heads as i32,
+                            al.head_dim as i32,
+                            seg.start_pos as i32,
+                            theta,
+                        )?;
+                    }
                 }
                 record_elementwise(Some(metrics));
 
-                kv.write_slots_from_device(
-                    &page_ids[layer_idx],
-                    start_pos,
-                    n_tok,
-                    page_tokens,
-                    al.n_kv_heads,
-                    al.head_dim,
-                    buf.k,
-                    buf.v,
-                    None,
-                )?;
+                for (si, seg) in segs.iter().enumerate() {
+                    let r0 = seg_row0[si];
+                    let (start_pos, n_tok, m) = (seg.start_pos, seg.n_rows, seg.n_rows as i32);
+                    kv.write_slots_from_device(
+                        &seg.page_ids[layer_idx],
+                        start_pos,
+                        n_tok,
+                        page_tokens,
+                        al.n_kv_heads,
+                        al.head_dim,
+                        buf.k_row(r0, al.kv_dim),
+                        buf.v_row(r0, al.kv_dim),
+                        None,
+                    )?;
 
-                let (packed_k, packed_v, n_kv) = kv.kv_device_views(
-                    &page_ids[layer_idx],
-                    al.n_kv_heads,
-                    al.head_dim,
-                    buf.packed_k,
-                    buf.packed_v,
-                    buf.max_kv,
-                )?;
-                if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
-                    let mut mask = vec![0u8; n_tok.saturating_mul(n_kv)];
-                    for t in 0..n_tok {
-                        let abs = start_pos + t;
-                        let lo = abs.saturating_add(1).saturating_sub(cfg.sliding_window);
-                        for s in lo..=abs.min(n_kv.saturating_sub(1)) {
-                            mask[t * n_kv + s] = 1;
+                    let (packed_k, packed_v, n_kv) = kv.kv_device_views(
+                        &seg.page_ids[layer_idx],
+                        al.n_kv_heads,
+                        al.head_dim,
+                        buf.packed_k,
+                        buf.packed_v,
+                        buf.max_kv,
+                    )?;
+                    if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
+                        let mut mask = vec![0u8; n_tok.saturating_mul(n_kv)];
+                        for t in 0..n_tok {
+                            let abs = start_pos + t;
+                            let lo = abs.saturating_add(1).saturating_sub(cfg.sliding_window);
+                            for s in lo..=abs.min(n_kv.saturating_sub(1)) {
+                                mask[t * n_kv + s] = 1;
+                            }
                         }
+                        hip.attention_device_masked_upload(
+                            buf.q_row(r0, q_stride),
+                            packed_k,
+                            packed_v,
+                            buf.attn_row(r0, al.attn_dim),
+                            m,
+                            n_kv as i32,
+                            al.n_heads as i32,
+                            al.n_kv_heads as i32,
+                            al.head_dim as i32,
+                            &mask,
+                        )?;
+                    } else {
+                        hip.attention_device(
+                            buf.q_row(r0, q_stride),
+                            packed_k,
+                            packed_v,
+                            buf.attn_row(r0, al.attn_dim),
+                            m,
+                            n_kv as i32,
+                            al.n_heads as i32,
+                            al.n_kv_heads as i32,
+                            al.head_dim as i32,
+                            true,
+                        )?;
                     }
-                    hip.attention_device_masked_upload(
-                        buf.q,
-                        packed_k,
-                        packed_v,
-                        buf.attn,
-                        m,
-                        n_kv as i32,
-                        al.n_heads as i32,
-                        al.n_kv_heads as i32,
-                        al.head_dim as i32,
-                        &mask,
-                    )?;
-                } else {
-                    hip.attention_device(
-                        buf.q,
-                        packed_k,
-                        packed_v,
-                        buf.attn,
-                        m,
-                        n_kv as i32,
-                        al.n_heads as i32,
-                        al.n_kv_heads as i32,
-                        al.head_dim as i32,
-                        true,
-                    )?;
                 }
                 if al.gated {
                     hip.sigmoid_mul_device(buf.attn, buf.gate, (n_tok * al.attn_dim) as i32)?;

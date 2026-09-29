@@ -36,6 +36,7 @@ cpu_only = false
 # pipeline_mode = "asymmetric"  # asymmetric | symmetric | mobile_tiered
 gpu_backend = "auto"            # auto | hip | cpu
 max_active_requests = 1
+# batch_decode = true          # >1 active: one batched HIP forward per decode tick
 poll_schedule = "fair"          # fair | decode_priority | prefill_budget
 max_consecutive_prefill_picks = 0
 # determinism_seed = 1
