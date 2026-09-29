@@ -496,6 +496,7 @@ fn load_qwen35_layer(
         attn_out_gate: Vec::new(),
         attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
+        shared_gate_inp: Vec::new(),
         ffn_post_norm: Vec::new(),
     })
 }
@@ -549,6 +550,7 @@ fn load_ling8_layer(
             attn_out_gate: Vec::new(),
             attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
+            shared_gate_inp: Vec::new(),
             ffn_post_norm: Vec::new(),
         });
     }
@@ -604,6 +606,7 @@ fn load_ling8_layer(
         attn_out_gate: Vec::new(),
         attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
+        shared_gate_inp: Vec::new(),
         ffn_post_norm: Vec::new(),
     })
 }

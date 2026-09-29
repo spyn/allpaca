@@ -178,6 +178,27 @@ int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, 
                          int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
+/* Softmax top-k MoE routing on the GPU (pair table + shared-expert gate). */
+int allpaca_moe_route_softmax_topk(const float *logits, int32_t rows, int32_t n_exp, int32_t k,
+                                   const float *x, const float *shexp_gate, int32_t dim,
+                                   float *w_out, int32_t *row_out, int32_t *exp_out,
+                                   int32_t *row_start, float *shexp_scale, allpaca_stream_t stream);
+/* x[r][:] *= scale[r]. */
+int allpaca_scale_rows(float *x, const float *scale, int32_t rows, int32_t dim,
+                       allpaca_stream_t stream);
+/* Element-wise copy by kernel; either side may be pinned host memory. */
+int allpaca_copy_f32_kernel(float *dst, const float *src, int32_t n, allpaca_stream_t stream);
+/* Expert-parallel MoE FFN over stacked K-quant experts; see kernels.cpp. */
+uint64_t allpaca_moe_ffn_scratch_bytes(int32_t rows, int32_t dim, int32_t ff, int32_t pairs);
+int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const float *xd, int32_t rows, int32_t dim, int32_t ff, int32_t pairs,
+                           const int32_t *pair_row, const int32_t *pair_expert,
+                           const float *pair_w, const int32_t *row_start, int32_t groups,
+                           const int32_t *group_start, const int32_t *row_pairs, int32_t max_group,
+                           const uint8_t *gate,
+                           int32_t gate_qt, uint64_t gate_stride, const uint8_t *up,
+                           int32_t up_qt, uint64_t up_stride, const uint8_t *down,
+                           int32_t down_qt, uint64_t down_stride, void *scratch, float *out,
+                           allpaca_stream_t stream);
 int allpaca_gemm_nt_q5_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
 int allpaca_gemm_nt_q5_k_cols(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -312,7 +333,7 @@ int allpaca_gdn_conv1d_step(const float *x, const float *kernel, float *conv_sta
                             int32_t qkv_dim, int32_t conv_kernel, allpaca_stream_t stream);
 
 /* Tile K-heads to V-heads: dst[vh] = src[vh % n_k] (ggml repeat). */
-int allpaca_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v, int32_t head_k,
+int allpaca_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v, int32_t head_k, int32_t interleave,
                            allpaca_stream_t stream);
 
 /* decay = exp(softplus(alpha + dt_bias) * a); beta = sigmoid(beta) in-place. */

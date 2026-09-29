@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use allpaca_gguf::{GgufFile, HybridLayerKind};
-use allpaca_rpc::{BufId, KernelOp, LaunchItem, LaunchList, RpcBackendKind, RpcSession};
+use allpaca_rpc::{
+    BufId, KernelOp, LaunchItem, LaunchList, MoeFfnRequest, RpcBackendKind, RpcSession,
+};
 use allpaca_types::{AllpacaError, DeviceKind, FatalError, RPC_DEVICE_ID_BASE};
 
 use crate::compute::ComputeDev;
@@ -17,6 +19,8 @@ pub struct RpcRuntime {
     sessions: Mutex<Vec<RpcSession>>,
     plan: Mutex<LayerPlan>,
     remote: Mutex<Vec<Option<RemoteLayer>>>,
+    /// Expert-parallel MoE: layers whose routed experts live on a worker.
+    experts: Mutex<Vec<Option<RemoteExperts>>>,
     /// HIP device for each local layer. `-1` means the layer was placed on RPC.
     layer_device: Mutex<Vec<i32>>,
     /// Second local GPU: device id, workspace, and the layers that live there.
@@ -34,6 +38,16 @@ impl std::fmt::Debug for RpcRuntime {
             .field("roundtrips", &self.roundtrips.load(Ordering::Relaxed))
             .finish()
     }
+}
+
+/// One layer's routed experts on a worker GPU (`MoeFfn`).
+#[derive(Clone, Copy)]
+struct RemoteExperts {
+    session: usize,
+    req: MoeFfnRequest,
+    /// Send rows as int8 blocks: the worker's fused K-quant kernels quantize
+    /// to exactly that, so it is lossless and a quarter of the bytes.
+    q8: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +188,7 @@ impl RpcRuntime {
             sessions: Mutex::new(sessions),
             plan: Mutex::new(LayerPlan::all_local(0)),
             remote: Mutex::new(Vec::new()),
+            experts: Mutex::new(Vec::new()),
             layer_device: Mutex::new(Vec::new()),
             local_peer: Mutex::new(None),
             roundtrips: AtomicU64::new(0),
@@ -326,6 +341,18 @@ impl RpcRuntime {
             }
             groups
         };
+        if let Some(file) = gguf {
+            if !groups.is_empty() && tensor_split.is_none() && has_stacked_experts(file) {
+                return self.prepare_expert_parallel(
+                    model,
+                    file,
+                    &local_ids,
+                    &owners,
+                    kv_vram_bytes,
+                    draft_bytes,
+                );
+            }
+        }
         let expanded = match tensor_split {
             Some(split) => Some(expand_rpc_split(split, &local_mems, &groups)?),
             None => None,
@@ -440,6 +467,234 @@ impl RpcRuntime {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc layer device lock".into()))
         })? = layer_device;
         Ok(())
+    }
+
+    /// Expert-parallel MoE: every layer body stays on the local GPUs, which
+    /// then fill with routed experts to ~92% of VRAM; the remaining layers'
+    /// experts go to worker GPUs by free memory and run there as `MoeFfn`.
+    fn prepare_expert_parallel(
+        &self,
+        model: &TinyModel,
+        file: &GgufFile,
+        local_ids: &[i32],
+        owners: &[(usize, u32)],
+        kv_vram_bytes: u64,
+        draft_bytes: u64,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &model.config;
+        let n = model.layers.len();
+        let (mut body, experts, globals) = crate::model::gguf_device_bytes_split(file, cfg);
+        let is_attn: Vec<bool> = model
+            .layers
+            .iter()
+            .map(|l| l.block == HybridLayerKind::Attention)
+            .collect();
+        let kv_share = kv_vram_bytes / is_attn.iter().filter(|a| **a).count().max(1) as u64;
+        for (b, attn) in body.iter_mut().zip(&is_attn) {
+            if *attn {
+                *b += kv_share;
+            }
+        }
+        let mut budgets = Vec::with_capacity(local_ids.len());
+        for (slot, dev) in local_ids.iter().copied().enumerate() {
+            let (hip_free, total) = allpaca_hip::device_memory_info(dev).unwrap_or((0, 0));
+            let free = allpaca_hip::device_local_headroom(dev).map_or(hip_free, |h| h.min(hip_free));
+            // Keep ~8% of the card free: workspaces, hipBLASLt, desktop churn.
+            let reserve = local_reserve_bytes(total).max(total / 100 * 8);
+            let mut budget = free.saturating_sub(reserve);
+            if slot == 0 {
+                budget = budget.saturating_sub(globals);
+            } else if slot == 1 {
+                budget = budget.saturating_sub(draft_bytes);
+            }
+            tracing::info!(
+                hip = dev,
+                free_mib = free >> 20,
+                total_mib = total >> 20,
+                budget_mib = budget >> 20,
+                "expert-parallel: local GPU budget"
+            );
+            budgets.push(budget);
+        }
+        let plan = crate::layer_split::plan_expert_parallel(&body, &experts, &budgets);
+        let mut layer_device = vec![local_ids[0]; n];
+        for (l, dev) in layer_device.iter_mut().enumerate() {
+            *dev = local_ids[plan.layers.owner(l).min(local_ids.len() - 1)];
+        }
+        // Worker GPU free bytes, filled in order: consecutive remote layers
+        // share a GPU. An MI50 left idle ~2 ms between calls drops its clocks
+        // and runs the next MoeFfn ~2x slower; alternating GPUs per layer
+        // idled each one that long every token.
+        let mut worker_free: Vec<u64> = {
+            let sessions = self.sessions.lock().map_err(|_| {
+                AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
+            })?;
+            owners
+                .iter()
+                .map(|&(s, d)| {
+                    let mems = sessions[s].hello().device_memories();
+                    let mem = mems.get(d as usize).copied().unwrap_or(0);
+                    // Leave the worker ~5% for MoeFfn scratch.
+                    mem.saturating_sub(mem / 20)
+                })
+                .collect()
+        };
+        let mut remote_experts = vec![None; n];
+        let mut remote_bytes = 0u64;
+        for l in 0..n {
+            if plan.experts_local[l] || experts[l] == 0 {
+                continue;
+            }
+            let pick = (0..owners.len())
+                .find(|&o| worker_free[o] >= experts[l])
+                .ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                        "expert-parallel: layer {l} experts ({} MiB) fit no local or RPC GPU",
+                        experts[l] >> 20
+                    )))
+                })?;
+            worker_free[pick] -= experts[l];
+            let (session, device) = owners[pick];
+            remote_experts[l] = Some(self.upload_experts(file, cfg, l, session, device)?);
+            remote_bytes += experts[l];
+            tracing::info!(
+                layer = l,
+                session,
+                device,
+                mib = experts[l] >> 20,
+                "expert-parallel: layer experts uploaded to rpc"
+            );
+        }
+        for (slot, id) in local_ids.iter().copied().enumerate() {
+            let on = |l: &usize| layer_device[*l] == id;
+            let body_mib: u64 = (0..n).filter(on).map(|l| body[l]).sum::<u64>() >> 20;
+            let expert_mib: u64 = (0..n)
+                .filter(|l| on(l) && plan.experts_local[*l])
+                .map(|l| experts[l])
+                .sum::<u64>()
+                >> 20;
+            tracing::info!(
+                slot,
+                hip = id,
+                layers = (0..n).filter(on).count(),
+                body_mib,
+                expert_mib,
+                budget_mib = budgets[slot] >> 20,
+                "expert-parallel: local GPU plan"
+            );
+        }
+        tracing::info!(
+            remote_expert_layers = remote_experts.iter().filter(|e| e.is_some()).count(),
+            remote_mib = remote_bytes >> 20,
+            "expert-parallel: routed experts on rpc"
+        );
+        let lock = |e| AllpacaError::Fatal(FatalError::InvalidConfig(e));
+        *self.plan.lock().map_err(|_| lock("rpc plan lock".into()))? = plan.layers;
+        *self.remote.lock().map_err(|_| lock("rpc remote lock".into()))? = vec![None; n];
+        *self.experts.lock().map_err(|_| lock("rpc experts lock".into()))? = remote_experts;
+        *self.layer_device.lock().map_err(|_| lock("rpc layer device lock".into()))? =
+            layer_device;
+        Ok(())
+    }
+
+    /// `PutTensor` a layer's stacked `ffn_{gate,up,down}_exps` onto one worker GPU.
+    fn upload_experts(
+        &self,
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        layer: usize,
+        session: usize,
+        device: u32,
+    ) -> Result<RemoteExperts, AllpacaError> {
+        let blk = cfg.gguf_blk(layer);
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
+        })?;
+        let s = &mut sessions[session];
+        let backend = s.hello().backend;
+        let mut put = |part: &str| -> Result<BufId, AllpacaError> {
+            let name = format!("blk.{blk}.ffn_{part}_exps.weight");
+            let info = file.tensor(&name).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
+            })?;
+            if !worker_accepts_type(backend, info.ggml_type_id) {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "rpc worker has no gemm for {name} (ggml type {})",
+                    info.ggml_type_id
+                ))));
+            }
+            let dims: Vec<u32> = info.dims.iter().map(|&d| d as u32).collect();
+            let bytes = file.tensor_bytes(&name)?;
+            self.h2d_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            s.put_tensor(info.ggml_type_id, &dims, bytes, Some(device))
+                .map_err(map_rpc)
+        };
+        let (gate, up, down) = (put("gate")?, put("up")?, put("down")?);
+        let kquant = ["gate", "up", "down"].iter().all(|part| {
+            file.tensor(&format!("blk.{blk}.ffn_{part}_exps.weight"))
+                .is_some_and(|t| matches!(t.ggml_type_id, 12..=14))
+        });
+        let fused = backend == RpcBackendKind::Hip && cfg.dim % 256 == 0 && cfg.ff_dim % 256 == 0;
+        Ok(RemoteExperts {
+            q8: kquant && fused,
+            session,
+            req: MoeFfnRequest {
+                gate,
+                up,
+                down,
+                n_experts: cfg.n_experts as u32,
+                dim: cfg.dim as u32,
+                ff: cfg.ff_dim as u32,
+                // Sunny's 5 GbE card sits in a Gen2 x1 slot (~2 Gbit/s): the
+                // reply is the larger half of every call, so ship it as F16.
+                f16_out: true,
+            },
+        })
+    }
+
+    /// This layer's routed experts run on an RPC worker.
+    pub fn experts_remote(&self, layer_idx: usize) -> bool {
+        self.experts
+            .lock()
+            .ok()
+            .is_some_and(|e| e.get(layer_idx).is_some_and(Option::is_some))
+    }
+
+    /// Routing-weighted sum of each row's experts, computed on the worker that
+    /// holds this layer's experts. `x` is `[rows][dim]` post-norm hidden
+    /// states and `routes[r]` row `r`'s `(expert, weight)`. `None` when the
+    /// layer's experts are local.
+    pub fn moe_ffn(
+        &self,
+        layer_idx: usize,
+        x: &[f32],
+        routes: &[Vec<(usize, f32)>],
+    ) -> Result<Option<Vec<f32>>, AllpacaError> {
+        let home = self
+            .experts
+            .lock()
+            .ok()
+            .and_then(|e| e.get(layer_idx).copied().flatten());
+        let Some(home) = home else {
+            return Ok(None);
+        };
+        let pairs: Vec<(u32, u32, f32)> = routes
+            .iter()
+            .enumerate()
+            .flat_map(|(r, route)| route.iter().map(move |&(e, w)| (r as u32, e as u32, w)))
+            .collect();
+        let out = {
+            let mut sessions = self.sessions.lock().map_err(|_| {
+                AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
+            })?;
+            sessions[home.session]
+                .moe_ffn(home.req, x, home.q8, &pairs)
+                .map_err(map_rpc)?
+        };
+        self.roundtrips.fetch_add(1, Ordering::Relaxed);
+        self.activation_bytes
+            .fetch_add(((x.len() + out.len()) * 4) as u64, Ordering::Relaxed);
+        Ok(Some(out))
     }
 
     fn upload_layer(
@@ -1073,6 +1328,12 @@ fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
         RpcBackendKind::Cpu => hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 20 | 23),
         RpcBackendKind::Cuda => false,
     }
+}
+
+fn has_stacked_experts(file: &GgufFile) -> bool {
+    file.tensors
+        .iter()
+        .any(|t| crate::model::is_stacked_expert_tensor(&t.name))
 }
 
 fn is_dense_attn_ffn(layer: &LayerWeights) -> bool {

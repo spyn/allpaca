@@ -237,9 +237,73 @@ pub fn pin_full_attn_to_target(layer_device: &mut [i32], target: i32, is_full_at
     }
 }
 
+/// Expert-parallel MoE placement: every layer body (attention or GDN, router,
+/// shared expert) runs on a local GPU; routed-expert blocks fill what the
+/// bodies leave on the GPU that owns their layer, and the rest go to RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertPlan {
+    /// Local GPU slot per layer, in contiguous runs.
+    pub layers: LayerPlan,
+    /// The layer's experts sit beside its body; `false` means an RPC worker.
+    pub experts_local: Vec<bool>,
+}
+
+/// Split layers across local GPUs in proportion to their budgets, so each
+/// GPU keeps room for experts next to its own layer bodies, then keep experts
+/// local in layer order while they fit.
+pub fn plan_expert_parallel(body: &[u64], experts: &[u64], budgets: &[u64]) -> ExpertPlan {
+    let n = body.len();
+    let total: Vec<u64> = body.iter().zip(experts).map(|(b, e)| b + e).collect();
+    let need: u64 = total.iter().sum();
+    let have: u64 = budgets.iter().sum::<u64>().max(1);
+    let layers = if budgets.len() < 2 {
+        LayerPlan::all_local(n)
+    } else {
+        let scale = need.max(have) as f64 / have as f64;
+        let scaled: Vec<u64> = budgets
+            .iter()
+            .map(|&b| (b as f64 * scale).ceil() as u64)
+            .collect();
+        plan_local_fill(&total, &scaled)
+    };
+    let mut left: Vec<u64> = budgets.to_vec();
+    if left.is_empty() {
+        left.push(0);
+    }
+    for (l, &b) in body.iter().enumerate() {
+        let o = layers.owner(l).min(left.len() - 1);
+        left[o] = left[o].saturating_sub(b);
+    }
+    let mut experts_local = vec![false; n];
+    for (l, &e) in experts.iter().enumerate() {
+        let o = layers.owner(l).min(left.len() - 1);
+        if e <= left[o] {
+            left[o] -= e;
+            experts_local[l] = true;
+        }
+    }
+    ExpertPlan {
+        layers,
+        experts_local,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_parallel_keeps_bodies_local_and_overflows_experts() {
+        // Four layers of body 1 + experts 10 on two GPUs of 15: each GPU owns
+        // two bodies and keeps one layer's experts; the other two go remote.
+        let plan = plan_expert_parallel(&[1; 4], &[10; 4], &[15, 15]);
+        assert_eq!(plan.layers.owners, vec![0, 0, 1, 1]);
+        assert_eq!(plan.experts_local, vec![true, false, true, false]);
+        // Everything fits: all local, first GPU filled first.
+        let plan = plan_expert_parallel(&[1; 4], &[10; 4], &[100, 100]);
+        assert_eq!(plan.experts_local, vec![true; 4]);
+        assert_eq!(plan.layers.owners, vec![0, 0, 0, 0]);
+    }
 
     #[test]
     fn single_device_all_local() {

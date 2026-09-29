@@ -456,6 +456,51 @@ fn rmsnorm_heads(x: &mut [f32], weight: &[f32], n_heads: usize, head_dim: usize,
 }
 
 /// Expand a packed GGUF weight to F32 for the CPU worker. HIP uses device GEMM instead.
+/// `(row, weight)` lists per expert, experts ascending.
+fn moe_groups(pairs: &[(u32, u32, f32)]) -> std::collections::BTreeMap<u32, Vec<(usize, f32)>> {
+    let mut groups: std::collections::BTreeMap<u32, Vec<(usize, f32)>> = Default::default();
+    for &(row, expert, weight) in pairs {
+        groups.entry(expert).or_default().push((row as usize, weight));
+    }
+    groups
+}
+
+impl CpuWorker {
+    fn moe_ffn(
+        &mut self,
+        req: &crate::protocol::MoeFfnRequest,
+        x: &[f32],
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        let (dim, ff, n_exp) = (req.dim as usize, req.ff as usize, req.n_experts as usize);
+        let mut out = vec![0.0f32; x.len()];
+        let expert = |slot: &Slot, e: usize, n: usize| -> Result<Vec<f32>, RpcError> {
+            let stride = slot.data.len() / n_exp;
+            let mut w = vec![0.0f32; n];
+            dequant_weight(slot.ggml_type, &slot.data[e * stride..(e + 1) * stride], n, &mut w)?;
+            Ok(w)
+        };
+        for (e, rows) in moe_groups(pairs) {
+            let e = e as usize;
+            let wg = expert(self.slot(req.gate)?, e, ff * dim)?;
+            let wu = expert(self.slot(req.up)?, e, ff * dim)?;
+            let wd = expert(self.slot(req.down)?, e, dim * ff)?;
+            for (row, weight) in rows {
+                let xr = &x[row * dim..(row + 1) * dim];
+                let (mut g, mut u, mut o) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
+                matmul_nt(xr, &wg, &mut g, 1, ff, dim).map_err(map_kernel)?;
+                matmul_nt(xr, &wu, &mut u, 1, ff, dim).map_err(map_kernel)?;
+                let h: Vec<f32> = g.iter().zip(&u).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+                matmul_nt(&h, &wd, &mut o, 1, dim, ff).map_err(map_kernel)?;
+                for (acc, v) in out[row * dim..(row + 1) * dim].iter_mut().zip(&o) {
+                    *acc += weight * v;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 fn dequant_weight(ty: u32, bytes: &[u8], n: usize, out: &mut [f32]) -> Result<(), RpcError> {
     if out.len() < n {
         return Err(RpcError::Worker("dequant output too small".into()));
@@ -523,6 +568,8 @@ struct HipGpu {
     used: u64,
     /// Vega 20. Decode GEMV uses the vectorized kernel, not the scalar tile.
     gfx906: bool,
+    /// Grow-only scratch for `MoeFfn`.
+    moe_scratch: Option<allpaca_hip::DeviceWeights>,
 }
 
 /// HIP worker: every visible device, or one pinned ordinal.
@@ -536,6 +583,20 @@ pub struct HipWorker {
     sticky: usize,
 }
 
+/// A session's buffers die with its backend: a coordinator that reconnects
+/// would otherwise find the GPUs still full from its last run.
+#[cfg(feature = "hip")]
+impl Drop for HipWorker {
+    fn drop(&mut self) {
+        for (_, s) in self.slots.drain() {
+            if let Some(g) = self.gpus.get(s.gpu) {
+                let _ = g.hip.bind();
+            }
+            allpaca_hip::device_free(s.ptr, s.bytes);
+        }
+    }
+}
+
 #[cfg(feature = "hip")]
 struct HipSlot {
     gen: u32,
@@ -544,6 +605,129 @@ struct HipSlot {
     ptr: *mut u8,
     bytes: usize,
     gpu: usize,
+}
+
+#[cfg(feature = "hip")]
+impl HipWorker {
+    fn moe_ffn(
+        &mut self,
+        req: &crate::protocol::MoeFfnRequest,
+        x_in: &crate::protocol::MoeX,
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+        let (dim, ff, n_exp) = (req.dim as usize, req.ff as usize, req.n_experts as usize);
+        let rows = x_in.len() / dim.max(1);
+        let (g, u, d) = (self.slot(req.gate)?, self.slot(req.up)?, self.slot(req.down)?);
+        if g.gpu != u.gpu || g.gpu != d.gpu {
+            return Err(RpcError::Worker("moe ffn experts span GPUs".into()));
+        }
+        let gpu = g.gpu;
+        let (gs, us, ds) = (g.bytes / n_exp, u.bytes / n_exp, d.bytes / n_exp);
+        let (gp, up, dp) = (g.ptr, u.ptr, d.ptr);
+        let (gt, ut, dt) = (g.ggml_type, u.ggml_type, d.ggml_type);
+        let experts = |ptr: *mut u8, ggml_type: u32, stride: usize| allpaca_hip::MoeExperts {
+            ptr,
+            ggml_type,
+            stride: stride as u64,
+        };
+        let fused = [experts(gp, gt, gs), experts(up, ut, us), experts(dp, dt, ds)];
+        if dim % 256 == 0 && ff % 256 == 0 && fused.iter().all(allpaca_hip::MoeExperts::fused_ok) {
+            return self.moe_ffn_fused(gpu, dim, ff, x_in, pairs, fused);
+        }
+        let x_f32 = x_in.to_f32();
+        let x = x_f32.as_slice();
+        // Scratch: x, gathered rows, gate, up, expert out, accumulator.
+        let floats = 4 * rows * dim + 2 * rows * ff;
+        let scratch = self.moe_scratch(gpu, floats * 4)?;
+        let f = |i: usize| unsafe { scratch.add(i) };
+        let (xs, xe, out_e, acc) = (f(0), f(rows * dim), f(2 * rows * dim), f(3 * rows * dim));
+        let (gate, upb) = (f(4 * rows * dim), f(4 * rows * dim + rows * ff));
+        let hip = &self.gpus[gpu].hip;
+        hip.copy_h2d_f32(xs, x).map_err(bad)?;
+        hip.copy_h2d_f32(acc, &vec![0.0f32; rows * dim]).map_err(bad)?;
+        for (e, group) in moe_groups(pairs) {
+            let e = e as usize;
+            for (i, &(row, _)) in group.iter().enumerate() {
+                hip.copy_d2d_f32(unsafe { xe.add(i * dim) }, unsafe { xs.add(row * dim) }, dim)
+                    .map_err(bad)?;
+            }
+            let m = group.len() as i32;
+            let (dimi, ffi) = (dim as i32, ff as i32);
+            hip_quant_gemm(gt, xe, unsafe { gp.add(e * gs) }, gate, m, ffi, dimi)?;
+            hip_quant_gemm(ut, xe, unsafe { up.add(e * us) }, upb, m, ffi, dimi)?;
+            hip.silu_mul_device(gate, upb, m * ffi).map_err(bad)?;
+            hip_quant_gemm(dt, gate, unsafe { dp.add(e * ds) }, out_e, m, dimi, ffi)?;
+            for (i, &(row, weight)) in group.iter().enumerate() {
+                let src = unsafe { out_e.add(i * dim) };
+                hip.scale_f32(src, dim, weight).map_err(bad)?;
+                hip.residual_add(unsafe { acc.add(row * dim) }, src, dimi).map_err(bad)?;
+            }
+        }
+        let mut out = vec![0.0f32; rows * dim];
+        hip.copy_d2h_f32(acc, &mut out).map_err(bad)?;
+        Ok(out)
+    }
+
+    /// K-quant experts: one H2D of `x` plus the row-sorted pair table, the
+    /// seven-launch fused MoE kernels, one D2H.
+    fn moe_ffn_fused(
+        &mut self,
+        gpu: usize,
+        dim: usize,
+        ff: usize,
+        x: &crate::protocol::MoeX,
+        pairs: &[(u32, u32, f32)],
+        [gate, up, down]: [allpaca_hip::MoeExperts; 3],
+    ) -> Result<Vec<f32>, RpcError> {
+        let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+        let rows = x.len() / dim.max(1);
+        // One upload: [x | pair table], then output and kernel scratch. Q8
+        // rows go as [int8 quants (4 per float) | scales].
+        let (prefix, x_q8) = match x {
+            crate::protocol::MoeX::F32(v) => (v.clone(), None),
+            crate::protocol::MoeX::Q8 { q, d } => {
+                let mut v: Vec<f32> = q
+                    .chunks_exact(4)
+                    .map(|b| f32::from_bits(u32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8])))
+                    .collect();
+                v.resize(v.len().next_multiple_of(64), 0.0);
+                let d_off = v.len();
+                v.extend_from_slice(d);
+                (v, Some(d_off))
+            }
+        };
+        let table = allpaca_hip::MoePairTable::new(rows, pairs, &prefix);
+        let out_off = table.end;
+        let work_off = (out_off + rows * dim).next_multiple_of(64);
+        let bytes = work_off * 4 + allpaca_hip::moe_ffn_scratch_bytes(rows, dim, ff, table.pairs);
+        let base = self.moe_scratch(gpu, bytes)?;
+        let at = |i: usize| unsafe { base.add(i) };
+        let hip = &self.gpus[gpu].hip;
+        hip.copy_h2d_f32(base, &table.host).map_err(bad)?;
+        let input = match x_q8 {
+            None => allpaca_hip::MoeInput::F32(base),
+            Some(d_off) => allpaca_hip::MoeInput::Q8 { q: base.cast(), d: at(d_off) },
+        };
+        table
+            .run(base, input, rows, dim, ff, [gate, up, down], at(work_off).cast(), at(out_off))
+            .map_err(bad)?;
+        let mut out = vec![0.0f32; rows * dim];
+        hip.copy_d2h_f32(at(out_off), &mut out).map_err(bad)?;
+        Ok(out)
+    }
+
+    /// Grow-only per-GPU scratch for [`Self::moe_ffn`].
+    fn moe_scratch(&mut self, gpu: usize, bytes: usize) -> Result<*mut f32, RpcError> {
+        let g = &mut self.gpus[gpu];
+        if g.moe_scratch.as_ref().is_none_or(|s| s.bytes() < bytes as u64) {
+            g.moe_scratch = None;
+            let buf = allpaca_hip::DeviceWeights::alloc(g.device, bytes.max(1 << 20))
+                .map_err(|e| RpcError::Worker(e.to_string()))?;
+            g.moe_scratch = Some(buf);
+        }
+        Ok(g.moe_scratch.as_ref().expect("moe scratch").ptr_at(0) as *mut f32)
+    }
 }
 
 #[cfg(feature = "hip")]
@@ -648,6 +832,7 @@ impl HipGpu {
             total,
             used: 0,
             gfx906,
+            moe_scratch: None,
         })
     }
 
@@ -1003,7 +1188,7 @@ impl HipWorker {
                         n_kv,
                         head_dim,
                         n_rot,
-                        pos,
+                        [pos; 3],
                         theta,
                         sections,
                     )
@@ -1134,6 +1319,15 @@ pub struct CudaWorker {
     hash_cache: HashMap<u64, Vec<u8>>,
     memory_bytes: u64,
     used: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaWorker {
+    fn drop(&mut self) {
+        for (_, s) in self.slots.drain() {
+            allpaca_cuda::device_free(s.ptr);
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1500,6 +1694,21 @@ pub enum WorkerBackend {
 }
 
 impl WorkerBackend {
+    fn moe_ffn(
+        &mut self,
+        req: &crate::protocol::MoeFfnRequest,
+        x: &crate::protocol::MoeX,
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        match self {
+            Self::Cpu(w) => w.moe_ffn(req, &x.to_f32(), pairs),
+            #[cfg(feature = "hip")]
+            Self::Hip(w) => w.moe_ffn(req, x, pairs),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => Err(RpcError::Worker("CUDA worker has no MoeFfn yet".into())),
+        }
+    }
+
     fn hello(&self) -> HelloReply {
         match self {
             Self::Cpu(w) => w.hello(),
@@ -1517,9 +1726,11 @@ impl WorkerBackend {
         device: Option<u32>,
     ) -> Result<BufId, RpcError> {
         let repacked = self.repack_rocmfp4(ggml_type, bytes, device)?;
-        let (payload, stored_ty) = match repacked.as_deref() {
-            Some(f32_bytes) => (f32_bytes, 0),
-            None => (bytes, ggml_type),
+        let staged = self.stage_q8_0(ggml_type, bytes)?;
+        let (payload, stored_ty) = match (repacked.as_deref(), staged.as_deref()) {
+            (Some(f32_bytes), _) => (f32_bytes, 0),
+            (None, Some(q8)) => (q8, ggml_type),
+            (None, None) => (bytes, ggml_type),
         };
         let id = self.alloc(payload.len() as u64, device)?;
         self.h2d(id, 0, payload)?;
@@ -1531,6 +1742,19 @@ impl WorkerBackend {
             Self::Cuda(w) => w.set_ggml_type(id, stored_ty)?,
         }
         Ok(id)
+    }
+
+    /// HIP Q8_0 kernels read 36-byte staged blocks (F32 scale, aligned qs), not
+    /// GGUF's 34-byte blocks. Block-wise, so stacked expert tensors stage too.
+    fn stage_q8_0(&self, ggml_type: u32, bytes: &[u8]) -> Result<Option<Vec<u8>>, RpcError> {
+        #[cfg(feature = "hip")]
+        if ggml_type == 8 && matches!(self, Self::Hip(_)) {
+            return allpaca_hip::stage_q8_0_blocks(bytes)
+                .map(Some)
+                .map_err(|e| RpcError::Worker(e.to_string()));
+        }
+        let _ = (ggml_type, bytes);
+        Ok(None)
     }
 
     /// gfx906 runs the scalar ROCmFP4 GEMV. Expand those weights to F32 once
@@ -1741,6 +1965,15 @@ pub fn serve_listener_with_token(
     let (stream, addr) = listener.accept()?;
     tracing::info!(%addr, "rpc client connected");
     stream.set_nodelay(true)?;
+    // A coordinator that dies without closing the socket (killed, network
+    // drop) would otherwise leave the worker blocked on it forever, never
+    // accepting the next client.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(10))
+        .with_interval(std::time::Duration::from_secs(5));
+    if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(error = %e, "rpc keepalive not set");
+    }
     serve_connection_with_token(stream, backend, expected_token)
 }
 
@@ -1854,6 +2087,11 @@ fn handle(
             Ok(Vec::new())
         }
         Cmd::RunSpan => run_span(backend, payload),
+        Cmd::MoeFfn => {
+            let (req, x, pairs) = crate::protocol::decode_moe_ffn(payload)?;
+            let out = backend.moe_ffn(&req, &x, &pairs)?;
+            Ok(crate::protocol::encode_moe_reply(&out, req.f16_out))
+        }
         Cmd::PutTensor => {
             let mut c = Cursor::new(payload);
             let ggml_type = c.u32()?;
@@ -1941,5 +2179,106 @@ mod tests {
             f32_bytes.len(),
             allpaca_cpu::ROCMFP4_BLOCK_ELEMS * 4
         );
+    }
+
+    /// Fused `MoeFfn` at Qwen3-Next shapes on one GPU: 512 experts, dim 2048,
+    /// ff 512, Q5_K gate/up and Q6_K down, 10 experts per token.
+    /// `cargo test --release -p allpaca-rpc --features hip --lib bench_fused_moe -- --ignored --nocapture`
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore]
+    fn bench_fused_moe_qwen3next_shapes() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let (n_exp, dim, ff) = (512usize, 2048usize, 512usize);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut noise = |bytes: &mut [u8]| {
+            for b in bytes.iter_mut() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *b = (seed >> 56) as u8;
+            }
+        };
+        // Random quants with small, finite f16 scales (0x1400 ~ 1.2e-3).
+        let tensor = |noise: &mut dyn FnMut(&mut [u8]), ty: u32, n: usize| -> Vec<u8> {
+            let (bb, scales): (usize, &[usize]) = if ty == 13 { (176, &[0, 2]) } else { (210, &[208]) };
+            let mut v = vec![0u8; n / 256 * bb];
+            noise(&mut v);
+            for blk in v.chunks_exact_mut(bb) {
+                for &o in scales {
+                    blk[o..o + 2].copy_from_slice(&0x1400u16.to_le_bytes());
+                }
+            }
+            v
+        };
+        let mut backend = super::WorkerBackend::Hip(super::HipWorker::new(0).expect("HipWorker"));
+        let gate = backend.put_tensor(13, &tensor(&mut noise, 13, n_exp * ff * dim), Some(0)).unwrap();
+        let up = backend.put_tensor(13, &tensor(&mut noise, 13, n_exp * ff * dim), Some(0)).unwrap();
+        let down = backend.put_tensor(14, &tensor(&mut noise, 14, n_exp * dim * ff), Some(0)).unwrap();
+        let req = crate::protocol::MoeFfnRequest {
+            gate,
+            up,
+            down,
+            n_experts: n_exp as u32,
+            dim: dim as u32,
+            ff: ff as u32,
+            f16_out: false,
+        };
+        // Verify-span shape: 4 rows sharing 3 of their 10 experts (~78% of
+        // pairs unique, as measured in decode) vs the same pairs all distinct.
+        for shared in [true, false] {
+            let rows = 4usize;
+            let xf: Vec<f32> = (0..rows * dim).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+            let (q, d) = crate::protocol::quantize_q8_rows(&xf);
+            let x = crate::protocol::MoeX::Q8 { q, d };
+            let pairs_for = |it: usize| -> Vec<(u32, u32, f32)> {
+                (0..rows * 10)
+                    .map(|i| {
+                        let (r, j) = (i / 10, i % 10);
+                        let e = if shared && j < 3 { j * 101 + it * 7 } else { (r * 10 + j) * 11 + it * 7 };
+                        (r as u32, (e % n_exp) as u32, 0.1)
+                    })
+                    .collect()
+            };
+            for it in 0..50 {
+                backend.moe_ffn(&req, &x, &pairs_for(it)).unwrap();
+            }
+            let t = std::time::Instant::now();
+            for it in 0..300 {
+                backend.moe_ffn(&req, &x, &pairs_for(it + 50)).unwrap();
+            }
+            eprintln!("BENCH rows=4 shared3={shared} moe_ffn {:.1} us", t.elapsed().as_secs_f64() * 1e6 / 300.0);
+        }
+        // (rows, fresh experts every call, idle gap between calls in us)
+        for (rows, vary, gap_us) in [(1usize, true, 0u64), (1, true, 250), (1, true, 500), (1, true, 1000), (1, true, 2000), (4, true, 0)] {
+            let xf: Vec<f32> = (0..rows * dim).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+            // Rows arrive pre-quantized, as the coordinator sends them.
+            let (q, d) = crate::protocol::quantize_q8_rows(&xf);
+            let x = crate::protocol::MoeX::Q8 { q, d };
+            let pairs_for = |it: usize| -> Vec<(u32, u32, f32)> {
+                let salt = if vary { it * 131 } else { 0 };
+                (0..rows * 10)
+                    .map(|i| ((i / 10) as u32, ((i * 53 + 7 + salt) % n_exp) as u32, 0.1))
+                    .collect()
+            };
+            for it in 0..50 {
+                backend.moe_ffn(&req, &x, &pairs_for(it)).unwrap();
+            }
+            let iters = 300;
+            let mut busy = 0.0f64;
+            for it in 0..iters {
+                let p = pairs_for(it + 50);
+                if gap_us > 0 {
+                    let until = std::time::Instant::now() + std::time::Duration::from_micros(gap_us);
+                    while std::time::Instant::now() < until {}
+                }
+                let t = std::time::Instant::now();
+                backend.moe_ffn(&req, &x, &p).unwrap();
+                busy += t.elapsed().as_secs_f64();
+            }
+            let us = busy * 1e6 / iters as f64;
+            let mb = (rows * 10) as f64 * (2.0 * 176.0 + 210.0) / 256.0 * (ff * dim) as f64 / 1e6;
+            eprintln!("BENCH rows={rows} vary={vary} gap={gap_us}us moe_ffn {us:.1} us ({:.0} GB/s)", mb / us * 1e3);
+        }
     }
 }

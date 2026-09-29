@@ -5756,7 +5756,7 @@ fn hip_expand_k_heads_matches_host_ggml_repeat() {
     hip.copy_h2d_f32(src_d as *mut f32, &src).unwrap();
     let dst_d = blob.ptr_at(4 * 4) as *mut f32;
 
-    if let Err(e) = hip.expand_k_heads(src_d, dst_d, 2, 4, 2) {
+    if let Err(e) = hip.expand_k_heads(src_d, dst_d, 2, 4, 2, false) {
         eprintln!("skip hip_expand_k_heads_matches_host: {e}");
         return;
     }
@@ -5769,6 +5769,19 @@ fn hip_expand_k_heads_matches_host_ggml_repeat() {
             dst_h[i]
         );
     }
+    // Qwen3-Next interleave: [h0,h0, h1,h1].
+    let mut dst_i = [0.0f32; 8];
+    allpaca_core::deltanet::expand_k_heads_as(
+        &src,
+        &mut dst_i,
+        2,
+        4,
+        2,
+        allpaca_core::deltanet::KHeadRepeat::Interleave,
+    );
+    hip.expand_k_heads(src_d, dst_d, 2, 4, 2, true).unwrap();
+    hip.copy_d2h_f32(dst_d, &mut dst).unwrap();
+    assert_eq!(dst, dst_i, "device interleave must match host");
 }
 
 /// Device-pointer decay/β must match host `decay_from_alpha` plus sigmoid(β).
@@ -5951,6 +5964,7 @@ fn hip_gdn_layer_step_matches_host_without_qkv_d2h() {
         head_k as i32,
         conv_k as i32,
         1e-6,
+        false,
     ) {
         eprintln!("skip hip_gdn_layer_step: {e}");
         return;
@@ -6159,6 +6173,7 @@ fn hip_gdn_decode_step_resident_matches_host_without_qkv_d2h() {
         head_k as i32,
         conv_k as i32,
         1e-6,
+        false,
     ) {
         eprintln!("skip hip_gdn_decode_step_resident: {e}");
         return;
@@ -6270,6 +6285,7 @@ fn hip_gdn_rewind_restores_device_state_and_conv_after_extra_step() {
             head_k as i32,
             conv_k as i32,
             1e-6,
+            false,
         )
     };
     let pull = |hip: &allpaca_hip::HipWorkspace, rid: u64| {

@@ -471,7 +471,7 @@ impl ModelConfig {
                 .meta_f32(&format!("{arch}.rope.freq_base_swa"))
                 .unwrap_or(0.0),
             headwise_attn_gate: arch == "spark2_5"
-                || file.tensor("blk.0.attn_gate.weight").is_some() && arch != "qwen35",
+                || file.tensor("blk.0.attn_gate.weight").is_some() && !is_qwen_gdn_arch(&arch),
             attn_logit_softcap: {
                 let v = file
                     .meta_f32(&format!("{arch}.attn_logit_softcapping"))
@@ -667,8 +667,11 @@ struct LayerOff {
     k_norm: WeightRef,
     /// Spark2_5 head-wise attention output gate (zero-sized when absent).
     attn_out_gate: WeightRef,
+    w_shared_gate: WeightRef,
     w_shared_up: WeightRef,
     w_shared_down: WeightRef,
+    /// Qwen3-Next shared-expert gate `ffn_gate_inp_shexp` (`[dim]`).
+    shared_gate_inp: WeightRef,
 }
 
 /// Device-resident NextN/MTP seed weights (`blk.{i}.nextn.*`).
@@ -897,6 +900,12 @@ pub struct ResidentModel {
     /// Staging buffers for copies still in flight on `h2d`. Held until the
     /// stream is drained so the DMA source cannot be freed underneath it.
     h2d_pending: Mutex<Vec<Vec<u8>>>,
+    /// Grow-only scratch for the fused MoE kernels (gate/up/down outputs).
+    moe_scratch: Mutex<Option<DeviceWeights>>,
+    /// Pinned staging the GPU reads in place: MoE pair tables and remote
+    /// expert sums. Rewritten only after the next layer's readback has
+    /// synchronized the stream, so kernels never see it change underneath.
+    moe_stage: Mutex<allpaca_hip::PinnedBuf>,
     embed: WeightRef,
     /// Set when `token_embd` stays packed on the host (see [`HostEmbed`]).
     host_embed: Option<HostEmbed>,
@@ -904,6 +913,42 @@ pub struct ResidentModel {
     norm: WeightRef,
     lm_head: WeightRef,
     mtp_nextn: Option<MtpNextnOff>,
+}
+
+/// A layer's stacked routed experts as the fused MoE kernels read them:
+/// `[gate, up, down]`, each Q4_K/Q5_K/Q6_K at a fixed per-expert stride.
+fn stacked_moe_experts(
+    weights: &DeviceWeights,
+    offs: &[[WeightRef; 3]],
+) -> Option<[allpaca_hip::MoeExperts; 3]> {
+    if offs.len() < 2 {
+        return None;
+    }
+    let last = offs.len() - 1;
+    let mut out = [allpaca_hip::MoeExperts {
+        ptr: std::ptr::null(),
+        ggml_type: 0,
+        stride: 0,
+    }; 3];
+    for (j, slot) in out.iter_mut().enumerate() {
+        let (first, second) = (offs[0][j], offs[1][j]);
+        let ggml_type = match first.kind {
+            WeightKind::Q4_K => 12,
+            WeightKind::Q5_K => 13,
+            WeightKind::Q6_K => 14,
+            _ => return None,
+        };
+        let stride = second.off.checked_sub(first.off)?;
+        if first.n == 0 || offs[last][j].off != first.off + last * stride {
+            return None;
+        }
+        *slot = allpaca_hip::MoeExperts {
+            ptr: weights.ptr_at(first.off).cast(),
+            ggml_type,
+            stride: stride as u64,
+        };
+    }
+    Some(out)
 }
 
 impl ResidentModel {
@@ -991,6 +1036,11 @@ impl ResidentModel {
                 } else {
                     push(&mut slices, &mut off, layer.attn_out_gate.as_slice())
                 },
+                w_shared_gate: if layer.shared_expert.w_gate.is_empty() {
+                    WeightRef::f32(0, 0)
+                } else {
+                    push(&mut slices, &mut off, layer.shared_expert.w_gate.as_slice())
+                },
                 w_shared_up: if layer.shared_expert.w_up.is_empty() {
                     WeightRef::f32(0, 0)
                 } else {
@@ -1000,6 +1050,11 @@ impl ResidentModel {
                     WeightRef::f32(0, 0)
                 } else {
                     push(&mut slices, &mut off, layer.shared_expert.w_down.as_slice())
+                },
+                shared_gate_inp: if layer.shared_gate_inp.is_empty() {
+                    WeightRef::f32(0, 0)
+                } else {
+                    push(&mut slices, &mut off, layer.shared_gate_inp.as_slice())
                 },
             });
         }
@@ -1071,6 +1126,8 @@ impl ResidentModel {
             prefill_pipe: Mutex::new(PrefillGpuPipe::default()),
             h2d: allpaca_hip::H2dStream::new().ok(),
             h2d_pending: Mutex::new(Vec::new()),
+            moe_scratch: Mutex::new(None),
+            moe_stage: Mutex::new(allpaca_hip::PinnedBuf::default()),
             embed,
             host_embed: None,
             layers,
@@ -1434,17 +1491,19 @@ impl ResidentModel {
         cfg: &ModelConfig,
         device: i32,
     ) -> Result<Self, AllpacaError> {
-        Self::upload_gguf_filtered(file, cfg, device, &[])
+        Self::upload_gguf_filtered(file, cfg, device, &[], &[])
     }
 
-    /// `skip_remote[local]` leaves that layer's weights on the RPC worker.
+    /// `skip_remote[local]` leaves that layer's weights on the RPC worker;
+    /// `skip_experts[local]` leaves only its routed experts there.
     pub fn upload_gguf_filtered(
         file: &GgufFile,
         cfg: &ModelConfig,
         device: i32,
         skip_remote: &[bool],
+        skip_experts: &[bool],
     ) -> Result<Self, AllpacaError> {
-        Self::upload_gguf_split(file, cfg, device, skip_remote, true)
+        Self::upload_gguf_split(file, cfg, device, skip_remote, skip_experts, true)
     }
 
     /// Layer weights only, for a second local GPU in the layer split.
@@ -1457,8 +1516,9 @@ impl ResidentModel {
         cfg: &ModelConfig,
         device: i32,
         skip: &[bool],
+        skip_experts: &[bool],
     ) -> Result<Self, AllpacaError> {
-        Self::upload_gguf_split(file, cfg, device, skip, false)
+        Self::upload_gguf_split(file, cfg, device, skip, skip_experts, false)
     }
 
     fn upload_gguf_split(
@@ -1466,6 +1526,7 @@ impl ResidentModel {
         cfg: &ModelConfig,
         device: i32,
         skip_remote: &[bool],
+        skip_experts: &[bool],
         globals: bool,
     ) -> Result<Self, AllpacaError> {
         let report = file.compat_report();
@@ -1510,8 +1571,10 @@ impl ResidentModel {
                     q_norm: WeightRef::f32(0, 0),
                     k_norm: WeightRef::f32(0, 0),
                     attn_out_gate: WeightRef::f32(0, 0),
+                    w_shared_gate: WeightRef::f32(0, 0),
                     w_shared_up: WeightRef::f32(0, 0),
                     w_shared_down: WeightRef::f32(0, 0),
+                    shared_gate_inp: WeightRef::f32(0, 0),
                 });
                 continue;
             }
@@ -1535,6 +1598,8 @@ impl ResidentModel {
             let (wq, wk, wv, wo, w_qkv, w_z, w_alpha, w_beta, w_ssm_in, w_ssm_out) = match block {
                 HybridLayerKind::Ssm => {
                     if file.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some() {
+                        let (gdn_alpha, gdn_beta) =
+                            append_gguf_gdn_alpha_beta(file, i, &mut parts, &mut off)?;
                         (
                             WeightRef::f32(0, 0),
                             WeightRef::f32(0, 0),
@@ -1552,18 +1617,8 @@ impl ResidentModel {
                                 &mut parts,
                                 &mut off,
                             )?,
-                            append_gguf_tensor(
-                                file,
-                                &format!("blk.{i}.ssm_alpha.weight"),
-                                &mut parts,
-                                &mut off,
-                            )?,
-                            append_gguf_tensor(
-                                file,
-                                &format!("blk.{i}.ssm_beta.weight"),
-                                &mut parts,
-                                &mut off,
-                            )?,
+                            gdn_alpha,
+                            gdn_beta,
                             WeightRef::f32(0, 0),
                             append_gguf_tensor(
                                 file,
@@ -1749,7 +1804,11 @@ impl ResidentModel {
                         &mut off,
                     )?
                 };
-                let packed_ex = append_gguf_experts(file, i, cfg.n_experts, &mut parts, &mut off)?;
+                let packed_ex = if skip_experts.get(local).copied().unwrap_or(false) {
+                    Vec::new()
+                } else {
+                    append_gguf_experts(file, i, cfg.n_experts, &mut parts, &mut off)?
+                };
                 (
                     WeightRef::f32(0, 0),
                     WeightRef::f32(0, 0),
@@ -1831,8 +1890,14 @@ impl ResidentModel {
             } else {
                 WeightRef::f32(0, 0)
             };
-            let (w_shared_up, w_shared_down) =
+            let (w_shared_gate, w_shared_up, w_shared_down) =
                 append_gguf_shared_expert(file, i, &mut parts, &mut off)?;
+            let shexp_gate_name = format!("blk.{i}.ffn_gate_inp_shexp.weight");
+            let shared_gate_inp = if file.tensor(&shexp_gate_name).is_some() {
+                append_gguf_tensor(file, &shexp_gate_name, &mut parts, &mut off)?
+            } else {
+                none
+            };
             layers.push(LayerOff {
                 attn_norm,
                 wq,
@@ -1853,8 +1918,10 @@ impl ResidentModel {
                 q_norm,
                 k_norm,
                 attn_out_gate,
+                w_shared_gate,
                 w_shared_up,
                 w_shared_down,
+                shared_gate_inp,
             });
         }
         let norm = if !globals {
@@ -1921,6 +1988,8 @@ impl ResidentModel {
             prefill_pipe: Mutex::new(PrefillGpuPipe::default()),
             h2d: allpaca_hip::H2dStream::new().ok(),
             h2d_pending: Mutex::new(Vec::new()),
+            moe_scratch: Mutex::new(None),
+            moe_stage: Mutex::new(allpaca_hip::PinnedBuf::default()),
             weights,
             embed,
             host_embed,
@@ -2618,6 +2687,7 @@ fn empty_layer() -> LayerWeights {
         attn_out_gate: Vec::new(),
         attn_sinks: Vec::new(),
         attn_post_norm: Vec::new(),
+        shared_gate_inp: Vec::new(),
         ffn_post_norm: Vec::new(),
     }
 }
@@ -2643,16 +2713,18 @@ fn split_fused_qkv_host(
     Ok((q, k, v))
 }
 
-/// `materialize_projections` expands qkv/z/alpha/beta/out to host F32 (CPU
-/// and host-weight CUDA paths). Device-resident loads upload them from the
-/// file instead, so they stay empty (`gdn_needs_device_projections`).
-fn load_gguf_gdn_host(
-    file: &GgufFile,
-    layer: usize,
-    materialize_projections: bool,
-) -> Result<GdnHostWeights, AllpacaError> {
+
+
+
+/// Qwen Gated DeltaNet checkpoints: Qwen3.5 (`qwen35`) and Qwen3-Next (`qwen3next`).
+pub(crate) fn is_qwen_gdn_arch(arch: &str) -> bool {
+    matches!(arch, "qwen35" | "qwen3next")
+}
+
+/// GDN dims from GGUF meta. Qwen3-Next repeat-interleaves K heads; Qwen3.5 tiles.
+fn gguf_gdn_dims(file: &GgufFile, layer: usize) -> Result<GdnDims, AllpacaError> {
     let arch = file.architecture().unwrap_or("qwen35");
-    let dims = GdnDims::from_meta(
+    let mut dims = GdnDims::from_meta(
         file.meta_u32(&format!("{arch}.ssm.state_size"))
             .unwrap_or(128) as usize,
         file.meta_u32(&format!("{arch}.ssm.inner_size"))
@@ -2669,6 +2741,104 @@ fn load_gguf_gdn_host(
             "blk.{layer}: cannot infer GDN dims from GGUF meta"
         )))
     })?;
+    if arch == "qwen3next" {
+        dims.k_repeat = crate::deltanet::KHeadRepeat::Interleave;
+    }
+    Ok(dims)
+}
+
+/// Qwen3-Next packs beta and alpha into one `ssm_ba` (`[dim, 2 * n_v]`): K
+/// group `g` holds `r = n_v / n_k` beta rows, then `r` alpha rows, for V
+/// heads `g * r ..`. Returns `(beta, alpha)`, each row-major `[n_v][dim]`.
+fn split_ssm_ba(ba: &[f32], dim: usize, n_k: usize, n_v: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+    if n_k == 0 || dim == 0 || n_v % n_k != 0 || ba.len() != 2 * n_v * dim {
+        return None;
+    }
+    let r = n_v / n_k;
+    let row = |i: usize| &ba[i * dim..(i + 1) * dim];
+    let mut beta = Vec::with_capacity(n_v * dim);
+    let mut alpha = Vec::with_capacity(n_v * dim);
+    for g in 0..n_k {
+        for j in 0..r {
+            beta.extend_from_slice(row(g * 2 * r + j));
+        }
+        for j in 0..r {
+            alpha.extend_from_slice(row(g * 2 * r + r + j));
+        }
+    }
+    Some((beta, alpha))
+}
+
+/// GDN `(beta, alpha)` projections as host F32, from `ssm_beta` / `ssm_alpha`
+/// or Qwen3-Next's packed `ssm_ba`.
+fn gguf_gdn_beta_alpha(
+    file: &GgufFile,
+    layer: usize,
+    dims: &GdnDims,
+) -> Result<(Vec<f32>, Vec<f32>), AllpacaError> {
+    let ba_name = format!("blk.{layer}.ssm_ba.weight");
+    if file.tensor(&ba_name).is_none() {
+        return Ok((
+            file.tensor_f32(&format!("blk.{layer}.ssm_beta.weight"))?,
+            file.tensor_f32(&format!("blk.{layer}.ssm_alpha.weight"))?,
+        ));
+    }
+    let ba = file.tensor_f32(&ba_name)?;
+    let dim = ba.len() / (2 * dims.n_v_heads).max(1);
+    split_ssm_ba(&ba, dim, dims.n_k_heads, dims.n_v_heads).ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "blk.{layer}: ssm_ba has {} values, not 2 x {} heads x dim",
+            ba.len(),
+            dims.n_v_heads
+        )))
+    })
+}
+
+/// Device `(alpha, beta)` for a GDN layer. Packed `ssm_ba` splits on the host
+/// into two small F32 tensors.
+fn append_gguf_gdn_alpha_beta<'a>(
+    file: &'a GgufFile,
+    layer: usize,
+    parts: &mut Vec<UploadPart<'a>>,
+    off: &mut usize,
+) -> Result<(WeightRef, WeightRef), AllpacaError> {
+    if file.tensor(&format!("blk.{layer}.ssm_ba.weight")).is_none() {
+        return Ok((
+            append_gguf_tensor(file, &format!("blk.{layer}.ssm_alpha.weight"), parts, off)?,
+            append_gguf_tensor(file, &format!("blk.{layer}.ssm_beta.weight"), parts, off)?,
+        ));
+    }
+    let dims = gguf_gdn_dims(file, layer)?;
+    let (beta, alpha) = gguf_gdn_beta_alpha(file, layer, &dims)?;
+    Ok((append_f32_part(&alpha, parts, off), append_f32_part(&beta, parts, off)))
+}
+
+/// Upload host F32 values as their own 16-byte aligned part.
+fn append_f32_part(data: &[f32], parts: &mut Vec<UploadPart<'_>>, off: &mut usize) -> WeightRef {
+    if *off % 16 != 0 {
+        let pad = 16 - (*off % 16);
+        parts.push(UploadPart::Owned(vec![0u8; pad]));
+        *off += pad;
+    }
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let w = WeightRef::f32(*off, data.len());
+    *off += bytes.len();
+    parts.push(UploadPart::Owned(bytes));
+    w
+}
+
+/// `materialize_projections` expands qkv/z/alpha/beta/out to host F32 (CPU
+/// and host-weight CUDA paths). Device-resident loads upload them from the
+/// file instead, so they stay empty (`gdn_needs_device_projections`).
+fn load_gguf_gdn_host(
+    file: &GgufFile,
+    layer: usize,
+    materialize_projections: bool,
+) -> Result<GdnHostWeights, AllpacaError> {
+    let dims = gguf_gdn_dims(file, layer)?;
     if file
         .tensor(&format!("blk.{layer}.attn_qkv.weight"))
         .is_none()
@@ -2721,8 +2891,7 @@ fn load_gguf_gdn_host(
     // Host projections for CUDA / CPU host-step GDN (HIP also uploads these on-device).
     let w_qkv = file.tensor_f32(&format!("blk.{layer}.attn_qkv.weight"))?;
     let w_z = file.tensor_f32(&format!("blk.{layer}.attn_gate.weight"))?;
-    let w_alpha = file.tensor_f32(&format!("blk.{layer}.ssm_alpha.weight"))?;
-    let w_beta = file.tensor_f32(&format!("blk.{layer}.ssm_beta.weight"))?;
+    let (w_beta, w_alpha) = gguf_gdn_beta_alpha(file, layer, &dims)?;
     let w_out = file.tensor_f32(&format!("blk.{layer}.ssm_out.weight"))?;
     let dim_in = w_qkv.len() / dims.qkv_dim.max(1);
     if dim_in == 0
@@ -3172,12 +3341,21 @@ fn append_gguf_shared_expert<'a>(
     layer: usize,
     parts: &mut Vec<UploadPart<'a>>,
     off: &mut usize,
-) -> Result<(WeightRef, WeightRef), AllpacaError> {
+) -> Result<(WeightRef, WeightRef, WeightRef), AllpacaError> {
+    let none = WeightRef::f32(0, 0);
     let up_name = format!("blk.{layer}.ffn_up_shexp.weight");
     if file.tensor(&up_name).is_none() {
-        return Ok((WeightRef::f32(0, 0), WeightRef::f32(0, 0)));
+        return Ok((none, none, none));
     }
+    // SwiGLU shared experts (Qwen3-Next) carry a gate; Lightning's ReLU² does not.
+    let gate_name = format!("blk.{layer}.ffn_gate_shexp.weight");
+    let gate = if file.tensor(&gate_name).is_some() {
+        append_gguf_tensor(file, &gate_name, parts, off)?
+    } else {
+        none
+    };
     Ok((
+        gate,
         append_gguf_tensor(file, &up_name, parts, off)?,
         append_gguf_tensor(
             file,
@@ -3235,22 +3413,42 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
 /// Per-layer VRAM footprint of a GGUF upload, plus the target-only globals
 /// (device embed, `output_norm`, lm_head). Used to place layers by bytes.
 pub fn gguf_device_bytes(file: &GgufFile, cfg: &ModelConfig) -> (Vec<u64>, u64) {
+    let (mut layers, experts, globals) = gguf_device_bytes_split(file, cfg);
+    for (l, e) in layers.iter_mut().zip(experts) {
+        *l += e;
+    }
+    (layers, globals)
+}
+
+/// Stacked routed-expert tensors (`ffn_{gate,up,down}_exps`).
+pub fn is_stacked_expert_tensor(name: &str) -> bool {
+    name.ends_with("_exps.weight")
+}
+
+/// [`gguf_device_bytes`] with each layer's routed-expert bytes apart from
+/// its body: `(body, experts, globals)`.
+pub fn gguf_device_bytes_split(file: &GgufFile, cfg: &ModelConfig) -> (Vec<u64>, Vec<u64>, u64) {
     let prefixes: Vec<String> = (0..cfg.n_layers)
         .map(|l| format!("blk.{}.", cfg.gguf_blk(l)))
         .collect();
     let tied = file.tensor("output.weight").is_none();
     let mut layers = vec![0u64; cfg.n_layers];
+    let mut experts = vec![0u64; cfg.n_layers];
     let mut globals = 0u64;
     for t in &file.tensors {
         if let Some(l) = prefixes.iter().position(|p| t.name.starts_with(p.as_str())) {
-            layers[l] += staged_device_bytes(t);
+            if is_stacked_expert_tensor(&t.name) {
+                experts[l] += staged_device_bytes(t);
+            } else {
+                layers[l] += staged_device_bytes(t);
+            }
         } else if t.name == "output.weight" || t.name == "output_norm.weight" {
             globals += staged_device_bytes(t);
         } else if t.name == "token_embd.weight" && (tied || !HostEmbed::wanted(t.ggml_type)) {
             globals += staged_device_bytes(t);
         }
     }
-    (layers, globals)
+    (layers, experts, globals)
 }
 
 /// `gather` stages `token_embd` for row gathers (F32 expand for K-quants,
@@ -3734,6 +3932,9 @@ pub struct LayerWeights {
     pub experts: Vec<LayerFfn>,
     /// Always-on shared expert (`ffn_*_shexp`); empty when unused.
     pub shared_expert: LayerFfn,
+    /// Qwen3-Next shared-expert gate (`ffn_gate_inp_shexp`, `[dim]`): the
+    /// shared expert output is scaled by `sigmoid(x_norm · w)`. Empty = 1.
+    pub shared_gate_inp: Vec<f32>,
     /// DeepSeek-style expert bias for sigmoid-group selection.
     pub expert_bias: Vec<f32>,
     /// Spark2_5 head-wise attention output gate (`attn_gate.weight`, shape `[n_heads, dim]`).
@@ -3949,6 +4150,7 @@ impl TinyModel {
                 attn_out_gate: Vec::new(),
                 attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
+                shared_gate_inp: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
         }
@@ -4014,6 +4216,7 @@ impl TinyModel {
             attn_out_gate: Vec::new(),
             attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
+            shared_gate_inp: Vec::new(),
             ffn_post_norm: Vec::new(),
         };
         model
@@ -4062,6 +4265,7 @@ impl TinyModel {
             attn_out_gate: Vec::new(),
             attn_sinks: Vec::new(),
             attn_post_norm: Vec::new(),
+            shared_gate_inp: Vec::new(),
             ffn_post_norm: Vec::new(),
         };
         model
@@ -4686,10 +4890,16 @@ impl TinyModel {
 
     /// Router-only union of experts a draft verify span may touch (prefetch).
     pub fn routed_experts_for_verify_span(&self, span: &[u32]) -> Vec<ExpertId> {
-        if self.config.n_experts == 0 || span.is_empty() {
+        let dim = self.config.dim;
+        // The hint feeds the expert LRU's prefetch, and routes host token
+        // embeddings; large device-resident GGUFs keep neither.
+        if self.config.n_experts == 0
+            || span.is_empty()
+            || self.expert_lru.is_none()
+            || self.embed.len() < self.config.vocab_size * dim
+        {
             return Vec::new();
         }
-        let dim = self.config.dim;
         let n_exp = self.config.n_experts.max(1);
         let n_act = self.config.n_active.max(1).min(n_exp);
         let mut union = std::collections::HashSet::new();
@@ -4906,8 +5116,18 @@ impl TinyModel {
         )?;
         metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
         record_elementwise(Some(metrics));
-        let mut x_norm = vec![0.0f32; dim];
-        hip.copy_d2h_f32(buf.normed, &mut x_norm)?;
+        // `moe_norm` only feeds layer staggering, which needs an expert LRU
+        // with CPU runs (never true on the GPU-routed path).
+        let staggering = side
+            .as_ref()
+            .and_then(|s| s.layer_stagger)
+            .is_some_and(|ls| ls.active().is_some());
+        if !staggering && self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, 1)?
+        {
+            record_elementwise(Some(metrics));
+            return Ok(());
+        }
+        let (x_norm, mut router_logits) = self.device_moe_readback(hip, resident, off, buf, 1)?;
         let ds_probe = side.as_ref().and_then(|s| s.ds_probe);
         let ds_queue = side.as_ref().and_then(|s| s.ds_queue);
         let nvme_side = side.as_ref().map(|s| DeviceDecodeSide {
@@ -4940,6 +5160,8 @@ impl TinyModel {
         let n_act = cfg.n_active.max(1).min(n_exp);
         let routed = if self.edge0.is_some() || cfg.edge0_tier.is_some() {
             self.edge0_moe_route(layer_idx, host_layer, &x_norm)
+        } else if let Some(logits) = router_logits.as_mut() {
+            topk_from_logits(logits, n_act, cfg)
         } else {
             topk_route(&x_norm, &host_layer.w_router, n_exp, n_act, cfg)
         };
@@ -4950,156 +5172,146 @@ impl TinyModel {
                 expert: e as u32,
             })
             .collect();
-        let plan = if let Some(lru) = &self.expert_lru {
-            let route_ids = if !prefill {
-                if let Some(u) = micro_batch {
-                    let merged = u.union_with(layer_idx as u32, &ids);
-                    if merged.len() == ids.len() {
-                        u.stage_routed(layer_idx as u32, &ids);
+        // Expert-parallel: this layer's experts may live on an RPC worker.
+        let routes = std::slice::from_ref(&routed);
+        if !self.remote_moe_rows(layer_idx, hip, resident, buf, &x_norm, routes)?
+            && !self.fused_local_moe_rows(layer_idx, hip, resident, buf, routes)?
+        {
+            let plan = if let Some(lru) = &self.expert_lru {
+                let route_ids = if !prefill {
+                    if let Some(u) = micro_batch {
+                        let merged = u.union_with(layer_idx as u32, &ids);
+                        if merged.len() == ids.len() {
+                            u.stage_routed(layer_idx as u32, &ids);
+                        }
+                        merged
+                    } else {
+                        ids.clone()
                     }
-                    merged
                 } else {
                     ids.clone()
+                };
+                let union_plan = lru.plan(&route_ids);
+                lru.note_plan(&union_plan);
+                if !union_plan.fill.is_empty() {
+                    let mut pairs: Vec<(ExpertId, LayerFfn)> = Vec::new();
+                    for id in &union_plan.fill {
+                        let host = self.host_expert(id.layer as usize, id.expert as usize)?;
+                        pairs.push((*id, host));
+                    }
+                    if !pairs.is_empty() {
+                        let nvme_side = nvme_side.as_ref();
+                        let mut nvme = |id: ExpertId, dev_off: usize, slot_bytes: usize| {
+                            self.try_nvme_expert_fill(id, dev_off, slot_bytes, nvme_side, resident)
+                        };
+                        resident.bulk_fill_experts(
+                            &pairs,
+                            Some(metrics),
+                            None,
+                            false,
+                            Some(&mut nvme),
+                        )?;
+                    }
+                    for (id, host) in &pairs {
+                        lru.admit(*id, host)?;
+                    }
                 }
+                lru.plan(&ids)
             } else {
-                ids.clone()
+                MissPlan {
+                    hits: ids.clone(),
+                    fill: Vec::new(),
+                    cpu: Vec::new(),
+                }
             };
-            let union_plan = lru.plan(&route_ids);
-            lru.note_plan(&union_plan);
-            if !union_plan.fill.is_empty() {
-                let mut pairs: Vec<(ExpertId, LayerFfn)> = Vec::new();
-                for id in &union_plan.fill {
-                    let host = self.host_expert(id.layer as usize, id.expert as usize)?;
-                    pairs.push((*id, host));
-                }
-                if !pairs.is_empty() {
-                    let nvme_side = nvme_side.as_ref();
-                    let mut nvme = |id: ExpertId, dev_off: usize, slot_bytes: usize| {
-                        self.try_nvme_expert_fill(id, dev_off, slot_bytes, nvme_side, resident)
-                    };
-                    resident.bulk_fill_experts(
-                        &pairs,
-                        Some(metrics),
-                        None,
-                        false,
-                        Some(&mut nvme),
-                    )?;
-                }
-                for (id, host) in &pairs {
-                    lru.admit(*id, host)?;
+            hip.copy_h2d_f32(buf.attn, &vec![0.0f32; dim])?;
+            let mut cpu_jobs: Vec<(ExpertId, LayerFfn, f32)> = Vec::new();
+            let mut gpu_jobs: Vec<(ExpertId, LayerFfn, f32)> = Vec::new();
+            for &(e, w) in &routed {
+                let id = ExpertId {
+                    layer: layer_idx as u32,
+                    expert: e as u32,
+                };
+                let host = self.host_expert(layer_idx, e)?;
+                let ffn = if let Some(lru) = &self.expert_lru {
+                    lru.materialize(id, &host)?
+                } else {
+                    host
+                };
+                if plan.cpu.iter().any(|&c| c == id) {
+                    cpu_jobs.push((id, ffn, w));
+                } else {
+                    gpu_jobs.push((id, ffn, w));
                 }
             }
-            lru.plan(&ids)
-        } else {
-            MissPlan {
-                hits: ids.clone(),
-                fill: Vec::new(),
-                cpu: Vec::new(),
+            // GEM micro-batch: run CPU expert MLPs in parallel with the GPU expert loop.
+            if !cpu_jobs.is_empty() && !gpu_jobs.is_empty() {
+                metrics.micro_batch_plans.fetch_add(1, Ordering::Relaxed);
             }
-        };
-        hip.copy_h2d_f32(buf.attn, &vec![0.0f32; dim])?;
-        let mut cpu_jobs: Vec<(ExpertId, LayerFfn, f32)> = Vec::new();
-        let mut gpu_jobs: Vec<(ExpertId, LayerFfn, f32)> = Vec::new();
-        for &(e, w) in &routed {
-            let id = ExpertId {
-                layer: layer_idx as u32,
-                expert: e as u32,
-            };
-            let host = self.host_expert(layer_idx, e)?;
-            let ffn = if let Some(lru) = &self.expert_lru {
-                lru.materialize(id, &host)?
-            } else {
-                host
-            };
-            if plan.cpu.iter().any(|&c| c == id) {
-                cpu_jobs.push((id, ffn, w));
-            } else {
-                gpu_jobs.push((id, ffn, w));
-            }
-        }
-        // GEM micro-batch: run CPU expert MLPs in parallel with the GPU expert loop.
-        if !cpu_jobs.is_empty() && !gpu_jobs.is_empty() {
-            metrics.micro_batch_plans.fetch_add(1, Ordering::Relaxed);
-        }
-        let cpu_outs: Vec<Vec<f32>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = cpu_jobs
-                .iter()
-                .map(|(id, ffn, w)| {
-                    let x = &x_norm;
-                    scope.spawn(move || {
-                        let mut scratch = vec![0.0f32; dim];
-                        // NUMA bind inside thread for this expert.
-                        if let Some(pool) = &self.expert_host {
-                            let node = pool.preferred_numa_node(*id);
-                            pool.numa()
-                                .run_on_node(node, || {
-                                    expert_mlp(
-                                        x,
-                                        ffn,
-                                        cfg.ff_dim,
-                                        dim,
-                                        &mut scratch,
-                                        cfg.moe_relu_sqr,
-                                    )
-                                })
-                                .expect("expert_mlp");
-                        } else {
-                            expert_mlp(x, ffn, cfg.ff_dim, dim, &mut scratch, cfg.moe_relu_sqr)
-                                .expect("expert_mlp");
-                        }
-                        for v in &mut scratch {
-                            *v *= *w;
-                        }
-                        scratch
+            let cpu_outs: Vec<Vec<f32>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = cpu_jobs
+                    .iter()
+                    .map(|(id, ffn, w)| {
+                        let x = &x_norm;
+                        scope.spawn(move || {
+                            let mut scratch = vec![0.0f32; dim];
+                            // NUMA bind inside thread for this expert.
+                            if let Some(pool) = &self.expert_host {
+                                let node = pool.preferred_numa_node(*id);
+                                pool.numa()
+                                    .run_on_node(node, || {
+                                        expert_mlp(
+                                            x,
+                                            ffn,
+                                            cfg.ff_dim,
+                                            dim,
+                                            &mut scratch,
+                                            cfg.moe_relu_sqr,
+                                        )
+                                    })
+                                    .expect("expert_mlp");
+                            } else {
+                                expert_mlp(x, ffn, cfg.ff_dim, dim, &mut scratch, cfg.moe_relu_sqr)
+                                    .expect("expert_mlp");
+                            }
+                            for v in &mut scratch {
+                                *v *= *w;
+                            }
+                            scratch
+                        })
                     })
-                })
-                .collect();
-            for (id, ffn, w) in &gpu_jobs {
-                let expert = resident.bind_expert(*id, ffn, Some(metrics))?;
-                self.device_expert_gemm(
-                    hip,
-                    resident,
-                    buf,
-                    buf.normed,
-                    1,
-                    expert.w_gate(),
-                    expert.w_up(),
-                    expert.w_down(),
-                    cfg.ff_dim,
-                )?;
-                drop(expert);
-                hip.scale_f32(buf.proj, dim, *w)?;
+                    .collect();
+                for (id, ffn, w) in &gpu_jobs {
+                    let expert = resident.bind_expert(*id, ffn, Some(metrics))?;
+                    self.device_expert_gemm(
+                        hip,
+                        resident,
+                        buf,
+                        buf.normed,
+                        1,
+                        expert.w_gate(),
+                        expert.w_up(),
+                        expert.w_down(),
+                        cfg.ff_dim,
+                    )?;
+                    drop(expert);
+                    hip.scale_f32(buf.proj, dim, *w)?;
+                    hip.residual_add(buf.attn, buf.proj, dim as i32)?;
+                }
+                Ok::<Vec<Vec<f32>>, AllpacaError>(
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("cpu expert thread"))
+                        .collect(),
+                )
+            })?;
+            for scratch in cpu_outs {
+                hip.copy_h2d_f32(buf.proj, &scratch)?;
                 hip.residual_add(buf.attn, buf.proj, dim as i32)?;
             }
-            Ok::<Vec<Vec<f32>>, AllpacaError>(
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("cpu expert thread"))
-                    .collect(),
-            )
-        })?;
-        for scratch in cpu_outs {
-            hip.copy_h2d_f32(buf.proj, &scratch)?;
-            hip.residual_add(buf.attn, buf.proj, dim as i32)?;
         }
         if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
-            let sff = if cfg.shared_ff_dim > 0 {
-                cfg.shared_ff_dim
-            } else {
-                off.w_shared_up.n / dim.max(1)
-            };
-            self.device_expert_gemm(
-                hip,
-                resident,
-                buf,
-                buf.normed,
-                1,
-                WeightRef::f32(0, 0),
-                off.w_shared_up,
-                off.w_shared_down,
-                sff,
-            )?;
-            hip.residual_add(buf.attn, buf.proj, dim as i32)?;
+            self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &x_norm, 1, None)?;
         } else if !host_layer.shared_expert.w_up.is_empty() {
             let sff = if cfg.shared_ff_dim > 0 {
                 cfg.shared_ff_dim
@@ -5120,6 +5332,306 @@ impl TinyModel {
         }
         hip.copy_d2d_f32(buf.proj, buf.attn, dim)?;
         record_elementwise(Some(metrics));
+        Ok(())
+    }
+
+    /// Read back what host routing needs from `n_tok` rows of `buf.normed`:
+    /// the rows themselves and, when the router is a device-resident
+    /// `[n_experts, dim]` softmax router, its logits (GEMM into `buf.q`, free
+    /// once the mixer is done). `buf.q` follows `buf.normed` in the decode
+    /// workspace, so both come back in one D2H: on Windows every small copy
+    /// costs ~60-80 us whatever its size.
+    fn device_moe_readback(
+        &self,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        off: &LayerOff,
+        buf: DeviceDecode,
+        n_tok: usize,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>), AllpacaError> {
+        let cfg = &self.config;
+        let (dim, n_exp) = (cfg.dim, cfg.n_experts);
+        let xn = n_tok * dim;
+        let router = n_exp > 0
+            && off.w_router.n == n_exp * dim
+            && cfg.router_kind == RouterKind::SoftmaxTopk
+            && self.edge0.is_none()
+            && cfg.edge0_tier.is_none();
+        let mut x_norm = vec![0.0f32; xn];
+        if !router {
+            hip.copy_d2h_f32(buf.normed, &mut x_norm)?;
+            return Ok((x_norm, None));
+        }
+        resident.gemm_nt(
+            hip,
+            buf.normed,
+            off.w_router,
+            buf.q,
+            n_tok as i32,
+            n_exp as i32,
+            dim as i32,
+        )?;
+        let ln = n_tok * n_exp;
+        let gap = (buf.q as usize)
+            .checked_sub(buf.normed as usize)
+            .map(|b| b / 4)
+            .filter(|&g| g >= xn && g <= xn + (1 << 16));
+        let Some(gap) = gap else {
+            let mut logits = vec![0.0f32; ln];
+            hip.copy_d2h_f32(buf.normed, &mut x_norm)?;
+            hip.copy_d2h_f32(buf.q, &mut logits)?;
+            return Ok((x_norm, Some(logits)));
+        };
+        // Copy by kernel into pinned memory, then wait: cheaper than a
+        // hipMemcpy D2H on Windows (~48 vs ~70 us).
+        let mut stage = resident.moe_stage.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("moe stage lock".into()))
+        })?;
+        let host = stage.ensure((gap + ln) * 4)?.cast::<f32>();
+        hip.bind()?;
+        allpaca_hip::copy_f32_kernel(host, buf.normed, gap + ln)?;
+        allpaca_hip::stream_synchronize()?;
+        let staged = unsafe { std::slice::from_raw_parts(host, gap + ln) };
+        Ok((staged[..xn].to_vec(), Some(staged[gap..].to_vec())))
+    }
+
+    /// Expert-parallel MoE: when this layer's routed experts live on an RPC
+    /// worker, run them there and write the weighted sums (`[rows][dim]`) to
+    /// `buf.attn`. `false` means the experts are local.
+    fn remote_moe_rows(
+        &self,
+        layer_idx: usize,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        buf: DeviceDecode,
+        x_norm: &[f32],
+        routes: &[Vec<(usize, f32)>],
+    ) -> Result<bool, AllpacaError> {
+        let Some(rpc) = self.rpc.as_ref() else {
+            return Ok(false);
+        };
+        let Some(out) = rpc.moe_ffn(layer_idx, x_norm, routes)? else {
+            return Ok(false);
+        };
+        // Stage in pinned memory and copy by kernel: queued, where a
+        // hipMemcpy would block the host for ~60 us.
+        let mut stage = resident.moe_stage.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("moe stage lock".into()))
+        })?;
+        let host = stage.ensure(out.len() * 4)?.cast::<f32>();
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), host, out.len()) };
+        hip.bind()?;
+        allpaca_hip::copy_f32_kernel(buf.attn, host, out.len())?;
+        Ok(true)
+    }
+
+    /// `n_tok` rows' MoE entirely on the GPU for a layer whose experts are
+    /// local stacked K-quants: router GEMV, softmax top-k into a device pair
+    /// table, fused experts, shared expert scaled by its on-device gate. No
+    /// host round trip, so the host keeps queueing while the GPU runs (on
+    /// Windows each sync after an idle gap costs 100-200 us). Leaves the MoE
+    /// output in `buf.proj` like [`Self::device_moe`]. `false` when this layer
+    /// needs host routing.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_routed_local_moe(
+        &self,
+        layer_idx: usize,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        off: &LayerOff,
+        host_layer: &LayerWeights,
+        buf: DeviceDecode,
+        n_tok: usize,
+    ) -> Result<bool, AllpacaError> {
+        let cfg = &self.config;
+        let (dim, ff, n_exp) = (cfg.dim, cfg.ff_dim, cfg.n_experts);
+        let k = cfg.n_active.max(1).min(n_exp);
+        let softmax_router = cfg.router_kind == RouterKind::SoftmaxTopk
+            && !cfg.moe_sigmoid_gating
+            && !cfg.moe_sqrt_softplus
+            && (cfg.expert_weights_scale == 0.0 || cfg.expert_weights_scale == 1.0);
+        if !softmax_router
+            || k > 64
+            || off.w_router.n != n_exp * dim
+            || self.edge0.is_some()
+            || cfg.edge0_tier.is_some()
+            || self.expert_lru.is_some()
+            || resident.expert_ring.is_some()
+            || cfg.moe_relu_sqr
+            || cfg.ffn_gelu
+            || dim % 256 != 0
+            || ff % 256 != 0
+            || self.rpc.as_ref().is_some_and(|r| r.experts_remote(layer_idx))
+        {
+            return Ok(false);
+        }
+        let Some(experts) = resident
+            .expert_offs
+            .get(layer_idx)
+            .filter(|o| o.len() == n_exp)
+            .and_then(|o| stacked_moe_experts(&resident.weights, o))
+        else {
+            return Ok(false);
+        };
+        let has_shared = off.w_shared_up.n > 0 && off.w_shared_down.n > 0;
+        let shexp_gate = if host_layer.shared_gate_inp.is_empty() {
+            std::ptr::null()
+        } else if off.shared_gate_inp.n == dim && off.shared_gate_inp.kind == WeightKind::F32 {
+            resident.weights.ptr_at(off.shared_gate_inp.off)
+        } else {
+            return Ok(false);
+        };
+        let m = n_tok as i32;
+        resident.gemm_nt(hip, buf.normed, off.w_router, buf.q, m, n_exp as i32, dim as i32)?;
+        let (_, table_bytes) = allpaca_hip::MoeDeviceRoutes::at(std::ptr::null_mut(), n_tok, k);
+        let bytes = table_bytes + allpaca_hip::moe_ffn_scratch_bytes(n_tok, dim, ff, n_tok * k);
+        let mut scratch = resident.moe_scratch.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("moe scratch lock".into()))
+        })?;
+        if scratch.as_ref().is_none_or(|s| s.bytes() < bytes as u64) {
+            *scratch = None;
+            *scratch = Some(DeviceWeights::alloc(resident.weights.device(), bytes.max(1 << 20))?);
+        }
+        let base = scratch.as_ref().expect("moe scratch").ptr_at(0) as *mut u8;
+        let (routes, used) = allpaca_hip::MoeDeviceRoutes::at(base, n_tok, k);
+        hip.bind()?;
+        allpaca_hip::moe_route_softmax_topk_device(buf.q, n_exp, buf.normed, shexp_gate, dim, &routes)?;
+        allpaca_hip::moe_ffn_kquant_device(
+            allpaca_hip::MoeInput::F32(buf.normed),
+            n_tok,
+            dim,
+            ff,
+            n_tok * k,
+            routes.row,
+            routes.expert,
+            routes.w,
+            routes.row_start,
+            allpaca_hip::MoeGroups::per_pair(n_tok * k),
+            experts[0],
+            experts[1],
+            experts[2],
+            unsafe { base.add(used) },
+            buf.attn,
+        )?;
+        drop(scratch);
+        if has_shared {
+            let scale = (!shexp_gate.is_null()).then_some(routes.shexp_scale.cast_const());
+            self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &[], n_tok, scale)?;
+        }
+        hip.copy_d2d_f32(buf.proj, buf.attn, n_tok * dim)?;
+        Ok(true)
+    }
+
+    /// Local routed experts through the fused K-quant MoE kernels: three
+    /// launches per layer instead of ~4 per selected expert, with the same
+    /// arithmetic. Rows of `buf.normed`; weighted sums into `buf.attn`.
+    /// `false` when the layer's experts are not stacked K-quants resident here.
+    fn fused_local_moe_rows(
+        &self,
+        layer_idx: usize,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        buf: DeviceDecode,
+        routes: &[Vec<(usize, f32)>],
+    ) -> Result<bool, AllpacaError> {
+        let cfg = &self.config;
+        let (dim, ff) = (cfg.dim, cfg.ff_dim);
+        if self.expert_lru.is_some()
+            || resident.expert_ring.is_some()
+            || cfg.moe_relu_sqr
+            || cfg.ffn_gelu
+            || dim % 256 != 0
+            || ff % 256 != 0
+        {
+            return Ok(false);
+        }
+        let Some(experts) = resident
+            .expert_offs
+            .get(layer_idx)
+            .filter(|o| o.len() == cfg.n_experts)
+            .and_then(|o| stacked_moe_experts(&resident.weights, o))
+        else {
+            return Ok(false);
+        };
+        let pairs: Vec<(u32, u32, f32)> = routes
+            .iter()
+            .enumerate()
+            .flat_map(|(r, route)| route.iter().map(move |&(e, w)| (r as u32, e as u32, w)))
+            .collect();
+        let rows = routes.len();
+        let table = allpaca_hip::MoePairTable::new(rows, &pairs, &[]);
+        let bytes = allpaca_hip::moe_ffn_scratch_bytes(rows, dim, ff, table.pairs);
+        let mut scratch = resident.moe_scratch.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("moe scratch lock".into()))
+        })?;
+        if scratch.as_ref().is_none_or(|s| s.bytes() < bytes as u64) {
+            *scratch = None;
+            *scratch = Some(DeviceWeights::alloc(resident.weights.device(), bytes.max(1 << 20))?);
+        }
+        let work = scratch.as_ref().expect("moe scratch").ptr_at(0) as *mut u8;
+        // The kernels read the pair table from pinned memory in place.
+        let mut stage = resident.moe_stage.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("moe stage lock".into()))
+        })?;
+        let host = stage.ensure(table.host.len() * 4)?.cast::<f32>();
+        unsafe { std::ptr::copy_nonoverlapping(table.host.as_ptr(), host, table.host.len()) };
+        hip.bind()?;
+        table.run(
+            host,
+            allpaca_hip::MoeInput::F32(buf.normed),
+            rows,
+            dim,
+            ff,
+            experts,
+            work,
+            buf.attn,
+        )?;
+        Ok(true)
+    }
+
+    /// Device shared expert (`ffn_*_shexp`) on `n_tok` rows of `buf.normed`,
+    /// added into `buf.attn`. Qwen3-Next scales each row's output by
+    /// `sigmoid(x_norm · ffn_gate_inp_shexp)`.
+    #[allow(clippy::too_many_arguments)]
+    fn device_shared_expert_rows(
+        &self,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        buf: DeviceDecode,
+        off: &LayerOff,
+        host_layer: &LayerWeights,
+        x_norm: &[f32],
+        n_tok: usize,
+        device_scale: Option<*const f32>,
+    ) -> Result<(), AllpacaError> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let sff = if cfg.shared_ff_dim > 0 {
+            cfg.shared_ff_dim
+        } else {
+            off.w_shared_up.n / dim.max(1)
+        };
+        self.device_expert_gemm(
+            hip,
+            resident,
+            buf,
+            buf.normed,
+            n_tok as i32,
+            off.w_shared_gate,
+            off.w_shared_up,
+            off.w_shared_down,
+            sff,
+        )?;
+        let gate = &host_layer.shared_gate_inp;
+        if let Some(scale) = device_scale {
+            allpaca_hip::scale_rows_device(buf.proj, scale, n_tok, dim)?;
+        } else if gate.len() == dim {
+            for (t, x) in x_norm.chunks_exact(dim).take(n_tok).enumerate() {
+                let logit: f32 = x.iter().zip(gate).map(|(a, b)| a * b).sum();
+                hip.scale_f32(buf.proj_row(t, dim), dim, sigmoid_stable(logit))?;
+            }
+        }
+        hip.residual_add(buf.attn, buf.proj, (n_tok * dim) as i32)?;
         Ok(())
     }
 
@@ -5185,138 +5697,134 @@ impl TinyModel {
         )?;
         metrics.residual_gpu_ops.fetch_add(1, Ordering::Relaxed);
         record_elementwise(Some(metrics));
-        let mut x_norm = vec![0.0f32; n_tok * dim];
-        hip.copy_d2h_f32(buf.normed, &mut x_norm)?;
+        // Same GPU routing as single-token decode, so verify spans and decode
+        // produce identical tokens.
+        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, n_tok)? {
+            record_elementwise(Some(metrics));
+            return Ok(());
+        }
+        let (x_norm, mut logits) = self.device_moe_readback(hip, resident, off, buf, n_tok)?;
         let n_exp = cfg.n_experts.max(1);
         let n_act = cfg.n_active.max(1).min(n_exp);
         let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
         let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for t in 0..n_tok {
-            let routed = topk_route(
-                &x_norm[t * dim..(t + 1) * dim],
-                &host_layer.w_router,
-                n_exp,
-                n_act,
-                cfg,
-            );
+            let routed = match logits.as_mut() {
+                Some(l) => topk_from_logits(&mut l[t * n_exp..(t + 1) * n_exp], n_act, cfg),
+                None => topk_route(
+                    &x_norm[t * dim..(t + 1) * dim],
+                    &host_layer.w_router,
+                    n_exp,
+                    n_act,
+                    cfg,
+                ),
+            };
             for &(e, _) in &routed {
                 union.insert(e);
             }
             routes.push(routed);
         }
-        let ids: Vec<ExpertId> = union
-            .iter()
-            .map(|&e| ExpertId {
-                layer: layer_idx as u32,
-                expert: e as u32,
-            })
-            .collect();
-        let plan = if let Some(lru) = &self.expert_lru {
-            let union_plan = lru.plan(&ids);
-            lru.note_plan(&union_plan);
-            if !union_plan.fill.is_empty() {
-                let mut pairs: Vec<(ExpertId, LayerFfn)> = Vec::new();
-                for id in &union_plan.fill {
-                    let host = self.host_expert(id.layer as usize, id.expert as usize)?;
-                    pairs.push((*id, host));
-                }
-                if !pairs.is_empty() {
-                    resident.bulk_fill_experts(&pairs, Some(metrics), None, false, None)?;
-                }
-                for (id, host) in &pairs {
-                    lru.admit(*id, host)?;
-                }
-            }
-            lru.plan(&ids)
-        } else {
-            MissPlan {
-                hits: ids.clone(),
-                fill: Vec::new(),
-                cpu: Vec::new(),
-            }
-        };
-        hip.copy_h2d_f32(buf.attn, &vec![0.0f32; n_tok * dim])?;
-        let mut groups: std::collections::BTreeMap<usize, Vec<(usize, f32)>> =
-            std::collections::BTreeMap::new();
-        for (t, routed) in routes.iter().enumerate() {
-            for &(e, w) in routed {
-                groups.entry(e).or_default().push((t, w));
-            }
-        }
-        for (e, group) in &groups {
-            let id = ExpertId {
-                layer: layer_idx as u32,
-                expert: *e as u32,
-            };
-            let host = self.host_expert(layer_idx, *e)?;
-            let ffn = if let Some(lru) = &self.expert_lru {
-                lru.materialize(id, &host)?
-            } else {
-                host
-            };
-            if plan.cpu.iter().any(|&c| c == id) {
-                for &(t, w) in group {
-                    let mut scratch = vec![0.0f32; dim];
-                    self.run_expert_mlp_numa(
-                        id,
-                        &x_norm[t * dim..(t + 1) * dim],
-                        &ffn,
-                        cfg.ff_dim,
-                        dim,
-                        &mut scratch,
-                        None,
-                    )?;
-                    for v in &mut scratch {
-                        *v *= w;
+        if !self.remote_moe_rows(layer_idx, hip, resident, buf, &x_norm, &routes)?
+            && !self.fused_local_moe_rows(layer_idx, hip, resident, buf, &routes)?
+        {
+            let ids: Vec<ExpertId> = union
+                .iter()
+                .map(|&e| ExpertId {
+                    layer: layer_idx as u32,
+                    expert: e as u32,
+                })
+                .collect();
+            let plan = if let Some(lru) = &self.expert_lru {
+                let union_plan = lru.plan(&ids);
+                lru.note_plan(&union_plan);
+                if !union_plan.fill.is_empty() {
+                    let mut pairs: Vec<(ExpertId, LayerFfn)> = Vec::new();
+                    for id in &union_plan.fill {
+                        let host = self.host_expert(id.layer as usize, id.expert as usize)?;
+                        pairs.push((*id, host));
                     }
-                    hip.copy_h2d_f32(buf.proj_row(t, dim), &scratch)?;
-                    hip.residual_add(buf.attn_row(t, dim), buf.proj_row(t, dim), dim as i32)?;
+                    if !pairs.is_empty() {
+                        resident.bulk_fill_experts(&pairs, Some(metrics), None, false, None)?;
+                    }
+                    for (id, host) in &pairs {
+                        lru.admit(*id, host)?;
+                    }
                 }
-                continue;
-            }
-            let expert = resident.bind_expert(id, &ffn, Some(metrics))?;
-            let m = group.len() as i32;
-            for (i, &(t, _)) in group.iter().enumerate() {
-                hip.copy_d2d_f32(buf.q_row(i, dim), buf.normed_row(t, dim), dim)?;
-            }
-            self.device_expert_gemm(
-                hip,
-                resident,
-                buf,
-                buf.q,
-                m,
-                expert.w_gate(),
-                expert.w_up(),
-                expert.w_down(),
-                cfg.ff_dim,
-            )?;
-            drop(expert);
-            for (i, &(t, w)) in group.iter().enumerate() {
-                let src = buf.proj_row(i, dim);
-                if (w - 1.0).abs() > f32::EPSILON {
-                    hip.scale_f32(src, dim, w)?;
+                lru.plan(&ids)
+            } else {
+                MissPlan {
+                    hits: ids.clone(),
+                    fill: Vec::new(),
+                    cpu: Vec::new(),
                 }
-                hip.residual_add(buf.attn_row(t, dim), src, dim as i32)?;
+            };
+            hip.copy_h2d_f32(buf.attn, &vec![0.0f32; n_tok * dim])?;
+            let mut groups: std::collections::BTreeMap<usize, Vec<(usize, f32)>> =
+                std::collections::BTreeMap::new();
+            for (t, routed) in routes.iter().enumerate() {
+                for &(e, w) in routed {
+                    groups.entry(e).or_default().push((t, w));
+                }
+            }
+            for (e, group) in &groups {
+                let id = ExpertId {
+                    layer: layer_idx as u32,
+                    expert: *e as u32,
+                };
+                let host = self.host_expert(layer_idx, *e)?;
+                let ffn = if let Some(lru) = &self.expert_lru {
+                    lru.materialize(id, &host)?
+                } else {
+                    host
+                };
+                if plan.cpu.iter().any(|&c| c == id) {
+                    for &(t, w) in group {
+                        let mut scratch = vec![0.0f32; dim];
+                        self.run_expert_mlp_numa(
+                            id,
+                            &x_norm[t * dim..(t + 1) * dim],
+                            &ffn,
+                            cfg.ff_dim,
+                            dim,
+                            &mut scratch,
+                            None,
+                        )?;
+                        for v in &mut scratch {
+                            *v *= w;
+                        }
+                        hip.copy_h2d_f32(buf.proj_row(t, dim), &scratch)?;
+                        hip.residual_add(buf.attn_row(t, dim), buf.proj_row(t, dim), dim as i32)?;
+                    }
+                    continue;
+                }
+                let expert = resident.bind_expert(id, &ffn, Some(metrics))?;
+                let m = group.len() as i32;
+                for (i, &(t, _)) in group.iter().enumerate() {
+                    hip.copy_d2d_f32(buf.q_row(i, dim), buf.normed_row(t, dim), dim)?;
+                }
+                self.device_expert_gemm(
+                    hip,
+                    resident,
+                    buf,
+                    buf.q,
+                    m,
+                    expert.w_gate(),
+                    expert.w_up(),
+                    expert.w_down(),
+                    cfg.ff_dim,
+                )?;
+                drop(expert);
+                for (i, &(t, w)) in group.iter().enumerate() {
+                    let src = buf.proj_row(i, dim);
+                    if (w - 1.0).abs() > f32::EPSILON {
+                        hip.scale_f32(src, dim, w)?;
+                    }
+                    hip.residual_add(buf.attn_row(t, dim), src, dim as i32)?;
+                }
             }
         }
         if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
-            let sff = if cfg.shared_ff_dim > 0 {
-                cfg.shared_ff_dim
-            } else {
-                off.w_shared_up.n / dim.max(1)
-            };
-            self.device_expert_gemm(
-                hip,
-                resident,
-                buf,
-                buf.normed,
-                n_tok as i32,
-                WeightRef::f32(0, 0),
-                off.w_shared_up,
-                off.w_shared_down,
-                sff,
-            )?;
-            hip.residual_add(buf.attn, buf.proj, (n_tok * dim) as i32)?;
+            self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &x_norm, n_tok, None)?;
         } else if !host_layer.shared_expert.w_up.is_empty() {
             let sff = if cfg.shared_ff_dim > 0 {
                 cfg.shared_ff_dim
@@ -5607,12 +6115,12 @@ impl TinyModel {
                         };
                     LayerWeights {
                         block: HybridLayerKind::Ssm,
-                        ssm: if file.architecture() == Some("qwen35") {
+                        ssm: if file.architecture().is_some_and(is_qwen_gdn_arch) {
                             None
                         } else {
                             Some(load_gguf_ssm_layer(file, i, cfg.dim, true)?)
                         },
-                        gdn: if file.architecture() == Some("qwen35") {
+                        gdn: if file.architecture().is_some_and(is_qwen_gdn_arch) {
                             load_gguf_gdn_host(file, i, true).ok()
                         } else {
                             None
@@ -5636,6 +6144,7 @@ impl TinyModel {
                         attn_out_gate: Vec::new(),
                         attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
+                        shared_gate_inp: Vec::new(),
                         ffn_post_norm: Vec::new(),
                     }
                 }
@@ -5677,6 +6186,7 @@ impl TinyModel {
                         attn_out_gate: Vec::new(),
                         attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
+                        shared_gate_inp: Vec::new(),
                         ffn_post_norm: Vec::new(),
                     }
                 }
@@ -5793,6 +6303,7 @@ impl TinyModel {
                         } else {
                             Vec::new()
                         },
+                        shared_gate_inp: Vec::new(),
                         ffn_post_norm: if file
                             .tensor(&format!("blk.{i}.ffn_post_norm.weight"))
                             .is_some()
@@ -5904,7 +6415,7 @@ impl TinyModel {
                 layer.block = block;
                 if block == HybridLayerKind::Ssm {
                     if let Some(f) = file {
-                        if f.architecture() == Some("qwen35") {
+                        if f.architecture().is_some_and(is_qwen_gdn_arch) {
                             if let Ok(gdn) = load_gguf_gdn_host(f, i, false) {
                                 layer.gdn = Some(gdn);
                             }
@@ -5966,6 +6477,25 @@ impl TinyModel {
                         if let Ok(norm) = gguf_ffn_norm(f, i) {
                             layer.ffn_norm = norm;
                         }
+                    }
+                }
+                if let Some(f) = file {
+                    // GDN + MoE blocks (Qwen3-Next) route after the SSM mixer.
+                    let routes = f.tensor(&format!("blk.{i}.ffn_gate_inp.weight"));
+                    if block == HybridLayerKind::Ssm
+                        && cfg.n_experts > 0
+                        && routes.is_some_and(|t| t.ggml_type != allpaca_gguf::GgmlType::BF16)
+                    {
+                        if let Ok(router) = f.tensor_f32(&format!("blk.{i}.ffn_gate_inp.weight")) {
+                            layer.w_router = router;
+                        }
+                        if let Ok(norm) = gguf_ffn_norm(f, i) {
+                            layer.ffn_norm = norm;
+                        }
+                    }
+                    let shexp_gate = format!("blk.{i}.ffn_gate_inp_shexp.weight");
+                    if f.tensor(&shexp_gate).is_some() {
+                        layer.shared_gate_inp = f.tensor_f32(&shexp_gate).unwrap_or_default();
                     }
                 }
                 layer
@@ -6083,6 +6613,7 @@ impl TinyModel {
                 attn_out_gate: Vec::new(),
                 attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
+                shared_gate_inp: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
         }
@@ -6194,6 +6725,7 @@ impl TinyModel {
                 attn_out_gate: Vec::new(),
                 attn_sinks: Vec::new(),
                 attn_post_norm: Vec::new(),
+                shared_gate_inp: Vec::new(),
                 ffn_post_norm: Vec::new(),
             });
         }
@@ -7172,6 +7704,7 @@ impl TinyModel {
                     dims.head_k as i32,
                     dims.conv_kernel as i32,
                     cfg.eps,
+                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
                 )
             })();
             if let Err(e) = device_gdn {
@@ -7210,6 +7743,7 @@ impl TinyModel {
                     dims.n_k_heads as i32,
                     dims.n_v_heads as i32,
                     dims.head_k as i32,
+                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
                 )?;
                 hip.expand_k_heads_host(
                     k_raw,
@@ -7217,6 +7751,7 @@ impl TinyModel {
                     dims.n_k_heads as i32,
                     dims.n_v_heads as i32,
                     dims.head_k as i32,
+                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
                 )?;
                 let mut decay = vec![0.0f32; dims.n_v_heads];
                 hip.gdn_decay_beta_host(&alpha, &gdn.dt_bias, &gdn.a, &mut decay, &mut beta)?;
@@ -7293,6 +7828,31 @@ impl TinyModel {
                     cfg.ff_dim as i32,
                 )?;
                 drop(ffn);
+            } else if Self::layer_has_device_moe(layer, resident, layer_idx) {
+                // Qwen3-Next: routed MoE after the GDN mixer.
+                if let Some(s) = side.as_mut() {
+                    self.device_moe(
+                        layer_idx,
+                        hip,
+                        resident,
+                        buf,
+                        metrics,
+                        prefill,
+                        micro_batch,
+                        Some(s),
+                    )?;
+                } else {
+                    self.device_moe(
+                        layer_idx,
+                        hip,
+                        resident,
+                        buf,
+                        metrics,
+                        prefill,
+                        micro_batch,
+                        None,
+                    )?;
+                }
             }
             if self.fuse_next_attn_norm(layer_idx, hip.device) {
                 hip.residual_rmsnorm(
@@ -7553,6 +8113,7 @@ impl TinyModel {
                 dims.head_k as i32,
                 dims.conv_kernel as i32,
                 cfg.eps,
+                dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
             ) {
                 static LOGGED: AtomicBool = AtomicBool::new(false);
                 if !LOGGED.swap(true, Ordering::Relaxed) {
@@ -7585,6 +8146,7 @@ impl TinyModel {
                     dims.n_k_heads as i32,
                     dims.n_v_heads as i32,
                     dims.head_k as i32,
+                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
                 )?;
                 hip.expand_k_heads_host(
                     k_raw,
@@ -7592,6 +8154,7 @@ impl TinyModel {
                     dims.n_k_heads as i32,
                     dims.n_v_heads as i32,
                     dims.head_k as i32,
+                    dims.k_repeat == crate::deltanet::KHeadRepeat::Interleave,
                 )?;
                 let mut decay = vec![0.0f32; dims.n_v_heads];
                 hip.gdn_decay_beta_host(&alpha_h, &gdn.dt_bias, &gdn.a, &mut decay, &mut beta_h)?;
@@ -7670,6 +8233,8 @@ impl TinyModel {
                 cfg.ff_dim as i32,
             )?;
             drop(ffn);
+        } else if Self::layer_has_device_moe(layer, resident, layer_idx) {
+            self.device_moe_rows(layer_idx, hip, resident, buf, n_tok, metrics, request_id)?;
         }
         hip.residual_add(buf.x, buf.proj, (n_tok * dim) as i32)?;
         if self.fuse_next_attn_norm(layer_idx, hip.device) {
@@ -10821,6 +11386,70 @@ mod lightning_moe_tests {
             })
             .collect();
         allpaca_gguf::write_gguf(path, &meta, &tensors).unwrap();
+    }
+
+    /// The GPU router picks the host's experts in the host's order, with its
+    /// weights, and computes the shared-expert gate.
+    #[test]
+    fn gpu_moe_routing_matches_host_topk() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let (rows, n_exp, k, dim) = (3usize, 512usize, 10usize, 256usize);
+        let cfg = ModelConfig::tiny();
+        let logits: Vec<f32> = (0..rows * n_exp)
+            .map(|i| ((i * 7919 % 1009) as f32) * 0.013 - 6.0)
+            .collect();
+        let x: Vec<f32> = (0..rows * dim).map(|i| ((i % 37) as f32) * 0.05 - 0.9).collect();
+        let gate: Vec<f32> = (0..dim).map(|i| ((i % 11) as f32) * 0.02 - 0.1).collect();
+        let up = |v: &[f32]| {
+            let p = allpaca_hip::device_malloc(v.len() * 4, 0).unwrap();
+            allpaca_hip::memcpy(p, v.as_ptr().cast(), v.len() * 4, allpaca_hip::MEMCPY_H2D).unwrap();
+            p
+        };
+        let (dl, dx, dg) = (up(&logits), up(&x), up(&gate));
+        let table = allpaca_hip::device_malloc(1 << 16, 0).unwrap();
+        let (routes, _) = allpaca_hip::MoeDeviceRoutes::at(table, rows, k);
+        allpaca_hip::moe_route_softmax_topk_device(dl.cast(), n_exp, dx.cast(), dg.cast(), dim, &routes)
+            .unwrap();
+        let down = |p: *mut u8, n: usize| {
+            let mut v = vec![0u32; n];
+            allpaca_hip::memcpy(v.as_mut_ptr().cast(), p, n * 4, allpaca_hip::MEMCPY_D2H).unwrap();
+            v
+        };
+        let w = down(routes.w.cast(), rows * k);
+        let e = down(routes.expert.cast(), rows * k);
+        let rs = down(routes.row_start.cast(), rows + 1);
+        let sc = down(routes.shexp_scale.cast(), rows);
+        for r in 0..rows {
+            let mut row = logits[r * n_exp..(r + 1) * n_exp].to_vec();
+            let want = topk_from_logits(&mut row, k, &cfg);
+            for (j, &(we, ww)) in want.iter().enumerate() {
+                let p = r * k + j;
+                assert_eq!(e[p] as usize, we, "row {r} rank {j} expert");
+                let got = f32::from_bits(w[p]);
+                assert!((got - ww).abs() <= 1e-6 * ww.abs().max(1.0), "row {r} rank {j}: {got} vs {ww}");
+            }
+            assert_eq!(rs[r] as usize, r * k);
+            let dot: f32 = x[r * dim..(r + 1) * dim].iter().zip(&gate).map(|(a, b)| a * b).sum();
+            let got = f32::from_bits(sc[r]);
+            assert!((got - sigmoid_stable(dot)).abs() < 1e-5, "row {r} shexp {got}");
+        }
+        assert_eq!(rs[rows] as usize, rows * k);
+        for (p, n) in [(dl, rows * n_exp), (dx, rows * dim), (dg, dim)] {
+            allpaca_hip::device_free(p, n * 4);
+        }
+        allpaca_hip::device_free(table, 1 << 16);
+    }
+
+    #[test]
+    fn ssm_ba_splits_per_k_group_into_beta_then_alpha() {
+        // 2 K groups x 2 V heads, dim 1: rows are [b0 b1 a0 a1 | b2 b3 a2 a3].
+        let ba = [10.0, 11.0, 20.0, 21.0, 12.0, 13.0, 22.0, 23.0];
+        let (beta, alpha) = super::split_ssm_ba(&ba, 1, 2, 4).expect("split");
+        assert_eq!(beta, [10.0, 11.0, 12.0, 13.0]);
+        assert_eq!(alpha, [20.0, 21.0, 22.0, 23.0]);
+        assert!(super::split_ssm_ba(&ba, 1, 3, 4).is_none());
     }
 
     #[test]

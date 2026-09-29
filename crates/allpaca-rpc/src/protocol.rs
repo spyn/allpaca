@@ -8,7 +8,8 @@ pub const PROTO_MINOR: u16 = 0;
 pub const PROTO_PATCH: u16 = 0;
 /// Bump when the named kernel set or C ABI revision changes.
 /// 2 adds `PutTensor` and `GemmNtQuant` (packed GGUF weights).
-pub const KERNEL_ABI_REV: u32 = 2;
+/// 3 adds `MoeFfn` (expert-parallel MoE FFN).
+pub const KERNEL_ABI_REV: u32 = 5;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
@@ -47,6 +48,8 @@ pub enum Cmd {
     RunSpan = 12,
     /// Store one packed GGUF tensor (ggml type + dims + raw bytes). Reply is a BufId.
     PutTensor = 13,
+    /// Expert-parallel MoE FFN over stacked expert tensors; see [`MoeFfnRequest`].
+    MoeFfn = 14,
 }
 
 impl Cmd {
@@ -66,6 +69,7 @@ impl Cmd {
             11 => Self::Sync,
             12 => Self::RunSpan,
             13 => Self::PutTensor,
+            14 => Self::MoeFfn,
             _ => return None,
         })
     }
@@ -231,6 +235,206 @@ pub fn write_i32(w: &mut Vec<u8>, v: i32) {
 
 pub fn write_f32(w: &mut Vec<u8>, v: f32) {
     w.extend_from_slice(&v.to_le_bytes());
+}
+
+/// One MoE layer's experts on a worker: `gate` / `up` are stacked
+/// `[n_experts][ff][dim]` and `down` `[n_experts][dim][ff]` packed GGUF tensors
+/// (`PutTensor`), each expert an equal byte slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeFfnRequest {
+    pub gate: BufId,
+    pub up: BufId,
+    pub down: BufId,
+    pub n_experts: u32,
+    pub dim: u32,
+    pub ff: u32,
+    /// Reply as F16 instead of F32: half the bytes back over a slow link, at
+    /// ~5e-4 relative rounding of the MoE output.
+    pub f16_out: bool,
+}
+
+/// `MoeFfn` format flags (one u32 in the request).
+const MOE_FLAG_Q8_IN: u32 = 1;
+const MOE_FLAG_F16_OUT: u32 = 2;
+
+/// F32 to F16 bits, round to nearest even, with subnormals and overflow to
+/// infinity (unlike `allpaca_cpu::f32_to_f16`, which truncates).
+pub fn f32_to_f16_rne(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7f_ffff;
+    if exp == 0xff {
+        // Inf stays inf; NaN stays a (quiet) NaN.
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // Subnormal: shift the full significand, rounding half to even.
+        let m = mant | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rest = m & ((1u32 << shift) - 1);
+        let mut out = m >> shift;
+        if rest > half || (rest == half && out & 1 == 1) {
+            out += 1;
+        }
+        return sign | out as u16;
+    }
+    let mut out = ((e as u32) << 10) | (mant >> 13);
+    let rest = mant & 0x1fff;
+    if rest > 0x1000 || (rest == 0x1000 && out & 1 == 1) {
+        out += 1; // may carry into the exponent, and up to inf: both correct
+    }
+    sign | out as u16
+}
+
+/// `MoeFfn` reply payload: `out` as F32 or F16 little-endian values.
+pub fn encode_moe_reply(out: &[f32], f16_out: bool) -> Vec<u8> {
+    if f16_out {
+        out.iter().flat_map(|&v| f32_to_f16_rne(v).to_le_bytes()).collect()
+    } else {
+        out.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+}
+
+/// Inverse of [`encode_moe_reply`]; `None` when `body` is not `n` values.
+pub fn decode_moe_reply(body: &[u8], n: usize, f16_out: bool) -> Option<Vec<f32>> {
+    if f16_out {
+        (body.len() == n * 2).then(|| {
+            body.chunks_exact(2)
+                .map(|b| allpaca_cpu::f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .collect()
+        })
+    } else {
+        (body.len() == n * 4).then(|| {
+            body.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        })
+    }
+}
+
+/// Quantize activation rows the way the worker's int8 K-quant GEMVs do: per
+/// 32 values, `d = amax / 127` and `q = round(x / d)`, bit for bit what the
+/// HIP `quantize_rows_q8_kernel` computes. `x.len()` must be whole blocks.
+pub fn quantize_q8_rows(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let mut q = Vec::with_capacity(x.len());
+    let mut d = Vec::with_capacity(x.len() / 32);
+    for blk in x.chunks_exact(32) {
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+        let inv = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+        q.extend(blk.iter().map(|v| (v * inv).round().clamp(-127.0, 127.0) as i8));
+        d.push(scale);
+    }
+    (q, d)
+}
+
+/// `MoeFfn` activation rows: F32, or pre-quantized int8 blocks of 32 (a
+/// quarter of the bytes on the wire, and exactly what the fused kernels read).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MoeX {
+    F32(Vec<f32>),
+    Q8 { q: Vec<i8>, d: Vec<f32> },
+}
+
+impl MoeX {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(x) => x.len(),
+            Self::Q8 { q, .. } => q.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// F32 rows; dequantized for Q8.
+    pub fn to_f32(&self) -> Vec<f32> {
+        match self {
+            Self::F32(x) => x.clone(),
+            Self::Q8 { q, d } => q
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| f32::from(v) * d[i / 32])
+                .collect(),
+        }
+    }
+}
+
+/// `MoeFfn` payload: request, rows `x` (`[rows][dim]`, F32 or int8 blocks
+/// when `q8`), then `(row, expert, weight)` pairs. The reply is `[rows][dim]`
+/// F32 of `sum weight * down_e(silu(gate_e x) * up_e x)` per row.
+pub fn encode_moe_ffn(
+    req: &MoeFfnRequest,
+    x: &[f32],
+    q8: bool,
+    pairs: &[(u32, u32, f32)],
+) -> Vec<u8> {
+    let q8 = q8 && x.len() % 32 == 0;
+    let mut w = Vec::with_capacity(64 + x.len() * 4 + pairs.len() * 12);
+    for id in [req.gate, req.up, req.down] {
+        write_buf_id(&mut w, id);
+    }
+    let flags = if q8 { MOE_FLAG_Q8_IN } else { 0 } | if req.f16_out { MOE_FLAG_F16_OUT } else { 0 };
+    for v in [req.n_experts, req.dim, req.ff, x.len() as u32, pairs.len() as u32, flags] {
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+    if q8 {
+        let (q, d) = quantize_q8_rows(x);
+        w.extend(q.iter().map(|&v| v as u8));
+        for v in d {
+            w.extend_from_slice(&v.to_le_bytes());
+        }
+    } else {
+        for v in x {
+            w.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for &(row, expert, weight) in pairs {
+        w.extend_from_slice(&row.to_le_bytes());
+        w.extend_from_slice(&expert.to_le_bytes());
+        w.extend_from_slice(&weight.to_le_bytes());
+    }
+    w
+}
+
+#[allow(clippy::type_complexity)]
+pub fn decode_moe_ffn(data: &[u8]) -> Result<(MoeFfnRequest, MoeX, Vec<(u32, u32, f32)>), RpcError> {
+    let mut c = Cursor::new(data);
+    let (gate, up, down) = (c.buf_id()?, c.buf_id()?, c.buf_id()?);
+    let (n_experts, dim, ff, n_x, n_pairs) = (c.u32()?, c.u32()?, c.u32()?, c.u32()?, c.u32()?);
+    let flags = c.u32()?;
+    let (q8, f16_out) = (flags & MOE_FLAG_Q8_IN != 0, flags & MOE_FLAG_F16_OUT != 0);
+    if dim == 0 || n_x % dim != 0 || n_experts == 0 || (q8 && n_x % 32 != 0) {
+        return Err(RpcError::Protocol("moe ffn shape".into()));
+    }
+    let rows = n_x / dim;
+    let x = if q8 {
+        let q = (0..n_x).map(|_| c.u8().map(|b| b as i8)).collect::<Result<Vec<_>, _>>()?;
+        let d = (0..n_x / 32).map(|_| c.f32()).collect::<Result<Vec<_>, _>>()?;
+        MoeX::Q8 { q, d }
+    } else {
+        MoeX::F32((0..n_x).map(|_| c.f32()).collect::<Result<Vec<_>, _>>()?)
+    };
+    let mut pairs = Vec::with_capacity(n_pairs as usize);
+    for _ in 0..n_pairs {
+        let (row, expert, weight) = (c.u32()?, c.u32()?, c.f32()?);
+        if row >= rows || expert >= n_experts {
+            return Err(RpcError::Protocol("moe ffn pair out of range".into()));
+        }
+        pairs.push((row, expert, weight));
+    }
+    let req = MoeFfnRequest { gate, up, down, n_experts, dim, ff, f16_out };
+    Ok((req, x, pairs))
 }
 
 pub fn write_buf_id(w: &mut Vec<u8>, id: BufId) {

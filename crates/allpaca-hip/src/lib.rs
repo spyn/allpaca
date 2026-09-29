@@ -605,6 +605,53 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
+        pub fn allpaca_copy_f32_kernel(dst: *mut f32, src: *const f32, n: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_moe_route_softmax_topk(
+            logits: *const f32,
+            rows: i32,
+            n_exp: i32,
+            k: i32,
+            x: *const f32,
+            shexp_gate: *const f32,
+            dim: i32,
+            w_out: *mut f32,
+            row_out: *mut i32,
+            exp_out: *mut i32,
+            row_start: *mut i32,
+            shexp_scale: *mut f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_scale_rows(x: *mut f32, scale: *const f32, rows: i32, dim: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_moe_ffn_kquant(
+            x: *const f32,
+            xq: *const i8,
+            xd: *const f32,
+            rows: i32,
+            dim: i32,
+            ff: i32,
+            pairs: i32,
+            pair_row: *const i32,
+            pair_expert: *const i32,
+            pair_w: *const f32,
+            row_start: *const i32,
+            groups: i32,
+            group_start: *const i32,
+            row_pairs: *const i32,
+            max_group: i32,
+            gate: *const u8,
+            gate_qt: i32,
+            gate_stride: u64,
+            up: *const u8,
+            up_qt: i32,
+            up_stride: u64,
+            down: *const u8,
+            down_qt: i32,
+            down_stride: u64,
+            scratch: *mut c_void,
+            out: *mut f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_q5_k(
             a: *const f32,
             b: *const u8,
@@ -908,6 +955,7 @@ mod ffi {
             n_k: i32,
             n_v: i32,
             head_k: i32,
+            interleave: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gdn_decay_beta(
@@ -2602,6 +2650,444 @@ pub fn gemm_nt_q3_k_device(
 }
 
 /// Device-pointer NT GEMM with native GGUF Q5_K `b` (`C = A * dequant(B)^T`).
+/// Grow-only pinned host buffer. hipHostMalloc memory is device-mapped, so
+/// kernels read and write it in place: small uploads skip a blocking
+/// `hipMemcpy` (~60-80 us each on Windows).
+#[derive(Debug, Default)]
+pub struct PinnedBuf {
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
+impl PinnedBuf {
+    /// At least `bytes`, contents undefined after a grow.
+    pub fn ensure(&mut self, bytes: usize) -> Result<*mut u8, AllpacaError> {
+        if self.ptr.is_null() || self.bytes < bytes {
+            host_free(std::mem::replace(&mut self.ptr, std::ptr::null_mut()));
+            let want = bytes.max(1 << 16);
+            self.ptr = host_malloc(want)?;
+            self.bytes = want;
+        }
+        Ok(self.ptr)
+    }
+}
+
+/// A pair table built on the device by [`moe_route_softmax_topk_device`]:
+/// `rows * k` pairs, row-sorted, in the layout [`moe_ffn_kquant_device`] reads.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeDeviceRoutes {
+    pub w: *mut f32,
+    pub row: *mut i32,
+    pub expert: *mut i32,
+    pub row_start: *mut i32,
+    /// Per-row shared-expert gate `sigmoid(x . g)`.
+    pub shexp_scale: *mut f32,
+    pub rows: usize,
+    pub k: usize,
+}
+
+impl MoeDeviceRoutes {
+    /// Carve the table out of device memory at `base`; returns it and the
+    /// bytes used (256-byte aligned sections).
+    pub fn at(base: *mut u8, rows: usize, k: usize) -> (Self, usize) {
+        let pairs = rows * k;
+        let a = |n: usize| (n * 4).next_multiple_of(256);
+        let mut off = 0usize;
+        let mut take = |n: usize| {
+            let p = unsafe { base.add(off) };
+            off += a(n);
+            p
+        };
+        let t = Self {
+            w: take(pairs).cast(),
+            row: take(pairs).cast(),
+            expert: take(pairs).cast(),
+            row_start: take(rows + 1).cast(),
+            shexp_scale: take(rows).cast(),
+            rows,
+            k,
+        };
+        (t, off)
+    }
+}
+
+/// Softmax + top-k + renormalize routing for `rows` rows of router logits,
+/// on the device (see `allpaca_moe_route_softmax_topk`). With `shexp_gate`,
+/// also `sigmoid(x_r . gate)` per row into `routes.shexp_scale`.
+pub fn moe_route_softmax_topk_device(
+    logits: *const f32,
+    n_exp: usize,
+    x: *const f32,
+    shexp_gate: *const f32,
+    dim: usize,
+    routes: &MoeDeviceRoutes,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_moe_route_softmax_topk(
+                logits,
+                routes.rows as i32,
+                n_exp as i32,
+                routes.k as i32,
+                x,
+                shexp_gate,
+                dim as i32,
+                routes.w,
+                routes.row,
+                routes.expert,
+                routes.row_start,
+                routes.shexp_scale,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "moe_route_softmax_topk")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (logits, n_exp, x, shexp_gate, dim, routes);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP moe_route_softmax_topk unavailable".into(),
+        )))
+    }
+}
+
+/// `x[r][:] *= scale[r]` with `scale` in device memory.
+pub fn scale_rows_device(
+    x: *mut f32,
+    scale: *const f32,
+    rows: usize,
+    dim: usize,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_scale_rows(x, scale, rows as i32, dim as i32, std::ptr::null_mut())
+        };
+        status(rc, "scale_rows")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, scale, rows, dim);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP scale_rows unavailable".into(),
+        )))
+    }
+}
+
+/// Copy `n` floats with a kernel (queued, not waited on). Either side may be
+/// pinned host memory from [`host_malloc`]: small copies skip the ~80 us
+/// DMA setup a `hipMemcpy` pays on Windows.
+pub fn copy_f32_kernel(dst: *mut f32, src: *const f32, n: usize) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_copy_f32_kernel(dst, src, n as i32, std::ptr::null_mut()) };
+        status(rc, "copy_f32_kernel")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (dst, src, n);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP copy_f32_kernel unavailable".into(),
+        )))
+    }
+}
+
+/// One stacked `[n_experts][n][k]` K-quant tensor for [`moe_ffn_kquant_device`].
+#[derive(Debug, Clone, Copy)]
+pub struct MoeExperts {
+    pub ptr: *const u8,
+    /// ggml type id: 12 (Q4_K), 13 (Q5_K) or 14 (Q6_K).
+    pub ggml_type: u32,
+    /// Bytes per expert.
+    pub stride: u64,
+}
+
+impl MoeExperts {
+    fn qt(&self) -> Option<i32> {
+        match self.ggml_type {
+            12 => Some(4),
+            13 => Some(5),
+            14 => Some(6),
+            _ => None,
+        }
+    }
+
+    /// The fused MoE kernels read this tensor.
+    pub fn fused_ok(&self) -> bool {
+        self.qt().is_some()
+    }
+}
+
+/// Activation rows for [`moe_ffn_kquant_device`], in device memory.
+#[derive(Debug, Clone, Copy)]
+pub enum MoeInput {
+    F32(*const f32),
+    /// Already int8-quantized per 32 values (`quants`, then one scale each).
+    Q8 { q: *const i8, d: *const f32 },
+}
+
+/// `(row, expert, weight)` pairs for [`moe_ffn_kquant_device`], grouped by
+/// expert (at most [`MOE_MAX_GROUP`] rows per group) so the kernels read each
+/// expert's weights once for all the rows that picked it. Packed with an
+/// optional prefix (the worker's `x`) for a single H2D. Offsets are in floats
+/// from the start of `host`, each 256-byte aligned; integers are stored as
+/// their bit patterns.
+#[derive(Debug, Clone, Default)]
+pub struct MoePairTable {
+    pub host: Vec<f32>,
+    pub pairs: usize,
+    pub groups: usize,
+    pub max_group: usize,
+    /// Per pair (group order): routing weight and token row.
+    pub w: usize,
+    pub row: usize,
+    /// Per group: expert id, then `groups + 1` starts into the pairs.
+    pub expert: usize,
+    pub group_start: usize,
+    /// `rows + 1` starts into `row_pairs`, which lists each row's pairs in
+    /// routing order (the weighted sum's order).
+    pub row_start: usize,
+    pub row_pairs: usize,
+    /// First float past the table: callers may place output or scratch here.
+    pub end: usize,
+}
+
+/// Rows per expert group in [`MoePairTable`]; the kernels' LDS holds this many.
+pub const MOE_MAX_GROUP: usize = 8;
+
+impl MoePairTable {
+    pub fn new(rows: usize, pairs: &[(u32, u32, f32)], prefix: &[f32]) -> Self {
+        // Group order: by expert, then row. Stable, so a row's pairs keep
+        // their routing order within the row index lists below.
+        let mut order: Vec<usize> = (0..pairs.len()).collect();
+        order.sort_by_key(|&i| (pairs[i].1, pairs[i].0));
+        let mut group_expert: Vec<u32> = Vec::new();
+        let mut group_start: Vec<i32> = Vec::new();
+        for (pos, &i) in order.iter().enumerate() {
+            let e = pairs[i].1;
+            let open = group_expert.last() == Some(&e)
+                && pos - (*group_start.last().expect("group") as usize) < MOE_MAX_GROUP;
+            if !open {
+                group_expert.push(e);
+                group_start.push(pos as i32);
+            }
+        }
+        group_start.push(order.len() as i32);
+        let max_group = group_start.windows(2).map(|w| (w[1] - w[0]) as usize).max().unwrap_or(1);
+        // Position of each input pair in group order.
+        let mut pos_of = vec![0usize; pairs.len()];
+        for (pos, &i) in order.iter().enumerate() {
+            pos_of[i] = pos;
+        }
+        let mut row_start = vec![0i32; rows + 1];
+        for &(row, _, _) in pairs {
+            row_start[row as usize + 1] += 1;
+        }
+        for r in 0..rows {
+            row_start[r + 1] += row_start[r];
+        }
+        let mut fill = row_start.clone();
+        let mut row_pairs = vec![0i32; pairs.len()];
+        for (i, &(row, _, _)) in pairs.iter().enumerate() {
+            let slot = &mut fill[row as usize];
+            row_pairs[*slot as usize] = pos_of[i] as i32;
+            *slot += 1;
+        }
+        let pad = |v: &mut Vec<f32>| v.resize(v.len().next_multiple_of(64), 0.0);
+        let bits = |v: i32| f32::from_bits(v as u32);
+        let mut host = prefix.to_vec();
+        pad(&mut host);
+        let w = host.len();
+        host.extend(order.iter().map(|&i| pairs[i].2));
+        pad(&mut host);
+        let row = host.len();
+        host.extend(order.iter().map(|&i| f32::from_bits(pairs[i].0)));
+        pad(&mut host);
+        let expert = host.len();
+        host.extend(group_expert.iter().map(|&e| f32::from_bits(e)));
+        pad(&mut host);
+        let gs = host.len();
+        host.extend(group_start.iter().map(|&v| bits(v)));
+        pad(&mut host);
+        let rs = host.len();
+        host.extend(row_start.iter().map(|&v| bits(v)));
+        pad(&mut host);
+        let rp = host.len();
+        host.extend(row_pairs.iter().map(|&v| bits(v)));
+        pad(&mut host);
+        Self {
+            end: host.len(),
+            host,
+            pairs: pairs.len(),
+            groups: group_expert.len(),
+            max_group,
+            w,
+            row,
+            expert,
+            group_start: gs,
+            row_start: rs,
+            row_pairs: rp,
+        }
+    }
+
+    /// [`moe_ffn_kquant_device`] with this table uploaded at `dev`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        dev: *mut f32,
+        x: MoeInput,
+        rows: usize,
+        dim: usize,
+        ff: usize,
+        experts: [MoeExperts; 3],
+        scratch: *mut u8,
+        out: *mut f32,
+    ) -> Result<(), AllpacaError> {
+        let at = |i: usize| unsafe { dev.add(i) };
+        moe_ffn_kquant_device(
+            x,
+            rows,
+            dim,
+            ff,
+            self.pairs,
+            at(self.row).cast(),
+            at(self.expert).cast(),
+            at(self.w),
+            at(self.row_start).cast(),
+            MoeGroups {
+                groups: self.groups,
+                group_start: at(self.group_start).cast(),
+                row_pairs: at(self.row_pairs).cast(),
+                max_group: self.max_group,
+            },
+            experts[0],
+            experts[1],
+            experts[2],
+            scratch,
+            out,
+        )
+    }
+}
+
+/// How [`moe_ffn_kquant_device`]'s pairs are grouped by expert.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeGroups {
+    pub groups: usize,
+    /// `groups + 1` starts into the pairs; null = one pair per group.
+    pub group_start: *const i32,
+    /// Each row's pairs in routing order; null = pairs are already row-sorted.
+    pub row_pairs: *const i32,
+    pub max_group: usize,
+}
+
+impl MoeGroups {
+    /// One pair per group, pairs row-sorted (as the GPU router writes them).
+    pub fn per_pair(pairs: usize) -> Self {
+        Self {
+            groups: pairs,
+            group_start: std::ptr::null(),
+            row_pairs: std::ptr::null(),
+            max_group: 1,
+        }
+    }
+}
+
+/// Device scratch [`moe_ffn_kquant_device`] needs (beyond its inputs).
+pub fn moe_ffn_scratch_bytes(rows: usize, dim: usize, ff: usize, pairs: usize) -> usize {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe {
+            ffi::allpaca_moe_ffn_scratch_bytes(rows as i32, dim as i32, ff as i32, pairs as i32)
+                as usize
+        }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (rows, dim, ff, pairs);
+        0
+    }
+}
+
+/// Expert-parallel MoE FFN in seven launches: for each row `r`, the sum over
+/// its `(expert, weight)` pairs of `w * down_e(silu(gate_e x_r) * up_e x_r)`.
+/// Pairs are sorted by row and `row_start` has `rows + 1` entries; every
+/// pointer is device memory. Needs `dim` and `ff` in whole 256-value blocks.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_ffn_kquant_device(
+    x: MoeInput,
+    rows: usize,
+    dim: usize,
+    ff: usize,
+    pairs: usize,
+    pair_row: *const i32,
+    group_expert: *const i32,
+    pair_w: *const f32,
+    row_start: *const i32,
+    groups: MoeGroups,
+    gate: MoeExperts,
+    up: MoeExperts,
+    down: MoeExperts,
+    scratch: *mut u8,
+    out: *mut f32,
+) -> Result<(), AllpacaError> {
+    let (Some(gq), Some(uq), Some(dq)) = (gate.qt(), up.qt(), down.qt()) else {
+        return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "fused MoE needs Q4_K/Q5_K/Q6_K experts".into(),
+        )));
+    };
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let (xf, xq, xd) = match x {
+            MoeInput::F32(p) => (p, std::ptr::null(), std::ptr::null()),
+            MoeInput::Q8 { q, d } => (std::ptr::null(), q, d),
+        };
+        let rc = unsafe {
+            ffi::allpaca_moe_ffn_kquant(
+                xf,
+                xq,
+                xd,
+                rows as i32,
+                dim as i32,
+                ff as i32,
+                pairs as i32,
+                pair_row,
+                group_expert,
+                pair_w,
+                row_start,
+                groups.groups as i32,
+                groups.group_start,
+                groups.row_pairs,
+                groups.max_group as i32,
+                gate.ptr,
+                gq,
+                gate.stride,
+                up.ptr,
+                uq,
+                up.stride,
+                down.ptr,
+                dq,
+                down.stride,
+                scratch.cast(),
+                out,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "moe_ffn_kquant")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, rows, dim, ff, pairs, pair_row, group_expert, pair_w, row_start, groups);
+        let _ = (gq, uq, dq, scratch, out);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP moe_ffn_kquant unavailable".into(),
+        )))
+    }
+}
+
 pub fn gemm_nt_q5_k_device(
     a: *const f32,
     b: *const u8,
@@ -4649,6 +5135,7 @@ struct GdnJournal {
     head_k: usize,
     conv_kernel: usize,
     eps: f32,
+    k_interleave: bool,
     conv_w: *const f32,
     dt_bias: *const f32,
     a: *const f32,
@@ -8239,7 +8726,7 @@ impl HipWorkspace {
         conv_w: *const f32,
         dt_bias: *const f32,
         a: *const f32,
-        dims: [usize; 6],
+        dims: [usize; 7],
         eps: f32,
     ) -> Result<(), AllpacaError> {
         let cloned = self.gdn_clone_is_live(key.0)
@@ -8251,7 +8738,7 @@ impl HipWorkspace {
         if !cloned {
             return Ok(());
         }
-        let [qkv_dim, n_v, n_k, head_v, head_k, conv_kernel] = dims;
+        let [qkv_dim, n_v, n_k, head_v, head_k, conv_kernel, interleave] = dims;
         let row_floats = qkv_dim + 2 * n_v;
         let mut j = self.gdn_journal.lock().map_err(|_| Self::gdn_mutex_err())?;
         let fits = j
@@ -8275,6 +8762,7 @@ impl HipWorkspace {
                     head_k,
                     conv_kernel,
                     eps,
+                    k_interleave: interleave != 0,
                     conv_w,
                     dt_bias,
                     a,
@@ -8319,7 +8807,7 @@ impl HipWorkspace {
     pub fn gdn_rewind_request_to(&self, request_id: u64, keep: usize) -> Result<(), AllpacaError> {
         self.gdn_rewind_request(request_id)?;
         // (slot, journal rows, dims, eps, [conv_w, dt_bias, a])
-        type Replay = ((u64, usize), *const f32, [usize; 6], f32, [*const f32; 3]);
+        type Replay = ((u64, usize), *const f32, [usize; 7], f32, [*const f32; 3]);
         let journals: Vec<Replay> = {
             let j = self.gdn_journal.lock().map_err(|_| Self::gdn_mutex_err())?;
             j.iter()
@@ -8328,7 +8816,15 @@ impl HipWorkspace {
                     (
                         *key,
                         jr.rows_buf.ptr_at(0),
-                        [jr.qkv_dim, jr.n_v, jr.n_k, jr.head_v, jr.head_k, jr.conv_kernel],
+                        [
+                            jr.qkv_dim,
+                            jr.n_v,
+                            jr.n_k,
+                            jr.head_v,
+                            jr.head_k,
+                            jr.conv_kernel,
+                            usize::from(jr.k_interleave),
+                        ],
                         jr.eps,
                         [jr.conv_w, jr.dt_bias, jr.a],
                     )
@@ -8336,7 +8832,7 @@ impl HipWorkspace {
                 .collect()
         };
         for (key, rows, dims, eps, [conv_w, dt_bias, a]) in journals {
-            let [qkv_dim, n_v, n_k, head_v, head_k, conv_kernel] = dims;
+            let [qkv_dim, n_v, n_k, head_v, head_k, conv_kernel, interleave] = dims;
             let (dstate, dconv) = {
                 let g = self.gdn.lock().map_err(|_| Self::gdn_mutex_err())?;
                 let slot = g.get(&key).ok_or_else(|| {
@@ -8383,6 +8879,7 @@ impl HipWorkspace {
                     head_k as i32,
                     conv_kernel as i32,
                     eps,
+                    interleave != 0,
                 )?;
             }
         }
@@ -9153,6 +9650,7 @@ impl HipWorkspace {
         head_k: i32,
         conv_kernel: i32,
         eps: f32,
+        k_interleave: bool,
     ) -> Result<(), AllpacaError> {
         if qkv.is_null()
             || z.is_null()
@@ -9269,7 +9767,7 @@ impl HipWorkspace {
             conv_w,
             dt_bias,
             a,
-            [qkv_dim, n_v, n_k, hv, hk, conv_kernel as usize],
+            [qkv_dim, n_v, n_k, hv, hk, conv_kernel as usize, usize::from(k_interleave)],
             eps,
         )?;
         self.gdn_layer_step(
@@ -9288,6 +9786,7 @@ impl HipWorkspace {
             head_k,
             conv_kernel,
             eps,
+            k_interleave,
         )?;
         self.gdn_rmsnorm_silu_gate(y, z, norm, out, n_v_heads, head_v, eps)?;
         if let Ok(mut g) = self.gdn.lock() {
@@ -9435,6 +9934,7 @@ impl HipWorkspace {
         n_k: i32,
         n_v: i32,
         head_k: i32,
+        interleave: bool,
     ) -> Result<(), AllpacaError> {
         if src.is_null() || dst.is_null() || n_k <= 0 || n_v <= 0 || head_k <= 0 || n_v % n_k != 0 {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -9446,7 +9946,7 @@ impl HipWorkspace {
         {
             self.timed_gpu(DecodeOp::OtherGpu, || {
                 let rc = unsafe {
-                    ffi::allpaca_expand_k_heads(src, dst, n_k, n_v, head_k, std::ptr::null_mut())
+                    ffi::allpaca_expand_k_heads(src, dst, n_k, n_v, head_k, i32::from(interleave), std::ptr::null_mut())
                 };
                 status(rc, "expand_k_heads")
             })
@@ -9466,6 +9966,7 @@ impl HipWorkspace {
         n_k: i32,
         n_v: i32,
         head_k: i32,
+        interleave: bool,
     ) -> Result<(), AllpacaError> {
         let nk = n_k as usize;
         let nv = n_v as usize;
@@ -9496,7 +9997,7 @@ impl HipWorkspace {
         {
             self.timed_gpu(DecodeOp::OtherGpu, || {
                 let rc = unsafe {
-                    ffi::allpaca_expand_k_heads(ds, dd, n_k, n_v, head_k, std::ptr::null_mut())
+                    ffi::allpaca_expand_k_heads(ds, dd, n_k, n_v, head_k, i32::from(interleave), std::ptr::null_mut())
                 };
                 status(rc, "expand_k_heads")
             })?;
@@ -9584,6 +10085,7 @@ impl HipWorkspace {
         head_k: i32,
         conv_kernel: i32,
         eps: f32,
+        k_interleave: bool,
     ) -> Result<(), AllpacaError> {
         let n_v = n_v_heads as usize;
         let n_k = n_k_heads as usize;
@@ -9644,8 +10146,8 @@ impl HipWorkspace {
         let q_raw = conv_out as *const f32;
         let k_raw = unsafe { conv_out.add(key_dim) as *const f32 };
         let v_raw = unsafe { conv_out.add(key_dim * 2) as *const f32 };
-        self.expand_k_heads(q_raw, q_exp, n_k_heads, n_v_heads, head_k)?;
-        self.expand_k_heads(k_raw, k_exp, n_k_heads, n_v_heads, head_k)?;
+        self.expand_k_heads(q_raw, q_exp, n_k_heads, n_v_heads, head_k, k_interleave)?;
+        self.expand_k_heads(k_raw, k_exp, n_k_heads, n_v_heads, head_k, k_interleave)?;
         self.gdn_decay_beta(alpha, dt_bias, a, decay, beta, n_v_heads)?;
         self.gated_delta_step(
             q_exp, k_exp, v_raw, decay, beta, state, y, n_v_heads, head_v, head_k, eps,
@@ -10581,6 +11083,187 @@ impl Drop for HipWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small host<->device copy latency: pageable `hipMemcpy` vs a pinned
+    /// staging buffer. `cargo test --release -p allpaca-hip --features hip --lib bench_small_copies -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_small_copies() {
+        if device_count() == 0 {
+            return;
+        }
+        let n = 2048usize;
+        let bytes = n * 4;
+        let dev = device_malloc(bytes, 0).unwrap();
+        let pinned = host_malloc(bytes).unwrap();
+        let mut host = vec![1.0f32; n];
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            for _ in 0..50 {
+                f();
+            }
+            let mut v: Vec<f64> = (0..400)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64() * 1e6
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!("COPY {name}: median {:.1} us p90 {:.1} us", v[200], v[360]);
+        };
+        time("sync only", &mut || stream_synchronize().unwrap());
+        time("h2d pageable", &mut || {
+            memcpy(dev, host.as_ptr().cast(), bytes, MEMCPY_H2D).unwrap();
+            stream_synchronize().unwrap();
+        });
+        time("h2d pinned", &mut || {
+            memcpy(dev, pinned, bytes, MEMCPY_H2D).unwrap();
+            stream_synchronize().unwrap();
+        });
+        time("d2h pageable", &mut || {
+            memcpy(host.as_mut_ptr().cast(), dev, bytes, MEMCPY_D2H).unwrap();
+        });
+        time("d2h pinned", &mut || {
+            memcpy(pinned, dev, bytes, MEMCPY_D2H).unwrap();
+        });
+        time("d2h 2 KB pinned", &mut || {
+            memcpy(pinned, dev, 2048, MEMCPY_D2H).unwrap();
+        });
+        time("h2d by kernel from pinned", &mut || {
+            copy_f32_kernel(dev.cast(), pinned.cast(), n).unwrap();
+            stream_synchronize().unwrap();
+        });
+        time("d2h by kernel to pinned", &mut || {
+            copy_f32_kernel(pinned.cast(), dev.cast(), n).unwrap();
+            stream_synchronize().unwrap();
+        });
+        // The value must actually land in host memory.
+        let probe = device_malloc(bytes, 0).unwrap();
+        let ones = vec![3.5f32; n];
+        memcpy(probe, ones.as_ptr().cast(), bytes, MEMCPY_H2D).unwrap();
+        copy_f32_kernel(pinned.cast(), probe.cast(), n).unwrap();
+        stream_synchronize().unwrap();
+        let got = unsafe { std::slice::from_raw_parts(pinned.cast::<f32>(), n) };
+        assert!(got.iter().all(|v| *v == 3.5), "kernel D2H into pinned memory");
+        device_free(probe, bytes);
+        // CPU cost of issuing work, no waits.
+        let t = std::time::Instant::now();
+        for _ in 0..2000 {
+            copy_f32_kernel(dev.cast(), probe_src(dev), n).unwrap();
+        }
+        let launch_us = t.elapsed().as_secs_f64() * 1e6 / 2000.0;
+        let t = std::time::Instant::now();
+        stream_synchronize().unwrap();
+        eprintln!("COPY launch-only cpu cost: {launch_us:.2} us/launch; drain {:.0} us for 2000", t.elapsed().as_secs_f64() * 1e6);
+        let t = std::time::Instant::now();
+        for _ in 0..2000 {
+            set_device(0).unwrap();
+        }
+        eprintln!("COPY set_device: {:.2} us/call", t.elapsed().as_secs_f64() * 1e6 / 2000.0);
+        host_free(pinned);
+        device_free(dev, bytes);
+    }
+
+    /// GPU cost of the Qwen3-Next GDN decode GEMVs, pipelined (1000 launches
+    /// then one sync). `cargo test --release -p allpaca-hip --features hip --lib bench_gdn_gemv -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_gdn_gemv() {
+        if device_count() == 0 {
+            return;
+        }
+        let dev = std::env::var("BENCH_DEV").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        set_device(dev).unwrap();
+        let k = 2048usize;
+        let x = device_malloc(8192 * 4, dev).unwrap();
+        let y = device_malloc(16384 * 4, dev).unwrap();
+        memcpy(x, vec![0.01f32; 8192].as_ptr().cast(), 8192 * 4, MEMCPY_H2D).unwrap();
+        let run = |name: &str, bytes: usize, f: &dyn Fn()| {
+            for _ in 0..50 {
+                f();
+            }
+            stream_synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..1000 {
+                f();
+            }
+            stream_synchronize().unwrap();
+            let us = t.elapsed().as_secs_f64() * 1e6 / 1000.0;
+            eprintln!("GEMV {name}: {us:.1} us ({:.0} GB/s)", bytes as f64 / us / 1e3);
+        };
+        for (n, kk) in [(8192usize, k), (4096, k), (2048, 4096), (512, k), (2048, 512)] {
+            let blocks = n * kk / 32;
+            let packed: Vec<u8> = (0..blocks * 34).map(|i| if i % 34 < 2 { if i % 34 == 0 { 0x00 } else { 0x1c } } else { (i * 7 % 251) as u8 }).collect();
+            let staged = stage_q8_0_blocks(&packed).unwrap();
+            let w = device_malloc(staged.len(), dev).unwrap();
+            memcpy(w, staged.as_ptr(), staged.len(), MEMCPY_H2D).unwrap();
+            run(&format!("q8_0 n={n} k={kk}"), staged.len(), &|| {
+                gemm_nt_q8_0_device(x.cast(), w, y.cast(), 1, n as i32, kk as i32).unwrap()
+            });
+            device_free(w, staged.len());
+        }
+        let wf = device_malloc(64 * k * 4, dev).unwrap();
+        run("f32 n=32 k=2048", 32 * k * 4, &|| {
+            gemm_nt_device(x.cast(), wf.cast(), y.cast(), 1, 32, k as i32).unwrap()
+        });
+        run("f32 n=64 k=2048", 64 * k * 4, &|| {
+            gemm_nt_device(x.cast(), wf.cast(), y.cast(), 1, 64, k as i32).unwrap()
+        });
+        let wr = device_malloc(512 * k * 4, dev).unwrap();
+        run("f32 n=512 k=2048 (router)", 512 * k * 4, &|| {
+            gemm_nt_device(x.cast(), wr.cast(), y.cast(), 1, 512, k as i32).unwrap()
+        });
+        device_free(wr, 512 * k * 4);
+        run("d2d hipMemcpy 2048 floats", 8192, &|| {
+            memcpy(y, x, 8192, MEMCPY_D2D).unwrap()
+        });
+        run("kernel + d2d hipMemcpy + kernel", 8192, &|| {
+            copy_f32_kernel(y.cast(), x.cast(), 2048).unwrap();
+            memcpy(y, x, 8192, MEMCPY_D2D).unwrap();
+            copy_f32_kernel(y.cast(), x.cast(), 2048).unwrap();
+        });
+        run("kernel x3 (same work by kernel)", 8192, &|| {
+            for _ in 0..3 {
+                copy_f32_kernel(y.cast(), x.cast(), 2048).unwrap();
+            }
+        });
+        {
+            // One GEMV after an idle gap, timed launch -> sync (minus an empty kernel's).
+            let packed: Vec<u8> = (0..8192 * 2048 / 32 * 34).map(|i| if i % 34 < 2 { if i % 34 == 0 { 0 } else { 0x1c } } else { (i * 7 % 251) as u8 }).collect();
+            let staged = stage_q8_0_blocks(&packed).unwrap();
+            let w = device_malloc(staged.len(), dev).unwrap();
+            memcpy(w, staged.as_ptr(), staged.len(), MEMCPY_H2D).unwrap();
+            for gap_us in [0u64, 200, 500, 1000, 3000] {
+                let mut tot = 0.0;
+                let mut base = 0.0;
+                for it in 0..300 {
+                    let until = std::time::Instant::now() + std::time::Duration::from_micros(gap_us);
+                    while std::time::Instant::now() < until {}
+                    let t = std::time::Instant::now();
+                    if it % 2 == 0 {
+                        gemm_nt_q8_0_device(x.cast(), w, y.cast(), 1, 8192, 2048).unwrap();
+                    } else {
+                        copy_f32_kernel(y.cast(), x.cast(), 16).unwrap();
+                    }
+                    stream_synchronize().unwrap();
+                    let us = t.elapsed().as_secs_f64() * 1e6;
+                    if it % 2 == 0 { tot += us } else { base += us }
+                }
+                eprintln!("GEMV idle gap {gap_us}us: q8 n=8192 launch->sync {:.1} us, empty kernel {:.1} us", tot / 150.0, base / 150.0);
+            }
+            device_free(w, staged.len());
+        }
+        run("copy 2048 (launch floor)", 8192, &|| {
+            copy_f32_kernel(y.cast(), x.cast(), 2048).unwrap()
+        });
+        device_free(wf, 64 * k * 4);
+        device_free(x, 8192 * 4);
+        device_free(y, 16384 * 4);
+    }
+
+    fn probe_src(dev: *mut u8) -> *const f32 {
+        dev.cast::<f32>().cast_const()
+    }
 
     #[cfg(all(windows, feature = "hip", allpaca_hip_runtime))]
     #[test]

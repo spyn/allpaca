@@ -129,6 +129,7 @@ dependencies = [
  "allpaca-cuda",
  "allpaca-hip",
  "allpaca-types",
+ "socket2",
  "thiserror 2.0.20",
  "tracing",
 ]

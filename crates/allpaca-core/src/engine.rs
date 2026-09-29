@@ -1693,7 +1693,16 @@ impl Engine {
                     let skip: Vec<bool> = (0..target_m.config.n_layers)
                         .map(|i| rpc.is_remote(i) || rpc.local_device(i) != dev)
                         .collect();
-                    match ResidentModel::upload_gguf_peer_layers(file, &target_m.config, dev, &skip) {
+                    let skip_experts: Vec<bool> = (0..target_m.config.n_layers)
+                        .map(|i| rpc.experts_remote(i))
+                        .collect();
+                    match ResidentModel::upload_gguf_peer_layers(
+                        file,
+                        &target_m.config,
+                        dev,
+                        &skip,
+                        &skip_experts,
+                    ) {
                         Ok(resident) => {
                             let hip_used = allpaca_hip::device_memory_info(dev)
                                 .ok()
@@ -1736,7 +1745,16 @@ impl Engine {
                         })
                     })
                     .collect();
-                ResidentModel::upload_gguf_filtered(file, &target.config, hip.device, &skip)
+                let skip_experts: Vec<bool> = (0..target.config.n_layers)
+                    .map(|i| target.rpc.as_ref().is_some_and(|r| r.experts_remote(i)))
+                    .collect();
+                ResidentModel::upload_gguf_filtered(
+                    file,
+                    &target.config,
+                    hip.device,
+                    &skip,
+                    &skip_experts,
+                )
             } else if host_ready {
                 ResidentModel::upload(&target, hip.device)
             } else {
