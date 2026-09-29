@@ -101,13 +101,36 @@ cargo run -p allpaca-server -- `
 
 Device order: local target, then `rpc[192.168.69.2:50052]`, then `rpc[192.168.69.2:50053]`.
 
+## MoE models: expert-parallel mode
+
+A GGUF with stacked experts (`ffn_{gate,up,down}_exps`, for example Qwen3-Coder-Next `qwen3next`) does not place whole layers remotely. With at least one `--rpc` endpoint and no `--tensor-split`:
+
+- Every layer body stays on the local GPUs: attention or GDN, the router, the shared expert, and the norms. GDN state never leaves the coordinator.
+- Local GPUs keep about 8% of VRAM free and fill with routed experts, layer by layer. The rest of the experts go to the worker's GPUs, filled one GPU at a time. A GPU idle for more than ~1-2 ms between calls drops its clocks, so consecutive layers share a GPU.
+- Each remote layer is one `MoeFfn` round trip. The request carries the rows (int8, as the fused kernels consume them) and the `(row, expert, weight)` pairs; the reply is F16. The worker runs the three-launch fused K-quant MoE kernels (Q4_K/Q5_K/Q6_K experts), grouping rows that picked the same expert.
+
+```toml
+[rpc]
+endpoints = ["192.168.69.2:50052"]
+token = "<same token as the worker>"
+
+[speculative]          # optional: prompt-lookup drafting, no draft model
+enabled = true
+providers = ["ngram"]
+```
+
+Run the worker with every GPU (`--device hip`) and `sudo rocm-smi --setperflevel high`. At `auto`, an MI50 that idles between calls downclocks, and calls take about twice as long. The load uploads the remote experts over the link, about 37 GB for Qwen3-Coder-Next UD-Q5_K_XL.
+
+On sunny the NIC sits in a PCIe Gen2 x1 slot: bulk transfer runs about 1.7-2.5 Gbit/s, and a small round trip takes about 70 us. Decode uses under 100 Mbit/s. It is bound by latency, one round trip per remote layer per token (or per verify step).
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | Connection refused | Worker down, or probing `10.1.1.69` | Probe `192.168.69.2`; worker `-H 192.168.69.2` |
 | Timeout, SSH still works | RPC sent on the 10.1.1.0 NIC | `--rpc 192.168.69.2:50052` only |
-| Version / kernel ABI mismatch | Different commits, or a worker still on `KERNEL_ABI_REV` 1 | Rebuild both from the same `HEAD`. Rev 2 is `PutTensor` + `GemmNtQuant` |
+| Version / kernel ABI mismatch | Different commits | Rebuild both from the same `HEAD`. Rev 2 added `PutTensor` + `GemmNtQuant`, rev 3 `MoeFfn`, rev 4 int8 rows, rev 5 F16 replies |
+| New coordinator hangs at `rpc HELLO` | Worker still serving a dead session | Workers since rev 5 send TCP keepalives and drop it within ~30 s; restart an older worker |
 
 ## Quantized GGUF
 
