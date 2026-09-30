@@ -656,8 +656,13 @@ __device__ inline float q8_dot8(const float *as, uint32_t qlo, uint32_t qhi) {
 }
 
 /* Float A × Q8 weight (fallback if integer MAC is slower). */
-__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
-                                        int k) {
+/* blockIdx.z == 1 computes the second matrix (b2 -> c2) of a pair sharing
+ * the input `a` (a shared expert's gate and up): same per-output math, one
+ * launch instead of two. */
+__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b0, float *c0, int m, int n,
+                                        int k, const uint8_t *b2, float *c2) {
+    const uint8_t *b = blockIdx.z ? b2 : b0;
+    float *c = blockIdx.z ? c2 : c0;
     constexpr int WARPS = 16;
     constexpr int COLS = 8;
     constexpr int SUB = 4;
@@ -1810,7 +1815,7 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     if (intdot) {
         hipLaunchKernelGGL(gemv_nt_q8_0_intdot_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     } else {
-        hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, grid, block, 0, stream, a, b, c, m, n, k, b, c);
     }
     return hip_status(hipGetLastError());
 }
@@ -5024,18 +5029,23 @@ __global__ void gdn_qk_l2norm_kernel(float *q, float *k, int n_heads, int head_k
  * barriers per call on n_v_heads blocks) and was pure latency. */
 constexpr int GDN_ROWS_PER_WARP = 4;
 constexpr int GDN_WARPS = 4;
+/* `n_k` > 0: q and k hold n_k heads and V head h reads K head
+ * h / (n_v_heads / n_k) (interleave) or h % n_k (tile), instead of an expanded
+ * per-V-head copy. */
 template <int NJ>
 __global__ void gated_delta_step_warp_kernel(const float *q, const float *k, const float *v,
                                              const float *decay, const float *beta, float *state,
-                                             float *out, int n_v_heads, int head_v, int head_k) {
+                                             float *out, int n_v_heads, int head_v, int head_k,
+                                             int n_k, int interleave) {
     const int h = static_cast<int>(blockIdx.x);
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
     if (h >= n_v_heads) {
         return;
     }
-    const float *q_h = q + static_cast<size_t>(h) * head_k + lane * NJ;
-    const float *k_h = k + static_cast<size_t>(h) * head_k + lane * NJ;
+    const int kh = n_k > 0 ? (interleave ? h / (n_v_heads / n_k) : h % n_k) : h;
+    const float *q_h = q + static_cast<size_t>(kh) * head_k + lane * NJ;
+    const float *k_h = k + static_cast<size_t>(kh) * head_k + lane * NJ;
     float qv[NJ], kv[NJ];
 #pragma unroll
     for (int t = 0; t < NJ; ++t) {
@@ -5351,7 +5361,7 @@ extern "C" int allpaca_gated_delta_step(float *q, float *k, const float *v, cons
         const dim3 block(32 * GDN_WARPS);
 #define GDN_WARP_LAUNCH(NJV)                                                                       \
     hipLaunchKernelGGL(gated_delta_step_warp_kernel<NJV>, grid, block, 0, s, q, k, v, decay, beta, \
-                       state, out, n_v_heads, head_v, head_k)
+                       state, out, n_v_heads, head_v, head_k, 0, 0)
         if (nj == 1) {
             GDN_WARP_LAUNCH(1);
         } else if (nj == 2) {
@@ -5436,6 +5446,92 @@ __global__ void gdn_decay_beta_kernel(const float *alpha, const float *dt_bias, 
     }
     decay[i] = expf(gdn_softplus(alpha[i] + dt_bias[i]) * a[i]);
     beta[i] = 1.0f / (1.0f + expf(-beta[i]));
+}
+
+/* One GDN decode step's element-wise front: thread c < qkv_dim runs the
+ * depthwise conv + SiLU for channel c, then shifts that channel's history
+ * (as gdn_conv1d_compute then gdn_conv1d_shift did); the next n_v threads
+ * compute decay and sigmoid(beta) (as gdn_decay_beta did). */
+__global__ void gdn_step_prep_kernel(const float *x, const float *kernel, float *conv_state,
+                                     float *out, int qkv_dim, int conv_kernel, const float *alpha,
+                                     const float *dt_bias, const float *a, float *decay,
+                                     float *beta, int n_v) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= qkv_dim) {
+        const int h = i - qkv_dim;
+        if (h < n_v) {
+            decay[h] = expf(gdn_softplus(alpha[h] + dt_bias[h]) * a[h]);
+            beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+        }
+        return;
+    }
+    const int c = i;
+    const int hist = conv_kernel - 1;
+    float acc = 0.0f;
+    for (int j = 0; j < hist; ++j) {
+        acc += kernel[j + c * conv_kernel] * conv_state[j * qkv_dim + c];
+    }
+    acc += kernel[(conv_kernel - 1) + c * conv_kernel] * x[c];
+    out[c] = gdn_silu(acc);
+    if (hist <= 0) {
+        return;
+    }
+    for (int j = 0; j < hist - 1; ++j) {
+        conv_state[j * qkv_dim + c] = conv_state[(j + 1) * qkv_dim + c];
+    }
+    conv_state[(hist - 1) * qkv_dim + c] = x[c];
+}
+
+/* A whole GDN decode step in three launches (was seven): prep (conv, shift,
+ * decay, beta), q/k L2 norm on the n_k K heads in place in `conv_out`, and the
+ * delta step reading each V head's K head directly (no expanded copies).
+ * Bit-identical to conv1d_step + 2x expand_k_heads + decay_beta +
+ * gated_delta_step. ALLPACA_ERR_INVALID when the warp kernel does not cover
+ * head_k (the caller falls back to the unfused sequence). */
+extern "C" int allpaca_gdn_step_fused(const float *qkv, const float *conv_w, float *conv_state,
+                                      float *conv_out, const float *alpha, const float *dt_bias,
+                                      const float *a, float *decay, float *beta, float *state,
+                                      float *out, int32_t n_v, int32_t n_k, int32_t head_v,
+                                      int32_t head_k, int32_t conv_kernel, float eps,
+                                      int32_t interleave, allpaca_stream_t stream) {
+    const int nj = head_k % 32 == 0 ? head_k / 32 : 0;
+    if (!qkv || !conv_w || !conv_state || !conv_out || !alpha || !dt_bias || !a || !decay ||
+        !beta || !state || !out || n_v <= 0 || n_k <= 0 || n_v % n_k != 0 || head_v <= 0 ||
+        conv_kernel <= 0 || !(nj == 1 || nj == 2 || nj == 4 || nj == 8)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipStream_t s = as_stream(stream);
+    const int key_dim = n_k * head_k;
+    const int qkv_dim = 2 * key_dim + n_v * head_v;
+    const int threads = 256;
+    const int blocks = (qkv_dim + n_v + threads - 1) / threads;
+    hipLaunchKernelGGL(gdn_step_prep_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, s, qkv, conv_w, conv_state,
+                       conv_out, qkv_dim, conv_kernel, alpha, dt_bias, a, decay, beta, n_v);
+    float *q = conv_out;
+    float *k = conv_out + key_dim;
+    const float *v = conv_out + 2 * key_dim;
+    hipLaunchKernelGGL(gdn_qk_l2norm_kernel, dim3(static_cast<unsigned>(n_k)), dim3(32), 0, s, q,
+                       k, n_k, head_k, eps);
+    constexpr int rows_per_block = GDN_WARPS * GDN_ROWS_PER_WARP;
+    const dim3 grid(static_cast<unsigned>(n_v),
+                    static_cast<unsigned>((head_v + rows_per_block - 1) / rows_per_block));
+    const dim3 block(32 * GDN_WARPS);
+    if (nj == 1) {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<1>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    } else if (nj == 2) {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<2>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    } else if (nj == 4) {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<4>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    } else {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<8>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    }
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state,
@@ -5812,6 +5908,48 @@ extern "C" int allpaca_scale_heads_sigmoid(float *attn, const float *scores, int
     return hip_status(hipGetLastError());
 }
 
+/* GDN output: out = silu(z) * rmsnorm_head(y) * weight in one launch, one
+ * block of 256 per head. Same reduction tree as rmsnorm_heads_kernel and the
+ * same element math as silu_mul_kernel, so it gives the bits the copy +
+ * rmsnorm_heads + silu_mul + copy sequence gave. `out` may alias `z` or `y`. */
+__global__ void gdn_norm_gate_kernel(const float *y, const float *z, const float *weight,
+                                     float *out, int head_dim, float eps) {
+    const size_t base = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(head_dim);
+    const float *row = y + base;
+    __shared__ float shared[256];
+    float sum = 0.0f;
+    for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
+        const float v = row[i];
+        sum += v * v;
+    }
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(shared[0] / static_cast<float>(head_dim) + eps);
+    for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
+        const float normed = row[i] * inv * weight[i];
+        const float g = z[base + i];
+        out[base + i] = (g / (1.0f + expf(-g))) * normed;
+    }
+}
+
+extern "C" int allpaca_gdn_norm_gate(const float *y, const float *z, const float *weight,
+                                     float *out, int32_t n_heads, int32_t head_dim, float eps,
+                                     allpaca_stream_t stream) {
+    if (!y || !z || !weight || !out || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(gdn_norm_gate_kernel, dim3(static_cast<unsigned>(n_heads)), dim3(256), 0,
+                       as_stream(stream), y, z, weight, out, head_dim, eps);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_rmsnorm_heads(float *x, const float *weight, int32_t n_heads,
                                      int32_t head_dim, float eps, allpaca_stream_t stream) {
     if (!x || !weight || n_heads <= 0 || head_dim <= 0) {
@@ -5917,6 +6055,49 @@ __global__ void scale_f32_kernel(float *x, float scale, int n) {
         return;
     }
     x[idx] *= scale;
+}
+
+/* Two Q8_0 GEMVs over one input row (m == 1) in one launch: c1 = a * b1^T,
+ * c2 = a * b2^T, both [n, k], each bit-identical to its own GEMV launch.
+ * ALLPACA_ERR_INVALID where the single GEMV would take another kernel. */
+extern "C" int allpaca_gemm_nt_q8_0_pair(const float *a, const uint8_t *b1, float *c1,
+                                         const uint8_t *b2, float *c2, int32_t m, int32_t n,
+                                         int32_t k, allpaca_stream_t stream) {
+    if (!a || !b1 || !c1 || !b2 || !c2 || m != 1 || n <= 0 || k <= 0 || ALLPACA_Q8_GEMV_INTDOT) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int cols_per_block = 16 * 8;
+    const unsigned gx = static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block);
+    hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, dim3(gx, 1, 2), dim3(512), 0, as_stream(stream), a,
+                       b1, c1, m, n, k, b2, c2);
+    return hip_status(hipGetLastError());
+}
+
+/* x[i] += y[i] * s, then y[i] = x[i]: scale_f32(y, s) + residual_add(x, y) +
+ * copy(y <- x) in one launch. The three kernels rounded the product and the
+ * sum separately; contraction is off here because __fmul_rn/__fadd_rn alone
+ * still compiled to an FMA (1-ulp differences). */
+__global__ void scale_add_copy_kernel(float *x, float *y, float s, int n) {
+#pragma clang fp contract(off)
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) {
+        return;
+    }
+    const float v = x[i] + y[i] * s;
+    x[i] = v;
+    y[i] = v;
+}
+
+extern "C" int allpaca_scale_add_copy(float *x, float *y, float s, int32_t n,
+                                      allpaca_stream_t stream) {
+    if (!x || !y || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(scale_add_copy_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256),
+                       0, as_stream(stream), x, y, s, n);
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
@@ -7191,6 +7372,21 @@ extern "C" int allpaca_scale_heads_sigmoid(float *, const float *, int32_t, int3
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gemm_nt_q8_0_pair(const float *, const uint8_t *, float *,
+                                         const uint8_t *, float *, int32_t, int32_t, int32_t,
+                                         allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scale_add_copy(float *, float *, float, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gdn_norm_gate(const float *, const float *, const float *, float *,
+                                     int32_t, int32_t, float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_rmsnorm_heads(float *, const float *, int32_t, int32_t, float,
                                      allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -7256,6 +7452,13 @@ extern "C" int allpaca_residual_rmsnorm(float *, const float *, const float *, f
 extern "C" int allpaca_gated_delta_step(float *, float *, const float *, const float *,
                                         const float *, float *, float *, int32_t, int32_t, int32_t,
                                         float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gdn_step_fused(const float *, const float *, float *, float *,
+                                      const float *, const float *, const float *, float *, float *,
+                                      float *, float *, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                      float, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

@@ -5125,6 +5125,33 @@ impl TinyModel {
             return Ok(());
         }
         let hidden = (m as usize).saturating_mul(ff_dim);
+        // Decode with Q8_0 gate and up: both GEMVs in one launch.
+        let paired = m == 1
+            && w_gate.n == w_up.n
+            && w_gate.kind == WeightKind::Q8_0
+            && w_up.kind == WeightKind::Q8_0
+            && hip.gemm_nt_q8_pair_dev(
+                x,
+                resident.weights.byte_ptr_at(w_gate.off),
+                buf.gate,
+                resident.weights.byte_ptr_at(w_up.off),
+                buf.up,
+                m,
+                ff_dim as i32,
+                dim as i32,
+            )?;
+        if paired {
+            self.device_act_mul(hip, buf.gate, buf.up, hidden as i32)?;
+            return resident.gemm_nt(
+                hip,
+                buf.gate,
+                w_down,
+                buf.proj,
+                m,
+                dim as i32,
+                ff_dim as i32,
+            );
+        }
         resident.gemm_nt(hip, x, w_up, buf.up, m, ff_dim as i32, dim as i32)?;
         if w_gate.n == 0 {
             if cfg.moe_relu_sqr {
@@ -5441,7 +5468,38 @@ impl TinyModel {
                 hip.residual_add(buf.attn, buf.proj, dim as i32)?;
             }
         }
-        if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
+        if off.w_shared_up.n > 0
+            && off.w_shared_down.n > 0
+            && host_layer.shared_gate_inp.len() == dim
+            && x_norm.len() >= dim
+        {
+            // Shared expert, then its sigmoid-gated scale, the residual add
+            // and the copy back into proj in one launch.
+            let sff = if cfg.shared_ff_dim > 0 {
+                cfg.shared_ff_dim
+            } else {
+                off.w_shared_up.n / dim.max(1)
+            };
+            self.device_expert_gemm(
+                hip,
+                resident,
+                buf,
+                buf.normed,
+                1,
+                off.w_shared_gate,
+                off.w_shared_up,
+                off.w_shared_down,
+                sff,
+            )?;
+            let logit: f32 = x_norm[..dim]
+                .iter()
+                .zip(&host_layer.shared_gate_inp)
+                .map(|(a, b)| a * b)
+                .sum();
+            hip.scale_add_copy(buf.attn, buf.proj, sigmoid_stable(logit), dim)?;
+            record_elementwise(Some(metrics));
+            return Ok(());
+        } else if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
             self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &x_norm, 1, None)?;
         } else if !host_layer.shared_expert.w_up.is_empty() {
             let sff = if cfg.shared_ff_dim > 0 {

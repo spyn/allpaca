@@ -7223,3 +7223,215 @@ User: SELECT name, email FROM users WHERE",
         stats.batched_decode_steps, stats.batched_decode_rows, stats.linear_packed_verifies
     );
 }
+
+/// The fused GDN decode step (3 launches) gives the same bits as the unfused
+/// sequence (conv, shift, 2x expand, decay/beta, L2 norm, delta step) at
+/// Qwen3-Next's shape, for both K-head mappings, over several steps.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_fused_step_matches_unfused_bit_for_bit() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_fused_step: no HIP device");
+        return;
+    }
+    let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 8) else {
+        eprintln!("skip hip_gdn_fused_step: HIP workspace unavailable");
+        return;
+    };
+    let (n_k, n_v, hk, hv, ck) = (16usize, 32usize, 128usize, 128usize, 4usize);
+    let qkv_dim = 2 * n_k * hk + n_v * hv;
+    let mut seed = 0x9e37_79b9u32;
+    let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * scale
+            })
+            .collect()
+    };
+    let conv_w = rnd(ck * qkv_dim, 1.0);
+    let dt_bias = rnd(n_v, 1.0);
+    let a: Vec<f32> = rnd(n_v, 1.0).iter().map(|x| -x.abs() - 0.1).collect();
+    let conv_state0 = rnd((ck - 1) * qkv_dim, 1.0);
+    let state0 = rnd(n_v * hv * hk, 0.2);
+    let steps: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> =
+        (0..3).map(|_| (rnd(qkv_dim, 2.0), rnd(n_v, 2.0), rnd(n_v, 2.0))).collect();
+
+    for interleave in [true, false] {
+        // One set of device buffers per path; same inputs, stepped in lockstep.
+        let run = |fused: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let floats = qkv_dim * 2 + conv_w.len() + conv_state0.len() + n_v * 4 + state0.len() + n_v * hv;
+            let blob = allpaca_hip::DeviceWeights::alloc(0, floats * 4).expect("alloc");
+            let mut off = 0usize;
+            let mut put = |src: &[f32]| -> *mut f32 {
+                let p = blob.ptr_at(off) as *mut f32;
+                hip.copy_h2d_f32(p, src).unwrap();
+                off += src.len() * 4;
+                p
+            };
+            let conv_w_d = put(&conv_w);
+            let conv_s_d = put(&conv_state0);
+            let dt_d = put(&dt_bias);
+            let a_d = put(&a);
+            let state_d = put(&state0);
+            let qkv_d = put(&vec![0.0; qkv_dim]);
+            let alpha_d = put(&vec![0.0; n_v]);
+            let beta_d = put(&vec![0.0; n_v]);
+            let y_d = put(&vec![0.0; n_v * hv]);
+            let mut y = vec![0.0f32; n_v * hv];
+            let mut beta = vec![0.0f32; n_v];
+            for (qkv, alpha, beta0) in &steps {
+                hip.copy_h2d_f32(qkv_d, qkv).unwrap();
+                hip.copy_h2d_f32(alpha_d, alpha).unwrap();
+                hip.copy_h2d_f32(beta_d, beta0).unwrap();
+                let args = (
+                    qkv_d as *const f32, alpha_d as *const f32, beta_d, conv_w_d as *const f32,
+                    conv_s_d, dt_d as *const f32, a_d as *const f32, state_d, y_d,
+                );
+                let r = if fused {
+                    hip.gdn_layer_step(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8,
+                        n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32, 1e-6, interleave)
+                } else {
+                    hip.gdn_layer_step_unfused(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8,
+                        n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32, 1e-6, interleave)
+                };
+                r.expect("gdn step");
+            }
+            hip.copy_d2h_f32(y_d, &mut y).unwrap();
+            hip.copy_d2h_f32(beta_d, &mut beta).unwrap();
+            let mut state = vec![0.0f32; state0.len()];
+            hip.copy_d2h_f32(state_d, &mut state).unwrap();
+            let mut conv_s = vec![0.0f32; conv_state0.len()];
+            hip.copy_d2h_f32(conv_s_d, &mut conv_s).unwrap();
+            (y, state, conv_s, beta)
+        };
+        let fused = run(true);
+        let unfused = run(false);
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        assert!(fused.0.iter().any(|v| *v != 0.0), "fused step produced no output");
+        assert!(same(&fused.0, &unfused.0), "y differs (interleave={interleave})");
+        assert!(same(&fused.1, &unfused.1), "recurrent state differs (interleave={interleave})");
+        assert!(same(&fused.2, &unfused.2), "conv state differs (interleave={interleave})");
+        assert!(same(&fused.3, &unfused.3), "beta differs (interleave={interleave})");
+    }
+}
+
+/// The fused GDN output (per-head RMSNorm + SiLU gate) gives the same bits as
+/// copies + rmsnorm_heads + silu_mul, including decode's `out == z` aliasing.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_norm_gate_fused_matches_unfused_bit_for_bit() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gdn_norm_gate_fused: no HIP device");
+        return;
+    }
+    let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 8) else {
+        eprintln!("skip hip_gdn_norm_gate_fused: HIP workspace unavailable");
+        return;
+    };
+    let (n_heads, hv) = (32usize, 128usize);
+    let n = n_heads * hv;
+    let mut seed = 0x1234_5677u32;
+    let mut rnd = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed >> 8) as f32 / (1u32 << 24) as f32 * 4.0 - 2.0
+            })
+            .collect()
+    };
+    let (y, z, w) = (rnd(n), rnd(n), rnd(hv));
+    let run = |fused: bool, alias_z: bool| -> Vec<f32> {
+        let blob = allpaca_hip::DeviceWeights::alloc(0, (3 * n + hv) * 4).expect("alloc");
+        let (y_d, z_d, w_d, o_d) = (
+            blob.ptr_at(0) as *mut f32,
+            blob.ptr_at(n * 4) as *mut f32,
+            blob.ptr_at(2 * n * 4) as *mut f32,
+            blob.ptr_at((2 * n + hv) * 4) as *mut f32,
+        );
+        hip.copy_h2d_f32(y_d, &y).unwrap();
+        hip.copy_h2d_f32(z_d, &z).unwrap();
+        hip.copy_h2d_f32(w_d, &w).unwrap();
+        let out = if alias_z { z_d } else { o_d };
+        let r = if fused {
+            hip.gdn_rmsnorm_silu_gate(y_d, z_d, w_d, out, n_heads as i32, hv as i32, 1e-6)
+        } else {
+            hip.gdn_rmsnorm_silu_gate_unfused(y_d, z_d, w_d, out, n_heads as i32, hv as i32, 1e-6)
+        };
+        r.expect("norm gate");
+        let mut o = vec![0.0f32; n];
+        hip.copy_d2h_f32(out, &mut o).unwrap();
+        o
+    };
+    for alias_z in [false, true] {
+        let (f, u) = (run(true, alias_z), run(false, alias_z));
+        assert!(f.iter().any(|v| *v != 0.0), "no output");
+        assert!(
+            f.iter().zip(&u).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "fused norm+gate differs (alias_z={alias_z})"
+        );
+    }
+}
+
+/// Wall time of one GDN decode step (delta step + norm/gate) at Qwen3-Next's
+/// shape, fused vs unfused, launch -> sync. Run with
+/// `cargo test --release -p allpaca-core --features hip --test hip_runtime bench_gdn_step_fused -- --ignored --nocapture`.
+#[cfg(feature = "hip")]
+#[test]
+#[ignore]
+fn bench_gdn_step_fused_vs_unfused() {
+    if allpaca_hip::device_count() == 0 {
+        return;
+    }
+    let dev = std::env::var("BENCH_DEV").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let Ok(hip) = allpaca_hip::HipWorkspace::new(dev, 1 << 20, 8) else { return };
+    let (n_k, n_v, hk, hv, ck) = (16usize, 32usize, 128usize, 128usize, 4usize);
+    let qkv_dim = 2 * n_k * hk + n_v * hv;
+    let floats = qkv_dim * (1 + ck + (ck - 1)) + n_v * 4 + n_v * hv * hk + n_v * hv * 2 + hv;
+    let blob = allpaca_hip::DeviceWeights::alloc(dev, floats * 4).expect("alloc");
+    let mut off = 0usize;
+    let mut take = |n: usize, v: f32| -> *mut f32 {
+        let p = blob.ptr_at(off) as *mut f32;
+        hip.copy_h2d_f32(p, &vec![v; n]).unwrap();
+        off += n * 4;
+        p
+    };
+    let qkv = take(qkv_dim, 0.1);
+    let conv_w = take(ck * qkv_dim, 0.2);
+    let conv_s = take((ck - 1) * qkv_dim, 0.0);
+    let alpha = take(n_v, 0.1);
+    let beta = take(n_v, 0.5);
+    let dt = take(n_v, 0.0);
+    let a = take(n_v, -0.5);
+    let state = take(n_v * hv * hk, 0.0);
+    let y = take(n_v * hv, 0.0);
+    let z = take(n_v * hv, 0.3);
+    let norm = take(hv, 1.0);
+    let step = |fused: bool| {
+        if fused {
+            hip.gdn_layer_step(qkv, alpha, beta, conv_w, conv_s, dt, a, state, y, n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32, 1e-6, true).unwrap();
+            hip.gdn_rmsnorm_silu_gate(y, z, norm, z, n_v as i32, hv as i32, 1e-6).unwrap();
+        } else {
+            hip.gdn_layer_step_unfused(qkv, alpha, beta, conv_w, conv_s, dt, a, state, y, n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32, 1e-6, true).unwrap();
+            hip.gdn_rmsnorm_silu_gate_unfused(y, z, norm, z, n_v as i32, hv as i32, 1e-6).unwrap();
+        }
+    };
+    for gap_us in [0u64, 500] {
+        for fused in [false, true, false, true] {
+            let mut tot = 0.0;
+            for _ in 0..200 {
+                let until = std::time::Instant::now() + std::time::Duration::from_micros(gap_us);
+                while std::time::Instant::now() < until {}
+                let t = std::time::Instant::now();
+                step(fused);
+                allpaca_hip::stream_synchronize().unwrap();
+                tot += t.elapsed().as_secs_f64() * 1e6;
+            }
+            eprintln!("GDNSTEP dev{dev} gap {gap_us}us {}: {:.1} us", if fused { "fused  " } else { "unfused" }, tot / 200.0);
+        }
+    }
+}

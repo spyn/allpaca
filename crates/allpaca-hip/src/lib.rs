@@ -927,6 +927,55 @@ mod ffi {
             eps: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_q8_0_pair(
+            a: *const f32,
+            b1: *const u8,
+            c1: *mut f32,
+            b2: *const u8,
+            c2: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_scale_add_copy(
+            x: *mut f32,
+            y: *mut f32,
+            s: f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gdn_norm_gate(
+            y: *const f32,
+            z: *const f32,
+            weight: *const f32,
+            out: *mut f32,
+            n_heads: i32,
+            head_dim: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gdn_step_fused(
+            qkv: *const f32,
+            conv_w: *const f32,
+            conv_state: *mut f32,
+            conv_out: *mut f32,
+            alpha: *const f32,
+            dt_bias: *const f32,
+            a: *const f32,
+            decay: *mut f32,
+            beta: *mut f32,
+            state: *mut f32,
+            out: *mut f32,
+            n_v: i32,
+            n_k: i32,
+            head_v: i32,
+            head_k: i32,
+            conv_kernel: i32,
+            eps: f32,
+            interleave: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gated_delta_step(
             q: *mut f32,
             k: *mut f32,
@@ -8266,6 +8315,61 @@ impl HipWorkspace {
         memcpy(dst.cast(), src.cast(), n * 4, MEMCPY_D2D)
     }
 
+    /// Two Q8_0 GEMVs sharing one input row in one launch (a shared
+    /// expert's gate and up). `Ok(false)` = not covered (m != 1): run them
+    /// separately. Each output is bit-identical to its own GEMV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nt_q8_pair_dev(
+        &self,
+        a: *const f32,
+        b1: *const u8,
+        c1: *mut f32,
+        b2: *const u8,
+        c2: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool, AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.bind()?;
+            let rc = unsafe {
+                ffi::allpaca_gemm_nt_q8_0_pair(a, b1, c1, b2, c2, m, n, k, std::ptr::null_mut())
+            };
+            if rc == ALLPACA_ERR_INVALID {
+                return Ok(false);
+            }
+            status(rc, "gemm_nt_q8_0_pair")?;
+            Ok(true)
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (a, b1, c1, b2, c2, m, n, k);
+            Ok(false)
+        }
+    }
+
+    /// `x += y * s; y = x` over `n` floats in one launch: the bits of
+    /// [`Self::scale_f32`] + [`Self::residual_add`] + a copy back.
+    pub fn scale_add_copy(&self, x: *mut f32, y: *mut f32, s: f32, n: usize) -> Result<(), AllpacaError> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_scale_add_copy(x, y, s, n as i32, std::ptr::null_mut()) };
+            status(rc, "scale_add_copy")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (x, y, s);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP scale_add_copy unavailable".into(),
+            )))
+        }
+    }
+
     pub fn scale_f32(&self, ptr: *mut f32, n: usize, scale: f32) -> Result<(), AllpacaError> {
         if n == 0 || ptr.is_null() {
             return Ok(());
@@ -10093,8 +10197,98 @@ impl HipWorkspace {
 
     /// One-token GDN layer on device: conv1d → expand-k → decay/β → gated delta.
     /// Activations `qkv` / `α` / `β` stay on device (no D2H). `β` is sigmoid'd in place.
+    /// Three launches when the fused kernels cover the shape (`head_k` a
+    /// multiple of 32 up to 256), else [`Self::gdn_layer_step_unfused`];
+    /// both give the same bits.
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_layer_step(
+        &self,
+        qkv: *const f32,
+        alpha: *const f32,
+        beta: *mut f32,
+        conv_w: *const f32,
+        conv_state: *mut f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        state: *mut f32,
+        y: *mut f32,
+        n_v_heads: i32,
+        n_k_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        conv_kernel: i32,
+        eps: f32,
+        k_interleave: bool,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let (n_v, n_k, hv, hk) = (
+                n_v_heads.max(0) as usize,
+                n_k_heads.max(0) as usize,
+                head_v.max(0) as usize,
+                head_k.max(0) as usize,
+            );
+            let qkv_dim = 2 * n_k * hk + n_v * hv;
+            // Same scratch layout as the unfused step: conv_out first, decay
+            // after the two (unused here) expanded q/k slots.
+            let decay_off = qkv_dim + 2 * n_v * hk;
+            if (decay_off + n_v) * 4 <= self.scratch_bytes && !conv_w.is_null() {
+                self.bind()?;
+                let conv_out = self.scratch.cast::<f32>();
+                let decay = unsafe { self.scratch.add(decay_off * 4).cast::<f32>() };
+                let rc = unsafe {
+                    ffi::allpaca_gdn_step_fused(
+                        qkv,
+                        conv_w,
+                        conv_state,
+                        conv_out,
+                        alpha,
+                        dt_bias,
+                        a,
+                        decay,
+                        beta,
+                        state,
+                        y,
+                        n_v_heads,
+                        n_k_heads,
+                        head_v,
+                        head_k,
+                        conv_kernel,
+                        eps,
+                        i32::from(k_interleave),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != ALLPACA_ERR_INVALID {
+                    return status(rc, "gdn_step_fused");
+                }
+            }
+        }
+        self.gdn_layer_step_unfused(
+            qkv,
+            alpha,
+            beta,
+            conv_w,
+            conv_state,
+            dt_bias,
+            a,
+            state,
+            y,
+            n_v_heads,
+            n_k_heads,
+            head_v,
+            head_k,
+            conv_kernel,
+            eps,
+            k_interleave,
+        )
+    }
+
+    /// [`Self::gdn_layer_step`] as separate launches (conv, shift, 2x expand,
+    /// decay/β, L2 norm, delta step): the fallback, and the reference the
+    /// fused path is tested against.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_layer_step_unfused(
         &self,
         qkv: *const f32,
         alpha: *const f32,
@@ -10181,7 +10375,45 @@ impl HipWorkspace {
     }
 
     /// `out = silu(z) * rmsnorm(y)` per V-head (matches host `deltanet::rmsnorm_silu_gate`).
+    /// One launch; [`Self::gdn_rmsnorm_silu_gate_unfused`] gives the same bits.
     pub fn gdn_rmsnorm_silu_gate(
+        &self,
+        y: *const f32,
+        z: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        n_heads: i32,
+        head_v: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            if !(y.is_null() || z.is_null() || weight.is_null() || out.is_null())
+                && n_heads > 0
+                && head_v > 0
+            {
+                self.bind()?;
+                let rc = unsafe {
+                    ffi::allpaca_gdn_norm_gate(
+                        y,
+                        z,
+                        weight,
+                        out,
+                        n_heads,
+                        head_v,
+                        eps,
+                        std::ptr::null_mut(),
+                    )
+                };
+                return status(rc, "gdn_norm_gate");
+            }
+        }
+        self.gdn_rmsnorm_silu_gate_unfused(y, z, weight, out, n_heads, head_v, eps)
+    }
+
+    /// [`Self::gdn_rmsnorm_silu_gate`] as copies + `rmsnorm_heads` + `silu_mul`:
+    /// the reference the fused kernel is tested against.
+    pub fn gdn_rmsnorm_silu_gate_unfused(
         &self,
         y: *const f32,
         z: *const f32,
@@ -11192,6 +11424,73 @@ mod tests {
 
     /// GPU cost of the Qwen3-Next GDN decode GEMVs, pipelined (1000 launches
     /// then one sync). `cargo test --release -p allpaca-hip --features hip --lib bench_gdn_gemv -- --ignored --nocapture`
+    /// A shared expert's gate + up as one paired Q8_0 launch gives the bits of
+    /// two separate GEMVs; scale_add_copy the bits of scale_f32 +
+    /// residual_add + copy.
+    #[test]
+    fn q8_pair_and_scale_add_copy_match_separate_launches() {
+        if device_count() == 0 {
+            return;
+        }
+        let Ok(hip) = HipWorkspace::new(0, 1 << 20, 8) else { return };
+        let (n, k) = (512usize, 2048usize);
+        let q8 = |salt: usize| -> Vec<u8> {
+            let packed: Vec<u8> = (0..n * k / 32 * 34)
+                .map(|i| match i % 34 {
+                    0 => ((i / 34 + salt) % 7) as u8 * 16,
+                    1 => 0x1c,
+                    _ => ((i * 7 + salt * 13) % 251) as u8,
+                })
+                .collect();
+            stage_q8_0_blocks(&packed).unwrap()
+        };
+        let (g, u) = (q8(1), q8(2));
+        let x: Vec<f32> = (0..k).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013).collect();
+        let dev = |bytes: usize| device_malloc(bytes, 0).unwrap();
+        let (gd, ud, xd) = (dev(g.len()), dev(u.len()), dev(k * 4));
+        memcpy(gd, g.as_ptr(), g.len(), MEMCPY_H2D).unwrap();
+        memcpy(ud, u.as_ptr(), u.len(), MEMCPY_H2D).unwrap();
+        memcpy(xd, x.as_ptr().cast(), k * 4, MEMCPY_H2D).unwrap();
+        let outs: Vec<*mut u8> = (0..4).map(|_| dev(n * 4)).collect();
+        hip.gemm_nt_q8_dev(xd.cast(), gd, outs[0].cast(), 1, n as i32, k as i32).unwrap();
+        hip.gemm_nt_q8_dev(xd.cast(), ud, outs[1].cast(), 1, n as i32, k as i32).unwrap();
+        let paired = hip
+            .gemm_nt_q8_pair_dev(xd.cast(), gd, outs[2].cast(), ud, outs[3].cast(), 1, n as i32, k as i32)
+            .unwrap();
+        assert!(paired, "m == 1 must take the paired launch");
+        let read = |p: *mut u8| {
+            let mut v = vec![0.0f32; n];
+            hip.copy_d2h_f32(p.cast(), &mut v).unwrap();
+            v
+        };
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert!(read(outs[0]).iter().any(|v| *v != 0.0));
+        assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
+        assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+
+        // scale_add_copy vs scale_f32 + residual_add + copy_d2d.
+        let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+        let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).cos() * 3.0).collect();
+        let s = 0.731_234_5f32;
+        let put = |p: *mut u8, v: &[f32]| hip.copy_h2d_f32(p.cast(), v).unwrap();
+        put(outs[0], &a);
+        put(outs[1], &b);
+        hip.scale_f32(outs[1].cast(), n, s).unwrap();
+        hip.residual_add(outs[0].cast(), outs[1].cast(), n as i32).unwrap();
+        hip.copy_d2d_f32(outs[1].cast(), outs[0].cast(), n).unwrap();
+        put(outs[2], &a);
+        put(outs[3], &b);
+        hip.scale_add_copy(outs[2].cast(), outs[3].cast(), s, n).unwrap();
+        assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "scale_add_copy x differs");
+        assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "scale_add_copy y differs");
+        for p in outs {
+            device_free(p, n * 4);
+        }
+        device_free(gd, g.len());
+        device_free(ud, u.len());
+        device_free(xd, k * 4);
+    }
+
     #[test]
     #[ignore]
     fn bench_gdn_gemv() {
