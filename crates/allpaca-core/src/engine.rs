@@ -3229,11 +3229,15 @@ impl Engine {
         let json_constraints = inner.flags.json_constraints;
         let structured = json_constraints && self.config.structured_output.enabled;
         let suppress_draft = request(&inner, id)?.suppress_draft;
+        let spec_limit = self.config.speculative.max_concurrent_requests;
+        let crowded = spec_limit > 0
+            && inner.active.values().filter(|r| !r.finished).count() > spec_limit;
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation
                 || inner.flags.draft_model_speculation
                 || inner.dspark.is_some())
-            && !suppress_draft;
+            && !suppress_draft
+            && !crowded;
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
@@ -8535,6 +8539,36 @@ mod tests {
             stats.poll_decode_picks > 0,
             "fair generate must record decode picks; stats={stats:?}"
         );
+    }
+
+    /// Two Requests decoded together: speculation stops while more Requests
+    /// are active than `speculative.max_concurrent_requests` (0 = no limit).
+    #[test]
+    fn speculation_pauses_above_max_concurrent_requests() {
+        let drafted = |limit: usize| {
+            let mut cfg = test_config();
+            cfg.engine.max_active_requests = 2;
+            cfg.speculative.max_concurrent_requests = limit;
+            let engine = Engine::new(cfg).unwrap();
+            let params = GenerationParams {
+                max_tokens: 24,
+                temperature: 0.0,
+                seed: Some(7),
+                ..GenerationParams::default()
+            };
+            let prompt = "hello world hello world hello world hello world";
+            let a = engine.begin_request(prompt, params.clone()).unwrap();
+            let b = engine.begin_request(prompt, params).unwrap();
+            for _ in 0..512 {
+                if engine.poll().expect("poll").is_none() {
+                    break;
+                }
+            }
+            drop((a, b));
+            engine.stats().draft_proposed
+        };
+        assert_eq!(drafted(1), 0, "two active Requests exceed a limit of 1: no drafts");
+        assert!(drafted(0) > 0, "without a limit the same Requests draft");
     }
 
     #[test]

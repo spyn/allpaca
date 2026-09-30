@@ -11277,6 +11277,25 @@ mod tests {
                 }
                 eprintln!("GEMV idle gap {gap_us}us: q8 n=8192 launch->sync {:.1} us, empty kernel {:.1} us", tot / 150.0, base / 150.0);
             }
+            // A decode layer body: many small kernels after the RPC wait. Burst
+            // (host enqueues back to back) vs trickle (host work between
+            // launches), timed from the first launch to sync.
+            for (n, host_us) in [(1usize, 0u64), (8, 0), (25, 0), (50, 0), (25, 5), (25, 15)] {
+                let mut tot = 0.0;
+                for _ in 0..100 {
+                    let until = std::time::Instant::now() + std::time::Duration::from_micros(500);
+                    while std::time::Instant::now() < until {}
+                    let t = std::time::Instant::now();
+                    for _ in 0..n {
+                        copy_f32_kernel(y.cast(), x.cast(), 2048).unwrap();
+                        let until = std::time::Instant::now() + std::time::Duration::from_micros(host_us);
+                        while std::time::Instant::now() < until {}
+                    }
+                    stream_synchronize().unwrap();
+                    tot += t.elapsed().as_secs_f64() * 1e6;
+                }
+                eprintln!("GEMV layer-like {n} kernels, {host_us}us host between: {:.1} us to sync ({:.1} us/kernel)", tot / 100.0, tot / 100.0 / n as f64);
+            }
             device_free(w, staged.len());
         }
         run("copy 2048 (launch floor)", 8192, &|| {

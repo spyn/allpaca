@@ -45,6 +45,7 @@ max_consecutive_prefill_picks = 0
 enabled = true
 providers = ["ngram", "draft_model"]  # ngram | draft_model | mtp | dspark
 max_depth = 8
+max_concurrent_requests = 3     # speculate only while <= this many Requests are active (0 = always)
 min_depth = 2
 adaptive = true
 ngram_n = 3
