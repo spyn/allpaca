@@ -5136,9 +5136,12 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        allpaca_hip::host_register(ptr as *mut u8, len, 0)
-            .expect("hipHostRegister on file mmap window");
-        allpaca_hip::host_unregister(ptr as *mut u8);
+        // Pinning a read-only file mapping is platform-dependent (Windows HIP
+        // refuses it); the copy below must be right either way.
+        match allpaca_hip::host_register(ptr as *mut u8, len, 0) {
+            Ok(()) => allpaca_hip::host_unregister(ptr as *mut u8),
+            Err(e) => eprintln!("file mmap window not pinnable here ({e}); checking the fallback copy"),
+        }
         let pin = super::try_window_pin_pair();
         let hip = std::sync::Arc::new(
             allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace"),

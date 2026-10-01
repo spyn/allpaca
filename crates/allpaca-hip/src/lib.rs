@@ -148,7 +148,9 @@ struct ProfileState {
 /// `hipEventRecord`s per kernel (~2.6k per token on a 64-layer model) plus a
 /// full sync and ~1.3k elapsed-time queries at token end; on Windows each
 /// marker can also split the command buffer. Buckets are EMAs, so a sample
-/// every few tokens tracks them just as well.
+/// every few tokens tracks them just as well. The workspace's first forward is
+/// never sampled: it pays one-time costs (module load, buffer growth) whose
+/// event times exceed its wall time and would seed the EMAs wrong.
 const PROFILE_EVERY: u64 = 16;
 
 impl Default for ProfileState {
@@ -5405,7 +5407,7 @@ impl HipWorkspace {
         let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
         g.used = 0;
         g.ops.clear();
-        g.full = g.forwards % PROFILE_EVERY == 0;
+        g.full = g.forwards % PROFILE_EVERY == 1;
         g.forwards = g.forwards.wrapping_add(1);
         self.profiling.store(u64::from(g.full), Ordering::Relaxed);
         g.wall_start = Some(std::time::Instant::now());
@@ -5460,7 +5462,15 @@ impl HipWorkspace {
             let mut buckets = [0u64; 5];
             #[cfg(all(feature = "hip", allpaca_hip_runtime))]
             {
+                // The thread may be bound to another GPU by now (layer split):
+                // wait on this workspace's last marker, or the last pairs
+                // (lm_head) read back as not ready and count zero.
+                let _ = self.bind();
                 let _ = stream_synchronize();
+                let last = g.used.min(g.pairs.len());
+                if last > 0 {
+                    let _ = event_synchronize(g.pairs[last - 1][1]);
+                }
                 for i in 0..g.used.min(g.ops.len()).min(g.pairs.len()) {
                     let op = g.ops[i] as usize;
                     if op >= 4 {

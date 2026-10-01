@@ -105,7 +105,12 @@ pub fn matmul_nt(
 ) -> Result<(), AllpacaError> {
     if x.len() < rows * k || w_t.len() < n * k || y.len() < rows * n {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-            "matmul_nt shape mismatch".into(),
+            format!(
+                "matmul_nt shape mismatch: x {} (rows {rows} x k {k}), w {} (n {n} x k), y {} (rows x n)",
+                x.len(),
+                w_t.len(),
+                y.len()
+            ),
         )));
     }
     for r in 0..rows {
