@@ -164,6 +164,7 @@ name = "allpaca-server"
 version = "0.1.0"
 dependencies = [
  "allpaca-core",
+ "allpaca-gguf",
  "allpaca-types",
  "async-stream",
  "axum",

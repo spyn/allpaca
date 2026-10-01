@@ -26,11 +26,13 @@
       <nav aria-label="Pages">
         <button data-page="dashboard" class="tab active">Dashboard</button>
         <button data-page="chat" class="tab">Chat</button>
+        <button data-page="model" class="tab">Model</button>
         <button data-page="logs" class="tab">Logs</button>
       </nav>
       <span id="conn" class="conn" title="Server connection"><span class="dot"></span><span id="conn-text">connecting</span></span>
       <button id="logout" class="ghost">Log out</button>
     </header>
+    <div id="reload-banner" class="banner hidden" role="status"></div>
 
     <main id="page-dashboard" class="page">
       <section class="hero card">
@@ -96,6 +98,80 @@
             <button id="stop" type="button" class="danger hidden">Stop</button>
           </div>
         </form>
+      </div>
+    </main>
+
+    <main id="page-model" class="page hidden">
+      <section class="card model-head">
+        <div>
+          <h2>Model</h2>
+          <div id="m-name" class="hero-model">—</div>
+          <div id="m-path" class="muted small-text"></div>
+        </div>
+        <div class="model-actions">
+          <span id="m-pending" class="pill warn-pill hidden">Reload needed to apply the context size</span>
+          <button id="m-reload" class="ghost" disabled>Reload model</button>
+        </div>
+      </section>
+
+      <h2 class="section-title">Context size</h2>
+      <section class="card">
+        <div class="ctx-row">
+          <input id="ctx-slider" type="range" min="0" max="15" step="1" value="5" aria-label="Context size">
+          <input id="ctx-input" type="number" min="256" step="256" aria-label="Context tokens">
+          <span class="muted">tokens</span>
+        </div>
+        <div class="ctx-readout">
+          <div><span class="muted">KV cache</span> <strong id="ctx-kv">—</strong></div>
+          <div><span class="muted">Per token</span> <strong id="ctx-per">—</strong></div>
+          <div><span class="muted">Running with</span> <strong id="ctx-now">—</strong></div>
+        </div>
+        <h3 class="sub-title">VRAM estimator</h3>
+        <div id="vram-bar" class="stack-bar" aria-label="Estimated VRAM use"></div>
+        <div id="vram-legend" class="legend"></div>
+        <p id="vram-note" class="muted small-text"></p>
+        <div class="row-end">
+          <button id="ctx-save" class="primary" disabled>Save context size</button>
+        </div>
+      </section>
+
+      <div id="experts-wrap" class="hidden">
+        <h2 class="section-title">Experts</h2>
+        <section class="card">
+          <div class="exp-toolbar">
+            <button id="layer-prev" class="ghost small" aria-label="Previous layer">‹</button>
+            <label>Layer <select id="layer-select"></select></label>
+            <button id="layer-next" class="ghost small" aria-label="Next layer">›</button>
+            <span id="exp-summary" class="muted small-text"></span>
+            <span class="spacer"></span>
+            <label class="check"><input id="rec-toggle" type="checkbox"> Record usage</label>
+            <button id="usage-reset" class="ghost small">Reset counts</button>
+          </div>
+          <div class="exp-body">
+            <div>
+              <div id="exp-grid" class="exp-grid" role="grid" aria-label="Experts in this layer"></div>
+              <div class="legend">
+                <span><i class="sw heat-lo"></i>few hits</span>
+                <span><i class="sw heat-hi"></i>many hits</span>
+                <span><i class="sw sw-off"></i>disabled</span>
+                <span><i class="sw sw-named"></i>named</span>
+              </div>
+            </div>
+            <aside id="exp-panel" class="exp-panel">
+              <p class="muted">Select an expert to name or disable it. Turn on <em>Record usage</em>, send a prompt, and the grid shows which experts it routed to.</p>
+            </aside>
+          </div>
+          <div class="row-end">
+            <button id="layer-enable-all" class="ghost small">Enable all in layer</button>
+          </div>
+        </section>
+        <section class="card named-card">
+          <h3>Named and disabled experts</h3>
+          <table>
+            <thead><tr><th>Layer</th><th>Expert</th><th>Name</th><th>State</th></tr></thead>
+            <tbody id="named-rows"></tbody>
+          </table>
+        </section>
       </div>
     </main>
 

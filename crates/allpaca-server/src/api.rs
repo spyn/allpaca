@@ -19,6 +19,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, AuthState};
+use crate::engine_slot::{EngineSlot, EngineStatus};
+use crate::model_settings::SettingsStore;
 use crate::host::{HostSampler, HostSnapshot};
 use crate::image_url::load_image_url;
 use crate::logs::LogRing;
@@ -26,7 +28,9 @@ use crate::ui;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub engine: Arc<Engine>,
+    pub engine: Arc<EngineSlot>,
+    /// Per-model settings file of the served model.
+    pub settings: Arc<SettingsStore>,
     pub config: Config,
     pub auth: AuthState,
     pub logs: LogRing,
@@ -36,7 +40,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(engine: Arc<Engine>, config: Config, auth: AuthState, logs: LogRing) -> Self {
         Self {
-            engine,
+            settings: Arc::new(SettingsStore::open(&config)),
+            engine: EngineSlot::new(engine, config.clone()),
             config,
             auth,
             logs,
@@ -45,11 +50,35 @@ impl AppState {
     }
 }
 
+impl AppState {
+    /// The served engine, `None` while it reloads.
+    pub fn engine(&self) -> Option<Arc<Engine>> {
+        self.engine.get()
+    }
+}
+
+/// 503 while the engine is reloading or absent.
+pub(crate) fn engine_unavailable(state: &AppState) -> Response {
+    let status = state.engine.status();
+    let message = if status.state == "loading" {
+        format!("model is reloading: {}", status.message.unwrap_or_default())
+    } else {
+        "no model loaded".to_string()
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": {"message": message, "type": "transient"}})),
+    )
+        .into_response()
+}
+
 #[derive(Serialize)]
 struct StatusBody {
-    stats: StatsSnapshot,
+    /// `None` while the engine reloads.
+    stats: Option<StatsSnapshot>,
     devices: Vec<DeviceInfo>,
     host: HostSnapshot,
+    engine: EngineStatus,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -62,6 +91,20 @@ pub fn router(state: AppState) -> Router {
         .route("/stats", get(stats))
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/metrics/otlp", get(otlp_metrics))
+        .route(
+            "/v1/model/settings",
+            get(crate::model_api::get_settings).put(crate::model_api::put_settings),
+        )
+        .route("/v1/model/experts/usage", get(crate::model_api::get_usage))
+        .route(
+            "/v1/model/experts/usage/reset",
+            post(crate::model_api::reset_usage),
+        )
+        .route(
+            "/v1/model/experts/recording",
+            post(crate::model_api::set_recording),
+        )
+        .route("/v1/model/reload", post(crate::model_api::reload))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -80,10 +123,15 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusBody> {
+    let engine = state.engine();
     Json(StatusBody {
-        stats: state.engine.stats(),
-        devices: state.engine.inventory().devices.clone(),
+        stats: engine.as_ref().map(|e| e.stats()),
+        devices: engine
+            .as_ref()
+            .map(|e| e.inventory().devices.clone())
+            .unwrap_or_default(),
         host: state.host.snapshot(),
+        engine: state.engine.status(),
     })
 }
 
@@ -289,15 +337,12 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    if !state.engine.has_model() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": {"message": "no model loaded", "type": "fatal"}})),
-        )
-            .into_response();
-    }
+    let Some(engine) = state.engine().filter(|e| e.has_model()) else {
+        return engine_unavailable(&state);
+    };
     let messages = req.messages.clone();
-    let engine = state.engine.clone();
+    let served = Arc::clone(&engine);
+    let engine = served.clone();
     let (prompt, images) = match tokio::task::spawn_blocking(move || {
         let (turns, images) = flatten_chat_messages(&messages, engine.image_marker())?;
         let pairs: Vec<(&str, &str)> = turns
@@ -319,18 +364,18 @@ async fn chat_completions(
         }
     };
     let params = params_from_request(&req, &state.config);
-    let model = req.model.clone().unwrap_or_else(|| state.engine.model_id());
+    let model = req.model.clone().unwrap_or_else(|| served.model_id());
     let id = format!("chatcmpl-{}", now_secs());
     let created = now_secs();
     tracing::info!("chat completion model={model} stream={}", req.stream);
 
     if req.stream {
-        return stream_completion(state, prompt, images, params, model, id, created)
+        return stream_completion(state, served, prompt, images, params, model, id, created)
             .into_response();
     }
 
     if state.config.engine.max_active_requests > 1 {
-        let mut stream = Box::pin(state.engine.generate_stream_multimodal(
+        let mut stream = Box::pin(served.generate_stream_multimodal(
             prompt.clone(),
             images,
             params,
@@ -373,7 +418,7 @@ async fn chat_completions(
         .into_response();
     }
 
-    let engine = Arc::clone(&state.engine);
+    let engine = Arc::clone(&served);
     match tokio::task::spawn_blocking(move || engine.generate_multimodal(&prompt, &images, params))
         .await
     {
@@ -406,8 +451,10 @@ async fn chat_completions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_completion(
     state: AppState,
+    engine: Arc<Engine>,
     prompt: String,
     images: Vec<ImageInput>,
     params: GenerationParams,
@@ -417,7 +464,6 @@ fn stream_completion(
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(16);
     let use_async_poll = state.config.engine.max_active_requests > 1;
-    let engine = Arc::clone(&state.engine);
     if use_async_poll {
         tokio::spawn(async move {
             let mut stream = Box::pin(engine.generate_stream_multimodal(prompt, images, params));
@@ -463,11 +509,8 @@ fn stream_completion(
     } else {
         let rt = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            let mut stream = Box::pin(
-                state
-                    .engine
-                    .generate_stream_multimodal(prompt, images, params),
-            );
+            let _ = &state;
+            let mut stream = Box::pin(engine.generate_stream_multimodal(prompt, images, params));
             rt.block_on(async {
                 let first = serde_json::json!({
                     "id": id,
@@ -518,8 +561,11 @@ fn stream_completion(
     })
 }
 
-async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
-    let id = state.engine.model_id();
+async fn list_models(State(state): State<AppState>) -> Response {
+    let Some(engine) = state.engine() else {
+        return engine_unavailable(&state);
+    };
+    let id = engine.model_id();
     Json(ModelList {
         object: "list",
         data: vec![ModelCard {
@@ -529,15 +575,22 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
             owned_by: "allpaca",
         }],
     })
+    .into_response()
 }
 
-async fn stats(State(state): State<AppState>) -> Json<allpaca_types::StatsSnapshot> {
-    Json(state.engine.stats())
+async fn stats(State(state): State<AppState>) -> Response {
+    match state.engine() {
+        Some(engine) => Json(engine.stats()).into_response(),
+        None => engine_unavailable(&state),
+    }
 }
 
 /// Prometheus text exposition (subset of Engine `/stats`).
-async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = render_prometheus_text(&state.engine.stats());
+async fn prometheus_metrics(State(state): State<AppState>) -> Response {
+    let Some(engine) = state.engine() else {
+        return engine_unavailable(&state);
+    };
+    let body = render_prometheus_text(&engine.stats());
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -545,16 +598,21 @@ async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse 
         )],
         body,
     )
+        .into_response()
 }
 
 /// OTLP-ish JSON metrics (`allpaca_*` names). Pull endpoint; push uses `telemetry.otlp_endpoint`.
-async fn otlp_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let snap = state.engine.stats();
-    let body = state.engine.metrics().export_otlp_json(&snap);
+async fn otlp_metrics(State(state): State<AppState>) -> Response {
+    let Some(engine) = state.engine() else {
+        return engine_unavailable(&state);
+    };
+    let snap = engine.stats();
+    let body = engine.metrics().export_otlp_json(&snap);
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
+        .into_response()
 }
 
 fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
@@ -883,7 +941,7 @@ mod tests {
             tokio::join!(app.clone().oneshot(make_req()), app.oneshot(make_req()),);
         assert_eq!(res_a.expect("a").status(), StatusCode::OK);
         assert_eq!(res_b.expect("b").status(), StatusCode::OK);
-        let stats = state.engine.stats();
+        let stats = state.engine().unwrap().stats();
         assert!(
             stats.poll_ticks > 0,
             "HTTP chat with max_active_requests=2 must use Engine::poll; stats={stats:?}"
@@ -1024,7 +1082,7 @@ mod tests {
         let body_b = res_b.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body_a).contains("[DONE]"));
         assert!(String::from_utf8_lossy(&body_b).contains("[DONE]"));
-        let stats = state.engine.stats();
+        let stats = state.engine().unwrap().stats();
         assert!(
             stats.poll_ticks > 0,
             "overlapping SSE must use fair poll; stats={stats:?}"
@@ -1274,11 +1332,12 @@ mod tests {
             return;
         };
         let state = test_state();
-        state.engine.set_vision_encoder(Arc::new(StubEnc)).unwrap();
+        state.engine().unwrap().set_vision_encoder(Arc::new(StubEnc)).unwrap();
         let text_only = state
-            .engine
+            .engine()
+            .unwrap()
             .generate(
-                &state.engine.format_chat(&[("user", "describe")]),
+                &state.engine().unwrap().format_chat(&[("user", "describe")]),
                 GenerationParams {
                     max_tokens: 4,
                     temperature: 0.0,
@@ -1464,7 +1523,7 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
         let url = format!("data:image/jpeg;base64,{b64}");
         let state = test_state();
-        state.engine.set_vision_encoder(Arc::new(StubEnc)).unwrap();
+        state.engine().unwrap().set_vision_encoder(Arc::new(StubEnc)).unwrap();
         let app = router(state);
         let body = serde_json::json!({
             "model": "synthetic",
