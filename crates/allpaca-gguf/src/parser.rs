@@ -667,6 +667,10 @@ impl GgufFile {
                 HybridLayerKind::Ssm
             } else if attn {
                 HybridLayerKind::Attention
+            } else if moe {
+                // MoE-only block (Nemotron-H): the FFN must route experts,
+                // which `apply_ffn` skips for DenseFfn blocks.
+                HybridLayerKind::Moe
             } else {
                 HybridLayerKind::DenseFfn
             };

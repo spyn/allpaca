@@ -258,6 +258,16 @@ impl RpcRuntime {
             .unwrap_or(0)
     }
 
+    /// Move every local layer on HIP `from` to HIP `to` (the second GPU's
+    /// layers were not uploaded there, so the target GPU runs them).
+    pub fn fold_local_device(&self, from: i32, to: i32) {
+        if let Ok(mut devs) = self.layer_device.lock() {
+            for d in devs.iter_mut().filter(|d| **d == from) {
+                *d = to;
+            }
+        }
+    }
+
     /// Local layers occupy more than one HIP device.
     pub fn splits_local(&self) -> bool {
         let Ok(devs) = self.layer_device.lock() else {

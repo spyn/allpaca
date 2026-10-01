@@ -1,42 +1,68 @@
+"use strict";
+
 const $ = (id) => document.getElementById(id);
 const LEVELS = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+const POLL_MS = 1000;
+const SPARK_POINTS = 60;
+const LOG_CAP = 4000;
+const CHAT_KEY = "allpaca.chat";
+const SETTINGS_KEY = "allpaca.settings";
+
+class Unauthorized extends Error {}
 
 const state = {
   page: "dashboard",
-  messages: loadMessages(),
+  authed: false,
+  pollTimer: null,
+  lastTokens: null,
+  lastTokensAt: 0,
+  tps: [],
+  messages: loadJson(CHAT_KEY, []),
+  pending: [],
+  streaming: null,
   logLines: [],
   logSource: null,
+  logRetry: 1000,
+  logRendered: 0,
+  logFrame: 0,
 };
 
-function loadMessages() {
+/* ---------- storage ---------- */
+
+function loadJson(key, fallback) {
   try {
-    return JSON.parse(localStorage.getItem("allpaca.chat") || "[]");
+    const v = JSON.parse(localStorage.getItem(key) || "null");
+    return v ?? fallback;
   } catch {
-    return [];
+    return fallback;
+  }
+}
+
+function saveJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
   }
 }
 
 function saveMessages() {
-  localStorage.setItem("allpaca.chat", JSON.stringify(state.messages.slice(-80)));
-}
-
-async function api(path, opts = {}) {
-  const res = await fetch(path, { credentials: "include", ...opts });
-  if (res.status === 401) {
-    showLogin();
-    throw new Error("unauthorized");
+  const keep = state.messages.slice(-80);
+  // Images can blow the storage quota: keep the text if they do.
+  if (!saveJson(CHAT_KEY, keep)) {
+    saveJson(CHAT_KEY, keep.map(({ images, ...m }) => m));
   }
-  return res;
 }
 
-function showLogin() {
-  $("login").classList.remove("hidden");
-  $("app").classList.add("hidden");
-}
+/* ---------- formatting ---------- */
 
-function showApp() {
-  $("login").classList.add("hidden");
-  $("app").classList.remove("hidden");
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function bytes(n) {
@@ -47,224 +73,740 @@ function bytes(n) {
   return `${(v / 1024 ** 3).toFixed(2)} GiB`;
 }
 
+function num(n) {
+  return (Number(n) || 0).toLocaleString();
+}
+
 function meter(frac) {
-  const pct = Math.max(0, Math.min(100, Math.round((frac || 0) * 100)));
-  return `<div class="meter"><span style="width:${pct}%"></span></div>`;
+  const f = Math.max(0, Math.min(1, frac || 0));
+  const cls = f > 0.93 ? "hot" : f > 0.8 ? "warn" : "";
+  return `<div class="meter ${cls}"><span style="width:${(f * 100).toFixed(1)}%"></span></div>`;
 }
 
-function card(title, body, extra = "") {
-  return `<article class="card"><h3>${title}</h3><div class="metric">${body}</div>${extra}</article>`;
+function card(title, value, sub = "", extra = "") {
+  const subHtml = sub ? `<p class="metric-sub">${sub}</p>` : "";
+  return `<article class="card"><h3>${title}</h3><div class="metric">${value}</div>${subHtml}${extra}</article>`;
 }
 
-function renderDashboard(data) {
-  const s = data.stats || {};
-  const h = data.host || {};
-  const ramFrac = h.ram_total_bytes ? h.ram_used_bytes / h.ram_total_bytes : 0;
-  const vramFrac = s.gpu_vram_total_bytes ? s.gpu_vram_used_bytes / s.gpu_vram_total_bytes : 0;
-  const draftFrac = s.draft_gpu_vram_total_bytes
-    ? s.draft_gpu_vram_used_bytes / s.draft_gpu_vram_total_bytes
-    : 0;
-  const gpuLabel = (id, fallback) => {
-    const d = (data.devices || []).find((x) => x.id === id);
-    if (d && d.name) return d.name.replace(/^AMD Radeon /, "");
-    return fallback;
+/* Minimal, escape-first markdown: fenced code, inline code, bold, headings,
+ * lists and paragraphs. Enough for model replies without a dependency. */
+function renderMarkdown(src) {
+  const out = [];
+  const fence = /```([^\n`]*)\n?([\s\S]*?)(```|$)/g;
+  let last = 0;
+  let m;
+  while ((m = fence.exec(src)) !== null) {
+    if (m.index > last) out.push(renderBlocks(src.slice(last, m.index)));
+    const lang = escapeHtml(m[1].trim() || "code");
+    out.push(
+      `<div class="codeblock"><div class="code-head"><span>${lang}</span>` +
+        `<button type="button" class="ghost copy">Copy</button></div>` +
+        `<pre><code>${escapeHtml(m[2].replace(/\n$/, ""))}</code></pre></div>`
+    );
+    last = fence.lastIndex;
+    if (m[0].length === 0) break;
+  }
+  if (last < src.length) out.push(renderBlocks(src.slice(last)));
+  return out.join("");
+}
+
+function renderInline(s) {
+  return escapeHtml(s)
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+}
+
+function renderBlocks(text) {
+  const html = [];
+  let list = null;
+  let para = [];
+  const flushPara = () => {
+    if (para.length) html.push(`<p>${para.map(renderInline).join("<br>")}</p>`);
+    para = [];
   };
-  $("dash-cards").innerHTML = [
-    card("Model", escapeHtml(s.model_id || "—"), `<p class="muted">${escapeHtml(s.backend || "")} · ${s.active_requests || 0} active</p>`),
-    card("Host CPU", `${(h.cpu_usage || 0).toFixed(0)}%`, meter((h.cpu_usage || 0) / 100)),
-    card("Host RAM", `${bytes(h.ram_used_bytes)} / ${bytes(h.ram_total_bytes)}`, meter(ramFrac)),
-    card(`${escapeHtml(gpuLabel(s.target_device, "GPU 0"))} VRAM`, s.gpu_vram_total_bytes ? `${bytes(s.gpu_vram_used_bytes)} / ${bytes(s.gpu_vram_total_bytes)}` : "n/a", meter(vramFrac)),
-    card(`${escapeHtml(gpuLabel(s.draft_device, "GPU 1"))} VRAM`, s.draft_gpu_vram_total_bytes ? `${bytes(s.draft_gpu_vram_used_bytes)} / ${bytes(s.draft_gpu_vram_total_bytes)}` : "n/a", meter(draftFrac)),
-    card("GPU util", `${((s.gpu_util || 0) * 100).toFixed(0)}%`),
-    card("TTFT / ITL", `${s.ttft_ms_last || 0} ms / ${(s.itl_ms_ema || 0).toFixed(1)} ms`),
-    card("KV pages", `VRAM ${s.vram_pages || 0} · DRAM ${s.dram_pages || 0}`),
-    card("Weights on device", bytes(s.weight_bytes_on_device)),
-    card("Speculation", `${((s.acceptance_rate || 0) * 100).toFixed(1)}% accept`, `<p class="muted">${s.draft_accepted || 0} / ${s.draft_proposed || 0}</p>`),
-    card("RPC", `${s.rpc_roundtrips || 0} roundtrips`, `<p class="muted">${bytes(s.rpc_activation_bytes)} activations</p>`),
-  ].join("");
-  const rows = (data.devices || [])
-    .map(
-      (d) =>
-        `<tr><td>${d.id}</td><td>${escapeHtml(d.kind)}</td><td>${escapeHtml(d.name)}</td><td>${bytes(d.memory_bytes)}</td></tr>`
-    )
-    .join("");
-  $("device-rows").innerHTML = rows || `<tr><td colspan="4" class="muted">No devices</td></tr>`;
+  const flushList = () => {
+    if (list) html.push(`<${list.tag}>${list.items.map((i) => `<li>${renderInline(i)}</li>`).join("")}</${list.tag}>`);
+    list = null;
+  };
+  for (const line of text.split("\n")) {
+    const h = /^(#{1,4})\s+(.*)$/.exec(line);
+    const ul = /^\s*[-*]\s+(.*)$/.exec(line);
+    const ol = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    if (!line.trim()) {
+      flushPara();
+      flushList();
+    } else if (h) {
+      flushPara();
+      flushList();
+      const lvl = Math.min(4, h[1].length + 1);
+      html.push(`<h${lvl}>${renderInline(h[2])}</h${lvl}>`);
+    } else if (ul || ol) {
+      flushPara();
+      const tag = ul ? "ul" : "ol";
+      if (!list || list.tag !== tag) {
+        flushList();
+        list = { tag, items: [] };
+      }
+      list.items.push((ul || ol)[1]);
+    } else {
+      flushList();
+      para.push(line);
+    }
+  }
+  flushPara();
+  flushList();
+  return html.join("");
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+/* ---------- auth + api ---------- */
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { credentials: "include", ...opts });
+  if (res.status === 401) {
+    onUnauthorized();
+    throw new Unauthorized();
+  }
+  return res;
 }
 
-function renderMessages() {
-  const box = $("messages");
-  box.innerHTML = state.messages
-    .map((m) => `<div class="bubble ${m.role}">${escapeHtml(m.content)}</div>`)
-    .join("");
-  box.scrollTop = box.scrollHeight;
+function onUnauthorized() {
+  state.authed = false;
+  stopPolling();
+  stopLogs();
+  $("app").classList.add("hidden");
+  $("login").classList.remove("hidden");
+  $("password").focus();
 }
 
-function setPage(name) {
-  state.page = name;
-  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.page === name));
-  ["dashboard", "chat", "logs"].forEach((p) => {
-    $(`page-${p}`).classList.toggle("hidden", p !== name);
-  });
-  if (name === "logs") startLogs();
+function enterApp() {
+  state.authed = true;
+  $("login").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  setPage(location.hash.slice(1) || state.page);
+  startPolling();
+  loadModel();
+}
+
+async function boot() {
+  try {
+    const res = await api("/v1/status");
+    enterApp();
+    if (res.ok) renderDashboard(await res.json());
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) {
+      // Server unreachable: show the app and let polling report it.
+      enterApp();
+      setConn("down");
+    }
+  }
+}
+
+/* ---------- dashboard ---------- */
+
+function setConn(kind) {
+  const el = $("conn");
+  el.classList.toggle("ok", kind === "ok");
+  el.classList.toggle("down", kind === "down");
+  $("conn-text").textContent = kind === "ok" ? "live" : kind === "down" ? "offline" : "connecting";
+}
+
+function startPolling() {
+  stopPolling();
+  const tick = async () => {
+    if (!state.authed) return;
+    if (!document.hidden) await pollStatus();
+    if (state.authed) state.pollTimer = setTimeout(tick, POLL_MS);
+  };
+  tick();
+}
+
+function stopPolling() {
+  clearTimeout(state.pollTimer);
+  state.pollTimer = null;
 }
 
 async function pollStatus() {
   try {
     const res = await api("/v1/status");
-    if (!res.ok) return;
-    const data = await res.json();
-    renderDashboard(data);
-    const models = await api("/v1/models").then((r) => r.json()).catch(() => null);
-    if (models && models.data && models.data[0]) {
-      $("chat-model").textContent = models.data[0].id;
+    if (!res.ok) {
+      setConn("down");
+      return;
     }
-  } catch {
-    /* login gate handles 401 */
+    renderDashboard(await res.json());
+    setConn("ok");
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) setConn("down");
   }
+}
+
+async function loadModel() {
+  try {
+    const body = await api("/v1/models").then((r) => r.json());
+    const id = body && body.data && body.data[0] && body.data[0].id;
+    $("chat-model").textContent = id || "no model";
+    $("chat-model").classList.toggle("muted", !id);
+  } catch {
+    /* status polling reports connectivity */
+  }
+}
+
+function sampleThroughput(s) {
+  const now = performance.now();
+  const toks = Number(s.tokens_generated) || 0;
+  if (state.lastTokens !== null && now > state.lastTokensAt) {
+    const dt = (now - state.lastTokensAt) / 1000;
+    const rate = Math.max(0, toks - state.lastTokens) / dt;
+    state.tps.push(rate);
+    if (state.tps.length > SPARK_POINTS) state.tps.shift();
+  }
+  state.lastTokens = toks;
+  state.lastTokensAt = now;
+}
+
+function renderSpark() {
+  const pts = state.tps;
+  const latest = pts.length ? pts[pts.length - 1] : 0;
+  $("hero-tps").textContent = latest.toFixed(1);
+  if (pts.length < 2) {
+    $("spark-line").setAttribute("d", "");
+    $("spark-fill").setAttribute("d", "");
+    return;
+  }
+  const max = Math.max(1, ...pts);
+  const step = 120 / (SPARK_POINTS - 1);
+  const x0 = 120 - step * (pts.length - 1);
+  const coords = pts.map((v, i) => [x0 + i * step, 31 - (v / max) * 29]);
+  const line = coords.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+  $("spark-line").setAttribute("d", line);
+  $("spark-fill").setAttribute("d", `${line} L120,32 L${x0.toFixed(2)},32 Z`);
+}
+
+function renderDashboard(data) {
+  const s = data.stats || {};
+  const h = data.host || {};
+  const devices = data.devices || [];
+  sampleThroughput(s);
+  renderSpark();
+
+  const gpuName = (id, fallback) => {
+    const d = devices.find((x) => x.id === id && /gpu|hip|cuda|vulkan/i.test(x.kind || "gpu"));
+    return d && d.name ? d.name.replace(/^AMD Radeon /, "") : fallback;
+  };
+  $("hero-model").textContent = s.model_id || "—";
+  const active = Number(s.active_requests) || 0;
+  $("hero-sub").textContent = [
+    s.backend ? s.backend.toUpperCase() : "",
+    `${active} active request${active === 1 ? "" : "s"}`,
+    `${num(s.requests_total)} served`,
+    `${num(s.tokens_generated)} tokens`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  // No VRAM card for a GPU the engine does not report (CPU-only, one GPU).
+  const vram = (used, total, label) =>
+    total ? card(`${escapeHtml(label)} VRAM`, bytes(used), `of ${bytes(total)}`, meter(used / total)) : "";
+  $("mem-cards").innerHTML = [
+    card("Host RAM", bytes(h.ram_used_bytes), `of ${bytes(h.ram_total_bytes)}`, meter(h.ram_total_bytes ? h.ram_used_bytes / h.ram_total_bytes : 0)),
+    vram(s.gpu_vram_used_bytes, s.gpu_vram_total_bytes, gpuName(s.target_device, "GPU 0")),
+    vram(s.draft_gpu_vram_used_bytes, s.draft_gpu_vram_total_bytes, gpuName(s.draft_device, "GPU 1")),
+    card("Weights on device", bytes(s.weight_bytes_on_device), `KV on device ${bytes(s.kv_bytes_on_device)}`),
+  ].join("");
+
+  const proposed = Number(s.draft_proposed) || 0;
+  const steps = Number(s.batched_decode_steps) || 0;
+  $("engine-cards").innerHTML = [
+    card("Latency", `${(s.itl_ms_ema || 0).toFixed(1)} ms`, `ITL · TTFT ${num(s.ttft_ms_last)} ms`),
+    card("Host CPU", `${(h.cpu_usage || 0).toFixed(0)}%`, "", meter((h.cpu_usage || 0) / 100)),
+    card("GPU util", `${((s.gpu_util || 0) * 100).toFixed(0)}%`, "", meter(s.gpu_util || 0)),
+    card("KV pages", `${num(s.vram_pages)} VRAM`, `${num(s.dram_pages)} DRAM`),
+    card(
+      "Speculation",
+      proposed ? `${((s.acceptance_rate || 0) * 100).toFixed(1)}%` : "idle",
+      proposed ? `${num(s.draft_accepted)} of ${num(proposed)} drafts accepted` : "no drafts proposed"
+    ),
+    card(
+      "Batched decode",
+      steps ? `${((Number(s.batched_decode_rows) || 0) / steps).toFixed(2)} rows` : "—",
+      steps ? `avg per step · ${num(steps)} steps` : "single stream so far"
+    ),
+    card("RPC", `${num(s.rpc_roundtrips)}`, `round trips · ${bytes(s.rpc_activation_bytes)} activations`),
+  ].join("");
+
+  $("device-rows").innerHTML =
+    devices
+      .map(
+        (d) =>
+          `<tr><td>${escapeHtml(d.id)}</td><td>${escapeHtml(d.kind)}</td><td>${escapeHtml(d.name)}</td><td class="num">${bytes(d.memory_bytes)}</td></tr>`
+      )
+      .join("") || `<tr><td colspan="4" class="muted">No devices</td></tr>`;
+}
+
+/* ---------- pages ---------- */
+
+function setPage(name) {
+  if (!["dashboard", "chat", "logs"].includes(name)) name = "dashboard";
+  state.page = name;
+  document.querySelectorAll("nav .tab").forEach((b) => {
+    const on = b.dataset.page === name;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-current", on ? "page" : "false");
+  });
+  ["dashboard", "chat", "logs"].forEach((p) => $(`page-${p}`).classList.toggle("hidden", p !== name));
+  if (location.hash.slice(1) !== name) history.replaceState(null, "", `#${name}`);
+  if (name === "logs") {
+    startLogs();
+    scheduleLogRender(true);
+  }
+  if (name === "chat") {
+    renderMessages();
+    $("prompt").focus();
+  }
+}
+
+/* ---------- chat ---------- */
+
+function loadSettings() {
+  const s = loadJson(SETTINGS_KEY, {});
+  if (s.maxTokens) $("max-tokens").value = s.maxTokens;
+  if (s.temperature !== undefined) $("temperature").value = s.temperature;
+  if (s.system) $("system-prompt").value = s.system;
+}
+
+function saveSettings() {
+  saveJson(SETTINGS_KEY, {
+    maxTokens: $("max-tokens").value,
+    temperature: $("temperature").value,
+    system: $("system-prompt").value,
+  });
+}
+
+function messageHtml(m, i) {
+  const live = state.streaming && state.streaming.index === i;
+  const images = (m.images || []).map((src) => `<img src="${escapeHtml(src)}" alt="attached image">`).join("");
+  const body =
+    m.role === "assistant" ? renderMarkdown(m.content) : escapeHtml(m.content);
+  const bubbleCls = `bubble${m.error ? " error-bubble" : ""}${live ? " cursor" : ""}`;
+  const meta = m.meta ? `<div class="msg-meta">${escapeHtml(m.meta)}</div>` : "";
+  return (
+    `<div class="msg ${m.role}" data-i="${i}">` +
+    (images ? `<div class="msg-images">${images}</div>` : "") +
+    (m.content || live || !images ? `<div class="${bubbleCls}">${body}</div>` : "") +
+    meta +
+    `</div>`
+  );
+}
+
+function nearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+}
+
+function renderMessages() {
+  const box = $("messages");
+  const empty = $("empty-chat");
+  box.querySelectorAll(".msg").forEach((n) => n.remove());
+  empty.classList.toggle("hidden", state.messages.length > 0);
+  box.insertAdjacentHTML("beforeend", state.messages.map(messageHtml).join(""));
+  box.scrollTop = box.scrollHeight;
+}
+
+let streamFrame = 0;
+function renderStreaming() {
+  if (streamFrame) return;
+  streamFrame = requestAnimationFrame(() => {
+    streamFrame = 0;
+    const st = state.streaming;
+    const i = st ? st.index : state.messages.length - 1;
+    const box = $("messages");
+    const node = box.querySelector(`.msg[data-i="${i}"]`);
+    if (!node || !state.messages[i]) return renderMessages();
+    const stick = nearBottom(box);
+    node.outerHTML = messageHtml(state.messages[i], i);
+    if (stick) box.scrollTop = box.scrollHeight;
+  });
+}
+
+function setStreaming(on) {
+  $("send").classList.toggle("hidden", on);
+  $("stop").classList.toggle("hidden", !on);
+}
+
+function chatPayload() {
+  const sys = $("system-prompt").value.trim();
+  const msgs = state.messages
+    .filter((m) => !m.error && (m.content || (m.images && m.images.length)))
+    .map((m) => {
+      if (!m.images || !m.images.length) return { role: m.role, content: m.content };
+      return {
+        role: m.role,
+        content: [
+          ...(m.content ? [{ type: "text", text: m.content }] : []),
+          ...m.images.map((url) => ({ type: "image_url", image_url: { url } })),
+        ],
+      };
+    });
+  if (sys) msgs.unshift({ role: "system", content: sys });
+  const temp = Number($("temperature").value);
+  return {
+    messages: msgs,
+    stream: true,
+    max_tokens: Math.max(1, Number($("max-tokens").value) || 512),
+    temperature: Number.isFinite(temp) ? temp : 0.7,
+  };
+}
+
+function autosize() {
+  const t = $("prompt");
+  t.style.height = "auto";
+  t.style.height = `${Math.min(t.scrollHeight, window.innerHeight * 0.4)}px`;
 }
 
 async function sendChat(ev) {
   ev.preventDefault();
+  if (state.streaming) return;
   const prompt = $("prompt").value.trim();
-  if (!prompt) return;
+  if (!prompt && !state.pending.length) return;
+  const user = { role: "user", content: prompt };
+  if (state.pending.length) user.images = state.pending.slice();
+  state.messages.push(user);
+  state.pending = [];
+  renderAttachments();
   $("prompt").value = "";
-  state.messages.push({ role: "user", content: prompt });
-  state.messages.push({ role: "assistant", content: "" });
-  saveMessages();
+  autosize();
+  const payload = chatPayload();
+  const assistant = { role: "assistant", content: "" };
+  state.messages.push(assistant);
+  const ctrl = new AbortController();
+  state.streaming = { index: state.messages.length - 1, ctrl };
+  setStreaming(true);
   renderMessages();
-  const payload = {
-    messages: state.messages.slice(0, -1),
-    stream: true,
-    max_tokens: Number($("max-tokens").value) || 128,
-    temperature: Number($("temperature").value) || 0,
-  };
-  const res = await api("/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok || !res.body) {
-    state.messages[state.messages.length - 1].content = `(error ${res.status})`;
-    saveMessages();
-    renderMessages();
-    return;
-  }
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  const assistant = state.messages[state.messages.length - 1];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const parts = buf.split("\n\n");
-    buf = parts.pop() || "";
-    for (const part of parts) {
-      const line = part.split("\n").find((l) => l.startsWith("data:"));
-      if (!line) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") continue;
+
+  const started = performance.now();
+  let firstAt = 0;
+  let chunks = 0;
+  let finish = "";
+  try {
+    const res = await api("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    if (!res.ok || !res.body) {
+      let msg = `HTTP ${res.status}`;
       try {
-        const json = JSON.parse(data);
-        const delta = json.choices && json.choices[0] && json.choices[0].delta;
-        if (delta && delta.content) {
-          assistant.content += delta.content;
-          renderMessages();
-        }
+        const j = await res.json();
+        if (j && j.error && j.error.message) msg = j.error.message;
       } catch {
-        /* ignore keepalives */
+        /* not JSON */
+      }
+      throw new Error(msg);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop() || "";
+      for (const part of parts) {
+        const line = part.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        let json;
+        try {
+          json = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        if (json.error) throw new Error(json.error.message || "stream error");
+        const choice = json.choices && json.choices[0];
+        if (!choice) continue;
+        if (choice.delta && choice.delta.content) {
+          if (!firstAt) firstAt = performance.now();
+          chunks += 1;
+          assistant.content += choice.delta.content;
+          renderStreaming();
+        }
+        if (choice.finish_reason) finish = choice.finish_reason;
       }
     }
+  } catch (e) {
+    if (e instanceof Unauthorized) {
+      assistant.error = true;
+      assistant.content = assistant.content || "Signed out.";
+    } else if (e.name === "AbortError") {
+      finish = "stopped";
+    } else {
+      assistant.error = !assistant.content;
+      assistant.meta = `error: ${e.message}`;
+      if (!assistant.content) assistant.content = e.message;
+    }
+  } finally {
+    const end = performance.now();
+    if (chunks && !assistant.error) {
+      const gen = firstAt ? (end - firstAt) / 1000 : 0;
+      const rate = gen > 0 && chunks > 1 ? ` · ${((chunks - 1) / gen).toFixed(1)} tok/s` : "";
+      const fin = finish && finish !== "stop" ? ` · ${finish}` : "";
+      assistant.meta = `${chunks} tokens · TTFT ${Math.round(firstAt - started)} ms${rate}${fin}`;
+    } else if (finish === "stopped" && !assistant.meta) {
+      assistant.meta = "stopped";
+    }
+    state.streaming = null;
+    setStreaming(false);
+    saveMessages();
+    renderMessages();
   }
-  saveMessages();
 }
 
-function levelOk(line, min) {
-  return LEVELS.indexOf((line.level || "INFO").toUpperCase()) >= LEVELS.indexOf(min);
+function renderAttachments() {
+  const box = $("attachments");
+  box.classList.toggle("hidden", !state.pending.length);
+  box.innerHTML = state.pending
+    .map(
+      (src, i) =>
+        `<div class="thumb"><img src="${escapeHtml(src)}" alt="attachment ${i + 1}">` +
+        `<button type="button" data-rm="${i}" aria-label="Remove attachment">×</button></div>`
+    )
+    .join("");
 }
 
-function renderLogs() {
-  const min = $("log-level").value;
-  const text = state.logLines
-    .filter((l) => levelOk(l, min))
-    .map((l) => `${new Date(l.ts_ms).toISOString()} ${l.level.padEnd(5)} ${l.target} ${l.message}`)
-    .join("\n");
-  const view = $("log-view");
-  const follow = $("log-follow").checked;
-  view.textContent = text;
-  if (follow) view.scrollTop = view.scrollHeight;
+function addFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    const reader = new FileReader();
+    reader.onload = () => {
+      state.pending.push(reader.result);
+      renderAttachments();
+    };
+    reader.readAsDataURL(f);
+  }
 }
+
+/* ---------- logs ---------- */
 
 function startLogs() {
-  if (state.logSource) return;
+  if (state.logSource || !state.authed) return;
+  // The snapshot replaces history; streamed lines newer than it are kept.
   api("/v1/logs")
     .then((r) => r.json())
     .then((body) => {
-      state.logLines = body.lines || [];
-      renderLogs();
+      const snap = body.lines || [];
+      const top = snap.length ? snap[snap.length - 1].seq : -1;
+      state.logLines = snap.concat(state.logLines.filter((l) => l.seq > top));
+      scheduleLogRender(true);
     })
     .catch(() => {});
-  const src = new EventSource("/v1/logs/stream");
+  const src = new EventSource("/v1/logs/stream", { withCredentials: true });
+  src.onopen = () => {
+    state.logRetry = 1000;
+  };
   src.onmessage = (ev) => {
     try {
-      const line = JSON.parse(ev.data);
-      state.logLines.push(line);
-      if (state.logLines.length > 4000) state.logLines.splice(0, 1000);
-      if (state.page === "logs") renderLogs();
+      state.logLines.push(JSON.parse(ev.data));
     } catch {
-      /* ignore */
+      return;
     }
+    if (state.logLines.length > LOG_CAP) {
+      state.logLines.splice(0, state.logLines.length - LOG_CAP);
+      state.logRendered = -1; // force a full rebuild
+    }
+    if (state.page === "logs") scheduleLogRender(false);
   };
   src.onerror = () => {
     src.close();
     state.logSource = null;
+    if (!state.authed) return;
+    const wait = state.logRetry;
+    state.logRetry = Math.min(state.logRetry * 2, 15000);
+    setTimeout(() => {
+      if (state.authed && state.page === "logs") startLogs();
+    }, wait);
   };
   state.logSource = src;
 }
 
+function stopLogs() {
+  if (state.logSource) state.logSource.close();
+  state.logSource = null;
+}
+
+function logLineEl(l) {
+  const lvl = (l.level || "INFO").toUpperCase();
+  const div = document.createElement("div");
+  div.className = `log-line lvl-${lvl}`;
+  const ts = new Date(l.ts_ms || 0);
+  const time = Number.isNaN(ts.getTime()) ? "" : ts.toISOString().replace("T", " ").replace("Z", "");
+  div.innerHTML =
+    `<span class="ts">${time}</span> <span class="lvl">${lvl}</span> ` +
+    `<span class="tgt">${escapeHtml(l.target || "")}</span> ${escapeHtml(l.message || "")}`;
+  return div;
+}
+
+function logPasses(l, min, needle) {
+  if (LEVELS.indexOf((l.level || "INFO").toUpperCase()) < min) return false;
+  if (!needle) return true;
+  return `${l.target || ""} ${l.message || ""}`.toLowerCase().includes(needle);
+}
+
+function scheduleLogRender(full) {
+  if (full) state.logRendered = -1;
+  if (state.logFrame) return;
+  state.logFrame = requestAnimationFrame(() => {
+    state.logFrame = 0;
+    renderLogs();
+  });
+}
+
+function renderLogs() {
+  const view = $("log-view");
+  const min = LEVELS.indexOf($("log-level").value);
+  const needle = $("log-filter").value.trim().toLowerCase();
+  const rebuild = state.logRendered < 0 || state.logRendered > state.logLines.length;
+  const from = rebuild ? 0 : state.logRendered;
+  const frag = document.createDocumentFragment();
+  for (let i = from; i < state.logLines.length; i++) {
+    const l = state.logLines[i];
+    if (logPasses(l, min, needle)) frag.appendChild(logLineEl(l));
+  }
+  if (rebuild) view.replaceChildren(frag);
+  else view.appendChild(frag);
+  state.logRendered = state.logLines.length;
+  const shown = view.childElementCount;
+  $("log-count").textContent = `${shown.toLocaleString()} of ${state.logLines.length.toLocaleString()} lines`;
+  if ($("log-follow").checked) view.scrollTop = view.scrollHeight;
+}
+
+/* ---------- wiring ---------- */
+
 $("login-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  $("login-error").classList.add("hidden");
-  const res = await fetch("/v1/auth/login", {
-    method: "POST",
-    credentials: "include",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ password: $("password").value }),
-  });
-  if (!res.ok) {
-    $("login-error").textContent = "Invalid password";
-    $("login-error").classList.remove("hidden");
-    return;
+  const err = $("login-error");
+  const btn = ev.submitter || ev.target.querySelector("button");
+  err.classList.add("hidden");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/v1/auth/login", {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: $("password").value }),
+    });
+    if (!res.ok) {
+      err.textContent = res.status === 401 ? "Invalid password" : `Sign-in failed (HTTP ${res.status})`;
+      err.classList.remove("hidden");
+      $("password").select();
+      return;
+    }
+    $("password").value = "";
+    enterApp();
+  } catch {
+    err.textContent = "Server unreachable";
+    err.classList.remove("hidden");
+  } finally {
+    btn.disabled = false;
   }
-  $("password").value = "";
-  showApp();
-  pollStatus();
 });
 
 $("logout").addEventListener("click", async () => {
-  await fetch("/v1/auth/logout", { method: "POST", credentials: "include" });
-  showLogin();
+  try {
+    await fetch("/v1/auth/logout", { method: "POST", credentials: "include" });
+  } finally {
+    onUnauthorized();
+  }
 });
 
-document.querySelectorAll("nav button").forEach((b) => {
-  b.addEventListener("click", () => setPage(b.dataset.page));
+document.querySelectorAll("nav .tab").forEach((b) => b.addEventListener("click", () => setPage(b.dataset.page)));
+window.addEventListener("hashchange", () => {
+  const p = location.hash.slice(1);
+  if (state.authed && p && p !== state.page) setPage(p);
 });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.authed) startPolling();
+});
+
 $("chat-form").addEventListener("submit", sendChat);
-$("log-level").addEventListener("change", renderLogs);
-$("log-follow").addEventListener("change", renderLogs);
-
-renderMessages();
-pollStatus().then(() => {
-  showApp();
-  setInterval(pollStatus, 1000);
-}).catch(() => {
-  showLogin();
+$("stop").addEventListener("click", () => state.streaming && state.streaming.ctrl.abort());
+$("prompt").addEventListener("input", autosize);
+$("prompt").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+    ev.preventDefault();
+    $("chat-form").requestSubmit();
+  }
 });
+$("prompt").addEventListener("paste", (ev) => {
+  const files = [...(ev.clipboardData ? ev.clipboardData.files : [])];
+  if (files.length) {
+    ev.preventDefault();
+    addFiles(files);
+  }
+});
+$("file-input").addEventListener("change", (ev) => {
+  addFiles(ev.target.files);
+  ev.target.value = "";
+});
+$("attachments").addEventListener("click", (ev) => {
+  const i = ev.target.dataset && ev.target.dataset.rm;
+  if (i === undefined) return;
+  state.pending.splice(Number(i), 1);
+  renderAttachments();
+});
+const chatLayout = document.querySelector(".chat-layout");
+chatLayout.addEventListener("dragover", (ev) => {
+  ev.preventDefault();
+  chatLayout.classList.add("drop-hint");
+});
+chatLayout.addEventListener("dragleave", (ev) => {
+  if (!chatLayout.contains(ev.relatedTarget)) chatLayout.classList.remove("drop-hint");
+});
+chatLayout.addEventListener("drop", (ev) => {
+  ev.preventDefault();
+  chatLayout.classList.remove("drop-hint");
+  addFiles(ev.dataTransfer.files);
+});
+$("messages").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest(".copy");
+  if (!btn) return;
+  const code = btn.closest(".codeblock").querySelector("code").textContent;
+  try {
+    await navigator.clipboard.writeText(code);
+    btn.textContent = "Copied";
+  } catch {
+    btn.textContent = "Copy failed";
+  }
+  setTimeout(() => (btn.textContent = "Copy"), 1200);
+});
+$("new-chat").addEventListener("click", () => {
+  if (state.streaming) state.streaming.ctrl.abort();
+  state.messages = [];
+  state.pending = [];
+  saveMessages();
+  renderAttachments();
+  renderMessages();
+  $("prompt").focus();
+});
+$("settings-toggle").addEventListener("click", () => {
+  const open = $("settings").classList.toggle("hidden") === false;
+  $("settings-toggle").setAttribute("aria-expanded", String(open));
+});
+["max-tokens", "temperature", "system-prompt"].forEach((id) => $(id).addEventListener("change", saveSettings));
+
+$("log-level").addEventListener("change", () => scheduleLogRender(true));
+$("log-filter").addEventListener("input", () => scheduleLogRender(true));
+$("log-follow").addEventListener("change", () => scheduleLogRender(false));
+$("log-clear").addEventListener("click", () => {
+  state.logLines = [];
+  scheduleLogRender(true);
+});
+$("log-view").addEventListener("scroll", () => {
+  const view = $("log-view");
+  const atEnd = nearBottom(view);
+  // Scrolling up pauses follow; returning to the end resumes it.
+  if ($("log-follow").checked !== atEnd) $("log-follow").checked = atEnd;
+});
+
+loadSettings();
+boot();

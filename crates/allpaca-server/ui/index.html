@@ -3,60 +3,105 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
   <title>Allpaca</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233fb950'/%3E%3Ctext x='16' y='23' font-family='system-ui,sans-serif' font-size='19' font-weight='700' text-anchor='middle' fill='%230d1117'%3EA%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-  <div id="login" class="gate">
+  <div id="login" class="gate hidden">
     <form id="login-form" class="card login-card">
-      <h1>Allpaca</h1>
+      <div class="brand"><span class="logo" aria-hidden="true">A</span><h1>Allpaca</h1></div>
       <p class="muted">Operator login</p>
-      <input id="password" type="password" autocomplete="current-password" placeholder="Password" autofocus>
-      <button type="submit">Sign in</button>
-      <p id="login-error" class="error hidden"></p>
+      <label class="sr-only" for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
+      <button type="submit" class="primary">Sign in</button>
+      <p id="login-error" class="error hidden" role="alert"></p>
     </form>
   </div>
 
   <div id="app" class="hidden">
-    <header>
-      <strong>Allpaca</strong>
-      <nav>
-        <button data-page="dashboard" class="active">Dashboard</button>
-        <button data-page="chat">Chat</button>
-        <button data-page="logs">Logs</button>
+    <header class="topbar">
+      <div class="brand"><span class="logo" aria-hidden="true">A</span><strong>Allpaca</strong></div>
+      <nav aria-label="Pages">
+        <button data-page="dashboard" class="tab active">Dashboard</button>
+        <button data-page="chat" class="tab">Chat</button>
+        <button data-page="logs" class="tab">Logs</button>
       </nav>
+      <span id="conn" class="conn" title="Server connection"><span class="dot"></span><span id="conn-text">connecting</span></span>
       <button id="logout" class="ghost">Log out</button>
     </header>
 
     <main id="page-dashboard" class="page">
-      <section class="grid" id="dash-cards"></section>
-      <section class="card">
-        <h2>Devices</h2>
+      <section class="hero card">
+        <div class="hero-main">
+          <h2>Model</h2>
+          <div id="hero-model" class="hero-model">—</div>
+          <div id="hero-sub" class="muted"></div>
+        </div>
+        <div class="hero-rate">
+          <h2>Throughput</h2>
+          <div class="hero-num"><span id="hero-tps">0.0</span><small>tok/s</small></div>
+          <svg id="spark" class="spark" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true">
+            <path id="spark-fill" class="spark-fill" d=""></path>
+            <path id="spark-line" class="spark-line" d=""></path>
+          </svg>
+        </div>
+      </section>
+
+      <h2 class="section-title">Memory</h2>
+      <section class="grid" id="mem-cards"></section>
+
+      <h2 class="section-title">Engine</h2>
+      <section class="grid" id="engine-cards"></section>
+
+      <h2 class="section-title">Devices</h2>
+      <section class="card table-card">
         <table>
-          <thead><tr><th>ID</th><th>Kind</th><th>Name</th><th>Memory</th></tr></thead>
+          <thead><tr><th>ID</th><th>Kind</th><th>Name</th><th class="num">Memory</th></tr></thead>
           <tbody id="device-rows"></tbody>
         </table>
       </section>
     </main>
 
-    <main id="page-chat" class="page hidden">
+    <main id="page-chat" class="page page-chat hidden">
       <div class="chat-layout">
-        <div id="messages" class="messages"></div>
-        <form id="chat-form" class="composer">
+        <div class="chat-bar">
+          <span id="chat-model" class="pill muted">no model</span>
+          <span class="spacer"></span>
+          <button id="settings-toggle" class="ghost small" aria-expanded="false" aria-controls="settings">Settings</button>
+          <button id="new-chat" class="ghost small">New chat</button>
+        </div>
+        <div id="settings" class="settings hidden">
+          <label>System prompt
+            <textarea id="system-prompt" rows="2" placeholder="Optional instructions sent before the conversation"></textarea>
+          </label>
           <div class="controls">
-            <label>max tokens <input id="max-tokens" type="number" min="1" max="4096" value="128"></label>
-            <label>temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8"></label>
-            <span id="chat-model" class="muted"></span>
+            <label>Max tokens <input id="max-tokens" type="number" min="1" max="32768" value="512"></label>
+            <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7"></label>
           </div>
-          <textarea id="prompt" rows="3" placeholder="Message…"></textarea>
-          <button type="submit">Send</button>
+        </div>
+        <div id="messages" class="messages" aria-live="polite">
+          <div id="empty-chat" class="empty muted">Start a conversation. Enter sends, Shift+Enter adds a line. Paste or drop images to attach them.</div>
+        </div>
+        <form id="chat-form" class="composer">
+          <div id="attachments" class="attachments hidden"></div>
+          <div class="composer-row">
+            <label class="ghost icon-btn" title="Attach image">
+              <input id="file-input" type="file" accept="image/*" multiple class="sr-only">
+              <span aria-hidden="true">＋</span><span class="sr-only">Attach image</span>
+            </label>
+            <textarea id="prompt" rows="1" placeholder="Message…" aria-label="Message"></textarea>
+            <button id="send" type="submit" class="primary">Send</button>
+            <button id="stop" type="button" class="danger hidden">Stop</button>
+          </div>
         </form>
       </div>
     </main>
 
-    <main id="page-logs" class="page hidden">
+    <main id="page-logs" class="page page-logs hidden">
       <div class="log-toolbar">
-        <label>level
+        <label>Level
           <select id="log-level">
             <option value="TRACE">TRACE</option>
             <option value="DEBUG">DEBUG</option>
@@ -65,9 +110,13 @@
             <option value="ERROR">ERROR</option>
           </select>
         </label>
-        <label class="check"><input id="log-follow" type="checkbox" checked> follow</label>
+        <input id="log-filter" type="search" placeholder="Filter text" aria-label="Filter log text">
+        <label class="check"><input id="log-follow" type="checkbox" checked> Follow</label>
+        <span class="spacer"></span>
+        <span id="log-count" class="muted small-text"></span>
+        <button id="log-clear" class="ghost small">Clear</button>
       </div>
-      <pre id="log-view" class="log-view"></pre>
+      <div id="log-view" class="log-view" role="log"></div>
     </main>
   </div>
   <script src="/app.js"></script>

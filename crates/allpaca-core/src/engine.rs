@@ -999,7 +999,26 @@ impl Engine {
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(hip) = &self.hip {
-            let p = hip.decode_profile();
+            let mut p = hip.decode_profile();
+            let itl_us = self
+                .metrics
+                .itl_ms_ema_x100
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                * 10.0;
+            let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
+            // The event-timed sample forward runs slower than an untimed one
+            // (a marker per kernel; on Windows each can split the command
+            // buffer). When its buckets overshoot the measured ITL, report
+            // them as shares of the ITL instead.
+            let sampled_us = gpu_us + p.host_us;
+            if itl_us > 0.0 && sampled_us > itl_us {
+                let k = itl_us / sampled_us;
+                p.q8_gemm_us *= k;
+                p.attention_us *= k;
+                p.lm_head_us *= k;
+                p.other_gpu_us *= k;
+                p.host_us *= k;
+            }
             self.metrics.q8_gemm_ns.store(
                 (p.q8_gemm_us * 1_000.0).round() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -1017,11 +1036,6 @@ impl Engine {
                 std::sync::atomic::Ordering::Relaxed,
             );
             let gpu_us = p.q8_gemm_us + p.attention_us + p.lm_head_us + p.other_gpu_us;
-            let itl_us = self
-                .metrics
-                .itl_ms_ema_x100
-                .load(std::sync::atomic::Ordering::Relaxed) as f64
-                * 10.0;
             let host_us = if itl_us > gpu_us {
                 itl_us - gpu_us
             } else {
@@ -1796,6 +1810,24 @@ impl Engine {
         }
         let peer_ok = peer_uploaded.is_some();
         let peer_dev = self.draft_hip.as_ref().map(|h| h.device);
+        if !peer_ok {
+            // Nothing was uploaded to the second GPU (no GGUF to read its
+            // layers from, no draft workspace, or the upload failed): its
+            // layers run on the target GPU, which uploads them below.
+            if let (Some(hip), Some(rpc)) = (
+                self.hip.as_ref(),
+                inner.target.as_ref().and_then(|m| m.rpc.clone()),
+            ) {
+                let n_layers = inner.target.as_ref().map_or(0, |m| m.config.n_layers);
+                let others: Vec<i32> = (0..n_layers)
+                    .map(|i| rpc.local_device(i))
+                    .filter(|&d| d >= 0 && d != hip.device)
+                    .collect();
+                for d in others {
+                    rpc.fold_local_device(d, hip.device);
+                }
+            }
+        }
         let target = inner.target.clone();
         let draft = inner.draft_model.clone();
         inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
@@ -8753,6 +8785,15 @@ mod tests {
             }
         }
         let stats = engine.stats();
+        // The device batched decode (one forward over both rows) supersedes
+        // the soft packed-GEMM co-step whenever the target is GPU-resident.
+        if stats.batched_decode_steps >= 1
+            && stats.batched_decode_rows >= 2 * stats.batched_decode_steps
+        {
+            drop(a);
+            drop(b);
+            return;
+        }
         assert!(
             stats.batch_gemm_hip_kernels >= 7,
             "packed Q/K/V C must feed attention then WO plus FFN(gate/up/down); stats={stats:?}"
@@ -8820,6 +8861,15 @@ mod tests {
             }
         }
         let stats = engine.stats();
+        // The device batched decode (one forward over both rows) supersedes
+        // the soft packed-GEMM co-step whenever the target is GPU-resident.
+        if stats.batched_decode_steps >= 1
+            && stats.batched_decode_rows >= 2 * stats.batched_decode_steps
+        {
+            drop(a);
+            drop(b);
+            return;
+        }
         assert!(
             stats.batch_gemm_hip_applied >= 1,
             "packed lm_head must be applied on HIP cohort; stats={stats:?}"

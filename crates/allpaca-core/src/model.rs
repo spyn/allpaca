@@ -874,11 +874,13 @@ impl HostEmbed {
         !matches!(ty, T::F32 | T::F16 | T::Q8_0 | T::RocmFp4 | T::I32 | T::Other)
     }
 
-    fn from_gguf(file: &GgufFile, name: &str) -> Result<Self, AllpacaError> {
+    /// `dim` is the model width: rows are `dim` elements whichever order the
+    /// file lists the dims in (`[dim, vocab]` usually, `[vocab, dim]` in some
+    /// writers).
+    fn from_gguf(file: &GgufFile, name: &str, dim: usize) -> Result<Self, AllpacaError> {
         let info = file.tensor(name).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
         })?;
-        let dim = *info.dims.first().unwrap_or(&0) as usize;
         let n = info.n_elements() as usize;
         let bytes = file.tensor_bytes(name)?;
         if dim == 0 || n % dim != 0 || bytes.len() % (n / dim).max(1) != 0 {
@@ -1582,7 +1584,7 @@ impl ResidentModel {
         let embed_ty = file.tensor("token_embd.weight").map(|t| t.ggml_type);
         let host_embed = match embed_ty {
             Some(ty) if globals && HostEmbed::wanted(ty) => {
-                Some(HostEmbed::from_gguf(file, "token_embd.weight")?)
+                Some(HostEmbed::from_gguf(file, "token_embd.weight", cfg.dim)?)
             }
             _ => None,
         };

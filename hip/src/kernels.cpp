@@ -6080,8 +6080,8 @@ extern "C" int allpaca_gemm_nt_q8_0_pair(const float *a, const uint8_t *b1, floa
 
 /* x[i] += y[i] * s, then y[i] = x[i]: scale_f32(y, s) + residual_add(x, y) +
  * copy(y <- x) in one launch. The three kernels rounded the product and the
- * sum separately; contraction is off here because __fmul_rn/__fadd_rn alone
- * still compiled to an FMA (1-ulp differences). */
+ * sum separately; contraction is off here because __fmul_rn/__fadd_rn still
+ * compiled to an FMA (1-ulp differences); see moe_combine_kernel. */
 __global__ void scale_add_copy_kernel(float *x, float *y, float s, int n) {
 #pragma clang fp contract(off)
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -6890,9 +6890,12 @@ __global__ void moe_down_kernel(const int8_t *hq, const float *hd, const int32_t
 
 /* out[r] = sum of w[p] * y[p] over row r's pairs `row_start[r] .. row_start[r+1]`,
  * rounded like `scale_f32` then `residual_add` per expert (no FMA), so the
- * fused path matches the per-expert path bit for bit. */
+ * fused path matches the per-expert path bit for bit. Contraction is off
+ * explicitly with plain operators: __fmul_rn/__fadd_rn (and this pragma around
+ * them) still compiled to v_fmac_f32. */
 __global__ void moe_combine_kernel(const float *y, const float *w, const int32_t *row_start,
                                    const int32_t *row_pairs, float *out, int rows, int dim) {
+#pragma clang fp contract(off)
     const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int r = static_cast<int>(blockIdx.y);
     if (d >= dim || r >= rows) {
@@ -6901,7 +6904,7 @@ __global__ void moe_combine_kernel(const float *y, const float *w, const int32_t
     float acc = 0.f;
     for (int i = row_start[r]; i < row_start[r + 1]; ++i) {
         const int p = row_pairs ? row_pairs[i] : i;
-        acc = __fadd_rn(acc, __fmul_rn(y[static_cast<size_t>(p) * dim + d], w[p]));
+        acc = acc + y[static_cast<size_t>(p) * dim + d] * w[p];
     }
     out[static_cast<size_t>(r) * dim + d] = acc;
 }

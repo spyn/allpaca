@@ -833,7 +833,9 @@ fn hip_decode_profile_buckets_sum_toward_itl() {
         "decode profile buckets must be non-zero on HIP; stats={stats:?}"
     );
     let itl_us = stats.itl_ms_ema * 1_000.0;
-    if itl_us >= 500.0 {
+    // Wall/token includes load and prefill: only a fallback when no ITL was
+    // measured.
+    if itl_us > 0.0 {
         assert!(
             sum > itl_us / 10.0 && sum < itl_us * 10.0,
             "profile sum {sum:.1}us should be order-of-magnitude of ITL {itl_us:.1}us; stats={stats:?}"
@@ -3980,9 +3982,10 @@ fn hip_generate_real_7b_gguf_when_path_set() {
         PROFILE_BLAS_OTHER_GPU_US
     );
     let itl_us = stats.itl_ms_ema * 1_000.0;
+    // A real multi-GB GGUF reads all its weights per token: not sub-ms.
     assert!(
-        itl_us > 10_000.0,
-        "8B decode ITL should be tens of ms; itl_us={itl_us:.1} stats={stats:?}"
+        itl_us > 1_000.0,
+        "real GGUF decode ITL should be milliseconds; itl_us={itl_us:.1} stats={stats:?}"
     );
     assert!(
         profile_sum > itl_us * 0.8 && profile_sum < itl_us * 1.25,
