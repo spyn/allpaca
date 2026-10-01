@@ -337,6 +337,10 @@ pub struct EngineSection {
     /// When `poll_schedule = prefill_budget`, max consecutive prefill picks before a
     /// decode Request must be served (0 = unlimited). Ignored for other schedules.
     pub max_consecutive_prefill_picks: usize,
+    /// With `max_active_requests > 1`, decode the next token of every
+    /// Request in plain decode (no speculation, grammar or vision) in one
+    /// batched forward on HIP instead of one forward per Request.
+    pub batch_decode: bool,
     /// `"auto"` (HIP, else CUDA, else Vulkan), `"hip"`, `"cuda"`, `"vulkan"`, or `"cpu"`.
     pub gpu_backend: String,
 }
@@ -368,6 +372,7 @@ impl Default for EngineSection {
             max_active_requests: 1,
             poll_schedule: PollSchedule::Fair,
             max_consecutive_prefill_picks: 0,
+            batch_decode: true,
             gpu_backend: "auto".into(),
         }
     }
@@ -465,6 +470,12 @@ pub struct SpeculativeSection {
     pub adaptive: bool,
     pub ngram_n: usize,
     pub tree: TreeSection,
+    /// Speculate only while at most this many Requests are active (0 = no
+    /// limit). Beyond it, batched plain decode outruns batched verify: on
+    /// Qwen3-Coder-Next with remote experts, 4 concurrent Requests ran 31-32
+    /// tok/s without speculation and ~28 with n-gram, while 3 ran ~28 with
+    /// n-gram and ~25 without.
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for SpeculativeSection {
@@ -477,6 +488,7 @@ impl Default for SpeculativeSection {
             adaptive: true,
             ngram_n: 3,
             tree: TreeSection::default(),
+            max_concurrent_requests: 3,
         }
     }
 }

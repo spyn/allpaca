@@ -231,6 +231,45 @@ __global__ void gemv_nt_tiled_kernel(const float *a, const float *b, float *c, i
     }
 }
 
+/* F32 GEMV for few rows and at most a couple of thousand columns: one block
+ * per output (column, row), threads stride K so loads coalesce, then a block
+ * reduction. The 64-column tiled kernel put a whole 32-output GEMV (GDN
+ * alpha/beta) on one CU with per-thread strided rows: ~30 us for 256 KB. */
+__global__ void gemv_nt_colblock_kernel(const float *a, const float *b, float *c, int m, int n,
+                                        int k) {
+    __shared__ float part[32];
+    const int col = static_cast<int>(blockIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (col >= n || row >= m) {
+        return;
+    }
+    const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+    const float *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+    float acc = 0.f;
+    for (int i = tid; i < k; i += static_cast<int>(blockDim.x)) {
+        acc += arow[i] * brow[i];
+    }
+    const int ws = warpSize;
+    for (int off = ws / 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, ws);
+    }
+    const int lane = tid % ws;
+    const int wid = tid / ws;
+    if (lane == 0) {
+        part[wid] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.f;
+        const int nw = (static_cast<int>(blockDim.x) + ws - 1) / ws;
+        for (int w = 0; w < nw; ++w) {
+            sum += part[w];
+        }
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = sum;
+    }
+}
+
 /* Decode F16 GEMV baseline: eight columns per warp, A from global each column. */
 __global__ void gemv_nt_f16_untiled_kernel(const float *a, const uint16_t *b, float *c, int m,
                                            int n, int k) {
@@ -617,8 +656,14 @@ __device__ inline float q8_dot8(const float *as, uint32_t qlo, uint32_t qhi) {
 }
 
 /* Float A × Q8 weight (fallback if integer MAC is slower). */
-__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
-                                        int k) {
+/* blockIdx.z == 1 computes the second matrix (b2 -> c2, n2 columns) of a pair
+ * sharing the input `a` (a shared expert's gate and up, a GDN layer's qkv and
+ * z): same per-output math, one launch instead of two. */
+__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b0, float *c0, int m, int n0,
+                                        int k, const uint8_t *b2, float *c2, int n2) {
+    const uint8_t *b = blockIdx.z ? b2 : b0;
+    float *c = blockIdx.z ? c2 : c0;
+    const int n = blockIdx.z ? n2 : n0;
     constexpr int WARPS = 16;
     constexpr int COLS = 8;
     constexpr int SUB = 4;
@@ -1553,10 +1598,36 @@ static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, in
 }
 #endif
 
+/* Row-exact mode (batched decode over several Requests): each row of an
+ * M-row GEMM must equal that row computed alone. The small-M GEMV kernels
+ * compute rows independently; the tiled / BLAS GEMMs used above them sum in
+ * another order. With the mode on, wider M runs as row chunks on the GEMV
+ * kernels. Host-side and per calling thread, like the launches it steers. */
+static thread_local int g_exact_rows = 0;
+
+extern "C" void allpaca_hip_set_exact_rows(int32_t on) { g_exact_rows = on != 0; }
+
+template <typename F>
+static int exact_row_chunks(int32_t m, int32_t chunk, F &&launch) {
+    for (int32_t r0 = 0; r0 < m; r0 += chunk) {
+        const int rc = launch(r0, m - r0 < chunk ? m - r0 : chunk);
+        if (rc != ALLPACA_OK) {
+            return rc;
+        }
+    }
+    return ALLPACA_OK;
+}
+
 static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
                           hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
+    }
+    if (g_exact_rows && m > 8) {
+        return exact_row_chunks(m, 8, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt(a + static_cast<size_t>(r0) * k, b,
+                                  c + static_cast<size_t>(r0) * n, rows, n, k, stream, tiled);
+        });
     }
     clear_last_error();
 #ifdef ALLPACA_HAS_HIPBLASLT
@@ -1578,6 +1649,11 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
     }
 #endif
     /* Decode is always M=1; small-M prefill stays on the coalesced GEMV. */
+    if (m <= 8 && tiled && n <= 2048) {
+        hipLaunchKernelGGL(gemv_nt_colblock_kernel, dim3(static_cast<unsigned>(n), static_cast<unsigned>(m)),
+                           dim3(256), 0, stream, a, b, c, m, n, k);
+        return hip_status(hipGetLastError());
+    }
     if (m <= 8) {
         if (tiled) {
             constexpr int COLS = 64;
@@ -1607,6 +1683,12 @@ static int launch_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32
                               int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
+    }
+    if (g_exact_rows && m > 8) {
+        return exact_row_chunks(m, 8, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt_f16(a + static_cast<size_t>(r0) * k, b,
+                                      c + static_cast<size_t>(r0) * n, rows, n, k, stream, tiled);
+        });
     }
     clear_last_error();
     /* Decode M<=8 stays on GEMV. Prefill M>8 reuses F16 B tiles across A rows. */
@@ -1640,6 +1722,12 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
                                int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
+    }
+    if (g_exact_rows && m > 8) {
+        return exact_row_chunks(m, 8, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt_bf16(a + static_cast<size_t>(r0) * k, b,
+                                       c + static_cast<size_t>(r0) * n, rows, n, k, stream, tiled);
+        });
     }
     clear_last_error();
     if (m > 8) {
@@ -1684,6 +1772,12 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
+    if (g_exact_rows && m > 16) {
+        return exact_row_chunks(m, 16, [&](int32_t r0, int32_t rows) {
+            return launch_gemm_nt_q8_0(a + static_cast<size_t>(r0) * k, b,
+                                       c + static_cast<size_t>(r0) * n, rows, n, k, stream, intdot);
+        });
+    }
     clear_last_error();
     /* M=1 decode stays on the 36-byte GEMV. Prefill M>8 reuses Q8 B tiles across A rows. */
     // Up to 16 rows stay on the GEMV kernels: a verify span (max_depth 8 plus
@@ -1722,7 +1816,7 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     if (intdot) {
         hipLaunchKernelGGL(gemv_nt_q8_0_intdot_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     } else {
-        hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, grid, block, 0, stream, a, b, c, m, n, k, b, c, n);
     }
     return hip_status(hipGetLastError());
 }
@@ -2130,18 +2224,18 @@ __device__ inline void kq_load_u32s(const void *p, uint32_t (&v)[NC]) {
     }
 }
 
+/* One block of the int8 K-quant GEMV: columns from `bx`, rows `row0 .. +MR`. */
 template <int QT, int MR, int LPC>
-__global__ void gemv_nt_kquant_i8_kernel(const int8_t *aq, const float *ad, const uint8_t *b,
-                                         float *c, int m, int n, int k) {
+__device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const uint8_t *b,
+                                       float *c, int m, int n, int k, int bx, int row0) {
     constexpr int BB = KqBlock<QT>::bytes;
     constexpr int W = 128 / LPC;
     constexpr int NC = W / 4;
     constexpr int LPG = LPC / 4;
     constexpr uint32_t ONES = 0x01010101u;
     const int sl = static_cast<int>(threadIdx.x) % LPC;
-    const int col = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / LPC) +
+    const int col = bx * (static_cast<int>(blockDim.x) / LPC) +
                     static_cast<int>(threadIdx.x) / LPC;
-    const int row0 = static_cast<int>(blockIdx.y) * MR;
     const bool live = col < n;
     const int nblocks = k / 256;
     const int kb = k / 32;
@@ -2289,6 +2383,13 @@ __global__ void gemv_nt_kquant_i8_kernel(const int8_t *aq, const float *ad, cons
                 v;
         }
     }
+}
+
+template <int QT, int MR, int LPC>
+__global__ void gemv_nt_kquant_i8_kernel(const int8_t *aq, const float *ad, const uint8_t *b,
+                                         float *c, int m, int n, int k) {
+    kquant_i8_block<QT, MR, LPC>(aq, ad, b, c, m, n, k, static_cast<int>(blockIdx.x),
+                                 static_cast<int>(blockIdx.y) * MR);
 }
 
 /* Per-device int8 activation scratch, grow-only. The lock is held from
@@ -4929,18 +5030,23 @@ __global__ void gdn_qk_l2norm_kernel(float *q, float *k, int n_heads, int head_k
  * barriers per call on n_v_heads blocks) and was pure latency. */
 constexpr int GDN_ROWS_PER_WARP = 4;
 constexpr int GDN_WARPS = 4;
+/* `n_k` > 0: q and k hold n_k heads and V head h reads K head
+ * h / (n_v_heads / n_k) (interleave) or h % n_k (tile), instead of an expanded
+ * per-V-head copy. */
 template <int NJ>
 __global__ void gated_delta_step_warp_kernel(const float *q, const float *k, const float *v,
                                              const float *decay, const float *beta, float *state,
-                                             float *out, int n_v_heads, int head_v, int head_k) {
+                                             float *out, int n_v_heads, int head_v, int head_k,
+                                             int n_k, int interleave) {
     const int h = static_cast<int>(blockIdx.x);
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
     if (h >= n_v_heads) {
         return;
     }
-    const float *q_h = q + static_cast<size_t>(h) * head_k + lane * NJ;
-    const float *k_h = k + static_cast<size_t>(h) * head_k + lane * NJ;
+    const int kh = n_k > 0 ? (interleave ? h / (n_v_heads / n_k) : h % n_k) : h;
+    const float *q_h = q + static_cast<size_t>(kh) * head_k + lane * NJ;
+    const float *k_h = k + static_cast<size_t>(kh) * head_k + lane * NJ;
     float qv[NJ], kv[NJ];
 #pragma unroll
     for (int t = 0; t < NJ; ++t) {
@@ -5256,7 +5362,7 @@ extern "C" int allpaca_gated_delta_step(float *q, float *k, const float *v, cons
         const dim3 block(32 * GDN_WARPS);
 #define GDN_WARP_LAUNCH(NJV)                                                                       \
     hipLaunchKernelGGL(gated_delta_step_warp_kernel<NJV>, grid, block, 0, s, q, k, v, decay, beta, \
-                       state, out, n_v_heads, head_v, head_k)
+                       state, out, n_v_heads, head_v, head_k, 0, 0)
         if (nj == 1) {
             GDN_WARP_LAUNCH(1);
         } else if (nj == 2) {
@@ -5320,13 +5426,16 @@ __global__ void gdn_conv1d_shift_kernel(const float *x, float *conv_state, int q
     conv_state[(hist - 1) * qkv_dim + c] = x[c];
 }
 
-__global__ void expand_k_heads_kernel(const float *src, float *dst, int n_k, int n_v, int head_k) {
+/* V head vh reads K head vh % n_k (tile, Qwen3.5) or vh / (n_v / n_k)
+ * (interleave, Qwen3-Next). */
+__global__ void expand_k_heads_kernel(const float *src, float *dst, int n_k, int n_v, int head_k,
+                                      int interleave) {
     const int vh = static_cast<int>(blockIdx.x);
     const int j = static_cast<int>(threadIdx.x);
     if (vh >= n_v || j >= head_k) {
         return;
     }
-    const int kh = vh % n_k;
+    const int kh = interleave ? vh / (n_v / n_k) : vh % n_k;
     dst[vh * head_k + j] = src[kh * head_k + j];
 }
 
@@ -5338,6 +5447,93 @@ __global__ void gdn_decay_beta_kernel(const float *alpha, const float *dt_bias, 
     }
     decay[i] = expf(gdn_softplus(alpha[i] + dt_bias[i]) * a[i]);
     beta[i] = 1.0f / (1.0f + expf(-beta[i]));
+}
+
+/* One GDN decode step's element-wise front: thread c < qkv_dim runs the
+ * depthwise conv + SiLU for channel c, then shifts that channel's history
+ * (as gdn_conv1d_compute then gdn_conv1d_shift did); the next n_v threads
+ * compute decay and sigmoid(beta) (as gdn_decay_beta did). */
+__global__ void gdn_step_prep_kernel(const float *x, const float *kernel, float *conv_state,
+                                     float *out, int qkv_dim, int conv_kernel, const float *alpha,
+                                     const float *dt_bias, const float *a, float *decay,
+                                     float *beta, int n_v) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= qkv_dim) {
+        const int h = i - qkv_dim;
+        if (h < n_v) {
+            decay[h] = expf(gdn_softplus(alpha[h] + dt_bias[h]) * a[h]);
+            beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+        }
+        return;
+    }
+    const int c = i;
+    const int hist = conv_kernel - 1;
+    float acc = 0.0f;
+    for (int j = 0; j < hist; ++j) {
+        acc += kernel[j + c * conv_kernel] * conv_state[j * qkv_dim + c];
+    }
+    acc += kernel[(conv_kernel - 1) + c * conv_kernel] * x[c];
+    out[c] = gdn_silu(acc);
+    if (hist <= 0) {
+        return;
+    }
+    for (int j = 0; j < hist - 1; ++j) {
+        conv_state[j * qkv_dim + c] = conv_state[(j + 1) * qkv_dim + c];
+    }
+    conv_state[(hist - 1) * qkv_dim + c] = x[c];
+}
+
+/* A whole GDN decode step in three launches (was seven): prep (conv, shift,
+ * decay, beta), q/k L2 norm on the n_k K heads in place in `conv_out`, and the
+ * delta step reading each V head's K head directly (no expanded copies).
+ * Bit-identical to conv1d_step + 2x expand_k_heads + decay_beta +
+ * gated_delta_step. ALLPACA_ERR_INVALID when the warp kernel does not cover
+ * head_k (the caller falls back to the unfused sequence). Folding the L2 norm
+ * into the delta step (2 launches) measured no gain and drifted ~1e-7. */
+extern "C" int allpaca_gdn_step_fused(const float *qkv, const float *conv_w, float *conv_state,
+                                      float *conv_out, const float *alpha, const float *dt_bias,
+                                      const float *a, float *decay, float *beta, float *state,
+                                      float *out, int32_t n_v, int32_t n_k, int32_t head_v,
+                                      int32_t head_k, int32_t conv_kernel, float eps,
+                                      int32_t interleave, allpaca_stream_t stream) {
+    const int nj = head_k % 32 == 0 ? head_k / 32 : 0;
+    if (!qkv || !conv_w || !conv_state || !conv_out || !alpha || !dt_bias || !a || !decay ||
+        !beta || !state || !out || n_v <= 0 || n_k <= 0 || n_v % n_k != 0 || head_v <= 0 ||
+        conv_kernel <= 0 || !(nj == 1 || nj == 2 || nj == 4 || nj == 8)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipStream_t s = as_stream(stream);
+    const int key_dim = n_k * head_k;
+    const int qkv_dim = 2 * key_dim + n_v * head_v;
+    const int threads = 256;
+    const int blocks = (qkv_dim + n_v + threads - 1) / threads;
+    hipLaunchKernelGGL(gdn_step_prep_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, s, qkv, conv_w, conv_state,
+                       conv_out, qkv_dim, conv_kernel, alpha, dt_bias, a, decay, beta, n_v);
+    float *q = conv_out;
+    float *k = conv_out + key_dim;
+    const float *v = conv_out + 2 * key_dim;
+    hipLaunchKernelGGL(gdn_qk_l2norm_kernel, dim3(static_cast<unsigned>(n_k)), dim3(32), 0, s, q,
+                       k, n_k, head_k, eps);
+    constexpr int rows_per_block = GDN_WARPS * GDN_ROWS_PER_WARP;
+    const dim3 grid(static_cast<unsigned>(n_v),
+                    static_cast<unsigned>((head_v + rows_per_block - 1) / rows_per_block));
+    const dim3 block(32 * GDN_WARPS);
+    if (nj == 1) {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<1>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    } else if (nj == 2) {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<2>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    } else if (nj == 4) {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<4>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    } else {
+        hipLaunchKernelGGL(gated_delta_step_warp_kernel<8>, grid, block, 0, s, q, k, v, decay,
+                           beta, state, out, n_v, head_v, head_k, n_k, interleave);
+    }
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state,
@@ -5363,14 +5559,14 @@ extern "C" int allpaca_gdn_conv1d_step(const float *x, const float *kernel, floa
 }
 
 extern "C" int allpaca_expand_k_heads(const float *src, float *dst, int32_t n_k, int32_t n_v,
-                                      int32_t head_k, allpaca_stream_t stream) {
+                                      int32_t head_k, int32_t interleave, allpaca_stream_t stream) {
     if (!src || !dst || n_k <= 0 || n_v <= 0 || head_k <= 0 || (n_v % n_k) != 0) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
     hipLaunchKernelGGL(expand_k_heads_kernel, dim3(static_cast<unsigned>(n_v)),
                        dim3(static_cast<unsigned>(head_k)), 0, as_stream(stream), src, dst, n_k, n_v,
-                       head_k);
+                       head_k, interleave);
     return hip_status(hipGetLastError());
 }
 
@@ -5714,6 +5910,48 @@ extern "C" int allpaca_scale_heads_sigmoid(float *attn, const float *scores, int
     return hip_status(hipGetLastError());
 }
 
+/* GDN output: out = silu(z) * rmsnorm_head(y) * weight in one launch, one
+ * block of 256 per head. Same reduction tree as rmsnorm_heads_kernel and the
+ * same element math as silu_mul_kernel, so it gives the bits the copy +
+ * rmsnorm_heads + silu_mul + copy sequence gave. `out` may alias `z` or `y`. */
+__global__ void gdn_norm_gate_kernel(const float *y, const float *z, const float *weight,
+                                     float *out, int head_dim, float eps) {
+    const size_t base = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(head_dim);
+    const float *row = y + base;
+    __shared__ float shared[256];
+    float sum = 0.0f;
+    for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
+        const float v = row[i];
+        sum += v * v;
+    }
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(shared[0] / static_cast<float>(head_dim) + eps);
+    for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
+        const float normed = row[i] * inv * weight[i];
+        const float g = z[base + i];
+        out[base + i] = (g / (1.0f + expf(-g))) * normed;
+    }
+}
+
+extern "C" int allpaca_gdn_norm_gate(const float *y, const float *z, const float *weight,
+                                     float *out, int32_t n_heads, int32_t head_dim, float eps,
+                                     allpaca_stream_t stream) {
+    if (!y || !z || !weight || !out || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(gdn_norm_gate_kernel, dim3(static_cast<unsigned>(n_heads)), dim3(256), 0,
+                       as_stream(stream), y, z, weight, out, head_dim, eps);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_rmsnorm_heads(float *x, const float *weight, int32_t n_heads,
                                      int32_t head_dim, float eps, allpaca_stream_t stream) {
     if (!x || !weight || n_heads <= 0 || head_dim <= 0) {
@@ -5819,6 +6057,51 @@ __global__ void scale_f32_kernel(float *x, float scale, int n) {
         return;
     }
     x[idx] *= scale;
+}
+
+/* Two Q8_0 GEMVs over one input row (m == 1) in one launch: c1 = a * b1^T
+ * ([n1, k]) and c2 = a * b2^T ([n2, k]), each bit-identical to its own GEMV
+ * launch. ALLPACA_ERR_INVALID where the single GEMV would take another kernel. */
+extern "C" int allpaca_gemm_nt_q8_0_pair(const float *a, const uint8_t *b1, float *c1,
+                                         const uint8_t *b2, float *c2, int32_t m, int32_t n1,
+                                         int32_t n2, int32_t k, allpaca_stream_t stream) {
+    if (!a || !b1 || !c1 || !b2 || !c2 || m != 1 || n1 <= 0 || n2 <= 0 || k <= 0 ||
+        ALLPACA_Q8_GEMV_INTDOT) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int cols_per_block = 16 * 8;
+    const int n = n1 > n2 ? n1 : n2;
+    const unsigned gx = static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block);
+    hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, dim3(gx, 1, 2), dim3(512), 0, as_stream(stream), a,
+                       b1, c1, m, n1, k, b2, c2, n2);
+    return hip_status(hipGetLastError());
+}
+
+/* x[i] += y[i] * s, then y[i] = x[i]: scale_f32(y, s) + residual_add(x, y) +
+ * copy(y <- x) in one launch. The three kernels rounded the product and the
+ * sum separately; contraction is off here because __fmul_rn/__fadd_rn alone
+ * still compiled to an FMA (1-ulp differences). */
+__global__ void scale_add_copy_kernel(float *x, float *y, float s, int n) {
+#pragma clang fp contract(off)
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) {
+        return;
+    }
+    const float v = x[i] + y[i] * s;
+    x[i] = v;
+    y[i] = v;
+}
+
+extern "C" int allpaca_scale_add_copy(float *x, float *y, float s, int32_t n,
+                                      allpaca_stream_t stream) {
+    if (!x || !y || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(scale_add_copy_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256),
+                       0, as_stream(stream), x, y, s, n);
+    return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_embed_gather(const float *table, int32_t token, float *out, int32_t dim,
@@ -6253,6 +6536,217 @@ extern "C" int allpaca_scale_f32(float *x, int32_t n, float scale, allpaca_strea
     return hip_status(hipGetLastError());
 }
 
+/* Busy-wait (not interrupt-driven) host synchronization for `device`. Must
+ * run before the device's context exists. Windows wakes a blocked host
+ * thread tens of us after the GPU finishes; decode syncs once per layer. */
+/* Block reductions over any block size and wave width. `scratch` holds at
+ * least blockDim / warpSize values; every thread gets the result. */
+__device__ inline float moe_block_sum(float v, float *scratch) {
+    const int ws = warpSize;
+    for (int off = ws / 2; off > 0; off >>= 1) {
+        v += __shfl_down(v, off, ws);
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+    __syncthreads();
+    if (tid % ws == 0) {
+        scratch[tid / ws] = v;
+    }
+    __syncthreads();
+    float total = 0.f;
+    const int nw = (static_cast<int>(blockDim.x) + ws - 1) / ws;
+    for (int w = 0; w < nw; ++w) {
+        total += scratch[w];
+    }
+    return total;
+}
+
+__device__ inline float moe_block_max(float v, float *scratch) {
+    const int ws = warpSize;
+    for (int off = ws / 2; off > 0; off >>= 1) {
+        v = fmaxf(v, __shfl_down(v, off, ws));
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+    __syncthreads();
+    if (tid % ws == 0) {
+        scratch[tid / ws] = v;
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    const int nw = (static_cast<int>(blockDim.x) + ws - 1) / ws;
+    for (int w = 0; w < nw; ++w) {
+        m = fmaxf(m, scratch[w]);
+    }
+    return m;
+}
+
+/* Softmax router on the GPU, one block per token row: softmax over n_exp
+ * logits, top-k (ties to the lower index), renormalize over the k, as the
+ * host `topk_from_logits`. Writes the row-sorted pair table the fused MoE
+ * kernels read, and optionally the shared-expert gate sigmoid(x . g) per
+ * row, so a layer with local experts needs no host round trip. */
+__global__ void moe_route_softmax_topk_kernel(const float *logits, int n_exp, int k,
+                                              const float *x, const float *shexp_gate, int dim,
+                                              float *w_out, int32_t *row_out, int32_t *exp_out,
+                                              int32_t *row_start, float *shexp_scale, int rows) {
+    extern __shared__ float route_lds[];
+    float *prob = route_lds;
+    float *scratch = route_lds + n_exp;
+    __shared__ float best_v[64];
+    __shared__ int best_i[64];
+    __shared__ float sel_w[64];
+    __shared__ int sel_e[64];
+    const int r = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int bd = static_cast<int>(blockDim.x);
+    const float *lg = logits + static_cast<size_t>(r) * n_exp;
+    float m = -INFINITY;
+    for (int i = tid; i < n_exp; i += bd) {
+        m = fmaxf(m, lg[i]);
+    }
+    m = moe_block_max(m, scratch);
+    float sum = 0.f;
+    for (int i = tid; i < n_exp; i += bd) {
+        const float e = expf(lg[i] - m);
+        prob[i] = e;
+        sum += e;
+    }
+    sum = fmaxf(moe_block_sum(sum, scratch), 1e-9f);
+    for (int i = tid; i < n_exp; i += bd) {
+        prob[i] = prob[i] / sum;
+    }
+    __syncthreads();
+    const int ws = warpSize;
+    for (int j = 0; j < k; ++j) {
+        float bv = -INFINITY;
+        int bi = n_exp;
+        for (int i = tid; i < n_exp; i += bd) {
+            const float v = prob[i];
+            if (v > bv || (v == bv && i < bi)) {
+                bv = v;
+                bi = i;
+            }
+        }
+        for (int off = ws / 2; off > 0; off >>= 1) {
+            const float ov = __shfl_down(bv, off, ws);
+            const int oi = __shfl_down(bi, off, ws);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (tid % ws == 0) {
+            best_v[tid / ws] = bv;
+            best_i[tid / ws] = bi;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float v = best_v[0];
+            int idx = best_i[0];
+            for (int w = 1; w < (bd + ws - 1) / ws; ++w) {
+                if (best_v[w] > v || (best_v[w] == v && best_i[w] < idx)) {
+                    v = best_v[w];
+                    idx = best_i[w];
+                }
+            }
+            sel_w[j] = v;
+            sel_e[j] = idx;
+            prob[idx] = -INFINITY;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float part = 0.f;
+        for (int j = 0; j < k; ++j) {
+            part += sel_w[j];
+        }
+        part = fmaxf(part, 1e-9f);
+        for (int j = 0; j < k; ++j) {
+            const size_t p = static_cast<size_t>(r) * k + j;
+            w_out[p] = sel_w[j] / part;
+            row_out[p] = r;
+            exp_out[p] = sel_e[j];
+        }
+        row_start[r] = r * k;
+        if (r == rows - 1) {
+            row_start[rows] = rows * k;
+        }
+    }
+    if (shexp_gate) {
+        const float *xr = x + static_cast<size_t>(r) * dim;
+        float dot = 0.f;
+        for (int i = tid; i < dim; i += bd) {
+            dot += xr[i] * shexp_gate[i];
+        }
+        dot = moe_block_sum(dot, scratch);
+        if (tid == 0) {
+            const float z = expf(dot >= 0.f ? -dot : dot);
+            shexp_scale[r] = dot >= 0.f ? 1.f / (1.f + z) : z / (1.f + z);
+        }
+    }
+}
+
+extern "C" int allpaca_moe_route_softmax_topk(const float *logits, int32_t rows, int32_t n_exp,
+                                              int32_t k, const float *x, const float *shexp_gate,
+                                              int32_t dim, float *w_out, int32_t *row_out,
+                                              int32_t *exp_out, int32_t *row_start,
+                                              float *shexp_scale, allpaca_stream_t stream) {
+    if (!logits || rows <= 0 || n_exp <= 0 || k <= 0 || k > 64 || k > n_exp || !w_out ||
+        !row_out || !exp_out || !row_start || (shexp_gate && (!x || !shexp_scale || dim <= 0))) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const size_t lds = (static_cast<size_t>(n_exp) + 64) * sizeof(float);
+    hipLaunchKernelGGL(moe_route_softmax_topk_kernel, dim3(static_cast<unsigned>(rows)), dim3(256),
+                       lds, as_stream(stream), logits, n_exp, k, x, shexp_gate, dim, w_out, row_out,
+                       exp_out, row_start, shexp_scale, rows);
+    return hip_status(hipGetLastError());
+}
+
+__global__ void scale_rows_kernel(float *x, const float *scale, int rows, int dim) {
+    const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int r = static_cast<int>(blockIdx.y);
+    if (d < dim && r < rows) {
+        x[static_cast<size_t>(r) * dim + d] *= scale[r];
+    }
+}
+
+/* x[r][:] *= scale[r], scales in device memory. */
+extern "C" int allpaca_scale_rows(float *x, const float *scale, int32_t rows, int32_t dim,
+                                  allpaca_stream_t stream) {
+    if (!x || !scale || rows <= 0 || dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(scale_rows_kernel,
+                       dim3(static_cast<unsigned>((dim + 255) / 256), static_cast<unsigned>(rows)),
+                       dim3(256), 0, as_stream(stream), x, scale, rows, dim);
+    return hip_status(hipGetLastError());
+}
+
+__global__ void copy_f32_kernel(float *dst, const float *src, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        dst[i] = src[i];
+    }
+}
+
+/* Copy by kernel instead of DMA. Either side may be pinned host memory
+ * (hipHostMalloc is device-mapped): on Windows a small hipMemcpy costs
+ * ~80 us of DMA setup, a launch and sync a fraction of that. */
+extern "C" int allpaca_copy_f32_kernel(float *dst, const float *src, int32_t n,
+                                       allpaca_stream_t stream) {
+    if (!dst || !src || n < 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (n == 0) {
+        return ALLPACA_OK;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(copy_f32_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), 0,
+                       as_stream(stream), dst, src, n);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_copy_async(void *dst, const void *src, size_t bytes,
                                   allpaca_stream_t stream) {
     if (!dst || !src) {
@@ -6265,7 +6759,298 @@ extern "C" int allpaca_copy_async(void *dst, const void *src, size_t bytes,
     return hip_status(hipStreamSynchronize(as_stream(stream)));
 }
 
+/* Quantize `k` floats (whole 32-value blocks) into LDS exactly as
+ * `quantize_rows_q8_kernel` does, so the fused MoE path matches the GEMV path
+ * bit for bit. Every thread of the block takes part; ends with a barrier. */
+__device__ inline void moe_quantize_lds(const float *v, int k, int8_t *aq, float *ad) {
+    // One 32-lane group per 32-value block, as `quantize_rows_q8_kernel`: a
+    // lane per value, amax by shuffle. (A thread per block serialized ~64
+    // global loads per GEMV block.)
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int groups = static_cast<int>(blockDim.x) / 32;
+    const int kb = k / 32;
+    for (int blk = static_cast<int>(threadIdx.x) / 32; blk < kb; blk += groups) {
+        const float x = v[blk * 32 + lane];
+        float amax = fabsf(x);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+        }
+        const float d = amax == 0.f ? 0.f : amax / 127.f;
+        const float inv = d == 0.f ? 0.f : 1.f / d;
+        int q = static_cast<int>(roundf(x * inv));
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        aq[blk * 32 + lane] = static_cast<int8_t>(q);
+        if (lane == 0) {
+            ad[blk] = d;
+        }
+    }
+    __syncthreads();
+}
+
+/* SiLU(gate) * up, then quantize, into LDS (the down GEMV's activation). */
+__device__ inline void moe_silu_quantize_lds(const float *g, const float *u, int k, float *tmp,
+                                             int8_t *aq, float *ad) {
+    for (int i = static_cast<int>(threadIdx.x); i < k; i += static_cast<int>(blockDim.x)) {
+        const float gv = g[i];
+        tmp[i] = gv / (1.f + expf(-gv)) * u[i];
+    }
+    __syncthreads();
+    moe_quantize_lds(tmp, k, aq, ad);
+}
+
+/* Pair groups: group g covers pairs group_start[g] .. group_start[g+1], all
+ * routed to expert[g] (at most MR of them). A null group_start means one pair
+ * per group. Each block reads its expert's weights once for all the group's
+ * rows; per-row arithmetic is the same for any MR. */
+__device__ inline void moe_group(const int32_t *group_start, int g, int &p0, int &mr) {
+    p0 = group_start ? group_start[g] : g;
+    mr = group_start ? group_start[g + 1] - p0 : 1;
+}
+
+/* Gate (z = 0) and up (z = 1) for every group in one launch. Block (x, g)
+ * gathers the group's token rows, quantized, into LDS and runs the int8
+ * K-quant GEMV against expert[g] of the stacked tensor for all of them. */
+template <int QG, int QU, int LPC, int MR>
+__global__ void moe_gate_up_kernel(const float *x, const int8_t *xq, const float *xd,
+                                   const int32_t *pair_row, const int32_t *group_start,
+                                   const int32_t *expert, const uint8_t *gate,
+                                   unsigned long long gate_stride, const uint8_t *up,
+                                   unsigned long long up_stride, float *g, float *u, int ff,
+                                   int dim) {
+    extern __shared__ unsigned char moe_lds[];
+    const int gi = static_cast<int>(blockIdx.y);
+    int p0, mr;
+    moe_group(group_start, gi, p0, mr);
+    const int kb = dim / 32;
+    const int8_t *aq;
+    const float *ad;
+    if (MR == 1 && xq) {
+        // One pre-quantized row: read it in place.
+        const size_t row = static_cast<size_t>(pair_row[p0]);
+        aq = xq + row * dim;
+        ad = xd + row * kb;
+    } else {
+        int8_t *lq = reinterpret_cast<int8_t *>(moe_lds);
+        float *ld = reinterpret_cast<float *>(moe_lds + ((static_cast<size_t>(MR) * dim + 15) & ~size_t(15)));
+        for (int r = 0; r < mr; ++r) {
+            const size_t row = static_cast<size_t>(pair_row[p0 + r]);
+            if (xq) {
+                for (int i = static_cast<int>(threadIdx.x); i < dim; i += static_cast<int>(blockDim.x)) {
+                    lq[r * dim + i] = xq[row * dim + i];
+                }
+                for (int i = static_cast<int>(threadIdx.x); i < kb; i += static_cast<int>(blockDim.x)) {
+                    ld[r * kb + i] = xd[row * kb + i];
+                }
+            } else {
+                moe_quantize_lds(x + row * dim, dim, lq + r * dim, ld + r * kb);
+            }
+        }
+        __syncthreads();
+        aq = lq;
+        ad = ld;
+    }
+    const size_t e = static_cast<size_t>(expert[gi]);
+    if (blockIdx.z == 0) {
+        kquant_i8_block<QG, MR, LPC>(aq, ad, gate + e * gate_stride,
+                                     g + static_cast<size_t>(p0) * ff, mr, ff, dim,
+                                     static_cast<int>(blockIdx.x), 0);
+    } else {
+        kquant_i8_block<QU, MR, LPC>(aq, ad, up + e * up_stride,
+                                     u + static_cast<size_t>(p0) * ff, mr, ff, dim,
+                                     static_cast<int>(blockIdx.x), 0);
+    }
+}
+
+/* SiLU(gate) * up per pair, int8-quantized once into `hq` / `hd` for the
+ * down GEMV (each down block used to redo it for its pair's row). */
+__global__ void moe_silu_quant_kernel(const float *g, const float *u, int8_t *hq, float *hd,
+                                      int ff) {
+    extern __shared__ unsigned char moe_lds[];
+    float *tmp = reinterpret_cast<float *>(moe_lds);
+    const size_t p = blockIdx.x;
+    moe_silu_quantize_lds(g + p * ff, u + p * ff, ff, tmp, hq + p * ff, hd + p * (ff / 32));
+}
+
+/* Down for every group: the group's quantized hidden rows (adjacent, since a
+ * group's pairs are) times expert[g]. */
+template <int QD, int LPC, int MR>
+__global__ void moe_down_kernel(const int8_t *hq, const float *hd, const int32_t *group_start,
+                                const int32_t *expert, const uint8_t *down,
+                                unsigned long long down_stride, float *y, int dim, int ff) {
+    const int gi = static_cast<int>(blockIdx.y);
+    int p0, mr;
+    moe_group(group_start, gi, p0, mr);
+    kquant_i8_block<QD, MR, LPC>(hq + static_cast<size_t>(p0) * ff,
+                                 hd + static_cast<size_t>(p0) * (ff / 32),
+                                 down + static_cast<size_t>(expert[gi]) * down_stride,
+                                 y + static_cast<size_t>(p0) * dim, mr, dim, ff,
+                                 static_cast<int>(blockIdx.x), 0);
+}
+
+/* out[r] = sum of w[p] * y[p] over row r's pairs `row_start[r] .. row_start[r+1]`,
+ * rounded like `scale_f32` then `residual_add` per expert (no FMA), so the
+ * fused path matches the per-expert path bit for bit. */
+__global__ void moe_combine_kernel(const float *y, const float *w, const int32_t *row_start,
+                                   const int32_t *row_pairs, float *out, int rows, int dim) {
+    const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int r = static_cast<int>(blockIdx.y);
+    if (d >= dim || r >= rows) {
+        return;
+    }
+    float acc = 0.f;
+    for (int i = row_start[r]; i < row_start[r + 1]; ++i) {
+        const int p = row_pairs ? row_pairs[i] : i;
+        acc = __fadd_rn(acc, __fmul_rn(y[static_cast<size_t>(p) * dim + d], w[p]));
+    }
+    out[static_cast<size_t>(r) * dim + d] = acc;
+}
+
+
+constexpr int MOE_LPC = 8; // lanes per column; 16 cut 1-row calls 10% but slowed grouped rows 40%
+
+template <int QG, int QU, int MR>
+static void moe_gate_up_launch(dim3 grid, size_t lds, hipStream_t st, const float *x,
+                               const int8_t *xq, const float *xd, const int32_t *pair_row,
+                               const int32_t *group_start, const int32_t *expert,
+                               const uint8_t *gate, unsigned long long gs, const uint8_t *up,
+                               unsigned long long us, float *g, float *u, int ff, int dim) {
+    hipLaunchKernelGGL((moe_gate_up_kernel<QG, QU, MOE_LPC, MR>), grid, dim3(256), lds, st, x, xq,
+                       xd, pair_row, group_start, expert, gate, gs, up, us, g, u, ff, dim);
+}
+
+template <int MR>
+static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, hipStream_t st,
+                              const float *x, const int8_t *xq, const float *xd,
+                              const int32_t *pair_row, const int32_t *group_start,
+                              const int32_t *expert, const uint8_t *gate, unsigned long long gs,
+                              const uint8_t *up, unsigned long long us, float *g, float *u, int ff,
+                              int dim) {
+#define MOE_GU(A, B)                                                                               \
+    if (qg == A && qu == B) {                                                                      \
+        moe_gate_up_launch<A, B, MR>(grid, lds, st, x, xq, xd, pair_row, group_start, expert,     \
+                                     gate, gs, up, us, g, u, ff, dim);                             \
+        return true;                                                                               \
+    }
+    MOE_GU(4, 4) MOE_GU(4, 5) MOE_GU(4, 6)
+    MOE_GU(5, 4) MOE_GU(5, 5) MOE_GU(5, 6)
+    MOE_GU(6, 4) MOE_GU(6, 5) MOE_GU(6, 6)
+#undef MOE_GU
+    return false;
+}
+
+template <int MR>
+static bool moe_down_types(int qd, dim3 grid, hipStream_t st, const int8_t *hq,
+                           const float *hd, const int32_t *group_start, const int32_t *expert,
+                           const uint8_t *down, unsigned long long ds, float *y, int dim, int ff) {
+#define MOE_D(Q)                                                                                   \
+    if (qd == Q) {                                                                                 \
+        hipLaunchKernelGGL((moe_down_kernel<Q, MOE_LPC, MR>), grid, dim3(256), 0, st, hq, hd,     \
+                           group_start, expert, down, ds, y, dim, ff);                            \
+        return true;                                                                               \
+    }
+    MOE_D(4) MOE_D(5) MOE_D(6)
+#undef MOE_D
+    return false;
+}
+
+static size_t moe_align(size_t v) { return (v + 255) & ~size_t(255); }
+
+/* Scratch after the caller's packed inputs: gate, up, per-pair expert output. */
+extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t rows, int32_t dim, int32_t ff,
+                                                  int32_t pairs) {
+    (void)rows;
+    const size_t p = static_cast<size_t>(pairs);
+    return 2 * moe_align(p * ff * 4) + moe_align(p * dim * 4) + moe_align(p * ff) +
+           moe_align(p * (ff / 32) * 4);
+}
+
+/* Expert-parallel MoE FFN over stacked K-quant experts (`qt` 4/5/6 = Q4_K/Q5_K/Q6_K):
+ * out[r] = sum over row r's pairs of w * down_e(silu(gate_e x_r) * up_e x_r).
+ * Pairs are sorted by row; `row_start` has rows + 1 entries. Three launches,
+ * whatever the expert count: an MI50 pays ~10 us per dependent launch, and at
+ * one token the whole MoE reads only ~23 MB. */
+extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const float *xd,
+                                      int32_t rows, int32_t dim, int32_t ff, int32_t pairs,
+                                      const int32_t *pair_row, const int32_t *expert,
+                                      const float *pair_w, const int32_t *row_start,
+                                      int32_t groups, const int32_t *group_start,
+                                      const int32_t *row_pairs, int32_t max_group,
+                                      const uint8_t *gate, int32_t gate_qt, uint64_t gate_stride,
+                                      const uint8_t *up, int32_t up_qt, uint64_t up_stride,
+                                      const uint8_t *down, int32_t down_qt, uint64_t down_stride,
+                                      void *scratch, float *out, allpaca_stream_t stream) {
+    if ((!x && !(xq && xd)) || !out || !scratch || rows <= 0 || pairs <= 0 || groups <= 0 ||
+        dim % 256 != 0 || ff % 256 != 0 || !pair_row || !expert || !pair_w || !row_start ||
+        (group_start == nullptr && groups != pairs) || max_group < 1 || max_group > 8) {
+        return ALLPACA_ERR_INVALID;
+    }
+    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6; };
+    if (!kq(gate_qt) || !kq(up_qt) || !kq(down_qt)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipStream_t st = as_stream(stream);
+    uint8_t *base = static_cast<uint8_t *>(scratch);
+    const size_t p = static_cast<size_t>(pairs);
+    float *g = reinterpret_cast<float *>(base);
+    base += moe_align(p * ff * 4);
+    float *u = reinterpret_cast<float *>(base);
+    base += moe_align(p * ff * 4);
+    float *y = reinterpret_cast<float *>(base);
+    base += moe_align(p * dim * 4);
+    int8_t *hq = reinterpret_cast<int8_t *>(base);
+    base += moe_align(p * ff);
+    float *hd = reinterpret_cast<float *>(base);
+    constexpr int COLS = 256 / MOE_LPC;
+    const int mrc = max_group <= 1 ? 1 : (max_group <= 2 ? 2 : (max_group <= 4 ? 4 : 8));
+    const size_t lds_up = ((static_cast<size_t>(mrc) * dim + 15) & ~size_t(15)) +
+                          static_cast<size_t>(mrc) * (dim / 32) * 4;
+    const dim3 grid_up(static_cast<unsigned>((ff + COLS - 1) / COLS), static_cast<unsigned>(groups), 2);
+    const dim3 grid_down(static_cast<unsigned>((dim + COLS - 1) / COLS), static_cast<unsigned>(groups));
+    bool ok = false;
+#define MOE_MR(M)                                                                                  \
+    ok = moe_gate_up_types<M>(gate_qt, up_qt, grid_up, lds_up, st, x, xq, xd, pair_row,            \
+                              group_start, expert, gate, gate_stride, up, up_stride, g, u, ff,     \
+                              dim);                                                                \
+    if (ok) {                                                                                      \
+        hipLaunchKernelGGL(moe_silu_quant_kernel, dim3(static_cast<unsigned>(pairs)), dim3(256),   \
+                           static_cast<size_t>(ff) * 4, st, g, u, hq, hd, ff);                     \
+    }                                                                                              \
+    ok = ok && moe_down_types<M>(down_qt, grid_down, st, hq, hd, group_start, expert, down,        \
+                                 down_stride, y, dim, ff)
+    switch (mrc) {
+    case 1: MOE_MR(1); break;
+    case 2: MOE_MR(2); break;
+    case 4: MOE_MR(4); break;
+    default: MOE_MR(8); break;
+    }
+#undef MOE_MR
+    if (!ok) {
+        return ALLPACA_ERR_INVALID;
+    }
+    hipLaunchKernelGGL(moe_combine_kernel,
+                       dim3(static_cast<unsigned>((dim + 255) / 256), static_cast<unsigned>(rows)),
+                       dim3(256), 0, st, y, pair_w, row_start, row_pairs, out, rows, dim);
+    return hip_status(hipGetLastError());
+}
+
 #else /* !ALLPACA_HAS_HIP */
+
+extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t, int32_t, int32_t, int32_t) {
+    return 0;
+}
+
+extern "C" void allpaca_hip_set_exact_rows(int32_t) {}
+
+extern "C" int allpaca_moe_ffn_kquant(const float *, const int8_t *, const float *, int32_t, int32_t, int32_t, int32_t,
+                                      const int32_t *, const int32_t *, const float *,
+                                      const int32_t *, int32_t, const int32_t *, const int32_t *,
+                                      int32_t, const uint8_t *, int32_t, uint64_t,
+                                      const uint8_t *, int32_t, uint64_t, const uint8_t *, int32_t,
+                                      uint64_t, void *, float *, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
 
 extern "C" int allpaca_hip_device_count(int32_t *count) {
     if (count) {
@@ -6527,6 +7312,21 @@ extern "C" int allpaca_attention_masked(const float *, const float *, const floa
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_moe_route_softmax_topk(const float *, int32_t, int32_t, int32_t,
+                                              const float *, const float *, int32_t, float *,
+                                              int32_t *, int32_t *, int32_t *, float *,
+                                              allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scale_rows(float *, const float *, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_copy_f32_kernel(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_copy_async(void *, const void *, size_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
@@ -6573,6 +7373,21 @@ extern "C" int allpaca_sigmoid_mul(float *, const float *, int32_t, allpaca_stre
 
 extern "C" int allpaca_scale_heads_sigmoid(float *, const float *, int32_t, int32_t, int32_t,
                                            allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q8_0_pair(const float *, const uint8_t *, float *,
+                                         const uint8_t *, float *, int32_t, int32_t, int32_t,
+                                         int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scale_add_copy(float *, float *, float, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gdn_norm_gate(const float *, const float *, const float *, float *,
+                                     int32_t, int32_t, float, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
@@ -6644,12 +7459,19 @@ extern "C" int allpaca_gated_delta_step(float *, float *, const float *, const f
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gdn_step_fused(const float *, const float *, float *, float *,
+                                      const float *, const float *, const float *, float *, float *,
+                                      float *, float *, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                      float, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_gdn_conv1d_step(const float *, const float *, float *, float *, int32_t,
                                        int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
-extern "C" int allpaca_expand_k_heads(const float *, float *, int32_t, int32_t, int32_t,
+extern "C" int allpaca_expand_k_heads(const float *, float *, int32_t, int32_t, int32_t, int32_t,
                                       allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }

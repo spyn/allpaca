@@ -184,6 +184,11 @@ pub struct StatsSnapshot {
     /// Poll ticks that co-advanced a stagger partner (same-tick dual step).
     #[serde(default)]
     pub micro_batch_dual_steps: u64,
+    /// Batched decode forwards over several Requests, and the rows they ran.
+    #[serde(default)]
+    pub batched_decode_steps: u64,
+    #[serde(default)]
+    pub batched_decode_rows: u64,
     /// MoE prefill: next-layer expert H2D overlapped with current layer GPU work.
     #[serde(default)]
     pub expert_prefill_overlaps: u64,

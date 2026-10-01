@@ -96,6 +96,58 @@ struct ActiveRequest {
     suppress_draft: bool,
 }
 
+/// What one [`Engine::poll_for`] tick yielded for the calling Request.
+enum PollFor {
+    /// This Request's next result.
+    Result(StepResult),
+    /// Finished with nothing left to hand out.
+    Done,
+    /// The tick served another Request (or found nothing runnable).
+    Idle,
+}
+
+/// A Request's rows awaiting the batched decode forward: its sampled token,
+/// or a packed n-gram verify span (`span` then holds the rest of the verify).
+struct StagedDecode {
+    id: u64,
+    tokens: Vec<u32>,
+    pos: usize,
+    span: Option<Box<SpanTail>>,
+}
+
+/// Rows one batched decode forward may carry. `forward_batch` runs its GEMMs
+/// row-exact (`allpaca_hip::ExactRows`: wide M as chunks on the small-M
+/// kernels), so any count reproduces solo rows; this bounds the per-tick
+/// workspace and keeps four Requests' n-gram spans (up to 8 rows each) in
+/// one forward.
+const BATCH_EXACT_ROWS: usize = 32;
+
+/// Whether `rows` more fit in the batched forward being staged (`None`: not
+/// staging at all).
+fn stage_fits(inner: &EngineInner, rows: usize) -> bool {
+    inner.staged_decode.as_ref().is_some_and(|staged| {
+        staged.iter().map(|st| st.tokens.len()).sum::<usize>() + rows <= BATCH_EXACT_ROWS
+    })
+}
+
+/// What a packed linear verify carries from its forward to its accept walk
+/// and rewind ([`finish_linear_span`]).
+struct SpanTail {
+    span: Vec<u32>,
+    first: u32,
+    remaining: usize,
+    start_pos: usize,
+    page_tokens: u32,
+    last_logits: Vec<f32>,
+    rec_before: Option<RecurrentState>,
+    device_gdn_cloned: usize,
+    journal_rewind: bool,
+    pending_h: Vec<f32>,
+    /// The span is headed by an already-emitted deferred correction, which
+    /// is dropped from the produced tokens.
+    drop_first: bool,
+}
+
 struct EngineInner {
     flags: FeatureFlags,
     scheduler: Scheduler,
@@ -129,6 +181,13 @@ struct EngineInner {
     consecutive_prefill_picks: usize,
     /// Next poll prefers this request (cross-req micro-batch partner).
     prefer_next: Option<u64>,
+    /// Request whose next-token logits may still be in flight on the HIP
+    /// workspace's single pinned logits buffer (decode starts the D2H and the
+    /// next step of the same Request waits on it).
+    logits_owner: Option<u64>,
+    /// Set while `poll` batches decode: `append_and_forward` records the
+    /// token here instead of running its own forward.
+    staged_decode: Option<Vec<StagedDecode>>,
     /// Consecutive decode steps with expert LRU misses (elastic pressure).
     elastic_miss_streak: u32,
     /// Run [`Engine::rebalance_experts_elastic`] on next idle safe point.
@@ -175,6 +234,10 @@ pub struct Engine {
     /// rate limit is per engine, not per handle.
     gpu_sampler: Arc<GpuSampler>,
     rpc: Option<Arc<crate::rpc_runtime::RpcRuntime>>,
+    /// Serializes `poll` ticks across threads: a batched decode tick steps
+    /// several Requests with `inner` released in between, and no other tick
+    /// may step them before their batched forward lands.
+    poll_tick: Arc<Mutex<()>>,
 }
 
 pub struct RequestHandle {
@@ -465,6 +528,8 @@ impl Engine {
             last_poll_id: None,
             consecutive_prefill_picks: 0,
             prefer_next: None,
+            logits_owner: None,
+            staged_decode: None,
             elastic_miss_streak: 0,
             elastic_rebalance_pending: false,
             elastic_last_misses: 0,
@@ -487,6 +552,7 @@ impl Engine {
             layer_stagger: Arc::new(LayerStagger::new()),
             gpu_sampler: Arc::new(GpuSampler::default()),
             rpc,
+            poll_tick: Arc::new(Mutex::new(())),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -1693,7 +1759,16 @@ impl Engine {
                     let skip: Vec<bool> = (0..target_m.config.n_layers)
                         .map(|i| rpc.is_remote(i) || rpc.local_device(i) != dev)
                         .collect();
-                    match ResidentModel::upload_gguf_peer_layers(file, &target_m.config, dev, &skip) {
+                    let skip_experts: Vec<bool> = (0..target_m.config.n_layers)
+                        .map(|i| rpc.experts_remote(i))
+                        .collect();
+                    match ResidentModel::upload_gguf_peer_layers(
+                        file,
+                        &target_m.config,
+                        dev,
+                        &skip,
+                        &skip_experts,
+                    ) {
                         Ok(resident) => {
                             let hip_used = allpaca_hip::device_memory_info(dev)
                                 .ok()
@@ -1736,7 +1811,16 @@ impl Engine {
                         })
                     })
                     .collect();
-                ResidentModel::upload_gguf_filtered(file, &target.config, hip.device, &skip)
+                let skip_experts: Vec<bool> = (0..target.config.n_layers)
+                    .map(|i| target.rpc.as_ref().is_some_and(|r| r.experts_remote(i)))
+                    .collect();
+                ResidentModel::upload_gguf_filtered(
+                    file,
+                    &target.config,
+                    hip.device,
+                    &skip,
+                    &skip_experts,
+                )
             } else if host_ready {
                 ResidentModel::upload(&target, hip.device)
             } else {
@@ -2108,33 +2192,19 @@ impl Engine {
     fn next_fair(&self, handle: &mut RequestHandle) -> Result<Option<TokenEvent>, AllpacaError> {
         let id = handle.id;
         loop {
-            if let Some(parked) = self.take_parked(id)? {
-                match parked {
-                    StepResult::Token(ev) => return Ok(Some(ev)),
-                    StepResult::Prefill { .. } => continue,
-                    StepResult::Finished(_) => return Ok(None),
-                }
-            }
-            // Finished locally: do not spin parking a peer's entire decode.
-            if self.request_fully_done(id)? {
-                return Ok(None);
-            }
-            match self.poll()? {
-                None => {
-                    if self.request_fully_done(id)? {
-                        return Ok(None);
-                    }
-                    std::thread::yield_now();
-                    continue;
-                }
-                Some(ev) if ev.request_id == id => match ev.result {
-                    StepResult::Token(tok) => return Ok(Some(tok)),
-                    StepResult::Prefill { .. } => continue,
-                    StepResult::Finished(_) => return Ok(None),
+            let result = match self.take_parked(id)? {
+                Some(parked) => Some(parked),
+                None => match self.poll_for(id)? {
+                    PollFor::Result(r) => Some(r),
+                    PollFor::Done => return Ok(None),
+                    PollFor::Idle => None,
                 },
-                Some(ev) => {
-                    self.park_result(ev.request_id, ev.result)?;
-                }
+            };
+            match result {
+                Some(StepResult::Token(ev)) => return Ok(Some(ev)),
+                Some(StepResult::Prefill { .. }) => continue,
+                Some(StepResult::Finished(_)) => return Ok(None),
+                None => std::thread::yield_now(),
             }
         }
     }
@@ -2402,6 +2472,9 @@ impl Engine {
             .fetch_add(prompt_len as u64, std::sync::atomic::Ordering::Relaxed);
         // One chunk only — remaining prompt tokens continue in `step` so a
         // second Request can admit / decode between chunks.
+        // Another Request's decode logits may still be in flight: land them
+        // before this prefill's forward reuses the pinned logits slot.
+        self.drain_foreign_logits(&mut inner, id)?;
         self.prefill_chunk(&mut inner, id)?;
         Ok(RequestHandle {
             id,
@@ -2437,6 +2510,43 @@ impl Engine {
     /// so they still surface as later `PollEvent`s (prior silent dual-step broke
     /// interleave observability).
     pub fn poll(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
+        let _tick = self.poll_tick.lock().unwrap_or_else(|e| e.into_inner());
+        self.poll_tick_locked()
+    }
+
+    /// One `poll` tick for the caller driving `id`: another Request's event
+    /// goes back to the front of that Request's queue before the tick ends.
+    /// It was the oldest undelivered result for that Request, and while it
+    /// sat outside the queue that Request could be stepped again and hand
+    /// its next token to its own caller first.
+    fn poll_for(&self, id: u64) -> Result<PollFor, AllpacaError> {
+        let _tick = self.poll_tick.lock().unwrap_or_else(|e| e.into_inner());
+        // A tick that just ended may have parked this Request's result, or
+        // finished it: check both with no tick in flight, so a result still
+        // held by a running tick is never mistaken for the end of the stream.
+        if let Some(parked) = self.take_parked(id)? {
+            return Ok(PollFor::Result(parked));
+        }
+        if self.request_fully_done(id)? {
+            return Ok(PollFor::Done);
+        }
+        match self.poll_tick_locked()? {
+            Some(ev) if ev.request_id == id => Ok(PollFor::Result(ev.result)),
+            Some(ev) => {
+                let mut inner = self.lock()?;
+                if let Some(active) = inner.active.get_mut(&ev.request_id) {
+                    active.parked.push_front(ev.result);
+                }
+                Ok(PollFor::Idle)
+            }
+            None => Ok(PollFor::Idle),
+        }
+    }
+
+    fn poll_tick_locked(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
+        if let Some(ev) = self.poll_decode_batch()? {
+            return Ok(Some(ev));
+        }
         loop {
             let (id, waited_ms, is_prefill, stagger_partner, batch_gemm_plan) = {
                 let mut inner = self.lock()?;
@@ -2867,6 +2977,7 @@ impl Engine {
                 req.pending_logits.resize(n_logits, 0.0);
             }
             req.pending_logits[..n_logits].copy_from_slice(&row[..n_logits]);
+            req.last_hidden_fresh = false;
         }
     }
 
@@ -3049,6 +3160,10 @@ impl Engine {
                             req.pending_logits.resize(n_logits, 0.0);
                         }
                         req.pending_logits[..n_logits].copy_from_slice(&row[..n_logits]);
+                        // This hidden row is spent: a later tick in which the
+                        // Request does not forward must not re-apply it (it
+                        // would sample the previous position's logits again).
+                        req.last_hidden_fresh = false;
                         wrote = true;
                     }
                     if wrote {
@@ -3080,6 +3195,7 @@ impl Engine {
 
     fn step_id(&self, id: u64) -> Result<StepResult, AllpacaError> {
         let mut inner = self.lock()?;
+        self.drain_foreign_logits(&mut inner, id)?;
         {
             let active = request_mut(&mut inner, id)?;
             // Drain same-tick micro-batch parks before fresh work.
@@ -3113,11 +3229,15 @@ impl Engine {
         let json_constraints = inner.flags.json_constraints;
         let structured = json_constraints && self.config.structured_output.enabled;
         let suppress_draft = request(&inner, id)?.suppress_draft;
+        let spec_limit = self.config.speculative.max_concurrent_requests;
+        let crowded = spec_limit > 0
+            && inner.active.values().filter(|r| !r.finished).count() > spec_limit;
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation
                 || inner.flags.draft_model_speculation
                 || inner.dspark.is_some())
-            && !suppress_draft;
+            && !suppress_draft
+            && !crowded;
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
@@ -3164,7 +3284,20 @@ impl Engine {
             .draft_ahead
             .as_ref()
             .is_some_and(|a| a.ctx == ctx_now && !a.tokens.is_empty());
-        let use_tree = speculate && inner.flags.tree_speculation && depth > 0 && !ahead_ready;
+        let forest_ok = inner
+            .target
+            .as_ref()
+            .is_some_and(|t| t.supports_forest_verify());
+        if inner.flags.tree_speculation && !forest_ok {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "speculative.tree needs host weights and no recurrent layers; using linear verify"
+                );
+            }
+        }
+        let use_tree =
+            speculate && inner.flags.tree_speculation && forest_ok && depth > 0 && !ahead_ready;
         self.metrics
             .target_evals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3237,6 +3370,28 @@ impl Engine {
                 &hooks,
             )?
         };
+        if produced.tokens.is_empty()
+            && inner
+                .staged_decode
+                .as_ref()
+                .is_some_and(|s| s.iter().any(|st| st.id == id && st.span.is_some()))
+        {
+            // Staged verify span: the batched decode tick finishes and emits it.
+            return Ok(StepResult::Prefill {
+                tokens_done: 0,
+                tokens_total: 0,
+            });
+        }
+        self.emit_produced(&mut inner, id, produced)
+    }
+
+    /// Record a step's acceptance and queue its tokens; returns the first.
+    fn emit_produced(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        produced: Produced,
+    ) -> Result<StepResult, AllpacaError> {
         let accepted = produced.accepted;
         let proposed = produced.proposed;
         let active_n = inner.active.len();
@@ -3258,7 +3413,7 @@ impl Engine {
                 .map(|t| t.decode_one(tok))
                 .unwrap_or_default();
             let (stop, maxed, first) = {
-                let active = request(&inner, id)?;
+                let active = request(inner, id)?;
                 (
                     is_stop(tok, &active.params),
                     active.generated + 1 >= active.params.max_tokens && i == last_idx,
@@ -3652,6 +3807,274 @@ impl Engine {
             inner.ngram.observe(&tokens);
         }
         Ok((end, total))
+    }
+
+    /// Whether this Engine can batch decode at all: enabled, several Request
+    /// slots, a HIP-resident target that supports multi-sequence forwards, and
+    /// no draft model (its per-Request state needs its own forward).
+    fn batch_decode_enabled(&self, inner: &EngineInner) -> bool {
+        self.config.engine.batch_decode
+            && self.config.engine.max_active_requests >= 2
+            && inner.target_resident.is_some()
+            && inner.draft_model.is_none()
+            && match (self.hip.as_deref(), inner.target.as_ref()) {
+                (Some(hip), Some(t)) => t.supports_forward_batch(hip),
+                _ => false,
+            }
+    }
+
+    /// Requests whose next step ends in one forward the tick can batch: a plain
+    /// decode token or an n-gram verify span. Prefill done, nothing queued to
+    /// emit, and no grammar, JSON mode, vision, deferred lm_head or speculation
+    /// that runs its own forwards.
+    fn batch_decode_ids(&self, inner: &EngineInner) -> Vec<u64> {
+        let cfg = &self.config;
+        // N-gram verify spans ride along in the batched forward; draft-model,
+        // DSpark and tree speculation run their own forwards.
+        let own_forward_spec = cfg.speculative.enabled
+            && (inner.flags.draft_model_speculation
+                || inner.dspark.is_some()
+                || inner.flags.tree_speculation);
+        let structured = inner.flags.json_constraints && cfg.structured_output.enabled;
+        let mut ids: Vec<(Instant, u64)> = inner
+            .active
+            .iter()
+            .filter(|(_, r)| {
+                !r.finished
+                    && r.prefill_pos >= r.prompt_len
+                    && r.emit_queue.is_empty()
+                    && r.parked.is_empty()
+                    && r.generated < r.params.max_tokens
+                    && (!own_forward_spec || r.suppress_draft)
+                    && r.grammar.is_none()
+                    && !(r.params.json_mode && structured)
+                    && r.vision.is_empty()
+                    && !r.defer_lm_head
+            })
+            .map(|(id, r)| (r.last_token_at, *id))
+            .collect();
+        // Longest-waiting first, so the returned event is the fair pick.
+        ids.sort();
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// One continuous-batching tick: when two or more Requests are in plain
+    /// decode, sample each one's next token and run a single batched forward
+    /// for all of them. The longest-waiting Request's token is returned; the
+    /// others are parked and come out on their next pick.
+    fn poll_decode_batch(&self) -> Result<Option<allpaca_types::PollEvent>, AllpacaError> {
+        let ids = {
+            let mut inner = self.lock()?;
+            if !self.batch_decode_enabled(&inner) {
+                return Ok(None);
+            }
+            // Hand out the previous batch's parked tokens before the next
+            // batch, so its members stay in step with each other.
+            let parked = inner
+                .active
+                .iter()
+                .filter(|(_, r)| !r.parked.is_empty())
+                .min_by_key(|(_, r)| r.last_token_at)
+                .map(|(id, _)| *id);
+            if let Some(id) = parked {
+                drop(inner);
+                let result = self.step_id(id)?;
+                return Ok(Some(allpaca_types::PollEvent {
+                    request_id: id,
+                    result,
+                }));
+            }
+            let ids = self.batch_decode_ids(&inner);
+            if ids.len() < 2 {
+                return Ok(None);
+            }
+            inner.staged_decode = Some(Vec::new());
+            ids
+        };
+        let mut results = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            match self.step_id(id) {
+                Ok(r) => results.push((id, r)),
+                // Dropped between pick and step.
+                Err(AllpacaError::Transient(TransientError::RequestBusy)) => {}
+                Err(e) => {
+                    self.lock()?.staged_decode = None;
+                    return Err(e);
+                }
+            }
+        }
+        {
+            let mut inner = self.lock()?;
+            let staged = inner.staged_decode.take().unwrap_or_default();
+            let spans = self.forward_staged_decode(&mut inner, staged)?;
+            // Finish the staged n-gram verifies now that their rows' logits
+            // are in: accept walk, rewind, correction, then emit.
+            let hooks = DecodePollHooks {
+                layer_stagger: Some(self.layer_stagger.as_ref()),
+                ds_probe: &self.ds_probe,
+                ds_queue: &self.ds_queue,
+                #[cfg(feature = "cuda")]
+                cuda: self.cuda.as_deref(),
+                #[cfg(feature = "vulkan")]
+                vulkan: self.vulkan.as_deref(),
+            };
+            for (id, tail, mut rows) in spans {
+                // A previous finish may have left its correction's logits in flight.
+                self.drain_foreign_logits(&mut inner, id)?;
+                let walk = accept_span(
+                    &mut inner,
+                    id,
+                    &tail.span,
+                    tail.first,
+                    &mut rows,
+                    None,
+                    tail.remaining,
+                )?;
+                let recurrent = request_mut(&mut inner, id)?.recurrent.take();
+                let produced = finish_linear_span(
+                    &mut inner,
+                    id,
+                    *tail,
+                    walk,
+                    rows,
+                    Vec::new(),
+                    recurrent,
+                    false,
+                    &self.metrics,
+                    self.hip.as_deref(),
+                    self.draft_hip.as_deref(),
+                    &hooks,
+                    None,
+                )?;
+                let result = self.emit_produced(&mut inner, id, produced)?;
+                if let Some(slot) = results.iter_mut().find(|(rid, _)| *rid == id) {
+                    slot.1 = result;
+                }
+            }
+            inner.last_poll_id = Some(ids[0]);
+            inner.consecutive_prefill_picks = 0;
+        }
+        let mut results = results.into_iter();
+        let Some((primary_id, primary)) = results.next() else {
+            return Ok(None);
+        };
+        for (id, r) in results {
+            self.park_result(id, r)?;
+        }
+        self.metrics
+            .poll_ticks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .poll_decode_picks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(allpaca_types::PollEvent {
+            request_id: primary_id,
+            result: primary,
+        }))
+    }
+
+    /// Run the batched decode forward for `staged` and hand each Request its
+    /// next-token logits.
+    fn forward_staged_decode(
+        &self,
+        inner: &mut EngineInner,
+        mut staged: Vec<StagedDecode>,
+    ) -> Result<Vec<(u64, Box<SpanTail>, Vec<f32>)>, AllpacaError> {
+        staged.retain(|st| inner.active.contains_key(&st.id));
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Nothing may still be in flight in the pinned logits slot.
+        self.drain_foreign_logits(inner, u64::MAX)?;
+        let hip = self
+            .hip
+            .as_deref()
+            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let target = inner
+            .target
+            .clone()
+            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let resident = inner
+            .target_resident
+            .clone()
+            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let vocab = target.config.vocab_size;
+        let pages: Vec<Vec<Vec<u64>>> = staged
+            .iter()
+            .map(|st| request(inner, st.id).map(|r| r.pages.clone()))
+            .collect::<Result<_, _>>()?;
+        let mut recurrent: Vec<Option<RecurrentState>> = staged
+            .iter()
+            .map(|st| request_mut(inner, st.id).map(|r| r.recurrent.take()))
+            .collect::<Result<_, _>>()?;
+        let tokens: Vec<u32> = staged.iter().flat_map(|st| st.tokens.iter().copied()).collect();
+        let mut row_logits = vec![0.0f32; tokens.len() * vocab];
+        let result = {
+            let mut segs: Vec<crate::model::SeqRows<'_>> = staged
+                .iter()
+                .zip(&pages)
+                .zip(recurrent.iter_mut())
+                .map(|((st, pages), rec)| crate::model::SeqRows {
+                    start_pos: st.pos,
+                    n_rows: st.tokens.len(),
+                    page_ids: pages,
+                    request_id: st.id,
+                    recurrent: rec.as_mut(),
+                })
+                .collect();
+            target.forward_batch(
+                &tokens,
+                &mut segs,
+                &mut inner.kv,
+                &self.metrics,
+                &mut row_logits,
+                hip,
+                &resident,
+            )
+        };
+        let mut spans = Vec::new();
+        let mut row0 = 0usize;
+        for (st, rec) in staged.into_iter().zip(recurrent) {
+            let rows = row_logits[row0 * vocab..(row0 + st.tokens.len()) * vocab].to_vec();
+            row0 += st.tokens.len();
+            let Some(active) = inner.active.get_mut(&st.id) else {
+                continue;
+            };
+            active.recurrent = rec;
+            match st.span {
+                Some(tail) => spans.push((st.id, tail, rows)),
+                None => {
+                    active.pending_logits = rows;
+                    active.decode_step = active.decode_step.saturating_add(1);
+                    active.last_hidden_fresh = false;
+                }
+            }
+        }
+        result?;
+        self.metrics
+            .batched_decode_steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .batched_decode_rows
+            .fetch_add(row0 as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(spans)
+    }
+
+    /// Land logits still in flight for another Request in that Request's
+    /// buffer before `id` runs a forward (the workspace has one pinned logits
+    /// slot, so `id`'s own wait would otherwise take them).
+    fn drain_foreign_logits(&self, inner: &mut EngineInner, id: u64) -> Result<(), AllpacaError> {
+        let Some(owner) = inner.logits_owner.filter(|&o| o != id) else {
+            return Ok(());
+        };
+        inner.logits_owner = None;
+        let Some(hip) = self.hip.as_deref() else {
+            return Ok(());
+        };
+        match inner.active.get_mut(&owner) {
+            Some(active) => hip.wait_logits_d2h(&mut active.pending_logits),
+            None => hip.wait_logits_d2h(&mut []),
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, EngineInner>, AllpacaError> {
@@ -4655,13 +5078,26 @@ fn verify_and_sample(
                 temperature,
                 hooks,
             )?;
+            if let Some(tail) = inner
+                .staged_decode
+                .as_mut()
+                .and_then(|s| s.iter_mut().find(|st| st.id == id))
+                .and_then(|st| st.span.as_mut())
+            {
+                // Staged: the batched tick drops the correction when it finishes.
+                tail.drop_first = true;
+                return Ok(out);
+            }
             // The correction was already emitted and is not a drafted token.
             out.tokens.remove(0);
             out.accepted = out.accepted.saturating_sub(1);
             out.proposed = out.proposed.saturating_sub(1);
             return Ok(out);
         }
-        append_and_forward(
+        // This step samples from the correction's logits right away, so its
+        // forward cannot wait for a batched decode tick.
+        let staged = inner.staged_decode.take();
+        let forwarded = append_and_forward(
             inner,
             id,
             tok,
@@ -4676,7 +5112,9 @@ fn verify_and_sample(
             hooks.cuda,
             #[cfg(feature = "vulkan")]
             hooks.vulkan,
-        )?;
+        );
+        inner.staged_decode = staged;
+        forwarded?;
         // They were aligned one slot behind the context that now includes `tok`.
         drafts.clear();
     }
@@ -5213,7 +5651,6 @@ fn packed_linear_verify_span(
         }
     }
     let rec_before = recurrent.clone();
-    let dim = target.config.dim;
     let pending_h = request(inner, id)?.last_hidden.clone();
     // One packed forward over the span when a partial accept can be rewound
     // from the device GDN journal. Otherwise (host GDN state, Mamba-2 slots)
@@ -5296,6 +5733,42 @@ fn packed_linear_verify_span(
             row_hiddens.extend_from_slice(&one_hidden);
         }
     } else {
+        if stage_fits(inner, span.len())
+            && before_draft_gpu.is_none()
+            && after_row_hiddens.is_none()
+            && vision_ref.is_none()
+            && mask.is_none()
+        {
+            // Batched decode tick: these rows go out with the other Requests'
+            // in one forward, then the tick runs `finish_linear_span`.
+            request_mut(inner, id)?.recurrent = recurrent;
+            let tail = SpanTail {
+                span: span.clone(),
+                first,
+                remaining,
+                start_pos,
+                page_tokens,
+                last_logits,
+                rec_before,
+                device_gdn_cloned,
+                journal_rewind,
+                pending_h,
+                drop_first: false,
+            };
+            if let Some(staged) = inner.staged_decode.as_mut() {
+                staged.push(StagedDecode {
+                    id,
+                    tokens: span,
+                    pos: start_pos,
+                    span: Some(Box::new(tail)),
+                });
+            }
+            return Ok(Produced {
+                tokens: Vec::new(),
+                accepted: 0,
+                proposed: drafts_len,
+            });
+        }
         target.forward_tokens(
             &span,
             start_pos,
@@ -5316,34 +5789,125 @@ fn packed_linear_verify_span(
             hip.bind()?;
             hip.wait_logits_d2h(&mut row_logits)?;
         }
-        let params_stop = request(inner, id)?.params.clone();
-        for i in 0..span.len().saturating_sub(1) {
-            if produced.len() >= remaining {
-                break;
-            }
-            if is_stop(produced[produced.len() - 1], &params_stop) {
-                break;
-            }
-            let off = i * vocab;
-            let row = &mut row_logits[off..off + vocab];
-            let next = {
-                let active = request_mut(inner, id)?;
-                sample(row, mask, &active.params, &mut active.rng)
-            };
-            produced.push(next);
-            if next == span[i + 1] {
-                accepted += 1;
-                keep = i + 2;
-            } else {
-                break;
-            }
-        }
+        (produced, accepted, keep) =
+            accept_span(inner, id, &span, first, &mut row_logits, mask, remaining)?;
     }
     if let Some(send) = after_row_hiddens {
         // Draft-ahead assumes the whole span lands; after a reject its work
         // would be discarded, so hand it nothing and let it exit.
         send(if keep == span.len() { &row_hiddens } else { &[] });
     }
+    finish_linear_span(
+        inner,
+        id,
+        SpanTail {
+            span,
+            first,
+            remaining,
+            start_pos,
+            page_tokens,
+            last_logits,
+            rec_before,
+            device_gdn_cloned,
+            journal_rewind,
+            pending_h,
+            drop_first: false,
+        },
+        (produced, accepted, keep),
+        row_logits,
+        row_hiddens,
+        recurrent,
+        incremental_gdn,
+        metrics,
+        hip,
+        draft_hip,
+        hooks,
+        before_draft_gpu,
+    )
+}
+
+/// Accept walk over a forwarded span's row logits: sample each row, stop at
+/// the first token that differs from the draft. Returns `(produced, accepted, keep)`.
+fn accept_span(
+    inner: &mut EngineInner,
+    id: u64,
+    span: &[u32],
+    first: u32,
+    row_logits: &mut [f32],
+    mask: Option<&allpaca_types::TokenMask>,
+    remaining: usize,
+) -> Result<(Vec<u32>, u64, usize), AllpacaError> {
+    let vocab = row_logits.len() / span.len().max(1);
+    let mut produced = vec![first];
+    let mut accepted = 1u64;
+    let mut keep = 1usize;
+    let params_stop = request(inner, id)?.params.clone();
+    for i in 0..span.len().saturating_sub(1) {
+        if produced.len() >= remaining {
+            break;
+        }
+        if is_stop(produced[produced.len() - 1], &params_stop) {
+            break;
+        }
+        let off = i * vocab;
+        let row = &mut row_logits[off..off + vocab];
+        let next = {
+            let active = request_mut(inner, id)?;
+            sample(row, mask, &active.params, &mut active.rng)
+        };
+        produced.push(next);
+        if next == span[i + 1] {
+            accepted += 1;
+            keep = i + 2;
+        } else {
+            break;
+        }
+    }
+    Ok((produced, accepted, keep))
+}
+
+/// After a verify span's forward and accept walk: rewind KV and recurrent
+/// state to the accepted prefix, extend the context, and forward (or defer)
+/// the correction.
+#[allow(clippy::too_many_arguments)]
+fn finish_linear_span(
+    inner: &mut EngineInner,
+    id: u64,
+    tail: SpanTail,
+    (produced, accepted, keep): (Vec<u32>, u64, usize),
+    row_logits: Vec<f32>,
+    row_hiddens: Vec<f32>,
+    mut recurrent: Option<RecurrentState>,
+    incremental_gdn: bool,
+    metrics: &Metrics,
+    hip: Option<&HipWorkspace>,
+    draft_hip: Option<&HipWorkspace>,
+    hooks: &DecodePollHooks<'_>,
+    before_draft_gpu: Option<&dyn Fn()>,
+) -> Result<Produced, AllpacaError> {
+    let SpanTail {
+        span,
+        remaining,
+        start_pos,
+        page_tokens,
+        last_logits,
+        rec_before,
+        device_gdn_cloned,
+        journal_rewind,
+        pending_h,
+        drop_first,
+        ..
+    } = tail;
+    let drafts_len = span.len() as u64;
+    let vocab = last_logits.len();
+    let target = inner
+        .target
+        .clone()
+        .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+    let resident = inner.target_resident.clone();
+    let vision = request(inner, id)?.vision.clone();
+    let vision_ref = (!vision.is_empty()).then_some(&*vision);
+    let dim = target.config.dim;
     request_mut(inner, id)?.pending_logits = last_logits;
     metrics
         .linear_packed_verifies
@@ -5478,11 +6042,18 @@ fn packed_linear_verify_span(
         let pending = row_logits[off..off + vocab].to_vec();
         request_mut(inner, id)?.pending_logits = pending;
     }
-    Ok(Produced {
+    let mut out = Produced {
         tokens: produced,
         accepted,
         proposed: drafts_len,
-    })
+    };
+    if drop_first {
+        // The correction was already emitted and is not a drafted token.
+        out.tokens.remove(0);
+        out.accepted = out.accepted.saturating_sub(1);
+        out.proposed = out.proposed.saturating_sub(1);
+    }
+    Ok(out)
 }
 
 fn verify_forest(
@@ -5642,6 +6213,18 @@ fn append_and_forward(
         let ctx = request(inner, id)?.tokens.clone();
         inner.ngram.observe(&ctx);
     }
+    // Batched decode tick with room left: the tick forwards this row.
+    if stage_fits(inner, 1) {
+        if let Some(staged) = inner.staged_decode.as_mut() {
+            staged.push(StagedDecode {
+                id,
+                tokens: vec![token],
+                pos,
+                span: None,
+            });
+            return Ok(());
+        }
+    }
     let mut logits = std::mem::take(&mut request_mut(inner, id)?.pending_logits);
     let pages = request(inner, id)?.pages.clone();
     let resident = inner.target_resident.clone();
@@ -5761,6 +6344,9 @@ fn append_and_forward(
         )?;
     }
     request_mut(inner, id)?.pending_logits = logits;
+    if hip.is_some() {
+        inner.logits_owner = Some(id);
+    }
     request_mut(inner, id)?.recurrent = recurrent;
     request_mut(inner, id)?.moe_norm = moe_norm;
     request_mut(inner, id)?.last_hidden = last_hidden;
@@ -7953,6 +8539,36 @@ mod tests {
             stats.poll_decode_picks > 0,
             "fair generate must record decode picks; stats={stats:?}"
         );
+    }
+
+    /// Two Requests decoded together: speculation stops while more Requests
+    /// are active than `speculative.max_concurrent_requests` (0 = no limit).
+    #[test]
+    fn speculation_pauses_above_max_concurrent_requests() {
+        let drafted = |limit: usize| {
+            let mut cfg = test_config();
+            cfg.engine.max_active_requests = 2;
+            cfg.speculative.max_concurrent_requests = limit;
+            let engine = Engine::new(cfg).unwrap();
+            let params = GenerationParams {
+                max_tokens: 24,
+                temperature: 0.0,
+                seed: Some(7),
+                ..GenerationParams::default()
+            };
+            let prompt = "hello world hello world hello world hello world";
+            let a = engine.begin_request(prompt, params.clone()).unwrap();
+            let b = engine.begin_request(prompt, params).unwrap();
+            for _ in 0..512 {
+                if engine.poll().expect("poll").is_none() {
+                    break;
+                }
+            }
+            drop((a, b));
+            engine.stats().draft_proposed
+        };
+        assert_eq!(drafted(1), 0, "two active Requests exceed a limit of 1: no drafts");
+        assert!(drafted(0) > 0, "without a limit the same Requests draft");
     }
 
     #[test]

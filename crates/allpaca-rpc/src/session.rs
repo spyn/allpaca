@@ -205,6 +205,22 @@ impl RpcSession {
         self.rpc(Cmd::RunSpan, &payload)
     }
 
+    /// Routing-weighted SwiGLU of the chosen experts per row (one round trip).
+    /// `q8` sends `x` as the worker's int8 blocks (see
+    /// [`crate::protocol::quantize_q8_rows`]): lossless for K-quant experts,
+    /// whose fused kernels quantize to exactly that.
+    pub fn moe_ffn(
+        &mut self,
+        req: crate::protocol::MoeFfnRequest,
+        x: &[f32],
+        q8: bool,
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        let body = self.rpc(Cmd::MoeFfn, &crate::protocol::encode_moe_ffn(&req, x, q8, pairs))?;
+        crate::protocol::decode_moe_reply(&body, x.len(), req.f16_out)
+            .ok_or_else(|| RpcError::Protocol("moe ffn reply size".into()))
+    }
+
     pub fn mem_info(&mut self) -> Result<(u64, u64), RpcError> {
         let body = self.rpc(Cmd::MemInfo, &[])?;
         let mut c = crate::protocol::Cursor::new(&body);

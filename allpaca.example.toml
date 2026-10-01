@@ -36,6 +36,7 @@ cpu_only = false
 # pipeline_mode = "asymmetric"  # asymmetric | symmetric | mobile_tiered
 gpu_backend = "auto"            # auto | hip | cpu
 max_active_requests = 1
+# batch_decode = true          # >1 active: one batched HIP forward per decode tick
 poll_schedule = "fair"          # fair | decode_priority | prefill_budget
 max_consecutive_prefill_picks = 0
 # determinism_seed = 1
@@ -44,6 +45,7 @@ max_consecutive_prefill_picks = 0
 enabled = true
 providers = ["ngram", "draft_model"]  # ngram | draft_model | mtp | dspark
 max_depth = 8
+max_concurrent_requests = 3     # speculate only while <= this many Requests are active (0 = always)
 min_depth = 2
 adaptive = true
 ngram_n = 3

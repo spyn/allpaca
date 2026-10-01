@@ -739,7 +739,12 @@ pub fn f32_to_f16(v: f32) -> u16 {
         return sign | 0x7c00;
     }
     if new_exp <= 0 {
-        return sign;
+        // Subnormal f16 (below 6.1e-5): K-quant super-block scales of small
+        // weights land here, and flushing them zeroed whole blocks.
+        if new_exp < -10 {
+            return sign;
+        }
+        return sign | ((mant | 0x80_0000) >> (14 - new_exp)) as u16;
     }
     sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
 }
@@ -2020,6 +2025,17 @@ pub fn dequant_q8_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_to_f16_keeps_subnormals() {
+        // Q6_K `d` for weights of ~0.24 is ~5.9e-5: an f16 subnormal, not 0.
+        for v in [5.9e-5f32, 1.0e-6, -3.0e-7, 6.0e-8] {
+            let back = f16_to_f32(f32_to_f16(v));
+            assert!((back - v).abs() <= 6.0e-8, "{v} -> {back}");
+        }
+        assert_eq!(f16_to_f32(f32_to_f16(1.0e-9)), 0.0);
+        assert_eq!(f16_to_f32(f32_to_f16(0.5)), 0.5);
+    }
 
     #[test]
     fn matmul_2x2() {

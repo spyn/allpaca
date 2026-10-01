@@ -12,6 +12,7 @@ mod session;
 mod worker;
 
 pub use protocol::{
+    f32_to_f16_rne, quantize_q8_rows, MoeFfnRequest, MoeX,
     check_rpc_bind, encode_hello_reply, fnv1a64, is_loopback_bind_host, write_reply, BufId, Cmd,
     HelloReply, HelloRequest, KernelOp, LaunchItem, LaunchList, RpcBackendKind, KERNEL_ABI_REV,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
@@ -188,6 +189,219 @@ mod tests {
         }
         drop(client);
         worker.join().unwrap();
+    }
+
+    /// Expert-parallel MoE: the worker runs each selected expert's SwiGLU on
+    /// its rows and returns the routing-weighted sum per row.
+    #[test]
+    fn loopback_moe_ffn_sums_weighted_experts() {
+        check_moe_ffn(WorkerBackend::Cpu(CpuWorker::new(64 << 20)), MOE_Q8);
+        check_moe_ffn(WorkerBackend::Cpu(CpuWorker::new(64 << 20)), MOE_KQUANT);
+    }
+
+    /// Q8_0 experts take the per-expert GEMM path on HIP.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn loopback_hip_moe_ffn_sums_weighted_experts() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        check_moe_ffn(WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker")), MOE_Q8);
+    }
+
+    /// Q5_K gate/up with Q6_K down (Qwen3-Next) take the fused MoE kernels.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn loopback_hip_fused_kquant_moe_ffn_matches_reference() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        check_moe_ffn(WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker")), MOE_KQUANT_FUSED);
+    }
+
+    /// Rows that share experts run as expert groups (each expert's weights
+    /// read once for all its rows); the result must equal each row on its own.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn loopback_hip_grouped_experts_match_single_rows() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let (n_exp, dim, ff) = (3usize, 256usize, 256usize);
+        let mat = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2).collect()
+        };
+        let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
+            let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
+            client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+        };
+        let (gate, up, down) = (put(13, 1, ff, dim), put(13, 5, ff, dim), put(14, 9, dim, ff));
+        let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: false };
+        let rows = 4usize;
+        let x: Vec<f32> = (0..rows * dim).map(|i| ((i % 61) as f32) * 0.03 - 0.9).collect();
+        let routes: [&[(u32, f32)]; 4] = [
+            &[(1, 0.6), (0, 0.4)],
+            &[(1, 0.5), (2, 0.5)],
+            &[(0, 0.7), (1, 0.3)],
+            &[(1, 1.0)],
+        ];
+        let pairs: Vec<(u32, u32, f32)> = routes
+            .iter()
+            .enumerate()
+            .flat_map(|(r, rt)| rt.iter().map(move |&(e, w)| (r as u32, e, w)))
+            .collect();
+        for q8 in [false, true] {
+            let all = client.moe_ffn(req, &x, q8, &pairs).unwrap();
+            for (r, rt) in routes.iter().enumerate() {
+                let one: Vec<(u32, u32, f32)> = rt.iter().map(|&(e, w)| (0, e, w)).collect();
+                let single = client.moe_ffn(req, &x[r * dim..(r + 1) * dim], q8, &one).unwrap();
+                assert!(
+                    single.iter().zip(&all[r * dim..(r + 1) * dim]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "row {r} (q8 {q8}) differs between grouped and single-row runs"
+                );
+            }
+        }
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    /// Expert tensor types, sizes, and the allowed error relative to the
+    /// largest output (the fused kernels quantize activations to int8).
+    struct MoeCase {
+        gate_up: u32,
+        down: u32,
+        dim: usize,
+        ff: usize,
+        tol: f32,
+        /// Also send int8 rows and require the identical result (fused path).
+        q8_exact: bool,
+    }
+    const MOE_Q8: MoeCase =
+        MoeCase { gate_up: 8, down: 8, dim: 32, ff: 64, tol: 2e-3, q8_exact: false };
+    const MOE_KQUANT: MoeCase =
+        MoeCase { gate_up: 13, down: 14, dim: 256, ff: 256, tol: 3e-2, q8_exact: false };
+    const MOE_KQUANT_FUSED: MoeCase = MoeCase { q8_exact: true, ..MOE_KQUANT };
+
+    fn quantize(ty: u32, m: &[f32]) -> Vec<u8> {
+        match ty {
+            8 => allpaca_cpu::quantize_q8_0(m),
+            13 => allpaca_cpu::quantize_q5_k(m),
+            14 => allpaca_cpu::quantize_q6_k(m),
+            _ => unreachable!("test type {ty}"),
+        }
+    }
+
+    /// The weights the worker actually holds after quantization.
+    fn dequantize(ty: u32, m: &[f32]) -> Vec<f32> {
+        let q = quantize(ty, m);
+        let mut w = vec![0.0f32; m.len()];
+        match ty {
+            8 => allpaca_cpu::dequant_q8_0(&q, w.len(), &mut w).unwrap(),
+            13 => allpaca_cpu::dequant_q5_k(&q, w.len(), &mut w).unwrap(),
+            14 => allpaca_cpu::dequant_q6_k(&q, w.len(), &mut w).unwrap(),
+            _ => unreachable!(),
+        }
+        w
+    }
+
+    fn check_moe_ffn(backend: WorkerBackend, case: MoeCase) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, backend).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let (n_exp, dim, ff, rows) = (3usize, case.dim, case.ff, 3usize);
+        let mat = |seed: usize, rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols).map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2).collect()
+        };
+        // Stacked like GGUF `ffn_*_exps`: expert e's matrix follows expert e-1's.
+        let stack = |seed: usize, rows: usize, cols: usize| -> Vec<Vec<f32>> {
+            (0..n_exp).map(|e| mat(seed + e, rows, cols)).collect()
+        };
+        let (gates, ups, downs) = (stack(1, ff, dim), stack(5, ff, dim), stack(9, dim, ff));
+        let put = |c: &mut RpcSession, ty: u32, m: &[Vec<f32>], rows: usize, cols: usize| {
+            let bytes: Vec<u8> = m.iter().flat_map(|w| quantize(ty, w)).collect();
+            c.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+        };
+        let gb = put(&mut client, case.gate_up, &gates, ff, dim);
+        let ub = put(&mut client, case.gate_up, &ups, ff, dim);
+        let db = put(&mut client, case.down, &downs, dim, ff);
+        let x: Vec<f32> = (0..rows * dim).map(|i| ((i % 61) as f32) * 0.03 - 0.9).collect();
+        // Unsorted, and row 2 routes to no expert.
+        let pairs = [(1u32, 1u32, 1.0f32), (0, 0, 0.7), (0, 2, 0.3)];
+        let req = MoeFfnRequest {
+            gate: gb,
+            up: ub,
+            down: db,
+            n_experts: n_exp as u32,
+            dim: dim as u32,
+            ff: ff as u32,
+            f16_out: false,
+        };
+        let got = client.moe_ffn(req, &x, false, &pairs).unwrap();
+        // F16 replies: the same values, rounded to nearest-even F16.
+        let half = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &x, false, &pairs).unwrap();
+        for (h, g) in half.iter().zip(&got) {
+            assert_eq!(*h, allpaca_cpu::f16_to_f32(f32_to_f16_rne(*g)), "f16 reply of {g}");
+        }
+        if case.q8_exact {
+            // Pre-quantized rows are what the fused kernels compute anyway.
+            let q8 = client.moe_ffn(req, &x, true, &pairs).unwrap();
+            assert!(
+                q8.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "q8 rows must match f32 rows bit for bit"
+            );
+        }
+        let mut want = vec![0.0f32; rows * dim];
+        for &(row, e, wgt) in &pairs {
+            let (r, e) = (row as usize, e as usize);
+            let xr = &x[r * dim..(r + 1) * dim];
+            let (mut g, mut u, mut o) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
+            allpaca_cpu::matmul_nt(xr, &dequantize(case.gate_up, &gates[e]), &mut g, 1, ff, dim)
+                .unwrap();
+            allpaca_cpu::matmul_nt(xr, &dequantize(case.gate_up, &ups[e]), &mut u, 1, ff, dim)
+                .unwrap();
+            let h: Vec<f32> = g.iter().zip(&u).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+            allpaca_cpu::matmul_nt(&h, &dequantize(case.down, &downs[e]), &mut o, 1, dim, ff)
+                .unwrap();
+            for i in 0..dim {
+                want[r * dim + i] += wgt * o[i];
+            }
+        }
+        assert_eq!(got.len(), want.len());
+        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let tol = if case.tol < 1e-2 { case.tol } else { case.tol * scale };
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() < tol, "out[{i}] {g} vs {w} (tol {tol})");
+        }
+        assert!(got[2 * dim..].iter().all(|v| *v == 0.0), "unrouted row must be zero");
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn f16_rne_rounds_to_nearest_even() {
+        for v in [0.0f32, -0.0, 1.0, -2.5, 65504.0, 1.0e-5, -6.0e-8, 0.333_333, 1234.567] {
+            let h = f32_to_f16_rne(v);
+            let back = allpaca_cpu::f16_to_f32(h);
+            // Spacing: 2^-10 relative for normals, a fixed 2^-24 below 2^-14.
+            let ulp = (back.abs() / 1024.0).max(1.0 / 16_777_216.0);
+            assert!((back - v).abs() <= ulp * 0.5 + f32::EPSILON * v.abs(), "{v} -> {back}");
+        }
+        // Ties go to even: 1 + 2^-11 sits halfway between 1 and 1 + 2^-10.
+        assert_eq!(f32_to_f16_rne(1.0 + 1.0 / 2048.0), 0x3c00);
+        assert_eq!(f32_to_f16_rne(1.0 + 3.0 / 2048.0), 0x3c02);
+        assert_eq!(f32_to_f16_rne(70000.0), 0x7c00);
+        assert!(allpaca_cpu::f16_to_f32(f32_to_f16_rne(f32::NAN)).is_nan());
     }
 
     #[test]

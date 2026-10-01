@@ -26,6 +26,8 @@ pub fn silu(x: f32) -> f32 {
 /// Infer GDN dims from GGUF meta + projection widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GdnDims {
+    /// How V heads share K heads when `n_v_heads > n_k_heads`.
+    pub k_repeat: KHeadRepeat,
     pub n_v_heads: usize,
     pub n_k_heads: usize,
     pub head_v: usize,
@@ -55,6 +57,7 @@ impl GdnDims {
         let value_dim = inner_size;
         let qkv_dim = key_dim.saturating_mul(2).saturating_add(value_dim);
         Some(Self {
+            k_repeat: KHeadRepeat::Tile,
             n_v_heads,
             n_k_heads,
             head_v,
@@ -282,17 +285,41 @@ pub fn rmsnorm_silu_gate(
     }
 }
 
-/// Repeat K-head vectors to V-heads (`n_v % n_k == 0`).
-///
-/// Matches ggml `ggml_repeat` / `ggml_repeat_4d` along the head axis: the whole
-/// K-head block is tiled (`dst[vh] = src[vh % n_k]`), **not** each head repeated
-/// contiguously (`0,0,0,1,1,1,…`).
+/// How a Gated DeltaNet's V heads share K heads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KHeadRepeat {
+    /// Qwen3.5 (`ggml_repeat`): the K-head block tiles, `dst[vh] = src[vh % n_k]`.
+    #[default]
+    Tile,
+    /// Qwen3-Next (repeat-interleave): each K head repeats for its run of V
+    /// heads, `dst[vh] = src[vh / (n_v / n_k)]`.
+    Interleave,
+}
+
+/// Repeat K-head vectors to V-heads (`n_v % n_k == 0`) by tiling; see
+/// [`KHeadRepeat::Tile`].
 pub fn expand_k_heads(src: &[f32], dst: &mut [f32], n_k: usize, n_v: usize, head_k: usize) {
+    expand_k_heads_as(src, dst, n_k, n_v, head_k, KHeadRepeat::Tile);
+}
+
+/// Repeat K-head vectors to V-heads (`n_v % n_k == 0`) in the given layout.
+pub fn expand_k_heads_as(
+    src: &[f32],
+    dst: &mut [f32],
+    n_k: usize,
+    n_v: usize,
+    head_k: usize,
+    repeat: KHeadRepeat,
+) {
     debug_assert_eq!(src.len(), n_k.saturating_mul(head_k));
     debug_assert_eq!(dst.len(), n_v.saturating_mul(head_k));
     debug_assert_eq!(n_v % n_k, 0);
+    let per_k = (n_v / n_k.max(1)).max(1);
     for vh in 0..n_v {
-        let kh = vh % n_k;
+        let kh = match repeat {
+            KHeadRepeat::Tile => vh % n_k,
+            KHeadRepeat::Interleave => vh / per_k,
+        };
         let s = &src[kh * head_k..(kh + 1) * head_k];
         dst[vh * head_k..(vh + 1) * head_k].copy_from_slice(s);
     }
@@ -426,5 +453,14 @@ mod tests {
         expand_k_heads(&src, &mut dst, 2, 4, 2);
         // ggml_repeat tiles the whole block: [h0,h1, h0,h1], not [h0,h0, h1,h1].
         assert_eq!(dst, [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn expand_k_heads_interleaves_for_qwen3next() {
+        // Qwen3-Next repeats each K head for its V heads: [h0,h0, h1,h1].
+        let src = [1.0f32, 2.0, 3.0, 4.0];
+        let mut dst = [0.0f32; 8];
+        expand_k_heads_as(&src, &mut dst, 2, 4, 2, KHeadRepeat::Interleave);
+        assert_eq!(dst, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
     }
 }

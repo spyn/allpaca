@@ -904,6 +904,8 @@ mod tests {
             attn_out_gate: vec![],
             attn_sinks: vec![],
             attn_post_norm: vec![],
+            shared_gate_inp: Vec::new(),
+            attn_bias: Default::default(),
             ffn_post_norm: vec![],
         }
     }

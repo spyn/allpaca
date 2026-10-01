@@ -15,5 +15,6 @@ allpaca-cpu.workspace = true
 allpaca-cuda.workspace = true
 allpaca-hip.workspace = true
 allpaca-types.workspace = true
+socket2 = "0.6"
 thiserror.workspace = true
 tracing.workspace = true
