@@ -656,13 +656,14 @@ __device__ inline float q8_dot8(const float *as, uint32_t qlo, uint32_t qhi) {
 }
 
 /* Float A × Q8 weight (fallback if integer MAC is slower). */
-/* blockIdx.z == 1 computes the second matrix (b2 -> c2) of a pair sharing
- * the input `a` (a shared expert's gate and up): same per-output math, one
- * launch instead of two. */
-__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b0, float *c0, int m, int n,
-                                        int k, const uint8_t *b2, float *c2) {
+/* blockIdx.z == 1 computes the second matrix (b2 -> c2, n2 columns) of a pair
+ * sharing the input `a` (a shared expert's gate and up, a GDN layer's qkv and
+ * z): same per-output math, one launch instead of two. */
+__global__ void gemv_nt_q8_0_f32_kernel(const float *a, const uint8_t *b0, float *c0, int m, int n0,
+                                        int k, const uint8_t *b2, float *c2, int n2) {
     const uint8_t *b = blockIdx.z ? b2 : b0;
     float *c = blockIdx.z ? c2 : c0;
+    const int n = blockIdx.z ? n2 : n0;
     constexpr int WARPS = 16;
     constexpr int COLS = 8;
     constexpr int SUB = 4;
@@ -1815,7 +1816,7 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     if (intdot) {
         hipLaunchKernelGGL(gemv_nt_q8_0_intdot_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     } else {
-        hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, grid, block, 0, stream, a, b, c, m, n, k, b, c);
+        hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, grid, block, 0, stream, a, b, c, m, n, k, b, c, n);
     }
     return hip_status(hipGetLastError());
 }
@@ -5487,7 +5488,8 @@ __global__ void gdn_step_prep_kernel(const float *x, const float *kernel, float 
  * delta step reading each V head's K head directly (no expanded copies).
  * Bit-identical to conv1d_step + 2x expand_k_heads + decay_beta +
  * gated_delta_step. ALLPACA_ERR_INVALID when the warp kernel does not cover
- * head_k (the caller falls back to the unfused sequence). */
+ * head_k (the caller falls back to the unfused sequence). Folding the L2 norm
+ * into the delta step (2 launches) measured no gain and drifted ~1e-7. */
 extern "C" int allpaca_gdn_step_fused(const float *qkv, const float *conv_w, float *conv_state,
                                       float *conv_out, const float *alpha, const float *dt_bias,
                                       const float *a, float *decay, float *beta, float *state,
@@ -6057,20 +6059,22 @@ __global__ void scale_f32_kernel(float *x, float scale, int n) {
     x[idx] *= scale;
 }
 
-/* Two Q8_0 GEMVs over one input row (m == 1) in one launch: c1 = a * b1^T,
- * c2 = a * b2^T, both [n, k], each bit-identical to its own GEMV launch.
- * ALLPACA_ERR_INVALID where the single GEMV would take another kernel. */
+/* Two Q8_0 GEMVs over one input row (m == 1) in one launch: c1 = a * b1^T
+ * ([n1, k]) and c2 = a * b2^T ([n2, k]), each bit-identical to its own GEMV
+ * launch. ALLPACA_ERR_INVALID where the single GEMV would take another kernel. */
 extern "C" int allpaca_gemm_nt_q8_0_pair(const float *a, const uint8_t *b1, float *c1,
-                                         const uint8_t *b2, float *c2, int32_t m, int32_t n,
-                                         int32_t k, allpaca_stream_t stream) {
-    if (!a || !b1 || !c1 || !b2 || !c2 || m != 1 || n <= 0 || k <= 0 || ALLPACA_Q8_GEMV_INTDOT) {
+                                         const uint8_t *b2, float *c2, int32_t m, int32_t n1,
+                                         int32_t n2, int32_t k, allpaca_stream_t stream) {
+    if (!a || !b1 || !c1 || !b2 || !c2 || m != 1 || n1 <= 0 || n2 <= 0 || k <= 0 ||
+        ALLPACA_Q8_GEMV_INTDOT) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
     constexpr int cols_per_block = 16 * 8;
+    const int n = n1 > n2 ? n1 : n2;
     const unsigned gx = static_cast<unsigned>((n + cols_per_block - 1) / cols_per_block);
     hipLaunchKernelGGL(gemv_nt_q8_0_f32_kernel, dim3(gx, 1, 2), dim3(512), 0, as_stream(stream), a,
-                       b1, c1, m, n, k, b2, c2);
+                       b1, c1, m, n1, k, b2, c2, n2);
     return hip_status(hipGetLastError());
 }
 
@@ -7374,7 +7378,7 @@ extern "C" int allpaca_scale_heads_sigmoid(float *, const float *, int32_t, int3
 
 extern "C" int allpaca_gemm_nt_q8_0_pair(const float *, const uint8_t *, float *,
                                          const uint8_t *, float *, int32_t, int32_t, int32_t,
-                                         allpaca_stream_t) {
+                                         int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

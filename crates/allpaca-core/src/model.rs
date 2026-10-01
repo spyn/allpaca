@@ -5138,6 +5138,7 @@ impl TinyModel {
                 buf.up,
                 m,
                 ff_dim as i32,
+                ff_dim as i32,
                 dim as i32,
             )?;
         if paired {
@@ -7924,42 +7925,82 @@ impl TinyModel {
         }
         if let (Some(gdn), true) = (host_layer.gdn.as_ref(), layer.w_qkv.n > 0) {
             let dims = &gdn.dims;
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                layer.w_qkv,
-                buf.q,
-                1,
-                dims.qkv_dim as i32,
-                dim as i32,
-            )?;
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                layer.w_z,
-                buf.attn,
-                1,
-                dims.value_dim as i32,
-                dim as i32,
-            )?;
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                layer.w_alpha,
-                buf.gate,
-                1,
-                dims.n_v_heads as i32,
-                dim as i32,
-            )?;
-            resident.gemm_nt(
-                hip,
-                buf.normed,
-                layer.w_beta,
-                buf.up,
-                1,
-                dims.n_v_heads as i32,
-                dim as i32,
-            )?;
+            // qkv and z read the same normed row: one paired launch when both
+            // are Q8_0 (bit-identical to two GEMVs).
+            let qkv_z_paired = layer.w_qkv.kind == WeightKind::Q8_0
+                && layer.w_z.kind == WeightKind::Q8_0
+                && hip.gemm_nt_q8_pair_dev(
+                    buf.normed,
+                    resident.weights.byte_ptr_at(layer.w_qkv.off),
+                    buf.q,
+                    resident.weights.byte_ptr_at(layer.w_z.off),
+                    buf.attn,
+                    1,
+                    dims.qkv_dim as i32,
+                    dims.value_dim as i32,
+                    dim as i32,
+                )?;
+            if !qkv_z_paired {
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    layer.w_qkv,
+                    buf.q,
+                    1,
+                    dims.qkv_dim as i32,
+                    dim as i32,
+                )?;
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    layer.w_z,
+                    buf.attn,
+                    1,
+                    dims.value_dim as i32,
+                    dim as i32,
+                )?;
+            }
+            // Packed ssm_ba uploads alpha then beta as adjacent F32 rows: one
+            // [2 n_v, dim] GEMV, beta read from its second half (each output
+            // column is computed alone, so the bits match two GEMVs).
+            let n_v = dims.n_v_heads;
+            let ab_adjacent = layer.w_alpha.kind == WeightKind::F32
+                && layer.w_beta.kind == WeightKind::F32
+                && layer.w_alpha.n == n_v * dim
+                && layer.w_beta.n == n_v * dim
+                && layer.w_beta.off == layer.w_alpha.off + n_v * dim * 4;
+            let beta_ptr = if ab_adjacent {
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    WeightRef::f32(layer.w_alpha.off, 2 * n_v * dim),
+                    buf.gate,
+                    1,
+                    (2 * n_v) as i32,
+                    dim as i32,
+                )?;
+                unsafe { buf.gate.add(n_v) }
+            } else {
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    layer.w_alpha,
+                    buf.gate,
+                    1,
+                    n_v as i32,
+                    dim as i32,
+                )?;
+                resident.gemm_nt(
+                    hip,
+                    buf.normed,
+                    layer.w_beta,
+                    buf.up,
+                    1,
+                    n_v as i32,
+                    dim as i32,
+                )?;
+                buf.up
+            };
             let state = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad(
                     "Gated DeltaNet layer requires recurrent state".into(),
@@ -7983,7 +8024,7 @@ impl TinyModel {
                     buf.q,
                     buf.attn,
                     buf.gate,
-                    buf.up,
+                    beta_ptr,
                     conv_w,
                     dt,
                     a,
@@ -8014,7 +8055,7 @@ impl TinyModel {
                 hip.copy_d2h_f32(buf.q, &mut qkv)?;
                 hip.copy_d2h_f32(buf.attn, &mut z)?;
                 hip.copy_d2h_f32(buf.gate, &mut alpha)?;
-                hip.copy_d2h_f32(buf.up, &mut beta)?;
+                hip.copy_d2h_f32(beta_ptr, &mut beta)?;
                 let mut conv_out = vec![0.0f32; dims.qkv_dim];
                 hip.gdn_conv1d_step_host(
                     &qkv,

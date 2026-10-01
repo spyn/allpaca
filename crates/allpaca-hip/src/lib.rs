@@ -934,7 +934,8 @@ mod ffi {
             b2: *const u8,
             c2: *mut f32,
             m: i32,
-            n: i32,
+            n1: i32,
+            n2: i32,
             k: i32,
             stream: *mut c_void,
         ) -> i32;
@@ -8316,7 +8317,8 @@ impl HipWorkspace {
     }
 
     /// Two Q8_0 GEMVs sharing one input row in one launch (a shared
-    /// expert's gate and up). `Ok(false)` = not covered (m != 1): run them
+    /// expert's gate and up; a GDN layer's qkv and z), `b1` with `n1` rows and
+    /// `b2` with `n2`. `Ok(false)` = not covered (m != 1): run them
     /// separately. Each output is bit-identical to its own GEMV.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_nt_q8_pair_dev(
@@ -8327,14 +8329,15 @@ impl HipWorkspace {
         b2: *const u8,
         c2: *mut f32,
         m: i32,
-        n: i32,
+        n1: i32,
+        n2: i32,
         k: i32,
     ) -> Result<bool, AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
             self.bind()?;
             let rc = unsafe {
-                ffi::allpaca_gemm_nt_q8_0_pair(a, b1, c1, b2, c2, m, n, k, std::ptr::null_mut())
+                ffi::allpaca_gemm_nt_q8_0_pair(a, b1, c1, b2, c2, m, n1, n2, k, std::ptr::null_mut())
             };
             if rc == ALLPACA_ERR_INVALID {
                 return Ok(false);
@@ -8344,7 +8347,7 @@ impl HipWorkspace {
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (a, b1, c1, b2, c2, m, n, k);
+            let _ = (a, b1, c1, b2, c2, m, n1, n2, k);
             Ok(false)
         }
     }
@@ -11455,7 +11458,7 @@ mod tests {
         hip.gemm_nt_q8_dev(xd.cast(), gd, outs[0].cast(), 1, n as i32, k as i32).unwrap();
         hip.gemm_nt_q8_dev(xd.cast(), ud, outs[1].cast(), 1, n as i32, k as i32).unwrap();
         let paired = hip
-            .gemm_nt_q8_pair_dev(xd.cast(), gd, outs[2].cast(), ud, outs[3].cast(), 1, n as i32, k as i32)
+            .gemm_nt_q8_pair_dev(xd.cast(), gd, outs[2].cast(), ud, outs[3].cast(), 1, n as i32, n as i32, k as i32)
             .unwrap();
         assert!(paired, "m == 1 must take the paired launch");
         let read = |p: *mut u8| {
