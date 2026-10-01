@@ -367,6 +367,7 @@ fn load_edge0_weights(
         rpc: None,
         edge0: None,
         mla_cache: None,
+        expert_controls: Default::default(),
         dsv4: None,
     })
 }

@@ -623,6 +623,8 @@ mod ffi {
             exp_out: *mut i32,
             row_start: *mut i32,
             shexp_scale: *mut f32,
+            disabled: *const u8,
+            counts: *mut u32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_scale_rows(x: *mut f32, scale: *const f32, rows: i32, dim: i32, stream: *mut c_void) -> i32;
@@ -2769,7 +2771,10 @@ impl MoeDeviceRoutes {
 
 /// Softmax + top-k + renormalize routing for `rows` rows of router logits,
 /// on the device (see `allpaca_moe_route_softmax_topk`). With `shexp_gate`,
-/// also `sigmoid(x_r . gate)` per row into `routes.shexp_scale`.
+/// also `sigmoid(x_r . gate)` per row into `routes.shexp_scale`. Optional
+/// device `disabled` (n_exp bytes, nonzero = never picked) and `counts`
+/// (n_exp u32, +1 per pick); null for none.
+#[allow(clippy::too_many_arguments)]
 pub fn moe_route_softmax_topk_device(
     logits: *const f32,
     n_exp: usize,
@@ -2777,6 +2782,8 @@ pub fn moe_route_softmax_topk_device(
     shexp_gate: *const f32,
     dim: usize,
     routes: &MoeDeviceRoutes,
+    disabled: *const u8,
+    counts: *mut u32,
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -2794,6 +2801,8 @@ pub fn moe_route_softmax_topk_device(
                 routes.expert,
                 routes.row_start,
                 routes.shexp_scale,
+                disabled,
+                counts,
                 std::ptr::null_mut(),
             )
         };
@@ -2801,7 +2810,7 @@ pub fn moe_route_softmax_topk_device(
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
-        let _ = (logits, n_exp, x, shexp_gate, dim, routes);
+        let _ = (logits, n_exp, x, shexp_gate, dim, routes, disabled, counts);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP moe_route_softmax_topk unavailable".into(),
         )))
@@ -4884,6 +4893,27 @@ impl DeviceWeights {
             src.as_ptr(),
             src.len(),
             MEMCPY_H2D,
+        )
+    }
+
+    /// Blocking D2H of `dest.len()` bytes from `offset`.
+    pub fn copy_d2h(&self, offset: usize, dest: &mut [u8]) -> Result<(), AllpacaError> {
+        if dest.is_empty() {
+            return Ok(());
+        }
+        if offset.saturating_add(dest.len()) > self.bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(format!(
+                "weight D2H overflow: off={offset} n={} cap={}",
+                dest.len(),
+                self.bytes
+            ))));
+        }
+        set_device(self.device)?;
+        memcpy(
+            dest.as_mut_ptr(),
+            unsafe { self.ptr.add(offset) },
+            dest.len(),
+            MEMCPY_D2H,
         )
     }
 
