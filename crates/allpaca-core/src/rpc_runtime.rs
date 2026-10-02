@@ -1044,6 +1044,8 @@ impl RpcRuntime {
             || al.attn_dim % al.head_dim != 0
             || k_n % al.head_dim != 0
             || (n_rot > 0 && (n_rot > al.head_dim || n_rot % 2 != 0))
+            // The worker's attention always rotates Q/K.
+            || cfg.rope_none
         {
             tracing::warn!(layer_idx, "rpc packed layer skipped; tensor shape is not dense attn+ffn");
             return Ok(None);

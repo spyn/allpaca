@@ -7496,3 +7496,32 @@ fn bench_gdn_step_fused_vs_unfused() {
         }
     }
 }
+
+/// Nemotron-H attention has no rotary positions (its Mamba layers carry
+/// order). A `rope_none` model must decode the same on HIP as on CPU, dense
+/// and hybrid, and must not decode like the rotating model.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rope_none_matches_cpu_and_differs_from_rope() {
+    let run = |cfg: Config, model: ModelConfig| {
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(model).unwrap();
+        let out = engine
+            .generate("hello world hello hello world", greedy(12))
+            .unwrap();
+        (out.token_ids, hip_gpus(&engine).len())
+    };
+    for (name, base) in [("dense", ModelConfig::tiny()), ("hybrid", ModelConfig::tiny_hybrid())] {
+        let mut none = base.clone();
+        none.rope_none = true;
+        let (cpu, _) = run(cpu_only_synthetic(), none.clone());
+        let (hip, gpus) = run(hip_auto_synthetic(), none);
+        if gpus == 0 {
+            eprintln!("skip hip_rope_none_matches_cpu_and_differs_from_rope: no HIP device");
+            return;
+        }
+        assert_eq!(hip, cpu, "{name}: HIP must skip the rotation like CPU");
+        let (rotated, _) = run(cpu_only_synthetic(), base);
+        assert_ne!(cpu, rotated, "{name}: rope_none must change the decode");
+    }
+}

@@ -193,6 +193,10 @@ pub struct ModelConfig {
     /// (adjacent pairs), per llama.cpp's rope type for the GGUF architecture.
     /// Hugging Face checkpoints (unpermuted Q/K) are always NeoX.
     pub rope_neox: bool,
+    /// Attention applies no rotary positions (Nemotron-H: the Mamba layers
+    /// carry order; llama.cpp's graph never rotates Q/K there, whatever
+    /// `rope.dimension_count` says).
+    pub rope_none: bool,
     /// Qwen3.5 MRoPE/IMRoPE sections; zeros → classic RoPE.
     pub rope_sections: [i32; 4],
     /// Synthetic recurrent mix (semantic-anchor tracer). Not a KDA/FLA kernel.
@@ -274,6 +278,7 @@ impl ModelConfig {
             rope_dims: 0,
             rope_sections: [0; 4],
             rope_neox: false,
+            rope_none: false,
             recurrent: false,
             nextn_predict_layers: 0,
             gguf_layer_base: 0,
@@ -443,6 +448,7 @@ impl ModelConfig {
             rope_dims,
             rope_sections,
             rope_neox: gguf_rope_neox(&arch),
+            rope_none: gguf_rope_none(&arch),
             recurrent: file.tensors.iter().any(|t| t.name.contains(".ssm_")),
             nextn_predict_layers: nextn,
             gguf_layer_base: 0,
@@ -2804,6 +2810,7 @@ pub(crate) fn topk_route(
     n_active: usize,
     cfg: &ModelConfig,
     mask: Option<&[bool]>,
+    select_bias: &[f32],
 ) -> Vec<(usize, f32)> {
     let dim = x.len();
     let mut weights = vec![0.0f32; n_experts];
@@ -2815,17 +2822,22 @@ pub(crate) fn topk_route(
         }
         weights[e] = s;
     }
-    topk_from_logits(&mut weights, n_active, cfg, mask)
+    topk_from_logits(&mut weights, n_active, cfg, mask, select_bias)
 }
 
 /// `mask[e]` = expert `e` is disabled: it takes no part in the softmax and
 /// is never picked (scores are >= 0, a disabled one is set to -1). `None`
 /// computes exactly the unmasked routing.
+///
+/// `select_bias` (`blk.N.exp_probs_b`, empty = none) is DeepSeek-V3's expert
+/// selection bias for sigmoid routers: experts are picked on
+/// `sigmoid(logit) + bias`, and weighted by the unbiased sigmoid.
 pub(crate) fn topk_from_logits(
     weights: &mut [f32],
     n_active: usize,
     cfg: &ModelConfig,
     mask: Option<&[bool]>,
+    select_bias: &[f32],
 ) -> Vec<(usize, f32)> {
     let n_experts = weights.len();
     let off = |e: usize| mask.is_some_and(|m| m.get(e).copied().unwrap_or(false));
@@ -2872,10 +2884,20 @@ pub(crate) fn topk_from_logits(
             }
         }
     }
+    let biased = cfg.moe_sigmoid_gating && !cfg.moe_sqrt_softplus && !select_bias.is_empty();
+    let score = |e: usize| {
+        if !biased {
+            weights[e]
+        } else if off(e) {
+            f32::NEG_INFINITY
+        } else {
+            weights[e] + select_bias.get(e).copied().unwrap_or(0.0)
+        }
+    };
     let mut idx: Vec<usize> = (0..n_experts).collect();
     idx.sort_by(|&a, &b| {
-        weights[b]
-            .partial_cmp(&weights[a])
+        score(b)
+            .partial_cmp(&score(a))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.cmp(&b))
     });
@@ -2963,6 +2985,11 @@ fn gguf_rope_neox(arch: &str) -> bool {
             | "gemma" | "gemma2" | "gemma3" | "starcoder2" | "stablelm" | "gptneox" | "falcon"
             | "olmo2" | "nemotron"
     )
+}
+
+/// Architectures whose llama.cpp graph feeds Q/K to attention unrotated.
+fn gguf_rope_none(arch: &str) -> bool {
+    matches!(arch, "nemotron_h" | "nemotron_h_moe")
 }
 
 /// Qwen2-family Q/K/V projection biases (`blk.N.attn_{q,k,v}.bias`) onto
@@ -3443,19 +3470,15 @@ fn load_gguf_mla_host(
 }
 
 fn load_gguf_expert_bias(file: &GgufFile, layer: usize) -> Result<Vec<f32>, AllpacaError> {
-    if file
-        .tensor(&format!("blk.{layer}.ffn_exp_probs_b.bias"))
-        .is_some()
-    {
-        file.tensor_f32(&format!("blk.{layer}.ffn_exp_probs_b.bias"))
-    } else if file
-        .tensor(&format!("blk.{layer}.ffn_exp_probs_b.weight"))
-        .is_some()
-    {
-        file.tensor_f32(&format!("blk.{layer}.ffn_exp_probs_b.weight"))
-    } else {
-        Ok(Vec::new())
+    // llama.cpp writes `blk.N.exp_probs_b.bias`; the `ffn_` spellings are
+    // older converters.
+    for name in ["exp_probs_b.bias", "ffn_exp_probs_b.bias", "ffn_exp_probs_b.weight"] {
+        let name = format!("blk.{layer}.{name}");
+        if file.tensor(&name).is_some() {
+            return file.tensor_f32(&name);
+        }
     }
+    Ok(Vec::new())
 }
 
 /// Scalar meta, or max of a u32/i32 array (Nemotron stores per-layer head/ff dims).
@@ -5028,7 +5051,7 @@ impl TinyModel {
             let n_exp = cfg.n_experts.max(1);
             let n_act = cfg.n_active.max(1).min(n_exp);
             let mask = self.route_mask(layer_idx);
-            topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg, mask.as_deref().map(Vec::as_slice))
+            topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg, mask.as_deref().map(Vec::as_slice), &layer.expert_bias)
         } else {
             self.edge0_moe_route(layer_idx, layer, x_norm)
         };
@@ -5255,7 +5278,7 @@ impl TinyModel {
                     continue;
                 }
                 let mask = self.route_mask(layer_idx);
-                for (e, _) in topk_route(x, &layer.w_router, n_exp, n_act, &self.config, mask.as_deref().map(Vec::as_slice)) {
+                for (e, _) in topk_route(x, &layer.w_router, n_exp, n_act, &self.config, mask.as_deref().map(Vec::as_slice), &layer.expert_bias) {
                     union.insert(ExpertId {
                         layer: layer_idx as u32,
                         expert: e as u32,
@@ -5407,7 +5430,7 @@ impl TinyModel {
         let n_exp = cfg.n_experts.max(1);
         let n_act = cfg.n_active.max(1).min(n_exp);
         let mask = self.route_mask(layer_idx);
-        let routed = topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg, mask.as_deref().map(Vec::as_slice));
+        let routed = topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg, mask.as_deref().map(Vec::as_slice), &layer.expert_bias);
         self.expert_controls.record(layer_idx, &routed);
         if routed.is_empty() {
             return Ok(());
@@ -5534,9 +5557,9 @@ impl TinyModel {
         let routed = if self.edge0.is_some() || cfg.edge0_tier.is_some() {
             self.edge0_moe_route(layer_idx, host_layer, &x_norm)
         } else if let Some(logits) = router_logits.as_mut() {
-            topk_from_logits(logits, n_act, cfg, mask)
+            topk_from_logits(logits, n_act, cfg, mask, &host_layer.expert_bias)
         } else {
-            topk_route(&x_norm, &host_layer.w_router, n_exp, n_act, cfg, mask)
+            topk_route(&x_norm, &host_layer.w_router, n_exp, n_act, cfg, mask, &host_layer.expert_bias)
         };
         self.expert_controls.record(layer_idx, &routed);
         let ids: Vec<ExpertId> = routed
@@ -6141,7 +6164,13 @@ impl TinyModel {
         let mask = mask.as_deref().map(Vec::as_slice);
         for t in 0..n_tok {
             let routed = match logits.as_mut() {
-                Some(l) => topk_from_logits(&mut l[t * n_exp..(t + 1) * n_exp], n_act, cfg, mask),
+                Some(l) => topk_from_logits(
+                    &mut l[t * n_exp..(t + 1) * n_exp],
+                    n_act,
+                    cfg,
+                    mask,
+                    &host_layer.expert_bias,
+                ),
                 None => topk_route(
                     &x_norm[t * dim..(t + 1) * dim],
                     &host_layer.w_router,
@@ -6149,6 +6178,7 @@ impl TinyModel {
                     n_act,
                     cfg,
                     mask,
+                    &host_layer.expert_bias,
                 ),
             };
             self.expert_controls.record(layer_idx, &routed);
@@ -6935,6 +6965,10 @@ impl TinyModel {
                     if f.tensor(&shexp_gate).is_some() {
                         layer.shared_gate_inp = f.tensor_f32(&shexp_gate).unwrap_or_default();
                     }
+                    // Routing runs on host: it needs the selection bias too.
+                    if !layer.w_router.is_empty() {
+                        layer.expert_bias = load_gguf_expert_bias(f, i).unwrap_or_default();
+                    }
                 }
                 layer
             })
@@ -6994,6 +7028,7 @@ impl TinyModel {
             rope_dims: 0,
             rope_sections: [0; 4],
             rope_neox: true,
+            rope_none: false,
             recurrent: false,
             nextn_predict_layers: 0,
             gguf_layer_base: 0,
@@ -7109,6 +7144,7 @@ impl TinyModel {
             rope_dims: 0,
             rope_sections: [0; 4],
             rope_neox: true,
+            rope_none: false,
             recurrent: false,
             nextn_predict_layers: 0,
             gguf_layer_base: 0,
@@ -7501,7 +7537,8 @@ impl TinyModel {
             add_row_bias(&mut v, &layer.attn_bias[2]);
             let theta = cfg.rope_theta_for_layer(layer_idx);
             let neox = cfg.neox_rot_dims(layer_idx, head_dim).filter(|_| !cfg.uses_imrope());
-            if let Some(n_rot) = neox {
+            if cfg.rope_none {
+            } else if let Some(n_rot) = neox {
                 for h in 0..cfg.n_heads {
                     let slice = &mut q[h * head_dim..(h + 1) * head_dim];
                     rope_imrope_neox(slice, pos, theta, n_rot, [0; 4])?;
@@ -9164,7 +9201,8 @@ impl TinyModel {
                         )?;
                     }
                 }
-                if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
+                if cfg.rope_none {
+                } else if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
                     hip.rope_imrope_qk_device(
                         buf.q,
                         buf.k,
@@ -9795,7 +9833,8 @@ impl TinyModel {
                 }
                 let q_stride = if al.gated { al.attn_dim } else { al.q_out };
                 let theta = cfg.rope_theta_for_layer(layer_idx);
-                if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, al.head_dim) {
+                if cfg.rope_none {
+                } else if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, al.head_dim) {
                     for t in 0..n_tok {
                         hip.rope_imrope_qk_device(
                             buf.q_row(t, q_stride),
@@ -10253,14 +10292,14 @@ impl TinyModel {
                 add_row_bias(&mut ks[i * kv_dim..(i + 1) * kv_dim], &layer.attn_bias[1]);
                 add_row_bias(&mut vs[i * kv_dim..(i + 1) * kv_dim], &layer.attn_bias[2]);
                 let pos = prompt_len + forest.nodes[i].depth as usize - 1;
-                for h in 0..cfg.n_heads {
+                for h in 0..if cfg.rope_none { 0 } else { cfg.n_heads } {
                     rope(
                         &mut qs[i * dim + h * head_dim..i * dim + (h + 1) * head_dim],
                         pos,
                         cfg.rope_theta,
                     )?;
                 }
-                for h in 0..cfg.n_kv_heads {
+                for h in 0..if cfg.rope_none { 0 } else { cfg.n_kv_heads } {
                     rope(
                         &mut ks[i * kv_dim + h * head_dim..i * kv_dim + (h + 1) * head_dim],
                         pos,
@@ -10486,7 +10525,8 @@ impl TinyModel {
             add_row_bias(&mut q, &layer.attn_bias[0]);
             add_row_bias(&mut k, &layer.attn_bias[1]);
             add_row_bias(&mut v, &layer.attn_bias[2]);
-            if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
+            if cfg.rope_none {
+            } else if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
                 for h in q.chunks_exact_mut(head_dim).chain(k.chunks_exact_mut(head_dim)) {
                     rope_imrope_neox(h, pos, cfg.rope_theta, n_rot, [0; 4])?;
                 }
@@ -10802,7 +10842,8 @@ impl TinyModel {
                     )?;
                 }
             }
-            if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
+            if cfg.rope_none {
+            } else if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
                 hip.rope_imrope_qk_device(
                     buf.q,
                     buf.k,
@@ -11910,7 +11951,7 @@ mod lightning_moe_tests {
             w[i] = 1.0;
             w[cfg.dim + i] = 0.5;
         }
-        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg, None);
+        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg, None, &[]);
         assert_eq!(routed.len(), 2);
         assert_eq!(routed[0].0, 0);
         assert_eq!(routed[1].0, 1);
@@ -11932,13 +11973,35 @@ mod lightning_moe_tests {
             w[2 * cfg.dim + i] = -0.1;
             w[3 * cfg.dim + i] = -0.2;
         }
-        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg, None);
+        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg, None, &[]);
         assert_eq!(routed.len(), 2);
         assert_eq!(routed[0].0, 0);
         assert_eq!(routed[1].0, 1);
         let sum: f32 = routed.iter().map(|(_, wt)| *wt).sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
         assert!(routed[0].1 > routed[1].1);
+    }
+
+    /// Nemotron-H / DeepSeek-V3 `exp_probs_b`: experts are picked on
+    /// `sigmoid + bias` and weighted by the plain sigmoid; a disabled expert
+    /// stays out whatever its bias.
+    #[test]
+    fn sigmoid_topk_selects_on_the_biased_score() {
+        let mut cfg = ModelConfig::tiny_moe();
+        cfg.moe_sigmoid_gating = true;
+        cfg.expert_weights_norm = false;
+        cfg.expert_weights_scale = 1.0;
+        let logits = vec![2.0f32, 1.0, 0.0, -1.0];
+        let plain = topk_from_logits(&mut logits.clone(), 2, &cfg, None, &[]);
+        assert_eq!(plain.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 1]);
+        let bias = [0.0f32, 0.0, 0.0, 5.0];
+        let got = topk_from_logits(&mut logits.clone(), 2, &cfg, None, &bias);
+        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), vec![3, 0]);
+        assert!((got[0].1 - sigmoid_stable(-1.0)).abs() < 1e-6, "weight is unbiased: {got:?}");
+        assert!((got[1].1 - sigmoid_stable(2.0)).abs() < 1e-6, "{got:?}");
+        let mask = [false, false, false, true];
+        let got = topk_from_logits(&mut logits.clone(), 2, &cfg, Some(&mask), &bias);
+        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 1]);
     }
 
     /// One Qwen3.5-style Gated DeltaNet layer (dim 16, 2 V heads of 4).
@@ -11992,6 +12055,10 @@ mod lightning_moe_tests {
         assert!(!super::gguf_rope_neox("deepseek2"));
         assert!(super::gguf_rope_neox("qwen2"));
         assert!(super::gguf_rope_neox("qwen3next"));
+        assert!(super::gguf_rope_none("nemotron_h_moe"));
+        assert!(super::gguf_rope_none("nemotron_h"));
+        assert!(!super::gguf_rope_none("nemotron"));
+        assert!(!super::gguf_rope_none("llama"));
         let mut cfg = ModelConfig::tiny();
         let hd = cfg.head_dim();
         // Llama GGUFs set rope.dimension_count == head_dim: still NORM.
@@ -12051,7 +12118,7 @@ mod lightning_moe_tests {
         let sc = down(routes.shexp_scale.cast(), rows);
         for r in 0..rows {
             let mut row = logits[r * n_exp..(r + 1) * n_exp].to_vec();
-            let want = topk_from_logits(&mut row, k, &cfg, None);
+            let want = topk_from_logits(&mut row, k, &cfg, None, &[]);
             for (j, &(we, ww)) in want.iter().enumerate() {
                 let p = r * k + j;
                 assert_eq!(e[p] as usize, we, "row {r} rank {j} expert");
@@ -12084,7 +12151,7 @@ mod lightning_moe_tests {
             .collect();
         // Disable every expert row 0 would pick unmasked, plus a stripe.
         let mut mask = vec![false; n_exp];
-        for (e, _) in topk_from_logits(&mut logits[..n_exp].to_vec(), k, &cfg, None) {
+        for (e, _) in topk_from_logits(&mut logits[..n_exp].to_vec(), k, &cfg, None, &[]) {
             mask[e] = true;
         }
         for e in (0..n_exp).step_by(7) {
@@ -12123,7 +12190,7 @@ mod lightning_moe_tests {
         let mut want_counts = vec![0u32; n_exp];
         for r in 0..rows {
             let mut row = logits[r * n_exp..(r + 1) * n_exp].to_vec();
-            let want = topk_from_logits(&mut row, k, &cfg, Some(&mask));
+            let want = topk_from_logits(&mut row, k, &cfg, Some(&mask), &[]);
             assert_eq!(want.len(), k);
             for (j, &(we, ww)) in want.iter().enumerate() {
                 assert!(!mask[we], "host picked disabled expert {we}");
@@ -12147,12 +12214,12 @@ mod lightning_moe_tests {
     fn host_routing_skips_disabled_experts() {
         let cfg = ModelConfig::tiny();
         let logits = vec![3.0f32, 2.5, 2.0, -1.0, 0.5, 1.0];
-        let plain = topk_from_logits(&mut logits.clone(), 2, &cfg, None);
+        let plain = topk_from_logits(&mut logits.clone(), 2, &cfg, None, &[]);
         assert_eq!(plain.iter().map(|p| p.0).collect::<Vec<_>>(), vec![0, 1]);
         let none = vec![false; 6];
-        assert_eq!(topk_from_logits(&mut logits.clone(), 2, &cfg, Some(&none)), plain);
+        assert_eq!(topk_from_logits(&mut logits.clone(), 2, &cfg, Some(&none), &[]), plain);
         let mask = vec![true, false, false, false, false, false];
-        let got = topk_from_logits(&mut logits.clone(), 2, &cfg, Some(&mask));
+        let got = topk_from_logits(&mut logits.clone(), 2, &cfg, Some(&mask), &[]);
         assert_eq!(got.iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 2]);
         let sum: f32 = got.iter().map(|p| p.1).sum();
         assert!((sum - 1.0).abs() < 1e-6);

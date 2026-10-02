@@ -3131,7 +3131,13 @@ static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, in
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    if (tiled == 1) {
+    /* ALLPACA_ROCMFP4_F32_GEMV=1 keeps decode on float activations, to tell
+     * int8-activation rounding apart from a model-level difference. */
+    static const bool f32_only = [] {
+        const char *v = std::getenv("ALLPACA_ROCMFP4_F32_GEMV");
+        return v && v[0] == '1';
+    }();
+    if (tiled == 1 && !f32_only) {
         const int rc = fast ? launch_rocmfp4_i8<17>(a, b, c, m, n, k, stream)
                             : launch_rocmfp4_i8<18>(a, b, c, m, n, k, stream);
         if (rc != ALLPACA_ERR_INVALID) {
