@@ -6583,11 +6583,14 @@ __device__ inline float moe_block_max(float v, float *scratch) {
  * logits, top-k (ties to the lower index), renormalize over the k, as the
  * host `topk_from_logits`. Writes the row-sorted pair table the fused MoE
  * kernels read, and optionally the shared-expert gate sigmoid(x . g) per
- * row, so a layer with local experts needs no host round trip. */
+ * row, so a layer with local experts needs no host round trip.
+ * `disabled` (optional, n_exp bytes): those experts take no part in the
+ * softmax and are never picked. `counts` (optional, n_exp): +1 per pick. */
 __global__ void moe_route_softmax_topk_kernel(const float *logits, int n_exp, int k,
                                               const float *x, const float *shexp_gate, int dim,
                                               float *w_out, int32_t *row_out, int32_t *exp_out,
-                                              int32_t *row_start, float *shexp_scale, int rows) {
+                                              int32_t *row_start, float *shexp_scale, int rows,
+                                              const uint8_t *disabled, uint32_t *counts) {
     extern __shared__ float route_lds[];
     float *prob = route_lds;
     float *scratch = route_lds + n_exp;
@@ -6601,18 +6604,21 @@ __global__ void moe_route_softmax_topk_kernel(const float *logits, int n_exp, in
     const float *lg = logits + static_cast<size_t>(r) * n_exp;
     float m = -INFINITY;
     for (int i = tid; i < n_exp; i += bd) {
-        m = fmaxf(m, lg[i]);
+        if (!(disabled && disabled[i])) {
+            m = fmaxf(m, lg[i]);
+        }
     }
     m = moe_block_max(m, scratch);
     float sum = 0.f;
     for (int i = tid; i < n_exp; i += bd) {
-        const float e = expf(lg[i] - m);
+        const float e = (disabled && disabled[i]) ? 0.f : expf(lg[i] - m);
         prob[i] = e;
         sum += e;
     }
     sum = fmaxf(moe_block_sum(sum, scratch), 1e-9f);
     for (int i = tid; i < n_exp; i += bd) {
-        prob[i] = prob[i] / sum;
+        // Probabilities are >= 0, so a disabled expert at -1 is never picked.
+        prob[i] = (disabled && disabled[i]) ? -1.f : prob[i] / sum;
     }
     __syncthreads();
     const int ws = warpSize;
@@ -6665,6 +6671,9 @@ __global__ void moe_route_softmax_topk_kernel(const float *logits, int n_exp, in
             w_out[p] = sel_w[j] / part;
             row_out[p] = r;
             exp_out[p] = sel_e[j];
+            if (counts) {
+                atomicAdd(&counts[sel_e[j]], 1u);
+            }
         }
         row_start[r] = r * k;
         if (r == rows - 1) {
@@ -6689,7 +6698,8 @@ extern "C" int allpaca_moe_route_softmax_topk(const float *logits, int32_t rows,
                                               int32_t k, const float *x, const float *shexp_gate,
                                               int32_t dim, float *w_out, int32_t *row_out,
                                               int32_t *exp_out, int32_t *row_start,
-                                              float *shexp_scale, allpaca_stream_t stream) {
+                                              float *shexp_scale, const uint8_t *disabled,
+                                              uint32_t *counts, allpaca_stream_t stream) {
     if (!logits || rows <= 0 || n_exp <= 0 || k <= 0 || k > 64 || k > n_exp || !w_out ||
         !row_out || !exp_out || !row_start || (shexp_gate && (!x || !shexp_scale || dim <= 0))) {
         return ALLPACA_ERR_INVALID;
@@ -6698,7 +6708,7 @@ extern "C" int allpaca_moe_route_softmax_topk(const float *logits, int32_t rows,
     const size_t lds = (static_cast<size_t>(n_exp) + 64) * sizeof(float);
     hipLaunchKernelGGL(moe_route_softmax_topk_kernel, dim3(static_cast<unsigned>(rows)), dim3(256),
                        lds, as_stream(stream), logits, n_exp, k, x, shexp_gate, dim, w_out, row_out,
-                       exp_out, row_start, shexp_scale, rows);
+                       exp_out, row_start, shexp_scale, rows, disabled, counts);
     return hip_status(hipGetLastError());
 }
 
@@ -7318,7 +7328,7 @@ extern "C" int allpaca_attention_masked(const float *, const float *, const floa
 extern "C" int allpaca_moe_route_softmax_topk(const float *, int32_t, int32_t, int32_t,
                                               const float *, const float *, int32_t, float *,
                                               int32_t *, int32_t *, int32_t *, float *,
-                                              allpaca_stream_t) {
+                                              const uint8_t *, uint32_t *, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

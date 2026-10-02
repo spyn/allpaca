@@ -643,6 +643,51 @@ impl Engine {
         &self.metrics
     }
 
+    /// The loaded target's expert controls, sized to its routed experts.
+    /// `None` when no model is loaded.
+    pub fn expert_controls(&self) -> Option<Arc<crate::expert_controls::ExpertControls>> {
+        let inner = self.lock().ok()?;
+        let target = inner.target.as_ref()?;
+        let cfg = &target.config;
+        let routed = target.layers.iter().any(|l| !l.w_router.is_empty()) || cfg.n_experts > 1;
+        let shape = crate::expert_controls::ExpertShape {
+            n_layers: if routed { target.layers.len() } else { 0 },
+            n_experts: if routed { cfg.n_experts } else { 0 },
+            n_active: cfg.n_active.max(1).min(cfg.n_experts.max(1)),
+        };
+        let ctl = Arc::clone(&target.expert_controls);
+        if ctl.shape() != shape {
+            ctl.configure(shape);
+        }
+        Some(ctl)
+    }
+
+    /// Routing hits per (layer, expert), layer-major: host-routed layers plus
+    /// every local GPU's device counts. Zeros unless recording is on.
+    pub fn expert_usage(&self) -> Result<Vec<u64>, AllpacaError> {
+        let Some(ctl) = self.expert_controls() else {
+            return Ok(Vec::new());
+        };
+        let mut total = ctl.host_usage();
+        let (resident, peer) = {
+            let inner = self.lock()?;
+            let peer = inner
+                .target
+                .as_ref()
+                .and_then(|t| t.rpc.as_ref())
+                .and_then(|r| r.local_peer())
+                .map(|(_, _, res)| res);
+            (inner.target_resident.clone(), peer)
+        };
+        for res in resident.into_iter().chain(peer) {
+            let dev = res.device_expert_usage(&ctl)?;
+            for (t, d) in total.iter_mut().zip(dev) {
+                *t += d;
+            }
+        }
+        Ok(total)
+    }
+
     /// Register a vision encoder for multimodal Requests. Text-only generate is unchanged.
     /// When the encoder's placement matches a HIP workspace, uploads weights once and
     /// records [`Metrics::vision_weight_bytes_on_device`].
@@ -755,6 +800,37 @@ impl Engine {
     /// Configured KV VRAM budget after boot-time GPU capacity scaling.
     pub fn kv_vram_budget_bytes(&self) -> usize {
         self.config.kv.vram_bytes
+    }
+
+    /// KV cost per context token of the loaded target, for sizing
+    /// `kv.vram_bytes` from a context length. `None` when no model is loaded.
+    pub fn kv_estimate(&self) -> Option<KvEstimate> {
+        let inner = self.lock().ok()?;
+        let target = inner.target.as_ref()?;
+        let cfg = &target.config;
+        // KV pages are f32 K and V per attention layer.
+        let per_layer = (cfg.n_kv_heads.max(1) * cfg.head_dim().max(1) * 2 * 4) as u64;
+        let mut est = KvEstimate {
+            budget_bytes: self.config.kv.vram_bytes as u64,
+            page_tokens: self.config.kv.page_tokens,
+            ..KvEstimate::default()
+        };
+        for (l, layer) in target.layers.iter().enumerate() {
+            let attends = layer.gdn.is_none()
+                && layer.ssm.is_none()
+                && layer.block == allpaca_gguf::HybridLayerKind::Attention;
+            if !attends {
+                continue;
+            }
+            est.attention_layers += 1;
+            if cfg.sliding_window > 0 && cfg.swa_pattern.get(l).copied().unwrap_or(false) {
+                est.swa_window = cfg.sliding_window as u64;
+                est.swa_bytes_per_token += per_layer;
+            } else {
+                est.full_bytes_per_token += per_layer;
+            }
+        }
+        Some(est)
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -6443,6 +6519,43 @@ fn handle_prompt_len(
         return Ok(active.prompt_len);
     }
     Ok(0)
+}
+
+/// What a context length costs in KV for the loaded model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct KvEstimate {
+    /// Bytes per token over the full-attention layers.
+    pub full_bytes_per_token: u64,
+    /// Bytes per token over sliding-window layers, which stop growing at
+    /// `swa_window` tokens.
+    pub swa_bytes_per_token: u64,
+    pub swa_window: u64,
+    pub attention_layers: usize,
+    /// The engine's current `kv.vram_bytes`.
+    pub budget_bytes: u64,
+    pub page_tokens: u32,
+}
+
+impl KvEstimate {
+    /// KV bytes for `tokens` of context.
+    pub fn bytes_for(&self, tokens: u64) -> u64 {
+        let swa = if self.swa_window > 0 { tokens.min(self.swa_window) } else { tokens };
+        tokens * self.full_bytes_per_token + swa * self.swa_bytes_per_token
+    }
+
+    /// Context tokens that fit in `bytes`.
+    pub fn tokens_for(&self, bytes: u64) -> u64 {
+        let (mut lo, mut hi) = (0u64, 1u64 << 24);
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if self.bytes_for(mid) <= bytes {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
 }
 
 #[cfg(test)]

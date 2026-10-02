@@ -939,6 +939,8 @@ pub struct ResidentModel {
     /// expert sums. Rewritten only after the next layer's readback has
     /// synchronized the stream, so kernels never see it change underneath.
     moe_stage: Mutex<allpaca_hip::PinnedBuf>,
+    /// This GPU's copies of the expert controls the router kernel reads.
+    route_ctl: Mutex<DeviceRouteCtl>,
     embed: WeightRef,
     /// Set when `token_embd` stays packed on the host (see [`HostEmbed`]).
     host_embed: Option<HostEmbed>,
@@ -946,6 +948,19 @@ pub struct ResidentModel {
     norm: WeightRef,
     lm_head: WeightRef,
     mtp_nextn: Option<MtpNextnOff>,
+}
+
+/// Device side of [`crate::expert_controls::ExpertControls`] on one GPU:
+/// per-layer disabled masks (n_exp bytes, re-uploaded when the controls'
+/// generation moves) and routing-hit counts (`n_layers * n_exp` u32,
+/// allocated on first use, zeroed when the usage epoch moves).
+#[derive(Default)]
+struct DeviceRouteCtl {
+    mask_gen: Option<u64>,
+    masks: Vec<Option<DeviceWeights>>,
+    counts: Option<DeviceWeights>,
+    counts_epoch: u64,
+    shape: crate::expert_controls::ExpertShape,
 }
 
 /// A layer's stacked routed experts as the fused MoE kernels read them:
@@ -985,6 +1000,91 @@ fn stacked_moe_experts(
 }
 
 impl ResidentModel {
+    /// Router-kernel pointers for `layer`: its disabled mask (null when none)
+    /// and its slice of the hit counts (null unless recording).
+    fn route_ctl_ptrs(
+        &self,
+        ctl: &crate::expert_controls::ExpertControls,
+        layer: usize,
+    ) -> Result<(*const u8, *mut u32), AllpacaError> {
+        let shape = ctl.shape();
+        if shape.n_experts == 0 {
+            return Ok((std::ptr::null(), std::ptr::null_mut()));
+        }
+        let mut g = self
+            .route_ctl
+            .lock()
+            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidConfig("route ctl lock".into())))?;
+        if g.shape != shape {
+            *g = DeviceRouteCtl {
+                shape,
+                ..DeviceRouteCtl::default()
+            };
+        }
+        let gen = ctl.generation();
+        if g.mask_gen != Some(gen) {
+            let mut masks = Vec::with_capacity(shape.n_layers);
+            for l in 0..shape.n_layers {
+                masks.push(match ctl.layer_mask(l) {
+                    Some(mask) => {
+                        let bytes: Vec<u8> = mask.iter().map(|&d| u8::from(d)).collect();
+                        let dw = DeviceWeights::alloc(self.weights.device(), bytes.len().max(256))?;
+                        dw.copy_h2d(0, &bytes)?;
+                        Some(dw)
+                    }
+                    None => None,
+                });
+            }
+            g.masks = masks;
+            g.mask_gen = Some(gen);
+        }
+        let disabled = g
+            .masks
+            .get(layer)
+            .and_then(Option::as_ref)
+            .map_or(std::ptr::null(), |m| m.ptr_at(0) as *const u8);
+        let counts = if ctl.recording() {
+            let epoch = ctl.usage_epoch();
+            let bytes = shape.n_layers * shape.n_experts * 4;
+            if g.counts.is_none() {
+                g.counts = Some(DeviceWeights::alloc(self.weights.device(), bytes.max(256))?);
+                g.counts_epoch = epoch.wrapping_sub(1);
+            }
+            if g.counts_epoch != epoch {
+                g.counts.as_ref().expect("counts").copy_h2d(0, &vec![0u8; bytes])?;
+                g.counts_epoch = epoch;
+            }
+            let base = g.counts.as_ref().expect("counts").ptr_at(0) as *mut u32;
+            unsafe { base.add(layer * shape.n_experts) }
+        } else {
+            std::ptr::null_mut()
+        };
+        Ok((disabled, counts))
+    }
+
+    /// This GPU's routing-hit counts (`n_layers * n_experts`), zeros when it
+    /// has not counted since the last reset.
+    pub(crate) fn device_expert_usage(
+        &self,
+        ctl: &crate::expert_controls::ExpertControls,
+    ) -> Result<Vec<u64>, AllpacaError> {
+        let shape = ctl.shape();
+        let n = shape.n_layers * shape.n_experts;
+        let g = self
+            .route_ctl
+            .lock()
+            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidConfig("route ctl lock".into())))?;
+        let Some(counts) = g.counts.as_ref().filter(|_| g.counts_epoch == ctl.usage_epoch() && g.shape == shape) else {
+            return Ok(vec![0; n]);
+        };
+        let mut raw = vec![0u8; n * 4];
+        counts.copy_d2h(0, &mut raw)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| u64::from(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect())
+    }
+
     pub fn upload(model: &TinyModel, device: i32) -> Result<Self, AllpacaError> {
         let mut slices: Vec<&[f32]> = Vec::new();
         let mut off = 0usize;
@@ -1176,6 +1276,7 @@ impl ResidentModel {
             h2d_pending: Mutex::new(Vec::new()),
             moe_scratch: Mutex::new(None),
             moe_stage: Mutex::new(allpaca_hip::PinnedBuf::default()),
+            route_ctl: Mutex::new(DeviceRouteCtl::default()),
             embed,
             host_embed: None,
             layers,
@@ -2049,6 +2150,7 @@ impl ResidentModel {
             h2d_pending: Mutex::new(Vec::new()),
             moe_scratch: Mutex::new(None),
             moe_stage: Mutex::new(allpaca_hip::PinnedBuf::default()),
+            route_ctl: Mutex::new(DeviceRouteCtl::default()),
             weights,
             embed,
             host_embed,
@@ -2584,11 +2686,17 @@ fn sqrt_softplus_moe(x: f32) -> f32 {
     sp.max(0.0).sqrt()
 }
 
-fn moe_route(x: &[f32], layer: &LayerWeights, cfg: &ModelConfig) -> Vec<(usize, f32)> {
+fn moe_route(
+    x: &[f32],
+    layer: &LayerWeights,
+    cfg: &ModelConfig,
+    mask: Option<&[bool]>,
+) -> Vec<(usize, f32)> {
     let n_exp = cfg.n_experts.max(1);
     let n_act = cfg.n_active.max(1).min(n_exp);
     moe_route_logits(
         x,
+        mask,
         &layer.w_router,
         n_exp,
         n_act,
@@ -2615,6 +2723,7 @@ fn moe_route(x: &[f32], layer: &LayerWeights, cfg: &ModelConfig) -> Vec<(usize, 
 
 fn moe_route_logits(
     x: &[f32],
+    mask: Option<&[bool]>,
     w_router: &[f32],
     n_experts: usize,
     n_active: usize,
@@ -2637,6 +2746,24 @@ fn moe_route_logits(
             logits[e] = s;
         }
     }
+    // Disabled experts: -inf logit (softmax, plain sigmoid top-k) and -inf
+    // selection bias (group routing selects on sigmoid + bias).
+    let masked_bias: Option<Vec<f32>> = mask.map(|mask| {
+        for (l, off) in logits.iter_mut().zip(mask) {
+            if *off {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+        (0..n_experts)
+            .map(|e| {
+                if mask.get(e).copied().unwrap_or(false) {
+                    f32::NEG_INFINITY
+                } else {
+                    expert_bias.and_then(|b| b.get(e)).copied().unwrap_or(0.0)
+                }
+            })
+            .collect()
+    });
     crate::edge0::route_logits(
         kind,
         &logits,
@@ -2645,7 +2772,7 @@ fn moe_route_logits(
         n_group,
         topk_group,
         routed_scaling,
-        expert_bias,
+        masked_bias.as_deref().or(expert_bias),
     )
 }
 
@@ -2655,6 +2782,7 @@ pub(crate) fn topk_route(
     n_experts: usize,
     n_active: usize,
     cfg: &ModelConfig,
+    mask: Option<&[bool]>,
 ) -> Vec<(usize, f32)> {
     let dim = x.len();
     let mut weights = vec![0.0f32; n_experts];
@@ -2666,15 +2794,20 @@ pub(crate) fn topk_route(
         }
         weights[e] = s;
     }
-    topk_from_logits(&mut weights, n_active, cfg)
+    topk_from_logits(&mut weights, n_active, cfg, mask)
 }
 
+/// `mask[e]` = expert `e` is disabled: it takes no part in the softmax and
+/// is never picked (scores are >= 0, a disabled one is set to -1). `None`
+/// computes exactly the unmasked routing.
 pub(crate) fn topk_from_logits(
     weights: &mut [f32],
     n_active: usize,
     cfg: &ModelConfig,
+    mask: Option<&[bool]>,
 ) -> Vec<(usize, f32)> {
     let n_experts = weights.len();
+    let off = |e: usize| mask.is_some_and(|m| m.get(e).copied().unwrap_or(false));
     if cfg.moe_sqrt_softplus {
         for w in weights.iter_mut() {
             *w = sqrt_softplus_moe(*w);
@@ -2682,6 +2815,22 @@ pub(crate) fn topk_from_logits(
     } else if cfg.moe_sigmoid_gating {
         for w in weights.iter_mut() {
             *w = sigmoid_stable(*w);
+        }
+    } else if mask.is_some() {
+        let mut max = f32::NEG_INFINITY;
+        for (e, w) in weights.iter().enumerate() {
+            if !off(e) {
+                max = max.max(*w);
+            }
+        }
+        let mut sum = 0.0f32;
+        for (e, w) in weights.iter_mut().enumerate() {
+            *w = if off(e) { 0.0 } else { (*w - max).exp() };
+            sum += *w;
+        }
+        let sum = sum.max(1e-9);
+        for w in weights.iter_mut() {
+            *w /= sum;
         }
     } else {
         let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -2693,6 +2842,13 @@ pub(crate) fn topk_from_logits(
         let sum = sum.max(1e-9);
         for w in weights.iter_mut() {
             *w /= sum;
+        }
+    }
+    if mask.is_some() {
+        for (e, w) in weights.iter_mut().enumerate() {
+            if off(e) {
+                *w = -1.0;
+            }
         }
     }
     let mut idx: Vec<usize> = (0..n_experts).collect();
@@ -4122,6 +4278,8 @@ pub struct TinyModel {
     pub edge0: Option<Edge0Runtime>,
     /// DeepSeek2 / Ling MLA compressed KV cache: per-layer (ckv_seq, krope_seq).
     pub mla_cache: Option<Arc<std::sync::Mutex<Vec<(Vec<f32>, Vec<f32>)>>>>,
+    /// Operator-disabled routed experts and routing-hit counts.
+    pub expert_controls: Arc<crate::expert_controls::ExpertControls>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4293,6 +4451,7 @@ impl TinyModel {
             rpc: None,
             edge0: None,
             mla_cache: None,
+            expert_controls: Default::default(),
         }
     }
 
@@ -4831,10 +4990,12 @@ impl TinyModel {
         {
             let n_exp = cfg.n_experts.max(1);
             let n_act = cfg.n_active.max(1).min(n_exp);
-            topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg)
+            let mask = self.route_mask(layer_idx);
+            topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg, mask.as_deref().map(Vec::as_slice))
         } else {
             self.edge0_moe_route(layer_idx, layer, x_norm)
         };
+        self.expert_controls.record(layer_idx, &routed);
         let ids: Vec<ExpertId> = routed
             .iter()
             .map(|&(e, _)| ExpertId {
@@ -4903,11 +5064,13 @@ impl TinyModel {
         layer: &LayerWeights,
         x_norm: &[f32],
     ) -> Vec<(usize, f32)> {
+        let mask = self.route_mask(layer_idx);
+        let mask = mask.as_deref().map(Vec::as_slice);
         let Some(e0) = &self.edge0 else {
-            return moe_route(x_norm, layer, &self.config);
+            return moe_route(x_norm, layer, &self.config, mask);
         };
         let Some(stager) = &e0.stager else {
-            return moe_route(x_norm, layer, &self.config);
+            return moe_route(x_norm, layer, &self.config, mask);
         };
         let mut g = stager.lock().unwrap_or_else(|e| e.into_inner());
         let staged = g.take_prediction(layer_idx);
@@ -4925,11 +5088,18 @@ impl TinyModel {
                     }
                 }
             }
-            if patch {
+            // A staged route that picks a disabled expert is not used.
+            let picks_disabled = mask.is_some_and(|m| pred.iter().any(|&(e, _)| m.get(e).copied().unwrap_or(false)));
+            if patch && !picks_disabled {
                 return pred.clone();
             }
         }
-        moe_route(x_norm, layer, &self.config)
+        moe_route(x_norm, layer, &self.config, mask)
+    }
+
+    /// Layer `layer`'s disabled-expert mask, `None` when nothing is disabled.
+    pub(crate) fn route_mask(&self, layer: usize) -> Option<Arc<Vec<bool>>> {
+        self.expert_controls.layer_mask(layer)
     }
 
     fn apply_edge0_lora(&self, layer_idx: usize, proj: &str, x: &[f32], y: &mut [f32]) {
@@ -5047,7 +5217,8 @@ impl TinyModel {
                 if layer.w_router.is_empty() {
                     continue;
                 }
-                for (e, _) in topk_route(x, &layer.w_router, n_exp, n_act, &self.config) {
+                let mask = self.route_mask(layer_idx);
+                for (e, _) in topk_route(x, &layer.w_router, n_exp, n_act, &self.config, mask.as_deref().map(Vec::as_slice)) {
                     union.insert(ExpertId {
                         layer: layer_idx as u32,
                         expert: e as u32,
@@ -5198,7 +5369,9 @@ impl TinyModel {
         let dim = cfg.dim;
         let n_exp = cfg.n_experts.max(1);
         let n_act = cfg.n_active.max(1).min(n_exp);
-        let routed = topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg);
+        let mask = self.route_mask(layer_idx);
+        let routed = topk_route(x_norm, &layer.w_router, n_exp, n_act, cfg, mask.as_deref().map(Vec::as_slice));
+        self.expert_controls.record(layer_idx, &routed);
         if routed.is_empty() {
             return Ok(());
         }
@@ -5319,13 +5492,16 @@ impl TinyModel {
         }
         let n_exp = cfg.n_experts.max(1);
         let n_act = cfg.n_active.max(1).min(n_exp);
+        let mask = self.route_mask(layer_idx);
+        let mask = mask.as_deref().map(Vec::as_slice);
         let routed = if self.edge0.is_some() || cfg.edge0_tier.is_some() {
             self.edge0_moe_route(layer_idx, host_layer, &x_norm)
         } else if let Some(logits) = router_logits.as_mut() {
-            topk_from_logits(logits, n_act, cfg)
+            topk_from_logits(logits, n_act, cfg, mask)
         } else {
-            topk_route(&x_norm, &host_layer.w_router, n_exp, n_act, cfg)
+            topk_route(&x_norm, &host_layer.w_router, n_exp, n_act, cfg, mask)
         };
+        self.expert_controls.record(layer_idx, &routed);
         let ids: Vec<ExpertId> = routed
             .iter()
             .map(|&(e, _)| ExpertId {
@@ -5708,7 +5884,10 @@ impl TinyModel {
         let base = scratch.as_ref().expect("moe scratch").ptr_at(0) as *mut u8;
         let (routes, used) = allpaca_hip::MoeDeviceRoutes::at(base, n_tok, k);
         hip.bind()?;
-        allpaca_hip::moe_route_softmax_topk_device(buf.q, n_exp, buf.normed, shexp_gate, dim, &routes)?;
+        let (disabled, counts) = resident.route_ctl_ptrs(&self.expert_controls, layer_idx)?;
+        allpaca_hip::moe_route_softmax_topk_device(
+            buf.q, n_exp, buf.normed, shexp_gate, dim, &routes, disabled, counts,
+        )?;
         allpaca_hip::moe_ffn_kquant_device(
             allpaca_hip::MoeInput::F32(buf.normed),
             n_tok,
@@ -5921,17 +6100,21 @@ impl TinyModel {
         let n_act = cfg.n_active.max(1).min(n_exp);
         let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
         let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mask = self.route_mask(layer_idx);
+        let mask = mask.as_deref().map(Vec::as_slice);
         for t in 0..n_tok {
             let routed = match logits.as_mut() {
-                Some(l) => topk_from_logits(&mut l[t * n_exp..(t + 1) * n_exp], n_act, cfg),
+                Some(l) => topk_from_logits(&mut l[t * n_exp..(t + 1) * n_exp], n_act, cfg, mask),
                 None => topk_route(
                     &x_norm[t * dim..(t + 1) * dim],
                     &host_layer.w_router,
                     n_exp,
                     n_act,
                     cfg,
+                    mask,
                 ),
             };
+            self.expert_controls.record(layer_idx, &routed);
             for &(e, _) in &routed {
                 union.insert(e);
             }
@@ -6582,6 +6765,7 @@ impl TinyModel {
             rpc: None,
             edge0: None,
             mla_cache,
+            expert_controls: Default::default(),
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -6735,6 +6919,7 @@ impl TinyModel {
             rpc: None,
             edge0: None,
             mla_cache: None,
+            expert_controls: Default::default(),
         }
     }
 
@@ -6864,6 +7049,7 @@ impl TinyModel {
             rpc: None,
             edge0: None,
             mla_cache: None,
+            expert_controls: Default::default(),
         })
     }
 
@@ -6972,6 +7158,7 @@ impl TinyModel {
             rpc: None,
             edge0: None,
             mla_cache: None,
+            expert_controls: Default::default(),
         })
     }
 
@@ -11686,7 +11873,7 @@ mod lightning_moe_tests {
             w[i] = 1.0;
             w[cfg.dim + i] = 0.5;
         }
-        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg);
+        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg, None);
         assert_eq!(routed.len(), 2);
         assert_eq!(routed[0].0, 0);
         assert_eq!(routed[1].0, 1);
@@ -11708,7 +11895,7 @@ mod lightning_moe_tests {
             w[2 * cfg.dim + i] = -0.1;
             w[3 * cfg.dim + i] = -0.2;
         }
-        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg);
+        let routed = topk_route(&x, &w, cfg.n_experts, cfg.n_active, &cfg, None);
         assert_eq!(routed.len(), 2);
         assert_eq!(routed[0].0, 0);
         assert_eq!(routed[1].0, 1);
@@ -11814,7 +12001,7 @@ mod lightning_moe_tests {
         let (dl, dx, dg) = (up(&logits), up(&x), up(&gate));
         let table = allpaca_hip::device_malloc(1 << 16, 0).unwrap();
         let (routes, _) = allpaca_hip::MoeDeviceRoutes::at(table, rows, k);
-        allpaca_hip::moe_route_softmax_topk_device(dl.cast(), n_exp, dx.cast(), dg.cast(), dim, &routes)
+        allpaca_hip::moe_route_softmax_topk_device(dl.cast(), n_exp, dx.cast(), dg.cast(), dim, &routes, std::ptr::null(), std::ptr::null_mut())
             .unwrap();
         let down = |p: *mut u8, n: usize| {
             let mut v = vec![0u32; n];
@@ -11827,7 +12014,7 @@ mod lightning_moe_tests {
         let sc = down(routes.shexp_scale.cast(), rows);
         for r in 0..rows {
             let mut row = logits[r * n_exp..(r + 1) * n_exp].to_vec();
-            let want = topk_from_logits(&mut row, k, &cfg);
+            let want = topk_from_logits(&mut row, k, &cfg, None);
             for (j, &(we, ww)) in want.iter().enumerate() {
                 let p = r * k + j;
                 assert_eq!(e[p] as usize, we, "row {r} rank {j} expert");
@@ -11844,6 +12031,94 @@ mod lightning_moe_tests {
             allpaca_hip::device_free(p, n * 4);
         }
         allpaca_hip::device_free(table, 1 << 16);
+    }
+
+    /// Disabled experts: the GPU router matches the masked host top-k (never
+    /// picking a disabled expert) and counts exactly the experts it picked.
+    #[test]
+    fn gpu_moe_routing_honours_disabled_experts_and_counts_picks() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let (rows, n_exp, k, dim) = (4usize, 512usize, 10usize, 256usize);
+        let cfg = ModelConfig::tiny();
+        let logits: Vec<f32> = (0..rows * n_exp)
+            .map(|i| ((i * 7919 % 1009) as f32) * 0.013 - 6.0)
+            .collect();
+        // Disable every expert row 0 would pick unmasked, plus a stripe.
+        let mut mask = vec![false; n_exp];
+        for (e, _) in topk_from_logits(&mut logits[..n_exp].to_vec(), k, &cfg, None) {
+            mask[e] = true;
+        }
+        for e in (0..n_exp).step_by(7) {
+            mask[e] = true;
+        }
+        let up = |b: &[u8]| {
+            let p = allpaca_hip::device_malloc(b.len().max(4), 0).unwrap();
+            allpaca_hip::memcpy(p, b.as_ptr(), b.len(), allpaca_hip::MEMCPY_H2D).unwrap();
+            p
+        };
+        let lbytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let dl = up(&lbytes);
+        let dm = up(&mask.iter().map(|&d| u8::from(d)).collect::<Vec<u8>>());
+        let dc = up(&vec![0u8; n_exp * 4]);
+        let table = allpaca_hip::device_malloc(1 << 16, 0).unwrap();
+        let (routes, _) = allpaca_hip::MoeDeviceRoutes::at(table, rows, k);
+        allpaca_hip::moe_route_softmax_topk_device(
+            dl.cast(),
+            n_exp,
+            std::ptr::null(),
+            std::ptr::null(),
+            dim,
+            &routes,
+            dm.cast_const(),
+            dc.cast(),
+        )
+        .unwrap();
+        let down = |p: *mut u8, n: usize| {
+            let mut v = vec![0u32; n];
+            allpaca_hip::memcpy(v.as_mut_ptr().cast(), p, n * 4, allpaca_hip::MEMCPY_D2H).unwrap();
+            v
+        };
+        let w = down(routes.w.cast(), rows * k);
+        let e = down(routes.expert.cast(), rows * k);
+        let counts = down(dc, n_exp);
+        let mut want_counts = vec![0u32; n_exp];
+        for r in 0..rows {
+            let mut row = logits[r * n_exp..(r + 1) * n_exp].to_vec();
+            let want = topk_from_logits(&mut row, k, &cfg, Some(&mask));
+            assert_eq!(want.len(), k);
+            for (j, &(we, ww)) in want.iter().enumerate() {
+                assert!(!mask[we], "host picked disabled expert {we}");
+                let p = r * k + j;
+                assert_eq!(e[p] as usize, we, "row {r} rank {j} expert");
+                let got = f32::from_bits(w[p]);
+                assert!((got - ww).abs() <= 1e-6 * ww.abs().max(1.0), "row {r} rank {j}: {got} vs {ww}");
+                want_counts[we] += 1;
+            }
+        }
+        assert_eq!(counts, want_counts);
+        allpaca_hip::device_free(dl, lbytes.len());
+        allpaca_hip::device_free(dm, n_exp);
+        allpaca_hip::device_free(dc, n_exp * 4);
+        allpaca_hip::device_free(table, 1 << 16);
+    }
+
+    /// Host routing with a mask never picks a disabled expert, renormalizes
+    /// over the rest, and leaves unmasked routing untouched.
+    #[test]
+    fn host_routing_skips_disabled_experts() {
+        let cfg = ModelConfig::tiny();
+        let logits = vec![3.0f32, 2.5, 2.0, -1.0, 0.5, 1.0];
+        let plain = topk_from_logits(&mut logits.clone(), 2, &cfg, None);
+        assert_eq!(plain.iter().map(|p| p.0).collect::<Vec<_>>(), vec![0, 1]);
+        let none = vec![false; 6];
+        assert_eq!(topk_from_logits(&mut logits.clone(), 2, &cfg, Some(&none)), plain);
+        let mask = vec![true, false, false, false, false, false];
+        let got = topk_from_logits(&mut logits.clone(), 2, &cfg, Some(&mask));
+        assert_eq!(got.iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 2]);
+        let sum: f32 = got.iter().map(|p| p.1).sum();
+        assert!((sum - 1.0).abs() < 1e-6);
     }
 
     #[test]

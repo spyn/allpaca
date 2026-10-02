@@ -1,9 +1,12 @@
 mod api;
 mod auth;
 mod cli;
+mod engine_slot;
 mod host;
 mod image_url;
 mod logs;
+mod model_api;
+mod model_settings;
 mod otlp_push;
 mod tune;
 mod ui;
@@ -66,16 +69,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // The model's saved settings: context size before the engine is built,
+    // disabled experts once it is up.
+    let saved = model_settings::SettingsStore::open(&config).get();
+    saved.apply_to_config(&mut config);
     let engine = Engine::new(config.clone())?;
-    let engine = Arc::new(engine);
+    saved.apply_to_engine(&engine);
     let state = api::AppState::new(
-        Arc::clone(&engine),
+        Arc::new(engine),
         config.clone(),
         auth::AuthState::from_password(Some(password)),
         log_ring,
     );
     let _otlp_push = otlp_push::maybe_spawn_otlp_push(
-        engine,
+        Arc::clone(&state.engine),
         config.telemetry.otlp_endpoint.clone(),
         Duration::from_secs(15),
     );

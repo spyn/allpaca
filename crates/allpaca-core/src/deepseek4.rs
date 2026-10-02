@@ -3716,7 +3716,7 @@ fn route_experts(
             scores[e] += meta.exp_probs_b.get(e).copied().unwrap_or(0.0);
         }
     }
-    Ok(topk_from_logits(&mut scores, cfg.n_active, cfg))
+    Ok(topk_from_logits(&mut scores, cfg.n_active, cfg, None))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3807,7 +3807,7 @@ fn route_experts_rows(
     for t in 0..n_tok {
         let off = t.saturating_mul(n_exp);
         let mut row = scores[off..off + n_exp].to_vec();
-        out.push(topk_from_logits(&mut row, cfg.n_active, cfg));
+        out.push(topk_from_logits(&mut row, cfg.n_active, cfg, None));
     }
     Ok(out)
 }

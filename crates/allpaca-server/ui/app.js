@@ -283,6 +283,9 @@ function renderSpark() {
 
 function renderDashboard(data) {
   const s = data.stats || {};
+  if (data.stats) state.lastStats = data.stats;
+  renderBanner(data.engine);
+  if (state.page === "model" && model.info) renderCtx();
   const h = data.host || {};
   const devices = data.devices || [];
   sampleThroughput(s);
@@ -345,14 +348,14 @@ function renderDashboard(data) {
 /* ---------- pages ---------- */
 
 function setPage(name) {
-  if (!["dashboard", "chat", "logs"].includes(name)) name = "dashboard";
+  if (!["dashboard", "chat", "model", "logs"].includes(name)) name = "dashboard";
   state.page = name;
   document.querySelectorAll("nav .tab").forEach((b) => {
     const on = b.dataset.page === name;
     b.classList.toggle("active", on);
     b.setAttribute("aria-current", on ? "page" : "false");
   });
-  ["dashboard", "chat", "logs"].forEach((p) => $(`page-${p}`).classList.toggle("hidden", p !== name));
+  ["dashboard", "chat", "model", "logs"].forEach((p) => $(`page-${p}`).classList.toggle("hidden", p !== name));
   if (location.hash.slice(1) !== name) history.replaceState(null, "", `#${name}`);
   if (name === "logs") {
     startLogs();
@@ -362,6 +365,7 @@ function setPage(name) {
     renderMessages();
     $("prompt").focus();
   }
+  if (name === "model") loadModelSettings();
 }
 
 /* ---------- chat ---------- */
@@ -680,6 +684,411 @@ function renderLogs() {
   if ($("log-follow").checked) view.scrollTop = view.scrollHeight;
 }
 
+/* ---------- model page ---------- */
+
+const CTX_STEPS = [
+  1024, 2048, 4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288,
+  786432, 1048576,
+];
+
+const model = {
+  info: null,
+  usage: null,
+  layer: 0,
+  sel: null,
+  ctx: null,
+  usageTimer: null,
+  lastEngineState: "ready",
+};
+
+function toast(msg, err = false) {
+  const el = document.createElement("div");
+  el.className = `toast${err ? " err" : ""}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), err ? 4000 : 1800);
+}
+
+async function apiJson(path, opts = {}) {
+  const res = await api(path, {
+    ...opts,
+    headers: opts.body ? { "content-type": "application/json" } : undefined,
+  });
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    /* empty body */
+  }
+  if (!res.ok) {
+    throw new Error((body && body.error && body.error.message) || `HTTP ${res.status}`);
+  }
+  return body;
+}
+
+async function loadModelSettings() {
+  try {
+    model.info = await apiJson("/v1/model/settings");
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+    return;
+  }
+  const s = model.info.settings || {};
+  if (model.ctx === null) {
+    model.ctx = s.context_tokens || (model.info.kv && model.info.kv.context_tokens) || 32768;
+  }
+  renderModel();
+  if (model.info.experts && model.info.experts.recording) startUsagePolling();
+  if (model.info.experts) refreshUsage();
+}
+
+function kvBytes(tokens) {
+  const kv = model.info && model.info.kv;
+  if (!kv) return 0;
+  const swa = kv.swa_window ? Math.min(tokens, kv.swa_window) : tokens;
+  return tokens * kv.full_bytes_per_token + swa * kv.swa_bytes_per_token;
+}
+
+function nearestStep(tokens) {
+  let best = 0;
+  CTX_STEPS.forEach((v, i) => {
+    if (Math.abs(Math.log(v) - Math.log(tokens)) < Math.abs(Math.log(CTX_STEPS[best]) - Math.log(tokens))) best = i;
+  });
+  return best;
+}
+
+function renderModel() {
+  const info = model.info;
+  if (!info) return;
+  $("m-name").textContent = info.model || "—";
+  $("m-path").textContent = info.persisted
+    ? `Settings file: ${info.path}`
+    : "Settings are not saved to disk for this model (no model file).";
+  $("m-pending").classList.toggle("hidden", !info.reload_pending);
+  const loading = info.engine && info.engine.state === "loading";
+  $("m-reload").disabled = loading;
+  $("m-reload").className = info.reload_pending ? "primary" : "ghost";
+  $("m-reload").textContent = loading ? "Reloading…" : "Reload model";
+  renderCtx();
+  renderExperts();
+}
+
+function renderCtx() {
+  const info = model.info;
+  const kv = info && info.kv;
+  const ctx = model.ctx || 0;
+  $("ctx-slider").value = String(nearestStep(ctx));
+  if (document.activeElement !== $("ctx-input")) $("ctx-input").value = String(ctx);
+  if (!kv) {
+    $("ctx-kv").textContent = "—";
+    $("ctx-per").textContent = "—";
+    $("ctx-now").textContent = "—";
+    $("ctx-save").disabled = true;
+    return;
+  }
+  const bytesNew = kvBytes(ctx);
+  $("ctx-kv").textContent = bytes(bytesNew);
+  const per = kv.full_bytes_per_token + kv.swa_bytes_per_token;
+  $("ctx-per").textContent = `${bytes(per)} · ${kv.attention_layers} attention layer${kv.attention_layers === 1 ? "" : "s"}`;
+  $("ctx-now").textContent = `${num(kv.context_tokens)} tokens (${bytes(kv.budget_bytes)})`;
+  const saved = info.settings && info.settings.context_tokens;
+  $("ctx-save").disabled = ctx === saved || ctx < 256;
+  renderVram(bytesNew);
+}
+
+function renderVram(kvNew) {
+  const s = state.lastStats || {};
+  const sameGpu = s.draft_device === s.target_device;
+  const total = (s.gpu_vram_total_bytes || 0) + (sameGpu ? 0 : s.draft_gpu_vram_total_bytes || 0);
+  const used = (s.gpu_vram_used_bytes || 0) + (sameGpu ? 0 : s.draft_gpu_vram_used_bytes || 0);
+  const weights = s.weight_bytes_on_device || 0;
+  const kvLive = s.kv_bytes_on_device || 0;
+  const other = Math.max(0, used - weights - kvLive);
+  const need = weights + other + kvNew;
+  const scale = Math.max(total, need, 1);
+  const over = total > 0 && need > total;
+  const pct = (v) => `${((v / scale) * 100).toFixed(2)}%`;
+  $("vram-bar").innerHTML =
+    `<span class="seg-weights" style="width:${pct(weights)}" title="Weights ${bytes(weights)}"></span>` +
+    `<span class="seg-other" style="width:${pct(other)}" title="Other ${bytes(other)}"></span>` +
+    `<span class="seg-kv${over ? " over" : ""}" style="width:${pct(kvNew)}" title="KV ${bytes(kvNew)}"></span>`;
+  $("vram-legend").innerHTML =
+    `<span><i class="seg-weights"></i>Weights ${bytes(weights)}</span>` +
+    `<span><i class="seg-other"></i>Other in use ${bytes(other)}</span>` +
+    `<span><i class="seg-kv${over ? " over" : ""}"></i>KV at this context ${bytes(kvNew)}</span>` +
+    `<span>Local VRAM ${total ? bytes(total) : "n/a"}</span>`;
+  const note = $("vram-note");
+  if (!total) {
+    note.textContent = "No local GPU reports VRAM; the KV budget sizes host memory instead.";
+  } else if (over) {
+    note.textContent = `Estimated ${bytes(need)} exceeds local VRAM by ${bytes(need - total)}. Pick a smaller context, or the KV cache will not fit.`;
+  } else {
+    note.textContent = `Estimated ${bytes(need)} of ${bytes(total)} (${((need / total) * 100).toFixed(0)}%) with the context full. Weights on RPC workers are not counted. "Other" is what the GPUs hold beyond weights and live KV (workspaces, desktop).`;
+  }
+}
+
+async function saveContext() {
+  try {
+    model.info = await apiJson("/v1/model/settings", {
+      method: "PUT",
+      body: JSON.stringify({ context_tokens: model.ctx }),
+    });
+    renderModel();
+    toast(model.info.reload_pending ? "Saved. Reload the model to apply it." : "Saved.");
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+  }
+}
+
+async function reloadModel() {
+  const ok = window.confirm(
+    "Reload the model with the saved settings?\n\nRunning requests finish first, then the model is unloaded and loaded again. The server cannot answer chats until the load is done (minutes for large models)."
+  );
+  if (!ok) return;
+  try {
+    await apiJson("/v1/model/reload", { method: "POST" });
+    model.lastEngineState = "loading";
+    pollStatus();
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+  }
+}
+
+function renderBanner(engine) {
+  if (!engine) return;
+  const prev = model.lastEngineState;
+  model.lastEngineState = engine.state;
+  if (prev === "loading" && engine.state !== "loading") {
+    toast(engine.state === "ready" ? engine.message || "Model reloaded" : engine.message || "Reload failed", engine.state !== "ready");
+    model.ctx = null;
+    loadModelSettings();
+    loadModel();
+  }
+  const loading = engine.state === "loading";
+  $("m-reload").disabled = loading;
+  if (loading) $("m-reload").textContent = "Reloading…";
+  const b = $("reload-banner");
+  const show = engine.state !== "ready";
+  b.classList.toggle("hidden", !show);
+  if (!show) return;
+  b.classList.toggle("failed", engine.state === "failed");
+  if (engine.state === "loading") {
+    const secs = Math.max(0, Math.round((Date.now() - engine.since_ms) / 1000));
+    const t = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+    b.textContent = `Model reloading: ${engine.message || "working"} (${t}). Chat is unavailable until it finishes.`;
+  } else {
+    b.textContent = engine.message || "The model failed to load.";
+  }
+}
+
+/* Experts */
+
+function disabledMap() {
+  return { ...((model.info && model.info.settings && model.info.settings.disabled_experts) || {}) };
+}
+
+function namesMap() {
+  return { ...((model.info && model.info.settings && model.info.settings.expert_names) || {}) };
+}
+
+function layerDisabled(l) {
+  return new Set(disabledMap()[String(l)] || []);
+}
+
+function renderExperts() {
+  const ex = model.info && model.info.experts;
+  $("experts-wrap").classList.toggle("hidden", !ex);
+  if (!ex) return;
+  const dis = disabledMap();
+  const sel = $("layer-select");
+  if (sel.options.length !== ex.n_layers) {
+    sel.innerHTML = Array.from({ length: ex.n_layers }, (_, l) => `<option value="${l}">${l}</option>`).join("");
+  }
+  for (let l = 0; l < ex.n_layers; l++) {
+    const n = (dis[String(l)] || []).length;
+    const label = n ? `${l} · ${n} off` : `${l}`;
+    if (sel.options[l].textContent !== label) sel.options[l].textContent = label;
+  }
+  sel.value = String(model.layer);
+  $("rec-toggle").checked = !!ex.recording;
+  renderGrid();
+  renderPanel();
+  renderNamed();
+}
+
+function layerCounts(l) {
+  const u = model.usage;
+  const ex = model.info && model.info.experts;
+  if (!u || !ex || u.n_experts !== ex.n_experts) return null;
+  return u.counts.slice(l * u.n_experts, (l + 1) * u.n_experts);
+}
+
+function renderGrid() {
+  const ex = model.info.experts;
+  const n = ex.n_experts;
+  const grid = $("exp-grid");
+  const cols = n >= 256 ? 32 : n >= 64 ? 16 : Math.max(4, Math.min(n, 8));
+  grid.style.setProperty("--cols", cols);
+  const counts = layerCounts(model.layer);
+  const max = counts ? Math.max(0, ...counts) : 0;
+  const total = counts ? counts.reduce((a, b) => a + b, 0) : 0;
+  const off = layerDisabled(model.layer);
+  const names = namesMap();
+  const cells = [];
+  for (let e = 0; e < n; e++) {
+    const hits = counts ? counts[e] : 0;
+    const name = names[`${model.layer}:${e}`];
+    let style = "";
+    if (max > 0 && hits > 0) {
+      const a = 0.18 + 0.82 * (Math.log1p(hits) / Math.log1p(max));
+      style = ` style="background:rgba(63,185,80,${a.toFixed(3)})"`;
+    }
+    const cls = `cell${off.has(e) ? " off" : ""}${name ? " named" : ""}${model.sel === e ? " sel" : ""}`;
+    const tip = `Expert ${e}${name ? ` · ${name}` : ""}${counts ? ` · ${num(hits)} hits` : ""}${off.has(e) ? " · disabled" : ""}`;
+    cells.push(`<button type="button" class="${cls}" data-e="${e}" title="${escapeHtml(tip)}" aria-label="${escapeHtml(tip)}"${style}></button>`);
+  }
+  grid.innerHTML = cells.join("");
+  const recorded = counts ? `${num(total)} hits recorded` : "no usage recorded";
+  $("exp-summary").textContent = `${n} experts · top-${ex.n_active} · ${off.size} off here · ${ex.disabled_total} off in all · ${recorded}`;
+}
+
+function renderPanel() {
+  const panel = $("exp-panel");
+  const e = model.sel;
+  if (e === null || !model.info || !model.info.experts) {
+    panel.innerHTML =
+      `<p class="muted">Select an expert to name or disable it. Turn on <em>Record usage</em>, send a prompt, and the grid shows which experts it routed to.</p>`;
+    return;
+  }
+  const l = model.layer;
+  const counts = layerCounts(l);
+  const hits = counts ? counts[e] : null;
+  const total = counts ? counts.reduce((a, b) => a + b, 0) : 0;
+  const isOff = layerDisabled(l).has(e);
+  const name = namesMap()[`${l}:${e}`] || "";
+  panel.innerHTML =
+    `<h4>Layer ${l} · Expert ${e}</h4>` +
+    `<div class="stat muted">${hits === null ? "No usage recorded" : `${num(hits)} hits${total ? ` (${((hits / total) * 100).toFixed(1)}% of this layer)` : ""}`}</div>` +
+    `<label>Name <input id="exp-name" type="text" maxlength="80" placeholder="e.g. rust syntax" value="${escapeHtml(name)}"></label>` +
+    `<button id="exp-toggle" type="button" class="${isOff ? "primary" : "danger"}">${isOff ? "Enable expert" : "Disable expert"}</button>` +
+    (isOff ? `<p class="small-text tag-off">Disabled: the router never picks it.</p>` : "");
+  $("exp-name").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") ev.target.blur();
+  });
+  $("exp-name").addEventListener("change", (ev) => saveName(l, e, ev.target.value));
+  $("exp-toggle").addEventListener("click", () => toggleExpert(l, e));
+}
+
+function renderNamed() {
+  const names = namesMap();
+  const dis = disabledMap();
+  const keys = new Set(Object.keys(names));
+  for (const [l, ids] of Object.entries(dis)) ids.forEach((e) => keys.add(`${l}:${e}`));
+  const rows = [...keys]
+    .map((k) => k.split(":").map(Number))
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1])
+    .map(([l, e]) => {
+      const off = (dis[String(l)] || []).includes(e);
+      return (
+        `<tr><td>${l}</td><td>${e}</td><td>${escapeHtml(names[`${l}:${e}`] || "")}</td>` +
+        `<td>${off ? '<span class="tag-off">disabled</span>' : "enabled"} ` +
+        `<button type="button" class="ghost" data-jump="${l}:${e}">Show</button></td></tr>`
+      );
+    });
+  $("named-rows").innerHTML =
+    rows.join("") || `<tr><td colspan="4" class="muted">No experts named or disabled yet.</td></tr>`;
+}
+
+async function putSettings(body, okMsg) {
+  try {
+    model.info = await apiJson("/v1/model/settings", { method: "PUT", body: JSON.stringify(body) });
+    renderModel();
+    if (okMsg) toast(okMsg);
+    return true;
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+    renderModel();
+    return false;
+  }
+}
+
+function toggleExpert(l, e) {
+  const dis = disabledMap();
+  const ids = new Set(dis[String(l)] || []);
+  const ex = model.info.experts;
+  if (ids.has(e)) {
+    ids.delete(e);
+  } else {
+    if (ex.n_experts - ids.size - 1 < ex.n_active) {
+      toast(`Layer ${l} must keep at least ${ex.n_active} experts enabled`, true);
+      return;
+    }
+    ids.add(e);
+  }
+  dis[String(l)] = [...ids].sort((a, b) => a - b);
+  if (!dis[String(l)].length) delete dis[String(l)];
+  putSettings({ disabled_experts: dis }, ids.has(e) ? `Expert ${l}:${e} disabled` : `Expert ${l}:${e} enabled`);
+}
+
+function saveName(l, e, value) {
+  const names = namesMap();
+  const v = value.trim();
+  if (v) names[`${l}:${e}`] = v;
+  else delete names[`${l}:${e}`];
+  putSettings({ expert_names: names }, v ? "Name saved" : "Name cleared");
+}
+
+function enableLayer() {
+  const dis = disabledMap();
+  if (!dis[String(model.layer)]) return;
+  delete dis[String(model.layer)];
+  putSettings({ disabled_experts: dis }, `Layer ${model.layer}: all experts enabled`);
+}
+
+function setLayer(l) {
+  const ex = model.info && model.info.experts;
+  if (!ex) return;
+  model.layer = Math.max(0, Math.min(ex.n_layers - 1, l));
+  model.sel = null;
+  renderExperts();
+}
+
+async function refreshUsage() {
+  try {
+    model.usage = await apiJson("/v1/model/experts/usage");
+    if (state.page === "model" && model.info && model.info.experts) {
+      renderGrid();
+      renderPanel();
+    }
+  } catch {
+    /* status polling reports connectivity */
+  }
+}
+
+function startUsagePolling() {
+  stopUsagePolling();
+  model.usageTimer = setInterval(() => {
+    if (state.page === "model" && !document.hidden) refreshUsage();
+  }, 1500);
+}
+
+function stopUsagePolling() {
+  clearInterval(model.usageTimer);
+  model.usageTimer = null;
+}
+
+async function setRecording(on) {
+  try {
+    await apiJson("/v1/model/experts/recording", { method: "POST", body: JSON.stringify({ on }) });
+    if (model.info && model.info.experts) model.info.experts.recording = on;
+    if (on) startUsagePolling();
+    else stopUsagePolling();
+    refreshUsage();
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+  }
+}
+
 /* ---------- wiring ---------- */
 
 $("login-form").addEventListener("submit", async (ev) => {
@@ -806,6 +1215,56 @@ $("log-view").addEventListener("scroll", () => {
   const atEnd = nearBottom(view);
   // Scrolling up pauses follow; returning to the end resumes it.
   if ($("log-follow").checked !== atEnd) $("log-follow").checked = atEnd;
+});
+
+$("ctx-slider").addEventListener("input", (ev) => {
+  model.ctx = CTX_STEPS[Number(ev.target.value)] || model.ctx;
+  $("ctx-input").value = String(model.ctx);
+  renderCtx();
+});
+$("ctx-input").addEventListener("input", (ev) => {
+  const v = Math.round(Number(ev.target.value));
+  if (Number.isFinite(v) && v > 0) {
+    model.ctx = v;
+    renderCtx();
+  }
+});
+$("ctx-save").addEventListener("click", saveContext);
+$("m-reload").addEventListener("click", reloadModel);
+$("layer-select").addEventListener("change", (ev) => setLayer(Number(ev.target.value)));
+$("layer-prev").addEventListener("click", () => setLayer(model.layer - 1));
+$("layer-next").addEventListener("click", () => setLayer(model.layer + 1));
+$("rec-toggle").addEventListener("change", (ev) => setRecording(ev.target.checked));
+$("usage-reset").addEventListener("click", async () => {
+  try {
+    await apiJson("/v1/model/experts/usage/reset", { method: "POST" });
+    refreshUsage();
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+  }
+});
+$("layer-enable-all").addEventListener("click", enableLayer);
+$("exp-grid").addEventListener("click", (ev) => {
+  const cell = ev.target.closest(".cell");
+  if (!cell) return;
+  const e = Number(cell.dataset.e);
+  if (ev.shiftKey) {
+    toggleExpert(model.layer, e);
+    return;
+  }
+  model.sel = model.sel === e ? null : e;
+  renderGrid();
+  renderPanel();
+});
+$("named-rows").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-jump]");
+  if (!btn) return;
+  const [l, e] = btn.dataset.jump.split(":").map(Number);
+  setLayer(l);
+  model.sel = e;
+  renderGrid();
+  renderPanel();
+  $("exp-grid").scrollIntoView({ behavior: "smooth", block: "center" });
 });
 
 loadSettings();

@@ -784,7 +784,9 @@ fn hip_generate_reports_decode_profile_buckets() {
     if hip_gpus(&engine).is_empty() {
         return;
     }
-    let out = engine.generate("hello", greedy(4)).unwrap();
+    // Two sampled forwards (1 and 17): one tiny-kernel sample can read 0
+    // when the GPU is shared with parallel tests.
+    let out = engine.generate("hello", greedy(20)).unwrap();
     assert!(!out.token_ids.is_empty());
     let stats = engine.stats();
     assert_eq!(stats.backend, "hip");
@@ -2025,6 +2027,47 @@ fn hip_fused_qkv_attention_gguf_generates() {
     let _ = std::fs::remove_file(path);
     let generated = result.expect("fused attn_qkv GGUF must generate on HIP");
     assert!(!generated.token_ids.is_empty());
+}
+
+/// Operator expert controls on a real MoE load, CPU and HIP: recording
+/// counts routing hits, a disabled expert gets none, top-k must stay
+/// satisfiable, and clearing the mask restores the original tokens.
+#[cfg(feature = "hip")]
+#[test]
+fn expert_controls_disable_experts_and_count_usage() {
+    let path = std::env::temp_dir().join("allpaca_expert_controls_moe.gguf");
+    write_tiny_moe_gguf(&path);
+    for cpu_only in [true, false] {
+        let mut cfg = if cpu_only { cpu_only_synthetic() } else { hip_auto_synthetic() };
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        let engine = Engine::new(cfg).unwrap();
+        if !cpu_only && hip_gpus(&engine).is_empty() {
+            continue;
+        }
+        let ctl = engine.expert_controls().expect("model loaded");
+        let shape = ctl.shape();
+        assert_eq!((shape.n_layers, shape.n_experts, shape.n_active), (1, 4, 2));
+        ctl.set_recording(true);
+        let base = engine.generate("hello", greedy(6)).unwrap().token_ids;
+        let usage = engine.expert_usage().unwrap();
+        assert_eq!(usage.len(), 4);
+        assert!(usage.iter().sum::<u64>() > 0, "cpu_only={cpu_only}: no routing hits counted");
+        let hot = (0..4).max_by_key(|&e| usage[e]).unwrap();
+
+        assert!(ctl.set_disabled(&[vec![0, 1, 2]]).is_err(), "must keep top-k enabled");
+        ctl.set_disabled(&[vec![hot as u32]]).unwrap();
+        ctl.reset_usage();
+        engine.generate("hello", greedy(6)).unwrap();
+        let usage = engine.expert_usage().unwrap();
+        assert_eq!(usage[hot], 0, "cpu_only={cpu_only}: disabled expert {hot} was routed: {usage:?}");
+        assert!(usage.iter().sum::<u64>() > 0);
+
+        ctl.set_disabled(&[]).unwrap();
+        let again = engine.generate("hello", greedy(6)).unwrap().token_ids;
+        assert_eq!(again, base, "cpu_only={cpu_only}: clearing the mask must restore the output");
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 #[cfg(feature = "hip")]

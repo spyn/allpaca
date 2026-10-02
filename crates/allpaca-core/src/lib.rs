@@ -15,6 +15,7 @@ mod early_exit;
 pub mod edge0;
 mod engine;
 mod expert_batch;
+pub mod expert_controls;
 mod forest;
 mod grammar;
 mod hf;
@@ -63,7 +64,7 @@ pub use edge0::{
     detect_edge0_dir, load_edge0_dir, Edge0LoadOptions, Edge0Loaded, Edge0Tier, MoESpec,
     RecoverLora, RouterKind,
 };
-pub use engine::{mtp_text_is_garbled, Engine, RequestHandle};
+pub use engine::{mtp_text_is_garbled, Engine, KvEstimate, RequestHandle};
 pub use kv_tier::KvTierManager;
 pub use layer_split::{plan_layer_owners, LayerPlan};
 pub use memory_tier::{

@@ -178,11 +178,15 @@ int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, 
                          int32_t k, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
-/* Softmax top-k MoE routing on the GPU (pair table + shared-expert gate). */
+/* Softmax top-k MoE routing on the GPU (pair table + shared-expert gate).
+ * Optional `disabled` (n_exp bytes) excludes experts; optional `counts`
+ * (n_exp) counts picks. */
 int allpaca_moe_route_softmax_topk(const float *logits, int32_t rows, int32_t n_exp, int32_t k,
                                    const float *x, const float *shexp_gate, int32_t dim,
                                    float *w_out, int32_t *row_out, int32_t *exp_out,
-                                   int32_t *row_start, float *shexp_scale, allpaca_stream_t stream);
+                                   int32_t *row_start, float *shexp_scale,
+                                   const uint8_t *disabled, uint32_t *counts,
+                                   allpaca_stream_t stream);
 /* x[r][:] *= scale[r]. */
 int allpaca_scale_rows(float *x, const float *scale, int32_t rows, int32_t dim,
                        allpaca_stream_t stream);

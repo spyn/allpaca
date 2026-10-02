@@ -5,7 +5,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use allpaca_core::Engine;
+
+use crate::engine_slot::EngineSlot;
 
 /// Resolve the OTLP HTTP metrics URL.
 ///
@@ -50,7 +53,7 @@ pub fn push_otlp_metrics(endpoint: &str, body: &str) -> Result<(), String> {
 /// When `endpoint` is `Some`, spawn a periodic push of Engine OTLP JSON.
 /// Returns `None` when endpoint is unset (no push task).
 pub fn maybe_spawn_otlp_push(
-    engine: Arc<Engine>,
+    slot: Arc<EngineSlot>,
     endpoint: Option<String>,
     interval: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -59,7 +62,11 @@ pub fn maybe_spawn_otlp_push(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            let engine = Arc::clone(&engine);
+            // Take the engine per tick: holding it would keep a reloaded
+            // engine's VRAM alive.
+            let Some(engine) = slot.get() else {
+                continue;
+            };
             let endpoint = endpoint.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let snap = engine.stats();
@@ -146,9 +153,9 @@ mod tests {
             seed: Some(1),
             ..CliOverrides::default()
         });
-        let engine = Arc::new(Engine::new(cfg).unwrap());
+        let engine = Arc::new(Engine::new(cfg.clone()).unwrap());
         let handle = maybe_spawn_otlp_push(
-            engine,
+            EngineSlot::new(engine, cfg),
             Some(format!("http://{addr}")),
             Duration::from_millis(50),
         )
@@ -180,7 +187,7 @@ mod tests {
             seed: Some(1),
             ..CliOverrides::default()
         });
-        let engine = Arc::new(Engine::new(cfg).unwrap());
-        assert!(maybe_spawn_otlp_push(engine, None, Duration::from_millis(50)).is_none());
+        let engine = Arc::new(Engine::new(cfg.clone()).unwrap());
+        assert!(maybe_spawn_otlp_push(EngineSlot::new(engine, cfg), None, Duration::from_millis(50)).is_none());
     }
 }
