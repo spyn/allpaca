@@ -2990,12 +2990,154 @@ __global__ void gemv_nt_rocmfp4_tiled_kernel(const float *a, const uint8_t *b, f
     }
 }
 
+/* Four 4-bit ROCmFP4 codes, one per byte, to their signed half-scale levels
+ * (0,1,2,3,4,6,8,10, negated when bit 3 is set) as four int8 bytes. */
+__device__ inline uint32_t rocmfp4_levels_i8x4(uint32_t code) {
+    const uint32_t mag3 = code & 0x07070707u;
+    // 0xFF in each byte whose magnitude index is 5..7 (levels 6, 8, 10).
+    const uint32_t big = (((mag3 + 0x03030303u) >> 3) & 0x01010101u) * 0xFFu;
+    const uint32_t mag = mag3 + ((((mag3 | 0x80808080u) - 0x04040404u) & 0x07070707u) & big);
+    // Negate where the sign bit is set and the level is not zero (so the
+    // per-byte +1 never carries into its neighbour).
+    const uint32_t nonzero = (((mag + 0x7F7F7F7Fu) >> 7) & 0x01010101u) * 0xFFu;
+    const uint32_t neg = (((code >> 3) & 0x01010101u) * 0xFFu) & nonzero;
+    return (mag ^ neg) + (neg & 0x01010101u);
+}
+
+/* ROCmFP4 GEMV on int8 activations (the K-quant int8 scheme, llama.cpp
+ * mmvq): A is quantized once per GEMV to int8 with one f32 scale per 32
+ * values, and each lane takes whole 32-weight blocks: two signed dot4 chains
+ * (low nibbles = weights 0..15, high = 16..31) per row and one scale product.
+ * MR rows share one pass over the weights, so 2..8 verify rows cost little
+ * more than one. Every m uses this path, so a verify or batched row
+ * reproduces the decode (m == 1) row bit for bit. BB = 18 dual-scale (type
+ * 100), BB = 17 FAST single-scale (type 101). */
+template <int BB, int MR>
+__global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, const uint8_t *b,
+                                          float *c, int m, int n, int k) {
+#pragma clang fp contract(off)
+    constexpr int LPC = 8;
+    const int sl = static_cast<int>(threadIdx.x) % LPC;
+    const int col = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / LPC) +
+                    static_cast<int>(threadIdx.x) / LPC;
+    const int row0 = static_cast<int>(blockIdx.y) * MR;
+    const bool live = col < n;
+    const int kb = k / 32;
+    const uint8_t *brow = b + static_cast<size_t>(live ? col : 0) * static_cast<size_t>(kb) * BB;
+    const int8_t *arow[MR];
+    const float *drow[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        const size_t ar = static_cast<size_t>(row0 + r < m ? row0 + r : row0);
+        arow[r] = aq + ar * static_cast<size_t>(k);
+        drow[r] = ad + ar * static_cast<size_t>(kb);
+    }
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.f;
+    }
+    if (live) {
+        for (int ib = sl; ib < kb; ib += LPC) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
+            // Blocks are 17 or 18 bytes: unaligned loads.
+            uint32_t x[4];
+            __builtin_memcpy(x, blk, 16);
+            const float d0 = rocmfp4_scale(blk[16]);
+            const float d1 = rocmfp4_scale(blk[BB - 1]);
+            uint32_t wl[4], wh[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
+                wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+            }
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                uint32_t al[4], ah[4];
+                kq_load_u32s<4>(arow[r] + ib * 32, al);
+                kq_load_u32s<4>(arow[r] + ib * 32 + 16, ah);
+                int32_t dl = 0, dh = 0;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    dl = i8dot4(al[t], wl[t], dl);
+                    dh = i8dot4(ah[t], wh[t], dh);
+                }
+                acc[r] = acc[r] + drow[r][ib] * (d0 * static_cast<float>(dl) +
+                                                 d1 * static_cast<float>(dh));
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = LPC / 2; off > 0; off >>= 1) {
+            v = v + __shfl_down(v, off, LPC);
+        }
+        if (live && sl == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+                v;
+        }
+    }
+}
+
+/* Returns ALLPACA_ERR_INVALID when the int8 path cannot run (caller falls back). */
+template <int BB>
+static int launch_rocmfp4_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                             int32_t k, hipStream_t stream) {
+    if (k % 32 != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const size_t aq_bytes = (static_cast<size_t>(m) * k + 255) & ~size_t(255);
+    const size_t need = aq_bytes + static_cast<size_t>(m) * (k / 32) * sizeof(float);
+    std::unique_lock<std::mutex> lock;
+    KqActScratch *scratch = kq_act_acquire(stream, need, lock);
+    if (!scratch) {
+        return ALLPACA_ERR_INVALID;
+    }
+    uint8_t *base = static_cast<uint8_t *>(scratch->p);
+    int8_t *aq = reinterpret_cast<int8_t *>(base);
+    float *ad = reinterpret_cast<float *>(base + aq_bytes);
+    const int kb = k / 32;
+    hipLaunchKernelGGL(quantize_rows_q8_kernel,
+                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
+                       dim3(256), 0, stream, a, aq, ad, m, k);
+    constexpr int COLS = 256 / 8;
+    const dim3 block(256);
+    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
+                    static_cast<unsigned>((m + mr - 1) / mr));
+#define FP4_I8_LAUNCH(MRV)                                                                         \
+    hipLaunchKernelGGL((gemv_nt_rocmfp4_i8_kernel<BB, MRV>), grid, block, 0, stream, aq, ad, b, c, \
+                       m, n, k)
+    if (mr == 1) {
+        FP4_I8_LAUNCH(1);
+    } else if (mr == 2) {
+        FP4_I8_LAUNCH(2);
+    } else if (mr == 4) {
+        FP4_I8_LAUNCH(4);
+    } else {
+        FP4_I8_LAUNCH(8);
+    }
+#undef FP4_I8_LAUNCH
+    return hip_status(hipGetLastError());
+}
+
+/* `tiled`: 1 = decode path (int8 activations, float ksplit when K is not
+ * whole blocks), 2 = float ksplit kernel (A/B and reference), 0 = untiled. */
 static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                   int32_t k, hipStream_t stream, int tiled, bool fast = false) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    if (tiled == 1) {
+        const int rc = fast ? launch_rocmfp4_i8<17>(a, b, c, m, n, k, stream)
+                            : launch_rocmfp4_i8<18>(a, b, c, m, n, k, stream);
+        if (rc != ALLPACA_ERR_INVALID) {
+            return rc;
+        }
+    }
     if (tiled) {
         /* ksplit is the proven decode kernel (row = blockIdx.y). The COLS=64
          * tiled path was built for large-M prefill and is not trusted for
@@ -3039,6 +3181,15 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b,
 extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m,
                                             int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 1, true);
+}
+
+/* Float-activation ROCmFP4 GEMV (32 lanes split K): the kernel the int8
+ * path replaced. Kept for A/B and as the exact-float reference. `fast`
+ * selects 17-byte type-101 blocks. */
+extern "C" int allpaca_gemm_nt_rocmfp4_f32(const float *a, const uint8_t *b, float *c, int32_t m,
+                                           int32_t n, int32_t k, int32_t fast,
+                                           allpaca_stream_t stream) {
+    return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 2, fast != 0);
 }
 
 /* ggml MXFP4 (ggml_type_id=39): 17-byte blocks, one E8M0 scale + 16 nibbles / 32 elems. */
@@ -7299,6 +7450,11 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *, const uint8_t *, f
 
 extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *, const uint8_t *, float *, int32_t,
                                             int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_rocmfp4_f32(const float *, const uint8_t *, float *, int32_t,
+                                           int32_t, int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

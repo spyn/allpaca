@@ -169,6 +169,11 @@ int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, 
 int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
 
+/* Float-activation ROCmFP4 GEMV (the pre-int8 kernel), for A/B and as the
+ * exact-float reference. `fast` != 0 reads 17-byte type-101 blocks. */
+int allpaca_gemm_nt_rocmfp4_f32(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                int32_t k, int32_t fast, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * dequant(B_q6_k[n,k])^T. Native 210-byte Q6_K super-blocks (GEM mixed-quant).
  * Default tile cols from §12 picker; use _cols / _untiled for tracers. */
 int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,

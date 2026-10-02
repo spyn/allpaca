@@ -551,6 +551,16 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_rocmfp4_f32(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            fast: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_mxfp4(
             a: *const f32,
             b: *const u8,
@@ -2550,6 +2560,33 @@ pub fn gemm_nt_rocmfp4_fast_device(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_rocmfp4_fast unavailable".into(),
+        )))
+    }
+}
+
+/// Float-activation ROCmFP4 GEMV (the kernel the int8 path replaced), for
+/// A/B and as the exact-float reference. `fast`: 17-byte type-101 blocks.
+pub fn gemm_nt_rocmfp4_f32_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+    fast: bool,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_gemm_nt_rocmfp4_f32(a, b, c, m, n, k, i32::from(fast), std::ptr::null_mut())
+        };
+        status(rc, "gemm_nt_rocmfp4_f32")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k, fast);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_rocmfp4_f32 unavailable".into(),
         )))
     }
 }
@@ -12108,6 +12145,16 @@ mod tests {
         d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
     }
 
+    /// Tolerance for GEMVs on int8-quantized activations against an exact
+    /// float result: 2% of the output's scale (measured error is ~0.5%).
+    fn i8_gemv_close(got: f32, exp: f32, scale: f32) -> bool {
+        (got - exp).abs() <= 1e-4 + 0.02 * scale
+    }
+
+    fn abs_max(v: &[f32]) -> f32 {
+        v.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+    }
+
     /// Public `gemm_nt` must match CPU `C[m,n] = A[m,k] * B[n,k]^T` on small random shapes.
     #[cfg(feature = "hip")]
     #[test]
@@ -12769,9 +12816,10 @@ mod tests {
             cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
             gemm_nt_rocmfp4(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
                 .expect("HIP gemm_nt_rocmfp4 must run when a device is present");
+            let scale = abs_max(&cpu);
             for i in 0..m * n {
                 assert!(
-                    gemm_close(hip[i], cpu[i]),
+                    i8_gemv_close(hip[i], cpu[i], scale),
                     "gemm_nt_rocmfp4 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
                     hip[i],
                     cpu[i]
@@ -12846,7 +12894,7 @@ mod tests {
                     want[i]
                 );
                 assert!(
-                    gemm_close(got[i], cpu[i]),
+                    i8_gemv_close(got[i], cpu[i], abs_max(&cpu)),
                     "gemm_nt_rocmfp4_fast vs cpu, shape {m}x{n}x{k} idx={i}: {} vs {}",
                     got[i],
                     cpu[i]
@@ -12899,6 +12947,140 @@ mod tests {
         device_free(dout, cpu.len() * 4);
     }
 
+    /// The int8-activation ROCmFP4 GEMV (types 100 and 101) at a Qwen3.8
+    /// shape: within int8 activation error of the float kernel, every row of
+    /// an m-row call bit-identical to that row run alone (so verify and
+    /// batched rows reproduce decode), and faster than the float kernel, far
+    /// more so for several rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rocmfp4_i8_gemv_matches_float_kernel_and_is_row_exact() {
+        if device_count() == 0 {
+            return;
+        }
+        let (n, k) = (2048usize, 5120usize);
+        for fast in [false, true] {
+            let bb = if fast { 17 } else { ROCMFP4_BLOCK_BYTES };
+            let max_m = 8usize;
+            let mut a = vec![0.0f32; max_m * k];
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut rnd = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            };
+            for v in a.iter_mut() {
+                *v = rnd() * 2.0;
+            }
+            let mut b_q = Vec::with_capacity(n * (k / 32) * bb);
+            let mut row = vec![0.0f32; k];
+            for _ in 0..n {
+                for v in row.iter_mut() {
+                    *v = rnd() * 0.1;
+                }
+                if fast {
+                    b_q.extend(allpaca_cpu::quantize_rocmfp4_fast(&row));
+                } else {
+                    b_q.extend(allpaca_cpu::quantize_rocmfp4(&row));
+                }
+            }
+            let da = device_malloc(a.len() * 4, 0).unwrap();
+            let db = device_malloc(b_q.len(), 0).unwrap();
+            let dc = device_malloc(max_m * n * 4, 0).unwrap();
+            set_device(0).unwrap();
+            memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, b_q.as_ptr(), b_q.len(), MEMCPY_H2D).unwrap();
+            let i8k = |a: *const f32, c: *mut f32, m: usize| {
+                if fast {
+                    gemm_nt_rocmfp4_fast_device(a, db, c, m as i32, n as i32, k as i32)
+                } else {
+                    gemm_nt_rocmfp4_device(a, db, c, m as i32, n as i32, k as i32)
+                }
+                .unwrap()
+            };
+            let f32k = |a: *const f32, c: *mut f32, m: usize| {
+                gemm_nt_rocmfp4_f32_device(a, db, c, m as i32, n as i32, k as i32, fast).unwrap()
+            };
+            let read = |m: usize| {
+                let mut v = vec![0.0f32; m * n];
+                memcpy(v.as_mut_ptr().cast(), dc, m * n * 4, MEMCPY_D2H).unwrap();
+                v
+            };
+            // Each row alone (m == 1) is the reference for every batch size.
+            let mut single = Vec::new();
+            for r in 0..max_m {
+                i8k(unsafe { da.cast::<f32>().add(r * k) }, dc.cast(), 1);
+                single.extend(read(1));
+            }
+            for m in [2usize, 3, 4, 5, 8] {
+                i8k(da.cast(), dc.cast(), m);
+                let got = read(m);
+                for i in 0..m * n {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        single[i].to_bits(),
+                        "fast={fast} m={m}: row {} col {} differs from its m=1 result",
+                        i / n,
+                        i % n
+                    );
+                }
+            }
+            f32k(da.cast(), dc.cast(), max_m);
+            let float = read(max_m);
+            let scale = float.iter().fold(0.0f32, |s, v| s.max(v.abs()));
+            let worst = single
+                .iter()
+                .zip(&float)
+                .fold(0.0f32, |w, (a, b)| w.max((a - b).abs()));
+            assert!(
+                worst <= 0.02 * scale,
+                "fast={fast}: int8 GEMV off by {worst} against the float kernel (output scale {scale})"
+            );
+            let time = |f: &dyn Fn(*const f32, *mut f32, usize), m: usize| {
+                f(da.cast(), dc.cast(), m);
+                stream_synchronize().unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    f(da.cast(), dc.cast(), m);
+                }
+                stream_synchronize().unwrap();
+                t.elapsed().as_micros() / 20
+            };
+            let (i1, f1) = (time(&i8k, 1), time(&f32k, 1));
+            let (i4, f4) = (time(&i8k, 4), time(&f32k, 4));
+            eprintln!(
+                "rocmfp4 gemv n={n} k={k} fast={fast}: m=1 int8 {i1}us float {f1}us; m=4 int8 {i4}us float {f4}us; max err {:.3}% of scale",
+                100.0 * worst / scale
+            );
+            assert!(i4 * 2 < f4, "fast={fast}: 4-row int8 GEMV {i4}us not 2x faster than float {f4}us");
+            device_free(da, a.len() * 4);
+            device_free(db, b_q.len());
+            device_free(dc, max_m * n * 4);
+        }
+    }
+
+    /// K that is not a whole number of 32-weight blocks cannot use the int8
+    /// path: the decode entry point falls back to the float kernel and
+    /// matches the CPU dequant exactly-float.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rocmfp4_partial_block_k_uses_float_kernel() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, n, k) = (2usize, 9usize, 300usize);
+        let (a, b_q) = fill_rocmfp4_gemm_case(3, m, n, k);
+        let b_deq = dequant_rocmfp4_matrix(&b_q, n, k);
+        let mut cpu = vec![0.0f32; m * n];
+        let mut hip = vec![0.0f32; m * n];
+        cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+        gemm_nt_rocmfp4(&a, &b_q, &mut hip, m as i32, n as i32, k as i32).unwrap();
+        for i in 0..m * n {
+            assert!(gemm_close(hip[i], cpu[i]), "idx={i} hip={} cpu={}", hip[i], cpu[i]);
+        }
+    }
+
     /// The §12 tiled ROCmFP4 GEMV must agree with the untiled baseline.
     #[cfg(feature = "hip")]
     #[test]
@@ -12915,7 +13097,7 @@ mod tests {
             .expect("untiled ROCmFP4");
         for i in 0..m * n {
             assert!(
-                gemm_close(tiled[i], untiled[i]),
+                i8_gemv_close(tiled[i], untiled[i], abs_max(&untiled)),
                 "ROCmFP4 tiled/untiled mismatch idx={i} tiled={} untiled={}",
                 tiled[i],
                 untiled[i]
@@ -12938,7 +13120,7 @@ mod tests {
         gemm_nt_rocmfp4_untiled(&a, &b_q, &mut expect, 1, n as i32, k as i32).expect("untiled");
         for i in 0..n {
             assert!(
-                gemm_close(got[i], expect[i]),
+                i8_gemv_close(got[i], expect[i], abs_max(&expect)),
                 "lds mismatch idx={i} lds={} untiled={}",
                 got[i],
                 expect[i]
