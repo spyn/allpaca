@@ -88,13 +88,23 @@ impl EngineTokenizer {
         self.token_id("<|im_start|>").is_some() && self.token_id("<|im_end|>").is_some()
     }
 
-    /// ChatML when the vocab has the specials; otherwise `role: text` (tiny/synthetic).
+    /// Vocab has Llama 3 header and end-of-turn specials.
+    pub fn uses_llama3_chat(&self) -> bool {
+        self.token_id("<|start_header_id|>").is_some()
+            && self.token_id("<|end_header_id|>").is_some()
+            && self.token_id("<|eot_id|>").is_some()
+    }
+
+    /// ChatML or Llama 3 turns when the vocab has their specials; otherwise
+    /// `role: text` (tiny/synthetic).
     ///
     /// Does **not** open `<think>` — that is Qwen-specific and role-echoes on
     /// Nemotron Lightning.
     pub fn format_chat(&self, messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
         if self.uses_chatml() {
             format_chatml(messages, add_generation_prompt)
+        } else if self.uses_llama3_chat() {
+            format_llama3_chat(messages, add_generation_prompt)
         } else {
             format_chat_colon(messages, add_generation_prompt)
         }
@@ -407,6 +417,23 @@ pub fn format_chatml(messages: &[(&str, &str)], add_generation_prompt: bool) -> 
     out
 }
 
+/// Llama 3 turns. `<|begin_of_text|>` is the tokenizer's BOS, not part of
+/// the text.
+pub fn format_llama3_chat(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+    let mut out = String::new();
+    for (role, content) in messages {
+        out.push_str("<|start_header_id|>");
+        out.push_str(role);
+        out.push_str("<|end_header_id|>\n\n");
+        out.push_str(content.trim());
+        out.push_str("<|eot_id|>");
+    }
+    if add_generation_prompt {
+        out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+    out
+}
+
 /// Colon fallback for synthetic / non-ChatML vocabs.
 pub fn format_chat_colon(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
     let mut out = String::new();
@@ -571,6 +598,17 @@ fn json_u32_second(value: Option<&Value>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llama3_chat_turns() {
+        let got = format_llama3_chat(&[("system", "Be brief."), ("user", "Hi ")], true);
+        let want = concat!(
+            "<|start_header_id|>system<|end_header_id|>\n\nBe brief.<|eot_id|>",
+            "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
+        assert_eq!(got, want);
+    }
 
     /// An emoji split across tokens comes out whole, never as U+FFFD.
     #[test]

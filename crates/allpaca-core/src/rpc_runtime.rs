@@ -370,7 +370,11 @@ impl RpcRuntime {
         let packed_bytes = gguf
             .map(|file| file.tensors.iter().map(|t| t.nbytes() as u64).sum::<u64>())
             .unwrap_or(0);
-        if packed_fits_local(packed_bytes, &local_mems) {
+        // GPU before GPU-over-RPC: weights that fit the local pool stay there
+        // even when RPC workers are configured (an explicit tensor_split
+        // still decides).
+        let fits_local = packed_fits_local(packed_bytes, &local_mems) && tensor_split.is_none();
+        if fits_local {
             tracing::info!(
                 packed_bytes,
                 local_vram = local_mems.iter().copied().sum::<u64>(),
@@ -378,7 +382,9 @@ impl RpcRuntime {
                 "packed weights fit in the local GPU pool"
             );
         }
-        let plan = if groups.is_empty() && n_local > 1 && tensor_split.is_none() {
+        let plan = if fits_local && n_local == 1 {
+            plan_layer_owners(model.config.n_layers, &device_bytes[..1], None)?
+        } else if (groups.is_empty() || fits_local) && n_local > 1 && tensor_split.is_none() {
             let attn: Vec<bool> = model
                 .layers
                 .iter()
