@@ -65,6 +65,7 @@ pub use edge0::{
     RecoverLora, RouterKind,
 };
 pub use engine::{mtp_text_is_garbled, Engine, KvEstimate, RequestHandle};
+pub use rpc_runtime::RemoteGpu;
 pub use kv_tier::KvTierManager;
 pub use layer_split::{plan_layer_owners, LayerPlan};
 pub use memory_tier::{

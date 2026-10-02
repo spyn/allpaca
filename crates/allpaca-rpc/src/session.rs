@@ -235,6 +235,12 @@ impl RpcSession {
         c.u32()
     }
 
+    /// Live stats for each of the worker's devices.
+    pub fn device_stats(&mut self) -> Result<Vec<crate::protocol::DeviceStat>, RpcError> {
+        let body = self.rpc(Cmd::DeviceStats, &[])?;
+        crate::protocol::decode_device_stats(&body)
+    }
+
     pub fn sync(&mut self) -> Result<(), RpcError> {
         self.rpc(Cmd::Sync, &[])?;
         Ok(())

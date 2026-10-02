@@ -7,6 +7,7 @@
 //! wire protocol so an AMD coordinator can drive an NVIDIA worker (and vice
 //! versa) as long as HELLO majors match.
 
+mod gpu_sysfs;
 mod protocol;
 mod session;
 mod worker;
@@ -14,6 +15,7 @@ mod worker;
 pub use protocol::{
     f32_to_f16_rne, quantize_q8_rows, MoeFfnRequest, MoeX,
     check_rpc_bind, encode_hello_reply, fnv1a64, is_loopback_bind_host, write_reply, BufId, Cmd,
+    DeviceStat,
     HelloReply, HelloRequest, KernelOp, LaunchItem, LaunchList, RpcBackendKind, KERNEL_ABI_REV,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
 };
@@ -452,6 +454,28 @@ mod tests {
             "{err}"
         );
         let _ = worker.join();
+    }
+
+    /// `DeviceStats` over a real session: one entry per worker device, with
+    /// memory in use tracking allocations.
+    #[test]
+    fn device_stats_roundtrip_over_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(8 << 20))).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let before = client.device_stats().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].name, "cpu");
+        assert_eq!((before[0].mem_used, before[0].mem_total), (0, 8 << 20));
+        assert_eq!((before[0].util_pct, before[0].temp_c, before[0].power_w), (-1, -1, -1));
+        let _buf = client.alloc(4096).unwrap();
+        assert_eq!(client.device_stats().unwrap()[0].mem_used, 4096);
+        drop(client);
+        worker.join().unwrap();
     }
 
     #[test]

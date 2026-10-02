@@ -28,6 +28,8 @@ pub struct RpcRuntime {
     /// `engine.local_vram_budget_mib`: per-slot layer budgets that replace the
     /// measured ones (0 or missing = measured).
     local_budget_mib: Mutex<Vec<u64>>,
+    /// Last worker GPU stats and when they were read.
+    gpu_stats: Mutex<(Option<std::time::Instant>, Vec<RemoteGpu>)>,
     pub roundtrips: AtomicU64,
     pub activation_bytes: AtomicU64,
     pub h2d_bytes: AtomicU64,
@@ -41,6 +43,26 @@ impl std::fmt::Debug for RpcRuntime {
             .field("roundtrips", &self.roundtrips.load(Ordering::Relaxed))
             .finish()
     }
+}
+
+/// How long a worker GPU reading is served before it is refreshed.
+const GPU_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One GPU on an RPC worker, for the operator dashboard. `None` = the
+/// worker's platform does not report it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteGpu {
+    /// Worker `host:port`.
+    pub endpoint: String,
+    /// Device index on that worker.
+    pub index: u32,
+    pub name: String,
+    /// Device-wide VRAM in use (all processes).
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    pub util_pct: Option<u32>,
+    pub temp_c: Option<u32>,
+    pub power_w: Option<u32>,
 }
 
 /// One layer's routed experts on a worker GPU (`MoeFfn`).
@@ -206,6 +228,7 @@ impl RpcRuntime {
             experts: Mutex::new(Vec::new()),
             layer_device: Mutex::new(Vec::new()),
             local_budget_mib: Mutex::new(Vec::new()),
+            gpu_stats: Mutex::new((None, Vec::new())),
             local_peer: Mutex::new(None),
             roundtrips: AtomicU64::new(0),
             activation_bytes: AtomicU64::new(0),
@@ -263,6 +286,42 @@ impl RpcRuntime {
 
     pub fn session_count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Every worker GPU's live stats, at most [`GPU_STATS_MAX_AGE`] old when
+    /// the sessions are free. Never waits on a session: while one is busy (a
+    /// weight upload, a decode round trip) the last reading is returned.
+    pub fn remote_gpu_stats(&self) -> Vec<RemoteGpu> {
+        let Ok(mut cache) = self.gpu_stats.lock() else {
+            return Vec::new();
+        };
+        let fresh = cache.0.is_some_and(|t| t.elapsed() < GPU_STATS_MAX_AGE);
+        if !fresh {
+            if let Ok(mut sessions) = self.sessions.try_lock() {
+                let mut out = Vec::new();
+                for s in sessions.iter_mut() {
+                    let endpoint = s.endpoint().to_string();
+                    let Ok(stats) = s.device_stats() else {
+                        continue;
+                    };
+                    for (index, d) in stats.into_iter().enumerate() {
+                        let known = |v: i32| u32::try_from(v).ok();
+                        out.push(RemoteGpu {
+                            endpoint: endpoint.clone(),
+                            index: index as u32,
+                            name: d.name,
+                            mem_used_bytes: d.mem_used,
+                            mem_total_bytes: d.mem_total,
+                            util_pct: known(d.util_pct),
+                            temp_c: known(d.temp_c),
+                            power_w: known(d.power_w),
+                        });
+                    }
+                }
+                *cache = (Some(std::time::Instant::now()), out);
+            }
+        }
+        cache.1.clone()
     }
 
     /// Pin the per-GPU layer budgets (`engine.local_vram_budget_mib`).

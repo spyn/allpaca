@@ -115,6 +115,8 @@ main.page { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, ca
 .meter > span { display: block; height: 100%; background: var(--accent); transition: width .4s ease; }
 .meter.warn > span { background: var(--warn); }
 .meter.hot > span { background: var(--err); }
+.meter.util { height: 3px; margin-top: 4px; }
+.meter.util > span { background: var(--info); }
 .table-card { padding: 0; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--border); }

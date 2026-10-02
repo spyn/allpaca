@@ -645,6 +645,11 @@ impl Engine {
         &self.metrics
     }
 
+    /// Live stats for every GPU on the RPC workers (empty without RPC).
+    pub fn remote_gpus(&self) -> Vec<crate::rpc_runtime::RemoteGpu> {
+        self.rpc.as_ref().map(|r| r.remote_gpu_stats()).unwrap_or_default()
+    }
+
     /// The loaded target's expert controls, sized to its routed experts.
     /// `None` when no model is loaded.
     pub fn expert_controls(&self) -> Option<Arc<crate::expert_controls::ExpertControls>> {

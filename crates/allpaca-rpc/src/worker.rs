@@ -1819,6 +1819,60 @@ impl WorkerBackend {
         }
     }
 
+    /// Per-device stats. HIP workers on Linux read amdgpu sysfs (device-wide
+    /// VRAM, busy percent, temperature, power); elsewhere memory comes from
+    /// the runtime and the rest is unreported.
+    fn device_stats(&self) -> Vec<crate::protocol::DeviceStat> {
+        use crate::protocol::DeviceStat;
+        match self {
+            Self::Cpu(w) => vec![DeviceStat {
+                name: "cpu".into(),
+                mem_used: w.used,
+                mem_total: w.memory_bytes,
+                util_pct: -1,
+                temp_c: -1,
+                power_w: -1,
+            }],
+            #[cfg(feature = "hip")]
+            Self::Hip(w) => {
+                let cards = crate::gpu_sysfs::amd_cards();
+                w.gpus
+                    .iter()
+                    .map(|g| {
+                        let (free, total) =
+                            allpaca_hip::device_memory_info(g.device).unwrap_or((0, g.total));
+                        let mut stat = DeviceStat {
+                            name: format!("hip:{}", g.device),
+                            mem_used: total.saturating_sub(free),
+                            mem_total: total,
+                            util_pct: -1,
+                            temp_c: -1,
+                            power_w: -1,
+                        };
+                        // HIP enumerates AMD cards in PCI order, as sysfs does.
+                        if let Some(card) = usize::try_from(g.device).ok().and_then(|i| cards.get(i)) {
+                            card.fill(&mut stat);
+                        }
+                        stat
+                    })
+                    .collect()
+            }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(w) => {
+                let (free, total) = allpaca_cuda::device_memory_info(w.device)
+                    .unwrap_or((w.memory_bytes.saturating_sub(w.used), w.memory_bytes));
+                vec![DeviceStat {
+                    name: format!("cuda:{}", w.device),
+                    mem_used: total.saturating_sub(free),
+                    mem_total: total,
+                    util_pct: -1,
+                    temp_c: -1,
+                    power_w: -1,
+                }]
+            }
+        }
+    }
+
     fn device_count(&self) -> u32 {
         match self {
             Self::Cpu(_) => 1,
@@ -2094,6 +2148,7 @@ fn handle(
             write_u32(&mut out, backend.device_count());
             Ok(out)
         }
+        Cmd::DeviceStats => Ok(crate::protocol::encode_device_stats(&backend.device_stats())),
         Cmd::Sync => {
             backend.sync()?;
             Ok(Vec::new())
