@@ -332,7 +332,11 @@ function renderDashboard(data) {
   $("remote-cards").innerHTML = remote
     .map((g) => {
       const host = String(g.endpoint || "").replace(/:\d+$/, "");
-      const name = String(g.name || "GPU").replace(/^(AMD )?Radeon /, "");
+      // The driver's product name can carry the wrong capacity (32 GB MI50s
+      // report "MI50 16GB"); the measured total is shown below instead.
+      const name = String(g.name || "GPU")
+        .replace(/^(AMD )?Radeon /, "")
+        .replace(/\s+\d+\s*GB$/i, "");
       const frac = g.mem_total_bytes ? g.mem_used_bytes / g.mem_total_bytes : 0;
       const live = [
         g.util_pct != null ? `${g.util_pct}% busy` : "",
