@@ -1261,13 +1261,18 @@ impl Engine {
         if local_devices.is_empty() {
             local_devices.push((0, 8 << 30));
         }
+        let rpc_max_seq = rpc_kv_max_seq(
+            self.config.rpc.max_seq,
+            self.config.kv.vram_bytes as u64,
+            model,
+        );
         if let Some(rt) = &self.rpc {
             rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
             rt.prepare(
                 model,
                 &local_devices,
                 self.config.rpc.tensor_split.as_deref(),
-                self.config.rpc.max_seq,
+                rpc_max_seq,
                 gguf,
                 self.config.kv.vram_bytes as u64,
                 draft_bytes,
@@ -1287,7 +1292,7 @@ impl Engine {
                 model,
                 &local_devices,
                 self.config.rpc.tensor_split.as_deref(),
-                self.config.rpc.max_seq,
+                rpc_max_seq,
                 gguf,
                 self.config.kv.vram_bytes as u64,
                 draft_bytes,
@@ -6534,6 +6539,33 @@ fn handle_prompt_len(
     Ok(0)
 }
 
+/// Smallest remote KV capacity the auto setting picks.
+const RPC_AUTO_MIN_SEQ: usize = 2048;
+
+/// Remote layers' KV capacity in tokens: `configured`, or when that is 0 the
+/// context `kv_vram_bytes` holds across this model's attention layers (the
+/// same sizing the local KV uses), at least [`RPC_AUTO_MIN_SEQ`].
+fn rpc_kv_max_seq(configured: usize, kv_vram_bytes: u64, model: &TinyModel) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    let cfg = &model.config;
+    let per_layer = (cfg.n_kv_heads.max(1) * cfg.head_dim().max(1) * 2 * 4) as u64;
+    let attn_layers = model
+        .layers
+        .iter()
+        // By layer type: large GGUFs keep no host weights to look at.
+        .filter(|l| {
+            l.gdn.is_none()
+                && l.ssm.is_none()
+                && l.block == allpaca_gguf::HybridLayerKind::Attention
+        })
+        .count()
+        .max(1) as u64;
+    let tokens = (kv_vram_bytes / (per_layer * attn_layers).max(1)) as usize;
+    tokens.max(RPC_AUTO_MIN_SEQ)
+}
+
 /// What a context length costs in KV for the loaded model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct KvEstimate {
@@ -6803,6 +6835,13 @@ mod tests {
             "llama.feed_forward_length".into(),
             GgufValue::Uint32(ff as u32),
         );
+        // As real Llama GGUFs: dimension_count == head_dim, which is still
+        // the standard (not NeoX) rotation. Remote layers once took this as
+        // a NeoX partial rotation and diverged as positions grew.
+        meta.insert(
+            "llama.rope.dimension_count".into(),
+            GgufValue::Uint32((dim / 4) as u32),
+        );
         meta.insert(
             "tokenizer.ggml.model".into(),
             GgufValue::String("wordlevel".into()),
@@ -6819,19 +6858,32 @@ mod tests {
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
         meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
 
+        // Varied weights: with constant ones every head and position looks
+        // alike and a wrong rotation cannot show.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5) * scale
+                })
+                .collect()
+        };
         let mut quant = Vec::new();
         let mut f32s: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
-        let embd = vec![0.02f32; vocab * dim];
+        let embd = rnd(vocab * dim, 2.0);
         quant.push((
             "token_embd.weight".to_string(),
             vec![vocab as u64, dim as u64],
             quantize_q8_0(&embd),
         ));
         for layer in 0..2 {
-            let q = vec![0.01f32; dim * dim];
-            let kv = vec![0.01f32; n_kv * dim];
-            let ffn_up = vec![0.01f32; ff * dim];
-            let ffn_down = vec![0.01f32; dim * ff];
+            let q = rnd(dim * dim, 0.6);
+            let kv = rnd(n_kv * dim, 0.6);
+            let ffn_up = rnd(ff * dim, 0.3);
+            let ffn_down = rnd(dim * ff, 0.3);
             let mut push = |suffix: &str, dims: Vec<u64>, data: &[f32]| {
                 quant.push((
                     format!("blk.{layer}.{suffix}"),
@@ -6862,7 +6914,7 @@ mod tests {
             vec![dim as u64],
             vec![1.0; dim],
         ));
-        let head = vec![0.02f32; vocab * dim];
+        let head = rnd(vocab * dim, 1.0);
         quant.push((
             "output.weight".into(),
             vec![vocab as u64, dim as u64],
@@ -6894,8 +6946,10 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
         });
+        // Long enough that positions matter (12 prompt tokens + 8 generated).
+        let prompt = "hello a b c d a b c d hello a b";
         let params = GenerationParams {
-            max_tokens: 4,
+            max_tokens: 8,
             temperature: 0.0,
             seed: Some(2),
             ..GenerationParams::default()
@@ -6911,7 +6965,7 @@ mod tests {
         cpu_cfg.model.path = Some(path.clone());
         cpu_cfg.kv.page_tokens = 8;
         let cpu = Engine::new(cpu_cfg).unwrap();
-        let cpu_ids = cpu.generate("hello", params.clone()).unwrap().token_ids;
+        let cpu_ids = cpu.generate(prompt, params.clone()).unwrap().token_ids;
 
         let mut rpc_cfg = Config::compiled_defaults();
         rpc_cfg.merge_cli(&CliOverrides {
@@ -6927,7 +6981,7 @@ mod tests {
         rpc_cfg.rpc.max_seq = 32;
         rpc_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
         let rpc = Engine::new(rpc_cfg).unwrap();
-        let rpc_out = rpc.generate("hello", params).unwrap();
+        let rpc_out = rpc.generate(prompt, params).unwrap();
         let stats = rpc.stats();
         drop(rpc);
         worker.join().unwrap();
@@ -11988,6 +12042,19 @@ mod tests {
         if let Some(p) = nvme {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// `rpc.max_seq = 0` sizes remote KV from the engine's KV budget; an
+    /// explicit value is used as given.
+    #[test]
+    fn rpc_kv_capacity_follows_the_kv_budget() {
+        let cfg = ModelConfig::tiny();
+        let model = TinyModel::synthetic(cfg.clone(), 1, "synthetic");
+        assert_eq!(rpc_kv_max_seq(64, 1 << 30, &model), 64);
+        let per_token = (cfg.n_kv_heads * cfg.head_dim() * 2 * 4 * cfg.n_layers) as u64;
+        assert_eq!(rpc_kv_max_seq(0, per_token * 50_000, &model), 50_000);
+        // A tiny budget still leaves the floor.
+        assert_eq!(rpc_kv_max_seq(0, 1024, &model), RPC_AUTO_MIN_SEQ);
     }
 
     /// A blocking reply is the same string a streamed reply adds up to, so

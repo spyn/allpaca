@@ -394,7 +394,9 @@ pub struct RpcSection {
     pub endpoints: Vec<String>,
     /// Relative layer weights in device order (local target, then RPC). `None` = MemInfo.
     pub tensor_split: Option<Vec<f64>>,
-    /// KV sequence cap for remote layer caches.
+    /// KV sequence cap for remote layer caches (tokens). `0` (default) sizes
+    /// it to the context the engine's own KV budget (`kv.vram_bytes`) holds
+    /// for this model, so remote layers are not the shorter limit.
     pub max_seq: usize,
     /// Shared HELLO secret (`--rpc-token` / `ALLPACA_RPC_TOKEN`). Empty = loopback workers only.
     #[serde(default)]
@@ -406,7 +408,7 @@ impl Default for RpcSection {
         Self {
             endpoints: Vec::new(),
             tensor_split: None,
-            max_seq: 2048,
+            max_seq: 0,
             token: None,
         }
     }

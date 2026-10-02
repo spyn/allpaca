@@ -947,7 +947,11 @@ impl RpcRuntime {
             infos[1].n_elements() as usize,
             infos[3].n_elements() as usize,
         );
-        let n_rot = cfg.rope_dims_for_layer(layer_idx);
+        // The same choice the local path makes: NeoX pairing (partial or
+        // full, `RopePartial`) only where `neox_rot_dims` says so; otherwise
+        // the standard interleaved rotation (`Rope`). Llama GGUFs set
+        // rope.dimension_count == head_dim and are still standard.
+        let n_rot = cfg.neox_rot_dims(layer_idx, al.head_dim).unwrap_or(0);
         if q_k != dim
             || k_k != dim
             || v_k != dim
@@ -1181,7 +1185,7 @@ impl RpcRuntime {
         for layer in &span {
             if pos >= layer.max_seq {
                 return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-                    "rpc kv pos {pos} >= max_seq {}",
+                    "context position {pos} is past the remote layers' KV capacity of {} tokens; raise rpc.max_seq (0 sizes it from kv.vram_bytes)",
                     layer.max_seq
                 ))));
             }
