@@ -105,6 +105,8 @@ pub fn router(state: AppState) -> Router {
             post(crate::model_api::set_recording),
         )
         .route("/v1/model/reload", post(crate::model_api::reload))
+        .route("/v1/model/available", get(crate::model_api::get_available))
+        .route("/v1/model/load", post(crate::model_api::load_model))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -451,6 +453,54 @@ async fn chat_completions(
     }
 }
 
+/// One log line per streamed reply when it ends: tokens, time, and how it
+/// ended (finish reason, client gone, engine error, or dropped unfinished).
+struct DoneLog {
+    id: String,
+    started: std::time::Instant,
+    tokens: usize,
+    finish: Option<FinishReason>,
+    client_gone: bool,
+    error: Option<String>,
+}
+
+impl DoneLog {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            started: std::time::Instant::now(),
+            tokens: 0,
+            finish: None,
+            client_gone: false,
+            error: None,
+        }
+    }
+
+    fn token(&mut self, finish: Option<FinishReason>) {
+        self.tokens += 1;
+        if finish.is_some() {
+            self.finish = finish;
+        }
+    }
+}
+
+impl Drop for DoneLog {
+    fn drop(&mut self) {
+        let secs = self.started.elapsed().as_secs_f64();
+        let ended = match (&self.error, self.client_gone, self.finish) {
+            (Some(e), _, _) => format!("error: {e}"),
+            (None, true, _) => "client disconnected".to_string(),
+            (None, false, Some(f)) => finish_name(f).to_string(),
+            (None, false, None) => "ended without a finish reason".to_string(),
+        };
+        if self.error.is_some() || self.client_gone || self.finish.is_none() {
+            tracing::warn!(id = %self.id, tokens = self.tokens, secs = format!("{secs:.1}"), "chat stream ended: {ended}");
+        } else {
+            tracing::info!(id = %self.id, tokens = self.tokens, secs = format!("{secs:.1}"), "chat stream done: {ended}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_completion(
     state: AppState,
@@ -467,6 +517,7 @@ fn stream_completion(
     if use_async_poll {
         tokio::spawn(async move {
             let mut stream = Box::pin(engine.generate_stream_multimodal(prompt, images, params));
+            let mut done = DoneLog::new(&id);
             let first = serde_json::json!({
                 "id": id,
                 "object": "chat.completion.chunk",
@@ -478,6 +529,7 @@ fn stream_completion(
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(ev) => {
+                        done.token(ev.finish_reason);
                         let chunk = serde_json::json!({
                             "id": id,
                             "object": "chat.completion.chunk",
@@ -494,10 +546,12 @@ fn stream_completion(
                             .await
                             .is_err()
                         {
+                            done.client_gone = true;
                             break;
                         }
                     }
                     Err(e) => {
+                        done.error = Some(e.to_string());
                         let err = serde_json::json!({"error": {"message": e.to_string()}});
                         let _ = tx.send(Ok(Event::default().data(err.to_string()))).await;
                         break;
@@ -511,6 +565,7 @@ fn stream_completion(
         tokio::task::spawn_blocking(move || {
             let _ = &state;
             let mut stream = Box::pin(engine.generate_stream_multimodal(prompt, images, params));
+            let mut done = DoneLog::new(&id);
             rt.block_on(async {
                 let first = serde_json::json!({
                     "id": id,
@@ -523,6 +578,7 @@ fn stream_completion(
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(ev) => {
+                            done.token(ev.finish_reason);
                             let chunk = serde_json::json!({
                                 "id": id,
                                 "object": "chat.completion.chunk",
@@ -539,10 +595,12 @@ fn stream_completion(
                                 .await
                                 .is_err()
                             {
+                                done.client_gone = true;
                                 break;
                             }
                         }
                         Err(e) => {
+                            done.error = Some(e.to_string());
                             let err = serde_json::json!({"error": {"message": e.to_string()}});
                             let _ = tx.send(Ok(Event::default().data(err.to_string()))).await;
                             break;

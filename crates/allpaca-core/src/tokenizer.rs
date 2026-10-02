@@ -88,13 +88,23 @@ impl EngineTokenizer {
         self.token_id("<|im_start|>").is_some() && self.token_id("<|im_end|>").is_some()
     }
 
-    /// ChatML when the vocab has the specials; otherwise `role: text` (tiny/synthetic).
+    /// Vocab has Llama 3 header and end-of-turn specials.
+    pub fn uses_llama3_chat(&self) -> bool {
+        self.token_id("<|start_header_id|>").is_some()
+            && self.token_id("<|end_header_id|>").is_some()
+            && self.token_id("<|eot_id|>").is_some()
+    }
+
+    /// ChatML or Llama 3 turns when the vocab has their specials; otherwise
+    /// `role: text` (tiny/synthetic).
     ///
     /// Does **not** open `<think>` — that is Qwen-specific and role-echoes on
     /// Nemotron Lightning.
     pub fn format_chat(&self, messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
         if self.uses_chatml() {
             format_chatml(messages, add_generation_prompt)
+        } else if self.uses_llama3_chat() {
+            format_llama3_chat(messages, add_generation_prompt)
         } else {
             format_chat_colon(messages, add_generation_prompt)
         }
@@ -302,8 +312,76 @@ impl EngineTokenizer {
         normalize_piece(piece)
     }
 
+    /// Raw bytes of one token, for streaming: a UTF-8 character can span
+    /// several tokens (byte-level BPE pieces, SPM `<0xNN>` byte tokens), so
+    /// text must be cut only on complete characters. See [`Utf8Stream`].
+    pub fn decode_one_bytes(&self, id: u32) -> Vec<u8> {
+        let Some(piece) = self.tokens.get(id as usize) else {
+            return format!("<{id}>").into_bytes();
+        };
+        if is_special_piece(piece) {
+            return normalize_piece(piece).into_bytes();
+        }
+        if self.byte_level {
+            let mut bytes = Vec::new();
+            push_gpt2_piece_bytes(piece, &mut bytes);
+            return bytes;
+        }
+        if let Some(byte) = parse_hex_byte_token(piece) {
+            return vec![byte];
+        }
+        normalize_piece(piece).into_bytes()
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+}
+
+/// Turns a stream of token bytes into text without splitting a character:
+/// an incomplete UTF-8 sequence at the end is held until the next token
+/// completes it. Bytes that can never be valid UTF-8 become U+FFFD.
+#[derive(Debug, Default, Clone)]
+pub struct Utf8Stream {
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Append `bytes`, return the text that is now complete.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    out.push_str(std::str::from_utf8(&self.pending[..valid]).expect("valid prefix"));
+                    match e.error_len() {
+                        // Incomplete trailing sequence: wait for more bytes.
+                        None => {
+                            self.pending.drain(..valid);
+                            return out;
+                        }
+                        Some(bad) => {
+                            out.push('\u{FFFD}');
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whatever is still held, lossily (end of the reply).
+    pub fn finish(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        out
     }
 }
 
@@ -335,6 +413,23 @@ pub fn format_chatml(messages: &[(&str, &str)], add_generation_prompt: bool) -> 
     }
     if add_generation_prompt {
         out.push_str("<|im_start|>assistant\n");
+    }
+    out
+}
+
+/// Llama 3 turns. `<|begin_of_text|>` is the tokenizer's BOS, not part of
+/// the text.
+pub fn format_llama3_chat(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+    let mut out = String::new();
+    for (role, content) in messages {
+        out.push_str("<|start_header_id|>");
+        out.push_str(role);
+        out.push_str("<|end_header_id|>\n\n");
+        out.push_str(content.trim());
+        out.push_str("<|eot_id|>");
+    }
+    if add_generation_prompt {
+        out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     }
     out
 }
@@ -503,6 +598,31 @@ fn json_u32_second(value: Option<&Value>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llama3_chat_turns() {
+        let got = format_llama3_chat(&[("system", "Be brief."), ("user", "Hi ")], true);
+        let want = concat!(
+            "<|start_header_id|>system<|end_header_id|>\n\nBe brief.<|eot_id|>",
+            "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
+        assert_eq!(got, want);
+    }
+
+    /// An emoji split across tokens comes out whole, never as U+FFFD.
+    #[test]
+    fn utf8_stream_joins_characters_split_across_tokens() {
+        let wave = "\u{1F44B}".as_bytes(); // 4 bytes
+        let mut st = Utf8Stream::default();
+        assert_eq!(st.push(b"Hi there! "), "Hi there! ");
+        assert_eq!(st.push(&wave[..2]), "");
+        assert_eq!(st.push(&wave[2..]), "\u{1F44B}");
+        assert_eq!(st.push(&[0xFF, b'a']), "\u{FFFD}a");
+        assert_eq!(st.push(&wave[..1]), "");
+        assert_eq!(st.finish(), "\u{FFFD}");
+        assert_eq!(st.finish(), "");
+    }
 
     #[test]
     fn synthetic_encodes_hello() {

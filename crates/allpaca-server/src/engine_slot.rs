@@ -80,11 +80,12 @@ impl EngineSlot {
     /// Rebuild the engine from `config`. Returns once the reload has started;
     /// progress shows in [`Self::status`]. The old engine is dropped (its
     /// VRAM freed) before the new one loads; if the new one fails, the old
-    /// config is loaded again. `after` runs on each engine that comes up.
+    /// config is loaded again. `after` runs on each engine that comes up,
+    /// with the config it was built from.
     pub fn reload(
         self: &Arc<Self>,
         config: Config,
-        after: impl Fn(&Engine) + Send + Sync + 'static,
+        after: impl Fn(&Engine, &Config) + Send + Sync + 'static,
     ) -> Result<(), String> {
         {
             let mut s = self.status.lock().map_err(|_| "status lock".to_string())?;
@@ -101,7 +102,7 @@ impl EngineSlot {
         Ok(())
     }
 
-    fn reload_blocking(&self, config: Config, after: impl Fn(&Engine)) {
+    fn reload_blocking(&self, config: Config, after: impl Fn(&Engine, &Config)) {
         let old = self.engine.write().ok().and_then(|mut g| g.take());
         if let Some(old) = old {
             // In-flight requests hold their own Arc; the VRAM is only freed
@@ -129,7 +130,7 @@ impl EngineSlot {
         tracing::info!(kv_vram_bytes = config.kv.vram_bytes, "reload: building engine");
         match build(&config) {
             Ok(engine) => {
-                after(&engine);
+                after(&engine, &config);
                 self.install(engine, config);
                 self.set_status("ready", Some("reloaded".into()));
                 tracing::info!("reload: engine ready");
@@ -143,7 +144,7 @@ impl EngineSlot {
                 );
                 match build(&previous) {
                     Ok(engine) => {
-                        after(&engine);
+                        after(&engine, &previous);
                         self.install(engine, previous);
                         self.set_status("failed", Some(format!("reload failed: {msg}; previous settings restored")));
                     }

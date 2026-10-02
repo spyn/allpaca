@@ -219,6 +219,36 @@ tr:last-child td { border-bottom: none; }
 }
 .toast.err { border-color: var(--err); color: var(--err); }
 
+/* Model picker */
+.models-card { padding: 0; }
+.models-toolbar { display: flex; gap: 10px; align-items: center; padding: 12px 16px; flex-wrap: wrap; }
+.models-toolbar input[type="search"] { width: min(240px, 100%); }
+.table-scroll { overflow-x: auto; }
+.models-table td { vertical-align: top; }
+.models-table tbody tr { cursor: pointer; }
+.models-table tbody tr:hover { background: var(--panel-2); }
+.models-table tbody tr.sel { background: var(--accent-soft); }
+.m-name { font-weight: 600; }
+.m-file { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.badge.on { border-color: var(--accent); color: var(--accent); }
+.badge.warn { border-color: var(--warn); color: var(--warn); }
+#models-extra { padding: 0 16px 12px; margin: 0; }
+.model-detail { border-top: 1px solid var(--border); padding: 14px 16px; display: grid; gap: 12px; }
+.model-detail h3 { margin: 0; font-size: 16px; text-transform: none; letter-spacing: 0; color: var(--text); }
+.kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px 16px; margin: 0; }
+.kv-grid div { min-width: 0; }
+.kv-grid dt { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.kv-grid dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.fit { padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); font-size: 13px; }
+.fit.ok { border-color: var(--accent); }
+.fit.rpc { border-color: var(--info); }
+.fit.ram { border-color: var(--warn); }
+.load-opts { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+.load-opts label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.model-desc { margin: 0; color: var(--muted); font-size: 13px; }
+
 /* Logs */
 .page-logs { display: flex; flex-direction: column; overflow: hidden; padding: 12px 16px 16px; }
 .log-toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }

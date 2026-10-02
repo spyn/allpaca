@@ -6,6 +6,7 @@ mod host;
 mod image_url;
 mod logs;
 mod model_api;
+mod model_scan;
 mod model_settings;
 mod otlp_push;
 mod tune;
@@ -71,13 +72,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // The model's saved settings: context size before the engine is built,
     // disabled experts once it is up.
+    // `base` (without the saved settings) is what a model switch starts from.
+    let base = config.clone();
     let saved = model_settings::SettingsStore::open(&config).get();
     saved.apply_to_config(&mut config);
     let engine = Engine::new(config.clone())?;
     saved.apply_to_engine(&engine);
     let state = api::AppState::new(
         Arc::new(engine),
-        config.clone(),
+        base,
         auth::AuthState::from_password(Some(password)),
         log_ring,
     );

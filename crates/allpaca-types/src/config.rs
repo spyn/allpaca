@@ -700,6 +700,10 @@ pub struct ModelSection {
     /// Edge0: skip prerouter install (reactive expert fill only).
     #[serde(default)]
     pub edge0_no_prerouter: bool,
+    /// Folder the WebUI scans (recursively) for models to switch to. Unset:
+    /// the nearest `models` folder above `path`, else `./models`.
+    #[serde(default)]
+    pub models_dir: Option<PathBuf>,
 }
 
 impl Default for ModelSection {
@@ -714,6 +718,7 @@ impl Default for ModelSection {
             id: "allpaca".into(),
             edge0_no_lora: false,
             edge0_no_prerouter: false,
+            models_dir: None,
         }
     }
 }

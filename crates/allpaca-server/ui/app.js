@@ -111,9 +111,17 @@ function renderMarkdown(src) {
 }
 
 function renderInline(s) {
-  return escapeHtml(s)
-    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  // Odd parts are `code` spans: left as written.
+  return s
+    .split(/(`[^`\n]+`)/)
+    .map((part, i) =>
+      i % 2
+        ? `<code>${escapeHtml(part.slice(1, -1))}</code>`
+        : escapeHtml(part)
+            .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+            .replace(/(^|[^*\w])\*([^*\s][^*\n]*?)\*(?![*\w])/g, "$1<em>$2</em>")
+    )
+    .join("");
 }
 
 function renderBlocks(text) {
@@ -284,6 +292,7 @@ function renderSpark() {
 function renderDashboard(data) {
   const s = data.stats || {};
   if (data.stats) state.lastStats = data.stats;
+  if (data.devices && data.devices.length) state.lastDevices = data.devices;
   renderBanner(data.engine);
   if (state.page === "model" && model.info) renderCtx();
   const h = data.host || {};
@@ -365,14 +374,18 @@ function setPage(name) {
     renderMessages();
     $("prompt").focus();
   }
-  if (name === "model") loadModelSettings();
+  if (name === "model") {
+    loadModelSettings();
+    loadAvailable();
+  }
 }
 
 /* ---------- chat ---------- */
 
 function loadSettings() {
   const s = loadJson(SETTINGS_KEY, {});
-  if (s.maxTokens) $("max-tokens").value = s.maxTokens;
+  // 512 was the old default, saved alongside other settings: not a choice.
+  if (s.maxTokens && String(s.maxTokens) !== "512") $("max-tokens").value = s.maxTokens;
   if (s.temperature !== undefined) $("temperature").value = s.temperature;
   if (s.system) $("system-prompt").value = s.system;
 }
@@ -391,7 +404,11 @@ function messageHtml(m, i) {
   const body =
     m.role === "assistant" ? renderMarkdown(m.content) : escapeHtml(m.content);
   const bubbleCls = `bubble${m.error ? " error-bubble" : ""}${live ? " cursor" : ""}`;
-  const meta = m.meta ? `<div class="msg-meta">${escapeHtml(m.meta)}</div>` : "";
+  const last = i === state.messages.length - 1;
+  const more = m.truncated && last && !state.streaming
+    ? ` <button type="button" class="ghost small continue-btn">Continue</button>`
+    : "";
+  const meta = m.meta ? `<div class="msg-meta">${escapeHtml(m.meta)}${more}</div>` : "";
   return (
     `<div class="msg ${m.role}" data-i="${i}">` +
     (images ? `<div class="msg-images">${images}</div>` : "") +
@@ -454,7 +471,7 @@ function chatPayload() {
   return {
     messages: msgs,
     stream: true,
-    max_tokens: Math.max(1, Number($("max-tokens").value) || 512),
+    max_tokens: Math.max(1, Number($("max-tokens").value) || 4096),
     temperature: Number.isFinite(temp) ? temp : 0.7,
   };
 }
@@ -529,11 +546,15 @@ async function sendChat(ev) {
         if (json.error) throw new Error(json.error.message || "stream error");
         const choice = json.choices && json.choices[0];
         if (!choice) continue;
-        if (choice.delta && choice.delta.content) {
+        if (choice.delta && typeof choice.delta.content === "string") {
+          // One event per token; a character split across tokens arrives
+          // with the first part as empty content.
           if (!firstAt) firstAt = performance.now();
           chunks += 1;
-          assistant.content += choice.delta.content;
-          renderStreaming();
+          if (choice.delta.content) {
+            assistant.content += choice.delta.content;
+            renderStreaming();
+          }
         }
         if (choice.finish_reason) finish = choice.finish_reason;
       }
@@ -554,8 +575,9 @@ async function sendChat(ev) {
     if (chunks && !assistant.error) {
       const gen = firstAt ? (end - firstAt) / 1000 : 0;
       const rate = gen > 0 && chunks > 1 ? ` · ${((chunks - 1) / gen).toFixed(1)} tok/s` : "";
-      const fin = finish && finish !== "stop" ? ` · ${finish}` : "";
+      const fin = finish === "length" ? " · cut off at the max-tokens limit" : finish && finish !== "stop" ? ` · ${finish}` : "";
       assistant.meta = `${chunks} tokens · TTFT ${Math.round(firstAt - started)} ms${rate}${fin}`;
+      assistant.truncated = finish === "length";
     } else if (finish === "stopped" && !assistant.meta) {
       assistant.meta = "stopped";
     }
@@ -861,8 +883,12 @@ function renderBanner(engine) {
   if (prev === "loading" && engine.state !== "loading") {
     toast(engine.state === "ready" ? engine.message || "Model reloaded" : engine.message || "Reload failed", engine.state !== "ready");
     model.ctx = null;
+    model.layer = 0;
+    model.sel = null;
+    model.usage = null;
     loadModelSettings();
     loadModel();
+    loadAvailable();
   }
   const loading = engine.state === "loading";
   $("m-reload").disabled = loading;
@@ -1089,6 +1115,187 @@ async function setRecording(on) {
   }
 }
 
+/* Model picker */
+
+const picker = { data: null, sel: null };
+
+function fmtCtx(n) {
+  if (!n) return "—";
+  return n >= 1024 ? `${Math.round(n / 1024)}k` : String(n);
+}
+
+function baseName(p) {
+  return String(p || "").split(/[\\/]/).pop();
+}
+
+async function loadAvailable(rescan = false) {
+  if (rescan) $("models-rows").innerHTML = `<tr><td colspan="7" class="muted">Scanning…</td></tr>`;
+  try {
+    picker.data = await apiJson("/v1/model/available");
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) {
+      $("models-rows").innerHTML = `<tr><td colspan="7" class="error">${escapeHtml(e.message)}</td></tr>`;
+    }
+    return;
+  }
+  if (picker.sel === null && picker.data.current) picker.sel = picker.data.current;
+  renderAvailable();
+}
+
+function sameFile(a, b) {
+  return String(a || "").replace(/\\/g, "/").toLowerCase() === String(b || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function renderAvailable() {
+  const d = picker.data;
+  if (!d) return;
+  $("models-dir").textContent = d.models_dir ? `Scanning ${d.models_dir}` : "No models folder (set model.models_dir)";
+  const q = $("models-filter").value.trim().toLowerCase();
+  const models = d.entries.filter((e) => e.kind === "model");
+  const shown = models.filter((e) =>
+    !q || [e.name, e.rel_path, e.architecture, e.quant, e.size_label].some((v) => String(v || "").toLowerCase().includes(q))
+  );
+  $("models-rows").innerHTML =
+    shown
+      .map((e) => {
+        const cur = sameFile(e.path, d.current);
+        const badges = [
+          cur ? `<span class="badge on">loaded</span>` : "",
+          e.companions.vision.length ? `<span class="badge">vision</span>` : "",
+          e.companions.mtp.length || e.nextn_layers ? `<span class="badge">MTP</span>` : "",
+          e.settings ? `<span class="badge">saved settings</span>` : "",
+          e.shards > 1 ? `<span class="badge">${e.shards} shards</span>` : "",
+          e.error ? `<span class="badge warn">unreadable</span>` : "",
+        ].join("");
+        const experts = e.expert_count ? `${e.expert_count} · top-${e.expert_used_count || "?"}` : "dense";
+        return (
+          `<tr data-path="${escapeHtml(e.path)}" class="${sameFile(e.path, picker.sel) ? "sel" : ""}">` +
+          `<td><div class="m-name">${escapeHtml(e.name || baseName(e.path))}</div>` +
+          `<div class="m-file">${escapeHtml(e.rel_path)}</div><div class="badges">${badges}</div></td>` +
+          `<td>${escapeHtml(e.architecture || "—")}</td>` +
+          `<td>${escapeHtml([e.size_label, e.quant].filter(Boolean).join(" · ") || "—")}</td>` +
+          `<td class="num">${fmtCtx(e.context_length)}</td>` +
+          `<td>${escapeHtml(experts)}</td>` +
+          `<td class="num">${bytes(e.size_bytes)}</td>` +
+          `<td><button type="button" class="ghost small" data-detail="${escapeHtml(e.path)}">${cur ? "Details" : "Select"}</button></td>` +
+          `</tr>`
+        );
+      })
+      .join("") || `<tr><td colspan="7" class="muted">${models.length ? "No model matches the filter." : "No models found."}</td></tr>`;
+  const count = (k) => d.entries.filter((e) => e.kind === k).length;
+  const extra = [
+    count("mmproj") && `${count("mmproj")} vision projector${count("mmproj") > 1 ? "s" : ""}`,
+    count("mtp") && `${count("mtp")} MTP draft${count("mtp") > 1 ? "s" : ""}`,
+    count("imatrix") && `${count("imatrix")} imatrix file${count("imatrix") > 1 ? "s" : ""}`,
+  ].filter(Boolean);
+  const bad = d.entries.filter((e) => e.kind === "other");
+  $("models-extra").textContent =
+    (extra.length ? `Also found ${extra.join(", ")} (used alongside a model, not on their own). ` : "") +
+    (bad.length ? `Could not read: ${bad.map((e) => e.rel_path).join(", ")}.` : "");
+  renderModelDetail();
+}
+
+function fitText(e) {
+  const s = state.lastStats || {};
+  const sameGpu = s.draft_device === s.target_device;
+  const local = (s.gpu_vram_total_bytes || 0) + (sameGpu ? 0 : s.draft_gpu_vram_total_bytes || 0);
+  const devices = state.lastDevices || [];
+  const rpc = devices.filter((d) => /^rpc\[/.test(d.name || "")).reduce((a, d) => a + (d.memory_bytes || 0), 0);
+  const size = e.size_bytes;
+  if (!local) return { cls: "ram", text: "No local GPU memory reported: weights would sit in system RAM." };
+  if (size < local * 0.9) return { cls: "ok", text: `Fits in local VRAM: ${bytes(size)} of ${bytes(local)} (KV cache and workspaces come on top).` };
+  if (rpc && size < (local + rpc) * 0.9)
+    return { cls: "rpc", text: `Larger than local VRAM (${bytes(local)}): the rest goes to the RPC workers (${bytes(rpc)}).` };
+  return { cls: "ram", text: `Larger than GPU memory${rpc ? " including RPC" : ""} (${bytes(local + rpc)}): part of it runs from system RAM, which is much slower.` };
+}
+
+function renderModelDetail() {
+  const box = $("model-detail");
+  const d = picker.data;
+  const e = d && d.entries.find((x) => x.kind === "model" && sameFile(x.path, picker.sel));
+  if (!e) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  const cur = sameFile(e.path, d.current);
+  const row = (k, v) => (v === undefined || v === null || v === "" ? "" : `<div><dt>${k}</dt><dd>${escapeHtml(v)}</dd></div>`);
+  const fit = fitText(e);
+  const mtpOk = e.companions.mtp.length > 0 || (e.nextn_layers || 0) > 0;
+  const specNow = cur ? d.speculation : "ngram";
+  const opt = (v, label, on, dis = false) =>
+    `<option value="${v}"${on ? " selected" : ""}${dis ? " disabled" : ""}>${label}</option>`;
+  box.innerHTML =
+    `<h3>${escapeHtml(e.name || baseName(e.path))}${cur ? ' <span class="badge on">loaded</span>' : ""}</h3>` +
+    (e.description ? `<p class="model-desc">${escapeHtml(e.description)}</p>` : "") +
+    `<dl class="kv-grid">` +
+    row("File", e.rel_path) +
+    row("Architecture", e.architecture) +
+    row("Parameters", e.size_label) +
+    row("Quantization", e.quant) +
+    row("Context (trained)", e.context_length ? `${num(e.context_length)} tokens` : "") +
+    row("Layers", e.block_count) +
+    row("Width", e.embedding_length) +
+    row("Experts", e.expert_count ? `${e.expert_count} routed, ${e.expert_used_count} per token` : "dense") +
+    row("MTP / NextN layers", e.nextn_layers) +
+    row("On disk", `${bytes(e.size_bytes)}${e.shards > 1 ? ` in ${e.shards} shards` : ""}`) +
+    row("License", e.license) +
+    row("Quantized by", e.quantized_by) +
+    row(
+      "Saved settings",
+      e.settings
+        ? [
+            e.settings.context_tokens ? `context ${num(e.settings.context_tokens)}` : "",
+            e.settings.disabled_experts ? `${e.settings.disabled_experts} experts off` : "",
+            e.settings.named_experts ? `${e.settings.named_experts} named` : "",
+          ].filter(Boolean).join(", ") || "yes"
+        : ""
+    ) +
+    row("Unreadable", e.error) +
+    `</dl>` +
+    `<div class="fit ${fit.cls}">${escapeHtml(fit.text)}</div>` +
+    `<div class="load-opts">` +
+    `<label>Vision projector<select id="ld-vision">${opt("", "None", !e.companions.vision.length)}${e.companions.vision
+      .map((v, i) => opt(escapeHtml(v), escapeHtml(baseName(v)), i === 0))
+      .join("")}</select></label>` +
+    `<label>Speculation<select id="ld-spec">${opt("off", "Off", specNow === "off")}${opt("ngram", "n-gram", specNow === "ngram" || specNow === "draft")}${opt(
+      "mtp",
+      mtpOk ? "MTP draft" : "MTP (not available)",
+      specNow === "mtp" && mtpOk,
+      !mtpOk
+    )}</select></label>` +
+    (e.companions.mtp.length
+      ? `<label>MTP draft<select id="ld-mtp">${e.companions.mtp
+          .map((v, i) => opt(escapeHtml(v), escapeHtml(baseName(v)), i === 0))
+          .join("")}${e.nextn_layers ? opt("", "Model's own NextN layers", false) : ""}</select></label>`
+      : "") +
+    `<button id="ld-go" type="button" class="primary"${e.error ? " disabled" : ""}>${cur ? "Reload with these options" : "Load this model"}</button>` +
+    `</div>`;
+  $("ld-go").addEventListener("click", () => loadSelectedModel(e));
+}
+
+async function loadSelectedModel(e) {
+  const vision = $("ld-vision").value || null;
+  const speculation = $("ld-spec").value;
+  const mtpSel = $("ld-mtp");
+  const mtp_draft = speculation === "mtp" && mtpSel ? mtpSel.value || null : null;
+  const ok = window.confirm(
+    `Load ${e.name || baseName(e.path)}?\n\nRunning requests finish first, then the current model is unloaded and this one is loaded (minutes for large models). Chat is unavailable meanwhile.`
+  );
+  if (!ok) return;
+  try {
+    await apiJson("/v1/model/load", {
+      method: "POST",
+      body: JSON.stringify({ path: e.path, vision, speculation, mtp_draft }),
+    });
+    model.lastEngineState = "loading";
+    toast("Loading model…");
+    pollStatus();
+  } catch (err) {
+    if (!(err instanceof Unauthorized)) toast(err.message, true);
+  }
+}
+
 /* ---------- wiring ---------- */
 
 $("login-form").addEventListener("submit", async (ev) => {
@@ -1175,6 +1382,11 @@ chatLayout.addEventListener("drop", (ev) => {
   ev.preventDefault();
   chatLayout.classList.remove("drop-hint");
   addFiles(ev.dataTransfer.files);
+});
+$("messages").addEventListener("click", (ev) => {
+  if (!ev.target.closest(".continue-btn") || state.streaming) return;
+  $("prompt").value = "Continue exactly where you stopped.";
+  $("chat-form").requestSubmit();
 });
 $("messages").addEventListener("click", async (ev) => {
   const btn = ev.target.closest(".copy");
@@ -1265,6 +1477,16 @@ $("named-rows").addEventListener("click", (ev) => {
   renderGrid();
   renderPanel();
   $("exp-grid").scrollIntoView({ behavior: "smooth", block: "center" });
+});
+
+$("models-rescan").addEventListener("click", () => loadAvailable(true));
+$("models-filter").addEventListener("input", renderAvailable);
+$("models-rows").addEventListener("click", (ev) => {
+  const tr = ev.target.closest("tr[data-path]");
+  if (!tr) return;
+  picker.sel = tr.dataset.path;
+  renderAvailable();
+  $("model-detail").scrollIntoView({ behavior: "smooth", block: "nearest" });
 });
 
 loadSettings();
