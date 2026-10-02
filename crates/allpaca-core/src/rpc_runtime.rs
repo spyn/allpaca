@@ -48,6 +48,9 @@ impl std::fmt::Debug for RpcRuntime {
 /// How long a worker GPU reading is served before it is refreshed.
 const GPU_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Longest a stats refresh waits for the worker sessions to be free.
+const GPU_STATS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(60);
+
 /// One GPU on an RPC worker, for the operator dashboard. `None` = the
 /// worker's platform does not report it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -297,7 +300,20 @@ impl RpcRuntime {
         };
         let fresh = cache.0.is_some_and(|t| t.elapsed() < GPU_STATS_MAX_AGE);
         if !fresh {
-            if let Ok(mut sessions) = self.sessions.try_lock() {
+            // During decode the sessions are busy in back-to-back round
+            // trips: wait briefly for a gap between two of them. A weight
+            // upload holds them for seconds, and then this gives up.
+            let deadline = std::time::Instant::now() + GPU_STATS_LOCK_WAIT;
+            let sessions = loop {
+                match self.sessions.try_lock() {
+                    Ok(g) => break Some(g),
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            if let Some(mut sessions) = sessions {
                 let mut out = Vec::new();
                 for s in sessions.iter_mut() {
                     let endpoint = s.endpoint().to_string();
