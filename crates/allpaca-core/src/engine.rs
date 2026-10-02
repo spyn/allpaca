@@ -799,7 +799,7 @@ impl Engine {
             let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
             self.metrics
                 .record_gpu_sample(used, total, draft_used, draft_total, util);
-            if let Ok(g) = self.lock() {
+            if let Some(g) = self.lock_for_read() {
                 if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
                     lru.set_gpu_busy(util);
                 }
