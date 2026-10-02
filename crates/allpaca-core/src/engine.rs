@@ -240,6 +240,24 @@ pub struct Engine {
     /// several Requests with `inner` released in between, and no other tick
     /// may step them before their batched forward lands.
     poll_tick: Arc<Mutex<()>>,
+    /// Last values `stats` / `model_id` read under `inner`, served while a
+    /// prefill holds the engine lock.
+    read_side: Arc<Mutex<ReadSide>>,
+}
+
+/// How long a monitoring read waits for the engine lock. Decode releases it
+/// between tokens; a prefill holds it for the whole time to first token, and
+/// a dashboard poll must not hang that long.
+const READ_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Clone, Default)]
+struct ReadSide {
+    model_id: Option<String>,
+    target_name: Option<String>,
+    kv_h2d: u64,
+    kv_d2h: u64,
+    draft_kv_bytes: u64,
+    draft_depth: u64,
 }
 
 pub struct RequestHandle {
@@ -555,6 +573,7 @@ impl Engine {
             gpu_sampler: Arc::new(GpuSampler::default()),
             rpc,
             poll_tick: Arc::new(Mutex::new(())),
+            read_side: Arc::new(Mutex::new(ReadSide::default())),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -842,8 +861,8 @@ impl Engine {
 
     pub fn stats(&self) -> StatsSnapshot {
         self.sample_gpu();
-        let (model_id, kv_h2d, kv_d2h, draft_kv_bytes) = match self.lock() {
-            Ok(g) => {
+        let (model_id, kv_h2d, kv_d2h, draft_kv_bytes, draft_depth) = match self.lock_for_read() {
+            Some(g) => {
                 if let Some(ws) = g.target.as_ref().and_then(|m| m.working_set.as_ref()) {
                     self.metrics
                         .weight_ring_binds
@@ -963,7 +982,7 @@ impl Engine {
                 self.metrics
                     .kv_nvme_prefetches
                     .store(g.kv.nvme_prefetches(), std::sync::atomic::Ordering::Relaxed);
-                (
+                let fresh = (
                     g.target
                         .as_ref()
                         .map(|m| m.name.clone())
@@ -971,9 +990,26 @@ impl Engine {
                     g.kv.activation_h2d_bytes(),
                     g.kv.activation_d2h_bytes(),
                     g.draft_kv.device_bytes(),
+                    g.scheduler.draft_depth as u64,
+                );
+                drop(g);
+                if let Ok(mut c) = self.read_side.lock() {
+                    c.target_name = Some(fresh.0.clone());
+                    (c.kv_h2d, c.kv_d2h, c.draft_kv_bytes, c.draft_depth) =
+                        (fresh.1, fresh.2, fresh.3, fresh.4);
+                }
+                fresh
+            }
+            None => {
+                let c = self.read_side.lock().map(|c| c.clone()).unwrap_or_default();
+                (
+                    c.target_name.unwrap_or_else(|| self.config.model.id.clone()),
+                    c.kv_h2d,
+                    c.kv_d2h,
+                    c.draft_kv_bytes,
+                    c.draft_depth,
                 )
             }
-            Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
         let (backend, device_memory_bytes) =
             if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
@@ -1136,11 +1172,6 @@ impl Engine {
         } else {
             "p2p_unavailable"
         };
-        let draft_depth = self
-            .lock()
-            .ok()
-            .map(|g| g.scheduler.draft_depth as u64)
-            .unwrap_or(0);
         self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
@@ -1160,10 +1191,40 @@ impl Engine {
     }
 
     pub fn model_id(&self) -> String {
-        self.lock()
-            .ok()
-            .map(|g| g.model_id.clone())
-            .unwrap_or_else(|| self.config.model.id.clone())
+        match self.lock_for_read() {
+            Some(g) => {
+                let id = g.model_id.clone();
+                drop(g);
+                if let Ok(mut c) = self.read_side.lock() {
+                    c.model_id = Some(id.clone());
+                }
+                id
+            }
+            None => self
+                .read_side
+                .lock()
+                .ok()
+                .and_then(|c| c.model_id.clone())
+                .unwrap_or_else(|| self.config.model.id.clone()),
+        }
+    }
+
+    /// The engine lock for a monitoring read: gives up after
+    /// [`READ_LOCK_WAIT`] (or on a poisoned lock) so the caller serves its
+    /// last values instead.
+    fn lock_for_read(&self) -> Option<std::sync::MutexGuard<'_, EngineInner>> {
+        let deadline = std::time::Instant::now() + READ_LOCK_WAIT;
+        loop {
+            match self.inner.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::WouldBlock)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                Err(_) => return None,
+            }
+        }
     }
 
     pub fn has_model(&self) -> bool {
@@ -12060,6 +12121,37 @@ mod tests {
         assert_eq!(rpc_kv_max_seq(0, per_token * 50_000, &model), 50_000);
         // A tiny budget still leaves the floor.
         assert_eq!(rpc_kv_max_seq(0, 1024, &model), RPC_AUTO_MIN_SEQ);
+    }
+
+    /// A dashboard poll during a prefill (engine lock held for the whole time
+    /// to first token) returns the last readings instead of hanging.
+    #[test]
+    fn stats_and_model_id_do_not_wait_for_a_busy_engine() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(3),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        let engine = Engine::new(cfg).unwrap();
+        engine.generate("hello", GenerationParams { max_tokens: 4, ..GenerationParams::default() }).unwrap();
+        let idle = engine.stats();
+        let id = engine.model_id();
+        let busy = engine.inner.lock().unwrap();
+        let started = std::time::Instant::now();
+        let during = engine.stats();
+        assert_eq!(engine.model_id(), id);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "monitoring reads waited {:?} on a busy engine",
+            started.elapsed()
+        );
+        drop(busy);
+        assert_eq!(during.model_id, idle.model_id);
+        assert_eq!(during.tokens_generated, idle.tokens_generated);
+        assert_eq!(during.draft_depth, idle.draft_depth);
     }
 
     /// A blocking reply is the same string a streamed reply adds up to, so
