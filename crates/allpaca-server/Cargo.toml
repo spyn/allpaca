@@ -13,6 +13,7 @@ vulkan = ["allpaca-core/vulkan"]
 
 [dependencies]
 allpaca-core.workspace = true
+allpaca-gguf.workspace = true
 allpaca-types.workspace = true
 async-stream.workspace = true
 axum.workspace = true
@@ -33,6 +34,5 @@ ratatui.workspace = true
 crossterm.workspace = true
 
 [dev-dependencies]
-allpaca-gguf.workspace = true
 http-body-util.workspace = true
 tower.workspace = true

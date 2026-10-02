@@ -105,6 +105,8 @@ pub fn router(state: AppState) -> Router {
             post(crate::model_api::set_recording),
         )
         .route("/v1/model/reload", post(crate::model_api::reload))
+        .route("/v1/model/available", get(crate::model_api::get_available))
+        .route("/v1/model/load", post(crate::model_api::load_model))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,

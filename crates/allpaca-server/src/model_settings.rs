@@ -80,8 +80,9 @@ impl ModelSettings {
 /// The settings file for the served model. In memory only when the model has
 /// no path (synthetic).
 pub struct SettingsStore {
-    path: Option<PathBuf>,
-    current: Mutex<ModelSettings>,
+    /// The served model's settings file and its contents; switches with
+    /// the model.
+    inner: Mutex<(Option<PathBuf>, ModelSettings)>,
 }
 
 impl SettingsStore {
@@ -97,6 +98,12 @@ impl SettingsStore {
     /// Open the settings for `config`'s model. A missing file is empty
     /// settings; an unreadable one is logged and left untouched until saved.
     pub fn open(config: &Config) -> Self {
+        Self {
+            inner: Mutex::new(Self::read(config)),
+        }
+    }
+
+    fn read(config: &Config) -> (Option<PathBuf>, ModelSettings) {
         let path = Self::path_for(config);
         let current = path.as_deref().map(load).unwrap_or_default();
         if let Some(p) = &path {
@@ -104,33 +111,37 @@ impl SettingsStore {
                 tracing::info!(path = %p.display(), "model settings loaded");
             }
         }
-        Self {
-            path,
-            current: Mutex::new(current),
+        (path, current)
+    }
+
+    /// Point at `config`'s model (after a model switch).
+    pub fn switch(&self, config: &Config) {
+        let next = Self::read(config);
+        if let Ok(mut g) = self.inner.lock() {
+            *g = next;
         }
     }
 
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+    pub fn path(&self) -> Option<PathBuf> {
+        self.inner.lock().ok().and_then(|g| g.0.clone())
     }
 
     pub fn get(&self) -> ModelSettings {
-        self.current.lock().map(|g| g.clone()).unwrap_or_default()
+        self.inner.lock().map(|g| g.1.clone()).unwrap_or_default()
     }
 
     /// Replace and persist. Written to a temp file and renamed, so a crash
     /// never leaves a half-written file.
     pub fn set(&self, mut settings: ModelSettings) -> Result<(), String> {
         settings.version = SETTINGS_VERSION;
-        if let Some(path) = &self.path {
+        let mut g = self.inner.lock().map_err(|_| "settings lock".to_string())?;
+        if let Some(path) = &g.0 {
             let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
             let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
             std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
         }
-        if let Ok(mut g) = self.current.lock() {
-            *g = settings;
-        }
+        g.1 = settings;
         Ok(())
     }
 }

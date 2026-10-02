@@ -114,6 +114,24 @@
         </div>
       </section>
 
+      <h2 class="section-title">Available models</h2>
+      <section class="card models-card">
+        <div class="models-toolbar">
+          <span id="models-dir" class="muted small-text"></span>
+          <span class="spacer"></span>
+          <input id="models-filter" type="search" placeholder="Filter models" aria-label="Filter models">
+          <button id="models-rescan" class="ghost small">Rescan</button>
+        </div>
+        <div class="table-scroll">
+          <table class="models-table">
+            <thead><tr><th>Model</th><th>Architecture</th><th>Size · quant</th><th class="num">Context</th><th>Experts</th><th class="num">On disk</th><th></th></tr></thead>
+            <tbody id="models-rows"><tr><td colspan="7" class="muted">Scanning…</td></tr></tbody>
+          </table>
+        </div>
+        <p id="models-extra" class="muted small-text"></p>
+        <div id="model-detail" class="model-detail hidden"></div>
+      </section>
+
       <h2 class="section-title">Context size</h2>
       <section class="card">
         <div class="ctx-row">

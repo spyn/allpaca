@@ -40,6 +40,8 @@ struct KvInfo {
 #[derive(Serialize)]
 struct SettingsBody {
     model: Option<String>,
+    /// File the running engine was built from.
+    model_path: Option<String>,
     path: Option<String>,
     persisted: bool,
     settings: ModelSettings,
@@ -81,6 +83,12 @@ fn settings_body(state: &AppState) -> SettingsBody {
     };
     SettingsBody {
         model: engine.as_ref().map(|e| e.model_id()),
+        model_path: state
+            .engine
+            .config()
+            .model
+            .path
+            .map(|p| p.display().to_string()),
         path: state.settings.path().map(|p| p.display().to_string()),
         persisted: state.settings.path().is_some(),
         settings,
@@ -219,10 +227,10 @@ pub async fn reload(State(state): State<AppState>) -> Response {
     let mut config = state.engine.config();
     state.settings.get().apply_to_config(&mut config);
     let store = Arc::clone(&state.settings);
-    match state
-        .engine
-        .reload(config, move |engine| store.get().apply_to_engine(engine))
-    {
+    match state.engine.reload(config, move |engine, cfg| {
+        store.switch(cfg);
+        store.get().apply_to_engine(engine);
+    }) {
         Ok(()) => (StatusCode::ACCEPTED, Json(state.engine.status())).into_response(),
         Err(e) => (
             StatusCode::CONFLICT,
@@ -425,6 +433,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The folder scan lists models with metadata; loading one switches the
+    /// engine and the settings file; paths and companions not from the scan
+    /// are refused.
+    #[tokio::test]
+    async fn available_models_and_switching() {
+        let dir = tmp_dir("switch");
+        let (mut state, first) = moe_state(&dir);
+        let second = dir.join("sub").join("other-moe-Q8_0.gguf");
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        write_tiny_moe_gguf(&second);
+        state.config.model.models_dir = Some(dir.clone());
+        // A saved setting on the second model must follow the switch.
+        std::fs::write(
+            second.with_file_name("other-moe-Q8_0.gguf.allpaca.json"),
+            r#"{"version":1,"disabled_experts":{"0":[2]}}"#,
+        )
+        .unwrap();
+        let app = router(state.clone());
+
+        let (st, body) = call(&app, "GET", "/v1/model/available", None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{body}");
+        let other = entries.iter().find(|e| e["rel_path"] == "sub/other-moe-Q8_0.gguf").unwrap();
+        assert_eq!(other["kind"], "model");
+        assert_eq!(other["quant"], "Q8_0");
+        assert_eq!(other["expert_count"], 4);
+        assert_eq!(other["settings"]["disabled_experts"], 1);
+        assert_eq!(body["current"], first.display().to_string());
+
+        let path = other["path"].as_str().unwrap().to_string();
+        for bad in [
+            serde_json::json!({"path": "C:/Windows/notepad.exe"}),
+            serde_json::json!({"path": path, "vision": "C:/x/mmproj.gguf"}),
+            serde_json::json!({"path": path, "speculation": "mtp"}),
+            serde_json::json!({"path": path, "speculation": "warp"}),
+        ] {
+            let (st, body) = call(&app, "POST", "/v1/model/load", Some(bad.clone())).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+        }
+
+        let old = state.engine().unwrap();
+        let (st, _) = call(
+            &app,
+            "POST",
+            "/v1/model/load",
+            Some(serde_json::json!({"path": path, "speculation": "ngram"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        drop(old);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let body = loop {
+            let (_, body) = call(&app, "GET", "/v1/model/settings", None).await;
+            if body["engine"]["state"] == "ready" && body["model_path"] == path.as_str() {
+                break body;
+            }
+            assert!(std::time::Instant::now() < deadline, "switch did not finish: {body}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(body["experts"]["disabled_total"], 1, "{body}");
+        assert!(body["path"].as_str().unwrap().ends_with("other-moe-Q8_0.gguf.allpaca.json"));
+        let (_, avail) = call(&app, "GET", "/v1/model/available", None).await;
+        assert_eq!(avail["current"], path.as_str());
+        assert_eq!(avail["speculation"], "ngram");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A new context size is saved, marks a reload pending, and the reload
     /// rebuilds the engine with that KV budget and keeps disabled experts.
     #[tokio::test]
@@ -470,5 +546,151 @@ mod tests {
         let (st, _) = call(&app, "GET", "/v1/models", None).await;
         assert_eq!(st, StatusCode::OK);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[derive(Serialize)]
+struct AvailableBody {
+    models_dir: Option<String>,
+    /// Path of the model the engine is running (or loading).
+    current: Option<String>,
+    /// Speculation of the running config: `off`, `ngram`, `mtp`, `draft`.
+    speculation: &'static str,
+    entries: Vec<crate::model_scan::ModelEntry>,
+}
+
+fn speculation_mode(config: &allpaca_types::Config) -> &'static str {
+    use allpaca_types::DraftProviderKind as K;
+    let p = &config.speculative.providers;
+    if !config.speculative.enabled || p.is_empty() {
+        "off"
+    } else if p.contains(&K::Mtp) {
+        "mtp"
+    } else if p.contains(&K::DraftModel) {
+        "draft"
+    } else {
+        "ngram"
+    }
+}
+
+fn scan_available(state: &AppState) -> (Option<std::path::PathBuf>, Vec<crate::model_scan::ModelEntry>) {
+    // The folder comes from the startup config, so it does not move when
+    // the served model changes.
+    let dir = crate::model_scan::models_dir(&state.config);
+    let entries = dir.as_deref().map(crate::model_scan::scan).unwrap_or_default();
+    (dir, entries)
+}
+
+pub async fn get_available(State(state): State<AppState>) -> Response {
+    let st = state.clone();
+    let Ok((dir, entries)) = tokio::task::spawn_blocking(move || scan_available(&st)).await else {
+        return bad_request("model scan failed");
+    };
+    let config = state.engine.config();
+    Json(AvailableBody {
+        models_dir: dir.map(|d| d.display().to_string()),
+        current: config.model.path.as_ref().map(|p| p.display().to_string()),
+        speculation: speculation_mode(&config),
+        entries,
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoadRequest {
+    /// `path` of a `model` entry from `/v1/model/available`.
+    pub path: String,
+    /// One of the entry's vision projectors, or none.
+    pub vision: Option<String>,
+    /// `off`, `ngram` or `mtp`.
+    pub speculation: Option<String>,
+    /// MTP draft sidecar (one of the entry's `companions.mtp`); without one,
+    /// MTP uses the model's own NextN layers.
+    pub mtp_draft: Option<String>,
+}
+
+/// The config to serve `entry` with: the startup config with the model,
+/// its companions and speculation swapped in, then its saved settings.
+fn config_for(
+    state: &AppState,
+    entry: &crate::model_scan::ModelEntry,
+    req: &LoadRequest,
+) -> Result<allpaca_types::Config, String> {
+    use allpaca_types::DraftProviderKind as K;
+    if let Some(v) = &req.vision {
+        if !entry.companions.vision.contains(v) {
+            return Err(format!("{v} is not a vision projector next to this model"));
+        }
+    }
+    if let Some(m) = &req.mtp_draft {
+        if !entry.companions.mtp.contains(m) {
+            return Err(format!("{m} is not an MTP draft next to this model"));
+        }
+    }
+    let mut c = state.config.clone();
+    let path = std::path::PathBuf::from(&entry.path);
+    c.model.synthetic = false;
+    c.model.path = Some(path.clone());
+    c.model.id = entry.name.clone().unwrap_or_else(|| {
+        path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    });
+    c.model.config_path = None;
+    c.model.tokenizer_path = None;
+    c.model.hf_revision = None;
+    c.model.draft_path = None;
+    c.multimodal.vision_path = req.vision.as_ref().map(std::path::PathBuf::from);
+    match req.speculation.as_deref().unwrap_or("off") {
+        "off" => {
+            c.speculative.enabled = false;
+            c.speculative.providers = Vec::new();
+        }
+        "ngram" => {
+            c.speculative.enabled = true;
+            c.speculative.providers = vec![K::Ngram];
+            c.features.ngram_speculation = Some(true);
+        }
+        "mtp" => {
+            if req.mtp_draft.is_none() && entry.nextn_layers.unwrap_or(0) == 0 {
+                return Err("MTP needs an mtp-*.gguf draft or NextN layers in the model".into());
+            }
+            c.speculative.enabled = true;
+            c.speculative.providers = vec![K::Mtp];
+            c.features.draft_model_speculation = Some(true);
+            c.model.draft_path = req.mtp_draft.as_ref().map(std::path::PathBuf::from);
+        }
+        other => return Err(format!("speculation must be off, ngram or mtp, not {other:?}")),
+    }
+    crate::model_settings::SettingsStore::open(&c).get().apply_to_config(&mut c);
+    Ok(c)
+}
+
+/// Switch the served model: rebuilds the engine (see `reload`).
+pub async fn load_model(State(state): State<AppState>, Json(req): Json<LoadRequest>) -> Response {
+    let st = state.clone();
+    let Ok((_, entries)) = tokio::task::spawn_blocking(move || scan_available(&st)).await else {
+        return bad_request("model scan failed");
+    };
+    let Some(entry) = entries.iter().find(|e| e.path == req.path && e.kind == "model") else {
+        return bad_request(format!("{} is not a model in the models folder", req.path));
+    };
+    if let Some(err) = &entry.error {
+        return bad_request(format!("{} cannot be read: {err}", entry.rel_path));
+    }
+    let config = match config_for(&state, entry, &req) {
+        Ok(c) => c,
+        Err(e) => return bad_request(e),
+    };
+    tracing::info!(model = %entry.rel_path, speculation = ?req.speculation, "model switch requested");
+    let store = Arc::clone(&state.settings);
+    match state.engine.reload(config, move |engine, cfg| {
+        store.switch(cfg);
+        store.get().apply_to_engine(engine);
+    }) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(state.engine.status())).into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": {"message": e, "type": "conflict"}})),
+        )
+            .into_response(),
     }
 }
