@@ -261,11 +261,26 @@ fn stats_carry_driver_vram_and_gpu_util_sampled_off_decode() {
         s.gpu_vram_total_bytes > 0,
         "driver must report total VRAM; stats={s:?}"
     );
+    // `device_memory_bytes` is process-wide and spans both boards, and the
+    // driver reading is up to one sample interval old: other tests in this
+    // binary allocate meanwhile, so allow the sampler to catch up.
+    let covered = |s: &allpaca_types::StatsSnapshot| {
+        s.gpu_vram_used_bytes + s.draft_gpu_vram_used_bytes >= s.device_memory_bytes
+    };
+    let mut seen = s.clone();
+    for _ in 0..40 {
+        if covered(&seen) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        seen = engine.stats();
+    }
     assert!(
-        s.gpu_vram_used_bytes >= s.device_memory_bytes,
-        "board usage must cover what this process allocated; used={} owned={}",
-        s.gpu_vram_used_bytes,
-        s.device_memory_bytes
+        covered(&seen),
+        "board usage must cover what this process allocated; used={}+{} owned={}",
+        seen.gpu_vram_used_bytes,
+        seen.draft_gpu_vram_used_bytes,
+        seen.device_memory_bytes
     );
     assert!(
         s.gpu_vram_used_bytes <= s.gpu_vram_total_bytes,

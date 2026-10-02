@@ -142,6 +142,8 @@ struct ProfileState {
     ema_ns: [u64; 5],
     /// Decode forwards seen; every [`PROFILE_EVERY`]th is event-timed.
     forwards: u64,
+    /// lm_head time of this sampled forward, measured between stream syncs.
+    lm_head_ns: u64,
 }
 
 /// Event-time one decode forward in this many. Timing every forward cost two
@@ -163,6 +165,7 @@ impl Default for ProfileState {
             wall_start: None,
             ema_ns: [0; 5],
             forwards: 0,
+            lm_head_ns: 0,
         }
     }
 }
@@ -334,10 +337,13 @@ fn destroy_swiglu_pair(
 fn event_elapsed_ns(start: *mut std::ffi::c_void, stop: *mut std::ffi::c_void) -> u64 {
     let mut us = 0.0f64;
     let rc = unsafe { ffi::allpaca_hip_event_elapsed_us(start, stop, &mut us) };
-    if rc != ALLPACA_OK || us <= 0.0 {
+    if rc != ALLPACA_OK {
         0
     } else {
-        (us * 1_000.0).round() as u64
+        // Short kernels read back as zero or slightly negative when the GPU is
+        // shared (the two markers land in one submission): the op still ran,
+        // so it keeps its bucket at the timer's floor.
+        ((us * 1_000.0).round() as i64).max(1) as u64
     }
 }
 
@@ -5521,6 +5527,7 @@ impl HipWorkspace {
         let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
         g.used = 0;
         g.ops.clear();
+        g.lm_head_ns = 0;
         g.full = g.forwards % PROFILE_EVERY == 1;
         g.forwards = g.forwards.wrapping_add(1);
         self.profiling.store(u64::from(g.full), Ordering::Relaxed);
@@ -5593,6 +5600,7 @@ impl HipWorkspace {
                     buckets[op] += event_elapsed_ns(g.pairs[i][0], g.pairs[i][1]);
                 }
             }
+            buckets[DecodeOp::LmHead as usize] += g.lm_head_ns;
             let gpu_ns = buckets[0] + buckets[1] + buckets[2] + buckets[3];
             buckets[4] = wall_ns.saturating_sub(gpu_ns);
             for i in 0..5 {
@@ -5629,6 +5637,19 @@ impl HipWorkspace {
         }
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
+            if matches!(op, DecodeOp::LmHead) {
+                // The vocab GEMV is the forward's last kernel, so its two
+                // markers share a submission and their event delta is noise.
+                // One GEMV per sampled forward: time it between stream syncs.
+                let _ = stream_synchronize();
+                let started = std::time::Instant::now();
+                let result = f();
+                let _ = stream_synchronize();
+                let ns = started.elapsed().as_nanos() as u64;
+                let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+                g.lm_head_ns += ns.max(1);
+                return result;
+            }
             let pair = {
                 let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
                 if g.used >= g.pairs.len() {
