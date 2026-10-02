@@ -2172,11 +2172,16 @@ impl Engine {
         images: &[crate::ImageInput],
         params: GenerationParams,
     ) -> Result<GenerationOutput, AllpacaError> {
-        let own_stops = params.stop_token_ids.clone();
         let mut handle = self.begin_request_multimodal(prompt, images, params)?;
         let mut token_ids = Vec::new();
+        // The reply text is the stream's text, so a blocking reply and a
+        // streamed one are the same string: special tokens the model emits
+        // (`<think>`) are kept, the stop token's text is not, and characters
+        // split across tokens are joined.
+        let mut text = String::new();
         let finish = self.drive_request(&mut handle, |ev| {
             token_ids.push(ev.token_id);
+            text.push_str(&ev.text);
             ev.finish_reason
         })?;
         tracing::info!(
@@ -2186,24 +2191,6 @@ impl Engine {
             ?finish,
             "generate tokens"
         );
-        let text = {
-            let inner = self.lock()?;
-            let tokenizer = inner
-                .tokenizer
-                .as_ref()
-                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-            // Same as the stream: a final stop token is not decoded into text.
-            let ends_on_stop = finish == FinishReason::Stop
-                && token_ids
-                    .last()
-                    .is_some_and(|t| own_stops.contains(t) || tokenizer.stop_token_ids().contains(t));
-            let body = if ends_on_stop {
-                &token_ids[..token_ids.len() - 1]
-            } else {
-                &token_ids[..]
-            };
-            tokenizer.decode(body)?
-        };
         let prompt_tokens = handle_prompt_len(&handle, &self.inner)?;
         Ok(GenerationOutput {
             text,
@@ -12001,6 +11988,41 @@ mod tests {
         if let Some(p) = nvme {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// A blocking reply is the same string a streamed reply adds up to, so
+    /// the text does not depend on which path served the request (special
+    /// pieces the model emits are kept in both).
+    #[test]
+    fn generate_text_equals_streamed_text() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(3),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 48,
+            temperature: 0.0,
+            seed: Some(3),
+            ..GenerationParams::default()
+        };
+        let out = engine.generate("hello world", params.clone()).unwrap();
+        let mut handle = engine.begin_request("hello world", params).unwrap();
+        let (mut streamed, mut ids) = (String::new(), Vec::new());
+        engine
+            .drive_request(&mut handle, |ev| {
+                streamed.push_str(&ev.text);
+                ids.push(ev.token_id);
+                ev.finish_reason
+            })
+            .unwrap();
+        assert_eq!(ids, out.token_ids);
+        assert_eq!(out.text, streamed);
+        assert!(!out.text.is_empty());
     }
 
     #[test]
