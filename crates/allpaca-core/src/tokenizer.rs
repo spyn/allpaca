@@ -302,8 +302,76 @@ impl EngineTokenizer {
         normalize_piece(piece)
     }
 
+    /// Raw bytes of one token, for streaming: a UTF-8 character can span
+    /// several tokens (byte-level BPE pieces, SPM `<0xNN>` byte tokens), so
+    /// text must be cut only on complete characters. See [`Utf8Stream`].
+    pub fn decode_one_bytes(&self, id: u32) -> Vec<u8> {
+        let Some(piece) = self.tokens.get(id as usize) else {
+            return format!("<{id}>").into_bytes();
+        };
+        if is_special_piece(piece) {
+            return normalize_piece(piece).into_bytes();
+        }
+        if self.byte_level {
+            let mut bytes = Vec::new();
+            push_gpt2_piece_bytes(piece, &mut bytes);
+            return bytes;
+        }
+        if let Some(byte) = parse_hex_byte_token(piece) {
+            return vec![byte];
+        }
+        normalize_piece(piece).into_bytes()
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+}
+
+/// Turns a stream of token bytes into text without splitting a character:
+/// an incomplete UTF-8 sequence at the end is held until the next token
+/// completes it. Bytes that can never be valid UTF-8 become U+FFFD.
+#[derive(Debug, Default, Clone)]
+pub struct Utf8Stream {
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Append `bytes`, return the text that is now complete.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    out.push_str(std::str::from_utf8(&self.pending[..valid]).expect("valid prefix"));
+                    match e.error_len() {
+                        // Incomplete trailing sequence: wait for more bytes.
+                        None => {
+                            self.pending.drain(..valid);
+                            return out;
+                        }
+                        Some(bad) => {
+                            out.push('\u{FFFD}');
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whatever is still held, lossily (end of the reply).
+    pub fn finish(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        out
     }
 }
 
@@ -503,6 +571,20 @@ fn json_u32_second(value: Option<&Value>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An emoji split across tokens comes out whole, never as U+FFFD.
+    #[test]
+    fn utf8_stream_joins_characters_split_across_tokens() {
+        let wave = "\u{1F44B}".as_bytes(); // 4 bytes
+        let mut st = Utf8Stream::default();
+        assert_eq!(st.push(b"Hi there! "), "Hi there! ");
+        assert_eq!(st.push(&wave[..2]), "");
+        assert_eq!(st.push(&wave[2..]), "\u{1F44B}");
+        assert_eq!(st.push(&[0xFF, b'a']), "\u{FFFD}a");
+        assert_eq!(st.push(&wave[..1]), "");
+        assert_eq!(st.finish(), "\u{FFFD}");
+        assert_eq!(st.finish(), "");
+    }
 
     #[test]
     fn synthetic_encodes_hello() {

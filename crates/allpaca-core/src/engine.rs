@@ -67,6 +67,8 @@ struct ActiveRequest {
     /// Prefetched grammar mask from a background thread (`structured_output.async`).
     async_mask_rx: Option<std::sync::mpsc::Receiver<Result<allpaca_types::TokenMask, String>>>,
     json_prefix: String,
+    /// Holds a UTF-8 character split across tokens until it is complete.
+    utf8: crate::tokenizer::Utf8Stream,
     grammar: Option<llguidance::Matcher>,
     rng: StdRng,
     started: Instant,
@@ -2555,6 +2557,7 @@ impl Engine {
                 parked: VecDeque::new(),
                 async_mask_rx: None,
                 json_prefix: String::new(),
+                utf8: Default::default(),
                 grammar,
                 rng,
                 started: Instant::now(),
@@ -3526,10 +3529,10 @@ impl Engine {
 
         let last_idx = produced.tokens.len().saturating_sub(1);
         for (i, tok) in produced.tokens.into_iter().enumerate() {
-            let piece = inner
+            let piece_bytes = inner
                 .tokenizer
                 .as_ref()
-                .map(|t| t.decode_one(tok))
+                .map(|t| t.decode_one_bytes(tok))
                 .unwrap_or_default();
             let (stop, maxed, first) = {
                 let active = request(inner, id)?;
@@ -3566,6 +3569,16 @@ impl Engine {
                         }
                     }
                 }
+                // The stop token ends the reply; its text (`<|im_end|>`) is
+                // not part of it. Otherwise emit only complete characters.
+                let mut piece = if stop {
+                    String::new()
+                } else {
+                    active.utf8.push(&piece_bytes)
+                };
+                if finish.is_some() {
+                    piece.push_str(&active.utf8.finish());
+                }
                 if !is_special(&piece) {
                     active.json_prefix.push_str(&piece);
                 }
@@ -3586,9 +3599,7 @@ impl Engine {
                 }
                 active.emit_queue.push(TokenEvent {
                     token_id: tok,
-                    // The stop token ends the reply; its text (`<|im_end|>`)
-                    // is not part of it.
-                    text: if stop { String::new() } else { piece },
+                    text: piece,
                     finish_reason: finish,
                 });
             }
