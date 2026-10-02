@@ -343,6 +343,13 @@ pub struct EngineSection {
     pub batch_decode: bool,
     /// `"auto"` (HIP, else CUDA, else Vulkan), `"hip"`, `"cuda"`, `"vulkan"`, or `"cpu"`.
     pub gpu_backend: String,
+    /// Layer budget per local GPU in MiB, target GPU first, used instead of
+    /// the budget measured from free VRAM at load. The measured value moves
+    /// with desktop VRAM use, which can shift a layer between GPUs (or its
+    /// experts onto RPC) from one load to the next; pin it for reproducible
+    /// placement. Empty (default) or a `0` entry keeps the measured budget.
+    #[serde(default)]
+    pub local_vram_budget_mib: Vec<u64>,
 }
 
 /// Continuous-batching poll selection policy.
@@ -373,6 +380,7 @@ impl Default for EngineSection {
             poll_schedule: PollSchedule::Fair,
             max_consecutive_prefill_picks: 0,
             batch_decode: true,
+            local_vram_budget_mib: Vec::new(),
             gpu_backend: "auto".into(),
         }
     }

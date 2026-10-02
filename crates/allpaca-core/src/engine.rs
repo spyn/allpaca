@@ -1262,6 +1262,7 @@ impl Engine {
             local_devices.push((0, 8 << 30));
         }
         if let Some(rt) = &self.rpc {
+            rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
             rt.prepare(
                 model,
                 &local_devices,
@@ -1281,6 +1282,7 @@ impl Engine {
         }
         if local_devices.len() > 1 {
             let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[], None)?);
+            rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
             rt.prepare(
                 model,
                 &local_devices,

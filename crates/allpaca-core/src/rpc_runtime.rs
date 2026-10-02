@@ -25,6 +25,9 @@ pub struct RpcRuntime {
     layer_device: Mutex<Vec<i32>>,
     /// Second local GPU: device id, workspace, and the layers that live there.
     local_peer: Mutex<Option<(i32, Arc<allpaca_hip::HipWorkspace>, Arc<ResidentModel>)>>,
+    /// `engine.local_vram_budget_mib`: per-slot layer budgets that replace the
+    /// measured ones (0 or missing = measured).
+    local_budget_mib: Mutex<Vec<u64>>,
     pub roundtrips: AtomicU64,
     pub activation_bytes: AtomicU64,
     pub h2d_bytes: AtomicU64,
@@ -118,6 +121,12 @@ fn local_reserve_bytes(total: u64) -> u64 {
 /// read now, not the card's total: on Windows a display GPU can have several
 /// GiB taken by the desktop, and WDDM silently spills past-capacity
 /// allocations to shared system memory, which reads over PCIe at decode.
+/// `engine.local_vram_budget_mib` entry for `slot`, in bytes; `None` keeps
+/// the measured budget.
+fn pinned_budget(pinned_mib: &[u64], slot: usize) -> Option<u64> {
+    pinned_mib.get(slot).copied().filter(|m| *m > 0).map(|m| m << 20)
+}
+
 fn plan_local_by_bytes(
     model: &TinyModel,
     file: &GgufFile,
@@ -125,6 +134,7 @@ fn plan_local_by_bytes(
     is_full_attn: &[bool],
     kv_vram_bytes: u64,
     draft_bytes: u64,
+    pinned_mib: &[u64],
 ) -> LayerPlan {
     let (mut layer_bytes, globals) = crate::model::gguf_device_bytes(file, &model.config);
     let n_attn = is_full_attn.iter().filter(|a| **a).count().max(1) as u64;
@@ -144,11 +154,16 @@ fn plan_local_by_bytes(
         } else if slot == 1 {
             budget = budget.saturating_sub(draft_bytes);
         }
+        let pinned = pinned_budget(pinned_mib, slot);
+        if let Some(b) = pinned {
+            budget = b;
+        }
         tracing::info!(
             hip = dev,
             free_mib = free >> 20,
             total_mib = total >> 20,
             budget_mib = budget >> 20,
+            pinned = pinned.is_some(),
             "local GPU pool budget"
         );
         budgets.push(budget);
@@ -190,6 +205,7 @@ impl RpcRuntime {
             remote: Mutex::new(Vec::new()),
             experts: Mutex::new(Vec::new()),
             layer_device: Mutex::new(Vec::new()),
+            local_budget_mib: Mutex::new(Vec::new()),
             local_peer: Mutex::new(None),
             roundtrips: AtomicU64::new(0),
             activation_bytes: AtomicU64::new(0),
@@ -247,6 +263,17 @@ impl RpcRuntime {
 
     pub fn session_count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Pin the per-GPU layer budgets (`engine.local_vram_budget_mib`).
+    pub fn set_local_budgets_mib(&self, mib: &[u64]) {
+        if let Ok(mut b) = self.local_budget_mib.lock() {
+            *b = mib.to_vec();
+        }
+    }
+
+    fn local_budgets_mib(&self) -> Vec<u64> {
+        self.local_budget_mib.lock().map(|b| b.clone()).unwrap_or_default()
     }
 
     /// HIP device that runs a local layer. `-1` when the layer is on RPC.
@@ -391,7 +418,15 @@ impl RpcRuntime {
                 .map(|l| l.block == HybridLayerKind::Attention)
                 .collect();
             if let Some(file) = gguf {
-                plan_local_by_bytes(model, file, &local_ids, &attn, kv_vram_bytes, draft_bytes)
+                plan_local_by_bytes(
+                    model,
+                    file,
+                    &local_ids,
+                    &attn,
+                    kv_vram_bytes,
+                    draft_bytes,
+                    &self.local_budgets_mib(),
+                )
             } else {
                 let hybrid = attn.iter().any(|full| !*full);
                 let window = if hybrid {
@@ -511,6 +546,7 @@ impl RpcRuntime {
                 *b += kv_share;
             }
         }
+        let pinned_mib = self.local_budgets_mib();
         let mut budgets = Vec::with_capacity(local_ids.len());
         for (slot, dev) in local_ids.iter().copied().enumerate() {
             let (hip_free, total) = allpaca_hip::device_memory_info(dev).unwrap_or((0, 0));
@@ -523,11 +559,16 @@ impl RpcRuntime {
             } else if slot == 1 {
                 budget = budget.saturating_sub(draft_bytes);
             }
+            let pinned = pinned_budget(&pinned_mib, slot);
+            if let Some(b) = pinned {
+                budget = b;
+            }
             tracing::info!(
                 hip = dev,
                 free_mib = free >> 20,
                 total_mib = total >> 20,
                 budget_mib = budget >> 20,
+                pinned = pinned.is_some(),
                 "expert-parallel: local GPU budget"
             );
             budgets.push(budget);
@@ -1460,5 +1501,18 @@ fn memcpy_at(dst: BufId, src: BufId, dst_off: i32, nbytes: i32) -> LaunchItem {
         bufs: vec![dst, src],
         i32s: vec![dst_off, nbytes],
         f32s: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pinned_budget;
+
+    #[test]
+    fn pinned_budget_overrides_only_set_slots() {
+        assert_eq!(pinned_budget(&[], 0), None);
+        assert_eq!(pinned_budget(&[8332, 0], 0), Some(8332 << 20));
+        assert_eq!(pinned_budget(&[8332, 0], 1), None);
+        assert_eq!(pinned_budget(&[8332], 1), None);
     }
 }
