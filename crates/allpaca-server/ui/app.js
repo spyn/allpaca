@@ -111,9 +111,17 @@ function renderMarkdown(src) {
 }
 
 function renderInline(s) {
-  return escapeHtml(s)
-    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  // Odd parts are `code` spans: left as written.
+  return s
+    .split(/(`[^`\n]+`)/)
+    .map((part, i) =>
+      i % 2
+        ? `<code>${escapeHtml(part.slice(1, -1))}</code>`
+        : escapeHtml(part)
+            .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+            .replace(/(^|[^*\w])\*([^*\s][^*\n]*?)\*(?![*\w])/g, "$1<em>$2</em>")
+    )
+    .join("");
 }
 
 function renderBlocks(text) {
@@ -372,7 +380,8 @@ function setPage(name) {
 
 function loadSettings() {
   const s = loadJson(SETTINGS_KEY, {});
-  if (s.maxTokens) $("max-tokens").value = s.maxTokens;
+  // 512 was the old default, saved alongside other settings: not a choice.
+  if (s.maxTokens && String(s.maxTokens) !== "512") $("max-tokens").value = s.maxTokens;
   if (s.temperature !== undefined) $("temperature").value = s.temperature;
   if (s.system) $("system-prompt").value = s.system;
 }
@@ -391,7 +400,11 @@ function messageHtml(m, i) {
   const body =
     m.role === "assistant" ? renderMarkdown(m.content) : escapeHtml(m.content);
   const bubbleCls = `bubble${m.error ? " error-bubble" : ""}${live ? " cursor" : ""}`;
-  const meta = m.meta ? `<div class="msg-meta">${escapeHtml(m.meta)}</div>` : "";
+  const last = i === state.messages.length - 1;
+  const more = m.truncated && last && !state.streaming
+    ? ` <button type="button" class="ghost small continue-btn">Continue</button>`
+    : "";
+  const meta = m.meta ? `<div class="msg-meta">${escapeHtml(m.meta)}${more}</div>` : "";
   return (
     `<div class="msg ${m.role}" data-i="${i}">` +
     (images ? `<div class="msg-images">${images}</div>` : "") +
@@ -454,7 +467,7 @@ function chatPayload() {
   return {
     messages: msgs,
     stream: true,
-    max_tokens: Math.max(1, Number($("max-tokens").value) || 512),
+    max_tokens: Math.max(1, Number($("max-tokens").value) || 4096),
     temperature: Number.isFinite(temp) ? temp : 0.7,
   };
 }
@@ -529,11 +542,15 @@ async function sendChat(ev) {
         if (json.error) throw new Error(json.error.message || "stream error");
         const choice = json.choices && json.choices[0];
         if (!choice) continue;
-        if (choice.delta && choice.delta.content) {
+        if (choice.delta && typeof choice.delta.content === "string") {
+          // One event per token; a character split across tokens arrives
+          // with the first part as empty content.
           if (!firstAt) firstAt = performance.now();
           chunks += 1;
-          assistant.content += choice.delta.content;
-          renderStreaming();
+          if (choice.delta.content) {
+            assistant.content += choice.delta.content;
+            renderStreaming();
+          }
         }
         if (choice.finish_reason) finish = choice.finish_reason;
       }
@@ -554,8 +571,9 @@ async function sendChat(ev) {
     if (chunks && !assistant.error) {
       const gen = firstAt ? (end - firstAt) / 1000 : 0;
       const rate = gen > 0 && chunks > 1 ? ` · ${((chunks - 1) / gen).toFixed(1)} tok/s` : "";
-      const fin = finish && finish !== "stop" ? ` · ${finish}` : "";
+      const fin = finish === "length" ? " · cut off at the max-tokens limit" : finish && finish !== "stop" ? ` · ${finish}` : "";
       assistant.meta = `${chunks} tokens · TTFT ${Math.round(firstAt - started)} ms${rate}${fin}`;
+      assistant.truncated = finish === "length";
     } else if (finish === "stopped" && !assistant.meta) {
       assistant.meta = "stopped";
     }
@@ -1175,6 +1193,11 @@ chatLayout.addEventListener("drop", (ev) => {
   ev.preventDefault();
   chatLayout.classList.remove("drop-hint");
   addFiles(ev.dataTransfer.files);
+});
+$("messages").addEventListener("click", (ev) => {
+  if (!ev.target.closest(".continue-btn") || state.streaming) return;
+  $("prompt").value = "Continue exactly where you stopped.";
+  $("chat-form").requestSubmit();
 });
 $("messages").addEventListener("click", async (ev) => {
   const btn = ev.target.closest(".copy");
