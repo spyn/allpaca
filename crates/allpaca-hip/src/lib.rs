@@ -542,6 +542,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_rocmfp4_fast(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_mxfp4(
             a: *const f32,
             b: *const u8,
@@ -1124,6 +1133,21 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_embed_gather_rocmfp4_rows(
+            table: *const u8,
+            tokens: *const i32,
+            out: *mut f32,
+            n_tok: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_rocmfp4_fast(
+            table: *const u8,
+            token: i32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_rocmfp4_fast_rows(
             table: *const u8,
             tokens: *const i32,
             out: *mut f32,
@@ -2503,6 +2527,29 @@ pub fn gemm_nt_rocmfp4_device(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_rocmfp4 unavailable".into(),
+        )))
+    }
+}
+
+/// As [`gemm_nt_rocmfp4_device`] for ROCmFP4 FAST `b` (ggml type 101, 17-byte blocks).
+pub fn gemm_nt_rocmfp4_fast_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_rocmfp4_fast(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_rocmfp4_fast")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_rocmfp4_fast unavailable".into(),
         )))
     }
 }
@@ -5684,6 +5731,25 @@ impl HipWorkspace {
         self.timed_gpu(op, || gemm_nt_rocmfp4_device(a, b, c, m, n, k))
     }
 
+    /// ROCmFP4 FAST (ggml type 101) GEMV; accounted like [`Self::gemm_nt_rocmfp4_dev`].
+    pub fn gemm_nt_rocmfp4_fast_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            // Treat packed ROCmFP4 body GEMVs like Q8 for §12 decode accounting.
+            DecodeOp::Q8Gemm
+        };
+        self.timed_gpu(op, || gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k))
+    }
+
     pub fn gemm_nt_q6_k_dev(
         &self,
         a: *const f32,
@@ -6025,6 +6091,44 @@ impl HipWorkspace {
                     )
                 };
                 status(rc, "embed_gather_rocmfp4")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = token;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_rocmfp4 unavailable".into(),
+            )))
+        }
+    }
+
+    /// One token's row from a ROCmFP4 FAST (17-byte block) embedding table.
+    pub fn embed_gather_rocmfp4_fast(
+        &self,
+        table: *const u8,
+        token: u32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rocmfp4 embed gather".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_rocmfp4_fast(
+                        table,
+                        token as i32,
+                        out,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_rocmfp4_fast")
             })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -8287,6 +8391,55 @@ impl HipWorkspace {
             self.timed_gpu(DecodeOp::OtherGpu, || {
                 let rc = unsafe {
                     ffi::allpaca_embed_gather_rocmfp4_rows(
+                        table,
+                        self.scratch.cast(),
+                        out,
+                        tokens.len() as i32,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_rocmfp4_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_rocmfp4 unavailable".into(),
+            )))
+        }
+    }
+
+    /// Rows of a ROCmFP4 FAST (17-byte block) embedding table.
+    pub fn embed_gather_rocmfp4_fast_rows(
+        &self,
+        table: *const u8,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rocmfp4 embed gather".into(),
+            )));
+        }
+        let id_bytes = tokens.len() * 4;
+        if id_bytes > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed gather tokens exceed scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        memcpy(self.scratch, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_rocmfp4_fast_rows(
                         table,
                         self.scratch.cast(),
                         out,
@@ -12625,6 +12778,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ROCmFP4 FAST (type 101) GEMV: bit-identical to the dual-scale kernel on
+    /// the same weights with the scale byte duplicated, and close to the CPU
+    /// dequant + GEMM. Shapes cover one row, several rows, a K that is not a
+    /// whole number of 256-float slabs, and many columns.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_rocmfp4_fast_matches_dual_scale_kernel_and_cpu() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(1, 4, 32), (1, 8, 256), (3, 5, 128), (1, 70, 512), (2, 9, 288)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let nblocks = k.div_ceil(ROCMFP4_BLOCK_ELEMS);
+            let (mut fast, mut dual) = (Vec::new(), Vec::new());
+            let mut b_deq = vec![0.0f32; n * k];
+            for row in 0..n {
+                let q = allpaca_cpu::quantize_rocmfp4_fast(&b_f[row * k..(row + 1) * k]);
+                assert_eq!(q.len(), nblocks * allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES);
+                let mut tmp = vec![0.0f32; nblocks * ROCMFP4_BLOCK_ELEMS];
+                allpaca_cpu::dequant_rocmfp4_fast(&q, tmp.len(), &mut tmp).unwrap();
+                b_deq[row * k..(row + 1) * k].copy_from_slice(&tmp[..k]);
+                for blk in q.chunks_exact(allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES) {
+                    dual.extend_from_slice(blk);
+                    dual.push(blk[16]);
+                }
+                fast.extend(q);
+            }
+            let mut cpu = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            let mut want = vec![0.0f32; m * n];
+            gemm_nt_rocmfp4(&a, &dual, &mut want, m as i32, n as i32, k as i32).unwrap();
+
+            let da = device_malloc(a.len() * 4, 0).unwrap();
+            let db = device_malloc(fast.len(), 0).unwrap();
+            let dc = device_malloc(m * n * 4, 0).unwrap();
+            set_device(0).unwrap();
+            memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, fast.as_ptr(), fast.len(), MEMCPY_H2D).unwrap();
+            gemm_nt_rocmfp4_fast_device(da.cast(), db, dc.cast(), m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_rocmfp4_fast must run when a device is present");
+            let mut got = vec![0.0f32; m * n];
+            memcpy(got.as_mut_ptr().cast(), dc, m * n * 4, MEMCPY_D2H).unwrap();
+            device_free(da, a.len() * 4);
+            device_free(db, fast.len());
+            device_free(dc, m * n * 4);
+
+            for i in 0..m * n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "FAST vs dual-scale kernel differ, shape {m}x{n}x{k} idx={i}: {} vs {}",
+                    got[i],
+                    want[i]
+                );
+                assert!(
+                    gemm_close(got[i], cpu[i]),
+                    "gemm_nt_rocmfp4_fast vs cpu, shape {m}x{n}x{k} idx={i}: {} vs {}",
+                    got[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// ROCmFP4 FAST embed rows (single token and batched) equal the CPU
+    /// dequant of those rows exactly, for a dim that is not a multiple of 32.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn embed_gather_rocmfp4_fast_matches_dequant_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        let (vocab, dim) = (9usize, 80usize);
+        let row_bytes = dim.div_ceil(32) * allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES;
+        let tokens = [0u32, 3, 8, 1, 3, 2];
+        let mut packed = Vec::new();
+        for row in 0..vocab {
+            let vals: Vec<f32> =
+                (0..dim).map(|i| (((row * dim + i) * 17) % 50) as f32 * 0.02 - 0.5).collect();
+            packed.extend(allpaca_cpu::quantize_rocmfp4_fast(&vals));
+        }
+        assert_eq!(packed.len(), vocab * row_bytes);
+        let mut cpu = vec![0.0f32; tokens.len() * dim];
+        for (r, &tok) in tokens.iter().enumerate() {
+            let off = tok as usize * row_bytes;
+            let mut tmp = vec![0.0f32; dim.div_ceil(32) * 32];
+            allpaca_cpu::dequant_rocmfp4_fast(&packed[off..off + row_bytes], tmp.len(), &mut tmp)
+                .unwrap();
+            cpu[r * dim..(r + 1) * dim].copy_from_slice(&tmp[..dim]);
+        }
+        let ws = HipWorkspace::new(0, 1 << 20, 64).unwrap();
+        let dt = device_malloc(packed.len(), 0).unwrap();
+        let dout = device_malloc(cpu.len() * 4, 0).unwrap();
+        set_device(0).unwrap();
+        memcpy(dt, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+        ws.embed_gather_rocmfp4_fast_rows(dt, &tokens, dout.cast(), dim as i32)
+            .expect("HIP embed_gather_rocmfp4_fast_rows must run when a device is present");
+        let mut rows = vec![0.0f32; cpu.len()];
+        memcpy(rows.as_mut_ptr().cast(), dout, cpu.len() * 4, MEMCPY_D2H).unwrap();
+        assert_eq!(rows, cpu, "batched FAST embed rows");
+        ws.embed_gather_rocmfp4_fast(dt, 8, dout.cast(), dim as i32).unwrap();
+        let mut one = vec![0.0f32; dim];
+        memcpy(one.as_mut_ptr().cast(), dout, dim * 4, MEMCPY_D2H).unwrap();
+        assert_eq!(one, cpu[2 * dim..3 * dim], "single FAST embed row");
+        device_free(dt, packed.len());
+        device_free(dout, cpu.len() * 4);
     }
 
     /// The §12 tiled ROCmFP4 GEMV must agree with the untiled baseline.

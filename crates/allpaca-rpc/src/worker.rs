@@ -553,6 +553,7 @@ fn dequant_weight(ty: u32, bytes: &[u8], n: usize, out: &mut [f32]) -> Result<()
         35 => allpaca_cpu::dequant_tq2_0(bytes, n, out).map_err(bad),
         39 => allpaca_cpu::dequant_mxfp4(bytes, n, out).map_err(bad),
         100 => allpaca_cpu::dequant_rocmfp4(bytes, n, out).map_err(bad),
+        101 => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out).map_err(bad),
         other => Err(RpcError::Worker(format!(
             "ggml type {other} has no cpu dequant"
         ))),
@@ -753,6 +754,7 @@ fn hip_quant_gemm(
         35 => allpaca_hip::gemm_nt_tq2_0_device(a, b, c, m, n, k).map_err(bad),
         39 => allpaca_hip::gemm_nt_mxfp4_device(a, b, c, m, n, k).map_err(bad),
         100 => allpaca_hip::gemm_nt_rocmfp4_device(a, b, c, m, n, k).map_err(bad),
+        101 => allpaca_hip::gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k).map_err(bad),
         other => Err(RpcError::Worker(format!(
             "hip worker has no gemm for ggml type {other}"
         ))),
@@ -798,16 +800,26 @@ pub(crate) fn gfx906_expands_rocmfp4(arch: &str) -> bool {
     arch.split(':').next() == Some("gfx906")
 }
 
-/// Whole-block ROCmFP4 bytes to little-endian F32. `None` is not returned; a
-/// truncated blob is an error.
-pub(crate) fn expand_rocmfp4_f32(bytes: &[u8]) -> Result<Vec<u8>, RpcError> {
-    if bytes.is_empty() || bytes.len() % allpaca_cpu::ROCMFP4_BLOCK_BYTES != 0 {
+/// Whole-block ROCmFP4 bytes (`fast`: 17-byte type-101 blocks, else 18-byte
+/// type 100) to little-endian F32. `None` is not returned; a truncated blob
+/// is an error.
+pub(crate) fn expand_rocmfp4_f32(bytes: &[u8], fast: bool) -> Result<Vec<u8>, RpcError> {
+    let block_bytes = if fast {
+        allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES
+    } else {
+        allpaca_cpu::ROCMFP4_BLOCK_BYTES
+    };
+    if bytes.is_empty() || bytes.len() % block_bytes != 0 {
         return Err(RpcError::Worker("rocmfp4 blob is not whole blocks".into()));
     }
-    let n = bytes.len() / allpaca_cpu::ROCMFP4_BLOCK_BYTES * allpaca_cpu::ROCMFP4_BLOCK_ELEMS;
+    let n = bytes.len() / block_bytes * allpaca_cpu::ROCMFP4_BLOCK_ELEMS;
     let mut weights = vec![0.0f32; n];
-    allpaca_cpu::dequant_rocmfp4(bytes, n, &mut weights)
-        .map_err(|e| RpcError::Worker(e.to_string()))?;
+    if fast {
+        allpaca_cpu::dequant_rocmfp4_fast(bytes, n, &mut weights)
+    } else {
+        allpaca_cpu::dequant_rocmfp4(bytes, n, &mut weights)
+    }
+    .map_err(|e| RpcError::Worker(e.to_string()))?;
     let mut out = Vec::with_capacity(n * 4);
     for v in weights {
         out.extend_from_slice(&v.to_le_bytes());
@@ -1765,7 +1777,7 @@ impl WorkerBackend {
         bytes: &[u8],
         device: Option<u32>,
     ) -> Result<Option<Vec<u8>>, RpcError> {
-        if ggml_type != 100 {
+        if !matches!(ggml_type, 100 | 101) {
             return Ok(None);
         }
         #[cfg(feature = "hip")]
@@ -1780,7 +1792,7 @@ impl WorkerBackend {
             let expand = allpaca_hip::device_gcn_arch(dev)
                 .is_some_and(|(arch, _)| gfx906_expands_rocmfp4(&arch));
             if expand {
-                return expand_rocmfp4_f32(bytes).map(Some);
+                return expand_rocmfp4_f32(bytes, ggml_type == 101).map(Some);
             }
         }
         let _ = (bytes, device);
@@ -2174,7 +2186,16 @@ mod tests {
         block[0] = 0x21;
         block[16] = 0x38;
         block[17] = 0x38;
-        let f32_bytes = expand_rocmfp4_f32(&block).unwrap();
+        // FAST (type 101) blocks expand through their own 17-byte layout.
+        let vals: Vec<f32> = (0..64).map(|i| (i as f32 - 20.0) * 0.07).collect();
+        let fast = allpaca_cpu::quantize_rocmfp4_fast(&vals);
+        let got = expand_rocmfp4_f32(&fast, true).unwrap();
+        let mut want = vec![0.0f32; 64];
+        allpaca_cpu::dequant_rocmfp4_fast(&fast, 64, &mut want).unwrap();
+        let want: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(got, want);
+        assert!(expand_rocmfp4_f32(&fast, false).is_err(), "34 bytes is not whole 18-byte blocks");
+        let f32_bytes = expand_rocmfp4_f32(&block, false).unwrap();
         assert_eq!(
             f32_bytes.len(),
             allpaca_cpu::ROCMFP4_BLOCK_ELEMS * 4

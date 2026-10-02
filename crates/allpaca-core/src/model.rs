@@ -630,6 +630,8 @@ enum WeightKind {
     TQ1_0,
     TQ2_0,
     RocmFp4,
+    /// ROCmFP4 FAST (ggml type 101): 17-byte single-scale blocks.
+    RocmFp4Fast,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -871,7 +873,10 @@ impl HostEmbed {
     /// `token_embd` types the HIP upload would otherwise expand to F32.
     fn wanted(ty: allpaca_gguf::GgmlType) -> bool {
         use allpaca_gguf::GgmlType as T;
-        !matches!(ty, T::F32 | T::F16 | T::Q8_0 | T::RocmFp4 | T::I32 | T::Other)
+        !matches!(
+            ty,
+            T::F32 | T::F16 | T::Q8_0 | T::RocmFp4 | T::RocmFp4Fast | T::I32 | T::Other
+        )
     }
 
     /// `dim` is the model width: rows are `dim` elements whichever order the
@@ -2367,7 +2372,8 @@ impl ResidentModel {
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0
-            | WeightKind::RocmFp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            | WeightKind::RocmFp4
+            | WeightKind::RocmFp4Fast => Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "F16/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
         }
@@ -2410,6 +2416,9 @@ impl ResidentModel {
             WeightKind::RocmFp4 => {
                 hip.gemm_nt_rocmfp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::RocmFp4Fast => {
+                hip.gemm_nt_rocmfp4_fast_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
         }
     }
 
@@ -2439,6 +2448,12 @@ impl ResidentModel {
             WeightKind::RocmFp4 => {
                 hip.embed_gather_rocmfp4(self.weights.byte_ptr_at(self.embed.off), token, out, dim)
             }
+            WeightKind::RocmFp4Fast => hip.embed_gather_rocmfp4_fast(
+                self.weights.byte_ptr_at(self.embed.off),
+                token,
+                out,
+                dim,
+            ),
             WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
@@ -2477,6 +2492,12 @@ impl ResidentModel {
                 dim,
             ),
             WeightKind::RocmFp4 => hip.embed_gather_rocmfp4_rows(
+                self.weights.byte_ptr_at(self.embed.off),
+                tokens,
+                out,
+                dim,
+            ),
+            WeightKind::RocmFp4Fast => hip.embed_gather_rocmfp4_fast_rows(
                 self.weights.byte_ptr_at(self.embed.off),
                 tokens,
                 out,
@@ -3677,7 +3698,9 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         T::F32 => n * 4,
         _ if n <= 65_536 => n * 4,
         T::F16 => n * 2,
-        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 => info.nbytes() as u64,
+        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 | T::RocmFp4Fast => {
+            info.nbytes() as u64
+        }
         T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
         T::Q8_0 => q8_staged,
         ty if requant_q8_0_on_load(ty) => q8_staged,
@@ -3820,12 +3843,17 @@ fn append_gguf_tensor_as<'a>(
                 (UploadPart::Mapped(packed), WeightKind::TQ1_0)
             }
         }
-        allpaca_gguf::GgmlType::RocmFp4 => {
+        ty @ (allpaca_gguf::GgmlType::RocmFp4 | allpaca_gguf::GgmlType::RocmFp4Fast) => {
+            let fast = ty == allpaca_gguf::GgmlType::RocmFp4Fast;
             let packed = file.tensor_bytes(name)?;
             // Keep large embeds packed: vocab×dim F32 would be multi-GiB host RAM.
             if n <= 65_536 {
                 let mut f32s = vec![0.0f32; n];
-                allpaca_cpu::dequant_rocmfp4(packed, n, &mut f32s)?;
+                if fast {
+                    allpaca_cpu::dequant_rocmfp4_fast(packed, n, &mut f32s)?;
+                } else {
+                    allpaca_cpu::dequant_rocmfp4(packed, n, &mut f32s)?;
+                }
                 let mut bytes = Vec::with_capacity(n * 4);
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -3839,7 +3867,12 @@ fn append_gguf_tensor_as<'a>(
                         info.dims
                     ))));
                 }
-                (UploadPart::Mapped(packed), WeightKind::RocmFp4)
+                let kind = if fast {
+                    WeightKind::RocmFp4Fast
+                } else {
+                    WeightKind::RocmFp4
+                };
+                (UploadPart::Mapped(packed), kind)
             }
         }
         allpaca_gguf::GgmlType::Q5_K => {
@@ -4029,15 +4062,19 @@ fn split_packed_experts(
     let stride = match w.kind {
         WeightKind::F32 => n_per.saturating_mul(4),
         WeightKind::F16 => n_per.saturating_mul(2),
-        WeightKind::RocmFp4 => {
+        kind @ (WeightKind::RocmFp4 | WeightKind::RocmFp4Fast) => {
+            let block_bytes = if kind == WeightKind::RocmFp4Fast {
+                allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES
+            } else {
+                allpaca_cpu::ROCMFP4_BLOCK_BYTES
+            };
             if n_per % allpaca_cpu::ROCMFP4_BLOCK_ELEMS != 0 {
                 return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
                     "{what} ROCmFP4 expert elems {n_per} not aligned to {}",
                     allpaca_cpu::ROCMFP4_BLOCK_ELEMS
                 ))));
             }
-            (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
-                .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES)
+            (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS).saturating_mul(block_bytes)
         }
         WeightKind::Q3_K => {
             if n_per % allpaca_cpu::Q3_K_BLOCK_ELEMS != 0 {

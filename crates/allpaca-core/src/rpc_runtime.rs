@@ -1338,7 +1338,7 @@ fn gemm_nk(info: &allpaca_gguf::TensorInfo) -> Option<(usize, usize)> {
 }
 
 fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
-    let hip = matches!(ty, 0 | 1 | 8 | 12 | 13 | 14 | 30 | 34 | 35 | 39 | 100);
+    let hip = matches!(ty, 0 | 1 | 8 | 12 | 13 | 14 | 30 | 34 | 35 | 39 | 100 | 101);
     match backend {
         RpcBackendKind::Hip => hip,
         RpcBackendKind::Cpu => hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 20 | 23),

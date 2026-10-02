@@ -2849,8 +2849,11 @@ __device__ inline float rocmfp4_scale(uint8_t e) {
     return out;
 }
 
-/* One thread per output column. Native 18-byte ROCmFP4 blocks along K.
- * Baseline: each column re-reads A from global (no LDS tile). */
+/* One thread per output column. Native ROCmFP4 blocks along K: BB = 18 is
+ * the dual-scale layout (ggml type 100: qs[16], e[2]), BB = 17 the FAST
+ * single-scale layout (type 101: qs[16], e), where both halves read the one
+ * scale byte. Baseline: each column re-reads A from global (no LDS tile). */
+template <int BB>
 __global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
                                                int n, int k) {
     const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -2859,13 +2862,13 @@ __global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b,
         return;
     }
     const int nblocks = (k + 31) / 32;
-    const uint8_t *row_blocks = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+    const uint8_t *row_blocks = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * BB;
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
     float acc = 0.f;
     for (int ib = 0; ib < nblocks; ++ib) {
-        const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * 18;
+        const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * BB;
         const float d0 = rocmfp4_scale(blk[16]);
-        const float d1 = rocmfp4_scale(blk[17]);
+        const float d1 = rocmfp4_scale(blk[BB - 1]);
         const int k0 = ib * 32;
         for (int j = 0; j < 16; ++j) {
             const uint8_t packed = blk[j];
@@ -2884,6 +2887,7 @@ __global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b,
 
 // Decode GEMV: 32 lanes split K for each column. One thread walking all of K
 // made the local ROCmFP4 projections the largest remaining per-token cost.
+template <int BB>
 __global__ void gemv_nt_rocmfp4_ksplit_kernel(const float *a, const uint8_t *b, float *c, int m,
                                               int n, int k) {
     constexpr int LANES = 32;
@@ -2899,12 +2903,12 @@ __global__ void gemv_nt_rocmfp4_ksplit_kernel(const float *a, const uint8_t *b, 
     float acc = 0.f;
     if (col < n) {
         const uint8_t *row_blocks =
-            b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+            b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * BB;
         const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
         for (int ib = lane; ib < nblocks; ib += LANES) {
-            const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * 18;
+            const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * BB;
             const float d0 = rocmfp4_scale(blk[16]);
-            const float d1 = rocmfp4_scale(blk[17]);
+            const float d1 = rocmfp4_scale(blk[BB - 1]);
             const int k0 = ib * 32;
             for (int j = 0; j < 16; ++j) {
                 const uint8_t packed = blk[j];
@@ -2987,7 +2991,7 @@ __global__ void gemv_nt_rocmfp4_tiled_kernel(const float *a, const uint8_t *b, f
 }
 
 static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
-                                  int32_t k, hipStream_t stream, int tiled) {
+                                  int32_t k, hipStream_t stream, int tiled, bool fast = false) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
@@ -2999,11 +3003,23 @@ static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, in
         constexpr int GROUPS = 8;
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + GROUPS - 1) / GROUPS), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_rocmfp4_ksplit_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        if (fast) {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_ksplit_kernel<17>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        } else {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_ksplit_kernel<18>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        }
     } else {
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_rocmfp4_untiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        if (fast) {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_untiled_kernel<17>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        } else {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_untiled_kernel<18>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        }
     }
     return hip_status(hipGetLastError());
 }
@@ -3017,6 +3033,12 @@ extern "C" int allpaca_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *
 extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m,
                                                int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 0);
+}
+
+/* ROCmFP4 FAST (ggml_type_id=101): 17-byte single-scale blocks. */
+extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m,
+                                            int32_t n, int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 1, true);
 }
 
 /* ggml MXFP4 (ggml_type_id=39): 17-byte blocks, one E8M0 scale + 16 nibbles / 32 elems. */
@@ -6313,6 +6335,7 @@ extern "C" int allpaca_embed_gather_q8_0_rows(const uint8_t *table, const int32_
     return hip_status(hipGetLastError());
 }
 
+template <int BB>
 __global__ void embed_gather_rocmfp4_kernel(const uint8_t *table, int token, float *out, int dim) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= dim) {
@@ -6324,15 +6347,16 @@ __global__ void embed_gather_rocmfp4_kernel(const uint8_t *table, int token, flo
     const uint8_t *blk =
         table + (static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row) +
                  static_cast<size_t>(b)) *
-                    18u;
+                    static_cast<size_t>(BB);
     if (j < 16) {
         out[i] = static_cast<float>(k_rocmfp4_codebook[blk[j] & 0x0F]) * rocmfp4_scale(blk[16]);
     } else {
         out[i] =
-            static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[17]);
+            static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[BB - 1]);
     }
 }
 
+template <int BB>
 __global__ void embed_gather_rocmfp4_rows_kernel(const uint8_t *table, const int32_t *tokens,
                                                  float *out, int n_tok, int dim) {
     const int row = static_cast<int>(blockIdx.y);
@@ -6347,44 +6371,79 @@ __global__ void embed_gather_rocmfp4_rows_kernel(const uint8_t *table, const int
     const uint8_t *blk =
         table + (static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row) +
                  static_cast<size_t>(b)) *
-                    18u;
+                    static_cast<size_t>(BB);
     float v;
     if (j < 16) {
         v = static_cast<float>(k_rocmfp4_codebook[blk[j] & 0x0F]) * rocmfp4_scale(blk[16]);
     } else {
-        v = static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[17]);
+        v = static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[BB - 1]);
     }
     out[static_cast<size_t>(row) * static_cast<size_t>(dim) + i] = v;
 }
 
-extern "C" int allpaca_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out,
-                                            int32_t dim, allpaca_stream_t stream) {
+static int launch_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out,
+                                       int32_t dim, hipStream_t stream, bool fast) {
     if (!table || !out || dim <= 0 || token < 0) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
     const int threads = 256;
-    const int blocks = (dim + threads - 1) / threads;
-    hipLaunchKernelGGL(embed_gather_rocmfp4_kernel, dim3(static_cast<unsigned>(blocks)),
-                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
-                       dim);
+    const dim3 grid(static_cast<unsigned>((dim + threads - 1) / threads));
+    const dim3 block(static_cast<unsigned>(threads));
+    if (fast) {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_kernel<17>, grid, block, 0, stream, table, token, out,
+                           dim);
+    } else {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_kernel<18>, grid, block, 0, stream, table, token, out,
+                           dim);
+    }
     return hip_status(hipGetLastError());
 }
 
-extern "C" int allpaca_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens,
-                                                 float *out, int32_t n_tok, int32_t dim,
-                                                 allpaca_stream_t stream) {
+static int launch_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens, float *out,
+                                            int32_t n_tok, int32_t dim, hipStream_t stream,
+                                            bool fast) {
     if (!table || !tokens || !out || n_tok <= 0 || dim <= 0) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
     const int threads = 256;
-    const int blocks = (dim + threads - 1) / threads;
-    hipLaunchKernelGGL(embed_gather_rocmfp4_rows_kernel,
-                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(n_tok)),
-                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, tokens, out,
-                       n_tok, dim);
+    const dim3 grid(static_cast<unsigned>((dim + threads - 1) / threads),
+                    static_cast<unsigned>(n_tok));
+    const dim3 block(static_cast<unsigned>(threads));
+    if (fast) {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_rows_kernel<17>, grid, block, 0, stream, table,
+                           tokens, out, n_tok, dim);
+    } else {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_rows_kernel<18>, grid, block, 0, stream, table,
+                           tokens, out, n_tok, dim);
+    }
     return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out,
+                                            int32_t dim, allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4(table, token, out, dim, as_stream(stream), false);
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens,
+                                                 float *out, int32_t n_tok, int32_t dim,
+                                                 allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4_rows(table, tokens, out, n_tok, dim, as_stream(stream),
+                                            false);
+}
+
+/* ROCmFP4 FAST (ggml_type_id=101) embed rows: 17-byte blocks. */
+extern "C" int allpaca_embed_gather_rocmfp4_fast(const uint8_t *table, int32_t token, float *out,
+                                                 int32_t dim, allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4(table, token, out, dim, as_stream(stream), true);
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_fast_rows(const uint8_t *table, const int32_t *tokens,
+                                                      float *out, int32_t n_tok, int32_t dim,
+                                                      allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4_rows(table, tokens, out, n_tok, dim, as_stream(stream),
+                                            true);
 }
 
 extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
@@ -7238,6 +7297,11 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *, const uint8_t *, f
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *, const uint8_t *, float *, int32_t,
+                                            int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_gemm_nt_mxfp4(const float *, const uint8_t *, float *, int32_t, int32_t,
                                      int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -7547,6 +7611,16 @@ extern "C" int allpaca_embed_gather_rocmfp4(const uint8_t *, int32_t, float *, i
 
 extern "C" int allpaca_embed_gather_rocmfp4_rows(const uint8_t *, const int32_t *, float *, int32_t,
                                                  int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_fast(const uint8_t *, int32_t, float *, int32_t,
+                                                 allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_fast_rows(const uint8_t *, const int32_t *, float *,
+                                                      int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

@@ -212,6 +212,8 @@ pub enum GgmlType {
     MXFP4 = 39,
     /// AMD ROCmFP4 dual-scale (ggml_type_id=100).
     RocmFp4 = 100,
+    /// AMD ROCmFP4 FAST single-scale, 17-byte blocks (ggml_type_id=101).
+    RocmFp4Fast = 101,
     Other = 255,
 }
 
@@ -268,6 +270,7 @@ pub fn dequant_packed(
         GgmlType::TQ2_0 => allpaca_cpu::dequant_tq2_0(bytes, n, out),
         GgmlType::MXFP4 => allpaca_cpu::dequant_mxfp4(bytes, n, out),
         GgmlType::RocmFp4 => allpaca_cpu::dequant_rocmfp4(bytes, n, out),
+        GgmlType::RocmFp4Fast => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out),
         GgmlType::I32 | GgmlType::Other => Err(AllpacaError::Fatal(FatalError::ModelLoad(
             format!("dequant {ty:?} unsupported"),
         ))),
@@ -298,6 +301,7 @@ impl GgmlType {
             35 => Self::TQ2_0,
             39 => Self::MXFP4,
             100 => Self::RocmFp4,
+            101 => Self::RocmFp4Fast,
             _ => Self::Other,
         }
     }
@@ -377,6 +381,9 @@ impl TensorInfo {
             GgmlType::RocmFp4 => n
                 .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::ROCMFP4_BLOCK_BYTES),
+            GgmlType::RocmFp4Fast => n
+                .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES),
             _ => n.saturating_mul(4),
         }
     }
@@ -706,6 +713,7 @@ impl GgufFile {
             GgmlType::TQ1_0 as u32,
             GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
+            GgmlType::RocmFp4Fast as u32,
         ];
         let unsupported_types: Vec<u32> = ggml_type_ids
             .iter()
@@ -1050,6 +1058,17 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_rocmfp4(&mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::RocmFp4Fast => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} ROCmFP4 FAST out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_rocmfp4_fast(&mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -1856,6 +1875,41 @@ mod tests {
         assert_eq!(loaded.len(), 256);
         assert!(loaded[..32].iter().all(|v| (v - 1.0).abs() < 1e-4));
         assert!(loaded[32..].iter().all(|v| v.abs() < 1e-5));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ggml type 101 (ROCmFP4 FAST): 17 bytes per 32 weights, supported by
+    /// the compat probe, dequantized through the FAST layout.
+    #[test]
+    fn rocmfp4_fast_type_101_loads_and_dequants_to_f32() {
+        let path = std::env::temp_dir().join("allpaca_gguf_rocmfp4_fast.gguf");
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.125).collect();
+        let payload = allpaca_cpu::quantize_rocmfp4_fast(&values);
+        assert_eq!(payload.len(), 2 * allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES);
+        write_typed_gguf(&path, 101, &payload, 64);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::RocmFp4Fast);
+        assert_eq!(info.ggml_type_id, 101);
+        assert_eq!(info.nbytes(), 2 * allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES);
+        assert_eq!(file.tensor_bytes("quant.weight").unwrap(), &payload[..]);
+        let report = file.compat_report();
+        assert!(report.ggml_type_ids.contains(&101));
+        assert!(
+            !report
+                .reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+            "type 101 must not be rejected as an unsupported type: {:?}",
+            report.reject_reason
+        );
+        let loaded = file.tensor_f32("quant.weight").unwrap();
+        let mut want = vec![0.0f32; 64];
+        allpaca_cpu::dequant_rocmfp4_fast(&payload, 64, &mut want).unwrap();
+        assert_eq!(loaded, want);
+        let mut row = vec![0.0f32; 32];
+        dequant_packed(GgmlType::RocmFp4Fast, &payload[17..], 32, &mut row).unwrap();
+        assert_eq!(row, want[32..]);
         let _ = std::fs::remove_file(path);
     }
 
