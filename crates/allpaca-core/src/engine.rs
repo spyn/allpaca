@@ -2168,6 +2168,7 @@ impl Engine {
         images: &[crate::ImageInput],
         params: GenerationParams,
     ) -> Result<GenerationOutput, AllpacaError> {
+        let own_stops = params.stop_token_ids.clone();
         let mut handle = self.begin_request_multimodal(prompt, images, params)?;
         let mut token_ids = Vec::new();
         let finish = self.drive_request(&mut handle, |ev| {
@@ -2183,11 +2184,21 @@ impl Engine {
         );
         let text = {
             let inner = self.lock()?;
-            inner
+            let tokenizer = inner
                 .tokenizer
                 .as_ref()
-                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?
-                .decode(&token_ids)?
+                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+            // Same as the stream: a final stop token is not decoded into text.
+            let ends_on_stop = finish == FinishReason::Stop
+                && token_ids
+                    .last()
+                    .is_some_and(|t| own_stops.contains(t) || tokenizer.stop_token_ids().contains(t));
+            let body = if ends_on_stop {
+                &token_ids[..token_ids.len() - 1]
+            } else {
+                &token_ids[..]
+            };
+            tokenizer.decode(body)?
         };
         let prompt_tokens = handle_prompt_len(&handle, &self.inner)?;
         Ok(GenerationOutput {
@@ -3575,7 +3586,9 @@ impl Engine {
                 }
                 active.emit_queue.push(TokenEvent {
                     token_id: tok,
-                    text: piece,
+                    // The stop token ends the reply; its text (`<|im_end|>`)
+                    // is not part of it.
+                    text: if stop { String::new() } else { piece },
                     finish_reason: finish,
                 });
             }
