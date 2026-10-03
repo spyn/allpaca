@@ -15583,6 +15583,66 @@ mod tests {
         }
     }
 
+    /// Several query rows (the Q-tiled kernel, keys staged in LDS) give each
+    /// row bit for bit what a one-row call over the keys it sees gives, so
+    /// prefill, verify and decode rows agree.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn attention_rows_equal_single_row_calls() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (13, 40, 4, 2, 128, true),
+            (9, 9, 8, 8, 64, true),
+            (20, 300, 6, 2, 128, true),
+            (3, 5, 2, 1, 4, true),
+            (17, 50, 2, 2, 96, true),
+            (11, 70, 4, 4, 256, true),
+            (6, 33, 4, 2, 128, false),
+        ];
+        for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
+            shapes.iter().copied().enumerate()
+        {
+            let q_row = n_heads * head_dim;
+            let kv_row = n_kv_heads * head_dim;
+            let fill = |n: usize, a: usize, b: usize| -> Vec<f32> {
+                (0..n).map(|i| ((i * a + si * b) % 97) as f32 * 0.021 - 1.0).collect()
+            };
+            let q = fill(n_q * q_row, 17, 3);
+            let k = fill(n_kv * kv_row, 13, 7);
+            let v = fill(n_kv * kv_row, 11, 5);
+            let mut rows = vec![0.0f32; n_q * q_row];
+            attention(
+                &q, &k, &v, &mut rows, n_q as i32, n_kv as i32, n_heads as i32,
+                n_kv_heads as i32, head_dim as i32, causal,
+            )
+            .unwrap();
+            for i in 0..n_q {
+                let seen = if causal { n_kv - n_q + i + 1 } else { n_kv };
+                let mut one = vec![0.0f32; q_row];
+                attention(
+                    &q[i * q_row..(i + 1) * q_row],
+                    &k[..seen * kv_row],
+                    &v[..seen * kv_row],
+                    &mut one,
+                    1,
+                    seen as i32,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    causal,
+                )
+                .unwrap();
+                let got = &rows[i * q_row..(i + 1) * q_row];
+                assert!(
+                    got.iter().zip(&one).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "row {i} of n_q={n_q} n_kv={n_kv} heads={n_heads}/{n_kv_heads} d={head_dim} causal={causal} differs from its one-row call"
+                );
+            }
+        }
+    }
+
     /// Batched causal `attention_sinks` (scratch and malloc) must match CPU sinks.
     #[cfg(feature = "hip")]
     #[test]
