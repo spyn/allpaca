@@ -73,8 +73,10 @@ pub(crate) fn amd_cards_in(root: &std::path::Path) -> Vec<AmdCard> {
             if vendor.trim() != "0x1002" {
                 return None;
             }
-            // The device link resolves to its PCI address (0000:04:00.0).
-            let pci = std::fs::canonicalize(&dir)
+            // The device link points at its PCI address (0000:04:00.0). A
+            // plain directory (no link) sorts by card name instead of every
+            // card resolving to the same `device` and keeping readdir order.
+            let pci = std::fs::read_link(&dir)
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or(name);
