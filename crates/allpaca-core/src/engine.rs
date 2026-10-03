@@ -1963,10 +1963,14 @@ impl Engine {
                     spec.dim, target.config.dim
                 ))));
             }
-            let device = self
-                .draft_hip
-                .as_ref()
-                .map_or(target_hip.device, |h| h.device);
+            let device = std::env::var("ALLPACA_DFLASH2_DEVICE")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or_else(|| {
+                    self.draft_hip
+                        .as_ref()
+                        .map_or(target_hip.device, |h| h.device)
+                });
             let hip = Arc::new(HipWorkspace::new(device, 8 * 1024 * 1024, 256)?);
             let head = crate::dflash2::ResidentHead::new(
                 target_hip,
@@ -6343,7 +6347,9 @@ fn finish_linear_span(
         !is_stop(tok, &params_end)
             && produced.len() < remaining
             && !inner.flags.tree_speculation
-            && (inner.flags.draft_model_speculation || inner.flags.ngram_speculation)
+            && (inner.flags.draft_model_speculation
+                || inner.flags.ngram_speculation
+                || inner.dflash2.is_some())
     });
     if defer {
         // Forwarded next step at the head of the drafted span (or alone).

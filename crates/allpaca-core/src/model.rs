@@ -9035,6 +9035,7 @@ impl TinyModel {
             vocab,
             max_kv,
         )?;
+        let fwd_t0 = std::time::Instant::now();
         hip.begin_decode_profile();
         let n_exp = cfg.n_experts;
         let double_buffer = prefill
@@ -9544,6 +9545,10 @@ impl TinyModel {
             Ok(())
         })();
         hip.end_decode_profile();
+        if std::env::var("ALLPACA_FWD_LOG").is_ok_and(|v| v == "1") {
+            let _ = allpaca_hip::stream_synchronize();
+            eprintln!("FWD1 pos={pos} ms={:.2}", fwd_t0.elapsed().as_secs_f64() * 1e3);
+        }
         result
     }
 
@@ -9640,6 +9645,7 @@ impl TinyModel {
             logits_rows,
             q_workspace,
         )?;
+        let fwd_t0 = std::time::Instant::now();
         hip.begin_decode_profile();
         let result = (|| {
             let primary_hip = hip;
@@ -10282,6 +10288,14 @@ impl TinyModel {
             Ok(())
         })();
         hip.end_decode_profile();
+        if std::env::var("ALLPACA_FWD_LOG").is_ok_and(|v| v == "1") {
+            let _ = allpaca_hip::stream_synchronize();
+            eprintln!(
+                "FWD rows={} ms={:.2}",
+                tokens.len(),
+                fwd_t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         result
     }
 
