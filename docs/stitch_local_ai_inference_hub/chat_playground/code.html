@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="web_standard" name="shell-type"/><style>@layer base{html,body{margin:0;padding:0;}body{overscroll-behavior:none;}main>:first-child{margin-top:0!important;}main>:last-child{margin-bottom:0!important;}}::-webkit-scrollbar{display:none;}</style><link href="https://fonts.googleapis.com" rel="preconnect"/><link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/><link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/><link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script><script id="tailwind-config">tailwind.config = {
+  darkMode: "class",
+  theme: {
+    extend: {
+      "colors": {
+        "on-primary-container": "#00422b",
+        "primary-fixed": "#6ffbbe",
+        "inverse-on-surface": "#2d3136",
+        "secondary-fixed-dim": "#4cd7f6",
+        "on-tertiary": "#3c0091",
+        "background": "#101419",
+        "on-primary": "#003824",
+        "surface-container-high": "#262a30",
+        "outline-variant": "#3c4a42",
+        "on-surface": "#e0e2ea",
+        "surface-container-highest": "#31353b",
+        "inverse-surface": "#e0e2ea",
+        "surface": "#101419",
+        "on-secondary-fixed-variant": "#004e5c",
+        "on-secondary": "#003640",
+        "secondary-fixed": "#acedff",
+        "surface-tint": "#4edea3",
+        "on-tertiary-fixed": "#23005c",
+        "on-error": "#690005",
+        "inverse-primary": "#006c49",
+        "secondary": "#4cd7f6",
+        "secondary-container": "#03b5d3",
+        "surface-container-low": "#181c21",
+        "surface-container-lowest": "#0a0e13",
+        "surface-container": "#1c2025",
+        "on-surface-variant": "#bbcabf",
+        "on-primary-fixed": "#002113",
+        "outline": "#86948a",
+        "surface-bright": "#36393f",
+        "error-container": "#93000a",
+        "on-tertiary-container": "#4600a7",
+        "on-secondary-fixed": "#001f26",
+        "surface-dim": "#101419",
+        "tertiary-fixed-dim": "#d0bcff",
+        "on-error-container": "#ffdad6",
+        "primary-fixed-dim": "#4edea3",
+        "error": "#ffb4ab",
+        "tertiary-fixed": "#e9ddff",
+        "primary-container": "#10b981",
+        "on-primary-fixed-variant": "#005236",
+        "tertiary": "#d0bcff",
+        "on-secondary-container": "#00424e",
+        "surface-variant": "#31353b",
+        "primary": "#4edea3",
+        "on-tertiary-fixed-variant": "#5516be",
+        "on-background": "#e0e2ea",
+        "tertiary-container": "#b090ff"
+      },
+      "borderRadius": {
+        "DEFAULT": "0.125rem",
+        "lg": "0.25rem",
+        "xl": "0.5rem",
+        "full": "0.75rem"
+      },
+      "spacing": {
+        "space-xs": "0.25rem",
+        "gutter": "0.75rem",
+        "space-sm": "0.5rem",
+        "space-md": "0.75rem",
+        "space-lg": "1rem",
+        "margin": "1.25rem",
+        "space-xl": "1.5rem"
+      },
+      "fontFamily": {
+        "label-section": [
+          "JetBrains Mono"
+        ],
+        "body-sm": [
+          "Inter"
+        ],
+        "body-md": [
+          "Inter"
+        ],
+        "headline-lg": [
+          "Geist"
+        ],
+        "body-lg": [
+          "Inter"
+        ],
+        "headline-md": [
+          "Geist"
+        ],
+        "label-code": [
+          "JetBrains Mono"
+        ],
+        "label-mono": [
+          "JetBrains Mono"
+        ],
+        "metric-unit": [
+          "JetBrains Mono"
+        ],
+        "metric-display": [
+          "Geist"
+        ],
+        "headline-xl": [
+          "Geist"
+        ]
+      },
+      "fontSize": {
+        "label-section": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "letterSpacing": "0.08em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-sm": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "body-md": [
+          "13px",
+          {
+            "lineHeight": "18px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-lg": [
+          "22px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.015em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-lg": [
+          "15px",
+          {
+            "lineHeight": "22px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-md": [
+          "18px",
+          {
+            "lineHeight": "24px",
+            "letterSpacing": "-0.01em",
+            "fontWeight": "600"
+          }
+        ],
+        "label-code": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "fontWeight": "500"
+          }
+        ],
+        "label-mono": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "metric-unit": [
+          "13px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "500"
+          }
+        ],
+        "metric-display": [
+          "24px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.03em",
+            "fontWeight": "700"
+          }
+        ],
+        "headline-xl": [
+          "28px",
+          {
+            "lineHeight": "36px",
+            "letterSpacing": "-0.02em",
+            "fontWeight": "700"
+          }
+        ]
+      }
+    }
+  }
+};</script></head><body class="bg-surface font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container"><header class="fixed top-0 left-0 w-full z-50 bg-surface-container-lowest/90 backdrop-blur-xl border-b border-outline-variant/30"><div class="h-16 w-full px-margin flex items-center justify-between gap-space-lg"><div class="flex items-center gap-space-lg shrink-0"><div class="flex items-center gap-space-sm"><img alt="Allpaca Logo" class="h-8 w-auto object-contain" src="https://lh3.googleusercontent.com/aida/AEtjO1U7lp6rlcEHSXUXP3vTEzxtA04C3M7RyQNyYx6kfaHmkdlxNmAQymz1wJ_GiZ6ijkv99AHXGhcnvFh7yYWuOaoDit8NWmHod6ONmP2Fh_RerSp0W1iGej96VrEDzZ-3KlcCykcDiDQDXJHhi9v5gSyfmTrzBnMv4rN_z-I0jI2sg-r_yR0JVdhQx_cosSTxuVzJLfwYgDm22J9Xp_DF_vPRbEpjwW7zpJjSBsk7GYqqTilReINHU6Xa"/><div class="flex flex-col"><span class="font-headline-md text-headline-md tracking-tight font-bold text-on-surface leading-none">Allpaca</span><span class="font-label-code text-label-code text-primary uppercase tracking-wider mt-0.5">Cluster: Home-Lab</span></div></div><div class="h-4 w-px bg-outline-variant/40 mx-space-xs hidden lg:block"></div><span class="hidden lg:inline-flex items-center font-label-mono text-label-mono text-on-surface-variant bg-surface-container px-space-sm py-0.5 rounded">v0.9.4-rc</span><nav class="hidden xl:flex items-center gap-space-xs" data-active-classes="bg-surface-container-high text-primary font-medium rounded-lg"><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="dashboard" href="#">Dashboard</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="chat-playground" href="#">Chat Playground</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="models-vram" href="#">Models &amp; VRAM</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="logs-traces" href="#">Logs &amp; Traces</a></nav></div><div class="hidden 2xl:flex items-center gap-space-md bg-surface-container-low px-space-md py-1.5 rounded border border-outline-variant/30"><div class="flex items-center gap-space-xs"><span class="h-2 w-2 rounded-full bg-primary animate-pulse"></span><span class="font-label-mono text-label-mono text-on-surface font-medium">Live · 4 Devices</span><span class="font-body-sm text-body-sm text-on-surface-variant">(2 Local HIP, 2 RPC)</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="material-symbols-outlined text-[14px] text-secondary">network_ping</span><span class="font-label-code text-label-code text-secondary font-medium">0.4ms LAN</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="font-label-code text-label-code text-on-surface-variant">Throughput:</span><span class="font-label-mono text-label-mono text-primary font-semibold">142.8 t/s</span></div></div><div class="flex items-center gap-space-sm shrink-0"><a class="hidden sm:inline-flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container hover:bg-surface-container-high text-on-surface font-body-sm text-body-sm transition-colors border border-outline-variant/40" href="#"><span class="material-symbols-outlined text-[16px] text-primary">api</span><span>API Docs</span></a><div class="hidden md:flex items-center gap-1 px-space-sm py-1 rounded bg-surface-container-low border border-outline-variant/30"><span class="material-symbols-outlined text-[16px] text-secondary">dns</span><span class="font-label-code text-label-code text-on-surface-variant">:11434, :8080</span><span class="material-symbols-outlined text-[16px] text-on-surface-variant">expand_more</span></div><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Cluster Settings"><span class="material-symbols-outlined text-[20px]">tune</span></button><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Lock UI"><span class="material-symbols-outlined text-[20px]">lock</span></button><div class="h-4 w-px bg-outline-variant/40 mx-0.5"></div><div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center"><span class="material-symbols-outlined text-on-primary text-[18px]">person</span></div></div></div></header><main class="w-full pt-16 bg-surface min-h-[calc(100vh-4rem)]"><div class="flex flex-col w-full">
+<div class="w-full bg-surface-container-lowest/80 px-margin py-2.5 flex flex-wrap items-center justify-between gap-space-md">
+<div class="flex items-center flex-wrap gap-space-sm">
+<div class="flex items-center gap-2 bg-surface-container px-space-md py-1.5 rounded-lg shadow-sm">
+<span class="material-symbols-outlined text-[16px] text-primary" style="font-variation-settings: 'FILL' 1;">neurology</span>
+<span class="font-headline-md text-body-md font-semibold text-on-surface">Qwen3.8-27B</span>
+<span class="font-label-code text-label-code bg-surface-container-high text-primary px-2 py-0.5 rounded">ROCm · UD-Q5_K_XL</span>
+</div>
+<div class="h-4 w-px bg-surface-container-high hidden sm:block"></div>
+<div class="flex items-center gap-1.5 bg-surface-container-low px-space-sm py-1 rounded">
+<span class="material-symbols-outlined text-[14px] text-secondary">memory</span>
+<span class="font-label-code text-label-code text-on-surface-variant">Ctx:</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium">4,120 / 32,768</span>
+<div class="w-16 h-1.5 bg-surface-container-high rounded-full overflow-hidden ml-1">
+<div class="h-full bg-primary rounded-full" style="width: 12.5%;"></div>
+</div>
+<span class="font-label-code text-label-code text-primary font-medium ml-0.5">12.5%</span>
+</div>
+<div class="hidden xl:flex items-center gap-1.5 bg-surface-container-low px-space-sm py-1 rounded">
+<span class="material-symbols-outlined text-[14px] text-primary">speed</span>
+<span class="font-label-code text-label-code text-on-surface-variant">Last TTFT:</span>
+<span class="font-label-mono text-label-mono text-primary font-medium">462 ms</span>
+<span class="text-surface-container-highest">·</span>
+<span class="font-label-mono text-label-mono text-secondary font-medium">16.4 tok/s</span>
+</div>
+<div class="hidden lg:flex items-center gap-1 bg-surface-container-low px-space-sm py-1 rounded text-on-surface-variant">
+<span class="material-symbols-outlined text-[14px] text-tertiary">hub</span>
+<span class="font-label-code text-label-code text-tertiary">MTP γ=3</span>
+</div>
+</div>
+<div class="flex items-center gap-space-xs">
+<button class="flex items-center gap-1.5 px-space-sm py-1.5 rounded-lg bg-surface-container hover:bg-surface-container-high text-on-surface font-label-code text-label-code transition-colors shadow-sm" id="btn-system-prompt">
+<span class="material-symbols-outlined text-[15px] text-secondary">psychology_alt</span>
+<span class="hidden sm:inline">System Prompt</span>
+</button>
+<button class="flex items-center gap-1.5 px-space-sm py-1.5 rounded-lg bg-surface-container hover:bg-surface-container-high text-on-surface font-label-code text-label-code transition-colors shadow-sm" id="btn-export">
+<span class="material-symbols-outlined text-[15px] text-outline">data_object</span>
+<span class="hidden sm:inline">Export JSON</span>
+</button>
+<button class="p-1.5 rounded-lg hover:bg-error-container hover:text-error text-on-surface-variant transition-colors" id="btn-clear-chat" title="Clear Session Thread">
+<span class="material-symbols-outlined text-[18px]">delete_sweep</span>
+</button>
+<div class="h-4 w-px bg-surface-container-high mx-1"></div>
+<button class="flex items-center gap-1.5 px-space-md py-1.5 rounded-lg bg-primary-container text-on-primary-container font-headline-md text-label-code font-bold hover:brightness-110 transition-all shadow-md" id="toggle-sidebar-btn">
+<span class="material-symbols-outlined text-[16px]">tune</span>
+<span>Sampling &amp; Cluster</span>
+</button>
+</div>
+</div>
+<div class="hidden w-full bg-surface-container-low px-margin py-2 flex items-center justify-between gap-space-md" id="system-prompt-banner">
+<div class="flex items-center gap-2 text-on-surface-variant font-label-code text-label-code min-w-0">
+<span class="material-symbols-outlined text-[16px] text-secondary shrink-0">terminal</span>
+<span class="text-on-surface font-semibold shrink-0">System instructions:</span>
+<span class="truncate text-on-surface-variant">"You are an autonomous distributed engineering copilot on the Allpaca local cluster. Adhere to ROCm, PyTorch, and CUDA low-level performance guidelines."</span>
+</div>
+<button class="text-on-surface-variant hover:text-on-surface shrink-0" onclick="document.getElementById('system-prompt-banner').classList.add('hidden')">
+<span class="material-symbols-outlined text-[16px]">close</span>
+</button>
+</div>
+<div class="w-full flex flex-1 relative overflow-hidden h-[calc(100vh-8.75rem)]">
+<div class="flex-1 flex flex-col h-full overflow-hidden bg-surface">
+<div class="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6" id="chat-scroller">
+<div class="flex justify-center">
+<div class="flex items-center gap-2 px-3 py-1 bg-surface-container-lowest/70 rounded-full font-label-code text-label-code text-on-surface-variant">
+<span class="h-1.5 w-1.5 rounded-full bg-primary"></span>
+            Session initialized · Speculative Draft MTP enabled · Context limit 32k
+          </div>
+</div>
+<div class="flex flex-col items-end w-full group">
+<div class="max-w-[85%] md:max-w-[70%] bg-surface-container-high text-on-surface rounded-xl rounded-tr-none px-4 py-3 shadow-md">
+<p class="font-body-md text-body-md leading-relaxed">hello qwen!</p>
+</div>
+<div class="flex items-center gap-2 mt-1 mr-1 text-on-surface-variant font-label-code text-label-code opacity-75">
+<span>2 tokens</span>
+<span>·</span>
+<span>14:02:11</span>
+</div>
+</div>
+<div class="flex flex-col items-start w-full group">
+<div class="max-w-[95%] xl:max-w-[85%] w-full bg-surface-container-low rounded-xl rounded-tl-none p-4 shadow-sm space-y-3">
+<div class="flex items-center justify-between bg-surface-container-lowest/80 px-3 py-2 rounded-lg cursor-pointer select-none transition-colors hover:bg-surface-container-lowest" onclick="toggleThought('thought-1', this)">
+<div class="flex items-center gap-2 min-w-0">
+<span class="material-symbols-outlined text-[16px] text-tertiary animate-pulse">psychology</span>
+<span class="font-label-section text-label-section uppercase text-tertiary">Reasoning Process</span>
+<span class="font-label-code text-label-code text-on-surface-variant">(93 tokens · 1.2s elapsed)</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="font-label-code text-[10px] text-on-surface-variant uppercase tracking-wider">Expand</span>
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant transform transition-transform duration-200">expand_more</span>
+</div>
+</div>
+<div class="hidden bg-surface-container-lowest/40 rounded-lg p-3.5 font-label-code text-label-code text-on-surface-variant leading-relaxed overflow-x-auto whitespace-pre-wrap" id="thought-1">The user is greeting me and calling me "Qwen." I am Qwen (Tongyi Qianwen), developed by Alibaba Group's Tongyi Lab. This is a simple greeting, so I should respond warmly and naturally, keeping it light and conversational.</div>
+<div class="font-body-md text-body-md text-on-surface leading-relaxed pt-1">
+              Hello! 👋 Great to meet you! How's it going? Is there something I can help you with today, or are you just saying hi? Either way, I'm here! 😊
+            </div>
+<div class="pt-2 flex flex-wrap items-center justify-between gap-2 text-on-surface-variant font-label-code text-label-code bg-surface-container-lowest/30 px-3 py-1.5 rounded">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-primary font-medium">93 tokens</span>
+<span>·</span>
+<span>TTFT <strong class="text-on-surface font-normal">18,921 ms</strong></span>
+<span>·</span>
+<span>16.4 tok/s</span>
+<span class="hidden sm:inline">·</span>
+<span class="hidden sm:inline text-secondary">MTP verified</span>
+</div>
+<div class="flex items-center gap-2">
+<button class="hover:text-primary transition-colors" onclick="navigator.clipboard.writeText('Hello! 👋 Great to meet you! How\'s it going?')" title="Copy Raw Markdown">
+<span class="material-symbols-outlined text-[14px]">content_copy</span>
+</button>
+<button class="hover:text-primary transition-colors" title="Regenerate with Seed 10293">
+<span class="material-symbols-outlined text-[14px]">cached</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<div class="flex flex-col items-end w-full group">
+<div class="max-w-[85%] md:max-w-[70%] bg-surface-container-high text-on-surface rounded-xl rounded-tr-none px-4 py-3 shadow-md">
+<p class="font-body-md text-body-md leading-relaxed">it's going well. how are you doing?</p>
+</div>
+<div class="flex items-center gap-2 mt-1 mr-1 text-on-surface-variant font-label-code text-label-code opacity-75">
+<span>9 tokens</span>
+<span>·</span>
+<span>14:02:45</span>
+</div>
+</div>
+<div class="flex flex-col items-start w-full group">
+<div class="max-w-[95%] xl:max-w-[85%] w-full bg-surface-container-low rounded-xl rounded-tl-none p-4 shadow-sm space-y-3">
+<div class="flex items-center justify-between bg-surface-container-lowest/80 px-3 py-2 rounded-lg cursor-pointer select-none transition-colors hover:bg-surface-container-lowest" onclick="toggleThought('thought-2', this)">
+<div class="flex items-center gap-2 min-w-0">
+<span class="material-symbols-outlined text-[16px] text-tertiary">psychology</span>
+<span class="font-label-section text-label-section uppercase text-tertiary">Reasoning Process</span>
+<span class="font-label-code text-label-code text-on-surface-variant">(108 tokens · 0.8s elapsed)</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="font-label-code text-[10px] text-on-surface-variant uppercase tracking-wider">Expand</span>
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant transform transition-transform duration-200">expand_more</span>
+</div>
+</div>
+<div class="hidden bg-surface-container-lowest/40 rounded-lg p-3.5 font-label-code text-label-code text-on-surface-variant leading-relaxed overflow-x-auto whitespace-pre-wrap" id="thought-2">The user is asking how I'm doing in a casual, friendly conversation. I should respond warmly and naturally, keeping it light and conversational. I don't need to overthink this — just a friendly, genuine-sounding reply.</div>
+<div class="font-body-md text-body-md text-on-surface leading-relaxed pt-1 space-y-2">
+<p>I'm doing well, thanks for asking! I always enjoy a good chat. 😄</p>
+<p>Glad to hear things are going well on your end. Is there anything on your mind today, or are we just enjoying a little conversation? I'm happy for either!</p>
+</div>
+<div class="pt-2 flex flex-wrap items-center justify-between gap-2 text-on-surface-variant font-label-code text-label-code bg-surface-container-lowest/30 px-3 py-1.5 rounded">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-primary font-medium">108 tokens</span>
+<span>·</span>
+<span>TTFT <strong class="text-on-surface font-normal">6,650 ms</strong></span>
+<span>·</span>
+<span>13.8 tok/s</span>
+<span class="hidden sm:inline">·</span>
+<span class="hidden sm:inline text-secondary">RPC Worker Sync</span>
+</div>
+<div class="flex items-center gap-2">
+<button class="hover:text-primary transition-colors" onclick="navigator.clipboard.writeText('I\'m doing well, thanks for asking!')" title="Copy Raw Markdown">
+<span class="material-symbols-outlined text-[14px]">content_copy</span>
+</button>
+<button class="hover:text-primary transition-colors" title="Regenerate">
+<span class="material-symbols-outlined text-[14px]">cached</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<div class="flex flex-col items-start w-full group" id="streaming-bubble">
+<div class="max-w-[95%] xl:max-w-[85%] w-full bg-surface-container-low rounded-xl rounded-tl-none p-4 shadow-sm space-y-3">
+<div class="flex items-center justify-between bg-surface-container-lowest/90 px-3 py-2 rounded-lg cursor-pointer" onclick="toggleThought('thought-streaming', this)">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[16px] text-primary animate-spin">cyclone</span>
+<span class="font-label-section text-label-section uppercase text-primary">Inference Active</span>
+<span class="font-label-code text-label-code text-on-surface-variant">Thinking &amp; Draft Verification...</span>
+</div>
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant transform rotate-180 transition-transform">expand_more</span>
+</div>
+<div class="bg-surface-container-lowest/60 rounded-lg p-3.5 font-label-code text-label-code text-primary-fixed-dim leading-relaxed whitespace-pre-wrap" id="thought-streaming">1. Evaluating user affinity &amp; local ROCm compute graph.
+2. Allocating intermediate tensors on local GPU0 (RX 7900 XTX).
+3. Verifying KV Cache state in offloaded RPC node (192.168.69.2:50052).
+4. Generating streaming payload...</div>
+<div class="flex items-center gap-2 text-on-surface-variant font-label-code text-label-code pt-1">
+<span class="h-2 w-2 rounded-full bg-primary animate-ping"></span>
+<span>Speculative engine: 24 accepted / 28 proposed drafts (85.7% hit rate)</span>
+</div>
+</div>
+</div>
+</div>
+<div class="p-4 bg-surface-container-lowest/90 backdrop-blur-md">
+<div class="max-w-5xl mx-auto flex flex-col gap-2">
+<div class="flex items-center justify-between px-1">
+<div class="flex items-center gap-2">
+<button class="inline-flex items-center gap-1 font-label-code text-label-code text-primary bg-surface-container-high px-2 py-0.5 rounded hover:bg-surface-container transition-colors">
+<span class="material-symbols-outlined text-[13px]">visibility</span>
+<span>mmproj (CLIP-ViT) Active</span>
+</button>
+<span class="font-label-code text-label-code text-on-surface-variant hidden md:inline">Draft: mtp-gamma-3</span>
+</div>
+<div class="flex items-center gap-2 font-label-code text-label-code text-on-surface-variant">
+<span>Shift + Enter for newline</span>
+<span>·</span>
+<span class="text-primary font-medium">Ctrl + Enter to send</span>
+</div>
+</div>
+<div class="relative bg-surface-container rounded-xl shadow-lg p-2 flex flex-col">
+<textarea class="w-full bg-transparent text-on-surface placeholder:text-on-surface-variant/50 font-body-md text-body-md resize-none focus:outline-none px-2 py-1" id="prompt-input" placeholder="Send a message or code prompt to Qwen3.8-27B..." rows="2"></textarea>
+<div class="flex items-center justify-between pt-2 px-1">
+<div class="flex items-center gap-1">
+<button class="p-1.5 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" title="Attach Multimodal Vision Input">
+<span class="material-symbols-outlined text-[18px]">add_photo_alternate</span>
+</button>
+<button class="p-1.5 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" title="Inject Function Tool schema">
+<span class="material-symbols-outlined text-[18px]">handyman</span>
+</button>
+<button class="p-1.5 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" title="Set Dynamic Stop Sequences">
+<span class="material-symbols-outlined text-[18px]">rule</span>
+</button>
+</div>
+<div class="flex items-center gap-2">
+<button class="hidden items-center gap-1 px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-error-container hover:text-error text-on-surface font-label-code text-label-code transition-colors" id="btn-stop">
+<span class="material-symbols-outlined text-[14px]">stop_circle</span>
+<span>Stop</span>
+</button>
+<button class="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-primary-container hover:brightness-110 text-on-primary-container font-headline-md text-body-sm font-semibold transition-all shadow-md" id="btn-send">
+<span>Send</span>
+<span class="material-symbols-outlined text-[16px]">send</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<aside class="w-80 lg:w-96 bg-surface-container-lowest overflow-y-auto flex flex-col shrink-0 transition-all duration-300 shadow-xl" id="sampling-sidebar">
+<div class="p-4 bg-surface-container-low flex items-center justify-between sticky top-0 z-10">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-primary text-[18px]">instant_mix</span>
+<span class="font-headline-md text-headline-md font-semibold text-on-surface">Sampling &amp; Nodes</span>
+</div>
+<button class="p-1 rounded hover:bg-surface-container text-on-surface-variant hover:text-on-surface" id="close-sidebar-btn">
+<span class="material-symbols-outlined text-[18px]">close</span>
+</button>
+</div>
+<div class="p-4 space-y-6">
+<div class="space-y-3">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section uppercase text-on-surface-variant">Cluster Allocation</span>
+<span class="font-label-code text-label-code text-primary bg-surface-container px-2 py-0.5 rounded">All Synced</span>
+</div>
+<div class="space-y-2 bg-surface-container-low p-3 rounded-lg">
+<div class="flex items-center justify-between font-label-code text-label-code">
+<span class="text-on-surface flex items-center gap-1.5">
+<span class="h-2 w-2 rounded-full bg-primary"></span>
+                Local HIP: RX 7900 XTX
+              </span>
+<span class="text-primary font-semibold">22.1 / 24 GB</span>
+</div>
+<div class="w-full bg-surface-container-high h-1.5 rounded-full overflow-hidden">
+<div class="bg-primary h-full rounded-full" style="width: 92%;"></div>
+</div>
+<div class="flex items-center justify-between font-label-code text-label-code pt-1">
+<span class="text-on-surface flex items-center gap-1.5">
+<span class="h-2 w-2 rounded-full bg-secondary"></span>
+                RPC[node-02:50052]
+              </span>
+<span class="text-secondary font-semibold">18.4 / 32 GB</span>
+</div>
+<div class="w-full bg-surface-container-high h-1.5 rounded-full overflow-hidden">
+<div class="bg-secondary h-full rounded-full" style="width: 57%;"></div>
+</div>
+<div class="flex items-center justify-between font-label-code text-label-code pt-1">
+<span class="text-on-surface flex items-center gap-1.5">
+<span class="h-2 w-2 rounded-full bg-tertiary"></span>
+                RPC[mac-studio:50052]
+              </span>
+<span class="text-tertiary font-semibold">27.7 / 40 GB</span>
+</div>
+<div class="w-full bg-surface-container-high h-1.5 rounded-full overflow-hidden">
+<div class="bg-tertiary h-full rounded-full" style="width: 69%;"></div>
+</div>
+</div>
+</div>
+<div class="space-y-4">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section uppercase text-on-surface-variant">Hyperparameters</span>
+<button class="font-label-code text-label-code text-primary hover:underline" onclick="resetSamplingDefaults()">Reset</button>
+</div>
+<div class="space-y-1.5 bg-surface-container-low p-3 rounded-lg">
+<div class="flex items-center justify-between">
+<label class="font-body-sm text-body-sm text-on-surface font-medium" for="temp-slider">Temperature</label>
+<span class="font-label-mono text-label-mono text-primary font-semibold" id="temp-val">0.70</span>
+</div>
+<input class="w-full accent-primary bg-surface-container-highest h-1 rounded cursor-pointer" id="temp-slider" max="2.0" min="0" oninput="document.getElementById('temp-val').innerText = parseFloat(this.value).toFixed(2)" step="0.05" type="range" value="0.70"/>
+<div class="flex justify-between font-label-code text-[10px] text-on-surface-variant">
+<span>Deterministic (0.0)</span>
+<span>Creative (1.5+)</span>
+</div>
+</div>
+<div class="space-y-1.5 bg-surface-container-low p-3 rounded-lg">
+<div class="flex items-center justify-between">
+<label class="font-body-sm text-body-sm text-on-surface font-medium" for="topp-slider">Top-P (Nucleus)</label>
+<span class="font-label-mono text-label-mono text-primary font-semibold" id="topp-val">0.90</span>
+</div>
+<input class="w-full accent-primary bg-surface-container-highest h-1 rounded cursor-pointer" id="topp-slider" max="1.0" min="0.1" oninput="document.getElementById('topp-val').innerText = parseFloat(this.value).toFixed(2)" step="0.05" type="range" value="0.90"/>
+</div>
+<div class="space-y-1.5 bg-surface-container-low p-3 rounded-lg">
+<div class="flex items-center justify-between">
+<label class="font-body-sm text-body-sm text-on-surface font-medium" for="rep-slider">Repetition Penalty</label>
+<span class="font-label-mono text-label-mono text-primary font-semibold" id="rep-val">1.10</span>
+</div>
+<input class="w-full accent-primary bg-surface-container-highest h-1 rounded cursor-pointer" id="rep-slider" max="1.5" min="1.0" oninput="document.getElementById('rep-val').innerText = parseFloat(this.value).toFixed(2)" step="0.02" type="range" value="1.10"/>
+</div>
+<div class="space-y-1.5 bg-surface-container-low p-3 rounded-lg">
+<div class="flex items-center justify-between">
+<label class="font-body-sm text-body-sm text-on-surface font-medium" for="maxtok-input">Max Tokens</label>
+<span class="font-label-code text-label-code text-on-surface-variant">Generation cap</span>
+</div>
+<div class="flex items-center gap-2">
+<input class="w-full bg-surface-container font-label-mono text-label-mono text-on-surface px-2.5 py-1.5 rounded focus:outline-none" id="maxtok-input" max="16384" min="256" step="256" type="number" value="4096"/>
+<button class="font-label-code text-label-code bg-surface-container px-2 py-1.5 rounded text-on-surface-variant hover:text-on-surface" onclick="document.getElementById('maxtok-input').value = '8192'">8k</button>
+</div>
+</div>
+</div>
+<div class="space-y-3">
+<span class="font-label-section text-label-section uppercase text-on-surface-variant">Speculative Decoding</span>
+<div class="bg-surface-container-low p-3 rounded-lg space-y-2">
+<div class="flex items-center justify-between">
+<span class="font-body-sm text-body-sm text-on-surface font-medium">Multi-Token Prediction</span>
+<span class="font-label-code text-label-code text-tertiary bg-surface-container px-2 py-0.5 rounded">γ = 3</span>
+</div>
+<p class="font-label-code text-label-code text-on-surface-variant">Draft: mtp-Qwen3.8-27B-Q4_0.gguf</p>
+<div class="pt-1 flex items-center justify-between font-label-code text-label-code text-on-surface-variant">
+<span>Acceptance rate:</span>
+<span class="text-primary font-semibold">82.4% avg</span>
+</div>
+</div>
+</div>
+<div class="space-y-2 pt-2">
+<button class="w-full py-2 bg-surface-container hover:bg-surface-container-high text-on-surface font-headline-md text-label-code font-medium rounded-lg transition-colors flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-[16px]">tune</span>
+<span>Advanced Flash-Attn &amp; RoPE</span>
+</button>
+</div>
+</div>
+</aside>
+</div>
+</div>
+<script>
+  function toggleThought(elementId, triggerEl) {
+    const target = document.getElementById(elementId);
+    if (!target) return;
+    const isHidden = target.classList.contains('hidden');
+    target.classList.toggle('hidden');
+    
+    const icon = triggerEl.querySelector('.material-symbols-outlined:last-child');
+    const label = triggerEl.querySelector('span:nth-child(2)');
+    if (icon) {
+      icon.style.transform = isHidden ? 'rotate(180deg)' : 'rotate(0deg)';
+    }
+    const stateText = triggerEl.querySelector('span.uppercase.tracking-wider');
+    if (stateText) {
+      stateText.innerText = isHidden ? 'Collapse' : 'Expand';
+    }
+  }
+
+  function resetSamplingDefaults() {
+    const tempSlider = document.getElementById('temp-slider');
+    const toppSlider = document.getElementById('topp-slider');
+    const repSlider = document.getElementById('rep-slider');
+    const maxTok = document.getElementById('maxtok-input');
+
+    if (tempSlider) { tempSlider.value = '0.70'; document.getElementById('temp-val').innerText = '0.70'; }
+    if (toppSlider) { toppSlider.value = '0.90'; document.getElementById('topp-val').innerText = '0.90'; }
+    if (repSlider) { repSlider.value = '1.10'; document.getElementById('rep-val').innerText = '1.10'; }
+    if (maxTok) { maxTok.value = '4096'; }
+  }
+
+  const toggleSidebarBtn = document.getElementById('toggle-sidebar-btn');
+  const closeSidebarBtn = document.getElementById('close-sidebar-btn');
+  const sidebar = document.getElementById('sampling-sidebar');
+
+  if (toggleSidebarBtn && sidebar) {
+    toggleSidebarBtn.addEventListener('click', () => {
+      sidebar.classList.toggle('hidden');
+    });
+  }
+
+  if (closeSidebarBtn && sidebar) {
+    closeSidebarBtn.addEventListener('click', () => {
+      sidebar.classList.add('hidden');
+    });
+  }
+
+  const promptInput = document.getElementById('prompt-input');
+  const btnSend = document.getElementById('btn-send');
+  const chatScroller = document.getElementById('chat-scroller');
+  const btnClearChat = document.getElementById('btn-clear-chat');
+  const btnSysPrompt = document.getElementById('btn-system-prompt');
+  const sysBanner = document.getElementById('system-prompt-banner');
+
+  if (btnSysPrompt && sysBanner) {
+    btnSysPrompt.addEventListener('click', () => {
+      sysBanner.classList.toggle('hidden');
+    });
+  }
+
+  if (btnClearChat && chatScroller) {
+    btnClearChat.addEventListener('click', () => {
+      const confirmClear = confirm('Reset this chat context and wipe KV cache?');
+      if (confirmClear) {
+        chatScroller.innerHTML = `
+          <div class="flex justify-center">
+            <div class="flex items-center gap-2 px-3 py-1 bg-surface-container-lowest/70 rounded-full font-label-code text-label-code text-on-surface-variant">
+              <span class="h-1.5 w-1.5 rounded-full bg-primary"></span>
+              Session cleared · Clean context window (0 / 32,768 tokens)
+            </div>
+          </div>
+        `;
+      }
+    });
+  }
+
+  function handleSend() {
+    if (!promptInput) return;
+    const text = promptInput.value.trim();
+    if (!text) return;
+
+    const userBubble = document.createElement('div');
+    userBubble.className = 'flex flex-col items-end w-full group';
+    userBubble.innerHTML = `
+      <div class="max-w-[85%] md:max-w-[70%] bg-surface-container-high text-on-surface rounded-xl rounded-tr-none px-4 py-3 shadow-md">
+        <p class="font-body-md text-body-md leading-relaxed">${escapeHtml(text)}</p>
+      </div>
+      <div class="flex items-center gap-2 mt-1 mr-1 text-on-surface-variant font-label-code text-label-code opacity-75">
+        <span>${Math.ceil(text.length / 3.8)} tokens</span>
+        <span>·</span>
+        <span>Just now</span>
+      </div>
+    `;
+
+    chatScroller.appendChild(userBubble);
+    promptInput.value = '';
+    chatScroller.scrollTop = chatScroller.scrollHeight;
+
+    const stream = document.getElementById('streaming-bubble');
+    if (stream) {
+      chatScroller.appendChild(stream);
+      chatScroller.scrollTop = chatScroller.scrollHeight;
+    }
+  }
+
+  function escapeHtml(str) {
+    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  }
+
+  if (btnSend) {
+    btnSend.addEventListener('click', handleSend);
+  }
+
+  if (promptInput) {
+    promptInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        handleSend();
+      }
+    });
+  }
+</script></main><footer class="w-full bg-surface-container-lowest border-t border-outline-variant/20 py-space-lg"><div class="w-full px-margin flex flex-col sm:flex-row items-center justify-between gap-space-sm font-label-code text-label-code text-on-surface-variant"><div>Allpaca Distributed Engine · Node <span class="text-primary">master-alpha</span> · ROCm 6.1 / Vulkan RPC</div><div>Memory: <span class="text-secondary">68.2 GiB / 96.0 GiB</span> · 4 Nodes Synced</div></div></footer></body></html>

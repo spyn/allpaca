@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="web_standard" name="shell-type"/><style>@layer base{html,body{margin:0;padding:0;}body{overscroll-behavior:none;}main>:first-child{margin-top:0!important;}main>:last-child{margin-bottom:0!important;}}::-webkit-scrollbar{display:none;}</style><link href="https://fonts.googleapis.com" rel="preconnect"/><link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/><link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/><link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script><script id="tailwind-config">tailwind.config = {
+  darkMode: "class",
+  theme: {
+    extend: {
+      "colors": {
+        "on-primary-container": "#00422b",
+        "primary-fixed": "#6ffbbe",
+        "inverse-on-surface": "#2d3136",
+        "secondary-fixed-dim": "#4cd7f6",
+        "on-tertiary": "#3c0091",
+        "background": "#101419",
+        "on-primary": "#003824",
+        "surface-container-high": "#262a30",
+        "outline-variant": "#3c4a42",
+        "on-surface": "#e0e2ea",
+        "surface-container-highest": "#31353b",
+        "inverse-surface": "#e0e2ea",
+        "surface": "#101419",
+        "on-secondary-fixed-variant": "#004e5c",
+        "on-secondary": "#003640",
+        "secondary-fixed": "#acedff",
+        "surface-tint": "#4edea3",
+        "on-tertiary-fixed": "#23005c",
+        "on-error": "#690005",
+        "inverse-primary": "#006c49",
+        "secondary": "#4cd7f6",
+        "secondary-container": "#03b5d3",
+        "surface-container-low": "#181c21",
+        "surface-container-lowest": "#0a0e13",
+        "surface-container": "#1c2025",
+        "on-surface-variant": "#bbcabf",
+        "on-primary-fixed": "#002113",
+        "outline": "#86948a",
+        "surface-bright": "#36393f",
+        "error-container": "#93000a",
+        "on-tertiary-container": "#4600a7",
+        "on-secondary-fixed": "#001f26",
+        "surface-dim": "#101419",
+        "tertiary-fixed-dim": "#d0bcff",
+        "on-error-container": "#ffdad6",
+        "primary-fixed-dim": "#4edea3",
+        "error": "#ffb4ab",
+        "tertiary-fixed": "#e9ddff",
+        "primary-container": "#10b981",
+        "on-primary-fixed-variant": "#005236",
+        "tertiary": "#d0bcff",
+        "on-secondary-container": "#00424e",
+        "surface-variant": "#31353b",
+        "primary": "#4edea3",
+        "on-tertiary-fixed-variant": "#5516be",
+        "on-background": "#e0e2ea",
+        "tertiary-container": "#b090ff"
+      },
+      "borderRadius": {
+        "DEFAULT": "0.125rem",
+        "lg": "0.25rem",
+        "xl": "0.5rem",
+        "full": "0.75rem"
+      },
+      "spacing": {
+        "space-xs": "0.25rem",
+        "gutter": "0.75rem",
+        "space-sm": "0.5rem",
+        "space-md": "0.75rem",
+        "space-lg": "1rem",
+        "margin": "1.25rem",
+        "space-xl": "1.5rem"
+      },
+      "fontFamily": {
+        "label-section": [
+          "JetBrains Mono"
+        ],
+        "body-sm": [
+          "Inter"
+        ],
+        "body-md": [
+          "Inter"
+        ],
+        "headline-lg": [
+          "Geist"
+        ],
+        "body-lg": [
+          "Inter"
+        ],
+        "headline-md": [
+          "Geist"
+        ],
+        "label-code": [
+          "JetBrains Mono"
+        ],
+        "label-mono": [
+          "JetBrains Mono"
+        ],
+        "metric-unit": [
+          "JetBrains Mono"
+        ],
+        "metric-display": [
+          "Geist"
+        ],
+        "headline-xl": [
+          "Geist"
+        ]
+      },
+      "fontSize": {
+        "label-section": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "letterSpacing": "0.08em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-sm": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "body-md": [
+          "13px",
+          {
+            "lineHeight": "18px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-lg": [
+          "22px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.015em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-lg": [
+          "15px",
+          {
+            "lineHeight": "22px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-md": [
+          "18px",
+          {
+            "lineHeight": "24px",
+            "letterSpacing": "-0.01em",
+            "fontWeight": "600"
+          }
+        ],
+        "label-code": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "fontWeight": "500"
+          }
+        ],
+        "label-mono": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "metric-unit": [
+          "13px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "500"
+          }
+        ],
+        "metric-display": [
+          "24px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.03em",
+            "fontWeight": "700"
+          }
+        ],
+        "headline-xl": [
+          "28px",
+          {
+            "lineHeight": "36px",
+            "letterSpacing": "-0.02em",
+            "fontWeight": "700"
+          }
+        ]
+      }
+    }
+  }
+};</script></head><body class="bg-surface font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container"><header class="fixed top-0 left-0 w-full z-50 bg-surface-container-lowest/90 backdrop-blur-xl border-b border-outline-variant/30"><div class="h-16 w-full px-margin flex items-center justify-between gap-space-lg"><div class="flex items-center gap-space-lg shrink-0"><div class="flex items-center gap-space-sm"><img alt="Allpaca Logo" class="h-8 w-auto object-contain" src="https://lh3.googleusercontent.com/aida/AEtjO1U7lp6rlcEHSXUXP3vTEzxtA04C3M7RyQNyYx6kfaHmkdlxNmAQymz1wJ_GiZ6ijkv99AHXGhcnvFh7yYWuOaoDit8NWmHod6ONmP2Fh_RerSp0W1iGej96VrEDzZ-3KlcCykcDiDQDXJHhi9v5gSyfmTrzBnMv4rN_z-I0jI2sg-r_yR0JVdhQx_cosSTxuVzJLfwYgDm22J9Xp_DF_vPRbEpjwW7zpJjSBsk7GYqqTilReINHU6Xa"/><div class="flex flex-col"><span class="font-headline-md text-headline-md tracking-tight font-bold text-on-surface leading-none">Allpaca</span><span class="font-label-code text-label-code text-primary uppercase tracking-wider mt-0.5">Cluster: Home-Lab</span></div></div><div class="h-4 w-px bg-outline-variant/40 mx-space-xs hidden lg:block"></div><span class="hidden lg:inline-flex items-center font-label-mono text-label-mono text-on-surface-variant bg-surface-container px-space-sm py-0.5 rounded">v0.9.4-rc</span><nav class="hidden xl:flex items-center gap-space-xs" data-active-classes="bg-surface-container-high text-primary font-medium rounded-lg"><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="dashboard" href="#">Dashboard</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="chat-playground" href="#">Chat Playground</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="models-vram" href="#">Models &amp; VRAM</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="logs-traces" href="#">Logs &amp; Traces</a></nav></div><div class="hidden 2xl:flex items-center gap-space-md bg-surface-container-low px-space-md py-1.5 rounded border border-outline-variant/30"><div class="flex items-center gap-space-xs"><span class="h-2 w-2 rounded-full bg-primary animate-pulse"></span><span class="font-label-mono text-label-mono text-on-surface font-medium">Live · 4 Devices</span><span class="font-body-sm text-body-sm text-on-surface-variant">(2 Local HIP, 2 RPC)</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="material-symbols-outlined text-[14px] text-secondary">network_ping</span><span class="font-label-code text-label-code text-secondary font-medium">0.4ms LAN</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="font-label-code text-label-code text-on-surface-variant">Throughput:</span><span class="font-label-mono text-label-mono text-primary font-semibold">142.8 t/s</span></div></div><div class="flex items-center gap-space-sm shrink-0"><a class="hidden sm:inline-flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container hover:bg-surface-container-high text-on-surface font-body-sm text-body-sm transition-colors border border-outline-variant/40" href="#"><span class="material-symbols-outlined text-[16px] text-primary">api</span><span>API Docs</span></a><div class="hidden md:flex items-center gap-1 px-space-sm py-1 rounded bg-surface-container-low border border-outline-variant/30"><span class="material-symbols-outlined text-[16px] text-secondary">dns</span><span class="font-label-code text-label-code text-on-surface-variant">:11434, :8080</span><span class="material-symbols-outlined text-[16px] text-on-surface-variant">expand_more</span></div><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Cluster Settings"><span class="material-symbols-outlined text-[20px]">tune</span></button><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Lock UI"><span class="material-symbols-outlined text-[20px]">lock</span></button><div class="h-4 w-px bg-outline-variant/40 mx-0.5"></div><div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center"><span class="material-symbols-outlined text-on-primary text-[18px]">person</span></div></div></div></header><main class="w-full pt-16 bg-surface min-h-[calc(100vh-4rem)]"><div class="flex flex-col w-full">
+<div class="w-full px-margin py-space-lg flex flex-col gap-space-lg">
+<!-- Breadcrumb & Top System Bar -->
+<div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-space-sm pb-space-xs">
+<div class="flex flex-col">
+<div class="flex items-center gap-space-xs font-label-section text-label-section text-on-surface-variant uppercase tracking-wider">
+<span class="text-primary font-semibold">ENGINE RUNTIME</span>
+<span>/</span>
+<span>CLUSTER MODELS &amp; VRAM TOPOLOGY</span>
+</div>
+<div class="flex items-center gap-space-sm mt-1">
+<h1 class="font-headline-lg text-headline-lg text-on-surface font-bold tracking-tight">Qwen3.8-27B</h1>
+<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-primary-container/20 text-primary font-label-code text-label-code border border-primary/30">
+<span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span>
+            ACTIVE · 65/65 LAYERS RESIDENT
+          </span>
+</div>
+<p class="font-label-code text-label-code text-on-surface-variant mt-0.5">
+          Settings file: <span class="text-secondary font-mono">D:/code/inference/allpaca/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q5_K_XL.gguf.allpaca.json</span>
+</p>
+</div>
+<div class="flex items-center gap-space-sm shrink-0">
+<button class="flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container hover:bg-surface-container-high text-on-surface font-body-sm text-body-sm transition-colors border border-outline-variant/30" id="ejectBtn">
+<span class="material-symbols-outlined text-[16px] text-error">power_settings_new</span>
+<span>Unload VRAM</span>
+</button>
+<button class="flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container-high hover:bg-surface-bright text-on-surface font-body-sm text-body-sm transition-colors border border-outline-variant/40" id="reloadModelTop">
+<span class="material-symbols-outlined text-[16px] text-primary">sync</span>
+<span>Reload Model</span>
+</button>
+</div>
+</div>
+<!-- Active Loaded Model Card (Top Hero) -->
+<div class="w-full bg-surface-container-low rounded border border-outline-variant/30 overflow-hidden shadow-xl">
+<!-- Header row of the card -->
+<div class="p-space-lg bg-surface-container/60 border-b border-outline-variant/20 flex flex-col md:flex-row md:items-center justify-between gap-space-md">
+<div class="flex flex-col gap-1">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="font-headline-md text-headline-md font-bold text-on-surface">Qwen3.8-27B</span>
+<span class="px-2 py-0.5 rounded font-label-code text-label-code bg-primary/15 text-primary border border-primary/30 uppercase font-semibold">loaded</span>
+<span class="px-2 py-0.5 rounded font-label-code text-label-code bg-secondary/10 text-secondary border border-secondary/30 uppercase">vision</span>
+<span class="px-2 py-0.5 rounded font-label-code text-label-code bg-tertiary/10 text-tertiary border border-tertiary/30 uppercase">mtp 1-step</span>
+<span class="font-label-mono text-label-mono text-on-surface-variant ml-2">ROCm 6.1.2 HIP · Vulkan RPC Sharded</span>
+</div>
+<p class="font-body-md text-body-md text-on-surface-variant max-w-3xl">
+            Renewal of the beloved Qwen model, delivering unmatched intelligence density with integrated multi-token prediction and multimodal projector support.
+          </p>
+</div>
+<div class="flex items-center gap-space-md bg-surface-container-lowest/80 px-space-md py-2 rounded border border-outline-variant/20 self-start md:self-auto">
+<div class="flex flex-col items-end">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">Local + RPC VRAM</span>
+<span class="font-metric-display text-metric-display text-primary leading-none mt-0.5">25.25 <span class="font-metric-unit text-metric-unit text-on-surface-variant">/ 31.84 GiB</span></span>
+</div>
+<span class="material-symbols-outlined text-primary text-[28px]">memory</span>
+</div>
+</div>
+<!-- Specs Grid -->
+<div class="p-space-lg grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-space-md border-b border-outline-variant/20 bg-surface-container-low/40">
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">FILE</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium truncate mt-0.5" title="Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q5_K_XL.gguf">Qwen3.8-27B-UD-Q5_K_XL.gguf</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">ARCHITECTURE</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">qwen35</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">PARAMETERS</span>
+<span class="font-label-mono text-label-mono text-secondary font-semibold mt-0.5">27.0B</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">QUANTIZATION</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">UD-Q5_K_XL</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">CONTEXT (TRAINED)</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">262,144 tokens</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">LAYERS / ATTN</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">65 / 16 heads</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">EMBED WIDTH</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">5120</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">EXPERTS</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">dense (non-MoE)</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">MTP / NEXTN LAYERS</span>
+<span class="font-label-mono text-label-mono text-tertiary font-medium mt-0.5">1 (Speculative 2.1x)</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">ON DISK SIZE</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">19.44 GiB</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">LICENSE</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium mt-0.5">apache-2.0</span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">QUANTIZED BY</span>
+<span class="font-label-mono text-label-mono text-primary font-medium mt-0.5">Unsloth Dynamic</span>
+</div>
+</div>
+<!-- VRAM Local Fit Callout -->
+<div class="p-space-md px-space-lg bg-surface-container-lowest/60 flex items-center justify-between gap-space-md border-b border-outline-variant/20">
+<div class="flex items-center gap-space-sm">
+<span class="material-symbols-outlined text-primary text-[20px]">check_circle</span>
+<span class="font-body-sm text-body-sm text-on-surface">
+<strong class="font-medium text-primary">Fits fully in local primary VRAM:</strong>
+            19.44 GiB base weights within 31.84 GiB capacity (KV cache, flash attention buffers, and desktop workspaces occupy dynamic headroom).
+          </span>
+</div>
+<div class="hidden md:flex items-center gap-space-xs font-label-code text-label-code text-on-surface-variant">
+<span class="inline-block w-2 h-2 rounded-full bg-primary"></span>
+<span>ROCm Device #0: RX 7900 XTX 24GB + RPC Node #1</span>
+</div>
+</div>
+<!-- Runtime Options / Speculative Config Form -->
+<div class="p-space-lg bg-surface-container-low flex flex-col lg:flex-row items-stretch lg:items-end justify-between gap-space-lg">
+<div class="grid grid-cols-1 sm:grid-cols-3 gap-space-md flex-1">
+<div class="flex flex-col gap-1">
+<label class="font-label-section text-label-section text-on-surface-variant uppercase flex items-center gap-1">
+<span class="material-symbols-outlined text-[14px] text-secondary">image</span>
+<span>Vision Projector</span>
+</label>
+<div class="relative">
+<select class="w-full bg-surface-container-highest px-space-md py-2 rounded text-on-surface font-label-mono text-label-mono appearance-none border border-outline-variant/40 focus:border-primary focus:outline-none pr-8">
+<option selected="">mmproj-F16.gguf (620 MiB)</option>
+<option>mmproj-Q8_0.gguf (310 MiB)</option>
+<option>None (Disable Multimodal)</option>
+</select>
+<span class="material-symbols-outlined absolute right-2.5 top-2.5 text-[16px] text-on-surface-variant pointer-events-none">expand_more</span>
+</div>
+</div>
+<div class="flex flex-col gap-1">
+<label class="font-label-section text-label-section text-on-surface-variant uppercase flex items-center gap-1">
+<span class="material-symbols-outlined text-[14px] text-tertiary">bolt</span>
+<span>Speculation Mode</span>
+</label>
+<div class="relative">
+<select class="w-full bg-surface-container-highest px-space-md py-2 rounded text-on-surface font-label-mono text-label-mono appearance-none border border-outline-variant/40 focus:border-primary focus:outline-none pr-8">
+<option selected="">MTP draft (Internal Head)</option>
+<option>Draft Model Speculation (0.5B)</option>
+<option>Disabled (Standard Autoregressive)</option>
+</select>
+<span class="material-symbols-outlined absolute right-2.5 top-2.5 text-[16px] text-on-surface-variant pointer-events-none">expand_more</span>
+</div>
+</div>
+<div class="flex flex-col gap-1">
+<label class="font-label-section text-label-section text-on-surface-variant uppercase flex items-center gap-1">
+<span class="material-symbols-outlined text-[14px] text-primary">layers</span>
+<span>MTP Draft Weights</span>
+</label>
+<div class="relative">
+<select class="w-full bg-surface-container-highest px-space-md py-2 rounded text-on-surface font-label-mono text-label-mono appearance-none border border-outline-variant/40 focus:border-primary focus:outline-none pr-8">
+<option selected="">mtp-Qwen3.8-27B-Q4_0.gguf</option>
+<option>mtp-Qwen3.8-27B-Q8_0.gguf</option>
+<option>External: Qwen2.5-0.5B-Q8_0.gguf</option>
+</select>
+<span class="material-symbols-outlined absolute right-2.5 top-2.5 text-[16px] text-on-surface-variant pointer-events-none">expand_more</span>
+</div>
+</div>
+</div>
+<button class="px-space-xl py-2 rounded bg-primary text-on-primary font-headline-md text-[14px] font-semibold flex items-center justify-center gap-2 hover:bg-primary-fixed-dim transition-all shadow-md active:scale-95 shrink-0" id="applyRuntimeOptions">
+<span class="material-symbols-outlined text-[18px]">cached</span>
+<span>Reload with these options</span>
+</button>
+</div>
+</div>
+<!-- Interactive Context Size & Dynamic VRAM Estimator -->
+<div class="w-full bg-surface-container-low rounded border border-outline-variant/30 p-space-lg flex flex-col gap-space-md shadow-lg">
+<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-space-sm border-b border-outline-variant/20 pb-space-sm">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-primary text-[20px]">tune</span>
+<span class="font-label-section text-label-section text-on-surface font-bold tracking-wider uppercase">Context Size &amp; KV Cache Allocation</span>
+</div>
+<div class="flex items-center gap-space-md font-label-code text-label-code text-on-surface-variant">
+<span>Max Supported: <strong class="text-on-surface">262,144 tokens</strong></span>
+<span>FlashAttention: <strong class="text-primary font-mono">v2.5.8 active</strong></span>
+<span>Quant Type: <strong class="text-secondary font-mono">FP16 KV</strong></span>
+</div>
+</div>
+<!-- Slider + Numeric Scrubber -->
+<div class="flex flex-col md:flex-row items-center gap-space-lg pt-space-xs">
+<div class="flex-1 w-full flex flex-col gap-1.5">
+<div class="flex justify-between items-center text-label-code font-label-code text-on-surface-variant">
+<span>2,048 (Minimal)</span>
+<span>8,192</span>
+<span class="text-primary font-semibold">32,768 (Optimal)</span>
+<span>65,536</span>
+<span>131,072 (High VRAM)</span>
+</div>
+<div class="relative w-full flex items-center">
+<input class="w-full h-2 bg-surface-container-highest rounded-lg appearance-none cursor-pointer accent-primary focus:outline-none" id="contextSlider" max="131072" min="2048" step="2048" type="range" value="32768"/>
+</div>
+</div>
+<div class="flex items-center gap-2 shrink-0 bg-surface-container-highest px-space-md py-1.5 rounded border border-outline-variant/40">
+<input class="bg-transparent font-label-mono text-metric-display text-[18px] text-primary w-24 text-right focus:outline-none font-bold" id="contextInput" max="131072" min="2048" step="2048" type="number" value="32768"/>
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">tokens</span>
+</div>
+</div>
+<!-- KV Cache Calculation Metrics -->
+<div class="flex flex-wrap items-center gap-x-space-xl gap-y-space-xs font-body-sm text-body-sm pt-space-xs text-on-surface-variant">
+<div class="flex items-center gap-1.5">
+<span class="h-2 w-2 rounded-full bg-primary"></span>
+<span>KV Cache Footprint:</span>
+<span class="font-label-mono text-label-mono text-on-surface font-semibold" id="kvCacheSize">4.00 GiB</span>
+</div>
+<div class="h-3 w-px bg-outline-variant/40"></div>
+<div class="flex items-center gap-1.5">
+<span>Per Token Cost:</span>
+<span class="font-label-mono text-label-mono text-on-surface font-medium">128.0 KiB · 16 attention layers</span>
+</div>
+<div class="h-3 w-px bg-outline-variant/40"></div>
+<div class="flex items-center gap-1.5">
+<span>Allocated Envelope:</span>
+<span class="font-label-mono text-label-mono text-primary font-medium" id="runningTokenBanner">Running with 32,768 tokens (4.00 GiB)</span>
+</div>
+</div>
+<!-- Segmented VRAM Estimator Bar -->
+<div class="flex flex-col gap-2 pt-space-sm">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">VRAM Allocation Breakdown (Local 31.84 GiB Total)</span>
+<span class="font-label-mono text-label-mono text-primary font-semibold" id="vramPct">79.3% Utilized</span>
+</div>
+<!-- The segmented track -->
+<div class="w-full h-4 bg-surface-container-highest rounded-full overflow-hidden flex p-0.5 gap-0.5 border border-outline-variant/30">
+<!-- Weights: ~63.9% -->
+<div class="h-full bg-tertiary-container rounded-sm transition-all duration-300" id="barWeights" style="width: 63.9%;" title="Model Weights: 20.35 GiB"></div>
+<!-- Other processes: ~2.9% -->
+<div class="h-full bg-outline rounded-sm transition-all duration-300" id="barOther" style="width: 2.9%;" title="System / Display Workspaces: 926.9 MiB"></div>
+<!-- KV Cache: ~12.5% dynamically updated -->
+<div class="h-full bg-primary-container rounded-sm transition-all duration-300 shadow-[0_0_8px_rgba(16,185,129,0.4)]" id="barKV" style="width: 12.56%;" title="KV Cache: 4.00 GiB"></div>
+<!-- Free unallocated headroom -->
+<div class="h-full bg-surface-container-high rounded-sm transition-all duration-300" id="barFree" style="width: 20.64%;" title="Free VRAM Headroom"></div>
+</div>
+<!-- Legend and details -->
+<div class="flex flex-wrap items-center justify-between gap-space-md pt-1">
+<div class="flex flex-wrap items-center gap-space-lg font-label-code text-label-code">
+<div class="flex items-center gap-1.5">
+<span class="w-3 h-3 rounded-xs bg-tertiary-container"></span>
+<span class="text-on-surface">Weights 20.35 GiB</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="w-3 h-3 rounded-xs bg-outline"></span>
+<span class="text-on-surface-variant">Other in use 926.9 MiB</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="w-3 h-3 rounded-xs bg-primary-container"></span>
+<span class="text-primary font-medium" id="legendKVText">KV at this context 4.00 GiB</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="w-3 h-3 rounded-xs bg-surface-container-high"></span>
+<span class="text-on-surface-variant" id="legendFreeText">Free Headroom 6.56 GiB</span>
+</div>
+</div>
+<div class="flex items-center gap-space-sm">
+<button class="px-space-lg py-1.5 rounded bg-primary-container hover:bg-primary text-on-primary font-label-section text-label-section uppercase font-semibold transition-all active:scale-95 shadow" id="saveContextBtn">
+              Save Context Size
+            </button>
+</div>
+</div>
+<p class="font-label-code text-label-code text-on-surface-variant/80 mt-1" id="vramNotice">
+          Estimated 25.25 GiB of 31.84 GiB (79.3%) with the context full. Weights on remote RPC workers are excluded. "Other" represents display compositor, desktop workspace buffers, and HIP runtime overhead.
+        </p>
+</div>
+</div>
+<!-- Available Models Catalog Section -->
+<div class="w-full flex flex-col gap-space-md mt-space-xs">
+<!-- Catalog Filter Toolbar -->
+<div class="w-full bg-surface-container-low rounded border border-outline-variant/30 p-space-md flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-space-md">
+<div class="flex items-center gap-space-sm flex-1 min-w-0">
+<span class="material-symbols-outlined text-secondary text-[20px] shrink-0">folder_open</span>
+<div class="flex flex-col min-w-0">
+<span class="font-label-section text-[10px] text-on-surface-variant uppercase tracking-wider">Storage Directory</span>
+<span class="font-label-mono text-label-mono text-on-surface truncate">Scanning: D:/code/inference/allpaca/models</span>
+</div>
+</div>
+<div class="flex items-center gap-space-sm shrink-0">
+<div class="relative w-full sm:w-64">
+<input class="w-full bg-surface-container-highest px-space-md py-1.5 pl-8 rounded text-on-surface font-body-sm text-body-sm border border-outline-variant/30 focus:border-primary focus:outline-none placeholder:text-on-surface-variant/60" id="modelFilter" placeholder="Filter models (Llama, Qwen, MoE)..." type="text"/>
+<span class="material-symbols-outlined absolute left-2 top-2 text-[16px] text-on-surface-variant">search</span>
+</div>
+<button class="flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container-high hover:bg-surface-bright text-on-surface font-body-sm text-body-sm transition-colors border border-outline-variant/30 shrink-0" id="rescanBtn">
+<span class="material-symbols-outlined text-[16px] text-secondary">refresh</span>
+<span>Rescan</span>
+</button>
+</div>
+</div>
+<!-- Model List Table Container -->
+<div class="w-full bg-surface-container-low rounded border border-outline-variant/30 overflow-x-auto shadow-md">
+<table class="w-full text-left border-collapse min-w-[960px]">
+<thead>
+<tr class="border-b border-outline-variant/20 bg-surface-container/80 font-label-section text-label-section text-on-surface-variant uppercase">
+<th class="py-space-md px-space-lg font-semibold">Model ID &amp; Filepath</th>
+<th class="py-space-md px-space-md font-semibold">Architecture</th>
+<th class="py-space-md px-space-md font-semibold">Size · Quant</th>
+<th class="py-space-md px-space-md font-semibold">Context</th>
+<th class="py-space-md px-space-md font-semibold">Topology</th>
+<th class="py-space-md px-space-md font-semibold">On Disk</th>
+<th class="py-space-md px-space-lg text-right font-semibold">Action</th>
+</tr>
+</thead>
+<tbody class="divide-y divide-outline-variant/15 font-body-sm text-body-sm" id="modelsTableBody">
+<!-- Row: Llama 3.2 1B Instruct -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Llama 3.2 1B Instruct</span>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Llama-3.2-1B-Instruct-Q8_0.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">llama</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">1B · Q8_0</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">128k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">1.23 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Llama 3.2 3B Instruct (F16) -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Llama 3.2 3B Instruct</span>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Llama-3.2-3B-Instruct-f16.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">llama</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">3B · F16</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">128k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">5.99 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Llama 3.2 3B Instruct (Q4_K_M) -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Llama 3.2 3B Instruct</span>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Llama-3.2-3B-Instruct-Q4_K_M.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">llama</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">3B · Q4_K_M</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">128k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">1.88 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Llama 3.2 3B Instruct (Q8_0) -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Llama 3.2 3B Instruct</span>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Llama-3.2-3B-Instruct-Q8_0.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">llama</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">3B · Q8_0</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">128k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">3.19 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Hf Bf16 Nemotron MoE -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<div class="flex items-center gap-2">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Hf Bf16 Nemotron</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-secondary/10 text-secondary border border-secondary/20">MoE 128E</span>
+</div>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-COHERENT.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">nemotron_h_moe</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-secondary">128x2.4B · ROCmFP4</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">256k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-secondary">128 · top-6</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">16.74 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Qwen3-Coder-Next (Sharded) -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<div class="flex items-center gap-2">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Qwen3-Coder-Next</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-outline-variant/40 text-on-surface-variant">3 shards</span>
+</div>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Qwen.Coder/UD-Q5_K_XL/Qwen3-Coder-Next-UD-Q5_K_XL-00001-of-00003.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">qwen3next</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">512x2.5B · UD-Q5_K_XL</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">256k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">512 · top-10</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface font-semibold">55.45 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Qwen2.5 Coder 0.5B Instruct AWQ -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Qwen2.5 Coder 0.5B Instruct AWQ</span>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Qwen2.5-Coder-0.5B/qwen2.5-coder-0.5b-instruct-q8_0.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">qwen2</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">0.5B · Q8_0</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">32k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">644.4 MiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Qwen3.8-27B-DFlash2 -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Qwen3.8-27B-DFlash2</span>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q8_0.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">dflash</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">1.9B · Q8_0</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">256k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">1.92 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Qwen3.8-27B (Currently Active Highlighted Row) -->
+<tr class="model-row bg-primary/10 hover:bg-primary/15 transition-colors border-l-2 border-primary">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<div class="flex items-center gap-2">
+<span class="font-body-md text-body-md font-bold text-primary">Qwen3.8-27B</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-primary text-on-primary font-bold">LOADED</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-secondary/20 text-secondary">vision</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-tertiary/20 text-tertiary">MTP</span>
+</div>
+<span class="font-label-code text-label-code text-primary/80 font-mono">Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q5_K_XL.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface font-medium">qwen35</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-primary font-medium">27B · UD-Q5_K_XL</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">256k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-primary font-bold">19.44 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="px-space-md py-1 rounded bg-primary/20 text-primary hover:bg-primary/30 font-label-code text-label-code border border-primary/40 font-semibold transition-colors">
+                  Details
+                </button>
+</td>
+</tr>
+<!-- Row: Qwen3.8-27B ROCmFP4-FAST -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<div class="flex items-center gap-2">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Qwen3.8-27B</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-outline-variant/40 text-on-surface-variant">MTP</span>
+</div>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Qwen3.8-27B-ROCmFP4-FAST-GGUF/Qwen3.8-27B-ROCmFP4-FAST.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">qwen35</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">27B · ROCmFP4-FAST</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">256k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">13.56 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+<!-- Row: Qwen3.8-27B ROCmFP4-COHERENT -->
+<tr class="model-row hover:bg-surface-container-high/40 transition-colors">
+<td class="py-space-md px-space-lg">
+<div class="flex flex-col">
+<div class="flex items-center gap-2">
+<span class="font-body-md text-body-md font-semibold text-on-surface">Qwen3.8-27B</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-secondary/15 text-secondary">vision</span>
+<span class="px-1.5 py-0.2 rounded font-label-code text-[10px] bg-outline-variant/40 text-on-surface-variant">MTP</span>
+</div>
+<span class="font-label-code text-label-code text-on-surface-variant font-mono">Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/Qwen3.8-27B-Q4_0_ROCmFP4_COHERENT.gguf</span>
+</div>
+</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">qwen35</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">27B · ROCmFP4-COHERENT</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">256k</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface-variant">dense</td>
+<td class="py-space-md px-space-md font-label-mono text-label-mono text-on-surface">14.66 GiB</td>
+<td class="py-space-md px-space-lg text-right">
+<button class="select-model-btn px-space-md py-1 rounded bg-surface-container hover:bg-surface-container-highest text-on-surface font-label-code text-label-code border border-outline-variant/30 transition-colors">
+                  Select
+                </button>
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+<!-- Aux Discovery Footer Notice -->
+<div class="px-space-md py-space-sm bg-surface-container-lowest/50 rounded flex items-center justify-between text-on-surface-variant font-label-code text-label-code">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[15px] text-secondary">info</span>
+<span>Also detected in models tree: <strong>2 vision projectors</strong>, <strong>2 MTP speculative drafts</strong>, <strong>1 imatrix calibration file</strong> (used alongside main models).</span>
+</div>
+<span class="hidden md:inline">11 valid GGUF manifests indexed</span>
+</div>
+</div>
+</div>
+</div>
+<script>
+  (function initEstimator() {
+    const slider = document.getElementById('contextSlider');
+    const numInput = document.getElementById('contextInput');
+    const kvDisplay = document.getElementById('kvCacheSize');
+    const runningBanner = document.getElementById('runningTokenBanner');
+    const barKV = document.getElementById('barKV');
+    const barFree = document.getElementById('barFree');
+    const legendKV = document.getElementById('legendKVText');
+    const legendFree = document.getElementById('legendFreeText');
+    const vramPct = document.getElementById('vramPct');
+    const vramNotice = document.getElementById('vramNotice');
+    const modelFilter = document.getElementById('modelFilter');
+    const rows = document.querySelectorAll('.model-row');
+    const saveBtn = document.getElementById('saveContextBtn');
+
+    // Hardware parameters
+    const TOTAL_VRAM = 31.84; // GiB total on local device
+    const WEIGHTS = 20.35;    // GiB
+    const OTHER = 0.905;      // ~926.9 MiB -> 0.905 GiB
+
+    // KV Cache math: 128 KiB per token -> 128 / (1024 * 1024) GiB per token
+    const GIB_PER_TOKEN = 128 / (1024 * 1024);
+
+    function updateEstimates(tokens) {
+      tokens = parseInt(tokens, 10);
+      if (isNaN(tokens)) tokens = 32768;
+
+      const kvGiB = tokens * GIB_PER_TOKEN;
+      const totalUsed = WEIGHTS + OTHER + kvGiB;
+      const headroom = Math.max(0, TOTAL_VRAM - totalUsed);
+      const usedPct = ((totalUsed / TOTAL_VRAM) * 100);
+
+      // Percentages for bar
+      const kvPct = ((kvGiB / TOTAL_VRAM) * 100);
+      const freePct = Math.max(0, 100 - (63.9 + 2.9 + kvPct));
+
+      // Update DOM
+      kvDisplay.textContent = kvGiB.toFixed(2) + ' GiB';
+      runningBanner.textContent = `Running with ${tokens.toLocaleString()} tokens (${kvGiB.toFixed(2)} GiB)`;
+      legendKV.textContent = `KV at this context ${kvGiB.toFixed(2)} GiB`;
+      legendFree.textContent = `Free Headroom ${headroom.toFixed(2)} GiB`;
+      vramPct.textContent = `${usedPct.toFixed(1)}% Utilized`;
+
+      barKV.style.width = kvPct.toFixed(2) + '%';
+      barFree.style.width = freePct.toFixed(2) + '%';
+
+      if (headroom <= 0) {
+        barKV.classList.remove('bg-primary-container');
+        barKV.classList.add('bg-error');
+        vramNotice.innerHTML = `<span class="text-error font-semibold">⚠️ OOM WARNING: Total allocation ${totalUsed.toFixed(2)} GiB exceeds device capacity of ${TOTAL_VRAM} GiB. Context will swap to system RAM or trigger HIP failure.</span>`;
+      } else {
+        barKV.classList.remove('bg-error');
+        barKV.classList.add('bg-primary-container');
+        vramNotice.textContent = `Estimated ${totalUsed.toFixed(2)} GiB of ${TOTAL_VRAM} GiB (${usedPct.toFixed(1)}%) with the context full. Weights on remote RPC workers are excluded. "Other" represents display compositor, desktop workspace buffers, and HIP runtime overhead.`;
+      }
+    }
+
+    if (slider && numInput) {
+      slider.addEventListener('input', (e) => {
+        numInput.value = e.target.value;
+        updateEstimates(e.target.value);
+      });
+
+      numInput.addEventListener('input', (e) => {
+        let val = parseInt(e.target.value, 10);
+        if (val > 131072) val = 131072;
+        slider.value = val;
+        updateEstimates(val);
+      });
+    }
+
+    if (modelFilter) {
+      modelFilter.addEventListener('input', (e) => {
+        const query = e.target.value.toLowerCase().trim();
+        rows.forEach(row => {
+          const text = row.textContent.toLowerCase();
+          row.style.display = text.includes(query) ? '' : 'none';
+        });
+      });
+    }
+
+    if (saveBtn) {
+      saveBtn.addEventListener('click', () => {
+        const orig = saveBtn.textContent;
+        saveBtn.textContent = 'SAVED ✓';
+        saveBtn.classList.remove('bg-primary-container');
+        saveBtn.classList.add('bg-primary', 'text-on-primary');
+        setTimeout(() => {
+          saveBtn.textContent = orig;
+          saveBtn.classList.remove('bg-primary');
+          saveBtn.classList.add('bg-primary-container');
+        }, 1800);
+      });
+    }
+
+    // Attach click feedback to model select buttons
+    document.querySelectorAll('.select-model-btn').forEach(btn => {
+      btn.addEventListener('click', function() {
+        const row = this.closest('tr');
+        const modelName = row.querySelector('.font-semibold').textContent;
+        this.textContent = 'Switching...';
+        setTimeout(() => {
+          this.textContent = 'Selected';
+        }, 600);
+      });
+    });
+  })();
+</script></main><footer class="w-full bg-surface-container-lowest border-t border-outline-variant/20 py-space-lg"><div class="w-full px-margin flex flex-col sm:flex-row items-center justify-between gap-space-sm font-label-code text-label-code text-on-surface-variant"><div>Allpaca Distributed Engine · Node <span class="text-primary">master-alpha</span> · ROCm 6.1 / Vulkan RPC</div><div>Memory: <span class="text-secondary">68.2 GiB / 96.0 GiB</span> · 4 Nodes Synced</div></div></footer></body></html>
