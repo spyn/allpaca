@@ -839,6 +839,11 @@ impl Dflash2Provider {
         &self.spec
     }
 
+    /// HIP device the draft runs on.
+    pub fn device(&self) -> i32 {
+        self.hip.device
+    }
+
     fn w(&self, off: usize) -> *const f32 {
         self.weights.ptr_at(off)
     }

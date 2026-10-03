@@ -190,6 +190,16 @@ tr:last-child td { border-bottom: none; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .legend .sw, .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 .row-end { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.layer-map { display: flex; height: 18px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); background: var(--meter-bg); }
+.layer-map > span { flex: 1; min-width: 1px; border-right: 1px solid rgba(0, 0, 0, 0.18); }
+.layer-map > span:last-child { border-right: 0; }
+.placement { display: grid; gap: 8px; margin-top: 12px; }
+.place-row { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: 4px 10px; align-items: baseline; }
+.place-row .sw { width: 12px; height: 12px; border-radius: 3px; align-self: center; }
+.place-row .dev { font-weight: 600; overflow-wrap: anywhere; }
+.place-row .dev .muted { font-weight: 400; }
+.place-row .size { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; }
+.place-row .detail { grid-column: 2 / 4; font-size: 13px; color: var(--muted); }
 .exp-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .exp-toolbar label { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
 .exp-body { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 16px; align-items: start; }
