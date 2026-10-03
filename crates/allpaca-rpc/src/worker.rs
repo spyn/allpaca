@@ -1772,46 +1772,123 @@ impl CudaWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::RmsNormRows => {
-                let rows = arg(i32s, 0, "rows")?;
-                let dim = arg(i32s, 1, "dim")?;
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let dim = arg(i32s, 1, "dim")? as i32;
                 let eps = *f32s.first().unwrap_or(&1e-5);
-                let (x, w, out) = (
-                    self.ptr_f32(need(bufs, 0)?)?,
-                    self.ptr_f32(need(bufs, 1)?)?,
-                    self.ptr_f32(need(bufs, 2)?)?,
-                );
+                self.cuda
+                    .rmsnorm_dev_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        self.ptr_f32(need(bufs, 2)?)?,
+                        rows,
+                        dim,
+                        eps,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopeRows => {
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let n_heads = arg(i32s, 1, "heads")? as i32;
+                let n_kv = arg(i32s, 2, "kv heads")? as i32;
+                let head_dim = arg(i32s, 3, "head dim")? as i32;
+                let start = arg(i32s, 4, "start pos")? as i32;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                self.cuda
+                    .rope_qk_dev_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        rows,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        n_heads * head_dim,
+                        n_kv * head_dim,
+                        start,
+                        theta,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopePartial | KernelOp::RopePartialRows => {
+                // RopePartial: [n_heads, n_kv, head_dim, pos, n_rot];
+                // RopePartialRows: [rows, n_heads, n_kv, head_dim, start, n_rot].
+                let o = usize::from(op == KernelOp::RopePartialRows);
+                let rows = if o == 1 { arg(i32s, 0, "rows")? } else { 1 };
+                let n_heads = arg(i32s, o, "heads")?;
+                let n_kv = arg(i32s, o + 1, "kv heads")?;
+                let head_dim = arg(i32s, o + 2, "head dim")?;
+                let start = arg(i32s, o + 3, "pos")?;
+                let n_rot = *i32s.get(o + 4).unwrap_or(&(head_dim as i32));
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let sections = sections_of(f32s);
+                let (q, k) = (self.ptr_f32(need(bufs, 0)?)?, self.ptr_f32(need(bufs, 1)?)?);
                 for r in 0..rows {
                     self.cuda
-                        .rmsnorm_dev(x.wrapping_add(r * dim), w, out.wrapping_add(r * dim), dim as i32, eps)
+                        .rope_imrope_qk_dev(
+                            q.wrapping_add(r * n_heads * head_dim),
+                            k.wrapping_add(r * n_kv * head_dim),
+                            n_heads as i32,
+                            n_kv as i32,
+                            head_dim as i32,
+                            n_rot,
+                            (start + r) as i32,
+                            theta,
+                            sections,
+                        )
                         .map_err(|e| RpcError::Worker(e.to_string()))?;
                 }
             }
-            KernelOp::RopeRows => {
-                let rows = arg(i32s, 0, "rows")?;
-                let n_heads = arg(i32s, 1, "heads")?;
-                let n_kv = arg(i32s, 2, "kv heads")?;
-                let head_dim = arg(i32s, 3, "head dim")?;
-                let start = arg(i32s, 4, "start pos")?;
-                let theta = *f32s.first().unwrap_or(&10_000.0);
-                let (q, k) = (self.ptr_f32(need(bufs, 0)?)?, self.ptr_f32(need(bufs, 1)?)?);
-                for r in 0..rows {
-                    let pos = (start + r) as i32;
-                    for (x, heads) in [(q.wrapping_add(r * n_heads * head_dim), n_heads), (k.wrapping_add(r * n_kv * head_dim), n_kv)] {
-                        self.cuda
-                            .rope_dev(x, heads as i32, head_dim as i32, pos, theta)
-                            .map_err(|e| RpcError::Worker(e.to_string()))?;
+            KernelOp::GemmNtQuant => {
+                let m = arg(i32s, 0, "gemm m")? as i32;
+                let n = arg(i32s, 1, "gemm n")? as i32;
+                let k = arg(i32s, 2, "gemm k")? as i32;
+                let a = self.ptr_f32(need(bufs, 0)?)?;
+                let b_id = need(bufs, 1)?;
+                let (ty, b) = (self.slot(b_id)?.ggml_type, self.slot(b_id)?.ptr);
+                let c = self.ptr_f32(need(bufs, 2)?)?;
+                match ty {
+                    0 => self.cuda.gemm_nt_dev(a, b.cast(), c, m, n, k),
+                    // Staged 36-byte blocks (see `WorkerBackend::stage_q8_0`).
+                    8 => self.cuda.gemm_nt_q8_0_dev(a, b.cast(), c, m, n, k),
+                    _ => {
+                        return Err(RpcError::Worker(format!(
+                            "cuda worker has no gemm for ggml type {ty}"
+                        )))
                     }
                 }
+                .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
-            KernelOp::GemmNtQuant
-            | KernelOp::DeinterleaveQGate
-            | KernelOp::RmsNormHeads
-            | KernelOp::SigmoidMul
-            | KernelOp::RopePartial
-            | KernelOp::RopePartialRows => {
-                return Err(RpcError::Worker(
-                    "quant gemm and gated attention are implemented on CPU and HIP workers".into(),
-                ));
+            KernelOp::DeinterleaveQGate => {
+                let n_heads = arg(i32s, 0, "deinterleave heads")? as i32;
+                let head_dim = arg(i32s, 1, "deinterleave head")? as i32;
+                self.cuda
+                    .deinterleave_q_gate_dev(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        self.ptr_f32(need(bufs, 2)?)?,
+                        n_heads,
+                        head_dim,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RmsNormHeads => {
+                let n_heads = arg(i32s, 0, "rmsnorm heads")? as i32;
+                let head_dim = arg(i32s, 1, "rmsnorm head")? as i32;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                self.cuda
+                    .rmsnorm_heads_dev(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        n_heads,
+                        head_dim,
+                        eps,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::SigmoidMul => {
+                let n = arg(i32s, 0, "sigmoid n")? as i32;
+                self.cuda
+                    .sigmoid_mul_dev(self.ptr_f32(need(bufs, 0)?)?, self.ptr_f32(need(bufs, 1)?)?, n)
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::Memcpy => {
                 if i32s.len() >= 2 {
@@ -1927,6 +2004,12 @@ impl WorkerBackend {
         #[cfg(feature = "hip")]
         if ggml_type == 8 && matches!(self, Self::Hip(_)) {
             return allpaca_hip::stage_q8_0_blocks(bytes)
+                .map(Some)
+                .map_err(|e| RpcError::Worker(e.to_string()));
+        }
+        #[cfg(feature = "cuda")]
+        if ggml_type == 8 && matches!(self, Self::Cuda(_)) {
+            return allpaca_cuda::stage_q8_0_blocks(bytes)
                 .map(Some)
                 .map_err(|e| RpcError::Worker(e.to_string()));
         }

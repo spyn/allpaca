@@ -1782,7 +1782,8 @@ fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
     match backend {
         RpcBackendKind::Hip => hip,
         RpcBackendKind::Cpu => hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 20 | 23),
-        RpcBackendKind::Cuda => false,
+        // F32 and Q8_0 GEMMs; K-quants and ROCmFP4 stay off CUDA workers.
+        RpcBackendKind::Cuda => matches!(ty, 0 | 8),
     }
 }
 

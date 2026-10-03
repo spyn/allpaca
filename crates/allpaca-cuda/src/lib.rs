@@ -1673,6 +1673,32 @@ impl CudaWorkspace {
         }
     }
 
+    /// Float A × staged Q8_0 B ([`stage_q8_0_blocks`]) on this workspace's
+    /// stream, ordered with its other kernels.
+    pub fn gemm_nt_q8_0_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_gemm_nt_q8_0(a, b, c, m, n, k, self.stream) };
+            status(rc, "gemm_nt_q8_0")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (a, b, c, m, n, k);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA gemm_nt_q8_0 unavailable".into(),
+            )))
+        }
+    }
+
     pub fn residual_add_dev(
         &self,
         x: *const f32,
