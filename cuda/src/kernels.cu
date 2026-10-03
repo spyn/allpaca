@@ -1306,17 +1306,20 @@ __device__ __forceinline__ void attn_row_init(AttnRow &r, const float *qh, int l
     }
 }
 
+/* Rounding is spelled out (__fmaf_rn / __fmul_rn): left to contraction, nvcc
+ * fused `acc * alpha + p * v` differently in the two kernels and their rows
+ * differed in the last bit. */
 __device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const float *vh,
                                               bool valid, int lane, int head_dim, float scale,
                                               float softcap) {
     float partial = 0.f;
     int i = 0;
     for (int d = lane; d < head_dim && i < ATTN_MAX_DPT; d += 32) {
-        partial += r.qreg[i++] * (valid ? kh[d] : 0.f);
+        partial = __fmaf_rn(r.qreg[i++], valid ? kh[d] : 0.f, partial);
     }
-    float s = warp_sum32(partial) * scale;
+    float s = __fmul_rn(warp_sum32(partial), scale);
     if (softcap > 0.f) {
-        s = tanhf(s / softcap) * softcap;
+        s = __fmul_rn(tanhf(s / softcap), softcap);
     }
     if (!valid) {
         s = -1.0e30f;
@@ -1324,10 +1327,10 @@ __device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const
     const float m_new = fmaxf(r.m, s);
     const float alpha = expf(r.m - m_new);
     const float p = expf(s - m_new);
-    r.l = r.l * alpha + p;
+    r.l = __fmaf_rn(r.l, alpha, p);
     i = 0;
     for (int d = lane; d < head_dim && i < ATTN_MAX_DPT; d += 32) {
-        r.acc[i] = r.acc[i] * alpha + p * (valid ? vh[d] : 0.f);
+        r.acc[i] = __fmaf_rn(r.acc[i], alpha, __fmul_rn(p, valid ? vh[d] : 0.f));
         i++;
     }
     r.m = m_new;
