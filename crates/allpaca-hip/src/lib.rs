@@ -15576,6 +15576,9 @@ mod tests {
             (4, 4, 2, 2, 4, true),
             (3, 8, 4, 1, 8, true),
             (2, 2, 1, 1, 4, false),
+            // Long rows: chunked softmax folded across 256-key chunks.
+            (1, 3000, 4, 2, 128, true),
+            (2, 1300, 2, 1, 64, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()
@@ -15665,6 +15668,12 @@ mod tests {
             (17, 50, 2, 2, 96, true),
             (11, 70, 4, 4, 256, true),
             (6, 33, 4, 2, 128, false),
+            // Several 256-key chunks: one-row calls fold them in parallel
+            // (split + merge), multi-row calls fold them in the Q-tiled kernel.
+            (5, 1000, 8, 2, 128, true),
+            (3, 2049, 4, 4, 64, true),
+            (2, 700, 4, 1, 128, false),
+            (9, 513, 2, 2, 96, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()
