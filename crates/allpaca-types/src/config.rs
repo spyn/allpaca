@@ -398,6 +398,10 @@ pub struct RpcSection {
     /// it to the context the engine's own KV budget (`kv.vram_bytes`) holds
     /// for this model, so remote layers are not the shorter limit.
     pub max_seq: usize,
+    /// Prompt rows sent to a remote layer span per round trip during prefill
+    /// (the worker keeps a scratch of this many rows per GPU). `0` sends one
+    /// token per round trip.
+    pub prefill_rows: usize,
     /// Shared HELLO secret (`--rpc-token` / `ALLPACA_RPC_TOKEN`). Empty = loopback workers only.
     #[serde(default)]
     pub token: Option<String>,
@@ -409,6 +413,7 @@ impl Default for RpcSection {
             endpoints: Vec::new(),
             tensor_split: None,
             max_seq: 0,
+            prefill_rows: 128,
             token: None,
         }
     }

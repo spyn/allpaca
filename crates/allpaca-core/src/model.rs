@@ -7866,7 +7866,11 @@ impl TinyModel {
                 true,
             );
         }
-        if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
+        // Layers on RPC workers: the batched device path below sends each
+        // remote span `rpc.prefill_rows` rows per round trip. Without a local
+        // GPU workspace the prompt runs one token at a time.
+        let batched_remote = hip.is_some() && resident.is_some() && self.supports_hip_batched_prefill();
+        if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) && !batched_remote {
             for (i, tok) in tokens.iter().enumerate() {
                 let last = i + 1 == tokens.len();
                 let mut side = DeviceDecodeSide {
@@ -9620,9 +9624,15 @@ impl TinyModel {
                         if rpc.is_span_start(layer_idx) {
                             let mut host_x = vec![0.0f32; n_tok * dim];
                             hip.copy_d2h_f32(buf.x, &mut host_x)?;
-                            for t in 0..n_tok {
-                                let row = &mut host_x[t * dim..(t + 1) * dim];
-                                rpc.run_layer(layer_idx, row_pos[t], row)?;
+                            let consecutive = row_pos.windows(2).all(|w| w[1] == w[0] + 1);
+                            if consecutive {
+                                // One prompt: the worker runs the rows together.
+                                rpc.run_rows(layer_idx, row_pos[0], dim, &mut host_x)?;
+                            } else {
+                                for t in 0..n_tok {
+                                    let row = &mut host_x[t * dim..(t + 1) * dim];
+                                    rpc.run_layer(layer_idx, row_pos[t], row)?;
+                                }
                             }
                             hip.copy_h2d_f32(buf.x, &host_x)?;
                         }

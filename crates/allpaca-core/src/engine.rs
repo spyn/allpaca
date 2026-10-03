@@ -1334,6 +1334,7 @@ impl Engine {
         );
         if let Some(rt) = &self.rpc {
             rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
+            rt.set_prefill_rows(self.config.rpc.prefill_rows);
             rt.prepare(
                 model,
                 &local_devices,
@@ -1354,6 +1355,7 @@ impl Engine {
         if local_devices.len() > 1 {
             let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[], None)?);
             rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
+            rt.set_prefill_rows(self.config.rpc.prefill_rows);
             rt.prepare(
                 model,
                 &local_devices,
@@ -6862,17 +6864,21 @@ mod tests {
         assert_eq!(rpc_out.token_ids, cpu_ids);
     }
 
-    #[test]
-    fn rpc_packed_q8_layer_matches_cpu() {
+    /// Two-layer Llama GGUF with Q8_0 weights and varied values, written to
+    /// the temp dir as `name`.
+    fn tiny_llama_q8_gguf(name: &str) -> std::path::PathBuf {
+        tiny_dense_q8_gguf(name, "llama")
+    }
+
+    /// [`tiny_llama_q8_gguf`] under another dense architecture name (its RoPE
+    /// style follows the architecture).
+    fn tiny_dense_q8_gguf(name: &str, arch: &str) -> std::path::PathBuf {
         use std::collections::HashMap;
-        use std::net::TcpListener;
-        use std::thread;
 
         use allpaca_gguf::{
             quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
             GgufWriteTensor,
         };
-        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
 
         let dim = 32usize;
         let vocab = 8usize;
@@ -6881,31 +6887,31 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert(
             "general.architecture".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String(arch.into()),
         );
-        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert(format!("{arch}.vocab_size"), GgufValue::Uint32(vocab as u32));
         meta.insert(
-            "llama.embedding_length".into(),
+            format!("{arch}.embedding_length"),
             GgufValue::Uint32(dim as u32),
         );
-        meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
+        meta.insert(format!("{arch}.block_count"), GgufValue::Uint32(2));
         meta.insert(
-            "llama.attention.head_count".into(),
+            format!("{arch}.attention.head_count"),
             GgufValue::Uint32(4),
         );
         meta.insert(
-            "llama.attention.head_count_kv".into(),
+            format!("{arch}.attention.head_count_kv"),
             GgufValue::Uint32(2),
         );
         meta.insert(
-            "llama.feed_forward_length".into(),
+            format!("{arch}.feed_forward_length"),
             GgufValue::Uint32(ff as u32),
         );
         // As real Llama GGUFs: dimension_count == head_dim, which is still
         // the standard (not NeoX) rotation. Remote layers once took this as
         // a NeoX partial rotation and diverged as positions grew.
         meta.insert(
-            "llama.rope.dimension_count".into(),
+            format!("{arch}.rope.dimension_count"),
             GgufValue::Uint32((dim / 4) as u32),
         );
         meta.insert(
@@ -7003,8 +7009,19 @@ mod tests {
                 bytes: bytes.as_slice(),
             })
             .collect();
-        let path = std::env::temp_dir().join("allpaca_rpc_packed_q8.gguf");
+        let path = std::env::temp_dir().join(name);
         write_gguf_quant(&path, &meta, &f32_tensors, &quant_tensors).unwrap();
+        path
+    }
+
+    #[test]
+    fn rpc_packed_q8_layer_matches_cpu() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let path = tiny_llama_q8_gguf("allpaca_rpc_packed_q8.gguf");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -7063,6 +7080,82 @@ mod tests {
             stats.rpc_h2d_bytes
         );
         assert_eq!(rpc_out.token_ids, cpu_ids);
+    }
+
+    /// A HIP host prefills a prompt through layers on an RPC worker in
+    /// chunks of `rpc.prefill_rows` rows per round trip, and decodes the same
+    /// tokens as one round trip per prompt token, on a CPU and a HIP worker.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rpc_batched_prefill_matches_per_token() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        for arch in ["llama", "qwen2"] {
+            // qwen2 rotates NeoX-style: the worker's partial-RoPE row op.
+            let path = tiny_dense_q8_gguf(&format!("allpaca_rpc_batched_prefill_{arch}.gguf"), arch);
+            // 12 prompt tokens: chunks of 5 rows cover 5 + 5 + 2.
+            let prompt = "hello a b c d a b c d hello a b";
+            let params = GenerationParams {
+                max_tokens: 8,
+                temperature: 0.0,
+                seed: Some(2),
+                ..GenerationParams::default()
+            };
+            let run = |prefill_rows: usize, hip_worker: bool| {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let worker = thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    let backend = if hip_worker {
+                        WorkerBackend::Hip(allpaca_rpc::HipWorker::new(0).unwrap())
+                    } else {
+                        WorkerBackend::Cpu(CpuWorker::new(64 << 20))
+                    };
+                    serve_connection(stream, backend).unwrap();
+                });
+                let mut cfg = Config::compiled_defaults();
+                cfg.merge_cli(&CliOverrides {
+                    seed: Some(2),
+                    speculative: Some(false),
+                    ..CliOverrides::default()
+                });
+                cfg.engine.gpu_backend = "hip".into();
+                cfg.model.synthetic = false;
+                cfg.model.path = Some(path.clone());
+                cfg.kv.page_tokens = 8;
+                cfg.rpc.endpoints = vec![addr.to_string()];
+                cfg.rpc.max_seq = 32;
+                cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+                cfg.rpc.prefill_rows = prefill_rows;
+                let engine = Engine::new(cfg).unwrap();
+                let out = engine.generate(prompt, params.clone()).unwrap();
+                let trips = engine.stats().rpc_roundtrips;
+                drop(engine);
+                worker.join().unwrap();
+                (out.token_ids, trips)
+            };
+            for hip_worker in [false, true] {
+                let (per_token, per_token_trips) = run(0, hip_worker);
+                let (batched, batched_trips) = run(5, hip_worker);
+                assert!(per_token_trips > 0, "a layer must run on the worker");
+                assert_eq!(
+                    batched, per_token,
+                    "batched prefill must decode the same tokens (hip worker: {hip_worker})"
+                );
+                // Prompt: 12 trips one by one, 3 in chunks of 5; decode is the same.
+                assert_eq!(
+                    per_token_trips - batched_trips,
+                    12 - 3,
+                    "trips: per-token {per_token_trips}, batched {batched_trips}"
+                );
+            }
+        }
     }
 
     #[test]

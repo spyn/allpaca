@@ -257,7 +257,7 @@ impl CpuWorker {
             KernelOp::SiluMul => {
                 let mut gate = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
                 let up = f32_buf(self.slot(need(bufs, 1)?)?)?;
-                let n = gate.len().min(up.len());
+                let n = count(i32s, gate.len().min(up.len()));
                 for i in 0..n {
                     gate[i] = silu(gate[i]) * up[i];
                 }
@@ -266,7 +266,7 @@ impl CpuWorker {
             KernelOp::ResidualAdd => {
                 let mut dst = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
                 let src = f32_buf(self.slot(need(bufs, 1)?)?)?;
-                let n = dst.len().min(src.len());
+                let n = count(i32s, dst.len().min(src.len()));
                 for i in 0..n {
                     dst[i] += src[i];
                 }
@@ -366,6 +366,54 @@ impl CpuWorker {
                 write_f32(self.slot_mut(need(bufs, 0)?)?, &q)?;
                 write_f32(self.slot_mut(need(bufs, 1)?)?, &k)?;
             }
+            KernelOp::RmsNormRows => {
+                let (rows, dim) = (arg(i32s, 0, "rows")?, arg(i32s, 1, "dim")?);
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                let x = f32_buf(self.slot(need(bufs, 0)?)?)?;
+                let w = f32_buf(self.slot(need(bufs, 1)?)?)?;
+                let mut out = f32_buf(self.slot(need(bufs, 2)?)?)?.to_vec();
+                if rows * dim > x.len().min(out.len()) || dim > w.len() {
+                    return Err(RpcError::Worker("rmsnorm rows range".into()));
+                }
+                for r in 0..rows {
+                    let span = r * dim..(r + 1) * dim;
+                    rmsnorm(&x[span.clone()], &w[..dim], eps, &mut out[span]).map_err(map_kernel)?;
+                }
+                write_f32(self.slot_mut(need(bufs, 2)?)?, &out)?;
+            }
+            KernelOp::RopeRows | KernelOp::RopePartialRows => {
+                let rows = arg(i32s, 0, "rows")?;
+                let n_heads = arg(i32s, 1, "heads")?;
+                let n_kv = arg(i32s, 2, "kv heads")?;
+                let head_dim = arg(i32s, 3, "head dim")?;
+                let start = arg(i32s, 4, "start pos")?;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let mut q = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
+                let mut k = f32_buf(self.slot(need(bufs, 1)?)?)?.to_vec();
+                let (q_row, k_row) = (n_heads * head_dim, n_kv * head_dim);
+                if rows * q_row > q.len() || rows * k_row > k.len() {
+                    return Err(RpcError::Worker("rope rows range".into()));
+                }
+                for r in 0..rows {
+                    let pos = start + r;
+                    let qr = &mut q[r * q_row..(r + 1) * q_row];
+                    let kr = &mut k[r * k_row..(r + 1) * k_row];
+                    if op == KernelOp::RopeRows {
+                        for h in qr.chunks_exact_mut(head_dim).chain(kr.chunks_exact_mut(head_dim)) {
+                            rope(h, pos, theta).map_err(map_kernel)?;
+                        }
+                    } else {
+                        let n_rot = arg(i32s, 5, "n_rot")?;
+                        let sections = sections_of(f32s);
+                        allpaca_cpu::rope_imrope_neox_heads(qr, n_heads, head_dim, pos, theta, n_rot, sections)
+                            .map_err(map_kernel)?;
+                        allpaca_cpu::rope_imrope_neox_heads(kr, n_kv, head_dim, pos, theta, n_rot, sections)
+                            .map_err(map_kernel)?;
+                    }
+                }
+                write_f32(self.slot_mut(need(bufs, 0)?)?, &q)?;
+                write_f32(self.slot_mut(need(bufs, 1)?)?, &k)?;
+            }
             KernelOp::Memcpy => {
                 // i32s empty → full buffer copy; [dst_off, nbytes] → partial into dst.
                 let src = self.slot(need(bufs, 1)?)?.data.clone();
@@ -385,6 +433,24 @@ impl CpuWorker {
         }
         Ok(())
     }
+}
+
+/// Element count of an elementwise op: `i32s[0]` when given (multi-row
+/// batches use part of a larger buffer), else the whole buffer.
+fn count(i32s: &[i32], whole: usize) -> usize {
+    i32s.first()
+        .and_then(|&n| usize::try_from(n).ok())
+        .map_or(whole, |n| n.min(whole))
+}
+
+fn arg(i32s: &[i32], i: usize, what: &str) -> Result<usize, RpcError> {
+    i32s.get(i)
+        .and_then(|&v| usize::try_from(v).ok())
+        .ok_or_else(|| RpcError::Worker(format!("missing {what}")))
+}
+
+fn sections_of(f32s: &[f32]) -> [i32; 4] {
+    [1, 2, 3, 4].map(|i| *f32s.get(i).unwrap_or(&0.0) as i32)
 }
 
 fn need(bufs: &[BufId], i: usize) -> Result<BufId, RpcError> {
@@ -1251,8 +1317,74 @@ impl HipWorker {
                     .rope_device(x, n_heads, head_dim, pos, theta)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
+            KernelOp::RmsNormRows => {
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let dim = arg(i32s, 1, "dim")? as i32;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                self.gpus[gpu]
+                    .hip
+                    .rmsnorm_device_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        self.ptr_f32(need(bufs, 2)?)?,
+                        rows,
+                        dim,
+                        eps,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopeRows => {
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let n_heads = arg(i32s, 1, "heads")? as i32;
+                let n_kv = arg(i32s, 2, "kv heads")? as i32;
+                let head_dim = arg(i32s, 3, "head dim")? as i32;
+                let start = arg(i32s, 4, "start pos")? as i32;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                self.gpus[gpu]
+                    .hip
+                    .rope_qk_device_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        rows,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        start,
+                        theta,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopePartialRows => {
+                let rows = arg(i32s, 0, "rows")?;
+                let n_heads = arg(i32s, 1, "heads")?;
+                let n_kv = arg(i32s, 2, "kv heads")?;
+                let head_dim = arg(i32s, 3, "head dim")?;
+                let start = arg(i32s, 4, "start pos")?;
+                let n_rot = arg(i32s, 5, "n_rot")? as i32;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let sections = sections_of(f32s);
+                let q = self.ptr_f32(need(bufs, 0)?)?;
+                let k = self.ptr_f32(need(bufs, 1)?)?;
+                for r in 0..rows {
+                    let pos = (start + r) as i32;
+                    self.gpus[gpu]
+                        .hip
+                        .rope_imrope_qk_device(
+                            q.wrapping_add(r * n_heads * head_dim),
+                            k.wrapping_add(r * n_kv * head_dim),
+                            n_heads as i32,
+                            n_kv as i32,
+                            head_dim as i32,
+                            n_rot,
+                            [pos; 3],
+                            theta,
+                            sections,
+                        )
+                        .map_err(|e| RpcError::Worker(e.to_string()))?;
+                }
+            }
             KernelOp::SiluMul => {
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 self.gpus[gpu]
                     .hip
                     .silu_mul_device(
@@ -1263,7 +1395,7 @@ impl HipWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::ResidualAdd => {
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 self.gpus[gpu]
                     .hip
                     .residual_add(
@@ -1623,7 +1755,7 @@ impl CudaWorker {
             }
             KernelOp::SiluMul => {
                 // Wire ABI matches HIP: in-place silu(gate)*up into buf0.
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 let gate = self.ptr_f32(need(bufs, 0)?)?;
                 let up = self.ptr_f32(need(bufs, 1)?)?;
                 self.cuda
@@ -1632,18 +1764,51 @@ impl CudaWorker {
             }
             KernelOp::ResidualAdd => {
                 // Wire ABI matches HIP: in-place x += residual into buf0.
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 let x = self.ptr_f32(need(bufs, 0)?)?;
                 let y = self.ptr_f32(need(bufs, 1)?)?;
                 self.cuda
                     .residual_add_dev(x, y, x, n)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
+            KernelOp::RmsNormRows => {
+                let rows = arg(i32s, 0, "rows")?;
+                let dim = arg(i32s, 1, "dim")?;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                let (x, w, out) = (
+                    self.ptr_f32(need(bufs, 0)?)?,
+                    self.ptr_f32(need(bufs, 1)?)?,
+                    self.ptr_f32(need(bufs, 2)?)?,
+                );
+                for r in 0..rows {
+                    self.cuda
+                        .rmsnorm_dev(x.wrapping_add(r * dim), w, out.wrapping_add(r * dim), dim as i32, eps)
+                        .map_err(|e| RpcError::Worker(e.to_string()))?;
+                }
+            }
+            KernelOp::RopeRows => {
+                let rows = arg(i32s, 0, "rows")?;
+                let n_heads = arg(i32s, 1, "heads")?;
+                let n_kv = arg(i32s, 2, "kv heads")?;
+                let head_dim = arg(i32s, 3, "head dim")?;
+                let start = arg(i32s, 4, "start pos")?;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let (q, k) = (self.ptr_f32(need(bufs, 0)?)?, self.ptr_f32(need(bufs, 1)?)?);
+                for r in 0..rows {
+                    let pos = (start + r) as i32;
+                    for (x, heads) in [(q.wrapping_add(r * n_heads * head_dim), n_heads), (k.wrapping_add(r * n_kv * head_dim), n_kv)] {
+                        self.cuda
+                            .rope_dev(x, heads as i32, head_dim as i32, pos, theta)
+                            .map_err(|e| RpcError::Worker(e.to_string()))?;
+                    }
+                }
+            }
             KernelOp::GemmNtQuant
             | KernelOp::DeinterleaveQGate
             | KernelOp::RmsNormHeads
             | KernelOp::SigmoidMul
-            | KernelOp::RopePartial => {
+            | KernelOp::RopePartial
+            | KernelOp::RopePartialRows => {
                 return Err(RpcError::Worker(
                     "quant gemm and gated attention are implemented on CPU and HIP workers".into(),
                 ));
@@ -2195,7 +2360,8 @@ fn run_span(backend: &mut WorkerBackend, payload: &[u8]) -> Result<Vec<u8>, RpcE
     for i in 1..steps.len() {
         let src = steps[i - 1].0;
         let dst = steps[i].0;
-        if backend.copy(src, dst).is_err() {
+        // Batched steps on one device run in place in a shared row buffer.
+        if src != dst && backend.copy(src, dst).is_err() {
             let mid = backend.d2h(src, 0, nbytes)?;
             backend.h2d(dst, 0, &mid)?;
         }

@@ -30,6 +30,11 @@ pub struct RpcRuntime {
     local_budget_mib: Mutex<Vec<u64>>,
     /// Last worker GPU stats and when they were read.
     gpu_stats: Mutex<(Option<std::time::Instant>, Vec<RemoteGpu>)>,
+    /// `rpc.prefill_rows`: rows per batched span call (0 = per token).
+    prefill_rows: std::sync::atomic::AtomicUsize,
+    /// Batched-prefill activations per (session, worker device), shared by
+    /// every remote layer on that device.
+    row_scratch: Mutex<std::collections::HashMap<(usize, u32), RowScratch>>,
     pub roundtrips: AtomicU64,
     pub activation_bytes: AtomicU64,
     pub h2d_bytes: AtomicU64,
@@ -43,6 +48,25 @@ impl std::fmt::Debug for RpcRuntime {
             .field("roundtrips", &self.roundtrips.load(Ordering::Relaxed))
             .finish()
     }
+}
+
+/// Activation buffers for `rows` prompt rows on one worker GPU, sized for the
+/// widest remote layer there. Batched launch lists run in these; the
+/// per-layer single-row buffers stay for decode.
+#[derive(Debug, Clone, Copy)]
+struct RowScratch {
+    rows: usize,
+    x: BufId,
+    norm_out: BufId,
+    q_proj: BufId,
+    q: BufId,
+    q_gate: BufId,
+    k: BufId,
+    v: BufId,
+    attn_out: BufId,
+    hidden: BufId,
+    gate: BufId,
+    up: BufId,
 }
 
 /// How long a worker GPU reading is served before it is refreshed.
@@ -81,6 +105,8 @@ struct RemoteExperts {
 #[derive(Clone, Copy)]
 struct RemoteLayer {
     session: usize,
+    /// Worker GPU holding this layer's buffers.
+    device: u32,
     attn_norm: BufId,
     wq: BufId,
     wk: BufId,
@@ -232,6 +258,8 @@ impl RpcRuntime {
             layer_device: Mutex::new(Vec::new()),
             local_budget_mib: Mutex::new(Vec::new()),
             gpu_stats: Mutex::new((None, Vec::new())),
+            prefill_rows: std::sync::atomic::AtomicUsize::new(128),
+            row_scratch: Mutex::new(std::collections::HashMap::new()),
             local_peer: Mutex::new(None),
             roundtrips: AtomicU64::new(0),
             activation_bytes: AtomicU64::new(0),
@@ -589,6 +617,10 @@ impl RpcRuntime {
         *self.remote.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
         })? = remote;
+        // Scratch is sized for the layers placed before; size it again lazily.
+        if let Ok(mut scratch) = self.row_scratch.lock() {
+            scratch.clear();
+        }
         *self.layer_device.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc layer device lock".into()))
         })? = layer_device;
@@ -895,6 +927,7 @@ impl RpcRuntime {
         self.h2d_bytes.fetch_add(h2d as u64, Ordering::Relaxed);
         Ok(RemoteLayer {
             session: session_idx,
+            device,
             attn_norm,
             wq,
             wk,
@@ -1157,6 +1190,7 @@ impl RpcRuntime {
         );
         Ok(Some(RemoteLayer {
             session: session_idx,
+            device,
             attn_norm: attn_norm_id,
             wq,
             wk,
@@ -1220,6 +1254,159 @@ impl RpcRuntime {
             .lock()
             .ok()
             .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|l| l.session))
+    }
+
+    /// Rows per batched span call (`rpc.prefill_rows`, 0 = one token per call).
+    pub fn set_prefill_rows(&self, rows: usize) {
+        self.prefill_rows.store(rows, Ordering::Relaxed);
+    }
+
+    /// The contiguous same-worker run of remote layers starting at `layer_idx`.
+    fn span_from(&self, layer_idx: usize) -> Result<Vec<RemoteLayer>, AllpacaError> {
+        let guard = self.remote.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
+        })?;
+        let session = guard
+            .get(layer_idx)
+            .and_then(|layer| layer.as_ref())
+            .map(|layer| layer.session)
+            .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig("rpc layer missing".into())))?;
+        let mut span = Vec::new();
+        for idx in layer_idx..guard.len() {
+            match guard.get(idx).and_then(|layer| layer.as_ref()) {
+                Some(layer) if layer.session == session => span.push(*layer),
+                _ => break,
+            }
+        }
+        Ok(span)
+    }
+
+    /// Run the remote span starting at `layer_idx` over `x`, which holds
+    /// `x.len() / dim` prompt rows at consecutive positions from `start_pos`.
+    /// Rows go to the worker `rpc.prefill_rows` at a time, one round trip per
+    /// chunk; with `prefill_rows = 0`, or a layer the batched list cannot
+    /// express, it falls back to one round trip per row. A call on any other
+    /// layer of the span is a no-op.
+    pub fn run_rows(
+        &self,
+        layer_idx: usize,
+        start_pos: usize,
+        dim: usize,
+        x: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        if !self.is_span_start(layer_idx) || dim == 0 {
+            return Ok(());
+        }
+        let n_rows = x.len() / dim;
+        let cap = self.prefill_rows.load(Ordering::Relaxed);
+        let span = self.span_from(layer_idx)?;
+        if n_rows <= 1 || cap == 0 || span.iter().any(|l| !rows_supported(l)) {
+            for (t, row) in x.chunks_exact_mut(dim).enumerate() {
+                self.run_layer(layer_idx, start_pos + t, row)?;
+            }
+            return Ok(());
+        }
+        if let Some(layer) = span.iter().find(|l| start_pos + n_rows > l.max_seq) {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "context position {} is past the remote layers' KV capacity of {} tokens; raise rpc.max_seq (0 sizes it from kv.vram_bytes)",
+                start_pos + n_rows - 1,
+                layer.max_seq
+            ))));
+        }
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
+        })?;
+        let session_idx = span[0].session;
+        let session = sessions.get_mut(session_idx).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc session missing".into()))
+        })?;
+        let mut scratch = Vec::with_capacity(span.len());
+        for layer in &span {
+            scratch.push(self.row_scratch_for(session, session_idx, layer.device, cap)?);
+        }
+        for (c, chunk) in x.chunks_mut(cap * dim).enumerate() {
+            let rows = chunk.len() / dim;
+            let pos = start_pos + c * cap;
+            let xs: Vec<BufId> = scratch.iter().map(|s| s.x).collect();
+            let lists: Vec<LaunchList> = span
+                .iter()
+                .zip(&scratch)
+                .map(|(layer, s)| layer_launch_rows(layer, s, pos, rows))
+                .collect();
+            let activation = f32_bytes(chunk);
+            self.activation_bytes
+                .fetch_add(activation.len() as u64, Ordering::Relaxed);
+            let out = session.run_span(&xs, &lists, &activation).map_err(map_rpc)?;
+            self.activation_bytes
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
+            self.roundtrips.fetch_add(1, Ordering::Relaxed);
+            if out.len() != chunk.len() * 4 {
+                return Err(AllpacaError::Fatal(FatalError::Io(format!(
+                    "rpc run_span returned {} bytes for {} rows",
+                    out.len(),
+                    rows
+                ))));
+            }
+            from_f32_bytes(&out, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// The row scratch on `device` of session `session_idx`, allocated on
+    /// first use for the widest remote layer placed there.
+    fn row_scratch_for(
+        &self,
+        session: &mut RpcSession,
+        session_idx: usize,
+        device: u32,
+        rows: usize,
+    ) -> Result<RowScratch, AllpacaError> {
+        let mut map = self.row_scratch.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc row scratch lock".into()))
+        })?;
+        if let Some(s) = map.get(&(session_idx, device)).filter(|s| s.rows == rows) {
+            return Ok(*s);
+        }
+        if let Some(old) = map.remove(&(session_idx, device)) {
+            for id in [
+                old.x, old.norm_out, old.q_proj, old.q, old.q_gate, old.k, old.v, old.attn_out,
+                old.hidden, old.gate, old.up,
+            ] {
+                let _ = session.free(id);
+            }
+        }
+        let layers: Vec<RemoteLayer> = self
+            .remote
+            .lock()
+            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into())))?
+            .iter()
+            .flatten()
+            .filter(|l| l.session == session_idx && l.device == device)
+            .copied()
+            .collect();
+        let widest = |f: &dyn Fn(&RemoteLayer) -> usize| layers.iter().map(f).max().unwrap_or(1).max(1);
+        let mut alloc = |width: usize| -> Result<BufId, AllpacaError> {
+            session
+                .alloc_on((width * rows * 4) as u64, Some(device))
+                .map_err(map_rpc)
+        };
+        let s = RowScratch {
+            rows,
+            x: alloc(widest(&|l| l.dim))?,
+            norm_out: alloc(widest(&|l| l.dim))?,
+            q_proj: alloc(widest(&|l| l.q_len))?,
+            q: alloc(widest(&|l| if l.gated { l.attn_dim } else { l.q_len }))?,
+            q_gate: alloc(widest(&|l| if l.gated { l.attn_dim } else { 1 }))?,
+            k: alloc(widest(&|l| l.kv_dim))?,
+            v: alloc(widest(&|l| l.kv_dim))?,
+            attn_out: alloc(widest(&|l| l.o_in))?,
+            hidden: alloc(widest(&|l| l.dim))?,
+            gate: alloc(widest(&|l| l.ff_dim))?,
+            up: alloc(widest(&|l| l.ff_dim))?,
+        };
+        tracing::info!(session = session_idx, device, rows, "rpc prefill row scratch allocated");
+        map.insert((session_idx, device), s);
+        Ok(s)
     }
 
     /// Run one remote layer. A call on the first layer of a contiguous same-worker
@@ -1287,6 +1474,137 @@ impl RpcRuntime {
         self.roundtrips.fetch_add(1, Ordering::Relaxed);
         from_f32_bytes(&out, x)?;
         Ok(())
+    }
+}
+
+/// Whether [`layer_launch_rows`] can express this layer: full-head RoPE
+/// rotates Q and K with one head size.
+fn rows_supported(layer: &RemoteLayer) -> bool {
+    layer.n_rot > 0 || layer.q_head_dim == 0 || layer.q_head_dim == layer.head_dim
+}
+
+/// [`layer_launch`] for `rows` prompt rows at positions `pos..pos + rows`,
+/// in the device's row scratch. Each row's K/V lands in the layer's cache at
+/// its position, and attention is causal over the cache, so the result
+/// matches running the rows one at a time.
+fn layer_launch_rows(layer: &RemoteLayer, s: &RowScratch, pos: usize, rows: usize) -> LaunchList {
+    let r = rows as i32;
+    let packed = layer.packed;
+    let q_dst = if layer.gated { s.q_proj } else { s.q };
+    let kv_row = layer.kv_dim * 4;
+    let mut items = vec![
+        rms_rows(s.x, layer.attn_norm, s.norm_out, rows, layer.dim, layer.eps),
+        gemm(packed, s.norm_out, layer.wq, q_dst, r, layer.q_len as i32, layer.dim as i32),
+        gemm(packed, s.norm_out, layer.wk, s.k, r, layer.kv_dim as i32, layer.dim as i32),
+        gemm(packed, s.norm_out, layer.wv, s.v, r, layer.kv_dim as i32, layer.dim as i32),
+    ];
+    if layer.gated {
+        items.push(LaunchItem {
+            op: KernelOp::DeinterleaveQGate,
+            bufs: vec![s.q_proj, s.q, s.q_gate],
+            i32s: vec![(layer.n_heads * rows) as i32, layer.head_dim as i32],
+            f32s: vec![],
+        });
+    }
+    if layer.has_q_norm {
+        items.push(LaunchItem {
+            op: KernelOp::RmsNormHeads,
+            bufs: vec![s.q, layer.q_norm],
+            i32s: vec![(layer.n_heads * rows) as i32, layer.head_dim as i32],
+            f32s: vec![layer.eps],
+        });
+    }
+    if layer.has_k_norm {
+        items.push(LaunchItem {
+            op: KernelOp::RmsNormHeads,
+            bufs: vec![s.k, layer.k_norm],
+            i32s: vec![(layer.n_kv_heads * rows) as i32, layer.head_dim as i32],
+            f32s: vec![layer.eps],
+        });
+    }
+    let rope_i32 = vec![
+        r,
+        layer.n_heads as i32,
+        layer.n_kv_heads as i32,
+        layer.head_dim as i32,
+        pos as i32,
+    ];
+    if layer.n_rot > 0 {
+        let mut i32s = rope_i32;
+        i32s.push(layer.n_rot as i32);
+        items.push(LaunchItem {
+            op: KernelOp::RopePartialRows,
+            bufs: vec![s.q, s.k],
+            i32s,
+            f32s: vec![
+                layer.theta,
+                layer.rope_sections[0] as f32,
+                layer.rope_sections[1] as f32,
+                layer.rope_sections[2] as f32,
+                layer.rope_sections[3] as f32,
+            ],
+        });
+    } else {
+        items.push(LaunchItem {
+            op: KernelOp::RopeRows,
+            bufs: vec![s.q, s.k],
+            i32s: rope_i32,
+            f32s: vec![layer.theta],
+        });
+    }
+    items.push(memcpy_at(layer.k_cache, s.k, (pos * kv_row) as i32, (rows * kv_row) as i32));
+    items.push(memcpy_at(layer.v_cache, s.v, (pos * kv_row) as i32, (rows * kv_row) as i32));
+    let mut attention = attn(
+        s.q,
+        layer.k_cache,
+        layer.v_cache,
+        s.attn_out,
+        pos + rows,
+        layer.n_heads,
+        layer.n_kv_heads,
+        layer.head_dim,
+    );
+    attention.i32s[0] = r;
+    items.push(attention);
+    if layer.gated {
+        items.push(LaunchItem {
+            op: KernelOp::SigmoidMul,
+            bufs: vec![s.attn_out, s.q_gate],
+            i32s: vec![(layer.attn_dim * rows) as i32],
+            f32s: vec![],
+        });
+    }
+    items.push(gemm(packed, s.attn_out, layer.wo, s.hidden, r, layer.dim as i32, layer.o_in as i32));
+    items.push(residual_n(s.x, s.hidden, rows * layer.dim));
+    items.push(rms_rows(s.x, layer.ffn_norm, s.norm_out, rows, layer.dim, layer.eps));
+    items.push(gemm(packed, s.norm_out, layer.w_gate, s.gate, r, layer.ff_dim as i32, layer.dim as i32));
+    items.push(gemm(packed, s.norm_out, layer.w_up, s.up, r, layer.ff_dim as i32, layer.dim as i32));
+    items.push(LaunchItem {
+        op: KernelOp::SiluMul,
+        bufs: vec![s.gate, s.up],
+        i32s: vec![(rows * layer.ff_dim) as i32],
+        f32s: vec![],
+    });
+    items.push(gemm(packed, s.gate, layer.w_down, s.hidden, r, layer.dim as i32, layer.ff_dim as i32));
+    items.push(residual_n(s.x, s.hidden, rows * layer.dim));
+    LaunchList { items }
+}
+
+fn rms_rows(x: BufId, w: BufId, out: BufId, rows: usize, dim: usize, eps: f32) -> LaunchItem {
+    LaunchItem {
+        op: KernelOp::RmsNormRows,
+        bufs: vec![x, w, out],
+        i32s: vec![rows as i32, dim as i32],
+        f32s: vec![eps],
+    }
+}
+
+fn residual_n(dst: BufId, src: BufId, n: usize) -> LaunchItem {
+    LaunchItem {
+        op: KernelOp::ResidualAdd,
+        bufs: vec![dst, src],
+        i32s: vec![n as i32],
+        f32s: vec![],
     }
 }
 

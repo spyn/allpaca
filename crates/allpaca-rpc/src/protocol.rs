@@ -10,7 +10,10 @@ pub const PROTO_PATCH: u16 = 0;
 /// 2 adds `PutTensor` and `GemmNtQuant` (packed GGUF weights).
 /// 3 adds `MoeFfn` (expert-parallel MoE FFN).
 /// 6 adds `DeviceStats` (per-GPU memory, utilisation, temperature).
-pub const KERNEL_ABI_REV: u32 = 6;
+/// 7 adds multi-row ops for batched prefill (`RmsNormRows`, `RopeRows`,
+/// `RopePartialRows`), an explicit element count on `SiluMul` /
+/// `ResidualAdd`, and `RunSpan` steps that share one activation buffer.
+pub const KERNEL_ABI_REV: u32 = 7;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
@@ -121,6 +124,16 @@ pub enum KernelOp {
     /// Partial or sectioned RoPE on Q and K. `i32s`: `[n_heads, n_kv_heads, head_dim, pos, n_rot]`.
     /// `f32s`: `[theta, section0, section1, section2, section3]`.
     RopePartial = 13,
+    /// RMSNorm of `rows` rows. `bufs`: `[x, w, out]`. `i32s`: `[rows, dim]`.
+    /// `f32s`: `[eps]`.
+    RmsNormRows = 14,
+    /// Full-head RoPE on Q and K for `rows` consecutive positions. `bufs`:
+    /// `[q, k]`. `i32s`: `[rows, n_heads, n_kv_heads, head_dim, start_pos]`.
+    /// `f32s`: `[theta]`.
+    RopeRows = 15,
+    /// [`Self::RopePartial`] for `rows` consecutive positions. `i32s`:
+    /// `[rows, n_heads, n_kv_heads, head_dim, start_pos, n_rot]`.
+    RopePartialRows = 16,
 }
 
 impl KernelOp {
@@ -139,6 +152,9 @@ impl KernelOp {
             11 => Self::RmsNormHeads,
             12 => Self::SigmoidMul,
             13 => Self::RopePartial,
+            14 => Self::RmsNormRows,
+            15 => Self::RopeRows,
+            16 => Self::RopePartialRows,
             _ => return None,
         })
     }
