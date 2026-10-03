@@ -830,6 +830,47 @@ impl Engine {
         self.config.kv.vram_bytes
     }
 
+    /// Which device runs which layers of the loaded target, in layer order,
+    /// for the operator UI. Empty when no model is loaded.
+    pub fn placement(&self) -> Vec<DevicePlacement> {
+        let (n_layers, rpc, target_bytes, draft, dflash2_dev) = {
+            let Ok(inner) = self.lock() else {
+                return Vec::new();
+            };
+            let Some(target) = inner.target.as_ref() else {
+                return Vec::new();
+            };
+            let draft = inner.draft_resident.as_ref().map(|r| {
+                let role = if mtp_draft_active(&inner) { "MTP draft" } else { "draft model" };
+                (r.bytes(), role)
+            });
+            (
+                target.config.n_layers,
+                target.rpc.clone(),
+                inner.target_resident.as_ref().map(|r| r.bytes()),
+                draft,
+                inner.dflash2.as_ref().map(|p| p.device()),
+            )
+        };
+        let primary = match self.hip.as_ref() {
+            Some(h) => ("hip", h.device),
+            None => {
+                #[cfg(feature = "cuda")]
+                if let Some(c) = self.cuda.as_ref() {
+                    return placement_rows(n_layers, ("cuda", c.device), self, None, None);
+                }
+                ("cpu", -1)
+            }
+        };
+        let draft_dev = self.draft_hip.as_ref().map(|h| h.device);
+        let extras = PlacementExtras {
+            target_bytes,
+            draft: draft.map(|(b, r)| (draft_dev, b, r)),
+            dflash2_dev,
+        };
+        placement_rows(n_layers, primary, self, rpc.as_deref(), Some(extras))
+    }
+
     /// KV cost per context token of the loaded target, for sizing
     /// `kv.vram_bytes` from a context length. `None` when no model is loaded.
     pub fn kv_estimate(&self) -> Option<KvEstimate> {
@@ -6785,6 +6826,139 @@ fn rpc_kv_max_seq(configured: usize, kv_vram_bytes: u64, model: &TinyModel) -> u
     tokens.max(RPC_AUTO_MIN_SEQ)
 }
 
+/// One device's share of the loaded model ([`Engine::placement`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DevicePlacement {
+    /// `hip:0`, `cuda:0`, `cpu`, or `rpc:<host:port>/<gpu>`.
+    pub device: String,
+    /// Card name when known.
+    pub name: String,
+    /// Inclusive layer ranges whose bodies run here.
+    pub layers: Vec<[usize; 2]>,
+    pub n_layers: usize,
+    /// Layers whose routed experts run here (expert-parallel MoE).
+    pub expert_layers: usize,
+    /// Weight bytes uploaded here, when known.
+    pub weight_bytes: Option<u64>,
+    /// Other parts held here, e.g. "output head", "MTP draft".
+    pub roles: Vec<String>,
+}
+
+/// Per-device rows in first-use order, found by device key.
+#[derive(Default)]
+struct PlacementRows {
+    rows: Vec<DevicePlacement>,
+}
+
+impl PlacementRows {
+    fn entry(&mut self, key: &str, name: &str) -> &mut DevicePlacement {
+        let i = match self.rows.iter().position(|r| r.device == key) {
+            Some(i) => i,
+            None => {
+                self.rows.push(DevicePlacement {
+                    device: key.to_string(),
+                    name: name.to_string(),
+                    layers: Vec::new(),
+                    n_layers: 0,
+                    expert_layers: 0,
+                    weight_bytes: None,
+                    roles: Vec::new(),
+                });
+                self.rows.len() - 1
+            }
+        };
+        &mut self.rows[i]
+    }
+}
+
+/// What else the engine holds, for [`placement_rows`]: target bytes on the
+/// primary device, the draft model's (device, bytes, role), DFlash2's device.
+struct PlacementExtras {
+    target_bytes: Option<u64>,
+    draft: Option<(Option<i32>, u64, &'static str)>,
+    dflash2_dev: Option<i32>,
+}
+
+/// Group layers by device (see [`Engine::placement`]). `(kind, dev)` is the
+/// backend device that runs local layers when there is no layer split.
+fn placement_rows(
+    n_layers: usize,
+    (kind, primary_dev): (&str, i32),
+    engine: &Engine,
+    rpc: Option<&crate::rpc_runtime::RpcRuntime>,
+    extras: Option<PlacementExtras>,
+) -> Vec<DevicePlacement> {
+    use crate::rpc_runtime::LayerHome;
+    let key_local = |dev: i32| {
+        if kind == "cpu" {
+            "cpu".to_string()
+        } else {
+            format!("{kind}:{dev}")
+        }
+    };
+    let local_name = |dev: i32| {
+        engine
+            .inventory
+            .devices
+            .iter()
+            .find(|d| d.is_gpu() && !d.is_rpc() && d.id == dev)
+            .map(|d| d.name.clone())
+            .unwrap_or_default()
+    };
+    let remote_names = rpc.map(|r| r.remote_gpu_stats()).unwrap_or_default();
+    let remote_name = |endpoint: &str, gpu: u32| {
+        remote_names
+            .iter()
+            .find(|g| g.endpoint == endpoint && g.index == gpu)
+            .map(|g| g.name.clone())
+            .unwrap_or_default()
+    };
+    let mut out = PlacementRows::default();
+    for l in 0..n_layers {
+        let (key, name) = match rpc.map(|r| r.layer_home(l)) {
+            Some(LayerHome::Remote { endpoint, device }) => (
+                format!("rpc:{endpoint}/{device}"),
+                remote_name(&endpoint, device),
+            ),
+            Some(LayerHome::Local(dev)) if dev >= 0 && kind != "cpu" => {
+                (key_local(dev), local_name(dev))
+            }
+            _ => (key_local(primary_dev), local_name(primary_dev)),
+        };
+        let row = out.entry(&key, &name);
+        row.n_layers += 1;
+        match row.layers.last_mut() {
+            Some(last) if last[1] + 1 == l => last[1] = l,
+            _ => row.layers.push([l, l]),
+        }
+    }
+    if let Some(rpc) = rpc {
+        for l in 0..n_layers {
+            if let Some(endpoint) = rpc.experts_home(l) {
+                out.entry(&format!("rpc:{endpoint}"), "").expert_layers += 1;
+            }
+        }
+    }
+    if let Some(x) = extras {
+        let row = out.entry(&key_local(primary_dev), &local_name(primary_dev));
+        row.weight_bytes = x.target_bytes;
+        row.roles.push("output head".into());
+        if let Some((dev, _, peer)) = rpc.and_then(|r| r.local_peer()) {
+            out.entry(&key_local(dev), &local_name(dev)).weight_bytes = Some(peer.bytes());
+        }
+        if let Some((dev, bytes, role)) = x.draft {
+            let dev = dev.unwrap_or(primary_dev);
+            out.entry(&key_local(dev), &local_name(dev))
+                .roles
+                .push(format!("{role} ({} MiB)", bytes >> 20));
+        }
+        if let Some(dev) = x.dflash2_dev {
+            out.entry(&key_local(dev), &local_name(dev)).roles.push("DFlash2 draft".into());
+        }
+    }
+    out.rows
+}
+
 /// What a context length costs in KV for the loaded model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct KvEstimate {
@@ -6844,6 +7018,18 @@ mod tests {
 
     fn test_engine() -> Engine {
         Engine::new(test_config()).unwrap()
+    }
+
+    #[test]
+    fn placement_lists_every_layer_once_by_device() {
+        let engine = test_engine();
+        let n_layers = engine.lock().unwrap().target.as_ref().map(|t| t.config.n_layers).unwrap();
+        let rows = engine.placement();
+        assert_eq!(rows.len(), 1, "a CPU-only engine has one device: {rows:?}");
+        assert_eq!(rows[0].device, "cpu");
+        assert_eq!(rows[0].n_layers, n_layers);
+        assert_eq!(rows[0].layers, vec![[0, n_layers - 1]]);
+        assert!(rows[0].roles.iter().any(|r| r == "output head"));
     }
 
     fn spawn_hello_stub(reply: allpaca_rpc::HelloReply) -> (String, std::thread::JoinHandle<()>) {

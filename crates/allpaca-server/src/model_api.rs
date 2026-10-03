@@ -50,6 +50,8 @@ struct SettingsBody {
     /// The saved context differs from what the running engine was built with.
     reload_pending: bool,
     engine: EngineStatus,
+    /// Which device runs which layers of the loaded model.
+    placement: Vec<allpaca_core::DevicePlacement>,
 }
 
 fn bad_request(msg: impl Into<String>) -> Response {
@@ -96,6 +98,7 @@ fn settings_body(state: &AppState) -> SettingsBody {
         kv,
         reload_pending,
         engine: state.engine.status(),
+        placement: engine.as_ref().map(|e| e.placement()).unwrap_or_default(),
     }
 }
 

@@ -8936,6 +8936,7 @@ impl TinyModel {
         if want < 0 || want == hip.device {
             return Ok(false);
         }
+        fwd_segment_mark(hip.device, "switch");
         let src_x = buf.x;
         let src_dev = hip.device;
         if want == primary_hip.device {
@@ -9036,6 +9037,7 @@ impl TinyModel {
             max_kv,
         )?;
         let fwd_t0 = std::time::Instant::now();
+        fwd_segment_mark(hip.device, "start");
         hip.begin_decode_profile();
         let n_exp = cfg.n_experts;
         let double_buffer = prefill
@@ -9545,7 +9547,8 @@ impl TinyModel {
             Ok(())
         })();
         hip.end_decode_profile();
-        if std::env::var("ALLPACA_FWD_LOG").is_ok_and(|v| v == "1") {
+        fwd_segment_mark(hip.device, "end");
+        if std::env::var("ALLPACA_FWD_LOG").is_ok_and(|v| v == "1" || v == "2") {
             let _ = allpaca_hip::stream_synchronize();
             eprintln!("FWD1 pos={pos} ms={:.2}", fwd_t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -9646,6 +9649,7 @@ impl TinyModel {
             q_workspace,
         )?;
         let fwd_t0 = std::time::Instant::now();
+        fwd_segment_mark(hip.device, "start");
         hip.begin_decode_profile();
         let result = (|| {
             let primary_hip = hip;
@@ -10288,7 +10292,8 @@ impl TinyModel {
             Ok(())
         })();
         hip.end_decode_profile();
-        if std::env::var("ALLPACA_FWD_LOG").is_ok_and(|v| v == "1") {
+        fwd_segment_mark(hip.device, "end");
+        if std::env::var("ALLPACA_FWD_LOG").is_ok_and(|v| v == "1" || v == "2") {
             let _ = allpaca_hip::stream_synchronize();
             eprintln!(
                 "FWD rows={} ms={:.2}",
@@ -12951,3 +12956,29 @@ mod cuda_softcap_tests {
         );
     }
 }
+
+thread_local! {
+    static FWD_SEG_T0: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// `ALLPACA_FWD_LOG=2`: wall time of each device's run of layers in a
+/// forward (syncs the device at every boundary, so only for diagnosis).
+pub(crate) fn fwd_segment_mark(device: i32, what: &str) {
+    if !std::env::var("ALLPACA_FWD_LOG").is_ok_and(|v| v == "2") {
+        return;
+    }
+    let _ = allpaca_hip::stream_synchronize();
+    let now = std::time::Instant::now();
+    FWD_SEG_T0.with(|t| {
+        if let Some(t0) = t.get() {
+            if what != "start" {
+                eprintln!(
+                    "SEG dev={device} {what} ms={:.2}",
+                    now.duration_since(t0).as_secs_f64() * 1e3
+                );
+            }
+        }
+        t.set(Some(now));
+    });
+}
+

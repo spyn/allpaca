@@ -820,6 +820,55 @@ function renderModel() {
   $("m-reload").textContent = loading ? "Reloading…" : "Reload model";
   renderCtx();
   renderExperts();
+  renderPlacement();
+}
+
+const PLACE_COLORS = ["#2f81f7", "#8957e5", "#3fb950", "#d29922", "#db61a2", "#56d4dd", "#f85149", "#a371f7"];
+
+function placeLabel(p) {
+  const d = p.device || "";
+  if (d.startsWith("hip:")) return `GPU ${d.slice(4)}`;
+  if (d.startsWith("cuda:")) return `CUDA ${d.slice(5)}`;
+  if (d.startsWith("rpc:")) {
+    const [ep, gpu] = d.slice(4).split("/");
+    return gpu === undefined ? `RPC ${ep}` : `RPC ${ep} · GPU ${gpu}`;
+  }
+  return "CPU";
+}
+
+/* Which device holds which layers: a strip with one cell per layer, then one
+ * line per device (layer ranges, uploaded weights, other parts it holds). */
+function renderPlacement() {
+  const rows = (model.info && model.info.placement) || [];
+  const map = $("m-layer-map");
+  const box = $("m-placement");
+  const color = (i) => PLACE_COLORS[i % PLACE_COLORS.length];
+  const owner = [];
+  rows.forEach((p, i) => p.layers.forEach(([a, b]) => {
+    for (let l = a; l <= b; l++) owner[l] = i;
+  }));
+  map.classList.toggle("hidden", owner.length === 0);
+  map.innerHTML = Array.from(owner, (i, l) => i === undefined
+    ? `<span title="layer ${l}"></span>`
+    : `<span style="background:${color(i)}" title="layer ${l}: ${escapeHtml(placeLabel(rows[i]))}"></span>`).join("");
+  if (!rows.length) {
+    box.innerHTML = `<span class="muted">No model loaded.</span>`;
+    return;
+  }
+  box.innerHTML = rows.map((p, i) => {
+    const parts = [];
+    if (p.n_layers) {
+      const ranges = p.layers.map(([a, b]) => (a === b ? `${a}` : `${a}–${b}`)).join(", ");
+      parts.push(`${p.n_layers} layer${p.n_layers === 1 ? "" : "s"} (${ranges})`);
+    }
+    if (p.expert_layers) parts.push(`routed experts of ${p.expert_layers} layers`);
+    parts.push(...(p.roles || []));
+    const name = p.name ? ` <span class="muted">${escapeHtml(p.name)}</span>` : "";
+    const size = p.weight_bytes ? bytes(p.weight_bytes) : "";
+    return `<div class="place-row"><span class="sw" style="background:${color(i)}"></span>` +
+      `<div class="dev">${escapeHtml(placeLabel(p))}${name}</div><div class="size">${size}</div>` +
+      `<div class="detail">${escapeHtml(parts.join(" · "))}</div></div>`;
+  }).join("");
 }
 
 function renderCtx() {

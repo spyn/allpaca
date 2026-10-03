@@ -17,6 +17,8 @@ use crate::model::{LayerWeights, ModelConfig, ResidentModel, TinyModel};
 /// Connected RPC workers plus the layer assignment used at decode.
 pub struct RpcRuntime {
     sessions: Mutex<Vec<RpcSession>>,
+    /// Worker `host:port` per session index (readable while a session is busy).
+    endpoints: Vec<String>,
     plan: Mutex<LayerPlan>,
     remote: Mutex<Vec<Option<RemoteLayer>>>,
     /// Expert-parallel MoE: layers whose routed experts live on a worker.
@@ -90,6 +92,13 @@ pub struct RemoteGpu {
     pub util_pct: Option<u32>,
     pub temp_c: Option<u32>,
     pub power_w: Option<u32>,
+}
+
+/// Where one layer's body runs (see [`RpcRuntime::layer_home`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerHome {
+    Local(i32),
+    Remote { endpoint: String, device: u32 },
 }
 
 /// One layer's routed experts on a worker GPU (`MoeFfn`).
@@ -252,6 +261,7 @@ impl RpcRuntime {
         }
         Ok(Self {
             sessions: Mutex::new(sessions),
+            endpoints: endpoints.to_vec(),
             plan: Mutex::new(LayerPlan::all_local(0)),
             remote: Mutex::new(Vec::new()),
             experts: Mutex::new(Vec::new()),
@@ -816,6 +826,29 @@ impl RpcRuntime {
                 f16_out: true,
             },
         })
+    }
+
+    /// Where `layer_idx` runs: a worker GPU, or the local HIP device.
+    pub fn layer_home(&self, layer_idx: usize) -> LayerHome {
+        let remote = self
+            .remote
+            .lock()
+            .ok()
+            .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|l| (l.session, l.device)));
+        match remote {
+            Some((session, device)) => LayerHome::Remote {
+                endpoint: self.endpoints.get(session).cloned().unwrap_or_default(),
+                device,
+            },
+            None => LayerHome::Local(self.local_device(layer_idx)),
+        }
+    }
+
+    /// The worker holding this layer's routed experts, when they are remote.
+    pub fn experts_home(&self, layer_idx: usize) -> Option<String> {
+        let e = self.experts.lock().ok()?;
+        let ex = e.get(layer_idx)?.as_ref()?;
+        Some(self.endpoints.get(ex.session).cloned().unwrap_or_default())
     }
 
     /// This layer's routed experts run on an RPC worker.
