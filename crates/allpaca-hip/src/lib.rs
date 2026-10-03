@@ -660,6 +660,16 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_scale_rows(x: *mut f32, scale: *const f32, rows: i32, dim: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_topk_chunks(
+            x: *const f32,
+            rows: i32,
+            n: i32,
+            chunk: i32,
+            k: i32,
+            out_v: *mut f32,
+            out_i: *mut i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_rope_neox_rows(
             x: *mut f32,
             n_tok: i32,
@@ -2932,6 +2942,43 @@ pub fn moe_route_softmax_topk_device(
         let _ = (logits, n_exp, x, shexp_gate, dim, routes, disabled, counts);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP moe_route_softmax_topk unavailable".into(),
+        )))
+    }
+}
+
+/// Largest `k` of every `chunk` (<= 2048) of each row of `x[rows][n]`, largest
+/// first, ties to the lower index: `out_v` / `out_i` are `[rows][ceil(n/chunk)][k]`.
+#[allow(clippy::too_many_arguments)]
+pub fn topk_chunks_device(
+    x: *const f32,
+    rows: usize,
+    n: usize,
+    chunk: usize,
+    k: usize,
+    out_v: *mut f32,
+    out_i: *mut i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_topk_chunks(
+                x,
+                rows as i32,
+                n as i32,
+                chunk as i32,
+                k as i32,
+                out_v,
+                out_i,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "topk_chunks")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, rows, n, chunk, k, out_v, out_i);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP topk_chunks unavailable".into(),
         )))
     }
 }

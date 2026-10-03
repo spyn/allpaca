@@ -242,9 +242,20 @@ impl LayerCapture {
 /// Target embeddings and lm_head, shared with the draft (DFlash2 ships neither).
 pub trait TargetHead: Send {
     fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, AllpacaError>;
-    /// Logits `[rows, vocab]` for output-normed hidden rows `[rows, dim]`.
-    fn logits_rows(&self, hidden: &[f32], rows: usize) -> Result<Vec<f32>, AllpacaError>;
+    /// The `k` largest logits (id, logit), largest first, of each output-normed
+    /// hidden row in `hidden[rows, dim]`.
+    fn topk_rows(
+        &self,
+        hidden: &[f32],
+        rows: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(usize, f32)>>, AllpacaError>;
 }
+
+/// Logits per GPU top-k chunk; each chunk returns its own top `k`.
+const TOPK_CHUNK: usize = 2048;
+/// Largest `k` the head's candidate buffers hold.
+const TOPK_MAX: usize = 32;
 
 /// [`TargetHead`] over the target's resident weights on its own GPU.
 pub struct ResidentHead {
@@ -255,6 +266,8 @@ pub struct ResidentHead {
     rows: usize,
     a: DeviceWeights,
     out: DeviceWeights,
+    cand_v: DeviceWeights,
+    cand_i: DeviceWeights,
 }
 
 impl ResidentHead {
@@ -267,6 +280,9 @@ impl ResidentHead {
     ) -> Result<Self, AllpacaError> {
         let a = DeviceWeights::alloc(hip.device, rows * dim * 4)?;
         let out = DeviceWeights::alloc(hip.device, rows * vocab.max(dim) * 4)?;
+        let cands = rows * vocab.div_ceil(TOPK_CHUNK) * TOPK_MAX * 4;
+        let cand_v = DeviceWeights::alloc(hip.device, cands)?;
+        let cand_i = DeviceWeights::alloc(hip.device, cands)?;
         Ok(Self {
             hip,
             resident,
@@ -275,6 +291,8 @@ impl ResidentHead {
             rows,
             a,
             out,
+            cand_v,
+            cand_i,
         })
     }
 
@@ -300,17 +318,50 @@ impl TargetHead for ResidentHead {
         Ok(host)
     }
 
-    fn logits_rows(&self, hidden: &[f32], rows: usize) -> Result<Vec<f32>, AllpacaError> {
+    fn topk_rows(
+        &self,
+        hidden: &[f32],
+        rows: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(usize, f32)>>, AllpacaError> {
         self.check(rows)?;
+        let k = k.clamp(1, TOPK_MAX);
         self.hip.bind()?;
         let a = self.a.ptr_at(0) as *mut f32;
         let out = self.out.ptr_at(0) as *mut f32;
         self.hip.copy_h2d_f32(a, &hidden[..rows * self.dim])?;
         self.resident
             .lm_head_rows_device(&self.hip, a, out, rows, self.vocab, self.dim)?;
-        let mut host = vec![0.0f32; rows * self.vocab];
-        self.hip.copy_d2h_f32(out, &mut host)?;
-        Ok(host)
+        // Per-chunk top-k on the GPU; the host merges ~1k candidates a row
+        // instead of copying back and scanning the whole vocab.
+        let chunks = self.vocab.div_ceil(TOPK_CHUNK);
+        allpaca_hip::topk_chunks_device(
+            out,
+            rows,
+            self.vocab,
+            TOPK_CHUNK,
+            k,
+            self.cand_v.ptr_at(0) as *mut f32,
+            self.cand_i.ptr_at(0) as *mut i32,
+        )?;
+        let n = rows * chunks * k;
+        let mut v = vec![0.0f32; n];
+        let mut i = vec![0.0f32; n];
+        self.hip.copy_d2h_f32(self.cand_v.ptr_at(0), &mut v)?;
+        self.hip.copy_d2h_f32(self.cand_i.ptr_at(0), &mut i)?;
+        Ok((0..rows)
+            .map(|r| {
+                let vr = &v[r * chunks * k..(r + 1) * chunks * k];
+                let ir = &i[r * chunks * k..(r + 1) * chunks * k];
+                top_k_desc(vr, k)
+                    .into_iter()
+                    .filter_map(|j| {
+                        let id = ir[j].to_bits() as i32;
+                        (id >= 0).then_some((id as usize, vr[j]))
+                    })
+                    .collect()
+            })
+            .collect())
     }
 }
 
@@ -1003,17 +1054,14 @@ impl Dflash2Provider {
         let mut gate = vec![0.0f32; b * rank];
         hip.copy_d2h_f32(s.sel, &mut gate)?;
         // Positions 1.. only: the anchor's logits are the target's job.
-        let logits = self.head.logits_rows(&hidden[dim..], b - 1)?;
-        let vocab = logits.len() / (b - 1);
+        let top = self.head.topk_rows(&hidden[dim..], b - 1, sp.top_k)?;
         let t_head = t0.elapsed();
         let mut cands = Vec::with_capacity(b - 1);
         let mut unary = Vec::with_capacity(b - 1);
         let mut gates = Vec::with_capacity(b - 1);
-        for i in 0..b - 1 {
-            let row = &logits[i * vocab..(i + 1) * vocab];
-            let c = top_k_desc(row, sp.top_k);
-            unary.push(c.iter().map(|&j| row[j]).collect::<Vec<f32>>());
-            cands.push(c);
+        for (i, row) in top.into_iter().enumerate() {
+            cands.push(row.iter().map(|&(id, _)| id).collect::<Vec<usize>>());
+            unary.push(row.iter().map(|&(_, v)| v).collect::<Vec<f32>>());
             gates.push(gate[(i + 1) * rank..(i + 2) * rank].to_vec());
         }
         let t_topk = t0.elapsed();
@@ -1170,6 +1218,46 @@ mod tests {
             for (g, w) in got.iter().zip(&want) {
                 assert!((g - w).abs() <= 1e-5 * w.abs().max(1.0), "side {side}: {g} vs {w}");
             }
+        }
+    }
+
+    #[test]
+    fn topk_chunks_kernel_merges_to_the_host_top_k() {
+        let Ok(hip) = HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        // 3 rows of 5000 (a ragged last chunk), with repeated values for ties.
+        let (rows, n, chunk, k) = (3usize, 5000usize, 2048usize, 16usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i * 2654435761usize) % 1009) as f32 / 7.0)
+            .collect();
+        let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let xd = DeviceWeights::upload_bytes(hip.device, &[&bytes]).unwrap();
+        let chunks = n.div_ceil(chunk);
+        let vd = DeviceWeights::alloc(hip.device, rows * chunks * k * 4).unwrap();
+        let id = DeviceWeights::alloc(hip.device, rows * chunks * k * 4).unwrap();
+        allpaca_hip::topk_chunks_device(
+            xd.ptr_at(0),
+            rows,
+            n,
+            chunk,
+            k,
+            vd.ptr_at(0) as *mut f32,
+            id.ptr_at(0) as *mut i32,
+        )
+        .unwrap();
+        let mut v = vec![0.0f32; rows * chunks * k];
+        let mut ib = vec![0.0f32; rows * chunks * k];
+        hip.copy_d2h_f32(vd.ptr_at(0), &mut v).unwrap();
+        hip.copy_d2h_f32(id.ptr_at(0), &mut ib).unwrap();
+        for r in 0..rows {
+            let vr = &v[r * chunks * k..(r + 1) * chunks * k];
+            let ir = &ib[r * chunks * k..(r + 1) * chunks * k];
+            let got: Vec<usize> = top_k_desc(vr, k)
+                .into_iter()
+                .map(|j| ir[j].to_bits() as i32 as usize)
+                .collect();
+            assert_eq!(got, top_k_desc(&x[r * n..(r + 1) * n], k), "row {r}");
         }
     }
 

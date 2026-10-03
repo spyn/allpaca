@@ -7282,6 +7282,80 @@ extern "C" int allpaca_scale_rows(float *x, const float *scale, int32_t rows, in
     return hip_status(hipGetLastError());
 }
 
+/* Chunked top-k: block (c, r) keeps the k largest of x[r][c*chunk .. (c+1)*chunk),
+ * largest first, ties to the lower index. out_v/out_i are [rows][n_chunks][k]; a
+ * chunk shorter than k pads with -inf / -1. */
+constexpr int TOPK_CHUNK_MAX = 2048;
+constexpr int TOPK_THREADS = 256;
+
+__global__ void topk_chunks_kernel(const float *x, int n, int chunk, int k, float *out_v,
+                                   int32_t *out_i) {
+    __shared__ float vals[TOPK_CHUNK_MAX];
+    __shared__ float red_v[TOPK_THREADS];
+    __shared__ int red_i[TOPK_THREADS];
+    const int c = static_cast<int>(blockIdx.x);
+    const int r = static_cast<int>(blockIdx.y);
+    const int n_chunks = static_cast<int>(gridDim.x);
+    const int base = c * chunk;
+    const int len = min(chunk, n - base);
+    const float *row = x + static_cast<size_t>(r) * n;
+    for (int i = static_cast<int>(threadIdx.x); i < chunk; i += TOPK_THREADS) {
+        vals[i] = i < len ? row[base + i] : -INFINITY;
+    }
+    __syncthreads();
+    const size_t out0 = (static_cast<size_t>(r) * n_chunks + c) * k;
+    for (int j = 0; j < k; ++j) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+        for (int i = static_cast<int>(threadIdx.x); i < len; i += TOPK_THREADS) {
+            const float v = vals[i];
+            if (v > bv || (v == bv && i < bi)) {
+                bv = v;
+                bi = i;
+            }
+        }
+        red_v[threadIdx.x] = bv;
+        red_i[threadIdx.x] = bi;
+        __syncthreads();
+        for (int sstep = TOPK_THREADS / 2; sstep > 0; sstep >>= 1) {
+            if (static_cast<int>(threadIdx.x) < sstep) {
+                const float ov = red_v[threadIdx.x + sstep];
+                const int oi = red_i[threadIdx.x + sstep];
+                if (ov > red_v[threadIdx.x] || (ov == red_v[threadIdx.x] && oi < red_i[threadIdx.x])) {
+                    red_v[threadIdx.x] = ov;
+                    red_i[threadIdx.x] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const int win = red_i[0];
+            const bool ok = win < len;
+            out_v[out0 + j] = ok ? red_v[0] : -INFINITY;
+            out_i[out0 + j] = ok ? base + win : -1;
+            if (ok) {
+                vals[win] = -INFINITY;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" int allpaca_topk_chunks(const float *x, int32_t rows, int32_t n, int32_t chunk,
+                                   int32_t k, float *out_v, int32_t *out_i,
+                                   allpaca_stream_t stream) {
+    if (!x || !out_v || !out_i || rows <= 0 || n <= 0 || chunk <= 0 || chunk > TOPK_CHUNK_MAX ||
+        k <= 0 || k > chunk) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int n_chunks = (n + chunk - 1) / chunk;
+    hipLaunchKernelGGL(topk_chunks_kernel,
+                       dim3(static_cast<unsigned>(n_chunks), static_cast<unsigned>(rows)),
+                       dim3(TOPK_THREADS), 0, as_stream(stream), x, n, chunk, k, out_v, out_i);
+    return hip_status(hipGetLastError());
+}
+
 /* NeoX RoPE over rows: x[n_tok][n_heads][head_dim], row t at position start_pos + t,
  * pairs (i, i + head_dim/2), freq theta^(-2i/head_dim). */
 __global__ void rope_neox_rows_kernel(float *x, int n_tok, int n_heads, int head_dim, int start_pos,
@@ -8025,6 +8099,11 @@ extern "C" int allpaca_moe_route_softmax_topk(const float *, int32_t, int32_t, i
 }
 
 extern "C" int allpaca_scale_rows(float *, const float *, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_topk_chunks(const float *, int32_t, int32_t, int32_t, int32_t, float *,
+                                   int32_t *, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

@@ -3513,8 +3513,10 @@ impl Engine {
         let structured = json_constraints && self.config.structured_output.enabled;
         let suppress_draft = request(&inner, id)?.suppress_draft;
         let spec_limit = self.config.speculative.max_concurrent_requests;
-        let crowded = spec_limit > 0
-            && inner.active.values().filter(|r| !r.finished).count() > spec_limit;
+        let live = inner.active.values().filter(|r| !r.finished).count();
+        // DFlash2 keeps one sequence's context ring: with company it steps
+        // aside and the requests batch-decode instead.
+        let crowded = (spec_limit > 0 && live > spec_limit) || (inner.dflash2.is_some() && live > 1);
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation
                 || inner.flags.draft_model_speculation
@@ -4141,10 +4143,11 @@ impl Engine {
         let cfg = &self.config;
         // N-gram verify spans ride along in the batched forward; draft-model,
         // DSpark and tree speculation run their own forwards.
+        let live = inner.active.values().filter(|r| !r.finished).count();
         let own_forward_spec = cfg.speculative.enabled
             && (inner.flags.draft_model_speculation
                 || inner.dspark.is_some()
-                || inner.dflash2.is_some()
+                || (inner.dflash2.is_some() && live <= 1)
                 || inner.flags.tree_speculation);
         let structured = inner.flags.json_constraints && cfg.structured_output.enabled;
         let mut ids: Vec<(Instant, u64)> = inner
