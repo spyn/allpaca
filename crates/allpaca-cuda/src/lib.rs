@@ -5838,6 +5838,10 @@ mod tests {
             (3, 5, 2, 1, 4, true),
             (17, 50, 2, 2, 96, true),
             (6, 33, 4, 2, 128, false),
+            (5, 1000, 8, 2, 128, true),
+            (3, 2049, 4, 4, 64, true),
+            (2, 700, 4, 1, 128, false),
+            (9, 513, 2, 2, 96, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()
