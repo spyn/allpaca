@@ -2567,6 +2567,38 @@ impl ResidentModel {
     pub fn lm_head(&self) -> *const f32 {
         self.weights.ptr_at(self.lm_head.off)
     }
+
+    /// Token embeddings into device rows `out` (`[tokens, dim]`) on `hip`.
+    pub(crate) fn embed_rows_device(
+        &self,
+        hip: &HipWorkspace,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: usize,
+    ) -> Result<(), AllpacaError> {
+        self.embed_gather_rows(hip, tokens, out, dim as i32)
+    }
+
+    /// `out[rows, vocab] = a[rows, dim] · lm_headᵀ` on `hip` (the target GPU).
+    pub(crate) fn lm_head_rows_device(
+        &self,
+        hip: &HipWorkspace,
+        a: *const f32,
+        out: *mut f32,
+        rows: usize,
+        vocab: usize,
+        dim: usize,
+    ) -> Result<(), AllpacaError> {
+        self.gemm_nt(
+            hip,
+            a,
+            self.lm_head,
+            out,
+            rows as i32,
+            vocab as i32,
+            dim as i32,
+        )
+    }
 }
 
 fn relu_sqr(v: f32) -> f32 {
@@ -4340,6 +4372,8 @@ pub struct TinyModel {
     pub mla_cache: Option<Arc<std::sync::Mutex<Vec<(Vec<f32>, Vec<f32>)>>>>,
     /// Operator-disabled routed experts and routing-hit counts.
     pub expert_controls: Arc<crate::expert_controls::ExpertControls>,
+    /// Residual rows entering chosen layers, for a DFlash2 draft (off by default).
+    pub layer_capture: Arc<crate::dflash2::LayerCapture>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4512,6 +4546,7 @@ impl TinyModel {
             edge0: None,
             mla_cache: None,
             expert_controls: Default::default(),
+            layer_capture: Default::default(),
         }
     }
 
@@ -6833,6 +6868,7 @@ impl TinyModel {
             edge0: None,
             mla_cache,
             expert_controls: Default::default(),
+            layer_capture: Default::default(),
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -6991,6 +7027,7 @@ impl TinyModel {
             edge0: None,
             mla_cache: None,
             expert_controls: Default::default(),
+            layer_capture: Default::default(),
         }
     }
 
@@ -7122,6 +7159,7 @@ impl TinyModel {
             edge0: None,
             mla_cache: None,
             expert_controls: Default::default(),
+            layer_capture: Default::default(),
         })
     }
 
@@ -7232,6 +7270,7 @@ impl TinyModel {
             edge0: None,
             mla_cache: None,
             expert_controls: Default::default(),
+            layer_capture: Default::default(),
         })
     }
 
@@ -9071,6 +9110,11 @@ impl TinyModel {
                         normed_ready = false;
                     }
                 }
+                if let Some(k) = self.layer_capture.slot(layer_idx) {
+                    let mut host = vec![0.0f32; dim];
+                    hip.copy_d2h_f32(buf.x, &mut host)?;
+                    self.layer_capture.record(k, &[(pos, token)], &host);
+                }
                 let layer = &resident.layers[layer_idx];
                 if !Self::layer_has_device_weights(layer) {
                     return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -9658,6 +9702,17 @@ impl TinyModel {
                         logits_rows,
                     )? {
                         normed_ready = false;
+                    }
+                }
+                if let Some(k) = self.layer_capture.slot(layer_idx) {
+                    if segs.len() == 1 {
+                        let rows: Vec<(usize, u32)> =
+                            row_pos.iter().copied().zip(tokens.iter().copied()).collect();
+                        let mut host = vec![0.0f32; n_tok * dim];
+                        hip.copy_d2h_f32(buf.x, &mut host)?;
+                        self.layer_capture.record(k, &rows, &host);
+                    } else {
+                        self.layer_capture.invalidate();
                     }
                 }
                 let layer = &resident.layers[layer_idx];

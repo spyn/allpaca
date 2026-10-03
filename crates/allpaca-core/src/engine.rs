@@ -160,6 +160,7 @@ struct EngineInner {
     draft_model: Option<Arc<TinyModel>>,
     ngram: NGramProvider,
     dspark: Option<crate::dspark::DsparkProvider>,
+    dflash2: Option<crate::dflash2::Dflash2Provider>,
     active: HashMap<u64, ActiveRequest>,
     next_request_id: u64,
     model_id: String,
@@ -530,6 +531,7 @@ impl Engine {
             draft_model: None,
             ngram: NGramProvider::new(config.speculative.ngram_n),
             dspark: None,
+            dflash2: None,
             active: HashMap::new(),
             next_request_id: 1,
             model_id: config.model.id.clone(),
@@ -1706,14 +1708,25 @@ impl Engine {
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut draft_reuses_target_gguf = false;
-        let draft_path_is_dspark = self.config.model.draft_path.as_ref().is_some_and(|p| {
-            is_dspark_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or(""))
-        });
+        // A DFlash2 draft's file name also reads as a DSpark sidecar.
+        let draft_path_is_dspark = !self
+            .config
+            .speculative
+            .providers
+            .contains(&DraftProviderKind::Dflash2)
+            && self.config.model.draft_path.as_ref().is_some_and(|p| {
+                is_dspark_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or(""))
+            });
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, EngineTokenizer::from_gguf(tok));
+        let draft_path_is_dflash2 = self
+            .config
+            .speculative
+            .providers
+            .contains(&DraftProviderKind::Dflash2);
         if let Some(draft_path) = &self.config.model.draft_path {
-            if !draft_path_is_dspark {
+            if !draft_path_is_dspark && !draft_path_is_dflash2 {
                 let opened =
                     self.resolve_configured_path(draft_path)
                         .and_then(|(resolved, preferred)| {
@@ -1778,6 +1791,8 @@ impl Engine {
         }
         let dspark_path = if draft_path_is_dspark {
             self.config.model.draft_path.clone()
+        } else if draft_path_is_dflash2 {
+            None
         } else {
             discover_dspark_sidecar(path)
         };
@@ -1899,7 +1914,87 @@ impl Engine {
             draft_file.as_ref()
         };
         self.upload_resident_from_gguf(Some(file.as_ref()), draft_ref)?;
+        self.attach_dflash2();
         self.note_early_exit_gate()
+    }
+
+    /// Loads the DFlash2 draft named by `model.draft_path` onto the draft GPU
+    /// (the target GPU when there is none). It reads the target's embeddings
+    /// and lm_head in place and taps its layer inputs.
+    fn attach_dflash2(&self) {
+        if !self.config.speculative.enabled
+            || !self
+                .config
+                .speculative
+                .providers
+                .contains(&DraftProviderKind::Dflash2)
+        {
+            return;
+        }
+        let loaded = (|| -> Result<crate::dflash2::Dflash2Provider, AllpacaError> {
+            let path = self.config.model.draft_path.clone().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "speculative provider dflash2 needs model.draft_path".into(),
+                ))
+            })?;
+            let (resolved, preferred) = self.resolve_configured_path(&path)?;
+            let file = GgufFile::open(&discover_checkpoint(&resolved, preferred.as_deref())?.weights)?;
+            let spec = crate::dflash2::Dflash2Spec::from_gguf(&file).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{} is not a DFlash2 draft",
+                    resolved.display()
+                )))
+            })?;
+            let (target, resident) = {
+                let g = self.lock()?;
+                (g.target.clone(), g.target_resident.clone())
+            };
+            let target = target.ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+            let no_hip = || {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "DFlash2 needs the target resident on HIP".into(),
+                ))
+            };
+            let resident = resident.ok_or_else(no_hip)?;
+            let target_hip = self.hip.clone().ok_or_else(no_hip)?;
+            if spec.dim != target.config.dim {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "DFlash2 width {} != target {}",
+                    spec.dim, target.config.dim
+                ))));
+            }
+            let device = self
+                .draft_hip
+                .as_ref()
+                .map_or(target_hip.device, |h| h.device);
+            let hip = Arc::new(HipWorkspace::new(device, 8 * 1024 * 1024, 256)?);
+            let head = crate::dflash2::ResidentHead::new(
+                target_hip,
+                resident,
+                target.config.dim,
+                target.config.vocab_size,
+                spec.block_size,
+            )?;
+            crate::dflash2::Dflash2Provider::load(
+                &file,
+                hip,
+                Arc::clone(&target.layer_capture),
+                Box::new(head),
+            )
+        })();
+        match loaded {
+            Ok(p) => {
+                if let Ok(mut g) = self.lock() {
+                    g.dflash2 = Some(p);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DFlash2 draft failed; continuing without it");
+                self.metrics
+                    .degraded_events
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     fn upload_resident_weights(&self) -> Result<(), AllpacaError> {
@@ -3419,10 +3514,17 @@ impl Engine {
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation
                 || inner.flags.draft_model_speculation
-                || inner.dspark.is_some())
+                || inner.dspark.is_some()
+                || inner.dflash2.is_some())
             && !suppress_draft
             && !crowded;
-        let step_depth = if speculate { inner.scheduler.step_depth() } else { 0 };
+        // One DFlash2 pass drafts the whole block at the same cost, so it
+        // always proposes the full block; verify then takes what matches.
+        let step_depth = match (speculate, inner.dflash2.as_ref()) {
+            (false, _) => 0,
+            (true, Some(p)) => (p.spec().block_size - 1).min(self.config.speculative.max_depth),
+            (true, None) => inner.scheduler.step_depth(),
+        };
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
@@ -4038,6 +4140,7 @@ impl Engine {
         let own_forward_spec = cfg.speculative.enabled
             && (inner.flags.draft_model_speculation
                 || inner.dspark.is_some()
+                || inner.dflash2.is_some()
                 || inner.flags.tree_speculation);
         let structured = inner.flags.json_constraints && cfg.structured_output.enabled;
         let mut ids: Vec<(Instant, u64)> = inner
@@ -5030,6 +5133,20 @@ fn propose_after_deferred(
     metrics: &Metrics,
 ) -> Result<Vec<u32>, AllpacaError> {
     inner.draft_ahead = None;
+    if let Some(provider) = inner.dflash2.as_mut() {
+        let mut after = ctx.to_vec();
+        after.push(tok);
+        match provider.propose(&after, depth, temperature) {
+            Ok(more) if !more.is_empty() => {
+                let mut draft = vec![tok];
+                draft.extend(more);
+                host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
+                return Ok(draft);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
+        }
+    }
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mtp = mtp_draft_active(inner);
@@ -5098,6 +5215,16 @@ fn propose_drafts(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             host_stage_draft_tokens(&ahead.tokens, draft_hip, metrics);
             return Ok(ahead.tokens);
+        }
+    }
+    if let Some(provider) = inner.dflash2.as_mut() {
+        match provider.propose(&ctx, depth, temperature) {
+            Ok(draft) if !draft.is_empty() => {
+                host_stage_draft_tokens(&draft, draft_hip, metrics);
+                return Ok(draft);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
         }
     }
     if let Some(provider) = inner.dspark.as_mut() {

@@ -5,6 +5,7 @@ mod batch_gemm;
 mod compute;
 mod constraint;
 mod deepseek4;
+mod dflash2;
 pub mod deltanet;
 mod device_manager;
 mod direct_storage;

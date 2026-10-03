@@ -7282,6 +7282,82 @@ extern "C" int allpaca_scale_rows(float *x, const float *scale, int32_t rows, in
     return hip_status(hipGetLastError());
 }
 
+/* NeoX RoPE over rows: x[n_tok][n_heads][head_dim], row t at position start_pos + t,
+ * pairs (i, i + head_dim/2), freq theta^(-2i/head_dim). */
+__global__ void rope_neox_rows_kernel(float *x, int n_tok, int n_heads, int head_dim, int start_pos,
+                                      float theta) {
+    const int tok = static_cast<int>(blockIdx.y);
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = head_dim / 2;
+    if (tok >= n_tok || idx >= n_heads * half) {
+        return;
+    }
+    const int h = idx / half;
+    const int i = idx % half;
+    float *hvec = x + (static_cast<size_t>(tok) * n_heads + h) * static_cast<size_t>(head_dim);
+    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    const float angle = static_cast<float>(start_pos + tok) * freq;
+    const float sn = sinf(angle);
+    const float cs = cosf(angle);
+    const float a = hvec[i];
+    const float b = hvec[i + half];
+    hvec[i] = a * cs - b * sn;
+    hvec[i + half] = a * sn + b * cs;
+}
+
+extern "C" int allpaca_rope_neox_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                                      int32_t start_pos, float theta, allpaca_stream_t stream) {
+    if (!x || n_tok <= 0 || n_heads <= 0 || head_dim <= 0 || (head_dim & 1) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int total = n_heads * (head_dim / 2);
+    hipLaunchKernelGGL(rope_neox_rows_kernel,
+                       dim3(static_cast<unsigned>((total + 255) / 256), static_cast<unsigned>(n_tok)),
+                       dim3(256), 0, as_stream(stream), x, n_tok, n_heads, head_dim, start_pos,
+                       theta);
+    return hip_status(hipGetLastError());
+}
+
+/* DFlash2 two-tap dynamic convolution along each block of `block` rows:
+ * out[t][c] = sum_tap (dyn[t][g + groups*(tap + kernel*side)] + base[c + dim*(tap + kernel*side)])
+ *             * h[t - tap][c], taps that would cross the block start skipped. */
+__global__ void dflash_conv_kernel(const float *h, const float *dyn, const float *base, float *out,
+                                   int rows, int block, int dim, int kernel, int group, int side) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= rows * dim) {
+        return;
+    }
+    const int t = idx / dim;
+    const int c = idx - t * dim;
+    const int groups = dim / group;
+    const int proj = 2 * kernel * groups;
+    const int in_block = t % block;
+    float acc = 0.0f;
+    for (int tap = 0; tap < kernel && tap <= in_block; ++tap) {
+        const int k = tap + kernel * side;
+        const float w = dyn[static_cast<size_t>(t) * proj + groups * k + c / group] +
+                        base[static_cast<size_t>(dim) * k + c];
+        acc += w * h[static_cast<size_t>(t - tap) * dim + c];
+    }
+    out[idx] = acc;
+}
+
+extern "C" int allpaca_dflash_conv(const float *h, const float *dyn, const float *base, float *out,
+                                   int32_t rows, int32_t block, int32_t dim, int32_t kernel,
+                                   int32_t group, int32_t side, allpaca_stream_t stream) {
+    if (!h || !dyn || !base || !out || h == out || rows <= 0 || block <= 0 || dim <= 0 ||
+        kernel <= 0 || group <= 0 || dim % group != 0 || side < 0 || side > 1) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int n = rows * dim;
+    hipLaunchKernelGGL(dflash_conv_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256),
+                       0, as_stream(stream), h, dyn, base, out, rows, block, dim, kernel, group,
+                       side);
+    return hip_status(hipGetLastError());
+}
+
 __global__ void copy_f32_kernel(float *dst, const float *src, int n) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) {
@@ -7949,6 +8025,16 @@ extern "C" int allpaca_moe_route_softmax_topk(const float *, int32_t, int32_t, i
 }
 
 extern "C" int allpaca_scale_rows(float *, const float *, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rope_neox_rows(float *, int32_t, int32_t, int32_t, int32_t, float,
+                                      allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_dflash_conv(const float *, const float *, const float *, float *, int32_t,
+                                   int32_t, int32_t, int32_t, int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

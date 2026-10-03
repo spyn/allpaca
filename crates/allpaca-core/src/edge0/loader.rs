@@ -368,6 +368,7 @@ fn load_edge0_weights(
         edge0: None,
         mla_cache: None,
         expert_controls: Default::default(),
+        layer_capture: Default::default(),
         dsv4: None,
     })
 }

@@ -428,6 +428,8 @@ pub enum DraftProviderKind {
     Mtp,
     /// DeepSeek-V4-Flash DSpark sidecar (`dspark-*.gguf` / DFlash + Markov head).
     Dspark,
+    /// DFlash2 block-diffusion draft (`model.draft_path`, arch `dflash` with a selector).
+    Dflash2,
 }
 
 impl DraftProviderKind {
@@ -452,8 +454,9 @@ impl DraftProviderKind {
             "draft" | "draft_model" | "draft-model" => Ok(Self::DraftModel),
             "mtp" | "nextn" | "next-n" => Ok(Self::Mtp),
             "dspark" | "dflash" | "draft-dspark" | "draft_dspark" => Ok(Self::Dspark),
+            "dflash2" | "dflash-2" | "draft-dflash2" => Ok(Self::Dflash2),
             other => Err(format!(
-                "unknown draft provider '{other}' (expected ngram, draft_model, mtp, dspark)"
+                "unknown draft provider '{other}' (expected ngram, draft_model, mtp, dspark, dflash2)"
             )),
         }
     }
@@ -927,6 +930,9 @@ mod tests {
         assert!(DraftProviderKind::parse_list("nope").is_err());
         let ds = DraftProviderKind::parse_list("dspark").unwrap();
         assert_eq!(ds, vec![DraftProviderKind::Dspark]);
+        // "dflash" stays the DSpark alias; DFlash2 is its own provider.
+        let d2 = DraftProviderKind::parse_list("dflash2,dflash-2").unwrap();
+        assert_eq!(d2, vec![DraftProviderKind::Dflash2, DraftProviderKind::Dflash2]);
         let aliases = DraftProviderKind::parse_list("dflash,draft-dspark").unwrap();
         assert_eq!(
             aliases,

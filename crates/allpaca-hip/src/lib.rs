@@ -660,6 +660,28 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_scale_rows(x: *mut f32, scale: *const f32, rows: i32, dim: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_rope_neox_rows(
+            x: *mut f32,
+            n_tok: i32,
+            n_heads: i32,
+            head_dim: i32,
+            start_pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_dflash_conv(
+            h: *const f32,
+            dynamic: *const f32,
+            base: *const f32,
+            out: *mut f32,
+            rows: i32,
+            block: i32,
+            dim: i32,
+            kernel: i32,
+            group: i32,
+            side: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_moe_ffn_kquant(
             x: *const f32,
             xq: *const i8,
@@ -2910,6 +2932,83 @@ pub fn moe_route_softmax_topk_device(
         let _ = (logits, n_exp, x, shexp_gate, dim, routes, disabled, counts);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP moe_route_softmax_topk unavailable".into(),
+        )))
+    }
+}
+
+/// NeoX RoPE (pairs `i`, `i + head_dim/2`) over `x[n_tok][n_heads][head_dim]`,
+/// row `t` at position `start_pos + t`.
+pub fn rope_neox_rows_device(
+    x: *mut f32,
+    n_tok: usize,
+    n_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    theta: f32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_rope_neox_rows(
+                x,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                start_pos as i32,
+                theta,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "rope_neox_rows")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, n_tok, n_heads, head_dim, start_pos, theta);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP rope_neox_rows unavailable".into(),
+        )))
+    }
+}
+
+/// DFlash2 two-tap dynamic convolution along each `block` of rows (device
+/// pointers; `out` must not alias `h`). See `dflash_conv_kernel`.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_conv_device(
+    h: *const f32,
+    dynamic: *const f32,
+    base: *const f32,
+    out: *mut f32,
+    rows: usize,
+    block: usize,
+    dim: usize,
+    kernel: usize,
+    group: usize,
+    side: usize,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_dflash_conv(
+                h,
+                dynamic,
+                base,
+                out,
+                rows as i32,
+                block as i32,
+                dim as i32,
+                kernel as i32,
+                group as i32,
+                side as i32,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "dflash_conv")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (h, dynamic, base, out, rows, block, dim, kernel, group, side);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP dflash_conv unavailable".into(),
         )))
     }
 }
