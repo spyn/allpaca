@@ -12761,25 +12761,29 @@ mod tests {
         if free_before as usize <= CHUNK * 2 {
             return; // Board is already too full to measure a delta safely.
         }
-        let hog = DeviceWeights::alloc(0, CHUNK).expect("device alloc");
-        let (free_after, total_after) = device_memory_info(0).expect("mem_info after alloc");
-        assert_eq!(total_after, total, "total VRAM must not move");
-        assert!(
-            free_after < free_before,
-            "free VRAM must drop after a {CHUNK}B alloc: {free_before} -> {free_after}"
-        );
-        drop(hog);
+        // Board-wide readings: other tests in this binary (and other
+        // processes) allocate and free meanwhile, so take the best of a few.
+        let dropped = (0..5).any(|_| {
+            let (before, _) = device_memory_info(0).expect("mem_info");
+            let hog = DeviceWeights::alloc(0, CHUNK).expect("device alloc");
+            let (after, total_after) = device_memory_info(0).expect("mem_info after alloc");
+            assert_eq!(total_after, total, "total VRAM must not move");
+            drop(hog);
+            after < before
+        });
+        assert!(dropped, "free VRAM never dropped after a {CHUNK}B alloc");
 
         // `used` is the same reading; the two entry points must not disagree.
-        let used = device_memory_used(0).expect("mem_used");
-        let (free_now, total_now) = device_memory_info(0).expect("mem_info");
+        let (used, total_now, skew) = (0..5)
+            .map(|_| {
+                let used = device_memory_used(0).expect("mem_used");
+                let (free_now, total_now) = device_memory_info(0).expect("mem_info");
+                (used, total_now, (total_now - free_now).abs_diff(used))
+            })
+            .min_by_key(|r| r.2)
+            .unwrap();
         assert_eq!(total_now, total_now.max(used), "used must fit in total");
-        let derived = total_now - free_now;
-        let skew = derived.abs_diff(used);
-        assert!(
-            skew <= 64 << 20,
-            "mem_used {used} and total-free {derived} disagree by {skew}"
-        );
+        assert!(skew <= 64 << 20, "mem_used {used} and total-free disagree by {skew}");
     }
 
     /// The sampler runs on threads that are about to launch kernels, so the
@@ -15233,34 +15237,27 @@ mod tests {
         )
         .unwrap();
         stream_synchronize().unwrap();
-        let t0 = std::time::Instant::now();
-        for _ in 0..10 {
-            gemm_nt_device(
-                da.cast(),
-                db32.cast(),
-                dc.cast(),
-                m as i32,
-                n as i32,
-                k as i32,
-            )
-            .unwrap();
-        }
-        stream_synchronize().unwrap();
-        let f32_ms = t0.elapsed().as_secs_f64() * 1_000.0 / 10.0;
-        let t1 = std::time::Instant::now();
-        for _ in 0..10 {
-            gemm_nt_f16_device(
-                da.cast(),
-                db16.cast(),
-                dc.cast(),
-                m as i32,
-                n as i32,
-                k as i32,
-            )
-            .unwrap();
-        }
-        stream_synchronize().unwrap();
-        let f16_ms = t1.elapsed().as_secs_f64() * 1_000.0 / 10.0;
+        // Best of five windows: other tests share the GPU, and one window can
+        // land on their kernels.
+        let best = |f: &dyn Fn()| -> f64 {
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..10 {
+                        f();
+                    }
+                    stream_synchronize().unwrap();
+                    t.elapsed().as_secs_f64() * 1_000.0 / 10.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let f32_ms = best(&|| {
+            gemm_nt_device(da.cast(), db32.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        });
+        let f16_ms = best(&|| {
+            gemm_nt_f16_device(da.cast(), db16.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+        });
         device_free(da, a_b);
         device_free(db32, b32_b);
         device_free(db16, b16_b);
