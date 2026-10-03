@@ -1577,3 +1577,578 @@ extern "C" int allpaca_cuda_sigmoid_mul(float *x, const float *gate, int32_t n,
                          as_stream(stream)>>>(x, gate, n);
     return cuda_status(cudaGetLastError());
 }
+
+/* ---------------------------------------------------------------------------
+ * Int8-activation K-quant GEMV and the fused MoE FFN (Q4_K / Q5_K / Q6_K),
+ * ported from hip/src/kernels.cpp (`kquant_i8_block`, `allpaca_moe_ffn_kquant`).
+ * Activations are quantized per 32 values to int8 with one f32 scale, and
+ * every row is a signed dot4 against the unpacked weight bytes. The same
+ * block routine serves every m, so a verify row reproduces the decode row.
+ * ------------------------------------------------------------------------- */
+
+#include <mutex>
+
+__device__ inline int32_t kq_dot4(uint32_t a, uint32_t b, int32_t c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(static_cast<int>(a), static_cast<int>(b), c);
+#else
+    const int8_t *x = reinterpret_cast<const int8_t *>(&a);
+    const int8_t *y = reinterpret_cast<const int8_t *>(&b);
+    return c + x[0] * y[0] + x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
+#endif
+}
+
+__device__ inline float kq_f16le(const uint8_t *p) {
+    const uint16_t h = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u) << 16);
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t mant = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            const float f = (static_cast<float>(mant) / 1024.0f) * (1.0f / 16384.0f);
+            return (h & 0x8000u) ? -f : f;
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    return __uint_as_float(bits);
+}
+
+template <int QT>
+struct KqBytes;
+template <>
+struct KqBytes<4> {
+    static constexpr int bytes = 144;
+};
+template <>
+struct KqBytes<5> {
+    static constexpr int bytes = 176;
+};
+template <>
+struct KqBytes<6> {
+    static constexpr int bytes = 210;
+};
+
+__global__ void kq_quantize_rows_kernel(const float *a, int8_t *aq, float *ad, int m, int k) {
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int blk = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / 32) + warp;
+    const int row = static_cast<int>(blockIdx.y);
+    const int kb = k / 32;
+    if (row >= m || blk >= kb) {
+        return;
+    }
+    const size_t i = static_cast<size_t>(row) * static_cast<size_t>(k) + blk * 32 + lane;
+    const float v = a[i];
+    float amax = fabsf(v);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off, 32));
+    }
+    const float d = amax == 0.f ? 0.f : amax / 127.f;
+    const float inv = d == 0.f ? 0.f : 1.f / d;
+    int q = static_cast<int>(roundf(v * inv));
+    q = q > 127 ? 127 : (q < -127 ? -127 : q);
+    aq[i] = static_cast<int8_t>(q);
+    if (lane == 0) {
+        ad[static_cast<size_t>(row) * kb + blk] = d;
+    }
+}
+
+__device__ inline uint32_t kq_u32_from_u16(const uint8_t *p) {
+    const uint16_t *h = reinterpret_cast<const uint16_t *>(p);
+    return static_cast<uint32_t>(h[0]) | (static_cast<uint32_t>(h[1]) << 16);
+}
+
+template <int NC>
+__device__ inline void kq_load_u32s(const void *p, uint32_t (&v)[NC]) {
+    if constexpr (NC == 4) {
+        const uint4 x = *reinterpret_cast<const uint4 *>(p);
+        v[0] = x.x, v[1] = x.y, v[2] = x.z, v[3] = x.w;
+    } else if constexpr (NC == 2) {
+        const uint2 x = *reinterpret_cast<const uint2 *>(p);
+        v[0] = x.x, v[1] = x.y;
+    } else {
+        v[0] = *reinterpret_cast<const uint32_t *>(p);
+    }
+}
+
+__device__ inline void kq_scale_min_pair(const uint8_t *scales, int g, uint32_t &sc1, uint32_t &m1,
+                                         uint32_t &sc2, uint32_t &m2) {
+    const uint32_t w0 = *reinterpret_cast<const uint32_t *>(scales);
+    const uint32_t w1 = *reinterpret_cast<const uint32_t *>(scales + 4);
+    const uint32_t w2 = *reinterpret_cast<const uint32_t *>(scales + 8);
+    const int j1 = 2 * g;
+    const int j2 = 2 * g + 1;
+    auto byte = [](uint32_t w, int i) { return (w >> (8 * (i & 3))) & 0xFFu; };
+    const bool hi = g >= 2;
+    const uint32_t a1 = byte(w0, j1), b1 = byte(w1, j1), c1 = byte(w2, j1);
+    const uint32_t a2 = byte(w0, j2), b2 = byte(w1, j2), c2 = byte(w2, j2);
+    sc1 = hi ? ((c1 & 15) | ((a1 >> 6) << 4)) : (a1 & 63);
+    m1 = hi ? ((c1 >> 4) | ((b1 >> 6) << 4)) : (b1 & 63);
+    sc2 = hi ? ((c2 & 15) | ((a2 >> 6) << 4)) : (a2 & 63);
+    m2 = hi ? ((c2 >> 4) | ((b2 >> 6) << 4)) : (b2 & 63);
+}
+
+/* One block of the int8 K-quant GEMV: columns from `bx`, rows `row0 .. +MR`.
+ * LPC lanes per column, W = 128 / LPC weights per lane in each of two places
+ * (see the HIP kernel for the lane maps). */
+template <int QT, int MR, int LPC>
+__device__ inline void kq_i8_block(const int8_t *aq, const float *ad, const uint8_t *b, float *c,
+                                   int m, int n, int k, int bx, int row0) {
+    constexpr int BB = KqBytes<QT>::bytes;
+    constexpr int W = 128 / LPC;
+    constexpr int NC = W / 4;
+    constexpr int LPG = LPC / 4;
+    constexpr uint32_t ONES = 0x01010101u;
+    const int sl = static_cast<int>(threadIdx.x) % LPC;
+    const int col = bx * (static_cast<int>(blockDim.x) / LPC) + static_cast<int>(threadIdx.x) / LPC;
+    const bool live = col < n;
+    const int nblocks = k / 256;
+    const int kb = k / 32;
+    const uint8_t *brow = b + static_cast<size_t>(live ? col : 0) * static_cast<size_t>(nblocks) * BB;
+    const int g = sl / LPG;
+    const int j0 = (sl % LPG) * W;
+    const int8_t *arow[MR];
+    const float *drow[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        const size_t ar = static_cast<size_t>(row0 + r < m ? row0 + r : row0);
+        arow[r] = aq + ar * static_cast<size_t>(k);
+        drow[r] = ad + ar * static_cast<size_t>(kb);
+    }
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.f;
+    }
+    if (live) {
+        for (int ib = 0; ib < nblocks; ++ib) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
+            if constexpr (QT == 6) {
+                const float d = kq_f16le(blk + 208);
+                const int8_t *sc = reinterpret_cast<const int8_t *>(blk + 192);
+                const int lo_off = (g & 1) * 32 + j0;
+                const int nib = (g >> 1) * 4;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    uint32_t q[NC];
+#pragma unroll
+                    for (int t = 0; t < NC; ++t) {
+                        const uint32_t ql = kq_u32_from_u16(blk + h * 64 + lo_off + 4 * t);
+                        const uint32_t qh = kq_u32_from_u16(blk + 128 + h * 32 + j0 + 4 * t);
+                        q[t] = ((ql >> nib) & 0x0F0F0F0Fu) | (((qh >> (2 * g)) & 0x03030303u) << 4);
+                    }
+                    const float s = d * static_cast<float>(sc[h * 8 + j0 / 16 + 2 * g]);
+                    const int bi = ib * 8 + h * 4 + g;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        uint32_t av[NC];
+                        kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av);
+                        int32_t dot = 0, sum = 0;
+#pragma unroll
+                        for (int t = 0; t < NC; ++t) {
+                            dot = kq_dot4(av[t], q[t], dot);
+                            sum = kq_dot4(av[t], ONES, sum);
+                        }
+                        acc[r] += s * drow[r][bi] * static_cast<float>(dot - 32 * sum);
+                    }
+                }
+            } else {
+                const float d = kq_f16le(blk);
+                const float dmin = kq_f16le(blk + 2);
+                uint32_t sc1 = 0, m1 = 0, sc2 = 0, m2 = 0;
+                kq_scale_min_pair(blk + 4, g, sc1, m1, sc2, m2);
+                const uint32_t *qp =
+                    reinterpret_cast<const uint32_t *>(blk + (QT == 5 ? 48 : 16) + g * 32 + j0);
+                uint32_t lo[NC], hi[NC];
+#pragma unroll
+                for (int t = 0; t < NC; ++t) {
+                    const uint32_t qv = qp[t];
+                    uint32_t hb_lo = 0, hb_hi = 0;
+                    if constexpr (QT == 5) {
+                        const uint32_t qh = *reinterpret_cast<const uint32_t *>(blk + 16 + j0 + 4 * t);
+                        hb_lo = (qh >> (2 * g)) & ONES;
+                        hb_hi = (qh >> (2 * g + 1)) & ONES;
+                    }
+                    lo[t] = (qv & 0x0F0F0F0Fu) | (hb_lo << 4);
+                    hi[t] = ((qv >> 4) & 0x0F0F0F0Fu) | (hb_hi << 4);
+                }
+                const float dl = d * static_cast<float>(sc1);
+                const float ml = dmin * static_cast<float>(m1);
+                const float dh = d * static_cast<float>(sc2);
+                const float mh = dmin * static_cast<float>(m2);
+                const int bl = ib * 8 + 2 * g;
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    uint32_t alo[NC], ahi[NC];
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo);
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi);
+                    int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
+#pragma unroll
+                    for (int t = 0; t < NC; ++t) {
+                        il = kq_dot4(alo[t], lo[t], il);
+                        sl_ = kq_dot4(alo[t], ONES, sl_);
+                        ih = kq_dot4(ahi[t], hi[t], ih);
+                        sh = kq_dot4(ahi[t], ONES, sh);
+                    }
+                    acc[r] += drow[r][bl] * (dl * static_cast<float>(il) - ml * static_cast<float>(sl_)) +
+                              drow[r][bl + 1] * (dh * static_cast<float>(ih) - mh * static_cast<float>(sh));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = LPC / 2; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffffu, v, off, LPC);
+        }
+        if (live && sl == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + static_cast<size_t>(col)] = v;
+        }
+    }
+}
+
+template <int QT, int MR, int LPC>
+__global__ void kq_i8_gemv_kernel(const int8_t *aq, const float *ad, const uint8_t *b, float *c,
+                                  int m, int n, int k) {
+    kq_i8_block<QT, MR, LPC>(aq, ad, b, c, m, n, k, static_cast<int>(blockIdx.x),
+                             static_cast<int>(blockIdx.y) * MR);
+}
+
+/* Per-device int8 activation scratch, grow-only. The lock is held from
+ * quantize through GEMV enqueue; a switch to another stream first waits, on
+ * the GPU, for work queued on the previous one. */
+constexpr int KQ_DEVICES = 16;
+struct KqScratch {
+    std::mutex mu;
+    void *p = nullptr;
+    size_t cap = 0;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t handoff = nullptr;
+};
+static KqScratch g_kq[KQ_DEVICES];
+
+static KqScratch *kq_acquire(cudaStream_t stream, size_t need, std::unique_lock<std::mutex> &lock) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= KQ_DEVICES) {
+        return nullptr;
+    }
+    KqScratch &s = g_kq[dev];
+    lock = std::unique_lock<std::mutex>(s.mu);
+    if (s.p && s.stream != stream) {
+        if (!s.handoff && cudaEventCreateWithFlags(&s.handoff, cudaEventDisableTiming) != cudaSuccess) {
+            s.handoff = nullptr;
+            return nullptr;
+        }
+        if (cudaEventRecord(s.handoff, s.stream) != cudaSuccess ||
+            cudaStreamWaitEvent(stream, s.handoff, 0) != cudaSuccess) {
+            return nullptr;
+        }
+    }
+    if (s.cap < need) {
+        if (s.p) {
+            (void)cudaStreamSynchronize(stream);
+            (void)cudaFree(s.p);
+            s.p = nullptr;
+            s.cap = 0;
+        }
+        const size_t cap = need > (size_t(1) << 20) ? need : (size_t(1) << 20);
+        if (cudaMalloc(&s.p, cap) != cudaSuccess) {
+            s.p = nullptr;
+            return nullptr;
+        }
+        s.cap = cap;
+    }
+    s.stream = stream;
+    return &s;
+}
+
+template <int QT>
+static int kq_gemm_launch(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n, int32_t k,
+                          cudaStream_t stream) {
+    const uintptr_t ba = reinterpret_cast<uintptr_t>(b);
+    if (m <= 0 || n <= 0 || k <= 0 || k % 256 != 0 || !a || !b || !c ||
+        (QT == 6 ? ba % 2 != 0 : ba % 4 != 0)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    (void)cudaGetLastError();
+    const size_t aq_bytes = (static_cast<size_t>(m) * k + 255) & ~size_t(255);
+    const size_t need = aq_bytes + static_cast<size_t>(m) * (k / 32) * sizeof(float);
+    std::unique_lock<std::mutex> lock;
+    KqScratch *scratch = kq_acquire(stream, need, lock);
+    if (!scratch) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    uint8_t *base = static_cast<uint8_t *>(scratch->p);
+    int8_t *aq = reinterpret_cast<int8_t *>(base);
+    float *ad = reinterpret_cast<float *>(base + aq_bytes);
+    const int kb = k / 32;
+    kq_quantize_rows_kernel<<<dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
+                              dim3(256), 0, stream>>>(a, aq, ad, m, k);
+    constexpr int LPC = 8;
+    const int cols = 256 / LPC;
+    const unsigned gx = static_cast<unsigned>((n + cols - 1) / cols);
+    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
+    if (mr == 1) {
+        kq_i8_gemv_kernel<QT, 1, LPC><<<grid, 256, 0, stream>>>(aq, ad, b, c, m, n, k);
+    } else if (mr == 2) {
+        kq_i8_gemv_kernel<QT, 2, LPC><<<grid, 256, 0, stream>>>(aq, ad, b, c, m, n, k);
+    } else if (mr == 4) {
+        kq_i8_gemv_kernel<QT, 4, LPC><<<grid, 256, 0, stream>>>(aq, ad, b, c, m, n, k);
+    } else {
+        kq_i8_gemv_kernel<QT, 8, LPC><<<grid, 256, 0, stream>>>(aq, ad, b, c, m, n, k);
+    }
+    return cuda_status(cudaGetLastError());
+}
+
+extern "C" int allpaca_cuda_gemm_nt_kquant(int32_t qt, const float *a, const uint8_t *b, float *c,
+                                           int32_t m, int32_t n, int32_t k,
+                                           allpaca_cuda_stream_t stream) {
+    switch (qt) {
+    case 4: return kq_gemm_launch<4>(a, b, c, m, n, k, as_stream(stream));
+    case 5: return kq_gemm_launch<5>(a, b, c, m, n, k, as_stream(stream));
+    case 6: return kq_gemm_launch<6>(a, b, c, m, n, k, as_stream(stream));
+    default: return ALLPACA_ERR_INVALID;
+    }
+}
+
+/* ---------------------------- fused MoE FFN ------------------------------ */
+
+__device__ inline void moe_quantize_lds(const float *v, int k, int8_t *aq, float *ad) {
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int groups = static_cast<int>(blockDim.x) / 32;
+    const int kb = k / 32;
+    for (int blk = static_cast<int>(threadIdx.x) / 32; blk < kb; blk += groups) {
+        const float x = v[blk * 32 + lane];
+        float amax = fabsf(x);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off, 32));
+        }
+        const float d = amax == 0.f ? 0.f : amax / 127.f;
+        const float inv = d == 0.f ? 0.f : 1.f / d;
+        int q = static_cast<int>(roundf(x * inv));
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        aq[blk * 32 + lane] = static_cast<int8_t>(q);
+        if (lane == 0) {
+            ad[blk] = d;
+        }
+    }
+    __syncthreads();
+}
+
+__device__ inline void moe_group(const int32_t *group_start, int g, int &p0, int &mr) {
+    p0 = group_start ? group_start[g] : g;
+    mr = group_start ? group_start[g + 1] - p0 : 1;
+}
+
+template <int QG, int QU, int LPC, int MR>
+__global__ void moe_gate_up_kernel(const float *x, const int8_t *xq, const float *xd,
+                                   const int32_t *pair_row, const int32_t *group_start,
+                                   const int32_t *expert, const uint8_t *gate,
+                                   unsigned long long gate_stride, const uint8_t *up,
+                                   unsigned long long up_stride, float *g, float *u, int ff, int dim) {
+    extern __shared__ unsigned char moe_lds[];
+    const int gi = static_cast<int>(blockIdx.y);
+    int p0, mr;
+    moe_group(group_start, gi, p0, mr);
+    const int kb = dim / 32;
+    const int8_t *aq;
+    const float *ad;
+    if (MR == 1 && xq) {
+        const size_t row = static_cast<size_t>(pair_row[p0]);
+        aq = xq + row * dim;
+        ad = xd + row * kb;
+    } else {
+        int8_t *lq = reinterpret_cast<int8_t *>(moe_lds);
+        float *ld = reinterpret_cast<float *>(moe_lds + ((static_cast<size_t>(MR) * dim + 15) & ~size_t(15)));
+        for (int r = 0; r < mr; ++r) {
+            const size_t row = static_cast<size_t>(pair_row[p0 + r]);
+            if (xq) {
+                for (int i = static_cast<int>(threadIdx.x); i < dim; i += static_cast<int>(blockDim.x)) {
+                    lq[r * dim + i] = xq[row * dim + i];
+                }
+                for (int i = static_cast<int>(threadIdx.x); i < kb; i += static_cast<int>(blockDim.x)) {
+                    ld[r * kb + i] = xd[row * kb + i];
+                }
+            } else {
+                moe_quantize_lds(x + row * dim, dim, lq + r * dim, ld + r * kb);
+            }
+        }
+        __syncthreads();
+        aq = lq;
+        ad = ld;
+    }
+    const size_t e = static_cast<size_t>(expert[gi]);
+    if (blockIdx.z == 0) {
+        kq_i8_block<QG, MR, LPC>(aq, ad, gate + e * gate_stride, g + static_cast<size_t>(p0) * ff, mr,
+                                 ff, dim, static_cast<int>(blockIdx.x), 0);
+    } else {
+        kq_i8_block<QU, MR, LPC>(aq, ad, up + e * up_stride, u + static_cast<size_t>(p0) * ff, mr, ff,
+                                 dim, static_cast<int>(blockIdx.x), 0);
+    }
+}
+
+__global__ void moe_silu_quant_kernel(const float *g, const float *u, int8_t *hq, float *hd, int ff) {
+    extern __shared__ unsigned char moe_lds[];
+    float *tmp = reinterpret_cast<float *>(moe_lds);
+    const size_t p = blockIdx.x;
+    for (int i = static_cast<int>(threadIdx.x); i < ff; i += static_cast<int>(blockDim.x)) {
+        const float gv = g[p * ff + i];
+        tmp[i] = gv / (1.f + expf(-gv)) * u[p * ff + i];
+    }
+    __syncthreads();
+    moe_quantize_lds(tmp, ff, hq + p * ff, hd + p * (ff / 32));
+}
+
+template <int QD, int LPC, int MR>
+__global__ void moe_down_kernel(const int8_t *hq, const float *hd, const int32_t *group_start,
+                                const int32_t *expert, const uint8_t *down,
+                                unsigned long long down_stride, float *y, int dim, int ff) {
+    const int gi = static_cast<int>(blockIdx.y);
+    int p0, mr;
+    moe_group(group_start, gi, p0, mr);
+    kq_i8_block<QD, MR, LPC>(hq + static_cast<size_t>(p0) * ff, hd + static_cast<size_t>(p0) * (ff / 32),
+                             down + static_cast<size_t>(expert[gi]) * down_stride,
+                             y + static_cast<size_t>(p0) * dim, mr, dim, ff,
+                             static_cast<int>(blockIdx.x), 0);
+}
+
+/* out[r] = sum over row r's pairs (routing order) of w[p] * y[p], with
+ * separate rounding for the product and the sum (no FMA), as on HIP. */
+__global__ void moe_combine_kernel(const float *y, const float *w, const int32_t *row_start,
+                                   const int32_t *row_pairs, float *out, int rows, int dim) {
+    const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int r = static_cast<int>(blockIdx.y);
+    if (d >= dim || r >= rows) {
+        return;
+    }
+    float acc = 0.f;
+    for (int i = row_start[r]; i < row_start[r + 1]; ++i) {
+        const int p = row_pairs ? row_pairs[i] : i;
+        acc = __fadd_rn(acc, __fmul_rn(y[static_cast<size_t>(p) * dim + d], w[p]));
+    }
+    out[static_cast<size_t>(r) * dim + d] = acc;
+}
+
+constexpr int MOE_LPC = 8;
+
+template <int MR>
+static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, cudaStream_t st, const float *x,
+                              const int8_t *xq, const float *xd, const int32_t *pair_row,
+                              const int32_t *group_start, const int32_t *expert, const uint8_t *gate,
+                              unsigned long long gs, const uint8_t *up, unsigned long long us, float *g,
+                              float *u, int ff, int dim) {
+#define MOE_GU(A, B)                                                                               \
+    if (qg == A && qu == B) {                                                                      \
+        moe_gate_up_kernel<A, B, MOE_LPC, MR><<<grid, 256, lds, st>>>(                             \
+            x, xq, xd, pair_row, group_start, expert, gate, gs, up, us, g, u, ff, dim);           \
+        return true;                                                                               \
+    }
+    MOE_GU(4, 4) MOE_GU(4, 5) MOE_GU(4, 6)
+    MOE_GU(5, 4) MOE_GU(5, 5) MOE_GU(5, 6)
+    MOE_GU(6, 4) MOE_GU(6, 5) MOE_GU(6, 6)
+#undef MOE_GU
+    return false;
+}
+
+template <int MR>
+static bool moe_down_types(int qd, dim3 grid, cudaStream_t st, const int8_t *hq, const float *hd,
+                           const int32_t *group_start, const int32_t *expert, const uint8_t *down,
+                           unsigned long long ds, float *y, int dim, int ff) {
+#define MOE_D(Q)                                                                                   \
+    if (qd == Q) {                                                                                 \
+        moe_down_kernel<Q, MOE_LPC, MR><<<grid, 256, 0, st>>>(hq, hd, group_start, expert, down,  \
+                                                              ds, y, dim, ff);                     \
+        return true;                                                                               \
+    }
+    MOE_D(4) MOE_D(5) MOE_D(6)
+#undef MOE_D
+    return false;
+}
+
+static size_t moe_align(size_t v) { return (v + 255) & ~size_t(255); }
+
+extern "C" uint64_t allpaca_cuda_moe_ffn_scratch_bytes(int32_t rows, int32_t dim, int32_t ff,
+                                                       int32_t pairs) {
+    (void)rows;
+    const size_t p = static_cast<size_t>(pairs);
+    return 2 * moe_align(p * ff * 4) + moe_align(p * dim * 4) + moe_align(p * ff) +
+           moe_align(p * (ff / 32) * 4);
+}
+
+/* Same contract as HIP `allpaca_moe_ffn_kquant`. */
+extern "C" int allpaca_cuda_moe_ffn_kquant(
+    const float *x, const int8_t *xq, const float *xd, int32_t rows, int32_t dim, int32_t ff,
+    int32_t pairs, const int32_t *pair_row, const int32_t *expert, const float *pair_w,
+    const int32_t *row_start, int32_t groups, const int32_t *group_start, const int32_t *row_pairs,
+    int32_t max_group, const uint8_t *gate, int32_t gate_qt, uint64_t gate_stride, const uint8_t *up,
+    int32_t up_qt, uint64_t up_stride, const uint8_t *down, int32_t down_qt, uint64_t down_stride,
+    void *scratch, float *out, allpaca_cuda_stream_t stream) {
+    if ((!x && !(xq && xd)) || !out || !scratch || rows <= 0 || pairs <= 0 || groups <= 0 ||
+        dim % 256 != 0 || ff % 256 != 0 || !pair_row || !expert || !pair_w || !row_start ||
+        (group_start == nullptr && groups != pairs) || max_group < 1 || max_group > 8) {
+        return ALLPACA_ERR_INVALID;
+    }
+    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6; };
+    if (!kq(gate_qt) || !kq(up_qt) || !kq(down_qt)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    (void)cudaGetLastError();
+    cudaStream_t st = as_stream(stream);
+    uint8_t *base = static_cast<uint8_t *>(scratch);
+    const size_t p = static_cast<size_t>(pairs);
+    float *g = reinterpret_cast<float *>(base);
+    base += moe_align(p * ff * 4);
+    float *u = reinterpret_cast<float *>(base);
+    base += moe_align(p * ff * 4);
+    float *y = reinterpret_cast<float *>(base);
+    base += moe_align(p * dim * 4);
+    int8_t *hq = reinterpret_cast<int8_t *>(base);
+    base += moe_align(p * ff);
+    float *hd = reinterpret_cast<float *>(base);
+    constexpr int COLS = 256 / MOE_LPC;
+    const int mrc = max_group <= 1 ? 1 : (max_group <= 2 ? 2 : (max_group <= 4 ? 4 : 8));
+    const size_t lds_up = ((static_cast<size_t>(mrc) * dim + 15) & ~size_t(15)) +
+                          static_cast<size_t>(mrc) * (dim / 32) * 4;
+    const size_t lds_silu = static_cast<size_t>(ff) * 4;
+    /* Default dynamic shared memory limit: dim <= ~5k at 8 rows, ff <= 12k. */
+    if (lds_up > 48 * 1024 || lds_silu > 48 * 1024) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const dim3 grid_up(static_cast<unsigned>((ff + COLS - 1) / COLS), static_cast<unsigned>(groups), 2);
+    const dim3 grid_down(static_cast<unsigned>((dim + COLS - 1) / COLS), static_cast<unsigned>(groups));
+    bool ok = false;
+#define MOE_MR(M)                                                                                  \
+    ok = moe_gate_up_types<M>(gate_qt, up_qt, grid_up, lds_up, st, x, xq, xd, pair_row,            \
+                              group_start, expert, gate, gate_stride, up, up_stride, g, u, ff,     \
+                              dim);                                                                \
+    if (ok) {                                                                                      \
+        moe_silu_quant_kernel<<<static_cast<unsigned>(pairs), 256, lds_silu, st>>>(g, u, hq, hd,  \
+                                                                                   ff);            \
+    }                                                                                              \
+    ok = ok && moe_down_types<M>(down_qt, grid_down, st, hq, hd, group_start, expert, down,        \
+                                 down_stride, y, dim, ff)
+    switch (mrc) {
+    case 1: MOE_MR(1); break;
+    case 2: MOE_MR(2); break;
+    case 4: MOE_MR(4); break;
+    default: MOE_MR(8); break;
+    }
+#undef MOE_MR
+    if (!ok) {
+        return ALLPACA_ERR_INVALID;
+    }
+    moe_combine_kernel<<<dim3(static_cast<unsigned>((dim + 255) / 256), static_cast<unsigned>(rows)), 256,
+                         0, st>>>(y, pair_w, row_start, row_pairs, out, rows, dim);
+    return cuda_status(cudaGetLastError());
+}

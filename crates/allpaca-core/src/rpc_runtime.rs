@@ -798,7 +798,9 @@ impl RpcRuntime {
             file.tensor(&format!("blk.{blk}.ffn_{part}_exps.weight"))
                 .is_some_and(|t| matches!(t.ggml_type_id, 12..=14))
         });
-        let fused = backend == RpcBackendKind::Hip && cfg.dim % 256 == 0 && cfg.ff_dim % 256 == 0;
+        let fused = matches!(backend, RpcBackendKind::Hip | RpcBackendKind::Cuda)
+            && cfg.dim % 256 == 0
+            && cfg.ff_dim % 256 == 0;
         Ok(RemoteExperts {
             q8: kquant && fused,
             session,
@@ -1782,8 +1784,9 @@ fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
     match backend {
         RpcBackendKind::Hip => hip,
         RpcBackendKind::Cpu => hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 20 | 23),
-        // F32 and Q8_0 GEMMs; K-quants and ROCmFP4 stay off CUDA workers.
-        RpcBackendKind::Cuda => matches!(ty, 0 | 8),
+        // F32, Q8_0 and the int8 K-quant GEMV; ROCmFP4 and the rest stay off
+        // CUDA workers.
+        RpcBackendKind::Cuda => matches!(ty, 0 | 8 | 12 | 13 | 14),
     }
 }
 

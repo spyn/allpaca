@@ -229,11 +229,37 @@ mod tests {
         if allpaca_hip::device_count() == 0 {
             return;
         }
+        check_grouped_match_single(WorkerBackend::Hip(HipWorker::new(0).unwrap()));
+    }
+
+    /// The CUDA worker's fused K-quant MoE (port of the HIP kernels): Q5_K
+    /// gate/up with Q6_K down as in Qwen3-Next, and all-Q4_K.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_fused_kquant_moe_ffn_matches_reference() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        check_moe_ffn(WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")), MOE_KQUANT_FUSED);
+        check_moe_ffn(WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")), MOE_Q4K_FUSED);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_grouped_experts_match_single_rows() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        check_grouped_match_single(WorkerBackend::Cuda(CudaWorker::new(0).unwrap()));
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn check_grouped_match_single(backend: WorkerBackend) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+            serve_connection(stream, backend).unwrap();
         });
         let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
         let (n_exp, dim, ff) = (3usize, 256usize, 256usize);
@@ -290,10 +316,13 @@ mod tests {
     const MOE_KQUANT: MoeCase =
         MoeCase { gate_up: 13, down: 14, dim: 256, ff: 256, tol: 3e-2, q8_exact: false };
     const MOE_KQUANT_FUSED: MoeCase = MoeCase { q8_exact: true, ..MOE_KQUANT };
+    #[cfg(feature = "cuda")]
+    const MOE_Q4K_FUSED: MoeCase = MoeCase { gate_up: 12, down: 12, ..MOE_KQUANT_FUSED };
 
     fn quantize(ty: u32, m: &[f32]) -> Vec<u8> {
         match ty {
             8 => allpaca_cpu::quantize_q8_0(m),
+            12 => allpaca_cpu::quantize_q4_k(m),
             13 => allpaca_cpu::quantize_q5_k(m),
             14 => allpaca_cpu::quantize_q6_k(m),
             _ => unreachable!("test type {ty}"),
@@ -306,6 +335,7 @@ mod tests {
         let mut w = vec![0.0f32; m.len()];
         match ty {
             8 => allpaca_cpu::dequant_q8_0(&q, w.len(), &mut w).unwrap(),
+            12 => allpaca_cpu::dequant_q4_k(&q, w.len(), &mut w).unwrap(),
             13 => allpaca_cpu::dequant_q5_k(&q, w.len(), &mut w).unwrap(),
             14 => allpaca_cpu::dequant_q6_k(&q, w.len(), &mut w).unwrap(),
             _ => unreachable!(),

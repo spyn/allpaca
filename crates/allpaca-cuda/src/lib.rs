@@ -46,6 +46,19 @@ fn f16_bits_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Device scratch [`CudaWorkspace::moe_ffn_kquant_dev`] needs past its inputs.
+pub fn moe_ffn_scratch_bytes(rows: usize, dim: usize, ff: usize, pairs: usize) -> u64 {
+    #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+    {
+        unsafe { ffi::allpaca_cuda_moe_ffn_scratch_bytes(rows as i32, dim as i32, ff as i32, pairs as i32) }
+    }
+    #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+    {
+        let _ = (rows, dim, ff, pairs);
+        0
+    }
+}
+
 /// Repack GGUF 34-byte Q8_0 blocks into 36-byte device blocks with an F32 scale.
 pub fn stage_q8_0_blocks(packed: &[u8]) -> Result<Vec<u8>, AllpacaError> {
     if packed.len() % Q8_PACKED_BLOCK != 0 {
@@ -168,6 +181,46 @@ mod ffi {
             m: i32,
             n: i32,
             k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_gemm_nt_kquant(
+            qt: i32,
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_cuda_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
+        pub fn allpaca_cuda_moe_ffn_kquant(
+            x: *const f32,
+            xq: *const i8,
+            xd: *const f32,
+            rows: i32,
+            dim: i32,
+            ff: i32,
+            pairs: i32,
+            pair_row: *const i32,
+            expert: *const i32,
+            pair_w: *const f32,
+            row_start: *const i32,
+            groups: i32,
+            group_start: *const i32,
+            row_pairs: *const i32,
+            max_group: i32,
+            gate: *const u8,
+            gate_qt: i32,
+            gate_stride: u64,
+            up: *const u8,
+            up_qt: i32,
+            up_stride: u64,
+            down: *const u8,
+            down_qt: i32,
+            down_stride: u64,
+            scratch: *mut c_void,
+            out: *mut f32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_cuda_gemm_nt_q8_0(
@@ -1669,6 +1722,108 @@ impl CudaWorkspace {
             let _ = (a, b, c, m, n, k);
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "CUDA gemm_nt unavailable".into(),
+            )))
+        }
+    }
+
+    /// Float A × K-quant B (ggml Q4_K / Q5_K / Q6_K as `qt` 4 / 5 / 6, GGUF
+    /// layout) on this workspace's stream: A is quantized to int8 per 32
+    /// values and each row is a dp4a dot, the HIP int8 K-quant scheme.
+    /// `k` must be whole 256-weight super-blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nt_kquant_dev(
+        &self,
+        qt: i32,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            set_device(self.device)?;
+            let rc = unsafe { ffi::allpaca_cuda_gemm_nt_kquant(qt, a, b, c, m, n, k, self.stream) };
+            status(rc, "gemm_nt_kquant")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (qt, a, b, c, m, n, k);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA gemm_nt_kquant unavailable".into(),
+            )))
+        }
+    }
+
+    /// Fused expert-parallel MoE FFN over stacked K-quant experts on this
+    /// workspace's stream (same contract and pointer table as HIP
+    /// `moe_ffn_kquant_device`). `x` is F32 rows, or `xq`/`xd` int8 rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_ffn_kquant_dev(
+        &self,
+        x: *const f32,
+        xq: *const i8,
+        xd: *const f32,
+        rows: usize,
+        dim: usize,
+        ff: usize,
+        pairs: usize,
+        pair_row: *const i32,
+        expert: *const i32,
+        pair_w: *const f32,
+        row_start: *const i32,
+        groups: usize,
+        group_start: *const i32,
+        row_pairs: *const i32,
+        max_group: usize,
+        experts: [(*const u8, i32, u64); 3],
+        scratch: *mut u8,
+        out: *mut f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            set_device(self.device)?;
+            let [(g, gq, gs), (u, uq, us), (d, dq, ds)] = experts;
+            let rc = unsafe {
+                ffi::allpaca_cuda_moe_ffn_kquant(
+                    x,
+                    xq,
+                    xd,
+                    rows as i32,
+                    dim as i32,
+                    ff as i32,
+                    pairs as i32,
+                    pair_row,
+                    expert,
+                    pair_w,
+                    row_start,
+                    groups as i32,
+                    group_start,
+                    row_pairs,
+                    max_group as i32,
+                    g,
+                    gq,
+                    gs,
+                    u,
+                    uq,
+                    us,
+                    d,
+                    dq,
+                    ds,
+                    scratch.cast(),
+                    out,
+                    self.stream,
+                )
+            };
+            status(rc, "moe_ffn_kquant")
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (x, xq, xd, rows, dim, ff, pairs, pair_row, expert, pair_w, row_start);
+            let _ = (groups, group_start, row_pairs, max_group, experts, scratch, out);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "CUDA moe_ffn_kquant unavailable".into(),
             )))
         }
     }
@@ -5517,6 +5672,62 @@ mod tests {
     fn attn_close(got: f32, exp: f32) -> bool {
         let d = (got - exp).abs();
         d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
+    }
+
+    /// Int8-activation K-quant GEMV (Q4_K / Q5_K / Q6_K) against the CPU
+    /// dequantized weights, for 1..8 rows and a column count that does not
+    /// fill the last block; each row equals its one-row call bit for bit.
+    #[test]
+    fn kquant_gemv_matches_cpu_and_is_row_exact() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        let (n, k) = (77usize, 512usize);
+        let w: Vec<f32> = (0..n * k).map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.004).collect();
+        let a: Vec<f32> = (0..8 * k).map(|i| (((i * 13) % 59) as f32 - 29.0) * 0.03).collect();
+        for qt in [4i32, 5, 6] {
+            let (q, mut wd) = match qt {
+                4 => (allpaca_cpu::quantize_q4_k(&w), vec![0.0f32; n * k]),
+                5 => (allpaca_cpu::quantize_q5_k(&w), vec![0.0f32; n * k]),
+                _ => (allpaca_cpu::quantize_q6_k(&w), vec![0.0f32; n * k]),
+            };
+            match qt {
+                4 => allpaca_cpu::dequant_q4_k(&q, n * k, &mut wd).unwrap(),
+                5 => allpaca_cpu::dequant_q5_k(&q, n * k, &mut wd).unwrap(),
+                _ => allpaca_cpu::dequant_q6_k(&q, n * k, &mut wd).unwrap(),
+            }
+            let db = device_malloc(q.len(), 0).expect("weights");
+            memcpy_on(db, q.as_ptr().cast(), q.len(), MEMCPY_H2D, ws.raw_stream()).unwrap();
+            let run = |rows: &[f32], m: usize| -> Vec<f32> {
+                let da = ws.upload_f32(rows).expect("a");
+                let dc = device_malloc(m * n * 4, 0).expect("c");
+                ws.gemm_nt_kquant_dev(qt, da, db.cast_const().cast(), dc.cast(), m as i32, n as i32, k as i32)
+                    .expect("kquant gemv");
+                let mut out = vec![0.0f32; m * n];
+                memcpy_on(out.as_mut_ptr().cast(), dc, m * n * 4, MEMCPY_D2H, ws.raw_stream()).unwrap();
+                ws.synchronize().unwrap();
+                ws.free_ptr(da);
+                device_free(dc);
+                out
+            };
+            let all = run(&a, 8);
+            let mut want = vec![0.0f32; 8 * n];
+            allpaca_cpu::matmul_nt(&a, &wd, &mut want, 8, n, k).unwrap();
+            let scale = want.iter().fold(0.0f32, |s, v| s.max(v.abs()));
+            for (i, (g, e)) in all.iter().zip(&want).enumerate() {
+                assert!((g - e).abs() <= 0.02 * scale, "qt={qt} out[{i}] {g} vs {e} (scale {scale})");
+            }
+            for m in [1usize, 2, 3] {
+                let some = run(&a[..m * k], m);
+                assert!(
+                    some.iter().zip(&all[..m * n]).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "qt={qt} m={m} rows differ from the 8-row call"
+                );
+            }
+            ws.synchronize().unwrap();
+            device_free(db);
+        }
     }
 
     /// Several rows (the Q-tiled kernel) give each row bit for bit what a

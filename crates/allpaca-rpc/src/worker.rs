@@ -1463,6 +1463,9 @@ pub struct CudaWorker {
     hash_cache: HashMap<u64, Vec<u8>>,
     memory_bytes: u64,
     used: u64,
+    /// Grow-only device scratch for `MoeFfn` (inputs, pair table, kernel
+    /// scratch, output): pointer and bytes.
+    moe_scratch: Option<(*mut std::ffi::c_void, usize)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1470,6 +1473,9 @@ impl Drop for CudaWorker {
     fn drop(&mut self) {
         for (_, s) in self.slots.drain() {
             allpaca_cuda::device_free(s.ptr);
+        }
+        if let Some((p, _)) = self.moe_scratch.take() {
+            allpaca_cuda::device_free(p);
         }
     }
 }
@@ -1507,7 +1513,104 @@ impl CudaWorker {
             hash_cache: HashMap::new(),
             memory_bytes,
             used: 0,
+            moe_scratch: None,
         })
+    }
+
+    /// Routed experts of one layer over K-quant stacked tensors (gate, up,
+    /// down each `n_experts` equal slices): the HIP worker's fused path. One
+    /// H2D of `[x | pair table]`, four kernel launches, one D2H.
+    fn moe_ffn(
+        &mut self,
+        req: &crate::protocol::MoeFfnRequest,
+        x: &crate::protocol::MoeX,
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+        let (dim, ff, n_exp) = (req.dim as usize, req.ff as usize, req.n_experts.max(1) as usize);
+        let rows = x.len() / dim.max(1);
+        let qt = |ty: u32| match ty {
+            12 => Some(4i32),
+            13 => Some(5),
+            14 => Some(6),
+            _ => None,
+        };
+        let part = |id: BufId| -> Result<(*const u8, i32, u64), RpcError> {
+            let s = self.slot(id)?;
+            let q = qt(s.ggml_type).ok_or_else(|| {
+                RpcError::Worker(format!("cuda MoeFfn needs K-quant experts, got ggml type {}", s.ggml_type))
+            })?;
+            Ok((s.ptr.cast_const().cast(), q, (s.bytes / n_exp) as u64))
+        };
+        let experts = [part(req.gate)?, part(req.up)?, part(req.down)?];
+        if dim % 256 != 0 || ff % 256 != 0 {
+            return Err(RpcError::Worker("cuda MoeFfn needs dim and ff in 256-weight blocks".into()));
+        }
+        let (prefix, x_q8) = match x {
+            crate::protocol::MoeX::F32(v) => (v.clone(), None),
+            crate::protocol::MoeX::Q8 { q, d } => {
+                let mut v: Vec<f32> = q
+                    .chunks_exact(4)
+                    .map(|b| f32::from_bits(u32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8])))
+                    .collect();
+                v.resize(v.len().next_multiple_of(64), 0.0);
+                let d_off = v.len();
+                v.extend_from_slice(d);
+                (v, Some(d_off))
+            }
+        };
+        let table = allpaca_hip::MoePairTable::new(rows, pairs, &prefix);
+        let out_off = table.end;
+        let work_off = (out_off + rows * dim).next_multiple_of(64);
+        let bytes = work_off * 4 + allpaca_cuda::moe_ffn_scratch_bytes(rows, dim, ff, table.pairs) as usize;
+        if self.moe_scratch.is_none_or(|(_, have)| have < bytes) {
+            if let Some((p, _)) = self.moe_scratch.take() {
+                self.cuda.synchronize().map_err(bad)?;
+                allpaca_cuda::device_free(p);
+            }
+            let cap = bytes.max(1 << 20);
+            let p = allpaca_cuda::device_malloc(cap, self.device).map_err(bad)?;
+            self.moe_scratch = Some((p, cap));
+        }
+        let base = self.moe_scratch.expect("moe scratch").0.cast::<f32>();
+        let at = |i: usize| unsafe { base.add(i) };
+        let stream = self.cuda.raw_stream();
+        let host = &table.host;
+        allpaca_cuda::memcpy_on(base.cast(), host.as_ptr().cast(), host.len() * 4, allpaca_cuda::MEMCPY_H2D, stream)
+            .map_err(bad)?;
+        let (xf, xq, xd) = match x_q8 {
+            None => (base.cast_const(), std::ptr::null(), std::ptr::null()),
+            Some(d_off) => (std::ptr::null(), base.cast::<i8>().cast_const(), at(d_off).cast_const()),
+        };
+        let int = |i: usize| at(i).cast::<i32>().cast_const();
+        self.cuda
+            .moe_ffn_kquant_dev(
+                xf,
+                xq,
+                xd,
+                rows,
+                dim,
+                ff,
+                table.pairs,
+                int(table.row),
+                int(table.expert),
+                at(table.w).cast_const(),
+                int(table.row_start),
+                table.groups,
+                int(table.group_start),
+                int(table.row_pairs),
+                table.max_group,
+                experts,
+                at(work_off).cast(),
+                at(out_off),
+            )
+            .map_err(bad)?;
+        let mut out = vec![0.0f32; rows * dim];
+        allpaca_cuda::memcpy_on(out.as_mut_ptr().cast(), at(out_off).cast_const().cast(), rows * dim * 4,
+            allpaca_cuda::MEMCPY_D2H, stream)
+            .map_err(bad)?;
+        self.cuda.synchronize().map_err(bad)?;
+        Ok(out)
     }
 
     fn hello(&self) -> HelloReply {
@@ -1849,6 +1952,8 @@ impl CudaWorker {
                     0 => self.cuda.gemm_nt_dev(a, b.cast(), c, m, n, k),
                     // Staged 36-byte blocks (see `WorkerBackend::stage_q8_0`).
                     8 => self.cuda.gemm_nt_q8_0_dev(a, b.cast(), c, m, n, k),
+                    // GGUF K-quant blocks as uploaded.
+                    12..=14 => self.cuda.gemm_nt_kquant_dev(ty as i32 - 8, a, b.cast(), c, m, n, k),
                     _ => {
                         return Err(RpcError::Worker(format!(
                             "cuda worker has no gemm for ggml type {ty}"
@@ -1959,7 +2064,7 @@ impl WorkerBackend {
             #[cfg(feature = "hip")]
             Self::Hip(w) => w.moe_ffn(req, x, pairs),
             #[cfg(feature = "cuda")]
-            Self::Cuda(_) => Err(RpcError::Worker("CUDA worker has no MoeFfn yet".into())),
+            Self::Cuda(w) => w.moe_ffn(req, x, pairs),
         }
     }
 
