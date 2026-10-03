@@ -3422,10 +3422,11 @@ impl Engine {
                 || inner.dspark.is_some())
             && !suppress_draft
             && !crowded;
+        let step_depth = if speculate { inner.scheduler.step_depth() } else { 0 };
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
-            let depth = inner.scheduler.draft_depth.min(remaining.saturating_sub(1));
+            let depth = step_depth.min(remaining.saturating_sub(1));
             (
                 active.params.json_mode && structured && active.grammar.is_none(),
                 active.json_prefix.clone(),
@@ -3499,6 +3500,7 @@ impl Engine {
             #[cfg(feature = "vulkan")]
             vulkan: self.vulkan.as_deref(),
         };
+        let step_started = Instant::now();
         let produced = if use_tree {
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
             let draft = if inner.flags.draft_model_speculation {
@@ -3554,6 +3556,14 @@ impl Engine {
                 &hooks,
             )?
         };
+        // Cost of this step by rows verified, for the throughput-aware depth
+        // (a staged batched span finishes elsewhere and is not a solo step).
+        if speculate && !use_tree && !produced.tokens.is_empty() {
+            inner.scheduler.record_step_time(
+                produced.proposed as usize + 1,
+                step_started.elapsed().as_secs_f64() * 1e6,
+            );
+        }
         if produced.tokens.is_empty()
             && inner
                 .staged_decode
