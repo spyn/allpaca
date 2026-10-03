@@ -4787,22 +4787,27 @@ mod tests {
         if device_count() <= 0 {
             return;
         }
-        let (free, total) = device_memory_info(0).expect("mem_info");
-        let used = device_memory_used(0).expect("mem_used");
-        let derived = total.saturating_sub(free);
-        let skew = used.abs_diff(derived);
-        assert!(
-            skew < 16 * 1024 * 1024,
-            "mem_used {used} and total-free {derived} disagree by {skew}"
-        );
-        let chunk = 16 * 1024 * 1024;
-        let ptr = device_malloc(chunk, 0).expect("alloc");
-        let used_after = device_memory_used(0).expect("mem_used after");
-        assert!(
-            used_after >= used + (chunk as u64) / 2,
-            "used={used} used_after={used_after} chunk={chunk}"
-        );
-        device_free(ptr);
+        // Device-wide readings: other tests in this binary allocate and free
+        // in parallel, so a reading pair may straddle their changes. Take the
+        // best of a few tries, and allocate far more than their churn.
+        let skew = (0..5)
+            .map(|_| {
+                let (free, total) = device_memory_info(0).expect("mem_info");
+                let used = device_memory_used(0).expect("mem_used");
+                used.abs_diff(total.saturating_sub(free))
+            })
+            .min()
+            .unwrap();
+        assert!(skew < 16 * 1024 * 1024, "mem_used and total-free disagree by {skew}");
+        let chunk = 256 * 1024 * 1024;
+        let grew = (0..5).any(|_| {
+            let used = device_memory_used(0).expect("mem_used");
+            let ptr = device_malloc(chunk, 0).expect("alloc");
+            let used_after = device_memory_used(0).expect("mem_used after");
+            device_free(ptr);
+            used_after >= used + (chunk as u64) / 2
+        });
+        assert!(grew, "a {chunk}-byte allocation never showed in mem_used");
     }
 
     #[test]
