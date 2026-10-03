@@ -1798,6 +1798,11 @@ impl Engine {
         };
         if let Some(dsp) = dspark_path {
             match GgufFile::open(&dsp) {
+                Ok(f) if crate::dflash2::Dflash2Spec::from_gguf(&f).is_some() => {
+                    // A DFlash2 draft is not a DSpark sidecar; it attaches
+                    // only through `providers = ["dflash2"]`.
+                    tracing::info!(path = %dsp.display(), "skipping DFlash2 draft found as a DSpark sidecar");
+                }
                 Ok(f) => {
                     let draft = if crate::dspark::file_is_dspark(&f) {
                         None

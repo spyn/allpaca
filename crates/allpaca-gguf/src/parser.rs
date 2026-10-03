@@ -1179,6 +1179,13 @@ pub fn is_dspark_filename(name: &str) -> bool {
     l.contains("dspark") || l.contains("dflash")
 }
 
+/// A DFlash2 draft (`*DFlash2*.gguf`): a draft file like a DSpark sidecar,
+/// but only ever named by `model.draft_path`, never auto-attached.
+pub fn is_dflash2_filename(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.contains("dflash2") || l.contains("dflash-2")
+}
+
 pub fn is_split_gguf_name(name: &str) -> bool {
     parse_split_filename(name).is_some()
 }
@@ -1302,7 +1309,10 @@ fn collect_dspark_files(dir: &Path, nested: u32, hits: &mut Vec<std::path::PathB
             continue;
         }
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if path.extension().and_then(|e| e.to_str()) == Some("gguf") && is_dspark_filename(name) {
+        if path.extension().and_then(|e| e.to_str()) == Some("gguf")
+            && is_dspark_filename(name)
+            && !is_dflash2_filename(name)
+        {
             hits.push(path);
         }
     }
@@ -2538,9 +2548,28 @@ mod tests {
         assert_eq!(idx, 3);
         assert_eq!(total, 5);
         assert!(is_dspark_filename("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"));
+        assert!(is_dflash2_filename("Qwen3.8-27B-DFlash2-Q8_0.gguf"));
+        assert!(!is_dflash2_filename("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"));
         assert!(!is_dspark_filename(
             "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf"
         ));
+    }
+
+    #[test]
+    fn dspark_discovery_skips_a_dflash2_draft_in_a_sibling_dir() {
+        let root = std::env::temp_dir().join(format!("allpaca_dspark_disc_{}", std::process::id()));
+        let model_dir = root.join("Some-Model");
+        let draft_dir = root.join("Qwen3.8-27B-DFlash2-GGUF");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(&draft_dir).unwrap();
+        let target = model_dir.join("some-model-q8_0.gguf");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::write(draft_dir.join("Qwen3.8-27B-DFlash2-Q8_0.gguf"), b"x").unwrap();
+        assert_eq!(discover_dspark_sidecar(&target), None);
+        let sidecar = model_dir.join("dspark-some-model-Q8_0.gguf");
+        std::fs::write(&sidecar, b"x").unwrap();
+        assert_eq!(discover_dspark_sidecar(&target), Some(sidecar));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
