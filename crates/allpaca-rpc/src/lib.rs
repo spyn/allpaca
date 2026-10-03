@@ -7,6 +7,7 @@
 //! wire protocol so an AMD coordinator can drive an NVIDIA worker (and vice
 //! versa) as long as HELLO majors match.
 
+mod gpu_sysfs;
 mod protocol;
 mod session;
 mod worker;
@@ -14,6 +15,7 @@ mod worker;
 pub use protocol::{
     f32_to_f16_rne, quantize_q8_rows, MoeFfnRequest, MoeX,
     check_rpc_bind, encode_hello_reply, fnv1a64, is_loopback_bind_host, write_reply, BufId, Cmd,
+    DeviceStat,
     HelloReply, HelloRequest, KernelOp, LaunchItem, LaunchList, RpcBackendKind, KERNEL_ABI_REV,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
 };
@@ -227,11 +229,37 @@ mod tests {
         if allpaca_hip::device_count() == 0 {
             return;
         }
+        check_grouped_match_single(WorkerBackend::Hip(HipWorker::new(0).unwrap()));
+    }
+
+    /// The CUDA worker's fused K-quant MoE (port of the HIP kernels): Q5_K
+    /// gate/up with Q6_K down as in Qwen3-Next, and all-Q4_K.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_fused_kquant_moe_ffn_matches_reference() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        check_moe_ffn(WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")), MOE_KQUANT_FUSED);
+        check_moe_ffn(WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")), MOE_Q4K_FUSED);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loopback_cuda_grouped_experts_match_single_rows() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        check_grouped_match_single(WorkerBackend::Cuda(CudaWorker::new(0).unwrap()));
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn check_grouped_match_single(backend: WorkerBackend) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+            serve_connection(stream, backend).unwrap();
         });
         let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
         let (n_exp, dim, ff) = (3usize, 256usize, 256usize);
@@ -272,6 +300,144 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Cost of one fused MoeFfn call against the number of (row, expert)
+    /// pairs, at Qwen3-Next's expert shape (512 experts, dim 2048, ff 512,
+    /// Q5_K gate/up, Q6_K down), int8 rows in and F16 out as the coordinator
+    /// sends them. `ALLPACA_BENCH_RPC=host:port` (token in `ALLPACA_RPC_TOKEN`)
+    /// measures a remote worker; unset, a loopback HIP worker on this machine.
+    /// `cargo test --release -p allpaca-rpc --features hip --lib moe_cost_curve -- --ignored --nocapture`
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore]
+    fn moe_cost_curve() {
+        let remote = std::env::var("ALLPACA_BENCH_RPC").ok();
+        let mut worker = None;
+        let mut client = match &remote {
+            Some(ep) => {
+                let token = std::env::var("ALLPACA_RPC_TOKEN").unwrap_or_default();
+                RpcSession::connect_addr_with_token(ep, &token).unwrap()
+            }
+            None => {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                worker = Some(thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+                }));
+                RpcSession::connect_addr(&addr.to_string()).unwrap()
+            }
+        };
+        let (n_exp, dim, ff) = (512usize, 2048usize, 512usize);
+        // Weights do not change the cost: one quantized expert, repeated.
+        let one = |ty: u32, rows: usize, cols: usize| -> Vec<u8> {
+            let m: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 1000) as f32 - 500.0) * 1e-4).collect();
+            let q = quantize(ty, &m);
+            (0..n_exp).flat_map(|_| q.iter().copied()).collect()
+        };
+        let t = std::time::Instant::now();
+        let gate = client.put_tensor(13, &[dim as u32, ff as u32, n_exp as u32], &one(13, ff, dim), None).unwrap();
+        let up = client.put_tensor(13, &[dim as u32, ff as u32, n_exp as u32], &one(13, ff, dim), None).unwrap();
+        let down = client.put_tensor(14, &[ff as u32, dim as u32, n_exp as u32], &one(14, dim, ff), None).unwrap();
+        eprintln!("upload {:.1} s to {}", t.elapsed().as_secs_f64(), remote.as_deref().unwrap_or("loopback hip"));
+        let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: true };
+        let x: Vec<f32> = (0..8 * dim).map(|i| ((i % 97) as f32 - 48.0) * 0.02).collect();
+        for rows in [1usize, 4] {
+            for k in [1usize, 2, 4, 6, 8, 10] {
+                let pairs: Vec<(u32, u32, f32)> = (0..rows as u32)
+                    .flat_map(|r| (0..k as u32).map(move |j| (r, (r * 37 + j * 51) % 512, 0.1)))
+                    .collect();
+                for _ in 0..5 {
+                    client.moe_ffn(req, &x[..rows * dim], true, &pairs).unwrap();
+                }
+                let n = 40;
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    client.moe_ffn(req, &x[..rows * dim], true, &pairs).unwrap();
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                eprintln!("COST rows={rows} experts_per_row={k} pairs={} us={us:.0}", pairs.len());
+            }
+        }
+        drop(client);
+        if let Some(w) = worker {
+            w.join().unwrap();
+        }
+    }
+
+    /// Prints digests of K-quant GEMV and fused MoE outputs for fixed inputs,
+    /// to compare HIP and CUDA workers across machines bit for bit:
+    /// `cargo test --release -p allpaca-rpc --features <hip|cuda> --lib kquant_digest -- --ignored --nocapture`
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn kquant_digest() {
+        #[cfg(feature = "hip")]
+        let backend = WorkerBackend::Hip(HipWorker::new(0).unwrap());
+        #[cfg(all(feature = "cuda", not(feature = "hip")))]
+        let backend = WorkerBackend::Cuda(CudaWorker::new(0).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, backend).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let digest = |v: &[f32]| v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+        });
+        // Qwen3-Next's expert shape; 1-row calls (decode) and grouped rows.
+        let (dim, ff, n_exp) = (2048usize, 512usize, 4usize);
+        let mat = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((((i * 2654435761usize) ^ (seed * 40503)) % 1000) as f32 - 500.0) * 0.0007).collect()
+        };
+        let x: Vec<f32> = mat(77, 4 * dim).iter().map(|v| v * 9.0).collect();
+        for (gu, dn) in [(12u32, 12u32), (13, 14)] {
+            let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
+                let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
+                client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+            };
+            let (gate, up, down) = (put(gu, 1, ff, dim), put(gu, 5, ff, dim), put(dn, 9, dim, ff));
+            let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: false };
+            let pairs = [(0u32, 1u32, 0.6f32), (0, 3, 0.4), (1, 1, 0.5), (1, 2, 0.5), (2, 0, 1.0), (3, 1, 0.3), (3, 3, 0.7)];
+            for q8 in [false, true] {
+                let y = client.moe_ffn(req, &x, q8, &pairs).unwrap();
+                eprintln!("DIGEST moe gate_up={gu} down={dn} q8={q8}: {:016x} first={:?}", digest(&y), &y[..3]);
+                let one: Vec<(u32, u32, f32)> = (0..n_exp as u32).map(|e| (0, e, 0.25)).collect();
+                let y1 = client.moe_ffn(req, &x[..dim], q8, &one).unwrap();
+                let half = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &x[..dim], q8, &one).unwrap();
+                eprintln!("DIGEST moe1 gate_up={gu} down={dn} q8={q8}: {:016x} f16 {:016x}", digest(&y1), digest(&half));
+                // Prefill-sized: 20 rows, 2 experts each, groups of up to 8 rows.
+                let xs: Vec<f32> = mat(91, 20 * dim).iter().map(|v| v * 7.0).collect();
+                let many: Vec<(u32, u32, f32)> = (0..20u32)
+                    .flat_map(|r| [(r, r % 4, 0.7f32), (r, (r * 3 + 1) % 4, 0.3)])
+                    .collect();
+                let yp = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &xs, q8, &many).unwrap();
+                eprintln!("DIGEST moe20 gate_up={gu} down={dn} q8={q8}: {:016x}", digest(&yp));
+            }
+        }
+        // Real routing shape: 21 rows x 10 distinct experts of 64 (groups of
+        // 1-3 rows, the MR=4 template with short groups).
+        let n_exp = 64usize;
+        for (gu, dn) in [(13u32, 14u32)] {
+            let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
+                let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
+                client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+            };
+            let (gate, up, down) = (put(gu, 1, ff, dim), put(gu, 5, ff, dim), put(dn, 9, dim, ff));
+            let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: true };
+            let xs: Vec<f32> = mat(93, 21 * dim).iter().map(|v| v * 7.0).collect();
+            let many: Vec<(u32, u32, f32)> = (0..21u32)
+                .flat_map(|r| (0..10u32).map(move |j| (r, (r * 7 + j * 13 + j * j) % 64, 0.1)))
+                .collect();
+            for q8 in [false, true] {
+                let yp = client.moe_ffn(req, &xs, q8, &many).unwrap();
+                eprintln!("DIGEST moe21x10 q8={q8}: {:016x}", digest(&yp));
+            }
+        }
+        drop(client);
+        worker.join().unwrap();
+    }
+
     /// Expert tensor types, sizes, and the allowed error relative to the
     /// largest output (the fused kernels quantize activations to int8).
     struct MoeCase {
@@ -288,10 +454,13 @@ mod tests {
     const MOE_KQUANT: MoeCase =
         MoeCase { gate_up: 13, down: 14, dim: 256, ff: 256, tol: 3e-2, q8_exact: false };
     const MOE_KQUANT_FUSED: MoeCase = MoeCase { q8_exact: true, ..MOE_KQUANT };
+    #[cfg(feature = "cuda")]
+    const MOE_Q4K_FUSED: MoeCase = MoeCase { gate_up: 12, down: 12, ..MOE_KQUANT_FUSED };
 
     fn quantize(ty: u32, m: &[f32]) -> Vec<u8> {
         match ty {
             8 => allpaca_cpu::quantize_q8_0(m),
+            12 => allpaca_cpu::quantize_q4_k(m),
             13 => allpaca_cpu::quantize_q5_k(m),
             14 => allpaca_cpu::quantize_q6_k(m),
             _ => unreachable!("test type {ty}"),
@@ -304,6 +473,7 @@ mod tests {
         let mut w = vec![0.0f32; m.len()];
         match ty {
             8 => allpaca_cpu::dequant_q8_0(&q, w.len(), &mut w).unwrap(),
+            12 => allpaca_cpu::dequant_q4_k(&q, w.len(), &mut w).unwrap(),
             13 => allpaca_cpu::dequant_q5_k(&q, w.len(), &mut w).unwrap(),
             14 => allpaca_cpu::dequant_q6_k(&q, w.len(), &mut w).unwrap(),
             _ => unreachable!(),
@@ -452,6 +622,28 @@ mod tests {
             "{err}"
         );
         let _ = worker.join();
+    }
+
+    /// `DeviceStats` over a real session: one entry per worker device, with
+    /// memory in use tracking allocations.
+    #[test]
+    fn device_stats_roundtrip_over_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(8 << 20))).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let before = client.device_stats().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].name, "cpu");
+        assert_eq!((before[0].mem_used, before[0].mem_total), (0, 8 << 20));
+        assert_eq!((before[0].util_pct, before[0].temp_c, before[0].power_w), (-1, -1, -1));
+        let _buf = client.alloc(4096).unwrap();
+        assert_eq!(client.device_stats().unwrap()[0].mem_used, 4096);
+        drop(client);
+        worker.join().unwrap();
     }
 
     #[test]

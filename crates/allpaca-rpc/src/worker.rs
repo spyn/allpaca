@@ -257,7 +257,7 @@ impl CpuWorker {
             KernelOp::SiluMul => {
                 let mut gate = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
                 let up = f32_buf(self.slot(need(bufs, 1)?)?)?;
-                let n = gate.len().min(up.len());
+                let n = count(i32s, gate.len().min(up.len()));
                 for i in 0..n {
                     gate[i] = silu(gate[i]) * up[i];
                 }
@@ -266,7 +266,7 @@ impl CpuWorker {
             KernelOp::ResidualAdd => {
                 let mut dst = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
                 let src = f32_buf(self.slot(need(bufs, 1)?)?)?;
-                let n = dst.len().min(src.len());
+                let n = count(i32s, dst.len().min(src.len()));
                 for i in 0..n {
                     dst[i] += src[i];
                 }
@@ -366,6 +366,54 @@ impl CpuWorker {
                 write_f32(self.slot_mut(need(bufs, 0)?)?, &q)?;
                 write_f32(self.slot_mut(need(bufs, 1)?)?, &k)?;
             }
+            KernelOp::RmsNormRows => {
+                let (rows, dim) = (arg(i32s, 0, "rows")?, arg(i32s, 1, "dim")?);
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                let x = f32_buf(self.slot(need(bufs, 0)?)?)?;
+                let w = f32_buf(self.slot(need(bufs, 1)?)?)?;
+                let mut out = f32_buf(self.slot(need(bufs, 2)?)?)?.to_vec();
+                if rows * dim > x.len().min(out.len()) || dim > w.len() {
+                    return Err(RpcError::Worker("rmsnorm rows range".into()));
+                }
+                for r in 0..rows {
+                    let span = r * dim..(r + 1) * dim;
+                    rmsnorm(&x[span.clone()], &w[..dim], eps, &mut out[span]).map_err(map_kernel)?;
+                }
+                write_f32(self.slot_mut(need(bufs, 2)?)?, &out)?;
+            }
+            KernelOp::RopeRows | KernelOp::RopePartialRows => {
+                let rows = arg(i32s, 0, "rows")?;
+                let n_heads = arg(i32s, 1, "heads")?;
+                let n_kv = arg(i32s, 2, "kv heads")?;
+                let head_dim = arg(i32s, 3, "head dim")?;
+                let start = arg(i32s, 4, "start pos")?;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let mut q = f32_buf(self.slot(need(bufs, 0)?)?)?.to_vec();
+                let mut k = f32_buf(self.slot(need(bufs, 1)?)?)?.to_vec();
+                let (q_row, k_row) = (n_heads * head_dim, n_kv * head_dim);
+                if rows * q_row > q.len() || rows * k_row > k.len() {
+                    return Err(RpcError::Worker("rope rows range".into()));
+                }
+                for r in 0..rows {
+                    let pos = start + r;
+                    let qr = &mut q[r * q_row..(r + 1) * q_row];
+                    let kr = &mut k[r * k_row..(r + 1) * k_row];
+                    if op == KernelOp::RopeRows {
+                        for h in qr.chunks_exact_mut(head_dim).chain(kr.chunks_exact_mut(head_dim)) {
+                            rope(h, pos, theta).map_err(map_kernel)?;
+                        }
+                    } else {
+                        let n_rot = arg(i32s, 5, "n_rot")?;
+                        let sections = sections_of(f32s);
+                        allpaca_cpu::rope_imrope_neox_heads(qr, n_heads, head_dim, pos, theta, n_rot, sections)
+                            .map_err(map_kernel)?;
+                        allpaca_cpu::rope_imrope_neox_heads(kr, n_kv, head_dim, pos, theta, n_rot, sections)
+                            .map_err(map_kernel)?;
+                    }
+                }
+                write_f32(self.slot_mut(need(bufs, 0)?)?, &q)?;
+                write_f32(self.slot_mut(need(bufs, 1)?)?, &k)?;
+            }
             KernelOp::Memcpy => {
                 // i32s empty → full buffer copy; [dst_off, nbytes] → partial into dst.
                 let src = self.slot(need(bufs, 1)?)?.data.clone();
@@ -385,6 +433,24 @@ impl CpuWorker {
         }
         Ok(())
     }
+}
+
+/// Element count of an elementwise op: `i32s[0]` when given (multi-row
+/// batches use part of a larger buffer), else the whole buffer.
+fn count(i32s: &[i32], whole: usize) -> usize {
+    i32s.first()
+        .and_then(|&n| usize::try_from(n).ok())
+        .map_or(whole, |n| n.min(whole))
+}
+
+fn arg(i32s: &[i32], i: usize, what: &str) -> Result<usize, RpcError> {
+    i32s.get(i)
+        .and_then(|&v| usize::try_from(v).ok())
+        .ok_or_else(|| RpcError::Worker(format!("missing {what}")))
+}
+
+fn sections_of(f32s: &[f32]) -> [i32; 4] {
+    [1, 2, 3, 4].map(|i| *f32s.get(i).unwrap_or(&0.0) as i32)
 }
 
 fn need(bufs: &[BufId], i: usize) -> Result<BufId, RpcError> {
@@ -553,6 +619,7 @@ fn dequant_weight(ty: u32, bytes: &[u8], n: usize, out: &mut [f32]) -> Result<()
         35 => allpaca_cpu::dequant_tq2_0(bytes, n, out).map_err(bad),
         39 => allpaca_cpu::dequant_mxfp4(bytes, n, out).map_err(bad),
         100 => allpaca_cpu::dequant_rocmfp4(bytes, n, out).map_err(bad),
+        101 => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out).map_err(bad),
         other => Err(RpcError::Worker(format!(
             "ggml type {other} has no cpu dequant"
         ))),
@@ -753,6 +820,7 @@ fn hip_quant_gemm(
         35 => allpaca_hip::gemm_nt_tq2_0_device(a, b, c, m, n, k).map_err(bad),
         39 => allpaca_hip::gemm_nt_mxfp4_device(a, b, c, m, n, k).map_err(bad),
         100 => allpaca_hip::gemm_nt_rocmfp4_device(a, b, c, m, n, k).map_err(bad),
+        101 => allpaca_hip::gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k).map_err(bad),
         other => Err(RpcError::Worker(format!(
             "hip worker has no gemm for ggml type {other}"
         ))),
@@ -798,16 +866,26 @@ pub(crate) fn gfx906_expands_rocmfp4(arch: &str) -> bool {
     arch.split(':').next() == Some("gfx906")
 }
 
-/// Whole-block ROCmFP4 bytes to little-endian F32. `None` is not returned; a
-/// truncated blob is an error.
-pub(crate) fn expand_rocmfp4_f32(bytes: &[u8]) -> Result<Vec<u8>, RpcError> {
-    if bytes.is_empty() || bytes.len() % allpaca_cpu::ROCMFP4_BLOCK_BYTES != 0 {
+/// Whole-block ROCmFP4 bytes (`fast`: 17-byte type-101 blocks, else 18-byte
+/// type 100) to little-endian F32. `None` is not returned; a truncated blob
+/// is an error.
+pub(crate) fn expand_rocmfp4_f32(bytes: &[u8], fast: bool) -> Result<Vec<u8>, RpcError> {
+    let block_bytes = if fast {
+        allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES
+    } else {
+        allpaca_cpu::ROCMFP4_BLOCK_BYTES
+    };
+    if bytes.is_empty() || bytes.len() % block_bytes != 0 {
         return Err(RpcError::Worker("rocmfp4 blob is not whole blocks".into()));
     }
-    let n = bytes.len() / allpaca_cpu::ROCMFP4_BLOCK_BYTES * allpaca_cpu::ROCMFP4_BLOCK_ELEMS;
+    let n = bytes.len() / block_bytes * allpaca_cpu::ROCMFP4_BLOCK_ELEMS;
     let mut weights = vec![0.0f32; n];
-    allpaca_cpu::dequant_rocmfp4(bytes, n, &mut weights)
-        .map_err(|e| RpcError::Worker(e.to_string()))?;
+    if fast {
+        allpaca_cpu::dequant_rocmfp4_fast(bytes, n, &mut weights)
+    } else {
+        allpaca_cpu::dequant_rocmfp4(bytes, n, &mut weights)
+    }
+    .map_err(|e| RpcError::Worker(e.to_string()))?;
     let mut out = Vec::with_capacity(n * 4);
     for v in weights {
         out.extend_from_slice(&v.to_le_bytes());
@@ -1239,8 +1317,74 @@ impl HipWorker {
                     .rope_device(x, n_heads, head_dim, pos, theta)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
+            KernelOp::RmsNormRows => {
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let dim = arg(i32s, 1, "dim")? as i32;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                self.gpus[gpu]
+                    .hip
+                    .rmsnorm_device_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        self.ptr_f32(need(bufs, 2)?)?,
+                        rows,
+                        dim,
+                        eps,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopeRows => {
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let n_heads = arg(i32s, 1, "heads")? as i32;
+                let n_kv = arg(i32s, 2, "kv heads")? as i32;
+                let head_dim = arg(i32s, 3, "head dim")? as i32;
+                let start = arg(i32s, 4, "start pos")? as i32;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                self.gpus[gpu]
+                    .hip
+                    .rope_qk_device_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        rows,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        start,
+                        theta,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopePartialRows => {
+                let rows = arg(i32s, 0, "rows")?;
+                let n_heads = arg(i32s, 1, "heads")?;
+                let n_kv = arg(i32s, 2, "kv heads")?;
+                let head_dim = arg(i32s, 3, "head dim")?;
+                let start = arg(i32s, 4, "start pos")?;
+                let n_rot = arg(i32s, 5, "n_rot")? as i32;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let sections = sections_of(f32s);
+                let q = self.ptr_f32(need(bufs, 0)?)?;
+                let k = self.ptr_f32(need(bufs, 1)?)?;
+                for r in 0..rows {
+                    let pos = (start + r) as i32;
+                    self.gpus[gpu]
+                        .hip
+                        .rope_imrope_qk_device(
+                            q.wrapping_add(r * n_heads * head_dim),
+                            k.wrapping_add(r * n_kv * head_dim),
+                            n_heads as i32,
+                            n_kv as i32,
+                            head_dim as i32,
+                            n_rot,
+                            [pos; 3],
+                            theta,
+                            sections,
+                        )
+                        .map_err(|e| RpcError::Worker(e.to_string()))?;
+                }
+            }
             KernelOp::SiluMul => {
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 self.gpus[gpu]
                     .hip
                     .silu_mul_device(
@@ -1251,7 +1395,7 @@ impl HipWorker {
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::ResidualAdd => {
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 self.gpus[gpu]
                     .hip
                     .residual_add(
@@ -1319,6 +1463,9 @@ pub struct CudaWorker {
     hash_cache: HashMap<u64, Vec<u8>>,
     memory_bytes: u64,
     used: u64,
+    /// Grow-only device scratch for `MoeFfn` (inputs, pair table, kernel
+    /// scratch, output): pointer and bytes.
+    moe_scratch: Option<(*mut std::ffi::c_void, usize)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1326,6 +1473,9 @@ impl Drop for CudaWorker {
     fn drop(&mut self) {
         for (_, s) in self.slots.drain() {
             allpaca_cuda::device_free(s.ptr);
+        }
+        if let Some((p, _)) = self.moe_scratch.take() {
+            allpaca_cuda::device_free(p);
         }
     }
 }
@@ -1363,7 +1513,104 @@ impl CudaWorker {
             hash_cache: HashMap::new(),
             memory_bytes,
             used: 0,
+            moe_scratch: None,
         })
+    }
+
+    /// Routed experts of one layer over K-quant stacked tensors (gate, up,
+    /// down each `n_experts` equal slices): the HIP worker's fused path. One
+    /// H2D of `[x | pair table]`, four kernel launches, one D2H.
+    fn moe_ffn(
+        &mut self,
+        req: &crate::protocol::MoeFfnRequest,
+        x: &crate::protocol::MoeX,
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+        let (dim, ff, n_exp) = (req.dim as usize, req.ff as usize, req.n_experts.max(1) as usize);
+        let rows = x.len() / dim.max(1);
+        let qt = |ty: u32| match ty {
+            12 => Some(4i32),
+            13 => Some(5),
+            14 => Some(6),
+            _ => None,
+        };
+        let part = |id: BufId| -> Result<(*const u8, i32, u64), RpcError> {
+            let s = self.slot(id)?;
+            let q = qt(s.ggml_type).ok_or_else(|| {
+                RpcError::Worker(format!("cuda MoeFfn needs K-quant experts, got ggml type {}", s.ggml_type))
+            })?;
+            Ok((s.ptr.cast_const().cast(), q, (s.bytes / n_exp) as u64))
+        };
+        let experts = [part(req.gate)?, part(req.up)?, part(req.down)?];
+        if dim % 256 != 0 || ff % 256 != 0 {
+            return Err(RpcError::Worker("cuda MoeFfn needs dim and ff in 256-weight blocks".into()));
+        }
+        let (prefix, x_q8) = match x {
+            crate::protocol::MoeX::F32(v) => (v.clone(), None),
+            crate::protocol::MoeX::Q8 { q, d } => {
+                let mut v: Vec<f32> = q
+                    .chunks_exact(4)
+                    .map(|b| f32::from_bits(u32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8])))
+                    .collect();
+                v.resize(v.len().next_multiple_of(64), 0.0);
+                let d_off = v.len();
+                v.extend_from_slice(d);
+                (v, Some(d_off))
+            }
+        };
+        let table = allpaca_hip::MoePairTable::new(rows, pairs, &prefix);
+        let out_off = table.end;
+        let work_off = (out_off + rows * dim).next_multiple_of(64);
+        let bytes = work_off * 4 + allpaca_cuda::moe_ffn_scratch_bytes(rows, dim, ff, table.pairs) as usize;
+        if self.moe_scratch.is_none_or(|(_, have)| have < bytes) {
+            if let Some((p, _)) = self.moe_scratch.take() {
+                self.cuda.synchronize().map_err(bad)?;
+                allpaca_cuda::device_free(p);
+            }
+            let cap = bytes.max(1 << 20);
+            let p = allpaca_cuda::device_malloc(cap, self.device).map_err(bad)?;
+            self.moe_scratch = Some((p, cap));
+        }
+        let base = self.moe_scratch.expect("moe scratch").0.cast::<f32>();
+        let at = |i: usize| unsafe { base.add(i) };
+        let stream = self.cuda.raw_stream();
+        let host = &table.host;
+        allpaca_cuda::memcpy_on(base.cast(), host.as_ptr().cast(), host.len() * 4, allpaca_cuda::MEMCPY_H2D, stream)
+            .map_err(bad)?;
+        let (xf, xq, xd) = match x_q8 {
+            None => (base.cast_const(), std::ptr::null(), std::ptr::null()),
+            Some(d_off) => (std::ptr::null(), base.cast::<i8>().cast_const(), at(d_off).cast_const()),
+        };
+        let int = |i: usize| at(i).cast::<i32>().cast_const();
+        self.cuda
+            .moe_ffn_kquant_dev(
+                xf,
+                xq,
+                xd,
+                rows,
+                dim,
+                ff,
+                table.pairs,
+                int(table.row),
+                int(table.expert),
+                at(table.w).cast_const(),
+                int(table.row_start),
+                table.groups,
+                int(table.group_start),
+                int(table.row_pairs),
+                table.max_group,
+                experts,
+                at(work_off).cast(),
+                at(out_off),
+            )
+            .map_err(bad)?;
+        let mut out = vec![0.0f32; rows * dim];
+        allpaca_cuda::memcpy_on(out.as_mut_ptr().cast(), at(out_off).cast_const().cast(), rows * dim * 4,
+            allpaca_cuda::MEMCPY_D2H, stream)
+            .map_err(bad)?;
+        self.cuda.synchronize().map_err(bad)?;
+        Ok(out)
     }
 
     fn hello(&self) -> HelloReply {
@@ -1611,7 +1858,7 @@ impl CudaWorker {
             }
             KernelOp::SiluMul => {
                 // Wire ABI matches HIP: in-place silu(gate)*up into buf0.
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 let gate = self.ptr_f32(need(bufs, 0)?)?;
                 let up = self.ptr_f32(need(bufs, 1)?)?;
                 self.cuda
@@ -1620,21 +1867,133 @@ impl CudaWorker {
             }
             KernelOp::ResidualAdd => {
                 // Wire ABI matches HIP: in-place x += residual into buf0.
-                let n = (self.slot(need(bufs, 0)?)?.bytes / 4) as i32;
+                let n = count(i32s, (self.slot(need(bufs, 0)?)?.bytes / 4) as usize) as i32;
                 let x = self.ptr_f32(need(bufs, 0)?)?;
                 let y = self.ptr_f32(need(bufs, 1)?)?;
                 self.cuda
                     .residual_add_dev(x, y, x, n)
                     .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
-            KernelOp::GemmNtQuant
-            | KernelOp::DeinterleaveQGate
-            | KernelOp::RmsNormHeads
-            | KernelOp::SigmoidMul
-            | KernelOp::RopePartial => {
-                return Err(RpcError::Worker(
-                    "quant gemm and gated attention are implemented on CPU and HIP workers".into(),
-                ));
+            KernelOp::RmsNormRows => {
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let dim = arg(i32s, 1, "dim")? as i32;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                self.cuda
+                    .rmsnorm_dev_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        self.ptr_f32(need(bufs, 2)?)?,
+                        rows,
+                        dim,
+                        eps,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopeRows => {
+                let rows = arg(i32s, 0, "rows")? as i32;
+                let n_heads = arg(i32s, 1, "heads")? as i32;
+                let n_kv = arg(i32s, 2, "kv heads")? as i32;
+                let head_dim = arg(i32s, 3, "head dim")? as i32;
+                let start = arg(i32s, 4, "start pos")? as i32;
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                self.cuda
+                    .rope_qk_dev_rows(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        rows,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        n_heads * head_dim,
+                        n_kv * head_dim,
+                        start,
+                        theta,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RopePartial | KernelOp::RopePartialRows => {
+                // RopePartial: [n_heads, n_kv, head_dim, pos, n_rot];
+                // RopePartialRows: [rows, n_heads, n_kv, head_dim, start, n_rot].
+                let o = usize::from(op == KernelOp::RopePartialRows);
+                let rows = if o == 1 { arg(i32s, 0, "rows")? } else { 1 };
+                let n_heads = arg(i32s, o, "heads")?;
+                let n_kv = arg(i32s, o + 1, "kv heads")?;
+                let head_dim = arg(i32s, o + 2, "head dim")?;
+                let start = arg(i32s, o + 3, "pos")?;
+                let n_rot = *i32s.get(o + 4).unwrap_or(&(head_dim as i32));
+                let theta = *f32s.first().unwrap_or(&10_000.0);
+                let sections = sections_of(f32s);
+                let (q, k) = (self.ptr_f32(need(bufs, 0)?)?, self.ptr_f32(need(bufs, 1)?)?);
+                for r in 0..rows {
+                    self.cuda
+                        .rope_imrope_qk_dev(
+                            q.wrapping_add(r * n_heads * head_dim),
+                            k.wrapping_add(r * n_kv * head_dim),
+                            n_heads as i32,
+                            n_kv as i32,
+                            head_dim as i32,
+                            n_rot,
+                            (start + r) as i32,
+                            theta,
+                            sections,
+                        )
+                        .map_err(|e| RpcError::Worker(e.to_string()))?;
+                }
+            }
+            KernelOp::GemmNtQuant => {
+                let m = arg(i32s, 0, "gemm m")? as i32;
+                let n = arg(i32s, 1, "gemm n")? as i32;
+                let k = arg(i32s, 2, "gemm k")? as i32;
+                let a = self.ptr_f32(need(bufs, 0)?)?;
+                let b_id = need(bufs, 1)?;
+                let (ty, b) = (self.slot(b_id)?.ggml_type, self.slot(b_id)?.ptr);
+                let c = self.ptr_f32(need(bufs, 2)?)?;
+                match ty {
+                    0 => self.cuda.gemm_nt_dev(a, b.cast(), c, m, n, k),
+                    // Staged 36-byte blocks (see `WorkerBackend::stage_q8_0`).
+                    8 => self.cuda.gemm_nt_q8_0_dev(a, b.cast(), c, m, n, k),
+                    // GGUF K-quant blocks as uploaded.
+                    12..=14 => self.cuda.gemm_nt_kquant_dev(ty as i32 - 8, a, b.cast(), c, m, n, k),
+                    _ => {
+                        return Err(RpcError::Worker(format!(
+                            "cuda worker has no gemm for ggml type {ty}"
+                        )))
+                    }
+                }
+                .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::DeinterleaveQGate => {
+                let n_heads = arg(i32s, 0, "deinterleave heads")? as i32;
+                let head_dim = arg(i32s, 1, "deinterleave head")? as i32;
+                self.cuda
+                    .deinterleave_q_gate_dev(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        self.ptr_f32(need(bufs, 2)?)?,
+                        n_heads,
+                        head_dim,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::RmsNormHeads => {
+                let n_heads = arg(i32s, 0, "rmsnorm heads")? as i32;
+                let head_dim = arg(i32s, 1, "rmsnorm head")? as i32;
+                let eps = *f32s.first().unwrap_or(&1e-5);
+                self.cuda
+                    .rmsnorm_heads_dev(
+                        self.ptr_f32(need(bufs, 0)?)?,
+                        self.ptr_f32(need(bufs, 1)?)?,
+                        n_heads,
+                        head_dim,
+                        eps,
+                    )
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
+            }
+            KernelOp::SigmoidMul => {
+                let n = arg(i32s, 0, "sigmoid n")? as i32;
+                self.cuda
+                    .sigmoid_mul_dev(self.ptr_f32(need(bufs, 0)?)?, self.ptr_f32(need(bufs, 1)?)?, n)
+                    .map_err(|e| RpcError::Worker(e.to_string()))?;
             }
             KernelOp::Memcpy => {
                 if i32s.len() >= 2 {
@@ -1705,7 +2064,7 @@ impl WorkerBackend {
             #[cfg(feature = "hip")]
             Self::Hip(w) => w.moe_ffn(req, x, pairs),
             #[cfg(feature = "cuda")]
-            Self::Cuda(_) => Err(RpcError::Worker("CUDA worker has no MoeFfn yet".into())),
+            Self::Cuda(w) => w.moe_ffn(req, x, pairs),
         }
     }
 
@@ -1753,6 +2112,12 @@ impl WorkerBackend {
                 .map(Some)
                 .map_err(|e| RpcError::Worker(e.to_string()));
         }
+        #[cfg(feature = "cuda")]
+        if ggml_type == 8 && matches!(self, Self::Cuda(_)) {
+            return allpaca_cuda::stage_q8_0_blocks(bytes)
+                .map(Some)
+                .map_err(|e| RpcError::Worker(e.to_string()));
+        }
         let _ = (ggml_type, bytes);
         Ok(None)
     }
@@ -1765,7 +2130,7 @@ impl WorkerBackend {
         bytes: &[u8],
         device: Option<u32>,
     ) -> Result<Option<Vec<u8>>, RpcError> {
-        if ggml_type != 100 {
+        if !matches!(ggml_type, 100 | 101) {
             return Ok(None);
         }
         #[cfg(feature = "hip")]
@@ -1780,7 +2145,7 @@ impl WorkerBackend {
             let expand = allpaca_hip::device_gcn_arch(dev)
                 .is_some_and(|(arch, _)| gfx906_expands_rocmfp4(&arch));
             if expand {
-                return expand_rocmfp4_f32(bytes).map(Some);
+                return expand_rocmfp4_f32(bytes, ggml_type == 101).map(Some);
             }
         }
         let _ = (bytes, device);
@@ -1803,6 +2168,60 @@ impl WorkerBackend {
                     return Err(RpcError::Worker("cuda worker has one device".into()));
                 }
                 w.alloc(bytes)
+            }
+        }
+    }
+
+    /// Per-device stats. HIP workers on Linux read amdgpu sysfs (device-wide
+    /// VRAM, busy percent, temperature, power); elsewhere memory comes from
+    /// the runtime and the rest is unreported.
+    fn device_stats(&self) -> Vec<crate::protocol::DeviceStat> {
+        use crate::protocol::DeviceStat;
+        match self {
+            Self::Cpu(w) => vec![DeviceStat {
+                name: "cpu".into(),
+                mem_used: w.used,
+                mem_total: w.memory_bytes,
+                util_pct: -1,
+                temp_c: -1,
+                power_w: -1,
+            }],
+            #[cfg(feature = "hip")]
+            Self::Hip(w) => {
+                let cards = crate::gpu_sysfs::amd_cards();
+                w.gpus
+                    .iter()
+                    .map(|g| {
+                        let (free, total) =
+                            allpaca_hip::device_memory_info(g.device).unwrap_or((0, g.total));
+                        let mut stat = DeviceStat {
+                            name: format!("hip:{}", g.device),
+                            mem_used: total.saturating_sub(free),
+                            mem_total: total,
+                            util_pct: -1,
+                            temp_c: -1,
+                            power_w: -1,
+                        };
+                        // HIP enumerates AMD cards in PCI order, as sysfs does.
+                        if let Some(card) = usize::try_from(g.device).ok().and_then(|i| cards.get(i)) {
+                            card.fill(&mut stat);
+                        }
+                        stat
+                    })
+                    .collect()
+            }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(w) => {
+                let (free, total) = allpaca_cuda::device_memory_info(w.device)
+                    .unwrap_or((w.memory_bytes.saturating_sub(w.used), w.memory_bytes));
+                vec![DeviceStat {
+                    name: format!("cuda:{}", w.device),
+                    mem_used: total.saturating_sub(free),
+                    mem_total: total,
+                    util_pct: -1,
+                    temp_c: -1,
+                    power_w: -1,
+                }]
             }
         }
     }
@@ -2082,6 +2501,7 @@ fn handle(
             write_u32(&mut out, backend.device_count());
             Ok(out)
         }
+        Cmd::DeviceStats => Ok(crate::protocol::encode_device_stats(&backend.device_stats())),
         Cmd::Sync => {
             backend.sync()?;
             Ok(Vec::new())
@@ -2128,7 +2548,8 @@ fn run_span(backend: &mut WorkerBackend, payload: &[u8]) -> Result<Vec<u8>, RpcE
     for i in 1..steps.len() {
         let src = steps[i - 1].0;
         let dst = steps[i].0;
-        if backend.copy(src, dst).is_err() {
+        // Batched steps on one device run in place in a shared row buffer.
+        if src != dst && backend.copy(src, dst).is_err() {
             let mid = backend.d2h(src, 0, nbytes)?;
             backend.h2d(dst, 0, &mid)?;
         }
@@ -2174,7 +2595,16 @@ mod tests {
         block[0] = 0x21;
         block[16] = 0x38;
         block[17] = 0x38;
-        let f32_bytes = expand_rocmfp4_f32(&block).unwrap();
+        // FAST (type 101) blocks expand through their own 17-byte layout.
+        let vals: Vec<f32> = (0..64).map(|i| (i as f32 - 20.0) * 0.07).collect();
+        let fast = allpaca_cpu::quantize_rocmfp4_fast(&vals);
+        let got = expand_rocmfp4_f32(&fast, true).unwrap();
+        let mut want = vec![0.0f32; 64];
+        allpaca_cpu::dequant_rocmfp4_fast(&fast, 64, &mut want).unwrap();
+        let want: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(got, want);
+        assert!(expand_rocmfp4_f32(&fast, false).is_err(), "34 bytes is not whole 18-byte blocks");
+        let f32_bytes = expand_rocmfp4_f32(&block, false).unwrap();
         assert_eq!(
             f32_bytes.len(),
             allpaca_cpu::ROCMFP4_BLOCK_ELEMS * 4

@@ -626,7 +626,7 @@ fn apply_moe_vulkan(
     metrics.elementwise_gpu_ops.fetch_add(1, Ordering::Relaxed);
     let n_exp = cfg.n_experts.max(1);
     let n_act = cfg.n_active.max(1).min(n_exp);
-    let routed = topk_route(&scratch[..dim], &host.w_router, n_exp, n_act, cfg, None);
+    let routed = topk_route(&scratch[..dim], &host.w_router, n_exp, n_act, cfg, None, &host.expert_bias);
     let mut acc = vec![0.0f32; dim];
     let mut gate = vec![0.0f32; ff];
     let mut up = vec![0.0f32; ff];

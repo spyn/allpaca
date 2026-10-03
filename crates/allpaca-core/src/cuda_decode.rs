@@ -1882,7 +1882,7 @@ fn apply_moe_prefill_cuda(
     let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
     let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for t in 0..n_tok {
-        let routed = topk_route(&x_norm[t * dim..(t + 1) * dim], router, n_exp, n_act, cfg, None);
+        let routed = topk_route(&x_norm[t * dim..(t + 1) * dim], router, n_exp, n_act, cfg, None, &host.expert_bias);
         for &(e, _) in &routed {
             union.insert(e);
         }
@@ -2716,7 +2716,7 @@ fn apply_moe_cuda(
 
     let n_exp = cfg.n_experts.max(1);
     let n_act = cfg.n_active.max(1).min(n_exp);
-    let routed = topk_route(&scratch[..dim], &host.w_router, n_exp, n_act, cfg, None);
+    let routed = topk_route(&scratch[..dim], &host.w_router, n_exp, n_act, cfg, None, &host.expert_bias);
 
     let mut acc = vec![0.0f32; dim];
     let mut expert_out = vec![0.0f32; dim];

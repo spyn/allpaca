@@ -160,6 +160,7 @@ struct EngineInner {
     draft_model: Option<Arc<TinyModel>>,
     ngram: NGramProvider,
     dspark: Option<crate::dspark::DsparkProvider>,
+    dflash2: Option<crate::dflash2::Dflash2Provider>,
     active: HashMap<u64, ActiveRequest>,
     next_request_id: u64,
     model_id: String,
@@ -240,6 +241,24 @@ pub struct Engine {
     /// several Requests with `inner` released in between, and no other tick
     /// may step them before their batched forward lands.
     poll_tick: Arc<Mutex<()>>,
+    /// Last values `stats` / `model_id` read under `inner`, served while a
+    /// prefill holds the engine lock.
+    read_side: Arc<Mutex<ReadSide>>,
+}
+
+/// How long a monitoring read waits for the engine lock. Decode releases it
+/// between tokens; a prefill holds it for the whole time to first token, and
+/// a dashboard poll must not hang that long.
+const READ_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Clone, Default)]
+struct ReadSide {
+    model_id: Option<String>,
+    target_name: Option<String>,
+    kv_h2d: u64,
+    kv_d2h: u64,
+    draft_kv_bytes: u64,
+    draft_depth: u64,
 }
 
 pub struct RequestHandle {
@@ -512,6 +531,7 @@ impl Engine {
             draft_model: None,
             ngram: NGramProvider::new(config.speculative.ngram_n),
             dspark: None,
+            dflash2: None,
             active: HashMap::new(),
             next_request_id: 1,
             model_id: config.model.id.clone(),
@@ -555,6 +575,7 @@ impl Engine {
             gpu_sampler: Arc::new(GpuSampler::default()),
             rpc,
             poll_tick: Arc::new(Mutex::new(())),
+            read_side: Arc::new(Mutex::new(ReadSide::default())),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -643,6 +664,11 @@ impl Engine {
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// Live stats for every GPU on the RPC workers (empty without RPC).
+    pub fn remote_gpus(&self) -> Vec<crate::rpc_runtime::RemoteGpu> {
+        self.rpc.as_ref().map(|r| r.remote_gpu_stats()).unwrap_or_default()
     }
 
     /// The loaded target's expert controls, sized to its routed experts.
@@ -775,7 +801,7 @@ impl Engine {
             let util = if wall_us > 0.0 { gpu_us / wall_us } else { 0.0 };
             self.metrics
                 .record_gpu_sample(used, total, draft_used, draft_total, util);
-            if let Ok(g) = self.lock() {
+            if let Some(g) = self.lock_for_read() {
                 if let Some(lru) = g.target.as_ref().and_then(|m| m.expert_lru.as_ref()) {
                     lru.set_gpu_busy(util);
                 }
@@ -837,8 +863,8 @@ impl Engine {
 
     pub fn stats(&self) -> StatsSnapshot {
         self.sample_gpu();
-        let (model_id, kv_h2d, kv_d2h, draft_kv_bytes) = match self.lock() {
-            Ok(g) => {
+        let (model_id, kv_h2d, kv_d2h, draft_kv_bytes, draft_depth) = match self.lock_for_read() {
+            Some(g) => {
                 if let Some(ws) = g.target.as_ref().and_then(|m| m.working_set.as_ref()) {
                     self.metrics
                         .weight_ring_binds
@@ -958,7 +984,7 @@ impl Engine {
                 self.metrics
                     .kv_nvme_prefetches
                     .store(g.kv.nvme_prefetches(), std::sync::atomic::Ordering::Relaxed);
-                (
+                let fresh = (
                     g.target
                         .as_ref()
                         .map(|m| m.name.clone())
@@ -966,9 +992,26 @@ impl Engine {
                     g.kv.activation_h2d_bytes(),
                     g.kv.activation_d2h_bytes(),
                     g.draft_kv.device_bytes(),
+                    g.scheduler.draft_depth as u64,
+                );
+                drop(g);
+                if let Ok(mut c) = self.read_side.lock() {
+                    c.target_name = Some(fresh.0.clone());
+                    (c.kv_h2d, c.kv_d2h, c.draft_kv_bytes, c.draft_depth) =
+                        (fresh.1, fresh.2, fresh.3, fresh.4);
+                }
+                fresh
+            }
+            None => {
+                let c = self.read_side.lock().map(|c| c.clone()).unwrap_or_default();
+                (
+                    c.target_name.unwrap_or_else(|| self.config.model.id.clone()),
+                    c.kv_h2d,
+                    c.kv_d2h,
+                    c.draft_kv_bytes,
+                    c.draft_depth,
                 )
             }
-            Err(_) => (self.config.model.id.clone(), 0, 0, 0),
         };
         let (backend, device_memory_bytes) =
             if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
@@ -1131,11 +1174,6 @@ impl Engine {
         } else {
             "p2p_unavailable"
         };
-        let draft_depth = self
-            .lock()
-            .ok()
-            .map(|g| g.scheduler.draft_depth as u64)
-            .unwrap_or(0);
         self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
@@ -1155,10 +1193,40 @@ impl Engine {
     }
 
     pub fn model_id(&self) -> String {
-        self.lock()
-            .ok()
-            .map(|g| g.model_id.clone())
-            .unwrap_or_else(|| self.config.model.id.clone())
+        match self.lock_for_read() {
+            Some(g) => {
+                let id = g.model_id.clone();
+                drop(g);
+                if let Ok(mut c) = self.read_side.lock() {
+                    c.model_id = Some(id.clone());
+                }
+                id
+            }
+            None => self
+                .read_side
+                .lock()
+                .ok()
+                .and_then(|c| c.model_id.clone())
+                .unwrap_or_else(|| self.config.model.id.clone()),
+        }
+    }
+
+    /// The engine lock for a monitoring read: gives up after
+    /// [`READ_LOCK_WAIT`] (or on a poisoned lock) so the caller serves its
+    /// last values instead.
+    fn lock_for_read(&self) -> Option<std::sync::MutexGuard<'_, EngineInner>> {
+        let deadline = std::time::Instant::now() + READ_LOCK_WAIT;
+        loop {
+            match self.inner.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::WouldBlock)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                Err(_) => return None,
+            }
+        }
     }
 
     pub fn has_model(&self) -> bool {
@@ -1261,12 +1329,19 @@ impl Engine {
         if local_devices.is_empty() {
             local_devices.push((0, 8 << 30));
         }
+        let rpc_max_seq = rpc_kv_max_seq(
+            self.config.rpc.max_seq,
+            self.config.kv.vram_bytes as u64,
+            model,
+        );
         if let Some(rt) = &self.rpc {
+            rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
+            rt.set_prefill_rows(self.config.rpc.prefill_rows);
             rt.prepare(
                 model,
                 &local_devices,
                 self.config.rpc.tensor_split.as_deref(),
-                self.config.rpc.max_seq,
+                rpc_max_seq,
                 gguf,
                 self.config.kv.vram_bytes as u64,
                 draft_bytes,
@@ -1281,11 +1356,13 @@ impl Engine {
         }
         if local_devices.len() > 1 {
             let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[], None)?);
+            rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
+            rt.set_prefill_rows(self.config.rpc.prefill_rows);
             rt.prepare(
                 model,
                 &local_devices,
                 self.config.rpc.tensor_split.as_deref(),
-                self.config.rpc.max_seq,
+                rpc_max_seq,
                 gguf,
                 self.config.kv.vram_bytes as u64,
                 draft_bytes,
@@ -1631,14 +1708,25 @@ impl Engine {
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut draft_reuses_target_gguf = false;
-        let draft_path_is_dspark = self.config.model.draft_path.as_ref().is_some_and(|p| {
-            is_dspark_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or(""))
-        });
+        // A DFlash2 draft's file name also reads as a DSpark sidecar.
+        let draft_path_is_dspark = !self
+            .config
+            .speculative
+            .providers
+            .contains(&DraftProviderKind::Dflash2)
+            && self.config.model.draft_path.as_ref().is_some_and(|p| {
+                is_dspark_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or(""))
+            });
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, EngineTokenizer::from_gguf(tok));
+        let draft_path_is_dflash2 = self
+            .config
+            .speculative
+            .providers
+            .contains(&DraftProviderKind::Dflash2);
         if let Some(draft_path) = &self.config.model.draft_path {
-            if !draft_path_is_dspark {
+            if !draft_path_is_dspark && !draft_path_is_dflash2 {
                 let opened =
                     self.resolve_configured_path(draft_path)
                         .and_then(|(resolved, preferred)| {
@@ -1703,11 +1791,18 @@ impl Engine {
         }
         let dspark_path = if draft_path_is_dspark {
             self.config.model.draft_path.clone()
+        } else if draft_path_is_dflash2 {
+            None
         } else {
             discover_dspark_sidecar(path)
         };
         if let Some(dsp) = dspark_path {
             match GgufFile::open(&dsp) {
+                Ok(f) if crate::dflash2::Dflash2Spec::from_gguf(&f).is_some() => {
+                    // A DFlash2 draft is not a DSpark sidecar; it attaches
+                    // only through `providers = ["dflash2"]`.
+                    tracing::info!(path = %dsp.display(), "skipping DFlash2 draft found as a DSpark sidecar");
+                }
                 Ok(f) => {
                     let draft = if crate::dspark::file_is_dspark(&f) {
                         None
@@ -1824,7 +1919,91 @@ impl Engine {
             draft_file.as_ref()
         };
         self.upload_resident_from_gguf(Some(file.as_ref()), draft_ref)?;
+        self.attach_dflash2();
         self.note_early_exit_gate()
+    }
+
+    /// Loads the DFlash2 draft named by `model.draft_path` onto the draft GPU
+    /// (the target GPU when there is none). It reads the target's embeddings
+    /// and lm_head in place and taps its layer inputs.
+    fn attach_dflash2(&self) {
+        if !self.config.speculative.enabled
+            || !self
+                .config
+                .speculative
+                .providers
+                .contains(&DraftProviderKind::Dflash2)
+        {
+            return;
+        }
+        let loaded = (|| -> Result<crate::dflash2::Dflash2Provider, AllpacaError> {
+            let path = self.config.model.draft_path.clone().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "speculative provider dflash2 needs model.draft_path".into(),
+                ))
+            })?;
+            let (resolved, preferred) = self.resolve_configured_path(&path)?;
+            let file = GgufFile::open(&discover_checkpoint(&resolved, preferred.as_deref())?.weights)?;
+            let spec = crate::dflash2::Dflash2Spec::from_gguf(&file).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{} is not a DFlash2 draft",
+                    resolved.display()
+                )))
+            })?;
+            let (target, resident) = {
+                let g = self.lock()?;
+                (g.target.clone(), g.target_resident.clone())
+            };
+            let target = target.ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+            let no_hip = || {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "DFlash2 needs the target resident on HIP".into(),
+                ))
+            };
+            let resident = resident.ok_or_else(no_hip)?;
+            let target_hip = self.hip.clone().ok_or_else(no_hip)?;
+            if spec.dim != target.config.dim {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "DFlash2 width {} != target {}",
+                    spec.dim, target.config.dim
+                ))));
+            }
+            let device = std::env::var("ALLPACA_DFLASH2_DEVICE")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or_else(|| {
+                    self.draft_hip
+                        .as_ref()
+                        .map_or(target_hip.device, |h| h.device)
+                });
+            let hip = Arc::new(HipWorkspace::new(device, 8 * 1024 * 1024, 256)?);
+            let head = crate::dflash2::ResidentHead::new(
+                target_hip,
+                resident,
+                target.config.dim,
+                target.config.vocab_size,
+                spec.block_size,
+            )?;
+            crate::dflash2::Dflash2Provider::load(
+                &file,
+                hip,
+                Arc::clone(&target.layer_capture),
+                Box::new(head),
+            )
+        })();
+        match loaded {
+            Ok(p) => {
+                if let Ok(mut g) = self.lock() {
+                    g.dflash2 = Some(p);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DFlash2 draft failed; continuing without it");
+                self.metrics
+                    .degraded_events
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     fn upload_resident_weights(&self) -> Result<(), AllpacaError> {
@@ -2170,11 +2349,16 @@ impl Engine {
         images: &[crate::ImageInput],
         params: GenerationParams,
     ) -> Result<GenerationOutput, AllpacaError> {
-        let own_stops = params.stop_token_ids.clone();
         let mut handle = self.begin_request_multimodal(prompt, images, params)?;
         let mut token_ids = Vec::new();
+        // The reply text is the stream's text, so a blocking reply and a
+        // streamed one are the same string: special tokens the model emits
+        // (`<think>`) are kept, the stop token's text is not, and characters
+        // split across tokens are joined.
+        let mut text = String::new();
         let finish = self.drive_request(&mut handle, |ev| {
             token_ids.push(ev.token_id);
+            text.push_str(&ev.text);
             ev.finish_reason
         })?;
         tracing::info!(
@@ -2184,24 +2368,6 @@ impl Engine {
             ?finish,
             "generate tokens"
         );
-        let text = {
-            let inner = self.lock()?;
-            let tokenizer = inner
-                .tokenizer
-                .as_ref()
-                .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-            // Same as the stream: a final stop token is not decoded into text.
-            let ends_on_stop = finish == FinishReason::Stop
-                && token_ids
-                    .last()
-                    .is_some_and(|t| own_stops.contains(t) || tokenizer.stop_token_ids().contains(t));
-            let body = if ends_on_stop {
-                &token_ids[..token_ids.len() - 1]
-            } else {
-                &token_ids[..]
-            };
-            tokenizer.decode(body)?
-        };
         let prompt_tokens = handle_prompt_len(&handle, &self.inner)?;
         Ok(GenerationOutput {
             text,
@@ -3352,18 +3518,28 @@ impl Engine {
         let structured = json_constraints && self.config.structured_output.enabled;
         let suppress_draft = request(&inner, id)?.suppress_draft;
         let spec_limit = self.config.speculative.max_concurrent_requests;
-        let crowded = spec_limit > 0
-            && inner.active.values().filter(|r| !r.finished).count() > spec_limit;
+        let live = inner.active.values().filter(|r| !r.finished).count();
+        // DFlash2 keeps one sequence's context ring: with company it steps
+        // aside and the requests batch-decode instead.
+        let crowded = (spec_limit > 0 && live > spec_limit) || (inner.dflash2.is_some() && live > 1);
         let speculate = self.config.speculative.enabled
             && (inner.flags.ngram_speculation
                 || inner.flags.draft_model_speculation
-                || inner.dspark.is_some())
+                || inner.dspark.is_some()
+                || inner.dflash2.is_some())
             && !suppress_draft
             && !crowded;
+        // One DFlash2 pass drafts the whole block at the same cost, so it
+        // always proposes the full block; verify then takes what matches.
+        let step_depth = match (speculate, inner.dflash2.as_ref()) {
+            (false, _) => 0,
+            (true, Some(p)) => (p.spec().block_size - 1).min(self.config.speculative.max_depth),
+            (true, None) => inner.scheduler.step_depth(),
+        };
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
             let remaining = active.params.max_tokens.saturating_sub(active.generated);
-            let depth = inner.scheduler.draft_depth.min(remaining.saturating_sub(1));
+            let depth = step_depth.min(remaining.saturating_sub(1));
             (
                 active.params.json_mode && structured && active.grammar.is_none(),
                 active.json_prefix.clone(),
@@ -3437,6 +3613,7 @@ impl Engine {
             #[cfg(feature = "vulkan")]
             vulkan: self.vulkan.as_deref(),
         };
+        let step_started = Instant::now();
         let produced = if use_tree {
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
             let draft = if inner.flags.draft_model_speculation {
@@ -3492,6 +3669,14 @@ impl Engine {
                 &hooks,
             )?
         };
+        // Cost of this step by rows verified, for the throughput-aware depth
+        // (a staged batched span finishes elsewhere and is not a solo step).
+        if speculate && !use_tree && !produced.tokens.is_empty() {
+            inner.scheduler.record_step_time(
+                produced.proposed as usize + 1,
+                step_started.elapsed().as_secs_f64() * 1e6,
+            );
+        }
         if produced.tokens.is_empty()
             && inner
                 .staged_decode
@@ -3963,9 +4148,11 @@ impl Engine {
         let cfg = &self.config;
         // N-gram verify spans ride along in the batched forward; draft-model,
         // DSpark and tree speculation run their own forwards.
+        let live = inner.active.values().filter(|r| !r.finished).count();
         let own_forward_spec = cfg.speculative.enabled
             && (inner.flags.draft_model_speculation
                 || inner.dspark.is_some()
+                || (inner.dflash2.is_some() && live <= 1)
                 || inner.flags.tree_speculation);
         let structured = inner.flags.json_constraints && cfg.structured_output.enabled;
         let mut ids: Vec<(Instant, u64)> = inner
@@ -4958,6 +5145,20 @@ fn propose_after_deferred(
     metrics: &Metrics,
 ) -> Result<Vec<u32>, AllpacaError> {
     inner.draft_ahead = None;
+    if let Some(provider) = inner.dflash2.as_mut() {
+        let mut after = ctx.to_vec();
+        after.push(tok);
+        match provider.propose(&after, depth, temperature) {
+            Ok(more) if !more.is_empty() => {
+                let mut draft = vec![tok];
+                draft.extend(more);
+                host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
+                return Ok(draft);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
+        }
+    }
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mtp = mtp_draft_active(inner);
@@ -5026,6 +5227,16 @@ fn propose_drafts(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             host_stage_draft_tokens(&ahead.tokens, draft_hip, metrics);
             return Ok(ahead.tokens);
+        }
+    }
+    if let Some(provider) = inner.dflash2.as_mut() {
+        match provider.propose(&ctx, depth, temperature) {
+            Ok(draft) if !draft.is_empty() => {
+                host_stage_draft_tokens(&draft, draft_hip, metrics);
+                return Ok(draft);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
         }
     }
     if let Some(provider) = inner.dspark.as_mut() {
@@ -6144,7 +6355,9 @@ fn finish_linear_span(
         !is_stop(tok, &params_end)
             && produced.len() < remaining
             && !inner.flags.tree_speculation
-            && (inner.flags.draft_model_speculation || inner.flags.ngram_speculation)
+            && (inner.flags.draft_model_speculation
+                || inner.flags.ngram_speculation
+                || inner.dflash2.is_some())
     });
     if defer {
         // Forwarded next step at the head of the drafted span (or alone).
@@ -6545,6 +6758,33 @@ fn handle_prompt_len(
     Ok(0)
 }
 
+/// Smallest remote KV capacity the auto setting picks.
+const RPC_AUTO_MIN_SEQ: usize = 2048;
+
+/// Remote layers' KV capacity in tokens: `configured`, or when that is 0 the
+/// context `kv_vram_bytes` holds across this model's attention layers (the
+/// same sizing the local KV uses), at least [`RPC_AUTO_MIN_SEQ`].
+fn rpc_kv_max_seq(configured: usize, kv_vram_bytes: u64, model: &TinyModel) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    let cfg = &model.config;
+    let per_layer = (cfg.n_kv_heads.max(1) * cfg.head_dim().max(1) * 2 * 4) as u64;
+    let attn_layers = model
+        .layers
+        .iter()
+        // By layer type: large GGUFs keep no host weights to look at.
+        .filter(|l| {
+            l.gdn.is_none()
+                && l.ssm.is_none()
+                && l.block == allpaca_gguf::HybridLayerKind::Attention
+        })
+        .count()
+        .max(1) as u64;
+    let tokens = (kv_vram_bytes / (per_layer * attn_layers).max(1)) as usize;
+    tokens.max(RPC_AUTO_MIN_SEQ)
+}
+
 /// What a context length costs in KV for the loaded model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct KvEstimate {
@@ -6775,17 +7015,21 @@ mod tests {
         assert_eq!(rpc_out.token_ids, cpu_ids);
     }
 
-    #[test]
-    fn rpc_packed_q8_layer_matches_cpu() {
+    /// Two-layer Llama GGUF with Q8_0 weights and varied values, written to
+    /// the temp dir as `name`.
+    fn tiny_llama_q8_gguf(name: &str) -> std::path::PathBuf {
+        tiny_dense_q8_gguf(name, "llama")
+    }
+
+    /// [`tiny_llama_q8_gguf`] under another dense architecture name (its RoPE
+    /// style follows the architecture).
+    fn tiny_dense_q8_gguf(name: &str, arch: &str) -> std::path::PathBuf {
         use std::collections::HashMap;
-        use std::net::TcpListener;
-        use std::thread;
 
         use allpaca_gguf::{
             quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
             GgufWriteTensor,
         };
-        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
 
         let dim = 32usize;
         let vocab = 8usize;
@@ -6794,25 +7038,32 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert(
             "general.architecture".into(),
-            GgufValue::String("llama".into()),
+            GgufValue::String(arch.into()),
         );
-        meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+        meta.insert(format!("{arch}.vocab_size"), GgufValue::Uint32(vocab as u32));
         meta.insert(
-            "llama.embedding_length".into(),
+            format!("{arch}.embedding_length"),
             GgufValue::Uint32(dim as u32),
         );
-        meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
+        meta.insert(format!("{arch}.block_count"), GgufValue::Uint32(2));
         meta.insert(
-            "llama.attention.head_count".into(),
+            format!("{arch}.attention.head_count"),
             GgufValue::Uint32(4),
         );
         meta.insert(
-            "llama.attention.head_count_kv".into(),
+            format!("{arch}.attention.head_count_kv"),
             GgufValue::Uint32(2),
         );
         meta.insert(
-            "llama.feed_forward_length".into(),
+            format!("{arch}.feed_forward_length"),
             GgufValue::Uint32(ff as u32),
+        );
+        // As real Llama GGUFs: dimension_count == head_dim, which is still
+        // the standard (not NeoX) rotation. Remote layers once took this as
+        // a NeoX partial rotation and diverged as positions grew.
+        meta.insert(
+            format!("{arch}.rope.dimension_count"),
+            GgufValue::Uint32((dim / 4) as u32),
         );
         meta.insert(
             "tokenizer.ggml.model".into(),
@@ -6830,19 +7081,32 @@ mod tests {
         meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
         meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
 
+        // Varied weights: with constant ones every head and position looks
+        // alike and a wrong rotation cannot show.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5) * scale
+                })
+                .collect()
+        };
         let mut quant = Vec::new();
         let mut f32s: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
-        let embd = vec![0.02f32; vocab * dim];
+        let embd = rnd(vocab * dim, 2.0);
         quant.push((
             "token_embd.weight".to_string(),
             vec![vocab as u64, dim as u64],
             quantize_q8_0(&embd),
         ));
         for layer in 0..2 {
-            let q = vec![0.01f32; dim * dim];
-            let kv = vec![0.01f32; n_kv * dim];
-            let ffn_up = vec![0.01f32; ff * dim];
-            let ffn_down = vec![0.01f32; dim * ff];
+            let q = rnd(dim * dim, 0.6);
+            let kv = rnd(n_kv * dim, 0.6);
+            let ffn_up = rnd(ff * dim, 0.3);
+            let ffn_down = rnd(dim * ff, 0.3);
             let mut push = |suffix: &str, dims: Vec<u64>, data: &[f32]| {
                 quant.push((
                     format!("blk.{layer}.{suffix}"),
@@ -6873,7 +7137,7 @@ mod tests {
             vec![dim as u64],
             vec![1.0; dim],
         ));
-        let head = vec![0.02f32; vocab * dim];
+        let head = rnd(vocab * dim, 1.0);
         quant.push((
             "output.weight".into(),
             vec![vocab as u64, dim as u64],
@@ -6896,8 +7160,19 @@ mod tests {
                 bytes: bytes.as_slice(),
             })
             .collect();
-        let path = std::env::temp_dir().join("allpaca_rpc_packed_q8.gguf");
+        let path = std::env::temp_dir().join(name);
         write_gguf_quant(&path, &meta, &f32_tensors, &quant_tensors).unwrap();
+        path
+    }
+
+    #[test]
+    fn rpc_packed_q8_layer_matches_cpu() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        let path = tiny_llama_q8_gguf("allpaca_rpc_packed_q8.gguf");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6905,8 +7180,10 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
         });
+        // Long enough that positions matter (12 prompt tokens + 8 generated).
+        let prompt = "hello a b c d a b c d hello a b";
         let params = GenerationParams {
-            max_tokens: 4,
+            max_tokens: 8,
             temperature: 0.0,
             seed: Some(2),
             ..GenerationParams::default()
@@ -6922,7 +7199,7 @@ mod tests {
         cpu_cfg.model.path = Some(path.clone());
         cpu_cfg.kv.page_tokens = 8;
         let cpu = Engine::new(cpu_cfg).unwrap();
-        let cpu_ids = cpu.generate("hello", params.clone()).unwrap().token_ids;
+        let cpu_ids = cpu.generate(prompt, params.clone()).unwrap().token_ids;
 
         let mut rpc_cfg = Config::compiled_defaults();
         rpc_cfg.merge_cli(&CliOverrides {
@@ -6938,7 +7215,7 @@ mod tests {
         rpc_cfg.rpc.max_seq = 32;
         rpc_cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
         let rpc = Engine::new(rpc_cfg).unwrap();
-        let rpc_out = rpc.generate("hello", params).unwrap();
+        let rpc_out = rpc.generate(prompt, params).unwrap();
         let stats = rpc.stats();
         drop(rpc);
         worker.join().unwrap();
@@ -6954,6 +7231,82 @@ mod tests {
             stats.rpc_h2d_bytes
         );
         assert_eq!(rpc_out.token_ids, cpu_ids);
+    }
+
+    /// A HIP host prefills a prompt through layers on an RPC worker in
+    /// chunks of `rpc.prefill_rows` rows per round trip, and decodes the same
+    /// tokens as one round trip per prompt token, on a CPU and a HIP worker.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rpc_batched_prefill_matches_per_token() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_rpc::{serve_connection, CpuWorker, WorkerBackend};
+
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        for arch in ["llama", "qwen2"] {
+            // qwen2 rotates NeoX-style: the worker's partial-RoPE row op.
+            let path = tiny_dense_q8_gguf(&format!("allpaca_rpc_batched_prefill_{arch}.gguf"), arch);
+            // 12 prompt tokens: chunks of 5 rows cover 5 + 5 + 2.
+            let prompt = "hello a b c d a b c d hello a b";
+            let params = GenerationParams {
+                max_tokens: 8,
+                temperature: 0.0,
+                seed: Some(2),
+                ..GenerationParams::default()
+            };
+            let run = |prefill_rows: usize, hip_worker: bool| {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let worker = thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    let backend = if hip_worker {
+                        WorkerBackend::Hip(allpaca_rpc::HipWorker::new(0).unwrap())
+                    } else {
+                        WorkerBackend::Cpu(CpuWorker::new(64 << 20))
+                    };
+                    serve_connection(stream, backend).unwrap();
+                });
+                let mut cfg = Config::compiled_defaults();
+                cfg.merge_cli(&CliOverrides {
+                    seed: Some(2),
+                    speculative: Some(false),
+                    ..CliOverrides::default()
+                });
+                cfg.engine.gpu_backend = "hip".into();
+                cfg.model.synthetic = false;
+                cfg.model.path = Some(path.clone());
+                cfg.kv.page_tokens = 8;
+                cfg.rpc.endpoints = vec![addr.to_string()];
+                cfg.rpc.max_seq = 32;
+                cfg.rpc.tensor_split = Some(vec![1.0, 1.0]);
+                cfg.rpc.prefill_rows = prefill_rows;
+                let engine = Engine::new(cfg).unwrap();
+                let out = engine.generate(prompt, params.clone()).unwrap();
+                let trips = engine.stats().rpc_roundtrips;
+                drop(engine);
+                worker.join().unwrap();
+                (out.token_ids, trips)
+            };
+            for hip_worker in [false, true] {
+                let (per_token, per_token_trips) = run(0, hip_worker);
+                let (batched, batched_trips) = run(5, hip_worker);
+                assert!(per_token_trips > 0, "a layer must run on the worker");
+                assert_eq!(
+                    batched, per_token,
+                    "batched prefill must decode the same tokens (hip worker: {hip_worker})"
+                );
+                // Prompt: 12 trips one by one, 3 in chunks of 5; decode is the same.
+                assert_eq!(
+                    per_token_trips - batched_trips,
+                    12 - 3,
+                    "trips: per-token {per_token_trips}, batched {batched_trips}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -11999,6 +12352,85 @@ mod tests {
         if let Some(p) = nvme {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// `rpc.max_seq = 0` sizes remote KV from the engine's KV budget; an
+    /// explicit value is used as given.
+    #[test]
+    fn rpc_kv_capacity_follows_the_kv_budget() {
+        let cfg = ModelConfig::tiny();
+        let model = TinyModel::synthetic(cfg.clone(), 1, "synthetic");
+        assert_eq!(rpc_kv_max_seq(64, 1 << 30, &model), 64);
+        let per_token = (cfg.n_kv_heads * cfg.head_dim() * 2 * 4 * cfg.n_layers) as u64;
+        assert_eq!(rpc_kv_max_seq(0, per_token * 50_000, &model), 50_000);
+        // A tiny budget still leaves the floor.
+        assert_eq!(rpc_kv_max_seq(0, 1024, &model), RPC_AUTO_MIN_SEQ);
+    }
+
+    /// A dashboard poll during a prefill (engine lock held for the whole time
+    /// to first token) returns the last readings instead of hanging.
+    #[test]
+    fn stats_and_model_id_do_not_wait_for_a_busy_engine() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(3),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        let engine = Engine::new(cfg).unwrap();
+        engine.generate("hello", GenerationParams { max_tokens: 4, ..GenerationParams::default() }).unwrap();
+        let idle = engine.stats();
+        let id = engine.model_id();
+        let busy = engine.inner.lock().unwrap();
+        let started = std::time::Instant::now();
+        let during = engine.stats();
+        assert_eq!(engine.model_id(), id);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "monitoring reads waited {:?} on a busy engine",
+            started.elapsed()
+        );
+        drop(busy);
+        assert_eq!(during.model_id, idle.model_id);
+        assert_eq!(during.tokens_generated, idle.tokens_generated);
+        assert_eq!(during.draft_depth, idle.draft_depth);
+    }
+
+    /// A blocking reply is the same string a streamed reply adds up to, so
+    /// the text does not depend on which path served the request (special
+    /// pieces the model emits are kept in both).
+    #[test]
+    fn generate_text_equals_streamed_text() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(3),
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 48,
+            temperature: 0.0,
+            seed: Some(3),
+            ..GenerationParams::default()
+        };
+        let out = engine.generate("hello world", params.clone()).unwrap();
+        let mut handle = engine.begin_request("hello world", params).unwrap();
+        let (mut streamed, mut ids) = (String::new(), Vec::new());
+        engine
+            .drive_request(&mut handle, |ev| {
+                streamed.push_str(&ev.text);
+                ids.push(ev.token_id);
+                ev.finish_reason
+            })
+            .unwrap();
+        assert_eq!(ids, out.token_ids);
+        assert_eq!(out.text, streamed);
+        assert!(!out.text.is_empty());
     }
 
     #[test]

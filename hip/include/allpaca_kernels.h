@@ -164,6 +164,16 @@ int allpaca_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, int32_t 
 int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                     int32_t k, allpaca_stream_t stream);
 
+/* As allpaca_gemm_nt_rocmfp4 for ROCmFP4 FAST (ggml_type_id=101): 17-byte
+ * blocks, qs[16] then one unsigned-E4M3 scale for all 32 weights. */
+int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                 int32_t k, allpaca_stream_t stream);
+
+/* Float-activation ROCmFP4 GEMV (the pre-int8 kernel), for A/B and as the
+ * exact-float reference. `fast` != 0 reads 17-byte type-101 blocks. */
+int allpaca_gemm_nt_rocmfp4_f32(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                int32_t k, int32_t fast, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * dequant(B_q6_k[n,k])^T. Native 210-byte Q6_K super-blocks (GEM mixed-quant).
  * Default tile cols from §12 picker; use _cols / _untiled for tracers. */
 int allpaca_gemm_nt_q6_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -400,6 +410,13 @@ int allpaca_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out
 
 int allpaca_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens, float *out,
                                       int32_t n_tok, int32_t dim, allpaca_stream_t stream);
+
+/* ROCmFP4 FAST 17-byte blocks; row stride = ceil(dim/32)*17. */
+int allpaca_embed_gather_rocmfp4_fast(const uint8_t *table, int32_t token, float *out, int32_t dim,
+                                      allpaca_stream_t stream);
+
+int allpaca_embed_gather_rocmfp4_fast_rows(const uint8_t *table, const int32_t *tokens, float *out,
+                                           int32_t n_tok, int32_t dim, allpaca_stream_t stream);
 
 #ifdef __cplusplus
 }

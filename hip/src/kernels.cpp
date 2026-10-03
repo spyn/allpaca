@@ -1158,8 +1158,227 @@ __device__ float warp_sum32(float v) {
     return __shfl(v, 0, 32);
 }
 
-/* Decode/prefill: one warp per (query, head). Online softmax, coalesced KV. */
-__global__ void attention_flash_kernel(const float *q, const float *k, const float *v, float *out,
+/* Decode/prefill attention. One 32-lane warp owns one (query, head) row and
+ * walks its keys in order with an online softmax. `attn_row_*` hold the
+ * per-row arithmetic so the per-row kernel and the Q-tiled kernel run the
+ * same instructions on the same values: a row's result does not depend on
+ * which kernel, or how many rows, computed it. */
+constexpr int ATTN_MAX_DPT = 16;
+
+struct AttnRow {
+    float qreg[ATTN_MAX_DPT];
+    float acc[ATTN_MAX_DPT];
+    float m;
+    float l;
+};
+
+__device__ __forceinline__ void attn_row_init(AttnRow &r, const float *qh, int lane, int head_dim,
+                                              int nvec, bool vec4, const float *sinks, int h) {
+#pragma unroll
+    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+        r.qreg[i] = 0.0f;
+        r.acc[i] = 0.0f;
+    }
+    /* Fixed trip counts with a per-lane guard (not `v < nvec` bounds): the
+     * arrays then stay in registers; with runtime bounds gfx906 kept them in
+     * scratch memory. Same operations in the same order either way. */
+    if (vec4) {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+            const int v = lane + 32 * j;
+            if (v < nvec) {
+                const float4 qv = *reinterpret_cast<const float4 *>(qh + v * 4);
+                r.qreg[4 * j] = qv.x;
+                r.qreg[4 * j + 1] = qv.y;
+                r.qreg[4 * j + 2] = qv.z;
+                r.qreg[4 * j + 3] = qv.w;
+            }
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+            const int d = lane + 32 * j;
+            if (d < head_dim) {
+                r.qreg[j] = qh[d];
+            }
+        }
+    }
+    r.m = -1.0e30f;
+    r.l = 0.0f;
+    if (sinks) {
+        r.m = sinks[h];
+        r.l = 1.0f;
+    }
+}
+
+/* One key: `kh`/`vh` are that key's head rows (global memory or LDS).
+ * Contraction is off and every fused multiply-add is written out: left to the
+ * compiler, the per-row and Q-tiled kernels fused differently once their
+ * loops were unrolled, and their rows stopped matching. */
+__device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const float *vh,
+                                              bool valid, int lane, int head_dim, int nvec,
+                                              bool vec4, float scale) {
+#pragma clang fp contract(off)
+    float partial = 0.0f;
+    if (vec4) {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+            const int vec = lane + 32 * j;
+            if (vec >= nvec) {
+                continue;
+            }
+            const int i = 4 * j;
+            float4 kv;
+            if (valid && (reinterpret_cast<uintptr_t>(kh + vec * 4) % 16u) == 0) {
+                kv = *reinterpret_cast<const float4 *>(kh + vec * 4);
+            } else {
+                kv.x = (valid && vec * 4 < head_dim) ? kh[vec * 4] : 0.0f;
+                kv.y = (valid && vec * 4 + 1 < head_dim) ? kh[vec * 4 + 1] : 0.0f;
+                kv.z = (valid && vec * 4 + 2 < head_dim) ? kh[vec * 4 + 2] : 0.0f;
+                kv.w = (valid && vec * 4 + 3 < head_dim) ? kh[vec * 4 + 3] : 0.0f;
+            }
+            float d4 = r.qreg[i] * kv.x;
+            d4 = fmaf(r.qreg[i + 1], kv.y, d4);
+            d4 = fmaf(r.qreg[i + 2], kv.z, d4);
+            d4 = fmaf(r.qreg[i + 3], kv.w, d4);
+            partial = partial + d4;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+            const int d = lane + 32 * j;
+            if (d < head_dim) {
+                partial = fmaf(r.qreg[j], valid ? kh[d] : 0.0f, partial);
+            }
+        }
+    }
+    float s = warp_sum32(partial) * scale;
+    if (!valid) {
+        s = -1.0e30f;
+    }
+    const float m_new = fmaxf(r.m, s);
+    const float alpha = expf(r.m - m_new);
+    const float p = expf(s - m_new);
+    r.l = fmaf(r.l, alpha, p);
+    if (vec4) {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+            const int vec = lane + 32 * j;
+            if (vec >= nvec) {
+                continue;
+            }
+            const int i = 4 * j;
+            float4 vv;
+            if (valid && (reinterpret_cast<uintptr_t>(vh + vec * 4) % 16u) == 0) {
+                vv = *reinterpret_cast<const float4 *>(vh + vec * 4);
+            } else {
+                vv.x = (valid && vec * 4 < head_dim) ? vh[vec * 4] : 0.0f;
+                vv.y = (valid && vec * 4 + 1 < head_dim) ? vh[vec * 4 + 1] : 0.0f;
+                vv.z = (valid && vec * 4 + 2 < head_dim) ? vh[vec * 4 + 2] : 0.0f;
+                vv.w = (valid && vec * 4 + 3 < head_dim) ? vh[vec * 4 + 3] : 0.0f;
+            }
+            r.acc[i] = fmaf(r.acc[i], alpha, p * vv.x);
+            r.acc[i + 1] = fmaf(r.acc[i + 1], alpha, p * vv.y);
+            r.acc[i + 2] = fmaf(r.acc[i + 2], alpha, p * vv.z);
+            r.acc[i + 3] = fmaf(r.acc[i + 3], alpha, p * vv.w);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+            const int d = lane + 32 * j;
+            if (d < head_dim) {
+                r.acc[j] = fmaf(r.acc[j], alpha, p * (valid ? vh[d] : 0.0f));
+            }
+        }
+    }
+    r.m = m_new;
+}
+
+__device__ __forceinline__ void attn_row_store(const AttnRow &r, float *oh, int lane, int head_dim,
+                                               int nvec, bool vec4) {
+    const float inv = (r.l == 0.0f) ? 0.0f : 1.0f / r.l;
+    if (vec4) {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+            const int vec = lane + 32 * j;
+            if (vec >= nvec) {
+                continue;
+            }
+            const int i = 4 * j;
+            if (vec * 4 + 3 < head_dim && (reinterpret_cast<uintptr_t>(oh + vec * 4) % 16u) == 0) {
+                float4 o;
+                o.x = r.acc[i] * inv;
+                o.y = r.acc[i + 1] * inv;
+                o.z = r.acc[i + 2] * inv;
+                o.w = r.acc[i + 3] * inv;
+                *reinterpret_cast<float4 *>(oh + vec * 4) = o;
+            } else {
+                if (vec * 4 < head_dim) {
+                    oh[vec * 4] = r.acc[i] * inv;
+                }
+                if (vec * 4 + 1 < head_dim) {
+                    oh[vec * 4 + 1] = r.acc[i + 1] * inv;
+                }
+                if (vec * 4 + 2 < head_dim) {
+                    oh[vec * 4 + 2] = r.acc[i + 2] * inv;
+                }
+                if (vec * 4 + 3 < head_dim) {
+                    oh[vec * 4 + 3] = r.acc[i + 3] * inv;
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+            const int d = lane + 32 * j;
+            if (d < head_dim) {
+                oh[d] = r.acc[j] * inv;
+            }
+        }
+    }
+}
+
+/* Last key row `qi` may see: causal rows are bottom-right aligned. */
+__device__ __forceinline__ int attn_row_tmax(int qi, int n_q, int n_kv, int causal) {
+    return causal ? qi + (n_kv > n_q ? n_kv - n_q : 0) : n_kv - 1;
+}
+
+/* A row with more than ATTN_CHUNK keys: the keys split into chunks of
+ * ATTN_CHUNK, each an online softmax from an empty state (sinks in chunk 0
+ * only), folded in ascending order by attn_fold. Every kernel follows this
+ * order, so a row's bits do not depend on which kernel computed it, and a row
+ * with one chunk is exactly the single-pass result. Decode runs the chunks of
+ * a long row in parallel (attention_split_kernel + attention_merge_kernel). */
+constexpr int ATTN_CHUNK = 256;
+/* Floats per (row, head, chunk) partial: every lane's accumulators, m, l. */
+constexpr int ATTN_PART = 32 * ATTN_MAX_DPT + 2;
+
+__device__ __forceinline__ void attn_row_reset(AttnRow &r) {
+#pragma unroll
+    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+        r.acc[i] = 0.0f;
+    }
+    r.m = -1.0e30f;
+    r.l = 0.0f;
+}
+
+/* into (+)= (m_b, l_b, acc_b), rounding spelled out. */
+__device__ __forceinline__ void attn_fold(float &m, float &l, float (&acc)[ATTN_MAX_DPT], float m_b,
+                                          float l_b, const float (&acc_b)[ATTN_MAX_DPT]) {
+#pragma clang fp contract(off)
+    const float mm = fmaxf(m, m_b);
+    const float a = expf(m - mm);
+    const float b = expf(m_b - mm);
+    l = fmaf(l, a, __fmul_rn(l_b, b));
+#pragma unroll
+    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+        acc[i] = fmaf(acc[i], a, __fmul_rn(acc_b[i], b));
+    }
+    m = mm;
+}
+
+/* One warp per (query, head), keys from global memory. */
+__global__ void __launch_bounds__(32) attention_flash_kernel(const float *q, const float *k, const float *v, float *out,
                                        int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
                                        int causal, const uint8_t *mask, const float *sinks) {
     const int qi = static_cast<int>(blockIdx.x);
@@ -1168,148 +1387,270 @@ __global__ void attention_flash_kernel(const float *q, const float *k, const flo
         return;
     }
     const int lane = static_cast<int>(threadIdx.x);
-    const int reps = n_heads / n_kv_heads;
-    const int kv_h = h / reps;
+    const int kv_h = h / (n_heads / n_kv_heads);
     const float scale = rsqrtf(static_cast<float>(head_dim));
-    const int t_max = causal ? qi + (n_kv > n_q ? n_kv - n_q : 0) : n_kv - 1;
+    const int t_max = attn_row_tmax(qi, n_q, n_kv, causal);
     const float *qh = q + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
     float *oh = out + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
-
-    constexpr int MAX_DPT = 16;
-    float qreg[MAX_DPT];
-    float acc[MAX_DPT];
-#pragma unroll
-    for (int i = 0; i < MAX_DPT; ++i) {
-        qreg[i] = 0.0f;
-        acc[i] = 0.0f;
-    }
-
     const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
                       (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
     const int nvec = vec4 ? head_dim / 4 : head_dim;
-    if (vec4) {
-        int nd = 0;
-        for (int v = lane; v < nvec && nd + 3 < MAX_DPT; v += 32) {
-            const float4 qv = *reinterpret_cast<const float4 *>(qh + v * 4);
-            qreg[nd] = qv.x;
-            qreg[nd + 1] = qv.y;
-            qreg[nd + 2] = qv.z;
-            qreg[nd + 3] = qv.w;
-            nd += 4;
-        }
-    } else {
-        int nd = 0;
-        for (int d = lane; d < head_dim && nd < MAX_DPT; d += 32) {
-            qreg[nd++] = qh[d];
-        }
-    }
-
-    float m = -1.0e30f;
-    float l = 0.0f;
-    if (sinks) {
-        m = sinks[h];
-        l = 1.0f;
-    }
-
-    for (int t = 0; t < n_kv; ++t) {
+    AttnRow r;
+    attn_row_init(r, qh, lane, head_dim, nvec, vec4, sinks, h);
+    /* Causal rows stop at their last visible key: a masked step adds exactly
+     * nothing (p = 0, alpha = 1). */
+    const int t_end = mask ? n_kv : min(n_kv, t_max + 1);
+    for (int t = 0; t < t_end; ++t) {
         const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
                                        static_cast<size_t>(t)] != 0
                                 : t <= t_max;
         const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
-        float partial = 0.0f;
-        if (vec4) {
-            int i = 0;
-            for (int vec = lane; vec < nvec && i + 3 < MAX_DPT; vec += 32) {
-                float4 kv;
-                if (valid && (reinterpret_cast<uintptr_t>(kh + vec * 4) % 16u) == 0) {
-                    kv = *reinterpret_cast<const float4 *>(kh + vec * 4);
-                } else {
-                    kv.x = (valid && vec * 4 < head_dim) ? kh[vec * 4] : 0.0f;
-                    kv.y = (valid && vec * 4 + 1 < head_dim) ? kh[vec * 4 + 1] : 0.0f;
-                    kv.z = (valid && vec * 4 + 2 < head_dim) ? kh[vec * 4 + 2] : 0.0f;
-                    kv.w = (valid && vec * 4 + 3 < head_dim) ? kh[vec * 4 + 3] : 0.0f;
-                }
-                partial += qreg[i] * kv.x + qreg[i + 1] * kv.y + qreg[i + 2] * kv.z +
-                           qreg[i + 3] * kv.w;
-                i += 4;
-            }
-        } else {
-            int i = 0;
-            for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
-                partial += qreg[i++] * (valid ? kh[d] : 0.0f);
-            }
-        }
-        float s = warp_sum32(partial) * scale;
-        if (!valid) {
-            s = -1.0e30f;
-        }
-        const float m_new = fmaxf(m, s);
-        const float alpha = expf(m - m_new);
-        const float p = expf(s - m_new);
-        l = l * alpha + p;
-        if (vec4) {
-            int i = 0;
-            for (int vec = lane; vec < nvec && i + 3 < MAX_DPT; vec += 32) {
-                float4 vv;
-                if (valid && (reinterpret_cast<uintptr_t>(vh + vec * 4) % 16u) == 0) {
-                    vv = *reinterpret_cast<const float4 *>(vh + vec * 4);
-                } else {
-                    vv.x = (valid && vec * 4 < head_dim) ? vh[vec * 4] : 0.0f;
-                    vv.y = (valid && vec * 4 + 1 < head_dim) ? vh[vec * 4 + 1] : 0.0f;
-                    vv.z = (valid && vec * 4 + 2 < head_dim) ? vh[vec * 4 + 2] : 0.0f;
-                    vv.w = (valid && vec * 4 + 3 < head_dim) ? vh[vec * 4 + 3] : 0.0f;
-                }
-                acc[i] = acc[i] * alpha + p * vv.x;
-                acc[i + 1] = acc[i + 1] * alpha + p * vv.y;
-                acc[i + 2] = acc[i + 2] * alpha + p * vv.z;
-                acc[i + 3] = acc[i + 3] * alpha + p * vv.w;
-                i += 4;
-            }
-        } else {
-            int i = 0;
-            for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
-                acc[i] = acc[i] * alpha + p * (valid ? vh[d] : 0.0f);
-                i++;
-            }
-        }
-        m = m_new;
+        attn_row_step(r, kh, vh, valid, lane, head_dim, nvec, vec4, scale);
     }
+    attn_row_store(r, oh, lane, head_dim, nvec, vec4);
+}
 
-    const float inv = (l == 0.0f) ? 0.0f : 1.0f / l;
-    if (vec4) {
-        int i = 0;
-        for (int vec = lane; vec < nvec && i + 3 < MAX_DPT; vec += 32) {
-            if (vec * 4 + 3 < head_dim && (reinterpret_cast<uintptr_t>(oh + vec * 4) % 16u) == 0) {
-                float4 o;
-                o.x = acc[i] * inv;
-                o.y = acc[i + 1] * inv;
-                o.z = acc[i + 2] * inv;
-                o.w = acc[i + 3] * inv;
-                *reinterpret_cast<float4 *>(oh + vec * 4) = o;
-            } else {
-                if (vec * 4 < head_dim) {
-                    oh[vec * 4] = acc[i] * inv;
-                }
-                if (vec * 4 + 1 < head_dim) {
-                    oh[vec * 4 + 1] = acc[i + 1] * inv;
-                }
-                if (vec * 4 + 2 < head_dim) {
-                    oh[vec * 4 + 2] = acc[i + 2] * inv;
-                }
-                if (vec * 4 + 3 < head_dim) {
-                    oh[vec * 4 + 3] = acc[i + 3] * inv;
-                }
-            }
-            i += 4;
+/* ATTN_QTILE consecutive queries of one head per block, one warp each. The
+ * block stages `tile` keys of K and V in LDS and every warp reads them from
+ * there: each key is fetched from memory once per block instead of once per
+ * query. Per row, the steps, their order and the chunk folds are those of
+ * attention_flash_kernel / attention_split_kernel. */
+constexpr int ATTN_QTILE = 8;
+
+__global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const float *q, const float *k, const float *v, float *out,
+                                       int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
+                                       int causal, const uint8_t *mask, const float *sinks,
+                                       int tile) {
+    extern __shared__ float attn_lds[];
+    float *k_lds = attn_lds;
+    float *v_lds = attn_lds + static_cast<size_t>(tile) * head_dim;
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int q0 = static_cast<int>(blockIdx.x) * ATTN_QTILE;
+    const int qi = q0 + warp;
+    const int h = static_cast<int>(blockIdx.y);
+    const bool active = qi < n_q;
+    const int kv_h = h / (n_heads / n_kv_heads);
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+    const int qrow = active ? qi : q0;
+    const float *qh = q + (static_cast<size_t>(qrow) * n_heads + h) * head_dim;
+    float *oh = out + (static_cast<size_t>(qrow) * n_heads + h) * head_dim;
+    const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
+                      (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
+    const int nvec = vec4 ? head_dim / 4 : head_dim;
+    const int t_max = attn_row_tmax(qi, n_q, n_kv, causal);
+    const int t_end = active ? (mask ? n_kv : min(n_kv, t_max + 1)) : 0;
+    /* Keys the block needs: up to the last row's end. */
+    const int q_last = min(n_q, q0 + ATTN_QTILE) - 1;
+    const int block_end = mask ? n_kv : min(n_kv, attn_row_tmax(q_last, n_q, n_kv, causal) + 1);
+    AttnRow r;
+    attn_row_init(r, qh, lane, head_dim, nvec, vec4, sinks, h);
+    /* Folded chunks before the current one. */
+    float m_acc[ATTN_MAX_DPT];
+    float m_m = -1.0e30f, m_l = 0.0f;
+    bool folded = false;
+    int next_fold = ATTN_CHUNK;
+    const int n_tile = tile * head_dim;
+    for (int t0 = 0; t0 < block_end; t0 += tile) {
+        __syncthreads();
+        for (int e = static_cast<int>(threadIdx.x); e < n_tile; e += static_cast<int>(blockDim.x)) {
+            const int t = t0 + e / head_dim;
+            const int d = e % head_dim;
+            const size_t src = static_cast<size_t>(t) * kv_stride +
+                               static_cast<size_t>(kv_h) * head_dim + static_cast<size_t>(d);
+            k_lds[e] = t < n_kv ? k[src] : 0.0f;
+            v_lds[e] = t < n_kv ? v[src] : 0.0f;
         }
-    } else {
-        int i = 0;
-        for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
-            oh[d] = acc[i++] * inv;
+        __syncthreads();
+        const int stop = min(t_end, t0 + tile);
+        for (int t = t0; t < stop; ++t) {
+            if (t == next_fold) {
+                next_fold += ATTN_CHUNK;
+                if (folded) {
+                    attn_fold(m_m, m_l, m_acc, r.m, r.l, r.acc);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+                        m_acc[i] = r.acc[i];
+                    }
+                    m_m = r.m;
+                    m_l = r.l;
+                    folded = true;
+                }
+                attn_row_reset(r);
+            }
+            const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
+                                           static_cast<size_t>(t)] != 0
+                                    : t <= t_max;
+            const float *kh = k_lds + static_cast<size_t>(t - t0) * head_dim;
+            const float *vh = v_lds + static_cast<size_t>(t - t0) * head_dim;
+            attn_row_step(r, kh, vh, valid, lane, head_dim, nvec, vec4, scale);
         }
     }
+    if (active) {
+        if (folded) {
+            attn_fold(m_m, m_l, m_acc, r.m, r.l, r.acc);
+#pragma unroll
+            for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+                r.acc[i] = m_acc[i];
+            }
+            r.m = m_m;
+            r.l = m_l;
+        }
+        attn_row_store(r, oh, lane, head_dim, nvec, vec4);
+    }
+}
+
+/* One warp per (query, head, chunk) of a row longer than ATTN_CHUNK keys:
+ * the chunk's online softmax into `part` (see ATTN_PART). */
+__global__ void __launch_bounds__(32) attention_split_kernel(const float *q, const float *k, const float *v, float *part,
+                                       int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
+                                       int causal, const uint8_t *mask, const float *sinks,
+                                       int n_chunks) {
+    const int qi = static_cast<int>(blockIdx.x);
+    const int h = static_cast<int>(blockIdx.y);
+    const int c = static_cast<int>(blockIdx.z);
+    const int lane = static_cast<int>(threadIdx.x);
+    const int kv_h = h / (n_heads / n_kv_heads);
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int t_max = attn_row_tmax(qi, n_q, n_kv, causal);
+    const float *qh = q + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+    const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
+                      (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
+    const int nvec = vec4 ? head_dim / 4 : head_dim;
+    AttnRow r;
+    attn_row_init(r, qh, lane, head_dim, nvec, vec4, c == 0 ? sinks : nullptr, h);
+    const int t_end = mask ? n_kv : min(n_kv, t_max + 1);
+    const int t1 = min(t_end, (c + 1) * ATTN_CHUNK);
+    for (int t = c * ATTN_CHUNK; t < t1; ++t) {
+        const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
+                                       static_cast<size_t>(t)] != 0
+                                : t <= t_max;
+        const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+        const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+        attn_row_step(r, kh, vh, valid, lane, head_dim, nvec, vec4, scale);
+    }
+    float *dst = part + ((static_cast<size_t>(qi) * n_heads + h) * n_chunks + c) * ATTN_PART;
+#pragma unroll
+    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+        dst[lane * ATTN_MAX_DPT + i] = r.acc[i];
+    }
+    if (lane == 0) {
+        dst[32 * ATTN_MAX_DPT] = r.m;
+        dst[32 * ATTN_MAX_DPT + 1] = r.l;
+    }
+}
+
+/* Folds a row's chunk partials in ascending order and writes the row. */
+__global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, const float *part, float *out, int n_heads,
+                                       int head_dim, int n_chunks) {
+    const int qi = static_cast<int>(blockIdx.x);
+    const int h = static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
+    const float *qh = q + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
+    float *oh = out + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
+    const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
+                      (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
+    const int nvec = vec4 ? head_dim / 4 : head_dim;
+    const float *src = part + (static_cast<size_t>(qi) * n_heads + h) * n_chunks * ATTN_PART;
+    AttnRow r;
+#pragma unroll
+    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+        r.acc[i] = src[lane * ATTN_MAX_DPT + i];
+    }
+    r.m = src[32 * ATTN_MAX_DPT];
+    r.l = src[32 * ATTN_MAX_DPT + 1];
+    for (int c = 1; c < n_chunks; ++c) {
+        const float *pc = src + static_cast<size_t>(c) * ATTN_PART;
+        float acc_b[ATTN_MAX_DPT];
+#pragma unroll
+        for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+            acc_b[i] = pc[lane * ATTN_MAX_DPT + i];
+        }
+        attn_fold(r.m, r.l, r.acc, pc[32 * ATTN_MAX_DPT], pc[32 * ATTN_MAX_DPT + 1], acc_b);
+    }
+    attn_row_store(r, oh, lane, head_dim, nvec, vec4);
+}
+
+/* Per-device scratch for chunk partials, grow-only. The lock is held from the
+ * split launch through the merge launch; a switch to another stream first
+ * synchronizes the device (the old stream may be gone). */
+constexpr int ATTN_PART_DEVICES = 16;
+struct AttnPartScratch {
+    std::mutex mu;
+    float *p = nullptr;
+    size_t cap = 0;
+    hipStream_t stream = nullptr;
+};
+static AttnPartScratch g_attn_part[ATTN_PART_DEVICES];
+
+/* One query: the per-row kernel, or chunks in parallel plus a merge when the
+ * row is longer than one chunk. Several rows: the Q-tiled kernel. All three
+ * give a row the same bits. */
+static void launch_attention(const float *q, const float *k, const float *v, float *out, int n_q,
+                             int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
+                             const uint8_t *mask, const float *sinks, hipStream_t stream) {
+    /* 2048 floats of K (and of V) per tile, 16 keys at head_dim 128: on an
+     * MI50 (3199-token prompt, 14 layers) 4096 lost occupancy and 1024 paid
+     * more barriers; on an RX 9070 it is about even with one warp per row. */
+    const int tile = head_dim > 0 ? 2048 / head_dim : 0;
+    const bool fits = head_dim <= 32 * ATTN_MAX_DPT;
+    const int n_chunks = (n_kv + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    if (n_q == 1 && n_chunks > 1 && fits) {
+        int dev = 0;
+        if (hipGetDevice(&dev) == hipSuccess && dev >= 0 && dev < ATTN_PART_DEVICES) {
+            AttnPartScratch &s = g_attn_part[dev];
+            std::lock_guard<std::mutex> lock(s.mu);
+            bool ok = true;
+            if (s.p && s.stream != stream && hipDeviceSynchronize() != hipSuccess) {
+                ok = false;
+            }
+            const size_t need = static_cast<size_t>(n_heads) * n_chunks * ATTN_PART;
+            if (ok && s.cap < need) {
+                if (s.p) {
+                    (void)hipDeviceSynchronize();
+                    (void)hipFree(s.p);
+                    s.p = nullptr;
+                    s.cap = 0;
+                }
+                const size_t cap = need > (size_t(1) << 18) ? need : (size_t(1) << 18);
+                if (hipMalloc(&s.p, cap * sizeof(float)) == hipSuccess) {
+                    s.cap = cap;
+                } else {
+                    s.p = nullptr;
+                    ok = false;
+                }
+            }
+            if (ok) {
+                s.stream = stream;
+                hipLaunchKernelGGL(attention_split_kernel,
+                                   dim3(1, static_cast<unsigned>(n_heads), static_cast<unsigned>(n_chunks)),
+                                   dim3(32), 0, stream, q, k, v, s.p, n_q, n_kv, n_heads, n_kv_heads,
+                                   head_dim, causal, mask, sinks, n_chunks);
+                hipLaunchKernelGGL(attention_merge_kernel, dim3(1, static_cast<unsigned>(n_heads)),
+                                   dim3(32), 0, stream, q, s.p, out, n_heads, head_dim, n_chunks);
+                return;
+            }
+        }
+        /* No scratch: the Q-tiled kernel computes the same chunked row. */
+    }
+    if ((n_q >= 2 || n_chunks > 1) && tile >= 1 && fits) {
+        dim3 block(32 * ATTN_QTILE);
+        dim3 grid(static_cast<unsigned>((n_q + ATTN_QTILE - 1) / ATTN_QTILE),
+                  static_cast<unsigned>(n_heads));
+        const size_t lds = 2 * static_cast<size_t>(tile) * head_dim * sizeof(float);
+        hipLaunchKernelGGL(attention_qtile_kernel, grid, block, lds, stream, q, k, v, out, n_q, n_kv,
+                           n_heads, n_kv_heads, head_dim, causal, mask, sinks, tile);
+        return;
+    }
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    hipLaunchKernelGGL(attention_flash_kernel, grid, block, 0, stream, q, k, v, out, n_q, n_kv,
+                       n_heads, n_kv_heads, head_dim, causal, mask, sinks);
 }
 
 static int launch_gemm(const float *a, const float *b, float *c, int32_t m, int32_t n, int32_t k,
@@ -2849,8 +3190,11 @@ __device__ inline float rocmfp4_scale(uint8_t e) {
     return out;
 }
 
-/* One thread per output column. Native 18-byte ROCmFP4 blocks along K.
- * Baseline: each column re-reads A from global (no LDS tile). */
+/* One thread per output column. Native ROCmFP4 blocks along K: BB = 18 is
+ * the dual-scale layout (ggml type 100: qs[16], e[2]), BB = 17 the FAST
+ * single-scale layout (type 101: qs[16], e), where both halves read the one
+ * scale byte. Baseline: each column re-reads A from global (no LDS tile). */
+template <int BB>
 __global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
                                                int n, int k) {
     const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -2859,13 +3203,13 @@ __global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b,
         return;
     }
     const int nblocks = (k + 31) / 32;
-    const uint8_t *row_blocks = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+    const uint8_t *row_blocks = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * BB;
     const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
     float acc = 0.f;
     for (int ib = 0; ib < nblocks; ++ib) {
-        const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * 18;
+        const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * BB;
         const float d0 = rocmfp4_scale(blk[16]);
-        const float d1 = rocmfp4_scale(blk[17]);
+        const float d1 = rocmfp4_scale(blk[BB - 1]);
         const int k0 = ib * 32;
         for (int j = 0; j < 16; ++j) {
             const uint8_t packed = blk[j];
@@ -2884,6 +3228,7 @@ __global__ void gemv_nt_rocmfp4_untiled_kernel(const float *a, const uint8_t *b,
 
 // Decode GEMV: 32 lanes split K for each column. One thread walking all of K
 // made the local ROCmFP4 projections the largest remaining per-token cost.
+template <int BB>
 __global__ void gemv_nt_rocmfp4_ksplit_kernel(const float *a, const uint8_t *b, float *c, int m,
                                               int n, int k) {
     constexpr int LANES = 32;
@@ -2899,12 +3244,12 @@ __global__ void gemv_nt_rocmfp4_ksplit_kernel(const float *a, const uint8_t *b, 
     float acc = 0.f;
     if (col < n) {
         const uint8_t *row_blocks =
-            b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+            b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * BB;
         const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
         for (int ib = lane; ib < nblocks; ib += LANES) {
-            const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * 18;
+            const uint8_t *blk = row_blocks + static_cast<size_t>(ib) * BB;
             const float d0 = rocmfp4_scale(blk[16]);
-            const float d1 = rocmfp4_scale(blk[17]);
+            const float d1 = rocmfp4_scale(blk[BB - 1]);
             const int k0 = ib * 32;
             for (int j = 0; j < 16; ++j) {
                 const uint8_t packed = blk[j];
@@ -2986,12 +3331,160 @@ __global__ void gemv_nt_rocmfp4_tiled_kernel(const float *a, const uint8_t *b, f
     }
 }
 
+/* Four 4-bit ROCmFP4 codes, one per byte, to their signed half-scale levels
+ * (0,1,2,3,4,6,8,10, negated when bit 3 is set) as four int8 bytes. */
+__device__ inline uint32_t rocmfp4_levels_i8x4(uint32_t code) {
+    const uint32_t mag3 = code & 0x07070707u;
+    // 0xFF in each byte whose magnitude index is 5..7 (levels 6, 8, 10).
+    const uint32_t big = (((mag3 + 0x03030303u) >> 3) & 0x01010101u) * 0xFFu;
+    const uint32_t mag = mag3 + ((((mag3 | 0x80808080u) - 0x04040404u) & 0x07070707u) & big);
+    // Negate where the sign bit is set and the level is not zero (so the
+    // per-byte +1 never carries into its neighbour).
+    const uint32_t nonzero = (((mag + 0x7F7F7F7Fu) >> 7) & 0x01010101u) * 0xFFu;
+    const uint32_t neg = (((code >> 3) & 0x01010101u) * 0xFFu) & nonzero;
+    return (mag ^ neg) + (neg & 0x01010101u);
+}
+
+/* ROCmFP4 GEMV on int8 activations (the K-quant int8 scheme, llama.cpp
+ * mmvq): A is quantized once per GEMV to int8 with one f32 scale per 32
+ * values, and each lane takes whole 32-weight blocks: two signed dot4 chains
+ * (low nibbles = weights 0..15, high = 16..31) per row and one scale product.
+ * MR rows share one pass over the weights, so 2..8 verify rows cost little
+ * more than one. Every m uses this path, so a verify or batched row
+ * reproduces the decode (m == 1) row bit for bit. BB = 18 dual-scale (type
+ * 100), BB = 17 FAST single-scale (type 101). */
+template <int BB, int MR>
+__global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, const uint8_t *b,
+                                          float *c, int m, int n, int k) {
+#pragma clang fp contract(off)
+    constexpr int LPC = 8;
+    const int sl = static_cast<int>(threadIdx.x) % LPC;
+    const int col = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / LPC) +
+                    static_cast<int>(threadIdx.x) / LPC;
+    const int row0 = static_cast<int>(blockIdx.y) * MR;
+    const bool live = col < n;
+    const int kb = k / 32;
+    const uint8_t *brow = b + static_cast<size_t>(live ? col : 0) * static_cast<size_t>(kb) * BB;
+    const int8_t *arow[MR];
+    const float *drow[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        const size_t ar = static_cast<size_t>(row0 + r < m ? row0 + r : row0);
+        arow[r] = aq + ar * static_cast<size_t>(k);
+        drow[r] = ad + ar * static_cast<size_t>(kb);
+    }
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.f;
+    }
+    if (live) {
+        for (int ib = sl; ib < kb; ib += LPC) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
+            // Blocks are 17 or 18 bytes: unaligned loads.
+            uint32_t x[4];
+            __builtin_memcpy(x, blk, 16);
+            const float d0 = rocmfp4_scale(blk[16]);
+            const float d1 = rocmfp4_scale(blk[BB - 1]);
+            uint32_t wl[4], wh[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
+                wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+            }
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                uint32_t al[4], ah[4];
+                kq_load_u32s<4>(arow[r] + ib * 32, al);
+                kq_load_u32s<4>(arow[r] + ib * 32 + 16, ah);
+                int32_t dl = 0, dh = 0;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    dl = i8dot4(al[t], wl[t], dl);
+                    dh = i8dot4(ah[t], wh[t], dh);
+                }
+                acc[r] = acc[r] + drow[r][ib] * (d0 * static_cast<float>(dl) +
+                                                 d1 * static_cast<float>(dh));
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = LPC / 2; off > 0; off >>= 1) {
+            v = v + __shfl_down(v, off, LPC);
+        }
+        if (live && sl == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+                v;
+        }
+    }
+}
+
+/* Returns ALLPACA_ERR_INVALID when the int8 path cannot run (caller falls back). */
+template <int BB>
+static int launch_rocmfp4_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                             int32_t k, hipStream_t stream) {
+    if (k % 32 != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const size_t aq_bytes = (static_cast<size_t>(m) * k + 255) & ~size_t(255);
+    const size_t need = aq_bytes + static_cast<size_t>(m) * (k / 32) * sizeof(float);
+    std::unique_lock<std::mutex> lock;
+    KqActScratch *scratch = kq_act_acquire(stream, need, lock);
+    if (!scratch) {
+        return ALLPACA_ERR_INVALID;
+    }
+    uint8_t *base = static_cast<uint8_t *>(scratch->p);
+    int8_t *aq = reinterpret_cast<int8_t *>(base);
+    float *ad = reinterpret_cast<float *>(base + aq_bytes);
+    const int kb = k / 32;
+    hipLaunchKernelGGL(quantize_rows_q8_kernel,
+                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
+                       dim3(256), 0, stream, a, aq, ad, m, k);
+    constexpr int COLS = 256 / 8;
+    const dim3 block(256);
+    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
+                    static_cast<unsigned>((m + mr - 1) / mr));
+#define FP4_I8_LAUNCH(MRV)                                                                         \
+    hipLaunchKernelGGL((gemv_nt_rocmfp4_i8_kernel<BB, MRV>), grid, block, 0, stream, aq, ad, b, c, \
+                       m, n, k)
+    if (mr == 1) {
+        FP4_I8_LAUNCH(1);
+    } else if (mr == 2) {
+        FP4_I8_LAUNCH(2);
+    } else if (mr == 4) {
+        FP4_I8_LAUNCH(4);
+    } else {
+        FP4_I8_LAUNCH(8);
+    }
+#undef FP4_I8_LAUNCH
+    return hip_status(hipGetLastError());
+}
+
+/* `tiled`: 1 = decode path (int8 activations, float ksplit when K is not
+ * whole blocks), 2 = float ksplit kernel (A/B and reference), 0 = untiled. */
 static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
-                                  int32_t k, hipStream_t stream, int tiled) {
+                                  int32_t k, hipStream_t stream, int tiled, bool fast = false) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    /* ALLPACA_ROCMFP4_F32_GEMV=1 keeps decode on float activations, to tell
+     * int8-activation rounding apart from a model-level difference. */
+    static const bool f32_only = [] {
+        const char *v = std::getenv("ALLPACA_ROCMFP4_F32_GEMV");
+        return v && v[0] == '1';
+    }();
+    if (tiled == 1 && !f32_only) {
+        const int rc = fast ? launch_rocmfp4_i8<17>(a, b, c, m, n, k, stream)
+                            : launch_rocmfp4_i8<18>(a, b, c, m, n, k, stream);
+        if (rc != ALLPACA_ERR_INVALID) {
+            return rc;
+        }
+    }
     if (tiled) {
         /* ksplit is the proven decode kernel (row = blockIdx.y). The COLS=64
          * tiled path was built for large-M prefill and is not trusted for
@@ -2999,11 +3492,23 @@ static int launch_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *c, in
         constexpr int GROUPS = 8;
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + GROUPS - 1) / GROUPS), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_rocmfp4_ksplit_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        if (fast) {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_ksplit_kernel<17>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        } else {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_ksplit_kernel<18>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        }
     } else {
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_rocmfp4_untiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        if (fast) {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_untiled_kernel<17>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        } else {
+            hipLaunchKernelGGL(gemv_nt_rocmfp4_untiled_kernel<18>, grid, block, 0, stream, a, b, c, m,
+                               n, k);
+        }
     }
     return hip_status(hipGetLastError());
 }
@@ -3017,6 +3522,21 @@ extern "C" int allpaca_gemm_nt_rocmfp4(const float *a, const uint8_t *b, float *
 extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m,
                                                int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 0);
+}
+
+/* ROCmFP4 FAST (ggml_type_id=101): 17-byte single-scale blocks. */
+extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m,
+                                            int32_t n, int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 1, true);
+}
+
+/* Float-activation ROCmFP4 GEMV (32 lanes split K): the kernel the int8
+ * path replaced. Kept for A/B and as the exact-float reference. `fast`
+ * selects 17-byte type-101 blocks. */
+extern "C" int allpaca_gemm_nt_rocmfp4_f32(const float *a, const uint8_t *b, float *c, int32_t m,
+                                           int32_t n, int32_t k, int32_t fast,
+                                           allpaca_stream_t stream) {
+    return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 2, fast != 0);
 }
 
 /* ggml MXFP4 (ggml_type_id=39): 17-byte blocks, one E8M0 scale + 16 nibbles / 32 elems. */
@@ -4808,11 +5328,8 @@ extern "C" int allpaca_attention(const float *q, const float *k, const float *v,
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    dim3 block(32);
-    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    hipLaunchKernelGGL(attention_flash_kernel, grid, block, 0, as_stream(stream), q, k, v, out, n_q,
-                       n_kv, n_heads, n_kv_heads, head_dim, causal, static_cast<const uint8_t *>(nullptr),
-                       static_cast<const float *>(nullptr));
+    launch_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, static_cast<const uint8_t *>(nullptr),
+                     static_cast<const float *>(nullptr), as_stream(stream));
     return hip_status(hipGetLastError());
 }
 
@@ -4825,11 +5342,8 @@ extern "C" int allpaca_attention_sinks(const float *q, const float *k, const flo
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    dim3 block(32);
-    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    hipLaunchKernelGGL(attention_flash_kernel, grid, block, 0, as_stream(stream), q, k, v, out, n_q,
-                       n_kv, n_heads, n_kv_heads, head_dim, causal, static_cast<const uint8_t *>(nullptr),
-                       sinks);
+    launch_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, static_cast<const uint8_t *>(nullptr),
+                     sinks, as_stream(stream));
     return hip_status(hipGetLastError());
 }
 
@@ -4842,10 +5356,8 @@ extern "C" int allpaca_attention_masked(const float *q, const float *k, const fl
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    dim3 block(32);
-    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    hipLaunchKernelGGL(attention_flash_kernel, grid, block, 0, as_stream(stream), q, k, v, out, n_q,
-                       n_kv, n_heads, n_kv_heads, head_dim, 0, mask, static_cast<const float *>(nullptr));
+    launch_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask,
+                     static_cast<const float *>(nullptr), as_stream(stream));
     return hip_status(hipGetLastError());
 }
 
@@ -6313,6 +6825,7 @@ extern "C" int allpaca_embed_gather_q8_0_rows(const uint8_t *table, const int32_
     return hip_status(hipGetLastError());
 }
 
+template <int BB>
 __global__ void embed_gather_rocmfp4_kernel(const uint8_t *table, int token, float *out, int dim) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= dim) {
@@ -6324,15 +6837,16 @@ __global__ void embed_gather_rocmfp4_kernel(const uint8_t *table, int token, flo
     const uint8_t *blk =
         table + (static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row) +
                  static_cast<size_t>(b)) *
-                    18u;
+                    static_cast<size_t>(BB);
     if (j < 16) {
         out[i] = static_cast<float>(k_rocmfp4_codebook[blk[j] & 0x0F]) * rocmfp4_scale(blk[16]);
     } else {
         out[i] =
-            static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[17]);
+            static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[BB - 1]);
     }
 }
 
+template <int BB>
 __global__ void embed_gather_rocmfp4_rows_kernel(const uint8_t *table, const int32_t *tokens,
                                                  float *out, int n_tok, int dim) {
     const int row = static_cast<int>(blockIdx.y);
@@ -6347,44 +6861,79 @@ __global__ void embed_gather_rocmfp4_rows_kernel(const uint8_t *table, const int
     const uint8_t *blk =
         table + (static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row) +
                  static_cast<size_t>(b)) *
-                    18u;
+                    static_cast<size_t>(BB);
     float v;
     if (j < 16) {
         v = static_cast<float>(k_rocmfp4_codebook[blk[j] & 0x0F]) * rocmfp4_scale(blk[16]);
     } else {
-        v = static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[17]);
+        v = static_cast<float>(k_rocmfp4_codebook[blk[j - 16] >> 4]) * rocmfp4_scale(blk[BB - 1]);
     }
     out[static_cast<size_t>(row) * static_cast<size_t>(dim) + i] = v;
 }
 
-extern "C" int allpaca_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out,
-                                            int32_t dim, allpaca_stream_t stream) {
+static int launch_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out,
+                                       int32_t dim, hipStream_t stream, bool fast) {
     if (!table || !out || dim <= 0 || token < 0) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
     const int threads = 256;
-    const int blocks = (dim + threads - 1) / threads;
-    hipLaunchKernelGGL(embed_gather_rocmfp4_kernel, dim3(static_cast<unsigned>(blocks)),
-                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, token, out,
-                       dim);
+    const dim3 grid(static_cast<unsigned>((dim + threads - 1) / threads));
+    const dim3 block(static_cast<unsigned>(threads));
+    if (fast) {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_kernel<17>, grid, block, 0, stream, table, token, out,
+                           dim);
+    } else {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_kernel<18>, grid, block, 0, stream, table, token, out,
+                           dim);
+    }
     return hip_status(hipGetLastError());
 }
 
-extern "C" int allpaca_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens,
-                                                 float *out, int32_t n_tok, int32_t dim,
-                                                 allpaca_stream_t stream) {
+static int launch_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens, float *out,
+                                            int32_t n_tok, int32_t dim, hipStream_t stream,
+                                            bool fast) {
     if (!table || !tokens || !out || n_tok <= 0 || dim <= 0) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
     const int threads = 256;
-    const int blocks = (dim + threads - 1) / threads;
-    hipLaunchKernelGGL(embed_gather_rocmfp4_rows_kernel,
-                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(n_tok)),
-                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), table, tokens, out,
-                       n_tok, dim);
+    const dim3 grid(static_cast<unsigned>((dim + threads - 1) / threads),
+                    static_cast<unsigned>(n_tok));
+    const dim3 block(static_cast<unsigned>(threads));
+    if (fast) {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_rows_kernel<17>, grid, block, 0, stream, table,
+                           tokens, out, n_tok, dim);
+    } else {
+        hipLaunchKernelGGL(embed_gather_rocmfp4_rows_kernel<18>, grid, block, 0, stream, table,
+                           tokens, out, n_tok, dim);
+    }
     return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4(const uint8_t *table, int32_t token, float *out,
+                                            int32_t dim, allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4(table, token, out, dim, as_stream(stream), false);
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_rows(const uint8_t *table, const int32_t *tokens,
+                                                 float *out, int32_t n_tok, int32_t dim,
+                                                 allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4_rows(table, tokens, out, n_tok, dim, as_stream(stream),
+                                            false);
+}
+
+/* ROCmFP4 FAST (ggml_type_id=101) embed rows: 17-byte blocks. */
+extern "C" int allpaca_embed_gather_rocmfp4_fast(const uint8_t *table, int32_t token, float *out,
+                                                 int32_t dim, allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4(table, token, out, dim, as_stream(stream), true);
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_fast_rows(const uint8_t *table, const int32_t *tokens,
+                                                      float *out, int32_t n_tok, int32_t dim,
+                                                      allpaca_stream_t stream) {
+    return launch_embed_gather_rocmfp4_rows(table, tokens, out, n_tok, dim, as_stream(stream),
+                                            true);
 }
 
 extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
@@ -6733,6 +7282,156 @@ extern "C" int allpaca_scale_rows(float *x, const float *scale, int32_t rows, in
     return hip_status(hipGetLastError());
 }
 
+/* Chunked top-k: block (c, r) keeps the k largest of x[r][c*chunk .. (c+1)*chunk),
+ * largest first, ties to the lower index. out_v/out_i are [rows][n_chunks][k]; a
+ * chunk shorter than k pads with -inf / -1. */
+constexpr int TOPK_CHUNK_MAX = 2048;
+constexpr int TOPK_THREADS = 256;
+
+__global__ void topk_chunks_kernel(const float *x, int n, int chunk, int k, float *out_v,
+                                   int32_t *out_i) {
+    __shared__ float vals[TOPK_CHUNK_MAX];
+    __shared__ float red_v[TOPK_THREADS];
+    __shared__ int red_i[TOPK_THREADS];
+    const int c = static_cast<int>(blockIdx.x);
+    const int r = static_cast<int>(blockIdx.y);
+    const int n_chunks = static_cast<int>(gridDim.x);
+    const int base = c * chunk;
+    const int len = min(chunk, n - base);
+    const float *row = x + static_cast<size_t>(r) * n;
+    for (int i = static_cast<int>(threadIdx.x); i < chunk; i += TOPK_THREADS) {
+        vals[i] = i < len ? row[base + i] : -INFINITY;
+    }
+    __syncthreads();
+    const size_t out0 = (static_cast<size_t>(r) * n_chunks + c) * k;
+    for (int j = 0; j < k; ++j) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+        for (int i = static_cast<int>(threadIdx.x); i < len; i += TOPK_THREADS) {
+            const float v = vals[i];
+            if (v > bv || (v == bv && i < bi)) {
+                bv = v;
+                bi = i;
+            }
+        }
+        red_v[threadIdx.x] = bv;
+        red_i[threadIdx.x] = bi;
+        __syncthreads();
+        for (int sstep = TOPK_THREADS / 2; sstep > 0; sstep >>= 1) {
+            if (static_cast<int>(threadIdx.x) < sstep) {
+                const float ov = red_v[threadIdx.x + sstep];
+                const int oi = red_i[threadIdx.x + sstep];
+                if (ov > red_v[threadIdx.x] || (ov == red_v[threadIdx.x] && oi < red_i[threadIdx.x])) {
+                    red_v[threadIdx.x] = ov;
+                    red_i[threadIdx.x] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const int win = red_i[0];
+            const bool ok = win < len;
+            out_v[out0 + j] = ok ? red_v[0] : -INFINITY;
+            out_i[out0 + j] = ok ? base + win : -1;
+            if (ok) {
+                vals[win] = -INFINITY;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" int allpaca_topk_chunks(const float *x, int32_t rows, int32_t n, int32_t chunk,
+                                   int32_t k, float *out_v, int32_t *out_i,
+                                   allpaca_stream_t stream) {
+    if (!x || !out_v || !out_i || rows <= 0 || n <= 0 || chunk <= 0 || chunk > TOPK_CHUNK_MAX ||
+        k <= 0 || k > chunk) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int n_chunks = (n + chunk - 1) / chunk;
+    hipLaunchKernelGGL(topk_chunks_kernel,
+                       dim3(static_cast<unsigned>(n_chunks), static_cast<unsigned>(rows)),
+                       dim3(TOPK_THREADS), 0, as_stream(stream), x, n, chunk, k, out_v, out_i);
+    return hip_status(hipGetLastError());
+}
+
+/* NeoX RoPE over rows: x[n_tok][n_heads][head_dim], row t at position start_pos + t,
+ * pairs (i, i + head_dim/2), freq theta^(-2i/head_dim). */
+__global__ void rope_neox_rows_kernel(float *x, int n_tok, int n_heads, int head_dim, int start_pos,
+                                      float theta) {
+    const int tok = static_cast<int>(blockIdx.y);
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = head_dim / 2;
+    if (tok >= n_tok || idx >= n_heads * half) {
+        return;
+    }
+    const int h = idx / half;
+    const int i = idx % half;
+    float *hvec = x + (static_cast<size_t>(tok) * n_heads + h) * static_cast<size_t>(head_dim);
+    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    const float angle = static_cast<float>(start_pos + tok) * freq;
+    const float sn = sinf(angle);
+    const float cs = cosf(angle);
+    const float a = hvec[i];
+    const float b = hvec[i + half];
+    hvec[i] = a * cs - b * sn;
+    hvec[i + half] = a * sn + b * cs;
+}
+
+extern "C" int allpaca_rope_neox_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                                      int32_t start_pos, float theta, allpaca_stream_t stream) {
+    if (!x || n_tok <= 0 || n_heads <= 0 || head_dim <= 0 || (head_dim & 1) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int total = n_heads * (head_dim / 2);
+    hipLaunchKernelGGL(rope_neox_rows_kernel,
+                       dim3(static_cast<unsigned>((total + 255) / 256), static_cast<unsigned>(n_tok)),
+                       dim3(256), 0, as_stream(stream), x, n_tok, n_heads, head_dim, start_pos,
+                       theta);
+    return hip_status(hipGetLastError());
+}
+
+/* DFlash2 two-tap dynamic convolution along each block of `block` rows:
+ * out[t][c] = sum_tap (dyn[t][g + groups*(tap + kernel*side)] + base[c + dim*(tap + kernel*side)])
+ *             * h[t - tap][c], taps that would cross the block start skipped. */
+__global__ void dflash_conv_kernel(const float *h, const float *dyn, const float *base, float *out,
+                                   int rows, int block, int dim, int kernel, int group, int side) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= rows * dim) {
+        return;
+    }
+    const int t = idx / dim;
+    const int c = idx - t * dim;
+    const int groups = dim / group;
+    const int proj = 2 * kernel * groups;
+    const int in_block = t % block;
+    float acc = 0.0f;
+    for (int tap = 0; tap < kernel && tap <= in_block; ++tap) {
+        const int k = tap + kernel * side;
+        const float w = dyn[static_cast<size_t>(t) * proj + groups * k + c / group] +
+                        base[static_cast<size_t>(dim) * k + c];
+        acc += w * h[static_cast<size_t>(t - tap) * dim + c];
+    }
+    out[idx] = acc;
+}
+
+extern "C" int allpaca_dflash_conv(const float *h, const float *dyn, const float *base, float *out,
+                                   int32_t rows, int32_t block, int32_t dim, int32_t kernel,
+                                   int32_t group, int32_t side, allpaca_stream_t stream) {
+    if (!h || !dyn || !base || !out || h == out || rows <= 0 || block <= 0 || dim <= 0 ||
+        kernel <= 0 || group <= 0 || dim % group != 0 || side < 0 || side > 1) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int n = rows * dim;
+    hipLaunchKernelGGL(dflash_conv_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256),
+                       0, as_stream(stream), h, dyn, base, out, rows, block, dim, kernel, group,
+                       side);
+    return hip_status(hipGetLastError());
+}
+
 __global__ void copy_f32_kernel(float *dst, const float *src, int n) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) {
@@ -6798,12 +7497,64 @@ __device__ inline void moe_quantize_lds(const float *v, int k, int8_t *aq, float
     __syncthreads();
 }
 
+/* exp(x) with every rounding spelled out, so HIP, CUDA and the CPU
+ * reference (`allpaca_cpu::det_expf`) give the same bits: the vendors' expf
+ * differ in the last bit for some inputs, and the MoE SiLU used it, so expert
+ * layers on an NVIDIA worker changed the text against an AMD one.
+ * exp(x) = 2^n * exp(r), n = rint(x / ln 2), |r| <= ln 2 / 2, a degree-7
+ * Taylor polynomial in Horner form (error < 1e-8 relative), then 2^n applied
+ * as two exact power-of-two products. */
+__device__ inline float det_pow2i(int k) {
+    return __int_as_float((k + 127) << 23);
+}
+
+__device__ inline float det_expf(float x) {
+    x = fminf(fmaxf(x, -103.0f), 88.5f);
+    const float n = rintf(__fmul_rn(x, 1.44269504088896341f));
+    float r = fmaf(n, -0.693145751953125f, x);
+    r = fmaf(n, -1.42860682030941723212e-6f, r);
+    float p = 1.98412698412698413e-4f;
+    p = fmaf(p, r, 1.38888888888888889e-3f);
+    p = fmaf(p, r, 8.33333333333333333e-3f);
+    p = fmaf(p, r, 4.16666666666666667e-2f);
+    p = fmaf(p, r, 1.66666666666666667e-1f);
+    p = fmaf(p, r, 0.5f);
+    p = fmaf(p, r, 1.0f);
+    p = fmaf(p, r, 1.0f);
+    const int ni = static_cast<int>(n);
+    const int a = ni / 2;
+    return __fmul_rn(__fmul_rn(p, det_pow2i(a)), det_pow2i(ni - a));
+}
+
+/* silu(g) * u for the MoE expert FFN, bit-identical across backends. */
+__device__ inline float det_silu_mul(float g, float u) {
+    return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, det_expf(-g))), u);
+}
+
+/* Test hook: det_silu_mul over n values. */
+__global__ void det_silu_mul_kernel(const float *g, const float *u, float *out, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        out[i] = det_silu_mul(g[i], u[i]);
+    }
+}
+
+extern "C" int allpaca_det_silu_mul(const float *g, const float *u, float *out, int32_t n,
+                                    allpaca_stream_t stream) {
+    if (!g || !u || !out || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(det_silu_mul_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256),
+                       0, as_stream(stream), g, u, out, n);
+    return hip_status(hipGetLastError());
+}
+
 /* SiLU(gate) * up, then quantize, into LDS (the down GEMV's activation). */
 __device__ inline void moe_silu_quantize_lds(const float *g, const float *u, int k, float *tmp,
                                              int8_t *aq, float *ad) {
     for (int i = static_cast<int>(threadIdx.x); i < k; i += static_cast<int>(blockDim.x)) {
-        const float gv = g[i];
-        tmp[i] = gv / (1.f + expf(-gv)) * u[i];
+        tmp[i] = det_silu_mul(g[i], u[i]);
     }
     __syncthreads();
     moe_quantize_lds(tmp, k, aq, ad);
@@ -7054,6 +7805,11 @@ extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t, int32_t, int32_t, int
     return 0;
 }
 
+extern "C" int allpaca_det_silu_mul(const float *, const float *, float *, int32_t,
+                                    allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" void allpaca_hip_set_exact_rows(int32_t) {}
 
 extern "C" int allpaca_moe_ffn_kquant(const float *, const int8_t *, const float *, int32_t, int32_t, int32_t, int32_t,
@@ -7238,6 +7994,16 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *, const uint8_t *, f
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *, const uint8_t *, float *, int32_t,
+                                            int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_rocmfp4_f32(const float *, const uint8_t *, float *, int32_t,
+                                           int32_t, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_gemm_nt_mxfp4(const float *, const uint8_t *, float *, int32_t, int32_t,
                                      int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -7333,6 +8099,21 @@ extern "C" int allpaca_moe_route_softmax_topk(const float *, int32_t, int32_t, i
 }
 
 extern "C" int allpaca_scale_rows(float *, const float *, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_topk_chunks(const float *, int32_t, int32_t, int32_t, int32_t, float *,
+                                   int32_t *, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rope_neox_rows(float *, int32_t, int32_t, int32_t, int32_t, float,
+                                      allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_dflash_conv(const float *, const float *, const float *, float *, int32_t,
+                                   int32_t, int32_t, int32_t, int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
@@ -7547,6 +8328,16 @@ extern "C" int allpaca_embed_gather_rocmfp4(const uint8_t *, int32_t, float *, i
 
 extern "C" int allpaca_embed_gather_rocmfp4_rows(const uint8_t *, const int32_t *, float *, int32_t,
                                                  int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_fast(const uint8_t *, int32_t, float *, int32_t,
+                                                 allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_embed_gather_rocmfp4_fast_rows(const uint8_t *, const int32_t *, float *,
+                                                      int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

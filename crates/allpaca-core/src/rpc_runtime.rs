@@ -25,6 +25,16 @@ pub struct RpcRuntime {
     layer_device: Mutex<Vec<i32>>,
     /// Second local GPU: device id, workspace, and the layers that live there.
     local_peer: Mutex<Option<(i32, Arc<allpaca_hip::HipWorkspace>, Arc<ResidentModel>)>>,
+    /// `engine.local_vram_budget_mib`: per-slot layer budgets that replace the
+    /// measured ones (0 or missing = measured).
+    local_budget_mib: Mutex<Vec<u64>>,
+    /// Last worker GPU stats and when they were read.
+    gpu_stats: Mutex<(Option<std::time::Instant>, Vec<RemoteGpu>)>,
+    /// `rpc.prefill_rows`: rows per batched span call (0 = per token).
+    prefill_rows: std::sync::atomic::AtomicUsize,
+    /// Batched-prefill activations per (session, worker device), shared by
+    /// every remote layer on that device.
+    row_scratch: Mutex<std::collections::HashMap<(usize, u32), RowScratch>>,
     pub roundtrips: AtomicU64,
     pub activation_bytes: AtomicU64,
     pub h2d_bytes: AtomicU64,
@@ -40,6 +50,48 @@ impl std::fmt::Debug for RpcRuntime {
     }
 }
 
+/// Activation buffers for `rows` prompt rows on one worker GPU, sized for the
+/// widest remote layer there. Batched launch lists run in these; the
+/// per-layer single-row buffers stay for decode.
+#[derive(Debug, Clone, Copy)]
+struct RowScratch {
+    rows: usize,
+    x: BufId,
+    norm_out: BufId,
+    q_proj: BufId,
+    q: BufId,
+    q_gate: BufId,
+    k: BufId,
+    v: BufId,
+    attn_out: BufId,
+    hidden: BufId,
+    gate: BufId,
+    up: BufId,
+}
+
+/// How long a worker GPU reading is served before it is refreshed.
+const GPU_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Longest a stats refresh waits for the worker sessions to be free.
+const GPU_STATS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// One GPU on an RPC worker, for the operator dashboard. `None` = the
+/// worker's platform does not report it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteGpu {
+    /// Worker `host:port`.
+    pub endpoint: String,
+    /// Device index on that worker.
+    pub index: u32,
+    pub name: String,
+    /// Device-wide VRAM in use (all processes).
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    pub util_pct: Option<u32>,
+    pub temp_c: Option<u32>,
+    pub power_w: Option<u32>,
+}
+
 /// One layer's routed experts on a worker GPU (`MoeFfn`).
 #[derive(Clone, Copy)]
 struct RemoteExperts {
@@ -53,6 +105,8 @@ struct RemoteExperts {
 #[derive(Clone, Copy)]
 struct RemoteLayer {
     session: usize,
+    /// Worker GPU holding this layer's buffers.
+    device: u32,
     attn_norm: BufId,
     wq: BufId,
     wk: BufId,
@@ -118,6 +172,12 @@ fn local_reserve_bytes(total: u64) -> u64 {
 /// read now, not the card's total: on Windows a display GPU can have several
 /// GiB taken by the desktop, and WDDM silently spills past-capacity
 /// allocations to shared system memory, which reads over PCIe at decode.
+/// `engine.local_vram_budget_mib` entry for `slot`, in bytes; `None` keeps
+/// the measured budget.
+fn pinned_budget(pinned_mib: &[u64], slot: usize) -> Option<u64> {
+    pinned_mib.get(slot).copied().filter(|m| *m > 0).map(|m| m << 20)
+}
+
 fn plan_local_by_bytes(
     model: &TinyModel,
     file: &GgufFile,
@@ -125,6 +185,7 @@ fn plan_local_by_bytes(
     is_full_attn: &[bool],
     kv_vram_bytes: u64,
     draft_bytes: u64,
+    pinned_mib: &[u64],
 ) -> LayerPlan {
     let (mut layer_bytes, globals) = crate::model::gguf_device_bytes(file, &model.config);
     let n_attn = is_full_attn.iter().filter(|a| **a).count().max(1) as u64;
@@ -144,11 +205,16 @@ fn plan_local_by_bytes(
         } else if slot == 1 {
             budget = budget.saturating_sub(draft_bytes);
         }
+        let pinned = pinned_budget(pinned_mib, slot);
+        if let Some(b) = pinned {
+            budget = b;
+        }
         tracing::info!(
             hip = dev,
             free_mib = free >> 20,
             total_mib = total >> 20,
             budget_mib = budget >> 20,
+            pinned = pinned.is_some(),
             "local GPU pool budget"
         );
         budgets.push(budget);
@@ -190,6 +256,10 @@ impl RpcRuntime {
             remote: Mutex::new(Vec::new()),
             experts: Mutex::new(Vec::new()),
             layer_device: Mutex::new(Vec::new()),
+            local_budget_mib: Mutex::new(Vec::new()),
+            gpu_stats: Mutex::new((None, Vec::new())),
+            prefill_rows: std::sync::atomic::AtomicUsize::new(128),
+            row_scratch: Mutex::new(std::collections::HashMap::new()),
             local_peer: Mutex::new(None),
             roundtrips: AtomicU64::new(0),
             activation_bytes: AtomicU64::new(0),
@@ -247,6 +317,66 @@ impl RpcRuntime {
 
     pub fn session_count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Every worker GPU's live stats, at most [`GPU_STATS_MAX_AGE`] old when
+    /// the sessions are free. Never waits on a session: while one is busy (a
+    /// weight upload, a decode round trip) the last reading is returned.
+    pub fn remote_gpu_stats(&self) -> Vec<RemoteGpu> {
+        let Ok(mut cache) = self.gpu_stats.lock() else {
+            return Vec::new();
+        };
+        let fresh = cache.0.is_some_and(|t| t.elapsed() < GPU_STATS_MAX_AGE);
+        if !fresh {
+            // During decode the sessions are busy in back-to-back round
+            // trips: wait briefly for a gap between two of them. A weight
+            // upload holds them for seconds, and then this gives up.
+            let deadline = std::time::Instant::now() + GPU_STATS_LOCK_WAIT;
+            let sessions = loop {
+                match self.sessions.try_lock() {
+                    Ok(g) => break Some(g),
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            if let Some(mut sessions) = sessions {
+                let mut out = Vec::new();
+                for s in sessions.iter_mut() {
+                    let endpoint = s.endpoint().to_string();
+                    let Ok(stats) = s.device_stats() else {
+                        continue;
+                    };
+                    for (index, d) in stats.into_iter().enumerate() {
+                        let known = |v: i32| u32::try_from(v).ok();
+                        out.push(RemoteGpu {
+                            endpoint: endpoint.clone(),
+                            index: index as u32,
+                            name: d.name,
+                            mem_used_bytes: d.mem_used,
+                            mem_total_bytes: d.mem_total,
+                            util_pct: known(d.util_pct),
+                            temp_c: known(d.temp_c),
+                            power_w: known(d.power_w),
+                        });
+                    }
+                }
+                *cache = (Some(std::time::Instant::now()), out);
+            }
+        }
+        cache.1.clone()
+    }
+
+    /// Pin the per-GPU layer budgets (`engine.local_vram_budget_mib`).
+    pub fn set_local_budgets_mib(&self, mib: &[u64]) {
+        if let Ok(mut b) = self.local_budget_mib.lock() {
+            *b = mib.to_vec();
+        }
+    }
+
+    fn local_budgets_mib(&self) -> Vec<u64> {
+        self.local_budget_mib.lock().map(|b| b.clone()).unwrap_or_default()
     }
 
     /// HIP device that runs a local layer. `-1` when the layer is on RPC.
@@ -391,7 +521,15 @@ impl RpcRuntime {
                 .map(|l| l.block == HybridLayerKind::Attention)
                 .collect();
             if let Some(file) = gguf {
-                plan_local_by_bytes(model, file, &local_ids, &attn, kv_vram_bytes, draft_bytes)
+                plan_local_by_bytes(
+                    model,
+                    file,
+                    &local_ids,
+                    &attn,
+                    kv_vram_bytes,
+                    draft_bytes,
+                    &self.local_budgets_mib(),
+                )
             } else {
                 let hybrid = attn.iter().any(|full| !*full);
                 let window = if hybrid {
@@ -479,6 +617,10 @@ impl RpcRuntime {
         *self.remote.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
         })? = remote;
+        // Scratch is sized for the layers placed before; size it again lazily.
+        if let Ok(mut scratch) = self.row_scratch.lock() {
+            scratch.clear();
+        }
         *self.layer_device.lock().map_err(|_| {
             AllpacaError::Fatal(FatalError::InvalidConfig("rpc layer device lock".into()))
         })? = layer_device;
@@ -511,6 +653,7 @@ impl RpcRuntime {
                 *b += kv_share;
             }
         }
+        let pinned_mib = self.local_budgets_mib();
         let mut budgets = Vec::with_capacity(local_ids.len());
         for (slot, dev) in local_ids.iter().copied().enumerate() {
             let (hip_free, total) = allpaca_hip::device_memory_info(dev).unwrap_or((0, 0));
@@ -523,11 +666,16 @@ impl RpcRuntime {
             } else if slot == 1 {
                 budget = budget.saturating_sub(draft_bytes);
             }
+            let pinned = pinned_budget(&pinned_mib, slot);
+            if let Some(b) = pinned {
+                budget = b;
+            }
             tracing::info!(
                 hip = dev,
                 free_mib = free >> 20,
                 total_mib = total >> 20,
                 budget_mib = budget >> 20,
+                pinned = pinned.is_some(),
                 "expert-parallel: local GPU budget"
             );
             budgets.push(budget);
@@ -650,7 +798,9 @@ impl RpcRuntime {
             file.tensor(&format!("blk.{blk}.ffn_{part}_exps.weight"))
                 .is_some_and(|t| matches!(t.ggml_type_id, 12..=14))
         });
-        let fused = backend == RpcBackendKind::Hip && cfg.dim % 256 == 0 && cfg.ff_dim % 256 == 0;
+        let fused = matches!(backend, RpcBackendKind::Hip | RpcBackendKind::Cuda)
+            && cfg.dim % 256 == 0
+            && cfg.ff_dim % 256 == 0;
         Ok(RemoteExperts {
             q8: kquant && fused,
             session,
@@ -779,6 +929,7 @@ impl RpcRuntime {
         self.h2d_bytes.fetch_add(h2d as u64, Ordering::Relaxed);
         Ok(RemoteLayer {
             session: session_idx,
+            device,
             attn_norm,
             wq,
             wk,
@@ -906,7 +1057,11 @@ impl RpcRuntime {
             infos[1].n_elements() as usize,
             infos[3].n_elements() as usize,
         );
-        let n_rot = cfg.rope_dims_for_layer(layer_idx);
+        // The same choice the local path makes: NeoX pairing (partial or
+        // full, `RopePartial`) only where `neox_rot_dims` says so; otherwise
+        // the standard interleaved rotation (`Rope`). Llama GGUFs set
+        // rope.dimension_count == head_dim and are still standard.
+        let n_rot = cfg.neox_rot_dims(layer_idx, al.head_dim).unwrap_or(0);
         if q_k != dim
             || k_k != dim
             || v_k != dim
@@ -924,6 +1079,8 @@ impl RpcRuntime {
             || al.attn_dim % al.head_dim != 0
             || k_n % al.head_dim != 0
             || (n_rot > 0 && (n_rot > al.head_dim || n_rot % 2 != 0))
+            // The worker's attention always rotates Q/K.
+            || cfg.rope_none
         {
             tracing::warn!(layer_idx, "rpc packed layer skipped; tensor shape is not dense attn+ffn");
             return Ok(None);
@@ -1035,6 +1192,7 @@ impl RpcRuntime {
         );
         Ok(Some(RemoteLayer {
             session: session_idx,
+            device,
             attn_norm: attn_norm_id,
             wq,
             wk,
@@ -1100,6 +1258,159 @@ impl RpcRuntime {
             .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|l| l.session))
     }
 
+    /// Rows per batched span call (`rpc.prefill_rows`, 0 = one token per call).
+    pub fn set_prefill_rows(&self, rows: usize) {
+        self.prefill_rows.store(rows, Ordering::Relaxed);
+    }
+
+    /// The contiguous same-worker run of remote layers starting at `layer_idx`.
+    fn span_from(&self, layer_idx: usize) -> Result<Vec<RemoteLayer>, AllpacaError> {
+        let guard = self.remote.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into()))
+        })?;
+        let session = guard
+            .get(layer_idx)
+            .and_then(|layer| layer.as_ref())
+            .map(|layer| layer.session)
+            .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig("rpc layer missing".into())))?;
+        let mut span = Vec::new();
+        for idx in layer_idx..guard.len() {
+            match guard.get(idx).and_then(|layer| layer.as_ref()) {
+                Some(layer) if layer.session == session => span.push(*layer),
+                _ => break,
+            }
+        }
+        Ok(span)
+    }
+
+    /// Run the remote span starting at `layer_idx` over `x`, which holds
+    /// `x.len() / dim` prompt rows at consecutive positions from `start_pos`.
+    /// Rows go to the worker `rpc.prefill_rows` at a time, one round trip per
+    /// chunk; with `prefill_rows = 0`, or a layer the batched list cannot
+    /// express, it falls back to one round trip per row. A call on any other
+    /// layer of the span is a no-op.
+    pub fn run_rows(
+        &self,
+        layer_idx: usize,
+        start_pos: usize,
+        dim: usize,
+        x: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        if !self.is_span_start(layer_idx) || dim == 0 {
+            return Ok(());
+        }
+        let n_rows = x.len() / dim;
+        let cap = self.prefill_rows.load(Ordering::Relaxed);
+        let span = self.span_from(layer_idx)?;
+        if n_rows <= 1 || cap == 0 || span.iter().any(|l| !rows_supported(l)) {
+            for (t, row) in x.chunks_exact_mut(dim).enumerate() {
+                self.run_layer(layer_idx, start_pos + t, row)?;
+            }
+            return Ok(());
+        }
+        if let Some(layer) = span.iter().find(|l| start_pos + n_rows > l.max_seq) {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "context position {} is past the remote layers' KV capacity of {} tokens; raise rpc.max_seq (0 sizes it from kv.vram_bytes)",
+                start_pos + n_rows - 1,
+                layer.max_seq
+            ))));
+        }
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()))
+        })?;
+        let session_idx = span[0].session;
+        let session = sessions.get_mut(session_idx).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc session missing".into()))
+        })?;
+        let mut scratch = Vec::with_capacity(span.len());
+        for layer in &span {
+            scratch.push(self.row_scratch_for(session, session_idx, layer.device, cap)?);
+        }
+        for (c, chunk) in x.chunks_mut(cap * dim).enumerate() {
+            let rows = chunk.len() / dim;
+            let pos = start_pos + c * cap;
+            let xs: Vec<BufId> = scratch.iter().map(|s| s.x).collect();
+            let lists: Vec<LaunchList> = span
+                .iter()
+                .zip(&scratch)
+                .map(|(layer, s)| layer_launch_rows(layer, s, pos, rows))
+                .collect();
+            let activation = f32_bytes(chunk);
+            self.activation_bytes
+                .fetch_add(activation.len() as u64, Ordering::Relaxed);
+            let out = session.run_span(&xs, &lists, &activation).map_err(map_rpc)?;
+            self.activation_bytes
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
+            self.roundtrips.fetch_add(1, Ordering::Relaxed);
+            if out.len() != chunk.len() * 4 {
+                return Err(AllpacaError::Fatal(FatalError::Io(format!(
+                    "rpc run_span returned {} bytes for {} rows",
+                    out.len(),
+                    rows
+                ))));
+            }
+            from_f32_bytes(&out, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// The row scratch on `device` of session `session_idx`, allocated on
+    /// first use for the widest remote layer placed there.
+    fn row_scratch_for(
+        &self,
+        session: &mut RpcSession,
+        session_idx: usize,
+        device: u32,
+        rows: usize,
+    ) -> Result<RowScratch, AllpacaError> {
+        let mut map = self.row_scratch.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("rpc row scratch lock".into()))
+        })?;
+        if let Some(s) = map.get(&(session_idx, device)).filter(|s| s.rows == rows) {
+            return Ok(*s);
+        }
+        if let Some(old) = map.remove(&(session_idx, device)) {
+            for id in [
+                old.x, old.norm_out, old.q_proj, old.q, old.q_gate, old.k, old.v, old.attn_out,
+                old.hidden, old.gate, old.up,
+            ] {
+                let _ = session.free(id);
+            }
+        }
+        let layers: Vec<RemoteLayer> = self
+            .remote
+            .lock()
+            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidConfig("rpc remote lock".into())))?
+            .iter()
+            .flatten()
+            .filter(|l| l.session == session_idx && l.device == device)
+            .copied()
+            .collect();
+        let widest = |f: &dyn Fn(&RemoteLayer) -> usize| layers.iter().map(f).max().unwrap_or(1).max(1);
+        let mut alloc = |width: usize| -> Result<BufId, AllpacaError> {
+            session
+                .alloc_on((width * rows * 4) as u64, Some(device))
+                .map_err(map_rpc)
+        };
+        let s = RowScratch {
+            rows,
+            x: alloc(widest(&|l| l.dim))?,
+            norm_out: alloc(widest(&|l| l.dim))?,
+            q_proj: alloc(widest(&|l| l.q_len))?,
+            q: alloc(widest(&|l| if l.gated { l.attn_dim } else { l.q_len }))?,
+            q_gate: alloc(widest(&|l| if l.gated { l.attn_dim } else { 1 }))?,
+            k: alloc(widest(&|l| l.kv_dim))?,
+            v: alloc(widest(&|l| l.kv_dim))?,
+            attn_out: alloc(widest(&|l| l.o_in))?,
+            hidden: alloc(widest(&|l| l.dim))?,
+            gate: alloc(widest(&|l| l.ff_dim))?,
+            up: alloc(widest(&|l| l.ff_dim))?,
+        };
+        tracing::info!(session = session_idx, device, rows, "rpc prefill row scratch allocated");
+        map.insert((session_idx, device), s);
+        Ok(s)
+    }
+
     /// Run one remote layer. A call on the first layer of a contiguous same-worker
     /// run executes that whole span in one RPC. Later layers in the span are no-ops;
     /// `x` already holds the span output.
@@ -1140,7 +1451,7 @@ impl RpcRuntime {
         for layer in &span {
             if pos >= layer.max_seq {
                 return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-                    "rpc kv pos {pos} >= max_seq {}",
+                    "context position {pos} is past the remote layers' KV capacity of {} tokens; raise rpc.max_seq (0 sizes it from kv.vram_bytes)",
                     layer.max_seq
                 ))));
             }
@@ -1165,6 +1476,137 @@ impl RpcRuntime {
         self.roundtrips.fetch_add(1, Ordering::Relaxed);
         from_f32_bytes(&out, x)?;
         Ok(())
+    }
+}
+
+/// Whether [`layer_launch_rows`] can express this layer: full-head RoPE
+/// rotates Q and K with one head size.
+fn rows_supported(layer: &RemoteLayer) -> bool {
+    layer.n_rot > 0 || layer.q_head_dim == 0 || layer.q_head_dim == layer.head_dim
+}
+
+/// [`layer_launch`] for `rows` prompt rows at positions `pos..pos + rows`,
+/// in the device's row scratch. Each row's K/V lands in the layer's cache at
+/// its position, and attention is causal over the cache, so the result
+/// matches running the rows one at a time.
+fn layer_launch_rows(layer: &RemoteLayer, s: &RowScratch, pos: usize, rows: usize) -> LaunchList {
+    let r = rows as i32;
+    let packed = layer.packed;
+    let q_dst = if layer.gated { s.q_proj } else { s.q };
+    let kv_row = layer.kv_dim * 4;
+    let mut items = vec![
+        rms_rows(s.x, layer.attn_norm, s.norm_out, rows, layer.dim, layer.eps),
+        gemm(packed, s.norm_out, layer.wq, q_dst, r, layer.q_len as i32, layer.dim as i32),
+        gemm(packed, s.norm_out, layer.wk, s.k, r, layer.kv_dim as i32, layer.dim as i32),
+        gemm(packed, s.norm_out, layer.wv, s.v, r, layer.kv_dim as i32, layer.dim as i32),
+    ];
+    if layer.gated {
+        items.push(LaunchItem {
+            op: KernelOp::DeinterleaveQGate,
+            bufs: vec![s.q_proj, s.q, s.q_gate],
+            i32s: vec![(layer.n_heads * rows) as i32, layer.head_dim as i32],
+            f32s: vec![],
+        });
+    }
+    if layer.has_q_norm {
+        items.push(LaunchItem {
+            op: KernelOp::RmsNormHeads,
+            bufs: vec![s.q, layer.q_norm],
+            i32s: vec![(layer.n_heads * rows) as i32, layer.head_dim as i32],
+            f32s: vec![layer.eps],
+        });
+    }
+    if layer.has_k_norm {
+        items.push(LaunchItem {
+            op: KernelOp::RmsNormHeads,
+            bufs: vec![s.k, layer.k_norm],
+            i32s: vec![(layer.n_kv_heads * rows) as i32, layer.head_dim as i32],
+            f32s: vec![layer.eps],
+        });
+    }
+    let rope_i32 = vec![
+        r,
+        layer.n_heads as i32,
+        layer.n_kv_heads as i32,
+        layer.head_dim as i32,
+        pos as i32,
+    ];
+    if layer.n_rot > 0 {
+        let mut i32s = rope_i32;
+        i32s.push(layer.n_rot as i32);
+        items.push(LaunchItem {
+            op: KernelOp::RopePartialRows,
+            bufs: vec![s.q, s.k],
+            i32s,
+            f32s: vec![
+                layer.theta,
+                layer.rope_sections[0] as f32,
+                layer.rope_sections[1] as f32,
+                layer.rope_sections[2] as f32,
+                layer.rope_sections[3] as f32,
+            ],
+        });
+    } else {
+        items.push(LaunchItem {
+            op: KernelOp::RopeRows,
+            bufs: vec![s.q, s.k],
+            i32s: rope_i32,
+            f32s: vec![layer.theta],
+        });
+    }
+    items.push(memcpy_at(layer.k_cache, s.k, (pos * kv_row) as i32, (rows * kv_row) as i32));
+    items.push(memcpy_at(layer.v_cache, s.v, (pos * kv_row) as i32, (rows * kv_row) as i32));
+    let mut attention = attn(
+        s.q,
+        layer.k_cache,
+        layer.v_cache,
+        s.attn_out,
+        pos + rows,
+        layer.n_heads,
+        layer.n_kv_heads,
+        layer.head_dim,
+    );
+    attention.i32s[0] = r;
+    items.push(attention);
+    if layer.gated {
+        items.push(LaunchItem {
+            op: KernelOp::SigmoidMul,
+            bufs: vec![s.attn_out, s.q_gate],
+            i32s: vec![(layer.attn_dim * rows) as i32],
+            f32s: vec![],
+        });
+    }
+    items.push(gemm(packed, s.attn_out, layer.wo, s.hidden, r, layer.dim as i32, layer.o_in as i32));
+    items.push(residual_n(s.x, s.hidden, rows * layer.dim));
+    items.push(rms_rows(s.x, layer.ffn_norm, s.norm_out, rows, layer.dim, layer.eps));
+    items.push(gemm(packed, s.norm_out, layer.w_gate, s.gate, r, layer.ff_dim as i32, layer.dim as i32));
+    items.push(gemm(packed, s.norm_out, layer.w_up, s.up, r, layer.ff_dim as i32, layer.dim as i32));
+    items.push(LaunchItem {
+        op: KernelOp::SiluMul,
+        bufs: vec![s.gate, s.up],
+        i32s: vec![(rows * layer.ff_dim) as i32],
+        f32s: vec![],
+    });
+    items.push(gemm(packed, s.gate, layer.w_down, s.hidden, r, layer.dim as i32, layer.ff_dim as i32));
+    items.push(residual_n(s.x, s.hidden, rows * layer.dim));
+    LaunchList { items }
+}
+
+fn rms_rows(x: BufId, w: BufId, out: BufId, rows: usize, dim: usize, eps: f32) -> LaunchItem {
+    LaunchItem {
+        op: KernelOp::RmsNormRows,
+        bufs: vec![x, w, out],
+        i32s: vec![rows as i32, dim as i32],
+        f32s: vec![eps],
+    }
+}
+
+fn residual_n(dst: BufId, src: BufId, n: usize) -> LaunchItem {
+    LaunchItem {
+        op: KernelOp::ResidualAdd,
+        bufs: vec![dst, src],
+        i32s: vec![n as i32],
+        f32s: vec![],
     }
 }
 
@@ -1338,11 +1780,13 @@ fn gemm_nk(info: &allpaca_gguf::TensorInfo) -> Option<(usize, usize)> {
 }
 
 fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
-    let hip = matches!(ty, 0 | 1 | 8 | 12 | 13 | 14 | 30 | 34 | 35 | 39 | 100);
+    let hip = matches!(ty, 0 | 1 | 8 | 12 | 13 | 14 | 30 | 34 | 35 | 39 | 100 | 101);
     match backend {
         RpcBackendKind::Hip => hip,
         RpcBackendKind::Cpu => hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 20 | 23),
-        RpcBackendKind::Cuda => false,
+        // F32, Q8_0 and the int8 K-quant GEMV; ROCmFP4 and the rest stay off
+        // CUDA workers.
+        RpcBackendKind::Cuda => matches!(ty, 0 | 8 | 12 | 13 | 14),
     }
 }
 
@@ -1460,5 +1904,18 @@ fn memcpy_at(dst: BufId, src: BufId, dst_off: i32, nbytes: i32) -> LaunchItem {
         bufs: vec![dst, src],
         i32s: vec![dst_off, nbytes],
         f32s: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pinned_budget;
+
+    #[test]
+    fn pinned_budget_overrides_only_set_slots() {
+        assert_eq!(pinned_budget(&[], 0), None);
+        assert_eq!(pinned_budget(&[8332, 0], 0), Some(8332 << 20));
+        assert_eq!(pinned_budget(&[8332, 0], 1), None);
+        assert_eq!(pinned_budget(&[8332], 1), None);
     }
 }

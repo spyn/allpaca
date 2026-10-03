@@ -77,6 +77,8 @@ struct StatusBody {
     /// `None` while the engine reloads.
     stats: Option<StatsSnapshot>,
     devices: Vec<DeviceInfo>,
+    /// GPUs on the RPC workers, read live from each worker.
+    remote_gpus: Vec<allpaca_core::RemoteGpu>,
     host: HostSnapshot,
     engine: EngineStatus,
 }
@@ -132,6 +134,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusBody> {
             .as_ref()
             .map(|e| e.inventory().devices.clone())
             .unwrap_or_default(),
+        remote_gpus: engine.as_ref().map(|e| e.remote_gpus()).unwrap_or_default(),
         host: state.host.snapshot(),
         engine: state.engine.status(),
     })

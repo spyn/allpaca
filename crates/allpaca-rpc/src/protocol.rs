@@ -9,7 +9,11 @@ pub const PROTO_PATCH: u16 = 0;
 /// Bump when the named kernel set or C ABI revision changes.
 /// 2 adds `PutTensor` and `GemmNtQuant` (packed GGUF weights).
 /// 3 adds `MoeFfn` (expert-parallel MoE FFN).
-pub const KERNEL_ABI_REV: u32 = 5;
+/// 6 adds `DeviceStats` (per-GPU memory, utilisation, temperature).
+/// 7 adds multi-row ops for batched prefill (`RmsNormRows`, `RopeRows`,
+/// `RopePartialRows`), an explicit element count on `SiluMul` /
+/// `ResidualAdd`, and `RunSpan` steps that share one activation buffer.
+pub const KERNEL_ABI_REV: u32 = 7;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
@@ -50,6 +54,8 @@ pub enum Cmd {
     PutTensor = 13,
     /// Expert-parallel MoE FFN over stacked expert tensors; see [`MoeFfnRequest`].
     MoeFfn = 14,
+    /// Live per-device stats; reply is [`DeviceStat`] per device.
+    DeviceStats = 15,
 }
 
 impl Cmd {
@@ -70,6 +76,7 @@ impl Cmd {
             12 => Self::RunSpan,
             13 => Self::PutTensor,
             14 => Self::MoeFfn,
+            15 => Self::DeviceStats,
             _ => return None,
         })
     }
@@ -117,6 +124,16 @@ pub enum KernelOp {
     /// Partial or sectioned RoPE on Q and K. `i32s`: `[n_heads, n_kv_heads, head_dim, pos, n_rot]`.
     /// `f32s`: `[theta, section0, section1, section2, section3]`.
     RopePartial = 13,
+    /// RMSNorm of `rows` rows. `bufs`: `[x, w, out]`. `i32s`: `[rows, dim]`.
+    /// `f32s`: `[eps]`.
+    RmsNormRows = 14,
+    /// Full-head RoPE on Q and K for `rows` consecutive positions. `bufs`:
+    /// `[q, k]`. `i32s`: `[rows, n_heads, n_kv_heads, head_dim, start_pos]`.
+    /// `f32s`: `[theta]`.
+    RopeRows = 15,
+    /// [`Self::RopePartial`] for `rows` consecutive positions. `i32s`:
+    /// `[rows, n_heads, n_kv_heads, head_dim, start_pos, n_rot]`.
+    RopePartialRows = 16,
 }
 
 impl KernelOp {
@@ -135,6 +152,9 @@ impl KernelOp {
             11 => Self::RmsNormHeads,
             12 => Self::SigmoidMul,
             13 => Self::RopePartial,
+            14 => Self::RmsNormRows,
+            15 => Self::RopeRows,
+            16 => Self::RopePartialRows,
             _ => return None,
         })
     }
@@ -164,6 +184,54 @@ pub struct HelloReply {
     /// Free bytes per local device. Empty means one device of `memory_bytes`
     /// (older workers that do not append the list).
     pub devices: Vec<u64>,
+}
+
+/// One worker device as the operator sees it. `-1` = not reported by this
+/// platform.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeviceStat {
+    pub name: String,
+    /// Device-wide memory in use (every process), bytes.
+    pub mem_used: u64,
+    pub mem_total: u64,
+    /// GPU busy percent, 0..=100.
+    pub util_pct: i32,
+    pub temp_c: i32,
+    pub power_w: i32,
+}
+
+pub fn encode_device_stats(stats: &[DeviceStat]) -> Vec<u8> {
+    let mut w = Vec::new();
+    write_u32(&mut w, stats.len() as u32);
+    for s in stats {
+        write_str(&mut w, &s.name);
+        write_u64(&mut w, s.mem_used);
+        write_u64(&mut w, s.mem_total);
+        write_i32(&mut w, s.util_pct);
+        write_i32(&mut w, s.temp_c);
+        write_i32(&mut w, s.power_w);
+    }
+    w
+}
+
+pub fn decode_device_stats(data: &[u8]) -> Result<Vec<DeviceStat>, RpcError> {
+    let mut c = Cursor::new(data);
+    let n = c.u32()? as usize;
+    if n > 64 {
+        return Err(RpcError::Protocol("too many rpc devices".into()));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(DeviceStat {
+            name: c.str()?,
+            mem_used: c.u64()?,
+            mem_total: c.u64()?,
+            util_pct: c.i32()?,
+            temp_c: c.i32()?,
+            power_w: c.i32()?,
+        });
+    }
+    Ok(out)
 }
 
 impl HelloReply {

@@ -7,7 +7,7 @@ description = "Engine, scheduler, memory tiers, and draft providers"
 
 [features]
 default = []
-hip = ["allpaca-hip/hip"]
+hip = ["allpaca-hip/hip", "allpaca-rpc/hip"]
 cuda = ["allpaca-cuda/cuda", "allpaca-rpc/cuda"]
 vulkan = ["allpaca-vulkan/vulkan"]
 

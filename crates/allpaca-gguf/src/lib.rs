@@ -5,7 +5,7 @@ mod tokenizer;
 mod writer;
 
 pub use parser::{
-    dequant_packed, discover_dspark_sidecar, is_dspark_filename, is_split_gguf_name, parse_split_filename,
+    dequant_packed, discover_dspark_sidecar, is_dflash2_filename, is_dspark_filename, is_split_gguf_name, parse_split_filename,
     split_sibling_paths, GgmlType, GgufCompatReport, GgufFile, GgufValue, HybridLayerInfo,
     HybridLayerKind, TensorInfo, GGUF_MAGIC,
 };

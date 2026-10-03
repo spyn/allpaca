@@ -600,6 +600,38 @@ fn softmax_in_place(x: &mut [f32]) {
     }
 }
 
+/// `exp(x)` with every rounding fixed (range reduction, degree-7 Horner
+/// polynomial with fused multiply-adds, two exact power-of-two scalings): the
+/// same bits as the GPU `det_expf` in the HIP and CUDA MoE kernels, which use
+/// it instead of the vendors' `expf` so the backends agree.
+pub fn det_expf(x: f32) -> f32 {
+    let x = x.max(-103.0).min(88.5);
+    let n = (x * 1.442_695_040_888_963_4_f32).round_ties_even();
+    let mut r = n.mul_add(-0.693_145_751_953_125_f32, x);
+    r = n.mul_add(-1.428_606_820_309_417_2e-6_f32, r);
+    let mut p = 1.984_126_984_126_984e-4_f32;
+    for c in [
+        1.388_888_888_888_889e-3_f32,
+        8.333_333_333_333_333e-3,
+        4.166_666_666_666_667e-2,
+        1.666_666_666_666_666_7e-1,
+        0.5,
+        1.0,
+        1.0,
+    ] {
+        p = p.mul_add(r, c);
+    }
+    let pow2 = |k: i32| f32::from_bits(((k + 127) as u32) << 23);
+    let ni = n as i32;
+    let a = ni / 2;
+    p * pow2(a) * pow2(ni - a)
+}
+
+/// `silu(g) * u` as the GPU MoE expert FFN computes it ([`det_expf`]).
+pub fn det_silu_mul(g: f32, u: f32) -> f32 {
+    g / (1.0 + det_expf(-g)) * u
+}
+
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
@@ -637,6 +669,9 @@ pub const Q5_1_BLOCK_BYTES: usize = 24;
 /// `e[0]`), nibble `j` high → element `j + 16` (scale `e[1]`).
 pub const ROCMFP4_BLOCK_ELEMS: usize = 32;
 pub const ROCMFP4_BLOCK_BYTES: usize = 18;
+/// ROCmFP4 FAST (ggml_type_id=101): the same 16 packed-nibble bytes with one
+/// scale byte for all 32 weights.
+pub const ROCMFP4_FAST_BLOCK_BYTES: usize = 17;
 /// Signed E2M1-derived codebook at half-scale, top magnitude retuned 12 → 10.
 pub const ROCMFP4_CODEBOOK: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10];
 /// ggml MXFP4: 1× E8M0 scale + 16 packed nibbles / 32 elems (ggml_type_id=39).
@@ -1612,6 +1647,45 @@ pub fn dequant_rocmfp4(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), A
     Ok(())
 }
 
+/// Dequantize ROCmFP4 FAST (ggml_type_id=101) blocks: 16 bytes of packed
+/// codes then one scale byte, `y = codebook[q] * scale(e)` for all 32 weights
+/// (low nibbles are weights 0..16, high nibbles 16..32, as in type 100).
+pub fn dequant_rocmfp4_fast(
+    blocks: &[u8],
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), AllpacaError> {
+    if out.len() < n {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_rocmfp4_fast output too small".into(),
+        )));
+    }
+    let n_blocks = n.div_ceil(ROCMFP4_BLOCK_ELEMS);
+    if blocks.len() < n_blocks.saturating_mul(ROCMFP4_FAST_BLOCK_BYTES) {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "dequant_rocmfp4_fast truncated blocks".into(),
+        )));
+    }
+    let half = ROCMFP4_BLOCK_ELEMS / 2;
+    for b in 0..n_blocks {
+        let off = b * ROCMFP4_FAST_BLOCK_BYTES;
+        let qs = &blocks[off..off + half];
+        let d = rocmfp4_scale(blocks[off + half]);
+        let base = b * ROCMFP4_BLOCK_ELEMS;
+        for (j, &packed) in qs.iter().enumerate() {
+            let i0 = base + j;
+            let i1 = i0 + half;
+            if i0 < n {
+                out[i0] = f32::from(ROCMFP4_CODEBOOK[usize::from(packed & 0x0f)]) * d;
+            }
+            if i1 < n {
+                out[i1] = f32::from(ROCMFP4_CODEBOOK[usize::from(packed >> 4)]) * d;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Nearest codebook index for `x` under `1 / scale_half`. Ties keep the lower
 /// magnitude, matching the reference encoder.
 fn rocmfp4_best_index(x: f32, inv_scale_half: f32) -> u8 {
@@ -1706,6 +1780,31 @@ pub fn quantize_rocmfp4(data: &[f32]) -> Vec<u8> {
         }
         out[off + half] = e0;
         out[off + half + 1] = e1;
+    }
+    out
+}
+
+/// Quantize to ROCmFP4 FAST blocks (tests / tiny written models): one scale
+/// per 32 weights.
+pub fn quantize_rocmfp4_fast(data: &[f32]) -> Vec<u8> {
+    let half = ROCMFP4_BLOCK_ELEMS / 2;
+    let n_blocks = data.len().div_ceil(ROCMFP4_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * ROCMFP4_FAST_BLOCK_BYTES];
+    let mut vals = [0.0f32; ROCMFP4_BLOCK_ELEMS];
+    for b in 0..n_blocks {
+        let start = b * ROCMFP4_BLOCK_ELEMS;
+        for (j, v) in vals.iter_mut().enumerate() {
+            *v = data.get(start + j).copied().unwrap_or(0.0);
+        }
+        let e = rocmfp4_choose_scale(&vals);
+        let inv = inv_half_scale(e);
+        let off = b * ROCMFP4_FAST_BLOCK_BYTES;
+        for j in 0..half {
+            let q0 = rocmfp4_best_index(vals[j], inv);
+            let q1 = rocmfp4_best_index(vals[half + j], inv);
+            out[off + j] = q0 | (q1 << 4);
+        }
+        out[off + half] = e;
     }
     out
 }
@@ -2248,6 +2347,57 @@ mod tests {
                 "lane {i}: want {want} got {got}"
             );
         }
+    }
+
+    /// ROCmFP4 FAST (type 101): 16 code bytes then ONE scale byte that both
+    /// halves of the block use.
+    #[test]
+    fn rocmfp4_fast_block_layout_is_qs_then_one_scale() {
+        let mut block = vec![0u8; ROCMFP4_FAST_BLOCK_BYTES];
+        block[0] = 0x07 | (0x0f << 4); // lane 0 = +10, lane 16 = -10
+        block[3] = 0x02 | (0x09 << 4); // lane 3 = +2, lane 19 = -1
+        block[16] = 0x38; // scale 0.5 for all 32 lanes
+        let mut out = vec![0.0f32; ROCMFP4_BLOCK_ELEMS];
+        dequant_rocmfp4_fast(&block, ROCMFP4_BLOCK_ELEMS, &mut out).unwrap();
+        assert_eq!((out[0], out[16]), (5.0, -5.0));
+        assert_eq!((out[3], out[19]), (1.0, -0.5));
+        assert_eq!(out[1], 0.0);
+    }
+
+    /// A FAST block decodes exactly like a dual-scale block whose two scale
+    /// bytes are equal, across several blocks and a partial last block.
+    #[test]
+    fn rocmfp4_fast_equals_dual_scale_with_equal_scales() {
+        let n = ROCMFP4_BLOCK_ELEMS * 3 - 5;
+        let data: Vec<f32> = (0..n).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013).collect();
+        let fast = quantize_rocmfp4_fast(&data);
+        assert_eq!(fast.len(), 3 * ROCMFP4_FAST_BLOCK_BYTES);
+        let mut dual = Vec::new();
+        for blk in fast.chunks_exact(ROCMFP4_FAST_BLOCK_BYTES) {
+            dual.extend_from_slice(blk);
+            dual.push(blk[16]);
+        }
+        let mut a = vec![0.0f32; n];
+        let mut b = vec![0.0f32; n];
+        dequant_rocmfp4_fast(&fast, n, &mut a).unwrap();
+        dequant_rocmfp4(&dual, n, &mut b).unwrap();
+        assert_eq!(a, b);
+        let max_abs = data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for (i, (&want, &got)) in data.iter().zip(&a).enumerate() {
+            assert!((want - got).abs() <= max_abs * 0.2, "lane {i}: want {want} got {got}");
+        }
+    }
+
+    #[test]
+    fn rocmfp4_fast_rejects_truncated_blocks() {
+        let short = vec![0u8; ROCMFP4_FAST_BLOCK_BYTES - 1];
+        let mut out = vec![0.0f32; ROCMFP4_BLOCK_ELEMS];
+        assert!(dequant_rocmfp4_fast(&short, ROCMFP4_BLOCK_ELEMS, &mut out).is_err());
+        // A dual-scale buffer for 2 blocks is too long, not too short: only
+        // the type id tells the layouts apart, so the length check is `>=`.
+        let two = vec![0u8; 2 * ROCMFP4_FAST_BLOCK_BYTES];
+        let mut out = vec![0.0f32; 2 * ROCMFP4_BLOCK_ELEMS];
+        assert!(dequant_rocmfp4_fast(&two, 2 * ROCMFP4_BLOCK_ELEMS, &mut out).is_ok());
     }
 
     #[test]

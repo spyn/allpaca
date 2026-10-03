@@ -142,6 +142,8 @@ struct ProfileState {
     ema_ns: [u64; 5],
     /// Decode forwards seen; every [`PROFILE_EVERY`]th is event-timed.
     forwards: u64,
+    /// lm_head time of this sampled forward, measured between stream syncs.
+    lm_head_ns: u64,
 }
 
 /// Event-time one decode forward in this many. Timing every forward cost two
@@ -163,6 +165,7 @@ impl Default for ProfileState {
             wall_start: None,
             ema_ns: [0; 5],
             forwards: 0,
+            lm_head_ns: 0,
         }
     }
 }
@@ -334,10 +337,13 @@ fn destroy_swiglu_pair(
 fn event_elapsed_ns(start: *mut std::ffi::c_void, stop: *mut std::ffi::c_void) -> u64 {
     let mut us = 0.0f64;
     let rc = unsafe { ffi::allpaca_hip_event_elapsed_us(start, stop, &mut us) };
-    if rc != ALLPACA_OK || us <= 0.0 {
+    if rc != ALLPACA_OK {
         0
     } else {
-        (us * 1_000.0).round() as u64
+        // Short kernels read back as zero or slightly negative when the GPU is
+        // shared (the two markers land in one submission): the op still ran,
+        // so it keeps its bucket at the timer's floor.
+        ((us * 1_000.0).round() as i64).max(1) as u64
     }
 }
 
@@ -542,6 +548,25 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_rocmfp4_fast(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_rocmfp4_f32(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            fast: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_mxfp4(
             a: *const f32,
             b: *const u8,
@@ -608,6 +633,13 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
+        pub fn allpaca_det_silu_mul(
+            g: *const f32,
+            u: *const f32,
+            out: *mut f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_hip_set_exact_rows(on: i32);
         pub fn allpaca_copy_f32_kernel(dst: *mut f32, src: *const f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_moe_route_softmax_topk(
@@ -628,6 +660,38 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_scale_rows(x: *mut f32, scale: *const f32, rows: i32, dim: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_topk_chunks(
+            x: *const f32,
+            rows: i32,
+            n: i32,
+            chunk: i32,
+            k: i32,
+            out_v: *mut f32,
+            out_i: *mut i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_rope_neox_rows(
+            x: *mut f32,
+            n_tok: i32,
+            n_heads: i32,
+            head_dim: i32,
+            start_pos: i32,
+            theta: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_dflash_conv(
+            h: *const f32,
+            dynamic: *const f32,
+            base: *const f32,
+            out: *mut f32,
+            rows: i32,
+            block: i32,
+            dim: i32,
+            kernel: i32,
+            group: i32,
+            side: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_moe_ffn_kquant(
             x: *const f32,
             xq: *const i8,
@@ -1124,6 +1188,21 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_embed_gather_rocmfp4_rows(
+            table: *const u8,
+            tokens: *const i32,
+            out: *mut f32,
+            n_tok: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_rocmfp4_fast(
+            table: *const u8,
+            token: i32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_embed_gather_rocmfp4_fast_rows(
             table: *const u8,
             tokens: *const i32,
             out: *mut f32,
@@ -2507,6 +2586,56 @@ pub fn gemm_nt_rocmfp4_device(
     }
 }
 
+/// As [`gemm_nt_rocmfp4_device`] for ROCmFP4 FAST `b` (ggml type 101, 17-byte blocks).
+pub fn gemm_nt_rocmfp4_fast_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_rocmfp4_fast(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_rocmfp4_fast")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_rocmfp4_fast unavailable".into(),
+        )))
+    }
+}
+
+/// Float-activation ROCmFP4 GEMV (the kernel the int8 path replaced), for
+/// A/B and as the exact-float reference. `fast`: 17-byte type-101 blocks.
+pub fn gemm_nt_rocmfp4_f32_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+    fast: bool,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_gemm_nt_rocmfp4_f32(a, b, c, m, n, k, i32::from(fast), std::ptr::null_mut())
+        };
+        status(rc, "gemm_nt_rocmfp4_f32")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k, fast);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_rocmfp4_f32 unavailable".into(),
+        )))
+    }
+}
+
 /// Untiled ROCmFP4 GEMV baseline (§12 before/after).
 pub fn gemm_nt_rocmfp4_untiled_device(
     a: *const f32,
@@ -2817,6 +2946,120 @@ pub fn moe_route_softmax_topk_device(
     }
 }
 
+/// Largest `k` of every `chunk` (<= 2048) of each row of `x[rows][n]`, largest
+/// first, ties to the lower index: `out_v` / `out_i` are `[rows][ceil(n/chunk)][k]`.
+#[allow(clippy::too_many_arguments)]
+pub fn topk_chunks_device(
+    x: *const f32,
+    rows: usize,
+    n: usize,
+    chunk: usize,
+    k: usize,
+    out_v: *mut f32,
+    out_i: *mut i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_topk_chunks(
+                x,
+                rows as i32,
+                n as i32,
+                chunk as i32,
+                k as i32,
+                out_v,
+                out_i,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "topk_chunks")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, rows, n, chunk, k, out_v, out_i);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP topk_chunks unavailable".into(),
+        )))
+    }
+}
+
+/// NeoX RoPE (pairs `i`, `i + head_dim/2`) over `x[n_tok][n_heads][head_dim]`,
+/// row `t` at position `start_pos + t`.
+pub fn rope_neox_rows_device(
+    x: *mut f32,
+    n_tok: usize,
+    n_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    theta: f32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_rope_neox_rows(
+                x,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                start_pos as i32,
+                theta,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "rope_neox_rows")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, n_tok, n_heads, head_dim, start_pos, theta);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP rope_neox_rows unavailable".into(),
+        )))
+    }
+}
+
+/// DFlash2 two-tap dynamic convolution along each `block` of rows (device
+/// pointers; `out` must not alias `h`). See `dflash_conv_kernel`.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_conv_device(
+    h: *const f32,
+    dynamic: *const f32,
+    base: *const f32,
+    out: *mut f32,
+    rows: usize,
+    block: usize,
+    dim: usize,
+    kernel: usize,
+    group: usize,
+    side: usize,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_dflash_conv(
+                h,
+                dynamic,
+                base,
+                out,
+                rows as i32,
+                block as i32,
+                dim as i32,
+                kernel as i32,
+                group as i32,
+                side as i32,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "dflash_conv")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (h, dynamic, base, out, rows, block, dim, kernel, group, side);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP dflash_conv unavailable".into(),
+        )))
+    }
+}
+
 /// `x[r][:] *= scale[r]` with `scale` in device memory.
 pub fn scale_rows_device(
     x: *mut f32,
@@ -3084,6 +3327,39 @@ impl Drop for ExactRows {
 }
 
 /// Device scratch [`moe_ffn_kquant_device`] needs (beyond its inputs).
+/// `silu(g) * u` with the MoE kernels' deterministic exp, on the device
+/// (test hook: it must equal `allpaca_cpu::det_silu_mul` bit for bit).
+pub fn det_silu_mul(g: &[f32], u: &[f32]) -> Result<Vec<f32>, AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let n = g.len().min(u.len());
+        let (dg, du, dout) = (device_malloc(n * 4, 0)?, device_malloc(n * 4, 0)?, device_malloc(n * 4, 0)?);
+        let result = (|| {
+            memcpy(dg, g[..n].as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+            memcpy(du, u[..n].as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+            status(
+                unsafe {
+                    ffi::allpaca_det_silu_mul(dg.cast(), du.cast(), dout.cast(), n as i32, std::ptr::null_mut())
+                },
+                "det_silu_mul",
+            )?;
+            let mut out = vec![0.0f32; n];
+            stream_synchronize()?;
+            memcpy(out.as_mut_ptr().cast(), dout, n * 4, MEMCPY_D2H)?;
+            Ok(out)
+        })();
+        for p in [dg, du, dout] {
+            device_free(p, n * 4);
+        }
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (g, u);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("HIP unavailable".into())))
+    }
+}
+
 pub fn moe_ffn_scratch_bytes(rows: usize, dim: usize, ff: usize, pairs: usize) -> usize {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -5437,6 +5713,7 @@ impl HipWorkspace {
         let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
         g.used = 0;
         g.ops.clear();
+        g.lm_head_ns = 0;
         g.full = g.forwards % PROFILE_EVERY == 1;
         g.forwards = g.forwards.wrapping_add(1);
         self.profiling.store(u64::from(g.full), Ordering::Relaxed);
@@ -5509,6 +5786,7 @@ impl HipWorkspace {
                     buckets[op] += event_elapsed_ns(g.pairs[i][0], g.pairs[i][1]);
                 }
             }
+            buckets[DecodeOp::LmHead as usize] += g.lm_head_ns;
             let gpu_ns = buckets[0] + buckets[1] + buckets[2] + buckets[3];
             buckets[4] = wall_ns.saturating_sub(gpu_ns);
             for i in 0..5 {
@@ -5545,6 +5823,19 @@ impl HipWorkspace {
         }
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
+            if matches!(op, DecodeOp::LmHead) {
+                // The vocab GEMV is the forward's last kernel, so its two
+                // markers share a submission and their event delta is noise.
+                // One GEMV per sampled forward: time it between stream syncs.
+                let _ = stream_synchronize();
+                let started = std::time::Instant::now();
+                let result = f();
+                let _ = stream_synchronize();
+                let ns = started.elapsed().as_nanos() as u64;
+                let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+                g.lm_head_ns += ns.max(1);
+                return result;
+            }
             let pair = {
                 let mut g = self.profile.lock().unwrap_or_else(|e| e.into_inner());
                 if g.used >= g.pairs.len() {
@@ -5682,6 +5973,25 @@ impl HipWorkspace {
             DecodeOp::Q8Gemm
         };
         self.timed_gpu(op, || gemm_nt_rocmfp4_device(a, b, c, m, n, k))
+    }
+
+    /// ROCmFP4 FAST (ggml type 101) GEMV; accounted like [`Self::gemm_nt_rocmfp4_dev`].
+    pub fn gemm_nt_rocmfp4_fast_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            // Treat packed ROCmFP4 body GEMVs like Q8 for §12 decode accounting.
+            DecodeOp::Q8Gemm
+        };
+        self.timed_gpu(op, || gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q6_k_dev(
@@ -6025,6 +6335,44 @@ impl HipWorkspace {
                     )
                 };
                 status(rc, "embed_gather_rocmfp4")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = token;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_rocmfp4 unavailable".into(),
+            )))
+        }
+    }
+
+    /// One token's row from a ROCmFP4 FAST (17-byte block) embedding table.
+    pub fn embed_gather_rocmfp4_fast(
+        &self,
+        table: *const u8,
+        token: u32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rocmfp4 embed gather".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_rocmfp4_fast(
+                        table,
+                        token as i32,
+                        out,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_rocmfp4_fast")
             })
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -8287,6 +8635,55 @@ impl HipWorkspace {
             self.timed_gpu(DecodeOp::OtherGpu, || {
                 let rc = unsafe {
                     ffi::allpaca_embed_gather_rocmfp4_rows(
+                        table,
+                        self.scratch.cast(),
+                        out,
+                        tokens.len() as i32,
+                        dim,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "embed_gather_rocmfp4_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP embed_gather_rocmfp4 unavailable".into(),
+            )))
+        }
+    }
+
+    /// Rows of a ROCmFP4 FAST (17-byte block) embedding table.
+    pub fn embed_gather_rocmfp4_fast_rows(
+        &self,
+        table: *const u8,
+        tokens: &[u32],
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if table.is_null() || out.is_null() || dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid rocmfp4 embed gather".into(),
+            )));
+        }
+        let id_bytes = tokens.len() * 4;
+        if id_bytes > self.scratch_bytes {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "embed gather tokens exceed scratch".into(),
+            )));
+        }
+        self.bind()?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        memcpy(self.scratch, ids.as_ptr().cast(), id_bytes, MEMCPY_H2D)?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_embed_gather_rocmfp4_fast_rows(
                         table,
                         self.scratch.cast(),
                         out,
@@ -11955,6 +12352,16 @@ mod tests {
         d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
     }
 
+    /// Tolerance for GEMVs on int8-quantized activations against an exact
+    /// float result: 2% of the output's scale (measured error is ~0.5%).
+    fn i8_gemv_close(got: f32, exp: f32, scale: f32) -> bool {
+        (got - exp).abs() <= 1e-4 + 0.02 * scale
+    }
+
+    fn abs_max(v: &[f32]) -> f32 {
+        v.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+    }
+
     /// Public `gemm_nt` must match CPU `C[m,n] = A[m,k] * B[n,k]^T` on small random shapes.
     #[cfg(feature = "hip")]
     #[test]
@@ -12500,25 +12907,29 @@ mod tests {
         if free_before as usize <= CHUNK * 2 {
             return; // Board is already too full to measure a delta safely.
         }
-        let hog = DeviceWeights::alloc(0, CHUNK).expect("device alloc");
-        let (free_after, total_after) = device_memory_info(0).expect("mem_info after alloc");
-        assert_eq!(total_after, total, "total VRAM must not move");
-        assert!(
-            free_after < free_before,
-            "free VRAM must drop after a {CHUNK}B alloc: {free_before} -> {free_after}"
-        );
-        drop(hog);
+        // Board-wide readings: other tests in this binary (and other
+        // processes) allocate and free meanwhile, so take the best of a few.
+        let dropped = (0..5).any(|_| {
+            let (before, _) = device_memory_info(0).expect("mem_info");
+            let hog = DeviceWeights::alloc(0, CHUNK).expect("device alloc");
+            let (after, total_after) = device_memory_info(0).expect("mem_info after alloc");
+            assert_eq!(total_after, total, "total VRAM must not move");
+            drop(hog);
+            after < before
+        });
+        assert!(dropped, "free VRAM never dropped after a {CHUNK}B alloc");
 
         // `used` is the same reading; the two entry points must not disagree.
-        let used = device_memory_used(0).expect("mem_used");
-        let (free_now, total_now) = device_memory_info(0).expect("mem_info");
+        let (used, total_now, skew) = (0..5)
+            .map(|_| {
+                let used = device_memory_used(0).expect("mem_used");
+                let (free_now, total_now) = device_memory_info(0).expect("mem_info");
+                (used, total_now, (total_now - free_now).abs_diff(used))
+            })
+            .min_by_key(|r| r.2)
+            .unwrap();
         assert_eq!(total_now, total_now.max(used), "used must fit in total");
-        let derived = total_now - free_now;
-        let skew = derived.abs_diff(used);
-        assert!(
-            skew <= 64 << 20,
-            "mem_used {used} and total-free {derived} disagree by {skew}"
-        );
+        assert!(skew <= 64 << 20, "mem_used {used} and total-free disagree by {skew}");
     }
 
     /// The sampler runs on threads that are about to launch kernels, so the
@@ -12616,14 +13027,277 @@ mod tests {
             cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
             gemm_nt_rocmfp4(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
                 .expect("HIP gemm_nt_rocmfp4 must run when a device is present");
+            let scale = abs_max(&cpu);
             for i in 0..m * n {
                 assert!(
-                    gemm_close(hip[i], cpu[i]),
+                    i8_gemv_close(hip[i], cpu[i], scale),
                     "gemm_nt_rocmfp4 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
                     hip[i],
                     cpu[i]
                 );
             }
+        }
+    }
+
+    /// ROCmFP4 FAST (type 101) GEMV: bit-identical to the dual-scale kernel on
+    /// the same weights with the scale byte duplicated, and close to the CPU
+    /// dequant + GEMM. Shapes cover one row, several rows, a K that is not a
+    /// whole number of 256-float slabs, and many columns.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_rocmfp4_fast_matches_dual_scale_kernel_and_cpu() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(1, 4, 32), (1, 8, 256), (3, 5, 128), (1, 70, 512), (2, 9, 288)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let nblocks = k.div_ceil(ROCMFP4_BLOCK_ELEMS);
+            let (mut fast, mut dual) = (Vec::new(), Vec::new());
+            let mut b_deq = vec![0.0f32; n * k];
+            for row in 0..n {
+                let q = allpaca_cpu::quantize_rocmfp4_fast(&b_f[row * k..(row + 1) * k]);
+                assert_eq!(q.len(), nblocks * allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES);
+                let mut tmp = vec![0.0f32; nblocks * ROCMFP4_BLOCK_ELEMS];
+                allpaca_cpu::dequant_rocmfp4_fast(&q, tmp.len(), &mut tmp).unwrap();
+                b_deq[row * k..(row + 1) * k].copy_from_slice(&tmp[..k]);
+                for blk in q.chunks_exact(allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES) {
+                    dual.extend_from_slice(blk);
+                    dual.push(blk[16]);
+                }
+                fast.extend(q);
+            }
+            let mut cpu = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            let mut want = vec![0.0f32; m * n];
+            gemm_nt_rocmfp4(&a, &dual, &mut want, m as i32, n as i32, k as i32).unwrap();
+
+            let da = device_malloc(a.len() * 4, 0).unwrap();
+            let db = device_malloc(fast.len(), 0).unwrap();
+            let dc = device_malloc(m * n * 4, 0).unwrap();
+            set_device(0).unwrap();
+            memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, fast.as_ptr(), fast.len(), MEMCPY_H2D).unwrap();
+            gemm_nt_rocmfp4_fast_device(da.cast(), db, dc.cast(), m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_rocmfp4_fast must run when a device is present");
+            let mut got = vec![0.0f32; m * n];
+            memcpy(got.as_mut_ptr().cast(), dc, m * n * 4, MEMCPY_D2H).unwrap();
+            device_free(da, a.len() * 4);
+            device_free(db, fast.len());
+            device_free(dc, m * n * 4);
+
+            for i in 0..m * n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "FAST vs dual-scale kernel differ, shape {m}x{n}x{k} idx={i}: {} vs {}",
+                    got[i],
+                    want[i]
+                );
+                assert!(
+                    i8_gemv_close(got[i], cpu[i], abs_max(&cpu)),
+                    "gemm_nt_rocmfp4_fast vs cpu, shape {m}x{n}x{k} idx={i}: {} vs {}",
+                    got[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// ROCmFP4 FAST embed rows (single token and batched) equal the CPU
+    /// dequant of those rows exactly, for a dim that is not a multiple of 32.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn embed_gather_rocmfp4_fast_matches_dequant_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        let (vocab, dim) = (9usize, 80usize);
+        let row_bytes = dim.div_ceil(32) * allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES;
+        let tokens = [0u32, 3, 8, 1, 3, 2];
+        let mut packed = Vec::new();
+        for row in 0..vocab {
+            let vals: Vec<f32> =
+                (0..dim).map(|i| (((row * dim + i) * 17) % 50) as f32 * 0.02 - 0.5).collect();
+            packed.extend(allpaca_cpu::quantize_rocmfp4_fast(&vals));
+        }
+        assert_eq!(packed.len(), vocab * row_bytes);
+        let mut cpu = vec![0.0f32; tokens.len() * dim];
+        for (r, &tok) in tokens.iter().enumerate() {
+            let off = tok as usize * row_bytes;
+            let mut tmp = vec![0.0f32; dim.div_ceil(32) * 32];
+            allpaca_cpu::dequant_rocmfp4_fast(&packed[off..off + row_bytes], tmp.len(), &mut tmp)
+                .unwrap();
+            cpu[r * dim..(r + 1) * dim].copy_from_slice(&tmp[..dim]);
+        }
+        let ws = HipWorkspace::new(0, 1 << 20, 64).unwrap();
+        let dt = device_malloc(packed.len(), 0).unwrap();
+        let dout = device_malloc(cpu.len() * 4, 0).unwrap();
+        set_device(0).unwrap();
+        memcpy(dt, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+        ws.embed_gather_rocmfp4_fast_rows(dt, &tokens, dout.cast(), dim as i32)
+            .expect("HIP embed_gather_rocmfp4_fast_rows must run when a device is present");
+        let mut rows = vec![0.0f32; cpu.len()];
+        memcpy(rows.as_mut_ptr().cast(), dout, cpu.len() * 4, MEMCPY_D2H).unwrap();
+        assert_eq!(rows, cpu, "batched FAST embed rows");
+        ws.embed_gather_rocmfp4_fast(dt, 8, dout.cast(), dim as i32).unwrap();
+        let mut one = vec![0.0f32; dim];
+        memcpy(one.as_mut_ptr().cast(), dout, dim * 4, MEMCPY_D2H).unwrap();
+        assert_eq!(one, cpu[2 * dim..3 * dim], "single FAST embed row");
+        device_free(dt, packed.len());
+        device_free(dout, cpu.len() * 4);
+    }
+
+    /// The int8-activation ROCmFP4 GEMV (types 100 and 101) at a Qwen3.8
+    /// shape: within int8 activation error of the float kernel, every row of
+    /// an m-row call bit-identical to that row run alone (so verify and
+    /// batched rows reproduce decode), and faster than the float kernel, far
+    /// more so for several rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rocmfp4_i8_gemv_matches_float_kernel_and_is_row_exact() {
+        if device_count() == 0 {
+            return;
+        }
+        let (n, k) = (2048usize, 5120usize);
+        for fast in [false, true] {
+            let bb = if fast { 17 } else { ROCMFP4_BLOCK_BYTES };
+            let max_m = 8usize;
+            let mut a = vec![0.0f32; max_m * k];
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut rnd = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            };
+            for v in a.iter_mut() {
+                *v = rnd() * 2.0;
+            }
+            let mut b_q = Vec::with_capacity(n * (k / 32) * bb);
+            let mut row = vec![0.0f32; k];
+            for _ in 0..n {
+                for v in row.iter_mut() {
+                    *v = rnd() * 0.1;
+                }
+                if fast {
+                    b_q.extend(allpaca_cpu::quantize_rocmfp4_fast(&row));
+                } else {
+                    b_q.extend(allpaca_cpu::quantize_rocmfp4(&row));
+                }
+            }
+            let da = device_malloc(a.len() * 4, 0).unwrap();
+            let db = device_malloc(b_q.len(), 0).unwrap();
+            let dc = device_malloc(max_m * n * 4, 0).unwrap();
+            set_device(0).unwrap();
+            memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, b_q.as_ptr(), b_q.len(), MEMCPY_H2D).unwrap();
+            let i8k = |a: *const f32, c: *mut f32, m: usize| {
+                if fast {
+                    gemm_nt_rocmfp4_fast_device(a, db, c, m as i32, n as i32, k as i32)
+                } else {
+                    gemm_nt_rocmfp4_device(a, db, c, m as i32, n as i32, k as i32)
+                }
+                .unwrap()
+            };
+            let f32k = |a: *const f32, c: *mut f32, m: usize| {
+                gemm_nt_rocmfp4_f32_device(a, db, c, m as i32, n as i32, k as i32, fast).unwrap()
+            };
+            let read = |m: usize| {
+                let mut v = vec![0.0f32; m * n];
+                memcpy(v.as_mut_ptr().cast(), dc, m * n * 4, MEMCPY_D2H).unwrap();
+                v
+            };
+            // Each row alone (m == 1) is the reference for every batch size.
+            let mut single = Vec::new();
+            for r in 0..max_m {
+                i8k(unsafe { da.cast::<f32>().add(r * k) }, dc.cast(), 1);
+                single.extend(read(1));
+            }
+            for m in [2usize, 3, 4, 5, 8] {
+                i8k(da.cast(), dc.cast(), m);
+                let got = read(m);
+                for i in 0..m * n {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        single[i].to_bits(),
+                        "fast={fast} m={m}: row {} col {} differs from its m=1 result",
+                        i / n,
+                        i % n
+                    );
+                }
+            }
+            f32k(da.cast(), dc.cast(), max_m);
+            let float = read(max_m);
+            let scale = float.iter().fold(0.0f32, |s, v| s.max(v.abs()));
+            let worst = single
+                .iter()
+                .zip(&float)
+                .fold(0.0f32, |w, (a, b)| w.max((a - b).abs()));
+            assert!(
+                worst <= 0.02 * scale,
+                "fast={fast}: int8 GEMV off by {worst} against the float kernel (output scale {scale})"
+            );
+            // Best of five: other tests share the GPU, and a single window
+            // can land on their kernels.
+            let time = |f: &dyn Fn(*const f32, *mut f32, usize), m: usize| {
+                f(da.cast(), dc.cast(), m);
+                stream_synchronize().unwrap();
+                (0..5)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        for _ in 0..20 {
+                            f(da.cast(), dc.cast(), m);
+                        }
+                        stream_synchronize().unwrap();
+                        t.elapsed().as_micros() / 20
+                    })
+                    .min()
+                    .unwrap()
+            };
+            let (i1, f1) = (time(&i8k, 1), time(&f32k, 1));
+            let (i4, f4) = (time(&i8k, 4), time(&f32k, 4));
+            eprintln!(
+                "rocmfp4 gemv n={n} k={k} fast={fast}: m=1 int8 {i1}us float {f1}us; m=4 int8 {i4}us float {f4}us; max err {:.3}% of scale",
+                100.0 * worst / scale
+            );
+            // Typically 2-4x; the margin is loose because WDDM timing on a shared
+            // GPU swings by 2x between windows.
+            assert!(i4 < f4, "fast={fast}: 4-row int8 GEMV {i4}us not faster than float {f4}us");
+            device_free(da, a.len() * 4);
+            device_free(db, b_q.len());
+            device_free(dc, max_m * n * 4);
+        }
+    }
+
+    /// K that is not a whole number of 32-weight blocks cannot use the int8
+    /// path: the decode entry point falls back to the float kernel and
+    /// matches the CPU dequant exactly-float.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rocmfp4_partial_block_k_uses_float_kernel() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, n, k) = (2usize, 9usize, 300usize);
+        let (a, b_q) = fill_rocmfp4_gemm_case(3, m, n, k);
+        let b_deq = dequant_rocmfp4_matrix(&b_q, n, k);
+        let mut cpu = vec![0.0f32; m * n];
+        let mut hip = vec![0.0f32; m * n];
+        cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+        gemm_nt_rocmfp4(&a, &b_q, &mut hip, m as i32, n as i32, k as i32).unwrap();
+        for i in 0..m * n {
+            assert!(gemm_close(hip[i], cpu[i]), "idx={i} hip={} cpu={}", hip[i], cpu[i]);
         }
     }
 
@@ -12643,7 +13317,7 @@ mod tests {
             .expect("untiled ROCmFP4");
         for i in 0..m * n {
             assert!(
-                gemm_close(tiled[i], untiled[i]),
+                i8_gemv_close(tiled[i], untiled[i], abs_max(&untiled)),
                 "ROCmFP4 tiled/untiled mismatch idx={i} tiled={} untiled={}",
                 tiled[i],
                 untiled[i]
@@ -12666,7 +13340,7 @@ mod tests {
         gemm_nt_rocmfp4_untiled(&a, &b_q, &mut expect, 1, n as i32, k as i32).expect("untiled");
         for i in 0..n {
             assert!(
-                gemm_close(got[i], expect[i]),
+                i8_gemv_close(got[i], expect[i], abs_max(&expect)),
                 "lds mismatch idx={i} lds={} untiled={}",
                 got[i],
                 expect[i]
@@ -14709,34 +15383,27 @@ mod tests {
         )
         .unwrap();
         stream_synchronize().unwrap();
-        let t0 = std::time::Instant::now();
-        for _ in 0..10 {
-            gemm_nt_device(
-                da.cast(),
-                db32.cast(),
-                dc.cast(),
-                m as i32,
-                n as i32,
-                k as i32,
-            )
-            .unwrap();
-        }
-        stream_synchronize().unwrap();
-        let f32_ms = t0.elapsed().as_secs_f64() * 1_000.0 / 10.0;
-        let t1 = std::time::Instant::now();
-        for _ in 0..10 {
-            gemm_nt_f16_device(
-                da.cast(),
-                db16.cast(),
-                dc.cast(),
-                m as i32,
-                n as i32,
-                k as i32,
-            )
-            .unwrap();
-        }
-        stream_synchronize().unwrap();
-        let f16_ms = t1.elapsed().as_secs_f64() * 1_000.0 / 10.0;
+        // Best of five windows: other tests share the GPU, and one window can
+        // land on their kernels.
+        let best = |f: &dyn Fn()| -> f64 {
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..10 {
+                        f();
+                    }
+                    stream_synchronize().unwrap();
+                    t.elapsed().as_secs_f64() * 1_000.0 / 10.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let f32_ms = best(&|| {
+            gemm_nt_device(da.cast(), db32.cast(), dc.cast(), m as i32, n as i32, k as i32).unwrap();
+        });
+        let f16_ms = best(&|| {
+            gemm_nt_f16_device(da.cast(), db16.cast(), dc.cast(), m as i32, n as i32, k as i32)
+                .unwrap();
+        });
         device_free(da, a_b);
         device_free(db32, b32_b);
         device_free(db16, b16_b);
@@ -15052,6 +15719,9 @@ mod tests {
             (4, 4, 2, 2, 4, true),
             (3, 8, 4, 1, 8, true),
             (2, 2, 1, 1, 4, false),
+            // Long rows: chunked softmax folded across 256-key chunks.
+            (1, 3000, 4, 2, 128, true),
+            (2, 1300, 2, 1, 64, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()
@@ -15094,6 +15764,97 @@ mod tests {
                     "attention mismatch n_q={n_q} n_kv={n_kv} heads={n_heads}/{n_kv_heads} d={head_dim} causal={causal} idx={i} hip={} cpu={}",
                     hip[i],
                     cpu[i]
+                );
+            }
+        }
+    }
+
+    /// The MoE SiLU's exp is the same function as the CPU reference (and the
+    /// CUDA kernel's), bit for bit, so expert layers give the same values on
+    /// AMD and NVIDIA workers.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn det_silu_mul_matches_cpu_reference_bitwise() {
+        if device_count() == 0 {
+            return;
+        }
+        // Every regime: tiny, ordinary, both overflow clamps, signed zero.
+        let mut g: Vec<f32> = (0..40_000).map(|i| ((i as f32) - 20_000.0) * 0.0061).collect();
+        g.extend([0.0, -0.0, 1e-30, -1e-30, 88.4, -88.4, 120.0, -120.0, 1e4, -1e4]);
+        let u: Vec<f32> = (0..g.len()).map(|i| ((i % 13) as f32 - 6.0) * 0.37).collect();
+        let want: Vec<f32> = g.iter().zip(&u).map(|(&a, &b)| allpaca_cpu::det_silu_mul(a, b)).collect();
+        let got = det_silu_mul(&g, &u).unwrap();
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "g={} u={}: {a} vs {b}", g[i], u[i]);
+        }
+        // And it is exp to within 2 ulp where exp is representable.
+        for x in [-80.0f32, -10.0, -1.0, -0.01, 0.0, 0.3, 1.0, 5.0, 40.0, 88.0] {
+            let (d, e) = (allpaca_cpu::det_expf(x), x.exp());
+            assert!((d - e).abs() <= 2.0 * f32::EPSILON * e.abs().max(f32::MIN_POSITIVE), "exp({x}) {d} vs {e}");
+        }
+    }
+
+    /// Several query rows (the Q-tiled kernel, keys staged in LDS) give each
+    /// row bit for bit what a one-row call over the keys it sees gives, so
+    /// prefill, verify and decode rows agree.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn attention_rows_equal_single_row_calls() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (13, 40, 4, 2, 128, true),
+            (9, 9, 8, 8, 64, true),
+            (20, 300, 6, 2, 128, true),
+            (3, 5, 2, 1, 4, true),
+            (17, 50, 2, 2, 96, true),
+            (11, 70, 4, 4, 256, true),
+            (6, 33, 4, 2, 128, false),
+            // Several 256-key chunks: one-row calls fold them in parallel
+            // (split + merge), multi-row calls fold them in the Q-tiled kernel.
+            (5, 1000, 8, 2, 128, true),
+            (3, 2049, 4, 4, 64, true),
+            (2, 700, 4, 1, 128, false),
+            (9, 513, 2, 2, 96, true),
+        ];
+        for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
+            shapes.iter().copied().enumerate()
+        {
+            let q_row = n_heads * head_dim;
+            let kv_row = n_kv_heads * head_dim;
+            let fill = |n: usize, a: usize, b: usize| -> Vec<f32> {
+                (0..n).map(|i| ((i * a + si * b) % 97) as f32 * 0.021 - 1.0).collect()
+            };
+            let q = fill(n_q * q_row, 17, 3);
+            let k = fill(n_kv * kv_row, 13, 7);
+            let v = fill(n_kv * kv_row, 11, 5);
+            let mut rows = vec![0.0f32; n_q * q_row];
+            attention(
+                &q, &k, &v, &mut rows, n_q as i32, n_kv as i32, n_heads as i32,
+                n_kv_heads as i32, head_dim as i32, causal,
+            )
+            .unwrap();
+            for i in 0..n_q {
+                let seen = if causal { n_kv - n_q + i + 1 } else { n_kv };
+                let mut one = vec![0.0f32; q_row];
+                attention(
+                    &q[i * q_row..(i + 1) * q_row],
+                    &k[..seen * kv_row],
+                    &v[..seen * kv_row],
+                    &mut one,
+                    1,
+                    seen as i32,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    causal,
+                )
+                .unwrap();
+                let got = &rows[i * q_row..(i + 1) * q_row];
+                assert!(
+                    got.iter().zip(&one).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "row {i} of n_q={n_q} n_kv={n_kv} heads={n_heads}/{n_kv_heads} d={head_dim} causal={causal} differs from its one-row call"
                 );
             }
         }

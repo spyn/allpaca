@@ -5,6 +5,7 @@ mod batch_gemm;
 mod compute;
 mod constraint;
 mod deepseek4;
+mod dflash2;
 pub mod deltanet;
 mod device_manager;
 mod direct_storage;
@@ -65,6 +66,7 @@ pub use edge0::{
     RecoverLora, RouterKind,
 };
 pub use engine::{mtp_text_is_garbled, Engine, KvEstimate, RequestHandle};
+pub use rpc_runtime::RemoteGpu;
 pub use kv_tier::KvTierManager;
 pub use layer_split::{plan_layer_owners, LayerPlan};
 pub use memory_tier::{

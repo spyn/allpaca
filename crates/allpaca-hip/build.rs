@@ -132,6 +132,14 @@ fn windows_direct_storage(out: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
+fn same_file_contents(a: &Path, b: &Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
 fn restore_direct_storage_sdk(out: &Path) -> Result<PathBuf, String> {
     println!("cargo:rerun-if-env-changed=DOTNET_ROOT");
 
@@ -209,7 +217,15 @@ fn restore_direct_storage_sdk(out: &Path) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&directory)
             .map_err(|e| format!("create {}: {e}", directory.display()))?;
         for dll in ["dstorage.dll", "dstoragecore.dll"] {
-            std::fs::copy(sdk.join("native/bin/x64").join(dll), directory.join(dll))
+            let source = sdk.join("native/bin/x64").join(dll);
+            let target = directory.join(dll);
+            // A running allpaca binary keeps these DLLs loaded, and Windows
+            // will not overwrite a loaded DLL. The copy from an earlier build
+            // is this same SDK version: leave it.
+            if same_file_contents(&source, &target) {
+                continue;
+            }
+            std::fs::copy(&source, &target)
                 .map_err(|e| format!("copy {dll} to {}: {e}", directory.display()))?;
         }
     }

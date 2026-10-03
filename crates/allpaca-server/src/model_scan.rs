@@ -195,6 +195,15 @@ fn file_type_name(ft: u32) -> Option<&'static str> {
         32 => "BF16",
         36 => "TQ1_0",
         37 => "TQ2_0",
+        // ROCmFP4 presets (charlie12345/ROCmFPX): the name is the recipe, the
+        // tensors are ggml type 100 (dual-scale) and/or 101 (FAST).
+        100 => "ROCmFP4",
+        101 => "ROCmFP4-LEAN",
+        102 => "ROCmFP4-COHERENT",
+        103 => "ROCmFP4-FAST",
+        104 => "ROCmFP4-FAST-COHERENT",
+        105 => "ROCmFP4-STRIX",
+        106 => "ROCmFP4-STRIX-LEAN",
         _ => return None,
     })
 }
@@ -262,12 +271,13 @@ fn read_entry(path: &Path, rel: &str, size_bytes: u64, shards: u32) -> ModelEntr
             d
         }
     });
-    if e.quant.is_none() {
-        e.quant = md
-            .get("general.file_type")
-            .and_then(GgufValue::as_u32)
-            .and_then(file_type_name)
-            .map(str::to_string);
+    // The header's preset wins for ROCmFP4 files: their names are not
+    // reliable (a "STRIX" folder holding a COHERENT file).
+    let file_type = md.get("general.file_type").and_then(GgufValue::as_u32);
+    if e.quant.is_none() || file_type.is_some_and(|ft| (100..=106).contains(&ft)) {
+        if let Some(name) = file_type.and_then(file_type_name) {
+            e.quant = Some(name.to_string());
+        }
     }
     if let Some(arch) = e.architecture.clone() {
         let k = |s: &str| format!("{arch}.{s}");
@@ -381,6 +391,7 @@ mod tests {
         );
         assert_eq!(quant_from_name("Qwen3-Next"), None);
         assert_eq!(file_type_name(17), Some("Q5_K_M"));
+        assert_eq!(file_type_name(103), Some("ROCmFP4-FAST"));
     }
 
     fn write_gguf(path: &Path, meta: Vec<(&str, GgufValue)>) {
@@ -430,7 +441,7 @@ mod tests {
             vec![
                 ("general.architecture", S("qwen35".into())),
                 ("general.name", S("Model 27B".into())),
-                ("general.file_type", U(15)),
+                ("general.file_type", U(102)),
                 ("qwen35.nextn_predict_layers", U(1)),
             ],
         );
@@ -456,7 +467,8 @@ mod tests {
         assert_eq!((qwen.context_length, qwen.expert_count, qwen.expert_used_count), (Some(262_144), Some(512), Some(10)));
         let m27 = by("Vision27B/Model-27B-Q4_K_M.gguf");
         assert_eq!(m27.kind, "model");
-        assert_eq!(m27.quant.as_deref(), Some("Q4_K_M"));
+        // The file name says Q4_K_M; the header's ROCmFP4 preset wins.
+        assert_eq!(m27.quant.as_deref(), Some("ROCmFP4-COHERENT"));
         assert_eq!(m27.nextn_layers, Some(1));
         assert_eq!(m27.companions.vision.len(), 1);
         assert_eq!(m27.companions.mtp.len(), 1);

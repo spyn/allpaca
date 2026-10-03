@@ -325,6 +325,33 @@ function renderDashboard(data) {
     card("Weights on device", bytes(s.weight_bytes_on_device), `KV on device ${bytes(s.kv_bytes_on_device)}`),
   ].join("");
 
+  // GPUs on the RPC workers, as each worker reports them.
+  const remote = data.remote_gpus || [];
+  $("remote-title").classList.toggle("hidden", !remote.length);
+  $("remote-cards").classList.toggle("hidden", !remote.length);
+  $("remote-cards").innerHTML = remote
+    .map((g) => {
+      const host = String(g.endpoint || "").replace(/:\d+$/, "");
+      // The driver's product name can carry the wrong capacity (32 GB MI50s
+      // report "MI50 16GB"); the measured total is shown below instead.
+      const name = String(g.name || "GPU")
+        .replace(/^(AMD )?Radeon /, "")
+        .replace(/\s+\d+\s*GB$/i, "");
+      const frac = g.mem_total_bytes ? g.mem_used_bytes / g.mem_total_bytes : 0;
+      const live = [
+        g.util_pct != null ? `${g.util_pct}% busy` : "",
+        g.temp_c != null ? `${g.temp_c} °C` : "",
+        g.power_w != null ? `${g.power_w} W` : "",
+      ].filter(Boolean);
+      return card(
+        `${escapeHtml(name)} · ${escapeHtml(host)} #${g.index}`,
+        bytes(g.mem_used_bytes),
+        `of ${bytes(g.mem_total_bytes)}${live.length ? ` · ${live.join(" · ")}` : ""}`,
+        meter(frac) + (g.util_pct != null ? `<div class="meter util" title="GPU busy"><span style="width:${g.util_pct}%"></span></div>` : "")
+      );
+    })
+    .join("");
+
   const proposed = Number(s.draft_proposed) || 0;
   const steps = Number(s.batched_decode_steps) || 0;
   $("engine-cards").innerHTML = [

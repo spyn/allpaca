@@ -343,6 +343,13 @@ pub struct EngineSection {
     pub batch_decode: bool,
     /// `"auto"` (HIP, else CUDA, else Vulkan), `"hip"`, `"cuda"`, `"vulkan"`, or `"cpu"`.
     pub gpu_backend: String,
+    /// Layer budget per local GPU in MiB, target GPU first, used instead of
+    /// the budget measured from free VRAM at load. The measured value moves
+    /// with desktop VRAM use, which can shift a layer between GPUs (or its
+    /// experts onto RPC) from one load to the next; pin it for reproducible
+    /// placement. Empty (default) or a `0` entry keeps the measured budget.
+    #[serde(default)]
+    pub local_vram_budget_mib: Vec<u64>,
 }
 
 /// Continuous-batching poll selection policy.
@@ -373,6 +380,7 @@ impl Default for EngineSection {
             poll_schedule: PollSchedule::Fair,
             max_consecutive_prefill_picks: 0,
             batch_decode: true,
+            local_vram_budget_mib: Vec::new(),
             gpu_backend: "auto".into(),
         }
     }
@@ -386,8 +394,14 @@ pub struct RpcSection {
     pub endpoints: Vec<String>,
     /// Relative layer weights in device order (local target, then RPC). `None` = MemInfo.
     pub tensor_split: Option<Vec<f64>>,
-    /// KV sequence cap for remote layer caches.
+    /// KV sequence cap for remote layer caches (tokens). `0` (default) sizes
+    /// it to the context the engine's own KV budget (`kv.vram_bytes`) holds
+    /// for this model, so remote layers are not the shorter limit.
     pub max_seq: usize,
+    /// Prompt rows sent to a remote layer span per round trip during prefill
+    /// (the worker keeps a scratch of this many rows per GPU). `0` sends one
+    /// token per round trip.
+    pub prefill_rows: usize,
     /// Shared HELLO secret (`--rpc-token` / `ALLPACA_RPC_TOKEN`). Empty = loopback workers only.
     #[serde(default)]
     pub token: Option<String>,
@@ -398,7 +412,8 @@ impl Default for RpcSection {
         Self {
             endpoints: Vec::new(),
             tensor_split: None,
-            max_seq: 2048,
+            max_seq: 0,
+            prefill_rows: 128,
             token: None,
         }
     }
@@ -413,6 +428,8 @@ pub enum DraftProviderKind {
     Mtp,
     /// DeepSeek-V4-Flash DSpark sidecar (`dspark-*.gguf` / DFlash + Markov head).
     Dspark,
+    /// DFlash2 block-diffusion draft (`model.draft_path`, arch `dflash` with a selector).
+    Dflash2,
 }
 
 impl DraftProviderKind {
@@ -437,8 +454,9 @@ impl DraftProviderKind {
             "draft" | "draft_model" | "draft-model" => Ok(Self::DraftModel),
             "mtp" | "nextn" | "next-n" => Ok(Self::Mtp),
             "dspark" | "dflash" | "draft-dspark" | "draft_dspark" => Ok(Self::Dspark),
+            "dflash2" | "dflash-2" | "draft-dflash2" => Ok(Self::Dflash2),
             other => Err(format!(
-                "unknown draft provider '{other}' (expected ngram, draft_model, mtp, dspark)"
+                "unknown draft provider '{other}' (expected ngram, draft_model, mtp, dspark, dflash2)"
             )),
         }
     }
@@ -912,6 +930,9 @@ mod tests {
         assert!(DraftProviderKind::parse_list("nope").is_err());
         let ds = DraftProviderKind::parse_list("dspark").unwrap();
         assert_eq!(ds, vec![DraftProviderKind::Dspark]);
+        // "dflash" stays the DSpark alias; DFlash2 is its own provider.
+        let d2 = DraftProviderKind::parse_list("dflash2,dflash-2").unwrap();
+        assert_eq!(d2, vec![DraftProviderKind::Dflash2, DraftProviderKind::Dflash2]);
         let aliases = DraftProviderKind::parse_list("dflash,draft-dspark").unwrap();
         assert_eq!(
             aliases,

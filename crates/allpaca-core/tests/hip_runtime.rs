@@ -261,11 +261,26 @@ fn stats_carry_driver_vram_and_gpu_util_sampled_off_decode() {
         s.gpu_vram_total_bytes > 0,
         "driver must report total VRAM; stats={s:?}"
     );
+    // `device_memory_bytes` is process-wide and spans both boards, and the
+    // driver reading is up to one sample interval old: other tests in this
+    // binary allocate meanwhile, so allow the sampler to catch up.
+    let covered = |s: &allpaca_types::StatsSnapshot| {
+        s.gpu_vram_used_bytes + s.draft_gpu_vram_used_bytes >= s.device_memory_bytes
+    };
+    let mut seen = s.clone();
+    for _ in 0..40 {
+        if covered(&seen) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        seen = engine.stats();
+    }
     assert!(
-        s.gpu_vram_used_bytes >= s.device_memory_bytes,
-        "board usage must cover what this process allocated; used={} owned={}",
-        s.gpu_vram_used_bytes,
-        s.device_memory_bytes
+        covered(&seen),
+        "board usage must cover what this process allocated; used={}+{} owned={}",
+        seen.gpu_vram_used_bytes,
+        seen.draft_gpu_vram_used_bytes,
+        seen.device_memory_bytes
     );
     assert!(
         s.gpu_vram_used_bytes <= s.gpu_vram_total_bytes,
@@ -7479,5 +7494,34 @@ fn bench_gdn_step_fused_vs_unfused() {
             }
             eprintln!("GDNSTEP dev{dev} gap {gap_us}us {}: {:.1} us", if fused { "fused  " } else { "unfused" }, tot / 200.0);
         }
+    }
+}
+
+/// Nemotron-H attention has no rotary positions (its Mamba layers carry
+/// order). A `rope_none` model must decode the same on HIP as on CPU, dense
+/// and hybrid, and must not decode like the rotating model.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rope_none_matches_cpu_and_differs_from_rope() {
+    let run = |cfg: Config, model: ModelConfig| {
+        let engine = Engine::new(cfg).unwrap();
+        engine.load_synthetic(model).unwrap();
+        let out = engine
+            .generate("hello world hello hello world", greedy(12))
+            .unwrap();
+        (out.token_ids, hip_gpus(&engine).len())
+    };
+    for (name, base) in [("dense", ModelConfig::tiny()), ("hybrid", ModelConfig::tiny_hybrid())] {
+        let mut none = base.clone();
+        none.rope_none = true;
+        let (cpu, _) = run(cpu_only_synthetic(), none.clone());
+        let (hip, gpus) = run(hip_auto_synthetic(), none);
+        if gpus == 0 {
+            eprintln!("skip hip_rope_none_matches_cpu_and_differs_from_rope: no HIP device");
+            return;
+        }
+        assert_eq!(hip, cpu, "{name}: HIP must skip the rotation like CPU");
+        let (rotated, _) = run(cpu_only_synthetic(), base);
+        assert_ne!(cpu, rotated, "{name}: rope_none must change the decode");
     }
 }
