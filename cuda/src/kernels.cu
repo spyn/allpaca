@@ -1824,15 +1824,16 @@ __global__ void kq_i8_gemv_kernel(const int8_t *aq, const float *ad, const uint8
 }
 
 /* Per-device int8 activation scratch, grow-only. The lock is held from
- * quantize through GEMV enqueue; a switch to another stream first waits, on
- * the GPU, for work queued on the previous one. */
+ * quantize through GEMV enqueue. On a switch to another stream the device is
+ * synchronized first: the previous stream may already be destroyed (an RPC
+ * client's workspace goes away when it disconnects), so it cannot take an
+ * event record. Switches are rare (a new client or engine). */
 constexpr int KQ_DEVICES = 16;
 struct KqScratch {
     std::mutex mu;
     void *p = nullptr;
     size_t cap = 0;
     cudaStream_t stream = nullptr;
-    cudaEvent_t handoff = nullptr;
 };
 static KqScratch g_kq[KQ_DEVICES];
 
@@ -1843,15 +1844,8 @@ static KqScratch *kq_acquire(cudaStream_t stream, size_t need, std::unique_lock<
     }
     KqScratch &s = g_kq[dev];
     lock = std::unique_lock<std::mutex>(s.mu);
-    if (s.p && s.stream != stream) {
-        if (!s.handoff && cudaEventCreateWithFlags(&s.handoff, cudaEventDisableTiming) != cudaSuccess) {
-            s.handoff = nullptr;
-            return nullptr;
-        }
-        if (cudaEventRecord(s.handoff, s.stream) != cudaSuccess ||
-            cudaStreamWaitEvent(stream, s.handoff, 0) != cudaSuccess) {
-            return nullptr;
-        }
+    if (s.p && s.stream != stream && cudaDeviceSynchronize() != cudaSuccess) {
+        return nullptr;
     }
     if (s.cap < need) {
         if (s.p) {

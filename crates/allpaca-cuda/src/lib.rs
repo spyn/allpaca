@@ -5674,6 +5674,42 @@ mod tests {
         d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
     }
 
+    /// The K-quant activation scratch outlives workspaces: a GEMV on a new
+    /// workspace after the previous one (and its stream) was dropped must
+    /// still run. It segfaulted in libcuda when an RPC client reconnected.
+    #[test]
+    fn kquant_gemv_survives_a_dropped_workspace() {
+        if device_count() <= 0 {
+            return;
+        }
+        let (n, k) = (64usize, 256usize);
+        let w: Vec<f32> = (0..n * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+        let q = allpaca_cpu::quantize_q4_k(&w);
+        let a: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let run = |ws: &CudaWorkspace| -> Vec<f32> {
+            let db = device_malloc(q.len(), 0).expect("weights");
+            memcpy_on(db, q.as_ptr().cast(), q.len(), MEMCPY_H2D, ws.raw_stream()).unwrap();
+            let da = ws.upload_f32(&a).expect("a");
+            let dc = device_malloc(n * 4, 0).expect("c");
+            ws.gemm_nt_kquant_dev(4, da, db.cast_const().cast(), dc.cast(), 1, n as i32, k as i32)
+                .expect("kquant gemv");
+            let mut out = vec![0.0f32; n];
+            memcpy_on(out.as_mut_ptr().cast(), dc, n * 4, MEMCPY_D2H, ws.raw_stream()).unwrap();
+            ws.synchronize().unwrap();
+            ws.free_ptr(da);
+            device_free(dc);
+            device_free(db);
+            out
+        };
+        // The second workspace exists before the first goes, so its stream
+        // is a different one, and the scratch last ran on a destroyed stream.
+        let first = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        let want = run(&first);
+        let second = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        drop(first);
+        assert_eq!(run(&second), want);
+    }
+
     /// Int8-activation K-quant GEMV (Q4_K / Q5_K / Q6_K) against the CPU
     /// dequantized weights, for 1..8 rows and a column count that does not
     /// fill the last block; each row equals its one-row call bit for bit.
