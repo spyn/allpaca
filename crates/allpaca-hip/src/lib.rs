@@ -5714,7 +5714,8 @@ impl HipWorkspace {
         g.used = 0;
         g.ops.clear();
         g.lm_head_ns = 0;
-        g.full = g.forwards % PROFILE_EVERY == 1;
+        g.full = g.forwards % PROFILE_EVERY == 1
+            || std::env::var("ALLPACA_PROFILE_ALL").is_ok_and(|v| v == "1");
         g.forwards = g.forwards.wrapping_add(1);
         self.profiling.store(u64::from(g.full), Ordering::Relaxed);
         g.wall_start = Some(std::time::Instant::now());
@@ -5778,17 +5779,38 @@ impl HipWorkspace {
                 if last > 0 {
                     let _ = event_synchronize(g.pairs[last - 1][1]);
                 }
+                let dump = std::env::var("ALLPACA_PROFILE_ALL").is_ok_and(|v| v == "2");
+                let mut line = String::new();
                 for i in 0..g.used.min(g.ops.len()).min(g.pairs.len()) {
                     let op = g.ops[i] as usize;
                     if op >= 4 {
                         continue;
                     }
-                    buckets[op] += event_elapsed_ns(g.pairs[i][0], g.pairs[i][1]);
+                    let ns = event_elapsed_ns(g.pairs[i][0], g.pairs[i][1]);
+                    buckets[op] += ns;
+                    if dump {
+                        line.push_str(&format!("{op}:{} ", ns / 1000));
+                    }
+                }
+                if dump {
+                    eprintln!("OPS dev={} {line}", self.device);
                 }
             }
             buckets[DecodeOp::LmHead as usize] += g.lm_head_ns;
             let gpu_ns = buckets[0] + buckets[1] + buckets[2] + buckets[3];
             buckets[4] = wall_ns.saturating_sub(gpu_ns);
+            if std::env::var("ALLPACA_PROFILE_ALL").is_ok_and(|v| v == "1") {
+                eprintln!(
+                    "PROF dev={} ops={} q8={:.2} attn={:.2} lm={:.2} other={:.2} host={:.2} ms",
+                    self.device,
+                    g.used,
+                    buckets[0] as f64 / 1e6,
+                    buckets[1] as f64 / 1e6,
+                    buckets[2] as f64 / 1e6,
+                    buckets[3] as f64 / 1e6,
+                    buckets[4] as f64 / 1e6
+                );
+            }
             for i in 0..5 {
                 g.ema_ns[i] = ema_ns(g.ema_ns[i], buckets[i]);
             }
@@ -11897,7 +11919,6 @@ mod tests {
         let paired = hip
             .gemm_nt_q8_pair_dev(xd.cast(), gd, outs[2].cast(), ud, outs[3].cast(), 1, n as i32, n as i32, k as i32)
             .unwrap();
-        assert!(paired, "m == 1 must take the paired launch");
         let read = |p: *mut u8| {
             let mut v = vec![0.0f32; n];
             hip.copy_d2h_f32(p.cast(), &mut v).unwrap();
@@ -11905,8 +11926,14 @@ mod tests {
         };
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert!(read(outs[0]).iter().any(|v| *v != 0.0));
-        assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
-        assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        if std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            assert!(paired, "m == 1 must take the paired launch");
+            assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
+            assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        } else {
+            // The f32 pair kernel would not match the int8 GEMV decode uses.
+            assert!(!paired, "the f32 pair launch must step aside for the int8 Q8_0 GEMV");
+        }
 
         // scale_add_copy vs scale_f32 + residual_add + copy_d2d.
         let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -11929,6 +11956,58 @@ mod tests {
         device_free(gd, g.len());
         device_free(ud, u.len());
         device_free(xd, k * 4);
+    }
+
+    /// One fused GDN decode step at Qwen3.8-27B dims (48 v-heads, 16 k-heads,
+    /// 128x128 state): `BENCH_DEV=0|1 cargo test --release -p allpaca-hip
+    /// --features hip --lib bench_gdn_step -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_gdn_step() {
+        if device_count() == 0 {
+            return;
+        }
+        let dev = std::env::var("BENCH_DEV").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+        let (n_v, n_k, hv, hk, ck) = (48usize, 16usize, 128usize, 128usize, 4usize);
+        let qkv_dim = 2 * n_k * hk + n_v * hv;
+        let up = |v: &[f32]| {
+            let p = device_malloc(v.len() * 4, dev).unwrap();
+            memcpy(p, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D).unwrap();
+            p.cast::<f32>()
+        };
+        let qkv = up(&vec![0.01; qkv_dim]);
+        let alpha = up(&vec![0.1; n_v]);
+        let beta = up(&vec![0.2; n_v]);
+        let conv_w = up(&vec![0.25; qkv_dim * ck]);
+        let conv_state = up(&vec![0.0; qkv_dim * (ck - 1)]);
+        let dt = up(&vec![0.0; n_v]);
+        let a = up(&vec![-1.0; n_v]);
+        // Several states so they stream from VRAM like 48 layers do.
+        let states: Vec<*mut f32> = (0..16).map(|_| up(&vec![0.0; n_v * hv * hk])).collect();
+        let y = up(&vec![0.0; n_v * hv]);
+        let next = std::cell::Cell::new(0usize);
+        let step = || {
+            let st = states[next.get() % states.len()];
+            next.set(next.get() + 1);
+            ws.gdn_layer_step(
+                qkv, alpha, beta, conv_w, conv_state, dt, a, st, y, n_v as i32, n_k as i32,
+                hv as i32, hk as i32, ck as i32, 1e-6, false,
+            )
+            .unwrap();
+        };
+        for _ in 0..20 {
+            step();
+        }
+        stream_synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..500 {
+            step();
+        }
+        stream_synchronize().unwrap();
+        let us = t.elapsed().as_secs_f64() * 1e6 / 500.0;
+        let bytes = 2 * n_v * hv * hk * 4;
+        eprintln!("dev{dev} gdn_step_fused: {us:.1} us ({:.0} GB/s on state r+w)", bytes as f64 / us / 1e3);
     }
 
     #[test]
@@ -12343,6 +12422,19 @@ mod tests {
                 }
                 c[r * n + j] = acc;
             }
+        }
+    }
+
+    /// The activations a Q8_0 GEMV of `m` rows over `k` actually multiplies:
+    /// int8-quantized on the GEMV path (m <= 16, whole 32-value blocks),
+    /// as given on the tiled prefill path or with ALLPACA_Q8_F32_GEMV=1.
+    #[cfg(feature = "hip")]
+    fn q8_0_gemv_activations(a: &[f32], m: usize, k: usize) -> Vec<f32> {
+        let f32_gemv = std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1");
+        if m <= 16 && k % 32 == 0 && !f32_gemv {
+            q8_activations(a)
+        } else {
+            a.to_vec()
         }
     }
 
@@ -14631,7 +14723,7 @@ mod tests {
             let b_deq = dequant_q8_matrix(&b_q8, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
-            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            cpu_gemm_nt(&q8_0_gemv_activations(&a, m, k), &b_deq, &mut cpu, m, n, k);
             let run = |a: &[f32], c: &mut [f32], rows: i32| {
                 gemm_nt_q8_0(a, &b_q8, c, rows, n as i32, k as i32)
                     .expect("HIP gemm_nt_q8_0 must run when a device is present")
@@ -15468,7 +15560,7 @@ mod tests {
             let b_deq = dequant_q8_matrix(&b_q8, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
-            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            cpu_gemm_nt(&q8_0_gemv_activations(&a, m, k), &b_deq, &mut cpu, m, n, k);
             gemm_nt_q8_0(&a, &b_q8, &mut hip, m as i32, n as i32, k as i32)
                 .expect("HIP gemm_nt_q8_0 must run when a device is present");
             for i in 0..m * n {
@@ -15548,7 +15640,7 @@ mod tests {
         let b_q8 = stage_q8_0_gemv(&b_q8_packed, n, k).expect("stage q8 gemv");
         let b_deq = dequant_q8_matrix(&b_q8_packed, n, k);
         let mut cpu = vec![0.0f32; m * n];
-        cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+        cpu_gemm_nt(&q8_0_gemv_activations(&a, m, k), &b_deq, &mut cpu, m, n, k);
         for i in 0..m * n {
             cpu[i] += residual[i];
         }

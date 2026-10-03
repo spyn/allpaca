@@ -2108,6 +2108,18 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
     return hip_status(hipGetLastError());
 }
 
+static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                          int32_t k, hipStream_t stream);
+
+/* Q8_0 GEMVs (m <= 16) run on int8 activations unless ALLPACA_Q8_F32_GEMV=1. */
+static bool q8_0_i8_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_Q8_F32_GEMV");
+        return !(v && v[0] == '1');
+    }();
+    return on;
+}
+
 static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                int32_t k, hipStream_t stream, int intdot) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
@@ -2132,6 +2144,15 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
                   static_cast<unsigned>((m + BM - 1) / BM));
         hipLaunchKernelGGL(gemm_nt_q8_0_tiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
         return hip_status(hipGetLastError());
+    }
+    // Decode and verify rows (m <= 16) share the int8 kernel, so a verify row
+    // still reproduces decode bit for bit; the f32 kernels below are the
+    // ALLPACA_Q8_F32_GEMV fallback.
+    if (!intdot && q8_0_i8_enabled()) {
+        const int rc = launch_q8_0_i8(a, b, c, m, n, k, stream);
+        if (rc != ALLPACA_ERR_INVALID) {
+            return rc;
+        }
     }
     constexpr int warps = 16;
     constexpr int cols = 8;
@@ -2825,6 +2846,114 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
         KQ_I8_LAUNCH(8, LPC);
     }
 #undef KQ_I8_LAUNCH
+    return hip_status(hipGetLastError());
+}
+
+/* Q8_0 GEMV on int8 activations (the K-quant mmvq scheme for 36-byte staged
+ * Q8_0 blocks: f32 scale, 32 int8). LPC lanes per column take every LPC-th
+ * 32-value block; MR rows share each weight block load. A row's sum order
+ * does not depend on MR, so m = 1 decode and m <= 16 verify rows agree bit
+ * for bit. */
+template <int MR>
+__global__ void gemv_nt_q8_0_i8_kernel(const int8_t *aq, const float *ad, const uint8_t *b,
+                                       float *c, int m, int n, int k) {
+    constexpr int LPC = 8;
+    const int sl = static_cast<int>(threadIdx.x) % LPC;
+    const int col = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / LPC) +
+                    static_cast<int>(threadIdx.x) / LPC;
+    const int row0 = static_cast<int>(blockIdx.y) * MR;
+    const bool live = col < n;
+    const int kb = k / 32;
+    const uint8_t *brow = b + static_cast<size_t>(live ? col : 0) * static_cast<size_t>(kb) * 36;
+    const int8_t *arow[MR];
+    const float *drow[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        const size_t ar = static_cast<size_t>(row0 + r < m ? row0 + r : row0);
+        arow[r] = aq + ar * static_cast<size_t>(k);
+        drow[r] = ad + ar * static_cast<size_t>(kb);
+    }
+    float acc[MR];
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        acc[r] = 0.f;
+    }
+    if (live) {
+        for (int bi = sl; bi < kb; bi += LPC) {
+            const uint8_t *blk = brow + static_cast<size_t>(bi) * 36;
+            const float ws = *reinterpret_cast<const float *>(blk);
+            const uint32_t *qp = reinterpret_cast<const uint32_t *>(blk + 4);
+            uint32_t q[8];
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                q[t] = qp[t];
+            }
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                const uint4 *ap = reinterpret_cast<const uint4 *>(arow[r] + bi * 32);
+                const uint4 a0 = ap[0];
+                const uint4 a1 = ap[1];
+                int32_t dot = 0;
+                dot = i8dot4(a0.x, q[0], dot);
+                dot = i8dot4(a0.y, q[1], dot);
+                dot = i8dot4(a0.z, q[2], dot);
+                dot = i8dot4(a0.w, q[3], dot);
+                dot = i8dot4(a1.x, q[4], dot);
+                dot = i8dot4(a1.y, q[5], dot);
+                dot = i8dot4(a1.z, q[6], dot);
+                dot = i8dot4(a1.w, q[7], dot);
+                acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MR; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = LPC / 2; off > 0; off >>= 1) {
+            v += __shfl_xor(v, off, 32);
+        }
+        if (live && sl == 0 && row0 + r < m) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + col] = v;
+        }
+    }
+}
+
+/* Returns ALLPACA_ERR_INVALID when the int8 path cannot run (caller falls back). */
+static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                          int32_t k, hipStream_t stream) {
+    if (m <= 0 || m > 16 || k % 32 != 0 || reinterpret_cast<uintptr_t>(b) % 4 != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    const size_t aq_bytes = (static_cast<size_t>(m) * k + 255) & ~size_t(255);
+    const size_t need = aq_bytes + static_cast<size_t>(m) * (k / 32) * sizeof(float);
+    std::unique_lock<std::mutex> lock;
+    KqActScratch *scratch = kq_act_acquire(stream, need, lock);
+    if (!scratch) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    uint8_t *base = static_cast<uint8_t *>(scratch->p);
+    int8_t *aq = reinterpret_cast<int8_t *>(base);
+    float *ad = reinterpret_cast<float *>(base + aq_bytes);
+    const int kb = k / 32;
+    hipLaunchKernelGGL(quantize_rows_q8_kernel,
+                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
+                       dim3(256), 0, stream, a, aq, ad, m, k);
+    constexpr int LPC = 8;
+    dim3 block(256);
+    const unsigned gx = static_cast<unsigned>((n + (256 / LPC) - 1) / (256 / LPC));
+    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
+    if (mr == 1) {
+        hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<1>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
+    } else if (mr == 2) {
+        hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<2>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
+    } else if (mr == 4) {
+        hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<4>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
+    } else {
+        hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<8>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
+    }
     return hip_status(hipGetLastError());
 }
 
@@ -6578,7 +6707,7 @@ extern "C" int allpaca_gemm_nt_q8_0_pair(const float *a, const uint8_t *b1, floa
                                          const uint8_t *b2, float *c2, int32_t m, int32_t n1,
                                          int32_t n2, int32_t k, allpaca_stream_t stream) {
     if (!a || !b1 || !c1 || !b2 || !c2 || m != 1 || n1 <= 0 || n2 <= 0 || k <= 0 ||
-        ALLPACA_Q8_GEMV_INTDOT) {
+        ALLPACA_Q8_GEMV_INTDOT || q8_0_i8_enabled()) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
