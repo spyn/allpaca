@@ -1212,7 +1212,11 @@ __global__ void attention_flash_kernel(const float *q, const float *k, const flo
         l = 1.0f;
     }
 
-    for (int t = 0; t < n_kv; ++t) {
+    /* Causal rows stop at their last visible key: a masked step adds exactly
+     * nothing (p = 0, alpha = 1), so skipping it leaves the result bit-equal
+     * and halves prefill attention. */
+    const int t_end = mask ? n_kv : min(n_kv, t_max + 1);
+    for (int t = 0; t < t_end; ++t) {
         const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
                                        static_cast<size_t>(t)] != 0
                                 : t <= t_max;
