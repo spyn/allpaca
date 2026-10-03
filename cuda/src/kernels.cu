@@ -1276,9 +1276,75 @@ __device__ float warp_sum32(float v) {
     return v;
 }
 
-/* Warp-per-head online softmax. Supports head_dim <= 512 (16 dims/lane × 32).
+/* Warp-per-row online softmax. Supports head_dim <= 512 (16 dims/lane × 32).
  * Optional sinks[h] is a virtual logit with no V (HIP attention_flash_kernel).
- * softcap>0 applies Gemma logit softcap after scale. */
+ * softcap>0 applies Gemma logit softcap after scale. `attn_row_*` hold the
+ * per-row arithmetic so the per-row and Q-tiled kernels give the same bits
+ * for a row whichever computed it. */
+constexpr int ATTN_MAX_DPT = 16;
+
+struct AttnRow {
+    float qreg[ATTN_MAX_DPT];
+    float acc[ATTN_MAX_DPT];
+    float m;
+    float l;
+};
+
+__device__ __forceinline__ void attn_row_init(AttnRow &r, const float *qh, int lane, int head_dim,
+                                              const float *sinks, int h) {
+    int nd = 0;
+    for (int d = lane; d < head_dim && nd < ATTN_MAX_DPT; d += 32) {
+        r.qreg[nd] = qh[d];
+        r.acc[nd] = 0.f;
+        nd++;
+    }
+    r.m = -1.0e30f;
+    r.l = 0.f;
+    if (sinks) {
+        r.m = sinks[h];
+        r.l = 1.f;
+    }
+}
+
+__device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const float *vh,
+                                              bool valid, int lane, int head_dim, float scale,
+                                              float softcap) {
+    float partial = 0.f;
+    int i = 0;
+    for (int d = lane; d < head_dim && i < ATTN_MAX_DPT; d += 32) {
+        partial += r.qreg[i++] * (valid ? kh[d] : 0.f);
+    }
+    float s = warp_sum32(partial) * scale;
+    if (softcap > 0.f) {
+        s = tanhf(s / softcap) * softcap;
+    }
+    if (!valid) {
+        s = -1.0e30f;
+    }
+    const float m_new = fmaxf(r.m, s);
+    const float alpha = expf(r.m - m_new);
+    const float p = expf(s - m_new);
+    r.l = r.l * alpha + p;
+    i = 0;
+    for (int d = lane; d < head_dim && i < ATTN_MAX_DPT; d += 32) {
+        r.acc[i] = r.acc[i] * alpha + p * (valid ? vh[d] : 0.f);
+        i++;
+    }
+    r.m = m_new;
+}
+
+__device__ __forceinline__ void attn_row_store(const AttnRow &r, float *oh, int lane, int head_dim) {
+    const float inv = (r.l == 0.f) ? 0.f : 1.f / r.l;
+    int i = 0;
+    for (int d = lane; d < head_dim && i < ATTN_MAX_DPT; d += 32) {
+        oh[d] = r.acc[i++] * inv;
+    }
+}
+
+__device__ __forceinline__ int attn_row_tmax(int qi, int n_q, int n_kv, int causal) {
+    return causal ? qi + (n_kv > n_q ? n_kv - n_q : 0) : n_kv - 1;
+}
+
 __global__ void attention_online_kernel(const float *q, const float *k, const float *v, float *out,
                                         int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
                                         int causal, const uint8_t *mask, const float *sinks,
@@ -1289,66 +1355,106 @@ __global__ void attention_online_kernel(const float *q, const float *k, const fl
         return;
     }
     const int lane = static_cast<int>(threadIdx.x);
-    const int reps = n_heads / n_kv_heads;
-    const int kv_h = h / reps;
+    const int kv_h = h / (n_heads / n_kv_heads);
     const float scale = rsqrtf(static_cast<float>(head_dim));
-    const int t_max = causal ? qi + (n_kv > n_q ? n_kv - n_q : 0) : n_kv - 1;
+    const int t_max = attn_row_tmax(qi, n_q, n_kv, causal);
     const float *qh = q + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
     float *oh = out + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
-
-    constexpr int MAX_DPT = 16;
-    float qreg[MAX_DPT];
-    float acc[MAX_DPT];
-    int nd = 0;
-    for (int d = lane; d < head_dim && nd < MAX_DPT; d += 32) {
-        qreg[nd] = qh[d];
-        acc[nd] = 0.f;
-        nd++;
-    }
-
-    float m = -1.0e30f;
-    float l = 0.f;
-    if (sinks) {
-        m = sinks[h];
-        l = 1.f;
-    }
-
-    for (int t = 0; t < n_kv; ++t) {
+    AttnRow r;
+    attn_row_init(r, qh, lane, head_dim, sinks, h);
+    /* A masked step adds exactly nothing (p = 0, alpha = 1): causal rows stop
+     * at their last visible key. */
+    const int t_end = mask ? n_kv : min(n_kv, t_max + 1);
+    for (int t = 0; t < t_end; ++t) {
         const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
                                        static_cast<size_t>(t)] != 0
                                 : t <= t_max;
         const float *kh = k + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
         const float *vh = v + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
-        float partial = 0.f;
-        int i = 0;
-        for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
-            partial += qreg[i++] * (valid ? kh[d] : 0.f);
-        }
-        float s = warp_sum32(partial) * scale;
-        if (softcap > 0.f) {
-            s = tanhf(s / softcap) * softcap;
-        }
-        if (!valid) {
-            s = -1.0e30f;
-        }
-        const float m_new = fmaxf(m, s);
-        const float alpha = expf(m - m_new);
-        const float p = expf(s - m_new);
-        l = l * alpha + p;
-        i = 0;
-        for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
-            acc[i] = acc[i] * alpha + p * (valid ? vh[d] : 0.f);
-            i++;
-        }
-        m = m_new;
+        attn_row_step(r, kh, vh, valid, lane, head_dim, scale, softcap);
     }
+    attn_row_store(r, oh, lane, head_dim);
+}
 
-    const float inv = (l == 0.f) ? 0.f : 1.f / l;
-    int i = 0;
-    for (int d = lane; d < head_dim && i < MAX_DPT; d += 32) {
-        oh[d] = acc[i++] * inv;
+/* ATTN_QTILE consecutive rows of one head per block, one warp each, reading
+ * `tile` keys of K and V staged in shared memory (see the HIP kernel). */
+constexpr int ATTN_QTILE = 8;
+
+__global__ void attention_qtile_kernel(const float *q, const float *k, const float *v, float *out,
+                                       int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
+                                       int causal, const uint8_t *mask, const float *sinks,
+                                       float softcap, int tile) {
+    extern __shared__ float attn_lds[];
+    float *k_lds = attn_lds;
+    float *v_lds = attn_lds + static_cast<size_t>(tile) * head_dim;
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int q0 = static_cast<int>(blockIdx.x) * ATTN_QTILE;
+    const int qi = q0 + warp;
+    const int h = static_cast<int>(blockIdx.y);
+    const bool active = qi < n_q;
+    const int kv_h = h / (n_heads / n_kv_heads);
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+    const int qrow = active ? qi : q0;
+    const float *qh = q + (static_cast<size_t>(qrow) * n_heads + h) * head_dim;
+    float *oh = out + (static_cast<size_t>(qrow) * n_heads + h) * head_dim;
+    const int t_max = attn_row_tmax(qi, n_q, n_kv, causal);
+    const int t_end = active ? (mask ? n_kv : min(n_kv, t_max + 1)) : 0;
+    const int q_last = min(n_q, q0 + ATTN_QTILE) - 1;
+    const int block_end = mask ? n_kv : min(n_kv, attn_row_tmax(q_last, n_q, n_kv, causal) + 1);
+    AttnRow r;
+    attn_row_init(r, qh, lane, head_dim, sinks, h);
+    const int n_tile = tile * head_dim;
+    for (int t0 = 0; t0 < block_end; t0 += tile) {
+        __syncthreads();
+        for (int e = static_cast<int>(threadIdx.x); e < n_tile; e += static_cast<int>(blockDim.x)) {
+            const int t = t0 + e / head_dim;
+            const int d = e % head_dim;
+            const size_t src = static_cast<size_t>(t) * kv_stride +
+                               static_cast<size_t>(kv_h) * head_dim + static_cast<size_t>(d);
+            k_lds[e] = t < n_kv ? k[src] : 0.f;
+            v_lds[e] = t < n_kv ? v[src] : 0.f;
+        }
+        __syncthreads();
+        const int stop = min(t_end, t0 + tile);
+        for (int t = t0; t < stop; ++t) {
+            const bool valid = mask ? mask[static_cast<size_t>(qi) * static_cast<size_t>(n_kv) +
+                                           static_cast<size_t>(t)] != 0
+                                    : t <= t_max;
+            attn_row_step(r, k_lds + static_cast<size_t>(t - t0) * head_dim,
+                          v_lds + static_cast<size_t>(t - t0) * head_dim, valid, lane, head_dim,
+                          scale, softcap);
+        }
     }
+    if (active) {
+        attn_row_store(r, oh, lane, head_dim);
+    }
+}
+
+/* Per-row kernel for one query; Q-tiled for several, bit-equal either way.
+ * 2048 floats of K (and V) per tile, as on HIP. */
+static void launch_attention(const float *q, const float *k, const float *v, float *out, int n_q,
+                             int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
+                             const uint8_t *mask, const float *sinks, float softcap,
+                             cudaStream_t stream) {
+    const int tile = head_dim > 0 ? 2048 / head_dim : 0;
+    if (n_q >= 2 && tile >= 1) {
+        dim3 block(32 * ATTN_QTILE);
+        dim3 grid(static_cast<unsigned>((n_q + ATTN_QTILE - 1) / ATTN_QTILE),
+                  static_cast<unsigned>(n_heads));
+        const size_t lds = 2 * static_cast<size_t>(tile) * head_dim * sizeof(float);
+        attention_qtile_kernel<<<grid, block, lds, stream>>>(q, k, v, out, n_q, n_kv, n_heads,
+                                                             n_kv_heads, head_dim, causal, mask,
+                                                             sinks, softcap, tile);
+        return;
+    }
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
+    attention_online_kernel<<<grid, block, 0, stream>>>(q, k, v, out, n_q, n_kv, n_heads,
+                                                        n_kv_heads, head_dim, causal, mask, sinks,
+                                                        softcap);
 }
 
 extern "C" int allpaca_cuda_attention_sinks(const float *q, const float *k, const float *v,
@@ -1359,10 +1465,8 @@ extern "C" int allpaca_cuda_attention_sinks(const float *q, const float *k, cons
         head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
         return ALLPACA_ERR_INVALID;
     }
-    dim3 block(32);
-    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
-        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, nullptr, sinks, 0.f);
+    launch_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, nullptr,
+                     sinks, 0.f, as_stream(stream));
     return cuda_status(cudaGetLastError());
 }
 
@@ -1374,10 +1478,8 @@ extern "C" int allpaca_cuda_attention_masked(const float *q, const float *k, con
         n_kv_heads <= 0 || head_dim <= 0 || (n_heads % n_kv_heads) != 0 || head_dim > 512) {
         return ALLPACA_ERR_INVALID;
     }
-    dim3 block(32);
-    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
-        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask, nullptr, 0.f);
+    launch_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask,
+                     nullptr, 0.f, as_stream(stream));
     return cuda_status(cudaGetLastError());
 }
 
@@ -1401,10 +1503,8 @@ extern "C" int allpaca_cuda_attention_softcap(const float *q, const float *k, co
         return allpaca_cuda_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
                                       stream);
     }
-    dim3 block(32);
-    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
-        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, nullptr, nullptr, softcap);
+    launch_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, nullptr,
+                     nullptr, softcap, as_stream(stream));
     return cuda_status(cudaGetLastError());
 }
 
@@ -1421,10 +1521,8 @@ extern "C" int allpaca_cuda_attention_masked_softcap(const float *q, const float
         return allpaca_cuda_attention_masked(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim,
                                              mask, stream);
     }
-    dim3 block(32);
-    dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
-    attention_online_kernel<<<grid, block, 0, as_stream(stream)>>>(
-        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask, nullptr, softcap);
+    launch_attention(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, 0, mask,
+                     nullptr, softcap, as_stream(stream));
     return cuda_status(cudaGetLastError());
 }
 
