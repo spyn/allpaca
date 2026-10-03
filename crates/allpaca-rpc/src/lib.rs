@@ -300,6 +300,80 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Prints digests of K-quant GEMV and fused MoE outputs for fixed inputs,
+    /// to compare HIP and CUDA workers across machines bit for bit:
+    /// `cargo test --release -p allpaca-rpc --features <hip|cuda> --lib kquant_digest -- --ignored --nocapture`
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn kquant_digest() {
+        #[cfg(feature = "hip")]
+        let backend = WorkerBackend::Hip(HipWorker::new(0).unwrap());
+        #[cfg(all(feature = "cuda", not(feature = "hip")))]
+        let backend = WorkerBackend::Cuda(CudaWorker::new(0).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, backend).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let digest = |v: &[f32]| v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+        });
+        // Qwen3-Next's expert shape; 1-row calls (decode) and grouped rows.
+        let (dim, ff, n_exp) = (2048usize, 512usize, 4usize);
+        let mat = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((((i * 2654435761usize) ^ (seed * 40503)) % 1000) as f32 - 500.0) * 0.0007).collect()
+        };
+        let x: Vec<f32> = mat(77, 4 * dim).iter().map(|v| v * 9.0).collect();
+        for (gu, dn) in [(12u32, 12u32), (13, 14)] {
+            let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
+                let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
+                client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+            };
+            let (gate, up, down) = (put(gu, 1, ff, dim), put(gu, 5, ff, dim), put(dn, 9, dim, ff));
+            let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: false };
+            let pairs = [(0u32, 1u32, 0.6f32), (0, 3, 0.4), (1, 1, 0.5), (1, 2, 0.5), (2, 0, 1.0), (3, 1, 0.3), (3, 3, 0.7)];
+            for q8 in [false, true] {
+                let y = client.moe_ffn(req, &x, q8, &pairs).unwrap();
+                eprintln!("DIGEST moe gate_up={gu} down={dn} q8={q8}: {:016x} first={:?}", digest(&y), &y[..3]);
+                let one: Vec<(u32, u32, f32)> = (0..n_exp as u32).map(|e| (0, e, 0.25)).collect();
+                let y1 = client.moe_ffn(req, &x[..dim], q8, &one).unwrap();
+                let half = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &x[..dim], q8, &one).unwrap();
+                eprintln!("DIGEST moe1 gate_up={gu} down={dn} q8={q8}: {:016x} f16 {:016x}", digest(&y1), digest(&half));
+                // Prefill-sized: 20 rows, 2 experts each, groups of up to 8 rows.
+                let xs: Vec<f32> = mat(91, 20 * dim).iter().map(|v| v * 7.0).collect();
+                let many: Vec<(u32, u32, f32)> = (0..20u32)
+                    .flat_map(|r| [(r, r % 4, 0.7f32), (r, (r * 3 + 1) % 4, 0.3)])
+                    .collect();
+                let yp = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &xs, q8, &many).unwrap();
+                eprintln!("DIGEST moe20 gate_up={gu} down={dn} q8={q8}: {:016x}", digest(&yp));
+            }
+        }
+        // Real routing shape: 21 rows x 10 distinct experts of 64 (groups of
+        // 1-3 rows, the MR=4 template with short groups).
+        let n_exp = 64usize;
+        for (gu, dn) in [(13u32, 14u32)] {
+            let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
+                let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
+                client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+            };
+            let (gate, up, down) = (put(gu, 1, ff, dim), put(gu, 5, ff, dim), put(dn, 9, dim, ff));
+            let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: true };
+            let xs: Vec<f32> = mat(93, 21 * dim).iter().map(|v| v * 7.0).collect();
+            let many: Vec<(u32, u32, f32)> = (0..21u32)
+                .flat_map(|r| (0..10u32).map(move |j| (r, (r * 7 + j * 13 + j * j) % 64, 0.1)))
+                .collect();
+            for q8 in [false, true] {
+                let yp = client.moe_ffn(req, &xs, q8, &many).unwrap();
+                eprintln!("DIGEST moe21x10 q8={q8}: {:016x}", digest(&yp));
+            }
+        }
+        drop(client);
+        worker.join().unwrap();
+    }
+
     /// Expert tensor types, sizes, and the allowed error relative to the
     /// largest output (the fused kernels quantize activations to int8).
     struct MoeCase {
