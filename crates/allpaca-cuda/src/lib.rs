@@ -194,6 +194,13 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_cuda_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
+        pub fn allpaca_cuda_det_silu_mul(
+            g: *const f32,
+            u: *const f32,
+            out: *mut f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_cuda_moe_ffn_kquant(
             x: *const f32,
             xq: *const i8,
@@ -1753,6 +1760,37 @@ impl CudaWorkspace {
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "CUDA gemm_nt_kquant unavailable".into(),
             )))
+        }
+    }
+
+    /// `silu(g) * u` with the MoE kernels' deterministic exp (test hook: it
+    /// must equal `allpaca_cpu::det_silu_mul` bit for bit).
+    pub fn det_silu_mul(&self, g: &[f32], u: &[f32]) -> Result<Vec<f32>, AllpacaError> {
+        #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+        {
+            let n = g.len().min(u.len());
+            let (dg, du) = (self.upload_f32(&g[..n])?, self.upload_f32(&u[..n])?);
+            let dout = device_malloc(n * 4, self.device)?;
+            let result = (|| {
+                set_device(self.device)?;
+                status(
+                    unsafe { ffi::allpaca_cuda_det_silu_mul(dg, du, dout.cast(), n as i32, self.stream) },
+                    "det_silu_mul",
+                )?;
+                let mut out = vec![0.0f32; n];
+                memcpy_on(out.as_mut_ptr().cast(), dout, n * 4, MEMCPY_D2H, self.stream)?;
+                self.synchronize()?;
+                Ok(out)
+            })();
+            self.free_ptr(dg);
+            self.free_ptr(du);
+            device_free(dout);
+            result
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            let _ = (g, u);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("CUDA unavailable".into())))
         }
     }
 
@@ -5672,6 +5710,25 @@ mod tests {
     fn attn_close(got: f32, exp: f32) -> bool {
         let d = (got - exp).abs();
         d <= 1e-4 || d <= 1e-3 * got.abs().max(exp.abs())
+    }
+
+    /// The MoE SiLU's exp equals the CPU reference (and the HIP kernel's) bit
+    /// for bit.
+    #[test]
+    fn det_silu_mul_matches_cpu_reference_bitwise() {
+        if device_count() <= 0 {
+            return;
+        }
+        let ws = CudaWorkspace::new(0, 64 * 1024).expect("workspace");
+        // Every regime: tiny, ordinary, both overflow clamps, signed zero.
+        let mut g: Vec<f32> = (0..40_000).map(|i| ((i as f32) - 20_000.0) * 0.0061).collect();
+        g.extend([0.0, -0.0, 1e-30, -1e-30, 88.4, -88.4, 120.0, -120.0, 1e4, -1e4]);
+        let u: Vec<f32> = (0..g.len()).map(|i| ((i % 13) as f32 - 6.0) * 0.37).collect();
+        let want: Vec<f32> = g.iter().zip(&u).map(|(&a, &b)| allpaca_cpu::det_silu_mul(a, b)).collect();
+        let got = ws.det_silu_mul(&g, &u).unwrap();
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "g={} u={}: {a} vs {b}", g[i], u[i]);
+        }
     }
 
     /// The K-quant activation scratch outlives workspaces: a GEMV on a new

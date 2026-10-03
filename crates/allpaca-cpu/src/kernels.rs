@@ -600,6 +600,38 @@ fn softmax_in_place(x: &mut [f32]) {
     }
 }
 
+/// `exp(x)` with every rounding fixed (range reduction, degree-7 Horner
+/// polynomial with fused multiply-adds, two exact power-of-two scalings): the
+/// same bits as the GPU `det_expf` in the HIP and CUDA MoE kernels, which use
+/// it instead of the vendors' `expf` so the backends agree.
+pub fn det_expf(x: f32) -> f32 {
+    let x = x.max(-103.0).min(88.5);
+    let n = (x * 1.442_695_040_888_963_4_f32).round_ties_even();
+    let mut r = n.mul_add(-0.693_145_751_953_125_f32, x);
+    r = n.mul_add(-1.428_606_820_309_417_2e-6_f32, r);
+    let mut p = 1.984_126_984_126_984e-4_f32;
+    for c in [
+        1.388_888_888_888_889e-3_f32,
+        8.333_333_333_333_333e-3,
+        4.166_666_666_666_667e-2,
+        1.666_666_666_666_666_7e-1,
+        0.5,
+        1.0,
+        1.0,
+    ] {
+        p = p.mul_add(r, c);
+    }
+    let pow2 = |k: i32| f32::from_bits(((k + 127) as u32) << 23);
+    let ni = n as i32;
+    let a = ni / 2;
+    p * pow2(a) * pow2(ni - a)
+}
+
+/// `silu(g) * u` as the GPU MoE expert FFN computes it ([`det_expf`]).
+pub fn det_silu_mul(g: f32, u: f32) -> f32 {
+    g / (1.0 + det_expf(-g)) * u
+}
+
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }

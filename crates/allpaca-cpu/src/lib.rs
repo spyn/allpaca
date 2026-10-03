@@ -3,6 +3,7 @@
 mod kernels;
 
 pub use kernels::{
+    det_expf, det_silu_mul,
     attention, attention_softcap, attention_with_mask, attention_with_mask_softcap, bf16_to_f32,
     copy_async, dequant_iq4_nl, dequant_iq4_xs, dequant_mxfp4, dequant_q2_k, dequant_q3_k,
     dequant_q4_0, dequant_q4_1, dequant_q4_k, dequant_q5_0, dequant_q5_1, dequant_q5_k,

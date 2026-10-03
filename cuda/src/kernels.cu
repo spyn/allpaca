@@ -1992,13 +1992,64 @@ __global__ void moe_gate_up_kernel(const float *x, const int8_t *xq, const float
     }
 }
 
+/* exp(x) with every rounding spelled out, so HIP, CUDA and the CPU
+ * reference (`allpaca_cpu::det_expf`) give the same bits: the vendors' expf
+ * differ in the last bit for some inputs, and the MoE SiLU used it, so expert
+ * layers on an NVIDIA worker changed the text against an AMD one.
+ * exp(x) = 2^n * exp(r), n = rint(x / ln 2), |r| <= ln 2 / 2, a degree-7
+ * Taylor polynomial in Horner form (error < 1e-8 relative), then 2^n applied
+ * as two exact power-of-two products. */
+__device__ inline float det_pow2i(int k) {
+    return __int_as_float((k + 127) << 23);
+}
+
+__device__ inline float det_expf(float x) {
+    x = fminf(fmaxf(x, -103.0f), 88.5f);
+    const float n = rintf(__fmul_rn(x, 1.44269504088896341f));
+    float r = fmaf(n, -0.693145751953125f, x);
+    r = fmaf(n, -1.42860682030941723212e-6f, r);
+    float p = 1.98412698412698413e-4f;
+    p = fmaf(p, r, 1.38888888888888889e-3f);
+    p = fmaf(p, r, 8.33333333333333333e-3f);
+    p = fmaf(p, r, 4.16666666666666667e-2f);
+    p = fmaf(p, r, 1.66666666666666667e-1f);
+    p = fmaf(p, r, 0.5f);
+    p = fmaf(p, r, 1.0f);
+    p = fmaf(p, r, 1.0f);
+    const int ni = static_cast<int>(n);
+    const int a = ni / 2;
+    return __fmul_rn(__fmul_rn(p, det_pow2i(a)), det_pow2i(ni - a));
+}
+
+/* silu(g) * u for the MoE expert FFN, bit-identical across backends. */
+__device__ inline float det_silu_mul(float g, float u) {
+    return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, det_expf(-g))), u);
+}
+
+__global__ void det_silu_mul_kernel(const float *g, const float *u, float *out, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        out[i] = det_silu_mul(g[i], u[i]);
+    }
+}
+
+/* Test hook: det_silu_mul over n values. */
+extern "C" int allpaca_cuda_det_silu_mul(const float *g, const float *u, float *out, int32_t n,
+                                         allpaca_cuda_stream_t stream) {
+    if (!g || !u || !out || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    (void)cudaGetLastError();
+    det_silu_mul_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, as_stream(stream)>>>(g, u, out, n);
+    return cuda_status(cudaGetLastError());
+}
+
 __global__ void moe_silu_quant_kernel(const float *g, const float *u, int8_t *hq, float *hd, int ff) {
     extern __shared__ unsigned char moe_lds[];
     float *tmp = reinterpret_cast<float *>(moe_lds);
     const size_t p = blockIdx.x;
     for (int i = static_cast<int>(threadIdx.x); i < ff; i += static_cast<int>(blockDim.x)) {
-        const float gv = g[p * ff + i];
-        tmp[i] = gv / (1.f + expf(-gv)) * u[p * ff + i];
+        tmp[i] = det_silu_mul(g[p * ff + i], u[p * ff + i]);
     }
     __syncthreads();
     moe_quantize_lds(tmp, ff, hq + p * ff, hd + p * (ff / 32));

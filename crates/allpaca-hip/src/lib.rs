@@ -633,6 +633,13 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
+        pub fn allpaca_det_silu_mul(
+            g: *const f32,
+            u: *const f32,
+            out: *mut f32,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_hip_set_exact_rows(on: i32);
         pub fn allpaca_copy_f32_kernel(dst: *mut f32, src: *const f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_moe_route_softmax_topk(
@@ -3174,6 +3181,39 @@ impl Drop for ExactRows {
 }
 
 /// Device scratch [`moe_ffn_kquant_device`] needs (beyond its inputs).
+/// `silu(g) * u` with the MoE kernels' deterministic exp, on the device
+/// (test hook: it must equal `allpaca_cpu::det_silu_mul` bit for bit).
+pub fn det_silu_mul(g: &[f32], u: &[f32]) -> Result<Vec<f32>, AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let n = g.len().min(u.len());
+        let (dg, du, dout) = (device_malloc(n * 4, 0)?, device_malloc(n * 4, 0)?, device_malloc(n * 4, 0)?);
+        let result = (|| {
+            memcpy(dg, g[..n].as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+            memcpy(du, u[..n].as_ptr().cast(), n * 4, MEMCPY_H2D)?;
+            status(
+                unsafe {
+                    ffi::allpaca_det_silu_mul(dg.cast(), du.cast(), dout.cast(), n as i32, std::ptr::null_mut())
+                },
+                "det_silu_mul",
+            )?;
+            let mut out = vec![0.0f32; n];
+            stream_synchronize()?;
+            memcpy(out.as_mut_ptr().cast(), dout, n * 4, MEMCPY_D2H)?;
+            Ok(out)
+        })();
+        for p in [dg, du, dout] {
+            device_free(p, n * 4);
+        }
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (g, u);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("HIP unavailable".into())))
+    }
+}
+
 pub fn moe_ffn_scratch_bytes(rows: usize, dim: usize, ff: usize, pairs: usize) -> usize {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -15580,6 +15620,31 @@ mod tests {
                     cpu[i]
                 );
             }
+        }
+    }
+
+    /// The MoE SiLU's exp is the same function as the CPU reference (and the
+    /// CUDA kernel's), bit for bit, so expert layers give the same values on
+    /// AMD and NVIDIA workers.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn det_silu_mul_matches_cpu_reference_bitwise() {
+        if device_count() == 0 {
+            return;
+        }
+        // Every regime: tiny, ordinary, both overflow clamps, signed zero.
+        let mut g: Vec<f32> = (0..40_000).map(|i| ((i as f32) - 20_000.0) * 0.0061).collect();
+        g.extend([0.0, -0.0, 1e-30, -1e-30, 88.4, -88.4, 120.0, -120.0, 1e4, -1e4]);
+        let u: Vec<f32> = (0..g.len()).map(|i| ((i % 13) as f32 - 6.0) * 0.37).collect();
+        let want: Vec<f32> = g.iter().zip(&u).map(|(&a, &b)| allpaca_cpu::det_silu_mul(a, b)).collect();
+        let got = det_silu_mul(&g, &u).unwrap();
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "g={} u={}: {a} vs {b}", g[i], u[i]);
+        }
+        // And it is exp to within 2 ulp where exp is representable.
+        for x in [-80.0f32, -10.0, -1.0, -0.01, 0.0, 0.3, 1.0, 5.0, 40.0, 88.0] {
+            let (d, e) = (allpaca_cpu::det_expf(x), x.exp());
+            assert!((d - e).abs() <= 2.0 * f32::EPSILON * e.abs().max(f32::MIN_POSITIVE), "exp({x}) {d} vs {e}");
         }
     }
 
