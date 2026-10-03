@@ -11926,14 +11926,10 @@ mod tests {
         };
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert!(read(outs[0]).iter().any(|v| *v != 0.0));
-        if std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
-            assert!(paired, "m == 1 must take the paired launch");
-            assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
-            assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
-        } else {
-            // The f32 pair kernel would not match the int8 GEMV decode uses.
-            assert!(!paired, "the f32 pair launch must step aside for the int8 Q8_0 GEMV");
-        }
+        // Small weights stay on the f32 GEMV, so the pair launch applies.
+        assert!(paired, "m == 1 must take the paired launch");
+        assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
+        assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
 
         // scale_add_copy vs scale_f32 + residual_add + copy_d2d.
         let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -12425,13 +12421,14 @@ mod tests {
         }
     }
 
-    /// The activations a Q8_0 GEMV of `m` rows over `k` actually multiplies:
-    /// int8-quantized on the GEMV path (m <= 16, whole 32-value blocks),
-    /// as given on the tiled prefill path or with ALLPACA_Q8_F32_GEMV=1.
+    /// The activations a Q8_0 GEMV of `m` rows over an `n x k` weight
+    /// actually multiplies: int8-quantized on the wide-row GEMV path
+    /// (m <= 16, k >= 5120, whole 32-value blocks), as given otherwise or
+    /// with ALLPACA_Q8_F32_GEMV=1.
     #[cfg(feature = "hip")]
-    fn q8_0_gemv_activations(a: &[f32], m: usize, k: usize) -> Vec<f32> {
+    fn q8_0_gemv_activations(a: &[f32], m: usize, _n: usize, k: usize) -> Vec<f32> {
         let f32_gemv = std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1");
-        if m <= 16 && k % 32 == 0 && !f32_gemv {
+        if m <= 16 && k >= 5120 && k % 32 == 0 && !f32_gemv {
             q8_activations(a)
         } else {
             a.to_vec()
@@ -14723,7 +14720,7 @@ mod tests {
             let b_deq = dequant_q8_matrix(&b_q8, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
-            cpu_gemm_nt(&q8_0_gemv_activations(&a, m, k), &b_deq, &mut cpu, m, n, k);
+            cpu_gemm_nt(&q8_0_gemv_activations(&a, m, n, k), &b_deq, &mut cpu, m, n, k);
             let run = |a: &[f32], c: &mut [f32], rows: i32| {
                 gemm_nt_q8_0(a, &b_q8, c, rows, n as i32, k as i32)
                     .expect("HIP gemm_nt_q8_0 must run when a device is present")
@@ -15547,6 +15544,39 @@ mod tests {
         }
     }
 
+    /// Wide-row Q8_0 weights (k >= 5120) take the int8-activation GEMV: every
+    /// row batch matches its single-row result bit for bit and the CPU GEMM on
+    /// int8-quantized activations; the f32 pair launch declines them.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q8_0_wide_rows_take_the_int8_gemv() {
+        if device_count() == 0 || std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let (n, k) = (1000usize, 5120usize);
+        for (si, m) in [1usize, 2, 3, 5, 9].into_iter().enumerate() {
+            let (a, b_q8, _) = fill_q8_gemm_case(si + 70, m, n, k);
+            let b_deq = dequant_q8_matrix(&b_q8, n, k);
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&q8_activations(&a), &b_deq, &mut cpu, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q8_0(a, &b_q8, c, rows, n as i32, k as i32).expect("gemm_nt_q8_0")
+            };
+            run(&a, &mut hip, m as i32);
+            assert_rows_match_single("q8_0 large", run, &a, &hip, m, n, k);
+            let scale = cpu.iter().fold(0.0f32, |s, v| s.max(v.abs()));
+            for i in 0..m * n {
+                assert!(
+                    (hip[i] - cpu[i]).abs() <= 1e-4 + 1e-4 * scale,
+                    "q8_0 large m={m} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
     /// Prefill-wide Q8 NT GEMM (M>8) must match CPU dequant + NT GEMM.
     #[cfg(feature = "hip")]
     #[test]
@@ -15560,7 +15590,7 @@ mod tests {
             let b_deq = dequant_q8_matrix(&b_q8, n, k);
             let mut cpu = vec![0.0f32; m * n];
             let mut hip = vec![0.0f32; m * n];
-            cpu_gemm_nt(&q8_0_gemv_activations(&a, m, k), &b_deq, &mut cpu, m, n, k);
+            cpu_gemm_nt(&q8_0_gemv_activations(&a, m, n, k), &b_deq, &mut cpu, m, n, k);
             gemm_nt_q8_0(&a, &b_q8, &mut hip, m as i32, n as i32, k as i32)
                 .expect("HIP gemm_nt_q8_0 must run when a device is present");
             for i in 0..m * n {
@@ -15640,7 +15670,7 @@ mod tests {
         let b_q8 = stage_q8_0_gemv(&b_q8_packed, n, k).expect("stage q8 gemv");
         let b_deq = dequant_q8_matrix(&b_q8_packed, n, k);
         let mut cpu = vec![0.0f32; m * n];
-        cpu_gemm_nt(&q8_0_gemv_activations(&a, m, k), &b_deq, &mut cpu, m, n, k);
+        cpu_gemm_nt(&q8_0_gemv_activations(&a, m, n, k), &b_deq, &mut cpu, m, n, k);
         for i in 0..m * n {
             cpu[i] += residual[i];
         }

@@ -2111,13 +2111,25 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
 static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                           int32_t k, hipStream_t stream);
 
-/* Q8_0 GEMVs (m <= 16) run on int8 activations unless ALLPACA_Q8_F32_GEMV=1. */
+/* Q8_0 GEMVs (m <= 16) over rows of at least Q8_I8_MIN_K values run on int8
+ * activations unless ALLPACA_Q8_F32_GEMV=1. The choice depends on the
+ * weight's shape only, so a weight takes the same kernel at every m and
+ * verify rows match decode. Measured on xeres: 5120-wide rows (Qwen3.8-27B)
+ * gain at every m; 2048- and 4096-wide rows (Qwen3-Coder-Next) lose more to the extra
+ * quantize launch and the lost f32 pair launch than they gain. */
+constexpr int32_t Q8_I8_MIN_K = 5120;
+
 static bool q8_0_i8_enabled() {
     static const bool on = [] {
         const char *v = std::getenv("ALLPACA_Q8_F32_GEMV");
         return !(v && v[0] == '1');
     }();
     return on;
+}
+
+static bool q8_0_uses_i8(int32_t n, int32_t k) {
+    (void)n;
+    return q8_0_i8_enabled() && k >= Q8_I8_MIN_K;
 }
 
 static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -2148,7 +2160,7 @@ static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32
     // Decode and verify rows (m <= 16) share the int8 kernel, so a verify row
     // still reproduces decode bit for bit; the f32 kernels below are the
     // ALLPACA_Q8_F32_GEMV fallback.
-    if (!intdot && q8_0_i8_enabled()) {
+    if (!intdot && q8_0_uses_i8(n, k)) {
         const int rc = launch_q8_0_i8(a, b, c, m, n, k, stream);
         if (rc != ALLPACA_ERR_INVALID) {
             return rc;
@@ -6707,7 +6719,7 @@ extern "C" int allpaca_gemm_nt_q8_0_pair(const float *a, const uint8_t *b1, floa
                                          const uint8_t *b2, float *c2, int32_t m, int32_t n1,
                                          int32_t n2, int32_t k, allpaca_stream_t stream) {
     if (!a || !b1 || !c1 || !b2 || !c2 || m != 1 || n1 <= 0 || n2 <= 0 || k <= 0 ||
-        ALLPACA_Q8_GEMV_INTDOT || q8_0_i8_enabled()) {
+        ALLPACA_Q8_GEMV_INTDOT || q8_0_uses_i8(n1, k) || q8_0_uses_i8(n2, k)) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
