@@ -300,6 +300,70 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Cost of one fused MoeFfn call against the number of (row, expert)
+    /// pairs, at Qwen3-Next's expert shape (512 experts, dim 2048, ff 512,
+    /// Q5_K gate/up, Q6_K down), int8 rows in and F16 out as the coordinator
+    /// sends them. `ALLPACA_BENCH_RPC=host:port` (token in `ALLPACA_RPC_TOKEN`)
+    /// measures a remote worker; unset, a loopback HIP worker on this machine.
+    /// `cargo test --release -p allpaca-rpc --features hip --lib moe_cost_curve -- --ignored --nocapture`
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore]
+    fn moe_cost_curve() {
+        let remote = std::env::var("ALLPACA_BENCH_RPC").ok();
+        let mut worker = None;
+        let mut client = match &remote {
+            Some(ep) => {
+                let token = std::env::var("ALLPACA_RPC_TOKEN").unwrap_or_default();
+                RpcSession::connect_addr_with_token(ep, &token).unwrap()
+            }
+            None => {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                worker = Some(thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+                }));
+                RpcSession::connect_addr(&addr.to_string()).unwrap()
+            }
+        };
+        let (n_exp, dim, ff) = (512usize, 2048usize, 512usize);
+        // Weights do not change the cost: one quantized expert, repeated.
+        let one = |ty: u32, rows: usize, cols: usize| -> Vec<u8> {
+            let m: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 1000) as f32 - 500.0) * 1e-4).collect();
+            let q = quantize(ty, &m);
+            (0..n_exp).flat_map(|_| q.iter().copied()).collect()
+        };
+        let t = std::time::Instant::now();
+        let gate = client.put_tensor(13, &[dim as u32, ff as u32, n_exp as u32], &one(13, ff, dim), None).unwrap();
+        let up = client.put_tensor(13, &[dim as u32, ff as u32, n_exp as u32], &one(13, ff, dim), None).unwrap();
+        let down = client.put_tensor(14, &[ff as u32, dim as u32, n_exp as u32], &one(14, dim, ff), None).unwrap();
+        eprintln!("upload {:.1} s to {}", t.elapsed().as_secs_f64(), remote.as_deref().unwrap_or("loopback hip"));
+        let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: true };
+        let x: Vec<f32> = (0..8 * dim).map(|i| ((i % 97) as f32 - 48.0) * 0.02).collect();
+        for rows in [1usize, 4] {
+            for k in [1usize, 2, 4, 6, 8, 10] {
+                let pairs: Vec<(u32, u32, f32)> = (0..rows as u32)
+                    .flat_map(|r| (0..k as u32).map(move |j| (r, (r * 37 + j * 51) % 512, 0.1)))
+                    .collect();
+                for _ in 0..5 {
+                    client.moe_ffn(req, &x[..rows * dim], true, &pairs).unwrap();
+                }
+                let n = 40;
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    client.moe_ffn(req, &x[..rows * dim], true, &pairs).unwrap();
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                eprintln!("COST rows={rows} experts_per_row={k} pairs={} us={us:.0}", pairs.len());
+            }
+        }
+        drop(client);
+        if let Some(w) = worker {
+            w.join().unwrap();
+        }
+    }
+
     /// Prints digests of K-quant GEMV and fused MoE outputs for fixed inputs,
     /// to compare HIP and CUDA workers across machines bit for bit:
     /// `cargo test --release -p allpaca-rpc --features <hip|cuda> --lib kquant_digest -- --ignored --nocapture`
