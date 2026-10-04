@@ -231,6 +231,10 @@ pub struct ModelConfig {
     pub rope_theta_swa: f32,
     /// Head-wise sigmoid attention output gate (Spark2_5).
     pub headwise_attn_gate: bool,
+    /// Qwen3.5-family attention: the Q projection is `[Q|gate]` per head.
+    /// Needed when n_heads * head_dim == dim (Ornith-1.5-9B), where the
+    /// shapes alone look like a plain double-width Q.
+    pub gated_attn_q: bool,
     /// Gemma attn logit softcap (0 = off).
     pub attn_logit_softcap: f32,
     /// Gemma final logit softcap (0 = off).
@@ -295,6 +299,7 @@ impl ModelConfig {
             rope_dims_swa: 0,
             rope_theta_swa: 0.0,
             headwise_attn_gate: false,
+            gated_attn_q: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             scale_embed: false,
@@ -496,6 +501,7 @@ impl ModelConfig {
                 .unwrap_or(0.0),
             headwise_attn_gate: arch == "spark2_5"
                 || file.tensor("blk.0.attn_gate.weight").is_some() && !is_qwen_gdn_arch(&arch),
+            gated_attn_q: is_qwen_gdn_arch(&arch),
             attn_logit_softcap: {
                 let v = file
                     .meta_f32(&format!("{arch}.attn_logit_softcapping"))
@@ -975,7 +981,8 @@ struct DeviceRouteCtl {
 }
 
 /// A layer's stacked routed experts as the fused MoE kernels read them:
-/// `[gate, up, down]`, each Q4_K/Q5_K/Q6_K at a fixed per-expert stride.
+/// `[gate, up, down]`, each Q4_K/Q5_K/Q6_K or staged Q8_0 at a fixed
+/// per-expert stride.
 fn stacked_moe_experts(
     weights: &DeviceWeights,
     offs: &[[WeightRef; 3]],
@@ -995,6 +1002,7 @@ fn stacked_moe_experts(
             WeightKind::Q4_K => 12,
             WeightKind::Q5_K => 13,
             WeightKind::Q6_K => 14,
+            WeightKind::Q8_0 => 8,
             _ => return None,
         };
         let stride = second.off.checked_sub(first.off)?;
@@ -1007,7 +1015,7 @@ fn stacked_moe_experts(
             stride: stride as u64,
         };
     }
-    Some(out)
+    allpaca_hip::MoeExperts::fused_set_ok(&out).then_some(out)
 }
 
 impl ResidentModel {
@@ -3013,7 +3021,8 @@ fn split_fused_qkv_host(
 fn gguf_rope_neox(arch: &str) -> bool {
     matches!(
         arch,
-        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen3next" | "phi2" | "phi3"
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "qwen3next" | "phi2"
+            | "phi3"
             | "gemma" | "gemma2" | "gemma3" | "starcoder2" | "stablelm" | "gptneox" | "falcon"
             | "olmo2" | "nemotron"
     )
@@ -3071,9 +3080,11 @@ fn add_row_bias(x: &mut [f32], bias: &[f32]) {
     }
 }
 
-/// Qwen Gated DeltaNet checkpoints: Qwen3.5 (`qwen35`) and Qwen3-Next (`qwen3next`).
+/// Qwen Gated DeltaNet checkpoints: Qwen3.5 (`qwen35`), its MoE variant
+/// (`qwen35moe`: the same trunk with Qwen3-Next's routed + shared experts)
+/// and Qwen3-Next (`qwen3next`).
 pub(crate) fn is_qwen_gdn_arch(arch: &str) -> bool {
-    matches!(arch, "qwen35" | "qwen3next")
+    matches!(arch, "qwen35" | "qwen35moe" | "qwen3next")
 }
 
 /// GDN dims from GGUF meta. Qwen3-Next repeat-interleaves K heads; Qwen3.5 tiles.
@@ -4192,7 +4203,8 @@ fn split_packed_experts(
                     allpaca_cpu::Q8_0_BLOCK_ELEMS
                 ))));
             }
-            (n_per / allpaca_cpu::Q8_0_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES)
+            // Device Q8_0 is the 36-byte staged layout, not GGUF's 34-byte blocks.
+            (n_per / allpaca_cpu::Q8_0_BLOCK_ELEMS).saturating_mul(allpaca_hip::Q8_STAGED_BLOCK)
         }
     };
     Ok((0..n_experts)
@@ -4405,7 +4417,7 @@ pub(crate) fn attn_layout(cfg: &ModelConfig, wq_n: usize, wk_n: usize, wo_n: usi
     } else {
         dim
     };
-    let gated = q_out == wo_k.saturating_mul(2) && wo_k > dim;
+    let gated = q_out == wo_k.saturating_mul(2) && (wo_k > dim || cfg.gated_attn_q);
     let attn_dim = if gated {
         wo_k
     } else {
@@ -4439,8 +4451,10 @@ impl TinyModel {
     /// HIP M=N forward ([`Self::forward_tokens_device`]). Unlike the CUDA /
     /// Vulkan M=N paths it runs IMRoPE and gated `[Q|gate]` attention per row,
     /// so Qwen3.5/3.8 hybrids batch too. A `[Q|gate]` projection is only
-    /// recognised when n_heads * head_dim > dim; below that the per-token and
-    /// M=N paths read an ambiguous Q differently, so it stays per-token.
+    /// recognised by shape when n_heads * head_dim > dim; below that only
+    /// `gated_attn_q` (the architecture) identifies it. An ambiguous Q without
+    /// that flag is read differently by the per-token and M=N paths, so it
+    /// stays per-token.
     pub fn supports_hip_batched_prefill(&self) -> bool {
         let dim = self.config.dim.max(1);
         !self.layers.iter().any(|l| {
@@ -4449,7 +4463,7 @@ impl TinyModel {
             }
             let q_out = l.wq.len() / dim;
             let wo_k = l.wo.len() / dim;
-            q_out == wo_k.saturating_mul(2) && wo_k <= dim
+            q_out == wo_k.saturating_mul(2) && wo_k <= dim && !self.config.gated_attn_q
         })
     }
 
@@ -4464,7 +4478,7 @@ impl TinyModel {
             }
             let q_out = l.wq.len() / dim;
             let wo_k = l.wo.len() / dim;
-            q_out == wo_k.saturating_mul(2) && wo_k > dim
+            q_out == wo_k.saturating_mul(2) && (wo_k > dim || self.config.gated_attn_q)
         })
     }
 
@@ -6012,7 +6026,8 @@ impl TinyModel {
     /// Local routed experts through the fused K-quant MoE kernels: three
     /// launches per layer instead of ~4 per selected expert, with the same
     /// arithmetic. Rows of `buf.normed`; weighted sums into `buf.attn`.
-    /// `false` when the layer's experts are not stacked K-quants resident here.
+    /// `false` when the layer's experts are not stacked K-quants or Q8_0
+    /// resident here.
     fn fused_local_moe_rows(
         &self,
         layer_idx: usize,
@@ -7082,6 +7097,7 @@ impl TinyModel {
             rope_dims_swa: 0,
             rope_theta_swa: 0.0,
             headwise_attn_gate: false,
+            gated_attn_q: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             scale_embed: false,
@@ -7199,6 +7215,7 @@ impl TinyModel {
             rope_dims_swa: 0,
             rope_theta_swa: 0.0,
             headwise_attn_gate: false,
+            gated_attn_q: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             scale_embed: false,
@@ -10839,7 +10856,7 @@ impl TinyModel {
             } else {
                 dim
             };
-            let gated = q_out == wo_k.saturating_mul(2) && wo_k > dim;
+            let gated = q_out == wo_k.saturating_mul(2) && (wo_k > dim || cfg.gated_attn_q);
             let attn_dim = if gated {
                 wo_k
             } else {
@@ -12400,6 +12417,21 @@ mod lightning_moe_tests {
             layer.wq = vec![0.0; 2 * dim * dim];
         }
         assert!(!ambiguous.supports_hip_batched_prefill());
+    }
+
+    /// Ornith-1.5-9B: 16 heads x 256 = dim 4096, so only the architecture
+    /// flag says the double-width Q is `[Q|gate]`.
+    #[test]
+    fn attn_layout_reads_gated_q_at_attn_dim_equal_to_dim_from_the_arch_flag() {
+        let mut cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let (wq, wk, wo) = (2 * dim * dim, dim * dim, dim * dim);
+        let plain = attn_layout(&cfg, wq, wk, wo);
+        assert!(!plain.gated);
+        cfg.gated_attn_q = true;
+        let gated = attn_layout(&cfg, wq, wk, wo);
+        assert!(gated.gated);
+        assert_eq!((gated.q_out, gated.attn_dim), (2 * dim, dim));
     }
 
     #[test]

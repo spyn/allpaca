@@ -737,6 +737,7 @@ impl GgufFile {
                 | "qwen3"
                 | "qwen3moe"
                 | "qwen35"
+                | "qwen35moe"
                 | "qwen3next"
                 | "phi3"
                 | "minicpm"

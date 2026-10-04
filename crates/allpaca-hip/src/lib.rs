@@ -3101,11 +3101,13 @@ pub fn copy_f32_kernel(dst: *mut f32, src: *const f32, n: usize) -> Result<(), A
     }
 }
 
-/// One stacked `[n_experts][n][k]` K-quant tensor for [`moe_ffn_kquant_device`].
+/// One stacked `[n_experts][n][k]` K-quant or staged Q8_0 tensor for
+/// [`moe_ffn_kquant_device`].
 #[derive(Debug, Clone, Copy)]
 pub struct MoeExperts {
     pub ptr: *const u8,
-    /// ggml type id: 12 (Q4_K), 13 (Q5_K) or 14 (Q6_K).
+    /// ggml type id: 12 (Q4_K), 13 (Q5_K), 14 (Q6_K) or 8 (Q8_0 in the
+    /// 36-byte staged layout, see [`stage_q8_0_blocks`]).
     pub ggml_type: u32,
     /// Bytes per expert.
     pub stride: u64,
@@ -3117,6 +3119,7 @@ impl MoeExperts {
             12 => Some(4),
             13 => Some(5),
             14 => Some(6),
+            8 => Some(8),
             _ => None,
         }
     }
@@ -3124,6 +3127,12 @@ impl MoeExperts {
     /// The fused MoE kernels read this tensor.
     pub fn fused_ok(&self) -> bool {
         self.qt().is_some()
+    }
+
+    /// The fused MoE kernels run this `[gate, up, down]` set: gate and up
+    /// share a launch, which exists for K-quant pairs and for Q8_0 pairs.
+    pub fn fused_set_ok(set: &[Self; 3]) -> bool {
+        set.iter().all(Self::fused_ok) && (set[0].ggml_type == 8) == (set[1].ggml_type == 8)
     }
 }
 
@@ -3399,7 +3408,7 @@ pub fn moe_ffn_kquant_device(
 ) -> Result<(), AllpacaError> {
     let (Some(gq), Some(uq), Some(dq)) = (gate.qt(), up.qt(), down.qt()) else {
         return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
-            "fused MoE needs Q4_K/Q5_K/Q6_K experts".into(),
+            "fused MoE needs Q4_K/Q5_K/Q6_K or Q8_0 experts".into(),
         )));
     };
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]

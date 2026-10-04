@@ -2429,6 +2429,11 @@ template <>
 struct KqBlock<6> {
     static constexpr int bytes = 210;
 };
+/* Staged Q8_0: eight 36-byte blocks (f32 scale, 32 int8) per 256 values. */
+template <>
+struct KqBlock<8> {
+    static constexpr int bytes = 288;
+};
 
 template <int QT, int MR>
 __global__ void gemv_nt_kquant_warp_kernel(const float *a, const uint8_t *b, float *c, int m,
@@ -2633,7 +2638,31 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
     if (live) {
         for (int ib = 0; ib < nblocks; ++ib) {
             const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
-            if constexpr (QT == 3) {
+            if constexpr (QT == 8) {
+                // Lane sl takes every LPC-th 32-value block, summed as
+                // `gemv_nt_q8_0_i8_kernel` does, so both give the same bits.
+                for (int t = sl; t < 8; t += LPC) {
+                    const uint8_t *q8 = blk + t * 36;
+                    const float ws = *reinterpret_cast<const float *>(q8);
+                    const uint32_t *qp = reinterpret_cast<const uint32_t *>(q8 + 4);
+                    uint32_t q[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        q[j] = qp[j];
+                    }
+                    const int bi = ib * 8 + t;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        const uint32_t *ap = reinterpret_cast<const uint32_t *>(arow[r] + bi * 32);
+                        int32_t dot = 0;
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            dot = i8dot4(ap[j], q[j], dot);
+                        }
+                        acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
+                    }
+                }
+            } else if constexpr (QT == 3) {
                 // hmask[32] qs[64] scales[12] d: weight = d * (sc - 32) * (q2 | h << 2 - 4).
                 const float d = allpaca_f16le_to_f32(blk + 108);
                 const uint8_t *sc = blk + 96;
@@ -7840,6 +7869,7 @@ static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, hipStream_t
     MOE_GU(4, 4) MOE_GU(4, 5) MOE_GU(4, 6)
     MOE_GU(5, 4) MOE_GU(5, 5) MOE_GU(5, 6)
     MOE_GU(6, 4) MOE_GU(6, 5) MOE_GU(6, 6)
+    MOE_GU(8, 8)
 #undef MOE_GU
     return false;
 }
@@ -7854,7 +7884,7 @@ static bool moe_down_types(int qd, dim3 grid, hipStream_t st, const int8_t *hq,
                            group_start, expert, down, ds, y, dim, ff);                            \
         return true;                                                                               \
     }
-    MOE_D(4) MOE_D(5) MOE_D(6)
+    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8)
 #undef MOE_D
     return false;
 }
@@ -7870,7 +7900,8 @@ extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t rows, int32_t dim, int
            moe_align(p * (ff / 32) * 4);
 }
 
-/* Expert-parallel MoE FFN over stacked K-quant experts (`qt` 4/5/6 = Q4_K/Q5_K/Q6_K):
+/* Expert-parallel MoE FFN over stacked experts (`qt` 4/5/6 = Q4_K/Q5_K/Q6_K,
+ * 8 = Q8_0 in 36-byte staged blocks; gate and up are both Q8_0 or both K-quant):
  * out[r] = sum over row r's pairs of w * down_e(silu(gate_e x_r) * up_e x_r).
  * Pairs are sorted by row; `row_start` has rows + 1 entries. Three launches,
  * whatever the expert count: an MI50 pays ~10 us per dependent launch, and at
@@ -7890,7 +7921,7 @@ extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const fl
         (group_start == nullptr && groups != pairs) || max_group < 1 || max_group > 8) {
         return ALLPACA_ERR_INVALID;
     }
-    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6; };
+    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6 || qt == 8; };
     if (!kq(gate_qt) || !kq(up_qt) || !kq(down_qt)) {
         return ALLPACA_ERR_INVALID;
     }

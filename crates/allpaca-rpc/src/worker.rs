@@ -699,7 +699,7 @@ impl HipWorker {
             stride: stride as u64,
         };
         let fused = [experts(gp, gt, gs), experts(up, ut, us), experts(dp, dt, ds)];
-        if dim % 256 == 0 && ff % 256 == 0 && fused.iter().all(allpaca_hip::MoeExperts::fused_ok) {
+        if dim % 256 == 0 && ff % 256 == 0 && allpaca_hip::MoeExperts::fused_set_ok(&fused) {
             return self.moe_ffn_fused(gpu, dim, ff, x_in, pairs, fused);
         }
         let x_f32 = x_in.to_f32();
@@ -2710,5 +2710,74 @@ mod tests {
             let mb = (rows * 10) as f64 * (2.0 * 176.0 + 210.0) / 256.0 * (ff * dim) as f64 / 1e6;
             eprintln!("BENCH rows={rows} vary={vary} gap={gap_us}us moe_ffn {us:.1} us ({:.0} GB/s)", mb / us * 1e3);
         }
+    }
+
+    /// Q8_0 experts take the fused kernels (36-byte staged blocks). Checked
+    /// against the float FFN over the dequantized weights; the kernels
+    /// quantize activations to int8, hence the tolerance.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_fused_moe_q8_0_matches_float_reference() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let (n_exp, dim, ff) = (6usize, 512usize, 256usize);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        // Round-trip through Q8_0 so the reference uses the exact weights.
+        let q8 = |v: Vec<f32>| -> (Vec<u8>, Vec<f32>) {
+            let packed = allpaca_cpu::quantize_q8_0(&v);
+            let mut back = vec![0.0f32; v.len()];
+            allpaca_cpu::dequant_q8_0(&packed, v.len(), &mut back).unwrap();
+            (packed, back)
+        };
+        let (gate_q, gate) = q8(rand(n_exp * ff * dim, 0.2));
+        let (up_q, up) = q8(rand(n_exp * ff * dim, 0.2));
+        let (down_q, down) = q8(rand(n_exp * dim * ff, 0.2));
+        let rows = 3usize;
+        let x = rand(rows * dim, 2.0);
+        // Row 0 and 1 share expert 4; row 2 takes the last expert.
+        let pairs: Vec<(u32, u32, f32)> =
+            vec![(0, 4, 0.6), (0, 1, 0.4), (1, 4, 0.7), (1, 0, 0.3), (2, 5, 0.55), (2, 2, 0.45)];
+        let mut want = vec![0.0f32; rows * dim];
+        for &(r, e, w) in &pairs {
+            let (r, e) = (r as usize, e as usize);
+            let xr = &x[r * dim..(r + 1) * dim];
+            let dot = |m: &[f32], row: usize, k: usize, v: &[f32]| -> f32 {
+                m[row * k..(row + 1) * k].iter().zip(v).map(|(a, b)| a * b).sum()
+            };
+            let h: Vec<f32> = (0..ff)
+                .map(|j| {
+                    let g = dot(&gate[e * ff * dim..], j, dim, xr);
+                    let u = dot(&up[e * ff * dim..], j, dim, xr);
+                    g / (1.0 + (-g).exp()) * u
+                })
+                .collect();
+            for d in 0..dim {
+                want[r * dim + d] += w * dot(&down[e * dim * ff..], d, ff, &h);
+            }
+        }
+        let mut backend = super::WorkerBackend::Hip(super::HipWorker::new(0).expect("HipWorker"));
+        let req = crate::protocol::MoeFfnRequest {
+            gate: backend.put_tensor(8, &gate_q, Some(0)).unwrap(),
+            up: backend.put_tensor(8, &up_q, Some(0)).unwrap(),
+            down: backend.put_tensor(8, &down_q, Some(0)).unwrap(),
+            n_experts: n_exp as u32,
+            dim: dim as u32,
+            ff: ff as u32,
+            f16_out: false,
+        };
+        let got = backend.moe_ffn(&req, &crate::protocol::MoeX::F32(x), &pairs).unwrap();
+        let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let err = got.iter().zip(&want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(peak > 0.1, "reference is degenerate: peak {peak}");
+        assert!(err < 0.03 * peak, "fused Q8_0 MoE off by {err} (peak {peak})");
     }
 }

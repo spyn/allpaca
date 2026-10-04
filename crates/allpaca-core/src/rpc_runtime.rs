@@ -804,10 +804,18 @@ impl RpcRuntime {
                 .map_err(map_rpc)
         };
         let (gate, up, down) = (put("gate")?, put("up")?, put("down")?);
-        let kquant = ["gate", "up", "down"].iter().all(|part| {
+        // What the worker's fused MoE kernels take (they read int8 rows):
+        // K-quants, or Q8_0 with gate and up both Q8_0.
+        let ty = |part: &str| {
             file.tensor(&format!("blk.{blk}.ffn_{part}_exps.weight"))
-                .is_some_and(|t| matches!(t.ggml_type_id, 12..=14))
-        });
+                .map_or(0, |t| t.ggml_type_id)
+        };
+        let (g, u, d) = (ty("gate"), ty("up"), ty("down"));
+        // Only the HIP worker's kernels have the Q8_0 case.
+        let q8_0_ok = matches!(backend, RpcBackendKind::Hip) || ![g, u, d].contains(&8);
+        let kquant = [g, u, d].iter().all(|t| matches!(t, 8 | 12..=14))
+            && (g == 8) == (u == 8)
+            && q8_0_ok;
         let fused = matches!(backend, RpcBackendKind::Hip | RpcBackendKind::Cuda)
             && cfg.dim % 256 == 0
             && cfg.ff_dim % 256 == 0;
