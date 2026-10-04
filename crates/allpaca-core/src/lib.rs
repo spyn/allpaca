@@ -65,7 +65,10 @@ pub use edge0::{
     detect_edge0_dir, load_edge0_dir, Edge0LoadOptions, Edge0Loaded, Edge0Tier, MoESpec,
     RecoverLora, RouterKind,
 };
-pub use engine::{mtp_text_is_garbled, DevicePlacement, Engine, KvEstimate, RequestHandle};
+pub use engine::{
+    mtp_text_is_garbled, DevicePlacement, Engine, ExpertLayerHome, ExpertPlacement, KvEstimate,
+    RequestHandle,
+};
 pub use rpc_runtime::RemoteGpu;
 pub use kv_tier::KvTierManager;
 pub use layer_split::{plan_layer_owners, LayerPlan};

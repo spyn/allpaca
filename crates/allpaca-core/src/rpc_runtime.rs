@@ -30,6 +30,11 @@ pub struct RpcRuntime {
     /// `engine.local_vram_budget_mib`: per-slot layer budgets that replace the
     /// measured ones (0 or missing = measured).
     local_budget_mib: Mutex<Vec<u64>>,
+    /// `rpc.expert_homes`: operator pins for layers' routed experts.
+    expert_pins: Mutex<std::collections::BTreeMap<usize, String>>,
+    /// Expert-parallel layout of the loaded model: bytes of each layer's
+    /// routed experts and the worker GPUs they may be placed on.
+    expert_layout: Mutex<(Vec<u64>, Vec<String>)>,
     /// Last worker GPU stats and when they were read.
     gpu_stats: Mutex<(Option<std::time::Instant>, Vec<RemoteGpu>)>,
     /// `rpc.prefill_rows`: rows per batched span call (0 = per token).
@@ -105,6 +110,8 @@ pub enum LayerHome {
 #[derive(Clone, Copy)]
 struct RemoteExperts {
     session: usize,
+    /// Worker GPU holding the experts.
+    device: u32,
     req: MoeFfnRequest,
     /// Send rows as int8 blocks: the worker's fused K-quant kernels quantize
     /// to exactly that, so it is lossless and a quarter of the bytes.
@@ -267,6 +274,8 @@ impl RpcRuntime {
             experts: Mutex::new(Vec::new()),
             layer_device: Mutex::new(Vec::new()),
             local_budget_mib: Mutex::new(Vec::new()),
+            expert_pins: Mutex::new(std::collections::BTreeMap::new()),
+            expert_layout: Mutex::new((Vec::new(), Vec::new())),
             gpu_stats: Mutex::new((None, Vec::new())),
             prefill_rows: std::sync::atomic::AtomicUsize::new(128),
             row_scratch: Mutex::new(std::collections::HashMap::new()),
@@ -382,6 +391,18 @@ impl RpcRuntime {
     pub fn set_local_budgets_mib(&self, mib: &[u64]) {
         if let Ok(mut b) = self.local_budget_mib.lock() {
             *b = mib.to_vec();
+        }
+    }
+
+    /// Operator pins for layers' routed experts (`rpc.expert_homes`), read
+    /// by the next [`Self::prepare`]. Keys that are not layer numbers are
+    /// ignored.
+    pub fn set_expert_homes(&self, homes: &std::collections::BTreeMap<String, String>) {
+        if let Ok(mut pins) = self.expert_pins.lock() {
+            *pins = homes
+                .iter()
+                .filter_map(|(layer, home)| Some((layer.trim().parse().ok()?, home.trim().to_string())))
+                .collect();
         }
     }
 
@@ -690,7 +711,38 @@ impl RpcRuntime {
             );
             budgets.push(budget);
         }
-        let plan = crate::layer_split::plan_expert_parallel(&body, &experts, &budgets);
+        // Operator pins: "local", or "rpc:<endpoint>/<gpu>" naming a worker
+        // GPU this run has. Anything else is placed automatically.
+        use crate::layer_split::ExpertPin;
+        let targets: Vec<String> = owners
+            .iter()
+            .map(|&(s, d)| format!("rpc:{}/{d}", self.endpoints.get(s).map_or("", String::as_str)))
+            .collect();
+        let wanted = self.expert_pins.lock().map(|p| p.clone()).unwrap_or_default();
+        let mut pins = vec![ExpertPin::Auto; n];
+        let mut pinned_owner: Vec<Option<usize>> = vec![None; n];
+        for (&l, home) in &wanted {
+            if l >= n {
+                tracing::warn!(layer = l, "expert-parallel: pin names a layer this model does not have");
+            } else if home == "local" {
+                pins[l] = ExpertPin::Local;
+            } else if let Some(o) = targets.iter().position(|t| t == home) {
+                pins[l] = ExpertPin::Remote;
+                pinned_owner[l] = Some(o);
+            } else {
+                tracing::warn!(layer = l, home = %home, "expert-parallel: pinned device is not connected; placing automatically");
+            }
+        }
+        let plan = crate::layer_split::plan_expert_parallel_pinned(&body, &experts, &budgets, &pins);
+        for l in 0..n {
+            if pins[l] == ExpertPin::Local && !plan.experts_local[l] && experts[l] > 0 {
+                tracing::warn!(
+                    layer = l,
+                    mib = experts[l] >> 20,
+                    "expert-parallel: experts pinned local do not fit their GPU; using a worker"
+                );
+            }
+        }
         let mut layer_device = vec![local_ids[0]; n];
         for (l, dev) in layer_device.iter_mut().enumerate() {
             *dev = local_ids[plan.layers.owner(l).min(local_ids.len() - 1)];
@@ -713,21 +765,46 @@ impl RpcRuntime {
                 })
                 .collect()
         };
+        // Pinned layers take their worker GPU's room first; one that does
+        // not fit there is placed like an unpinned layer.
+        let remote = |l: usize| !plan.experts_local[l] && experts[l] > 0;
+        let mut picks: Vec<Option<usize>> = vec![None; n];
+        for l in (0..n).filter(|&l| remote(l)) {
+            if let Some(o) = pinned_owner[l] {
+                if worker_free[o] >= experts[l] {
+                    worker_free[o] -= experts[l];
+                    picks[l] = Some(o);
+                } else {
+                    tracing::warn!(
+                        layer = l,
+                        home = %targets[o],
+                        mib = experts[l] >> 20,
+                        "expert-parallel: pinned worker GPU is full; placing automatically"
+                    );
+                }
+            }
+        }
         let mut remote_experts = vec![None; n];
         let mut remote_bytes = 0u64;
         for l in 0..n {
-            if plan.experts_local[l] || experts[l] == 0 {
+            if !remote(l) {
                 continue;
             }
-            let pick = (0..owners.len())
-                .find(|&o| worker_free[o] >= experts[l])
-                .ok_or_else(|| {
-                    AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-                        "expert-parallel: layer {l} experts ({} MiB) fit no local or RPC GPU",
-                        experts[l] >> 20
-                    )))
-                })?;
-            worker_free[pick] -= experts[l];
+            let pick = match picks[l] {
+                Some(o) => o,
+                None => {
+                    let o = (0..owners.len())
+                        .find(|&o| worker_free[o] >= experts[l])
+                        .ok_or_else(|| {
+                            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                                "expert-parallel: layer {l} experts ({} MiB) fit no local or RPC GPU",
+                                experts[l] >> 20
+                            )))
+                        })?;
+                    worker_free[o] -= experts[l];
+                    o
+                }
+            };
             let (session, device) = owners[pick];
             remote_experts[l] = Some(self.upload_experts(file, cfg, l, session, device)?);
             remote_bytes += experts[l];
@@ -766,6 +843,8 @@ impl RpcRuntime {
         *self.plan.lock().map_err(|_| lock("rpc plan lock".into()))? = plan.layers;
         *self.remote.lock().map_err(|_| lock("rpc remote lock".into()))? = vec![None; n];
         *self.experts.lock().map_err(|_| lock("rpc experts lock".into()))? = remote_experts;
+        *self.expert_layout.lock().map_err(|_| lock("rpc expert layout lock".into()))? =
+            (experts, targets);
         *self.layer_device.lock().map_err(|_| lock("rpc layer device lock".into()))? =
             layer_device;
         Ok(())
@@ -822,6 +901,7 @@ impl RpcRuntime {
         Ok(RemoteExperts {
             q8: kquant && fused,
             session,
+            device,
             req: MoeFfnRequest {
                 gate,
                 up,
@@ -853,10 +933,20 @@ impl RpcRuntime {
     }
 
     /// The worker holding this layer's routed experts, when they are remote.
-    pub fn experts_home(&self, layer_idx: usize) -> Option<String> {
+    /// The worker (`host:port`) and GPU holding this layer's routed experts;
+    /// `None` when they are local.
+    pub fn experts_home(&self, layer_idx: usize) -> Option<(String, u32)> {
         let e = self.experts.lock().ok()?;
         let ex = e.get(layer_idx)?.as_ref()?;
-        Some(self.endpoints.get(ex.session).cloned().unwrap_or_default())
+        Some((self.endpoints.get(ex.session).cloned().unwrap_or_default(), ex.device))
+    }
+
+    /// With expert-parallel placement: each layer's routed-expert bytes and
+    /// the worker GPUs (`rpc:<host:port>/<gpu>`) a layer may be pinned to.
+    /// `None` for other placements.
+    pub fn expert_layout(&self) -> Option<(Vec<u64>, Vec<String>)> {
+        let layout = self.expert_layout.lock().ok()?;
+        (!layout.0.is_empty()).then(|| layout.clone())
     }
 
     /// This layer's routed experts run on an RPC worker.

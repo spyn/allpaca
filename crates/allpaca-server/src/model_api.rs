@@ -52,6 +52,9 @@ struct SettingsBody {
     engine: EngineStatus,
     /// Which device runs which layers of the loaded model.
     placement: Vec<allpaca_core::DevicePlacement>,
+    /// Where each layer's routed experts sit and may be pinned; `None`
+    /// unless they are spread over local GPUs and RPC workers.
+    expert_placement: Option<allpaca_core::ExpertPlacement>,
 }
 
 fn bad_request(msg: impl Into<String>) -> Response {
@@ -79,18 +82,16 @@ fn settings_body(state: &AppState) -> SettingsBody {
         context_tokens: estimate.tokens_for(estimate.budget_bytes),
         estimate,
     });
+    let running = state.engine.config();
     let reload_pending = match (&kv, settings.kv_vram_bytes) {
         (Some(kv), Some(want)) => want != kv.estimate.budget_bytes,
         _ => false,
-    };
+    } || engine
+        .as_ref()
+        .is_some_and(|e| settings.expert_homes_config() != *e.expert_homes());
     SettingsBody {
         model: engine.as_ref().map(|e| e.model_id()),
-        model_path: state
-            .engine
-            .config()
-            .model
-            .path
-            .map(|p| p.display().to_string()),
+        model_path: running.model.path.map(|p| p.display().to_string()),
         path: state.settings.path().map(|p| p.display().to_string()),
         persisted: state.settings.path().is_some(),
         settings,
@@ -99,6 +100,7 @@ fn settings_body(state: &AppState) -> SettingsBody {
         reload_pending,
         engine: state.engine.status(),
         placement: engine.as_ref().map(|e| e.placement()).unwrap_or_default(),
+        expert_placement: engine.as_ref().and_then(|e| e.expert_placement()),
     }
 }
 
@@ -113,6 +115,9 @@ pub struct SettingsUpdate {
     pub disabled_experts: Option<BTreeMap<u32, Vec<u32>>>,
     /// Replaces all names.
     pub expert_names: Option<BTreeMap<String, String>>,
+    /// Replaces all expert pins (layer -> `"local"` or
+    /// `"rpc:<host:port>/<gpu>"`); takes effect on the next reload.
+    pub expert_homes: Option<BTreeMap<u32, String>>,
 }
 
 pub async fn put_settings(
@@ -132,6 +137,23 @@ pub async fn put_settings(
         };
         next.context_tokens = Some(ctx);
         next.kv_vram_bytes = Some(est.bytes_for(ctx).max(1 << 20));
+    }
+    if let Some(homes) = update.expert_homes {
+        let Some(layout) = engine.expert_placement() else {
+            return bad_request("this model's experts are not spread over devices; nothing to pin");
+        };
+        for (layer, home) in &homes {
+            if *layer as usize >= layout.layers.len() {
+                return bad_request(format!("layer {layer} is past the model's {} layers", layout.layers.len()));
+            }
+            if home != "local" && !layout.workers.contains(home) {
+                return bad_request(format!(
+                    "layer {layer}: '{home}' is neither 'local' nor a connected worker GPU ({})",
+                    layout.workers.join(", ")
+                ));
+            }
+        }
+        next.expert_homes = homes;
     }
     if let Some(names) = update.expert_names {
         next.expert_names = names

@@ -248,10 +248,35 @@ pub struct ExpertPlan {
     pub experts_local: Vec<bool>,
 }
 
+/// Where the operator wants one layer's routed experts (`rpc.expert_homes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertPin {
+    /// Local while the layer's GPU has room, else a worker.
+    #[default]
+    Auto,
+    /// Beside the layer body on its local GPU.
+    Local,
+    /// On an RPC worker.
+    Remote,
+}
+
 /// Split layers across local GPUs in proportion to their budgets, so each
 /// GPU keeps room for experts next to its own layer bodies, then keep experts
 /// local in layer order while they fit.
 pub fn plan_expert_parallel(body: &[u64], experts: &[u64], budgets: &[u64]) -> ExpertPlan {
+    plan_expert_parallel_pinned(body, experts, budgets, &[])
+}
+
+/// [`plan_expert_parallel`] with per-layer pins (missing entries are `Auto`).
+/// Layers pinned local take their GPU's room first, in layer order; one that
+/// does not fit is left remote, as an unpinned one would be. Layers pinned
+/// remote never take local room. Layer ownership does not move.
+pub fn plan_expert_parallel_pinned(
+    body: &[u64],
+    experts: &[u64],
+    budgets: &[u64],
+    pins: &[ExpertPin],
+) -> ExpertPlan {
     let n = body.len();
     let total: Vec<u64> = body.iter().zip(experts).map(|(b, e)| b + e).collect();
     let need: u64 = total.iter().sum();
@@ -274,12 +299,18 @@ pub fn plan_expert_parallel(body: &[u64], experts: &[u64], budgets: &[u64]) -> E
         let o = layers.owner(l).min(left.len() - 1);
         left[o] = left[o].saturating_sub(b);
     }
+    let pin = |l: usize| pins.get(l).copied().unwrap_or_default();
     let mut experts_local = vec![false; n];
-    for (l, &e) in experts.iter().enumerate() {
-        let o = layers.owner(l).min(left.len() - 1);
-        if e <= left[o] {
-            left[o] -= e;
-            experts_local[l] = true;
+    for want in [ExpertPin::Local, ExpertPin::Auto] {
+        for (l, &e) in experts.iter().enumerate() {
+            if pin(l) != want {
+                continue;
+            }
+            let o = layers.owner(l).min(left.len() - 1);
+            if e <= left[o] {
+                left[o] -= e;
+                experts_local[l] = true;
+            }
         }
     }
     ExpertPlan {
@@ -303,6 +334,23 @@ mod tests {
         let plan = plan_expert_parallel(&[1; 4], &[10; 4], &[100, 100]);
         assert_eq!(plan.experts_local, vec![true; 4]);
         assert_eq!(plan.layers.owners, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn expert_pins_claim_local_room_first_and_keep_remote_layers_out() {
+        use ExpertPin::{Auto, Local, Remote};
+        // One GPU with room for two of four layers' experts.
+        let (body, experts, budgets) = ([1u64; 4], [10u64; 4], [24u64]);
+        let auto = plan_expert_parallel(&body, &experts, &budgets);
+        assert_eq!(auto.experts_local, vec![true, true, false, false]);
+        // Pin the last layer local and the first remote: 3 then 1 are local.
+        let pins = [Remote, Auto, Auto, Local];
+        let plan = plan_expert_parallel_pinned(&body, &experts, &budgets, &pins);
+        assert_eq!(plan.experts_local, vec![false, true, false, true]);
+        assert_eq!(plan.layers, auto.layers, "pins do not move layer bodies");
+        // More local pins than room: the later ones stay remote.
+        let plan = plan_expert_parallel_pinned(&body, &experts, &budgets, &[Local; 4]);
+        assert_eq!(plan.experts_local, vec![true, true, false, false]);
     }
 
     #[test]

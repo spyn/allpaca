@@ -405,6 +405,12 @@ pub struct RpcSection {
     /// Shared HELLO secret (`--rpc-token` / `ALLPACA_RPC_TOKEN`). Empty = loopback workers only.
     #[serde(default)]
     pub token: Option<String>,
+    /// Where a layer's routed experts go with expert-parallel MoE, by layer
+    /// index: `"local"` (beside the layer body on its GPU) or
+    /// `"rpc:<host:port>/<gpu>"`. Layers not listed are placed automatically.
+    /// The WebUI saves these per model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expert_homes: BTreeMap<String, String>,
 }
 
 impl Default for RpcSection {
@@ -415,6 +421,7 @@ impl Default for RpcSection {
             max_seq: 0,
             prefill_rows: 128,
             token: None,
+            expert_homes: BTreeMap::new(),
         }
     }
 }

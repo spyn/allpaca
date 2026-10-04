@@ -871,6 +871,31 @@ impl Engine {
         placement_rows(n_layers, primary, self, rpc.as_deref(), Some(extras))
     }
 
+    /// The expert pins (`rpc.expert_homes`) this engine was built with.
+    pub fn expert_homes(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.config.rpc.expert_homes
+    }
+
+    /// Where each layer's routed experts sit and where they may be pinned
+    /// (`rpc.expert_homes`). `None` unless the loaded model runs
+    /// expert-parallel across local GPUs and RPC workers.
+    pub fn expert_placement(&self) -> Option<ExpertPlacement> {
+        let rpc = self.lock().ok()?.target.as_ref()?.rpc.clone()?;
+        let (bytes, workers) = rpc.expert_layout()?;
+        let layers = bytes
+            .iter()
+            .enumerate()
+            .map(|(l, &bytes)| ExpertLayerHome {
+                device: match rpc.experts_home(l) {
+                    Some((endpoint, device)) => format!("rpc:{endpoint}/{device}"),
+                    None => format!("hip:{}", rpc.local_device(l)),
+                },
+                bytes,
+            })
+            .collect();
+        Some(ExpertPlacement { layers, workers })
+    }
+
     /// KV cost per context token of the loaded target, for sizing
     /// `kv.vram_bytes` from a context length. `None` when no model is loaded.
     pub fn kv_estimate(&self) -> Option<KvEstimate> {
@@ -1377,6 +1402,7 @@ impl Engine {
         );
         if let Some(rt) = &self.rpc {
             rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
+            rt.set_expert_homes(&self.config.rpc.expert_homes);
             rt.set_prefill_rows(self.config.rpc.prefill_rows);
             rt.prepare(
                 model,
@@ -6844,6 +6870,23 @@ pub struct DevicePlacement {
     pub roles: Vec<String>,
 }
 
+/// One layer's routed experts ([`Engine::expert_placement`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExpertLayerHome {
+    /// `hip:<n>` (beside the layer body) or `rpc:<host:port>/<gpu>`.
+    pub device: String,
+    pub bytes: u64,
+}
+
+/// Expert-parallel layout: every layer's experts move as one block.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExpertPlacement {
+    /// In layer order.
+    pub layers: Vec<ExpertLayerHome>,
+    /// Worker GPUs a layer's experts may be pinned to.
+    pub workers: Vec<String>,
+}
+
 /// Per-device rows in first-use order, found by device key.
 #[derive(Default)]
 struct PlacementRows {
@@ -6934,8 +6977,9 @@ fn placement_rows(
     }
     if let Some(rpc) = rpc {
         for l in 0..n_layers {
-            if let Some(endpoint) = rpc.experts_home(l) {
-                out.entry(&format!("rpc:{endpoint}"), "").expert_layers += 1;
+            if let Some((endpoint, device)) = rpc.experts_home(l) {
+                let name = remote_name(&endpoint, device);
+                out.entry(&format!("rpc:{endpoint}/{device}"), &name).expert_layers += 1;
             }
         }
     }
