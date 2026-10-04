@@ -3,6 +3,7 @@
 mod anchors;
 mod batch_gemm;
 mod compute;
+pub mod decision;
 mod constraint;
 mod deepseek4;
 mod dflash2;

@@ -52,6 +52,40 @@ use crate::weight_set::{
 };
 use allpaca_hip::HipWorkspace;
 
+/// What a decision request reads while its prompt is forwarded.
+struct DecisionProbe {
+    /// Tokens whose logits after the last prompt token are the scores.
+    labels: Vec<u32>,
+    /// Prompt positions whose final hidden state is kept, ascending; the
+    /// last one is the last prompt token.
+    positions: Vec<usize>,
+    /// One `dim` row per position reached so far.
+    rows: Vec<f32>,
+    label_logits: Vec<f32>,
+    done: bool,
+}
+
+impl DecisionProbe {
+    fn new(read: &crate::decision::DecisionRead, tokens: &[u32]) -> Self {
+        let (labels, positions) = match read {
+            crate::decision::DecisionRead::Labels(labels) => (labels.clone(), Vec::new()),
+            crate::decision::DecisionRead::Pointer { marker } => {
+                let last = tokens.len().saturating_sub(1);
+                let mut positions: Vec<usize> = (0..last).filter(|&i| tokens[i] == *marker).collect();
+                positions.push(last);
+                (Vec::new(), positions)
+            }
+        };
+        Self {
+            labels,
+            positions,
+            rows: Vec::new(),
+            label_logits: Vec::new(),
+            done: false,
+        }
+    }
+}
+
 struct ActiveRequest {
     id: u64,
     tokens: Vec<u32>,
@@ -61,6 +95,9 @@ struct ActiveRequest {
     params: GenerationParams,
     pages: Vec<Vec<u64>>,
     pending_logits: Vec<f32>,
+    /// Decision request: no token is sampled, the prompt's forward pass is
+    /// read instead.
+    probe: Option<DecisionProbe>,
     emit_queue: Vec<TokenEvent>,
     /// StepResults parked by a peer thread's fair `poll` demux.
     parked: VecDeque<StepResult>,
@@ -156,6 +193,8 @@ struct EngineInner {
     kv: KvTierManager,
     ring: LogitRing,
     tokenizer: Option<EngineTokenizer>,
+    /// Set when the loaded GGUF is a decision model (`<arch>.decision.type`).
+    decision: Option<Arc<crate::decision::DecisionModel>>,
     target: Option<Arc<TinyModel>>,
     draft_model: Option<Arc<TinyModel>>,
     ngram: NGramProvider,
@@ -527,6 +566,7 @@ impl Engine {
             kv,
             ring,
             tokenizer: None,
+            decision: None,
             target: None,
             draft_model: None,
             ngram: NGramProvider::new(config.speculative.ngram_n),
@@ -1787,6 +1827,10 @@ impl Engine {
         let mut inner = self.lock()?;
         inner.ring.resize_vocab(model.config.vocab_size);
         set_tokenizer(&mut inner, EngineTokenizer::from_gguf(tok));
+        inner.decision = match inner.tokenizer.as_ref() {
+            Some(tok) => crate::decision::DecisionModel::from_gguf(&file, tok)?.map(Arc::new),
+            None => None,
+        };
         let draft_path_is_dflash2 = self
             .config
             .speculative
@@ -2597,7 +2641,18 @@ impl Engine {
         &self,
         prompt: &str,
         vision: Option<crate::VisionTokens>,
+        params: GenerationParams,
+    ) -> Result<RequestHandle, AllpacaError> {
+        self.begin_request_probed(prompt, vision, params, None)
+    }
+
+    /// `read`: start a decision request, which ends with its prompt.
+    fn begin_request_probed(
+        &self,
+        prompt: &str,
+        vision: Option<crate::VisionTokens>,
         mut params: GenerationParams,
+        read: Option<&crate::decision::DecisionRead>,
     ) -> Result<RequestHandle, AllpacaError> {
         if params.max_tokens == 0 {
             params.max_tokens = 1;
@@ -2722,9 +2777,11 @@ impl Engine {
         } else {
             None
         };
+        let probe = read.map(|read| DecisionProbe::new(read, &tokens));
         let mut prefill_pos = 0;
-        // Soft vision tokens are not text anchors / radix keys yet.
-        if vision_seq.is_empty() {
+        // Soft vision tokens are not text anchors / radix keys yet. A
+        // decision request that reads hidden states forwards every token.
+        if vision_seq.is_empty() && !probe.as_ref().is_some_and(|p| !p.positions.is_empty()) {
             if let Some((state, rows, n)) = inner.anchors.lookup(&tokens) {
                 restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
                 if let Some(dst) = recurrent.as_mut() {
@@ -2786,6 +2843,7 @@ impl Engine {
                 params,
                 pages,
                 pending_logits: vec![0.0f32; vocab],
+                probe,
                 emit_queue: Vec::new(),
                 parked: VecDeque::new(),
                 async_mask_rx: None,
@@ -2851,6 +2909,63 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// The decision side of the loaded model, when it is a decision model.
+    pub fn decision(&self) -> Option<Arc<crate::decision::DecisionModel>> {
+        self.lock().ok().and_then(|inner| inner.decision.clone())
+    }
+
+    /// Run `prompt` through the model once and return the scores `read`
+    /// asks for, with the number of prompt tokens. No token is generated.
+    pub fn decision_scores(
+        &self,
+        prompt: &str,
+        read: &crate::decision::DecisionRead,
+    ) -> Result<(Vec<f32>, usize), AllpacaError> {
+        let params = GenerationParams {
+            max_tokens: 1,
+            ..GenerationParams::default()
+        };
+        let handle = self.begin_request_probed(prompt, None, params, Some(read))?;
+        let id = handle.id;
+        loop {
+            let mut inner = self.lock()?;
+            let active = request(&inner, id)?;
+            if active.probe.as_ref().is_some_and(|p| p.done) {
+                break;
+            }
+            if active.prefill_pos >= active.prompt_len {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "decision request ended without a result".into(),
+                )));
+            }
+            self.drain_foreign_logits(&mut inner, id)?;
+            self.prefill_chunk(&mut inner, id)?;
+        }
+        let inner = self.lock()?;
+        let active = request(&inner, id)?;
+        let prompt_tokens = active.prompt_len;
+        let probe = active.probe.as_ref().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("not a decision request".into()))
+        })?;
+        let scores = if probe.positions.is_empty() {
+            probe.label_logits.clone()
+        } else {
+            let dim = active.last_hidden.len();
+            if probe.rows.len() != probe.positions.len() * dim {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "decision request read {} of {} hidden states; this backend does not return them",
+                    probe.rows.len() / dim.max(1),
+                    probe.positions.len()
+                ))));
+            }
+            let model = inner.decision.as_ref().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig("not a decision model".into()))
+            })?;
+            model.pointer_scores(&probe.rows)?
+        };
+        Ok((scores, prompt_tokens))
     }
 
     pub fn step(&self, handle: &mut RequestHandle) -> Result<StepResult, AllpacaError> {
@@ -3579,6 +3694,10 @@ impl Engine {
                     tokens_total: total,
                 });
             }
+            if request(&inner, id)?.finished {
+                // A decision request: its prompt is all there is.
+                return Ok(StepResult::Finished(FinishReason::Stop));
+            }
         }
 
         let json_constraints = inner.flags.json_constraints;
@@ -3941,6 +4060,12 @@ impl Engine {
         #[cfg(not(feature = "cuda"))]
         let batch_prefill_cuda = false;
         let mut did_batch = false;
+        let probed: Vec<usize> = request(inner, id)?
+            .probe
+            .as_ref()
+            .map(|p| p.positions.iter().copied().filter(|p| (start..end).contains(p)).collect())
+            .unwrap_or_default();
+        let mut probed_rows: Vec<f32> = Vec::new();
         if batch_prefill_hip {
             let mtp = mtp_draft_active(inner);
             let mut row_hiddens = Vec::new();
@@ -3956,10 +4081,15 @@ impl Engine {
                 write_logits,
                 None,
                 recurrent.as_mut(),
-                mtp.then_some(&mut row_hiddens),
+                (mtp || !probed.is_empty()).then_some(&mut row_hiddens),
                 id,
                 vision_ref,
             )?;
+            if row_hiddens.len() == toks.len() * dim {
+                for pos in &probed {
+                    probed_rows.extend_from_slice(&row_hiddens[(pos - start) * dim..][..dim]);
+                }
+            }
             if mtp && row_hiddens.len() == toks.len() * dim {
                 // Same pairing as per-token prefill: token `pos` with h_{pos-1}.
                 for (i, tok) in toks.iter().enumerate() {
@@ -4012,7 +4142,7 @@ impl Engine {
             }
         }
         if !did_batch {
-            let want_hidden = mtp_draft_active(inner);
+            let want_hidden = mtp_draft_active(inner) || !probed.is_empty();
             for (i, tok) in toks.iter().enumerate() {
                 let pos = start + i;
                 let last = pos + 1 >= total;
@@ -4128,6 +4258,9 @@ impl Engine {
                         Some(&mut decode_side),
                         soft,
                     )?;
+                    if probed.contains(&pos) && last_hidden.len() == dim {
+                        probed_rows.extend_from_slice(&last_hidden);
+                    }
                 }
                 let device_gdn = self
                     .hip
@@ -4179,6 +4312,18 @@ impl Engine {
         {
             let active = request_mut(inner, id)?;
             active.prefill_pos = end;
+            if let Some(probe) = active.probe.as_mut() {
+                probe.rows.extend_from_slice(&probed_rows);
+                if end >= total {
+                    probe.label_logits = probe
+                        .labels
+                        .iter()
+                        .map(|&t| logits.get(t as usize).copied().unwrap_or(f32::NAN))
+                        .collect();
+                    probe.done = true;
+                    active.finished = true;
+                }
+            }
             active.pending_logits = logits;
             active.recurrent = recurrent;
             active.last_hidden = last_hidden;
@@ -7062,6 +7207,54 @@ mod tests {
 
     fn test_engine() -> Engine {
         Engine::new(test_config()).unwrap()
+    }
+
+    #[test]
+    fn decision_scores_read_the_prompt_and_generate_nothing() {
+        use crate::decision::{DecisionModel, DecisionRead};
+
+        let prompt = "alpha beta alpha gamma alpha delta";
+        let engine = test_engine();
+        let (tokens, dim) = {
+            let inner = engine.lock().unwrap();
+            (
+                inner.tokenizer.as_ref().unwrap().encode(prompt).unwrap(),
+                inner.target.as_ref().unwrap().config.dim,
+            )
+        };
+        let marker = tokens[0];
+        let n_markers = tokens[..tokens.len() - 1].iter().filter(|t| **t == marker).count();
+        assert!(n_markers >= 1 && tokens.len() >= 3, "{tokens:?}");
+
+        // One prompt token per prefill chunk must read the same values.
+        let mut cfg = test_config();
+        cfg.prefill.chunk_tokens = 1;
+        let chunked = Engine::new(cfg).unwrap();
+        for e in [&engine, &chunked] {
+            e.lock().unwrap().decision = Some(Arc::new(DecisionModel::test_pointer(marker, dim)));
+        }
+
+        // Label logits after the last prompt token.
+        let labels = DecisionRead::Labels(vec![3, 5]);
+        let (scores, n) = engine.decision_scores(prompt, &labels).unwrap();
+        assert_eq!(n, tokens.len());
+        assert_eq!(scores.len(), 2);
+        assert!(scores.iter().all(|s| s.is_finite()) && scores[0] != scores[1], "{scores:?}");
+        assert_eq!(engine.decision_scores(prompt, &labels).unwrap().0, scores);
+        assert_eq!(chunked.decision_scores(prompt, &labels).unwrap().0, scores);
+
+        // One score per marker token, from the hidden states.
+        let pointer = DecisionRead::Pointer { marker };
+        let (scores, n) = engine.decision_scores(prompt, &pointer).unwrap();
+        assert_eq!(n, tokens.len());
+        assert_eq!(scores.len(), n_markers);
+        assert!(scores.iter().all(|s| s.is_finite()), "{scores:?}");
+        assert_eq!(engine.decision_scores(prompt, &pointer).unwrap().0, scores);
+        assert_eq!(chunked.decision_scores(prompt, &pointer).unwrap().0, scores);
+
+        // Nothing was sampled and no request is left behind.
+        assert!(engine.lock().unwrap().active.is_empty());
+        assert_eq!(engine.stats().tokens_generated, 0);
     }
 
     #[test]

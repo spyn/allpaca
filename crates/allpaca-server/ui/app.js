@@ -2098,6 +2098,22 @@ function apiExampleBody(ep) {
       temperature: 0.7,
       stream: false,
     },
+    "POST /v1/systemone": {
+      state: "Customer message: I was charged twice for my order last week and nobody has replied.",
+      questions: {
+        route: {
+          type: "choice",
+          instructions: "Which team should handle this?",
+          criteria: { billing: null, shipping: null, technical: null },
+        },
+        angry: { type: "noul", instructions: "Is the customer angry?" },
+        urgency: {
+          type: "score",
+          instructions: "How urgent is this?",
+          criteria: ["can wait", "this week", "today", "right now"],
+        },
+      },
+    },
     "PUT /v1/model/settings": { context_tokens: (kv && kv.context_tokens) || 32768 },
     "POST /v1/model/load": {
       path: (picker.data && picker.data.current) || "<path from GET /v1/model/available>",

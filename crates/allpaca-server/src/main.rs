@@ -11,6 +11,7 @@ mod model_api;
 mod model_scan;
 mod model_settings;
 mod otlp_push;
+mod systemone;
 mod tune;
 mod ui;
 

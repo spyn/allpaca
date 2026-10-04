@@ -96,6 +96,7 @@ struct StatusBody {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/systemone", post(crate::systemone::systemone))
         .route("/v1/models", get(list_models))
         .route("/v1/status", get(status))
         .route("/v1/logs", get(crate::logs::logs_snapshot))
@@ -813,7 +814,7 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
     out
 }
 
-fn error_response(e: allpaca_types::AllpacaError) -> Response {
+pub(crate) fn error_response(e: allpaca_types::AllpacaError) -> Response {
     let status = match e.class() {
         allpaca_types::ErrorClass::Fatal => StatusCode::INTERNAL_SERVER_ERROR,
         allpaca_types::ErrorClass::Degraded => StatusCode::OK,
@@ -892,6 +893,27 @@ mod tests {
             AuthState::from_password(Some(password.into())),
             LogRing::new(64),
         )
+    }
+
+    #[tokio::test]
+    async fn systemone_needs_a_decision_model() {
+        let res = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"state": "s", "questions": {"q": {"type": "noul", "instructions": "x"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], "the loaded model is not a decision model");
     }
 
     #[tokio::test]

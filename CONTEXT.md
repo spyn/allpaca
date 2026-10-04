@@ -140,6 +140,7 @@ Sampling (temperature, top-k, top-p, grammar masking, RNG) happens on **CPU**. O
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/chat/completions` | Chat generation (streaming and non-streaming) |
+| `POST /v1/systemone` | Decision models (`<arch>.decision.type` = `openjev` or `kev`): typed questions about a `state`, answered with probabilities in one forward pass each; same schema as llama.cpp |
 | `GET /v1/models` | List loaded model info |
 | `GET /stats` | Internal metrics JSON (non-OpenAI) |
 | `GET /metrics` | Prometheus text exposition (subset of `/stats`; `allpaca_` prefix) |

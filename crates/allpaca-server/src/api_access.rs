@@ -248,8 +248,9 @@ pub const fn is_client_route_str(method: &str, path: &str) -> bool {
         }
         true
     }
-    const CLIENT: [(&str, &str); 6] = [
+    const CLIENT: [(&str, &str); 7] = [
         ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/systemone"),
         ("GET", "/v1/models"),
         ("GET", "/v1/status"),
         ("GET", "/stats"),
@@ -578,6 +579,7 @@ mod tests {
     #[test]
     fn client_routes_exclude_management() {
         assert!(is_client_route(&Method::POST, "/v1/chat/completions"));
+        assert!(is_client_route(&Method::POST, "/v1/systemone"));
         assert!(is_client_route(&Method::GET, "/v1/models"));
         for (m, p) in [
             (Method::POST, "/v1/model/load"),
