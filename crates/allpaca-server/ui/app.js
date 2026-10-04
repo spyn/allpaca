@@ -234,6 +234,9 @@ function enterApp() {
 
 async function boot() {
   try {
+    // An operator endpoint: with API lockdown off, /v1/status answers
+    // without a session and would skip the login.
+    await api("/v1/config");
     const res = await api("/v1/status");
     enterApp();
     if (res.ok) renderDashboard(await res.json());
@@ -616,15 +619,17 @@ function renderStatus() {
 
 /* ---------- pages ---------- */
 
+const PAGES = ["dashboard", "chat", "model", "logs", "api", "settings"];
+
 function setPage(name) {
-  if (!["dashboard", "chat", "model", "logs"].includes(name)) name = "dashboard";
+  if (!PAGES.includes(name)) name = "dashboard";
   state.page = name;
   document.querySelectorAll("nav .tab").forEach((b) => {
     const on = b.dataset.page === name;
     b.classList.toggle("active", on);
     b.setAttribute("aria-current", on ? "page" : "false");
   });
-  ["dashboard", "chat", "model", "logs"].forEach((p) => $(`page-${p}`).classList.toggle("hidden", p !== name));
+  PAGES.forEach((p) => $(`page-${p}`).classList.toggle("hidden", p !== name));
   if (location.hash.slice(1) !== name) history.replaceState(null, "", `#${name}`);
   renderStatus();
   startLogs();
@@ -639,6 +644,8 @@ function setPage(name) {
     loadModelSettings();
     loadAvailable();
   }
+  if (name === "settings") loadConfig();
+  if (name === "api") loadApiPage();
 }
 
 /* ---------- chat ---------- */
@@ -1520,6 +1527,7 @@ function renderExperts() {
   renderGrid();
   renderPanel();
   renderNamed();
+  renderExpertPlacement();
 }
 
 function layerCounts(l) {
@@ -1603,6 +1611,84 @@ function renderNamed() {
     });
   $("named-rows").innerHTML =
     rows.join("") || `<tr><td colspan="4" class="muted">No experts named or disabled yet.</td></tr>`;
+}
+
+/* Expert placement: which device holds each layer's routed experts, and
+ * pins that move a layer's experts on the next reload. */
+
+function expertPins() {
+  return { ...((model.info && model.info.settings && model.info.settings.expert_homes) || {}) };
+}
+
+/* A pin against where the experts are now. */
+function pinApplied(pin, device) {
+  return pin === "local" ? !String(device).startsWith("rpc:") : pin === device;
+}
+
+function renderExpertPlacement() {
+  const ep = model.info && model.info.expert_placement;
+  $("exp-place").classList.toggle("hidden", !ep);
+  if (!ep) return;
+  const pins = expertPins();
+  // Colours follow the Layer placement card where a device appears in both.
+  const rows = (model.info.placement || []).map((p) => p.device);
+  const devices = [...new Set([...rows, ...ep.layers.map((l) => l.device), ...ep.workers])];
+  const color = (dev) => PLACE_COLORS[devices.indexOf(dev) % PLACE_COLORS.length];
+  const label = (dev) => placeLabel({ device: dev });
+  const nPins = Object.keys(pins).length;
+  const pending = ep.layers.filter((l, i) => pins[i] && !pinApplied(pins[i], l.device)).length;
+  $("exp-place-count").textContent =
+    `${nPins} pinned` + (pending ? ` · ${pending} waiting for a reload` : "");
+  $("exp-place-count").className = `chip ${pending ? "chip-warn" : nPins ? "chip-primary" : ""}`;
+  $("exp-place-clear").disabled = !nPins;
+  $("exp-place-map").innerHTML = ep.layers
+    .map((l, i) => {
+      const pin = pins[i];
+      const cls = [i === model.layer ? "sel" : "", pin ? "pinned" : "", pin && !pinApplied(pin, l.device) ? "pending" : ""]
+        .filter(Boolean)
+        .join(" ");
+      const tip = `Layer ${i}: experts on ${label(l.device)} (${bytes(l.bytes)})` + (pin ? ` · pinned to ${pin === "local" ? "local" : label(pin)}` : "");
+      return `<span class="${cls}" data-l="${i}" role="option" aria-selected="${i === model.layer}" style="background:${color(l.device)}" title="${escapeHtml(tip)}"></span>`;
+    })
+    .join("");
+  const totals = new Map();
+  ep.layers.forEach((l) => {
+    const t = totals.get(l.device) || { n: 0, bytes: 0 };
+    t.n += 1;
+    t.bytes += l.bytes;
+    totals.set(l.device, t);
+  });
+  $("exp-place-legend").innerHTML = devices
+    .filter((dev) => totals.has(dev) || ep.workers.includes(dev))
+    .map((dev) => {
+      const t = totals.get(dev) || { n: 0, bytes: 0 };
+      return (
+        `<div class="place-row"><span class="sw" style="background:${color(dev)}"></span>` +
+        `<div class="dev">${escapeHtml(label(dev))}</div><div class="size">${t.n ? bytes(t.bytes) : ""}</div>` +
+        `<div class="detail">${t.n ? `experts of ${t.n} layer${t.n === 1 ? "" : "s"}` : "no experts yet"}</div></div>`
+      );
+    })
+    .join("");
+  const cur = ep.layers[model.layer];
+  if (!cur) return;
+  const pin = pins[model.layer] || "";
+  $("exp-place-layer").textContent = `Layer ${model.layer}`;
+  $("exp-place-now").textContent =
+    `${bytes(cur.bytes)} of experts, now on ${label(cur.device)}` +
+    (pin && !pinApplied(pin, cur.device) ? ` · moves to ${pin === "local" ? "the local GPU" : label(pin)} on reload` : "");
+  const body = (model.info.placement || []).find((p) => (p.layers || []).some(([a, b]) => model.layer >= a && model.layer <= b));
+  const opt = (v, text) => `<option value="${escapeHtml(v)}"${v === pin ? " selected" : ""}>${escapeHtml(text)}</option>`;
+  $("exp-place-select").innerHTML =
+    opt("", "Automatic (local while it fits, else a worker)") +
+    opt("local", `Local, beside the layer${body ? ` on ${placeLabel(body)}` : ""}`) +
+    ep.workers.map((w) => opt(w, label(w))).join("");
+}
+
+async function setExpertPin(layer, home) {
+  const pins = expertPins();
+  if (home) pins[layer] = home;
+  else delete pins[layer];
+  await putSettings({ expert_homes: pins }, home ? `Layer ${layer} pinned. Reload the model to move its experts.` : `Layer ${layer} back to automatic.`);
 }
 
 async function putSettings(body, okMsg) {
@@ -1894,6 +1980,415 @@ async function loadSelectedModel(e) {
   }
 }
 
+/* ---------- settings page ---------- */
+
+const settings = { data: null, ep: 0, shell: "bash", bodies: {} };
+
+async function loadConfig() {
+  try {
+    settings.data = await apiJson("/v1/config");
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+    return;
+  }
+  renderSettings();
+}
+
+/* Nested tables become dotted keys; arrays stay values. */
+function flattenConfig(obj, prefix = "") {
+  const out = [];
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v && typeof v === "object" && !Array.isArray(v)) out.push(...flattenConfig(v, `${prefix}${k}.`));
+    else out.push([`${prefix}${k}`, v]);
+  }
+  return out;
+}
+
+function configLookup(obj, dotted) {
+  return dotted.split(".").reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), obj);
+}
+
+function configText(key, v) {
+  if (v === null || v === undefined || v === "") return "unset";
+  if (Array.isArray(v)) return v.length ? v.map((x) => (typeof x === "object" ? JSON.stringify(x) : String(x))).join(", ") : "none";
+  if (typeof v === "number" && /_bytes$/.test(key)) return `${num(v)} (${bytes(v)})`;
+  // Fractions are f32 on the server: 0.9 arrives as 0.8999999761581421.
+  if (typeof v === "number") return Number.isInteger(v) ? num(v) : String(Number(v.toPrecision(6)));
+  return String(v);
+}
+
+function configValueHtml(key, v) {
+  const text = escapeHtml(configText(key, v));
+  if (text === "unset" || text === "none") return `<span class="unset">${text}</span>`;
+  if (v === true) return `<span class="on">true</span>`;
+  if (typeof v === "string" && v.startsWith("(set, hidden")) return `<span class="secret">${text}</span>`;
+  return text;
+}
+
+function renderSettings() {
+  const d = settings.data;
+  if (!d) return;
+  const cfg = d.config || {};
+  $("set-version").textContent = `v${d.version}`;
+  $("set-version").classList.remove("hidden");
+  const auth = $("set-auth");
+  auth.classList.remove("hidden");
+  auth.className = `chip ${d.auth_required ? "chip-primary" : "chip-warn"}`;
+  auth.textContent = d.auth_required ? "Password required" : "No password";
+  $("set-source").textContent = d.config_path ? `Config file: ${d.config_path}` : "No config file: built-in defaults and command-line flags.";
+  const spec = cfg.speculative || {};
+  const rpc = cfg.rpc || {};
+  const model = cfg.model || {};
+  $("set-summary").innerHTML = [
+    card("Model", escapeHtml(model.synthetic ? "synthetic" : baseName(model.path) || "none"), escapeHtml(`id ${model.id || "—"}`), "", { tag: icon("chip") }),
+    card(
+      "Speculation",
+      spec.enabled ? "on" : "off",
+      escapeHtml(spec.enabled ? `${(spec.providers || []).join(", ")} · depth ${spec.min_depth}–${spec.max_depth}` : "drafting disabled"),
+      "",
+      { tone: spec.enabled ? "secondary" : "", tag: icon("hub") }
+    ),
+    card("RPC workers", `${(rpc.endpoints || []).length}`, escapeHtml((rpc.endpoints || []).join(", ") || "local only"), "", { tag: icon("hub") }),
+    card("Concurrency", `${num((cfg.engine || {}).max_active_requests)} requests`, escapeHtml(`backend ${(cfg.engine || {}).gpu_backend || "auto"} · batch decode ${(cfg.engine || {}).batch_decode ? "on" : "off"}`), "", { tag: icon("layers") }),
+  ].join("");
+
+  const q = $("set-filter").value.trim().toLowerCase();
+  const sections = Object.entries(cfg)
+    // [http] is on the API page.
+    .filter(([name, v]) => name !== "http" && v && typeof v === "object" && !Array.isArray(v))
+    .map(([name, section]) => {
+      const rows = flattenConfig(section)
+        .map(([key, value]) => {
+          const def = configLookup((d.defaults || {})[name], key);
+          const changed = JSON.stringify(value ?? null) !== JSON.stringify(def ?? null);
+          return { key, value, def, changed };
+        })
+        .filter((r) => !q || `${name}.${r.key} ${configText(r.key, r.value)}`.toLowerCase().includes(q));
+      if (!rows.length) return "";
+      const n = rows.filter((r) => r.changed).length;
+      return (
+        `<article class="panel set-section"><header><h3>${escapeHtml(name)}</h3><span class="spacer"></span>` +
+        (n ? `<span class="chip chip-primary">${n} changed</span>` : `<span class="chip">defaults</span>`) +
+        `</header><table><tbody>` +
+        rows
+          .map(
+            (r) =>
+              `<tr class="${r.changed ? "changed" : ""}"><td class="k">${escapeHtml(r.key)}</td><td class="v">${configValueHtml(r.key, r.value)}` +
+              (r.changed && r.def !== undefined ? `<span class="def">default: ${escapeHtml(configText(r.key, r.def))}</span>` : "") +
+              `</td></tr>`
+          )
+          .join("") +
+        `</tbody></table></article>`
+      );
+    })
+    .join("");
+  $("set-sections").innerHTML = sections || `<p class="soft set-empty">No setting matches the filter.</p>`;
+}
+
+/* A starting body for each endpoint that takes one, from the live state. */
+function apiExampleBody(ep) {
+  const key = `${ep.method} ${ep.path}`;
+  const modelId = (state.lastStats || {}).model_id || "allpaca";
+  const kv = model.info && model.info.kv;
+  const examples = {
+    "POST /v1/chat/completions": {
+      model: modelId,
+      messages: [{ role: "user", content: "Hello!" }],
+      max_tokens: 256,
+      temperature: 0.7,
+      stream: false,
+    },
+    "PUT /v1/model/settings": { context_tokens: (kv && kv.context_tokens) || 32768 },
+    "POST /v1/model/load": {
+      path: (picker.data && picker.data.current) || "<path from GET /v1/model/available>",
+      vision: null,
+      speculation: "off",
+      mtp_draft: null,
+    },
+    "POST /v1/model/experts/recording": { on: true },
+    "POST /v1/auth/login": { password: "<password>" },
+    "PUT /v1/api": { enabled: true, require_keys: true },
+    "POST /v1/api/keys": { description: "laptop IDE" },
+  };
+  return examples[key] ? JSON.stringify(examples[key], null, 2) : "";
+}
+
+function shQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+function psQuote(s) {
+  return `'${String(s).replace(/'/g, "''")}'`;
+}
+
+/* What a caller must send to `ep`: nothing, an API key, or the operator
+ * password. */
+function apiCredential(ep) {
+  const d = settings.data;
+  if (!ep.auth || !d.auth_required) return null;
+  if (!ep.client) return "password";
+  return apiPage.data && !apiPage.data.require_keys ? null : "key";
+}
+
+const API_CRED = {
+  key: { chip: "API key", bash: "$ALLPACA_API_KEY", powershell: "$env:ALLPACA_API_KEY" },
+  password: { chip: "Operator password", bash: "$ALLPACA_PASSWORD", powershell: "$env:ALLPACA_PASSWORD" },
+};
+
+function buildCurl(ep, base, token, body, cred, shell) {
+  const url = `${base.replace(/\/+$/, "")}${ep.path}`;
+  const stream = ep.path.endsWith("/stream") || /"stream"\s*:\s*true/.test(body);
+  const flags = `-sS${stream ? " -N" : ""}${ep.method === "GET" ? "" : ` -X ${ep.method}`}`;
+  if (shell === "powershell") {
+    // The body goes in on stdin: quoting JSON for a native command differs
+    // between PowerShell versions, a here-string does not.
+    const parts = [`curl.exe ${flags} ${psQuote(url)}`];
+    if (cred) parts.push(token ? `-H ${psQuote(`Authorization: Bearer ${token}`)}` : `-H "Authorization: Bearer ${API_CRED[cred].powershell}"`);
+    if (body) parts.push(`-H 'Content-Type: application/json'`, `--data-binary '@-'`);
+    return (body ? `@'\n${body}\n'@ | ` : "") + parts.join(" `\n  ");
+  }
+  const parts = [`curl ${flags} ${shQuote(url)}`];
+  if (cred) parts.push(token ? `-H ${shQuote(`Authorization: Bearer ${token}`)}` : `-H "Authorization: Bearer ${API_CRED[cred].bash}"`);
+  if (body) parts.push(`-H 'Content-Type: application/json'`, `-d ${shQuote(body)}`);
+  return parts.join(" \\\n  ");
+}
+
+function renderApi() {
+  const d = settings.data;
+  if (!d) return;
+  const eps = d.endpoints || [];
+  settings.ep = Math.min(settings.ep, Math.max(0, eps.length - 1));
+  $("api-count").textContent = `${eps.length} endpoints`;
+  $("api-list").innerHTML = eps
+    .map(
+      (e, i) =>
+        `<button type="button" class="api-item${i === settings.ep ? " on" : ""}" data-ep="${i}" role="option" aria-selected="${i === settings.ep}">` +
+        `<span class="chip m-${e.method}">${e.method}</span><span class="mono">${escapeHtml(e.path)}</span>` +
+        `<span class="sum">${escapeHtml(e.summary)}${e.client ? " · API key" : e.auth ? " · operator" : ""}</span></button>`
+    )
+    .join("");
+  const ep = eps[settings.ep];
+  if (!ep) return;
+  const key = `${ep.method} ${ep.path}`;
+  if (!$("api-base").value) $("api-base").value = location.origin;
+  $("api-method").className = `chip m-${ep.method}`;
+  $("api-method").textContent = ep.method;
+  $("api-path").textContent = ep.path;
+  $("api-summary").textContent = ep.summary;
+  const cred = apiCredential(ep);
+  $("api-authchip").textContent = cred ? API_CRED[cred].chip : "No token";
+  $("api-authchip").className = `chip ${cred === "password" ? "chip-warn" : cred ? "chip-primary" : ""}`;
+  const template = apiExampleBody(ep);
+  $("api-body-wrap").classList.toggle("hidden", !template);
+  const box = $("api-body");
+  if (box.dataset.key !== key) {
+    box.dataset.key = key;
+    box.value = settings.bodies[key] ?? template;
+  }
+  renderCurl();
+}
+
+function renderCurl() {
+  const d = settings.data;
+  const ep = d && (d.endpoints || [])[settings.ep];
+  if (!ep) return;
+  const hasBody = !$("api-body-wrap").classList.contains("hidden");
+  const body = hasBody ? $("api-body").value.trim() : "";
+  let valid = true;
+  if (body) {
+    try {
+      JSON.parse(body);
+    } catch {
+      valid = false;
+    }
+  }
+  $("api-body-error").classList.toggle("hidden", valid);
+  const token = $("api-token").value.trim();
+  const base = $("api-base").value.trim() || location.origin;
+  const cred = apiCredential(ep);
+  $("api-curl").textContent = buildCurl(ep, base, token, body, cred, settings.shell);
+  const off = apiPage.data && !apiPage.data.enabled ? "The API is off, so the server will refuse this (403). " : "";
+  $("api-hint").textContent =
+    off +
+    (!cred
+      ? "This endpoint needs no token."
+      : token
+        ? "The token is written into the command: mind where you paste it."
+        : cred === "key"
+          ? `Reads the key from ${API_CRED.key[settings.shell]}: set it to an API key generated above.`
+          : `Operator endpoint: reads ${API_CRED.password[settings.shell]}, the server's password (http.password, or the one printed at start-up). API keys cannot call it.`);
+}
+
+/* ---------- API page ---------- */
+
+const apiPage = { data: null, newKey: null, busy: false };
+
+async function loadApiPage() {
+  try {
+    const [a, c] = await Promise.all([apiJson("/v1/api"), apiJson("/v1/config")]);
+    apiPage.data = a;
+    settings.data = c;
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+    return;
+  }
+  renderApiPage();
+  renderApi();
+}
+
+function isLoopback(host) {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+function listenChoice() {
+  const sel = $("api-host").value;
+  return { host: sel === "custom" ? $("api-host-custom").value.trim() : sel, port: Number($("api-port").value) };
+}
+
+function fmtWhen(ms) {
+  return ms ? new Date(ms).toLocaleString() : "never";
+}
+
+function renderApiPage() {
+  const d = apiPage.data;
+  if (!d) return;
+  const chip = (id, cls, text) => {
+    const el = $(id);
+    el.className = `chip ${cls}`;
+    el.textContent = text;
+  };
+  chip("api-state", d.enabled ? "chip-primary" : "chip-err", d.enabled ? "Enabled" : "Disabled");
+  chip("api-lock", d.require_keys ? "chip-primary" : "chip-warn", d.require_keys ? "Keys required" : "Open: no key needed");
+  chip("api-listen", isLoopback(d.host) ? "" : "chip-secondary", `${d.host}:${d.port}`);
+  $("api-source").textContent = d.settings_path
+    ? `Saved in ${d.settings_path}`
+    : "These settings are not saved to disk on this server.";
+  $("api-enabled").checked = d.enabled;
+  $("api-require").checked = d.require_keys;
+  $("api-require").disabled = !d.enabled;
+
+  const warn = [];
+  if (d.enabled && !d.require_keys && !isLoopback(d.host))
+    warn.push(`Anyone who can reach ${d.host}:${d.port} can run chat completions on this machine without a key.`);
+  else if (d.enabled && !d.require_keys) warn.push("Any program on this machine, including a web page open in a browser here, can call the client endpoints without a key.");
+  if (d.enabled && d.require_keys && !d.keys.length) warn.push("No API keys yet: until you generate one, only the operator password works as a bearer token.");
+  $("api-warn").classList.toggle("hidden", !warn.length);
+  $("api-warn").textContent = warn.join(" ");
+
+  // Listen address: presets, this machine's addresses, or any IP.
+  const presets = [
+    ["127.0.0.1", "127.0.0.1 · this machine only"],
+    ["0.0.0.0", "0.0.0.0 · every network interface"],
+    ...d.interfaces.map((i) => [i.addr, `${i.addr} · ${i.name}`]),
+  ];
+  const known = presets.some(([v]) => v === d.host);
+  const sel = $("api-host");
+  if (document.activeElement !== sel && document.activeElement !== $("api-host-custom")) {
+    sel.innerHTML =
+      presets.map(([v, label]) => `<option value="${escapeHtml(v)}">${escapeHtml(label)}</option>`).join("") +
+      `<option value="custom">Another IP address…</option>`;
+    sel.value = known ? d.host : "custom";
+    $("api-host-custom").value = known ? "" : d.host;
+    $("api-host-custom-wrap").classList.toggle("hidden", known);
+  }
+  if (document.activeElement !== $("api-port")) $("api-port").value = d.port;
+  $("api-listen-note").textContent =
+    (d.live_rebind
+      ? "Applies at once, without reloading the model; this page follows the new address. "
+      : "Takes effect the next time the server starts. ") +
+    `The config file says ${d.config_host}:${d.config_port}` +
+    (d.host !== d.config_host || d.port !== d.config_port ? "; the saved override is in use." : ".") +
+    " A --host or --port flag overrides both.";
+  syncListenApply();
+
+  const cfg = (settings.data && settings.data.config) || {};
+  const row = (k, note, v) => `<tr><td class="k">${k}<small>${note}</small></td><td>${escapeHtml(v)}</td></tr>`;
+  const e = cfg.engine || {};
+  const sm = cfg.sampling || {};
+  const so = cfg.structured_output || {};
+  $("api-related").innerHTML = [
+    row("http.max_tokens", "largest max_tokens a request may ask for", num((cfg.http || {}).max_tokens)),
+    row("engine.max_active_requests", "requests served at the same time", num(e.max_active_requests)),
+    row("engine.batch_decode", "decode concurrent requests in one batch", e.batch_decode ? "on" : "off"),
+    row("speculative.max_concurrent_requests", "speculation pauses above this many", num((cfg.speculative || {}).max_concurrent_requests)),
+    row("sampling", "used when a request does not set them", `temperature ${configText("", sm.temperature)} · top_k ${sm.top_k} · top_p ${configText("", sm.top_p)}`),
+    row("structured_output", "response_format support", `${so.enabled ? "on" : "off"}${so.json_mode ? " · JSON mode forced" : ""}`),
+    row("http.password", "operator password (WebUI login and bearer)", (cfg.http || {}).password ? "set" : "generated at start-up"),
+  ].join("");
+
+  $("api-keys-count").textContent = `${d.keys.length} key${d.keys.length === 1 ? "" : "s"}`;
+  $("api-key-rows").innerHTML =
+    d.keys
+      .map(
+        (k) =>
+          `<tr><td class="desc">${escapeHtml(k.description)}</td><td>${escapeHtml(k.prefix)}…</td>` +
+          `<td>${escapeHtml(fmtWhen(k.created_ms))}</td><td class="${k.last_used_ms ? "" : "soft"}">${escapeHtml(fmtWhen(k.last_used_ms))}</td>` +
+          `<td class="num"><button type="button" class="danger small" data-revoke="${escapeHtml(k.id)}">Revoke</button></td></tr>`
+      )
+      .join("") || `<tr><td colspan="5" class="soft">No API keys. Generate one for each client so it can be revoked on its own.</td></tr>`;
+
+  const box = $("api-key-new");
+  box.classList.toggle("hidden", !apiPage.newKey);
+  if (apiPage.newKey) {
+    box.innerHTML =
+      `<p><strong>New key for “${escapeHtml(apiPage.newKey.description)}”.</strong> Copy it now: it is not stored and will not be shown again.</p>` +
+      `<div class="row"><code id="api-key-secret">${escapeHtml(apiPage.newKey.key)}</code>` +
+      `<button type="button" class="secondary small" data-key-act="copy">${icon("copy")}Copy</button>` +
+      `<button type="button" class="secondary small" data-key-act="use">Use in curl below</button>` +
+      `<button type="button" class="secondary small" data-key-act="dismiss">Done</button></div>`;
+  }
+}
+
+function syncListenApply() {
+  const d = apiPage.data;
+  if (!d) return;
+  const { host, port } = listenChoice();
+  $("api-listen-apply").disabled = apiPage.busy || !host || !port || (host === d.host && port === d.port);
+}
+
+async function putApi(body, okMsg) {
+  apiPage.busy = true;
+  try {
+    apiPage.data = await apiJson("/v1/api", { method: "PUT", body: JSON.stringify(body) });
+    if (okMsg) toast(okMsg);
+    return true;
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+    return false;
+  } finally {
+    apiPage.busy = false;
+    renderApiPage();
+    renderApi();
+  }
+}
+
+async function applyListen() {
+  const d = apiPage.data;
+  const { host, port } = listenChoice();
+  const exposes = !isLoopback(host) && isLoopback(d.host);
+  const ok = window.confirm(
+    `Listen on ${host}:${port} instead of ${d.host}:${d.port}?\n\n` +
+      (exposes ? "This makes the server reachable from other machines on that network.\n\n" : "") +
+      "The WebUI uses the same address, so this page will reopen there. Requests in progress finish on the old address."
+  );
+  if (!ok) return;
+  if (!(await putApi({ host, port }))) return;
+  if (!apiPage.data.live_rebind) {
+    toast("Saved. It applies when the server restarts.");
+    return;
+  }
+  // Follow the server if this page's own address no longer reaches it.
+  const here = location.hostname;
+  const sameHost = host === "0.0.0.0" || host === here || (isLoopback(host) && isLoopback(here));
+  if (sameHost && String(port) === (location.port || "80")) {
+    toast(`Listening on ${host}:${port}`);
+    return;
+  }
+  toast(`Listening on ${host}:${port}. Reopening there…`);
+  const target = sameHost ? here : host;
+  setTimeout(() => (location.href = `${location.protocol}//${target}:${port}/#api`), 900);
+}
+
 /* ---------- wiring ---------- */
 
 $("login-form").addEventListener("submit", async (ev) => {
@@ -2135,6 +2630,16 @@ $("usage-reset").addEventListener("click", async () => {
   }
 });
 $("layer-enable-all").addEventListener("click", enableLayer);
+$("exp-place-map").addEventListener("click", (ev) => {
+  const cell = ev.target.closest("[data-l]");
+  if (cell) setLayer(Number(cell.dataset.l));
+});
+$("exp-place-select").addEventListener("change", (ev) => setExpertPin(model.layer, ev.target.value));
+$("exp-place-clear").addEventListener("click", () => {
+  if (window.confirm("Clear every expert pin?\n\nPlacement goes back to automatic on the next reload.")) {
+    putSettings({ expert_homes: {} }, "Pins cleared. Reload the model to apply.");
+  }
+});
 $("exp-grid").addEventListener("click", (ev) => {
   const cell = ev.target.closest(".cell");
   if (!cell) return;
@@ -2159,6 +2664,112 @@ $("named-rows").addEventListener("click", (ev) => {
 });
 
 $("models-rescan").addEventListener("click", () => loadAvailable(true));
+
+$("set-refresh").addEventListener("click", loadConfig);
+
+$("api-refresh").addEventListener("click", loadApiPage);
+$("api-enabled").addEventListener("change", (ev) => {
+  const on = ev.target.checked;
+  if (!on && !window.confirm("Turn the API off?\n\nEvery API key and bearer token is refused until you turn it back on. This WebUI keeps working.")) {
+    ev.target.checked = true;
+    return;
+  }
+  putApi({ enabled: on }, on ? "API enabled" : "API disabled");
+});
+$("api-require").addEventListener("change", (ev) => {
+  const on = ev.target.checked;
+  const d = apiPage.data;
+  if (!on) {
+    const where = isLoopback(d.host) ? "any program on this machine" : `anyone who can reach ${d.host}:${d.port}`;
+    if (!window.confirm(`Turn lockdown off?\n\nWithout a key, ${where} can run chat completions and read status and metrics.`)) {
+      ev.target.checked = true;
+      return;
+    }
+  }
+  putApi({ require_keys: on }, on ? "API keys required" : "Lockdown off");
+});
+$("api-host").addEventListener("change", (ev) => {
+  $("api-host-custom-wrap").classList.toggle("hidden", ev.target.value !== "custom");
+  if (ev.target.value === "custom") $("api-host-custom").focus();
+  syncListenApply();
+});
+["api-host-custom", "api-port"].forEach((id) => $(id).addEventListener("input", syncListenApply));
+$("api-listen-apply").addEventListener("click", applyListen);
+$("api-key-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const description = $("api-key-desc").value.trim();
+  if (!description) return;
+  try {
+    apiPage.newKey = await apiJson("/v1/api/keys", { method: "POST", body: JSON.stringify({ description }) });
+    $("api-key-desc").value = "";
+    await loadApiPage();
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+  }
+});
+$("api-key-new").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("[data-key-act]");
+  if (!btn || !apiPage.newKey) return;
+  const act = btn.dataset.keyAct;
+  if (act === "copy") {
+    try {
+      await navigator.clipboard.writeText(apiPage.newKey.key);
+      toast("Key copied");
+    } catch {
+      toast("Copy failed: select the key and copy it by hand", true);
+    }
+  } else if (act === "use") {
+    $("api-token").value = apiPage.newKey.key;
+    renderCurl();
+    $("api-curl").scrollIntoView({ behavior: "smooth", block: "center" });
+  } else {
+    apiPage.newKey = null;
+    renderApiPage();
+  }
+});
+$("api-key-rows").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("[data-revoke]");
+  if (!btn) return;
+  const key = apiPage.data.keys.find((k) => k.id === btn.dataset.revoke);
+  if (!key || !window.confirm(`Revoke the key “${key.description}” (${key.prefix}…)?\n\nClients using it are refused from now on.`)) return;
+  try {
+    await apiJson(`/v1/api/keys/${encodeURIComponent(key.id)}`, { method: "DELETE" });
+    if (apiPage.newKey && apiPage.newKey.id === key.id) apiPage.newKey = null;
+    toast("Key revoked");
+    await loadApiPage();
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) toast(e.message, true);
+  }
+});
+$("set-filter").addEventListener("input", renderSettings);
+$("api-list").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-ep]");
+  if (!btn) return;
+  settings.ep = Number(btn.dataset.ep);
+  renderApi();
+});
+$("api-shell").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-shell]");
+  if (!btn) return;
+  settings.shell = btn.dataset.shell;
+  document.querySelectorAll("#api-shell button").forEach((b) => b.classList.toggle("on", b === btn));
+  renderCurl();
+});
+["api-base", "api-token"].forEach((id) => $(id).addEventListener("input", renderCurl));
+$("api-body").addEventListener("input", (ev) => {
+  settings.bodies[ev.target.dataset.key] = ev.target.value;
+  renderCurl();
+});
+$("api-copy").addEventListener("click", async () => {
+  const btn = $("api-copy");
+  try {
+    await navigator.clipboard.writeText($("api-curl").textContent);
+    btn.textContent = "Copied";
+  } catch {
+    btn.textContent = "Copy failed";
+  }
+  setTimeout(() => (btn.textContent = "Copy"), 1200);
+});
 $("models-filter").addEventListener("input", renderAvailable);
 $("models-rows").addEventListener("click", (ev) => {
   const tr = ev.target.closest("tr[data-path]");

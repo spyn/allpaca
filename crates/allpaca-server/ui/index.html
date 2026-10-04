@@ -43,6 +43,7 @@
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol>
     <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M16 7l3 3M14 9l2 2"/></symbol>
     <symbol id="i-alpaca" viewBox="0 0 24 24"><path d="M8 3v3M16 3v3M7 6h10v7a5 5 0 0 1-10 0zM7 21v-4M17 21v-4M10 10h0M14 10h0"/></symbol>
   </svg>
 
@@ -71,6 +72,8 @@
         <button data-page="chat" class="tab">Chat Playground</button>
         <button data-page="model" class="tab">Models &amp; VRAM</button>
         <button data-page="logs" class="tab">Logs &amp; Traces</button>
+        <button data-page="api" class="tab">API</button>
+        <button data-page="settings" class="tab">Settings</button>
       </nav>
       <div id="conn" class="conn" title="Server connection">
         <span class="dot"></span><span id="conn-text">connecting</span>
@@ -253,7 +256,7 @@
           <div class="title-row">
             <h1 id="m-name">—</h1>
             <span id="m-active" class="chip chip-primary hidden"></span>
-            <span id="m-pending" class="chip chip-warn hidden">Reload needed to apply the context size</span>
+            <span id="m-pending" class="chip chip-warn hidden">Reload needed to apply the saved settings</span>
           </div>
           <div id="m-path" class="mono tiny soft"></div>
         </div>
@@ -326,6 +329,22 @@
 
       <div id="experts-wrap" class="hidden">
         <div class="section-head"><h2 class="label">Experts</h2></div>
+        <section id="exp-place" class="panel hidden">
+          <div class="panel-head bare">
+            <svg class="ic primary-text"><use href="#i-hub"/></svg>
+            <h2 class="label">Expert placement</h2>
+            <span id="exp-place-count" class="chip"></span>
+            <span class="spacer"></span>
+            <button id="exp-place-clear" class="secondary small">Clear all pins</button>
+          </div>
+          <div id="exp-place-map" class="layer-map exp-place-map" role="listbox" aria-label="Where each layer's experts are"></div>
+          <div id="exp-place-legend" class="placement"></div>
+          <div class="exp-place-row">
+            <div><strong id="exp-place-layer"></strong><div id="exp-place-now" class="mono tiny soft"></div></div>
+            <label>Experts of this layer go to<select id="exp-place-select"></select></label>
+          </div>
+          <p class="soft tiny mono exp-place-note">One cell per layer, coloured by the device that holds its routed experts; click a cell to choose that layer. A layer's experts move as one block, either beside the layer on its local GPU or onto a worker GPU, and the move happens when the model reloads. A dot marks a pinned layer; stripes mark a pin that has not been applied yet.</p>
+        </section>
         <section class="panel">
           <div class="exp-toolbar">
             <button id="layer-prev" class="secondary small" aria-label="Previous layer">‹</button>
@@ -406,6 +425,135 @@
         <div id="log-view" class="log-view" role="log"></div>
       </div>
       <div id="log-foot" class="grid log-foot"></div>
+    </main>
+
+    <main id="page-settings" class="page hidden">
+      <div class="page-head">
+        <div class="page-head-main">
+          <div class="crumb label"><span class="primary-text">Engine runtime</span> / Settings</div>
+          <div class="title-row">
+            <h1>Settings</h1>
+            <span id="set-version" class="chip hidden"></span>
+            <span id="set-auth" class="chip hidden"></span>
+          </div>
+          <div id="set-source" class="mono tiny soft"></div>
+        </div>
+        <div class="model-actions">
+          <label class="search"><svg class="ic"><use href="#i-search"/></svg><input id="set-filter" type="search" placeholder="Filter settings (kv, rpc, depth)…" aria-label="Filter settings"></label>
+          <button id="set-refresh" class="secondary"><svg class="ic"><use href="#i-refresh"/></svg>Refresh</button>
+        </div>
+      </div>
+
+      <section id="set-summary" class="grid"></section>
+      <p class="soft tiny mono set-note">Read-only: these are the values the running engine was built from (config file, command-line flags, the model chosen in the WebUI and its saved settings). Change them in the config file and restart; context size and experts are on Models &amp; VRAM. <span class="pip"></span> marks a value that differs from the built-in default.</p>
+      <section id="set-sections" class="set-sections"></section>
+    </main>
+
+    <main id="page-api" class="page hidden">
+      <div class="page-head">
+        <div class="page-head-main">
+          <div class="crumb label"><span class="primary-text">Engine runtime</span> / API</div>
+          <div class="title-row">
+            <h1>API</h1>
+            <span id="api-state" class="chip hidden"></span>
+            <span id="api-lock" class="chip hidden"></span>
+            <span id="api-listen" class="chip hidden"></span>
+          </div>
+          <div id="api-source" class="mono tiny soft"></div>
+        </div>
+        <div class="model-actions">
+          <button id="api-refresh" class="secondary"><svg class="ic"><use href="#i-refresh"/></svg>Refresh</button>
+        </div>
+      </div>
+
+      <div class="api-top">
+        <section class="panel api-access">
+          <div class="panel-head bare">
+            <svg class="ic primary-text"><use href="#i-lock"/></svg>
+            <h2 class="label">Access</h2>
+          </div>
+          <div class="switch-row">
+            <label class="switch"><input id="api-enabled" type="checkbox"><span></span><span class="sr-only">API enabled</span></label>
+            <div><strong>API enabled</strong>
+              <p class="soft">Off: only this WebUI, in a signed-in browser, can use the server. API keys and the password as a bearer token are refused.</p></div>
+          </div>
+          <div class="switch-row">
+            <label class="switch"><input id="api-require" type="checkbox"><span></span><span class="sr-only">Require an API key</span></label>
+            <div><strong>Require an API key (lockdown)</strong>
+              <p class="soft">Off: anyone who can reach the listen address may call the client endpoints (chat, models, status, metrics) with no key. Model management, settings and logs always need the operator password.</p></div>
+          </div>
+          <p id="api-warn" class="api-warn hidden" role="alert"></p>
+          <div class="listen-row">
+            <label>Listen address<select id="api-host"></select></label>
+            <label id="api-host-custom-wrap" class="hidden">IP address<input id="api-host-custom" type="text" spellcheck="false" autocomplete="off" placeholder="192.168.1.20"></label>
+            <label class="port">Port<input id="api-port" type="number" min="1" max="65535"></label>
+            <button id="api-listen-apply" class="primary" disabled>Apply</button>
+          </div>
+          <p id="api-listen-note" class="soft tiny mono"></p>
+        </section>
+
+        <section class="panel flush">
+          <div class="panel-head">
+            <svg class="ic primary-text"><use href="#i-tune"/></svg>
+            <h2 class="label">Request limits &amp; defaults</h2>
+            <span class="spacer"></span>
+            <span class="chip">from the config file</span>
+          </div>
+          <table class="api-related"><tbody id="api-related"></tbody></table>
+        </section>
+      </div>
+
+      <section class="panel flush api-keys">
+        <div class="panel-head">
+          <svg class="ic primary-text"><use href="#i-key"/></svg>
+          <h2 class="label">API keys</h2>
+          <span id="api-keys-count" class="chip"></span>
+          <span class="spacer"></span>
+          <form id="api-key-form" class="key-form">
+            <input id="api-key-desc" type="text" maxlength="80" required autocomplete="off" placeholder="What is this key for? (e.g. laptop IDE)" aria-label="Key description">
+            <button type="submit" class="primary"><svg class="ic"><use href="#i-plus"/></svg>Generate key</button>
+          </form>
+        </div>
+        <div id="api-key-new" class="key-new hidden"></div>
+        <div class="table-scroll">
+          <table class="key-table">
+            <thead><tr><th>Description</th><th>Key</th><th>Created</th><th>Last used</th><th class="num">Action</th></tr></thead>
+            <tbody id="api-key-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="section-head"><h2 class="label">Endpoints &amp; curl <span class="pip pulse" aria-hidden="true"></span></h2><span id="api-count" class="tiny soft"></span></div>
+      <section class="panel flush api">
+        <div id="api-list" class="api-list" role="listbox" aria-label="Endpoints"></div>
+        <div class="api-gen">
+          <div class="api-title">
+            <span id="api-method" class="chip"></span>
+            <strong id="api-path" class="mono"></strong>
+            <span id="api-authchip" class="chip"></span>
+          </div>
+          <p id="api-summary" class="soft"></p>
+          <div class="api-fields">
+            <label>Base URL<input id="api-base" type="text" spellcheck="false" autocomplete="off"></label>
+            <label>Token<input id="api-token" type="password" spellcheck="false" autocomplete="off" placeholder="blank = $ALLPACA_PASSWORD"></label>
+            <div class="api-shell"><span class="label">Shell</span>
+              <div id="api-shell" class="seg" role="group" aria-label="Shell">
+                <button data-shell="bash" class="on">bash</button>
+                <button data-shell="powershell">PowerShell</button>
+              </div>
+            </div>
+          </div>
+          <label id="api-body-wrap" class="api-body-wrap">Request body (JSON)
+            <textarea id="api-body" rows="8" spellcheck="false"></textarea>
+            <span id="api-body-error" class="error tiny hidden">The body is not valid JSON.</span>
+          </label>
+          <div class="codeblock api-out">
+            <div class="code-head"><span>curl</span><button id="api-copy" type="button" class="ghost copy">Copy</button></div>
+            <pre><code id="api-curl"></code></pre>
+          </div>
+          <p id="api-hint" class="soft tiny mono"></p>
+        </div>
+      </section>
     </main>
 
     <footer class="statusbar">
