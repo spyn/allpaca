@@ -95,14 +95,23 @@ impl EngineTokenizer {
             && self.token_id("<|eot_id|>").is_some()
     }
 
-    /// ChatML or Llama 3 turns when the vocab has their specials; otherwise
-    /// `role: text` (tiny/synthetic).
+    /// Vocab has Ling's (`bailingmoe2`) role specials.
+    pub fn uses_ling_chat(&self) -> bool {
+        self.token_id("<role>").is_some()
+            && self.token_id("</role>").is_some()
+            && self.token_id("<|role_end|>").is_some()
+    }
+
+    /// ChatML, Llama 3 or Ling turns when the vocab has their specials;
+    /// otherwise `role: text` (tiny/synthetic).
     ///
     /// Does **not** open `<think>` — that is Qwen-specific and role-echoes on
     /// Nemotron Lightning.
     pub fn format_chat(&self, messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
         if self.uses_chatml() {
             format_chatml(messages, add_generation_prompt)
+        } else if self.uses_ling_chat() {
+            format_ling_chat(messages, add_generation_prompt)
         } else if self.uses_llama3_chat() {
             format_llama3_chat(messages, add_generation_prompt)
         } else {
@@ -161,6 +170,15 @@ impl EngineTokenizer {
 
     pub fn synthetic(vocab_size: usize) -> Result<Self, AllpacaError> {
         Self::from_vocab(synthetic_vocab(vocab_size), Some(1), Some(2))
+    }
+
+    /// Token ids of `text` alone, never with a BOS token in front.
+    pub fn encode_plain(&self, text: &str) -> Result<Vec<u32>, AllpacaError> {
+        let encoding = self
+            .inner
+            .encode(text, false)
+            .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))?;
+        Ok(encoding.get_ids().to_vec())
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, AllpacaError> {
@@ -389,6 +407,7 @@ impl Utf8Stream {
 const CHAT_EOG_PIECES: &[&str] = &[
     "<|im_end|>",
     "<|eot_id|>",
+    "<|role_end|>",
     "<|eom_id|>",
     "<|end_of_turn|>",
     "<|endoftext|>",
@@ -430,6 +449,34 @@ pub fn format_llama3_chat(messages: &[(&str, &str)], add_generation_prompt: bool
     }
     if add_generation_prompt {
         out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+    out
+}
+
+/// Ling 2.0 turns, as the GGUF's template renders them without tools: a
+/// system turn always opens the prompt and ends with the thinking switch.
+pub fn format_ling_chat(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+    let mut out = String::from("<role>SYSTEM</role>");
+    let lead_system = messages.first().is_some_and(|(role, _)| *role == "system");
+    if let Some((_, content)) = messages.first().filter(|_| lead_system) {
+        out.push_str(content);
+        out.push('\n');
+    }
+    out.push_str("detailed thinking off<|role_end|>");
+    for (role, content) in messages.iter().skip(usize::from(lead_system)) {
+        let tag = match *role {
+            "user" => "HUMAN",
+            "assistant" => "ASSISTANT",
+            _ => "SYSTEM",
+        };
+        out.push_str("<role>");
+        out.push_str(tag);
+        out.push_str("</role>");
+        out.push_str(content);
+        out.push_str("<|role_end|>");
+    }
+    if add_generation_prompt {
+        out.push_str("<role>ASSISTANT</role>");
     }
     out
 }
