@@ -3982,12 +3982,133 @@ __global__ void gemm_nt_mxfp4_tiled_m_kernel(const float *a, const uint8_t *b, f
     }
 }
 
+/* MXFP4 code -> value without a table load: magnitudes 0,1,2,3,4,6,8,12,
+ * bit 3 is the sign. */
+__device__ inline float mxfp4_code(uint32_t n) {
+    const float mag =
+        static_cast<float>((0x0C08060403020100ull >> ((n & 7u) * 8u)) & 0xFFull);
+    return (n & 8u) ? -mag : mag;
+}
+
+/* Unscaled dot product of one 17-byte block with 32 inputs (16-byte aligned).
+ * Byte j of the block holds elements j (low nibble) and j + 16 (high). */
+__device__ inline float mxfp4_block_dot(const uint8_t *blk, const float *x) {
+    uint64_t q0;
+    uint64_t q1;
+    __builtin_memcpy(&q0, blk + 1, 8);
+    __builtin_memcpy(&q1, blk + 9, 8);
+    float xs[32];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const float4 v = *reinterpret_cast<const float4 *>(x + 4 * q);
+        xs[4 * q] = v.x;
+        xs[4 * q + 1] = v.y;
+        xs[4 * q + 2] = v.z;
+        xs[4 * q + 3] = v.w;
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t b0 = static_cast<uint32_t>(q0 >> (8 * j)) & 0xFFu;
+        const uint32_t b1 = static_cast<uint32_t>(q1 >> (8 * j)) & 0xFFu;
+        s += xs[j] * mxfp4_code(b0 & 15u) + xs[16 + j] * mxfp4_code(b0 >> 4);
+        s += xs[8 + j] * mxfp4_code(b1 & 15u) + xs[24 + j] * mxfp4_code(b1 >> 4);
+    }
+    return s;
+}
+
+/* Memory-bound MXFP4 GEMV: one 32-lane group per output column, each lane
+ * taking every 32nd block of the row, so a group streams the row's blocks in
+ * order. `k` is a multiple of 32 and `a` is 16-byte aligned. */
+__global__ void gemv_nt_mxfp4_wide_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                          int k) {
+    constexpr int GROUPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = k / 32;
+    float acc = 0.f;
+    if (col < n) {
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
+        for (int ib = lane; ib < nblocks; ib += 32) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * 17;
+            acc += mxfp4_e8m0_half(blk[0]) * mxfp4_block_dot(blk, arow + ib * 32);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor(acc, off, 32);
+    }
+    if (col < n && lane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+/* The same layout for the fused gate/up step: writes silu(gate)*up. */
+__global__ void mxfp4_swiglu_gate_up_wide_kernel(const float *a, const uint8_t *bg,
+                                                 const uint8_t *bu, float *c, int m, int n,
+                                                 int k) {
+    constexpr int GROUPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = k / 32;
+    float acc_g = 0.f;
+    float acc_u = 0.f;
+    if (col < n) {
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        const uint8_t *grow = bg + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
+        const uint8_t *urow = bu + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
+        for (int ib = lane; ib < nblocks; ib += 32) {
+            const uint8_t *g = grow + static_cast<size_t>(ib) * 17;
+            const uint8_t *u = urow + static_cast<size_t>(ib) * 17;
+            const float *x = arow + ib * 32;
+            acc_g += mxfp4_e8m0_half(g[0]) * mxfp4_block_dot(g, x);
+            acc_u += mxfp4_e8m0_half(u[0]) * mxfp4_block_dot(u, x);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc_g += __shfl_xor(acc_g, off, 32);
+        acc_u += __shfl_xor(acc_u, off, 32);
+    }
+    if (col < n && lane == 0) {
+        const float x = acc_g;
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] =
+            (x / (1.0f + expf(-x))) * acc_u;
+    }
+}
+
+/* ALLPACA_MXFP4_WIDE=0 keeps the older shared-tile kernels for single rows. */
+static bool mxfp4_wide(const float *a, int32_t m, int32_t k) {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_MXFP4_WIDE");
+        return !(v && v[0] == '0');
+    }();
+    return on && m == 1 && k % 32 == 0 && (reinterpret_cast<uintptr_t>(a) & 15u) == 0;
+}
+
 static int launch_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    if (tiled && mxfp4_wide(a, m, k)) {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + 7) / 8), 1);
+        hipLaunchKernelGGL(gemv_nt_mxfp4_wide_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        return hip_status(hipGetLastError());
+    }
     if (tiled) {
         constexpr int COLS = 64;
         if (m > 1) {
@@ -4177,6 +4298,13 @@ extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, c
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    if (mxfp4_wide(a, m, k)) {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + 7) / 8), 1);
+        hipLaunchKernelGGL(mxfp4_swiglu_gate_up_wide_kernel, grid, block, 0, as_stream(stream), a,
+                           bg, bu, c, m, n, k);
+        return hip_status(hipGetLastError());
+    }
     constexpr int COLS = 64;
     if (m > 1) {
         dim3 block(64);
