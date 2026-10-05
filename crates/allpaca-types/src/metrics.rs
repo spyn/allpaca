@@ -118,6 +118,9 @@ pub struct StatsSnapshot {
     pub expert_lru_fills: u64,
     #[serde(default)]
     pub expert_cpu_runs: u64,
+    /// CPU-run experts whose bytes were already in the host RAM tier.
+    #[serde(default)]
+    pub expert_ram_hits: u64,
     /// Measured expert H2D bandwidth (bytes/s) used by `q*`. 0 = unmeasured.
     #[serde(default)]
     pub expert_pcie_bps: u64,

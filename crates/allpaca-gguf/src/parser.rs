@@ -425,6 +425,8 @@ pub struct GgufCompatReport {
 struct GgufShard {
     mmap: Mmap,
     tensor_data_offset: usize,
+    /// The file behind `mmap`, when the GGUF was opened from a path.
+    path: Option<std::path::PathBuf>,
 }
 
 pub struct GgufFile {
@@ -452,7 +454,11 @@ impl GgufFile {
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
             AllpacaError::Fatal(FatalError::CorruptGguf(format!("mmap failed: {e}")))
         })?;
-        Self::parse(mmap)
+        let mut gguf = Self::parse(mmap)?;
+        if let Some(shard) = gguf.shards.first_mut() {
+            shard.path = Some(path.to_path_buf());
+        }
+        Ok(gguf)
     }
 
     fn open_dir(dir: &Path) -> Result<Self, AllpacaError> {
@@ -603,6 +609,7 @@ impl GgufFile {
             shards: vec![GgufShard {
                 mmap,
                 tensor_data_offset,
+                path: None,
             }],
             version,
             metadata,
@@ -1099,6 +1106,19 @@ impl GgufFile {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
         })?;
         self.tensor_bytes_of(info)
+    }
+
+    /// The file of each shard, in shard order; `None` unless every shard
+    /// was opened from a path.
+    pub fn shard_paths(&self) -> Option<Vec<std::path::PathBuf>> {
+        self.shards.iter().map(|s| s.path.clone()).collect()
+    }
+
+    /// The shard index and the byte offset in that shard's file where
+    /// `info`'s data starts.
+    pub fn tensor_file_offset(&self, info: &TensorInfo) -> Option<(usize, u64)> {
+        let shard = self.shards.get(info.shard)?;
+        Some((info.shard, shard.tensor_data_offset as u64 + info.offset))
     }
 
     pub fn tensor_bytes_of(&self, info: &TensorInfo) -> Result<&[u8], AllpacaError> {

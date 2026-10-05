@@ -2560,7 +2560,8 @@ fn dsv4_apply_moe(
     let cpu_jh = match file {
         Some(f) if !cpu_work.is_empty() => {
             let work = &cpu_work;
-            Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, 1, metrics)))
+            let ram = gpu.as_ref().and_then(|g| g.expert_ram());
+            Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, 1, metrics, ram.as_deref())))
         }
         _ => None,
     };
@@ -2695,24 +2696,60 @@ fn dsv4_cpu_experts(
     work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
     n_tok: usize,
     metrics: &Metrics,
+    ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
 ) -> Result<Vec<f32>, AllpacaError> {
     let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
     let t = Instant::now();
+    // Through the RAM tier (cached, else read from the file in large direct
+    // reads) when there is one; else through the mapped file.
+    let spans: Option<Vec<(usize, Vec<crate::dsv4_ram::FileSpan>)>> = ram.and_then(|_| {
+        work.iter()
+            .map(|(e, _, _)| crate::dsv4_gpu::expert_mxfp4_spans(file, blk, *e, cfg).map(|s| (*e, s)))
+            .collect()
+    });
+    let mut tier = match (ram, spans.as_ref()) {
+        (Some(r), Some(_)) => Some(r.lock().unwrap_or_else(|e| e.into_inner())),
+        _ => None,
+    };
+    let locs = match (tier.as_mut(), spans.as_ref()) {
+        (Some(t), Some(spans)) => Some(t.fetch(blk, spans, metrics)?),
+        _ => None,
+    };
     let mut parts = Vec::with_capacity(work.len());
-    for (e, _, _) in work {
-        parts.push(crate::dsv4_gpu::expert_mxfp4_parts(file, blk, *e, cfg)?);
+    if locs.is_none() {
+        for (e, _, _) in work {
+            parts.push(crate::dsv4_gpu::expert_mxfp4_parts(file, blk, *e, cfg)?);
+        }
     }
-    let experts: Vec<allpaca_cpu::Mxfp4Expert<'_>> = work
-        .iter()
-        .zip(&parts)
-        .map(|((_, x, group), p)| allpaca_cpu::Mxfp4Expert {
-            gate: p[0].1,
-            up: p[1].1,
-            down: p[2].1,
-            x,
-            m: group.len(),
-        })
-        .collect();
+    let experts: Vec<allpaca_cpu::Mxfp4Expert<'_>> = match (tier.as_ref(), locs.as_ref(), spans.as_ref()) {
+        (Some(t), Some(locs), Some(spans)) => work
+            .iter()
+            .zip(locs.iter().zip(spans))
+            .map(|((_, x, group), (loc, (_, s)))| {
+                let bytes = t.bytes(*loc);
+                let (gate, rest) = bytes.split_at(s[0].len);
+                let (up, down) = rest.split_at(s[1].len);
+                allpaca_cpu::Mxfp4Expert {
+                    gate,
+                    up,
+                    down,
+                    x,
+                    m: group.len(),
+                }
+            })
+            .collect(),
+        _ => work
+            .iter()
+            .zip(&parts)
+            .map(|((_, x, group), p)| allpaca_cpu::Mxfp4Expert {
+                gate: p[0].1,
+                up: p[1].1,
+                down: p[2].1,
+                x,
+                m: group.len(),
+            })
+            .collect(),
+    };
     // Half the logical cores: the rest drive the GPUs and the copies.
     let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
     let ys = allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, threads);
@@ -3088,7 +3125,8 @@ fn dsv4_apply_moe_rows(
         let cpu_jh = match file {
             Some(f) if !cpu_now.is_empty() => {
                 let work = &cpu_now;
-                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, metrics)))
+                let ram = gpu.as_ref().and_then(|g| g.expert_ram());
+                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, metrics, ram.as_deref())))
             }
             _ => None,
         };
@@ -3692,6 +3730,7 @@ pub fn forward_dsv4_token(
 }
 
 #[allow(clippy::too_many_arguments)]
+
 pub fn forward_dsv4_tokens(
     model: &TinyModel,
     tokens: &[u32],
@@ -4575,6 +4614,12 @@ mod tests {
         let cfg = ModelConfig::from_gguf(&file).expect("config");
         let (dim, ff) = (cfg.dim, cfg.ff_dim);
         let metrics = Metrics::default();
+        let slot = 3 * (dim * ff / 32 * 17);
+        let ram = Mutex::new(
+            crate::dsv4_ram::ExpertRam::new(file.shard_paths().expect("paths"), slot, slot / 3, 3 * slot as u64)
+                .expect("ram tier")
+                .expect("slots"),
+        );
         for (blk, expert, m) in [(0usize, 3usize, 1usize), (5, 17, 1), (20, 255, 2), (cfg.n_layers - 1, 128, 1)] {
             let x: Vec<f32> = (0..m * dim)
                 .map(|i| (((i * 2654435761usize) >> 7) % 2001) as f32 / 1000.0 - 1.0)
@@ -4583,7 +4628,13 @@ mod tests {
             let mut want = vec![0.0f32; m * dim];
             expert_mlp_rows(&x, &ffn, ff, dim, m, &mut want, false).expect("reference");
             let group: Vec<(usize, f32)> = (0..m).map(|t| (t, 1.0)).collect();
-            let got = dsv4_cpu_experts(&file, blk, &cfg, &[(expert, x, group)], m, &metrics).expect("packed");
+            let work = [(expert, x, group)];
+            let got = dsv4_cpu_experts(&file, blk, &cfg, &work, m, &metrics, None).expect("packed");
+            // The same expert through the RAM tier: read from the file, then cached.
+            for pass in 0..2 {
+                let tiered = dsv4_cpu_experts(&file, blk, &cfg, &work, m, &metrics, Some(&ram)).expect("tiered");
+                assert_eq!(tiered, got, "blk {blk} expert {expert} pass {pass}");
+            }
             let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
             let worst = got.iter().zip(&want).fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
             eprintln!("blk {blk} expert {expert} m {m}: |y| max {scale:.4} worst diff {worst:.3e}");

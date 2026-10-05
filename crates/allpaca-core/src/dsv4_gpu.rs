@@ -342,6 +342,10 @@ pub struct Dsv4Gpu {
     /// takes a slot only when it is routed clearly more often than the
     /// coldest resident one. Off: every miss is copied in (plain LRU).
     cpu_miss: bool,
+    /// Host RAM tier the CPU experts read through.
+    ram: Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>>,
+    /// Mapped expert slices handed to a GPU copy, released once it landed.
+    mapped_used: Vec<(usize, usize)>,
 }
 
 impl Dsv4Gpu {
@@ -352,6 +356,9 @@ impl Dsv4Gpu {
         draft: Option<Arc<HipWorkspace>>,
     ) -> Result<Self, AllpacaError> {
         hip.bind()?;
+        // Before the dense weights pass through this process on their way
+        // to the GPU.
+        let ram_free = crate::dsv4_ram::available_ram_bytes();
         let names = dense_bf16_names(cfg);
         let mut parts: Vec<(&str, &[u8])> = Vec::new();
         let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
@@ -364,6 +371,7 @@ impl Dsv4Gpu {
             }
             let bytes = file.tensor_bytes_of(info)?;
             owned.push((name.clone(), bytes.to_vec()));
+            crate::dsv4_ram::release_mapped(bytes);
         }
         for (name, bytes) in &owned {
             parts.push((name.as_str(), bytes.as_slice()));
@@ -481,7 +489,12 @@ impl Dsv4Gpu {
             heat_routes: 0,
             cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").map_or(true, |v| v != "0")
                 && cpu_expert_kernel_fits(file, cfg),
+            ram: None,
+            mapped_used: Vec::new(),
         };
+        if gpu.cpu_miss {
+            gpu.ram = open_expert_ram(file, cfg, gpu.expert_slot, ram_free);
+        }
         if gpu.h2d.is_some() {
             gpu.pin0 = try_expert_pin(file);
             if let Some(pin) = gpu.pin0.as_ref() {
@@ -504,6 +517,11 @@ impl Dsv4Gpu {
     /// Misses are computed on the CPU instead of being copied into the cache.
     pub(crate) fn cpu_miss(&self) -> bool {
         self.cpu_miss && self.has_expert_slots()
+    }
+
+    /// The host RAM tier, when the model file allows direct reads.
+    pub(crate) fn expert_ram(&self) -> Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>> {
+        self.ram.clone()
     }
 
     /// Count one routing of `(layer, expert)`.
@@ -964,6 +982,13 @@ impl Dsv4Gpu {
 
     pub fn finish_h2d_keep(&mut self) {
         self.h2d_keep.clear();
+        // Copies of this layer have landed: their source pages can go.
+        if !self.h2d_inflight && !self.h2d1_inflight {
+            for (ptr, len) in self.mapped_used.drain(..) {
+                // SAFETY: a slice of the model's mapping, which outlives the engine's GPU state.
+                crate::dsv4_ram::release_mapped(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) });
+            }
+        }
     }
 
     pub fn has_expert_slots(&self) -> bool {
@@ -1163,6 +1188,7 @@ impl Dsv4Gpu {
                 &mut plan.parts0
             };
             for (rel, sl) in slices {
+                self.mapped_used.push((sl.as_ptr() as usize, sl.len()));
                 dest.push((base + rel, sl));
             }
             if use_gpu1 {
@@ -3041,6 +3067,11 @@ impl Dsv4Gpu {
             prefill_device: 0,
             clock: 0,
             keep_set: HashSet::new(),
+            heat: HashMap::new(),
+            heat_routes: 0,
+            cpu_miss: false,
+            ram: None,
+            mapped_used: Vec::new(),
             h2d: None,
             h2d1: None,
             pin0: None,
@@ -3152,6 +3183,69 @@ fn packed_expert_bytes(dim: usize, ff: usize) -> usize {
 fn device_free_bytes(device: i32) -> u64 {
     let (free, _) = device_memory_info(device).unwrap_or((0, 0));
     allpaca_hip::device_local_headroom(device).map_or(free, |h| h.min(free))
+}
+
+/// RAM left to the rest of the system when the host expert tier is sized.
+const RAM_TIER_RESERVE: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The host RAM tier for experts that are not in VRAM: what is free now
+/// minus a reserve, or `ALLPACA_DSV4_RAM_MIB` (0 = off, experts are then
+/// read through the mapped file).
+fn open_expert_ram(
+    file: &GgufFile,
+    cfg: &ModelConfig,
+    slot: usize,
+    ram_free: Option<u64>,
+) -> Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>> {
+    let paths = file.shard_paths()?;
+    let all = (cfg.n_layers * cfg.n_experts) as u64 * slot as u64;
+    let budget = match std::env::var("ALLPACA_DSV4_RAM_MIB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(mib) => mib << 20,
+        None => ram_free?.saturating_sub(RAM_TIER_RESERVE),
+    }
+    .min(all);
+    let max_slice = mxfp4_matrix_bytes(cfg.ff_dim.max(1), cfg.dim).max(mxfp4_matrix_bytes(cfg.dim, cfg.ff_dim.max(1)));
+    match crate::dsv4_ram::ExpertRam::new(paths, slot, max_slice, budget) {
+        Ok(Some(ram)) => {
+            tracing::info!(
+                slots = ram.slots(),
+                bytes = ram.slots() as u64 * slot as u64,
+                "DeepSeek-V4 host RAM expert tier"
+            );
+            Some(Arc::new(std::sync::Mutex::new(ram)))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "DeepSeek-V4 host RAM expert tier unavailable; reading through the mapped file");
+            None
+        }
+    }
+}
+
+/// Where the three packed slices of one expert are in the model's files.
+pub(crate) fn expert_mxfp4_spans(
+    file: &GgufFile,
+    layer: usize,
+    expert: usize,
+    cfg: &ModelConfig,
+) -> Option<Vec<crate::dsv4_ram::FileSpan>> {
+    let n_exp = cfg.n_experts.max(1);
+    let mut out = Vec::with_capacity(3);
+    for part in ["gate", "up", "down"] {
+        let info = file.tensor(&format!("blk.{layer}.ffn_{part}_exps.weight"))?;
+        if info.ggml_type != GgmlType::MXFP4 {
+            return None;
+        }
+        let per = info.n_elements() as usize / n_exp;
+        let stride = per.div_ceil(MXFP4_BLOCK_ELEMS).saturating_mul(MXFP4_BLOCK_BYTES);
+        let (shard, start) = file.tensor_file_offset(info)?;
+        out.push(crate::dsv4_ram::FileSpan {
+            shard,
+            offset: start + (expert * stride) as u64,
+            len: stride,
+        });
+    }
+    Some(out)
 }
 
 /// The packed CPU expert kernel takes MXFP4 experts in whole 32-value blocks.
