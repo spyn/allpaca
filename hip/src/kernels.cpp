@@ -2059,6 +2059,56 @@ static int launch_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32
     return hip_status(hipGetLastError());
 }
 
+/* Memory-bound BF16 GEMV: one 32-lane group per output column, each lane
+ * reading 8 consecutive weights (16 bytes) per step, so a group streams 512
+ * contiguous bytes of the row at a time. `k` is a multiple of 8 and `a`, `b`
+ * are 16-byte aligned. */
+__global__ void gemv_nt_bf16_wide_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
+                                         int k) {
+    constexpr int GROUPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    if (row >= m) {
+        return;
+    }
+    float acc = 0.f;
+    if (col < n) {
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        const uint16_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+        for (int p = lane * 8; p < k; p += 256) {
+            const uint4 w = *reinterpret_cast<const uint4 *>(brow + p);
+            const float4 x0 = *reinterpret_cast<const float4 *>(arow + p);
+            const float4 x1 = *reinterpret_cast<const float4 *>(arow + p + 4);
+            acc += x0.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x)) +
+                   x0.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x >> 16)) +
+                   x0.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y)) +
+                   x0.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y >> 16)) +
+                   x1.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z)) +
+                   x1.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z >> 16)) +
+                   x1.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w)) +
+                   x1.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w >> 16));
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor(acc, off, 32);
+    }
+    if (col < n && lane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+/* ALLPACA_BF16_GEMV_WIDE=0 keeps the older shared-tile kernels. */
+static bool bf16_gemv_wide() {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_BF16_GEMV_WIDE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
 static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                                int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
@@ -2091,7 +2141,13 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
         }
         return hip_status(hipGetLastError());
     }
-    if (tiled) {
+    if (bf16_gemv_wide() && k % 8 == 0 && (reinterpret_cast<uintptr_t>(a) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(b) & 15u) == 0) {
+        constexpr int GROUPS = 8;
+        dim3 block(GROUPS * 32);
+        dim3 grid(static_cast<unsigned>((n + GROUPS - 1) / GROUPS), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_bf16_wide_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    } else if (tiled) {
         constexpr int COLS = 64;
         dim3 block(128);
         dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
