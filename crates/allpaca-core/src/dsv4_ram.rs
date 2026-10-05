@@ -159,6 +159,8 @@ pub(crate) struct ExpertRam {
     readers: Vec<Reader>,
     heat: HashMap<(usize, usize), f32>,
     requests: u64,
+    /// Slots being copied to a GPU cache: not evicted until released.
+    pinned: Vec<usize>,
 }
 
 impl ExpertRam {
@@ -192,6 +194,7 @@ impl ExpertRam {
             readers,
             heat: HashMap::new(),
             requests: 0,
+            pinned: Vec::new(),
         }))
     }
 
@@ -207,6 +210,28 @@ impl ExpertRam {
                 std::slice::from_raw_parts(self.arena.ptr.add(i * self.slot_bytes), self.slot_bytes)
             },
             Loc::Temp(i) => &self.temps[i][..self.slot_bytes],
+        }
+    }
+
+    /// The cached bytes of `key`, held in place until [`Self::release`]:
+    /// the source of a copy into a GPU cache. `None` when it is not cached.
+    pub(crate) fn pin(&mut self, key: (usize, usize)) -> Option<(*const u8, usize)> {
+        let slot = *self.index.get(&key)?;
+        if !self.pinned.contains(&slot) {
+            self.pinned.push(slot);
+        }
+        // SAFETY: slot `slot` lies inside the arena.
+        Some((unsafe { self.arena.ptr.add(slot * self.slot_bytes).cast_const() }, self.slot_bytes))
+    }
+
+    /// The copies of `keys` have landed: unpin them, and drop them from the
+    /// cache, since a GPU holds them now.
+    pub(crate) fn release(&mut self, keys: &[(usize, usize)]) {
+        for key in keys {
+            if let Some(slot) = self.index.remove(key) {
+                self.slots[slot] = None;
+                self.pinned.retain(|s| *s != slot);
+            }
         }
     }
 
@@ -342,7 +367,9 @@ impl ExpertRam {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, k)| k.map(|k| (i, k)))
-                    .filter(|(_, k)| !(k.0 == layer && wanted.iter().any(|(e, _)| *e == k.1)))
+                    .filter(|(i, k)| {
+                        !self.pinned.contains(i) && !(k.0 == layer && wanted.iter().any(|(e, _)| *e == k.1))
+                    })
                     .map(|(i, k)| (i, self.heat.get(&k).copied().unwrap_or(0.0)))
                     .min_by(|a, b| a.1.total_cmp(&b.1))?;
                 if self.heat.get(&key).copied().unwrap_or(0.0) < cold + HEAT_MARGIN {
@@ -509,6 +536,18 @@ mod tests {
         let locs = ram.fetch(7, &want(&[2]), &metrics).unwrap();
         check(&ram, locs[0], 2);
         assert_eq!(reads(&metrics), 15, "the fourth request is a RAM hit");
+
+        // A pinned expert keeps its bytes while others are fetched, and
+        // leaves the cache when released.
+        let (ptr, len) = ram.pin((7, 2)).expect("cached");
+        for _ in 0..6 {
+            ram.fetch(7, &want(&[3]), &metrics).unwrap();
+        }
+        // SAFETY: pinned, so the slot was not reused.
+        let held = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(held[..part].iter().all(|v| *v == 6) && held[2 * part..].iter().all(|v| *v == 8));
+        ram.release(&[(7, 2)]);
+        assert!(ram.pin((7, 2)).is_none());
 
         // The same expert number in another layer is a different expert.
         let locs = ram.fetch(8, &want(&[3]), &metrics).unwrap();

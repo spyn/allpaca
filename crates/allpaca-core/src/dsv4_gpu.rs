@@ -47,6 +47,13 @@ const ACT_SLOTS: usize = 3;
 /// `ulimit -l` (8 MiB here). Registering the whole GGUF mmap still fails;
 /// attach probes one window and uses ping-pong `hipHostRegister` when it works.
 const PIN_CHUNK_TRY: [usize; 2] = [2 * 1024 * 1024, 1024 * 1024];
+/// Bounce buffer sizes, largest first. Where pinned memory is not rationed
+/// by `ulimit -l`, one buffer takes a whole expert (13.4 MB for
+/// DeepSeek-V4-Flash) in a single copy.
+#[cfg(windows)]
+const PIN_BOUNCE_TRY: [usize; 4] = [16 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024];
+#[cfg(not(windows))]
+const PIN_BOUNCE_TRY: [usize; 2] = PIN_CHUNK_TRY;
 const HOST_PAGE: usize = 4096;
 /// Prefault this many host bytes, then decide if the rest is already in RAM.
 const PREFAULT_WARM_PROBE_BYTES: usize = 12 * 1024 * 1024;
@@ -182,7 +189,7 @@ fn try_window_pin_pair() -> PinPair {
 }
 
 fn try_pin_pair() -> Option<PinPair> {
-    for bytes in PIN_CHUNK_TRY {
+    for bytes in PIN_BOUNCE_TRY {
         let a = match host_malloc(bytes) {
             Ok(p) => p,
             Err(_) => continue,
@@ -346,6 +353,8 @@ pub struct Dsv4Gpu {
     ram: Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>>,
     /// Mapped expert slices handed to a GPU copy, released once it landed.
     mapped_used: Vec<(usize, usize)>,
+    /// RAM-tier experts pinned as the source of a GPU copy.
+    ram_pinned: Vec<(usize, usize)>,
 }
 
 impl Dsv4Gpu {
@@ -491,6 +500,7 @@ impl Dsv4Gpu {
                 && cpu_expert_kernel_fits(file, cfg),
             ram: None,
             mapped_used: Vec::new(),
+            ram_pinned: Vec::new(),
         };
         if gpu.cpu_miss {
             gpu.ram = open_expert_ram(file, cfg, gpu.expert_slot, ram_free);
@@ -988,6 +998,12 @@ impl Dsv4Gpu {
                 // SAFETY: a slice of the model's mapping, which outlives the engine's GPU state.
                 crate::dsv4_ram::release_mapped(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) });
             }
+            if !self.ram_pinned.is_empty() {
+                if let Some(ram) = self.ram.as_ref() {
+                    ram.lock().unwrap_or_else(|e| e.into_inner()).release(&self.ram_pinned);
+                }
+                self.ram_pinned.clear();
+            }
         }
     }
 
@@ -1182,14 +1198,32 @@ impl Dsv4Gpu {
             }
             let base = victim * self.expert_slot;
             let n_parts = slices.len();
+            // An expert that earned a GPU slot has usually been run on the
+            // CPU, so its bytes are in the RAM tier: copy from there, not
+            // through the mapped file.
+            let cached = self.ram.as_ref().and_then(|ram| {
+                let mut ram = ram.lock().unwrap_or_else(|e| e.into_inner());
+                ram.pin(key).filter(|(_, len)| *len == packed_len)
+            });
+            if cached.is_some() {
+                self.ram_pinned.push(key);
+            }
             let dest = if use_gpu1 {
                 &mut plan.parts1
             } else {
                 &mut plan.parts0
             };
             for (rel, sl) in slices {
-                self.mapped_used.push((sl.as_ptr() as usize, sl.len()));
-                dest.push((base + rel, sl));
+                let src: &'a [u8] = match cached {
+                    // SAFETY: pinned in the RAM tier until `finish_h2d_keep`,
+                    // which runs after this plan's copies have landed.
+                    Some((ptr, _)) => unsafe { std::slice::from_raw_parts(ptr.add(rel), sl.len()) },
+                    None => {
+                        self.mapped_used.push((sl.as_ptr() as usize, sl.len()));
+                        sl
+                    }
+                };
+                dest.push((base + rel, src));
             }
             if use_gpu1 {
                 plan.groups1.push((expert, n_parts));
@@ -3072,6 +3106,7 @@ impl Dsv4Gpu {
             cpu_miss: false,
             ram: None,
             mapped_used: Vec::new(),
+            ram_pinned: Vec::new(),
             h2d: None,
             h2d1: None,
             pin0: None,
