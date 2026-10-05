@@ -215,6 +215,7 @@ pub struct Metrics {
     pub dsv4_pack_ns: AtomicU64,
     pub dsv4_hc_ns: AtomicU64,
     pub dsv4_router_ns: AtomicU64,
+    pub dsv4_cpu_expert_ns: AtomicU64,
     pub dsv4_embed_ns: AtomicU64,
 }
 
@@ -399,6 +400,7 @@ impl Metrics {
             dsv4_pack_us: self.dsv4_pack_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             dsv4_hc_us: self.dsv4_hc_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             dsv4_router_us: self.dsv4_router_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
+            dsv4_cpu_expert_us: self.dsv4_cpu_expert_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             dsv4_embed_us: self.dsv4_embed_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
         }
     }

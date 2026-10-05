@@ -33,6 +33,14 @@ const HBM_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// (host RAM is 128 GiB; the Unsloth shard is 149 GiB) and turns mmap prefault
 /// into NVMe. 12 GiB ×2 holds the ChatML routed working set (~23 GiB).
 const EXPERT_LRU_MAX_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+/// Routing counts fade by `HEAT_DECAY` every this many routed experts
+/// (about eight tokens of DeepSeek-V4-Flash).
+const HEAT_DECAY_ROUTES: u64 = 2048;
+const HEAT_DECAY: f32 = 0.8;
+/// An expert displaces a resident one only when it has been routed this
+/// much more often: a copy costs several milliseconds, a miss on the CPU
+/// well under one.
+const HEAT_MARGIN: f32 = 2.0;
 const ACT_SLOT_FLOATS: usize = 131072;
 const ACT_SLOTS: usize = 3;
 /// Bounce / mmap-window size. Two in-flight windows × two GPUs must fit
@@ -327,6 +335,13 @@ pub struct Dsv4Gpu {
     warmup_miss: Vec<(usize, usize)>,
     pub used: AtomicBool,
     keep_set: HashSet<(usize, usize)>,
+    /// Decayed routing count per (layer, expert): what earns a cache slot.
+    heat: HashMap<(usize, usize), f32>,
+    heat_routes: u64,
+    /// Cache misses run on the CPU from the mapped file, and an expert
+    /// takes a slot only when it is routed clearly more often than the
+    /// coldest resident one. Off: every miss is copied in (plain LRU).
+    cpu_miss: bool,
 }
 
 impl Dsv4Gpu {
@@ -462,6 +477,10 @@ impl Dsv4Gpu {
             warmup_miss: Vec::new(),
             used: AtomicBool::new(false),
             keep_set: HashSet::new(),
+            heat: HashMap::new(),
+            heat_routes: 0,
+            cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").map_or(true, |v| v != "0")
+                && cpu_expert_kernel_fits(file, cfg),
         };
         if gpu.h2d.is_some() {
             gpu.pin0 = try_expert_pin(file);
@@ -480,6 +499,61 @@ impl Dsv4Gpu {
         }
         gpu.alloc_expert_pools(cfg)?;
         Ok(gpu)
+    }
+
+    /// Misses are computed on the CPU instead of being copied into the cache.
+    pub(crate) fn cpu_miss(&self) -> bool {
+        self.cpu_miss && self.has_expert_slots()
+    }
+
+    /// Count one routing of `(layer, expert)`.
+    pub(crate) fn note_route(&mut self, layer: usize, expert: usize) {
+        *self.heat.entry((layer, expert)).or_insert(0.0) += 1.0;
+        self.heat_routes += 1;
+        if self.heat_routes % HEAT_DECAY_ROUTES == 0 {
+            self.heat.retain(|_, h| {
+                *h *= HEAT_DECAY;
+                *h > 0.05
+            });
+        }
+    }
+
+    /// Whether `(layer, expert)`, which is not resident, takes a cache slot
+    /// now: always while slots are free, else only when it is routed
+    /// clearly more often than the coldest resident expert of each cache,
+    /// which then becomes the next one evicted.
+    pub(crate) fn admits(&mut self, layer: usize, expert: usize) -> bool {
+        if !self.cpu_miss {
+            return true;
+        }
+        if self.slots.iter().chain(&self.gpu1_slots).any(|s| s.key.is_none()) {
+            return true;
+        }
+        let heat = &self.heat;
+        let coldest = |slots: &[ExpertSlot]| -> Option<(usize, f32)> {
+            slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.pinned)
+                .filter_map(|(i, s)| s.key.map(|k| (i, heat.get(&k).copied().unwrap_or(0.0))))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        };
+        let (c0, c1) = (coldest(&self.slots), coldest(&self.gpu1_slots));
+        let floor = match (c0, c1) {
+            (Some(a), Some(b)) => a.1.max(b.1),
+            (Some(a), None) | (None, Some(a)) => a.1,
+            (None, None) => return false,
+        };
+        if heat.get(&(layer, expert)).copied().unwrap_or(0.0) < floor + HEAT_MARGIN {
+            return false;
+        }
+        if let Some((i, _)) = c0 {
+            self.slots[i].used = 0;
+        }
+        if let Some((i, _)) = c1 {
+            self.gpu1_slots[i].used = 0;
+        }
+        true
     }
 
     fn pin_keep(&self, key: (usize, usize)) -> bool {
@@ -509,7 +583,7 @@ impl Dsv4Gpu {
             if full_prefill {
                 self.try_alloc_prefill_layer(dhip.device, cfg);
             }
-            let (free1, _) = device_memory_info(dhip.device).unwrap_or((0, 0));
+            let free1 = device_free_bytes(dhip.device);
             if let Some((blob, n1)) = try_alloc_expert_lru(
                 dhip.device,
                 expert_lru_slots(free1, self.expert_slot),
@@ -548,7 +622,7 @@ impl Dsv4Gpu {
         if full_prefill && self.prefill.is_none() {
             self.try_alloc_prefill_layer(hip.device, cfg);
         }
-        let (free0, _) = device_memory_info(hip.device).unwrap_or((0, 0));
+        let free0 = device_free_bytes(hip.device);
         if let Some((blob, n0)) = try_alloc_expert_lru(
             hip.device,
             expert_lru_slots(free0, self.expert_slot),
@@ -3072,6 +3146,26 @@ fn packed_expert_bytes(dim: usize, ff: usize) -> usize {
         .saturating_add(mxfp4_matrix_bytes(dim, ff))
 }
 
+/// VRAM an expert cache may take on `device`: what the driver reports, capped
+/// by what the OS says no process holds. On Windows `hipMemGetInfo` ignores
+/// the desktop's share, and a cache sized from it spills into system RAM.
+fn device_free_bytes(device: i32) -> u64 {
+    let (free, _) = device_memory_info(device).unwrap_or((0, 0));
+    allpaca_hip::device_local_headroom(device).map_or(free, |h| h.min(free))
+}
+
+/// The packed CPU expert kernel takes MXFP4 experts in whole 32-value blocks.
+fn cpu_expert_kernel_fits(file: &GgufFile, cfg: &ModelConfig) -> bool {
+    let blk = cfg.gguf_blk(0);
+    cfg.dim % MXFP4_BLOCK_ELEMS == 0
+        && cfg.ff_dim > 0
+        && cfg.ff_dim % MXFP4_BLOCK_ELEMS == 0
+        && ["gate", "up", "down"].iter().all(|part| {
+            file.tensor(&format!("blk.{blk}.ffn_{part}_exps.weight"))
+                .is_some_and(|t| t.ggml_type == GgmlType::MXFP4)
+        })
+}
+
 fn expert_lru_slots(free: u64, slot: usize) -> usize {
     if slot == 0 {
         return 0;
@@ -3809,7 +3903,7 @@ fn run_expert_swiglu_pipelined(
     (out, failed)
 }
 
-fn expert_mxfp4_parts<'a>(
+pub(crate) fn expert_mxfp4_parts<'a>(
     file: &'a GgufFile,
     layer: usize,
     expert: usize,

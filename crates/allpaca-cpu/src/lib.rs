@@ -1,7 +1,9 @@
 //! CPU fallback for every kernel the control plane may call.
 
 mod kernels;
+mod mxfp4_expert;
 
+pub use mxfp4_expert::{mxfp4_swiglu_experts, Mxfp4Expert};
 pub use kernels::{
     det_expf, det_silu_mul,
     attention, attention_softcap, attention_with_mask, attention_with_mask_softcap, bf16_to_f32,

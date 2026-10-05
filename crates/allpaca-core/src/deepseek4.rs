@@ -2515,6 +2515,23 @@ fn dsv4_apply_moe(
         fcomb,
         picks,
     } = prep;
+    // Experts that stay out of the GPU caches run on the CPU, beside the
+    // GPU work.
+    let mut cpu_work: Vec<(usize, Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
+    let picks: Vec<(usize, f32)> = match (gpu.as_mut(), file) {
+        (Some(g), Some(_)) if g.cpu_miss() => picks
+            .into_iter()
+            .filter(|&(e, w)| {
+                g.note_route(blk, e);
+                let on_gpu = g.resident_expert(blk, e).is_some() || g.admits(blk, e);
+                if !on_gpu {
+                    cpu_work.push((e, fcur.clone(), vec![(0, w)]));
+                }
+                on_gpu
+            })
+            .collect(),
+        _ => picks,
+    };
     let ids: Vec<usize> = picks.iter().map(|(e, _)| *e).collect();
     if warmup {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
@@ -2539,6 +2556,14 @@ fn dsv4_apply_moe(
         .map(|g| if g.has_expert_slots() { picks.len() } else { 0 })
         .unwrap_or(0);
     let mut routed = vec![0.0f32; dim];
+    let cpu_sum = std::thread::scope(|s| -> Result<Option<Vec<f32>>, AllpacaError> {
+    let cpu_jh = match file {
+        Some(f) if !cpu_work.is_empty() => {
+            let work = &cpu_work;
+            Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, 1, metrics)))
+        }
+        _ => None,
+    };
     let mut deferred: Vec<(usize, usize, f32)> = Vec::new();
     for (i, (e, w)) in picks.into_iter().enumerate() {
         if gpu.as_ref().is_some_and(|g| g.expert_copy_pending(blk, e)) {
@@ -2599,6 +2624,17 @@ fn dsv4_apply_moe(
             routed[j] += y[j] * w;
         }
     }
+    match cpu_jh.map(|jh| jh.join()) {
+        Some(Ok(sum)) => sum.map(Some),
+        Some(Err(_)) => Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "CPU expert thread panicked".into(),
+        ))),
+        None => Ok(None),
+    }
+    })?;
+    if let Some(sum) = cpu_sum {
+        add_acc_slice(&mut routed, &sum);
+    }
     if let Some(g) = gpu.as_mut() {
         g.finish_h2d_keep();
     }
@@ -2647,6 +2683,49 @@ fn dsv4_apply_moe(
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Ok(streams)
+}
+
+/// Routed experts that are not in a GPU cache, computed on the CPU from the
+/// mapped MXFP4 file. `work` is `(expert, its m rows of dim, [(token, weight)])`;
+/// the result is the weighted sum per token, `n_tok * dim`.
+fn dsv4_cpu_experts(
+    file: &GgufFile,
+    blk: usize,
+    cfg: &ModelConfig,
+    work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
+    n_tok: usize,
+    metrics: &Metrics,
+) -> Result<Vec<f32>, AllpacaError> {
+    let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
+    let t = Instant::now();
+    let mut parts = Vec::with_capacity(work.len());
+    for (e, _, _) in work {
+        parts.push(crate::dsv4_gpu::expert_mxfp4_parts(file, blk, *e, cfg)?);
+    }
+    let experts: Vec<allpaca_cpu::Mxfp4Expert<'_>> = work
+        .iter()
+        .zip(&parts)
+        .map(|((_, x, group), p)| allpaca_cpu::Mxfp4Expert {
+            gate: p[0].1,
+            up: p[1].1,
+            down: p[2].1,
+            x,
+            m: group.len(),
+        })
+        .collect();
+    // Half the logical cores: the rest drive the GPUs and the copies.
+    let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
+    let ys = allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, threads);
+    let mut sum = vec![0.0f32; n_tok.saturating_mul(dim)];
+    for (y, (_, _, group)) in ys.iter().zip(work) {
+        scatter_expert_rows(&mut sum, y, group, dim);
+    }
+    metrics.expert_lru_misses.fetch_add(work.len() as u64, Ordering::Relaxed);
+    metrics.expert_cpu_runs.fetch_add(work.len() as u64, Ordering::Relaxed);
+    metrics
+        .dsv4_cpu_expert_ns
+        .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Ok(sum)
 }
 
 fn scatter_expert_rows(routed: &mut [f32], y: &[f32], group: &[(usize, f32)], dim: usize) {
@@ -2857,10 +2936,42 @@ fn dsv4_apply_moe_rows(
         }
         u
     };
+    // Experts that stay out of the GPU caches run on the CPU instead.
+    let cpu_miss = file.is_some() && gpu.as_ref().is_some_and(|g| g.cpu_miss());
+    let hint: Vec<usize> = match gpu.as_mut() {
+        Some(g) if cpu_miss => {
+            for prep in &preps {
+                for (e, _) in &prep.picks {
+                    g.note_route(blk, *e);
+                }
+            }
+            hint.into_iter()
+                .filter(|&e| g.resident_expert(blk, e).is_some() || g.admits(blk, e))
+                .collect()
+        }
+        _ => hint,
+    };
     let warmup_plan = match (gpu.as_mut(), file) {
         (Some(g), Some(f)) => g.warmup_experts(f, blk, &hint, cfg, Some(metrics)).ok(),
         _ => None,
     };
+    // The expert inputs may live on the GPU only (`xs` is then stale): the
+    // CPU experts need them on the host.
+    if cpu_miss {
+        if let Some(g) = gpu.as_ref() {
+            let on_cpu = preps
+                .iter()
+                .flat_map(|p| p.picks.iter())
+                .any(|(e, _)| g.resident_expert(blk, *e).is_none());
+            if on_cpu {
+                if let Some((ptr, n)) = g.hc_curs_device() {
+                    if n == xs.len() {
+                        g.copy_d2h_f32(ptr, &mut xs)?;
+                    }
+                }
+            }
+        }
+    }
     let gpu_slots = gpu.as_ref().is_some_and(|g| g.has_expert_slots());
     let mut groups: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
     for (t, prep) in preps.iter().enumerate() {
@@ -2959,6 +3070,13 @@ fn dsv4_apply_moe_rows(
             }
         }
     }
+    let cpu_now = if cpu_miss {
+        std::mem::take(&mut cpu_work)
+    } else {
+        Vec::new()
+    };
+    let mut cpu_sum: Option<Vec<f32>> = None;
+    let mut cpu_err: Option<AllpacaError> = None;
     let ff = cfg.ff_dim.max(1);
     let mut gpu_out: Vec<(Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
     let mut inflight = (false, false);
@@ -2967,6 +3085,13 @@ fn dsv4_apply_moe_rows(
     let (tx, rx) = std::sync::mpsc::channel();
     let mut bounced = false;
     std::thread::scope(|s| {
+        let cpu_jh = match file {
+            Some(f) if !cpu_now.is_empty() => {
+                let work = &cpu_now;
+                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, metrics)))
+            }
+            _ => None,
+        };
         let bounce = match (gpu.as_ref(), warmup_plan.as_ref()) {
             (Some(g), Some(plan)) if !plan.is_empty() => {
                 bounced = true;
@@ -3076,7 +3201,20 @@ fn dsv4_apply_moe_rows(
                 Err(_) => tracing::warn!("expert miss H2D thread panicked"),
             }
         }
+        match cpu_jh.map(|jh| jh.join()) {
+            Some(Ok(Ok(sum))) => cpu_sum = Some(sum),
+            Some(Ok(Err(e))) => cpu_err = Some(e),
+            Some(Err(_)) => {
+                cpu_err = Some(AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "CPU expert thread panicked".into(),
+                )))
+            }
+            None => {}
+        }
     });
+    if let Some(e) = cpu_err {
+        return Err(e);
+    }
     if !shexp_done {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
             if let Ok(y) = g.shexp_swiglu_rows(f, blk, &xs, n_tok, dim, sff_hint, Some(metrics)) {
@@ -3162,6 +3300,15 @@ fn dsv4_apply_moe_rows(
                         folded = false;
                     }
                 }
+                if folded {
+                    if let Some(sum) = cpu_sum.as_ref() {
+                        if h0.moe_add_from_host(sum).is_ok() {
+                            cpu_sum = None;
+                        } else {
+                            folded = false;
+                        }
+                    }
+                }
                 if folded && !shexp_dev {
                     if h0.moe_add_from_host(&shexp_y).is_ok() {
                         shexp_dev = true;
@@ -3192,6 +3339,9 @@ fn dsv4_apply_moe_rows(
         add_moe_acc(hip0.as_ref(), &mut routed, n_tok, dim);
         if let Some(tmp) = gpu1_host.as_ref() {
             add_acc_slice(&mut routed, tmp);
+        }
+        if let Some(sum) = cpu_sum.as_ref() {
+            add_acc_slice(&mut routed, sum);
         }
         let _ = hip0.as_ref().map(|h| h.bind());
         for (y, group) in gpu_out {
@@ -4413,6 +4563,33 @@ pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real weights (`ALLPACA_DSV4_GGUF` = first shard): the packed CPU expert
+    /// kernel against dequantise-then-F32 on experts taken from the file.
+    #[test]
+    fn cpu_packed_experts_match_dequantised_on_real_weights() {
+        let Ok(path) = std::env::var("ALLPACA_DSV4_GGUF") else {
+            return;
+        };
+        let file = GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let cfg = ModelConfig::from_gguf(&file).expect("config");
+        let (dim, ff) = (cfg.dim, cfg.ff_dim);
+        let metrics = Metrics::default();
+        for (blk, expert, m) in [(0usize, 3usize, 1usize), (5, 17, 1), (20, 255, 2), (cfg.n_layers - 1, 128, 1)] {
+            let x: Vec<f32> = (0..m * dim)
+                .map(|i| (((i * 2654435761usize) >> 7) % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            let ffn = load_mxfp4_expert(&file, blk, expert, cfg.n_experts, dim, ff).expect("dequant");
+            let mut want = vec![0.0f32; m * dim];
+            expert_mlp_rows(&x, &ffn, ff, dim, m, &mut want, false).expect("reference");
+            let group: Vec<(usize, f32)> = (0..m).map(|t| (t, 1.0)).collect();
+            let got = dsv4_cpu_experts(&file, blk, &cfg, &[(expert, x, group)], m, &metrics).expect("packed");
+            let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
+            let worst = got.iter().zip(&want).fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
+            eprintln!("blk {blk} expert {expert} m {m}: |y| max {scale:.4} worst diff {worst:.3e}");
+            assert!(worst <= 1e-3 * scale, "blk {blk} expert {expert}: worst {worst} of {scale}");
+        }
+    }
 
     #[test]
     fn device_shexp_runs_when_cpu_shexp_loader_is_skipped() {

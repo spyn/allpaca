@@ -341,6 +341,10 @@ pub struct StatsSnapshot {
     pub dsv4_hc_us: f64,
     #[serde(default)]
     pub dsv4_router_us: f64,
+    /// DeepSeek-V4: time in routed experts computed on the CPU from the
+    /// mapped file (GPU cache misses).
+    #[serde(default)]
+    pub dsv4_cpu_expert_us: f64,
     #[serde(default)]
     pub dsv4_embed_us: f64,
 }
