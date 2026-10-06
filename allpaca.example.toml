@@ -70,6 +70,10 @@ trunk_bytes = 0
 cache_bytes = 0
 ring_slots = 2
 miss_policy = "qstar"           # qstar | fill | cpu
+# RAM budget for experts held on the host. 0 = unlimited for models whose experts
+# fit in RAM. For DeepSeek-V4 it is the RAM tier between the GPU caches and the
+# model file: 0 = the RAM free at load minus 8 GiB (differs between starts),
+# e.g. 53687091200 for a fixed 50 GiB.
 host_bytes = 0
 
 # Per-model MoE pin-prefer keep-set from `allpaca-server --tune`.

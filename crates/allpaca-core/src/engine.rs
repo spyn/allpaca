@@ -1979,7 +1979,12 @@ impl Engine {
                     g.target.clone()
                 };
                 if let Some(target) = target {
-                    match crate::dsv4_gpu::attach(&target, hip, self.draft_hip.as_ref()) {
+                    match crate::dsv4_gpu::attach(
+                        &target,
+                        hip,
+                        self.draft_hip.as_ref(),
+                        self.config.weights.host_bytes as u64,
+                    ) {
                         Ok(()) => {
                             let keep = self.tune_keep_ids(&target);
                             if let Err(e) = crate::dsv4_gpu::apply_keep_set(&target, &keep) {

@@ -573,6 +573,11 @@ pub struct WeightsSection {
     pub miss_policy: MissPolicy,
     /// DRAM budget for the expert host pool. 0 = unlimited (experts stay in RAM).
     /// When the pool exceeds this, experts pack to an aligned file and page in via Direct I/O.
+    ///
+    /// DeepSeek-V4: the size of the RAM tier that holds the experts the GPU
+    /// caches do not (the rest are read from the model file as needed). 0 =
+    /// automatic: the RAM free when the model loads minus 8 GiB, which varies
+    /// from start to start. Set it for a tier of a fixed size.
     pub host_bytes: usize,
 }
 

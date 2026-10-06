@@ -383,6 +383,7 @@ impl Dsv4Gpu {
         cfg: &ModelConfig,
         hip: Arc<HipWorkspace>,
         draft: Option<Arc<HipWorkspace>>,
+        host_bytes: u64,
     ) -> Result<Self, AllpacaError> {
         hip.bind()?;
         // Before the dense weights pass through this process on their way
@@ -538,7 +539,7 @@ impl Dsv4Gpu {
             read_ahead: None,
         };
         if gpu.cpu_miss {
-            gpu.ram = open_expert_ram(file, cfg, gpu.expert_slot, ram_free);
+            gpu.ram = open_expert_ram(file, cfg, gpu.expert_slot, ram_free, host_bytes);
         }
         if gpu.h2d.is_some() {
             gpu.pin0 = try_expert_pin(file);
@@ -3318,28 +3319,48 @@ fn device_free_bytes(device: i32) -> u64 {
 /// RAM left to the rest of the system when the host expert tier is sized.
 const RAM_TIER_RESERVE: u64 = 8 * 1024 * 1024 * 1024;
 
-/// The host RAM tier for experts that are not in VRAM: what is free now
-/// minus a reserve, or `ALLPACA_DSV4_RAM_MIB` (0 = off, experts are then
-/// read through the mapped file).
+/// Bytes the host RAM expert tier may take, and where the figure comes
+/// from. In order: `ALLPACA_DSV4_RAM_MIB` (0 = no tier, experts are read
+/// through the mapped file), then `weights.host_bytes` when it is set,
+/// then the RAM free at load minus [`RAM_TIER_RESERVE`]. Never more than
+/// all the experts, `all`.
+///
+/// The automatic figure is a snapshot: a server started while another large
+/// process is still exiting sees less. Set `weights.host_bytes` for a tier
+/// that is the same size on every start.
+fn ram_tier_budget(
+    env_mib: Option<u64>,
+    host_bytes: u64,
+    ram_free: Option<u64>,
+    all: u64,
+) -> Option<(u64, &'static str)> {
+    let (bytes, source) = match env_mib {
+        Some(mib) => (mib << 20, "ALLPACA_DSV4_RAM_MIB"),
+        None if host_bytes > 0 => (host_bytes, "weights.host_bytes"),
+        None => (ram_free?.saturating_sub(RAM_TIER_RESERVE), "free RAM at load"),
+    };
+    Some((bytes.min(all), source))
+}
+
+/// The host RAM tier for experts that are not in VRAM.
 fn open_expert_ram(
     file: &GgufFile,
     cfg: &ModelConfig,
     slot: usize,
     ram_free: Option<u64>,
+    host_bytes: u64,
 ) -> Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>> {
     let paths = file.shard_paths()?;
     let all = (cfg.n_layers * cfg.n_experts) as u64 * slot as u64;
-    let budget = match std::env::var("ALLPACA_DSV4_RAM_MIB").ok().and_then(|v| v.parse::<u64>().ok()) {
-        Some(mib) => mib << 20,
-        None => ram_free?.saturating_sub(RAM_TIER_RESERVE),
-    }
-    .min(all);
+    let env_mib = std::env::var("ALLPACA_DSV4_RAM_MIB").ok().and_then(|v| v.parse::<u64>().ok());
+    let (budget, source) = ram_tier_budget(env_mib, host_bytes, ram_free, all)?;
     let max_slice = mxfp4_matrix_bytes(cfg.ff_dim.max(1), cfg.dim).max(mxfp4_matrix_bytes(cfg.dim, cfg.ff_dim.max(1)));
     match crate::dsv4_ram::ExpertRam::new(paths, slot, max_slice, budget) {
         Ok(Some(ram)) => {
             tracing::info!(
                 slots = ram.slots(),
                 bytes = ram.slots() as u64 * slot as u64,
+                budget_from = source,
                 "DeepSeek-V4 host RAM expert tier"
             );
             Some(Arc::new(std::sync::Mutex::new(ram)))
@@ -4242,6 +4263,7 @@ pub fn attach(
     model: &TinyModel,
     hip: &Arc<HipWorkspace>,
     draft: Option<&Arc<HipWorkspace>>,
+    host_bytes: u64,
 ) -> Result<(), AllpacaError> {
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad("missing DeepSeek-V4 weights".into()))
@@ -4251,7 +4273,7 @@ pub fn attach(
             "DeepSeek-V4 GGUF handle missing for HIP attach".into(),
         ))
     })?;
-    let mut gpu = Dsv4Gpu::build(file.as_ref(), &model.config, hip.clone(), draft.cloned())?;
+    let mut gpu = Dsv4Gpu::build(file.as_ref(), &model.config, hip.clone(), draft.cloned(), host_bytes)?;
     gpu.start_read_ahead(&file, &model.config);
     let mut guard = dsv4
         .gpu
@@ -4357,6 +4379,33 @@ mod tests {
         HBM_RESERVE,
     };
     use crate::model::ModelConfig;
+
+    #[test]
+    fn ram_tier_budget_prefers_the_env_then_the_config_then_free_ram() {
+        const GIB: u64 = 1 << 30;
+        let all = 140 * GIB;
+        // Automatic: what is free minus the reserve; unknown free RAM = no tier.
+        assert_eq!(super::ram_tier_budget(None, 0, Some(60 * GIB), all), Some((52 * GIB, "free RAM at load")));
+        assert_eq!(super::ram_tier_budget(None, 0, Some(4 * GIB), all), Some((0, "free RAM at load")));
+        assert_eq!(super::ram_tier_budget(None, 0, None, all), None);
+        // `weights.host_bytes` does not depend on what happens to be free.
+        assert_eq!(
+            super::ram_tier_budget(None, 40 * GIB, Some(10 * GIB), all),
+            Some((40 * GIB, "weights.host_bytes"))
+        );
+        assert_eq!(super::ram_tier_budget(None, 40 * GIB, None, all), Some((40 * GIB, "weights.host_bytes")));
+        // The environment overrides both; 0 turns the tier off.
+        assert_eq!(
+            super::ram_tier_budget(Some(1024), 40 * GIB, Some(60 * GIB), all),
+            Some((GIB, "ALLPACA_DSV4_RAM_MIB"))
+        );
+        assert_eq!(
+            super::ram_tier_budget(Some(0), 40 * GIB, Some(60 * GIB), all),
+            Some((0, "ALLPACA_DSV4_RAM_MIB"))
+        );
+        // Never more than the model's experts.
+        assert_eq!(super::ram_tier_budget(None, 500 * GIB, None, all), Some((all, "weights.host_bytes")));
+    }
 
     #[test]
     fn unsloth_short_prefill_skips_full_layer() {
