@@ -7166,6 +7166,40 @@ fn tiny_deepseek4_hip_matches_cpu() {
     }
 }
 
+/// Dense tensors stored as Q8_0 (Unsloth UD-Q4_K_XL) run on the GPU from
+/// staged int8 blocks, through the same path as BF16.
+#[cfg(feature = "hip")]
+#[test]
+fn tiny_deepseek4_q8_dense_hip_matches_cpu() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip tiny_deepseek4_q8_dense_hip_matches_cpu: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_hip_tiny_dsv4_q8-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    allpaca_core::write_tiny_deepseek4_q8_gguf(&path);
+    let (cpu_ids, _) = tiny_dsv4_generate(&path, true);
+    let (hip_ids, hip_stats) = tiny_dsv4_generate(&path, false);
+    let _ = std::fs::remove_file(&path);
+    assert!(!cpu_ids.is_empty());
+    assert_eq!(
+        hip_ids, cpu_ids,
+        "Q8_0 dense HIP must match CPU; hip={hip_ids:?} cpu={cpu_ids:?} stats={hip_stats:?}"
+    );
+    if hip_stats.backend == "hip" {
+        assert!(
+            hip_stats.gpu_forwards > 0,
+            "Q8_0 dense HIP generate should record gpu_forwards; stats={hip_stats:?}"
+        );
+    }
+}
+
 /// Decode `prompts` concurrently through `poll` (all admitted at once) and
 /// return each request's token ids in prompt order.
 #[cfg(feature = "hip")]

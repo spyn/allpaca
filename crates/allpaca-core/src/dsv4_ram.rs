@@ -8,11 +8,15 @@
 //! what stays in RAM). The cache has a fixed budget and keeps the experts
 //! that are routed most.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::{Arc, Mutex};
+
+use allpaca_gguf::{GgmlType, GgufFile};
 
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -27,6 +31,12 @@ const HEAT_DECAY_EVERY: u64 = 4096;
 const HEAT_DECAY: f32 = 0.8;
 /// A cached expert is replaced only by one requested this much more often.
 const HEAT_MARGIN: f32 = 1.0;
+/// Read-ahead experts waiting to be asked for; the oldest give way.
+const STAGE_MAX: usize = 24;
+/// Parallel readers of the read-ahead worker.
+const AHEAD_READERS: usize = 4;
+/// A read-ahead predicts for at most this many rows.
+pub(crate) const AHEAD_MAX_ROWS: usize = 4;
 
 /// Where one tensor slice of an expert lives on disk.
 #[derive(Debug, Clone)]
@@ -161,6 +171,12 @@ pub(crate) struct ExpertRam {
     requests: u64,
     /// Slots being copied to a GPU cache: not evicted until released.
     pinned: Vec<usize>,
+    /// Experts read ahead of use, oldest first.
+    staged: VecDeque<((usize, usize), Vec<u8>)>,
+    /// Expert-sized buffers to reuse.
+    spare: Vec<Vec<u8>>,
+    staged_total: u64,
+    staged_reported: u64,
 }
 
 impl ExpertRam {
@@ -195,6 +211,10 @@ impl ExpertRam {
             heat: HashMap::new(),
             requests: 0,
             pinned: Vec::new(),
+            staged: VecDeque::new(),
+            spare: Vec::new(),
+            staged_total: 0,
+            staged_reported: 0,
         }))
     }
 
@@ -211,6 +231,36 @@ impl ExpertRam {
             },
             Loc::Temp(i) => &self.temps[i][..self.slot_bytes],
         }
+    }
+
+    /// The experts of `layer` among `experts` that are neither cached nor
+    /// already read ahead.
+    pub(crate) fn missing(&self, layer: usize, experts: &[usize]) -> Vec<usize> {
+        experts
+            .iter()
+            .copied()
+            .filter(|e| {
+                let key = (layer, *e);
+                !self.index.contains_key(&key) && !self.staged.iter().any(|(k, _)| *k == key)
+            })
+            .collect()
+    }
+
+    /// An expert-sized buffer for a read-ahead.
+    pub(crate) fn spare_buf(&mut self) -> Vec<u8> {
+        self.spare.pop().unwrap_or_else(|| vec![0u8; self.slot_bytes])
+    }
+
+    /// Keep the packed bytes of `key`, read ahead of use, for the next
+    /// [`Self::fetch`] that asks for it.
+    pub(crate) fn stage(&mut self, key: (usize, usize), buf: Vec<u8>) {
+        if self.staged.len() >= STAGE_MAX {
+            if let Some((_, old)) = self.staged.pop_front() {
+                self.spare.push(old);
+            }
+        }
+        self.staged.push_back((key, buf));
+        self.staged_total += 1;
     }
 
     /// The cached bytes of `key`, held in place until [`Self::release`]:
@@ -249,6 +299,7 @@ impl ExpertRam {
         let mut reads: Vec<(Dst, &FileSpan)> = Vec::new();
         let mut n_temp = 0usize;
         let mut hits = 0u64;
+        let mut ahead_hits = 0u64;
         for (expert, spans) in wanted {
             let key = (layer, *expert);
             *self.heat.entry(key).or_insert(0.0) += 1.0;
@@ -279,6 +330,25 @@ impl ExpertRam {
                     Loc::Temp(n_temp - 1)
                 }
             };
+            // Already read ahead: no read, the bytes move into place.
+            let ahead = self.staged.iter().position(|(k, _)| *k == key).and_then(|i| self.staged.remove(i));
+            if let Some((_, mut buf)) = ahead {
+                match loc {
+                    // SAFETY: slot `i` lies inside the arena; `buf` holds one expert.
+                    Loc::Slot(i) => unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            self.arena.ptr.add(i * self.slot_bytes),
+                            self.slot_bytes,
+                        );
+                    },
+                    Loc::Temp(i) => std::mem::swap(&mut self.temps[i], &mut buf),
+                }
+                self.spare.push(buf);
+                ahead_hits += 1;
+                locs.push(loc);
+                continue;
+            }
             let base = match loc {
                 // SAFETY: inside the arena / the temp buffer.
                 Loc::Slot(i) => unsafe { self.arena.ptr.add(i * self.slot_bytes) },
@@ -293,47 +363,19 @@ impl ExpertRam {
             locs.push(loc);
         }
         metrics.expert_ram_hits.fetch_add(hits, Ordering::Relaxed);
+        metrics.expert_prefetch_hits.fetch_add(ahead_hits, Ordering::Relaxed);
+        metrics
+            .expert_prefetch_reads
+            .fetch_add(self.staged_total - self.staged_reported, Ordering::Relaxed);
+        self.staged_reported = self.staged_total;
         if reads.is_empty() {
             return Ok(locs);
         }
-        let next = AtomicUsize::new(0);
-        let (paths, reads) = (&self.paths, &reads);
-        let n_threads = READERS.min(reads.len());
-        let results: Vec<Result<u64, AllpacaError>> = std::thread::scope(|s| {
-            let handles: Vec<_> = self
-                .readers
-                .iter_mut()
-                .take(n_threads)
-                .map(|reader| {
-                    let next = &next;
-                    s.spawn(move || -> Result<u64, AllpacaError> {
-                        let mut direct = 0u64;
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some((dst, span)) = reads.get(i) else {
-                                return Ok(direct);
-                            };
-                            direct += u64::from(reader.read(paths, span, dst.0)?);
-                        }
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-                            "expert reader thread panicked".into(),
-                        )))
-                    })
-                })
-                .collect()
-        });
-        let mut direct = 0u64;
-        for r in results {
-            match r {
-                Ok(n) => direct += n,
-                Err(e) => {
+        let reads = &reads;
+        let direct = match read_all(&mut self.readers, &self.paths, reads) {
+            Ok(n) => n,
+            Err(e) => {
+                {
                     // Whatever was being read into a slot is not an expert.
                     for (loc, (expert, _)) in locs.iter().zip(wanted) {
                         if let Loc::Slot(i) = loc {
@@ -346,7 +388,7 @@ impl ExpertRam {
                     return Err(e);
                 }
             }
-        }
+        };
         let bytes: usize = reads.iter().map(|(_, s)| s.len).sum();
         metrics.nvme_reads.fetch_add(reads.len() as u64, Ordering::Relaxed);
         metrics.nvme_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -385,6 +427,213 @@ impl ExpertRam {
         self.index.insert(key, slot);
         Some(slot)
     }
+}
+
+/// Read-ahead: a worker that predicts the experts of the next layer and
+/// reads the ones that are in neither VRAM nor RAM while the current layer
+/// still computes.
+///
+/// The prediction applies the next layer's router to the current layer's
+/// expert input. It only decides what is read early: which experts run, and
+/// their result, do not depend on it.
+pub(crate) struct Prefetcher {
+    tx: Option<SyncSender<AheadJob>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+struct AheadJob {
+    layer: usize,
+    rows: Vec<f32>,
+    on_gpu: Vec<usize>,
+}
+
+impl Prefetcher {
+    /// `spans(layer, expert)` gives an expert's slices on disk; `top` is how
+    /// many experts a row routes to.
+    pub(crate) fn start(
+        file: Arc<GgufFile>,
+        ram: Arc<Mutex<ExpertRam>>,
+        dim: usize,
+        n_experts: usize,
+        top: usize,
+        max_slice: usize,
+        spans: impl Fn(&GgufFile, usize, usize) -> Option<Vec<FileSpan>> + Send + 'static,
+    ) -> Result<Self, AllpacaError> {
+        let paths = file.shard_paths().ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("read-ahead needs the model's files".into()))
+        })?;
+        let mut readers = Vec::with_capacity(AHEAD_READERS);
+        for _ in 0..AHEAD_READERS {
+            readers.push(Reader {
+                files: HashMap::new(),
+                scratch: AlignedBuf::new(max_slice + 2 * ALIGN)?,
+            });
+        }
+        // One job at a time: a prediction that had to wait is stale.
+        let (tx, rx) = sync_channel::<AheadJob>(1);
+        let worker = std::thread::Builder::new()
+            .name("dsv4-read-ahead".into())
+            .spawn(move || {
+                let mut routers: HashMap<usize, Vec<f32>> = HashMap::new();
+                while let Ok(job) = rx.recv() {
+                    let router = routers
+                        .entry(job.layer)
+                        .or_insert_with(|| load_router(&file, job.layer, dim, n_experts));
+                    if router.len() != dim * n_experts {
+                        continue;
+                    }
+                    let mut want = predict(router, &job.rows, dim, n_experts, top);
+                    want.retain(|e| !job.on_gpu.contains(e));
+                    let lock = || ram.lock().unwrap_or_else(|e| e.into_inner());
+                    let missing = lock().missing(job.layer, &want);
+                    let mut bufs: Vec<(usize, Vec<FileSpan>, Vec<u8>)> = Vec::new();
+                    for e in missing {
+                        if let Some(s) = spans(&file, job.layer, e) {
+                            let buf = lock().spare_buf();
+                            if s.iter().map(|x| x.len).sum::<usize>() == buf.len() {
+                                bufs.push((e, s, buf));
+                            }
+                        }
+                    }
+                    if bufs.is_empty() {
+                        continue;
+                    }
+                    let mut reads: Vec<(Dst, &FileSpan)> = Vec::new();
+                    for (_, s, buf) in bufs.iter_mut() {
+                        let mut at = 0usize;
+                        for span in s.iter() {
+                            // SAFETY: the slices sum to the buffer's length.
+                            reads.push((Dst(unsafe { buf.as_mut_ptr().add(at) }), span));
+                            at += span.len;
+                        }
+                    }
+                    let ok = read_all(&mut readers, &paths, &reads).is_ok();
+                    drop(reads);
+                    let mut ram = lock();
+                    for (e, _, buf) in bufs {
+                        if ok {
+                            ram.stage((job.layer, e), buf);
+                        } else {
+                            ram.spare.push(buf);
+                        }
+                    }
+                }
+            })
+            .map_err(|e| AllpacaError::Fatal(FatalError::InvalidConfig(format!("read-ahead thread: {e}"))))?;
+        Ok(Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        })
+    }
+
+    /// Predict from `rows` (the current layer's expert inputs, `dim` each)
+    /// and read ahead for `layer`. Dropped when the worker is still busy.
+    pub(crate) fn submit(&self, layer: usize, rows: &[f32], on_gpu: Vec<usize>) {
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.try_send(AheadJob {
+                layer,
+                rows: rows.to_vec(),
+                on_gpu,
+            });
+        }
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// The router of `layer` as F32, `n_experts` rows of `dim`; empty when the
+/// file has none this worker can read.
+fn load_router(file: &GgufFile, layer: usize, dim: usize, n_experts: usize) -> Vec<f32> {
+    let name = format!("blk.{layer}.ffn_gate_inp.weight");
+    let Some(info) = file.tensor(&name) else {
+        return Vec::new();
+    };
+    if info.n_elements() as usize != dim * n_experts {
+        return Vec::new();
+    }
+    match info.ggml_type {
+        GgmlType::BF16 => file
+            .tensor_bytes_of(info)
+            .map(|b| {
+                b.chunks_exact(2)
+                    .map(|c| allpaca_cpu::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => file.tensor_f32(&name).unwrap_or_default(),
+    }
+}
+
+/// The `top` highest-scoring experts of each row, without duplicates.
+fn predict(router: &[f32], rows: &[f32], dim: usize, n_experts: usize, top: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for x in rows.chunks_exact(dim) {
+        let mut scores: Vec<(f32, usize)> = (0..n_experts)
+            .map(|e| {
+                let w = &router[e * dim..(e + 1) * dim];
+                (w.iter().zip(x).map(|(a, b)| a * b).sum::<f32>(), e)
+            })
+            .collect();
+        let k = top.min(n_experts);
+        if k == 0 {
+            continue;
+        }
+        scores.select_nth_unstable_by(k - 1, |a, b| b.0.total_cmp(&a.0));
+        for (_, e) in &scores[..k] {
+            if !out.contains(e) {
+                out.push(*e);
+            }
+        }
+    }
+    out
+}
+
+/// Read every `(destination, span)` with `readers` in parallel. Returns how
+/// many were served by Direct I/O.
+fn read_all(readers: &mut [Reader], paths: &[PathBuf], reads: &[(Dst, &FileSpan)]) -> Result<u64, AllpacaError> {
+    let next = AtomicUsize::new(0);
+    let n_threads = readers.len().min(reads.len());
+    let results: Vec<Result<u64, AllpacaError>> = std::thread::scope(|s| {
+        let handles: Vec<_> = readers
+            .iter_mut()
+            .take(n_threads)
+            .map(|reader| {
+                let next = &next;
+                s.spawn(move || -> Result<u64, AllpacaError> {
+                    let mut direct = 0u64;
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((dst, span)) = reads.get(i) else {
+                            return Ok(direct);
+                        };
+                        direct += u64::from(reader.read(paths, span, dst.0)?);
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                        "expert reader thread panicked".into(),
+                    )))
+                })
+            })
+            .collect()
+    });
+    let mut direct = 0u64;
+    for r in results {
+        direct += r?;
+    }
+    Ok(direct)
 }
 
 /// Drop the pages of a mapped-file range from this process's working set.

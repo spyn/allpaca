@@ -64,6 +64,24 @@ const PREFAULT_WARM_MS: u128 = 8;
 struct DenseEntry {
     offset: usize,
     bytes: usize,
+    /// Staged Q8_0 blocks (36 bytes per 32 values) instead of BF16.
+    q8: bool,
+}
+
+impl DenseEntry {
+    /// Byte offset and length of `n` rows of `k` values starting at element
+    /// `elem_off` (a whole number of rows), when the entry holds them.
+    fn span(&self, n: usize, k: usize, elem_off: usize) -> Option<(usize, usize)> {
+        let (off, len) = if self.q8 {
+            if k % 32 != 0 || elem_off % 32 != 0 {
+                return None;
+            }
+            (elem_off / 32 * allpaca_hip::Q8_STAGED_BLOCK, n * (k / 32) * allpaca_hip::Q8_STAGED_BLOCK)
+        } else {
+            (elem_off * 2, n * k * 2)
+        };
+        (off + len <= self.bytes).then_some((off, len))
+    }
 }
 
 struct ExpertSlot {
@@ -355,6 +373,8 @@ pub struct Dsv4Gpu {
     mapped_used: Vec<(usize, usize)>,
     /// RAM-tier experts pinned as the source of a GPU copy.
     ram_pinned: Vec<(usize, usize)>,
+    /// Reads the next layer's cold experts ahead of use.
+    read_ahead: Option<crate::dsv4_ram::Prefetcher>,
 }
 
 impl Dsv4Gpu {
@@ -371,15 +391,22 @@ impl Dsv4Gpu {
         let names = dense_bf16_names(cfg);
         let mut parts: Vec<(&str, &[u8])> = Vec::new();
         let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut q8_names: HashSet<String> = HashSet::new();
         for name in &names {
             let Some(info) = file.tensor(name) else {
                 continue;
             };
-            if info.ggml_type != GgmlType::BF16 {
-                continue;
-            }
             let bytes = file.tensor_bytes_of(info)?;
-            owned.push((name.clone(), bytes.to_vec()));
+            match info.ggml_type {
+                GgmlType::BF16 => owned.push((name.clone(), bytes.to_vec())),
+                // `dims` are [k, n]: n rows of k values, whole blocks per row.
+                GgmlType::Q8_0 if info.dims.len() == 2 && info.dims[0] % 32 == 0 => {
+                    let (k, n) = (info.dims[0] as usize, info.dims[1] as usize);
+                    owned.push((name.clone(), allpaca_hip::stage_q8_0_gemv(bytes, n, k)?));
+                    q8_names.insert(name.clone());
+                }
+                _ => continue,
+            }
             crate::dsv4_ram::release_mapped(bytes);
         }
         for (name, bytes) in &owned {
@@ -390,11 +417,18 @@ impl Dsv4Gpu {
             None
         } else {
             match upload_named(hip.device, &parts) {
-                Ok((blob, map)) => {
+                Ok((blob, mut map)) => {
+                    for (name, ent) in map.iter_mut() {
+                        if q8_names.contains(name) {
+                            ent.q8 = true;
+                            hip.register_q8_dense(blob.byte_ptr_at(ent.offset), ent.bytes);
+                        }
+                    }
                     tracing::info!(
                         bytes = blob.bytes(),
                         n = map.len(),
-                        "DeepSeek-V4 HIP BF16 resident weights"
+                        q8_0 = q8_names.len(),
+                        "DeepSeek-V4 HIP dense resident weights"
                     );
                     dense_map = map;
                     Some(blob)
@@ -501,6 +535,7 @@ impl Dsv4Gpu {
             ram: None,
             mapped_used: Vec::new(),
             ram_pinned: Vec::new(),
+            read_ahead: None,
         };
         if gpu.cpu_miss {
             gpu.ram = open_expert_ram(file, cfg, gpu.expert_slot, ram_free);
@@ -532,6 +567,50 @@ impl Dsv4Gpu {
     /// The host RAM tier, when the model file allows direct reads.
     pub(crate) fn expert_ram(&self) -> Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>> {
         self.ram.clone()
+    }
+
+    /// Start the read-ahead worker when `ALLPACA_DSV4_READAHEAD=1`. Off by
+    /// default: on DeepSeek-V4-Flash about a quarter of its reads were used,
+    /// SSD traffic nearly doubled and throughput did not improve.
+    fn start_read_ahead(&mut self, file: &Arc<GgufFile>, cfg: &ModelConfig) {
+        let Some(ram) = self.ram.clone() else {
+            return;
+        };
+        if !std::env::var("ALLPACA_DSV4_READAHEAD").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let ff = cfg.ff_dim.max(1);
+        let max_slice = mxfp4_matrix_bytes(ff, cfg.dim).max(mxfp4_matrix_bytes(cfg.dim, ff));
+        let spans_cfg = cfg.clone();
+        match crate::dsv4_ram::Prefetcher::start(
+            file.clone(),
+            ram,
+            cfg.dim,
+            cfg.n_experts,
+            cfg.n_active.max(1),
+            max_slice,
+            move |f, layer, expert| expert_mxfp4_spans(f, layer, expert, &spans_cfg),
+        ) {
+            Ok(p) => self.read_ahead = Some(p),
+            Err(e) => tracing::warn!(error = %e, "DeepSeek-V4 expert read-ahead unavailable"),
+        }
+    }
+
+    /// Predict the experts of `next_layer` from `rows`, this layer's expert
+    /// inputs, and read the cold ones ahead.
+    pub(crate) fn read_ahead(&self, next_layer: usize, rows: &[f32]) {
+        let Some(p) = self.read_ahead.as_ref() else {
+            return;
+        };
+        let on_gpu: Vec<usize> = self
+            .slots
+            .iter()
+            .chain(&self.gpu1_slots)
+            .filter_map(|s| s.key)
+            .filter(|k| k.0 == next_layer)
+            .map(|k| k.1)
+            .collect();
+        p.submit(next_layer, rows, on_gpu);
     }
 
     /// Count one routing of `(layer, expert)`.
@@ -741,18 +820,23 @@ impl Dsv4Gpu {
                 "missing {name} for HIP BF16"
             )))
         })?;
-        if info.ggml_type != GgmlType::BF16 {
+        let resident = self
+            .dense_map
+            .get(name)
+            .and_then(|ent| ent.span(n, k, elem_off).map(|(off, _)| (*ent, off)));
+        // A Q8_0 tensor is served from its staged resident copy only.
+        if info.ggml_type != GgmlType::BF16 && resident.is_none() {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 format!("{name} is not BF16"),
             )));
         }
         let packed_need = n.saturating_mul(k).saturating_mul(2);
-        let byte_off = elem_off.saturating_mul(2);
+        let byte_off = resident.map_or(elem_off.saturating_mul(2), |(_, off)| off);
         let mi = m as i32;
         let ni = n as i32;
         let ki = k as i32;
-        if let Some(ent) = self.dense_map.get(name).copied() {
-            if byte_off.saturating_add(packed_need) <= ent.bytes {
+        if let Some((ent, _)) = resident {
+            {
                 if let Some(blob) = &self.dense {
                     let ptr = blob.byte_ptr_at(ent.offset + byte_off) as *const u16;
                     let da = self.device_a_if_curs(x, m, k);
@@ -767,6 +851,11 @@ impl Dsv4Gpu {
                     return Ok(());
                 }
             }
+        }
+        if info.ggml_type != GgmlType::BF16 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("{name} is not BF16"),
+            )));
         }
         let bytes = file.tensor_bytes_of(info)?;
         let slice = bytes.get(byte_off..byte_off + packed_need).ok_or_else(|| {
@@ -1681,10 +1770,8 @@ impl Dsv4Gpu {
         let packed_need = n.saturating_mul(k).saturating_mul(2);
         let byte_off = elem_off.saturating_mul(2);
         if let Some(ent) = self.dense_map.get(name).copied() {
-            if byte_off.saturating_add(packed_need) <= ent.bytes {
-                if let Some(blob) = &self.dense {
-                    return Ok(blob.byte_ptr_at(ent.offset + byte_off) as *const u16);
-                }
+            if let (Some((off, _)), Some(blob)) = (ent.span(n, k, elem_off), &self.dense) {
+                return Ok(blob.byte_ptr_at(ent.offset + off) as *const u16);
             }
         }
         let info = file.tensor(name).ok_or_else(|| {
@@ -2529,9 +2616,15 @@ impl Dsv4Gpu {
         Some((gate, up, down))
     }
 
+    /// `packed_need`: the tensor's size as BF16 (2 bytes per value).
     fn dense_entry_ptr(&self, name: &str, packed_need: usize) -> Option<*const u16> {
         let ent = self.dense_map.get(name).copied()?;
-        if packed_need > ent.bytes {
+        let need = if ent.q8 {
+            packed_need / 2 / 32 * allpaca_hip::Q8_STAGED_BLOCK
+        } else {
+            packed_need
+        };
+        if need > ent.bytes {
             return None;
         }
         let blob = self.dense.as_ref()?;
@@ -3107,6 +3200,7 @@ impl Dsv4Gpu {
             ram: None,
             mapped_used: Vec::new(),
             ram_pinned: Vec::new(),
+            read_ahead: None,
             h2d: None,
             h2d1: None,
             pin0: None,
@@ -3161,6 +3255,7 @@ fn upload_named(
             DenseEntry {
                 offset: off,
                 bytes: bytes.len(),
+                q8: false,
             },
         );
         off += bytes.len();
@@ -4156,7 +4251,8 @@ pub fn attach(
             "DeepSeek-V4 GGUF handle missing for HIP attach".into(),
         ))
     })?;
-    let gpu = Dsv4Gpu::build(file.as_ref(), &model.config, hip.clone(), draft.cloned())?;
+    let mut gpu = Dsv4Gpu::build(file.as_ref(), &model.config, hip.clone(), draft.cloned())?;
+    gpu.start_read_ahead(&file, &model.config);
     let mut guard = dsv4
         .gpu
         .lock()

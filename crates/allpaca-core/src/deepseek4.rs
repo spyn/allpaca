@@ -1358,6 +1358,20 @@ fn gather_embed(file: &GgufFile, token: u32, dim: usize) -> Result<Vec<f32>, All
                 out[i] = allpaca_cpu::bf16_to_f32(h);
             }
         }
+        allpaca_gguf::GgmlType::Q8_0 if dim % 32 == 0 => {
+            // One row: `dim / 32` blocks of an f16 scale and 32 int8.
+            let row = dim / 32 * 34;
+            let off = token as usize * row;
+            let blocks = bytes.get(off..off + row).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::CorruptGguf("embed Q8_0 row OOB".into()))
+            })?;
+            for (b, blk) in blocks.chunks_exact(34).enumerate() {
+                let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                for (i, q) in blk[2..].iter().enumerate() {
+                    out[b * 32 + i] = d * f32::from(*q as i8);
+                }
+            }
+        }
         allpaca_gguf::GgmlType::F16 => {
             let off = token as usize * dim * 2;
             for i in 0..dim {
@@ -1379,6 +1393,12 @@ fn gather_embed(file: &GgufFile, token: u32, dim: usize) -> Result<Vec<f32>, All
         }
     }
     Ok(out)
+}
+
+/// Dense tensor types the HIP path keeps resident and multiplies on the
+/// GPU (BF16 as it is, Q8_0 as staged int8 blocks).
+fn gpu_dense_type(t: allpaca_gguf::GgmlType) -> bool {
+    matches!(t, allpaca_gguf::GgmlType::BF16 | allpaca_gguf::GgmlType::Q8_0)
 }
 
 fn with_mla<R>(
@@ -2707,26 +2727,37 @@ fn dsv4_cpu_experts(
             .map(|(e, _, _)| crate::dsv4_gpu::expert_mxfp4_spans(file, blk, *e, cfg).map(|s| (*e, s)))
             .collect()
     });
-    let mut tier = match (ram, spans.as_ref()) {
-        (Some(r), Some(_)) => Some(r.lock().unwrap_or_else(|e| e.into_inner())),
-        _ => None,
-    };
-    let locs = match (tier.as_mut(), spans.as_ref()) {
-        (Some(t), Some(spans)) => Some(t.fetch(blk, spans, metrics)?),
+    // The tier is locked for the fetch only: fetched bytes stay where they
+    // are until this thread's next fetch, and the read-ahead worker, which
+    // needs the lock, never touches them.
+    let fetched: Option<Vec<(usize, usize)>> = match (ram, spans.as_ref()) {
+        (Some(r), Some(spans)) => {
+            let mut tier = r.lock().unwrap_or_else(|e| e.into_inner());
+            let locs = tier.fetch(blk, spans, metrics)?;
+            Some(
+                locs.iter()
+                    .map(|loc| {
+                        let b = tier.bytes(*loc);
+                        (b.as_ptr() as usize, b.len())
+                    })
+                    .collect(),
+            )
+        }
         _ => None,
     };
     let mut parts = Vec::with_capacity(work.len());
-    if locs.is_none() {
+    if fetched.is_none() {
         for (e, _, _) in work {
             parts.push(crate::dsv4_gpu::expert_mxfp4_parts(file, blk, *e, cfg)?);
         }
     }
-    let experts: Vec<allpaca_cpu::Mxfp4Expert<'_>> = match (tier.as_ref(), locs.as_ref(), spans.as_ref()) {
-        (Some(t), Some(locs), Some(spans)) => work
+    let experts: Vec<allpaca_cpu::Mxfp4Expert<'_>> = match (fetched.as_ref(), spans.as_ref()) {
+        (Some(fetched), Some(spans)) => work
             .iter()
-            .zip(locs.iter().zip(spans))
-            .map(|((_, x, group), (loc, (_, s)))| {
-                let bytes = t.bytes(*loc);
+            .zip(fetched.iter().zip(spans))
+            .map(|((_, x, group), (&(ptr, len), (_, s)))| {
+                // SAFETY: see above; `len` is one packed expert.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
                 let (gate, rest) = bytes.split_at(s[0].len);
                 let (up, down) = rest.split_at(s[1].len);
                 allpaca_cpu::Mxfp4Expert {
@@ -3005,6 +3036,16 @@ fn dsv4_apply_moe_rows(
                     if n == xs.len() {
                         g.copy_d2h_f32(ptr, &mut xs)?;
                     }
+                }
+                // While this layer computes, read the next layer's cold
+                // experts. The first layers route by token id, not by
+                // their input.
+                let next = layer_idx + 1;
+                if next < cfg.n_layers
+                    && next >= spec.hash_layer_count
+                    && n_tok <= crate::dsv4_ram::AHEAD_MAX_ROWS
+                {
+                    g.read_ahead(cfg.gguf_blk(next), &xs);
                 }
             }
         }
@@ -3613,7 +3654,7 @@ fn dsv4_packed_gpu_live(model: &TinyModel) -> bool {
     g.as_ref().is_some()
         && dsv4.gguf.as_ref().is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         })
 }
 
@@ -3674,12 +3715,12 @@ pub fn forward_dsv4_token(
     let skip_mla = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
     let skip_shexp = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.ffn_up_shexp.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
 
     for layer_idx in 0..cfg.n_layers {
@@ -3761,12 +3802,12 @@ pub fn forward_dsv4_tokens(
     let skip_mla = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
     let skip_shexp = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.ffn_up_shexp.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
     let mut states = HcBatch::new(tokens.len(), hc, dim);
     for (t, &token) in tokens.iter().enumerate() {
@@ -4278,8 +4319,20 @@ pub fn write_tiny_deepseek4_gguf(path: &std::path::Path) {
 /// Tiny DeepSeek-V4 GGUF with BF16 MLA/shexp/lm_head and MXFP4 experts (`k % 32 == 0`).
 /// HIP GEMV is used only for those dtypes; F32 fixtures stay on the CPU path.
 pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
+    write_tiny_deepseek4_packed(path, false);
+}
+
+/// The packed tiny fixture with its dense tensors as Q8_0 where a row is a
+/// whole number of 32-value blocks (as in Unsloth's UD-Q4_K_XL), BF16
+/// elsewhere.
+pub fn write_tiny_deepseek4_q8_gguf(path: &std::path::Path) {
+    write_tiny_deepseek4_packed(path, true);
+}
+
+fn write_tiny_deepseek4_packed(path: &std::path::Path, q8_dense: bool) {
     use allpaca_gguf::{
-        quantize_bf16, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor,
+        quantize_bf16, quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
+        GgufWriteTensor,
     };
     use std::collections::HashMap;
 
@@ -4565,6 +4618,10 @@ pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
     let mut packed_store: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)> = Vec::new();
     for (name, dims, data) in &owned {
         if bf16_names.contains(&name.as_str()) {
+            if q8_dense && dims.len() == 2 && dims[0] % 32 == 0 {
+                packed_store.push((name.clone(), dims.clone(), GgmlType::Q8_0, quantize_q8_0(data)));
+                continue;
+            }
             packed_store.push((
                 name.clone(),
                 dims.clone(),

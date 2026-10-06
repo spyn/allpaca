@@ -5600,6 +5600,9 @@ pub struct HipWorkspace {
     activation_d2h: AtomicU64,
     profiling: AtomicU64,
     lm_head: AtomicU64,
+    /// Device ranges `[start, end)` of dense weights staged as Q8_0 blocks,
+    /// sorted. See [`Self::register_q8_dense`].
+    q8_dense: std::sync::RwLock<Vec<(usize, usize)>>,
     profile_span: AtomicU64,
     logits_inflight: AtomicU64,
     profile: Mutex<ProfileState>,
@@ -5645,6 +5648,7 @@ impl HipWorkspace {
             activation_d2h: AtomicU64::new(0),
             profiling: AtomicU64::new(0),
             lm_head: AtomicU64::new(0),
+            q8_dense: std::sync::RwLock::new(Vec::new()),
             profile_span: AtomicU64::new(0),
             logits_inflight: AtomicU64::new(0),
             profile: Mutex::new(ProfileState::default()),
@@ -6078,6 +6082,26 @@ impl HipWorkspace {
         self.timed_gpu(op, || gemm_nt_f16_device(a, b, c, m, n, k))
     }
 
+    /// Dense weights of a model whose "BF16" tensors are Q8_0 in the file:
+    /// `bytes` at `ptr` hold 36-byte staged Q8_0 blocks
+    /// ([`stage_q8_0_gemv`]). Every dense GEMM of this workspace whose
+    /// weight pointer falls in a registered range runs the Q8_0 kernel, so
+    /// the callers' BF16 paths serve both formats.
+    pub fn register_q8_dense(&self, ptr: *const u8, bytes: usize) {
+        let mut ranges = self.q8_dense.write().unwrap_or_else(|e| e.into_inner());
+        ranges.push((ptr as usize, ptr as usize + bytes));
+        ranges.sort_unstable();
+    }
+
+    fn is_q8_dense(&self, ptr: usize) -> bool {
+        let ranges = self.q8_dense.read().unwrap_or_else(|e| e.into_inner());
+        if ranges.is_empty() {
+            return false;
+        }
+        let i = ranges.partition_point(|r| r.0 <= ptr);
+        i > 0 && ptr < ranges[i - 1].1
+    }
+
     pub fn gemm_nt_bf16_dev(
         &self,
         a: *const f32,
@@ -6092,6 +6116,9 @@ impl HipWorkspace {
         } else {
             DecodeOp::OtherGpu
         };
+        if self.is_q8_dense(b as usize) {
+            return self.timed_gpu(op, || gemm_nt_q8_0_device(a, b.cast(), c, m, n, k));
+        }
         self.timed_gpu(op, || gemm_nt_bf16_device(a, b, c, m, n, k))
     }
 

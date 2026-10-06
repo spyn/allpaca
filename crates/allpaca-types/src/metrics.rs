@@ -121,6 +121,12 @@ pub struct StatsSnapshot {
     /// CPU-run experts whose bytes were already in the host RAM tier.
     #[serde(default)]
     pub expert_ram_hits: u64,
+    /// Experts read from the file ahead of use, from a routing prediction.
+    #[serde(default)]
+    pub expert_prefetch_reads: u64,
+    /// Read-ahead experts that were then needed.
+    #[serde(default)]
+    pub expert_prefetch_hits: u64,
     /// Measured expert H2D bandwidth (bytes/s) used by `q*`. 0 = unmeasured.
     #[serde(default)]
     pub expert_pcie_bps: u64,
