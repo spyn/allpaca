@@ -335,6 +335,19 @@ const QWEN35_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|
 /// up to three.
 const LLAMA3_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// llama.cpp's split for DeepSeek-V3 and its relatives. It applies three
+/// regexes in turn (digit runs of up to three, CJK runs, then words and
+/// punctuation), each to what the one before left over. As one pattern:
+/// the first two come first, words do not take CJK letters, and spaces
+/// before a digit or CJK run stay whole, as at the end of a leftover.
+const DEEPSEEK3_SPLIT: &str = concat!(
+    r"\p{N}{1,3}|[一-龥぀-ゟ゠-ヿ]+",
+    r##"|[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"##,
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}&&[^一-龥぀-ゟ゠-ヿ]]+",
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+",
+    r"|\s+(?![^\s\p{N}一-龥぀-ゟ゠-ヿ])|\s+",
+);
+
 /// The word-splitting regex llama.cpp uses for a `tokenizer.ggml.pre` value,
 /// for the pre types Allpaca matches exactly. `None` = GPT-2's split.
 fn llama_split_regex(pre: &str) -> Option<&'static str> {
@@ -344,6 +357,7 @@ fn llama_split_regex(pre: &str) -> Option<&'static str> {
         "qwen35" => Some(QWEN35_SPLIT),
         "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral" | "midm-2.0"
         | "lfm2" | "jina-v5-nano" => Some(LLAMA3_SPLIT),
+        "deepseek-v3" | "step35" | "hunyuan-dense" | "joyai-llm" => Some(DEEPSEEK3_SPLIT),
         _ => None,
     }
 }
@@ -671,6 +685,16 @@ mod tests {
         // A combining mark breaks a qwen2 word and stays inside a qwen35 one.
         assert_eq!(pieces("qwen2", "e\u{301}t"), ["e", "\u{301}t"]);
         assert_eq!(pieces("qwen35", "e\u{301}t"), ["e\u{301}t"]);
+        // DeepSeek-V3/V4 (`joyai-llm` in the V4 files): digits in threes, a
+        // punctuation mark stays with the letters after it or takes the
+        // newlines after it.
+        assert_eq!(
+            pieces("joyai-llm", "is 7391, ten-minute.\n\nQ?\n"),
+            ["is", " ", "739", "1", ",", " ten", "-minute", ".\n\n", "Q", "?\n"]
+        );
+        // Digits and CJK runs are cut out first: letters do not run into a
+        // CJK run, and spaces before either stay in one piece.
+        assert_eq!(pieces("deepseek-v3", "ab中文  12"), ["ab", "中文", "  ", "12"]);
         assert!(llama_split_regex("gpt2").is_none());
     }
 }
