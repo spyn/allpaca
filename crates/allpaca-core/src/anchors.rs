@@ -23,6 +23,8 @@ pub struct RecurrentState {
     pub gdn_state: Vec<Vec<f32>>,
     /// Per-layer conv1d history `[(k-1) * qkv_dim]`.
     pub gdn_conv: Vec<Vec<f32>>,
+    /// DeepSeek-V4 compressed attention keys and the groups being pooled.
+    pub dsv4: crate::dsv4_attn::Dsv4Memory,
 }
 
 impl RecurrentState {
@@ -33,6 +35,7 @@ impl RecurrentState {
             ssm_conv: vec![Vec::new(); n_layers],
             gdn_state: vec![Vec::new(); n_layers],
             gdn_conv: vec![Vec::new(); n_layers],
+            dsv4: Default::default(),
         }
     }
 

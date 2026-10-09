@@ -6,6 +6,7 @@ mod compute;
 pub mod decision;
 mod constraint;
 mod deepseek4;
+mod dsv4_attn;
 mod dflash2;
 pub mod deltanet;
 mod device_manager;
@@ -57,7 +58,8 @@ pub use batch_gemm::{
 pub use compute::ComputeDev;
 #[doc(hidden)]
 pub use deepseek4::{
-    write_tiny_deepseek4_gguf, write_tiny_deepseek4_packed_gguf, write_tiny_deepseek4_q8_gguf,
+    write_tiny_deepseek4_ctx_gguf, write_tiny_deepseek4_gguf, write_tiny_deepseek4_packed_gguf,
+    write_tiny_deepseek4_q8_gguf, TinyDsv4Ctx,
 };
 pub use device_manager::{detect_pipeline_mode, suggested_kv_vram_bytes, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};

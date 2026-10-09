@@ -6048,6 +6048,37 @@ __global__ void rope_offset_rows_kernel(float *x, int n_tok, int n_heads, int he
     }
 }
 
+/* rope_offset_rows with YaRN frequencies: pair i turns by theta^(-i/half) times a blend of 1
+ * (pairs up to `low`) and `scale` (pairs from `high`). Magnitudes are not scaled. */
+__global__ void rope_yarn_rows_kernel(float *x, int n_tok, int n_heads, int head_dim, int n_rot,
+                                      int offset, int start_pos, float theta, float scale,
+                                      float low, float high, int back) {
+    const int tok = static_cast<int>(blockIdx.y);
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = n_rot / 2;
+    const int total = n_heads * half;
+    if (tok >= n_tok || idx >= total || n_rot <= 0 || (n_rot % 2) != 0) {
+        return;
+    }
+    const int h = idx / half;
+    const int i = idx % half;
+    float *hvec = x + (static_cast<size_t>(tok) * static_cast<size_t>(n_heads) +
+                       static_cast<size_t>(h)) *
+                          static_cast<size_t>(head_dim) +
+                  static_cast<size_t>(offset);
+    const float y = (static_cast<float>(i) - low) / fmaxf(0.001f, high - low);
+    const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half)) *
+                       (scale * (1.0f - ramp) + ramp);
+    const float angle = static_cast<float>(start_pos + tok) * freq;
+    const float s = back ? -sinf(angle) : sinf(angle);
+    const float c = cosf(angle);
+    const float a = hvec[2 * i];
+    const float b = hvec[2 * i + 1];
+    hvec[2 * i] = a * c - b * s;
+    hvec[2 * i + 1] = a * s + b * c;
+}
+
 __global__ void rope_kernel(float *x, int n_heads, int head_dim, int pos, float theta) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int half = head_dim / 2;
@@ -6593,6 +6624,33 @@ extern "C" int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads
                        dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(n_tok)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n_tok, n_heads,
                        head_dim, rot, off, start_pos, theta, back);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_rope_yarn_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                                      int32_t n_rot, int32_t offset, int32_t start_pos,
+                                      float theta, float scale, float low, float high,
+                                      int32_t back, allpaca_stream_t stream) {
+    if (!x || n_tok <= 0 || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int rot = n_rot;
+    int off = offset;
+    if (rot == 0) {
+        rot = head_dim;
+        off = 0;
+    }
+    if (rot < 0 || off < 0 || (rot % 2) != 0 || off + rot > head_dim) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int total = n_heads * (rot / 2);
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(rope_yarn_rows_kernel,
+                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(n_tok)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n_tok, n_heads,
+                       head_dim, rot, off, start_pos, theta, scale, low, high, back);
     return hip_status(hipGetLastError());
 }
 
@@ -8655,6 +8713,12 @@ extern "C" int allpaca_rope_qk_rows(float *, float *, int32_t, int32_t, int32_t,
 
 extern "C" int allpaca_rope_offset_rows(float *, int32_t, int32_t, int32_t, int32_t, int32_t,
                                         int32_t, float, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rope_yarn_rows(float *, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                      int32_t, float, float, float, float, int32_t,
+                                      allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

@@ -381,6 +381,13 @@ int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t h
                              int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
                              int32_t back, allpaca_stream_t stream);
 
+/* allpaca_rope_offset_rows with YaRN frequencies (DeepSeek-V4 compressed layers): pair i
+ * turns by theta^(-i/half) times a blend of 1 (i <= low) and scale (i >= high). */
+int allpaca_rope_yarn_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                           int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
+                           float scale, float low, float high, int32_t back,
+                           allpaca_stream_t stream);
+
 /* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e).
  * pos[3] is the M-RoPE (t, h, w) position; text tokens use (p, p, p). */
 /* x[r][c] = act(x[r][c] + bias[c]) on device rows; act 0 = none, 1 = tanh GELU. */

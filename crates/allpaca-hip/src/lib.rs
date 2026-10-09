@@ -1147,6 +1147,21 @@ mod ffi {
             back: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_rope_yarn_rows(
+            x: *mut f32,
+            n_tok: i32,
+            n_heads: i32,
+            head_dim: i32,
+            n_rot: i32,
+            offset: i32,
+            start_pos: i32,
+            theta: f32,
+            scale: f32,
+            low: f32,
+            high: f32,
+            back: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_rope_imrope_qk(
             q: *mut f32,
             k: *mut f32,
@@ -11281,6 +11296,62 @@ impl HipWorkspace {
             let _ = (n_rot, offset, start_pos, theta, back);
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP rope_offset unavailable".into(),
+            )))
+        }
+    }
+
+    /// [`Self::rope_offset_device_rows`] with YaRN frequencies: `yarn` is
+    /// the scale of the slow pairs and the pair indices the blend runs between.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_yarn_device_rows(
+        &self,
+        x: *mut f32,
+        n_tok: i32,
+        n_heads: i32,
+        head_dim: i32,
+        n_rot: i32,
+        offset: i32,
+        start_pos: i32,
+        theta: f32,
+        yarn: [f32; 3],
+        back: bool,
+    ) -> Result<(), AllpacaError> {
+        if x.is_null() || n_tok <= 0 || n_heads <= 0 || head_dim <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device rope_yarn".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                // SAFETY: `x` is a device `[n_tok, n_heads, head_dim]` buffer;
+                // the kernel only writes `[offset, offset+n_rot)` per head.
+                let rc = unsafe {
+                    ffi::allpaca_rope_yarn_rows(
+                        x,
+                        n_tok,
+                        n_heads,
+                        head_dim,
+                        n_rot,
+                        offset,
+                        start_pos,
+                        theta,
+                        yarn[0],
+                        yarn[1],
+                        yarn[2],
+                        i32::from(back),
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "rope_yarn_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (n_rot, offset, start_pos, theta, yarn, back);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP rope_yarn unavailable".into(),
             )))
         }
     }

@@ -468,7 +468,11 @@ impl ModelConfig {
             rope_sections,
             rope_neox: gguf_rope_neox(&arch),
             rope_none: gguf_rope_none(&arch),
-            recurrent: file.tensors.iter().any(|t| t.name.contains(".ssm_")),
+            // DeepSeek-V4 compressors keep per-sequence state too.
+            recurrent: file
+                .tensors
+                .iter()
+                .any(|t| t.name.contains(".ssm_") || t.name.contains(".attn_compressor_kv.")),
             nextn_predict_layers: nextn,
             gguf_layer_base: 0,
             router_kind: if arch == "deepseek2"
@@ -7430,7 +7434,17 @@ impl TinyModel {
         }
         if self.dsv4.is_some() {
             return crate::deepseek4::forward_dsv4_token(
-                self, token, pos, page_ids, kv, logits, metrics, None, hip, prefill,
+                self,
+                token,
+                pos,
+                page_ids,
+                kv,
+                logits,
+                metrics,
+                None,
+                hip,
+                prefill,
+                recurrent.as_deref_mut().map(|r| &mut r.dsv4),
             );
         }
         // Prefer on-device decode whenever resident weights exist — including hybrid
@@ -7996,6 +8010,7 @@ impl TinyModel {
                 hip,
                 write_logits,
                 true,
+                recurrent.as_deref_mut().map(|r| &mut r.dsv4),
             );
         }
         // Layers on RPC workers: the batched device path below sends each

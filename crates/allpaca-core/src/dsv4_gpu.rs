@@ -2001,6 +2001,7 @@ impl Dsv4Gpu {
         head_dim: usize,
         start_pos: usize,
         theta: f32,
+        yarn: Option<[f32; 3]>,
         n_rot: usize,
         rope_off: usize,
         metrics: Option<&Metrics>,
@@ -2048,17 +2049,31 @@ impl Dsv4Gpu {
         let t = Instant::now();
         hip.rmsnorm_device_rows(dq, dones, dq, rows as i32, head_dim as i32, eps)?;
         add_ns(metrics, |m| &m.dsv4_norm_ns, t);
-        hip.rope_offset_device_rows(
-            dq,
-            n_tok as i32,
-            n_heads as i32,
-            head_dim as i32,
-            n_rot as i32,
-            rope_off as i32,
-            start_pos as i32,
-            theta,
-            false,
-        )?;
+        match yarn {
+            Some(yarn) => hip.rope_yarn_device_rows(
+                dq,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                yarn,
+                false,
+            )?,
+            None => hip.rope_offset_device_rows(
+                dq,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                false,
+            )?,
+        }
         Ok(dq as *const f32)
     }
 
@@ -2100,6 +2115,7 @@ impl Dsv4Gpu {
         head_dim: usize,
         start_pos: usize,
         theta: f32,
+        yarn: Option<[f32; 3]>,
         n_rot: usize,
         rope_off: usize,
     ) -> Result<*const f32, AllpacaError> {
@@ -2134,17 +2150,31 @@ impl Dsv4Gpu {
             head_dim as i32,
             true,
         )?;
-        self.hip.rope_offset_device_rows(
-            dout,
-            n_tok as i32,
-            n_heads as i32,
-            head_dim as i32,
-            n_rot as i32,
-            rope_off as i32,
-            start_pos as i32,
-            theta,
-            true,
-        )?;
+        match yarn {
+            Some(yarn) => self.hip.rope_yarn_device_rows(
+                dout,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                yarn,
+                true,
+            )?,
+            None => self.hip.rope_offset_device_rows(
+                dout,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                true,
+            )?,
+        }
         self.used.store(true, Ordering::Relaxed);
         Ok(dout as *const f32)
     }
@@ -3278,6 +3308,11 @@ fn dense_bf16_names(cfg: &ModelConfig) -> Vec<String> {
             "ffn_up_shexp.weight",
             "ffn_down_shexp.weight",
             "ffn_gate_inp.weight",
+            // Compressed-attention layers only; every token goes through them.
+            "attn_compressor_kv.weight",
+            "attn_compressor_gate.weight",
+            "indexer_compressor_kv.weight",
+            "indexer_compressor_gate.weight",
         ] {
             names.push(format!("blk.{blk}.{suffix}"));
         }

@@ -1,8 +1,7 @@
 //! DeepSeek-V4-Flash (`deepseek4`) host decode: MLA + hyper-connections + MoE.
 //!
-//! CSA/HCA compressors are not applied: each token stores the 512-d latent KV
-//! and attends densely. That is enough for short-context load/use; long-context
-//! sparsity still needs the indexer path.
+//! What a token attends to (sliding window of raw keys, compressed keys, the
+//! indexer) is in [`crate::dsv4_attn`].
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -14,10 +13,11 @@ use allpaca_gguf::GgufFile;
 use allpaca_types::{AllpacaError, FatalError};
 
 use crate::model::{
-    expert_mlp, expert_mlp_rows, gather_kv, topk_from_logits, DenseKv, ModelConfig, TinyModel,
+    expert_mlp, expert_mlp_rows, topk_from_logits, DenseKv, ModelConfig, TinyModel,
 };
 use crate::telemetry::Metrics;
 use crate::weight_set::LayerFfn;
+use crate::dsv4_attn::{Dsv4AttnSpec, Dsv4Memory};
 use crate::KvTierManager;
 
 #[derive(Debug, Clone)]
@@ -30,6 +30,7 @@ pub struct Dsv4Spec {
     pub hc_eps: f32,
     pub hash_layer_count: usize,
     pub rope_offset: usize,
+    pub attn: Dsv4AttnSpec,
 }
 
 impl Dsv4Spec {
@@ -71,6 +72,7 @@ impl Dsv4Spec {
                 .meta_u32(&format!("{arch}.hash_layer_count"))
                 .unwrap_or(0) as usize,
             rope_offset: head_dim.saturating_sub(n_rot),
+            attn: Dsv4AttnSpec::from_gguf(file, arch, head_dim, n_rot, cfg.rope_theta, cfg.eps),
         }
     }
 }
@@ -102,6 +104,12 @@ pub struct Dsv4LayerMeta {
     pub exp_probs_b: Vec<f32>,
     pub attn_norm: Vec<f32>,
     pub ffn_norm: Vec<f32>,
+    /// Compressor gate bias per position in a group and key norm; empty
+    /// for a layer that keeps raw keys only.
+    pub comp_ape: Vec<f32>,
+    pub comp_norm: Vec<f32>,
+    pub index_ape: Vec<f32>,
+    pub index_norm: Vec<f32>,
 }
 
 struct Dsv4Cache {
@@ -118,6 +126,8 @@ pub struct Dsv4Weights {
     pub hc_head_base: Vec<f32>,
     pub hc_head_scale: f32,
     cache: Mutex<Dsv4Cache>,
+    /// Host copies of dense tensors the GPU does not hold, decoded on first use.
+    host_dense: Mutex<BTreeMap<String, Arc<Vec<f32>>>>,
     pub(crate) gguf: Option<Arc<GgufFile>>,
     pub(crate) gpu: Mutex<Option<crate::dsv4_gpu::Dsv4Gpu>>,
 }
@@ -163,6 +173,10 @@ impl Dsv4Weights {
                 exp_probs_b: optional_f32(file, &format!("blk.{blk}.exp_probs_b.bias"))?,
                 attn_norm: optional_f32(file, &format!("blk.{blk}.attn_norm.weight"))?,
                 ffn_norm: optional_f32(file, &format!("blk.{blk}.ffn_norm.weight"))?,
+                comp_ape: optional_f32(file, &format!("blk.{blk}.attn_compressor_ape.weight"))?,
+                comp_norm: optional_f32(file, &format!("blk.{blk}.attn_compressor_norm.weight"))?,
+                index_ape: optional_f32(file, &format!("blk.{blk}.indexer_compressor_ape.weight"))?,
+                index_norm: optional_f32(file, &format!("blk.{blk}.indexer_compressor_norm.weight"))?,
             });
         }
         let _ = materialize_mla;
@@ -184,6 +198,7 @@ impl Dsv4Weights {
                 shexp: None,
                 lm_head: None,
             }),
+            host_dense: Mutex::new(BTreeMap::new()),
             gguf: None,
             gpu: Mutex::new(None),
         })
@@ -1515,6 +1530,322 @@ fn dsv4_gemm(
     ))))
 }
 
+/// Rotate one key or query head to `pos`: the layer's own frequencies when
+/// it compresses, the model's plain RoPE otherwise.
+fn dsv4_rope(
+    cfg: &ModelConfig,
+    spec: &Dsv4Spec,
+    ratio: usize,
+    row: &mut [f32],
+    pos: usize,
+    inverse: bool,
+) -> Result<(), AllpacaError> {
+    if ratio != 0 {
+        spec.attn.rope(ratio).rotate(row, pos, inverse);
+        Ok(())
+    } else if inverse {
+        rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)
+    } else {
+        rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)
+    }
+}
+
+/// Raw keys of positions `lo..hi` from a layer's KV pages.
+fn gather_raw_keys(
+    kv: &KvTierManager,
+    pages: &[u64],
+    lo: usize,
+    hi: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>, AllpacaError> {
+    let kv_dim = n_kv_heads * head_dim;
+    let mut out = Vec::with_capacity(hi.saturating_sub(lo) * kv_dim);
+    if hi <= lo {
+        return Ok(out);
+    }
+    let cap = pages
+        .first()
+        .and_then(|id| kv.get(*id))
+        .map(|p| p.capacity_tokens as usize)
+        .unwrap_or(128)
+        .max(1);
+    for page in lo / cap..=(hi - 1) / cap {
+        let id = pages.get(page).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "DeepSeek-V4 KV page {page} not allocated"
+            )))
+        })?;
+        let (k, _) = kv.read_kv(*id, n_kv_heads, head_dim)?;
+        let base = page * cap;
+        let (a, b) = (lo.max(base) - base, hi.min(base + cap) - base);
+        let rows = k.get(a * kv_dim..b * kv_dim).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "DeepSeek-V4 KV page {page} holds {} keys, need {b}",
+                k.len() / kv_dim.max(1)
+            )))
+        })?;
+        out.extend_from_slice(rows);
+    }
+    Ok(out)
+}
+
+/// `m` rows of `x` times the dense tensor `name` (`n` outputs of `k`
+/// inputs): on the GPU when it holds the tensor, else from a host copy.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_dense_rows(
+    dsv4: &Dsv4Weights,
+    gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    file: Option<&GgufFile>,
+    name: &str,
+    x: &[f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    metrics: &Metrics,
+) -> Result<Vec<f32>, AllpacaError> {
+    let mut out = vec![0.0f32; m * n];
+    if let (Some(gpu), Some(file)) = (gpu, file) {
+        if gpu
+            .gemm_bf16(file, name, x, &mut out, n, k, 0, m, Some(metrics))
+            .is_ok()
+        {
+            return Ok(out);
+        }
+    }
+    let file = file.ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!("no weights for {name}")))
+    })?;
+    let w = {
+        let mut cache = dsv4.host_dense.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::ModelLoad("dsv4 dense cache poisoned".into()))
+        })?;
+        match cache.get(name) {
+            Some(w) => w.clone(),
+            None => {
+                let w = Arc::new(file.tensor_f32(name)?);
+                cache.insert(name.to_string(), w.clone());
+                w
+            }
+        }
+    };
+    if w.len() < n * k {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "{name} holds {} values, need {}",
+            w.len(),
+            n * k
+        ))));
+    }
+    matmul_nt(x, &w[..n * k], &mut out, m, n, k)?;
+    Ok(out)
+}
+
+/// What a layer's tokens may attend to, once [`dsv4_absorb`] has taken them in.
+struct Dsv4Keys {
+    /// Raw keys from position `raw_start` up to the forward's last token.
+    raw: Vec<f32>,
+    raw_start: usize,
+    /// Set once the indexer has to choose among the compressed keys.
+    index_query: Option<crate::dsv4_attn::IndexQuery>,
+}
+
+/// Take a forward's tokens into a layer's attention memory. Their raw keys
+/// are already in the KV pages; this runs the layer's compressors on `curs`
+/// (the layer's normed input, on the host) and gathers the raw keys the
+/// tokens may see.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_absorb(
+    model: &TinyModel,
+    dsv4: &Dsv4Weights,
+    layer_idx: usize,
+    ratio: usize,
+    curs: &[f32],
+    q_a_norm: &[f32],
+    start_pos: usize,
+    n_tok: usize,
+    pages: &[u64],
+    kv: &KvTierManager,
+    seq: &mut Dsv4Memory,
+    gpu: &mut Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    file: Option<&GgufFile>,
+    metrics: &Metrics,
+) -> Result<Dsv4Keys, AllpacaError> {
+    use crate::dsv4_attn::{IndexQuery, PoolCfg};
+    let cfg = &model.config;
+    let spec = &dsv4.spec;
+    let attn = &spec.attn;
+    let meta = &dsv4.layers[layer_idx];
+    let (dim, eps, head_dim) = (cfg.dim, cfg.eps, cfg.head_dim());
+    let blk = cfg.gguf_blk(layer_idx);
+    let end = start_pos + n_tok;
+    let raw_start = attn.raw_lo(start_pos);
+    let raw = gather_raw_keys(kv, pages, raw_start, end, cfg.n_kv_heads.max(1), head_dim)?;
+    let mut index_query = None;
+    if ratio != 0 {
+        let rope = attn.rope(ratio);
+        let mut rows = |name: &str, x: &[f32], n: usize, k: usize| {
+            dsv4_dense_rows(
+                dsv4,
+                gpu.as_deref_mut(),
+                file,
+                &format!("blk.{blk}.{name}.weight"),
+                x,
+                n,
+                k,
+                n_tok,
+                metrics,
+            )
+        };
+        let pool = PoolCfg {
+            ratio,
+            head: head_dim,
+            ape: &meta.comp_ape,
+            norm: &meta.comp_norm,
+            eps,
+            rope,
+            fp8_nope: attn.nope,
+        };
+        let kv_rows = rows("attn_compressor_kv", curs, pool.width(), dim)?;
+        let gate_rows = rows("attn_compressor_gate", curs, pool.width(), dim)?;
+        if ratio == 4 && !meta.index_ape.is_empty() {
+            let index_pool = PoolCfg {
+                ratio,
+                head: attn.index_dim,
+                ape: &meta.index_ape,
+                norm: &meta.index_norm,
+                eps,
+                rope,
+                fp8_nope: 0,
+            };
+            let index_kv = rows("indexer_compressor_kv", curs, index_pool.width(), dim)?;
+            let index_gate = rows("indexer_compressor_gate", curs, index_pool.width(), dim)?;
+            seq.absorb(
+                layer_idx,
+                start_pos,
+                n_tok,
+                (&pool, &kv_rows, &gate_rows),
+                Some((&index_pool, &index_kv, &index_gate)),
+            )?;
+            // The indexer only chooses once more keys are visible than it keeps.
+            if attn.top_k > 0 && end / ratio > attn.top_k {
+                let rank = spec.q_lora_rank;
+                let mut qr = rows("attn_q_a", curs, rank, dim)?;
+                if !q_a_norm.is_empty() {
+                    let mut normed = vec![0.0f32; rank];
+                    for row in qr.chunks_mut(rank) {
+                        rmsnorm(row, q_a_norm, eps, &mut normed)?;
+                        row.copy_from_slice(&normed);
+                    }
+                }
+                let (heads, idim) = (attn.index_heads, attn.index_dim);
+                let mut q = rows("indexer.attn_q_b", &qr, heads * idim, rank)?;
+                for (t, tok) in q.chunks_mut(heads * idim).enumerate() {
+                    for head in tok.chunks_mut(idim) {
+                        rope.rotate(head, start_pos + t, false);
+                    }
+                }
+                index_query = Some(IndexQuery {
+                    q,
+                    head_weights: rows("indexer.proj", curs, heads, dim)?,
+                });
+            }
+        } else {
+            seq.absorb(layer_idx, start_pos, n_tok, (&pool, &kv_rows, &gate_rows), None)?;
+        }
+    }
+    Ok(Dsv4Keys {
+        raw,
+        raw_start,
+        index_query,
+    })
+}
+
+/// The keys the `t`-th token of a forward attends to, into `out`.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_token_keys(
+    model: &TinyModel,
+    dsv4: &Dsv4Weights,
+    layer_idx: usize,
+    ratio: usize,
+    keys: &Dsv4Keys,
+    start_pos: usize,
+    t: usize,
+    seq: &Dsv4Memory,
+    out: &mut Vec<f32>,
+) -> Result<(), AllpacaError> {
+    let attn = &dsv4.spec.attn;
+    let (heads, idim) = (attn.index_heads, attn.index_dim);
+    let index_query = keys.index_query.as_ref().map(|iq| {
+        (
+            &iq.q[t * heads * idim..(t + 1) * heads * idim],
+            &iq.head_weights[t * heads..(t + 1) * heads],
+        )
+    });
+    seq.keys(
+        attn,
+        layer_idx,
+        ratio,
+        start_pos + t,
+        model.config.head_dim(),
+        &keys.raw,
+        keys.raw_start,
+        index_query,
+        out,
+    )
+}
+
+/// Attention on the host for tokens that each see their own set of keys:
+/// `q` holds their rotated queries. Returns the result rotated back.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_memory_attention(
+    model: &TinyModel,
+    dsv4: &Dsv4Weights,
+    layer_idx: usize,
+    ratio: usize,
+    keys: &Dsv4Keys,
+    q: &[f32],
+    start_pos: usize,
+    n_tok: usize,
+    seq: &Dsv4Memory,
+    gpu: &mut Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    hip: Option<&allpaca_hip::HipWorkspace>,
+    skip_mla: bool,
+) -> Result<Vec<f32>, AllpacaError> {
+    let cfg = &model.config;
+    let meta = &dsv4.layers[layer_idx];
+    let (n_heads, head_dim) = (cfg.n_heads, cfg.head_dim());
+    let q_out = n_heads * head_dim;
+    let rope = dsv4.spec.attn.rope(ratio);
+    let mut out = vec![0.0f32; n_tok * q_out];
+    let mut seen = Vec::new();
+    for (t, (q, out)) in q.chunks(q_out).zip(out.chunks_mut(q_out)).enumerate() {
+        dsv4_token_keys(model, dsv4, layer_idx, ratio, keys, start_pos, t, seq, &mut seen)?;
+        if skip_mla {
+            dsv4_attention_sinks_maybe_gpu(
+                skip_mla,
+                gpu.as_deref_mut(),
+                hip,
+                q,
+                &seen,
+                &seen,
+                &meta.sinks,
+                out,
+                1,
+                seen.len() / head_dim.max(1),
+                n_heads,
+                cfg.n_kv_heads.max(1),
+                head_dim,
+            )?;
+        } else {
+            crate::dsv4_attn::attend(q, &seen, &meta.sinks, n_heads, head_dim, out)?;
+        }
+        for head in out.chunks_mut(head_dim) {
+            rope.rotate(head, start_pos + t, true);
+        }
+    }
+    Ok(out)
+}
+
 struct Dsv4FfnPrep {
     fcur: Vec<f32>,
     fpost: Vec<f32>,
@@ -1538,6 +1869,7 @@ fn dsv4_attn_and_route(
     hip: Option<&allpaca_hip::HipWorkspace>,
     skip_mla: bool,
     prefill: bool,
+    seq: &mut Dsv4Memory,
 ) -> Result<(Vec<Vec<f32>>, Dsv4FfnPrep), AllpacaError> {
     let cfg = &model.config;
     let spec = &dsv4.spec;
@@ -1567,6 +1899,8 @@ fn dsv4_attn_and_route(
         cur = n;
     }
     let blk = cfg.gguf_blk(layer_idx);
+    let ratio = spec.attn.ratio(blk);
+    let masked = spec.attn.needs_mask(ratio, pos, 1);
     if crate::dsv4_gpu::want_full_layer_prefetch(prefill, cfg) {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
             let _ = g.prefetch_layer_experts(f, blk, cfg, Some(metrics));
@@ -1575,7 +1909,7 @@ fn dsv4_attn_and_route(
     let attn_out = with_mla(dsv4, layer_idx, blk, skip_mla, |mla| {
         let mut q = vec![0.0f32; q_out];
         let mut have_host_q = false;
-        let dq = if !meta.sinks.is_empty() {
+        let dq = if !meta.sinks.is_empty() && !masked {
             match (gpu.as_deref_mut(), file) {
                 (Some(g), Some(f)) => g
                     .mla_q_norm_rope_device(
@@ -1592,6 +1926,7 @@ fn dsv4_attn_and_route(
                         head_dim,
                         pos,
                         cfg.rope_theta,
+                        None,
                         cfg.rope_dims,
                         spec.rope_offset,
                         Some(metrics),
@@ -1657,7 +1992,7 @@ fn dsv4_attn_and_route(
                 let mut n = vec![0.0f32; head_dim];
                 timed_rmsnorm(row, &vec![1.0; head_dim], eps, &mut n, metrics)?;
                 row.copy_from_slice(&n);
-                rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                dsv4_rope(cfg, spec, ratio, row, pos, false)?;
             }
             have_host_q = true;
         }
@@ -1697,13 +2032,8 @@ fn dsv4_attn_and_route(
                 kv_lat = n;
             }
         }
-        rope_offset(
-            &mut kv_lat,
-            pos,
-            cfg.rope_theta,
-            cfg.rope_dims,
-            spec.rope_offset,
-        )?;
+        dsv4_rope(cfg, spec, ratio, &mut kv_lat, pos, false)?;
+        crate::dsv4_attn::fp8_quantize(&mut kv_lat, spec.rope_offset);
         let page_tokens = kv
             .get(page_ids[layer_idx][0])
             .map(|p| p.capacity_tokens)
@@ -1713,7 +2043,13 @@ fn dsv4_attn_and_route(
         let page_id = page_ids[layer_idx][page_index];
         kv.write_slot(page_id, slot, n_kv_heads, head_dim, &kv_lat, &kv_lat)?;
         kv.touch(page_id, 1.0);
-        let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
+        // The masked path reads the keys it needs itself.
+        let k_all = if masked {
+            Vec::new()
+        } else {
+            let lo = spec.attn.raw_lo(pos);
+            gather_raw_keys(kv, &page_ids[layer_idx], lo, pos + 1, n_kv_heads, head_dim)?
+        };
         let n_kv = k_all.len() / kv_dim.max(1);
         let mut attn_raw = Vec::new();
         let t_attn = Instant::now();
@@ -1722,7 +2058,7 @@ fn dsv4_attn_and_route(
                 .attention_rope_back_from_device_q(
                     p,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     1,
                     n_kv,
@@ -1731,20 +2067,41 @@ fn dsv4_attn_and_route(
                     head_dim,
                     pos,
                     cfg.rope_theta,
+                    None,
                     cfg.rope_dims,
                     spec.rope_offset,
                 )
                 .ok(),
             _ => None,
         };
-        if dattn.is_none() {
+        if masked {
+            let keys = dsv4_absorb(
+                model,
+                dsv4,
+                layer_idx,
+                ratio,
+                &cur,
+                &mla.q_a_norm,
+                pos,
+                1,
+                &page_ids[layer_idx],
+                kv,
+                seq,
+                &mut gpu,
+                file,
+                metrics,
+            )?;
+            attn_raw = dsv4_memory_attention(
+                model, dsv4, layer_idx, ratio, &keys, &q, pos, 1, seq, &mut gpu, hip, skip_mla,
+            )?;
+        } else if dattn.is_none() {
             attn_raw = vec![0.0f32; q_out];
             let attn_ok = match (dq, gpu.as_deref_mut()) {
                 (Some(p), Some(g)) => g
                     .attention_sinks_from_device_q(
                         p,
                         &k_all,
-                        &v_all,
+                        &k_all,
                         &meta.sinks,
                         &mut attn_raw,
                         1,
@@ -1773,7 +2130,7 @@ fn dsv4_attn_and_route(
                     hip,
                     &q,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     &mut attn_raw,
                     1,
@@ -2100,6 +2457,7 @@ fn dsv4_attn_and_route_rows(
     hip: Option<&allpaca_hip::HipWorkspace>,
     skip_mla: bool,
     prefill: bool,
+    seq: &mut Dsv4Memory,
 ) -> Result<Vec<Dsv4FfnPrep>, AllpacaError> {
     let n_tok = tokens.len();
     if n_tok == 0 {
@@ -2123,6 +2481,12 @@ fn dsv4_attn_and_route_rows(
     let host = &model.layers[layer_idx];
     let mut gpu = gpu;
     let blk = cfg.gguf_blk(layer_idx);
+    let ratio = spec.attn.ratio(blk);
+    let masked = spec.attn.needs_mask(ratio, start_pos, n_tok);
+    // Several tokens with their own keys each attend on the host; one
+    // token's keys go to the device as a single run.
+    let host_attn = masked && n_tok > 1;
+    let (rope_theta, rope_yarn) = spec.attn.rope(ratio).device();
     if crate::dsv4_gpu::want_full_layer_prefetch(prefill, cfg) {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
             let _ = g.prefetch_layer_experts(f, blk, cfg, Some(metrics));
@@ -2153,7 +2517,7 @@ fn dsv4_attn_and_route_rows(
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let attn_outs = with_mla(dsv4, layer_idx, blk, skip_mla, |mla| {
         let mut q = Vec::new();
-        let dq = if !meta.sinks.is_empty() {
+        let dq = if !meta.sinks.is_empty() && !host_attn {
             match (gpu.as_deref_mut(), file) {
                 (Some(g), Some(f)) => g
                     .mla_q_norm_rope_device(
@@ -2169,7 +2533,8 @@ fn dsv4_attn_and_route_rows(
                         n_heads,
                         head_dim,
                         start_pos,
-                        cfg.rope_theta,
+                        rope_theta,
+                        rope_yarn,
                         cfg.rope_dims,
                         spec.rope_offset,
                         Some(metrics),
@@ -2212,7 +2577,7 @@ fn dsv4_attn_and_route_rows(
                 let qrow = &mut q[t * q_out..(t + 1) * q_out];
                 for h in 0..n_heads {
                     let row = &mut qrow[h * head_dim..(h + 1) * head_dim];
-                    rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                    dsv4_rope(cfg, spec, ratio, row, pos, false)?;
                 }
             }
         }
@@ -2226,14 +2591,53 @@ fn dsv4_attn_and_route_rows(
         for t in 0..n_tok {
             let pos = start_pos + t;
             let kv_row = &mut kv_lat[t * head_dim..(t + 1) * head_dim];
-            rope_offset(kv_row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+            dsv4_rope(cfg, spec, ratio, kv_row, pos, false)?;
+            crate::dsv4_attn::fp8_quantize(kv_row, spec.rope_offset);
             let page_index = pos / page_tokens as usize;
             let slot = (pos % page_tokens as usize) as u32;
             let page_id = page_ids[layer_idx][page_index];
             kv.write_slot(page_id, slot, n_kv_heads, head_dim, kv_row, kv_row)?;
             kv.touch(page_id, 1.0);
         }
-        let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
+        let memory_keys = if masked {
+            if let Some(g) = gpu.as_deref_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
+            Some(dsv4_absorb(
+                model,
+                dsv4,
+                layer_idx,
+                ratio,
+                &curs,
+                &mla.q_a_norm,
+                start_pos,
+                n_tok,
+                &page_ids[layer_idx],
+                kv,
+                seq,
+                &mut gpu,
+                file,
+                metrics,
+            )?)
+        } else {
+            None
+        };
+        let k_all = match &memory_keys {
+            Some(_) if host_attn => Vec::new(),
+            Some(keys) => {
+                let mut seen = Vec::new();
+                dsv4_token_keys(model, dsv4, layer_idx, ratio, keys, start_pos, 0, seq, &mut seen)?;
+                seen
+            }
+            None => gather_raw_keys(
+                kv,
+                &page_ids[layer_idx],
+                spec.attn.raw_lo(start_pos),
+                start_pos + n_tok,
+                n_kv_heads,
+                head_dim,
+            )?,
+        };
         let n_kv = k_all.len() / kv_dim.max(1);
         let mut attn_raws = Vec::new();
         let t_attn = Instant::now();
@@ -2242,7 +2646,7 @@ fn dsv4_attn_and_route_rows(
                 .attention_rope_back_from_device_q(
                     p,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     n_tok,
                     n_kv,
@@ -2250,14 +2654,20 @@ fn dsv4_attn_and_route_rows(
                     n_kv_heads,
                     head_dim,
                     start_pos,
-                    cfg.rope_theta,
+                    rope_theta,
+                    rope_yarn,
                     cfg.rope_dims,
                     spec.rope_offset,
                 )
                 .ok(),
             _ => None,
         };
-        if dattn.is_none() {
+        if let (true, Some(keys)) = (host_attn, &memory_keys) {
+            attn_raws = dsv4_memory_attention(
+                model, dsv4, layer_idx, ratio, keys, &q, start_pos, n_tok, seq, &mut gpu, hip,
+                skip_mla,
+            )?;
+        } else if dattn.is_none() {
             if let Some(g) = gpu.as_deref_mut() {
                 g.ensure_hc_curs_host(&mut curs)?;
             }
@@ -2267,7 +2677,7 @@ fn dsv4_attn_and_route_rows(
                     .attention_sinks_from_device_q(
                         p,
                         &k_all,
-                        &v_all,
+                        &k_all,
                         &meta.sinks,
                         &mut attn_raws,
                         n_tok as i32,
@@ -2297,7 +2707,7 @@ fn dsv4_attn_and_route_rows(
                     hip,
                     &q,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     &mut attn_raws,
                     n_tok,
@@ -2312,7 +2722,7 @@ fn dsv4_attn_and_route_rows(
                 let attn_raw = &mut attn_raws[t * q_out..(t + 1) * q_out];
                 for h in 0..n_heads {
                     let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
-                    rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                    dsv4_rope(cfg, spec, ratio, row, pos, true)?;
                 }
             }
         }
@@ -3658,6 +4068,24 @@ fn dsv4_packed_gpu_live(model: &TinyModel) -> bool {
         })
 }
 
+/// The sequence's attention memory, or a fresh one for a forward that
+/// starts a sequence. A model with compressed layers cannot continue a
+/// sequence without the memory of what came before.
+fn sequence_memory<'a>(
+    spec: &Dsv4Spec,
+    seq: Option<&'a mut Dsv4Memory>,
+    start_pos: usize,
+    fresh: &'a mut Dsv4Memory,
+) -> Result<&'a mut Dsv4Memory, AllpacaError> {
+    match seq {
+        Some(seq) => Ok(seq),
+        None if start_pos == 0 || !spec.attn.compresses() => Ok(fresh),
+        None => Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+            "DeepSeek-V4 forward at position {start_pos} without the sequence's attention memory"
+        )))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn forward_dsv4_token(
     model: &TinyModel,
@@ -3670,6 +4098,7 @@ pub fn forward_dsv4_token(
     _dense: Option<&mut DenseKv>,
     hip: Option<&allpaca_hip::HipWorkspace>,
     prefill: bool,
+    seq: Option<&mut Dsv4Memory>,
 ) -> Result<(), AllpacaError> {
     if dsv4_packed_gpu_live(model) {
         return forward_dsv4_tokens(
@@ -3683,6 +4112,7 @@ pub fn forward_dsv4_token(
             hip,
             true,
             prefill,
+            seq,
         );
     }
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
@@ -3691,6 +4121,8 @@ pub fn forward_dsv4_token(
     let cfg = &model.config;
     let dim = cfg.dim;
     let hc = dsv4.spec.hc_mult.max(1);
+    let mut fresh = Dsv4Memory::default();
+    let seq = sequence_memory(&dsv4.spec, seq, pos, &mut fresh)?;
 
     let t_embed = Instant::now();
     let x0 = if !model.embed.is_empty() {
@@ -3740,6 +4172,7 @@ pub fn forward_dsv4_token(
             hip,
             skip_mla,
             prefill,
+            seq,
         )?;
         streams = dsv4_apply_moe(
             model,
@@ -3783,6 +4216,7 @@ pub fn forward_dsv4_tokens(
     hip: Option<&allpaca_hip::HipWorkspace>,
     write_logits: bool,
     prefill: bool,
+    seq: Option<&mut Dsv4Memory>,
 ) -> Result<(), AllpacaError> {
     if tokens.is_empty() {
         return Ok(());
@@ -3790,6 +4224,8 @@ pub fn forward_dsv4_tokens(
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad("missing DeepSeek-V4 weights".into()))
     })?;
+    let mut fresh = Dsv4Memory::default();
+    let seq = sequence_memory(&dsv4.spec, seq, start_pos, &mut fresh)?;
     let cfg = &model.config;
     let dim = cfg.dim;
     let hc = dsv4.spec.hc_mult.max(1);
@@ -3843,6 +4279,7 @@ pub fn forward_dsv4_tokens(
             hip,
             skip_mla,
             prefill,
+            seq,
         )?;
         dsv4_apply_moe_rows(
             model,
@@ -4316,6 +4753,175 @@ pub fn write_tiny_deepseek4_gguf(path: &std::path::Path) {
     write_gguf(path, &meta, &views).expect("write tiny deepseek4");
 }
 
+/// What [`write_tiny_deepseek4_ctx_gguf`] varies.
+pub struct TinyDsv4Ctx {
+    /// Raw keys a token attends to (0 = all).
+    pub window: u32,
+    /// One layer per entry: 0, 4 or 128.
+    pub compress_ratios: Vec<u32>,
+    /// Compressed keys the indexer keeps (0 = all).
+    pub top_k: u32,
+}
+
+/// Tiny DeepSeek-V4 GGUF for attention-memory tests: every weight differs
+/// (seeded noise), so tokens and positions are told apart, and layers have
+/// the compressors and indexer their ratio calls for.
+pub fn write_tiny_deepseek4_ctx_gguf(path: &std::path::Path, opts: &TinyDsv4Ctx) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let (dim, vocab, n_heads, head_dim, n_rot) = (16usize, 8usize, 2usize, 8usize, 4u32);
+    let (q_lora, o_lora, groups, hc) = (8usize, 8usize, 2usize, 2usize);
+    let (n_experts, ff) = (4usize, 16usize);
+    let (index_heads, index_dim) = (2usize, 8usize);
+    let q_out = n_heads * head_dim;
+    let oa_out = o_lora * groups;
+    let o_group_dim = (n_heads / groups) * head_dim;
+    let hc_dim = dim * hc;
+    let mix_dim = (2 + hc) * hc;
+
+    let mut meta = HashMap::new();
+    let u = |v: usize| GgufValue::Uint32(v as u32);
+    for (key, value) in [
+        ("vocab_size", u(vocab)),
+        ("embedding_length", u(dim)),
+        ("block_count", u(opts.compress_ratios.len())),
+        ("attention.head_count", u(n_heads)),
+        ("attention.head_count_kv", u(1)),
+        ("attention.key_length", u(head_dim)),
+        ("attention.value_length", u(head_dim)),
+        ("rope.dimension_count", GgufValue::Uint32(n_rot)),
+        ("rope.scaling.type", GgufValue::String("yarn".into())),
+        ("rope.scaling.factor", GgufValue::Float32(4.0)),
+        ("rope.scaling.original_context_length", u(64)),
+        ("attention.compress_rope_freq_base", GgufValue::Float32(100.0)),
+        ("attention.sliding_window", GgufValue::Uint32(opts.window)),
+        (
+            "attention.compress_ratios",
+            GgufValue::Array(opts.compress_ratios.iter().map(|r| GgufValue::Uint32(*r)).collect()),
+        ),
+        ("attention.indexer.head_count", u(index_heads)),
+        ("attention.indexer.key_length", u(index_dim)),
+        ("attention.indexer.top_k", GgufValue::Uint32(opts.top_k)),
+        ("attention.q_lora_rank", u(q_lora)),
+        ("attention.output_lora_rank", u(o_lora)),
+        ("attention.output_group_count", u(groups)),
+        ("hyper_connection.count", u(hc)),
+        ("hyper_connection.sinkhorn_iterations", u(4)),
+        ("hyper_connection.epsilon", GgufValue::Float32(1e-6)),
+        ("hash_layer_count", u(0)),
+        ("expert_count", u(n_experts)),
+        ("expert_used_count", u(2)),
+        ("expert_shared_count", u(1)),
+        ("expert_feed_forward_length", u(ff)),
+        ("expert_shared_feed_forward_length", u(ff)),
+        ("expert_weights_norm", GgufValue::Bool(true)),
+        ("expert_weights_scale", GgufValue::Float32(1.5)),
+        ("expert_gating_func", u(4)),
+    ] {
+        meta.insert(format!("deepseek4.{key}"), value);
+    }
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("deepseek4".into()),
+    );
+    meta.insert("general.name".into(), GgufValue::String("tiny-dsv4-ctx".into()));
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(
+            ["<unk>", "<s>", "</s>", "hi", "a", "b", "c", "d"]
+                .into_iter()
+                .map(|t| GgufValue::String(t.into()))
+                .collect(),
+        ),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+    let mut seed = 0x9e37_79b9u32;
+    let mut noise = |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    };
+    let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
+    let mut add = |name: String, dims: &[usize], data: Vec<f32>| {
+        owned.push((name, dims.iter().map(|d| *d as u64).collect(), data));
+    };
+    add("token_embd.weight".into(), &[vocab, dim], noise(vocab * dim, 1.0));
+    for (blk, &ratio) in opts.compress_ratios.iter().enumerate() {
+        let ratio = ratio as usize;
+        let mut t = |name: &str, dims: &[usize], data: Vec<f32>| {
+            add(format!("blk.{blk}.{name}.weight"), dims, data);
+        };
+        t("attn_norm", &[dim], vec![1.0; dim]);
+        t("attn_q_a", &[q_lora, dim], noise(q_lora * dim, 0.5));
+        t("attn_q_a_norm", &[q_lora], vec![1.0; q_lora]);
+        t("attn_q_b", &[q_out, q_lora], noise(q_out * q_lora, 0.5));
+        t("attn_kv", &[head_dim, dim], noise(head_dim * dim, 0.5));
+        t("attn_kv_a_norm", &[head_dim], vec![1.0; head_dim]);
+        t("attn_output_a", &[o_group_dim, oa_out], noise(o_group_dim * oa_out, 0.5));
+        t("attn_output_b", &[dim, oa_out], noise(dim * oa_out, 0.5));
+        t("attn_sinks", &[n_heads], noise(n_heads, 0.5));
+        t("ffn_norm", &[dim], vec![1.0; dim]);
+        for kind in ["attn", "ffn"] {
+            t(&format!("hc_{kind}_fn"), &[hc_dim, mix_dim], noise(mix_dim * hc_dim, 0.1));
+            t(&format!("hc_{kind}_base"), &[2 * hc + hc * hc], vec![0.0; 2 * hc + hc * hc]);
+            t(&format!("hc_{kind}_scale"), &[3], vec![1.0; 3]);
+        }
+        t("ffn_gate_inp", &[n_experts, dim], noise(n_experts * dim, 0.5));
+        t("ffn_gate_exps", &[n_experts * ff, dim], noise(n_experts * ff * dim, 0.3));
+        t("ffn_up_exps", &[n_experts * ff, dim], noise(n_experts * ff * dim, 0.3));
+        t("ffn_down_exps", &[n_experts * dim, ff], noise(n_experts * dim * ff, 0.3));
+        t("ffn_gate_shexp", &[ff, dim], noise(ff * dim, 0.3));
+        t("ffn_up_shexp", &[ff, dim], noise(ff * dim, 0.3));
+        t("ffn_down_shexp", &[dim, ff], noise(dim * ff, 0.3));
+        if ratio == 0 {
+            continue;
+        }
+        // Ratio-4 compressors project to two keys' width (group overlap).
+        let coff = if ratio == 4 { 2 } else { 1 };
+        let mut compressor = |prefix: &str, head: usize| {
+            let width = coff * head;
+            t(&format!("{prefix}_kv"), &[width, dim], noise(width * dim, 0.5));
+            t(&format!("{prefix}_gate"), &[width, dim], noise(width * dim, 0.5));
+            t(&format!("{prefix}_ape"), &[ratio, width], noise(ratio * width, 0.5));
+            t(&format!("{prefix}_norm"), &[head], vec![1.0; head]);
+        };
+        compressor("attn_compressor", head_dim);
+        if ratio == 4 {
+            compressor("indexer_compressor", index_dim);
+            t(
+                "indexer.attn_q_b",
+                &[index_heads * index_dim, q_lora],
+                noise(index_heads * index_dim * q_lora, 0.5),
+            );
+            t("indexer.proj", &[index_heads, dim], noise(index_heads * dim, 0.5));
+        }
+    }
+    add("output_hc_fn.weight".into(), &[hc_dim, hc], noise(hc * hc_dim, 0.1));
+    add("output_hc_base.weight".into(), &[hc], vec![0.0; hc]);
+    add("output_hc_scale.weight".into(), &[1], vec![1.0]);
+    add("output_norm.weight".into(), &[dim], vec![1.0; dim]);
+    add("output.weight".into(), &[vocab, dim], noise(vocab * dim, 0.5));
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).expect("write tiny deepseek4 ctx");
+}
+
 /// Tiny DeepSeek-V4 GGUF with BF16 MLA/shexp/lm_head and MXFP4 experts (`k % 32 == 0`).
 /// HIP GEMV is used only for those dtypes; F32 fixtures stay on the CPU path.
 pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
@@ -4732,6 +5338,7 @@ mod tests {
             hc_eps: 1e-6,
             hash_layer_count: 0,
             rope_offset: 0,
+            attn: Default::default(),
         };
         let dim = 8;
         let hc = spec.hc_mult;
@@ -4811,6 +5418,7 @@ mod tests {
                 hc_eps: 1e-6,
                 hash_layer_count: 0,
                 rope_offset: 0,
+                attn: Default::default(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -4871,6 +5479,7 @@ mod tests {
                 hc_eps: 1e-6,
                 hash_layer_count: 0,
                 rope_offset: 0,
+                attn: Default::default(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -5051,6 +5660,7 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
             )
             .expect("sequential token");
         }
@@ -5068,6 +5678,7 @@ mod tests {
             None,
             true,
             true,
+            None,
         )
         .expect("chunk tokens");
         for (i, (a, b)) in logits_seq.iter().zip(logits_chunk.iter()).enumerate() {
