@@ -244,9 +244,11 @@ int allpaca_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c, int32_t m,
 int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                   int32_t k, allpaca_stream_t stream);
 
-/* C[m,n] = silu(A * dequant(Bg)^T) * (A * dequant(Bu)^T). Same MXFP4 layout. */
+/* C[m,n] = silu(A * dequant(Bg)^T) * (A * dequant(Bu)^T). Same MXFP4 layout. With limit > 0
+ * the gate is capped at limit before SiLU and the up projection to +-limit. */
 int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_t *bu, float *c,
-                                 int32_t m, int32_t n, int32_t k, allpaca_stream_t stream);
+                                 int32_t m, int32_t n, int32_t k, float limit,
+                                 allpaca_stream_t stream);
 
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,

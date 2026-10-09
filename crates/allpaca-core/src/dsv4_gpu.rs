@@ -1097,6 +1097,15 @@ impl Dsv4Gpu {
         }
     }
 
+    /// Cap for the routed experts launched from now on (DeepSeek-V4's
+    /// `swiglu_clamp_exp` of the layer being run; 0 = none).
+    pub fn set_swiglu_limit(&self, limit: f32) {
+        self.hip.set_mxfp4_swiglu_limit(limit);
+        if let Some(draft) = &self.draft {
+            draft.set_mxfp4_swiglu_limit(limit);
+        }
+    }
+
     pub fn has_expert_slots(&self) -> bool {
         !self.slots.is_empty() || !self.gpu1_slots.is_empty() || self.prefill.is_some()
     }

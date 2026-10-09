@@ -127,10 +127,18 @@ unsafe impl Sync for Out {}
 const CHUNK: usize = 32;
 
 /// SwiGLU of every expert on its rows: `down · (silu(gate · x) * up · x)`.
+/// With `limit > 0` the gate is capped at `limit` before SiLU and the up
+/// projection to `±limit` (DeepSeek-V4's `swiglu_clamp_exp`).
 /// Returns one `m * dim` vector per expert. `dim` and `ff` must be multiples
 /// of 32. Rows are shared out over `threads` threads; `threads <= 1` runs on
 /// the caller.
-pub fn mxfp4_swiglu_experts(experts: &[Mxfp4Expert<'_>], dim: usize, ff: usize, threads: usize) -> Vec<Vec<f32>> {
+pub fn mxfp4_swiglu_experts(
+    experts: &[Mxfp4Expert<'_>],
+    dim: usize,
+    ff: usize,
+    limit: f32,
+    threads: usize,
+) -> Vec<Vec<f32>> {
     let (kb, fb) = (dim / MXFP4_BLOCK_ELEMS, ff / MXFP4_BLOCK_ELEMS);
     let row_in = kb * MXFP4_BLOCK_BYTES;
     let row_down = fb * MXFP4_BLOCK_BYTES;
@@ -170,7 +178,12 @@ pub fn mxfp4_swiglu_experts(experts: &[Mxfp4Expert<'_>], dim: usize, ff: usize, 
                 let u = &ex.up[row * row_in..(row + 1) * row_in];
                 for i in 0..ex.m {
                     let x = &ex.x[i * dim..(i + 1) * dim];
-                    let h = silu(dot.run(g, kb, x)) * dot.run(u, kb, x);
+                    let (mut gv, mut uv) = (dot.run(g, kb, x), dot.run(u, kb, x));
+                    if limit > 0.0 {
+                        gv = gv.min(limit);
+                        uv = uv.clamp(-limit, limit);
+                    }
+                    let h = silu(gv) * uv;
                     // SAFETY: each (expert, row, i) is written by one thread.
                     unsafe { *hid[e].0.add(i * ff + row) = h };
                 }
@@ -228,14 +241,28 @@ mod tests {
 
     #[test]
     fn packed_expert_matches_dequantised_reference() {
+        check_against_reference(0.0, 2.0);
+    }
+
+    #[test]
+    fn swiglu_limit_caps_the_gate_and_the_up_projection() {
+        // Inputs large enough that many gate and up values pass the limit.
+        check_against_reference(10.0, 60.0);
+    }
+
+    /// Packed experts against dequantise-then-F32 SwiGLU, with the gate
+    /// capped at `limit` before SiLU and the up projection to +-`limit`
+    /// (0 = no limit).
+    fn check_against_reference(limit: f32, x_scale: f32) {
         let (dim, ff) = (96usize, 64usize);
+        let mut capped = 0usize;
         let mut packed = Vec::new();
         let mut reference = Vec::new();
         for (e, m) in [(0u64, 1usize), (1, 3)] {
             let gate = quantize_mxfp4(&rand(ff * dim, 11 + e, 0.4));
             let up = quantize_mxfp4(&rand(ff * dim, 23 + e, 0.4));
             let down = quantize_mxfp4(&rand(dim * ff, 37 + e, 0.4));
-            let x = rand(m * dim, 51 + e, 2.0);
+            let x = rand(m * dim, 51 + e, x_scale);
             // Reference: dequantise, then plain F32 SwiGLU.
             let deq = |b: &[u8], n: usize| {
                 let mut o = vec![0.0f32; n];
@@ -249,7 +276,13 @@ mod tests {
                 let h: Vec<f32> = (0..ff)
                     .map(|r| {
                         let dot = |w: &[f32]| w[r * dim..(r + 1) * dim].iter().zip(xi).map(|(a, b)| a * b).sum::<f32>();
-                        silu(dot(&g)) * dot(&u)
+                        let (gv, uv) = (dot(&g), dot(&u));
+                        if limit > 0.0 {
+                            capped += usize::from(gv > limit || uv.abs() > limit);
+                            silu(gv.min(limit)) * uv.clamp(-limit, limit)
+                        } else {
+                            silu(gv) * uv
+                        }
                     })
                     .collect();
                 for j in 0..dim {
@@ -259,12 +292,13 @@ mod tests {
             reference.push(y);
             packed.push((gate, up, down, x, m));
         }
+        assert_eq!(capped > 0, limit > 0.0, "the limit must matter exactly when it is set");
         let experts: Vec<Mxfp4Expert<'_>> = packed
             .iter()
             .map(|(gate, up, down, x, m)| Mxfp4Expert { gate, up, down, x, m: *m })
             .collect();
         for threads in [1usize, 4] {
-            let got = mxfp4_swiglu_experts(&experts, dim, ff, threads);
+            let got = mxfp4_swiglu_experts(&experts, dim, ff, limit, threads);
             for (y, want) in got.iter().zip(&reference) {
                 assert_eq!(y.len(), want.len());
                 let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);

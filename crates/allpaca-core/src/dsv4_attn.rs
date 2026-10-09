@@ -734,6 +734,7 @@ mod tests {
                 window,
                 compress_ratios: compress_ratios.to_vec(),
                 top_k,
+                swiglu_clamp: 0.0,
             },
         );
         let file = std::sync::Arc::new(GgufFile::open(&path).expect("open tiny dsv4"));

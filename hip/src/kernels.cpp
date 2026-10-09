@@ -4049,10 +4049,12 @@ __global__ void gemv_nt_mxfp4_wide_kernel(const float *a, const uint8_t *b, floa
     }
 }
 
+__device__ inline float mxfp4_swiglu(float g, float u, float limit);
+
 /* The same layout for the fused gate/up step: writes silu(gate)*up. */
 __global__ void mxfp4_swiglu_gate_up_wide_kernel(const float *a, const uint8_t *bg,
                                                  const uint8_t *bu, float *c, int m, int n,
-                                                 int k) {
+                                                 int k, float limit) {
     constexpr int GROUPS = 8;
     const int row = static_cast<int>(blockIdx.y);
     const int grp = static_cast<int>(threadIdx.x) / 32;
@@ -4084,7 +4086,7 @@ __global__ void mxfp4_swiglu_gate_up_wide_kernel(const float *a, const uint8_t *
     if (col < n && lane == 0) {
         const float x = acc_g;
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] =
-            (x / (1.0f + expf(-x))) * acc_u;
+            mxfp4_swiglu(x, acc_u, limit);
     }
 }
 
@@ -4152,10 +4154,20 @@ extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, f
 
 __device__ inline float mxfp4_silu(float x) { return x / (1.0f + expf(-x)); }
 
+/* silu(gate) * up; with limit > 0 the gate is capped at limit first and up to +-limit
+ * (DeepSeek-V4 swiglu_clamp_exp). */
+__device__ inline float mxfp4_swiglu(float g, float u, float limit) {
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    return mxfp4_silu(g) * u;
+}
+
 /* One A-tile load, two MXFP4 B rows, write silu(gate)*up. */
 __global__ void mxfp4_swiglu_gate_up_tiled_kernel(const float *a, const uint8_t *bg,
                                                   const uint8_t *bu, float *c, int m, int n,
-                                                  int k) {
+                                                  int k, float limit) {
     constexpr int COLS = 64;
     constexpr int TILE = 256;
     constexpr int BLOCKS_PER_TILE = TILE / 32;
@@ -4209,7 +4221,7 @@ __global__ void mxfp4_swiglu_gate_up_tiled_kernel(const float *a, const uint8_t 
     }
     if (grow) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
-            mxfp4_silu(acc_g) * acc_u;
+            mxfp4_swiglu(acc_g, acc_u, limit);
     }
 }
 
@@ -4217,7 +4229,7 @@ __global__ void mxfp4_swiglu_gate_up_tiled_kernel(const float *a, const uint8_t 
 template <int TILE_M>
 __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_t *bg,
                                                     const uint8_t *bu, float *c, int m, int n,
-                                                    int k) {
+                                                    int k, float limit) {
     constexpr int COLS = 64;
     constexpr int TILE_K = 256;
     constexpr int BLOCKS_PER_TILE = TILE_K / 32;
@@ -4285,7 +4297,7 @@ __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_
             const int row = row0 + r;
             if (row < m) {
                 c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
-                    mxfp4_silu(acc_g[r]) * acc_u[r];
+                    mxfp4_swiglu(acc_g[r], acc_u[r], limit);
             }
         }
     }
@@ -4293,7 +4305,7 @@ __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_
 
 extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_t *bu,
                                             float *c, int32_t m, int32_t n, int32_t k,
-                                            allpaca_stream_t stream) {
+                                            float limit, allpaca_stream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !bg || !bu || !c) {
         return ALLPACA_ERR_INVALID;
     }
@@ -4302,7 +4314,7 @@ extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, c
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + 7) / 8), 1);
         hipLaunchKernelGGL(mxfp4_swiglu_gate_up_wide_kernel, grid, block, 0, as_stream(stream), a,
-                           bg, bu, c, m, n, k);
+                           bg, bu, c, m, n, k, limit);
         return hip_status(hipGetLastError());
     }
     constexpr int COLS = 64;
@@ -4313,19 +4325,19 @@ extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, c
             dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
                       static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
             hipLaunchKernelGGL((mxfp4_swiglu_gate_up_tiled_m_kernel<16>), grid, block, 0,
-                               as_stream(stream), a, bg, bu, c, m, n, k);
+                               as_stream(stream), a, bg, bu, c, m, n, k, limit);
         } else {
             constexpr int TILE_M = 8;
             dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
                       static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
             hipLaunchKernelGGL((mxfp4_swiglu_gate_up_tiled_m_kernel<8>), grid, block, 0,
-                               as_stream(stream), a, bg, bu, c, m, n, k);
+                               as_stream(stream), a, bg, bu, c, m, n, k, limit);
         }
     } else {
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
         hipLaunchKernelGGL(mxfp4_swiglu_gate_up_tiled_kernel, grid, block, 0, as_stream(stream), a,
-                           bg, bu, c, m, n, k);
+                           bg, bu, c, m, n, k, limit);
     }
     return hip_status(hipGetLastError());
 }
@@ -8429,7 +8441,8 @@ extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *, const uint8_t *, flo
 }
 
 extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *, const uint8_t *, const uint8_t *,
-                                            float *, int32_t, int32_t, int32_t, allpaca_stream_t) {
+                                            float *, int32_t, int32_t, int32_t, float,
+                                            allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

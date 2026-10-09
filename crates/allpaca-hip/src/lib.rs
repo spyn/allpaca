@@ -593,6 +593,7 @@ mod ffi {
             m: i32,
             n: i32,
             k: i32,
+            limit: f32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gemm_nt_q6_k(
@@ -2712,6 +2713,9 @@ pub fn gemm_nt_mxfp4_device_on(
 }
 
 /// Device-pointer fused MXFP4 gate+up+SiLU: `C = silu(A * dequant(Bg)^T) * (A * dequant(Bu)^T)`.
+/// With `limit > 0` the gate is capped at `limit` before SiLU and the up
+/// projection to `±limit`.
+#[allow(clippy::too_many_arguments)]
 pub fn mxfp4_swiglu_gate_up_device(
     a: *const f32,
     bg: *const u8,
@@ -2720,11 +2724,13 @@ pub fn mxfp4_swiglu_gate_up_device(
     m: i32,
     n: i32,
     k: i32,
+    limit: f32,
 ) -> Result<(), AllpacaError> {
-    mxfp4_swiglu_gate_up_device_on(a, bg, bu, c, m, n, k, std::ptr::null_mut())
+    mxfp4_swiglu_gate_up_device_on(a, bg, bu, c, m, n, k, limit, std::ptr::null_mut())
 }
 
 /// Same as [`mxfp4_swiglu_gate_up_device`], queued on `stream` (null is the default stream).
+#[allow(clippy::too_many_arguments)]
 pub fn mxfp4_swiglu_gate_up_device_on(
     a: *const f32,
     bg: *const u8,
@@ -2733,16 +2739,17 @@ pub fn mxfp4_swiglu_gate_up_device_on(
     m: i32,
     n: i32,
     k: i32,
+    limit: f32,
     stream: *mut std::ffi::c_void,
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_mxfp4_swiglu_gate_up(a, bg, bu, c, m, n, k, stream) };
+        let rc = unsafe { ffi::allpaca_mxfp4_swiglu_gate_up(a, bg, bu, c, m, n, k, limit, stream) };
         status(rc, "mxfp4_swiglu_gate_up")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
-        let _ = (a, bg, bu, c, m, n, k, stream);
+        let _ = (a, bg, bu, c, m, n, k, limit, stream);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP mxfp4_swiglu_gate_up unavailable".into(),
         )))
@@ -3867,6 +3874,7 @@ pub fn gemm_nt_mxfp4(
 }
 
 /// Host-pointer fused MXFP4 gate+up+SiLU.
+#[allow(clippy::too_many_arguments)]
 pub fn mxfp4_swiglu_gate_up(
     a: &[f32],
     bg: &[u8],
@@ -3875,6 +3883,7 @@ pub fn mxfp4_swiglu_gate_up(
     m: i32,
     n: i32,
     k: i32,
+    limit: f32,
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -3901,7 +3910,7 @@ pub fn mxfp4_swiglu_gate_up(
             memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
             memcpy(dbg, bg.as_ptr(), packed_bytes, MEMCPY_H2D)?;
             memcpy(dbu, bu.as_ptr(), packed_bytes, MEMCPY_H2D)?;
-            mxfp4_swiglu_gate_up_device(da.cast(), dbg, dbu, dc.cast(), m, n, k)?;
+            mxfp4_swiglu_gate_up_device(da.cast(), dbg, dbu, dc.cast(), m, n, k, limit)?;
             memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
         })();
         device_free(da, a_n * 4);
@@ -3912,7 +3921,7 @@ pub fn mxfp4_swiglu_gate_up(
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
-        let _ = (a, bg, bu, c, m, n, k);
+        let _ = (a, bg, bu, c, m, n, k, limit);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP mxfp4_swiglu_gate_up unavailable".into(),
         )))
@@ -5618,6 +5627,8 @@ pub struct HipWorkspace {
     /// Device ranges `[start, end)` of dense weights staged as Q8_0 blocks,
     /// sorted. See [`Self::register_q8_dense`].
     q8_dense: std::sync::RwLock<Vec<(usize, usize)>>,
+    /// Bits of the clamp the MXFP4 SwiGLU kernels apply (0.0 = none).
+    mxfp4_swiglu_limit: std::sync::atomic::AtomicU32,
     profile_span: AtomicU64,
     logits_inflight: AtomicU64,
     profile: Mutex<ProfileState>,
@@ -5664,6 +5675,7 @@ impl HipWorkspace {
             profiling: AtomicU64::new(0),
             lm_head: AtomicU64::new(0),
             q8_dense: std::sync::RwLock::new(Vec::new()),
+            mxfp4_swiglu_limit: std::sync::atomic::AtomicU32::new(0),
             profile_span: AtomicU64::new(0),
             logits_inflight: AtomicU64::new(0),
             profile: Mutex::new(ProfileState::default()),
@@ -6757,6 +6769,19 @@ impl HipWorkspace {
 
     /// Packed MXFP4 SwiGLU: H2D `x` once (`M` rows), gate/up GEMM, device SiLU, down GEMM, D2H `y`.
     #[allow(clippy::too_many_arguments)]
+    /// Clamp for the MXFP4 SwiGLU this workspace launches from now on: the
+    /// gate is capped at `limit` before SiLU and the up projection to
+    /// `±limit`; 0 = none. DeepSeek-V4 sets its layer's value before each
+    /// layer's experts.
+    pub fn set_mxfp4_swiglu_limit(&self, limit: f32) {
+        self.mxfp4_swiglu_limit
+            .store(limit.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn mxfp4_limit(&self) -> f32 {
+        f32::from_bits(self.mxfp4_swiglu_limit.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub fn mxfp4_swiglu_gemm(
         &self,
         x: &[f32],
@@ -6808,22 +6833,24 @@ impl HipWorkspace {
         ff: i32,
         silu_n: i32,
     ) -> Result<(), AllpacaError> {
-        if self
-            .timed_gpu(DecodeOp::Q8Gemm, || {
-                mxfp4_swiglu_gate_up_device_on(
-                    dx.cast(),
-                    gate_w,
-                    up_w,
-                    dg.cast(),
-                    m,
-                    ff,
-                    dim,
-                    std::ptr::null_mut(),
-                )
-            })
-            .is_ok()
-        {
-            return self.gemm_nt_mxfp4_dev(dg.cast(), down_w, dy.cast(), m, dim, ff);
+        let limit = self.mxfp4_limit();
+        match self.timed_gpu(DecodeOp::Q8Gemm, || {
+            mxfp4_swiglu_gate_up_device_on(
+                dx.cast(),
+                gate_w,
+                up_w,
+                dg.cast(),
+                m,
+                ff,
+                dim,
+                limit,
+                std::ptr::null_mut(),
+            )
+        }) {
+            Ok(()) => return self.gemm_nt_mxfp4_dev(dg.cast(), down_w, dy.cast(), m, dim, ff),
+            // Only the fused kernel clamps; the split path below does not.
+            Err(e) if limit > 0.0 => return Err(e),
+            Err(_) => {}
         }
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -7454,10 +7481,24 @@ impl HipWorkspace {
         stream: *mut std::ffi::c_void,
     ) -> Result<(), AllpacaError> {
         let silu_n = m.saturating_mul(ff);
-        if mxfp4_swiglu_gate_up_device_on(dx.cast(), gate_w, up_w, dg.cast(), m, ff, dim, stream)
-            .is_ok()
-        {
-            return gemm_nt_mxfp4_device_on(dg.cast(), down_w, dy.cast(), m, dim, ff, stream);
+        let limit = self.mxfp4_limit();
+        match mxfp4_swiglu_gate_up_device_on(
+            dx.cast(),
+            gate_w,
+            up_w,
+            dg.cast(),
+            m,
+            ff,
+            dim,
+            limit,
+            stream,
+        ) {
+            Ok(()) => {
+                return gemm_nt_mxfp4_device_on(dg.cast(), down_w, dy.cast(), m, dim, ff, stream)
+            }
+            // Only the fused kernel clamps; the split path below does not.
+            Err(e) if limit > 0.0 => return Err(e),
+            Err(_) => {}
         }
         gemm_nt_mxfp4_device_on(dx.cast(), gate_w, dg.cast(), m, ff, dim, stream)?;
         gemm_nt_mxfp4_device_on(dx.cast(), up_w, du.cast(), m, ff, dim, stream)?;
@@ -13723,7 +13764,7 @@ mod tests {
                 expect[i] = (g / (1.0 + (-g).exp())) * up[i];
             }
             let mut got = vec![0.0f32; m * n];
-            super::mxfp4_swiglu_gate_up(&a, &bg, &bu, &mut got, m as i32, n as i32, k as i32)
+            super::mxfp4_swiglu_gate_up(&a, &bg, &bu, &mut got, m as i32, n as i32, k as i32, 0.0)
                 .expect("fused MXFP4 gate-up");
             for i in 0..m * n {
                 assert!(
@@ -13733,6 +13774,93 @@ mod tests {
                     expect[i]
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mxfp4_swiglu_caps_gate_and_up_at_the_limit() {
+        if device_count() == 0 {
+            return;
+        }
+        let limit = 0.25f32;
+        // One row (the wide kernel), a few rows and many rows (the tiled ones).
+        for (m, n, k, seed) in [
+            (1usize, 64usize, 256usize, 5usize),
+            (2, 64, 128, 3),
+            (24, 96, 256, 13),
+        ] {
+            let (a, bg) = fill_mxfp4_gemm_case(seed, m, n, k);
+            let (_, bu) = fill_mxfp4_gemm_case(seed + 6, m, n, k);
+            let mut gate = vec![0.0f32; m * n];
+            let mut up = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &dequant_mxfp4_matrix(&bg, n, k), &mut gate, m, n, k);
+            cpu_gemm_nt(&a, &dequant_mxfp4_matrix(&bu, n, k), &mut up, m, n, k);
+            let capped = (0..m * n).filter(|&i| gate[i] > limit || up[i].abs() > limit).count();
+            assert!(capped > 0, "case m={m} never reaches the limit");
+            let mut got = vec![0.0f32; m * n];
+            super::mxfp4_swiglu_gate_up(&a, &bg, &bu, &mut got, m as i32, n as i32, k as i32, limit)
+                .expect("fused MXFP4 gate-up");
+            for i in 0..m * n {
+                let g = gate[i].min(limit);
+                let want = (g / (1.0 + (-g).exp())) * up[i].clamp(-limit, limit);
+                assert!(
+                    gemm_close(got[i], want),
+                    "capped gate-up mismatch m={m} idx={i} hip={} cpu={want}",
+                    got[i]
+                );
+            }
+        }
+        // A workspace applies its limit to the whole expert, as the CPU kernel does.
+        let (m, dim, ff) = (2usize, 64usize, 96usize);
+        let (x, gate_q) = fill_mxfp4_gemm_case(4, m, ff, dim);
+        let (_, up_q) = fill_mxfp4_gemm_case(8, m, ff, dim);
+        let (_, down_q) = fill_mxfp4_gemm_case(12, m, dim, ff);
+        let expert = allpaca_cpu::Mxfp4Expert {
+            gate: &gate_q,
+            up: &up_q,
+            down: &down_q,
+            x: &x,
+            m,
+        };
+        let want = allpaca_cpu::mxfp4_swiglu_experts(&[expert], dim, ff, limit, 1).remove(0);
+        let free = allpaca_cpu::mxfp4_swiglu_experts(
+            &[allpaca_cpu::Mxfp4Expert {
+                gate: &gate_q,
+                up: &up_q,
+                down: &down_q,
+                x: &x,
+                m,
+            }],
+            dim,
+            ff,
+            0.0,
+            1,
+        )
+        .remove(0);
+        assert!(want.iter().zip(&free).any(|(a, b)| (a - b).abs() > 1e-3), "limit never reached");
+        let hip = HipWorkspace::new(0, 8 * 1024 * 1024, 8).expect("hip");
+        hip.set_mxfp4_swiglu_limit(limit);
+        let gb = device_malloc(gate_q.len(), 0).expect("gate");
+        let ub = device_malloc(up_q.len(), 0).expect("up");
+        let db = device_malloc(down_q.len(), 0).expect("down");
+        set_device(0).expect("bind");
+        memcpy(gb, gate_q.as_ptr(), gate_q.len(), MEMCPY_H2D).expect("h2d gate");
+        memcpy(ub, up_q.as_ptr(), up_q.len(), MEMCPY_H2D).expect("h2d up");
+        memcpy(db, down_q.as_ptr(), down_q.len(), MEMCPY_H2D).expect("h2d down");
+        let mut got = vec![0.0f32; m * dim];
+        hip.mxfp4_swiglu_gemm(&x, gb, ub, db, &mut got, m as i32, dim as i32, ff as i32)
+            .expect("swiglu gemm");
+        device_free(gb, gate_q.len());
+        device_free(ub, up_q.len());
+        device_free(db, down_q.len());
+        for i in 0..m * dim {
+            assert!(
+                gemm_close(got[i], want[i]),
+                "capped swiglu mismatch idx={i} hip={} cpu={}",
+                got[i],
+                want[i]
+            );
         }
     }
 

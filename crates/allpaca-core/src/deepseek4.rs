@@ -31,6 +31,9 @@ pub struct Dsv4Spec {
     pub hash_layer_count: usize,
     pub rope_offset: usize,
     pub attn: Dsv4AttnSpec,
+    /// Per GGUF block: routed experts cap their gate at this before SiLU
+    /// and their up projection to plus or minus it (empty or 0 = no cap).
+    pub swiglu_clamp: Vec<f32>,
 }
 
 impl Dsv4Spec {
@@ -73,6 +76,19 @@ impl Dsv4Spec {
                 .unwrap_or(0) as usize,
             rope_offset: head_dim.saturating_sub(n_rot),
             attn: Dsv4AttnSpec::from_gguf(file, arch, head_dim, n_rot, cfg.rope_theta, cfg.eps),
+            swiglu_clamp: file
+                .metadata
+                .get(&format!("{arch}.swiglu_clamp_exp"))
+                .and_then(|v| v.as_f32_array())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The cap for the routed experts of GGUF block `blk` (0 = none).
+    pub fn swiglu_limit(&self, blk: usize) -> f32 {
+        match self.swiglu_clamp.get(blk) {
+            Some(limit) if *limit > 1.0e-6 => *limit,
+            _ => 0.0,
         }
     }
 }
@@ -1846,6 +1862,32 @@ fn dsv4_memory_attention(
     Ok(out)
 }
 
+/// A routed expert on host weights: SwiGLU with the gate capped at
+/// `limit` before SiLU and the up projection to plus or minus `limit`
+/// (0 = no cap).
+fn dsv4_expert_rows(
+    x: &[f32],
+    ffn: &LayerFfn,
+    ff_dim: usize,
+    dim: usize,
+    m: usize,
+    out: &mut [f32],
+    limit: f32,
+) -> Result<(), AllpacaError> {
+    if limit <= 0.0 || ffn.w_gate.is_empty() {
+        return expert_mlp_rows(x, ffn, ff_dim, dim, m, out, false);
+    }
+    let mut up = vec![0.0f32; m * ff_dim];
+    let mut gate = vec![0.0f32; m * ff_dim];
+    matmul_nt(x, &ffn.w_up, &mut up, m, ff_dim, dim)?;
+    matmul_nt(x, &ffn.w_gate, &mut gate, m, ff_dim, dim)?;
+    for (g, u) in gate.iter_mut().zip(&up) {
+        let capped = g.min(limit);
+        *g = capped / (1.0 + (-capped).exp()) * u.clamp(-limit, limit);
+    }
+    matmul_nt(&gate, &ffn.w_down, out, m, dim, ff_dim)
+}
+
 struct Dsv4FfnPrep {
     fcur: Vec<f32>,
     fpost: Vec<f32>,
@@ -2939,6 +2981,10 @@ fn dsv4_apply_moe(
     let host = &model.layers[layer_idx];
     let blk = cfg.gguf_blk(layer_idx);
     let mut gpu = gpu;
+    let limit = spec.swiglu_limit(blk);
+    if let Some(g) = gpu.as_deref() {
+        g.set_swiglu_limit(limit);
+    }
     let Dsv4FfnPrep {
         fcur,
         fpost,
@@ -2991,7 +3037,7 @@ fn dsv4_apply_moe(
         Some(f) if !cpu_work.is_empty() => {
             let work = &cpu_work;
             let ram = gpu.as_ref().and_then(|g| g.expert_ram());
-            Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, 1, metrics, ram.as_deref())))
+            Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, 1, limit, metrics, ram.as_deref())))
         }
         _ => None,
     };
@@ -3020,7 +3066,7 @@ fn dsv4_apply_moe(
             } else {
                 continue;
             };
-            expert_mlp(&fcur, &ffn, cfg.ff_dim, dim, &mut y, false)?;
+            dsv4_expert_rows(&fcur, &ffn, cfg.ff_dim, dim, 1, &mut y, limit)?;
         }
         for j in 0..dim {
             routed[j] += y[j] * w;
@@ -3049,7 +3095,7 @@ fn dsv4_apply_moe(
             } else {
                 continue;
             };
-            expert_mlp(&fcur, &ffn, cfg.ff_dim, dim, &mut y, false)?;
+            dsv4_expert_rows(&fcur, &ffn, cfg.ff_dim, dim, 1, &mut y, limit)?;
         }
         for j in 0..dim {
             routed[j] += y[j] * w;
@@ -3125,6 +3171,7 @@ fn dsv4_cpu_experts(
     cfg: &ModelConfig,
     work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
     n_tok: usize,
+    limit: f32,
     metrics: &Metrics,
     ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
 ) -> Result<Vec<f32>, AllpacaError> {
@@ -3193,7 +3240,7 @@ fn dsv4_cpu_experts(
     };
     // Half the logical cores: the rest drive the GPUs and the copies.
     let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
-    let ys = allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, threads);
+    let ys = allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, limit, threads);
     let mut sum = vec![0.0f32; n_tok.saturating_mul(dim)];
     for (y, (_, _, group)) in ys.iter().zip(work) {
         scatter_expert_rows(&mut sum, y, group, dim);
@@ -3373,6 +3420,10 @@ fn dsv4_apply_moe_rows(
     let host = &model.layers[layer_idx];
     let blk = cfg.gguf_blk(layer_idx);
     let mut gpu = gpu;
+    let limit = spec.swiglu_limit(blk);
+    if let Some(g) = gpu.as_deref() {
+        g.set_swiglu_limit(limit);
+    }
     let mut xs = vec![0.0f32; n_tok.saturating_mul(dim)];
     for (t, prep) in preps.iter().enumerate() {
         let dst = t.saturating_mul(dim);
@@ -3577,7 +3628,7 @@ fn dsv4_apply_moe_rows(
             Some(f) if !cpu_now.is_empty() => {
                 let work = &cpu_now;
                 let ram = gpu.as_ref().and_then(|g| g.expert_ram());
-                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, metrics, ram.as_deref())))
+                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, limit, metrics, ram.as_deref())))
             }
             _ => None,
         };
@@ -3857,7 +3908,7 @@ fn dsv4_apply_moe_rows(
                 } else {
                     continue;
                 };
-                expert_mlp_rows(&gx, &ffn, cfg.ff_dim, dim, m, &mut gy, false)?;
+                dsv4_expert_rows(&gx, &ffn, cfg.ff_dim, dim, m, &mut gy, limit)?;
             }
             scatter_expert_rows(&mut routed, &gy, &group, dim);
         }
@@ -4761,6 +4812,8 @@ pub struct TinyDsv4Ctx {
     pub compress_ratios: Vec<u32>,
     /// Compressed keys the indexer keeps (0 = all).
     pub top_k: u32,
+    /// `swiglu_clamp_exp` of every layer (0 = the key is left out).
+    pub swiglu_clamp: f32,
 }
 
 /// Tiny DeepSeek-V4 GGUF for attention-memory tests: every weight differs
@@ -4826,6 +4879,17 @@ pub fn write_tiny_deepseek4_ctx_gguf(path: &std::path::Path, opts: &TinyDsv4Ctx)
         GgufValue::String("deepseek4".into()),
     );
     meta.insert("general.name".into(), GgufValue::String("tiny-dsv4-ctx".into()));
+    if opts.swiglu_clamp > 0.0 {
+        meta.insert(
+            "deepseek4.swiglu_clamp_exp".into(),
+            GgufValue::Array(
+                opts.compress_ratios
+                    .iter()
+                    .map(|_| GgufValue::Float32(opts.swiglu_clamp))
+                    .collect(),
+            ),
+        );
+    }
     meta.insert(
         "tokenizer.ggml.model".into(),
         GgufValue::String("wordlevel".into()),
@@ -5292,10 +5356,10 @@ mod tests {
             expert_mlp_rows(&x, &ffn, ff, dim, m, &mut want, false).expect("reference");
             let group: Vec<(usize, f32)> = (0..m).map(|t| (t, 1.0)).collect();
             let work = [(expert, x, group)];
-            let got = dsv4_cpu_experts(&file, blk, &cfg, &work, m, &metrics, None).expect("packed");
+            let got = dsv4_cpu_experts(&file, blk, &cfg, &work, m, 0.0, &metrics, None).expect("packed");
             // The same expert through the RAM tier: read from the file, then cached.
             for pass in 0..2 {
-                let tiered = dsv4_cpu_experts(&file, blk, &cfg, &work, m, &metrics, Some(&ram)).expect("tiered");
+                let tiered = dsv4_cpu_experts(&file, blk, &cfg, &work, m, 0.0, &metrics, Some(&ram)).expect("tiered");
                 assert_eq!(tiered, got, "blk {blk} expert {expert} pass {pass}");
             }
             let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
@@ -5339,6 +5403,7 @@ mod tests {
             hash_layer_count: 0,
             rope_offset: 0,
             attn: Default::default(),
+            swiglu_clamp: Vec::new(),
         };
         let dim = 8;
         let hc = spec.hc_mult;
@@ -5419,6 +5484,7 @@ mod tests {
                 hash_layer_count: 0,
                 rope_offset: 0,
                 attn: Default::default(),
+                swiglu_clamp: Vec::new(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -5480,6 +5546,7 @@ mod tests {
                 hash_layer_count: 0,
                 rope_offset: 0,
                 attn: Default::default(),
+                swiglu_clamp: Vec::new(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -5609,6 +5676,46 @@ mod tests {
             let b = seq[i];
             assert!((a - b).abs() < 1e-5, "idx {i} batched={a} sequential={b}");
         }
+    }
+
+    #[test]
+    fn tiny_deepseek4_swiglu_clamp_caps_routed_experts() {
+        // First-token logits of the same weights under different clamps.
+        let logits = |swiglu_clamp: f32| {
+            let path = std::env::temp_dir().join(format!(
+                "allpaca_tiny_dsv4_clamp-{}-{}.gguf",
+                std::process::id(),
+                swiglu_clamp.to_bits()
+            ));
+            write_tiny_deepseek4_ctx_gguf(
+                &path,
+                &TinyDsv4Ctx {
+                    window: 0,
+                    compress_ratios: vec![0],
+                    top_k: 0,
+                    swiglu_clamp,
+                },
+            );
+            let file = std::sync::Arc::new(GgufFile::open(&path).expect("open tiny dsv4"));
+            let mut model = TinyModel::from_gguf(&file).expect("model");
+            model.bind_gguf(file);
+            let _ = std::fs::remove_file(&path);
+            let cfg = &model.config;
+            let metrics = crate::telemetry::Metrics::default();
+            let mut kv = KvTierManager::new(8 << 20, 8 << 20, 0.5);
+            let pages = vec![vec![kv
+                .alloc_page(0, 0, 32, cfg.n_kv_heads.max(1), cfg.head_dim(), &metrics)
+                .expect("kv page")]];
+            let mut out = vec![0.0f32; cfg.vocab_size];
+            super::forward_dsv4_token(&model, 3, 0, &pages, &mut kv, &mut out, &metrics, None, None, true, None)
+                .expect("forward");
+            out
+        };
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        let free = logits(0.0);
+        // A limit no activation reaches changes nothing; a tight one does.
+        assert!(diff(&free, &logits(1.0e6)) < 1e-6);
+        assert!(diff(&free, &logits(1.0e-3)) > 1e-4);
     }
 
     #[test]
