@@ -2210,6 +2210,153 @@ fn write_tiny_moe_gguf(path: &std::path::Path) {
     write_gguf(path, &meta, &views).unwrap();
 }
 
+/// Tiny Mixtral-style MoE whose routed experts are MoESQ paired-4:8 FP4
+/// (tensor type 200); everything else F32. Weights are seeded noise so tokens
+/// and experts differ.
+#[cfg(feature = "hip")]
+fn write_tiny_p48_moe_gguf(path: &std::path::Path, dim: usize, ff: usize) {
+    use allpaca_gguf::{write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let (vocab, n_exp) = (4usize, 4usize);
+    let mut meta = HashMap::new();
+    meta.insert("general.architecture".into(), GgufValue::String("llama".into()));
+    for (key, value) in [
+        ("vocab_size", vocab),
+        ("embedding_length", dim),
+        ("block_count", 1),
+        ("attention.head_count", 4),
+        ("attention.head_count_kv", 1),
+        ("feed_forward_length", ff),
+        ("expert_count", n_exp),
+        ("expert_used_count", 2),
+    ] {
+        meta.insert(format!("llama.{key}"), GgufValue::Uint32(value as u32));
+    }
+    meta.insert("tokenizer.ggml.model".into(), GgufValue::String("wordlevel".into()));
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(
+            ["<unk>", "<s>", "</s>", "hello"].into_iter().map(|t| GgufValue::String(t.into())).collect(),
+        ),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let mut seed = 0x2545_f491u32;
+    let mut noise = |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    };
+    let head = dim / 4;
+    let owned: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+        ("token_embd.weight", vec![vocab as u64, dim as u64], noise(vocab * dim, 1.0)),
+        ("blk.0.attn_norm.weight", vec![dim as u64], vec![1.0; dim]),
+        ("blk.0.attn_q.weight", vec![dim as u64, dim as u64], noise(dim * dim, 0.3)),
+        ("blk.0.attn_k.weight", vec![head as u64, dim as u64], noise(head * dim, 0.3)),
+        ("blk.0.attn_v.weight", vec![head as u64, dim as u64], noise(head * dim, 0.3)),
+        ("blk.0.attn_output.weight", vec![dim as u64, dim as u64], noise(dim * dim, 0.3)),
+        ("blk.0.ffn_norm.weight", vec![dim as u64], vec![1.0; dim]),
+        ("blk.0.ffn_gate_inp.weight", vec![n_exp as u64, dim as u64], noise(n_exp * dim, 0.5)),
+        ("output_norm.weight", vec![dim as u64], vec![1.0; dim]),
+        ("output.weight", vec![vocab as u64, dim as u64], noise(vocab * dim, 0.5)),
+    ];
+    let experts: Vec<(&str, Vec<u64>, Vec<u8>)> = vec![
+        (
+            "blk.0.ffn_gate_exps.weight",
+            vec![n_exp as u64, ff as u64, dim as u64],
+            allpaca_cpu::quantize_p48fp4(&noise(n_exp * ff * dim, 0.4)),
+        ),
+        (
+            "blk.0.ffn_up_exps.weight",
+            vec![n_exp as u64, ff as u64, dim as u64],
+            allpaca_cpu::quantize_p48fp4(&noise(n_exp * ff * dim, 0.4)),
+        ),
+        (
+            "blk.0.ffn_down_exps.weight",
+            vec![n_exp as u64, dim as u64, ff as u64],
+            allpaca_cpu::quantize_p48fp4(&noise(n_exp * dim * ff, 0.4)),
+        ),
+    ];
+    let f32_views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: (*name).into(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    let quant_views: Vec<GgufWriteQuantTensor<'_>> = experts
+        .iter()
+        .map(|(name, dims, bytes)| GgufWriteQuantTensor {
+            name: (*name).into(),
+            dims: dims.clone(),
+            ggml_type: GgmlType::P48Fp4,
+            bytes,
+        })
+        .collect();
+    write_gguf_quant(path, &meta, &f32_views, &quant_views).unwrap();
+}
+
+/// At widths in whole 256-value blocks the experts go through the fused
+/// expert-parallel kernels (int8 activations): same tokens as the CPU.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_p48fp4_experts_fused_match_cpu() {
+    let path = std::env::temp_dir().join(format!("allpaca_hip_p48_moe_fused-{}.gguf", std::process::id()));
+    write_tiny_p48_moe_gguf(&path, 256, 256);
+    let with_model = |mut cfg: Config| {
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg
+    };
+    let cpu = Engine::new(with_model(cpu_only_synthetic())).unwrap();
+    let hip = Engine::new(with_model(hip_auto_synthetic())).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    for prompt in ["hello", "hello hello hello hello hello hello"] {
+        let cpu_out = cpu.generate(prompt, greedy(6)).unwrap();
+        let hip_out = hip.generate(prompt, greedy(6)).unwrap();
+        assert!(!hip_out.token_ids.is_empty());
+        assert_eq!(hip_out.token_ids, cpu_out.token_ids, "prompt {prompt:?}");
+    }
+    assert!(hip.stats().gpu_forwards > 0, "must run on HIP: {:?}", hip.stats());
+    let _ = std::fs::remove_file(path);
+}
+
+/// MoESQ experts run from their sparse blocks on the GPU and give the tokens
+/// the CPU gets from the same weights decoded to F32.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_p48fp4_experts_match_cpu() {
+    let path = std::env::temp_dir().join(format!("allpaca_hip_p48_moe-{}.gguf", std::process::id()));
+    write_tiny_p48_moe_gguf(&path, 32, 32);
+    let with_model = |mut cfg: Config| {
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg
+    };
+    let cpu = Engine::new(with_model(cpu_only_synthetic())).unwrap();
+    let hip = Engine::new(with_model(hip_auto_synthetic())).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    for prompt in ["hello", "hello hello hello hello hello hello"] {
+        let cpu_out = cpu.generate(prompt, greedy(6)).unwrap();
+        let hip_out = hip.generate(prompt, greedy(6)).unwrap();
+        assert!(!hip_out.token_ids.is_empty());
+        assert_eq!(hip_out.token_ids, cpu_out.token_ids, "prompt {prompt:?}");
+    }
+    assert!(hip.stats().gpu_forwards > 0, "must run on HIP: {:?}", hip.stats());
+    let _ = std::fs::remove_file(path);
+}
+
 #[cfg(feature = "hip")]
 fn write_tiny_q4k_q6k_gguf(path: &std::path::Path) {
     use allpaca_gguf::{

@@ -557,6 +557,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_p48fp4(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_rocmfp4_f32(
             a: *const f32,
             b: *const u8,
@@ -2625,6 +2634,30 @@ pub fn gemm_nt_rocmfp4_fast_device(
     }
 }
 
+/// `C[m,n] = A[m,k] * W^T` for MoESQ paired-4:8 FP4 weights (tensor type
+/// 200, see `allpaca_cpu::dequant_p48fp4`), all in device memory.
+pub fn gemm_nt_p48fp4_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_p48fp4(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_p48fp4")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_p48fp4 unavailable".into(),
+        )))
+    }
+}
+
 /// Float-activation ROCmFP4 GEMV (the kernel the int8 path replaced), for
 /// A/B and as the exact-float reference. `fast`: 17-byte type-101 blocks.
 pub fn gemm_nt_rocmfp4_f32_device(
@@ -3128,8 +3161,9 @@ pub fn copy_f32_kernel(dst: *mut f32, src: *const f32, n: usize) -> Result<(), A
 #[derive(Debug, Clone, Copy)]
 pub struct MoeExperts {
     pub ptr: *const u8,
-    /// ggml type id: 12 (Q4_K), 13 (Q5_K), 14 (Q6_K) or 8 (Q8_0 in the
-    /// 36-byte staged layout, see [`stage_q8_0_blocks`]).
+    /// ggml type id: 12 (Q4_K), 13 (Q5_K), 14 (Q6_K), 8 (Q8_0 in the
+    /// 36-byte staged layout, see [`stage_q8_0_blocks`]) or 200 (MoESQ
+    /// paired-4:8 FP4).
     pub ggml_type: u32,
     /// Bytes per expert.
     pub stride: u64,
@@ -3142,6 +3176,7 @@ impl MoeExperts {
             13 => Some(5),
             14 => Some(6),
             8 => Some(8),
+            200 => Some(48),
             _ => None,
         }
     }
@@ -3152,9 +3187,15 @@ impl MoeExperts {
     }
 
     /// The fused MoE kernels run this `[gate, up, down]` set: gate and up
-    /// share a launch, which exists for K-quant pairs and for Q8_0 pairs.
+    /// share a launch, which exists for K-quant pairs, Q8_0 pairs and
+    /// paired-4:8 pairs.
     pub fn fused_set_ok(set: &[Self; 3]) -> bool {
-        set.iter().all(Self::fused_ok) && (set[0].ggml_type == 8) == (set[1].ggml_type == 8)
+        // K-quants mix with each other; the other two only pair with themselves.
+        let family = |e: &Self| match e.ggml_type {
+            8 | 200 => e.ggml_type,
+            _ => 0,
+        };
+        set.iter().all(Self::fused_ok) && family(&set[0]) == family(&set[1])
     }
 }
 
@@ -3430,7 +3471,7 @@ pub fn moe_ffn_kquant_device(
 ) -> Result<(), AllpacaError> {
     let (Some(gq), Some(uq), Some(dq)) = (gate.qt(), up.qt(), down.qt()) else {
         return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
-            "fused MoE needs Q4_K/Q5_K/Q6_K or Q8_0 experts".into(),
+            "fused MoE needs Q4_K/Q5_K/Q6_K, Q8_0 or paired-4:8 FP4 experts".into(),
         )));
     };
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
@@ -6035,6 +6076,24 @@ impl HipWorkspace {
             DecodeOp::Q8Gemm
         };
         self.timed_gpu(op, || gemm_nt_rocmfp4_device(a, b, c, m, n, k))
+    }
+
+    /// Paired-4:8 FP4 (tensor type 200) GEMV; accounted like [`Self::gemm_nt_rocmfp4_dev`].
+    pub fn gemm_nt_p48fp4_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::Q8Gemm
+        };
+        self.timed_gpu(op, || gemm_nt_p48fp4_device(a, b, c, m, n, k))
     }
 
     /// ROCmFP4 FAST (ggml type 101) GEMV; accounted like [`Self::gemm_nt_rocmfp4_dev`].
@@ -13280,6 +13339,68 @@ mod tests {
     /// the same weights with the scale byte duplicated, and close to the CPU
     /// dequant + GEMM. Shapes cover one row, several rows, a K that is not a
     /// whole number of 256-float slabs, and many columns.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_p48fp4_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(1, 4, 32), (1, 8, 256), (3, 5, 128), (1, 70, 512), (2, 9, 288), (9, 33, 768)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let a: Vec<f32> = (0..m * k).map(|i| ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5).collect();
+            let b_f: Vec<f32> = (0..n * k).map(|i| ((i * 13 + si * 7) % 61) as f32 * 0.02 - 0.6).collect();
+            let packed = allpaca_cpu::quantize_p48fp4(&b_f);
+            assert_eq!(packed.len(), n * k / 32 * allpaca_cpu::P48FP4_BLOCK_BYTES);
+            let mut b_deq = vec![0.0f32; n * k];
+            allpaca_cpu::dequant_p48fp4(&packed, n * k, &mut b_deq).unwrap();
+            // Half of every 8 weights are pruned, so the result differs from dense.
+            assert!(b_deq.chunks(8).all(|c| c.iter().filter(|v| **v == 0.0).count() >= 4));
+            let mut cpu = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            let da = device_malloc(a.len() * 4, 0).unwrap();
+            let db = device_malloc(packed.len(), 0).unwrap();
+            let dc = device_malloc(m * n * 4, 0).unwrap();
+            set_device(0).unwrap();
+            memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+            gemm_nt_p48fp4_device(da.cast(), db, dc.cast(), m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_p48fp4 must run when a device is present");
+            let mut got = vec![0.0f32; m * n];
+            memcpy(got.as_mut_ptr().cast(), dc, m * n * 4, MEMCPY_D2H).unwrap();
+            // A row computed alone equals the same row computed in the batch.
+            let mut solo = vec![0.0f32; n];
+            gemm_nt_p48fp4_device(
+                unsafe { da.cast::<f32>().add((m - 1) * k) },
+                db,
+                dc.cast(),
+                1,
+                n as i32,
+                k as i32,
+            )
+            .unwrap();
+            memcpy(solo.as_mut_ptr().cast(), dc, n * 4, MEMCPY_D2H).unwrap();
+            device_free(da, a.len() * 4);
+            device_free(db, packed.len());
+            device_free(dc, m * n * 4);
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(got[i], cpu[i]),
+                    "gemm_nt_p48fp4 vs cpu, shape {m}x{n}x{k} idx={i}: {} vs {}",
+                    got[i],
+                    cpu[i]
+                );
+            }
+            for j in 0..n {
+                assert_eq!(got[(m - 1) * n + j].to_bits(), solo[j].to_bits(), "row alone differs, col {j}");
+            }
+        }
+        // A row length that is not whole blocks is refused.
+        assert!(gemm_nt_p48fp4_device(std::ptr::NonNull::dangling().as_ptr(), std::ptr::NonNull::dangling().as_ptr(), std::ptr::NonNull::dangling().as_ptr(), 1, 4, 40).is_err());
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn gemm_nt_rocmfp4_fast_matches_dual_scale_kernel_and_cpu() {

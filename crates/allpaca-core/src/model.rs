@@ -669,6 +669,8 @@ enum WeightKind {
     RocmFp4,
     /// ROCmFP4 FAST (ggml type 101): 17-byte single-scale blocks.
     RocmFp4Fast,
+    /// MoESQ paired-4:8 sparse FP4 (tensor type 200): 12-byte blocks.
+    P48Fp4,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1006,8 +1008,8 @@ struct DeviceRouteCtl {
 }
 
 /// A layer's stacked routed experts as the fused MoE kernels read them:
-/// `[gate, up, down]`, each Q4_K/Q5_K/Q6_K or staged Q8_0 at a fixed
-/// per-expert stride.
+/// `[gate, up, down]`, each Q4_K/Q5_K/Q6_K, staged Q8_0 or paired-4:8 FP4
+/// at a fixed per-expert stride.
 fn stacked_moe_experts(
     weights: &DeviceWeights,
     offs: &[[WeightRef; 3]],
@@ -1028,6 +1030,7 @@ fn stacked_moe_experts(
             WeightKind::Q5_K => 13,
             WeightKind::Q6_K => 14,
             WeightKind::Q8_0 => 8,
+            WeightKind::P48Fp4 => 200,
             _ => return None,
         };
         let stride = second.off.checked_sub(first.off)?;
@@ -2412,7 +2415,8 @@ impl ResidentModel {
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0
             | WeightKind::RocmFp4
-            | WeightKind::RocmFp4Fast => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            | WeightKind::RocmFp4Fast
+            | WeightKind::P48Fp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "F16/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
         }
@@ -2458,6 +2462,9 @@ impl ResidentModel {
             WeightKind::RocmFp4Fast => {
                 hip.gemm_nt_rocmfp4_fast_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::P48Fp4 => {
+                hip.gemm_nt_p48fp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
         }
     }
 
@@ -2493,7 +2500,8 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q3_K
+            WeightKind::P48Fp4
+            | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
@@ -2542,7 +2550,8 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q3_K
+            WeightKind::P48Fp4
+            | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
@@ -3842,7 +3851,7 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         T::F32 => n * 4,
         _ if n <= 65_536 => n * 4,
         T::F16 => n * 2,
-        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 | T::RocmFp4Fast => {
+        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 | T::RocmFp4Fast | T::P48Fp4 => {
             info.nbytes() as u64
         }
         T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
@@ -3986,6 +3995,16 @@ fn append_gguf_tensor_as<'a>(
                 }
                 (UploadPart::Mapped(packed), WeightKind::TQ1_0)
             }
+        }
+        allpaca_gguf::GgmlType::P48Fp4 => {
+            // Stays packed: the GEMV reads the sparse blocks as they are.
+            let k = *info.dims.first().unwrap_or(&1) as usize;
+            if k == 0 || k % allpaca_cpu::P48FP4_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "paired-4:8 FP4 {name} rows of {k} weights are not whole 32-weight blocks"
+                ))));
+            }
+            (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::P48Fp4)
         }
         ty @ (allpaca_gguf::GgmlType::RocmFp4 | allpaca_gguf::GgmlType::RocmFp4Fast) => {
             let fast = ty == allpaca_gguf::GgmlType::RocmFp4Fast;
@@ -4219,6 +4238,15 @@ fn split_packed_experts(
                 ))));
             }
             (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS).saturating_mul(block_bytes)
+        }
+        WeightKind::P48Fp4 => {
+            if n_per % allpaca_cpu::P48FP4_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} paired-4:8 FP4 expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::P48FP4_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::P48FP4_BLOCK_ELEMS).saturating_mul(allpaca_cpu::P48FP4_BLOCK_BYTES)
         }
         WeightKind::Q3_K => {
             if n_per % allpaca_cpu::Q3_K_BLOCK_ELEMS != 0 {

@@ -169,6 +169,11 @@ int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, 
 int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * W^T for MoESQ paired-4:8 FP4 weights (Allpaca tensor type 200): n rows
+ * of k/32 12-byte blocks (8 kept value bytes, 2 mask bytes, half scale). k % 32 == 0. */
+int allpaca_gemm_nt_p48fp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                           int32_t k, allpaca_stream_t stream);
+
 /* Float-activation ROCmFP4 GEMV (the pre-int8 kernel), for A/B and as the
  * exact-float reference. `fast` != 0 reads 17-byte type-101 blocks. */
 int allpaca_gemm_nt_rocmfp4_f32(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,

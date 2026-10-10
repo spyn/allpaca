@@ -2490,6 +2490,27 @@ template <>
 struct KqBlock<8> {
     static constexpr int bytes = 288;
 };
+/* MoESQ paired-4:8 FP4 (tensor type 200): eight 12-byte blocks per 256 values. */
+template <>
+struct KqBlock<48> {
+    static constexpr int bytes = 96;
+};
+
+/* Twice the E2M1 value of a paired-4:8 code (bit 3 is the sign). */
+__constant__ const int8_t k_p48_levels2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+__device__ inline float kq_p48_half(uint32_t h) {
+    const uint32_t e = (h >> 10) & 0x1fu;
+    const uint32_t man = h & 0x3ffu;
+    float v;
+    if (e == 0) {
+        v = static_cast<float>(man) * 5.9604644775390625e-8f;
+    } else {
+        const uint32_t bits = ((e + 112u) << 23) | (man << 13);
+        __builtin_memcpy(&v, &bits, 4);
+    }
+    return (h & 0x8000u) ? -v : v;
+}
 
 template <int QT, int MR>
 __global__ void gemv_nt_kquant_warp_kernel(const float *a, const uint8_t *b, float *c, int m,
@@ -2714,6 +2735,44 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
 #pragma unroll
                         for (int j = 0; j < 8; ++j) {
                             dot = i8dot4(ap[j], q[j], dot);
+                        }
+                        acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
+                    }
+                }
+            } else if constexpr (QT == 48) {
+                // Half of every 8 weights are pruned in pairs: each chunk of 8
+                // is one dot4 of its four kept weights with the activations
+                // at their places. Lane sl takes every LPC-th 32-value block.
+                for (int t = sl; t < 8; t += LPC) {
+                    uint32_t w[3];
+                    __builtin_memcpy(w, blk + t * 12, 12);
+                    const float ws = 0.5f * kq_p48_half(w[2] >> 16);
+                    uint32_t q[4];
+                    int first[4], second[4];
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const uint32_t nib = (w[2] >> (4 * c)) & 0xfu;
+                        const uint32_t pairs = w[c >> 1] >> (16 * (c & 1));
+                        first[c] = nib ? __builtin_ctz(nib) : 0;
+                        second[c] = nib ? 31 - __builtin_clz(nib) : 0;
+                        q[c] = nib == 0u
+                                   ? 0u
+                                   : (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[pairs & 0xfu])) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[(pairs >> 4) & 0xfu])) << 8) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[(pairs >> 8) & 0xfu])) << 16) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[(pairs >> 12) & 0xfu])) << 24));
+                    }
+                    const int bi = ib * 8 + t;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        const int8_t *ap = arow[r] + bi * 32;
+                        int32_t dot = 0;
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            uint16_t lo, hi;
+                            __builtin_memcpy(&lo, ap + c * 8 + 2 * first[c], 2);
+                            __builtin_memcpy(&hi, ap + c * 8 + 2 * second[c], 2);
+                            dot = i8dot4(static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16), q[c], dot);
                         }
                         acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
                     }
@@ -3763,6 +3822,96 @@ extern "C" int allpaca_gemm_nt_rocmfp4_f32(const float *a, const uint8_t *b, flo
                                            int32_t n, int32_t k, int32_t fast,
                                            allpaca_stream_t stream) {
     return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 2, fast != 0);
+}
+
+/* MoESQ paired-4:8 FP4 (Allpaca tensor type 200): 12-byte blocks of 32 weights. Each 8
+ * weights are 4 pairs of which 2 are kept, a pair being one byte of two E2M1 codes (lower
+ * index in the low nibble): 8 value bytes (2 per chunk of 8), 2 mask bytes (a nibble per
+ * chunk, bit i = pair i kept), then the block's scale as an IEEE half. */
+__constant__ const float k_e2m1_levels[16] = {0.f,  0.5f,  1.f,  1.5f,  2.f,  3.f,  4.f,  6.f,
+                                              -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__device__ inline float p48fp4_half(uint32_t h) {
+    const uint32_t e = (h >> 10) & 0x1fu;
+    const uint32_t man = h & 0x3ffu;
+    float v;
+    if (e == 0) {
+        v = static_cast<float>(man) * 5.9604644775390625e-8f; /* 2^-24 */
+    } else {
+        const uint32_t bits = ((e + 112u) << 23) | (man << 13);
+        __builtin_memcpy(&v, &bits, 4);
+    }
+    return (h & 0x8000u) ? -v : v;
+}
+
+/* Sum over one block of weight * a, before the block scale. Reads 4 of every 8 activations. */
+__device__ inline float p48fp4_block_dot(const uint8_t *blk, const float *x, float *scale) {
+#pragma clang fp contract(off)
+    uint32_t w[3];
+    __builtin_memcpy(w, blk, 12);
+    *scale = p48fp4_half(w[2] >> 16);
+    float s = 0.f;
+#pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const uint32_t nib = (w[2] >> (4 * chunk)) & 0xfu;
+        if (nib == 0u) {
+            continue;
+        }
+        const int first = __builtin_ctz(nib);
+        const int second = 31 - __builtin_clz(nib);
+        const uint32_t pairs = w[chunk >> 1] >> (16 * (chunk & 1));
+        const float *xc = x + chunk * 8;
+        s = s + k_e2m1_levels[pairs & 0xfu] * xc[2 * first];
+        s = s + k_e2m1_levels[(pairs >> 4) & 0xfu] * xc[2 * first + 1];
+        s = s + k_e2m1_levels[(pairs >> 8) & 0xfu] * xc[2 * second];
+        s = s + k_e2m1_levels[(pairs >> 12) & 0xfu] * xc[2 * second + 1];
+    }
+    return s;
+}
+
+/* C[m,n] = A[m,k] * W^T. Eight lanes share a column and split its blocks; a row's result does
+ * not depend on m, so decode and batched rows agree bit for bit. */
+__global__ void gemv_nt_p48fp4_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                      int k) {
+#pragma clang fp contract(off)
+    constexpr int LPC = 8;
+    const int sl = static_cast<int>(threadIdx.x) % LPC;
+    const int col = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / LPC) +
+                    static_cast<int>(threadIdx.x) / LPC;
+    const int row = static_cast<int>(blockIdx.y);
+    const bool live = col < n && row < m;
+    const int kb = k / 32;
+    float acc = 0.f;
+    if (live) {
+        const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(kb) * 12;
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        for (int ib = sl; ib < kb; ib += LPC) {
+            float scale;
+            const float s = p48fp4_block_dot(brow + static_cast<size_t>(ib) * 12, arow + ib * 32,
+                                             &scale);
+            acc = acc + scale * s;
+        }
+    }
+#pragma unroll
+    for (int off = LPC / 2; off > 0; off >>= 1) {
+        acc = acc + __shfl_down(acc, off, LPC);
+    }
+    if (live && sl == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+extern "C" int allpaca_gemm_nt_p48fp4(const float *a, const uint8_t *b, float *c, int32_t m,
+                                      int32_t n, int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || (k % 32) != 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int COLS = 256 / 8;
+    hipLaunchKernelGGL(gemv_nt_p48fp4_kernel,
+                       dim3(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m)),
+                       dim3(256), 0, as_stream(stream), a, b, c, m, n, k);
+    return hip_status(hipGetLastError());
 }
 
 /* ggml MXFP4 (ggml_type_id=39): 17-byte blocks, one E8M0 scale + 16 nibbles / 32 elems. */
@@ -8124,6 +8273,7 @@ static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, hipStream_t
     MOE_GU(5, 4) MOE_GU(5, 5) MOE_GU(5, 6)
     MOE_GU(6, 4) MOE_GU(6, 5) MOE_GU(6, 6)
     MOE_GU(8, 8)
+    MOE_GU(48, 48)
 #undef MOE_GU
     return false;
 }
@@ -8138,7 +8288,7 @@ static bool moe_down_types(int qd, dim3 grid, hipStream_t st, const int8_t *hq,
                            group_start, expert, down, ds, y, dim, ff);                            \
         return true;                                                                               \
     }
-    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8)
+    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8) MOE_D(48)
 #undef MOE_D
     return false;
 }
@@ -8155,7 +8305,8 @@ extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t rows, int32_t dim, int
 }
 
 /* Expert-parallel MoE FFN over stacked experts (`qt` 4/5/6 = Q4_K/Q5_K/Q6_K,
- * 8 = Q8_0 in 36-byte staged blocks; gate and up are both Q8_0 or both K-quant):
+ * 8 = Q8_0 in 36-byte staged blocks, 48 = MoESQ paired-4:8 FP4; gate and up are
+ * both K-quant, both Q8_0 or both paired-4:8):
  * out[r] = sum over row r's pairs of w * down_e(silu(gate_e x_r) * up_e x_r).
  * Pairs are sorted by row; `row_start` has rows + 1 entries. Three launches,
  * whatever the expert count: an MI50 pays ~10 us per dependent launch, and at
@@ -8175,7 +8326,7 @@ extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const fl
         (group_start == nullptr && groups != pairs) || max_group < 1 || max_group > 8) {
         return ALLPACA_ERR_INVALID;
     }
-    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6 || qt == 8; };
+    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6 || qt == 8 || qt == 48; };
     if (!kq(gate_qt) || !kq(up_qt) || !kq(down_qt)) {
         return ALLPACA_ERR_INVALID;
     }
@@ -8422,6 +8573,11 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *, const uint8_t *, f
 
 extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *, const uint8_t *, float *, int32_t,
                                             int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_p48fp4(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                      int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

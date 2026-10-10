@@ -219,6 +219,9 @@ pub enum GgmlType {
     RocmFp4 = 100,
     /// AMD ROCmFP4 FAST single-scale, 17-byte blocks (ggml_type_id=101).
     RocmFp4Fast = 101,
+    /// MoESQ paired-4:8 sparse FP4, 12-byte blocks of 32 weights. Allpaca's
+    /// own id: no llama.cpp build reads it.
+    P48Fp4 = 200,
     Other = 255,
 }
 
@@ -278,6 +281,7 @@ pub fn dequant_packed(
         GgmlType::Q2_0 => allpaca_cpu::dequant_q2_0(bytes, n, out),
         GgmlType::RocmFp4 => allpaca_cpu::dequant_rocmfp4(bytes, n, out),
         GgmlType::RocmFp4Fast => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out),
+        GgmlType::P48Fp4 => allpaca_cpu::dequant_p48fp4(bytes, n, out),
         GgmlType::I32 | GgmlType::Other => Err(AllpacaError::Fatal(FatalError::ModelLoad(
             format!("dequant {ty:?} unsupported"),
         ))),
@@ -311,6 +315,7 @@ impl GgmlType {
             42 => Self::Q2_0,
             100 => Self::RocmFp4,
             101 => Self::RocmFp4Fast,
+            200 => Self::P48Fp4,
             _ => Self::Other,
         }
     }
@@ -399,6 +404,9 @@ impl TensorInfo {
             GgmlType::Q2_0 => n
                 .div_ceil(allpaca_cpu::Q2_0_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q2_0_BLOCK_BYTES),
+            GgmlType::P48Fp4 => n
+                .div_ceil(allpaca_cpu::P48FP4_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::P48FP4_BLOCK_BYTES),
             _ => n.saturating_mul(4),
         }
     }
@@ -736,6 +744,7 @@ impl GgufFile {
             GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
             GgmlType::RocmFp4Fast as u32,
+            GgmlType::P48Fp4 as u32,
             GgmlType::Q1_0 as u32,
             GgmlType::Q2_0 as u32,
         ];
@@ -1106,6 +1115,17 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 dequant_packed(ty, &mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::P48Fp4 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} paired-4:8 FP4 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_p48fp4(&mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -1968,6 +1988,39 @@ mod tests {
             assert!(loaded.iter().any(|v| *v != 0.0));
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// Type 200 (MoESQ paired-4:8 FP4): 12 bytes per 32 weights, half of
+    /// them zero.
+    #[test]
+    fn p48fp4_type_200_loads_and_dequants_to_f32() {
+        let path = std::env::temp_dir().join("allpaca_gguf_p48fp4.gguf");
+        let values: Vec<f32> = (0..64).map(|i| ((i * 37) % 64) as f32 * 0.125 - 4.0).collect();
+        let payload = allpaca_cpu::quantize_p48fp4(&values);
+        assert_eq!(payload.len(), 2 * allpaca_cpu::P48FP4_BLOCK_BYTES);
+        write_typed_gguf(&path, 200, &payload, 64);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::P48Fp4);
+        assert_eq!(info.nbytes(), 2 * allpaca_cpu::P48FP4_BLOCK_BYTES);
+        assert_eq!(file.tensor_bytes("quant.weight").unwrap(), &payload[..]);
+        let report = file.compat_report();
+        assert!(
+            !report
+                .reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+            "type 200 must not be rejected: {:?}",
+            report.reject_reason
+        );
+        let loaded = file.tensor_f32("quant.weight").unwrap();
+        let mut want = vec![0.0f32; 64];
+        allpaca_cpu::dequant_p48fp4(&payload, 64, &mut want).unwrap();
+        assert_eq!(loaded, want);
+        // Half the weights of every 8 are zero, and not all of them.
+        assert!(loaded.chunks(8).all(|c| c.iter().filter(|v| **v == 0.0).count() >= 4));
+        assert!(loaded.iter().any(|v| *v != 0.0));
+        let _ = std::fs::remove_file(path);
     }
 
     /// ggml type 101 (ROCmFP4 FAST): 17 bytes per 32 weights, supported by
