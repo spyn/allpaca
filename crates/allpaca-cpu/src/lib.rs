@@ -1,8 +1,13 @@
 //! CPU fallback for every kernel the control plane may call.
 
 mod kernels;
+mod lowbit;
 mod mxfp4_expert;
 
+pub use lowbit::{
+    dequant_q1_0, dequant_q2_0, quantize_q1_0, quantize_q2_0, Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMS,
+    Q2_0_BLOCK_BYTES, Q2_0_BLOCK_ELEMS,
+};
 pub use mxfp4_expert::{mxfp4_swiglu_experts, Mxfp4Expert};
 pub use kernels::{
     det_expf, det_silu_mul,

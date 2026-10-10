@@ -210,6 +210,11 @@ pub enum GgmlType {
     TQ2_0 = 35,
     /// ggml MXFP4 (E8M0 + nibbles, ggml_type_id=39).
     MXFP4 = 39,
+    /// One sign bit per weight, half scale per 128 (ggml_type_id=41).
+    Q1_0 = 41,
+    /// Two bits per weight on -1, 0, +1, +2 scales, half scale per 64
+    /// (ggml_type_id=42).
+    Q2_0 = 42,
     /// AMD ROCmFP4 dual-scale (ggml_type_id=100).
     RocmFp4 = 100,
     /// AMD ROCmFP4 FAST single-scale, 17-byte blocks (ggml_type_id=101).
@@ -269,6 +274,8 @@ pub fn dequant_packed(
         GgmlType::TQ1_0 => allpaca_cpu::dequant_tq1_0(bytes, n, out),
         GgmlType::TQ2_0 => allpaca_cpu::dequant_tq2_0(bytes, n, out),
         GgmlType::MXFP4 => allpaca_cpu::dequant_mxfp4(bytes, n, out),
+        GgmlType::Q1_0 => allpaca_cpu::dequant_q1_0(bytes, n, out),
+        GgmlType::Q2_0 => allpaca_cpu::dequant_q2_0(bytes, n, out),
         GgmlType::RocmFp4 => allpaca_cpu::dequant_rocmfp4(bytes, n, out),
         GgmlType::RocmFp4Fast => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out),
         GgmlType::I32 | GgmlType::Other => Err(AllpacaError::Fatal(FatalError::ModelLoad(
@@ -300,6 +307,8 @@ impl GgmlType {
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
             39 => Self::MXFP4,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
             100 => Self::RocmFp4,
             101 => Self::RocmFp4Fast,
             _ => Self::Other,
@@ -384,6 +393,12 @@ impl TensorInfo {
             GgmlType::RocmFp4Fast => n
                 .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES),
+            GgmlType::Q1_0 => n
+                .div_ceil(allpaca_cpu::Q1_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q1_0_BLOCK_BYTES),
+            GgmlType::Q2_0 => n
+                .div_ceil(allpaca_cpu::Q2_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q2_0_BLOCK_BYTES),
             _ => n.saturating_mul(4),
         }
     }
@@ -721,6 +736,8 @@ impl GgufFile {
             GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
             GgmlType::RocmFp4Fast as u32,
+            GgmlType::Q1_0 as u32,
+            GgmlType::Q2_0 as u32,
         ];
         let unsupported_types: Vec<u32> = ggml_type_ids
             .iter()
@@ -1078,6 +1095,17 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_rocmfp4_fast(&mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            ty @ (GgmlType::Q1_0 | GgmlType::Q2_0) => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} {ty:?} out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                dequant_packed(ty, &mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -1908,6 +1936,38 @@ mod tests {
         assert!(loaded[..32].iter().all(|v| (v - 1.0).abs() < 1e-4));
         assert!(loaded[32..].iter().all(|v| v.abs() < 1e-5));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// ggml types 41 and 42 (Q1_0, Q2_0): 18-byte blocks of 128 and 64 weights.
+    #[test]
+    fn q1_0_and_q2_0_load_and_dequant_to_f32() {
+        let values: Vec<f32> = (0..256).map(|i| ((i * 37) % 64) as f32 * 0.125 - 4.0).collect();
+        for (id, ty, payload) in [
+            (41u32, GgmlType::Q1_0, allpaca_cpu::quantize_q1_0(&values)),
+            (42, GgmlType::Q2_0, allpaca_cpu::quantize_q2_0(&values)),
+        ] {
+            let path = std::env::temp_dir().join(format!("allpaca_gguf_lowbit_{id}.gguf"));
+            write_typed_gguf(&path, id, &payload, 256);
+            let file = GgufFile::open(&path).unwrap();
+            let info = file.tensor("quant.weight").expect("header lists tensor");
+            assert_eq!(info.ggml_type, ty);
+            assert_eq!(info.nbytes(), payload.len());
+            assert_eq!(payload.len(), if id == 41 { 2 * 18 } else { 4 * 18 });
+            assert!(
+                !file
+                    .compat_report()
+                    .reject_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+                "type {id} must not be rejected"
+            );
+            let loaded = file.tensor_f32("quant.weight").unwrap();
+            let mut want = vec![0.0f32; 256];
+            dequant_packed(ty, &payload, 256, &mut want).unwrap();
+            assert_eq!(loaded, want);
+            assert!(loaded.iter().any(|v| *v != 0.0));
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// ggml type 101 (ROCmFP4 FAST): 17 bytes per 32 weights, supported by
