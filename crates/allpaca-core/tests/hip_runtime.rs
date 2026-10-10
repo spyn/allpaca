@@ -6987,6 +6987,7 @@ impl allpaca_core::VisionEncoder for GridVision {
     }
 }
 
+#[cfg(feature = "hip")]
 fn tiny_hybrid_image_generate(path: &std::path::Path, prefill_chunk: usize) -> Option<(Vec<u32>, u64)> {
     let mut cfg = tiny_written_cfg(path.to_path_buf(), false);
     cfg.prefill.chunk_tokens = prefill_chunk;
