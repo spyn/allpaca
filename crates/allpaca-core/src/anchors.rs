@@ -25,6 +25,8 @@ pub struct RecurrentState {
     pub gdn_conv: Vec<Vec<f32>>,
     /// DeepSeek-V4 compressed attention keys and the groups being pooled.
     pub dsv4: crate::dsv4_attn::Dsv4Memory,
+    /// qwen4exp: layer states, attention keys, token history and n-gram conv history.
+    pub q4x: crate::qwen4exp::Qwen4Memory,
 }
 
 impl RecurrentState {
@@ -36,6 +38,7 @@ impl RecurrentState {
             gdn_state: vec![Vec::new(); n_layers],
             gdn_conv: vec![Vec::new(); n_layers],
             dsv4: Default::default(),
+            q4x: Default::default(),
         }
     }
 

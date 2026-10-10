@@ -3108,7 +3108,8 @@ fn split_fused_qkv_host(
 fn gguf_rope_neox(arch: &str) -> bool {
     matches!(
         arch,
-        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "qwen3next" | "phi2"
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "qwen3next" | "qwen4exp"
+            | "phi2"
             | "phi3"
             | "gemma" | "gemma2" | "gemma3" | "starcoder2" | "stablelm" | "gptneox" | "falcon"
             | "olmo2" | "nemotron" | "bailingmoe2"
@@ -4482,6 +4483,8 @@ pub struct TinyModel {
     pub mtp_nextn: Option<MtpNextnWeights>,
     /// DeepSeek-V4 MLA / hyper-connection / MoE sidecar (CPU decode).
     pub(crate) dsv4: Option<Arc<crate::deepseek4::Dsv4Weights>>,
+    /// qwen4exp runs on its own host forward ([`crate::qwen4exp`]).
+    pub(crate) q4x: Option<Arc<crate::qwen4exp::Qwen4Weights>>,
     /// Shared RPC runtime when layers are offloaded to remote workers.
     pub rpc: Option<std::sync::Arc<crate::rpc_runtime::RpcRuntime>>,
     /// Edge0 Recover-LoRA + prerouter stager (when loaded via `load_edge0`).
@@ -4662,6 +4665,7 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -4981,6 +4985,11 @@ impl TinyModel {
 
     /// Keep a GGUF handle for lazy DeepSeek-V4 MLA / expert / lm_head gathers.
     pub(crate) fn bind_gguf(&mut self, file: Arc<GgufFile>) {
+        if let Some(q4x) = &mut self.q4x {
+            if let Some(inner) = Arc::get_mut(q4x) {
+                inner.attach_gguf(file.clone());
+            }
+        }
         if let Some(dsv4) = &mut self.dsv4 {
             if let Some(inner) = Arc::get_mut(dsv4) {
                 inner.attach_gguf(file);
@@ -6475,6 +6484,15 @@ impl TinyModel {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
         }
         let cfg = ModelConfig::from_gguf(file)?;
+        if crate::qwen4exp::file_is_qwen4exp(file) {
+            // Its own tensor set and forward: the generic layout checks do not apply.
+            let weights = crate::qwen4exp::Qwen4Weights::from_gguf(file, cfg.n_layers)?;
+            let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
+            let mut model = Self::skeleton_hybrid(cfg, name, &report, Some(file));
+            model.config.recurrent = true;
+            model.q4x = Some(Arc::new(weights));
+            return Ok(model);
+        }
         Self::from_gguf_cfg(file, cfg, &report)
     }
 
@@ -6985,6 +7003,7 @@ impl TinyModel {
             exit_heads,
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
             rpc: None,
             edge0: None,
             mla_cache,
@@ -7144,6 +7163,7 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7278,6 +7298,7 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7391,6 +7412,7 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7459,6 +7481,12 @@ impl TinyModel {
                     x0.len()
                 ))));
             }
+        }
+        if self.q4x.is_some() {
+            let memory = recurrent.as_deref_mut().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
+            })?;
+            return crate::qwen4exp::forward_qwen4_token(self, token, pos, logits, &mut memory.q4x);
         }
         if self.dsv4.is_some() {
             return crate::deepseek4::forward_dsv4_token(
@@ -8026,6 +8054,15 @@ impl TinyModel {
         }
         let mrope = vision.and_then(VisionSeq::mrope);
         let dim = self.config.dim;
+        if self.q4x.is_some() {
+            let memory = recurrent.as_deref_mut().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
+            })?;
+            for (i, &token) in tokens.iter().enumerate() {
+                crate::qwen4exp::forward_qwen4_token(self, token, start_pos + i, logits, &mut memory.q4x)?;
+            }
+            return Ok(());
+        }
         if self.dsv4.is_some() && tokens.len() > 1 {
             return crate::deepseek4::forward_dsv4_tokens(
                 self,

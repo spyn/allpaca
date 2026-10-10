@@ -773,6 +773,7 @@ impl GgufFile {
                 | "qwen35moe"
                 | "bailingmoe2"
                 | "qwen3next"
+                | "qwen4exp"
                 | "phi3"
                 | "minicpm"
                 | "nemotron_h_moe"

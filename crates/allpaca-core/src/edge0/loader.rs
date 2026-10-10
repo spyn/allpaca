@@ -370,6 +370,7 @@ fn load_edge0_weights(
         expert_controls: Default::default(),
         layer_capture: Default::default(),
         dsv4: None,
+        q4x: None,
     })
 }
 

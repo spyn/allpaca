@@ -35,6 +35,7 @@ mod model;
 mod numa;
 mod otel;
 mod packed;
+mod qwen4exp;
 mod rpc_runtime;
 mod sampling;
 mod scheduler;

@@ -240,6 +240,8 @@ fn array_elem_type(items: &[GgufValue]) -> Result<u32, AllpacaError> {
         Some(GgufValue::Float32(_)) => 6,
         Some(GgufValue::Uint32(_)) => 4,
         Some(GgufValue::Int32(_)) => 5,
+        Some(GgufValue::Uint64(_)) => 10,
+        Some(GgufValue::Int64(_)) => 11,
         None => 8,
         Some(other) => {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
@@ -255,6 +257,8 @@ fn write_array_elem(buf: &mut Vec<u8>, value: &GgufValue) -> Result<(), AllpacaE
         GgufValue::Float32(v) => buf.extend_from_slice(&v.to_le_bytes()),
         GgufValue::Uint32(v) => buf.extend_from_slice(&v.to_le_bytes()),
         GgufValue::Int32(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        GgufValue::Uint64(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        GgufValue::Int64(v) => buf.extend_from_slice(&v.to_le_bytes()),
         other => {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
                 "unsupported GGUF array element {other:?}"

@@ -1804,13 +1804,18 @@ impl Engine {
         let has_cuda = self.cuda.is_some();
         #[cfg(not(feature = "cuda"))]
         let has_cuda = false;
-        if !model.host_weights_ready() && self.hip.is_none() && !has_cuda && model.dsv4.is_none() {
+        if !model.host_weights_ready()
+            && self.hip.is_none()
+            && !has_cuda
+            && model.dsv4.is_none()
+            && model.q4x.is_none()
+        {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "large GGUF requires HIP or CUDA (host F32 materialize is skipped to avoid OOM)"
                     .into(),
             )));
         }
-        let skip_hip = model.dsv4.is_some();
+        let skip_hip = model.dsv4.is_some() || model.q4x.is_some();
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
