@@ -371,6 +371,7 @@ fn load_edge0_weights(
         layer_capture: Default::default(),
         dsv4: None,
         q4x: None,
+        calib: Default::default(),
     })
 }
 

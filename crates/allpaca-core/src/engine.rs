@@ -1798,7 +1798,11 @@ impl Engine {
     pub fn load_gguf(&self, path: &std::path::Path) -> Result<(), AllpacaError> {
         let file = Arc::new(GgufFile::open(path)?);
         let tok = extract_tokenizer(&file)?;
-        let mut model = TinyModel::from_gguf(&file)?;
+        let mut model = if self.config.weights.host_f32 {
+            TinyModel::from_gguf_host(&file)?
+        } else {
+            TinyModel::from_gguf(&file)?
+        };
         model.bind_gguf(file.clone());
         #[cfg(feature = "cuda")]
         let has_cuda = self.cuda.is_some();
@@ -2441,6 +2445,25 @@ impl Engine {
             .weight_h2d_bytes
             .store(h2d, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Read each text with the loaded model and return the second moments
+    /// of its matrix inputs ([`crate::calib`]). Only the CPU forward records.
+    pub fn capture_input_stats(&self, texts: &[&str]) -> Result<crate::calib::InputStats, AllpacaError> {
+        let model = self.lock_for_read().and_then(|g| g.target.clone()).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::ModelLoad("calibration needs a loaded model".into()))
+        })?;
+        model.calib.start();
+        let mut run = Ok(());
+        for text in texts {
+            let params = GenerationParams { max_tokens: 1, temperature: 0.0, seed: Some(7), ..GenerationParams::default() };
+            if let Err(e) = self.generate(text, params) {
+                run = Err(e);
+                break;
+            }
+        }
+        let stats = model.calib.finish();
+        run.map(|()| stats)
     }
 
     pub fn generate(

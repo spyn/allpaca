@@ -4485,6 +4485,8 @@ pub struct TinyModel {
     pub(crate) dsv4: Option<Arc<crate::deepseek4::Dsv4Weights>>,
     /// qwen4exp runs on its own host forward ([`crate::qwen4exp`]).
     pub(crate) q4x: Option<Arc<crate::qwen4exp::Qwen4Weights>>,
+    /// Records matrix inputs during a calibration run ([`crate::calib`]).
+    pub(crate) calib: Arc<crate::calib::Tap>,
     /// Shared RPC runtime when layers are offloaded to remote workers.
     pub rpc: Option<std::sync::Arc<crate::rpc_runtime::RpcRuntime>>,
     /// Edge0 Recover-LoRA + prerouter stager (when loaded via `load_edge0`).
@@ -4666,6 +4668,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -5159,6 +5162,7 @@ impl TinyModel {
         )?;
         let mut gate = vec![0.0f32; cfg.dense_ff()];
         let mut up = vec![0.0f32; cfg.dense_ff()];
+        self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::FfnIn, &scratch[..dim]);
         gemm_nt_dispatch(
             hip,
             &scratch[..dim],
@@ -5180,6 +5184,7 @@ impl TinyModel {
             dim,
         )?;
         silu_mul_dispatch(hip, &mut gate, &up, metrics, cfg.ffn_gelu)?;
+        self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::FfnAct, &gate);
         gemm_nt_dispatch(
             hip,
             &gate,
@@ -6479,6 +6484,16 @@ impl TinyModel {
     }
 
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
+        Self::from_gguf_sized(file, false)
+    }
+
+    /// [`Self::from_gguf`] with every weight decoded to F32 in RAM whatever
+    /// the model's size, for the CPU forward.
+    pub fn from_gguf_host(file: &GgufFile) -> Result<Self, AllpacaError> {
+        Self::from_gguf_sized(file, true)
+    }
+
+    fn from_gguf_sized(file: &GgufFile, host_all: bool) -> Result<Self, AllpacaError> {
         let report = file.compat_report();
         if let Some(reason) = report.reject_reason {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
@@ -6493,7 +6508,7 @@ impl TinyModel {
             model.q4x = Some(Arc::new(weights));
             return Ok(model);
         }
-        Self::from_gguf_cfg(file, cfg, &report)
+        Self::from_gguf_cfg(file, cfg, &report, host_all)
     }
 
     /// Load trailing NextN/MTP blocks as a standalone draft model (shared embed/lm_head).
@@ -6526,7 +6541,7 @@ impl TinyModel {
                 "MTP blk.{base} missing attn_q / nextn.eh_proj"
             ))));
         }
-        let mut model = Self::from_gguf_cfg(file, cfg, &report)?;
+        let mut model = Self::from_gguf_cfg(file, cfg, &report, false)?;
         // Dense MTP heads (Qwen3.5/3.8) ship `ffn_gate/up/down`, not MoE exps.
         // Clear trunk expert count so draft decode stays on the dense device path.
         let base = model.config.gguf_layer_base;
@@ -6568,6 +6583,7 @@ impl TinyModel {
         file: &GgufFile,
         cfg: ModelConfig,
         report: &GgufCompatReport,
+        host_all: bool,
     ) -> Result<Self, AllpacaError> {
         let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
         for i in 0..cfg.n_layers {
@@ -6698,7 +6714,7 @@ impl TinyModel {
             )));
         }
         let host_bytes = estimated_gguf_f32_bytes(file, &cfg);
-        if host_bytes > HOST_F32_LIMIT {
+        if host_bytes > HOST_F32_LIMIT && !host_all {
             let mut model = Self::skeleton_hybrid(cfg, name, report, Some(file));
             attach_dsv4(&mut model, file)?;
             return Ok(model);
@@ -7004,6 +7020,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache,
@@ -7164,6 +7181,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7299,6 +7317,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7413,6 +7432,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7701,6 +7721,7 @@ impl TinyModel {
                 )?;
                 continue;
             }
+            self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::AttnIn, &scratch[..dim]);
             gemm_nt_dispatch(
                 hip,
                 &scratch[..dim],
@@ -7828,6 +7849,7 @@ impl TinyModel {
                     dim,
                 );
             }
+            self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::AttnOut, &attn_out);
             gemm_nt_dispatch(
                 hip,
                 &attn_out,

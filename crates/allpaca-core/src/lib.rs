@@ -2,6 +2,7 @@
 
 mod anchors;
 mod batch_gemm;
+pub mod calib;
 mod compute;
 pub mod decision;
 mod constraint;
@@ -42,6 +43,7 @@ pub mod requant;
 mod rpc_runtime;
 mod sampling;
 mod scheduler;
+pub mod sensitivity;
 mod ssm;
 mod telemetry;
 mod tokenizer;

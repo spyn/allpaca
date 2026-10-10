@@ -98,25 +98,41 @@ impl Quantised {
 
 /// Output error of `q` against `w`: `sum over rows of (w - q) H (w - q)^T`.
 pub fn output_error(w: &[f32], q: &[f32], cols: usize, gram: &Gram<'_>) -> f64 {
-    let mut total = 0.0f64;
-    let mut hd = vec![0.0f32; cols];
-    for (wr, qr) in w.chunks(cols).zip(q.chunks(cols)) {
-        let d: Vec<f32> = wr.iter().zip(qr).map(|(a, b)| a - b).collect();
-        times_gram(&d, gram, &mut hd);
-        total += d.iter().zip(&hd).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>();
-    }
-    total
+    let d: Vec<f32> = w.iter().zip(q).map(|(a, b)| a - b).collect();
+    let Gram::Full(_) = gram else {
+        return d.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+    };
+    let mut hd = vec![0.0f32; d.len()];
+    rows_times_gram(&d, cols, gram, &mut hd);
+    d.iter().zip(&hd).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()
 }
 
-fn times_gram(d: &[f32], gram: &Gram<'_>, out: &mut [f32]) {
-    match gram {
-        Gram::Identity => out.copy_from_slice(d),
-        Gram::Full(h) => {
-            for (o, row) in out.iter_mut().zip(h.chunks(d.len())) {
-                *o = row.iter().zip(d).map(|(a, b)| a * b).sum();
+/// `out = d H` for every row of `d` (rows of `cols`), on all cores when the
+/// product is large enough to be worth the threads.
+fn rows_times_gram(d: &[f32], cols: usize, gram: &Gram<'_>, out: &mut [f32]) {
+    let Gram::Full(h) = gram else {
+        out.copy_from_slice(d);
+        return;
+    };
+    let rows = d.len() / cols;
+    let run = |d: &[f32], out: &mut [f32]| {
+        for (dr, or) in d.chunks(cols).zip(out.chunks_mut(cols)) {
+            for (o, hrow) in or.iter_mut().zip(h.chunks(cols)) {
+                *o = allpaca_cpu::dot(hrow, dr);
             }
         }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(rows);
+    if threads < 2 || d.len() * cols < (1 << 24) {
+        run(d, out);
+        return;
     }
+    let per = rows.div_ceil(threads) * cols;
+    std::thread::scope(|s| {
+        for (dc, oc) in d.chunks(per).zip(out.chunks_mut(per)) {
+            s.spawn(|| run(dc, oc));
+        }
+    });
 }
 
 fn nearest(x: f32) -> u8 {
@@ -154,6 +170,19 @@ fn round_with_best_scales(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
 struct Rng(u64);
 
 impl Rng {
+    /// The stream of one row at one step: rows are sampled on separate
+    /// threads, and the result must not depend on how they are split.
+    fn for_row(seed: u64, step: usize, row: usize) -> Self {
+        let mut x = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add((step as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+            .wrapping_add((row as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
+        x ^= x >> 31;
+        x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        x ^= x >> 32;
+        Self(x | 1)
+    }
+
     fn uniform(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -233,48 +262,103 @@ pub fn quantise_2bit(
         }
     }
     let mut scales = start.scales.clone();
-    let mut rng = Rng(cfg.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    // Rows are independent in everything but the Gram product: whole rows
+    // per thread once the matrix is large enough to pay for the threads.
+    let threads = if n < (1 << 16) { 1 } else { std::thread::available_parallelism().map_or(1, |t| t.get()).min(rows) };
+    let per = rows.div_ceil(threads);
     let (mut opt_logits, mut opt_scales) = (Adam::new(n * 4), Adam::new(scales.len()));
     let mut probs = vec![0.0f32; n * 4];
     let mut soft = vec![0.0f32; n];
     let mut grad_out = vec![0.0f32; n];
     let mut grad_logits = vec![0.0f32; n * 4];
     let mut grad_scales = vec![0.0f32; scales.len()];
-    let mut diff = vec![0.0f32; cols];
+    let mut diff = vec![0.0f32; n];
     // Scales move in proportion to their size.
     let scale_unit = scales.iter().map(|s| s.abs()).sum::<f32>() / scales.len().max(1) as f32;
     for step in 0..cfg.steps {
         let frac = step as f32 / cfg.steps.max(2).saturating_sub(1) as f32;
         let tau = cfg.temperature.0 * (cfg.temperature.1 / cfg.temperature.0).powf(frac);
-        for i in 0..n {
-            let z: Vec<f32> = (0..4).map(|k| (logits[i * 4 + k] + rng.gumbel()) / tau).collect();
-            let max = z.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = z.iter().map(|v| (v - max).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            soft[i] = 0.0;
-            for k in 0..4 {
-                probs[i * 4 + k] = exps[k] / sum;
-                soft[i] += probs[i * 4 + k] * VALUES[k];
+        // Relaxed sample of every weight: softmax((logits + Gumbel noise) / tau).
+        let sample = |first_row: usize, logits: &[f32], probs: &mut [f32], soft: &mut [f32]| {
+            for (r, soft_row) in soft.chunks_mut(cols).enumerate() {
+                let mut rng = Rng::for_row(cfg.seed, step, first_row + r);
+                for (c, s) in soft_row.iter_mut().enumerate() {
+                    let at = (r * cols + c) * 4;
+                    let mut z = [0.0f32; 4];
+                    let mut max = f32::NEG_INFINITY;
+                    for k in 0..4 {
+                        z[k] = (logits[at + k] + rng.gumbel()) / tau;
+                        max = max.max(z[k]);
+                    }
+                    let mut sum = 0.0f32;
+                    for v in &mut z {
+                        *v = (*v - max).exp();
+                        sum += *v;
+                    }
+                    *s = 0.0;
+                    for k in 0..4 {
+                        probs[at + k] = z[k] / sum;
+                        *s += probs[at + k] * VALUES[k];
+                    }
+                }
             }
+        };
+        if threads < 2 {
+            sample(0, &logits, &mut probs, &mut soft);
+        } else {
+            std::thread::scope(|s| {
+                let sample = &sample;
+                let chunks = logits.chunks(per * cols * 4).zip(probs.chunks_mut(per * cols * 4)).zip(soft.chunks_mut(per * cols));
+                for (i, ((l, p), so)) in chunks.enumerate() {
+                    s.spawn(move || sample(i * per, l, p, so));
+                }
+            });
         }
         // d(error)/d(output) = 2 (q - w) H per row.
-        for r in 0..rows {
-            for c in 0..cols {
-                let i = r * cols + c;
-                diff[c] = soft[i] * scales[group_of(i)] - w[i];
-            }
-            times_gram(&diff, gram, &mut grad_out[r * cols..(r + 1) * cols]);
-        }
-        grad_scales.fill(0.0);
         for i in 0..n {
-            let g = 2.0 * grad_out[i];
-            let s = scales[group_of(i)];
-            grad_scales[group_of(i)] += g * soft[i];
-            let gq: Vec<f32> = VALUES.iter().map(|v| g * s * v).collect();
-            let dot: f32 = (0..4).map(|k| gq[k] * probs[i * 4 + k]).sum();
-            for k in 0..4 {
-                grad_logits[i * 4 + k] = probs[i * 4 + k] * (gq[k] - dot) / tau;
+            diff[i] = soft[i] * scales[group_of(i)] - w[i];
+        }
+        rows_times_gram(&diff, cols, gram, &mut grad_out);
+        grad_scales.fill(0.0);
+        // Chain rule through the scale and the softmax; a chunk's groups are its own.
+        let backward = |scales: &[f32],
+                        soft: &[f32],
+                        probs: &[f32],
+                        grad_out: &[f32],
+                        grad_logits: &mut [f32],
+                        grad_scales: &mut [f32]| {
+            for i in 0..soft.len() {
+                let group = (i / cols) * gpr + (i % cols) / Q2_0_BLOCK_ELEMS;
+                let g = 2.0 * grad_out[i];
+                let s = scales[group];
+                grad_scales[group] += g * soft[i];
+                let mut gq = [0.0f32; 4];
+                let mut dot = 0.0f32;
+                for k in 0..4 {
+                    gq[k] = g * s * VALUES[k];
+                    dot += gq[k] * probs[i * 4 + k];
+                }
+                for k in 0..4 {
+                    grad_logits[i * 4 + k] = probs[i * 4 + k] * (gq[k] - dot) / tau;
+                }
             }
+        };
+        if threads < 2 {
+            backward(&scales, &soft, &probs, &grad_out, &mut grad_logits, &mut grad_scales);
+        } else {
+            std::thread::scope(|s| {
+                let backward = &backward;
+                let chunks = scales
+                    .chunks(per * gpr)
+                    .zip(soft.chunks(per * cols))
+                    .zip(probs.chunks(per * cols * 4))
+                    .zip(grad_out.chunks(per * cols))
+                    .zip(grad_logits.chunks_mut(per * cols * 4))
+                    .zip(grad_scales.chunks_mut(per * gpr));
+                for (((((sc, so), p), go), gl), gs) in chunks {
+                    s.spawn(move || backward(sc, so, p, go, gl, gs));
+                }
+            });
         }
         let t = (step + 1) as i32;
         opt_logits.step(&mut logits, &grad_logits, cfg.learning_rate, t);

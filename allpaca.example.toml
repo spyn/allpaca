@@ -75,6 +75,9 @@ miss_policy = "qstar"           # qstar | fill | cpu
 # model file: 0 = the RAM free at load minus 8 GiB (differs between starts),
 # e.g. 53687091200 for a fixed 50 GiB.
 host_bytes = 0
+# Decode every weight to F32 in RAM whatever the model's size (about 4 bytes
+# per weight), so the CPU forward can run it: reference runs and calibration.
+host_f32 = false
 
 # Per-model MoE pin-prefer keep-set from `allpaca-server --tune`.
 # Lookup key is the unresolved model spec (path or Hub `org/name`).

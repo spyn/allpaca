@@ -5,17 +5,27 @@
 //! is RCO's ([`crate::rco`]) knapsack, which meets the average-bits budget
 //! at the least total error. Everything else is copied unchanged.
 //!
-//! The error is each matrix's own squared error relative to its energy,
-//! weighted by its size: there is no calibration data here, so inputs count
-//! as uncorrelated and matrices as independent.
+//! The error is each matrix's own error relative to its energy, weighted by
+//! its size, with matrices counted as independent. Given measured inputs
+//! ([`Options::stats`]) it is the error of the matrix's output on them;
+//! without, inputs count as uncorrelated and it is the plain squared error
+//! of the weights.
+//!
+//! With a probe ([`Options::probe`]) the choice uses instead how far each
+//! option of each matrix, alone, moves the model's predictions on
+//! calibration text ([`crate::sensitivity`]): one number in the same unit
+//! for every matrix. It still adds the matrices' effects up as if they were
+//! independent.
 
 use std::path::Path;
 
 use allpaca_gguf::{GgmlType, GgufFile, GgufStreamTensor, GgufStreamWriter, GgufValue};
 use allpaca_types::{AllpacaError, FatalError};
 
+use crate::calib::InputStats;
 use crate::gsq::{output_error, quantise_2bit, Gram, GsqConfig};
 use crate::rco::{knapsack, Problem};
+use crate::sensitivity::Probe;
 
 /// A type a matrix may be requantised to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +55,16 @@ impl Target {
         }
     }
 
-    fn quantise(self, w: &[f32], rows: usize, cols: usize, gsq: &GsqConfig) -> Result<Vec<u8>, AllpacaError> {
+    fn quantise(
+        self,
+        w: &[f32],
+        rows: usize,
+        cols: usize,
+        gram: &Gram<'_>,
+        gsq: &GsqConfig,
+    ) -> Result<Vec<u8>, AllpacaError> {
         Ok(match self {
-            Target::Q2_0 => quantise_2bit(w, rows, cols, &Gram::Identity, gsq)?.to_q2_0(),
+            Target::Q2_0 => quantise_2bit(w, rows, cols, gram, gsq)?.to_q2_0(),
             Target::Q4_0 => allpaca_gguf::quantize_q4_0(w),
             Target::Q8_0 => allpaca_gguf::quantize_q8_0(w),
         })
@@ -63,6 +80,24 @@ pub struct Options {
     pub gsq: GsqConfig,
     /// Steps of the budget the allocation is solved in.
     pub resolution: usize,
+    /// Measured matrix inputs ([`crate::calib::capture`]). A matrix they
+    /// cover is quantised and scored by its output error on those inputs;
+    /// the others by their plain squared error.
+    pub stats: Option<InputStats>,
+    /// Share of a measured Gram's mean diagonal added to its diagonal.
+    pub damping: f32,
+    /// Choose the types by measured sensitivity ([`crate::sensitivity`])
+    /// instead of each matrix's own error: only matrices the probe can
+    /// swap are requantised, the rest are copied.
+    pub probe: Option<ProbeTexts>,
+}
+
+/// Calibration texts for the sensitivity probe.
+#[derive(Debug, Clone)]
+pub struct ProbeTexts {
+    pub texts: Vec<String>,
+    /// Tokens read of each text.
+    pub max_tokens: usize,
 }
 
 impl Default for Options {
@@ -72,6 +107,9 @@ impl Default for Options {
             min_weights: 4096,
             gsq: GsqConfig::default(),
             resolution: 4000,
+            stats: None,
+            damping: 0.01,
+            probe: None,
         }
     }
 }
@@ -82,8 +120,14 @@ pub struct Choice {
     pub name: String,
     pub weights: usize,
     pub target: Target,
-    /// Squared error of each of [`Target::ALL`] relative to the matrix's energy.
+    /// Error of each of [`Target::ALL`] relative to the matrix's energy:
+    /// of its output on the measured inputs when `calibrated`, of its
+    /// weights otherwise.
     pub relative_error: [f64; 3],
+    pub calibrated: bool,
+    /// With a probe: divergence of the model's predictions (nats per
+    /// token) with this matrix alone at each of [`Target::ALL`].
+    pub divergence: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +135,8 @@ pub struct Report {
     pub choices: Vec<Choice>,
     /// Tensors copied unchanged.
     pub copied: usize,
+    /// Requantised matrices that used measured inputs.
+    pub calibrated: usize,
 }
 
 impl Report {
@@ -109,21 +155,22 @@ fn matrix_shape(dims: &[u64], min_weights: usize) -> Option<(usize, usize)> {
     (dims.len() >= 2 && cols % 64 == 0 && n >= min_weights).then(|| (n / cols, cols))
 }
 
-fn relative_error(w: &[f32], bytes: &[u8], ty: GgmlType, cols: usize) -> Result<f64, AllpacaError> {
-    let mut decoded = vec![0.0f32; w.len()];
-    allpaca_gguf::dequant_packed(ty, bytes, w.len(), &mut decoded)?;
-    let energy: f64 = w.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-    Ok(output_error(w, &decoded, cols, &Gram::Identity) / energy.max(1e-30))
-}
-
 /// Requantise `input` into `output`.
 pub fn requantise(input: &Path, output: &Path, opts: &Options) -> Result<Report, AllpacaError> {
     let file = GgufFile::open(input)?;
+    let mut probe = match &opts.probe {
+        Some(p) => {
+            let texts: Vec<&str> = p.texts.iter().map(String::as_str).collect();
+            Some(Probe::open(input, &texts, p.max_tokens)?)
+        }
+        None => None,
+    };
     let candidates: Vec<(usize, usize, usize)> = file
         .tensors
         .iter()
         .enumerate()
         .filter(|(_, t)| t.name.ends_with(".weight") && !matches!(t.ggml_type, GgmlType::I32 | GgmlType::Other))
+        .filter(|(_, t)| probe.as_ref().is_none_or(|p| p.covers(&t.name)))
         .filter_map(|(i, t)| matrix_shape(&t.dims, opts.min_weights).map(|(rows, cols)| (i, rows, cols)))
         .collect();
     if candidates.is_empty() {
@@ -131,28 +178,60 @@ pub fn requantise(input: &Path, output: &Path, opts: &Options) -> Result<Report,
             "requantise: the file has no weight matrix with rows of whole 64-weight blocks".into(),
         )));
     }
-    // Error of every option for every matrix.
+    // The measured, damped Gram of a matrix's input, when the run covers it.
+    let measured = |i: usize, cols: usize| -> Option<Vec<f32>> {
+        let gram = opts.stats.as_ref()?.gram(&file.tensors[i].name)?;
+        (gram.cols == cols).then(|| gram.damped(opts.damping))
+    };
+    // Error of every option for every matrix. The 2-bit result is kept: it
+    // is small, and the search that makes it is the slow part.
     let mut errors = Vec::with_capacity(candidates.len());
+    let mut two_bit = Vec::with_capacity(candidates.len());
+    let mut calibrated = Vec::with_capacity(candidates.len());
+    let mut divergence = Vec::with_capacity(candidates.len());
     for &(i, rows, cols) in &candidates {
-        let w = file.tensor_f32(&file.tensors[i].name)?;
+        let name = &file.tensors[i].name;
+        let w = file.tensor_f32(name)?;
+        let h = measured(i, cols);
+        let gram = h.as_deref().map_or(Gram::Identity, Gram::Full);
+        let energy = output_error(&w, &vec![0.0; w.len()], cols, &gram);
         let mut row = [0.0f64; 3];
-        for (slot, target) in row.iter_mut().zip(Target::ALL) {
-            *slot = relative_error(&w, &target.quantise(&w, rows, cols, &opts.gsq)?, target.ggml(), cols)?;
+        let mut moved = [0.0f64; 3];
+        let mut decoded = vec![0.0f32; w.len()];
+        for (at, target) in Target::ALL.into_iter().enumerate() {
+            let bytes = target.quantise(&w, rows, cols, &gram, &opts.gsq)?;
+            allpaca_gguf::dequant_packed(target.ggml(), &bytes, w.len(), &mut decoded)?;
+            row[at] = output_error(&w, &decoded, cols, &gram) / energy.max(1e-30);
+            if let Some(probe) = probe.as_mut() {
+                moved[at] = probe.divergence(name, &decoded)?;
+            }
+            if target == Target::Q2_0 {
+                two_bit.push(bytes);
+            }
         }
         errors.push(row);
+        calibrated.push(h.is_some());
+        divergence.push(moved);
     }
+    // The probe holds the whole model in F32: not needed past here.
+    let probed = probe.take().is_some();
     let problem = Problem {
         costs: Target::ALL.iter().map(|t| t.bits()).collect(),
         weights: candidates.iter().map(|&(_, rows, cols)| (rows * cols) as f64).collect(),
         budget: opts.avg_bits,
     };
-    // The loss of a matrix's option is its error weighted by its size.
+    // The loss of a matrix's option: how far it moved the model's predictions
+    // when probed, otherwise its error weighted by its size.
     let mean_weight = problem.weights.iter().sum::<f64>() / candidates.len() as f64;
-    let loss: Vec<f64> = errors
-        .iter()
-        .zip(&problem.weights)
-        .flat_map(|(row, w)| row.iter().map(move |e| e * w / mean_weight))
-        .collect();
+    let loss: Vec<f64> = if probed {
+        divergence.iter().flatten().copied().collect()
+    } else {
+        errors
+            .iter()
+            .zip(&problem.weights)
+            .flat_map(|(row, w)| row.iter().map(move |e| e * w / mean_weight))
+            .collect()
+    };
     // The loss is one term per matrix and option, so the knapsack optimum is exact.
     let gain: Vec<f64> = loss.iter().map(|l| -l).collect();
     let assignment = knapsack(&problem, &gain, opts.resolution)?;
@@ -193,10 +272,14 @@ pub fn requantise(input: &Path, output: &Path, opts: &Options) -> Result<Report,
     let mut writer = GgufStreamWriter::create(output, &metadata, &declared)?;
     for (i, t) in file.tensors.iter().enumerate() {
         match chosen(i) {
+            Some(Target::Q2_0) => {
+                let at = candidates.iter().position(|c| c.0 == i).expect("chosen");
+                writer.write_tensor(&two_bit[at])?;
+            }
             Some(target) => {
                 let (_, rows, cols) = candidates[candidates.iter().position(|c| c.0 == i).expect("chosen")];
                 let w = file.tensor_f32(&t.name)?;
-                writer.write_tensor(&target.quantise(&w, rows, cols, &opts.gsq)?)?;
+                writer.write_tensor(&target.quantise(&w, rows, cols, &Gram::Identity, &opts.gsq)?)?;
             }
             None => writer.write_tensor(file.tensor_bytes(&t.name)?)?,
         }
@@ -207,14 +290,19 @@ pub fn requantise(input: &Path, output: &Path, opts: &Options) -> Result<Report,
             .iter()
             .zip(&assignment)
             .zip(&errors)
-            .map(|((&(i, rows, cols), &o), row)| Choice {
+            .zip(&calibrated)
+            .zip(&divergence)
+            .map(|((((&(i, rows, cols), &o), row), &calibrated), moved)| Choice {
                 name: file.tensors[i].name.clone(),
                 weights: rows * cols,
                 target: Target::ALL[o],
                 relative_error: *row,
+                calibrated,
+                divergence: probed.then_some(*moved),
             })
             .collect(),
         copied: file.tensors.len() - candidates.len(),
+        calibrated: calibrated.iter().filter(|c| **c).count(),
     })
 }
 
@@ -319,5 +407,98 @@ mod tests {
         assert!(err / energy < 0.02, "{}", err / energy);
         let _ = std::fs::remove_file(src);
         let _ = std::fs::remove_file(dst);
+    }
+
+    /// With measured inputs every covered matrix is quantised for its
+    /// output on them: the error there is lower than what quantising
+    /// the weights alone gives.
+    #[test]
+    fn measured_inputs_lower_the_output_error() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (src, plain, tuned) = (
+            dir.join(format!("allpaca_requant_cal_in-{pid}.gguf")),
+            dir.join(format!("allpaca_requant_cal_plain-{pid}.gguf")),
+            dir.join(format!("allpaca_requant_cal_tuned-{pid}.gguf")),
+        );
+        crate::calib::tests::write_tiny_calib_gguf(&src, 64, 128);
+        let stats = crate::calib::capture(&src, &["hello world again hello world", "again again hello"]).unwrap();
+        // 2.25 bits: every matrix goes to Q2_0, so only the quantiser differs.
+        let base = Options {
+            avg_bits: 2.25,
+            gsq: GsqConfig { steps: 80, ..GsqConfig::default() },
+            ..Options::default()
+        };
+        let plain_report = requantise(&src, &plain, &base).unwrap();
+        let tuned_report = requantise(&src, &tuned, &Options { stats: Some(stats.clone()), ..base.clone() }).unwrap();
+        assert_eq!(plain_report.calibrated, 0);
+        assert_eq!(tuned_report.calibrated, 7, "q, k, v, output, gate, up, down");
+        assert_eq!(tuned_report.choices.len(), 7);
+
+        let (original, plain_out, tuned_out) =
+            (GgufFile::open(&src).unwrap(), GgufFile::open(&plain).unwrap(), GgufFile::open(&tuned).unwrap());
+        let (mut plain_total, mut tuned_total) = (0.0f64, 0.0f64);
+        for choice in &tuned_report.choices {
+            assert_eq!(choice.target, Target::Q2_0);
+            let gram = stats.gram(&choice.name).unwrap();
+            let h = gram.damped(base.damping);
+            let w = original.tensor_f32(&choice.name).unwrap();
+            let on_inputs = |file: &GgufFile| {
+                output_error(&w, &file.tensor_f32(&choice.name).unwrap(), gram.cols, &Gram::Full(&h))
+            };
+            let (p, t) = (on_inputs(&plain_out), on_inputs(&tuned_out));
+            assert!(t <= p * 1.0001, "{}: {t} on the measured inputs, {p} without them", choice.name);
+            plain_total += p;
+            tuned_total += t;
+        }
+        assert!(tuned_total < 0.9 * plain_total, "{tuned_total} vs {plain_total}");
+        for path in [src, plain, tuned] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// With a probe the bits follow what the output is sensitive to. Here
+    /// the attention output projection is nearly zero, so the four
+    /// attention matrices barely reach the output: they take the two
+    /// bits and the feed-forward matrices keep four or more. By their
+    /// own error the matrices are all alike.
+    #[test]
+    fn probe_spends_the_bits_on_what_moves_the_output() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (src, dst) =
+            (dir.join(format!("allpaca_requant_probe_in-{pid}.gguf")), dir.join(format!("allpaca_requant_probe_out-{pid}.gguf")));
+        crate::calib::tests::write_tiny_calib_gguf_with(&src, 64, 128, 1e-4);
+        let opts = Options {
+            // Attention (4 * 4096 weights) at 2.25 bits, feed-forward (3 * 8192) at 4.5.
+            avg_bits: 3.6,
+            gsq: GsqConfig { steps: 40, ..GsqConfig::default() },
+            probe: Some(ProbeTexts {
+                texts: vec!["hello world again hello world".into(), "again again hello world".into()],
+                max_tokens: 32,
+            }),
+            ..Options::default()
+        };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        assert_eq!(report.choices.len(), 7);
+        assert!((report.avg_bits() - 3.6).abs() < 1e-9, "{}", report.avg_bits());
+        for c in &report.choices {
+            let d = c.divergence.unwrap_or_else(|| panic!("{} was not probed", c.name));
+            assert!(d.iter().all(|v| v.is_finite() && *v >= 0.0), "{}: {d:?}", c.name);
+            if c.name.contains("attn_") {
+                assert_eq!(c.target, Target::Q2_0, "{}: {d:?}", c.name);
+            } else {
+                assert_ne!(c.target, Target::Q2_0, "{}: {d:?}", c.name);
+                assert!(d[0] > d[2], "{}: two bits move the output more than eight: {d:?}", c.name);
+            }
+        }
+        let out = GgufFile::open(&dst).unwrap();
+        assert_eq!(out.tensor("blk.0.attn_q.weight").unwrap().ggml_type, GgmlType::Q2_0);
+        assert_ne!(out.tensor("blk.0.ffn_down.weight").unwrap().ggml_type, GgmlType::Q2_0);
+        // The embedding is below the size limit here: copied as it was.
+        assert_eq!(out.tensor("token_embd.weight").unwrap().ggml_type, GgmlType::F32);
+        for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

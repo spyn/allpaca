@@ -579,6 +579,10 @@ pub struct WeightsSection {
     /// automatic: the RAM free when the model loads minus 8 GiB, which varies
     /// from start to start. Set it for a tier of a fixed size.
     pub host_bytes: usize,
+    /// Decode every weight to F32 in RAM whatever the model's size, so the
+    /// CPU forward can run it (reference runs and calibration). Needs about
+    /// 4 bytes of RAM per weight.
+    pub host_f32: bool,
 }
 
 impl Default for WeightsSection {
@@ -589,6 +593,7 @@ impl Default for WeightsSection {
             ring_slots: 2,
             miss_policy: MissPolicy::Qstar,
             host_bytes: 0,
+            host_f32: false,
         }
     }
 }
