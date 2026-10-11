@@ -821,6 +821,7 @@ fn hip_quant_gemm(
         39 => allpaca_hip::gemm_nt_mxfp4_device(a, b, c, m, n, k).map_err(bad),
         100 => allpaca_hip::gemm_nt_rocmfp4_device(a, b, c, m, n, k).map_err(bad),
         101 => allpaca_hip::gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k).map_err(bad),
+        200 => allpaca_hip::gemm_nt_p48fp4_device(a, b, c, m, n, k).map_err(bad),
         other => Err(RpcError::Worker(format!(
             "hip worker has no gemm for ggml type {other}"
         ))),

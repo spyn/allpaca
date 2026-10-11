@@ -884,7 +884,7 @@ impl RpcRuntime {
         };
         let (gate, up, down) = (put("gate")?, put("up")?, put("down")?);
         // What the worker's fused MoE kernels take (they read int8 rows):
-        // K-quants, or Q8_0 with gate and up both Q8_0.
+        // K-quants, Q8_0 with gate and up both Q8_0, or MoESQ experts.
         let ty = |part: &str| {
             file.tensor(&format!("blk.{blk}.ffn_{part}_exps.weight"))
                 .map_or(0, |t| t.ggml_type_id)
@@ -892,9 +892,13 @@ impl RpcRuntime {
         let (g, u, d) = (ty("gate"), ty("up"), ty("down"));
         // Only the HIP worker's kernels have the Q8_0 case.
         let q8_0_ok = matches!(backend, RpcBackendKind::Hip) || ![g, u, d].contains(&8);
-        let kquant = [g, u, d].iter().all(|t| matches!(t, 8 | 12..=14))
-            && (g == 8) == (u == 8)
-            && q8_0_ok;
+        // MoESQ paired-4:8 experts (200) are fused only as a full set, and
+        // only on the HIP worker.
+        let p48 = [g, u, d] == [200, 200, 200] && matches!(backend, RpcBackendKind::Hip);
+        let kquant = p48
+            || ([g, u, d].iter().all(|t| matches!(t, 8 | 12..=14))
+                && (g == 8) == (u == 8)
+                && q8_0_ok);
         let fused = matches!(backend, RpcBackendKind::Hip | RpcBackendKind::Cuda)
             && cfg.dim % 256 == 0
             && cfg.ff_dim % 256 == 0;
@@ -1913,7 +1917,8 @@ fn gemm_nk(info: &allpaca_gguf::TensorInfo) -> Option<(usize, usize)> {
 fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
     let hip = matches!(ty, 0 | 1 | 8 | 12 | 13 | 14 | 30 | 34 | 35 | 39 | 100 | 101);
     match backend {
-        RpcBackendKind::Hip => hip,
+        // 200 = MoESQ paired-4:8 experts; only the HIP worker has kernels for it.
+        RpcBackendKind::Hip => hip || ty == 200,
         RpcBackendKind::Cpu => hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 20 | 23),
         // F32, Q8_0 and the int8 K-quant GEMV; ROCmFP4 and the rest stay off
         // CUDA workers.
