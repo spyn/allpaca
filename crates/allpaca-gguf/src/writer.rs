@@ -166,6 +166,97 @@ pub fn write_gguf_quant(
     Ok(())
 }
 
+/// One tensor of a file written by [`GgufStreamWriter`].
+pub struct GgufStreamTensor {
+    pub name: String,
+    /// Outermost dimension first, as the other writers take them.
+    pub dims: Vec<u64>,
+    pub ggml_type_id: u32,
+    pub nbytes: usize,
+}
+
+/// Writes a GGUF one tensor at a time, for files too large to assemble in
+/// memory: the header (metadata and every tensor's place) first, then each
+/// tensor's bytes in the order they were declared.
+pub struct GgufStreamWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    sizes: Vec<usize>,
+    next: usize,
+}
+
+impl GgufStreamWriter {
+    const ALIGN: usize = 32;
+
+    pub fn create(
+        path: &Path,
+        metadata: &HashMap<String, GgufValue>,
+        tensors: &[GgufStreamTensor],
+    ) -> Result<Self, AllpacaError> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        let mut keys: Vec<&String> = metadata.keys().collect();
+        keys.sort();
+        for key in keys {
+            write_string(&mut buf, key);
+            write_value(&mut buf, &metadata[key])?;
+        }
+        let mut offset = 0u64;
+        for tensor in tensors {
+            write_string(&mut buf, &tensor.name);
+            buf.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+            for d in &tensor.dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&tensor.ggml_type_id.to_le_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+            offset += tensor.nbytes.next_multiple_of(Self::ALIGN) as u64;
+        }
+        buf.resize(buf.len().next_multiple_of(Self::ALIGN), 0);
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path).map_err(FatalError::from)?);
+        file.write_all(&buf).map_err(FatalError::from)?;
+        Ok(Self {
+            file,
+            sizes: tensors.iter().map(|t| t.nbytes).collect(),
+            next: 0,
+        })
+    }
+
+    /// The next declared tensor's bytes.
+    pub fn write_tensor(&mut self, bytes: &[u8]) -> Result<(), AllpacaError> {
+        match self.sizes.get(self.next) {
+            Some(size) if *size == bytes.len() => {}
+            other => {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "GGUF tensor {} takes {other:?} bytes, got {}",
+                    self.next,
+                    bytes.len()
+                ))))
+            }
+        }
+        self.file.write_all(bytes).map_err(FatalError::from)?;
+        let pad = bytes.len().next_multiple_of(Self::ALIGN) - bytes.len();
+        self.file.write_all(&[0u8; Self::ALIGN][..pad]).map_err(FatalError::from)?;
+        self.next += 1;
+        Ok(())
+    }
+
+    /// Flush; every declared tensor must have been written.
+    pub fn finish(mut self) -> Result<(), AllpacaError> {
+        if self.next != self.sizes.len() {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "GGUF has {} tensors declared, {} written",
+                self.sizes.len(),
+                self.next
+            ))));
+        }
+        self.file.flush().map_err(FatalError::from)?;
+        Ok(())
+    }
+}
+
 fn write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
@@ -240,6 +331,8 @@ fn array_elem_type(items: &[GgufValue]) -> Result<u32, AllpacaError> {
         Some(GgufValue::Float32(_)) => 6,
         Some(GgufValue::Uint32(_)) => 4,
         Some(GgufValue::Int32(_)) => 5,
+        Some(GgufValue::Uint64(_)) => 10,
+        Some(GgufValue::Int64(_)) => 11,
         None => 8,
         Some(other) => {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
@@ -255,6 +348,8 @@ fn write_array_elem(buf: &mut Vec<u8>, value: &GgufValue) -> Result<(), AllpacaE
         GgufValue::Float32(v) => buf.extend_from_slice(&v.to_le_bytes()),
         GgufValue::Uint32(v) => buf.extend_from_slice(&v.to_le_bytes()),
         GgufValue::Int32(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        GgufValue::Uint64(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        GgufValue::Int64(v) => buf.extend_from_slice(&v.to_le_bytes()),
         other => {
             return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
                 "unsupported GGUF array element {other:?}"

@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="web_standard" name="shell-type"/><style>@layer base{html,body{margin:0;padding:0;}body{overscroll-behavior:none;}main>:first-child{margin-top:0!important;}main>:last-child{margin-bottom:0!important;}}::-webkit-scrollbar{display:none;}</style><link href="https://fonts.googleapis.com" rel="preconnect"/><link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/><link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/><link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script><script id="tailwind-config">tailwind.config = {
+  darkMode: "class",
+  theme: {
+    extend: {
+      "colors": {
+        "on-primary-container": "#00422b",
+        "primary-fixed": "#6ffbbe",
+        "inverse-on-surface": "#2d3136",
+        "secondary-fixed-dim": "#4cd7f6",
+        "on-tertiary": "#3c0091",
+        "background": "#101419",
+        "on-primary": "#003824",
+        "surface-container-high": "#262a30",
+        "outline-variant": "#3c4a42",
+        "on-surface": "#e0e2ea",
+        "surface-container-highest": "#31353b",
+        "inverse-surface": "#e0e2ea",
+        "surface": "#101419",
+        "on-secondary-fixed-variant": "#004e5c",
+        "on-secondary": "#003640",
+        "secondary-fixed": "#acedff",
+        "surface-tint": "#4edea3",
+        "on-tertiary-fixed": "#23005c",
+        "on-error": "#690005",
+        "inverse-primary": "#006c49",
+        "secondary": "#4cd7f6",
+        "secondary-container": "#03b5d3",
+        "surface-container-low": "#181c21",
+        "surface-container-lowest": "#0a0e13",
+        "surface-container": "#1c2025",
+        "on-surface-variant": "#bbcabf",
+        "on-primary-fixed": "#002113",
+        "outline": "#86948a",
+        "surface-bright": "#36393f",
+        "error-container": "#93000a",
+        "on-tertiary-container": "#4600a7",
+        "on-secondary-fixed": "#001f26",
+        "surface-dim": "#101419",
+        "tertiary-fixed-dim": "#d0bcff",
+        "on-error-container": "#ffdad6",
+        "primary-fixed-dim": "#4edea3",
+        "error": "#ffb4ab",
+        "tertiary-fixed": "#e9ddff",
+        "primary-container": "#10b981",
+        "on-primary-fixed-variant": "#005236",
+        "tertiary": "#d0bcff",
+        "on-secondary-container": "#00424e",
+        "surface-variant": "#31353b",
+        "primary": "#4edea3",
+        "on-tertiary-fixed-variant": "#5516be",
+        "on-background": "#e0e2ea",
+        "tertiary-container": "#b090ff"
+      },
+      "borderRadius": {
+        "DEFAULT": "0.125rem",
+        "lg": "0.25rem",
+        "xl": "0.5rem",
+        "full": "0.75rem"
+      },
+      "spacing": {
+        "space-xs": "0.25rem",
+        "gutter": "0.75rem",
+        "space-sm": "0.5rem",
+        "space-md": "0.75rem",
+        "space-lg": "1rem",
+        "margin": "1.25rem",
+        "space-xl": "1.5rem"
+      },
+      "fontFamily": {
+        "label-section": [
+          "JetBrains Mono"
+        ],
+        "body-sm": [
+          "Inter"
+        ],
+        "body-md": [
+          "Inter"
+        ],
+        "headline-lg": [
+          "Geist"
+        ],
+        "body-lg": [
+          "Inter"
+        ],
+        "headline-md": [
+          "Geist"
+        ],
+        "label-code": [
+          "JetBrains Mono"
+        ],
+        "label-mono": [
+          "JetBrains Mono"
+        ],
+        "metric-unit": [
+          "JetBrains Mono"
+        ],
+        "metric-display": [
+          "Geist"
+        ],
+        "headline-xl": [
+          "Geist"
+        ]
+      },
+      "fontSize": {
+        "label-section": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "letterSpacing": "0.08em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-sm": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "body-md": [
+          "13px",
+          {
+            "lineHeight": "18px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-lg": [
+          "22px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.015em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-lg": [
+          "15px",
+          {
+            "lineHeight": "22px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-md": [
+          "18px",
+          {
+            "lineHeight": "24px",
+            "letterSpacing": "-0.01em",
+            "fontWeight": "600"
+          }
+        ],
+        "label-code": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "fontWeight": "500"
+          }
+        ],
+        "label-mono": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "metric-unit": [
+          "13px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "500"
+          }
+        ],
+        "metric-display": [
+          "24px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.03em",
+            "fontWeight": "700"
+          }
+        ],
+        "headline-xl": [
+          "28px",
+          {
+            "lineHeight": "36px",
+            "letterSpacing": "-0.02em",
+            "fontWeight": "700"
+          }
+        ]
+      }
+    }
+  }
+};</script></head><body class="bg-surface font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container"><header class="fixed top-0 left-0 w-full z-50 bg-surface-container-lowest/90 backdrop-blur-xl border-b border-outline-variant/30"><div class="h-16 w-full px-margin flex items-center justify-between gap-space-lg"><div class="flex items-center gap-space-lg shrink-0"><div class="flex items-center gap-space-sm"><img alt="Allpaca Logo" class="h-8 w-auto object-contain" src="https://lh3.googleusercontent.com/aida/AEtjO1U7lp6rlcEHSXUXP3vTEzxtA04C3M7RyQNyYx6kfaHmkdlxNmAQymz1wJ_GiZ6ijkv99AHXGhcnvFh7yYWuOaoDit8NWmHod6ONmP2Fh_RerSp0W1iGej96VrEDzZ-3KlcCykcDiDQDXJHhi9v5gSyfmTrzBnMv4rN_z-I0jI2sg-r_yR0JVdhQx_cosSTxuVzJLfwYgDm22J9Xp_DF_vPRbEpjwW7zpJjSBsk7GYqqTilReINHU6Xa"/><div class="flex flex-col"><span class="font-headline-md text-headline-md tracking-tight font-bold text-on-surface leading-none">Allpaca</span><span class="font-label-code text-label-code text-primary uppercase tracking-wider mt-0.5">Cluster: Home-Lab</span></div></div><div class="h-4 w-px bg-outline-variant/40 mx-space-xs hidden lg:block"></div><span class="hidden lg:inline-flex items-center font-label-mono text-label-mono text-on-surface-variant bg-surface-container px-space-sm py-0.5 rounded">v0.9.4-rc</span><nav class="hidden xl:flex items-center gap-space-xs" data-active-classes="bg-surface-container-high text-primary font-medium rounded-lg"><a aria-current="page" class="px-space-md py-1.5 transition-colors bg-surface-container-high text-primary font-medium rounded-lg" data-path="dashboard" href="#">Dashboard</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="chat-playground" href="#">Chat Playground</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="models-vram" href="#">Models &amp; VRAM</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="logs-traces" href="#">Logs &amp; Traces</a></nav></div><div class="hidden 2xl:flex items-center gap-space-md bg-surface-container-low px-space-md py-1.5 rounded border border-outline-variant/30"><div class="flex items-center gap-space-xs"><span class="h-2 w-2 rounded-full bg-primary animate-pulse"></span><span class="font-label-mono text-label-mono text-on-surface font-medium">Live · 4 Devices</span><span class="font-body-sm text-body-sm text-on-surface-variant">(2 Local HIP, 2 RPC)</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="material-symbols-outlined text-[14px] text-secondary">network_ping</span><span class="font-label-code text-label-code text-secondary font-medium">0.4ms LAN</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="font-label-code text-label-code text-on-surface-variant">Throughput:</span><span class="font-label-mono text-label-mono text-primary font-semibold">142.8 t/s</span></div></div><div class="flex items-center gap-space-sm shrink-0"><a class="hidden sm:inline-flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container hover:bg-surface-container-high text-on-surface font-body-sm text-body-sm transition-colors border border-outline-variant/40" href="#"><span class="material-symbols-outlined text-[16px] text-primary">api</span><span>API Docs</span></a><div class="hidden md:flex items-center gap-1 px-space-sm py-1 rounded bg-surface-container-low border border-outline-variant/30"><span class="material-symbols-outlined text-[16px] text-secondary">dns</span><span class="font-label-code text-label-code text-on-surface-variant">:11434, :8080</span><span class="material-symbols-outlined text-[16px] text-on-surface-variant">expand_more</span></div><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Cluster Settings"><span class="material-symbols-outlined text-[20px]">tune</span></button><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Lock UI"><span class="material-symbols-outlined text-[20px]">lock</span></button><div class="h-4 w-px bg-outline-variant/40 mx-0.5"></div><div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center"><span class="material-symbols-outlined text-on-primary text-[18px]">person</span></div></div></div></header><main class="w-full pt-16 bg-surface min-h-[calc(100vh-4rem)]"><div class="flex flex-col w-full">
+<!-- Cluster Overview & Active Model Hero Card -->
+<section class="w-full px-margin pt-space-md pb-space-lg">
+<div class="w-full bg-surface-container-low rounded-xl p-space-lg shadow-xl relative overflow-hidden">
+<!-- Glow ambient backdrop accent -->
+<div class="absolute -right-20 -top-20 w-96 h-96 bg-primary/10 rounded-full blur-3xl pointer-events-none"></div>
+<div class="absolute right-1/3 -bottom-24 w-80 h-80 bg-secondary/10 rounded-full blur-3xl pointer-events-none"></div>
+<div class="relative z-10 flex flex-col xl:flex-row xl:items-center justify-between gap-space-xl">
+<!-- Model Specifications & Active Status -->
+<div class="flex-1 min-w-0">
+<div class="flex flex-wrap items-center gap-space-sm mb-2">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase tracking-widest">Active Model Target</span>
+<span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span>
+<span class="inline-flex items-center gap-1 font-label-code text-label-code text-primary bg-primary/10 px-space-xs py-0.5 rounded">
+<span class="material-symbols-outlined text-[13px]">bolt</span> HIP Backend Engine
+            </span>
+<span class="font-label-code text-label-code text-on-surface-variant bg-surface-container px-space-xs py-0.5 rounded">
+              qwen35 · UD-Q5_K_XL
+            </span>
+<span class="font-label-code text-label-code text-secondary bg-secondary/10 px-space-xs py-0.5 rounded">
+              Speculative MTP x2
+            </span>
+</div>
+<div class="flex items-baseline gap-space-md flex-wrap">
+<h1 class="font-headline-xl text-headline-xl text-on-surface font-extrabold tracking-tight">Qwen3.8-27B</h1>
+<span class="font-label-mono text-label-mono text-on-surface-variant">27.4 Billion Parameters · Unsloth Optimized</span>
+</div>
+<div class="mt-space-sm flex flex-wrap items-center gap-x-space-lg gap-y-1 font-body-sm text-body-sm text-on-surface-variant">
+<div class="flex items-center gap-1.5">
+<span class="h-2 w-2 rounded-full bg-primary"></span>
+<span class="text-on-surface font-medium">1 active streaming request</span>
+</div>
+<span class="text-outline-variant">•</span>
+<div><span class="text-on-surface font-label-mono font-medium">7</span> requests served</div>
+<span class="text-outline-variant">•</span>
+<div><span class="text-on-surface font-label-mono font-medium">1,089</span> tokens processed this session</div>
+<span class="text-outline-variant">•</span>
+<div class="flex items-center gap-1 text-secondary">
+<span class="material-symbols-outlined text-[14px]">lan</span>
+<span class="font-label-code">http://192.168.69.2:11434</span>
+</div>
+</div>
+</div>
+<!-- Throughput Sparkline & KPI Box -->
+<div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-space-lg shrink-0 bg-surface-container-lowest/80 p-space-md rounded-lg backdrop-blur-md">
+<div class="flex flex-col pr-space-md">
+<div class="flex items-center justify-between gap-space-md">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase tracking-wider">Throughput</span>
+<span class="inline-flex items-center gap-1 font-label-code text-[10px] text-primary bg-primary/10 px-1 rounded">
+<span class="material-symbols-outlined text-[12px]">trending_up</span> live
+              </span>
+</div>
+<div class="flex items-baseline gap-1 mt-0.5">
+<span class="font-metric-display text-metric-display text-primary tracking-tight" id="live-throughput">9.9</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">tok/s</span>
+</div>
+<span class="font-label-code text-[10px] text-on-surface-variant mt-0.5">Rolling 60s · Target: 12.0 tok/s</span>
+</div>
+<!-- Realtime SVG Sparkline -->
+<div class="w-full sm:w-48 h-16 relative flex items-end">
+<svg class="w-full h-full overflow-visible" preserveaspectratio="none" viewbox="0 0 160 48">
+<defs>
+<lineargradient id="primaryAreaGrad" x1="0%" x2="0%" y1="0%" y2="100%">
+<stop offset="0%" stop-color="#4edea3" stop-opacity="0.35"></stop>
+<stop offset="100%" stop-color="#4edea3" stop-opacity="0.0"></stop>
+</lineargradient>
+</defs>
+<!-- Filled area -->
+<path d="M 0,44 L 14,44 L 28,43 L 42,44 L 56,44 L 70,44 L 84,43 L 98,44 L 112,44 L 122,26 L 132,12 L 138,14 L 144,38 L 149,12 L 155,16 L 160,20 L 160,48 L 0,48 Z" fill="url(#primaryAreaGrad)"></path>
+<!-- Sparkline Stroke -->
+<path d="M 0,44 L 14,44 L 28,43 L 42,44 L 56,44 L 70,44 L 84,43 L 98,44 L 112,44 L 122,26 L 132,12 L 138,14 L 144,38 L 149,12 L 155,16 L 160,20" fill="none" stroke="#4edea3" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path>
+<!-- Peak Pip indicator -->
+<circle class="fill-primary animate-ping" cx="149" cy="12" opacity="0.75" r="3"></circle>
+<circle class="fill-surface-container-lowest stroke-primary" cx="149" cy="12" r="2.5" stroke-width="1.5"></circle>
+</svg>
+</div>
+<!-- Action Buttons -->
+<div class="flex sm:flex-col gap-1.5 shrink-0">
+<button class="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-space-md py-1.5 rounded bg-primary text-on-primary font-body-sm text-body-sm font-semibold hover:bg-primary-container transition-all">
+<span class="material-symbols-outlined text-[16px]">swap_horiz</span>
+<span>Switch Model</span>
+</button>
+<button class="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container-high text-on-surface hover:text-primary font-body-sm text-body-sm transition-colors">
+<span class="material-symbols-outlined text-[16px]">speed</span>
+<span>Benchmark</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+</section>
+<!-- Segmented Unified Memory Pool Bar -->
+<section class="w-full px-margin pb-space-lg">
+<div class="w-full bg-surface-container-low p-space-md rounded-lg shadow-md">
+<div class="flex flex-col md:flex-row md:items-center justify-between gap-space-sm mb-2">
+<div class="flex items-center gap-space-sm">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase tracking-wider">Global Cluster Memory Distribution</span>
+<span class="font-label-mono text-label-mono text-on-surface font-semibold">68.21 GiB / 111.75 GiB</span>
+<span class="font-label-code text-[10px] text-primary bg-primary/10 px-1 py-0.5 rounded">61.0% Allocated</span>
+</div>
+<div class="flex flex-wrap items-center gap-space-md font-label-code text-[11px] text-on-surface-variant">
+<div class="flex items-center gap-1.5">
+<span class="w-2.5 h-2.5 rounded-sm bg-tertiary-container"></span>
+<span>Weights: 19.44 GiB</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="w-2.5 h-2.5 rounded-sm bg-primary"></span>
+<span>Active KV Cache: 196.0 MiB</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="w-2.5 h-2.5 rounded-sm bg-secondary"></span>
+<span>System Buffers &amp; OS: 48.57 GiB</span>
+</div>
+<div class="flex items-center gap-1.5">
+<span class="w-2.5 h-2.5 rounded-sm bg-surface-container-highest"></span>
+<span>Headroom: 43.54 GiB Free</span>
+</div>
+</div>
+</div>
+<!-- Segmented Track -->
+<div class="w-full h-3 bg-surface-container-highest rounded-full overflow-hidden flex">
+<div class="h-full bg-tertiary-container transition-all" style="width: 17.4%" title="Weights: 19.44 GiB"></div>
+<div class="h-full bg-primary transition-all" style="width: 1.2%" title="KV Cache: 196.0 MiB"></div>
+<div class="h-full bg-secondary transition-all" style="width: 42.4%" title="System RAM Used: 47.88 GiB"></div>
+<div class="h-full bg-surface-container-highest flex-1" title="Unallocated Free Headroom: 43.54 GiB"></div>
+</div>
+</div>
+</section>
+<!-- Telemetry KPI Modular Grid (10 Dense Technical Cards) -->
+<section class="w-full px-margin pb-space-lg">
+<div class="flex items-center justify-between mb-space-sm">
+<div class="flex items-center gap-space-sm">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase tracking-widest">Hardware &amp; Engine Telemetry</span>
+<span class="h-1.5 w-1.5 rounded-full bg-secondary animate-pulse"></span>
+</div>
+<div class="flex items-center gap-space-xs font-label-code text-[11px] text-on-surface-variant">
+<span>Refresh: 500ms</span>
+<button class="p-1 hover:text-on-surface" title="Pause telemetry"><span class="material-symbols-outlined text-[14px]">pause</span></button>
+</div>
+</div>
+<!-- 10 Responsive Metric Cards -->
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-space-md">
+<!-- Card 1: HOST RAM -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">Host RAM</span>
+<span class="font-label-code text-[10px] text-on-surface-variant">DDR5-6000</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-on-surface tracking-tight">47.88</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">GiB</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">of 79.91 GiB (59.9%)</span>
+</div>
+<div class="mt-3">
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-primary rounded-full" style="width: 59.9%;"></div>
+</div>
+<div class="flex justify-between items-center mt-1 font-label-code text-[10px] text-on-surface-variant">
+<span>Dual Channel</span>
+<span>32.03 GiB free</span>
+</div>
+</div>
+</div>
+<!-- Card 2: RX 9070 VRAM -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-primary uppercase">RX 9070 VRAM</span>
+<span class="font-label-code text-[10px] text-primary bg-primary/10 px-1 rounded">Dev #0</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-primary tracking-tight">8.32</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">GiB</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">of 15.92 GiB (52.2%)</span>
+</div>
+<div class="mt-3">
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-primary rounded-full" style="width: 52.2%;"></div>
+</div>
+<div class="flex justify-between items-center mt-1 font-label-code text-[10px] text-on-surface-variant">
+<span>58°C · 185W</span>
+<span>PCIe 5.0 x16</span>
+</div>
+</div>
+</div>
+<!-- Card 3: RX 9060 XT VRAM -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-primary uppercase">RX 9060 XT VRAM</span>
+<span class="font-label-code text-[10px] text-primary bg-primary/10 px-1 rounded">Dev #1</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-primary tracking-tight">12.35</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">GiB</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">of 15.92 GiB (77.5%)</span>
+</div>
+<div class="mt-3">
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-primary rounded-full" style="width: 77.5%;"></div>
+</div>
+<div class="flex justify-between items-center mt-1 font-label-code text-[10px] text-on-surface-variant">
+<span>64°C · 160W</span>
+<span>PCIe 4.0 x16</span>
+</div>
+</div>
+</div>
+<!-- Card 4: WEIGHTS ON DEVICE -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">Weights on Device</span>
+<span class="material-symbols-outlined text-[16px] text-tertiary">layers</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-on-surface tracking-tight">19.44</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">GiB</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">KV Cache: 196.0 MiB</span>
+</div>
+<div class="mt-3 flex items-center justify-between font-label-code text-[10px] text-on-surface-variant">
+<span class="text-tertiary">Paged Attention ON</span>
+<span>Pinned HIP Memory</span>
+</div>
+</div>
+<!-- Card 5: LATENCY (ITL & TTFT) -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">Engine Latency</span>
+<span class="material-symbols-outlined text-[16px] text-secondary">timer</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-on-surface tracking-tight">66.0</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">ms</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">Inter-Token Latency (ITL)</span>
+</div>
+<div class="mt-3 flex items-center justify-between font-label-code text-[10px] text-on-surface-variant">
+<span class="text-secondary font-medium">TTFT: 462 ms</span>
+<span>p95: 72.4 ms</span>
+</div>
+</div>
+<!-- Card 6: HOST CPU -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">Host CPU</span>
+<span class="font-label-code text-[10px] text-on-surface-variant">16c / 32t</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-on-surface tracking-tight">63%</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">Ryzen 9 9950X @ 4.8 GHz</span>
+</div>
+<div class="mt-3">
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-primary rounded-full" style="width: 63%;"></div>
+</div>
+<div class="flex justify-between items-center mt-1 font-label-code text-[10px] text-on-surface-variant">
+<span>52°C · 105W</span>
+<span>K-Quants Core</span>
+</div>
+</div>
+</div>
+<!-- Card 7: GPU UTILIZATION (CLUSTER) -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">GPU Util (Aggregate)</span>
+<span class="material-symbols-outlined text-[16px] text-primary">speed</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-primary tracking-tight">53%</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">Local HIP Compute Average</span>
+</div>
+<div class="mt-3">
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-primary rounded-full" style="width: 53%;"></div>
+</div>
+<div class="flex justify-between items-center mt-1 font-label-code text-[10px] text-on-surface-variant">
+<span>Active Pipeline</span>
+<span>Compute Clocks Peak</span>
+</div>
+</div>
+</div>
+<!-- Card 8: KV PAGES -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">KV Pages</span>
+<span class="material-symbols-outlined text-[16px] text-secondary">memory</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-on-surface tracking-tight">192</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">VRAM</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">0 DRAM spillover</span>
+</div>
+<div class="mt-3 flex items-center justify-between font-label-code text-[10px] text-on-surface-variant">
+<span class="text-primary">100% On-Chip Hit</span>
+<span>Zero Swap</span>
+</div>
+</div>
+<!-- Card 9: SPECULATIVE DECODE -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">Speculation</span>
+<span class="font-label-code text-[10px] text-secondary bg-secondary/10 px-1 rounded">MTP Active</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-secondary tracking-tight">70.2%</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">859 / 1,223 drafts accepted</span>
+</div>
+<div class="mt-3">
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-secondary rounded-full" style="width: 70.2%;"></div>
+</div>
+<div class="flex justify-between items-center mt-1 font-label-code text-[10px] text-on-surface-variant">
+<span>+1.98x Speedup</span>
+<span>Gamma: 3</span>
+</div>
+</div>
+</div>
+<!-- Card 10: RPC & NETWORK -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between shadow-sm hover:bg-surface-container transition-colors">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">RPC &amp; Network</span>
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant">hub</span>
+</div>
+<div class="mt-2">
+<div class="flex items-baseline gap-1">
+<span class="font-metric-display text-metric-display text-on-surface tracking-tight">0</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">rtt</span>
+</div>
+<span class="font-label-mono text-body-sm text-on-surface-variant">0 B activations sent</span>
+</div>
+<div class="mt-3 flex items-center justify-between font-label-code text-[10px] text-on-surface-variant">
+<span class="text-primary font-medium">Local GPU Slicing</span>
+<span>RPC Ready (Standby)</span>
+</div>
+</div>
+</div>
+</section>
+<!-- Compute Device Topology & Worker Nodes (Hardware Cluster Matrix) -->
+<section class="w-full px-margin pb-space-lg">
+<div class="bg-surface-container-low rounded-xl overflow-hidden shadow-lg">
+<!-- Toolbar Header -->
+<div class="p-space-md bg-surface-container/60 flex flex-col md:flex-row md:items-center justify-between gap-space-md">
+<div class="flex items-center gap-space-md">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-primary text-[20px]">developer_board</span>
+<h2 class="font-headline-md text-headline-md text-on-surface font-semibold tracking-tight">Compute Hardware Topology</h2>
+</div>
+<span class="font-label-code text-label-code text-on-surface-variant bg-surface-container-high px-space-sm py-0.5 rounded">
+            5 Devices Registered
+          </span>
+</div>
+<!-- Filter tabs & Worker registration button -->
+<div class="flex flex-wrap items-center gap-space-sm">
+<div class="flex items-center bg-surface-container-lowest p-0.5 rounded">
+<button class="px-space-sm py-1 rounded bg-surface-container-high text-primary font-label-mono text-[11px] font-semibold">All (5)</button>
+<button class="px-space-sm py-1 rounded hover:text-on-surface text-on-surface-variant font-label-mono text-[11px]">Local (3)</button>
+<button class="px-space-sm py-1 rounded hover:text-on-surface text-on-surface-variant font-label-mono text-[11px]">RPC Workers (2)</button>
+</div>
+<button class="inline-flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container-high hover:bg-surface-bright text-on-surface font-body-sm text-body-sm transition-colors shadow-sm">
+<span class="material-symbols-outlined text-[16px] text-secondary">add_circle</span>
+<span>Attach Remote RPC Worker</span>
+</button>
+</div>
+</div>
+<!-- High-Density Telemetry Matrix Table -->
+<div class="w-full overflow-x-auto">
+<table class="w-full text-left border-collapse">
+<thead>
+<tr class="bg-surface-container-lowest/80 text-on-surface-variant font-label-section text-label-section uppercase tracking-wider">
+<th class="py-2.5 px-space-md w-16">ID</th>
+<th class="py-2.5 px-space-md">Kind / Driver</th>
+<th class="py-2.5 px-space-md">Device Hardware Name</th>
+<th class="py-2.5 px-space-md">Bus &amp; Address</th>
+<th class="py-2.5 px-space-md">Temp &amp; Power</th>
+<th class="py-2.5 px-space-md min-w-[220px]">Memory Allocation</th>
+<th class="py-2.5 px-space-md w-24">Util</th>
+<th class="py-2.5 px-space-md">Engine Role &amp; State</th>
+</tr>
+</thead>
+<tbody class="font-body-sm text-body-sm divide-y-0">
+<!-- Row 1: CPU Host -->
+<tr class="hover:bg-surface-container/50 transition-colors">
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">-1</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-label-code text-[11px] bg-surface-container-highest text-on-surface font-medium">
+<span class="material-symbols-outlined text-[12px] text-outline">memory</span> CPU
+                </span>
+</td>
+<td class="py-3 px-space-md font-body-sm font-semibold text-on-surface">
+                AMD Ryzen 9 9950X (Host Master)
+              </td>
+<td class="py-3 px-space-md font-label-code text-label-code text-on-surface-variant">localhost (AM5 Socket)</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">
+<span class="text-on-surface">52°C</span> · 105 W
+              </td>
+<td class="py-3 px-space-md">
+<div class="flex flex-col gap-1">
+<div class="flex justify-between font-label-mono text-[11px]">
+<span class="text-on-surface font-medium">47.88 GiB</span>
+<span class="text-on-surface-variant">79.91 GiB (60%)</span>
+</div>
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-secondary rounded-full" style="width: 59.9%"></div>
+</div>
+</div>
+</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono font-medium text-on-surface">63%</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-label-code text-[11px] bg-surface-container text-on-surface">
+<span class="h-1.5 w-1.5 rounded-full bg-on-surface"></span> Host Orchestrator
+                </span>
+</td>
+</tr>
+<!-- Row 2: RX 9070 Local Primary -->
+<tr class="hover:bg-surface-container/50 transition-colors bg-surface-container-low/30">
+<td class="py-3 px-space-md font-label-mono text-label-mono text-primary font-bold">0</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-label-code text-[11px] bg-primary/10 text-primary font-semibold">
+<span class="material-symbols-outlined text-[12px]">view_in_ar</span> HipGpu
+                </span>
+</td>
+<td class="py-3 px-space-md">
+<div class="font-body-sm font-semibold text-on-surface">AMD Radeon RX 9070</div>
+<div class="font-label-code text-[10px] text-on-surface-variant">ROCm 6.1.2 · gfx1150</div>
+</td>
+<td class="py-3 px-space-md font-label-code text-label-code text-on-surface-variant">PCIe 5.0 (0000:03:00.0)</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">
+<span class="text-primary font-medium">58°C</span> · 185 W
+              </td>
+<td class="py-3 px-space-md">
+<div class="flex flex-col gap-1">
+<div class="flex justify-between font-label-mono text-[11px]">
+<span class="text-primary font-semibold">8.32 GiB</span>
+<span class="text-on-surface-variant">15.92 GiB (52%)</span>
+</div>
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-primary rounded-full" style="width: 52.2%"></div>
+</div>
+</div>
+</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono font-bold text-primary">68%</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-label-code text-[11px] bg-primary/10 text-primary font-medium">
+<span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span> Layers 0-32 (Primary)
+                </span>
+</td>
+</tr>
+<!-- Row 3: RX 9060 XT Local Secondary -->
+<tr class="hover:bg-surface-container/50 transition-colors">
+<td class="py-3 px-space-md font-label-mono text-label-mono text-primary font-bold">1</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-label-code text-[11px] bg-primary/10 text-primary font-semibold">
+<span class="material-symbols-outlined text-[12px]">view_in_ar</span> HipGpu
+                </span>
+</td>
+<td class="py-3 px-space-md">
+<div class="font-body-sm font-semibold text-on-surface">AMD Radeon RX 9060 XT</div>
+<div class="font-label-code text-[10px] text-on-surface-variant">ROCm 6.1.2 · gfx1150</div>
+</td>
+<td class="py-3 px-space-md font-label-code text-label-code text-on-surface-variant">PCIe 4.0 (0000:07:00.0)</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">
+<span class="text-secondary font-medium">64°C</span> · 160 W
+              </td>
+<td class="py-3 px-space-md">
+<div class="flex flex-col gap-1">
+<div class="flex justify-between font-label-mono text-[11px]">
+<span class="text-primary font-semibold">12.35 GiB</span>
+<span class="text-on-surface-variant">15.92 GiB (78%)</span>
+</div>
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-primary rounded-full" style="width: 77.5%"></div>
+</div>
+</div>
+</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono font-bold text-primary">84%</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-label-code text-[11px] bg-primary/10 text-primary font-medium">
+<span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span> Layers 33-64 (Secondary)
+                </span>
+</td>
+</tr>
+<!-- Row 4: RPC Node Alpha Dev 0 -->
+<tr class="hover:bg-surface-container/50 transition-colors bg-surface-container-low/20">
+<td class="py-3 px-space-md font-label-mono text-label-mono text-secondary">1000</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-label-code text-[11px] bg-secondary/10 text-secondary font-medium">
+<span class="material-symbols-outlined text-[12px]">cell_tower</span> HipGpu (RPC)
+                </span>
+</td>
+<td class="py-3 px-space-md">
+<div class="font-body-sm font-medium text-on-surface font-label-code">rpc[192.168.69.2:50052#0]</div>
+<div class="font-label-code text-[10px] text-on-surface-variant">Cluster Node: alpha-rig (RX 7900 XTX)</div>
+</td>
+<td class="py-3 px-space-md font-label-code text-label-code text-secondary">10GbE LAN · 0.2ms</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">
+                54°C · 210 W
+              </td>
+<td class="py-3 px-space-md">
+<div class="flex flex-col gap-1">
+<div class="flex justify-between font-label-mono text-[11px]">
+<span class="text-on-surface font-medium">0.00 GiB</span>
+<span class="text-on-surface-variant">31.98 GiB Available</span>
+</div>
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-secondary/40 rounded-full" style="width: 0%"></div>
+</div>
+</div>
+</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">0%</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-label-code text-[11px] bg-surface-container text-secondary font-medium">
+<span class="h-1.5 w-1.5 rounded-full bg-secondary"></span> RPC Ready · Standby
+                </span>
+</td>
+</tr>
+<!-- Row 5: RPC Node Alpha Dev 1 -->
+<tr class="hover:bg-surface-container/50 transition-colors bg-surface-container-low/20">
+<td class="py-3 px-space-md font-label-mono text-label-mono text-secondary">1001</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-label-code text-[11px] bg-secondary/10 text-secondary font-medium">
+<span class="material-symbols-outlined text-[12px]">cell_tower</span> HipGpu (RPC)
+                </span>
+</td>
+<td class="py-3 px-space-md">
+<div class="font-body-sm font-medium text-on-surface font-label-code">rpc[192.168.69.2:50052#1]</div>
+<div class="font-label-code text-[10px] text-on-surface-variant">Cluster Node: alpha-rig (RX 7900 XTX)</div>
+</td>
+<td class="py-3 px-space-md font-label-code text-label-code text-secondary">10GbE LAN · 0.2ms</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">
+                51°C · 205 W
+              </td>
+<td class="py-3 px-space-md">
+<div class="flex flex-col gap-1">
+<div class="flex justify-between font-label-mono text-[11px]">
+<span class="text-on-surface font-medium">0.00 GiB</span>
+<span class="text-on-surface-variant">31.98 GiB Available</span>
+</div>
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full bg-secondary/40 rounded-full" style="width: 0%"></div>
+</div>
+</div>
+</td>
+<td class="py-3 px-space-md font-label-mono text-label-mono text-on-surface-variant">0%</td>
+<td class="py-3 px-space-md">
+<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-label-code text-[11px] bg-surface-container text-secondary font-medium">
+<span class="h-1.5 w-1.5 rounded-full bg-secondary"></span> RPC Ready · Standby
+                </span>
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<!-- Live Inference Activity & Execution Logs Drawer -->
+<section class="w-full px-margin pb-space-xl">
+<div class="bg-surface-container-low rounded-xl p-space-md shadow-md">
+<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-space-sm pb-space-sm mb-space-sm bg-surface-container-low">
+<div class="flex items-center gap-space-sm">
+<span class="material-symbols-outlined text-[18px] text-primary">terminal</span>
+<span class="font-headline-md text-headline-md text-on-surface font-semibold">Live Inference Event Stream</span>
+<span class="inline-flex items-center px-1.5 py-0.5 rounded bg-surface-container text-on-surface-variant font-label-code text-[10px]">
+            stdout / traces
+          </span>
+</div>
+<div class="flex items-center gap-space-xs font-label-code text-[11px]">
+<span class="text-primary flex items-center gap-1">
+<span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span> Streaming WS active
+          </span>
+<span class="text-outline-variant mx-1">|</span>
+<button class="hover:text-on-surface text-on-surface-variant">Clear</button>
+<span class="text-outline-variant mx-1">|</span>
+<button class="hover:text-on-surface text-on-surface-variant">Filter Level: INFO</button>
+</div>
+</div>
+<!-- Monospace Log Lines -->
+<div class="w-full bg-surface-container-lowest p-space-md rounded-lg font-label-code text-label-code flex flex-col gap-1.5 max-h-44 overflow-y-auto">
+<div class="flex items-start gap-space-sm text-on-surface-variant">
+<span class="text-outline select-none">[19:42:01.120]</span>
+<span class="text-primary font-semibold">POST /v1/chat/completions</span>
+<span>from 192.168.69.14:52940 · Prompt: 184 tokens · Stream: true</span>
+</div>
+<div class="flex items-start gap-space-sm text-on-surface-variant">
+<span class="text-outline select-none">[19:42:01.186]</span>
+<span class="text-secondary">EVAL_START</span>
+<span>KV Prefill done in 66.2ms (2778.2 t/s) · Paged blocks allocated: 12</span>
+</div>
+<div class="flex items-start gap-space-sm text-on-surface-variant">
+<span class="text-outline select-none">[19:42:01.648]</span>
+<span class="text-primary font-semibold">SPEC_DRAFT</span>
+<span>MTP gamma=3 · 3/3 tokens verified · Speedup current step: 2.14x</span>
+</div>
+<div class="flex items-start gap-space-sm text-on-surface-variant">
+<span class="text-outline select-none">[19:42:03.421]</span>
+<span class="text-tertiary">HEALTH_CHECK</span>
+<span>RPC remote workers rpc[192.168.69.2:50052#0, #1] ping 0.18ms · Keep-alive OK</span>
+</div>
+<div class="flex items-start gap-space-sm text-on-surface">
+<span class="text-outline select-none">[19:42:04.002]</span>
+<span class="text-primary animate-pulse font-semibold">• DECODING</span>
+<span class="text-on-surface">Tokens generated: 34 · Current speed: 9.92 tok/s · Context load: 218 / 32,768</span>
+</div>
+</div>
+</div>
+</section>
+</div>
+<script>
+  // Subtle real-time metric jitter to reflect live LLM engine streaming
+  (function initLiveTelemetry() {
+    const throughputEl = document.getElementById('live-throughput');
+    if (!throughputEl) return;
+    setInterval(() => {
+      // Natural fluctuation around ~9.9 tok/s
+      const jitter = (Math.random() * 0.6 - 0.3);
+      const val = Math.max(8.8, Math.min(10.8, 9.9 + jitter)).toFixed(1);
+      throughputEl.innerText = val;
+    }, 2400);
+  })();
+</script></main><footer class="w-full bg-surface-container-lowest border-t border-outline-variant/20 py-space-lg"><div class="w-full px-margin flex flex-col sm:flex-row items-center justify-between gap-space-sm font-label-code text-label-code text-on-surface-variant"><div>Allpaca Distributed Engine · Node <span class="text-primary">master-alpha</span> · ROCm 6.1 / Vulkan RPC</div><div>Memory: <span class="text-secondary">68.2 GiB / 96.0 GiB</span> · 4 Nodes Synced</div></div></footer></body></html>

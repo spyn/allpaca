@@ -3,16 +3,56 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
+  <meta name="color-scheme" content="dark">
   <title>Allpaca</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233fb950'/%3E%3Ctext x='16' y='23' font-family='system-ui,sans-serif' font-size='19' font-weight='700' text-anchor='middle' fill='%230d1117'%3EA%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2310b981'/%3E%3Ctext x='16' y='23' font-family='system-ui,sans-serif' font-size='19' font-weight='700' text-anchor='middle' fill='%23003824'%3EA%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+  <!-- Icon sprite: everything is served from this node, no icon font. -->
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></symbol>
+    <symbol id="i-lan" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/></symbol>
+    <symbol id="i-trend" viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 8-8M15 7h6v6"/></symbol>
+    <symbol id="i-swap" viewBox="0 0 24 24"><path d="M4 8h14l-4-4M20 16H6l4 4"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+    <symbol id="i-chip" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5zM3 13l9 5 9-5"/></symbol>
+    <symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l3 2M9 2h6"/></symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a9 9 0 1 1 16 0M12 14l4-5"/></symbol>
+    <symbol id="i-hub" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="m6.5 6.5 3.7 3.7M17.5 6.5l-3.7 3.7M6.5 17.5l3.7-3.7M17.5 17.5l-3.7-3.7"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol>
+    <symbol id="i-tune" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0M14 4v4M8 10v4M16 16v4"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14-4L4 9M4 4v5h5M4 13a8 8 0 0 0 14 4l2-2M20 20v-5h-5"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m4 18 5-5 4 4 3-3 4 4"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="m4 4 17 8-17 8 3-8zM7 12h8"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m7 5 12 7-12 7z"/></symbol>
+    <symbol id="i-clear" viewBox="0 0 24 24"><path d="M9 5h11v14H9l-6-7zM12 9l5 6M17 9l-5 6"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6 8v6l-4-2v-4z"/></symbol>
+    <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 6 0V7a3 3 0 0 0-3-3zM15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-6 0"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8 5c-3 0-1 5-4 7 3 2 1 7 4 7M16 5c3 0 1 5 4 7-3 2-1 7-4 7"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M16 7l3 3M14 9l2 2"/></symbol>
+    <symbol id="i-alpaca" viewBox="0 0 24 24"><path d="M8 3v3M16 3v3M7 6h10v7a5 5 0 0 1-10 0zM7 21v-4M17 21v-4M10 10h0M14 10h0"/></symbol>
+  </svg>
+
   <div id="login" class="gate hidden">
-    <form id="login-form" class="card login-card">
-      <div class="brand"><span class="logo" aria-hidden="true">A</span><h1>Allpaca</h1></div>
-      <p class="muted">Operator login</p>
+    <form id="login-form" class="panel login-card">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"><svg class="ic"><use href="#i-alpaca"/></svg></span>
+        <div class="brand-text"><h1>Allpaca</h1><span class="brand-sub">Operator login</span></div>
+      </div>
       <label class="sr-only" for="password">Password</label>
       <input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
       <button type="submit" class="primary">Sign in</button>
@@ -22,157 +62,298 @@
 
   <div id="app" class="hidden">
     <header class="topbar">
-      <div class="brand"><span class="logo" aria-hidden="true">A</span><strong>Allpaca</strong></div>
+      <div class="brand">
+        <span class="logo" aria-hidden="true"><svg class="ic"><use href="#i-alpaca"/></svg></span>
+        <div class="brand-text"><strong>Allpaca</strong><span id="brand-sub" class="brand-sub">Node</span></div>
+      </div>
+      <span class="vr" aria-hidden="true"></span>
       <nav aria-label="Pages">
         <button data-page="dashboard" class="tab active">Dashboard</button>
-        <button data-page="chat" class="tab">Chat</button>
-        <button data-page="model" class="tab">Model</button>
-        <button data-page="logs" class="tab">Logs</button>
+        <button data-page="chat" class="tab">Chat Playground</button>
+        <button data-page="model" class="tab">Models &amp; VRAM</button>
+        <button data-page="logs" class="tab">Logs &amp; Traces</button>
+        <button data-page="api" class="tab">API</button>
+        <button data-page="settings" class="tab">Settings</button>
       </nav>
-      <span id="conn" class="conn" title="Server connection"><span class="dot"></span><span id="conn-text">connecting</span></span>
-      <button id="logout" class="ghost">Log out</button>
+      <div id="conn" class="conn" title="Server connection">
+        <span class="dot"></span><span id="conn-text">connecting</span>
+        <span id="conn-detail" class="conn-detail"></span>
+      </div>
+      <button id="logout" class="icon-btn" title="Log out" aria-label="Log out"><svg class="ic"><use href="#i-lock"/></svg></button>
     </header>
     <div id="reload-banner" class="banner hidden" role="status"></div>
 
     <main id="page-dashboard" class="page">
-      <section class="hero card">
+      <section class="hero">
         <div class="hero-main">
-          <h2>Model</h2>
-          <div id="hero-model" class="hero-model">—</div>
-          <div id="hero-sub" class="muted"></div>
+          <div class="hero-tags">
+            <span class="label">Active model target</span>
+            <span class="pip pulse" aria-hidden="true"></span>
+            <span id="hero-tags" class="tag-row"></span>
+          </div>
+          <div class="hero-title">
+            <h1 id="hero-model">—</h1>
+            <span id="hero-params" class="mono soft"></span>
+          </div>
+          <div id="hero-sub" class="hero-sub"></div>
         </div>
-        <div class="hero-rate">
-          <h2>Throughput</h2>
-          <div class="hero-num"><span id="hero-tps">0.0</span><small>tok/s</small></div>
+        <div class="hero-kpi">
+          <div class="kpi-text">
+            <div class="kpi-head">
+              <span class="label">Throughput</span>
+              <span class="chip chip-primary"><svg class="ic"><use href="#i-trend"/></svg>live</span>
+            </div>
+            <div class="kpi-num"><span id="hero-tps">0.0</span><small>tok/s</small></div>
+            <span id="hero-tps-sub" class="tiny soft">Rolling 60s</span>
+          </div>
           <svg id="spark" class="spark" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="spark-grad" x1="0" x2="0" y1="0" y2="1">
+                <stop offset="0" stop-color="#4edea3" stop-opacity="0.35"/>
+                <stop offset="1" stop-color="#4edea3" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
             <path id="spark-fill" class="spark-fill" d=""></path>
             <path id="spark-line" class="spark-line" d=""></path>
           </svg>
+          <div class="kpi-actions">
+            <button id="hero-switch" class="primary"><svg class="ic"><use href="#i-swap"/></svg>Switch Model</button>
+            <button id="hero-chat" class="secondary"><svg class="ic"><use href="#i-chat"/></svg>Open Chat</button>
+          </div>
         </div>
       </section>
 
-      <h2 class="section-title">Memory</h2>
-      <section class="grid" id="mem-cards"></section>
+      <section id="mem-dist" class="panel mem-dist hidden">
+        <div class="mem-dist-head">
+          <span class="label">Local VRAM distribution</span>
+          <span id="mem-dist-total" class="mono strong"></span>
+          <span id="mem-dist-pct" class="chip chip-primary"></span>
+          <span id="mem-dist-legend" class="legend"></span>
+        </div>
+        <div id="mem-dist-bar" class="stack-bar"></div>
+      </section>
 
-      <h2 id="remote-title" class="section-title hidden">Remote GPUs</h2>
-      <section class="grid hidden" id="remote-cards"></section>
+      <div class="section-head">
+        <h2 class="label">Hardware &amp; engine telemetry <span class="pip pulse" aria-hidden="true"></span></h2>
+        <span class="tiny soft">Refresh: 1s</span>
+      </div>
+      <section class="grid" id="metric-cards"></section>
 
-      <h2 class="section-title">Engine</h2>
-      <section class="grid" id="engine-cards"></section>
+      <section class="panel flush">
+        <div class="panel-head">
+          <svg class="ic primary-text"><use href="#i-grid"/></svg>
+          <h2>Compute Hardware Topology</h2>
+          <span id="topo-count" class="chip"></span>
+          <span class="spacer"></span>
+          <div id="topo-filter" class="seg" role="group" aria-label="Filter devices">
+            <button data-topo="all" class="on">All</button>
+            <button data-topo="local">Local</button>
+            <button data-topo="rpc">RPC Workers</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="topo">
+            <thead><tr><th>ID</th><th>Kind / driver</th><th>Device hardware name</th><th>Temp &amp; power</th><th>Memory allocation</th><th>Util</th><th>Engine role</th></tr></thead>
+            <tbody id="device-rows"></tbody>
+          </table>
+        </div>
+      </section>
 
-      <h2 class="section-title">Devices</h2>
-      <section class="card table-card">
-        <table>
-          <thead><tr><th>ID</th><th>Kind</th><th>Name</th><th class="num">Memory</th></tr></thead>
-          <tbody id="device-rows"></tbody>
-        </table>
+      <section class="panel">
+        <div class="panel-head bare">
+          <svg class="ic primary-text"><use href="#i-terminal"/></svg>
+          <h2>Live Inference Event Stream</h2>
+          <span class="chip">server log</span>
+          <span class="spacer"></span>
+          <span id="event-state" class="tiny soft"></span>
+          <button id="event-open" class="link">Open Logs &amp; Traces</button>
+        </div>
+        <div id="event-stream" class="event-stream"></div>
       </section>
     </main>
 
     <main id="page-chat" class="page page-chat hidden">
-      <div class="chat-layout">
-        <div class="chat-bar">
-          <span id="chat-model" class="pill muted">no model</span>
-          <span class="spacer"></span>
-          <button id="settings-toggle" class="ghost small" aria-expanded="false" aria-controls="settings">Settings</button>
-          <button id="new-chat" class="ghost small">New chat</button>
-        </div>
-        <div id="settings" class="settings hidden">
-          <label>System prompt
-            <textarea id="system-prompt" rows="2" placeholder="Optional instructions sent before the conversation"></textarea>
-          </label>
-          <div class="controls">
-            <label>Max tokens <input id="max-tokens" type="number" min="1" max="4096" value="4096"></label>
-            <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7"></label>
-          </div>
-        </div>
-        <div id="messages" class="messages" aria-live="polite">
-          <div id="empty-chat" class="empty muted">Start a conversation. Enter sends, Shift+Enter adds a line. Paste or drop images to attach them.</div>
-        </div>
-        <form id="chat-form" class="composer">
-          <div id="attachments" class="attachments hidden"></div>
-          <div class="composer-row">
-            <label class="ghost icon-btn" title="Attach image">
-              <input id="file-input" type="file" accept="image/*" multiple class="sr-only">
-              <span aria-hidden="true">＋</span><span class="sr-only">Attach image</span>
+      <div class="chat-ribbon">
+        <span class="rib"><svg class="ic primary-text"><use href="#i-chip"/></svg><strong id="chat-model" class="soft">no model</strong><span id="chat-quant" class="chip chip-primary hidden"></span></span>
+        <span id="chat-ctx" class="rib hidden"></span>
+        <span id="chat-last" class="rib hidden"></span>
+        <span id="chat-spec" class="rib rib-violet hidden"></span>
+        <span class="spacer"></span>
+        <button id="settings-toggle" class="secondary small" aria-expanded="false" aria-controls="settings"><svg class="ic"><use href="#i-brain"/></svg>System Prompt</button>
+        <button id="export-chat" class="secondary small"><svg class="ic"><use href="#i-code"/></svg>Export JSON</button>
+        <button id="new-chat" class="secondary small"><svg class="ic"><use href="#i-plus"/></svg>New chat</button>
+        <button id="drawer-toggle" class="primary small" aria-expanded="false" aria-controls="drawer"><svg class="ic"><use href="#i-tune"/></svg>Sampling &amp; Cluster</button>
+      </div>
+      <div class="chat-body">
+        <div class="chat-layout">
+          <div id="settings" class="settings hidden">
+            <label>System prompt
+              <textarea id="system-prompt" rows="2" placeholder="Optional instructions sent before the conversation"></textarea>
             </label>
-            <textarea id="prompt" rows="1" placeholder="Message…" aria-label="Message"></textarea>
-            <button id="send" type="submit" class="primary">Send</button>
-            <button id="stop" type="button" class="danger hidden">Stop</button>
           </div>
-        </form>
+          <div id="messages" class="messages" aria-live="polite">
+            <div id="empty-chat" class="empty soft">Start a conversation. Enter sends, Shift+Enter adds a line. Paste or drop images to attach them.</div>
+          </div>
+          <form id="chat-form" class="composer">
+            <div class="composer-hint">
+              <span id="composer-tags" class="tag-row"></span>
+              <span class="spacer"></span>
+              <span class="tiny soft">Shift + Enter for newline · <span class="primary-text">Enter to send</span></span>
+            </div>
+            <div class="composer-box">
+              <div id="attachments" class="attachments hidden"></div>
+              <textarea id="prompt" rows="2" placeholder="Send a message…" aria-label="Message"></textarea>
+              <div class="composer-row">
+                <label class="icon-btn" title="Attach image">
+                  <input id="file-input" type="file" accept="image/*" multiple class="sr-only">
+                  <svg class="ic"><use href="#i-image"/></svg><span class="sr-only">Attach image</span>
+                </label>
+                <span class="spacer"></span>
+                <button id="send" type="submit" class="primary">Send<svg class="ic"><use href="#i-send"/></svg></button>
+                <button id="stop" type="button" class="danger hidden"><svg class="ic"><use href="#i-stop"/></svg>Stop</button>
+              </div>
+            </div>
+          </form>
+        </div>
+        <aside id="drawer" class="drawer hidden" aria-label="Sampling and nodes">
+          <div class="drawer-head">
+            <svg class="ic primary-text"><use href="#i-tune"/></svg><h2>Sampling &amp; Nodes</h2>
+            <span class="spacer"></span>
+            <button id="drawer-close" class="icon-btn" aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+          </div>
+          <div class="drawer-sec">
+            <div class="drawer-title"><span class="label">Cluster allocation</span></div>
+            <div id="drawer-nodes" class="well nodes"></div>
+          </div>
+          <div class="drawer-sec">
+            <div class="drawer-title"><span class="label">Hyperparameters</span><button id="sampling-reset" class="link">Reset</button></div>
+            <div class="well">
+              <label class="slider-row" for="temperature"><span>Temperature</span><output id="temperature-out" class="mono primary-text">0.70</output></label>
+              <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7">
+              <div class="slider-ends"><span>Deterministic (0.0)</span><span>Creative (1.5+)</span></div>
+            </div>
+            <div class="well">
+              <label class="slider-row" for="top-p"><span>Top-P (Nucleus)</span><output id="top-p-out" class="mono primary-text">0.95</output></label>
+              <input id="top-p" type="range" min="0.05" max="1" step="0.01" value="0.95">
+            </div>
+            <div class="well">
+              <label class="slider-row" for="max-tokens"><span>Max Tokens</span><span class="tiny soft">Generation cap</span></label>
+              <input id="max-tokens" type="number" min="1" max="4096" value="4096">
+            </div>
+          </div>
+          <div class="drawer-sec">
+            <div class="drawer-title"><span class="label">Speculative decoding</span></div>
+            <div id="drawer-spec" class="well"></div>
+          </div>
+        </aside>
       </div>
     </main>
 
     <main id="page-model" class="page hidden">
-      <section class="card model-head">
-        <div>
-          <h2>Model</h2>
-          <div id="m-name" class="hero-model">—</div>
-          <div id="m-path" class="muted small-text"></div>
+      <div class="page-head">
+        <div class="page-head-main">
+          <div class="crumb label"><span class="primary-text">Engine runtime</span> / Models &amp; VRAM topology</div>
+          <div class="title-row">
+            <h1 id="m-name">—</h1>
+            <span id="m-active" class="chip chip-primary hidden"></span>
+            <span id="m-pending" class="chip chip-warn hidden">Reload needed to apply the saved settings</span>
+          </div>
+          <div id="m-path" class="mono tiny soft"></div>
         </div>
         <div class="model-actions">
-          <span id="m-pending" class="pill warn-pill hidden">Reload needed to apply the context size</span>
-          <button id="m-reload" class="ghost" disabled>Reload model</button>
+          <button id="m-reload" class="secondary" disabled><svg class="ic"><use href="#i-refresh"/></svg><span id="m-reload-text">Reload Model</span></button>
         </div>
-      </section>
+      </div>
 
-      <h2 class="section-title">Placement</h2>
-      <section class="card">
+      <section id="model-detail" class="panel flush model-detail hidden"></section>
+
+      <section class="panel">
+        <div class="panel-head bare">
+          <svg class="ic primary-text"><use href="#i-layers"/></svg>
+          <h2 class="label">Layer placement</h2>
+        </div>
         <div id="m-layer-map" class="layer-map" aria-hidden="true"></div>
-        <div id="m-placement" class="placement"><span class="muted">No model loaded.</span></div>
+        <div id="m-placement" class="placement"><span class="soft">No model loaded.</span></div>
       </section>
 
-      <h2 class="section-title">Available models</h2>
-      <section class="card models-card">
-        <div class="models-toolbar">
-          <span id="models-dir" class="muted small-text"></span>
+      <section class="panel">
+        <div class="panel-head bare">
+          <svg class="ic primary-text"><use href="#i-tune"/></svg>
+          <h2 class="label">Context size &amp; KV cache allocation</h2>
           <span class="spacer"></span>
-          <input id="models-filter" type="search" placeholder="Filter models" aria-label="Filter models">
-          <button id="models-rescan" class="ghost small">Rescan</button>
+          <span id="ctx-facts" class="tiny soft"></span>
         </div>
-        <div class="table-scroll">
-          <table class="models-table">
-            <thead><tr><th>Model</th><th>Architecture</th><th>Size · quant</th><th class="num">Context</th><th>Experts</th><th class="num">On disk</th><th></th></tr></thead>
-            <tbody id="models-rows"><tr><td colspan="7" class="muted">Scanning…</td></tr></tbody>
-          </table>
-        </div>
-        <p id="models-extra" class="muted small-text"></p>
-        <div id="model-detail" class="model-detail hidden"></div>
-      </section>
-
-      <h2 class="section-title">Context size</h2>
-      <section class="card">
         <div class="ctx-row">
-          <input id="ctx-slider" type="range" min="0" max="15" step="1" value="5" aria-label="Context size">
-          <input id="ctx-input" type="number" min="256" step="256" aria-label="Context tokens">
-          <span class="muted">tokens</span>
+          <div class="ctx-slider">
+            <div class="ctx-ticks" id="ctx-ticks" aria-hidden="true"></div>
+            <input id="ctx-slider" type="range" min="0" max="15" step="1" value="5" aria-label="Context size">
+          </div>
+          <label class="ctx-box"><input id="ctx-input" type="number" min="256" step="256" aria-label="Context tokens"><span class="label">Tokens</span></label>
         </div>
         <div class="ctx-readout">
-          <div><span class="muted">KV cache</span> <strong id="ctx-kv">—</strong></div>
-          <div><span class="muted">Per token</span> <strong id="ctx-per">—</strong></div>
-          <div><span class="muted">Running with</span> <strong id="ctx-now">—</strong></div>
+          <div><span class="pip" aria-hidden="true"></span><span class="soft">KV cache footprint:</span> <strong id="ctx-kv">—</strong></div>
+          <div><span class="soft">Per token cost:</span> <strong id="ctx-per">—</strong></div>
+          <div><span class="soft">Running with:</span> <strong id="ctx-now" class="primary-text">—</strong></div>
         </div>
-        <h3 class="sub-title">VRAM estimator</h3>
+        <div class="vram-head">
+          <span class="label" id="vram-title">VRAM allocation breakdown</span>
+          <span id="vram-pct" class="mono primary-text"></span>
+        </div>
         <div id="vram-bar" class="stack-bar" aria-label="Estimated VRAM use"></div>
-        <div id="vram-legend" class="legend"></div>
-        <p id="vram-note" class="muted small-text"></p>
-        <div class="row-end">
-          <button id="ctx-save" class="primary" disabled>Save context size</button>
+        <div class="vram-foot">
+          <div id="vram-legend" class="legend"></div>
+          <button id="ctx-save" class="primary caps" disabled>Save context size</button>
         </div>
+        <p id="vram-note" class="soft tiny mono"></p>
+      </section>
+
+      <section class="panel models-toolbar">
+        <svg class="ic secondary-text big"><use href="#i-folder"/></svg>
+        <div class="dir">
+          <span class="label">Storage directory</span>
+          <span id="models-dir" class="mono"></span>
+        </div>
+        <span class="spacer"></span>
+        <label class="search"><svg class="ic"><use href="#i-search"/></svg><input id="models-filter" type="search" placeholder="Filter models (Llama, Qwen, MoE)…" aria-label="Filter models"></label>
+        <button id="models-rescan" class="secondary"><svg class="ic"><use href="#i-refresh"/></svg>Rescan</button>
+      </section>
+      <section class="panel flush">
+        <div class="table-scroll">
+          <table class="models-table">
+            <thead><tr><th>Model ID &amp; filepath</th><th>Architecture</th><th>Size · quant</th><th class="num">Context</th><th>Topology</th><th class="num">On disk</th><th class="num">Action</th></tr></thead>
+            <tbody id="models-rows"><tr><td colspan="7" class="soft">Scanning…</td></tr></tbody>
+          </table>
+        </div>
+        <p id="models-extra" class="soft tiny mono"></p>
       </section>
 
       <div id="experts-wrap" class="hidden">
-        <h2 class="section-title">Experts</h2>
-        <section class="card">
+        <div class="section-head"><h2 class="label">Experts</h2></div>
+        <section id="exp-place" class="panel hidden">
+          <div class="panel-head bare">
+            <svg class="ic primary-text"><use href="#i-hub"/></svg>
+            <h2 class="label">Expert placement</h2>
+            <span id="exp-place-count" class="chip"></span>
+            <span class="spacer"></span>
+            <button id="exp-place-clear" class="secondary small">Clear all pins</button>
+          </div>
+          <div id="exp-place-map" class="layer-map exp-place-map" role="listbox" aria-label="Where each layer's experts are"></div>
+          <div id="exp-place-legend" class="placement"></div>
+          <div class="exp-place-row">
+            <div><strong id="exp-place-layer"></strong><div id="exp-place-now" class="mono tiny soft"></div></div>
+            <label>Experts of this layer go to<select id="exp-place-select"></select></label>
+          </div>
+          <p class="soft tiny mono exp-place-note">One cell per layer, coloured by the device that holds its routed experts; click a cell to choose that layer. A layer's experts move as one block, either beside the layer on its local GPU or onto a worker GPU, and the move happens when the model reloads. A dot marks a pinned layer; stripes mark a pin that has not been applied yet.</p>
+        </section>
+        <section class="panel">
           <div class="exp-toolbar">
-            <button id="layer-prev" class="ghost small" aria-label="Previous layer">‹</button>
+            <button id="layer-prev" class="secondary small" aria-label="Previous layer">‹</button>
             <label>Layer <select id="layer-select"></select></label>
-            <button id="layer-next" class="ghost small" aria-label="Next layer">›</button>
-            <span id="exp-summary" class="muted small-text"></span>
+            <button id="layer-next" class="secondary small" aria-label="Next layer">›</button>
+            <span id="exp-summary" class="soft tiny mono"></span>
             <span class="spacer"></span>
             <label class="check"><input id="rec-toggle" type="checkbox"> Record usage</label>
-            <button id="usage-reset" class="ghost small">Reset counts</button>
+            <button id="usage-reset" class="secondary small">Reset counts</button>
           </div>
           <div class="exp-body">
             <div>
@@ -185,15 +366,15 @@
               </div>
             </div>
             <aside id="exp-panel" class="exp-panel">
-              <p class="muted">Select an expert to name or disable it. Turn on <em>Record usage</em>, send a prompt, and the grid shows which experts it routed to.</p>
+              <p class="soft">Select an expert to name or disable it. Turn on <em>Record usage</em>, send a prompt, and the grid shows which experts it routed to.</p>
             </aside>
           </div>
           <div class="row-end">
-            <button id="layer-enable-all" class="ghost small">Enable all in layer</button>
+            <button id="layer-enable-all" class="secondary small">Enable all in layer</button>
           </div>
         </section>
-        <section class="card named-card">
-          <h3>Named and disabled experts</h3>
+        <section class="panel flush named-card">
+          <h3 class="label">Named and disabled experts</h3>
           <table>
             <thead><tr><th>Layer</th><th>Expert</th><th>Name</th><th>State</th></tr></thead>
             <tbody id="named-rows"></tbody>
@@ -203,24 +384,182 @@
     </main>
 
     <main id="page-logs" class="page page-logs hidden">
-      <div class="log-toolbar">
-        <label>Level
-          <select id="log-level">
-            <option value="TRACE">TRACE</option>
-            <option value="DEBUG">DEBUG</option>
-            <option value="INFO" selected>INFO</option>
-            <option value="WARN">WARN</option>
-            <option value="ERROR">ERROR</option>
-          </select>
-        </label>
-        <input id="log-filter" type="search" placeholder="Filter text" aria-label="Filter log text">
-        <label class="check"><input id="log-follow" type="checkbox" checked> Follow</label>
+      <div class="panel log-banner">
+        <span id="log-pipe" class="pipe"><span class="dot"></span><span id="log-pipe-text">Log stream: connecting</span></span>
+        <span class="vr" aria-hidden="true"></span>
+        <span class="mono secondary-text"><svg class="ic"><use href="#i-lan"/></svg> /v1/logs/stream</span>
+        <span id="log-backend" class="chip chip-primary hidden"></span>
         <span class="spacer"></span>
-        <span id="log-count" class="muted small-text"></span>
-        <button id="log-clear" class="ghost small">Clear</button>
+        <span id="log-count" class="chip"></span>
+        <button id="log-pause" class="secondary small" aria-pressed="false"><svg class="ic"><use href="#i-pause"/></svg><span>Pause</span></button>
+        <button id="log-clear" class="secondary small"><svg class="ic"><use href="#i-clear"/></svg>Clear</button>
+        <button id="log-dump" class="primary small"><svg class="ic"><use href="#i-download"/></svg>Dump .ndjson</button>
       </div>
-      <div id="log-view" class="log-view" role="log"></div>
+      <div class="panel log-filters">
+        <div class="log-toolbar">
+          <label class="field"><span class="label">Level</span>
+            <select id="log-level">
+              <option value="TRACE">TRACE &amp; above</option>
+              <option value="DEBUG">DEBUG &amp; above</option>
+              <option value="INFO" selected>INFO &amp; above</option>
+              <option value="WARN">WARN &amp; above</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+          </label>
+          <label class="search grow"><svg class="ic"><use href="#i-filter"/></svg>
+            <input id="log-filter" type="search" placeholder="Filter text or regex (e.g. tower_http, spec_draft, rpc\[.*\])" aria-label="Filter log text">
+            <kbd>ESC to reset</kbd>
+          </label>
+          <label class="check field"><input id="log-follow" type="checkbox" checked> Follow output</label>
+          <label class="check field"><input id="log-wrap" type="checkbox" checked> Soft wrap</label>
+        </div>
+        <div class="log-subs"><span class="label">Subsystem:</span><span id="log-subsystems" class="tag-row"></span></div>
+      </div>
+      <div class="terminal">
+        <div class="term-head">
+          <span class="lights" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="mono">stdout/stderr [allpaca-server]</span>
+          <span class="spacer"></span>
+          <span id="log-rate" class="mono soft"></span>
+        </div>
+        <div id="log-view" class="log-view" role="log"></div>
+      </div>
+      <div id="log-foot" class="grid log-foot"></div>
     </main>
+
+    <main id="page-settings" class="page hidden">
+      <div class="page-head">
+        <div class="page-head-main">
+          <div class="crumb label"><span class="primary-text">Engine runtime</span> / Settings</div>
+          <div class="title-row">
+            <h1>Settings</h1>
+            <span id="set-version" class="chip hidden"></span>
+            <span id="set-auth" class="chip hidden"></span>
+          </div>
+          <div id="set-source" class="mono tiny soft"></div>
+        </div>
+        <div class="model-actions">
+          <label class="search"><svg class="ic"><use href="#i-search"/></svg><input id="set-filter" type="search" placeholder="Filter settings (kv, rpc, depth)…" aria-label="Filter settings"></label>
+          <button id="set-refresh" class="secondary"><svg class="ic"><use href="#i-refresh"/></svg>Refresh</button>
+        </div>
+      </div>
+
+      <section id="set-summary" class="grid"></section>
+      <p class="soft tiny mono set-note">Read-only: these are the values the running engine was built from (config file, command-line flags, the model chosen in the WebUI and its saved settings). Change them in the config file and restart; context size and experts are on Models &amp; VRAM. <span class="pip"></span> marks a value that differs from the built-in default.</p>
+      <section id="set-sections" class="set-sections"></section>
+    </main>
+
+    <main id="page-api" class="page hidden">
+      <div class="page-head">
+        <div class="page-head-main">
+          <div class="crumb label"><span class="primary-text">Engine runtime</span> / API</div>
+          <div class="title-row">
+            <h1>API</h1>
+            <span id="api-state" class="chip hidden"></span>
+            <span id="api-lock" class="chip hidden"></span>
+            <span id="api-listen" class="chip hidden"></span>
+          </div>
+          <div id="api-source" class="mono tiny soft"></div>
+        </div>
+        <div class="model-actions">
+          <button id="api-refresh" class="secondary"><svg class="ic"><use href="#i-refresh"/></svg>Refresh</button>
+        </div>
+      </div>
+
+      <div class="api-top">
+        <section class="panel api-access">
+          <div class="panel-head bare">
+            <svg class="ic primary-text"><use href="#i-lock"/></svg>
+            <h2 class="label">Access</h2>
+          </div>
+          <div class="switch-row">
+            <label class="switch"><input id="api-enabled" type="checkbox"><span></span><span class="sr-only">API enabled</span></label>
+            <div><strong>API enabled</strong>
+              <p class="soft">Off: only this WebUI, in a signed-in browser, can use the server. API keys and the password as a bearer token are refused.</p></div>
+          </div>
+          <div class="switch-row">
+            <label class="switch"><input id="api-require" type="checkbox"><span></span><span class="sr-only">Require an API key</span></label>
+            <div><strong>Require an API key (lockdown)</strong>
+              <p class="soft">Off: anyone who can reach the listen address may call the client endpoints (chat, models, status, metrics) with no key. Model management, settings and logs always need the operator password.</p></div>
+          </div>
+          <p id="api-warn" class="api-warn hidden" role="alert"></p>
+          <div class="listen-row">
+            <label>Listen address<select id="api-host"></select></label>
+            <label id="api-host-custom-wrap" class="hidden">IP address<input id="api-host-custom" type="text" spellcheck="false" autocomplete="off" placeholder="192.168.1.20"></label>
+            <label class="port">Port<input id="api-port" type="number" min="1" max="65535"></label>
+            <button id="api-listen-apply" class="primary" disabled>Apply</button>
+          </div>
+          <p id="api-listen-note" class="soft tiny mono"></p>
+        </section>
+
+        <section class="panel flush">
+          <div class="panel-head">
+            <svg class="ic primary-text"><use href="#i-tune"/></svg>
+            <h2 class="label">Request limits &amp; defaults</h2>
+            <span class="spacer"></span>
+            <span class="chip">from the config file</span>
+          </div>
+          <table class="api-related"><tbody id="api-related"></tbody></table>
+        </section>
+      </div>
+
+      <section class="panel flush api-keys">
+        <div class="panel-head">
+          <svg class="ic primary-text"><use href="#i-key"/></svg>
+          <h2 class="label">API keys</h2>
+          <span id="api-keys-count" class="chip"></span>
+          <span class="spacer"></span>
+          <form id="api-key-form" class="key-form">
+            <input id="api-key-desc" type="text" maxlength="80" required autocomplete="off" placeholder="What is this key for? (e.g. laptop IDE)" aria-label="Key description">
+            <button type="submit" class="primary"><svg class="ic"><use href="#i-plus"/></svg>Generate key</button>
+          </form>
+        </div>
+        <div id="api-key-new" class="key-new hidden"></div>
+        <div class="table-scroll">
+          <table class="key-table">
+            <thead><tr><th>Description</th><th>Key</th><th>Created</th><th>Last used</th><th class="num">Action</th></tr></thead>
+            <tbody id="api-key-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="section-head"><h2 class="label">Endpoints &amp; curl <span class="pip pulse" aria-hidden="true"></span></h2><span id="api-count" class="tiny soft"></span></div>
+      <section class="panel flush api">
+        <div id="api-list" class="api-list" role="listbox" aria-label="Endpoints"></div>
+        <div class="api-gen">
+          <div class="api-title">
+            <span id="api-method" class="chip"></span>
+            <strong id="api-path" class="mono"></strong>
+            <span id="api-authchip" class="chip"></span>
+          </div>
+          <p id="api-summary" class="soft"></p>
+          <div class="api-fields">
+            <label>Base URL<input id="api-base" type="text" spellcheck="false" autocomplete="off"></label>
+            <label>Token<input id="api-token" type="password" spellcheck="false" autocomplete="off" placeholder="blank = $ALLPACA_PASSWORD"></label>
+            <div class="api-shell"><span class="label">Shell</span>
+              <div id="api-shell" class="seg" role="group" aria-label="Shell">
+                <button data-shell="bash" class="on">bash</button>
+                <button data-shell="powershell">PowerShell</button>
+              </div>
+            </div>
+          </div>
+          <label id="api-body-wrap" class="api-body-wrap">Request body (JSON)
+            <textarea id="api-body" rows="8" spellcheck="false"></textarea>
+            <span id="api-body-error" class="error tiny hidden">The body is not valid JSON.</span>
+          </label>
+          <div class="codeblock api-out">
+            <div class="code-head"><span>curl</span><button id="api-copy" type="button" class="ghost copy">Copy</button></div>
+            <pre><code id="api-curl"></code></pre>
+          </div>
+          <p id="api-hint" class="soft tiny mono"></p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="statusbar">
+      <span id="foot-left"></span>
+      <span id="foot-right"></span>
+    </footer>
   </div>
   <script src="/app.js"></script>
 </body>

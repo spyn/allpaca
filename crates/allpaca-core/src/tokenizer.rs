@@ -95,16 +95,36 @@ impl EngineTokenizer {
             && self.token_id("<|eot_id|>").is_some()
     }
 
-    /// ChatML or Llama 3 turns when the vocab has their specials; otherwise
-    /// `role: text` (tiny/synthetic).
+    /// Vocab has Ling's (`bailingmoe2`) role specials.
+    pub fn uses_ling_chat(&self) -> bool {
+        self.token_id("<role>").is_some()
+            && self.token_id("</role>").is_some()
+            && self.token_id("<|role_end|>").is_some()
+    }
+
+    /// Vocab has DeepSeek's turn specials.
+    pub fn uses_deepseek_chat(&self) -> bool {
+        self.token_id("<｜User｜>").is_some() && self.token_id("<｜Assistant｜>").is_some()
+    }
+
+    /// ChatML, Llama 3, Ling or DeepSeek turns when the vocab has their specials;
+    /// otherwise `role: text` (tiny/synthetic).
     ///
     /// Does **not** open `<think>` — that is Qwen-specific and role-echoes on
     /// Nemotron Lightning.
     pub fn format_chat(&self, messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
         if self.uses_chatml() {
             format_chatml(messages, add_generation_prompt)
+        } else if self.uses_ling_chat() {
+            format_ling_chat(messages, add_generation_prompt)
         } else if self.uses_llama3_chat() {
             format_llama3_chat(messages, add_generation_prompt)
+        } else if self.uses_deepseek_chat() {
+            // DeepSeek-V4 (its vocab has the DSML tool marker) closes the
+            // reasoning block right after the assistant marker when
+            // thinking is off; earlier DeepSeek models have no such step.
+            let v4 = self.token_id("｜DSML｜").is_some();
+            format_deepseek_chat(messages, add_generation_prompt, v4)
         } else {
             format_chat_colon(messages, add_generation_prompt)
         }
@@ -161,6 +181,15 @@ impl EngineTokenizer {
 
     pub fn synthetic(vocab_size: usize) -> Result<Self, AllpacaError> {
         Self::from_vocab(synthetic_vocab(vocab_size), Some(1), Some(2))
+    }
+
+    /// Token ids of `text` alone, never with a BOS token in front.
+    pub fn encode_plain(&self, text: &str) -> Result<Vec<u32>, AllpacaError> {
+        let encoding = self
+            .inner
+            .encode(text, false)
+            .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))?;
+        Ok(encoding.get_ids().to_vec())
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, AllpacaError> {
@@ -389,6 +418,7 @@ impl Utf8Stream {
 const CHAT_EOG_PIECES: &[&str] = &[
     "<|im_end|>",
     "<|eot_id|>",
+    "<|role_end|>",
     "<|eom_id|>",
     "<|end_of_turn|>",
     "<|endoftext|>",
@@ -430,6 +460,84 @@ pub fn format_llama3_chat(messages: &[(&str, &str)], add_generation_prompt: bool
     }
     if add_generation_prompt {
         out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+    out
+}
+
+/// Ling 2.0 turns, as the GGUF's template renders them without tools: a
+/// system turn always opens the prompt and ends with the thinking switch.
+/// DeepSeek turns, as the model's chat template writes them with thinking
+/// off: `<bos>` + the system prompts, then `<User>` + text for a user turn
+/// (consecutive ones joined by a blank line) and `<Assistant>` + text +
+/// `<eos>` for an assistant turn. `close_think` (DeepSeek-V4) puts
+/// `</think>` after every `<Assistant>`: the model was trained to see an
+/// empty reasoning block there.
+pub fn format_deepseek_chat(
+    messages: &[(&str, &str)],
+    add_generation_prompt: bool,
+    close_think: bool,
+) -> String {
+    const ASSISTANT: &str = "<｜Assistant｜>";
+    let mut out = String::from("<｜begin▁of▁sentence｜>");
+    let system: Vec<&str> = messages
+        .iter()
+        .filter(|(role, _)| *role == "system")
+        .map(|(_, content)| *content)
+        .collect();
+    out.push_str(&system.join("\n\n"));
+    let mut in_user = false;
+    for (role, content) in messages {
+        match *role {
+            "system" => {}
+            "assistant" => {
+                if in_user {
+                    out.push_str(ASSISTANT);
+                    if close_think {
+                        out.push_str("</think>");
+                    }
+                }
+                in_user = false;
+                out.push_str(content);
+                out.push_str("<｜end▁of▁sentence｜>");
+            }
+            _ => {
+                out.push_str(if in_user { "\n\n" } else { "<｜User｜>" });
+                in_user = true;
+                out.push_str(content);
+            }
+        }
+    }
+    if add_generation_prompt {
+        out.push_str(ASSISTANT);
+        if close_think {
+            out.push_str("</think>");
+        }
+    }
+    out
+}
+
+pub fn format_ling_chat(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+    let mut out = String::from("<role>SYSTEM</role>");
+    let lead_system = messages.first().is_some_and(|(role, _)| *role == "system");
+    if let Some((_, content)) = messages.first().filter(|_| lead_system) {
+        out.push_str(content);
+        out.push('\n');
+    }
+    out.push_str("detailed thinking off<|role_end|>");
+    for (role, content) in messages.iter().skip(usize::from(lead_system)) {
+        let tag = match *role {
+            "user" => "HUMAN",
+            "assistant" => "ASSISTANT",
+            _ => "SYSTEM",
+        };
+        out.push_str("<role>");
+        out.push_str(tag);
+        out.push_str("</role>");
+        out.push_str(content);
+        out.push_str("<|role_end|>");
+    }
+    if add_generation_prompt {
+        out.push_str("<role>ASSISTANT</role>");
     }
     out
 }
@@ -598,6 +706,42 @@ fn json_u32_second(value: Option<&Value>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepseek_chat_uses_the_models_turn_tokens() {
+        let turns = [
+            ("system", "Be brief."),
+            ("user", "Hi"),
+            ("user", "Are you there?"),
+            ("assistant", "Yes."),
+            ("user", "Bye"),
+        ];
+        // DeepSeek-V4, thinking off: an empty reasoning block after each assistant marker.
+        assert_eq!(
+            format_deepseek_chat(&turns, true, true),
+            "<｜begin▁of▁sentence｜>Be brief.<｜User｜>Hi\n\nAre you there?\
+             <｜Assistant｜></think>Yes.<｜end▁of▁sentence｜>\
+             <｜User｜>Bye<｜Assistant｜></think>"
+        );
+        // Earlier DeepSeek models: the same turns without it.
+        assert_eq!(
+            format_deepseek_chat(&turns[1..2], true, false),
+            "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>"
+        );
+        // The vocabulary decides: DeepSeek specials, with the DSML marker for V4.
+        let vocab = |extra: &[&str]| {
+            let mut tokens: Vec<String> = ["<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "Hi"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            tokens.extend(extra.iter().map(|s| s.to_string()));
+            EngineTokenizer::from_vocab(tokens, Some(0), Some(1)).unwrap()
+        };
+        assert!(vocab(&[]).format_chat(&[("user", "Hi")], true).ends_with("<｜User｜>Hi<｜Assistant｜>"));
+        assert!(vocab(&["｜DSML｜"])
+            .format_chat(&[("user", "Hi")], true)
+            .ends_with("<｜User｜>Hi<｜Assistant｜></think>"));
+    }
 
     #[test]
     fn llama3_chat_turns() {

@@ -1,9 +1,21 @@
 //! CPU fallback for every kernel the control plane may call.
 
 mod kernels;
+mod lowbit;
+mod mxfp4_expert;
+mod p48fp4;
 
+pub use lowbit::{
+    dequant_q1_0, dequant_q2_0, quantize_q1_0, quantize_q2_0, Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMS,
+    Q2_0_BLOCK_BYTES, Q2_0_BLOCK_ELEMS,
+};
+pub use mxfp4_expert::{mxfp4_swiglu_experts, Mxfp4Expert};
+pub use p48fp4::{
+    dequant_p48fp4, e4m3_to_f32, p48fp4_interleave, quantize_p48fp4, P48FP4_BLOCK_BYTES,
+    P48FP4_BLOCK_ELEMS,
+};
 pub use kernels::{
-    det_expf, det_silu_mul,
+    det_expf, det_silu_mul, dot,
     attention, attention_softcap, attention_with_mask, attention_with_mask_softcap, bf16_to_f32,
     copy_async, dequant_iq4_nl, dequant_iq4_xs, dequant_mxfp4, dequant_q2_k, dequant_q3_k,
     dequant_q4_0, dequant_q4_1, dequant_q4_k, dequant_q5_0, dequant_q5_1, dequant_q5_k,

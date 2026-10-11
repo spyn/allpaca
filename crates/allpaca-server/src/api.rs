@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,13 @@ pub struct AppState {
     pub auth: AuthState,
     pub logs: LogRing,
     pub host: Arc<HostSampler>,
+    /// The TOML file the server was started with (shown on the Settings page).
+    pub config_path: Option<std::path::PathBuf>,
+    /// API on/off, key lockdown, listen address and the API keys.
+    pub api: Arc<crate::api_access::ApiStore>,
+    /// Lets the API page move the listener. `None` when nothing serves
+    /// this state over TCP (tests).
+    pub listen: Option<Arc<crate::api_access::ListenCtl>>,
 }
 
 impl AppState {
@@ -46,6 +53,9 @@ impl AppState {
             auth,
             logs,
             host: Arc::new(HostSampler::new()),
+            config_path: None,
+            api: Arc::new(crate::api_access::ApiStore::in_memory()),
+            listen: None,
         }
     }
 }
@@ -86,6 +96,7 @@ struct StatusBody {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/systemone", post(crate::systemone::systemone))
         .route("/v1/models", get(list_models))
         .route("/v1/status", get(status))
         .route("/v1/logs", get(crate::logs::logs_snapshot))
@@ -109,6 +120,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/model/reload", post(crate::model_api::reload))
         .route("/v1/model/available", get(crate::model_api::get_available))
         .route("/v1/model/load", post(crate::model_api::load_model))
+        .route("/v1/config", get(crate::config_api::get_config))
+        .route(
+            "/v1/api",
+            get(crate::api_access::get_api).put(crate::api_access::put_api),
+        )
+        .route("/v1/api/keys", post(crate::api_access::create_key))
+        .route("/v1/api/keys/{id}", delete(crate::api_access::revoke_key))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -796,7 +814,7 @@ fn render_prometheus_text(s: &allpaca_types::StatsSnapshot) -> String {
     out
 }
 
-fn error_response(e: allpaca_types::AllpacaError) -> Response {
+pub(crate) fn error_response(e: allpaca_types::AllpacaError) -> Response {
     let status = match e.class() {
         allpaca_types::ErrorClass::Fatal => StatusCode::INTERNAL_SERVER_ERROR,
         allpaca_types::ErrorClass::Degraded => StatusCode::OK,
@@ -875,6 +893,27 @@ mod tests {
             AuthState::from_password(Some(password.into())),
             LogRing::new(64),
         )
+    }
+
+    #[tokio::test]
+    async fn systemone_needs_a_decision_model() {
+        let res = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"state": "s", "questions": {"q": {"type": "noul", "instructions": "x"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], "the loaded model is not a decision model");
     }
 
     #[tokio::test]
@@ -1643,6 +1682,130 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("<title>Allpaca</title>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_redacts_secrets() {
+        let mut cfg = Config::compiled_defaults();
+        cfg.merge_cli(&CliOverrides {
+            synthetic: true,
+            cpu_only: true,
+            seed: Some(1),
+            ..CliOverrides::default()
+        });
+        cfg.http.password = Some("hunter2".into());
+        cfg.rpc.token = Some("tok-xyz".into());
+        let state = AppState::new(
+            Arc::new(Engine::new(cfg.clone()).unwrap()),
+            cfg,
+            AuthState::from_password(Some("hunter2".into())),
+            LogRing::new(64),
+        );
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/config")
+                    .header("authorization", "Bearer hunter2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("hunter2") && !text.contains("tok-xyz"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["config"]["http"]["password"], "(set, hidden)");
+        assert_eq!(json["config"]["rpc"]["token"], "(set, hidden)");
+        assert_eq!(json["config"]["model"]["synthetic"], true);
+        assert_eq!(json["defaults"]["model"]["synthetic"], false);
+        assert_eq!(json["auth_required"], true);
+    }
+
+    #[tokio::test]
+    async fn api_keys_lockdown_and_the_off_switch() {
+        let state = authed_state("secret");
+        let (key, _) = state.api.create_key("test client").unwrap();
+        let app = router(state.clone());
+        let call = |method: &'static str, path: &'static str, auth: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut req = Request::builder().method(method).uri(path);
+                if let Some(a) = auth {
+                    req = req.header("authorization", a);
+                }
+                app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status()
+            }
+        };
+        let (pw, k) = (Some("Bearer secret".to_string()), Some(format!("Bearer {key}")));
+
+        // Defaults: a credential is required; a key reaches client endpoints only.
+        assert_eq!(call("GET", "/v1/models", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("GET", "/v1/models", k.clone()).await, StatusCode::OK);
+        assert_eq!(call("GET", "/v1/config", k.clone()).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("GET", "/v1/api", k.clone()).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("GET", "/v1/config", pw.clone()).await, StatusCode::OK);
+        assert_eq!(
+            call("GET", "/v1/models", Some("Bearer alp_wrong".into())).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Lockdown off: client endpoints answer without a key, nothing else does.
+        state.api.update(|s| s.require_keys = false).unwrap();
+        assert_eq!(call("GET", "/v1/models", None).await, StatusCode::OK);
+        assert_eq!(call("GET", "/v1/config", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("POST", "/v1/model/reload", None).await, StatusCode::UNAUTHORIZED);
+
+        // API off: every bearer credential is refused, a WebUI session is not.
+        state.api.update(|s| s.enabled = false).unwrap();
+        assert_eq!(call("GET", "/v1/models", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("GET", "/v1/models", k).await, StatusCode::FORBIDDEN);
+        assert_eq!(call("GET", "/v1/config", pw).await, StatusCode::FORBIDDEN);
+        let session = state.auth.login("secret").unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/config")
+                    .header("cookie", format!("{}={session}", crate::auth::COOKIE_NAME))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// The Settings page builds curl commands from this list: a path that
+    /// the router does not serve would hand the operator a 404.
+    #[tokio::test]
+    async fn listed_endpoints_are_routed_and_guarded() {
+        let app = router(authed_state("secret"));
+        for ep in crate::config_api::ENDPOINTS {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(ep.method)
+                        .uri(ep.path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            if ep.auth {
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{} {}", ep.method, ep.path);
+            } else {
+                assert!(
+                    status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED,
+                    "{} {} -> {status}",
+                    ep.method,
+                    ep.path
+                );
+            }
+        }
     }
 
     #[tokio::test]

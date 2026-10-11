@@ -44,6 +44,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <hipblaslt/hipblaslt.h>
+#include <filesystem>
+#include <system_error>
 #endif
 
 __device__ float allpaca_f16_bits_to_f32(uint16_t h);
@@ -1671,27 +1673,45 @@ static int launch_gemm(const float *a, const float *b, float *c, int32_t m, int3
 /* Row-major C[m,n] = A[m,k] * B[n,k]^T via column-major rocBLAS (swap A/B, N/M). */
 static int launch_gemm_nt_rocblas(const float *a, const float *b, float *c, int32_t m, int32_t n,
                                   int32_t k, hipStream_t stream) {
+    /* A rocBLAS handle belongs to the device that was current when it was
+     * made (it picks that device's kernel library), so each device has its
+     * own. A device where a GEMM failed is not asked again. */
+    struct Dev {
+        rocblas_handle handle = nullptr;
+        bool tried = false;
+    };
     static std::mutex mu;
-    static rocblas_handle handle = nullptr;
-    static bool tried = false;
+    static Dev devs[16];
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= 16) {
+        return ALLPACA_ERR_DEVICE;
+    }
     std::lock_guard<std::mutex> lock(mu);
-    if (!tried) {
-        tried = true;
-        if (rocblas_create_handle(&handle) != rocblas_status_success) {
-            handle = nullptr;
+    Dev &d = devs[device];
+    if (!d.tried) {
+        d.tried = true;
+        if (rocblas_create_handle(&d.handle) != rocblas_status_success) {
+            d.handle = nullptr;
         }
     }
-    if (!handle) {
+    if (!d.handle) {
         return ALLPACA_ERR_NOT_IMPLEMENTED;
-    }
-    if (rocblas_set_stream(handle, stream) != rocblas_status_success) {
-        return ALLPACA_ERR_DEVICE;
     }
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    rocblas_status st = rocblas_sgemm(handle, rocblas_operation_transpose, rocblas_operation_none, n,
-                                      m, k, &alpha, b, k, a, k, &beta, c, n);
-    return st == rocblas_status_success ? ALLPACA_OK : ALLPACA_ERR_DEVICE;
+    rocblas_status st = rocblas_set_stream(d.handle, stream);
+    if (st == rocblas_status_success) {
+        st = rocblas_sgemm(d.handle, rocblas_operation_transpose, rocblas_operation_none, n, m, k,
+                           &alpha, b, k, a, k, &beta, c, n);
+    }
+    if (st != rocblas_status_success) {
+        std::fprintf(stderr, "allpaca: rocBLAS sgemm failed on device %d (status %d); using the built-in GEMM there\n",
+                     device, static_cast<int>(st));
+        rocblas_destroy_handle(d.handle);
+        d.handle = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    return ALLPACA_OK;
 }
 #endif
 
@@ -1719,6 +1739,20 @@ static void ensure_hipblaslt_tensile_path() {
     const char *fmt = "%.*s/bin/hipblaslt/library";
 #endif
     if (std::snprintf(path, sizeof(path), fmt, static_cast<int>(n), hip) < 0) {
+        return;
+    }
+    /* ROCm 10 keeps one folder per GPU family under this one and finds it by
+     * itself; pointing it here makes every lookup fail. Only the flat layout
+     * (library files directly in the folder) wants the hint. */
+    bool flat = false;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().filename().string().rfind("TensileLibrary", 0) == 0) {
+            flat = true;
+            break;
+        }
+    }
+    if (!flat) {
         return;
     }
 #ifdef _WIN32
@@ -1788,12 +1822,43 @@ struct HipblasLtDev {
     bool tried = false;
     void *workspace = nullptr;
     size_t workspace_bytes = 0;
-    int32_t cache_m = 0;
-    int32_t cache_n = 0;
-    int32_t cache_k = 0;
-    int cache_status = 0;
-    hipblasLtMatmulAlgo_t algo{};
+    /* What the library answered for a shape: the algorithm lookup costs
+     * ~30 ms, and a layer's attention GEMMs alternate between four shapes. */
+    struct Shape {
+        int32_t m = 0;
+        int32_t n = 0;
+        int32_t k = 0;
+        int status = 0; /* 1 = algo usable, 2 = no algorithm */
+        hipblasLtMatmulAlgo_t algo{};
+        size_t algo_ws = 0;
+    };
+    static constexpr int SHAPES = 64;
+    Shape shapes[SHAPES];
+    int next_shape = 0;
     size_t algo_ws = 0;
+
+    Shape *find(int32_t m, int32_t n, int32_t k) {
+        for (Shape &s : shapes) {
+            if (s.status != 0 && s.m == m && s.n == n && s.k == k) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    void remember(int32_t m, int32_t n, int32_t k, int status, const hipblasLtMatmulAlgo_t &algo, size_t ws) {
+        Shape *s = find(m, n, k);
+        if (!s) {
+            s = &shapes[next_shape];
+            next_shape = (next_shape + 1) % SHAPES;
+        }
+        s->m = m;
+        s->n = n;
+        s->k = k;
+        s->status = status;
+        s->algo = algo;
+        s->algo_ws = ws;
+    }
 };
 
 static int lt_grow_workspace(HipblasLtDev *st, size_t need, hipStream_t stream) {
@@ -1837,10 +1902,10 @@ static int lt_run(HipblasLtDev *st, const float *a, const float *b, float *c, in
     const float beta = 0.0f;
     hipblasLtMatmulAlgo_t algo{};
     size_t ws = 0;
-    bool have_algo = st->cache_status == 1 && st->cache_m == m && st->cache_n == n && st->cache_k == k;
-    if (have_algo) {
-        algo = st->algo;
-        ws = st->algo_ws;
+    const HipblasLtDev::Shape *known = st->find(m, n, k);
+    if (known && known->status == 1) {
+        algo = known->algo;
+        ws = known->algo_ws;
         if (out_algos) {
             *out_algos = 1;
         }
@@ -1878,13 +1943,21 @@ static int lt_run(HipblasLtDev *st, const float *a, const float *b, float *c, in
     if (ms != HIPBLAS_STATUS_SUCCESS) {
         return ALLPACA_ERR_DEVICE;
     }
-    st->cache_m = m;
-    st->cache_n = n;
-    st->cache_k = k;
-    st->cache_status = 1;
-    st->algo = algo;
+    st->remember(m, n, k, 1, algo, ws);
     st->algo_ws = ws;
     return ALLPACA_OK;
+}
+
+/* Off unless ALLPACA_HIPBLASLT=1. On two RDNA4 cards (SDK 7.1, Windows) it
+ * matched the fallback below at M = 187 and 512 on one card and offered no
+ * algorithm on the other, while each algorithm lookup cost ~30 ms and the
+ * first call ~2.7 s: a 23-row prefill of 21 layers took 2 s instead of 20 ms. */
+static bool hipblaslt_wanted() {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_HIPBLASLT");
+        return v && v[0] == '1';
+    }();
+    return on;
 }
 
 static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, int32_t m, int32_t n,
@@ -1913,7 +1986,7 @@ static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, in
     if (!st.handle) {
         return ALLPACA_ERR_NOT_IMPLEMENTED;
     }
-    if (st.cache_status == 2 && st.cache_m == m && st.cache_n == n && st.cache_k == k) {
+    if (const HipblasLtDev::Shape *known = st.find(m, n, k); known && known->status == 2) {
         return ALLPACA_ERR_NOT_IMPLEMENTED;
     }
     int algos = 0;
@@ -1926,10 +1999,7 @@ static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, in
         }
         return ALLPACA_OK;
     }
-    st.cache_m = m;
-    st.cache_n = n;
-    st.cache_k = k;
-    st.cache_status = 2;
+    st.remember(m, n, k, 2, hipblasLtMatmulAlgo_t{}, 0);
     if (!logged_miss) {
         logged_miss = true;
         std::fprintf(stderr, "allpaca: hipBLASLt F32 GEMM miss m=%d n=%d k=%d algos=%d\n", m, n, k,
@@ -1973,7 +2043,7 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
     clear_last_error();
 #ifdef ALLPACA_HAS_HIPBLASLT
     /* M=1 lm_head: hipBLASLt was ~378 ms vs ~0.5 ms custom GEMV. Keep Lt for wide/prefill only. */
-    if (m > 8) {
+    if (m > 8 && hipblaslt_wanted()) {
         int rc = launch_gemm_nt_hipblaslt(a, b, c, m, n, k, stream);
         if (rc == ALLPACA_OK) {
             return ALLPACA_OK;
@@ -1989,6 +2059,8 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
         }
     }
 #endif
+    /* A failed library attempt above must not fail the kernel that replaces it. */
+    clear_last_error();
     /* Decode is always M=1; small-M prefill stays on the coalesced GEMV. */
     if (m <= 8 && tiled && n <= 2048) {
         hipLaunchKernelGGL(gemv_nt_colblock_kernel, dim3(static_cast<unsigned>(n), static_cast<unsigned>(m)),
@@ -2059,6 +2131,56 @@ static int launch_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32
     return hip_status(hipGetLastError());
 }
 
+/* Memory-bound BF16 GEMV: one 32-lane group per output column, each lane
+ * reading 8 consecutive weights (16 bytes) per step, so a group streams 512
+ * contiguous bytes of the row at a time. `k` is a multiple of 8 and `a`, `b`
+ * are 16-byte aligned. */
+__global__ void gemv_nt_bf16_wide_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
+                                         int k) {
+    constexpr int GROUPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    if (row >= m) {
+        return;
+    }
+    float acc = 0.f;
+    if (col < n) {
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        const uint16_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+        for (int p = lane * 8; p < k; p += 256) {
+            const uint4 w = *reinterpret_cast<const uint4 *>(brow + p);
+            const float4 x0 = *reinterpret_cast<const float4 *>(arow + p);
+            const float4 x1 = *reinterpret_cast<const float4 *>(arow + p + 4);
+            acc += x0.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x)) +
+                   x0.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x >> 16)) +
+                   x0.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y)) +
+                   x0.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y >> 16)) +
+                   x1.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z)) +
+                   x1.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z >> 16)) +
+                   x1.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w)) +
+                   x1.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w >> 16));
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor(acc, off, 32);
+    }
+    if (col < n && lane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+/* ALLPACA_BF16_GEMV_WIDE=0 keeps the older shared-tile kernels. */
+static bool bf16_gemv_wide() {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_BF16_GEMV_WIDE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
 static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                                int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
@@ -2091,7 +2213,13 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
         }
         return hip_status(hipGetLastError());
     }
-    if (tiled) {
+    if (bf16_gemv_wide() && k % 8 == 0 && (reinterpret_cast<uintptr_t>(a) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(b) & 15u) == 0) {
+        constexpr int GROUPS = 8;
+        dim3 block(GROUPS * 32);
+        dim3 grid(static_cast<unsigned>((n + GROUPS - 1) / GROUPS), static_cast<unsigned>(m));
+        hipLaunchKernelGGL(gemv_nt_bf16_wide_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    } else if (tiled) {
         constexpr int COLS = 64;
         dim3 block(128);
         dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
@@ -2429,6 +2557,32 @@ template <>
 struct KqBlock<6> {
     static constexpr int bytes = 210;
 };
+/* Staged Q8_0: eight 36-byte blocks (f32 scale, 32 int8) per 256 values. */
+template <>
+struct KqBlock<8> {
+    static constexpr int bytes = 288;
+};
+/* MoESQ paired-4:8 FP4 (tensor type 200): eight 12-byte blocks per 256 values. */
+template <>
+struct KqBlock<48> {
+    static constexpr int bytes = 96;
+};
+
+/* Twice the E2M1 value of a paired-4:8 code (bit 3 is the sign). */
+__constant__ const int8_t k_p48_levels2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+__device__ inline float kq_p48_half(uint32_t h) {
+    const uint32_t e = (h >> 10) & 0x1fu;
+    const uint32_t man = h & 0x3ffu;
+    float v;
+    if (e == 0) {
+        v = static_cast<float>(man) * 5.9604644775390625e-8f;
+    } else {
+        const uint32_t bits = ((e + 112u) << 23) | (man << 13);
+        __builtin_memcpy(&v, &bits, 4);
+    }
+    return (h & 0x8000u) ? -v : v;
+}
 
 template <int QT, int MR>
 __global__ void gemv_nt_kquant_warp_kernel(const float *a, const uint8_t *b, float *c, int m,
@@ -2585,6 +2739,22 @@ __device__ inline uint32_t kq_u32_from_u16(const uint8_t *p) {
  * and Q3_K: weights g*32 + j0 .. +W-1 of each 128-half, one scale (W <= 16),
  * values offset by -32 (Q6_K) or -4 (Q3_K). Integer
  * dots accumulate across a lane's W weights; the scales apply once per row. */
+/* Which order the rows' activation loads take in the int8 GEMV kernels
+ * (K-quant and ROCmFP4). Same arithmetic either way; only the generated code
+ * differs. Measured on Qwen3.8 27B prefill (679 tokens):
+ *   - clang 24 (ROCm 10.1) waits for each row's loads in turn when they sit
+ *     inside the row loop: ROCmFP4 5.63 s, Q5_K mix 7.46 s. With every row's
+ *     loads issued first: ROCmFP4 4.95 s, Q5_K mix 6.67 s.
+ *   - clang 21 (SDK 7.1) already overlaps them: ROCmFP4 4.96 s, Q5_K mix
+ *     6.45 s; loads-first costs it about 2.5% on ROCmFP4 (5.10 s). */
+#ifndef ALLPACA_I8_LOADS_FIRST
+#if defined(__clang_major__) && __clang_major__ >= 22
+#define ALLPACA_I8_LOADS_FIRST 1
+#else
+#define ALLPACA_I8_LOADS_FIRST 0
+#endif
+#endif
+
 template <int NC>
 __device__ inline void kq_load_u32s(const void *p, uint32_t (&v)[NC]) {
     if constexpr (NC == 4) {
@@ -2633,7 +2803,69 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
     if (live) {
         for (int ib = 0; ib < nblocks; ++ib) {
             const uint8_t *blk = brow + static_cast<size_t>(ib) * BB;
-            if constexpr (QT == 3) {
+            if constexpr (QT == 8) {
+                // Lane sl takes every LPC-th 32-value block, summed as
+                // `gemv_nt_q8_0_i8_kernel` does, so both give the same bits.
+                for (int t = sl; t < 8; t += LPC) {
+                    const uint8_t *q8 = blk + t * 36;
+                    const float ws = *reinterpret_cast<const float *>(q8);
+                    const uint32_t *qp = reinterpret_cast<const uint32_t *>(q8 + 4);
+                    uint32_t q[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        q[j] = qp[j];
+                    }
+                    const int bi = ib * 8 + t;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        const uint32_t *ap = reinterpret_cast<const uint32_t *>(arow[r] + bi * 32);
+                        int32_t dot = 0;
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            dot = i8dot4(ap[j], q[j], dot);
+                        }
+                        acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
+                    }
+                }
+            } else if constexpr (QT == 48) {
+                // Half of every 8 weights are pruned in pairs: each chunk of 8
+                // is one dot4 of its four kept weights with the activations
+                // at their places. Lane sl takes every LPC-th 32-value block.
+                for (int t = sl; t < 8; t += LPC) {
+                    uint32_t w[3];
+                    __builtin_memcpy(w, blk + t * 12, 12);
+                    const float ws = 0.5f * kq_p48_half(w[2] >> 16);
+                    uint32_t q[4];
+                    int first[4], second[4];
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const uint32_t nib = (w[2] >> (4 * c)) & 0xfu;
+                        const uint32_t pairs = w[c >> 1] >> (16 * (c & 1));
+                        first[c] = nib ? __builtin_ctz(nib) : 0;
+                        second[c] = nib ? 31 - __builtin_clz(nib) : 0;
+                        q[c] = nib == 0u
+                                   ? 0u
+                                   : (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[pairs & 0xfu])) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[(pairs >> 4) & 0xfu])) << 8) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[(pairs >> 8) & 0xfu])) << 16) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(k_p48_levels2[(pairs >> 12) & 0xfu])) << 24));
+                    }
+                    const int bi = ib * 8 + t;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        const int8_t *ap = arow[r] + bi * 32;
+                        int32_t dot = 0;
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            uint16_t lo, hi;
+                            __builtin_memcpy(&lo, ap + c * 8 + 2 * first[c], 2);
+                            __builtin_memcpy(&hi, ap + c * 8 + 2 * second[c], 2);
+                            dot = i8dot4(static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16), q[c], dot);
+                        }
+                        acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
+                    }
+                }
+            } else if constexpr (QT == 3) {
                 // hmask[32] qs[64] scales[12] d: weight = d * (sc - 32) * (q2 | h << 2 - 4).
                 const float d = allpaca_f16le_to_f32(blk + 108);
                 const uint8_t *sc = blk + 96;
@@ -2680,6 +2912,25 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                     }
                     const float s = d * static_cast<float>(sc[h * 8 + j0 / 16 + 2 * g]);
                     const int bi = ib * 8 + h * 4 + g;
+#if ALLPACA_I8_LOADS_FIRST
+                    uint32_t av[MR][NC];
+                    float ds[MR];
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av[r]);
+                        ds[r] = drow[r][bi];
+                    }
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        int32_t dot = 0, sum = 0;
+#pragma unroll
+                        for (int t = 0; t < NC; ++t) {
+                            dot = i8dot4(av[r][t], q[t], dot);
+                            sum = i8dot4(av[r][t], ONES, sum);
+                        }
+                        acc[r] += s * ds[r] * static_cast<float>(dot - 32 * sum);
+                    }
+#else
 #pragma unroll
                     for (int r = 0; r < MR; ++r) {
                         uint32_t av[NC];
@@ -2692,6 +2943,7 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                         }
                         acc[r] += s * drow[r][bi] * static_cast<float>(dot - 32 * sum);
                     }
+#endif
                 }
             } else {
                 const float d = allpaca_f16le_to_f32(blk);
@@ -2724,6 +2976,32 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                 const float dh = d * static_cast<float>(sc2);
                 const float mh = dmin * static_cast<float>(m2);
                 const int bl = ib * 8 + 2 * g;
+#if ALLPACA_I8_LOADS_FIRST
+                uint32_t alo[MR][NC], ahi[MR][NC];
+                float dsl[MR], dsh[MR];
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo[r]);
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi[r]);
+                    dsl[r] = drow[r][bl];
+                    dsh[r] = drow[r][bl + 1];
+                }
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
+#pragma unroll
+                    for (int t = 0; t < NC; ++t) {
+                        il = i8dot4(alo[r][t], lo[t], il);
+                        sl_ = i8dot4(alo[r][t], ONES, sl_);
+                        ih = i8dot4(ahi[r][t], hi[t], ih);
+                        sh = i8dot4(ahi[r][t], ONES, sh);
+                    }
+                    acc[r] += dsl[r] * (dl * static_cast<float>(il) -
+                                        ml * static_cast<float>(sl_)) +
+                              dsh[r] * (dh * static_cast<float>(ih) -
+                                        mh * static_cast<float>(sh));
+                }
+#else
 #pragma unroll
                 for (int r = 0; r < MR; ++r) {
                     uint32_t alo[NC], ahi[NC];
@@ -2742,6 +3020,7 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                               drow[r][bl + 1] * (dh * static_cast<float>(ih) -
                                                  mh * static_cast<float>(sh));
                 }
+#endif
             }
         }
     }
@@ -3533,6 +3812,27 @@ __global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, con
                 wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
                 wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
             }
+#if ALLPACA_I8_LOADS_FIRST
+            uint32_t al[MR][4], ah[MR][4];
+            float ds[MR];
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                kq_load_u32s<4>(arow[r] + ib * 32, al[r]);
+                kq_load_u32s<4>(arow[r] + ib * 32 + 16, ah[r]);
+                ds[r] = drow[r][ib];
+            }
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                int32_t dl = 0, dh = 0;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    dl = i8dot4(al[r][t], wl[t], dl);
+                    dh = i8dot4(ah[r][t], wh[t], dh);
+                }
+                acc[r] = acc[r] + ds[r] * (d0 * static_cast<float>(dl) +
+                                           d1 * static_cast<float>(dh));
+            }
+#else
 #pragma unroll
             for (int r = 0; r < MR; ++r) {
                 uint32_t al[4], ah[4];
@@ -3547,6 +3847,7 @@ __global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, con
                 acc[r] = acc[r] + drow[r][ib] * (d0 * static_cast<float>(dl) +
                                                  d1 * static_cast<float>(dh));
             }
+#endif
         }
     }
 #pragma unroll
@@ -3678,6 +3979,96 @@ extern "C" int allpaca_gemm_nt_rocmfp4_f32(const float *a, const uint8_t *b, flo
                                            int32_t n, int32_t k, int32_t fast,
                                            allpaca_stream_t stream) {
     return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 2, fast != 0);
+}
+
+/* MoESQ paired-4:8 FP4 (Allpaca tensor type 200): 12-byte blocks of 32 weights. Each 8
+ * weights are 4 pairs of which 2 are kept, a pair being one byte of two E2M1 codes (lower
+ * index in the low nibble): 8 value bytes (2 per chunk of 8), 2 mask bytes (a nibble per
+ * chunk, bit i = pair i kept), then the block's scale as an IEEE half. */
+__constant__ const float k_e2m1_levels[16] = {0.f,  0.5f,  1.f,  1.5f,  2.f,  3.f,  4.f,  6.f,
+                                              -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__device__ inline float p48fp4_half(uint32_t h) {
+    const uint32_t e = (h >> 10) & 0x1fu;
+    const uint32_t man = h & 0x3ffu;
+    float v;
+    if (e == 0) {
+        v = static_cast<float>(man) * 5.9604644775390625e-8f; /* 2^-24 */
+    } else {
+        const uint32_t bits = ((e + 112u) << 23) | (man << 13);
+        __builtin_memcpy(&v, &bits, 4);
+    }
+    return (h & 0x8000u) ? -v : v;
+}
+
+/* Sum over one block of weight * a, before the block scale. Reads 4 of every 8 activations. */
+__device__ inline float p48fp4_block_dot(const uint8_t *blk, const float *x, float *scale) {
+#pragma clang fp contract(off)
+    uint32_t w[3];
+    __builtin_memcpy(w, blk, 12);
+    *scale = p48fp4_half(w[2] >> 16);
+    float s = 0.f;
+#pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const uint32_t nib = (w[2] >> (4 * chunk)) & 0xfu;
+        if (nib == 0u) {
+            continue;
+        }
+        const int first = __builtin_ctz(nib);
+        const int second = 31 - __builtin_clz(nib);
+        const uint32_t pairs = w[chunk >> 1] >> (16 * (chunk & 1));
+        const float *xc = x + chunk * 8;
+        s = s + k_e2m1_levels[pairs & 0xfu] * xc[2 * first];
+        s = s + k_e2m1_levels[(pairs >> 4) & 0xfu] * xc[2 * first + 1];
+        s = s + k_e2m1_levels[(pairs >> 8) & 0xfu] * xc[2 * second];
+        s = s + k_e2m1_levels[(pairs >> 12) & 0xfu] * xc[2 * second + 1];
+    }
+    return s;
+}
+
+/* C[m,n] = A[m,k] * W^T. Eight lanes share a column and split its blocks; a row's result does
+ * not depend on m, so decode and batched rows agree bit for bit. */
+__global__ void gemv_nt_p48fp4_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                      int k) {
+#pragma clang fp contract(off)
+    constexpr int LPC = 8;
+    const int sl = static_cast<int>(threadIdx.x) % LPC;
+    const int col = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / LPC) +
+                    static_cast<int>(threadIdx.x) / LPC;
+    const int row = static_cast<int>(blockIdx.y);
+    const bool live = col < n && row < m;
+    const int kb = k / 32;
+    float acc = 0.f;
+    if (live) {
+        const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(kb) * 12;
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        for (int ib = sl; ib < kb; ib += LPC) {
+            float scale;
+            const float s = p48fp4_block_dot(brow + static_cast<size_t>(ib) * 12, arow + ib * 32,
+                                             &scale);
+            acc = acc + scale * s;
+        }
+    }
+#pragma unroll
+    for (int off = LPC / 2; off > 0; off >>= 1) {
+        acc = acc + __shfl_down(acc, off, LPC);
+    }
+    if (live && sl == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+extern "C" int allpaca_gemm_nt_p48fp4(const float *a, const uint8_t *b, float *c, int32_t m,
+                                      int32_t n, int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || (k % 32) != 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    constexpr int COLS = 256 / 8;
+    hipLaunchKernelGGL(gemv_nt_p48fp4_kernel,
+                       dim3(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m)),
+                       dim3(256), 0, as_stream(stream), a, b, c, m, n, k);
+    return hip_status(hipGetLastError());
 }
 
 /* ggml MXFP4 (ggml_type_id=39): 17-byte blocks, one E8M0 scale + 16 nibbles / 32 elems. */
@@ -3897,12 +4288,135 @@ __global__ void gemm_nt_mxfp4_tiled_m_kernel(const float *a, const uint8_t *b, f
     }
 }
 
+/* MXFP4 code -> value without a table load: magnitudes 0,1,2,3,4,6,8,12,
+ * bit 3 is the sign. */
+__device__ inline float mxfp4_code(uint32_t n) {
+    const float mag =
+        static_cast<float>((0x0C08060403020100ull >> ((n & 7u) * 8u)) & 0xFFull);
+    return (n & 8u) ? -mag : mag;
+}
+
+/* Unscaled dot product of one 17-byte block with 32 inputs (16-byte aligned).
+ * Byte j of the block holds elements j (low nibble) and j + 16 (high). */
+__device__ inline float mxfp4_block_dot(const uint8_t *blk, const float *x) {
+    uint64_t q0;
+    uint64_t q1;
+    __builtin_memcpy(&q0, blk + 1, 8);
+    __builtin_memcpy(&q1, blk + 9, 8);
+    float xs[32];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const float4 v = *reinterpret_cast<const float4 *>(x + 4 * q);
+        xs[4 * q] = v.x;
+        xs[4 * q + 1] = v.y;
+        xs[4 * q + 2] = v.z;
+        xs[4 * q + 3] = v.w;
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t b0 = static_cast<uint32_t>(q0 >> (8 * j)) & 0xFFu;
+        const uint32_t b1 = static_cast<uint32_t>(q1 >> (8 * j)) & 0xFFu;
+        s += xs[j] * mxfp4_code(b0 & 15u) + xs[16 + j] * mxfp4_code(b0 >> 4);
+        s += xs[8 + j] * mxfp4_code(b1 & 15u) + xs[24 + j] * mxfp4_code(b1 >> 4);
+    }
+    return s;
+}
+
+/* Memory-bound MXFP4 GEMV: one 32-lane group per output column, each lane
+ * taking every 32nd block of the row, so a group streams the row's blocks in
+ * order. `k` is a multiple of 32 and `a` is 16-byte aligned. */
+__global__ void gemv_nt_mxfp4_wide_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                          int k) {
+    constexpr int GROUPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = k / 32;
+    float acc = 0.f;
+    if (col < n) {
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
+        for (int ib = lane; ib < nblocks; ib += 32) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * 17;
+            acc += mxfp4_e8m0_half(blk[0]) * mxfp4_block_dot(blk, arow + ib * 32);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor(acc, off, 32);
+    }
+    if (col < n && lane == 0) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
+    }
+}
+
+__device__ inline float mxfp4_swiglu(float g, float u, float limit);
+
+/* The same layout for the fused gate/up step: writes silu(gate)*up. */
+__global__ void mxfp4_swiglu_gate_up_wide_kernel(const float *a, const uint8_t *bg,
+                                                 const uint8_t *bu, float *c, int m, int n,
+                                                 int k, float limit) {
+    constexpr int GROUPS = 8;
+    const int row = static_cast<int>(blockIdx.y);
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    if (row >= m) {
+        return;
+    }
+    const int nblocks = k / 32;
+    float acc_g = 0.f;
+    float acc_u = 0.f;
+    if (col < n) {
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        const uint8_t *grow = bg + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
+        const uint8_t *urow = bu + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
+        for (int ib = lane; ib < nblocks; ib += 32) {
+            const uint8_t *g = grow + static_cast<size_t>(ib) * 17;
+            const uint8_t *u = urow + static_cast<size_t>(ib) * 17;
+            const float *x = arow + ib * 32;
+            acc_g += mxfp4_e8m0_half(g[0]) * mxfp4_block_dot(g, x);
+            acc_u += mxfp4_e8m0_half(u[0]) * mxfp4_block_dot(u, x);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc_g += __shfl_xor(acc_g, off, 32);
+        acc_u += __shfl_xor(acc_u, off, 32);
+    }
+    if (col < n && lane == 0) {
+        const float x = acc_g;
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] =
+            mxfp4_swiglu(x, acc_u, limit);
+    }
+}
+
+/* ALLPACA_MXFP4_WIDE=0 keeps the older shared-tile kernels for single rows. */
+static bool mxfp4_wide(const float *a, int32_t m, int32_t k) {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_MXFP4_WIDE");
+        return !(v && v[0] == '0');
+    }();
+    return on && m == 1 && k % 32 == 0 && (reinterpret_cast<uintptr_t>(a) & 15u) == 0;
+}
+
 static int launch_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, hipStream_t stream, int tiled) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    if (tiled && mxfp4_wide(a, m, k)) {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + 7) / 8), 1);
+        hipLaunchKernelGGL(gemv_nt_mxfp4_wide_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        return hip_status(hipGetLastError());
+    }
     if (tiled) {
         constexpr int COLS = 64;
         if (m > 1) {
@@ -3946,10 +4460,20 @@ extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, f
 
 __device__ inline float mxfp4_silu(float x) { return x / (1.0f + expf(-x)); }
 
+/* silu(gate) * up; with limit > 0 the gate is capped at limit first and up to +-limit
+ * (DeepSeek-V4 swiglu_clamp_exp). */
+__device__ inline float mxfp4_swiglu(float g, float u, float limit) {
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    return mxfp4_silu(g) * u;
+}
+
 /* One A-tile load, two MXFP4 B rows, write silu(gate)*up. */
 __global__ void mxfp4_swiglu_gate_up_tiled_kernel(const float *a, const uint8_t *bg,
                                                   const uint8_t *bu, float *c, int m, int n,
-                                                  int k) {
+                                                  int k, float limit) {
     constexpr int COLS = 64;
     constexpr int TILE = 256;
     constexpr int BLOCKS_PER_TILE = TILE / 32;
@@ -4003,7 +4527,7 @@ __global__ void mxfp4_swiglu_gate_up_tiled_kernel(const float *a, const uint8_t 
     }
     if (grow) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
-            mxfp4_silu(acc_g) * acc_u;
+            mxfp4_swiglu(acc_g, acc_u, limit);
     }
 }
 
@@ -4011,7 +4535,7 @@ __global__ void mxfp4_swiglu_gate_up_tiled_kernel(const float *a, const uint8_t 
 template <int TILE_M>
 __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_t *bg,
                                                     const uint8_t *bu, float *c, int m, int n,
-                                                    int k) {
+                                                    int k, float limit) {
     constexpr int COLS = 64;
     constexpr int TILE_K = 256;
     constexpr int BLOCKS_PER_TILE = TILE_K / 32;
@@ -4079,7 +4603,7 @@ __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_
             const int row = row0 + r;
             if (row < m) {
                 c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
-                    mxfp4_silu(acc_g[r]) * acc_u[r];
+                    mxfp4_swiglu(acc_g[r], acc_u[r], limit);
             }
         }
     }
@@ -4087,11 +4611,18 @@ __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_
 
 extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_t *bu,
                                             float *c, int32_t m, int32_t n, int32_t k,
-                                            allpaca_stream_t stream) {
+                                            float limit, allpaca_stream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0 || !a || !bg || !bu || !c) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
+    if (mxfp4_wide(a, m, k)) {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((n + 7) / 8), 1);
+        hipLaunchKernelGGL(mxfp4_swiglu_gate_up_wide_kernel, grid, block, 0, as_stream(stream), a,
+                           bg, bu, c, m, n, k, limit);
+        return hip_status(hipGetLastError());
+    }
     constexpr int COLS = 64;
     if (m > 1) {
         dim3 block(64);
@@ -4100,19 +4631,19 @@ extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, c
             dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
                       static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
             hipLaunchKernelGGL((mxfp4_swiglu_gate_up_tiled_m_kernel<16>), grid, block, 0,
-                               as_stream(stream), a, bg, bu, c, m, n, k);
+                               as_stream(stream), a, bg, bu, c, m, n, k, limit);
         } else {
             constexpr int TILE_M = 8;
             dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS),
                       static_cast<unsigned>((m + TILE_M - 1) / TILE_M));
             hipLaunchKernelGGL((mxfp4_swiglu_gate_up_tiled_m_kernel<8>), grid, block, 0,
-                               as_stream(stream), a, bg, bu, c, m, n, k);
+                               as_stream(stream), a, bg, bu, c, m, n, k, limit);
         }
     } else {
         dim3 block(256);
         dim3 grid(static_cast<unsigned>((n + COLS - 1) / COLS), static_cast<unsigned>(m));
         hipLaunchKernelGGL(mxfp4_swiglu_gate_up_tiled_kernel, grid, block, 0, as_stream(stream), a,
-                           bg, bu, c, m, n, k);
+                           bg, bu, c, m, n, k, limit);
     }
     return hip_status(hipGetLastError());
 }
@@ -5039,13 +5570,24 @@ static hipMemcpyKind to_hip_memcpy_kind(int32_t kind) {
  * loaded runtime rather than declaring the prototype, so a missing symbol
  * degrades to per-copy async instead of breaking the build. `attrs`,
  * `attrsIdxs` and `numAttrs` are documented as unsupported by HIP, so the
- * attribute pointer is always null and its layout never matters here. */
+ * attribute pointer is always null and its layout never matters here.
+ *
+ * Off unless ALLPACA_MEMCPY_BATCH=1. The SDK 7.1 Windows runtime does not
+ * export it after all, so the per-copy path is what every measured run used.
+ * The ROCm 10 runtime exports it, and there it reads the source when the
+ * stream runs, not during the call as hipMemcpyAsync does for pageable
+ * memory. Callers reuse their source once the call returns, and DeepSeek-V4
+ * expert uploads came out corrupted (non-finite logits). */
 typedef hipError_t (*allpaca_memcpy_batch_fn)(void **dsts, void **srcs, size_t *sizes, size_t count,
                                               void *attrs, size_t *attrsIdxs, size_t numAttrs,
                                               size_t *failIdx, hipStream_t stream);
 
 static allpaca_memcpy_batch_fn memcpy_batch_fn() {
     static allpaca_memcpy_batch_fn fn = []() -> allpaca_memcpy_batch_fn {
+        const char *want = std::getenv("ALLPACA_MEMCPY_BATCH");
+        if (!want || want[0] != '1') {
+            return nullptr;
+        }
         void *sym = nullptr;
         hipDriverProcAddressQueryResult status{};
         if (hipGetProcAddress("hipMemcpyBatchAsync", &sym, HIP_VERSION, 0, &status) == hipSuccess &&
@@ -5265,6 +5807,35 @@ extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, dou
 
 extern "C" int allpaca_hip_set_device(int32_t device) {
     return hip_status(hipSetDevice(device));
+}
+
+/* One small rocBLAS GEMM on `device`. The first GEMM a process runs on a
+ * device pays the library's start-up there, whatever its size (about 4 s on
+ * an RX 9070 with ROCm 10.1, 0.2-0.4 s on an RX 9060 XT). Calling this at
+ * load keeps that out of the first request. */
+extern "C" int allpaca_hip_blas_warmup(int32_t device) {
+#ifdef ALLPACA_HAS_ROCBLAS
+    if (hipSetDevice(device) != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    constexpr int32_t N = 16;
+    const size_t bytes = static_cast<size_t>(3) * N * N * sizeof(float);
+    void *mem = nullptr;
+    if (hipMalloc(&mem, bytes) != hipSuccess || !mem) {
+        clear_last_error();
+        return ALLPACA_ERR_DEVICE;
+    }
+    (void)hipMemset(mem, 0, bytes);
+    float *buf = static_cast<float *>(mem);
+    const int rc = launch_gemm_nt_rocblas(buf, buf + N * N, buf + 2 * N * N, N, N, N, nullptr);
+    (void)hipDeviceSynchronize();
+    (void)hipFree(mem);
+    clear_last_error();
+    return rc;
+#else
+    (void)device;
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+#endif
 }
 
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t stream) {
@@ -5835,6 +6406,37 @@ __global__ void rope_offset_rows_kernel(float *x, int n_tok, int n_heads, int he
     }
 }
 
+/* rope_offset_rows with YaRN frequencies: pair i turns by theta^(-i/half) times a blend of 1
+ * (pairs up to `low`) and `scale` (pairs from `high`). Magnitudes are not scaled. */
+__global__ void rope_yarn_rows_kernel(float *x, int n_tok, int n_heads, int head_dim, int n_rot,
+                                      int offset, int start_pos, float theta, float scale,
+                                      float low, float high, int back) {
+    const int tok = static_cast<int>(blockIdx.y);
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = n_rot / 2;
+    const int total = n_heads * half;
+    if (tok >= n_tok || idx >= total || n_rot <= 0 || (n_rot % 2) != 0) {
+        return;
+    }
+    const int h = idx / half;
+    const int i = idx % half;
+    float *hvec = x + (static_cast<size_t>(tok) * static_cast<size_t>(n_heads) +
+                       static_cast<size_t>(h)) *
+                          static_cast<size_t>(head_dim) +
+                  static_cast<size_t>(offset);
+    const float y = (static_cast<float>(i) - low) / fmaxf(0.001f, high - low);
+    const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half)) *
+                       (scale * (1.0f - ramp) + ramp);
+    const float angle = static_cast<float>(start_pos + tok) * freq;
+    const float s = back ? -sinf(angle) : sinf(angle);
+    const float c = cosf(angle);
+    const float a = hvec[2 * i];
+    const float b = hvec[2 * i + 1];
+    hvec[2 * i] = a * c - b * s;
+    hvec[2 * i + 1] = a * s + b * c;
+}
+
 __global__ void rope_kernel(float *x, int n_heads, int head_dim, int pos, float theta) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int half = head_dim / 2;
@@ -6380,6 +6982,33 @@ extern "C" int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads
                        dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(n_tok)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n_tok, n_heads,
                        head_dim, rot, off, start_pos, theta, back);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_rope_yarn_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                                      int32_t n_rot, int32_t offset, int32_t start_pos,
+                                      float theta, float scale, float low, float high,
+                                      int32_t back, allpaca_stream_t stream) {
+    if (!x || n_tok <= 0 || n_heads <= 0 || head_dim <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int rot = n_rot;
+    int off = offset;
+    if (rot == 0) {
+        rot = head_dim;
+        off = 0;
+    }
+    if (rot < 0 || off < 0 || (rot % 2) != 0 || off + rot > head_dim) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int total = n_heads * (rot / 2);
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(rope_yarn_rows_kernel,
+                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(n_tok)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n_tok, n_heads,
+                       head_dim, rot, off, start_pos, theta, scale, low, high, back);
     return hip_status(hipGetLastError());
 }
 
@@ -7840,6 +8469,8 @@ static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, hipStream_t
     MOE_GU(4, 4) MOE_GU(4, 5) MOE_GU(4, 6)
     MOE_GU(5, 4) MOE_GU(5, 5) MOE_GU(5, 6)
     MOE_GU(6, 4) MOE_GU(6, 5) MOE_GU(6, 6)
+    MOE_GU(8, 8)
+    MOE_GU(48, 48)
 #undef MOE_GU
     return false;
 }
@@ -7854,7 +8485,7 @@ static bool moe_down_types(int qd, dim3 grid, hipStream_t st, const int8_t *hq,
                            group_start, expert, down, ds, y, dim, ff);                            \
         return true;                                                                               \
     }
-    MOE_D(4) MOE_D(5) MOE_D(6)
+    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8) MOE_D(48)
 #undef MOE_D
     return false;
 }
@@ -7870,7 +8501,9 @@ extern "C" uint64_t allpaca_moe_ffn_scratch_bytes(int32_t rows, int32_t dim, int
            moe_align(p * (ff / 32) * 4);
 }
 
-/* Expert-parallel MoE FFN over stacked K-quant experts (`qt` 4/5/6 = Q4_K/Q5_K/Q6_K):
+/* Expert-parallel MoE FFN over stacked experts (`qt` 4/5/6 = Q4_K/Q5_K/Q6_K,
+ * 8 = Q8_0 in 36-byte staged blocks, 48 = MoESQ paired-4:8 FP4; gate and up are
+ * both K-quant, both Q8_0 or both paired-4:8):
  * out[r] = sum over row r's pairs of w * down_e(silu(gate_e x_r) * up_e x_r).
  * Pairs are sorted by row; `row_start` has rows + 1 entries. Three launches,
  * whatever the expert count: an MI50 pays ~10 us per dependent launch, and at
@@ -7890,7 +8523,7 @@ extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const fl
         (group_start == nullptr && groups != pairs) || max_group < 1 || max_group > 8) {
         return ALLPACA_ERR_INVALID;
     }
-    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6; };
+    auto kq = [](int32_t qt) { return qt == 4 || qt == 5 || qt == 6 || qt == 8 || qt == 48; };
     if (!kq(gate_qt) || !kq(up_qt) || !kq(down_qt)) {
         return ALLPACA_ERR_INVALID;
     }
@@ -8050,6 +8683,8 @@ extern "C" int allpaca_hip_local_headroom(int32_t, uint64_t *) {
 
 extern "C" int allpaca_hip_set_device(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
+extern "C" int allpaca_hip_blas_warmup(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
@@ -8140,6 +8775,11 @@ extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *, const uint8_t *, floa
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_gemm_nt_p48fp4(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                      int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
 extern "C" int allpaca_gemm_nt_rocmfp4_f32(const float *, const uint8_t *, float *, int32_t,
                                            int32_t, int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -8156,7 +8796,8 @@ extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *, const uint8_t *, flo
 }
 
 extern "C" int allpaca_mxfp4_swiglu_gate_up(const float *, const uint8_t *, const uint8_t *,
-                                            float *, int32_t, int32_t, int32_t, allpaca_stream_t) {
+                                            float *, int32_t, int32_t, int32_t, float,
+                                            allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
@@ -8440,6 +9081,12 @@ extern "C" int allpaca_rope_qk_rows(float *, float *, int32_t, int32_t, int32_t,
 
 extern "C" int allpaca_rope_offset_rows(float *, int32_t, int32_t, int32_t, int32_t, int32_t,
                                         int32_t, float, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rope_yarn_rows(float *, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                      int32_t, float, float, float, float, int32_t,
+                                      allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

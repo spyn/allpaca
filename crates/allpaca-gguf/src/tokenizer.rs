@@ -4,8 +4,11 @@ use tokenizers::models::bpe::BPE;
 use tokenizers::models::unigram::Unigram;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::sequence::Sequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
-use tokenizers::tokenizer::{AddedToken, Tokenizer};
+use tokenizers::tokenizer::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 use crate::parser::{GgufFile, GgufValue};
 
@@ -118,8 +121,9 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
             let pre = file.meta_str("tokenizer.ggml.pre").unwrap_or("");
             match build_bpe_model(&tokens, merges.as_deref(), unk_id) {
                 Ok(model) => {
-                    if pre == "spark2_5"
-                        || pre == "qwen2"
+                    if let Some(split) = llama_split_regex(pre) {
+                        regex_bpe(model, split)
+                    } else if pre == "spark2_5"
                         || pre == "qwen3"
                         || pre == "gemma"
                         || pre == "gemma2"
@@ -312,6 +316,69 @@ fn byte_level_bpe(model: BPE) -> Tokenizer {
     let byte_level = ByteLevel::new(false, true, true);
     tokenizer.with_pre_tokenizer(Some(byte_level.clone()));
     tokenizer.with_decoder(Some(byte_level));
+    tokenizer
+}
+
+/// llama.cpp's word-splitting regex for `tokenizer.ggml.pre` = `bailingmoe`
+/// / `bailingmoe2` (Ling). Unlike GPT-2's, a single punctuation mark stays
+/// with the letters after it ("-th") and digits split one by one.
+const BAILINGMOE_SPLIT: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
+
+/// llama.cpp's regex for the `qwen2` family: like Ling's, but a run of
+/// newlines stays together.
+const QWEN2_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// llama.cpp's regex for `qwen35`: `qwen2` with combining marks kept in words.
+const QWEN35_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// llama.cpp's regex for the `llama3` family: `qwen2` with digits in runs of
+/// up to three.
+const LLAMA3_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// llama.cpp's split for DeepSeek-V3 and its relatives. It applies three
+/// regexes in turn (digit runs of up to three, CJK runs, then words and
+/// punctuation), each to what the one before left over. As one pattern:
+/// the first two come first, words do not take CJK letters, and spaces
+/// before a digit or CJK run stay whole, as at the end of a leftover.
+const DEEPSEEK3_SPLIT: &str = concat!(
+    r"\p{N}{1,3}|[一-龥぀-ゟ゠-ヿ]+",
+    r##"|[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"##,
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}&&[^一-龥぀-ゟ゠-ヿ]]+",
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+",
+    r"|\s+(?![^\s\p{N}一-龥぀-ゟ゠-ヿ])|\s+",
+);
+
+/// The word-splitting regex llama.cpp uses for a `tokenizer.ggml.pre` value,
+/// for the pre types Allpaca matches exactly. `None` = GPT-2's split.
+fn llama_split_regex(pre: &str) -> Option<&'static str> {
+    match pre {
+        "bailingmoe" | "bailingmoe2" => Some(BAILINGMOE_SPLIT),
+        "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" => Some(QWEN2_SPLIT),
+        "qwen35" => Some(QWEN35_SPLIT),
+        "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral" | "midm-2.0"
+        | "lfm2" | "jina-v5-nano" => Some(LLAMA3_SPLIT),
+        "deepseek-v3" | "step35" | "hunyuan-dense" | "joyai-llm" => Some(DEEPSEEK3_SPLIT),
+        _ => None,
+    }
+}
+
+/// Byte-level BPE whose words are cut by the model's own regex instead of
+/// GPT-2's. Falls back to GPT-2's when the pattern does not compile.
+fn regex_bpe(model: BPE, pattern: &str) -> Tokenizer {
+    let Ok(split) = Split::new(
+        SplitPattern::Regex(pattern.to_string()),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    ) else {
+        tracing::warn!(pattern, "tokenizer split regex did not compile; using the GPT-2 split");
+        return byte_level_bpe(model);
+    };
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
+        PreTokenizerWrapper::Split(split),
+        PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
+    ])));
+    tokenizer.with_decoder(Some(ByteLevel::new(false, true, true)));
     tokenizer
 }
 
@@ -569,5 +636,65 @@ mod tests {
             assert!(!ids.get_ids().is_empty(), "pre={pre}");
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn bailingmoe_split_keeps_punctuation_with_the_word() {
+        use tokenizers::tokenizer::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+
+        let split = Split::new(
+            SplitPattern::Regex(BAILINGMOE_SPLIT.to_string()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .unwrap();
+        let mut text = PreTokenizedString::from("the n-th of 12\n\nit's");
+        split.pre_tokenize(&mut text).unwrap();
+        let pieces: Vec<&str> = text
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(piece, _, _)| piece)
+            .collect();
+        assert_eq!(
+            pieces,
+            ["the", " n", "-th", " of", " ", "1", "2", "\n\n", "it", "'s"]
+        );
+    }
+
+    #[test]
+    fn llama_split_regexes_follow_the_pre_type() {
+        use tokenizers::tokenizer::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+
+        let pieces = |pre: &str, text: &str| -> Vec<String> {
+            let split = Split::new(
+                SplitPattern::Regex(llama_split_regex(pre).unwrap().to_string()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap();
+            let mut text = PreTokenizedString::from(text);
+            split.pre_tokenize(&mut text).unwrap();
+            text.get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(piece, _, _)| piece.to_string())
+                .collect()
+        };
+        // Digits: one at a time for Qwen, runs of three for Llama 3.
+        assert_eq!(pieces("qwen2", "n-th 1234"), ["n", "-th", " ", "1", "2", "3", "4"]);
+        assert_eq!(pieces("llama-bpe", "n-th 1234"), ["n", "-th", " ", "123", "4"]);
+        // A combining mark breaks a qwen2 word and stays inside a qwen35 one.
+        assert_eq!(pieces("qwen2", "e\u{301}t"), ["e", "\u{301}t"]);
+        assert_eq!(pieces("qwen35", "e\u{301}t"), ["e\u{301}t"]);
+        // DeepSeek-V3/V4 (`joyai-llm` in the V4 files): digits in threes, a
+        // punctuation mark stays with the letters after it or takes the
+        // newlines after it.
+        assert_eq!(
+            pieces("joyai-llm", "is 7391, ten-minute.\n\nQ?\n"),
+            ["is", " ", "739", "1", ",", " ten", "-minute", ".\n\n", "Q", "?\n"]
+        );
+        // Digits and CJK runs are cut out first: letters do not run into a
+        // CJK run, and spaces before either stay in one piece.
+        assert_eq!(pieces("deepseek-v3", "ab中文  12"), ["ab", "中文", "  ", "12"]);
+        assert!(llama_split_regex("gpt2").is_none());
     }
 }

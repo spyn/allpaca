@@ -1,8 +1,7 @@
 //! DeepSeek-V4-Flash (`deepseek4`) host decode: MLA + hyper-connections + MoE.
 //!
-//! CSA/HCA compressors are not applied: each token stores the 512-d latent KV
-//! and attends densely. That is enough for short-context load/use; long-context
-//! sparsity still needs the indexer path.
+//! What a token attends to (sliding window of raw keys, compressed keys, the
+//! indexer) is in [`crate::dsv4_attn`].
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -14,10 +13,11 @@ use allpaca_gguf::GgufFile;
 use allpaca_types::{AllpacaError, FatalError};
 
 use crate::model::{
-    expert_mlp, expert_mlp_rows, gather_kv, topk_from_logits, DenseKv, ModelConfig, TinyModel,
+    expert_mlp, expert_mlp_rows, topk_from_logits, DenseKv, ModelConfig, TinyModel,
 };
 use crate::telemetry::Metrics;
 use crate::weight_set::LayerFfn;
+use crate::dsv4_attn::{Dsv4AttnSpec, Dsv4Memory};
 use crate::KvTierManager;
 
 #[derive(Debug, Clone)]
@@ -30,6 +30,10 @@ pub struct Dsv4Spec {
     pub hc_eps: f32,
     pub hash_layer_count: usize,
     pub rope_offset: usize,
+    pub attn: Dsv4AttnSpec,
+    /// Per GGUF block: routed experts cap their gate at this before SiLU
+    /// and their up projection to plus or minus it (empty or 0 = no cap).
+    pub swiglu_clamp: Vec<f32>,
 }
 
 impl Dsv4Spec {
@@ -71,6 +75,20 @@ impl Dsv4Spec {
                 .meta_u32(&format!("{arch}.hash_layer_count"))
                 .unwrap_or(0) as usize,
             rope_offset: head_dim.saturating_sub(n_rot),
+            attn: Dsv4AttnSpec::from_gguf(file, arch, head_dim, n_rot, cfg.rope_theta, cfg.eps),
+            swiglu_clamp: file
+                .metadata
+                .get(&format!("{arch}.swiglu_clamp_exp"))
+                .and_then(|v| v.as_f32_array())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The cap for the routed experts of GGUF block `blk` (0 = none).
+    pub fn swiglu_limit(&self, blk: usize) -> f32 {
+        match self.swiglu_clamp.get(blk) {
+            Some(limit) if *limit > 1.0e-6 => *limit,
+            _ => 0.0,
         }
     }
 }
@@ -102,6 +120,12 @@ pub struct Dsv4LayerMeta {
     pub exp_probs_b: Vec<f32>,
     pub attn_norm: Vec<f32>,
     pub ffn_norm: Vec<f32>,
+    /// Compressor gate bias per position in a group and key norm; empty
+    /// for a layer that keeps raw keys only.
+    pub comp_ape: Vec<f32>,
+    pub comp_norm: Vec<f32>,
+    pub index_ape: Vec<f32>,
+    pub index_norm: Vec<f32>,
 }
 
 struct Dsv4Cache {
@@ -118,6 +142,8 @@ pub struct Dsv4Weights {
     pub hc_head_base: Vec<f32>,
     pub hc_head_scale: f32,
     cache: Mutex<Dsv4Cache>,
+    /// Host copies of dense tensors the GPU does not hold, decoded on first use.
+    host_dense: Mutex<BTreeMap<String, Arc<Vec<f32>>>>,
     pub(crate) gguf: Option<Arc<GgufFile>>,
     pub(crate) gpu: Mutex<Option<crate::dsv4_gpu::Dsv4Gpu>>,
 }
@@ -163,6 +189,10 @@ impl Dsv4Weights {
                 exp_probs_b: optional_f32(file, &format!("blk.{blk}.exp_probs_b.bias"))?,
                 attn_norm: optional_f32(file, &format!("blk.{blk}.attn_norm.weight"))?,
                 ffn_norm: optional_f32(file, &format!("blk.{blk}.ffn_norm.weight"))?,
+                comp_ape: optional_f32(file, &format!("blk.{blk}.attn_compressor_ape.weight"))?,
+                comp_norm: optional_f32(file, &format!("blk.{blk}.attn_compressor_norm.weight"))?,
+                index_ape: optional_f32(file, &format!("blk.{blk}.indexer_compressor_ape.weight"))?,
+                index_norm: optional_f32(file, &format!("blk.{blk}.indexer_compressor_norm.weight"))?,
             });
         }
         let _ = materialize_mla;
@@ -184,6 +214,7 @@ impl Dsv4Weights {
                 shexp: None,
                 lm_head: None,
             }),
+            host_dense: Mutex::new(BTreeMap::new()),
             gguf: None,
             gpu: Mutex::new(None),
         })
@@ -1358,6 +1389,20 @@ fn gather_embed(file: &GgufFile, token: u32, dim: usize) -> Result<Vec<f32>, All
                 out[i] = allpaca_cpu::bf16_to_f32(h);
             }
         }
+        allpaca_gguf::GgmlType::Q8_0 if dim % 32 == 0 => {
+            // One row: `dim / 32` blocks of an f16 scale and 32 int8.
+            let row = dim / 32 * 34;
+            let off = token as usize * row;
+            let blocks = bytes.get(off..off + row).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::CorruptGguf("embed Q8_0 row OOB".into()))
+            })?;
+            for (b, blk) in blocks.chunks_exact(34).enumerate() {
+                let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                for (i, q) in blk[2..].iter().enumerate() {
+                    out[b * 32 + i] = d * f32::from(*q as i8);
+                }
+            }
+        }
         allpaca_gguf::GgmlType::F16 => {
             let off = token as usize * dim * 2;
             for i in 0..dim {
@@ -1379,6 +1424,12 @@ fn gather_embed(file: &GgufFile, token: u32, dim: usize) -> Result<Vec<f32>, All
         }
     }
     Ok(out)
+}
+
+/// Dense tensor types the HIP path keeps resident and multiplies on the
+/// GPU (BF16 as it is, Q8_0 as staged int8 blocks).
+fn gpu_dense_type(t: allpaca_gguf::GgmlType) -> bool {
+    matches!(t, allpaca_gguf::GgmlType::BF16 | allpaca_gguf::GgmlType::Q8_0)
 }
 
 fn with_mla<R>(
@@ -1495,6 +1546,348 @@ fn dsv4_gemm(
     ))))
 }
 
+/// Rotate one key or query head to `pos`: the layer's own frequencies when
+/// it compresses, the model's plain RoPE otherwise.
+fn dsv4_rope(
+    cfg: &ModelConfig,
+    spec: &Dsv4Spec,
+    ratio: usize,
+    row: &mut [f32],
+    pos: usize,
+    inverse: bool,
+) -> Result<(), AllpacaError> {
+    if ratio != 0 {
+        spec.attn.rope(ratio).rotate(row, pos, inverse);
+        Ok(())
+    } else if inverse {
+        rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)
+    } else {
+        rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)
+    }
+}
+
+/// Raw keys of positions `lo..hi` from a layer's KV pages.
+fn gather_raw_keys(
+    kv: &KvTierManager,
+    pages: &[u64],
+    lo: usize,
+    hi: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>, AllpacaError> {
+    let kv_dim = n_kv_heads * head_dim;
+    let mut out = Vec::with_capacity(hi.saturating_sub(lo) * kv_dim);
+    if hi <= lo {
+        return Ok(out);
+    }
+    let cap = pages
+        .first()
+        .and_then(|id| kv.get(*id))
+        .map(|p| p.capacity_tokens as usize)
+        .unwrap_or(128)
+        .max(1);
+    for page in lo / cap..=(hi - 1) / cap {
+        let id = pages.get(page).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "DeepSeek-V4 KV page {page} not allocated"
+            )))
+        })?;
+        let (k, _) = kv.read_kv(*id, n_kv_heads, head_dim)?;
+        let base = page * cap;
+        let (a, b) = (lo.max(base) - base, hi.min(base + cap) - base);
+        let rows = k.get(a * kv_dim..b * kv_dim).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "DeepSeek-V4 KV page {page} holds {} keys, need {b}",
+                k.len() / kv_dim.max(1)
+            )))
+        })?;
+        out.extend_from_slice(rows);
+    }
+    Ok(out)
+}
+
+/// `m` rows of `x` times the dense tensor `name` (`n` outputs of `k`
+/// inputs): on the GPU when it holds the tensor, else from a host copy.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_dense_rows(
+    dsv4: &Dsv4Weights,
+    gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    file: Option<&GgufFile>,
+    name: &str,
+    x: &[f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    metrics: &Metrics,
+) -> Result<Vec<f32>, AllpacaError> {
+    let mut out = vec![0.0f32; m * n];
+    if let (Some(gpu), Some(file)) = (gpu, file) {
+        if gpu
+            .gemm_bf16(file, name, x, &mut out, n, k, 0, m, Some(metrics))
+            .is_ok()
+        {
+            return Ok(out);
+        }
+    }
+    let file = file.ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!("no weights for {name}")))
+    })?;
+    let w = {
+        let mut cache = dsv4.host_dense.lock().map_err(|_| {
+            AllpacaError::Fatal(FatalError::ModelLoad("dsv4 dense cache poisoned".into()))
+        })?;
+        match cache.get(name) {
+            Some(w) => w.clone(),
+            None => {
+                let w = Arc::new(file.tensor_f32(name)?);
+                cache.insert(name.to_string(), w.clone());
+                w
+            }
+        }
+    };
+    if w.len() < n * k {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "{name} holds {} values, need {}",
+            w.len(),
+            n * k
+        ))));
+    }
+    matmul_nt(x, &w[..n * k], &mut out, m, n, k)?;
+    Ok(out)
+}
+
+/// What a layer's tokens may attend to, once [`dsv4_absorb`] has taken them in.
+struct Dsv4Keys {
+    /// Raw keys from position `raw_start` up to the forward's last token.
+    raw: Vec<f32>,
+    raw_start: usize,
+    /// Set once the indexer has to choose among the compressed keys.
+    index_query: Option<crate::dsv4_attn::IndexQuery>,
+}
+
+/// Take a forward's tokens into a layer's attention memory. Their raw keys
+/// are already in the KV pages; this runs the layer's compressors on `curs`
+/// (the layer's normed input, on the host) and gathers the raw keys the
+/// tokens may see.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_absorb(
+    model: &TinyModel,
+    dsv4: &Dsv4Weights,
+    layer_idx: usize,
+    ratio: usize,
+    curs: &[f32],
+    q_a_norm: &[f32],
+    start_pos: usize,
+    n_tok: usize,
+    pages: &[u64],
+    kv: &KvTierManager,
+    seq: &mut Dsv4Memory,
+    gpu: &mut Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    file: Option<&GgufFile>,
+    metrics: &Metrics,
+) -> Result<Dsv4Keys, AllpacaError> {
+    use crate::dsv4_attn::{IndexQuery, PoolCfg};
+    let cfg = &model.config;
+    let spec = &dsv4.spec;
+    let attn = &spec.attn;
+    let meta = &dsv4.layers[layer_idx];
+    let (dim, eps, head_dim) = (cfg.dim, cfg.eps, cfg.head_dim());
+    let blk = cfg.gguf_blk(layer_idx);
+    let end = start_pos + n_tok;
+    let raw_start = attn.raw_lo(start_pos);
+    let raw = gather_raw_keys(kv, pages, raw_start, end, cfg.n_kv_heads.max(1), head_dim)?;
+    let mut index_query = None;
+    if ratio != 0 {
+        let rope = attn.rope(ratio);
+        let mut rows = |name: &str, x: &[f32], n: usize, k: usize| {
+            dsv4_dense_rows(
+                dsv4,
+                gpu.as_deref_mut(),
+                file,
+                &format!("blk.{blk}.{name}.weight"),
+                x,
+                n,
+                k,
+                n_tok,
+                metrics,
+            )
+        };
+        let pool = PoolCfg {
+            ratio,
+            head: head_dim,
+            ape: &meta.comp_ape,
+            norm: &meta.comp_norm,
+            eps,
+            rope,
+            fp8_nope: attn.nope,
+        };
+        let kv_rows = rows("attn_compressor_kv", curs, pool.width(), dim)?;
+        let gate_rows = rows("attn_compressor_gate", curs, pool.width(), dim)?;
+        if ratio == 4 && !meta.index_ape.is_empty() {
+            let index_pool = PoolCfg {
+                ratio,
+                head: attn.index_dim,
+                ape: &meta.index_ape,
+                norm: &meta.index_norm,
+                eps,
+                rope,
+                fp8_nope: 0,
+            };
+            let index_kv = rows("indexer_compressor_kv", curs, index_pool.width(), dim)?;
+            let index_gate = rows("indexer_compressor_gate", curs, index_pool.width(), dim)?;
+            seq.absorb(
+                layer_idx,
+                start_pos,
+                n_tok,
+                (&pool, &kv_rows, &gate_rows),
+                Some((&index_pool, &index_kv, &index_gate)),
+            )?;
+            // The indexer only chooses once more keys are visible than it keeps.
+            if attn.top_k > 0 && end / ratio > attn.top_k {
+                let rank = spec.q_lora_rank;
+                let mut qr = rows("attn_q_a", curs, rank, dim)?;
+                if !q_a_norm.is_empty() {
+                    let mut normed = vec![0.0f32; rank];
+                    for row in qr.chunks_mut(rank) {
+                        rmsnorm(row, q_a_norm, eps, &mut normed)?;
+                        row.copy_from_slice(&normed);
+                    }
+                }
+                let (heads, idim) = (attn.index_heads, attn.index_dim);
+                let mut q = rows("indexer.attn_q_b", &qr, heads * idim, rank)?;
+                for (t, tok) in q.chunks_mut(heads * idim).enumerate() {
+                    for head in tok.chunks_mut(idim) {
+                        rope.rotate(head, start_pos + t, false);
+                    }
+                }
+                index_query = Some(IndexQuery {
+                    q,
+                    head_weights: rows("indexer.proj", curs, heads, dim)?,
+                });
+            }
+        } else {
+            seq.absorb(layer_idx, start_pos, n_tok, (&pool, &kv_rows, &gate_rows), None)?;
+        }
+    }
+    Ok(Dsv4Keys {
+        raw,
+        raw_start,
+        index_query,
+    })
+}
+
+/// The keys the `t`-th token of a forward attends to, into `out`.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_token_keys(
+    model: &TinyModel,
+    dsv4: &Dsv4Weights,
+    layer_idx: usize,
+    ratio: usize,
+    keys: &Dsv4Keys,
+    start_pos: usize,
+    t: usize,
+    seq: &Dsv4Memory,
+    out: &mut Vec<f32>,
+) -> Result<(), AllpacaError> {
+    let attn = &dsv4.spec.attn;
+    let (heads, idim) = (attn.index_heads, attn.index_dim);
+    let index_query = keys.index_query.as_ref().map(|iq| {
+        (
+            &iq.q[t * heads * idim..(t + 1) * heads * idim],
+            &iq.head_weights[t * heads..(t + 1) * heads],
+        )
+    });
+    seq.keys(
+        attn,
+        layer_idx,
+        ratio,
+        start_pos + t,
+        model.config.head_dim(),
+        &keys.raw,
+        keys.raw_start,
+        index_query,
+        out,
+    )
+}
+
+/// Attention on the host for tokens that each see their own set of keys:
+/// `q` holds their rotated queries. Returns the result rotated back.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_memory_attention(
+    model: &TinyModel,
+    dsv4: &Dsv4Weights,
+    layer_idx: usize,
+    ratio: usize,
+    keys: &Dsv4Keys,
+    q: &[f32],
+    start_pos: usize,
+    n_tok: usize,
+    seq: &Dsv4Memory,
+    gpu: &mut Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    hip: Option<&allpaca_hip::HipWorkspace>,
+    skip_mla: bool,
+) -> Result<Vec<f32>, AllpacaError> {
+    let cfg = &model.config;
+    let meta = &dsv4.layers[layer_idx];
+    let (n_heads, head_dim) = (cfg.n_heads, cfg.head_dim());
+    let q_out = n_heads * head_dim;
+    let rope = dsv4.spec.attn.rope(ratio);
+    let mut out = vec![0.0f32; n_tok * q_out];
+    let mut seen = Vec::new();
+    for (t, (q, out)) in q.chunks(q_out).zip(out.chunks_mut(q_out)).enumerate() {
+        dsv4_token_keys(model, dsv4, layer_idx, ratio, keys, start_pos, t, seq, &mut seen)?;
+        if skip_mla {
+            dsv4_attention_sinks_maybe_gpu(
+                skip_mla,
+                gpu.as_deref_mut(),
+                hip,
+                q,
+                &seen,
+                &seen,
+                &meta.sinks,
+                out,
+                1,
+                seen.len() / head_dim.max(1),
+                n_heads,
+                cfg.n_kv_heads.max(1),
+                head_dim,
+            )?;
+        } else {
+            crate::dsv4_attn::attend(q, &seen, &meta.sinks, n_heads, head_dim, out)?;
+        }
+        for head in out.chunks_mut(head_dim) {
+            rope.rotate(head, start_pos + t, true);
+        }
+    }
+    Ok(out)
+}
+
+/// A routed expert on host weights: SwiGLU with the gate capped at
+/// `limit` before SiLU and the up projection to plus or minus `limit`
+/// (0 = no cap).
+fn dsv4_expert_rows(
+    x: &[f32],
+    ffn: &LayerFfn,
+    ff_dim: usize,
+    dim: usize,
+    m: usize,
+    out: &mut [f32],
+    limit: f32,
+) -> Result<(), AllpacaError> {
+    if limit <= 0.0 || ffn.w_gate.is_empty() {
+        return expert_mlp_rows(x, ffn, ff_dim, dim, m, out, false);
+    }
+    let mut up = vec![0.0f32; m * ff_dim];
+    let mut gate = vec![0.0f32; m * ff_dim];
+    matmul_nt(x, &ffn.w_up, &mut up, m, ff_dim, dim)?;
+    matmul_nt(x, &ffn.w_gate, &mut gate, m, ff_dim, dim)?;
+    for (g, u) in gate.iter_mut().zip(&up) {
+        let capped = g.min(limit);
+        *g = capped / (1.0 + (-capped).exp()) * u.clamp(-limit, limit);
+    }
+    matmul_nt(&gate, &ffn.w_down, out, m, dim, ff_dim)
+}
+
 struct Dsv4FfnPrep {
     fcur: Vec<f32>,
     fpost: Vec<f32>,
@@ -1518,6 +1911,7 @@ fn dsv4_attn_and_route(
     hip: Option<&allpaca_hip::HipWorkspace>,
     skip_mla: bool,
     prefill: bool,
+    seq: &mut Dsv4Memory,
 ) -> Result<(Vec<Vec<f32>>, Dsv4FfnPrep), AllpacaError> {
     let cfg = &model.config;
     let spec = &dsv4.spec;
@@ -1547,6 +1941,8 @@ fn dsv4_attn_and_route(
         cur = n;
     }
     let blk = cfg.gguf_blk(layer_idx);
+    let ratio = spec.attn.ratio(blk);
+    let masked = spec.attn.needs_mask(ratio, pos, 1);
     if crate::dsv4_gpu::want_full_layer_prefetch(prefill, cfg) {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
             let _ = g.prefetch_layer_experts(f, blk, cfg, Some(metrics));
@@ -1555,7 +1951,7 @@ fn dsv4_attn_and_route(
     let attn_out = with_mla(dsv4, layer_idx, blk, skip_mla, |mla| {
         let mut q = vec![0.0f32; q_out];
         let mut have_host_q = false;
-        let dq = if !meta.sinks.is_empty() {
+        let dq = if !meta.sinks.is_empty() && !masked {
             match (gpu.as_deref_mut(), file) {
                 (Some(g), Some(f)) => g
                     .mla_q_norm_rope_device(
@@ -1572,6 +1968,7 @@ fn dsv4_attn_and_route(
                         head_dim,
                         pos,
                         cfg.rope_theta,
+                        None,
                         cfg.rope_dims,
                         spec.rope_offset,
                         Some(metrics),
@@ -1637,7 +2034,7 @@ fn dsv4_attn_and_route(
                 let mut n = vec![0.0f32; head_dim];
                 timed_rmsnorm(row, &vec![1.0; head_dim], eps, &mut n, metrics)?;
                 row.copy_from_slice(&n);
-                rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                dsv4_rope(cfg, spec, ratio, row, pos, false)?;
             }
             have_host_q = true;
         }
@@ -1677,13 +2074,8 @@ fn dsv4_attn_and_route(
                 kv_lat = n;
             }
         }
-        rope_offset(
-            &mut kv_lat,
-            pos,
-            cfg.rope_theta,
-            cfg.rope_dims,
-            spec.rope_offset,
-        )?;
+        dsv4_rope(cfg, spec, ratio, &mut kv_lat, pos, false)?;
+        crate::dsv4_attn::fp8_quantize(&mut kv_lat, spec.rope_offset);
         let page_tokens = kv
             .get(page_ids[layer_idx][0])
             .map(|p| p.capacity_tokens)
@@ -1693,7 +2085,13 @@ fn dsv4_attn_and_route(
         let page_id = page_ids[layer_idx][page_index];
         kv.write_slot(page_id, slot, n_kv_heads, head_dim, &kv_lat, &kv_lat)?;
         kv.touch(page_id, 1.0);
-        let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
+        // The masked path reads the keys it needs itself.
+        let k_all = if masked {
+            Vec::new()
+        } else {
+            let lo = spec.attn.raw_lo(pos);
+            gather_raw_keys(kv, &page_ids[layer_idx], lo, pos + 1, n_kv_heads, head_dim)?
+        };
         let n_kv = k_all.len() / kv_dim.max(1);
         let mut attn_raw = Vec::new();
         let t_attn = Instant::now();
@@ -1702,7 +2100,7 @@ fn dsv4_attn_and_route(
                 .attention_rope_back_from_device_q(
                     p,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     1,
                     n_kv,
@@ -1711,20 +2109,41 @@ fn dsv4_attn_and_route(
                     head_dim,
                     pos,
                     cfg.rope_theta,
+                    None,
                     cfg.rope_dims,
                     spec.rope_offset,
                 )
                 .ok(),
             _ => None,
         };
-        if dattn.is_none() {
+        if masked {
+            let keys = dsv4_absorb(
+                model,
+                dsv4,
+                layer_idx,
+                ratio,
+                &cur,
+                &mla.q_a_norm,
+                pos,
+                1,
+                &page_ids[layer_idx],
+                kv,
+                seq,
+                &mut gpu,
+                file,
+                metrics,
+            )?;
+            attn_raw = dsv4_memory_attention(
+                model, dsv4, layer_idx, ratio, &keys, &q, pos, 1, seq, &mut gpu, hip, skip_mla,
+            )?;
+        } else if dattn.is_none() {
             attn_raw = vec![0.0f32; q_out];
             let attn_ok = match (dq, gpu.as_deref_mut()) {
                 (Some(p), Some(g)) => g
                     .attention_sinks_from_device_q(
                         p,
                         &k_all,
-                        &v_all,
+                        &k_all,
                         &meta.sinks,
                         &mut attn_raw,
                         1,
@@ -1753,7 +2172,7 @@ fn dsv4_attn_and_route(
                     hip,
                     &q,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     &mut attn_raw,
                     1,
@@ -2080,6 +2499,7 @@ fn dsv4_attn_and_route_rows(
     hip: Option<&allpaca_hip::HipWorkspace>,
     skip_mla: bool,
     prefill: bool,
+    seq: &mut Dsv4Memory,
 ) -> Result<Vec<Dsv4FfnPrep>, AllpacaError> {
     let n_tok = tokens.len();
     if n_tok == 0 {
@@ -2103,6 +2523,12 @@ fn dsv4_attn_and_route_rows(
     let host = &model.layers[layer_idx];
     let mut gpu = gpu;
     let blk = cfg.gguf_blk(layer_idx);
+    let ratio = spec.attn.ratio(blk);
+    let masked = spec.attn.needs_mask(ratio, start_pos, n_tok);
+    // Several tokens with their own keys each attend on the host; one
+    // token's keys go to the device as a single run.
+    let host_attn = masked && n_tok > 1;
+    let (rope_theta, rope_yarn) = spec.attn.rope(ratio).device();
     if crate::dsv4_gpu::want_full_layer_prefetch(prefill, cfg) {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
             let _ = g.prefetch_layer_experts(f, blk, cfg, Some(metrics));
@@ -2133,7 +2559,7 @@ fn dsv4_attn_and_route_rows(
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let attn_outs = with_mla(dsv4, layer_idx, blk, skip_mla, |mla| {
         let mut q = Vec::new();
-        let dq = if !meta.sinks.is_empty() {
+        let dq = if !meta.sinks.is_empty() && !host_attn {
             match (gpu.as_deref_mut(), file) {
                 (Some(g), Some(f)) => g
                     .mla_q_norm_rope_device(
@@ -2149,7 +2575,8 @@ fn dsv4_attn_and_route_rows(
                         n_heads,
                         head_dim,
                         start_pos,
-                        cfg.rope_theta,
+                        rope_theta,
+                        rope_yarn,
                         cfg.rope_dims,
                         spec.rope_offset,
                         Some(metrics),
@@ -2192,7 +2619,7 @@ fn dsv4_attn_and_route_rows(
                 let qrow = &mut q[t * q_out..(t + 1) * q_out];
                 for h in 0..n_heads {
                     let row = &mut qrow[h * head_dim..(h + 1) * head_dim];
-                    rope_offset(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                    dsv4_rope(cfg, spec, ratio, row, pos, false)?;
                 }
             }
         }
@@ -2206,14 +2633,53 @@ fn dsv4_attn_and_route_rows(
         for t in 0..n_tok {
             let pos = start_pos + t;
             let kv_row = &mut kv_lat[t * head_dim..(t + 1) * head_dim];
-            rope_offset(kv_row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+            dsv4_rope(cfg, spec, ratio, kv_row, pos, false)?;
+            crate::dsv4_attn::fp8_quantize(kv_row, spec.rope_offset);
             let page_index = pos / page_tokens as usize;
             let slot = (pos % page_tokens as usize) as u32;
             let page_id = page_ids[layer_idx][page_index];
             kv.write_slot(page_id, slot, n_kv_heads, head_dim, kv_row, kv_row)?;
             kv.touch(page_id, 1.0);
         }
-        let (k_all, v_all) = gather_kv(kv, &page_ids[layer_idx], n_kv_heads, head_dim)?;
+        let memory_keys = if masked {
+            if let Some(g) = gpu.as_deref_mut() {
+                g.ensure_hc_curs_host(&mut curs)?;
+            }
+            Some(dsv4_absorb(
+                model,
+                dsv4,
+                layer_idx,
+                ratio,
+                &curs,
+                &mla.q_a_norm,
+                start_pos,
+                n_tok,
+                &page_ids[layer_idx],
+                kv,
+                seq,
+                &mut gpu,
+                file,
+                metrics,
+            )?)
+        } else {
+            None
+        };
+        let k_all = match &memory_keys {
+            Some(_) if host_attn => Vec::new(),
+            Some(keys) => {
+                let mut seen = Vec::new();
+                dsv4_token_keys(model, dsv4, layer_idx, ratio, keys, start_pos, 0, seq, &mut seen)?;
+                seen
+            }
+            None => gather_raw_keys(
+                kv,
+                &page_ids[layer_idx],
+                spec.attn.raw_lo(start_pos),
+                start_pos + n_tok,
+                n_kv_heads,
+                head_dim,
+            )?,
+        };
         let n_kv = k_all.len() / kv_dim.max(1);
         let mut attn_raws = Vec::new();
         let t_attn = Instant::now();
@@ -2222,7 +2688,7 @@ fn dsv4_attn_and_route_rows(
                 .attention_rope_back_from_device_q(
                     p,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     n_tok,
                     n_kv,
@@ -2230,14 +2696,20 @@ fn dsv4_attn_and_route_rows(
                     n_kv_heads,
                     head_dim,
                     start_pos,
-                    cfg.rope_theta,
+                    rope_theta,
+                    rope_yarn,
                     cfg.rope_dims,
                     spec.rope_offset,
                 )
                 .ok(),
             _ => None,
         };
-        if dattn.is_none() {
+        if let (true, Some(keys)) = (host_attn, &memory_keys) {
+            attn_raws = dsv4_memory_attention(
+                model, dsv4, layer_idx, ratio, keys, &q, start_pos, n_tok, seq, &mut gpu, hip,
+                skip_mla,
+            )?;
+        } else if dattn.is_none() {
             if let Some(g) = gpu.as_deref_mut() {
                 g.ensure_hc_curs_host(&mut curs)?;
             }
@@ -2247,7 +2719,7 @@ fn dsv4_attn_and_route_rows(
                     .attention_sinks_from_device_q(
                         p,
                         &k_all,
-                        &v_all,
+                        &k_all,
                         &meta.sinks,
                         &mut attn_raws,
                         n_tok as i32,
@@ -2277,7 +2749,7 @@ fn dsv4_attn_and_route_rows(
                     hip,
                     &q,
                     &k_all,
-                    &v_all,
+                    &k_all,
                     &meta.sinks,
                     &mut attn_raws,
                     n_tok,
@@ -2292,7 +2764,7 @@ fn dsv4_attn_and_route_rows(
                 let attn_raw = &mut attn_raws[t * q_out..(t + 1) * q_out];
                 for h in 0..n_heads {
                     let row = &mut attn_raw[h * head_dim..(h + 1) * head_dim];
-                    rope_offset_back(row, pos, cfg.rope_theta, cfg.rope_dims, spec.rope_offset)?;
+                    dsv4_rope(cfg, spec, ratio, row, pos, true)?;
                 }
             }
         }
@@ -2509,12 +2981,33 @@ fn dsv4_apply_moe(
     let host = &model.layers[layer_idx];
     let blk = cfg.gguf_blk(layer_idx);
     let mut gpu = gpu;
+    let limit = spec.swiglu_limit(blk);
+    if let Some(g) = gpu.as_deref() {
+        g.set_swiglu_limit(limit);
+    }
     let Dsv4FfnPrep {
         fcur,
         fpost,
         fcomb,
         picks,
     } = prep;
+    // Experts that stay out of the GPU caches run on the CPU, beside the
+    // GPU work.
+    let mut cpu_work: Vec<(usize, Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
+    let picks: Vec<(usize, f32)> = match (gpu.as_mut(), file) {
+        (Some(g), Some(_)) if g.cpu_miss() => picks
+            .into_iter()
+            .filter(|&(e, w)| {
+                g.note_route(blk, e);
+                let on_gpu = g.resident_expert(blk, e).is_some() || g.admits(blk, e);
+                if !on_gpu {
+                    cpu_work.push((e, fcur.clone(), vec![(0, w)]));
+                }
+                on_gpu
+            })
+            .collect(),
+        _ => picks,
+    };
     let ids: Vec<usize> = picks.iter().map(|(e, _)| *e).collect();
     if warmup {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
@@ -2539,6 +3032,15 @@ fn dsv4_apply_moe(
         .map(|g| if g.has_expert_slots() { picks.len() } else { 0 })
         .unwrap_or(0);
     let mut routed = vec![0.0f32; dim];
+    let cpu_sum = std::thread::scope(|s| -> Result<Option<Vec<f32>>, AllpacaError> {
+    let cpu_jh = match file {
+        Some(f) if !cpu_work.is_empty() => {
+            let work = &cpu_work;
+            let ram = gpu.as_ref().and_then(|g| g.expert_ram());
+            Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, 1, limit, metrics, ram.as_deref())))
+        }
+        _ => None,
+    };
     let mut deferred: Vec<(usize, usize, f32)> = Vec::new();
     for (i, (e, w)) in picks.into_iter().enumerate() {
         if gpu.as_ref().is_some_and(|g| g.expert_copy_pending(blk, e)) {
@@ -2564,7 +3066,7 @@ fn dsv4_apply_moe(
             } else {
                 continue;
             };
-            expert_mlp(&fcur, &ffn, cfg.ff_dim, dim, &mut y, false)?;
+            dsv4_expert_rows(&fcur, &ffn, cfg.ff_dim, dim, 1, &mut y, limit)?;
         }
         for j in 0..dim {
             routed[j] += y[j] * w;
@@ -2593,11 +3095,22 @@ fn dsv4_apply_moe(
             } else {
                 continue;
             };
-            expert_mlp(&fcur, &ffn, cfg.ff_dim, dim, &mut y, false)?;
+            dsv4_expert_rows(&fcur, &ffn, cfg.ff_dim, dim, 1, &mut y, limit)?;
         }
         for j in 0..dim {
             routed[j] += y[j] * w;
         }
+    }
+    match cpu_jh.map(|jh| jh.join()) {
+        Some(Ok(sum)) => sum.map(Some),
+        Some(Err(_)) => Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "CPU expert thread panicked".into(),
+        ))),
+        None => Ok(None),
+    }
+    })?;
+    if let Some(sum) = cpu_sum {
+        add_acc_slice(&mut routed, &sum);
     }
     if let Some(g) = gpu.as_mut() {
         g.finish_h2d_keep();
@@ -2647,6 +3160,97 @@ fn dsv4_apply_moe(
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Ok(streams)
+}
+
+/// Routed experts that are not in a GPU cache, computed on the CPU from the
+/// mapped MXFP4 file. `work` is `(expert, its m rows of dim, [(token, weight)])`;
+/// the result is the weighted sum per token, `n_tok * dim`.
+fn dsv4_cpu_experts(
+    file: &GgufFile,
+    blk: usize,
+    cfg: &ModelConfig,
+    work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
+    n_tok: usize,
+    limit: f32,
+    metrics: &Metrics,
+    ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
+) -> Result<Vec<f32>, AllpacaError> {
+    let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
+    let t = Instant::now();
+    // Through the RAM tier (cached, else read from the file in large direct
+    // reads) when there is one; else through the mapped file.
+    let spans: Option<Vec<(usize, Vec<crate::dsv4_ram::FileSpan>)>> = ram.and_then(|_| {
+        work.iter()
+            .map(|(e, _, _)| crate::dsv4_gpu::expert_mxfp4_spans(file, blk, *e, cfg).map(|s| (*e, s)))
+            .collect()
+    });
+    // The tier is locked for the fetch only: fetched bytes stay where they
+    // are until this thread's next fetch, and the read-ahead worker, which
+    // needs the lock, never touches them.
+    let fetched: Option<Vec<(usize, usize)>> = match (ram, spans.as_ref()) {
+        (Some(r), Some(spans)) => {
+            let mut tier = r.lock().unwrap_or_else(|e| e.into_inner());
+            let locs = tier.fetch(blk, spans, metrics)?;
+            Some(
+                locs.iter()
+                    .map(|loc| {
+                        let b = tier.bytes(*loc);
+                        (b.as_ptr() as usize, b.len())
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    let mut parts = Vec::with_capacity(work.len());
+    if fetched.is_none() {
+        for (e, _, _) in work {
+            parts.push(crate::dsv4_gpu::expert_mxfp4_parts(file, blk, *e, cfg)?);
+        }
+    }
+    let experts: Vec<allpaca_cpu::Mxfp4Expert<'_>> = match (fetched.as_ref(), spans.as_ref()) {
+        (Some(fetched), Some(spans)) => work
+            .iter()
+            .zip(fetched.iter().zip(spans))
+            .map(|((_, x, group), (&(ptr, len), (_, s)))| {
+                // SAFETY: see above; `len` is one packed expert.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+                let (gate, rest) = bytes.split_at(s[0].len);
+                let (up, down) = rest.split_at(s[1].len);
+                allpaca_cpu::Mxfp4Expert {
+                    gate,
+                    up,
+                    down,
+                    x,
+                    m: group.len(),
+                }
+            })
+            .collect(),
+        _ => work
+            .iter()
+            .zip(&parts)
+            .map(|((_, x, group), p)| allpaca_cpu::Mxfp4Expert {
+                gate: p[0].1,
+                up: p[1].1,
+                down: p[2].1,
+                x,
+                m: group.len(),
+            })
+            .collect(),
+    };
+    // Half the logical cores: the rest drive the GPUs and the copies.
+    let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
+    let ys = allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, limit, threads);
+    let mut sum = vec![0.0f32; n_tok.saturating_mul(dim)];
+    for (y, (_, _, group)) in ys.iter().zip(work) {
+        scatter_expert_rows(&mut sum, y, group, dim);
+    }
+    metrics.expert_lru_misses.fetch_add(work.len() as u64, Ordering::Relaxed);
+    metrics.expert_cpu_runs.fetch_add(work.len() as u64, Ordering::Relaxed);
+    metrics
+        .dsv4_cpu_expert_ns
+        .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Ok(sum)
 }
 
 fn scatter_expert_rows(routed: &mut [f32], y: &[f32], group: &[(usize, f32)], dim: usize) {
@@ -2816,6 +3420,10 @@ fn dsv4_apply_moe_rows(
     let host = &model.layers[layer_idx];
     let blk = cfg.gguf_blk(layer_idx);
     let mut gpu = gpu;
+    let limit = spec.swiglu_limit(blk);
+    if let Some(g) = gpu.as_deref() {
+        g.set_swiglu_limit(limit);
+    }
     let mut xs = vec![0.0f32; n_tok.saturating_mul(dim)];
     for (t, prep) in preps.iter().enumerate() {
         let dst = t.saturating_mul(dim);
@@ -2857,10 +3465,52 @@ fn dsv4_apply_moe_rows(
         }
         u
     };
+    // Experts that stay out of the GPU caches run on the CPU instead.
+    let cpu_miss = file.is_some() && gpu.as_ref().is_some_and(|g| g.cpu_miss());
+    let hint: Vec<usize> = match gpu.as_mut() {
+        Some(g) if cpu_miss => {
+            for prep in &preps {
+                for (e, _) in &prep.picks {
+                    g.note_route(blk, *e);
+                }
+            }
+            hint.into_iter()
+                .filter(|&e| g.resident_expert(blk, e).is_some() || g.admits(blk, e))
+                .collect()
+        }
+        _ => hint,
+    };
     let warmup_plan = match (gpu.as_mut(), file) {
         (Some(g), Some(f)) => g.warmup_experts(f, blk, &hint, cfg, Some(metrics)).ok(),
         _ => None,
     };
+    // The expert inputs may live on the GPU only (`xs` is then stale): the
+    // CPU experts need them on the host.
+    if cpu_miss {
+        if let Some(g) = gpu.as_ref() {
+            let on_cpu = preps
+                .iter()
+                .flat_map(|p| p.picks.iter())
+                .any(|(e, _)| g.resident_expert(blk, *e).is_none());
+            if on_cpu {
+                if let Some((ptr, n)) = g.hc_curs_device() {
+                    if n == xs.len() {
+                        g.copy_d2h_f32(ptr, &mut xs)?;
+                    }
+                }
+                // While this layer computes, read the next layer's cold
+                // experts. The first layers route by token id, not by
+                // their input.
+                let next = layer_idx + 1;
+                if next < cfg.n_layers
+                    && next >= spec.hash_layer_count
+                    && n_tok <= crate::dsv4_ram::AHEAD_MAX_ROWS
+                {
+                    g.read_ahead(cfg.gguf_blk(next), &xs);
+                }
+            }
+        }
+    }
     let gpu_slots = gpu.as_ref().is_some_and(|g| g.has_expert_slots());
     let mut groups: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
     for (t, prep) in preps.iter().enumerate() {
@@ -2959,6 +3609,13 @@ fn dsv4_apply_moe_rows(
             }
         }
     }
+    let cpu_now = if cpu_miss {
+        std::mem::take(&mut cpu_work)
+    } else {
+        Vec::new()
+    };
+    let mut cpu_sum: Option<Vec<f32>> = None;
+    let mut cpu_err: Option<AllpacaError> = None;
     let ff = cfg.ff_dim.max(1);
     let mut gpu_out: Vec<(Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
     let mut inflight = (false, false);
@@ -2967,6 +3624,14 @@ fn dsv4_apply_moe_rows(
     let (tx, rx) = std::sync::mpsc::channel();
     let mut bounced = false;
     std::thread::scope(|s| {
+        let cpu_jh = match file {
+            Some(f) if !cpu_now.is_empty() => {
+                let work = &cpu_now;
+                let ram = gpu.as_ref().and_then(|g| g.expert_ram());
+                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, limit, metrics, ram.as_deref())))
+            }
+            _ => None,
+        };
         let bounce = match (gpu.as_ref(), warmup_plan.as_ref()) {
             (Some(g), Some(plan)) if !plan.is_empty() => {
                 bounced = true;
@@ -3076,7 +3741,20 @@ fn dsv4_apply_moe_rows(
                 Err(_) => tracing::warn!("expert miss H2D thread panicked"),
             }
         }
+        match cpu_jh.map(|jh| jh.join()) {
+            Some(Ok(Ok(sum))) => cpu_sum = Some(sum),
+            Some(Ok(Err(e))) => cpu_err = Some(e),
+            Some(Err(_)) => {
+                cpu_err = Some(AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "CPU expert thread panicked".into(),
+                )))
+            }
+            None => {}
+        }
     });
+    if let Some(e) = cpu_err {
+        return Err(e);
+    }
     if !shexp_done {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
             if let Ok(y) = g.shexp_swiglu_rows(f, blk, &xs, n_tok, dim, sff_hint, Some(metrics)) {
@@ -3162,6 +3840,15 @@ fn dsv4_apply_moe_rows(
                         folded = false;
                     }
                 }
+                if folded {
+                    if let Some(sum) = cpu_sum.as_ref() {
+                        if h0.moe_add_from_host(sum).is_ok() {
+                            cpu_sum = None;
+                        } else {
+                            folded = false;
+                        }
+                    }
+                }
                 if folded && !shexp_dev {
                     if h0.moe_add_from_host(&shexp_y).is_ok() {
                         shexp_dev = true;
@@ -3193,6 +3880,9 @@ fn dsv4_apply_moe_rows(
         if let Some(tmp) = gpu1_host.as_ref() {
             add_acc_slice(&mut routed, tmp);
         }
+        if let Some(sum) = cpu_sum.as_ref() {
+            add_acc_slice(&mut routed, sum);
+        }
         let _ = hip0.as_ref().map(|h| h.bind());
         for (y, group) in gpu_out {
             scatter_expert_rows(&mut routed, &y, &group, dim);
@@ -3218,7 +3908,7 @@ fn dsv4_apply_moe_rows(
                 } else {
                     continue;
                 };
-                expert_mlp_rows(&gx, &ffn, cfg.ff_dim, dim, m, &mut gy, false)?;
+                dsv4_expert_rows(&gx, &ffn, cfg.ff_dim, dim, m, &mut gy, limit)?;
             }
             scatter_expert_rows(&mut routed, &gy, &group, dim);
         }
@@ -3425,8 +4115,26 @@ fn dsv4_packed_gpu_live(model: &TinyModel) -> bool {
     g.as_ref().is_some()
         && dsv4.gguf.as_ref().is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         })
+}
+
+/// The sequence's attention memory, or a fresh one for a forward that
+/// starts a sequence. A model with compressed layers cannot continue a
+/// sequence without the memory of what came before.
+fn sequence_memory<'a>(
+    spec: &Dsv4Spec,
+    seq: Option<&'a mut Dsv4Memory>,
+    start_pos: usize,
+    fresh: &'a mut Dsv4Memory,
+) -> Result<&'a mut Dsv4Memory, AllpacaError> {
+    match seq {
+        Some(seq) => Ok(seq),
+        None if start_pos == 0 || !spec.attn.compresses() => Ok(fresh),
+        None => Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+            "DeepSeek-V4 forward at position {start_pos} without the sequence's attention memory"
+        )))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3441,6 +4149,7 @@ pub fn forward_dsv4_token(
     _dense: Option<&mut DenseKv>,
     hip: Option<&allpaca_hip::HipWorkspace>,
     prefill: bool,
+    seq: Option<&mut Dsv4Memory>,
 ) -> Result<(), AllpacaError> {
     if dsv4_packed_gpu_live(model) {
         return forward_dsv4_tokens(
@@ -3454,6 +4163,7 @@ pub fn forward_dsv4_token(
             hip,
             true,
             prefill,
+            seq,
         );
     }
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
@@ -3462,6 +4172,8 @@ pub fn forward_dsv4_token(
     let cfg = &model.config;
     let dim = cfg.dim;
     let hc = dsv4.spec.hc_mult.max(1);
+    let mut fresh = Dsv4Memory::default();
+    let seq = sequence_memory(&dsv4.spec, seq, pos, &mut fresh)?;
 
     let t_embed = Instant::now();
     let x0 = if !model.embed.is_empty() {
@@ -3486,12 +4198,12 @@ pub fn forward_dsv4_token(
     let skip_mla = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
     let skip_shexp = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.ffn_up_shexp.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
 
     for layer_idx in 0..cfg.n_layers {
@@ -3511,6 +4223,7 @@ pub fn forward_dsv4_token(
             hip,
             skip_mla,
             prefill,
+            seq,
         )?;
         streams = dsv4_apply_moe(
             model,
@@ -3542,6 +4255,7 @@ pub fn forward_dsv4_token(
 }
 
 #[allow(clippy::too_many_arguments)]
+
 pub fn forward_dsv4_tokens(
     model: &TinyModel,
     tokens: &[u32],
@@ -3553,6 +4267,7 @@ pub fn forward_dsv4_tokens(
     hip: Option<&allpaca_hip::HipWorkspace>,
     write_logits: bool,
     prefill: bool,
+    seq: Option<&mut Dsv4Memory>,
 ) -> Result<(), AllpacaError> {
     if tokens.is_empty() {
         return Ok(());
@@ -3560,6 +4275,8 @@ pub fn forward_dsv4_tokens(
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad("missing DeepSeek-V4 weights".into()))
     })?;
+    let mut fresh = Dsv4Memory::default();
+    let seq = sequence_memory(&dsv4.spec, seq, start_pos, &mut fresh)?;
     let cfg = &model.config;
     let dim = cfg.dim;
     let hc = dsv4.spec.hc_mult.max(1);
@@ -3572,12 +4289,12 @@ pub fn forward_dsv4_tokens(
     let skip_mla = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.attn_q_a.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
     let skip_shexp = gpu.as_ref().is_some()
         && file.is_some_and(|f| {
             f.tensor("blk.0.ffn_up_shexp.weight")
-                .is_some_and(|t| t.ggml_type == allpaca_gguf::GgmlType::BF16)
+                .is_some_and(|t| gpu_dense_type(t.ggml_type))
         });
     let mut states = HcBatch::new(tokens.len(), hc, dim);
     for (t, &token) in tokens.iter().enumerate() {
@@ -3613,6 +4330,7 @@ pub fn forward_dsv4_tokens(
             hip,
             skip_mla,
             prefill,
+            seq,
         )?;
         dsv4_apply_moe_rows(
             model,
@@ -4086,11 +4804,205 @@ pub fn write_tiny_deepseek4_gguf(path: &std::path::Path) {
     write_gguf(path, &meta, &views).expect("write tiny deepseek4");
 }
 
+/// What [`write_tiny_deepseek4_ctx_gguf`] varies.
+pub struct TinyDsv4Ctx {
+    /// Raw keys a token attends to (0 = all).
+    pub window: u32,
+    /// One layer per entry: 0, 4 or 128.
+    pub compress_ratios: Vec<u32>,
+    /// Compressed keys the indexer keeps (0 = all).
+    pub top_k: u32,
+    /// `swiglu_clamp_exp` of every layer (0 = the key is left out).
+    pub swiglu_clamp: f32,
+}
+
+/// Tiny DeepSeek-V4 GGUF for attention-memory tests: every weight differs
+/// (seeded noise), so tokens and positions are told apart, and layers have
+/// the compressors and indexer their ratio calls for.
+pub fn write_tiny_deepseek4_ctx_gguf(path: &std::path::Path, opts: &TinyDsv4Ctx) {
+    use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let (dim, vocab, n_heads, head_dim, n_rot) = (16usize, 8usize, 2usize, 8usize, 4u32);
+    let (q_lora, o_lora, groups, hc) = (8usize, 8usize, 2usize, 2usize);
+    let (n_experts, ff) = (4usize, 16usize);
+    let (index_heads, index_dim) = (2usize, 8usize);
+    let q_out = n_heads * head_dim;
+    let oa_out = o_lora * groups;
+    let o_group_dim = (n_heads / groups) * head_dim;
+    let hc_dim = dim * hc;
+    let mix_dim = (2 + hc) * hc;
+
+    let mut meta = HashMap::new();
+    let u = |v: usize| GgufValue::Uint32(v as u32);
+    for (key, value) in [
+        ("vocab_size", u(vocab)),
+        ("embedding_length", u(dim)),
+        ("block_count", u(opts.compress_ratios.len())),
+        ("attention.head_count", u(n_heads)),
+        ("attention.head_count_kv", u(1)),
+        ("attention.key_length", u(head_dim)),
+        ("attention.value_length", u(head_dim)),
+        ("rope.dimension_count", GgufValue::Uint32(n_rot)),
+        ("rope.scaling.type", GgufValue::String("yarn".into())),
+        ("rope.scaling.factor", GgufValue::Float32(4.0)),
+        ("rope.scaling.original_context_length", u(64)),
+        ("attention.compress_rope_freq_base", GgufValue::Float32(100.0)),
+        ("attention.sliding_window", GgufValue::Uint32(opts.window)),
+        (
+            "attention.compress_ratios",
+            GgufValue::Array(opts.compress_ratios.iter().map(|r| GgufValue::Uint32(*r)).collect()),
+        ),
+        ("attention.indexer.head_count", u(index_heads)),
+        ("attention.indexer.key_length", u(index_dim)),
+        ("attention.indexer.top_k", GgufValue::Uint32(opts.top_k)),
+        ("attention.q_lora_rank", u(q_lora)),
+        ("attention.output_lora_rank", u(o_lora)),
+        ("attention.output_group_count", u(groups)),
+        ("hyper_connection.count", u(hc)),
+        ("hyper_connection.sinkhorn_iterations", u(4)),
+        ("hyper_connection.epsilon", GgufValue::Float32(1e-6)),
+        ("hash_layer_count", u(0)),
+        ("expert_count", u(n_experts)),
+        ("expert_used_count", u(2)),
+        ("expert_shared_count", u(1)),
+        ("expert_feed_forward_length", u(ff)),
+        ("expert_shared_feed_forward_length", u(ff)),
+        ("expert_weights_norm", GgufValue::Bool(true)),
+        ("expert_weights_scale", GgufValue::Float32(1.5)),
+        ("expert_gating_func", u(4)),
+    ] {
+        meta.insert(format!("deepseek4.{key}"), value);
+    }
+    meta.insert(
+        "general.architecture".into(),
+        GgufValue::String("deepseek4".into()),
+    );
+    meta.insert("general.name".into(), GgufValue::String("tiny-dsv4-ctx".into()));
+    if opts.swiglu_clamp > 0.0 {
+        meta.insert(
+            "deepseek4.swiglu_clamp_exp".into(),
+            GgufValue::Array(
+                opts.compress_ratios
+                    .iter()
+                    .map(|_| GgufValue::Float32(opts.swiglu_clamp))
+                    .collect(),
+            ),
+        );
+    }
+    meta.insert(
+        "tokenizer.ggml.model".into(),
+        GgufValue::String("wordlevel".into()),
+    );
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(
+            ["<unk>", "<s>", "</s>", "hi", "a", "b", "c", "d"]
+                .into_iter()
+                .map(|t| GgufValue::String(t.into()))
+                .collect(),
+        ),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+
+    let mut seed = 0x9e37_79b9u32;
+    let mut noise = |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    };
+    let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
+    let mut add = |name: String, dims: &[usize], data: Vec<f32>| {
+        owned.push((name, dims.iter().map(|d| *d as u64).collect(), data));
+    };
+    add("token_embd.weight".into(), &[vocab, dim], noise(vocab * dim, 1.0));
+    for (blk, &ratio) in opts.compress_ratios.iter().enumerate() {
+        let ratio = ratio as usize;
+        let mut t = |name: &str, dims: &[usize], data: Vec<f32>| {
+            add(format!("blk.{blk}.{name}.weight"), dims, data);
+        };
+        t("attn_norm", &[dim], vec![1.0; dim]);
+        t("attn_q_a", &[q_lora, dim], noise(q_lora * dim, 0.5));
+        t("attn_q_a_norm", &[q_lora], vec![1.0; q_lora]);
+        t("attn_q_b", &[q_out, q_lora], noise(q_out * q_lora, 0.5));
+        t("attn_kv", &[head_dim, dim], noise(head_dim * dim, 0.5));
+        t("attn_kv_a_norm", &[head_dim], vec![1.0; head_dim]);
+        t("attn_output_a", &[o_group_dim, oa_out], noise(o_group_dim * oa_out, 0.5));
+        t("attn_output_b", &[dim, oa_out], noise(dim * oa_out, 0.5));
+        t("attn_sinks", &[n_heads], noise(n_heads, 0.5));
+        t("ffn_norm", &[dim], vec![1.0; dim]);
+        for kind in ["attn", "ffn"] {
+            t(&format!("hc_{kind}_fn"), &[hc_dim, mix_dim], noise(mix_dim * hc_dim, 0.1));
+            t(&format!("hc_{kind}_base"), &[2 * hc + hc * hc], vec![0.0; 2 * hc + hc * hc]);
+            t(&format!("hc_{kind}_scale"), &[3], vec![1.0; 3]);
+        }
+        t("ffn_gate_inp", &[n_experts, dim], noise(n_experts * dim, 0.5));
+        t("ffn_gate_exps", &[n_experts * ff, dim], noise(n_experts * ff * dim, 0.3));
+        t("ffn_up_exps", &[n_experts * ff, dim], noise(n_experts * ff * dim, 0.3));
+        t("ffn_down_exps", &[n_experts * dim, ff], noise(n_experts * dim * ff, 0.3));
+        t("ffn_gate_shexp", &[ff, dim], noise(ff * dim, 0.3));
+        t("ffn_up_shexp", &[ff, dim], noise(ff * dim, 0.3));
+        t("ffn_down_shexp", &[dim, ff], noise(dim * ff, 0.3));
+        if ratio == 0 {
+            continue;
+        }
+        // Ratio-4 compressors project to two keys' width (group overlap).
+        let coff = if ratio == 4 { 2 } else { 1 };
+        let mut compressor = |prefix: &str, head: usize| {
+            let width = coff * head;
+            t(&format!("{prefix}_kv"), &[width, dim], noise(width * dim, 0.5));
+            t(&format!("{prefix}_gate"), &[width, dim], noise(width * dim, 0.5));
+            t(&format!("{prefix}_ape"), &[ratio, width], noise(ratio * width, 0.5));
+            t(&format!("{prefix}_norm"), &[head], vec![1.0; head]);
+        };
+        compressor("attn_compressor", head_dim);
+        if ratio == 4 {
+            compressor("indexer_compressor", index_dim);
+            t(
+                "indexer.attn_q_b",
+                &[index_heads * index_dim, q_lora],
+                noise(index_heads * index_dim * q_lora, 0.5),
+            );
+            t("indexer.proj", &[index_heads, dim], noise(index_heads * dim, 0.5));
+        }
+    }
+    add("output_hc_fn.weight".into(), &[hc_dim, hc], noise(hc * hc_dim, 0.1));
+    add("output_hc_base.weight".into(), &[hc], vec![0.0; hc]);
+    add("output_hc_scale.weight".into(), &[1], vec![1.0]);
+    add("output_norm.weight".into(), &[dim], vec![1.0; dim]);
+    add("output.weight".into(), &[vocab, dim], noise(vocab * dim, 0.5));
+    let views: Vec<GgufWriteTensor<'_>> = owned
+        .iter()
+        .map(|(name, dims, data)| GgufWriteTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            data,
+        })
+        .collect();
+    write_gguf(path, &meta, &views).expect("write tiny deepseek4 ctx");
+}
+
 /// Tiny DeepSeek-V4 GGUF with BF16 MLA/shexp/lm_head and MXFP4 experts (`k % 32 == 0`).
 /// HIP GEMV is used only for those dtypes; F32 fixtures stay on the CPU path.
 pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
+    write_tiny_deepseek4_packed(path, false);
+}
+
+/// The packed tiny fixture with its dense tensors as Q8_0 where a row is a
+/// whole number of 32-value blocks (as in Unsloth's UD-Q4_K_XL), BF16
+/// elsewhere.
+pub fn write_tiny_deepseek4_q8_gguf(path: &std::path::Path) {
+    write_tiny_deepseek4_packed(path, true);
+}
+
+fn write_tiny_deepseek4_packed(path: &std::path::Path, q8_dense: bool) {
     use allpaca_gguf::{
-        quantize_bf16, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor,
+        quantize_bf16, quantize_q8_0, write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor,
+        GgufWriteTensor,
     };
     use std::collections::HashMap;
 
@@ -4376,6 +5288,10 @@ pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
     let mut packed_store: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)> = Vec::new();
     for (name, dims, data) in &owned {
         if bf16_names.contains(&name.as_str()) {
+            if q8_dense && dims.len() == 2 && dims[0] % 32 == 0 {
+                packed_store.push((name.clone(), dims.clone(), GgmlType::Q8_0, quantize_q8_0(data)));
+                continue;
+            }
             packed_store.push((
                 name.clone(),
                 dims.clone(),
@@ -4414,6 +5330,45 @@ pub fn write_tiny_deepseek4_packed_gguf(path: &std::path::Path) {
 mod tests {
     use super::*;
 
+    /// Real weights (`ALLPACA_DSV4_GGUF` = first shard): the packed CPU expert
+    /// kernel against dequantise-then-F32 on experts taken from the file.
+    #[test]
+    fn cpu_packed_experts_match_dequantised_on_real_weights() {
+        let Ok(path) = std::env::var("ALLPACA_DSV4_GGUF") else {
+            return;
+        };
+        let file = GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let cfg = ModelConfig::from_gguf(&file).expect("config");
+        let (dim, ff) = (cfg.dim, cfg.ff_dim);
+        let metrics = Metrics::default();
+        let slot = 3 * (dim * ff / 32 * 17);
+        let ram = Mutex::new(
+            crate::dsv4_ram::ExpertRam::new(file.shard_paths().expect("paths"), slot, slot / 3, 3 * slot as u64)
+                .expect("ram tier")
+                .expect("slots"),
+        );
+        for (blk, expert, m) in [(0usize, 3usize, 1usize), (5, 17, 1), (20, 255, 2), (cfg.n_layers - 1, 128, 1)] {
+            let x: Vec<f32> = (0..m * dim)
+                .map(|i| (((i * 2654435761usize) >> 7) % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            let ffn = load_mxfp4_expert(&file, blk, expert, cfg.n_experts, dim, ff).expect("dequant");
+            let mut want = vec![0.0f32; m * dim];
+            expert_mlp_rows(&x, &ffn, ff, dim, m, &mut want, false).expect("reference");
+            let group: Vec<(usize, f32)> = (0..m).map(|t| (t, 1.0)).collect();
+            let work = [(expert, x, group)];
+            let got = dsv4_cpu_experts(&file, blk, &cfg, &work, m, 0.0, &metrics, None).expect("packed");
+            // The same expert through the RAM tier: read from the file, then cached.
+            for pass in 0..2 {
+                let tiered = dsv4_cpu_experts(&file, blk, &cfg, &work, m, 0.0, &metrics, Some(&ram)).expect("tiered");
+                assert_eq!(tiered, got, "blk {blk} expert {expert} pass {pass}");
+            }
+            let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-6);
+            let worst = got.iter().zip(&want).fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
+            eprintln!("blk {blk} expert {expert} m {m}: |y| max {scale:.4} worst diff {worst:.3e}");
+            assert!(worst <= 1e-3 * scale, "blk {blk} expert {expert}: worst {worst} of {scale}");
+        }
+    }
+
     #[test]
     fn device_shexp_runs_when_cpu_shexp_loader_is_skipped() {
         let skip_cpu_shexp = true;
@@ -4447,6 +5402,8 @@ mod tests {
             hc_eps: 1e-6,
             hash_layer_count: 0,
             rope_offset: 0,
+            attn: Default::default(),
+            swiglu_clamp: Vec::new(),
         };
         let dim = 8;
         let hc = spec.hc_mult;
@@ -4526,6 +5483,8 @@ mod tests {
                 hc_eps: 1e-6,
                 hash_layer_count: 0,
                 rope_offset: 0,
+                attn: Default::default(),
+                swiglu_clamp: Vec::new(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -4586,6 +5545,8 @@ mod tests {
                 hc_eps: 1e-6,
                 hash_layer_count: 0,
                 rope_offset: 0,
+                attn: Default::default(),
+                swiglu_clamp: Vec::new(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -4718,6 +5679,46 @@ mod tests {
     }
 
     #[test]
+    fn tiny_deepseek4_swiglu_clamp_caps_routed_experts() {
+        // First-token logits of the same weights under different clamps.
+        let logits = |swiglu_clamp: f32| {
+            let path = std::env::temp_dir().join(format!(
+                "allpaca_tiny_dsv4_clamp-{}-{}.gguf",
+                std::process::id(),
+                swiglu_clamp.to_bits()
+            ));
+            write_tiny_deepseek4_ctx_gguf(
+                &path,
+                &TinyDsv4Ctx {
+                    window: 0,
+                    compress_ratios: vec![0],
+                    top_k: 0,
+                    swiglu_clamp,
+                },
+            );
+            let file = std::sync::Arc::new(GgufFile::open(&path).expect("open tiny dsv4"));
+            let mut model = TinyModel::from_gguf(&file).expect("model");
+            model.bind_gguf(file);
+            let _ = std::fs::remove_file(&path);
+            let cfg = &model.config;
+            let metrics = crate::telemetry::Metrics::default();
+            let mut kv = KvTierManager::new(8 << 20, 8 << 20, 0.5);
+            let pages = vec![vec![kv
+                .alloc_page(0, 0, 32, cfg.n_kv_heads.max(1), cfg.head_dim(), &metrics)
+                .expect("kv page")]];
+            let mut out = vec![0.0f32; cfg.vocab_size];
+            super::forward_dsv4_token(&model, 3, 0, &pages, &mut kv, &mut out, &metrics, None, None, true, None)
+                .expect("forward");
+            out
+        };
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        let free = logits(0.0);
+        // A limit no activation reaches changes nothing; a tight one does.
+        assert!(diff(&free, &logits(1.0e6)) < 1e-6);
+        assert!(diff(&free, &logits(1.0e-3)) > 1e-4);
+    }
+
+    #[test]
     fn tiny_deepseek4_chunk_prefill_matches_sequential() {
         let path = std::env::temp_dir().join(format!(
             "allpaca_tiny_dsv4_chunk-{}-{}.gguf",
@@ -4766,6 +5767,7 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
             )
             .expect("sequential token");
         }
@@ -4783,6 +5785,7 @@ mod tests {
             None,
             true,
             true,
+            None,
         )
         .expect("chunk tokens");
         for (i, (a, b)) in logits_seq.iter().zip(logits_chunk.iter()).enumerate() {

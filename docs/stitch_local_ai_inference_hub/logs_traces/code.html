@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="web_standard" name="shell-type"/><style>@layer base{html,body{margin:0;padding:0;}body{overscroll-behavior:none;}main>:first-child{margin-top:0!important;}main>:last-child{margin-bottom:0!important;}}::-webkit-scrollbar{display:none;}</style><link href="https://fonts.googleapis.com" rel="preconnect"/><link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/><link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/><link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script><script id="tailwind-config">tailwind.config = {
+  darkMode: "class",
+  theme: {
+    extend: {
+      "colors": {
+        "on-primary-container": "#00422b",
+        "primary-fixed": "#6ffbbe",
+        "inverse-on-surface": "#2d3136",
+        "secondary-fixed-dim": "#4cd7f6",
+        "on-tertiary": "#3c0091",
+        "background": "#101419",
+        "on-primary": "#003824",
+        "surface-container-high": "#262a30",
+        "outline-variant": "#3c4a42",
+        "on-surface": "#e0e2ea",
+        "surface-container-highest": "#31353b",
+        "inverse-surface": "#e0e2ea",
+        "surface": "#101419",
+        "on-secondary-fixed-variant": "#004e5c",
+        "on-secondary": "#003640",
+        "secondary-fixed": "#acedff",
+        "surface-tint": "#4edea3",
+        "on-tertiary-fixed": "#23005c",
+        "on-error": "#690005",
+        "inverse-primary": "#006c49",
+        "secondary": "#4cd7f6",
+        "secondary-container": "#03b5d3",
+        "surface-container-low": "#181c21",
+        "surface-container-lowest": "#0a0e13",
+        "surface-container": "#1c2025",
+        "on-surface-variant": "#bbcabf",
+        "on-primary-fixed": "#002113",
+        "outline": "#86948a",
+        "surface-bright": "#36393f",
+        "error-container": "#93000a",
+        "on-tertiary-container": "#4600a7",
+        "on-secondary-fixed": "#001f26",
+        "surface-dim": "#101419",
+        "tertiary-fixed-dim": "#d0bcff",
+        "on-error-container": "#ffdad6",
+        "primary-fixed-dim": "#4edea3",
+        "error": "#ffb4ab",
+        "tertiary-fixed": "#e9ddff",
+        "primary-container": "#10b981",
+        "on-primary-fixed-variant": "#005236",
+        "tertiary": "#d0bcff",
+        "on-secondary-container": "#00424e",
+        "surface-variant": "#31353b",
+        "primary": "#4edea3",
+        "on-tertiary-fixed-variant": "#5516be",
+        "on-background": "#e0e2ea",
+        "tertiary-container": "#b090ff"
+      },
+      "borderRadius": {
+        "DEFAULT": "0.125rem",
+        "lg": "0.25rem",
+        "xl": "0.5rem",
+        "full": "0.75rem"
+      },
+      "spacing": {
+        "space-xs": "0.25rem",
+        "gutter": "0.75rem",
+        "space-sm": "0.5rem",
+        "space-md": "0.75rem",
+        "space-lg": "1rem",
+        "margin": "1.25rem",
+        "space-xl": "1.5rem"
+      },
+      "fontFamily": {
+        "label-section": [
+          "JetBrains Mono"
+        ],
+        "body-sm": [
+          "Inter"
+        ],
+        "body-md": [
+          "Inter"
+        ],
+        "headline-lg": [
+          "Geist"
+        ],
+        "body-lg": [
+          "Inter"
+        ],
+        "headline-md": [
+          "Geist"
+        ],
+        "label-code": [
+          "JetBrains Mono"
+        ],
+        "label-mono": [
+          "JetBrains Mono"
+        ],
+        "metric-unit": [
+          "JetBrains Mono"
+        ],
+        "metric-display": [
+          "Geist"
+        ],
+        "headline-xl": [
+          "Geist"
+        ]
+      },
+      "fontSize": {
+        "label-section": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "letterSpacing": "0.08em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-sm": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "body-md": [
+          "13px",
+          {
+            "lineHeight": "18px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-lg": [
+          "22px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.015em",
+            "fontWeight": "600"
+          }
+        ],
+        "body-lg": [
+          "15px",
+          {
+            "lineHeight": "22px",
+            "fontWeight": "400"
+          }
+        ],
+        "headline-md": [
+          "18px",
+          {
+            "lineHeight": "24px",
+            "letterSpacing": "-0.01em",
+            "fontWeight": "600"
+          }
+        ],
+        "label-code": [
+          "11px",
+          {
+            "lineHeight": "14px",
+            "fontWeight": "500"
+          }
+        ],
+        "label-mono": [
+          "12px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "400"
+          }
+        ],
+        "metric-unit": [
+          "13px",
+          {
+            "lineHeight": "16px",
+            "fontWeight": "500"
+          }
+        ],
+        "metric-display": [
+          "24px",
+          {
+            "lineHeight": "28px",
+            "letterSpacing": "-0.03em",
+            "fontWeight": "700"
+          }
+        ],
+        "headline-xl": [
+          "28px",
+          {
+            "lineHeight": "36px",
+            "letterSpacing": "-0.02em",
+            "fontWeight": "700"
+          }
+        ]
+      }
+    }
+  }
+};</script></head><body class="bg-surface font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container"><header class="fixed top-0 left-0 w-full z-50 bg-surface-container-lowest/90 backdrop-blur-xl border-b border-outline-variant/30"><div class="h-16 w-full px-margin flex items-center justify-between gap-space-lg"><div class="flex items-center gap-space-lg shrink-0"><div class="flex items-center gap-space-sm"><img alt="Allpaca Logo" class="h-8 w-auto object-contain" src="https://lh3.googleusercontent.com/aida/AEtjO1U7lp6rlcEHSXUXP3vTEzxtA04C3M7RyQNyYx6kfaHmkdlxNmAQymz1wJ_GiZ6ijkv99AHXGhcnvFh7yYWuOaoDit8NWmHod6ONmP2Fh_RerSp0W1iGej96VrEDzZ-3KlcCykcDiDQDXJHhi9v5gSyfmTrzBnMv4rN_z-I0jI2sg-r_yR0JVdhQx_cosSTxuVzJLfwYgDm22J9Xp_DF_vPRbEpjwW7zpJjSBsk7GYqqTilReINHU6Xa"/><div class="flex flex-col"><span class="font-headline-md text-headline-md tracking-tight font-bold text-on-surface leading-none">Allpaca</span><span class="font-label-code text-label-code text-primary uppercase tracking-wider mt-0.5">Cluster: Home-Lab</span></div></div><div class="h-4 w-px bg-outline-variant/40 mx-space-xs hidden lg:block"></div><span class="hidden lg:inline-flex items-center font-label-mono text-label-mono text-on-surface-variant bg-surface-container px-space-sm py-0.5 rounded">v0.9.4-rc</span><nav class="hidden xl:flex items-center gap-space-xs" data-active-classes="bg-surface-container-high text-primary font-medium rounded-lg"><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="dashboard" href="#">Dashboard</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="chat-playground" href="#">Chat Playground</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="models-vram" href="#">Models &amp; VRAM</a><a class="px-space-md py-1.5 font-body-sm text-body-sm text-on-surface-variant hover:text-on-surface transition-colors" data-path="logs-traces" href="#">Logs &amp; Traces</a></nav></div><div class="hidden 2xl:flex items-center gap-space-md bg-surface-container-low px-space-md py-1.5 rounded border border-outline-variant/30"><div class="flex items-center gap-space-xs"><span class="h-2 w-2 rounded-full bg-primary animate-pulse"></span><span class="font-label-mono text-label-mono text-on-surface font-medium">Live · 4 Devices</span><span class="font-body-sm text-body-sm text-on-surface-variant">(2 Local HIP, 2 RPC)</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="material-symbols-outlined text-[14px] text-secondary">network_ping</span><span class="font-label-code text-label-code text-secondary font-medium">0.4ms LAN</span></div><div class="h-3 w-px bg-outline-variant/40"></div><div class="flex items-center gap-1"><span class="font-label-code text-label-code text-on-surface-variant">Throughput:</span><span class="font-label-mono text-label-mono text-primary font-semibold">142.8 t/s</span></div></div><div class="flex items-center gap-space-sm shrink-0"><a class="hidden sm:inline-flex items-center gap-1.5 px-space-md py-1.5 rounded bg-surface-container hover:bg-surface-container-high text-on-surface font-body-sm text-body-sm transition-colors border border-outline-variant/40" href="#"><span class="material-symbols-outlined text-[16px] text-primary">api</span><span>API Docs</span></a><div class="hidden md:flex items-center gap-1 px-space-sm py-1 rounded bg-surface-container-low border border-outline-variant/30"><span class="material-symbols-outlined text-[16px] text-secondary">dns</span><span class="font-label-code text-label-code text-on-surface-variant">:11434, :8080</span><span class="material-symbols-outlined text-[16px] text-on-surface-variant">expand_more</span></div><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Cluster Settings"><span class="material-symbols-outlined text-[20px]">tune</span></button><button class="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors" title="Lock UI"><span class="material-symbols-outlined text-[20px]">lock</span></button><div class="h-4 w-px bg-outline-variant/40 mx-0.5"></div><div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center"><span class="material-symbols-outlined text-on-primary text-[18px]">person</span></div></div></div></header><main class="w-full pt-16 bg-surface min-h-[calc(100vh-4rem)]"><div class="flex flex-col w-full px-margin py-space-md gap-space-md">
+<!-- Sub-header & Status Strip -->
+<div class="flex flex-wrap items-center justify-between gap-space-md bg-surface-container-low px-space-lg py-space-sm rounded-lg shadow-sm">
+<div class="flex flex-wrap items-center gap-space-md">
+<div class="flex items-center gap-space-xs">
+<span class="relative flex h-2 w-2">
+<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
+<span class="relative inline-flex rounded-full h-2 w-2 bg-primary"></span>
+</span>
+<span class="font-label-section text-label-section uppercase tracking-wider text-on-surface">Engine Pipe: Active</span>
+</div>
+<div class="h-3 w-px bg-surface-variant"></div>
+<div class="flex items-center gap-1 font-label-code text-label-code text-on-surface-variant">
+<span class="material-symbols-outlined text-[15px] text-secondary">lan</span>
+<span>ws://127.0.0.1:11434/api/v1/cluster/traces</span>
+</div>
+<div class="h-3 w-px bg-surface-variant hidden md:block"></div>
+<span class="hidden md:inline-flex items-center gap-1 font-label-mono text-label-mono text-primary bg-surface-container px-space-xs py-0.5 rounded">
+        ROCm 6.1.2 · 4 Devices Synced
+      </span>
+</div>
+<!-- Buffer Counters & Quick Actions -->
+<div class="flex items-center gap-space-sm">
+<span class="font-label-mono text-label-mono text-on-surface-variant bg-surface-container-high px-space-sm py-1 rounded" id="line-counter">
+        342 of 342 lines
+      </span>
+<button class="flex items-center gap-1 px-space-sm py-1 rounded bg-surface-container hover:bg-surface-container-high text-on-surface font-label-code text-label-code transition-colors" id="toggle-stream-btn">
+<span class="material-symbols-outlined text-[15px] text-primary" id="stream-icon">pause</span>
+<span id="stream-text">Pause</span>
+</button>
+<button class="flex items-center gap-1 px-space-sm py-1 rounded bg-surface-container hover:bg-surface-container-high text-on-surface font-label-code text-label-code transition-colors" id="clear-buffer-btn">
+<span class="material-symbols-outlined text-[15px] text-on-surface-variant">backspace</span>
+<span>Clear</span>
+</button>
+<button class="flex items-center gap-1 px-space-sm py-1 rounded bg-primary text-on-primary font-label-code text-label-code transition-opacity hover:opacity-90" id="export-log-btn">
+<span class="material-symbols-outlined text-[15px]">download</span>
+<span>Dump .ndjson</span>
+</button>
+</div>
+</div>
+<!-- Primary Control Toolbar -->
+<div class="flex flex-col gap-space-sm bg-surface-container-low p-space-md rounded-lg shadow-sm">
+<div class="flex flex-wrap items-center gap-space-sm">
+<!-- Log Level Filter -->
+<div class="flex items-center gap-space-xs bg-surface-container px-space-sm py-1 rounded">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase">Level</span>
+<select class="bg-transparent font-label-code text-label-code text-primary focus:outline-none cursor-pointer pr-1" id="level-select">
+<option class="bg-surface-container-high text-on-surface" value="ALL">ALL (Verbose)</option>
+<option class="bg-surface-container-high text-on-surface" selected="" value="INFO">INFO &amp; Above</option>
+<option class="bg-surface-container-high text-on-surface" value="WARN">WARN &amp; ERROR</option>
+<option class="bg-surface-container-high text-error" value="ERROR">ERROR Only</option>
+<option class="bg-surface-container-high text-secondary" value="DEBUG">DEBUG / TRACE</option>
+</select>
+</div>
+<!-- Regex Filter Input Search -->
+<div class="flex-1 min-w-[240px] flex items-center gap-space-xs bg-surface-container px-space-md py-1.5 rounded">
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant">filter_alt</span>
+<input class="w-full bg-transparent font-label-code text-label-code text-on-surface placeholder:text-outline focus:outline-none" id="filter-input" placeholder="Filter text or regex (e.g. tower_http, spec_draft, rpc[...])" type="text"/>
+<span class="font-label-mono text-[10px] text-on-surface-variant bg-surface-container-high px-1.5 py-0.5 rounded">ESC to reset</span>
+</div>
+<!-- Auto Scroll Follow Checkbox -->
+<label class="flex items-center gap-space-xs cursor-pointer select-none bg-surface-container px-space-md py-1.5 rounded">
+<input checked="" class="accent-primary rounded-none cursor-pointer h-3.5 w-3.5" id="autoscroll-chk" type="checkbox"/>
+<span class="font-label-code text-label-code text-on-surface">Follow Output</span>
+</label>
+<!-- Formatting Toggle -->
+<button class="flex items-center gap-1 bg-surface-container px-space-sm py-1.5 rounded text-on-surface-variant hover:text-on-surface transition-colors font-label-code text-label-code" id="toggle-wrap-btn" title="Wrap Long Lines">
+<span class="material-symbols-outlined text-[16px]">wrap_text</span>
+<span class="hidden sm:inline">Soft Wrap</span>
+</button>
+</div>
+<!-- Subsystem Quick Filter Chips -->
+<div class="flex flex-wrap items-center gap-space-xs pt-space-xs">
+<span class="font-label-section text-label-section text-on-surface-variant uppercase pr-1">Subsystem:</span>
+<button class="subsystem-pill active px-2.5 py-0.5 rounded font-label-code text-label-code bg-surface-container-high text-primary hover:bg-surface-bright transition-colors" data-subsystem="ALL">All Subsystems</button>
+<button class="subsystem-pill px-2.5 py-0.5 rounded font-label-code text-label-code bg-surface-container text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" data-subsystem="tower_http">HTTP Tower (:11434)</button>
+<button class="subsystem-pill px-2.5 py-0.5 rounded font-label-code text-label-code bg-surface-container text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" data-subsystem="allpaca_core">Engine Core (ROCm/HIP)</button>
+<button class="subsystem-pill px-2.5 py-0.5 rounded font-label-code text-label-code bg-surface-container text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" data-subsystem="rpc_worker">RPC Cluster LAN</button>
+<button class="subsystem-pill px-2.5 py-0.5 rounded font-label-code text-label-code bg-surface-container text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" data-subsystem="spec_draft">Speculative MTP</button>
+<button class="subsystem-pill px-2.5 py-0.5 rounded font-label-code text-label-code bg-surface-container text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors" data-subsystem="allpaca_server">API Token Stream</button>
+</div>
+</div>
+<!-- Terminal Window / Trace Viewer Container -->
+<div class="relative w-full rounded-lg bg-surface-container-lowest shadow-xl flex flex-col overflow-hidden">
+<!-- Window Bar -->
+<div class="flex items-center justify-between px-space-md py-space-xs bg-surface-container-low select-none">
+<div class="flex items-center gap-space-xs">
+<span class="w-2.5 h-2.5 rounded-full bg-error inline-block"></span>
+<span class="w-2.5 h-2.5 rounded-full bg-secondary inline-block"></span>
+<span class="w-2.5 h-2.5 rounded-full bg-primary inline-block"></span>
+<span class="font-label-code text-label-code text-on-surface-variant ml-space-sm font-semibold">stdout/stderr [allpaca-clusterd.service]</span>
+</div>
+<div class="flex items-center gap-space-md font-label-code text-label-code text-on-surface-variant">
+<span>Encoding: UTF-8</span>
+<span class="hidden sm:inline">Stream Rate: 18 lines/sec</span>
+</div>
+</div>
+<!-- Scrollable Monospace Logs Area -->
+<div class="relative font-label-code text-label-code leading-relaxed h-[620px] overflow-y-auto overflow-x-hidden p-space-sm space-y-0.5 select-text" id="terminal-body">
+<!-- Line Item 1 -->
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="ERROR" data-subsystem="tower_http">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">301</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:04:49.980</span>
+<span class="text-error font-semibold shrink-0 select-none w-12 text-center bg-error/10 rounded px-1">ERROR</span>
+<span class="text-outline shrink-0">tower_http::trace::on_failure</span>
+<span class="text-error/90 flex-1">response failed · status=502 Bad Gateway latency=1.21ms method=POST path=/v1/chat/completions</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<!-- Repeated Error Burst -->
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors bg-error/5" data-level="ERROR" data-subsystem="tower_http">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">302</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:04:51.477</span>
+<span class="text-error font-semibold shrink-0 select-none w-12 text-center bg-error/10 rounded px-1">ERROR</span>
+<span class="text-outline shrink-0">tower_http::trace::on_failure</span>
+<span class="text-error/90 flex-1">response failed · connection reset by remote peer [rpc 192.168.69.2:50052]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="ERROR" data-subsystem="tower_http">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">303</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:04:55.982</span>
+<span class="text-error font-semibold shrink-0 select-none w-12 text-center bg-error/10 rounded px-1">ERROR</span>
+<span class="text-outline shrink-0">tower_http::trace::on_failure</span>
+<span class="text-error/90 flex-1">response failed · model slot busy: wait queue exceeded timeout (5000ms)</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="ERROR" data-subsystem="tower_http">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">304</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:05:01.979</span>
+<span class="text-error font-semibold shrink-0 select-none w-12 text-center bg-error/10 rounded px-1">ERROR</span>
+<span class="text-outline shrink-0">tower_http::trace::on_failure</span>
+<span class="text-error/90 flex-1">response failed · target device pool allocation fault [VRAM 23.8 GiB / 24.0 GiB OOM guarded]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<!-- Transition to INFO / ROCm init -->
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors bg-surface-container-low/40" data-level="INFO" data-subsystem="allpaca_core">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">305</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:05:04.978</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-secondary shrink-0">allpaca_core::engine</span>
+<span class="text-on-surface flex-1">local GPU pool: second device layers uploaded [gfx1100 HIP device #1, 32 layers of 80]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors bg-surface-container-low/40" data-level="INFO" data-subsystem="allpaca_core">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">306</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:05:20.255</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-secondary shrink-0">allpaca_core::engine</span>
+<span class="text-on-surface flex-1">local GPU pool: target device layers uploaded [gfx1100 HIP device #0, 48 layers of 80]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_core">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">307</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:05:29.525</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-secondary shrink-0">allpaca_core::engine</span>
+<span class="text-on-surface flex-1">HIP draft weight upload start: Qwen3.8-0.5B-MTP-F16 allocated onto local device #0 (940 MiB)</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_core">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">308</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:05:35.465</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-secondary shrink-0">allpaca_core::engine</span>
+<span class="text-on-surface flex-1">loaded <span class="text-tertiary font-semibold">Qwen3-VL mmproj</span> vision encoder tensor pool [2.14 GiB pinned host]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors bg-primary/5" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">309</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:05:35.466</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::engine_slot</span>
+<span class="text-primary flex-1 font-semibold">reload: engine ready · KV cache initialized for context_size=32768 tokens (FlashAttention-2)</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">310</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:22:45.550</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">chat completion model=<span class="text-secondary font-medium">Qwen3.8-27B</span> stream=true id=chatcmpl-9f82d1 prompt_tok=512</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<!-- Streaming Traces -->
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">311</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:23:10.081</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">chat stream done: stop · gen_tokens=623 prompt_eval=31.2ms [tok_rate=<span class="text-primary font-bold">142.8 t/s</span>]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<!-- Speculative Draft Traces -->
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="DEBUG" data-subsystem="spec_draft">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">312</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:24:02.148</span>
+<span class="text-secondary font-semibold shrink-0 select-none w-12 text-center bg-secondary/10 rounded px-1">TRACE</span>
+<span class="text-secondary-fixed shrink-0">spec_draft::mtp</span>
+<span class="text-on-surface-variant flex-1">spec_draft MTP gamma=3 · 3/3 tokens verified · Acceptance: 100.0% · Speedup 2.14x</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<!-- Remote RPC Heartbeat -->
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="DEBUG" data-subsystem="rpc_worker">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">313</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:25:01.002</span>
+<span class="text-secondary font-semibold shrink-0 select-none w-12 text-center bg-secondary/10 rounded px-1">DEBUG</span>
+<span class="text-secondary-fixed-dim shrink-0">rpc_worker</span>
+<span class="text-on-surface-variant flex-1">node[192.168.69.2:50052#0] heartbeat OK · ping=0.18ms · VRAM sync stable (32.1 GiB reserved)</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="DEBUG" data-subsystem="rpc_worker">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">314</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:25:05.114</span>
+<span class="text-secondary font-semibold shrink-0 select-none w-12 text-center bg-secondary/10 rounded px-1">DEBUG</span>
+<span class="text-secondary-fixed-dim shrink-0">rpc_worker</span>
+<span class="text-on-surface-variant flex-1">node[192.168.69.3:50052#1] heartbeat OK · ping=0.34ms · VRAM sync stable (16.0 GiB reserved)</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<!-- Additional Streaming Logs -->
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">315</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:28:25.789</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">chat completion model=Qwen3.8-27B stream=false prompt_tok=102 · gen_tokens=42</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">316</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:28:43.782</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">chat completion model=Qwen3.8-27B stream=false [eval_duration=288ms]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">317</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:29:04.009</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">chat completion model=Qwen3.8-27B stream=false [eval_duration=312ms]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">318</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:29:22.904</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">chat completion model=Qwen3.8-27B stream=false [eval_duration=294ms]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">319</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:29:43.205</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">chat completion model=Qwen3.8-27B stream=false [eval_duration=305ms]</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+<div class="log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors" data-level="INFO" data-subsystem="allpaca_server">
+<span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">320</span>
+<span class="text-on-surface-variant/70 shrink-0 select-none">2026-10-03 11:30:01.112</span>
+<span class="text-primary font-semibold shrink-0 select-none w-12 text-center bg-primary/10 rounded px-1">INFO</span>
+<span class="text-primary-fixed-dim shrink-0">allpaca_server::api</span>
+<span class="text-on-surface flex-1">batch scheduler cycle: 0 queued requests · all device pools idle</span>
+<button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+</div>
+</div>
+</div>
+<!-- Bottom Cluster Telemetry & Execution Strip -->
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-space-md">
+<!-- Card 1: RPC Node Health -->
+<div class="flex items-center justify-between p-space-md bg-surface-container-low rounded-lg shadow-sm">
+<div class="flex flex-col">
+<span class="font-label-section text-label-section uppercase text-on-surface-variant">Cluster Socket Health</span>
+<div class="flex items-baseline gap-space-xs mt-0.5">
+<span class="font-metric-display text-metric-display text-primary">4 / 4</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">Nodes Live</span>
+</div>
+<span class="font-label-code text-label-code text-on-surface-variant mt-1">Local HIP: 2 · Remote RPC: 2</span>
+</div>
+<div class="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
+<span class="material-symbols-outlined text-[20px] text-primary">hub</span>
+</div>
+</div>
+<!-- Card 2: Distributed VRAM Allocation -->
+<div class="flex flex-col justify-between p-space-md bg-surface-container-low rounded-lg shadow-sm">
+<div class="flex items-center justify-between">
+<span class="font-label-section text-label-section uppercase text-on-surface-variant">VRAM Allocation</span>
+<span class="font-label-mono text-label-mono text-secondary font-semibold">71.0%</span>
+</div>
+<div class="flex items-baseline gap-space-xs my-1">
+<span class="font-metric-display text-metric-display text-on-surface">68.2</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">/ 96.0 GiB</span>
+</div>
+<!-- Segmented VRAM Indicator -->
+<div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden flex">
+<div class="h-full bg-tertiary" style="width: 48%" title="Weights: 46.1 GiB"></div>
+<div class="h-full bg-primary" style="width: 23%" title="KV Cache: 22.1 GiB"></div>
+</div>
+</div>
+<!-- Card 3: Inference Throughput Sparkline -->
+<div class="flex items-center justify-between p-space-md bg-surface-container-low rounded-lg shadow-sm">
+<div class="flex flex-col">
+<span class="font-label-section text-label-section uppercase text-on-surface-variant">Throughput Rate</span>
+<div class="flex items-baseline gap-space-xs mt-0.5">
+<span class="font-metric-display text-metric-display text-primary font-bold">142.8</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">tok/s</span>
+</div>
+<span class="font-label-code text-label-code text-primary font-medium mt-1">Speculative MTP +2.14x</span>
+</div>
+<div class="w-20 h-10 flex items-end">
+<!-- SVG Sparkline -->
+<svg class="w-full h-8 overflow-visible" viewbox="0 0 100 40">
+<path class="text-primary" d="M0,35 Q15,30 30,32 T60,18 T80,10 L100,5" fill="none" stroke="currentColor" stroke-width="2.5"></path>
+<circle class="fill-primary" cx="100" cy="5" r="3"></circle>
+</svg>
+</div>
+</div>
+<!-- Card 4: Error Rate & Tower Health -->
+<div class="flex items-center justify-between p-space-md bg-surface-container-low rounded-lg shadow-sm">
+<div class="flex flex-col">
+<span class="font-label-section text-label-section uppercase text-on-surface-variant">Tower HTTP Status</span>
+<div class="flex items-baseline gap-space-xs mt-0.5">
+<span class="font-metric-display text-metric-display text-on-surface">200 OK</span>
+<span class="font-metric-unit text-metric-unit text-on-surface-variant">(99.4%)</span>
+</div>
+<span class="font-label-code text-label-code text-error mt-1">11 failure traces recorded</span>
+</div>
+<div class="w-10 h-10 rounded-full bg-surface-container flex items-center justify-center">
+<span class="material-symbols-outlined text-[20px] text-secondary">alt_route</span>
+</div>
+</div>
+</div>
+</div>
+<script>
+  (function() {
+    const terminal = document.getElementById('terminal-body');
+    const filterInput = document.getElementById('filter-input');
+    const levelSelect = document.getElementById('level-select');
+    const autoScrollChk = document.getElementById('autoscroll-chk');
+    const toggleStreamBtn = document.getElementById('toggle-stream-btn');
+    const streamIcon = document.getElementById('stream-icon');
+    const streamText = document.getElementById('stream-text');
+    const clearBufferBtn = document.getElementById('clear-buffer-btn');
+    const exportLogBtn = document.getElementById('export-log-btn');
+    const counterBadge = document.getElementById('line-counter');
+    const wrapBtn = document.getElementById('toggle-wrap-btn');
+    const subsystemPills = document.querySelectorAll('.subsystem-pill');
+
+    let isStreaming = true;
+    let streamTimer = null;
+    let lineIdx = 321;
+    let selectedSubsystem = 'ALL';
+
+    function scrollToBottom() {
+      if (autoScrollChk.checked) {
+        terminal.scrollTop = terminal.scrollHeight;
+      }
+    }
+
+    function updateLineCounter() {
+      const allLines = terminal.querySelectorAll('.log-line');
+      let visibleCount = 0;
+      allLines.forEach(l => {
+        if (l.style.display !== 'none') visibleCount++;
+      });
+      counterBadge.innerText = visibleCount + ' of ' + allLines.length + ' lines';
+    }
+
+    function filterLogs() {
+      const q = filterInput.value.toLowerCase().trim();
+      const level = levelSelect.value;
+      const lines = terminal.querySelectorAll('.log-line');
+
+      lines.forEach(line => {
+        const text = line.innerText.toLowerCase();
+        const lLevel = line.getAttribute('data-level');
+        const lSub = line.getAttribute('data-subsystem');
+
+        let matchText = !q || text.includes(q);
+        let matchSub = (selectedSubsystem === 'ALL') || (lSub === selectedSubsystem);
+        let matchLevel = true;
+
+        if (level === 'ERROR') {
+          matchLevel = (lLevel === 'ERROR');
+        } else if (level === 'WARN') {
+          matchLevel = (lLevel === 'WARN' || lLevel === 'ERROR');
+        } else if (level === 'INFO') {
+          matchLevel = (lLevel === 'INFO' || lLevel === 'WARN' || lLevel === 'ERROR');
+        } else if (level === 'DEBUG') {
+          matchLevel = true;
+        }
+
+        if (matchText && matchSub && matchLevel) {
+          line.style.display = 'flex';
+        } else {
+          line.style.display = 'none';
+        }
+      });
+      updateLineCounter();
+    }
+
+    // Filter Listeners
+    filterInput.addEventListener('input', filterLogs);
+    levelSelect.addEventListener('change', filterLogs);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && document.activeElement === filterInput) {
+        filterInput.value = '';
+        filterLogs();
+      }
+    });
+
+    // Subsystem Pills
+    subsystemPills.forEach(pill => {
+      pill.addEventListener('click', () => {
+        subsystemPills.forEach(p => {
+          p.classList.remove('bg-surface-container-high', 'text-primary');
+          p.classList.add('bg-surface-container', 'text-on-surface-variant');
+        });
+        pill.classList.remove('bg-surface-container', 'text-on-surface-variant');
+        pill.classList.add('bg-surface-container-high', 'text-primary');
+        selectedSubsystem = pill.getAttribute('data-subsystem');
+        filterLogs();
+      });
+    });
+
+    // Soft Wrap Toggle
+    let isWrapped = false;
+    wrapBtn.addEventListener('click', () => {
+      isWrapped = !isWrapped;
+      if (isWrapped) {
+        terminal.classList.remove('overflow-x-hidden');
+        terminal.classList.add('whitespace-normal');
+        wrapBtn.classList.add('text-primary');
+      } else {
+        terminal.classList.add('overflow-x-hidden');
+        terminal.classList.remove('whitespace-normal');
+        wrapBtn.classList.remove('text-primary');
+      }
+    });
+
+    // Pause/Resume Stream
+    toggleStreamBtn.addEventListener('click', () => {
+      isStreaming = !isStreaming;
+      if (isStreaming) {
+        streamIcon.innerText = 'pause';
+        streamText.innerText = 'Pause';
+        toggleStreamBtn.classList.remove('bg-primary', 'text-on-primary');
+        toggleStreamBtn.classList.add('bg-surface-container', 'text-on-surface');
+      } else {
+        streamIcon.innerText = 'play_arrow';
+        streamText.innerText = 'Resume';
+        toggleStreamBtn.classList.remove('bg-surface-container', 'text-on-surface');
+        toggleStreamBtn.classList.add('bg-primary', 'text-on-primary');
+      }
+    });
+
+    // Clear Buffer
+    clearBufferBtn.addEventListener('click', () => {
+      terminal.innerHTML = '';
+      updateLineCounter();
+    });
+
+    // Export Log
+    exportLogBtn.addEventListener('click', () => {
+      const lines = Array.from(terminal.querySelectorAll('.log-line'))
+        .filter(l => l.style.display !== 'none')
+        .map(l => l.innerText);
+      const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'allpaca_cluster_logs_' + Date.now() + '.ndjson';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    // Simulated Real-Time Log Generator
+    const liveMessages = [
+      { level: 'INFO', sub: 'allpaca_server', text: 'chat completion model=Qwen3.8-27B stream=true [12 prompt tok -> 418 gen tok | 143.2 tok/s]' },
+      { level: 'DEBUG', sub: 'spec_draft', text: 'spec_draft MTP gamma=3 · accepted 3/3 tokens · Latency per step: 6.8ms' },
+      { level: 'DEBUG', sub: 'rpc_worker', text: 'rpc_worker[192.168.69.2:50052#0] ring buffer flush OK · 0 dropped packets' },
+      { level: 'INFO', sub: 'allpaca_core', text: 'HIP device #0 stream synced · KV head pointers updated' },
+      { level: 'DEBUG', sub: 'spec_draft', text: 'spec_draft MTP speculative branch hit rate: 91.4%' }
+    ];
+
+    setInterval(() => {
+      if (!isStreaming) return;
+
+      const item = liveMessages[Math.floor(Math.random() * liveMessages.length)];
+      const now = new Date().toISOString().replace('T', ' ').substring(0, 23);
+
+      const lineDiv = document.createElement('div');
+      lineDiv.className = 'log-line group flex items-start gap-space-sm px-2 py-0.5 rounded hover:bg-surface-container-high/60 transition-colors';
+      lineDiv.setAttribute('data-level', item.level);
+      lineDiv.setAttribute('data-subsystem', item.sub);
+
+      let levelClass = 'text-primary bg-primary/10';
+      if (item.level === 'DEBUG') levelClass = 'text-secondary bg-secondary/10';
+      if (item.level === 'ERROR') levelClass = 'text-error bg-error/10';
+
+      lineDiv.innerHTML = `
+        <span class="text-on-surface-variant/40 select-none w-10 text-right shrink-0">${lineIdx++}</span>
+        <span class="text-on-surface-variant/70 shrink-0 select-none">${now}</span>
+        <span class="${levelClass} font-semibold shrink-0 select-none w-12 text-center rounded px-1">${item.level}</span>
+        <span class="text-secondary shrink-0">${item.sub}</span>
+        <span class="text-on-surface flex-1">${item.text}</span>
+        <button class="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-primary transition-opacity text-[11px] px-1 bg-surface-container rounded select-none" onclick="navigator.clipboard.writeText(this.parentElement.innerText)">copy</button>
+      `;
+
+      terminal.appendChild(lineDiv);
+
+      // Keep maximum buffer size under 500 lines for performance
+      const totalLines = terminal.querySelectorAll('.log-line');
+      if (totalLines.length > 500) {
+        totalLines[0].remove();
+      }
+
+      filterLogs();
+      scrollToBottom();
+    }, 2800);
+
+    scrollToBottom();
+    updateLineCounter();
+  })();
+</script></main><footer class="w-full bg-surface-container-lowest border-t border-outline-variant/20 py-space-lg"><div class="w-full px-margin flex flex-col sm:flex-row items-center justify-between gap-space-sm font-label-code text-label-code text-on-surface-variant"><div>Allpaca Distributed Engine · Node <span class="text-primary">master-alpha</span> · ROCm 6.1 / Vulkan RPC</div><div>Memory: <span class="text-secondary">68.2 GiB / 96.0 GiB</span> · 4 Nodes Synced</div></div></footer></body></html>

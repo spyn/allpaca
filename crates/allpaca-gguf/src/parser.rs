@@ -210,10 +210,18 @@ pub enum GgmlType {
     TQ2_0 = 35,
     /// ggml MXFP4 (E8M0 + nibbles, ggml_type_id=39).
     MXFP4 = 39,
+    /// One sign bit per weight, half scale per 128 (ggml_type_id=41).
+    Q1_0 = 41,
+    /// Two bits per weight on -1, 0, +1, +2 scales, half scale per 64
+    /// (ggml_type_id=42).
+    Q2_0 = 42,
     /// AMD ROCmFP4 dual-scale (ggml_type_id=100).
     RocmFp4 = 100,
     /// AMD ROCmFP4 FAST single-scale, 17-byte blocks (ggml_type_id=101).
     RocmFp4Fast = 101,
+    /// MoESQ paired-4:8 sparse FP4, 12-byte blocks of 32 weights. Allpaca's
+    /// own id: no llama.cpp build reads it.
+    P48Fp4 = 200,
     Other = 255,
 }
 
@@ -269,8 +277,11 @@ pub fn dequant_packed(
         GgmlType::TQ1_0 => allpaca_cpu::dequant_tq1_0(bytes, n, out),
         GgmlType::TQ2_0 => allpaca_cpu::dequant_tq2_0(bytes, n, out),
         GgmlType::MXFP4 => allpaca_cpu::dequant_mxfp4(bytes, n, out),
+        GgmlType::Q1_0 => allpaca_cpu::dequant_q1_0(bytes, n, out),
+        GgmlType::Q2_0 => allpaca_cpu::dequant_q2_0(bytes, n, out),
         GgmlType::RocmFp4 => allpaca_cpu::dequant_rocmfp4(bytes, n, out),
         GgmlType::RocmFp4Fast => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out),
+        GgmlType::P48Fp4 => allpaca_cpu::dequant_p48fp4(bytes, n, out),
         GgmlType::I32 | GgmlType::Other => Err(AllpacaError::Fatal(FatalError::ModelLoad(
             format!("dequant {ty:?} unsupported"),
         ))),
@@ -300,8 +311,11 @@ impl GgmlType {
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
             39 => Self::MXFP4,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
             100 => Self::RocmFp4,
             101 => Self::RocmFp4Fast,
+            200 => Self::P48Fp4,
             _ => Self::Other,
         }
     }
@@ -384,6 +398,15 @@ impl TensorInfo {
             GgmlType::RocmFp4Fast => n
                 .div_ceil(allpaca_cpu::ROCMFP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::ROCMFP4_FAST_BLOCK_BYTES),
+            GgmlType::Q1_0 => n
+                .div_ceil(allpaca_cpu::Q1_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q1_0_BLOCK_BYTES),
+            GgmlType::Q2_0 => n
+                .div_ceil(allpaca_cpu::Q2_0_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::Q2_0_BLOCK_BYTES),
+            GgmlType::P48Fp4 => n
+                .div_ceil(allpaca_cpu::P48FP4_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::P48FP4_BLOCK_BYTES),
             _ => n.saturating_mul(4),
         }
     }
@@ -425,6 +448,8 @@ pub struct GgufCompatReport {
 struct GgufShard {
     mmap: Mmap,
     tensor_data_offset: usize,
+    /// The file behind `mmap`, when the GGUF was opened from a path.
+    path: Option<std::path::PathBuf>,
 }
 
 pub struct GgufFile {
@@ -452,7 +477,11 @@ impl GgufFile {
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
             AllpacaError::Fatal(FatalError::CorruptGguf(format!("mmap failed: {e}")))
         })?;
-        Self::parse(mmap)
+        let mut gguf = Self::parse(mmap)?;
+        if let Some(shard) = gguf.shards.first_mut() {
+            shard.path = Some(path.to_path_buf());
+        }
+        Ok(gguf)
     }
 
     fn open_dir(dir: &Path) -> Result<Self, AllpacaError> {
@@ -603,6 +632,7 @@ impl GgufFile {
             shards: vec![GgufShard {
                 mmap,
                 tensor_data_offset,
+                path: None,
             }],
             version,
             metadata,
@@ -714,6 +744,9 @@ impl GgufFile {
             GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
             GgmlType::RocmFp4Fast as u32,
+            GgmlType::P48Fp4 as u32,
+            GgmlType::Q1_0 as u32,
+            GgmlType::Q2_0 as u32,
         ];
         let unsupported_types: Vec<u32> = ggml_type_ids
             .iter()
@@ -737,7 +770,10 @@ impl GgufFile {
                 | "qwen3"
                 | "qwen3moe"
                 | "qwen35"
+                | "qwen35moe"
+                | "bailingmoe2"
                 | "qwen3next"
+                | "qwen4exp"
                 | "phi3"
                 | "minicpm"
                 | "nemotron_h_moe"
@@ -1071,6 +1107,28 @@ impl GgufFile {
                 allpaca_cpu::dequant_rocmfp4_fast(&mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
+            ty @ (GgmlType::Q1_0 | GgmlType::Q2_0) => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} {ty:?} out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                dequant_packed(ty, &mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::P48Fp4 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} paired-4:8 FP4 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_p48fp4(&mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
                 "tensor {name} is {other:?} (unsupported GGUF quant)"
             )))),
@@ -1097,6 +1155,19 @@ impl GgufFile {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
         })?;
         self.tensor_bytes_of(info)
+    }
+
+    /// The file of each shard, in shard order; `None` unless every shard
+    /// was opened from a path.
+    pub fn shard_paths(&self) -> Option<Vec<std::path::PathBuf>> {
+        self.shards.iter().map(|s| s.path.clone()).collect()
+    }
+
+    /// The shard index and the byte offset in that shard's file where
+    /// `info`'s data starts.
+    pub fn tensor_file_offset(&self, info: &TensorInfo) -> Option<(usize, u64)> {
+        let shard = self.shards.get(info.shard)?;
+        Some((info.shard, shard.tensor_data_offset as u64 + info.offset))
     }
 
     pub fn tensor_bytes_of(&self, info: &TensorInfo) -> Result<&[u8], AllpacaError> {
@@ -1259,26 +1330,27 @@ fn collect_split_shards(dir: &Path, nested: u32, found: &mut Vec<std::path::Path
 }
 
 /// DSpark sidecar next to a target GGUF, at the snapshot root, or under `dspark/`.
+///
+/// The snapshot root is the directory above the target's. Only its own files
+/// and its `dspark/` folder are searched there: for a model that sits one
+/// level below a shared models directory, that directory's other folders hold
+/// other models, and their sidecars must not attach to this one.
 pub fn discover_dspark_sidecar(target: &Path) -> Option<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if target.is_file() {
-        if let Some(dir) = target.parent() {
-            dirs.push(dir.to_path_buf());
-            if let Some(up) = dir.parent() {
-                dirs.push(up.to_path_buf());
-            }
-        }
+    let own = if target.is_file() {
+        target.parent()?
     } else if target.is_dir() {
-        dirs.push(target.to_path_buf());
-        if let Some(up) = target.parent() {
-            dirs.push(up.to_path_buf());
-        }
-    }
+        target
+    } else {
+        return None;
+    };
     let mut hits = Vec::new();
-    for dir in dirs {
-        collect_dspark_files(&dir, 1, &mut hits);
+    collect_dspark_files(own, 1, &mut hits);
+    if let Some(root) = own.parent() {
+        collect_dspark_files(root, 0, &mut hits);
+        collect_dspark_files(&root.join("dspark"), 0, &mut hits);
     }
     hits.sort_by(|a, b| dspark_hit_rank(a).cmp(&dspark_hit_rank(b)));
+    hits.dedup();
     hits.into_iter().next()
 }
 
@@ -1885,6 +1957,71 @@ mod tests {
         assert_eq!(loaded.len(), 256);
         assert!(loaded[..32].iter().all(|v| (v - 1.0).abs() < 1e-4));
         assert!(loaded[32..].iter().all(|v| v.abs() < 1e-5));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ggml types 41 and 42 (Q1_0, Q2_0): 18-byte blocks of 128 and 64 weights.
+    #[test]
+    fn q1_0_and_q2_0_load_and_dequant_to_f32() {
+        let values: Vec<f32> = (0..256).map(|i| ((i * 37) % 64) as f32 * 0.125 - 4.0).collect();
+        for (id, ty, payload) in [
+            (41u32, GgmlType::Q1_0, allpaca_cpu::quantize_q1_0(&values)),
+            (42, GgmlType::Q2_0, allpaca_cpu::quantize_q2_0(&values)),
+        ] {
+            let path = std::env::temp_dir().join(format!("allpaca_gguf_lowbit_{id}.gguf"));
+            write_typed_gguf(&path, id, &payload, 256);
+            let file = GgufFile::open(&path).unwrap();
+            let info = file.tensor("quant.weight").expect("header lists tensor");
+            assert_eq!(info.ggml_type, ty);
+            assert_eq!(info.nbytes(), payload.len());
+            assert_eq!(payload.len(), if id == 41 { 2 * 18 } else { 4 * 18 });
+            assert!(
+                !file
+                    .compat_report()
+                    .reject_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+                "type {id} must not be rejected"
+            );
+            let loaded = file.tensor_f32("quant.weight").unwrap();
+            let mut want = vec![0.0f32; 256];
+            dequant_packed(ty, &payload, 256, &mut want).unwrap();
+            assert_eq!(loaded, want);
+            assert!(loaded.iter().any(|v| *v != 0.0));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Type 200 (MoESQ paired-4:8 FP4): 12 bytes per 32 weights, half of
+    /// them zero.
+    #[test]
+    fn p48fp4_type_200_loads_and_dequants_to_f32() {
+        let path = std::env::temp_dir().join("allpaca_gguf_p48fp4.gguf");
+        let values: Vec<f32> = (0..64).map(|i| ((i * 37) % 64) as f32 * 0.125 - 4.0).collect();
+        let payload = allpaca_cpu::quantize_p48fp4(&values);
+        assert_eq!(payload.len(), 2 * allpaca_cpu::P48FP4_BLOCK_BYTES);
+        write_typed_gguf(&path, 200, &payload, 64);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("quant.weight").expect("header lists tensor");
+        assert_eq!(info.ggml_type, GgmlType::P48Fp4);
+        assert_eq!(info.nbytes(), 2 * allpaca_cpu::P48FP4_BLOCK_BYTES);
+        assert_eq!(file.tensor_bytes("quant.weight").unwrap(), &payload[..]);
+        let report = file.compat_report();
+        assert!(
+            !report
+                .reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+            "type 200 must not be rejected: {:?}",
+            report.reject_reason
+        );
+        let loaded = file.tensor_f32("quant.weight").unwrap();
+        let mut want = vec![0.0f32; 64];
+        allpaca_cpu::dequant_p48fp4(&payload, 64, &mut want).unwrap();
+        assert_eq!(loaded, want);
+        // Half the weights of every 8 are zero, and not all of them.
+        assert!(loaded.chunks(8).all(|c| c.iter().filter(|v| **v == 0.0).count() >= 4));
+        assert!(loaded.iter().any(|v| *v != 0.0));
         let _ = std::fs::remove_file(path);
     }
 
@@ -2553,6 +2690,21 @@ mod tests {
         assert!(!is_dspark_filename(
             "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf"
         ));
+    }
+
+    #[test]
+    fn dspark_discovery_skips_another_models_sidecar() {
+        let root = std::env::temp_dir().join(format!("allpaca_dspark_other_{}", std::process::id()));
+        let model_dir = root.join("Qwen2.5-Coder-0.5B");
+        let other_dir = root.join("DeepSeek-V4-Flash-0731-GGUF");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let target = model_dir.join("qwen2.5-coder-0.5b-instruct-q8_0.gguf");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::write(other_dir.join("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"), b"x").unwrap();
+        assert_eq!(discover_dspark_sidecar(&target), None);
+        assert_eq!(discover_dspark_sidecar(&model_dir), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

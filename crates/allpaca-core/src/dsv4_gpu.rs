@@ -33,12 +33,27 @@ const HBM_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// (host RAM is 128 GiB; the Unsloth shard is 149 GiB) and turns mmap prefault
 /// into NVMe. 12 GiB ×2 holds the ChatML routed working set (~23 GiB).
 const EXPERT_LRU_MAX_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+/// Routing counts fade by `HEAT_DECAY` every this many routed experts
+/// (about eight tokens of DeepSeek-V4-Flash).
+const HEAT_DECAY_ROUTES: u64 = 2048;
+const HEAT_DECAY: f32 = 0.8;
+/// An expert displaces a resident one only when it has been routed this
+/// much more often: a copy costs several milliseconds, a miss on the CPU
+/// well under one.
+const HEAT_MARGIN: f32 = 2.0;
 const ACT_SLOT_FLOATS: usize = 131072;
 const ACT_SLOTS: usize = 3;
 /// Bounce / mmap-window size. Two in-flight windows × two GPUs must fit
 /// `ulimit -l` (8 MiB here). Registering the whole GGUF mmap still fails;
 /// attach probes one window and uses ping-pong `hipHostRegister` when it works.
 const PIN_CHUNK_TRY: [usize; 2] = [2 * 1024 * 1024, 1024 * 1024];
+/// Bounce buffer sizes, largest first. Where pinned memory is not rationed
+/// by `ulimit -l`, one buffer takes a whole expert (13.4 MB for
+/// DeepSeek-V4-Flash) in a single copy.
+#[cfg(windows)]
+const PIN_BOUNCE_TRY: [usize; 4] = [16 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024];
+#[cfg(not(windows))]
+const PIN_BOUNCE_TRY: [usize; 2] = PIN_CHUNK_TRY;
 const HOST_PAGE: usize = 4096;
 /// Prefault this many host bytes, then decide if the rest is already in RAM.
 const PREFAULT_WARM_PROBE_BYTES: usize = 12 * 1024 * 1024;
@@ -49,6 +64,24 @@ const PREFAULT_WARM_MS: u128 = 8;
 struct DenseEntry {
     offset: usize,
     bytes: usize,
+    /// Staged Q8_0 blocks (36 bytes per 32 values) instead of BF16.
+    q8: bool,
+}
+
+impl DenseEntry {
+    /// Byte offset and length of `n` rows of `k` values starting at element
+    /// `elem_off` (a whole number of rows), when the entry holds them.
+    fn span(&self, n: usize, k: usize, elem_off: usize) -> Option<(usize, usize)> {
+        let (off, len) = if self.q8 {
+            if k % 32 != 0 || elem_off % 32 != 0 {
+                return None;
+            }
+            (elem_off / 32 * allpaca_hip::Q8_STAGED_BLOCK, n * (k / 32) * allpaca_hip::Q8_STAGED_BLOCK)
+        } else {
+            (elem_off * 2, n * k * 2)
+        };
+        (off + len <= self.bytes).then_some((off, len))
+    }
 }
 
 struct ExpertSlot {
@@ -174,7 +207,7 @@ fn try_window_pin_pair() -> PinPair {
 }
 
 fn try_pin_pair() -> Option<PinPair> {
-    for bytes in PIN_CHUNK_TRY {
+    for bytes in PIN_BOUNCE_TRY {
         let a = match host_malloc(bytes) {
             Ok(p) => p,
             Err(_) => continue,
@@ -327,6 +360,21 @@ pub struct Dsv4Gpu {
     warmup_miss: Vec<(usize, usize)>,
     pub used: AtomicBool,
     keep_set: HashSet<(usize, usize)>,
+    /// Decayed routing count per (layer, expert): what earns a cache slot.
+    heat: HashMap<(usize, usize), f32>,
+    heat_routes: u64,
+    /// Cache misses run on the CPU from the mapped file, and an expert
+    /// takes a slot only when it is routed clearly more often than the
+    /// coldest resident one. Off: every miss is copied in (plain LRU).
+    cpu_miss: bool,
+    /// Host RAM tier the CPU experts read through.
+    ram: Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>>,
+    /// Mapped expert slices handed to a GPU copy, released once it landed.
+    mapped_used: Vec<(usize, usize)>,
+    /// RAM-tier experts pinned as the source of a GPU copy.
+    ram_pinned: Vec<(usize, usize)>,
+    /// Reads the next layer's cold experts ahead of use.
+    read_ahead: Option<crate::dsv4_ram::Prefetcher>,
 }
 
 impl Dsv4Gpu {
@@ -335,20 +383,32 @@ impl Dsv4Gpu {
         cfg: &ModelConfig,
         hip: Arc<HipWorkspace>,
         draft: Option<Arc<HipWorkspace>>,
+        host_bytes: u64,
     ) -> Result<Self, AllpacaError> {
         hip.bind()?;
+        // Before the dense weights pass through this process on their way
+        // to the GPU.
+        let ram_free = crate::dsv4_ram::available_ram_bytes();
         let names = dense_bf16_names(cfg);
         let mut parts: Vec<(&str, &[u8])> = Vec::new();
         let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut q8_names: HashSet<String> = HashSet::new();
         for name in &names {
             let Some(info) = file.tensor(name) else {
                 continue;
             };
-            if info.ggml_type != GgmlType::BF16 {
-                continue;
-            }
             let bytes = file.tensor_bytes_of(info)?;
-            owned.push((name.clone(), bytes.to_vec()));
+            match info.ggml_type {
+                GgmlType::BF16 => owned.push((name.clone(), bytes.to_vec())),
+                // `dims` are [k, n]: n rows of k values, whole blocks per row.
+                GgmlType::Q8_0 if info.dims.len() == 2 && info.dims[0] % 32 == 0 => {
+                    let (k, n) = (info.dims[0] as usize, info.dims[1] as usize);
+                    owned.push((name.clone(), allpaca_hip::stage_q8_0_gemv(bytes, n, k)?));
+                    q8_names.insert(name.clone());
+                }
+                _ => continue,
+            }
+            crate::dsv4_ram::release_mapped(bytes);
         }
         for (name, bytes) in &owned {
             parts.push((name.as_str(), bytes.as_slice()));
@@ -358,11 +418,18 @@ impl Dsv4Gpu {
             None
         } else {
             match upload_named(hip.device, &parts) {
-                Ok((blob, map)) => {
+                Ok((blob, mut map)) => {
+                    for (name, ent) in map.iter_mut() {
+                        if q8_names.contains(name) {
+                            ent.q8 = true;
+                            hip.register_q8_dense(blob.byte_ptr_at(ent.offset), ent.bytes);
+                        }
+                    }
                     tracing::info!(
                         bytes = blob.bytes(),
                         n = map.len(),
-                        "DeepSeek-V4 HIP BF16 resident weights"
+                        q8_0 = q8_names.len(),
+                        "DeepSeek-V4 HIP dense resident weights"
                     );
                     dense_map = map;
                     Some(blob)
@@ -462,7 +529,18 @@ impl Dsv4Gpu {
             warmup_miss: Vec::new(),
             used: AtomicBool::new(false),
             keep_set: HashSet::new(),
+            heat: HashMap::new(),
+            heat_routes: 0,
+            cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").map_or(true, |v| v != "0")
+                && cpu_expert_kernel_fits(file, cfg),
+            ram: None,
+            mapped_used: Vec::new(),
+            ram_pinned: Vec::new(),
+            read_ahead: None,
         };
+        if gpu.cpu_miss {
+            gpu.ram = open_expert_ram(file, cfg, gpu.expert_slot, ram_free, host_bytes);
+        }
         if gpu.h2d.is_some() {
             gpu.pin0 = try_expert_pin(file);
             if let Some(pin) = gpu.pin0.as_ref() {
@@ -480,6 +558,110 @@ impl Dsv4Gpu {
         }
         gpu.alloc_expert_pools(cfg)?;
         Ok(gpu)
+    }
+
+    /// Misses are computed on the CPU instead of being copied into the cache.
+    pub(crate) fn cpu_miss(&self) -> bool {
+        self.cpu_miss && self.has_expert_slots()
+    }
+
+    /// The host RAM tier, when the model file allows direct reads.
+    pub(crate) fn expert_ram(&self) -> Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>> {
+        self.ram.clone()
+    }
+
+    /// Start the read-ahead worker when `ALLPACA_DSV4_READAHEAD=1`. Off by
+    /// default: on DeepSeek-V4-Flash about a quarter of its reads were used,
+    /// SSD traffic nearly doubled and throughput did not improve.
+    fn start_read_ahead(&mut self, file: &Arc<GgufFile>, cfg: &ModelConfig) {
+        let Some(ram) = self.ram.clone() else {
+            return;
+        };
+        if !std::env::var("ALLPACA_DSV4_READAHEAD").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let ff = cfg.ff_dim.max(1);
+        let max_slice = mxfp4_matrix_bytes(ff, cfg.dim).max(mxfp4_matrix_bytes(cfg.dim, ff));
+        let spans_cfg = cfg.clone();
+        match crate::dsv4_ram::Prefetcher::start(
+            file.clone(),
+            ram,
+            cfg.dim,
+            cfg.n_experts,
+            cfg.n_active.max(1),
+            max_slice,
+            move |f, layer, expert| expert_mxfp4_spans(f, layer, expert, &spans_cfg),
+        ) {
+            Ok(p) => self.read_ahead = Some(p),
+            Err(e) => tracing::warn!(error = %e, "DeepSeek-V4 expert read-ahead unavailable"),
+        }
+    }
+
+    /// Predict the experts of `next_layer` from `rows`, this layer's expert
+    /// inputs, and read the cold ones ahead.
+    pub(crate) fn read_ahead(&self, next_layer: usize, rows: &[f32]) {
+        let Some(p) = self.read_ahead.as_ref() else {
+            return;
+        };
+        let on_gpu: Vec<usize> = self
+            .slots
+            .iter()
+            .chain(&self.gpu1_slots)
+            .filter_map(|s| s.key)
+            .filter(|k| k.0 == next_layer)
+            .map(|k| k.1)
+            .collect();
+        p.submit(next_layer, rows, on_gpu);
+    }
+
+    /// Count one routing of `(layer, expert)`.
+    pub(crate) fn note_route(&mut self, layer: usize, expert: usize) {
+        *self.heat.entry((layer, expert)).or_insert(0.0) += 1.0;
+        self.heat_routes += 1;
+        if self.heat_routes % HEAT_DECAY_ROUTES == 0 {
+            self.heat.retain(|_, h| {
+                *h *= HEAT_DECAY;
+                *h > 0.05
+            });
+        }
+    }
+
+    /// Whether `(layer, expert)`, which is not resident, takes a cache slot
+    /// now: always while slots are free, else only when it is routed
+    /// clearly more often than the coldest resident expert of each cache,
+    /// which then becomes the next one evicted.
+    pub(crate) fn admits(&mut self, layer: usize, expert: usize) -> bool {
+        if !self.cpu_miss {
+            return true;
+        }
+        if self.slots.iter().chain(&self.gpu1_slots).any(|s| s.key.is_none()) {
+            return true;
+        }
+        let heat = &self.heat;
+        let coldest = |slots: &[ExpertSlot]| -> Option<(usize, f32)> {
+            slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.pinned)
+                .filter_map(|(i, s)| s.key.map(|k| (i, heat.get(&k).copied().unwrap_or(0.0))))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        };
+        let (c0, c1) = (coldest(&self.slots), coldest(&self.gpu1_slots));
+        let floor = match (c0, c1) {
+            (Some(a), Some(b)) => a.1.max(b.1),
+            (Some(a), None) | (None, Some(a)) => a.1,
+            (None, None) => return false,
+        };
+        if heat.get(&(layer, expert)).copied().unwrap_or(0.0) < floor + HEAT_MARGIN {
+            return false;
+        }
+        if let Some((i, _)) = c0 {
+            self.slots[i].used = 0;
+        }
+        if let Some((i, _)) = c1 {
+            self.gpu1_slots[i].used = 0;
+        }
+        true
     }
 
     fn pin_keep(&self, key: (usize, usize)) -> bool {
@@ -509,7 +691,7 @@ impl Dsv4Gpu {
             if full_prefill {
                 self.try_alloc_prefill_layer(dhip.device, cfg);
             }
-            let (free1, _) = device_memory_info(dhip.device).unwrap_or((0, 0));
+            let free1 = device_free_bytes(dhip.device);
             if let Some((blob, n1)) = try_alloc_expert_lru(
                 dhip.device,
                 expert_lru_slots(free1, self.expert_slot),
@@ -548,7 +730,7 @@ impl Dsv4Gpu {
         if full_prefill && self.prefill.is_none() {
             self.try_alloc_prefill_layer(hip.device, cfg);
         }
-        let (free0, _) = device_memory_info(hip.device).unwrap_or((0, 0));
+        let free0 = device_free_bytes(hip.device);
         if let Some((blob, n0)) = try_alloc_expert_lru(
             hip.device,
             expert_lru_slots(free0, self.expert_slot),
@@ -639,18 +821,23 @@ impl Dsv4Gpu {
                 "missing {name} for HIP BF16"
             )))
         })?;
-        if info.ggml_type != GgmlType::BF16 {
+        let resident = self
+            .dense_map
+            .get(name)
+            .and_then(|ent| ent.span(n, k, elem_off).map(|(off, _)| (*ent, off)));
+        // A Q8_0 tensor is served from its staged resident copy only.
+        if info.ggml_type != GgmlType::BF16 && resident.is_none() {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 format!("{name} is not BF16"),
             )));
         }
         let packed_need = n.saturating_mul(k).saturating_mul(2);
-        let byte_off = elem_off.saturating_mul(2);
+        let byte_off = resident.map_or(elem_off.saturating_mul(2), |(_, off)| off);
         let mi = m as i32;
         let ni = n as i32;
         let ki = k as i32;
-        if let Some(ent) = self.dense_map.get(name).copied() {
-            if byte_off.saturating_add(packed_need) <= ent.bytes {
+        if let Some((ent, _)) = resident {
+            {
                 if let Some(blob) = &self.dense {
                     let ptr = blob.byte_ptr_at(ent.offset + byte_off) as *const u16;
                     let da = self.device_a_if_curs(x, m, k);
@@ -665,6 +852,11 @@ impl Dsv4Gpu {
                     return Ok(());
                 }
             }
+        }
+        if info.ggml_type != GgmlType::BF16 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                format!("{name} is not BF16"),
+            )));
         }
         let bytes = file.tensor_bytes_of(info)?;
         let slice = bytes.get(byte_off..byte_off + packed_need).ok_or_else(|| {
@@ -890,6 +1082,28 @@ impl Dsv4Gpu {
 
     pub fn finish_h2d_keep(&mut self) {
         self.h2d_keep.clear();
+        // Copies of this layer have landed: their source pages can go.
+        if !self.h2d_inflight && !self.h2d1_inflight {
+            for (ptr, len) in self.mapped_used.drain(..) {
+                // SAFETY: a slice of the model's mapping, which outlives the engine's GPU state.
+                crate::dsv4_ram::release_mapped(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) });
+            }
+            if !self.ram_pinned.is_empty() {
+                if let Some(ram) = self.ram.as_ref() {
+                    ram.lock().unwrap_or_else(|e| e.into_inner()).release(&self.ram_pinned);
+                }
+                self.ram_pinned.clear();
+            }
+        }
+    }
+
+    /// Cap for the routed experts launched from now on (DeepSeek-V4's
+    /// `swiglu_clamp_exp` of the layer being run; 0 = none).
+    pub fn set_swiglu_limit(&self, limit: f32) {
+        self.hip.set_mxfp4_swiglu_limit(limit);
+        if let Some(draft) = &self.draft {
+            draft.set_mxfp4_swiglu_limit(limit);
+        }
     }
 
     pub fn has_expert_slots(&self) -> bool {
@@ -1083,13 +1297,32 @@ impl Dsv4Gpu {
             }
             let base = victim * self.expert_slot;
             let n_parts = slices.len();
+            // An expert that earned a GPU slot has usually been run on the
+            // CPU, so its bytes are in the RAM tier: copy from there, not
+            // through the mapped file.
+            let cached = self.ram.as_ref().and_then(|ram| {
+                let mut ram = ram.lock().unwrap_or_else(|e| e.into_inner());
+                ram.pin(key).filter(|(_, len)| *len == packed_len)
+            });
+            if cached.is_some() {
+                self.ram_pinned.push(key);
+            }
             let dest = if use_gpu1 {
                 &mut plan.parts1
             } else {
                 &mut plan.parts0
             };
             for (rel, sl) in slices {
-                dest.push((base + rel, sl));
+                let src: &'a [u8] = match cached {
+                    // SAFETY: pinned in the RAM tier until `finish_h2d_keep`,
+                    // which runs after this plan's copies have landed.
+                    Some((ptr, _)) => unsafe { std::slice::from_raw_parts(ptr.add(rel), sl.len()) },
+                    None => {
+                        self.mapped_used.push((sl.as_ptr() as usize, sl.len()));
+                        sl
+                    }
+                };
+                dest.push((base + rel, src));
             }
             if use_gpu1 {
                 plan.groups1.push((expert, n_parts));
@@ -1547,10 +1780,8 @@ impl Dsv4Gpu {
         let packed_need = n.saturating_mul(k).saturating_mul(2);
         let byte_off = elem_off.saturating_mul(2);
         if let Some(ent) = self.dense_map.get(name).copied() {
-            if byte_off.saturating_add(packed_need) <= ent.bytes {
-                if let Some(blob) = &self.dense {
-                    return Ok(blob.byte_ptr_at(ent.offset + byte_off) as *const u16);
-                }
+            if let (Some((off, _)), Some(blob)) = (ent.span(n, k, elem_off), &self.dense) {
+                return Ok(blob.byte_ptr_at(ent.offset + off) as *const u16);
             }
         }
         let info = file.tensor(name).ok_or_else(|| {
@@ -1779,6 +2010,7 @@ impl Dsv4Gpu {
         head_dim: usize,
         start_pos: usize,
         theta: f32,
+        yarn: Option<[f32; 3]>,
         n_rot: usize,
         rope_off: usize,
         metrics: Option<&Metrics>,
@@ -1826,17 +2058,31 @@ impl Dsv4Gpu {
         let t = Instant::now();
         hip.rmsnorm_device_rows(dq, dones, dq, rows as i32, head_dim as i32, eps)?;
         add_ns(metrics, |m| &m.dsv4_norm_ns, t);
-        hip.rope_offset_device_rows(
-            dq,
-            n_tok as i32,
-            n_heads as i32,
-            head_dim as i32,
-            n_rot as i32,
-            rope_off as i32,
-            start_pos as i32,
-            theta,
-            false,
-        )?;
+        match yarn {
+            Some(yarn) => hip.rope_yarn_device_rows(
+                dq,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                yarn,
+                false,
+            )?,
+            None => hip.rope_offset_device_rows(
+                dq,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                false,
+            )?,
+        }
         Ok(dq as *const f32)
     }
 
@@ -1878,6 +2124,7 @@ impl Dsv4Gpu {
         head_dim: usize,
         start_pos: usize,
         theta: f32,
+        yarn: Option<[f32; 3]>,
         n_rot: usize,
         rope_off: usize,
     ) -> Result<*const f32, AllpacaError> {
@@ -1912,17 +2159,31 @@ impl Dsv4Gpu {
             head_dim as i32,
             true,
         )?;
-        self.hip.rope_offset_device_rows(
-            dout,
-            n_tok as i32,
-            n_heads as i32,
-            head_dim as i32,
-            n_rot as i32,
-            rope_off as i32,
-            start_pos as i32,
-            theta,
-            true,
-        )?;
+        match yarn {
+            Some(yarn) => self.hip.rope_yarn_device_rows(
+                dout,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                yarn,
+                true,
+            )?,
+            None => self.hip.rope_offset_device_rows(
+                dout,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                n_rot as i32,
+                rope_off as i32,
+                start_pos as i32,
+                theta,
+                true,
+            )?,
+        }
         self.used.store(true, Ordering::Relaxed);
         Ok(dout as *const f32)
     }
@@ -2395,9 +2656,15 @@ impl Dsv4Gpu {
         Some((gate, up, down))
     }
 
+    /// `packed_need`: the tensor's size as BF16 (2 bytes per value).
     fn dense_entry_ptr(&self, name: &str, packed_need: usize) -> Option<*const u16> {
         let ent = self.dense_map.get(name).copied()?;
-        if packed_need > ent.bytes {
+        let need = if ent.q8 {
+            packed_need / 2 / 32 * allpaca_hip::Q8_STAGED_BLOCK
+        } else {
+            packed_need
+        };
+        if need > ent.bytes {
             return None;
         }
         let blob = self.dense.as_ref()?;
@@ -2967,6 +3234,13 @@ impl Dsv4Gpu {
             prefill_device: 0,
             clock: 0,
             keep_set: HashSet::new(),
+            heat: HashMap::new(),
+            heat_routes: 0,
+            cpu_miss: false,
+            ram: None,
+            mapped_used: Vec::new(),
+            ram_pinned: Vec::new(),
+            read_ahead: None,
             h2d: None,
             h2d1: None,
             pin0: None,
@@ -3021,6 +3295,7 @@ fn upload_named(
             DenseEntry {
                 offset: off,
                 bytes: bytes.len(),
+                q8: false,
             },
         );
         off += bytes.len();
@@ -3042,6 +3317,11 @@ fn dense_bf16_names(cfg: &ModelConfig) -> Vec<String> {
             "ffn_up_shexp.weight",
             "ffn_down_shexp.weight",
             "ffn_gate_inp.weight",
+            // Compressed-attention layers only; every token goes through them.
+            "attn_compressor_kv.weight",
+            "attn_compressor_gate.weight",
+            "indexer_compressor_kv.weight",
+            "indexer_compressor_gate.weight",
         ] {
             names.push(format!("blk.{blk}.{suffix}"));
         }
@@ -3070,6 +3350,109 @@ fn packed_expert_bytes(dim: usize, ff: usize) -> usize {
     mxfp4_matrix_bytes(ff, dim)
         .saturating_mul(2)
         .saturating_add(mxfp4_matrix_bytes(dim, ff))
+}
+
+/// VRAM an expert cache may take on `device`: what the driver reports, capped
+/// by what the OS says no process holds. On Windows `hipMemGetInfo` ignores
+/// the desktop's share, and a cache sized from it spills into system RAM.
+fn device_free_bytes(device: i32) -> u64 {
+    let (free, _) = device_memory_info(device).unwrap_or((0, 0));
+    allpaca_hip::device_local_headroom(device).map_or(free, |h| h.min(free))
+}
+
+/// RAM left to the rest of the system when the host expert tier is sized.
+const RAM_TIER_RESERVE: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Bytes the host RAM expert tier may take, and where the figure comes
+/// from. In order: `ALLPACA_DSV4_RAM_MIB` (0 = no tier, experts are read
+/// through the mapped file), then `weights.host_bytes` when it is set,
+/// then the RAM free at load minus [`RAM_TIER_RESERVE`]. Never more than
+/// all the experts, `all`.
+///
+/// The automatic figure is a snapshot: a server started while another large
+/// process is still exiting sees less. Set `weights.host_bytes` for a tier
+/// that is the same size on every start.
+fn ram_tier_budget(
+    env_mib: Option<u64>,
+    host_bytes: u64,
+    ram_free: Option<u64>,
+    all: u64,
+) -> Option<(u64, &'static str)> {
+    let (bytes, source) = match env_mib {
+        Some(mib) => (mib << 20, "ALLPACA_DSV4_RAM_MIB"),
+        None if host_bytes > 0 => (host_bytes, "weights.host_bytes"),
+        None => (ram_free?.saturating_sub(RAM_TIER_RESERVE), "free RAM at load"),
+    };
+    Some((bytes.min(all), source))
+}
+
+/// The host RAM tier for experts that are not in VRAM.
+fn open_expert_ram(
+    file: &GgufFile,
+    cfg: &ModelConfig,
+    slot: usize,
+    ram_free: Option<u64>,
+    host_bytes: u64,
+) -> Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>> {
+    let paths = file.shard_paths()?;
+    let all = (cfg.n_layers * cfg.n_experts) as u64 * slot as u64;
+    let env_mib = std::env::var("ALLPACA_DSV4_RAM_MIB").ok().and_then(|v| v.parse::<u64>().ok());
+    let (budget, source) = ram_tier_budget(env_mib, host_bytes, ram_free, all)?;
+    let max_slice = mxfp4_matrix_bytes(cfg.ff_dim.max(1), cfg.dim).max(mxfp4_matrix_bytes(cfg.dim, cfg.ff_dim.max(1)));
+    match crate::dsv4_ram::ExpertRam::new(paths, slot, max_slice, budget) {
+        Ok(Some(ram)) => {
+            tracing::info!(
+                slots = ram.slots(),
+                bytes = ram.slots() as u64 * slot as u64,
+                budget_from = source,
+                "DeepSeek-V4 host RAM expert tier"
+            );
+            Some(Arc::new(std::sync::Mutex::new(ram)))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "DeepSeek-V4 host RAM expert tier unavailable; reading through the mapped file");
+            None
+        }
+    }
+}
+
+/// Where the three packed slices of one expert are in the model's files.
+pub(crate) fn expert_mxfp4_spans(
+    file: &GgufFile,
+    layer: usize,
+    expert: usize,
+    cfg: &ModelConfig,
+) -> Option<Vec<crate::dsv4_ram::FileSpan>> {
+    let n_exp = cfg.n_experts.max(1);
+    let mut out = Vec::with_capacity(3);
+    for part in ["gate", "up", "down"] {
+        let info = file.tensor(&format!("blk.{layer}.ffn_{part}_exps.weight"))?;
+        if info.ggml_type != GgmlType::MXFP4 {
+            return None;
+        }
+        let per = info.n_elements() as usize / n_exp;
+        let stride = per.div_ceil(MXFP4_BLOCK_ELEMS).saturating_mul(MXFP4_BLOCK_BYTES);
+        let (shard, start) = file.tensor_file_offset(info)?;
+        out.push(crate::dsv4_ram::FileSpan {
+            shard,
+            offset: start + (expert * stride) as u64,
+            len: stride,
+        });
+    }
+    Some(out)
+}
+
+/// The packed CPU expert kernel takes MXFP4 experts in whole 32-value blocks.
+fn cpu_expert_kernel_fits(file: &GgufFile, cfg: &ModelConfig) -> bool {
+    let blk = cfg.gguf_blk(0);
+    cfg.dim % MXFP4_BLOCK_ELEMS == 0
+        && cfg.ff_dim > 0
+        && cfg.ff_dim % MXFP4_BLOCK_ELEMS == 0
+        && ["gate", "up", "down"].iter().all(|part| {
+            file.tensor(&format!("blk.{blk}.ffn_{part}_exps.weight"))
+                .is_some_and(|t| t.ggml_type == GgmlType::MXFP4)
+        })
 }
 
 fn expert_lru_slots(free: u64, slot: usize) -> usize {
@@ -3809,7 +4192,7 @@ fn run_expert_swiglu_pipelined(
     (out, failed)
 }
 
-fn expert_mxfp4_parts<'a>(
+pub(crate) fn expert_mxfp4_parts<'a>(
     file: &'a GgufFile,
     layer: usize,
     expert: usize,
@@ -3924,6 +4307,7 @@ pub fn attach(
     model: &TinyModel,
     hip: &Arc<HipWorkspace>,
     draft: Option<&Arc<HipWorkspace>>,
+    host_bytes: u64,
 ) -> Result<(), AllpacaError> {
     let dsv4 = model.dsv4.as_ref().ok_or_else(|| {
         AllpacaError::Fatal(FatalError::ModelLoad("missing DeepSeek-V4 weights".into()))
@@ -3933,7 +4317,8 @@ pub fn attach(
             "DeepSeek-V4 GGUF handle missing for HIP attach".into(),
         ))
     })?;
-    let gpu = Dsv4Gpu::build(file.as_ref(), &model.config, hip.clone(), draft.cloned())?;
+    let mut gpu = Dsv4Gpu::build(file.as_ref(), &model.config, hip.clone(), draft.cloned(), host_bytes)?;
+    gpu.start_read_ahead(&file, &model.config);
     let mut guard = dsv4
         .gpu
         .lock()
@@ -4038,6 +4423,33 @@ mod tests {
         HBM_RESERVE,
     };
     use crate::model::ModelConfig;
+
+    #[test]
+    fn ram_tier_budget_prefers_the_env_then_the_config_then_free_ram() {
+        const GIB: u64 = 1 << 30;
+        let all = 140 * GIB;
+        // Automatic: what is free minus the reserve; unknown free RAM = no tier.
+        assert_eq!(super::ram_tier_budget(None, 0, Some(60 * GIB), all), Some((52 * GIB, "free RAM at load")));
+        assert_eq!(super::ram_tier_budget(None, 0, Some(4 * GIB), all), Some((0, "free RAM at load")));
+        assert_eq!(super::ram_tier_budget(None, 0, None, all), None);
+        // `weights.host_bytes` does not depend on what happens to be free.
+        assert_eq!(
+            super::ram_tier_budget(None, 40 * GIB, Some(10 * GIB), all),
+            Some((40 * GIB, "weights.host_bytes"))
+        );
+        assert_eq!(super::ram_tier_budget(None, 40 * GIB, None, all), Some((40 * GIB, "weights.host_bytes")));
+        // The environment overrides both; 0 turns the tier off.
+        assert_eq!(
+            super::ram_tier_budget(Some(1024), 40 * GIB, Some(60 * GIB), all),
+            Some((GIB, "ALLPACA_DSV4_RAM_MIB"))
+        );
+        assert_eq!(
+            super::ram_tier_budget(Some(0), 40 * GIB, Some(60 * GIB), all),
+            Some((0, "ALLPACA_DSV4_RAM_MIB"))
+        );
+        // Never more than the model's experts.
+        assert_eq!(super::ram_tier_budget(None, 500 * GIB, None, all), Some((all, "weights.host_bytes")));
+    }
 
     #[test]
     fn unsloth_short_prefill_skips_full_layer() {

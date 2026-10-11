@@ -67,26 +67,23 @@ impl AuthState {
         }
     }
 
-    pub fn authorized(&self, headers: &HeaderMap) -> bool {
-        let Some(expected) = self.password.as_deref() else {
-            return true;
+    /// The request carries a live WebUI session cookie.
+    pub fn session_valid(&self, headers: &HeaderMap) -> bool {
+        let Some(cookie) = cookie_value(headers, COOKIE_NAME) else {
+            return false;
         };
-        if let Some(bearer) = bearer_token(headers) {
-            if passwords_match(expected, bearer) {
-                return true;
-            }
-        }
-        if let Some(cookie) = cookie_value(headers, COOKIE_NAME) {
-            if let Ok(mut map) = self.sessions.lock() {
-                map.retain(|_, at| at.elapsed() < SESSION_TTL);
-                if let Some(at) = map.get(&cookie) {
-                    if at.elapsed() < SESSION_TTL {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        let Ok(mut map) = self.sessions.lock() else {
+            return false;
+        };
+        map.retain(|_, at| at.elapsed() < SESSION_TTL);
+        map.contains_key(&cookie)
+    }
+
+    /// `token` is the operator password.
+    pub fn password_matches(&self, token: &str) -> bool {
+        self.password
+            .as_deref()
+            .is_some_and(|expected| passwords_match(expected, token))
     }
 
     fn client_key(addr: Option<SocketAddr>) -> String {
@@ -157,7 +154,7 @@ fn passwords_match(expected: &str, given: &str) -> bool {
         == 0
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     raw.strip_prefix("Bearer ")
         .or_else(|| raw.strip_prefix("bearer "))
@@ -267,12 +264,18 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
 }
 
 pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if state.auth.authorized(request.headers()) {
-        return next.run(request).await;
+    use crate::api_access::{check, Denied};
+    match check(&state, request.method(), request.uri().path(), request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(Denied::Unauthorized) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": {"message": "unauthorized", "type": "fatal"}})),
+        )
+            .into_response(),
+        Err(Denied::Disabled) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": {"message": "the API is disabled on this server", "type": "forbidden"}})),
+        )
+            .into_response(),
     }
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({"error": {"message": "unauthorized", "type": "fatal"}})),
-    )
-        .into_response()
 }

@@ -50,7 +50,7 @@ Coral/NPU backends are dropped.
 - **Control plane:** scheduling, KV tiers (VRAM / pinned DRAM / optional NVMe), weight working set, speculation, constraints — all Rust ([ADR 0001](docs/adr/0001-thick-rust-control-plane.md)).
 - **Kernels:** `hip/` C ABI (`allpaca_gemm*`, attention, RoPE, RMSNorm, …); `allpaca-cpu` AVX2 fallbacks.
 - **Formats:** GGUF (Llama-family + hybrid Nemotron + **DeepSeek-V4 `deepseek4`**, including split shards and BF16/MXFP4), HuggingFace SafeTensors (`config.json` + `tokenizer.json`, F32/F16/BF16, sharded `index.json`) with Hub `org/name` download, ONNX weight-export.
-- **Server:** `POST /v1/chat/completions`, `GET /v1/models`, `GET /stats`.
+- **Server:** `POST /v1/chat/completions`, `POST /v1/systemone` (decision models), `GET /v1/models`, `GET /stats`.
 - **Config:** TOML + CLI; CLI overrides file; file overrides compiled defaults (`Config::compiled_defaults`).
 
 ---

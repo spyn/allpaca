@@ -405,6 +405,12 @@ pub struct RpcSection {
     /// Shared HELLO secret (`--rpc-token` / `ALLPACA_RPC_TOKEN`). Empty = loopback workers only.
     #[serde(default)]
     pub token: Option<String>,
+    /// Where a layer's routed experts go with expert-parallel MoE, by layer
+    /// index: `"local"` (beside the layer body on its GPU) or
+    /// `"rpc:<host:port>/<gpu>"`. Layers not listed are placed automatically.
+    /// The WebUI saves these per model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expert_homes: BTreeMap<String, String>,
 }
 
 impl Default for RpcSection {
@@ -415,6 +421,7 @@ impl Default for RpcSection {
             max_seq: 0,
             prefill_rows: 128,
             token: None,
+            expert_homes: BTreeMap::new(),
         }
     }
 }
@@ -566,7 +573,16 @@ pub struct WeightsSection {
     pub miss_policy: MissPolicy,
     /// DRAM budget for the expert host pool. 0 = unlimited (experts stay in RAM).
     /// When the pool exceeds this, experts pack to an aligned file and page in via Direct I/O.
+    ///
+    /// DeepSeek-V4: the size of the RAM tier that holds the experts the GPU
+    /// caches do not (the rest are read from the model file as needed). 0 =
+    /// automatic: the RAM free when the model loads minus 8 GiB, which varies
+    /// from start to start. Set it for a tier of a fixed size.
     pub host_bytes: usize,
+    /// Decode every weight to F32 in RAM whatever the model's size, so the
+    /// CPU forward can run it (reference runs and calibration). Needs about
+    /// 4 bytes of RAM per weight.
+    pub host_f32: bool,
 }
 
 impl Default for WeightsSection {
@@ -577,6 +593,7 @@ impl Default for WeightsSection {
             ring_slots: 2,
             miss_policy: MissPolicy::Qstar,
             host_bytes: 0,
+            host_f32: false,
         }
     }
 }

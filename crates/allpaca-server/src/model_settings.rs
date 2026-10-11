@@ -26,6 +26,10 @@ pub struct ModelSettings {
     /// `"layer:expert"` -> operator-chosen name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub expert_names: BTreeMap<String, String>,
+    /// Layer index -> where its routed experts go: `"local"` or
+    /// `"rpc:<host:port>/<gpu>"`. Applied when the model loads.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub expert_homes: BTreeMap<u32, String>,
 }
 
 pub const SETTINGS_VERSION: u32 = 1;
@@ -52,6 +56,17 @@ impl ModelSettings {
         if let Some(bytes) = self.kv_vram_bytes.filter(|b| *b > 0) {
             config.kv.vram_bytes = bytes as usize;
         }
+        // Pins belong to the model: a config built for another model must
+        // not keep them.
+        config.rpc.expert_homes = self.expert_homes_config();
+    }
+
+    /// The pins as `rpc.expert_homes` carries them.
+    pub fn expert_homes_config(&self) -> BTreeMap<String, String> {
+        self.expert_homes
+            .iter()
+            .map(|(layer, home)| (layer.to_string(), home.clone()))
+            .collect()
     }
 
     /// Apply the disabled experts to a loaded engine. Logs and skips when
@@ -159,6 +174,26 @@ fn load(path: &Path) -> ModelSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_pins_reach_the_config_and_do_not_outlive_their_model() {
+        let mut config = Config::compiled_defaults();
+        let mut pinned = ModelSettings::default();
+        pinned.expert_homes.insert(3, "local".into());
+        pinned.expert_homes.insert(12, "rpc:192.168.69.2:50052/1".into());
+        pinned.apply_to_config(&mut config);
+        assert_eq!(config.rpc.expert_homes.get("3").map(String::as_str), Some("local"));
+        assert_eq!(
+            config.rpc.expert_homes.get("12").map(String::as_str),
+            Some("rpc:192.168.69.2:50052/1")
+        );
+        // The pins survive the settings file.
+        let json = serde_json::to_string(&pinned).unwrap();
+        assert_eq!(serde_json::from_str::<ModelSettings>(&json).unwrap(), pinned);
+        // Another model's (empty) settings clear them.
+        ModelSettings::default().apply_to_config(&mut config);
+        assert!(config.rpc.expert_homes.is_empty());
+    }
 
     #[test]
     fn settings_path_sits_next_to_the_model() {

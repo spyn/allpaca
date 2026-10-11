@@ -99,6 +99,7 @@ int allpaca_hip_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_b
 int allpaca_hip_local_headroom(int32_t device, uint64_t *bytes);
 
 int allpaca_hip_set_device(int32_t device);
+int allpaca_hip_blas_warmup(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);
 
@@ -168,6 +169,11 @@ int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, 
  * blocks, qs[16] then one unsigned-E4M3 scale for all 32 weights. */
 int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
+
+/* C[m,n] = A[m,k] * W^T for MoESQ paired-4:8 FP4 weights (Allpaca tensor type 200): n rows
+ * of k/32 12-byte blocks (8 kept value bytes, 2 mask bytes, half scale). k % 32 == 0. */
+int allpaca_gemm_nt_p48fp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                           int32_t k, allpaca_stream_t stream);
 
 /* Float-activation ROCmFP4 GEMV (the pre-int8 kernel), for A/B and as the
  * exact-float reference. `fast` != 0 reads 17-byte type-101 blocks. */
@@ -244,9 +250,11 @@ int allpaca_gemm_nt_mxfp4(const float *a, const uint8_t *b, float *c, int32_t m,
 int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                   int32_t k, allpaca_stream_t stream);
 
-/* C[m,n] = silu(A * dequant(Bg)^T) * (A * dequant(Bu)^T). Same MXFP4 layout. */
+/* C[m,n] = silu(A * dequant(Bg)^T) * (A * dequant(Bu)^T). Same MXFP4 layout. With limit > 0
+ * the gate is capped at limit before SiLU and the up projection to +-limit. */
 int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_t *bu, float *c,
-                                 int32_t m, int32_t n, int32_t k, allpaca_stream_t stream);
+                                 int32_t m, int32_t n, int32_t k, float limit,
+                                 allpaca_stream_t stream);
 
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
@@ -380,6 +388,13 @@ int allpaca_rope_qk_rows(float *q, float *k, int32_t n_tok, int32_t n_q_heads, i
 int allpaca_rope_offset_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
                              int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
                              int32_t back, allpaca_stream_t stream);
+
+/* allpaca_rope_offset_rows with YaRN frequencies (DeepSeek-V4 compressed layers): pair i
+ * turns by theta^(-i/half) times a blend of 1 (i <= low) and scale (i >= high). */
+int allpaca_rope_yarn_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                           int32_t n_rot, int32_t offset, int32_t start_pos, float theta,
+                           float scale, float low, float high, int32_t back,
+                           allpaca_stream_t stream);
 
 /* Qwen3.5 IMRoPE / partial NeoX: rotate first n_rot dims; sections[4] select (t,h,w,e).
  * pos[3] is the M-RoPE (t, h, w) position; text tokens use (p, p, p). */

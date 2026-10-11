@@ -113,18 +113,95 @@ pub fn matmul_nt(
             ),
         )));
     }
-    for r in 0..rows {
-        for j in 0..n {
-            let mut acc = 0.0f32;
-            let x_row = &x[r * k..(r + 1) * k];
-            let w_row = &w_t[j * k..(j + 1) * k];
-            for p in 0..k {
-                acc += x_row[p] * w_row[p];
+    let (x, w_t, y) = (&x[..rows * k], &w_t[..n * k], &mut y[..rows * n]);
+    if k == 0 {
+        y.fill(0.0);
+        return Ok(());
+    }
+    // Columns `first..` of every output row, written to `y` (rows of `width`).
+    let run = |first: usize, width: usize, y: &mut [f32]| {
+        for (x_row, y_row) in x.chunks(k).zip(y.chunks_mut(width)) {
+            for (out, w_row) in y_row.iter_mut().zip(w_t[first * k..].chunks(k)) {
+                *out = dot(x_row, w_row);
             }
-            y[r * n + j] = acc;
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).min(n / 64);
+    if threads < 2 || rows != 1 || n * k < MATMUL_NT_THREADED {
+        run(0, n, y);
+        return Ok(());
+    }
+    // One input row against a large matrix (a projection or the output
+    // head at decode): split the outputs across the cores.
+    let per = n.div_ceil(threads);
+    std::thread::scope(|s| {
+        for (i, chunk) in y.chunks_mut(per).enumerate() {
+            s.spawn(move || run(i * per, chunk.len(), chunk));
+        }
+    });
+    Ok(())
+}
+
+/// Weights at which `matmul_nt` spreads one row's outputs over threads:
+/// below it, starting the threads costs more than the product.
+const MATMUL_NT_THREADED: usize = 1 << 24;
+
+/// Dot product of two vectors of the same length: AVX2 + FMA where the CPU
+/// has them, otherwise eight running sums the compiler turns into SIMD.
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let n = a.len().min(b.len());
+            // SAFETY: the features were just detected; both slices hold `n` values.
+            return unsafe { dot_avx2_fma(&a[..n], &b[..n]) };
         }
     }
-    Ok(())
+    dot8(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (lane, sum) in acc.iter_mut().enumerate() {
+            let at = i + lane * 8;
+            *sum = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(at)), _mm256_loadu_ps(pb.add(at)), *sum);
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        acc[0] = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc[0]);
+        i += 8;
+    }
+    let sum = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+    let mut total: f32 = lanes.iter().sum();
+    while i < n {
+        total += *pa.add(i) * *pb.add(i);
+        i += 1;
+    }
+    total
+}
+
+#[inline]
+fn dot8(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in ca.zip(cb) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    acc.iter().sum::<f32>() + tail
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2129,6 +2206,43 @@ pub fn dequant_q8_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `matmul_nt` against sums in f64, at a small size and at one large
+    /// enough for the threaded path, with row lengths that leave a tail.
+    #[test]
+    fn matmul_nt_matches_a_double_precision_reference() {
+        for (rows, n, k) in [(3usize, 5usize, 13usize), (2, 2100, 2003), (1, 1, 1)] {
+            let value = |i: usize, salt: usize| (((i * 2654435761 + salt * 40503) % 2001) as f32 - 1000.0) / 500.0;
+            let x: Vec<f32> = (0..rows * k).map(|i| value(i, 1)).collect();
+            let w: Vec<f32> = (0..n * k).map(|i| value(i, 2)).collect();
+            let mut y = vec![0.0f32; rows * n];
+            matmul_nt(&x, &w, &mut y, rows, n, k).unwrap();
+            for r in 0..rows {
+                for j in 0..n {
+                    let want: f64 = (0..k).map(|p| f64::from(x[r * k + p]) * f64::from(w[j * k + p])).sum();
+                    let got = f64::from(y[r * n + j]);
+                    assert!(
+                        (got - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                        "rows {rows} n {n} k {k} at ({r}, {j}): {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every length up to a few SIMD blocks, so each tail is covered, on
+    /// both the dispatched and the portable dot product.
+    #[test]
+    fn dot_matches_a_double_precision_reference_at_every_length() {
+        for n in 0..=75usize {
+            let a: Vec<f32> = (0..n).map(|i| ((i * 37 + 11) % 23) as f32 * 0.25 - 2.5).collect();
+            let b: Vec<f32> = (0..n).map(|i| ((i * 53 + 5) % 19) as f32 * 0.5 - 4.0).collect();
+            let want: f64 = a.iter().zip(&b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+            for (label, got) in [("dot", dot(&a, &b)), ("dot8", dot8(&a, &b))] {
+                assert!((f64::from(got) - want).abs() <= 1e-4 * (1.0 + want.abs()), "{label} n {n}: {got} vs {want}");
+            }
+        }
+    }
 
     #[test]
     fn f32_to_f16_keeps_subnormals() {

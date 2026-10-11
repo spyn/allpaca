@@ -2,9 +2,12 @@
 
 mod anchors;
 mod batch_gemm;
+pub mod calib;
 mod compute;
+pub mod decision;
 mod constraint;
 mod deepseek4;
+mod dsv4_attn;
 mod dflash2;
 pub mod deltanet;
 mod device_manager;
@@ -12,6 +15,7 @@ mod direct_storage;
 mod draft;
 mod dspark;
 mod dsv4_gpu;
+mod dsv4_ram;
 mod early_exit;
 pub mod edge0;
 mod engine;
@@ -32,9 +36,14 @@ mod model;
 mod numa;
 mod otel;
 mod packed;
+mod qwen4exp;
+pub mod gsq;
+pub mod rco;
+pub mod requant;
 mod rpc_runtime;
 mod sampling;
 mod scheduler;
+pub mod sensitivity;
 mod ssm;
 mod telemetry;
 mod tokenizer;
@@ -54,7 +63,10 @@ pub use batch_gemm::{
 };
 pub use compute::ComputeDev;
 #[doc(hidden)]
-pub use deepseek4::{write_tiny_deepseek4_gguf, write_tiny_deepseek4_packed_gguf};
+pub use deepseek4::{
+    write_tiny_deepseek4_ctx_gguf, write_tiny_deepseek4_gguf, write_tiny_deepseek4_packed_gguf,
+    write_tiny_deepseek4_q8_gguf, TinyDsv4Ctx,
+};
 pub use device_manager::{detect_pipeline_mode, suggested_kv_vram_bytes, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{
@@ -65,7 +77,10 @@ pub use edge0::{
     detect_edge0_dir, load_edge0_dir, Edge0LoadOptions, Edge0Loaded, Edge0Tier, MoESpec,
     RecoverLora, RouterKind,
 };
-pub use engine::{mtp_text_is_garbled, DevicePlacement, Engine, KvEstimate, RequestHandle};
+pub use engine::{
+    mtp_text_is_garbled, DevicePlacement, Engine, ExpertLayerHome, ExpertPlacement, KvEstimate,
+    RequestHandle,
+};
 pub use rpc_runtime::RemoteGpu;
 pub use kv_tier::KvTierManager;
 pub use layer_split::{plan_layer_owners, LayerPlan};

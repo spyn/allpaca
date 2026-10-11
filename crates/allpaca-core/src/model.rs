@@ -231,6 +231,10 @@ pub struct ModelConfig {
     pub rope_theta_swa: f32,
     /// Head-wise sigmoid attention output gate (Spark2_5).
     pub headwise_attn_gate: bool,
+    /// Qwen3.5-family attention: the Q projection is `[Q|gate]` per head.
+    /// Needed when n_heads * head_dim == dim (Ornith-1.5-9B), where the
+    /// shapes alone look like a plain double-width Q.
+    pub gated_attn_q: bool,
     /// Gemma attn logit softcap (0 = off).
     pub attn_logit_softcap: f32,
     /// Gemma final logit softcap (0 = off).
@@ -248,6 +252,10 @@ pub struct ModelConfig {
     /// Always-on shared experts (`ffn_*_shexp`). 0 = Mixtral-style routed-only.
     pub n_shared_experts: usize,
     pub shared_ff_dim: usize,
+    /// Width of the dense FFN blocks when it differs from the experts'
+    /// (`ff_dim`): MoE models with leading dense blocks, e.g. Ling 2.0's
+    /// 5120 against 512. 0 = the same as `ff_dim`.
+    pub dense_ff_dim: usize,
     /// llama.cpp `expert_weights_norm`: renormalize top-k sigmoid/softmax weights.
     pub expert_weights_norm: bool,
     pub expert_weights_scale: f32,
@@ -295,6 +303,7 @@ impl ModelConfig {
             rope_dims_swa: 0,
             rope_theta_swa: 0.0,
             headwise_attn_gate: false,
+            gated_attn_q: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             scale_embed: false,
@@ -305,6 +314,7 @@ impl ModelConfig {
             n_group_used: 1,
             n_shared_experts: 0,
             shared_ff_dim: 0,
+            dense_ff_dim: 0,
             expert_weights_norm: false,
             expert_weights_scale: 1.0,
             moe_sigmoid_gating: false,
@@ -315,7 +325,16 @@ impl ModelConfig {
     }
 
     pub fn moe_workspace(&self) -> usize {
-        self.ff_dim.max(self.shared_ff_dim)
+        self.ff_dim.max(self.shared_ff_dim).max(self.dense_ff_dim)
+    }
+
+    /// Hidden width of a dense (non-expert) FFN block.
+    pub fn dense_ff(&self) -> usize {
+        if self.dense_ff_dim > 0 {
+            self.dense_ff_dim
+        } else {
+            self.ff_dim
+        }
     }
 
     pub fn tiny_moe() -> Self {
@@ -449,7 +468,11 @@ impl ModelConfig {
             rope_sections,
             rope_neox: gguf_rope_neox(&arch),
             rope_none: gguf_rope_none(&arch),
-            recurrent: file.tensors.iter().any(|t| t.name.contains(".ssm_")),
+            // DeepSeek-V4 compressors keep per-sequence state too.
+            recurrent: file
+                .tensors
+                .iter()
+                .any(|t| t.name.contains(".ssm_") || t.name.contains(".attn_compressor_kv.")),
             nextn_predict_layers: nextn,
             gguf_layer_base: 0,
             router_kind: if arch == "deepseek2"
@@ -496,6 +519,7 @@ impl ModelConfig {
                 .unwrap_or(0.0),
             headwise_attn_gate: arch == "spark2_5"
                 || file.tensor("blk.0.attn_gate.weight").is_some() && !is_qwen_gdn_arch(&arch),
+            gated_attn_q: is_qwen_gdn_arch(&arch),
             attn_logit_softcap: {
                 let v = file
                     .meta_f32(&format!("{arch}.attn_logit_softcapping"))
@@ -539,12 +563,19 @@ impl ModelConfig {
             shared_ff_dim: file
                 .meta_u32(&format!("{arch}.expert_shared_feed_forward_length"))
                 .unwrap_or(0) as usize,
+            // `ff_dim` is the expert width when the file has one; dense
+            // blocks keep `feed_forward_length`.
+            dense_ff_dim: meta_u32_or_array_max(file, &format!("{arch}.feed_forward_length"))
+                .map(|v| v as usize)
+                .filter(|&v| v != ff_dim)
+                .unwrap_or(0),
             expert_weights_norm,
             expert_weights_scale: file
                 .meta_f32(&format!("{arch}.expert_weights_scale"))
                 .unwrap_or(1.0),
             moe_sigmoid_gating: lightning_moe,
-            moe_relu_sqr: lightning_moe,
+            // Ling 2.0 (`bailingmoe2`) gates like Lightning but its experts are SiLU.
+            moe_relu_sqr: lightning_moe && arch != "bailingmoe2",
             moe_sqrt_softplus: is_dsv4,
             rope_offset,
         })
@@ -638,6 +669,8 @@ enum WeightKind {
     RocmFp4,
     /// ROCmFP4 FAST (ggml type 101): 17-byte single-scale blocks.
     RocmFp4Fast,
+    /// MoESQ paired-4:8 sparse FP4 (tensor type 200): 12-byte blocks.
+    P48Fp4,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -975,7 +1008,8 @@ struct DeviceRouteCtl {
 }
 
 /// A layer's stacked routed experts as the fused MoE kernels read them:
-/// `[gate, up, down]`, each Q4_K/Q5_K/Q6_K at a fixed per-expert stride.
+/// `[gate, up, down]`, each Q4_K/Q5_K/Q6_K, staged Q8_0 or paired-4:8 FP4
+/// at a fixed per-expert stride.
 fn stacked_moe_experts(
     weights: &DeviceWeights,
     offs: &[[WeightRef; 3]],
@@ -995,6 +1029,8 @@ fn stacked_moe_experts(
             WeightKind::Q4_K => 12,
             WeightKind::Q5_K => 13,
             WeightKind::Q6_K => 14,
+            WeightKind::Q8_0 => 8,
+            WeightKind::P48Fp4 => 200,
             _ => return None,
         };
         let stride = second.off.checked_sub(first.off)?;
@@ -1007,7 +1043,7 @@ fn stacked_moe_experts(
             stride: stride as u64,
         };
     }
-    Some(out)
+    allpaca_hip::MoeExperts::fused_set_ok(&out).then_some(out)
 }
 
 impl ResidentModel {
@@ -2379,7 +2415,8 @@ impl ResidentModel {
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0
             | WeightKind::RocmFp4
-            | WeightKind::RocmFp4Fast => Err(AllpacaError::Fatal(FatalError::ModelLoad(
+            | WeightKind::RocmFp4Fast
+            | WeightKind::P48Fp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "F16/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
         }
@@ -2425,6 +2462,9 @@ impl ResidentModel {
             WeightKind::RocmFp4Fast => {
                 hip.gemm_nt_rocmfp4_fast_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::P48Fp4 => {
+                hip.gemm_nt_p48fp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
         }
     }
 
@@ -2460,7 +2500,8 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q3_K
+            WeightKind::P48Fp4
+            | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
@@ -2509,7 +2550,8 @@ impl ResidentModel {
                 out,
                 dim,
             ),
-            WeightKind::Q3_K
+            WeightKind::P48Fp4
+            | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
@@ -2926,7 +2968,11 @@ pub(crate) fn topk_from_logits(
             weights[e] + select_bias.get(e).copied().unwrap_or(0.0)
         }
     };
-    let mut idx: Vec<usize> = (0..n_experts).collect();
+    let kept = expert_groups_kept(n_experts, cfg.n_expert_groups, cfg.n_group_used, &score);
+    let mut idx: Vec<usize> = match &kept {
+        Some((per_group, keep)) => (0..n_experts).filter(|e| keep[e / per_group]).collect(),
+        None => (0..n_experts).collect(),
+    };
     idx.sort_by(|&a, &b| {
         score(b)
             .partial_cmp(&score(a))
@@ -2951,6 +2997,55 @@ pub(crate) fn topk_from_logits(
         }
     }
     idx.into_iter().map(|i| (i, weights[i])).collect()
+}
+
+/// Two-tier (group-limited) routing, as DeepSeek-V3 and Ling 2.0 train it:
+/// the experts form `n_groups` equal consecutive groups, a group scores the
+/// sum of its two best selection scores, and only the `n_used` best groups
+/// may supply experts. Returns `(experts per group, kept flag per group)`,
+/// or `None` when the model routes flat (one group, all groups used, or a
+/// group count that does not divide the experts).
+pub(crate) fn expert_groups_kept(
+    n_experts: usize,
+    n_groups: usize,
+    n_used: usize,
+    score: &impl Fn(usize) -> f32,
+) -> Option<(usize, Vec<bool>)> {
+    if n_groups < 2 || n_used == 0 || n_used >= n_groups || n_experts % n_groups != 0 {
+        return None;
+    }
+    let per_group = n_experts / n_groups;
+    let group_score: Vec<f32> = (0..n_groups)
+        .map(|g| {
+            let mut top = [f32::NEG_INFINITY; 2];
+            for e in g * per_group..(g + 1) * per_group {
+                let v = score(e);
+                if v > top[0] {
+                    top = [v, top[0]];
+                } else if v > top[1] {
+                    top[1] = v;
+                }
+            }
+            // A group of one expert (or one left enabled) scores that expert.
+            if top[1] == f32::NEG_INFINITY {
+                top[0]
+            } else {
+                top[0] + top[1]
+            }
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..n_groups).collect();
+    order.sort_by(|&a, &b| {
+        group_score[b]
+            .partial_cmp(&group_score[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    let mut keep = vec![false; n_groups];
+    for &g in order.iter().take(n_used) {
+        keep[g] = true;
+    }
+    Some((per_group, keep))
 }
 
 fn empty_layer() -> LayerWeights {
@@ -3013,9 +3108,11 @@ fn split_fused_qkv_host(
 fn gguf_rope_neox(arch: &str) -> bool {
     matches!(
         arch,
-        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen3next" | "phi2" | "phi3"
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "qwen3next" | "qwen4exp"
+            | "phi2"
+            | "phi3"
             | "gemma" | "gemma2" | "gemma3" | "starcoder2" | "stablelm" | "gptneox" | "falcon"
-            | "olmo2" | "nemotron"
+            | "olmo2" | "nemotron" | "bailingmoe2"
     )
 }
 
@@ -3071,9 +3168,11 @@ fn add_row_bias(x: &mut [f32], bias: &[f32]) {
     }
 }
 
-/// Qwen Gated DeltaNet checkpoints: Qwen3.5 (`qwen35`) and Qwen3-Next (`qwen3next`).
+/// Qwen Gated DeltaNet checkpoints: Qwen3.5 (`qwen35`), its MoE variant
+/// (`qwen35moe`: the same trunk with Qwen3-Next's routed + shared experts)
+/// and Qwen3-Next (`qwen3next`).
 pub(crate) fn is_qwen_gdn_arch(arch: &str) -> bool {
-    matches!(arch, "qwen35" | "qwen3next")
+    matches!(arch, "qwen35" | "qwen35moe" | "qwen3next")
 }
 
 /// GDN dims from GGUF meta. Qwen3-Next repeat-interleaves K heads; Qwen3.5 tiles.
@@ -3753,7 +3852,7 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         T::F32 => n * 4,
         _ if n <= 65_536 => n * 4,
         T::F16 => n * 2,
-        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 | T::RocmFp4Fast => {
+        T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 | T::RocmFp4Fast | T::P48Fp4 => {
             info.nbytes() as u64
         }
         T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
@@ -3897,6 +3996,16 @@ fn append_gguf_tensor_as<'a>(
                 }
                 (UploadPart::Mapped(packed), WeightKind::TQ1_0)
             }
+        }
+        allpaca_gguf::GgmlType::P48Fp4 => {
+            // Stays packed: the GEMV reads the sparse blocks as they are.
+            let k = *info.dims.first().unwrap_or(&1) as usize;
+            if k == 0 || k % allpaca_cpu::P48FP4_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "paired-4:8 FP4 {name} rows of {k} weights are not whole 32-weight blocks"
+                ))));
+            }
+            (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::P48Fp4)
         }
         ty @ (allpaca_gguf::GgmlType::RocmFp4 | allpaca_gguf::GgmlType::RocmFp4Fast) => {
             let fast = ty == allpaca_gguf::GgmlType::RocmFp4Fast;
@@ -4131,6 +4240,15 @@ fn split_packed_experts(
             }
             (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS).saturating_mul(block_bytes)
         }
+        WeightKind::P48Fp4 => {
+            if n_per % allpaca_cpu::P48FP4_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} paired-4:8 FP4 expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::P48FP4_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::P48FP4_BLOCK_ELEMS).saturating_mul(allpaca_cpu::P48FP4_BLOCK_BYTES)
+        }
         WeightKind::Q3_K => {
             if n_per % allpaca_cpu::Q3_K_BLOCK_ELEMS != 0 {
                 return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -4192,7 +4310,8 @@ fn split_packed_experts(
                     allpaca_cpu::Q8_0_BLOCK_ELEMS
                 ))));
             }
-            (n_per / allpaca_cpu::Q8_0_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q8_0_BLOCK_BYTES)
+            // Device Q8_0 is the 36-byte staged layout, not GGUF's 34-byte blocks.
+            (n_per / allpaca_cpu::Q8_0_BLOCK_ELEMS).saturating_mul(allpaca_hip::Q8_STAGED_BLOCK)
         }
     };
     Ok((0..n_experts)
@@ -4364,6 +4483,10 @@ pub struct TinyModel {
     pub mtp_nextn: Option<MtpNextnWeights>,
     /// DeepSeek-V4 MLA / hyper-connection / MoE sidecar (CPU decode).
     pub(crate) dsv4: Option<Arc<crate::deepseek4::Dsv4Weights>>,
+    /// qwen4exp runs on its own host forward ([`crate::qwen4exp`]).
+    pub(crate) q4x: Option<Arc<crate::qwen4exp::Qwen4Weights>>,
+    /// Records matrix inputs during a calibration run ([`crate::calib`]).
+    pub(crate) calib: Arc<crate::calib::Tap>,
     /// Shared RPC runtime when layers are offloaded to remote workers.
     pub rpc: Option<std::sync::Arc<crate::rpc_runtime::RpcRuntime>>,
     /// Edge0 Recover-LoRA + prerouter stager (when loaded via `load_edge0`).
@@ -4405,7 +4528,7 @@ pub(crate) fn attn_layout(cfg: &ModelConfig, wq_n: usize, wk_n: usize, wo_n: usi
     } else {
         dim
     };
-    let gated = q_out == wo_k.saturating_mul(2) && wo_k > dim;
+    let gated = q_out == wo_k.saturating_mul(2) && (wo_k > dim || cfg.gated_attn_q);
     let attn_dim = if gated {
         wo_k
     } else {
@@ -4439,8 +4562,10 @@ impl TinyModel {
     /// HIP M=N forward ([`Self::forward_tokens_device`]). Unlike the CUDA /
     /// Vulkan M=N paths it runs IMRoPE and gated `[Q|gate]` attention per row,
     /// so Qwen3.5/3.8 hybrids batch too. A `[Q|gate]` projection is only
-    /// recognised when n_heads * head_dim > dim; below that the per-token and
-    /// M=N paths read an ambiguous Q differently, so it stays per-token.
+    /// recognised by shape when n_heads * head_dim > dim; below that only
+    /// `gated_attn_q` (the architecture) identifies it. An ambiguous Q without
+    /// that flag is read differently by the per-token and M=N paths, so it
+    /// stays per-token.
     pub fn supports_hip_batched_prefill(&self) -> bool {
         let dim = self.config.dim.max(1);
         !self.layers.iter().any(|l| {
@@ -4449,7 +4574,7 @@ impl TinyModel {
             }
             let q_out = l.wq.len() / dim;
             let wo_k = l.wo.len() / dim;
-            q_out == wo_k.saturating_mul(2) && wo_k <= dim
+            q_out == wo_k.saturating_mul(2) && wo_k <= dim && !self.config.gated_attn_q
         })
     }
 
@@ -4464,7 +4589,7 @@ impl TinyModel {
             }
             let q_out = l.wq.len() / dim;
             let wo_k = l.wo.len() / dim;
-            q_out == wo_k.saturating_mul(2) && wo_k > dim
+            q_out == wo_k.saturating_mul(2) && (wo_k > dim || self.config.gated_attn_q)
         })
     }
 
@@ -4542,6 +4667,8 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -4861,6 +4988,11 @@ impl TinyModel {
 
     /// Keep a GGUF handle for lazy DeepSeek-V4 MLA / expert / lm_head gathers.
     pub(crate) fn bind_gguf(&mut self, file: Arc<GgufFile>) {
+        if let Some(q4x) = &mut self.q4x {
+            if let Some(inner) = Arc::get_mut(q4x) {
+                inner.attach_gguf(file.clone());
+            }
+        }
         if let Some(dsv4) = &mut self.dsv4 {
             if let Some(inner) = Arc::get_mut(dsv4) {
                 inner.attach_gguf(file);
@@ -5028,8 +5160,9 @@ impl TinyModel {
             &mut scratch[..dim],
             metrics,
         )?;
-        let mut gate = vec![0.0f32; cfg.ff_dim];
-        let mut up = vec![0.0f32; cfg.ff_dim];
+        let mut gate = vec![0.0f32; cfg.dense_ff()];
+        let mut up = vec![0.0f32; cfg.dense_ff()];
+        self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::FfnIn, &scratch[..dim]);
         gemm_nt_dispatch(
             hip,
             &scratch[..dim],
@@ -5037,7 +5170,7 @@ impl TinyModel {
             resident.filter(|_| ffn_dev).map(|r| r.w_gate(layer_idx)),
             &mut gate,
             1,
-            cfg.ff_dim,
+            cfg.dense_ff(),
             dim,
         )?;
         gemm_nt_dispatch(
@@ -5047,10 +5180,11 @@ impl TinyModel {
             resident.filter(|_| ffn_dev).map(|r| r.w_up(layer_idx)),
             &mut up,
             1,
-            cfg.ff_dim,
+            cfg.dense_ff(),
             dim,
         )?;
         silu_mul_dispatch(hip, &mut gate, &up, metrics, cfg.ffn_gelu)?;
+        self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::FfnAct, &gate);
         gemm_nt_dispatch(
             hip,
             &gate,
@@ -5059,7 +5193,7 @@ impl TinyModel {
             hidden,
             1,
             dim,
-            cfg.ff_dim,
+            cfg.dense_ff(),
         )?;
         if !layer.ffn_post_norm.is_empty() {
             let tmp = hidden.to_vec();
@@ -6012,7 +6146,8 @@ impl TinyModel {
     /// Local routed experts through the fused K-quant MoE kernels: three
     /// launches per layer instead of ~4 per selected expert, with the same
     /// arithmetic. Rows of `buf.normed`; weighted sums into `buf.attn`.
-    /// `false` when the layer's experts are not stacked K-quants resident here.
+    /// `false` when the layer's experts are not stacked K-quants or Q8_0
+    /// resident here.
     fn fused_local_moe_rows(
         &self,
         layer_idx: usize,
@@ -6349,12 +6484,31 @@ impl TinyModel {
     }
 
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AllpacaError> {
+        Self::from_gguf_sized(file, false)
+    }
+
+    /// [`Self::from_gguf`] with every weight decoded to F32 in RAM whatever
+    /// the model's size, for the CPU forward.
+    pub fn from_gguf_host(file: &GgufFile) -> Result<Self, AllpacaError> {
+        Self::from_gguf_sized(file, true)
+    }
+
+    fn from_gguf_sized(file: &GgufFile, host_all: bool) -> Result<Self, AllpacaError> {
         let report = file.compat_report();
         if let Some(reason) = report.reject_reason {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
         }
         let cfg = ModelConfig::from_gguf(file)?;
-        Self::from_gguf_cfg(file, cfg, &report)
+        if crate::qwen4exp::file_is_qwen4exp(file) {
+            // Its own tensor set and forward: the generic layout checks do not apply.
+            let weights = crate::qwen4exp::Qwen4Weights::from_gguf(file, cfg.n_layers)?;
+            let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
+            let mut model = Self::skeleton_hybrid(cfg, name, &report, Some(file));
+            model.config.recurrent = true;
+            model.q4x = Some(Arc::new(weights));
+            return Ok(model);
+        }
+        Self::from_gguf_cfg(file, cfg, &report, host_all)
     }
 
     /// Load trailing NextN/MTP blocks as a standalone draft model (shared embed/lm_head).
@@ -6387,7 +6541,7 @@ impl TinyModel {
                 "MTP blk.{base} missing attn_q / nextn.eh_proj"
             ))));
         }
-        let mut model = Self::from_gguf_cfg(file, cfg, &report)?;
+        let mut model = Self::from_gguf_cfg(file, cfg, &report, false)?;
         // Dense MTP heads (Qwen3.5/3.8) ship `ffn_gate/up/down`, not MoE exps.
         // Clear trunk expert count so draft decode stays on the dense device path.
         let base = model.config.gguf_layer_base;
@@ -6429,6 +6583,7 @@ impl TinyModel {
         file: &GgufFile,
         cfg: ModelConfig,
         report: &GgufCompatReport,
+        host_all: bool,
     ) -> Result<Self, AllpacaError> {
         let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
         for i in 0..cfg.n_layers {
@@ -6559,7 +6714,7 @@ impl TinyModel {
             )));
         }
         let host_bytes = estimated_gguf_f32_bytes(file, &cfg);
-        if host_bytes > HOST_F32_LIMIT {
+        if host_bytes > HOST_F32_LIMIT && !host_all {
             let mut model = Self::skeleton_hybrid(cfg, name, report, Some(file));
             attach_dsv4(&mut model, file)?;
             return Ok(model);
@@ -6864,6 +7019,8 @@ impl TinyModel {
             exit_heads,
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache,
@@ -7023,6 +7180,8 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7082,6 +7241,7 @@ impl TinyModel {
             rope_dims_swa: 0,
             rope_theta_swa: 0.0,
             headwise_attn_gate: false,
+            gated_attn_q: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             scale_embed: false,
@@ -7092,6 +7252,7 @@ impl TinyModel {
             n_group_used: 1,
             n_shared_experts: 0,
             shared_ff_dim: 0,
+            dense_ff_dim: 0,
             expert_weights_norm: false,
             expert_weights_scale: 1.0,
             moe_sigmoid_gating: false,
@@ -7155,6 +7316,8 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7199,6 +7362,7 @@ impl TinyModel {
             rope_dims_swa: 0,
             rope_theta_swa: 0.0,
             headwise_attn_gate: false,
+            gated_attn_q: false,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             scale_embed: false,
@@ -7209,6 +7373,7 @@ impl TinyModel {
             n_group_used: 1,
             n_shared_experts: 0,
             shared_ff_dim: 0,
+            dense_ff_dim: 0,
             expert_weights_norm: false,
             expert_weights_scale: 1.0,
             moe_sigmoid_gating: false,
@@ -7266,6 +7431,8 @@ impl TinyModel {
             exit_heads: Vec::new(),
             mtp_nextn: None,
             dsv4: None,
+            q4x: None,
+            calib: Default::default(),
             rpc: None,
             edge0: None,
             mla_cache: None,
@@ -7335,9 +7502,25 @@ impl TinyModel {
                 ))));
             }
         }
+        if self.q4x.is_some() {
+            let memory = recurrent.as_deref_mut().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
+            })?;
+            return crate::qwen4exp::forward_qwen4_token(self, token, pos, logits, &mut memory.q4x);
+        }
         if self.dsv4.is_some() {
             return crate::deepseek4::forward_dsv4_token(
-                self, token, pos, page_ids, kv, logits, metrics, None, hip, prefill,
+                self,
+                token,
+                pos,
+                page_ids,
+                kv,
+                logits,
+                metrics,
+                None,
+                hip,
+                prefill,
+                recurrent.as_deref_mut().map(|r| &mut r.dsv4),
             );
         }
         // Prefer on-device decode whenever resident weights exist — including hybrid
@@ -7388,7 +7571,7 @@ impl TinyModel {
                 *v *= s;
             }
         }
-        let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
+        let mut scratch = vec![0.0f32; dim.max(cfg.moe_workspace()).max(kv_dim)];
         let mut q = vec![0.0f32; dim];
         let mut k = vec![0.0f32; kv_dim];
         let mut v = vec![0.0f32; kv_dim];
@@ -7538,6 +7721,7 @@ impl TinyModel {
                 )?;
                 continue;
             }
+            self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::AttnIn, &scratch[..dim]);
             gemm_nt_dispatch(
                 hip,
                 &scratch[..dim],
@@ -7665,6 +7849,7 @@ impl TinyModel {
                     dim,
                 );
             }
+            self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::AttnOut, &attn_out);
             gemm_nt_dispatch(
                 hip,
                 &attn_out,
@@ -7891,6 +8076,15 @@ impl TinyModel {
         }
         let mrope = vision.and_then(VisionSeq::mrope);
         let dim = self.config.dim;
+        if self.q4x.is_some() {
+            let memory = recurrent.as_deref_mut().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
+            })?;
+            for (i, &token) in tokens.iter().enumerate() {
+                crate::qwen4exp::forward_qwen4_token(self, token, start_pos + i, logits, &mut memory.q4x)?;
+            }
+            return Ok(());
+        }
         if self.dsv4.is_some() && tokens.len() > 1 {
             return crate::deepseek4::forward_dsv4_tokens(
                 self,
@@ -7903,6 +8097,7 @@ impl TinyModel {
                 hip,
                 write_logits,
                 true,
+                recurrent.as_deref_mut().map(|r| &mut r.dsv4),
             );
         }
         // Layers on RPC workers: the batched device path below sends each
@@ -8443,7 +8638,7 @@ impl TinyModel {
                     w_gate,
                     buf.gate,
                     1,
-                    cfg.ff_dim as i32,
+                    cfg.dense_ff() as i32,
                     dim as i32,
                 )?;
                 resident.gemm_nt(
@@ -8452,10 +8647,10 @@ impl TinyModel {
                     w_up,
                     buf.up,
                     1,
-                    cfg.ff_dim as i32,
+                    cfg.dense_ff() as i32,
                     dim as i32,
                 )?;
-                hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+                hip.silu_mul_device(buf.gate, buf.up, cfg.dense_ff() as i32)?;
                 resident.gemm_nt(
                     hip,
                     buf.gate,
@@ -8463,7 +8658,7 @@ impl TinyModel {
                     buf.proj,
                     1,
                     dim as i32,
-                    cfg.ff_dim as i32,
+                    cfg.dense_ff() as i32,
                 )?;
                 drop(ffn);
             } else if Self::layer_has_device_moe(layer, resident, layer_idx) {
@@ -8569,7 +8764,7 @@ impl TinyModel {
                 w_gate,
                 buf.gate,
                 1,
-                cfg.ff_dim as i32,
+                cfg.dense_ff() as i32,
                 dim as i32,
             )?;
             resident.gemm_nt(
@@ -8578,10 +8773,10 @@ impl TinyModel {
                 w_up,
                 buf.up,
                 1,
-                cfg.ff_dim as i32,
+                cfg.dense_ff() as i32,
                 dim as i32,
             )?;
-            hip.silu_mul_device(buf.gate, buf.up, cfg.ff_dim as i32)?;
+            hip.silu_mul_device(buf.gate, buf.up, cfg.dense_ff() as i32)?;
             resident.gemm_nt(
                 hip,
                 buf.gate,
@@ -8589,7 +8784,7 @@ impl TinyModel {
                 buf.proj,
                 1,
                 dim as i32,
-                cfg.ff_dim as i32,
+                cfg.dense_ff() as i32,
             )?;
             drop(ffn);
             if layer_idx + 1 < resident.layers.len() {
@@ -8853,7 +9048,7 @@ impl TinyModel {
                 w_gate,
                 buf.gate,
                 m,
-                cfg.ff_dim as i32,
+                cfg.dense_ff() as i32,
                 dim as i32,
             )?;
             resident.gemm_nt(
@@ -8862,10 +9057,10 @@ impl TinyModel {
                 w_up,
                 buf.up,
                 m,
-                cfg.ff_dim as i32,
+                cfg.dense_ff() as i32,
                 dim as i32,
             )?;
-            hip.silu_mul_device(buf.gate, buf.up, (n_tok * cfg.ff_dim) as i32)?;
+            hip.silu_mul_device(buf.gate, buf.up, (n_tok * cfg.dense_ff()) as i32)?;
             resident.gemm_nt(
                 hip,
                 buf.gate,
@@ -8873,7 +9068,7 @@ impl TinyModel {
                 buf.proj,
                 m,
                 dim as i32,
-                cfg.ff_dim as i32,
+                cfg.dense_ff() as i32,
             )?;
             drop(ffn);
         } else if Self::layer_has_device_moe(layer, resident, layer_idx) {
@@ -9251,6 +9446,27 @@ impl TinyModel {
                             cfg.eps,
                         )?;
                     }
+                } else if q_out == n_heads * head_dim {
+                    // Plain attention with per-head Q/K RMSNorm before the
+                    // rotation (Qwen3, Ling 2.0, Gemma 3).
+                    if layer.q_norm.n == head_dim {
+                        hip.rmsnorm_heads_device(
+                            buf.q,
+                            resident.f32_or_dequant(hip, layer.q_norm)?,
+                            n_heads as i32,
+                            head_dim as i32,
+                            cfg.eps,
+                        )?;
+                    }
+                    if layer.k_norm.n == head_dim {
+                        hip.rmsnorm_heads_device(
+                            buf.k,
+                            resident.f32_or_dequant(hip, layer.k_norm)?,
+                            n_kv_heads as i32,
+                            head_dim as i32,
+                            cfg.eps,
+                        )?;
+                    }
                 }
                 if cfg.rope_none {
                 } else if let Some(n_rot) = cfg.neox_rot_dims(layer_idx, head_dim) {
@@ -9410,7 +9626,7 @@ impl TinyModel {
                                 w_gate,
                                 buf.gate,
                                 1,
-                                cfg.ff_dim as i32,
+                                cfg.dense_ff() as i32,
                                 dim as i32,
                             )?;
                             resident.gemm_nt(
@@ -9419,7 +9635,7 @@ impl TinyModel {
                                 w_up,
                                 buf.up,
                                 1,
-                                cfg.ff_dim as i32,
+                                cfg.dense_ff() as i32,
                                 dim as i32,
                             )?;
                             Ok(())
@@ -9431,7 +9647,7 @@ impl TinyModel {
                             w_gate,
                             buf.gate,
                             1,
-                            cfg.ff_dim as i32,
+                            cfg.dense_ff() as i32,
                             dim as i32,
                         )?;
                         resident.gemm_nt(
@@ -9440,11 +9656,11 @@ impl TinyModel {
                             w_up,
                             buf.up,
                             1,
-                            cfg.ff_dim as i32,
+                            cfg.dense_ff() as i32,
                             dim as i32,
                         )?;
                     }
-                    self.device_act_mul(hip, buf.gate, buf.up, cfg.ff_dim as i32)?;
+                    self.device_act_mul(hip, buf.gate, buf.up, cfg.dense_ff() as i32)?;
                     record_elementwise(Some(metrics));
                     if w_down.kind == WeightKind::Q8_0 {
                         hip.profile_q8(|| {
@@ -9455,7 +9671,7 @@ impl TinyModel {
                                 buf.proj,
                                 1,
                                 dim as i32,
-                                cfg.ff_dim as i32,
+                                cfg.dense_ff() as i32,
                             )
                         })?;
                     } else {
@@ -9466,7 +9682,7 @@ impl TinyModel {
                             buf.proj,
                             1,
                             dim as i32,
-                            cfg.ff_dim as i32,
+                            cfg.dense_ff() as i32,
                         )?;
                     }
                     drop(ffn);
@@ -9905,6 +10121,27 @@ impl TinyModel {
                             cfg.eps,
                         )?;
                     }
+                } else if al.q_out == al.n_heads * al.head_dim {
+                    // Plain attention with per-head Q/K RMSNorm before the
+                    // rotation (Qwen3, Ling 2.0, Gemma 3). Rows are contiguous.
+                    if layer.q_norm.n == al.head_dim {
+                        hip.rmsnorm_heads_device(
+                            buf.q,
+                            resident.f32_or_dequant(hip, layer.q_norm)?,
+                            (n_tok * al.n_heads) as i32,
+                            al.head_dim as i32,
+                            cfg.eps,
+                        )?;
+                    }
+                    if layer.k_norm.n == al.head_dim {
+                        hip.rmsnorm_heads_device(
+                            buf.k,
+                            resident.f32_or_dequant(hip, layer.k_norm)?,
+                            (n_tok * al.n_kv_heads) as i32,
+                            al.head_dim as i32,
+                            cfg.eps,
+                        )?;
+                    }
                 }
                 let q_stride = if al.gated { al.attn_dim } else { al.q_out };
                 let theta = cfg.rope_theta_for_layer(layer_idx);
@@ -10105,7 +10342,7 @@ impl TinyModel {
                             w_gate,
                             buf.gate,
                             m,
-                            cfg.ff_dim as i32,
+                            cfg.dense_ff() as i32,
                             dim as i32,
                         )?;
                         resident.gemm_nt(
@@ -10114,7 +10351,7 @@ impl TinyModel {
                             w_up,
                             buf.up,
                             m,
-                            cfg.ff_dim as i32,
+                            cfg.dense_ff() as i32,
                             dim as i32,
                         )?;
                         Ok(())
@@ -10126,7 +10363,7 @@ impl TinyModel {
                         w_gate,
                         buf.gate,
                         m,
-                        cfg.ff_dim as i32,
+                        cfg.dense_ff() as i32,
                         dim as i32,
                     )?;
                     resident.gemm_nt(
@@ -10135,11 +10372,11 @@ impl TinyModel {
                         w_up,
                         buf.up,
                         m,
-                        cfg.ff_dim as i32,
+                        cfg.dense_ff() as i32,
                         dim as i32,
                     )?;
                 }
-                self.device_act_mul(hip, buf.gate, buf.up, (n_tok * cfg.ff_dim) as i32)?;
+                self.device_act_mul(hip, buf.gate, buf.up, (n_tok * cfg.dense_ff()) as i32)?;
                 record_elementwise(Some(metrics));
                 if w_down.kind == WeightKind::Q8_0 {
                     hip.profile_q8(|| {
@@ -10150,7 +10387,7 @@ impl TinyModel {
                             buf.proj,
                             m,
                             dim as i32,
-                            cfg.ff_dim as i32,
+                            cfg.dense_ff() as i32,
                         )
                     })?;
                 } else {
@@ -10161,7 +10398,7 @@ impl TinyModel {
                         buf.proj,
                         m,
                         dim as i32,
-                        cfg.ff_dim as i32,
+                        cfg.dense_ff() as i32,
                     )?;
                 }
                 drop(ffn);
@@ -10335,7 +10572,7 @@ impl TinyModel {
             }
             xs.push(self.embed[tok * dim..(tok + 1) * dim].to_vec());
         }
-        let mut scratch = vec![0.0f32; dim.max(cfg.ff_dim).max(kv_dim)];
+        let mut scratch = vec![0.0f32; dim.max(cfg.moe_workspace()).max(kv_dim)];
         let ancestry = forest.ancestry_mask();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -10839,7 +11076,7 @@ impl TinyModel {
             } else {
                 dim
             };
-            let gated = q_out == wo_k.saturating_mul(2) && wo_k > dim;
+            let gated = q_out == wo_k.saturating_mul(2) && (wo_k > dim || cfg.gated_attn_q);
             let attn_dim = if gated {
                 wo_k
             } else {
@@ -10907,6 +11144,27 @@ impl TinyModel {
                     head_dim as i32,
                 )?;
                 hip.copy_d2d_f32(buf.q, buf.proj, attn_dim)?;
+                if layer.q_norm.n == head_dim {
+                    hip.rmsnorm_heads_device(
+                        buf.q,
+                        resident.f32_or_dequant(hip, layer.q_norm)?,
+                        n_heads as i32,
+                        head_dim as i32,
+                        cfg.eps,
+                    )?;
+                }
+                if layer.k_norm.n == head_dim {
+                    hip.rmsnorm_heads_device(
+                        buf.k,
+                        resident.f32_or_dequant(hip, layer.k_norm)?,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                        cfg.eps,
+                    )?;
+                }
+            } else if q_out == n_heads * head_dim {
+                // Plain attention with per-head Q/K RMSNorm before the
+                // rotation (Qwen3, Ling 2.0, Gemma 3).
                 if layer.q_norm.n == head_dim {
                     hip.rmsnorm_heads_device(
                         buf.q,
@@ -11065,7 +11323,7 @@ impl TinyModel {
                     w_gate,
                     buf.gate,
                     1,
-                    cfg.ff_dim as i32,
+                    cfg.dense_ff() as i32,
                     dim as i32,
                 )?;
                 resident.gemm_nt(
@@ -11074,10 +11332,10 @@ impl TinyModel {
                     w_up,
                     buf.up,
                     1,
-                    cfg.ff_dim as i32,
+                    cfg.dense_ff() as i32,
                     dim as i32,
                 )?;
-                self.device_act_mul(hip, buf.gate, buf.up, cfg.ff_dim as i32)?;
+                self.device_act_mul(hip, buf.gate, buf.up, cfg.dense_ff() as i32)?;
                 record_elementwise(metrics);
                 resident.gemm_nt(
                     hip,
@@ -11086,7 +11344,7 @@ impl TinyModel {
                     buf.proj,
                     1,
                     dim as i32,
-                    cfg.ff_dim as i32,
+                    cfg.dense_ff() as i32,
                 )?;
                 drop(ffn);
                 if self.fuse_next_attn_norm(layer_idx, hip.device) {
@@ -12400,6 +12658,56 @@ mod lightning_moe_tests {
             layer.wq = vec![0.0; 2 * dim * dim];
         }
         assert!(!ambiguous.supports_hip_batched_prefill());
+    }
+
+    /// Ling-mini-2.0's shape in small: 8 experts in 4 groups, 2 groups used,
+    /// top-3, sigmoid gating with normalised and scaled weights.
+    #[test]
+    fn group_limited_routing_keeps_the_best_groups_only() {
+        let mut cfg = ModelConfig::tiny_moe();
+        cfg.n_experts = 8;
+        cfg.n_active = 3;
+        cfg.moe_sigmoid_gating = true;
+        cfg.expert_weights_norm = true;
+        cfg.expert_weights_scale = 2.5;
+        cfg.n_expert_groups = 4;
+        cfg.n_group_used = 2;
+        // Groups: {0,1} {2,3} {4,5} {6,7}. Expert 2 is the single best, but
+        // its group's top-2 sum loses to groups 0 and 3.
+        let logits = [1.0f32, 0.9, 1.6, -4.0, 0.2, 0.1, 1.2, 0.8];
+        let got = topk_from_logits(&mut logits.clone(), cfg.n_active, &cfg, None, &[]);
+        let picked: Vec<usize> = got.iter().map(|(e, _)| *e).collect();
+        assert_eq!(picked, vec![6, 0, 1], "experts only from the two best groups");
+        let sum: f32 = got.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 2.5).abs() < 1e-5, "weights normalise to the scale, got {sum}");
+        // Flat routing would have picked expert 2 first.
+        cfg.n_expert_groups = 1;
+        let flat = topk_from_logits(&mut logits.clone(), cfg.n_active, &cfg, None, &[]);
+        assert_eq!(flat[0].0, 2);
+        // Disabled experts drop out of their group's score: with group 3
+        // off, groups 0 and 2 are the best two (expert 2's group still loses).
+        cfg.n_expert_groups = 4;
+        let mut mask = [false; 8];
+        mask[6] = true;
+        mask[7] = true;
+        let masked = topk_from_logits(&mut logits.clone(), cfg.n_active, &cfg, Some(&mask), &[]);
+        let picked: Vec<usize> = masked.iter().map(|(e, _)| *e).collect();
+        assert_eq!(picked, vec![0, 1, 4]);
+    }
+
+    /// Ornith-1.5-9B: 16 heads x 256 = dim 4096, so only the architecture
+    /// flag says the double-width Q is `[Q|gate]`.
+    #[test]
+    fn attn_layout_reads_gated_q_at_attn_dim_equal_to_dim_from_the_arch_flag() {
+        let mut cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let (wq, wk, wo) = (2 * dim * dim, dim * dim, dim * dim);
+        let plain = attn_layout(&cfg, wq, wk, wo);
+        assert!(!plain.gated);
+        cfg.gated_attn_q = true;
+        let gated = attn_layout(&cfg, wq, wk, wo);
+        assert!(gated.gated);
+        assert_eq!((gated.q_out, gated.attn_dim), (2 * dim, dim));
     }
 
     #[test]
