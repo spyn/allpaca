@@ -5485,13 +5485,24 @@ static hipMemcpyKind to_hip_memcpy_kind(int32_t kind) {
  * loaded runtime rather than declaring the prototype, so a missing symbol
  * degrades to per-copy async instead of breaking the build. `attrs`,
  * `attrsIdxs` and `numAttrs` are documented as unsupported by HIP, so the
- * attribute pointer is always null and its layout never matters here. */
+ * attribute pointer is always null and its layout never matters here.
+ *
+ * Off unless ALLPACA_MEMCPY_BATCH=1. The SDK 7.1 Windows runtime does not
+ * export it after all, so the per-copy path is what every measured run used.
+ * The ROCm 10 runtime exports it, and there it reads the source when the
+ * stream runs, not during the call as hipMemcpyAsync does for pageable
+ * memory. Callers reuse their source once the call returns, and DeepSeek-V4
+ * expert uploads came out corrupted (non-finite logits). */
 typedef hipError_t (*allpaca_memcpy_batch_fn)(void **dsts, void **srcs, size_t *sizes, size_t count,
                                               void *attrs, size_t *attrsIdxs, size_t numAttrs,
                                               size_t *failIdx, hipStream_t stream);
 
 static allpaca_memcpy_batch_fn memcpy_batch_fn() {
     static allpaca_memcpy_batch_fn fn = []() -> allpaca_memcpy_batch_fn {
+        const char *want = std::getenv("ALLPACA_MEMCPY_BATCH");
+        if (!want || want[0] != '1') {
+            return nullptr;
+        }
         void *sym = nullptr;
         hipDriverProcAddressQueryResult status{};
         if (hipGetProcAddress("hipMemcpyBatchAsync", &sym, HIP_VERSION, 0, &status) == hipSuccess &&

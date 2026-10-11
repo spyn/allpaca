@@ -13186,6 +13186,44 @@ mod tests {
         );
     }
 
+    /// Callers of the batched H2D copy reuse or drop their source as soon as
+    /// the call returns (bounce buffers, RAM-tier slots), so the copy must
+    /// have read it by then. `hipMemcpyBatchAsync` on the ROCm 10 runtime
+    /// reads the source only when the stream runs.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn batched_h2d_copy_has_read_its_source_when_it_returns() {
+        if device_count() == 0 {
+            return;
+        }
+        const PART: usize = 4 << 20;
+        const PARTS: usize = 3;
+        let blob = DeviceWeights::alloc(0, PART * PARTS).expect("device blob");
+        let want: Vec<u8> = (0..PART * PARTS)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let h2d = H2dStream::new().expect("side stream");
+        let mut src = want.clone();
+        {
+            let regions: Vec<(usize, &[u8])> = (0..PARTS)
+                .map(|p| (p * PART, &src[p * PART..(p + 1) * PART]))
+                .collect();
+            unsafe { blob.copy_h2d_batch_on(&regions, h2d.raw()) }.expect("batched H2D");
+        }
+        src.fill(0x11);
+        h2d.synchronize().expect("side stream sync");
+        let mut back = vec![0u8; PART * PARTS];
+        memcpy(
+            back.as_mut_ptr(),
+            blob.byte_ptr_at(0),
+            back.len(),
+            MEMCPY_D2H,
+        )
+        .expect("read back");
+        let wrong = back.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(wrong, 0, "{wrong} bytes came from the source after it was reused");
+    }
+
     /// Driver VRAM must be self-consistent and must react to a real allocation.
     /// This is the signal `rebalance_vram` grows the expert pool against, so a
     /// stale or process-local number would be worse than none.
