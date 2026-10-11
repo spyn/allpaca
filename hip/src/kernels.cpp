@@ -2739,6 +2739,22 @@ __device__ inline uint32_t kq_u32_from_u16(const uint8_t *p) {
  * and Q3_K: weights g*32 + j0 .. +W-1 of each 128-half, one scale (W <= 16),
  * values offset by -32 (Q6_K) or -4 (Q3_K). Integer
  * dots accumulate across a lane's W weights; the scales apply once per row. */
+/* Which order the rows' activation loads take in the int8 GEMV kernels
+ * (K-quant and ROCmFP4). Same arithmetic either way; only the generated code
+ * differs. Measured on Qwen3.8 27B prefill (679 tokens):
+ *   - clang 24 (ROCm 10.1) waits for each row's loads in turn when they sit
+ *     inside the row loop: ROCmFP4 5.63 s, Q5_K mix 7.46 s. With every row's
+ *     loads issued first: ROCmFP4 4.95 s, Q5_K mix 6.67 s.
+ *   - clang 21 (SDK 7.1) already overlaps them: ROCmFP4 4.96 s, Q5_K mix
+ *     6.45 s; loads-first costs it about 2.5% on ROCmFP4 (5.10 s). */
+#ifndef ALLPACA_I8_LOADS_FIRST
+#if defined(__clang_major__) && __clang_major__ >= 22
+#define ALLPACA_I8_LOADS_FIRST 1
+#else
+#define ALLPACA_I8_LOADS_FIRST 0
+#endif
+#endif
+
 template <int NC>
 __device__ inline void kq_load_u32s(const void *p, uint32_t (&v)[NC]) {
     if constexpr (NC == 4) {
@@ -2896,6 +2912,25 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                     }
                     const float s = d * static_cast<float>(sc[h * 8 + j0 / 16 + 2 * g]);
                     const int bi = ib * 8 + h * 4 + g;
+#if ALLPACA_I8_LOADS_FIRST
+                    uint32_t av[MR][NC];
+                    float ds[MR];
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av[r]);
+                        ds[r] = drow[r][bi];
+                    }
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        int32_t dot = 0, sum = 0;
+#pragma unroll
+                        for (int t = 0; t < NC; ++t) {
+                            dot = i8dot4(av[r][t], q[t], dot);
+                            sum = i8dot4(av[r][t], ONES, sum);
+                        }
+                        acc[r] += s * ds[r] * static_cast<float>(dot - 32 * sum);
+                    }
+#else
 #pragma unroll
                     for (int r = 0; r < MR; ++r) {
                         uint32_t av[NC];
@@ -2908,6 +2943,7 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                         }
                         acc[r] += s * drow[r][bi] * static_cast<float>(dot - 32 * sum);
                     }
+#endif
                 }
             } else {
                 const float d = allpaca_f16le_to_f32(blk);
@@ -2940,6 +2976,32 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                 const float dh = d * static_cast<float>(sc2);
                 const float mh = dmin * static_cast<float>(m2);
                 const int bl = ib * 8 + 2 * g;
+#if ALLPACA_I8_LOADS_FIRST
+                uint32_t alo[MR][NC], ahi[MR][NC];
+                float dsl[MR], dsh[MR];
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo[r]);
+                    kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi[r]);
+                    dsl[r] = drow[r][bl];
+                    dsh[r] = drow[r][bl + 1];
+                }
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
+#pragma unroll
+                    for (int t = 0; t < NC; ++t) {
+                        il = i8dot4(alo[r][t], lo[t], il);
+                        sl_ = i8dot4(alo[r][t], ONES, sl_);
+                        ih = i8dot4(ahi[r][t], hi[t], ih);
+                        sh = i8dot4(ahi[r][t], ONES, sh);
+                    }
+                    acc[r] += dsl[r] * (dl * static_cast<float>(il) -
+                                        ml * static_cast<float>(sl_)) +
+                              dsh[r] * (dh * static_cast<float>(ih) -
+                                        mh * static_cast<float>(sh));
+                }
+#else
 #pragma unroll
                 for (int r = 0; r < MR; ++r) {
                     uint32_t alo[NC], ahi[NC];
@@ -2958,6 +3020,7 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                               drow[r][bl + 1] * (dh * static_cast<float>(ih) -
                                                  mh * static_cast<float>(sh));
                 }
+#endif
             }
         }
     }
@@ -3702,21 +3765,6 @@ __device__ inline uint32_t rocmfp4_levels_i8x4(uint32_t code) {
     return (mag ^ neg) + (neg & 0x01010101u);
 }
 
-/* Which order the rows' activation loads take in the kernel below. Same
- * arithmetic either way; only the generated code differs. Measured on Qwen3.8
- * 27B prefill (679 tokens):
- *   - clang 24 (ROCm 10.1) waits for each row's loads in turn when they sit
- *     inside the row loop, 5.63 s; with every row's loads issued first, 4.95 s.
- *   - clang 21 (SDK 7.1) already overlaps them, 4.96 s; loads-first costs it
- *     about 2.5% (5.10 s). */
-#ifndef ALLPACA_FP4_LOADS_FIRST
-#if defined(__clang_major__) && __clang_major__ >= 22
-#define ALLPACA_FP4_LOADS_FIRST 1
-#else
-#define ALLPACA_FP4_LOADS_FIRST 0
-#endif
-#endif
-
 /* ROCmFP4 GEMV on int8 activations (the K-quant int8 scheme, llama.cpp
  * mmvq): A is quantized once per GEMV to int8 with one f32 scale per 32
  * values, and each lane takes whole 32-weight blocks: two signed dot4 chains
@@ -3764,7 +3812,7 @@ __global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, con
                 wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
                 wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
             }
-#if ALLPACA_FP4_LOADS_FIRST
+#if ALLPACA_I8_LOADS_FIRST
             uint32_t al[MR][4], ah[MR][4];
             float ds[MR];
 #pragma unroll
