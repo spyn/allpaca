@@ -44,6 +44,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <hipblaslt/hipblaslt.h>
+#include <filesystem>
+#include <system_error>
 #endif
 
 __device__ float allpaca_f16_bits_to_f32(uint16_t h);
@@ -1671,27 +1673,45 @@ static int launch_gemm(const float *a, const float *b, float *c, int32_t m, int3
 /* Row-major C[m,n] = A[m,k] * B[n,k]^T via column-major rocBLAS (swap A/B, N/M). */
 static int launch_gemm_nt_rocblas(const float *a, const float *b, float *c, int32_t m, int32_t n,
                                   int32_t k, hipStream_t stream) {
+    /* A rocBLAS handle belongs to the device that was current when it was
+     * made (it picks that device's kernel library), so each device has its
+     * own. A device where a GEMM failed is not asked again. */
+    struct Dev {
+        rocblas_handle handle = nullptr;
+        bool tried = false;
+    };
     static std::mutex mu;
-    static rocblas_handle handle = nullptr;
-    static bool tried = false;
+    static Dev devs[16];
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= 16) {
+        return ALLPACA_ERR_DEVICE;
+    }
     std::lock_guard<std::mutex> lock(mu);
-    if (!tried) {
-        tried = true;
-        if (rocblas_create_handle(&handle) != rocblas_status_success) {
-            handle = nullptr;
+    Dev &d = devs[device];
+    if (!d.tried) {
+        d.tried = true;
+        if (rocblas_create_handle(&d.handle) != rocblas_status_success) {
+            d.handle = nullptr;
         }
     }
-    if (!handle) {
+    if (!d.handle) {
         return ALLPACA_ERR_NOT_IMPLEMENTED;
-    }
-    if (rocblas_set_stream(handle, stream) != rocblas_status_success) {
-        return ALLPACA_ERR_DEVICE;
     }
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    rocblas_status st = rocblas_sgemm(handle, rocblas_operation_transpose, rocblas_operation_none, n,
-                                      m, k, &alpha, b, k, a, k, &beta, c, n);
-    return st == rocblas_status_success ? ALLPACA_OK : ALLPACA_ERR_DEVICE;
+    rocblas_status st = rocblas_set_stream(d.handle, stream);
+    if (st == rocblas_status_success) {
+        st = rocblas_sgemm(d.handle, rocblas_operation_transpose, rocblas_operation_none, n, m, k,
+                           &alpha, b, k, a, k, &beta, c, n);
+    }
+    if (st != rocblas_status_success) {
+        std::fprintf(stderr, "allpaca: rocBLAS sgemm failed on device %d (status %d); using the built-in GEMM there\n",
+                     device, static_cast<int>(st));
+        rocblas_destroy_handle(d.handle);
+        d.handle = nullptr;
+        return ALLPACA_ERR_DEVICE;
+    }
+    return ALLPACA_OK;
 }
 #endif
 
@@ -1719,6 +1739,20 @@ static void ensure_hipblaslt_tensile_path() {
     const char *fmt = "%.*s/bin/hipblaslt/library";
 #endif
     if (std::snprintf(path, sizeof(path), fmt, static_cast<int>(n), hip) < 0) {
+        return;
+    }
+    /* ROCm 10 keeps one folder per GPU family under this one and finds it by
+     * itself; pointing it here makes every lookup fail. Only the flat layout
+     * (library files directly in the folder) wants the hint. */
+    bool flat = false;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().filename().string().rfind("TensileLibrary", 0) == 0) {
+            flat = true;
+            break;
+        }
+    }
+    if (!flat) {
         return;
     }
 #ifdef _WIN32
@@ -2025,6 +2059,8 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
         }
     }
 #endif
+    /* A failed library attempt above must not fail the kernel that replaces it. */
+    clear_last_error();
     /* Decode is always M=1; small-M prefill stays on the coalesced GEMV. */
     if (m <= 8 && tiled && n <= 2048) {
         hipLaunchKernelGGL(gemv_nt_colblock_kernel, dim3(static_cast<unsigned>(n), static_cast<unsigned>(m)),

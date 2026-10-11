@@ -526,6 +526,19 @@ fn apply_hip_env(cmd: &mut Command, hip_root: &Path) {
     if clang.join("clang++").is_file() || clang.join("clang++.exe").is_file() {
         cmd.env("HIP_CLANG_PATH", clang);
     }
+    if let Some(dir) = nested_device_lib_dir(hip_root) {
+        cmd.env("DEVICE_LIB_PATH", dir);
+    }
+}
+
+/// TheRock layouts (ROCm 10 tarball and wheels) keep the device bitcode under
+/// `lib/llvm/amdgcn/bitcode`; clang only looks in `<root>/amdgcn/bitcode`.
+fn nested_device_lib_dir(hip_root: &Path) -> Option<PathBuf> {
+    if hip_root.join("amdgcn/bitcode").is_dir() {
+        return None;
+    }
+    let nested = hip_root.join("lib/llvm/amdgcn/bitcode");
+    nested.is_dir().then_some(nested)
 }
 
 fn try_hipcc(
@@ -558,6 +571,10 @@ fn try_hipcc(
         extra.push_str(" -DALLPACA_HAS_DIRECTSTORAGE -I\"");
         extra.push_str(&sdk.join("native/include").display().to_string());
         extra.push('"');
+    }
+    let device_lib = nested_device_lib_dir(hip_root);
+    if let Some(dir) = &device_lib {
+        extra.push_str(&format!(" --rocm-device-lib-path=\"{}\"", dir.display()));
     }
     let output = if cfg!(windows) {
         let vcvars = find_vcvars64()
@@ -593,6 +610,9 @@ fn try_hipcc(
             cmd.arg(flag);
         }
         apply_hip_env(&mut cmd, hip_root);
+        if let Some(dir) = &device_lib {
+            cmd.arg(format!("--rocm-device-lib-path={}", dir.display()));
+        }
         if rocblas_lib_exists(hip_root) {
             cmd.arg("-DALLPACA_HAS_ROCBLAS");
         }
