@@ -99,6 +99,7 @@ int allpaca_hip_mem_info(int32_t device, uint64_t *free_bytes, uint64_t *total_b
 int allpaca_hip_local_headroom(int32_t device, uint64_t *bytes);
 
 int allpaca_hip_set_device(int32_t device);
+int allpaca_hip_blas_warmup(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);
 

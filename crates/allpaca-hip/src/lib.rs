@@ -427,6 +427,7 @@ mod ffi {
             total_bytes: *mut u64,
         ) -> i32;
         pub fn allpaca_hip_set_device(device: i32) -> i32;
+        pub fn allpaca_hip_blas_warmup(device: i32) -> i32;
         pub fn allpaca_hip_memcpy_batch(
             dsts: *mut *mut c_void,
             srcs: *mut *mut c_void,
@@ -2121,6 +2122,25 @@ impl Drop for H2dStream {
 }
 
 /// Bind subsequent kernels / memcpy to `device`.
+/// Runs one small rocBLAS GEMM on `device` and waits for it. The first GEMM a
+/// process runs on a device pays the library's start-up there (seconds on
+/// some GPUs), so a caller can pay it at load instead of in the first request.
+/// Leaves `device` current on the calling thread.
+pub fn warm_up_blas(device: i32) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_blas_warmup(device) };
+        status(rc, "blas_warmup")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = device;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP blas_warmup unavailable".into(),
+        )))
+    }
+}
+
 pub fn set_device(device: i32) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -13191,6 +13211,27 @@ mod tests {
     /// have read it by then. `hipMemcpyBatchAsync` on the ROCm 10 runtime
     /// reads the source only when the stream runs.
     #[cfg(feature = "hip")]
+    #[test]
+    fn blas_warm_up_can_run_twice_and_leaves_gemm_correct() {
+        if device_count() == 0 {
+            return;
+        }
+        // Not every build links rocBLAS; the GEMM below must be right either way.
+        let first = warm_up_blas(0);
+        assert_eq!(first.is_ok(), warm_up_blas(0).is_ok());
+        let (m, n, k) = (16usize, 8usize, 4usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| (i % 5) as f32 * 0.5).collect();
+        let mut c = vec![0.0f32; m * n];
+        gemm_nt(&a, &b, &mut c, m as i32, n as i32, k as i32).unwrap();
+        for r in 0..m {
+            for j in 0..n {
+                let want: f32 = (0..k).map(|x| a[r * k + x] * b[j * k + x]).sum();
+                assert!((c[r * n + j] - want).abs() < 1e-4, "row {r} col {j}");
+            }
+        }
+    }
+
     #[test]
     fn batched_h2d_copy_has_read_its_source_when_it_returns() {
         if device_count() == 0 {

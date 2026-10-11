@@ -285,6 +285,21 @@ pub struct Engine {
     read_side: Arc<Mutex<ReadSide>>,
 }
 
+/// Starts the GPU BLAS library on `device` from a background thread while the
+/// model loads, so its one-time start-up is not paid by the first request. A
+/// request that arrives first waits for it, as it would have anyway.
+fn spawn_blas_warm_up(device: i32) {
+    std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        match allpaca_hip::warm_up_blas(device) {
+            Ok(()) => {
+                tracing::info!(device, ms = t.elapsed().as_millis() as u64, "GPU BLAS warmed up")
+            }
+            Err(e) => tracing::debug!(device, error = %e, "GPU BLAS warm-up skipped"),
+        }
+    });
+}
+
 /// How long a monitoring read waits for the engine lock. Decode releases it
 /// between tokens; a prefill holds it for the whole time to first token, and
 /// a dashboard poll must not hang that long.
@@ -4914,6 +4929,7 @@ fn open_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Option<Hi
                 bytes = ws.allocated_bytes(),
                 "HIP workspace allocated"
             );
+            spawn_blas_warm_up(device);
             Some(ws)
         }
         Err(e) => {
@@ -4953,6 +4969,7 @@ fn open_draft_hip_workspace(config: &Config, inventory: &DeviceInventory) -> Opt
                 bytes = ws.allocated_bytes(),
                 "HIP draft workspace allocated (resident; P2P not required)"
             );
+            spawn_blas_warm_up(draft);
             Some(ws)
         }
         Err(e) => {

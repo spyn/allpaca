@@ -5724,6 +5724,35 @@ extern "C" int allpaca_hip_set_device(int32_t device) {
     return hip_status(hipSetDevice(device));
 }
 
+/* One small rocBLAS GEMM on `device`. The first GEMM a process runs on a
+ * device pays the library's start-up there, whatever its size (about 4 s on
+ * an RX 9070 with ROCm 10.1, 0.2-0.4 s on an RX 9060 XT). Calling this at
+ * load keeps that out of the first request. */
+extern "C" int allpaca_hip_blas_warmup(int32_t device) {
+#ifdef ALLPACA_HAS_ROCBLAS
+    if (hipSetDevice(device) != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    constexpr int32_t N = 16;
+    const size_t bytes = static_cast<size_t>(3) * N * N * sizeof(float);
+    void *mem = nullptr;
+    if (hipMalloc(&mem, bytes) != hipSuccess || !mem) {
+        clear_last_error();
+        return ALLPACA_ERR_DEVICE;
+    }
+    (void)hipMemset(mem, 0, bytes);
+    float *buf = static_cast<float *>(mem);
+    const int rc = launch_gemm_nt_rocblas(buf, buf + N * N, buf + 2 * N * N, N, N, N, nullptr);
+    (void)hipDeviceSynchronize();
+    (void)hipFree(mem);
+    clear_last_error();
+    return rc;
+#else
+    (void)device;
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+#endif
+}
+
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t stream) {
     return hip_status(hipStreamSynchronize(as_stream(stream)));
 }
@@ -8568,6 +8597,8 @@ extern "C" int allpaca_hip_local_headroom(int32_t, uint64_t *) {
 }
 
 extern "C" int allpaca_hip_set_device(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
+extern "C" int allpaca_hip_blas_warmup(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
