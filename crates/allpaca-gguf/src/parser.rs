@@ -1330,26 +1330,27 @@ fn collect_split_shards(dir: &Path, nested: u32, found: &mut Vec<std::path::Path
 }
 
 /// DSpark sidecar next to a target GGUF, at the snapshot root, or under `dspark/`.
+///
+/// The snapshot root is the directory above the target's. Only its own files
+/// and its `dspark/` folder are searched there: for a model that sits one
+/// level below a shared models directory, that directory's other folders hold
+/// other models, and their sidecars must not attach to this one.
 pub fn discover_dspark_sidecar(target: &Path) -> Option<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if target.is_file() {
-        if let Some(dir) = target.parent() {
-            dirs.push(dir.to_path_buf());
-            if let Some(up) = dir.parent() {
-                dirs.push(up.to_path_buf());
-            }
-        }
+    let own = if target.is_file() {
+        target.parent()?
     } else if target.is_dir() {
-        dirs.push(target.to_path_buf());
-        if let Some(up) = target.parent() {
-            dirs.push(up.to_path_buf());
-        }
-    }
+        target
+    } else {
+        return None;
+    };
     let mut hits = Vec::new();
-    for dir in dirs {
-        collect_dspark_files(&dir, 1, &mut hits);
+    collect_dspark_files(own, 1, &mut hits);
+    if let Some(root) = own.parent() {
+        collect_dspark_files(root, 0, &mut hits);
+        collect_dspark_files(&root.join("dspark"), 0, &mut hits);
     }
     hits.sort_by(|a, b| dspark_hit_rank(a).cmp(&dspark_hit_rank(b)));
+    hits.dedup();
     hits.into_iter().next()
 }
 
@@ -2689,6 +2690,21 @@ mod tests {
         assert!(!is_dspark_filename(
             "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf"
         ));
+    }
+
+    #[test]
+    fn dspark_discovery_skips_another_models_sidecar() {
+        let root = std::env::temp_dir().join(format!("allpaca_dspark_other_{}", std::process::id()));
+        let model_dir = root.join("Qwen2.5-Coder-0.5B");
+        let other_dir = root.join("DeepSeek-V4-Flash-0731-GGUF");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let target = model_dir.join("qwen2.5-coder-0.5b-instruct-q8_0.gguf");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::write(other_dir.join("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"), b"x").unwrap();
+        assert_eq!(discover_dspark_sidecar(&target), None);
+        assert_eq!(discover_dspark_sidecar(&model_dir), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
