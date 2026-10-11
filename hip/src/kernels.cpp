@@ -1788,12 +1788,43 @@ struct HipblasLtDev {
     bool tried = false;
     void *workspace = nullptr;
     size_t workspace_bytes = 0;
-    int32_t cache_m = 0;
-    int32_t cache_n = 0;
-    int32_t cache_k = 0;
-    int cache_status = 0;
-    hipblasLtMatmulAlgo_t algo{};
+    /* What the library answered for a shape: the algorithm lookup costs
+     * ~30 ms, and a layer's attention GEMMs alternate between four shapes. */
+    struct Shape {
+        int32_t m = 0;
+        int32_t n = 0;
+        int32_t k = 0;
+        int status = 0; /* 1 = algo usable, 2 = no algorithm */
+        hipblasLtMatmulAlgo_t algo{};
+        size_t algo_ws = 0;
+    };
+    static constexpr int SHAPES = 64;
+    Shape shapes[SHAPES];
+    int next_shape = 0;
     size_t algo_ws = 0;
+
+    Shape *find(int32_t m, int32_t n, int32_t k) {
+        for (Shape &s : shapes) {
+            if (s.status != 0 && s.m == m && s.n == n && s.k == k) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    void remember(int32_t m, int32_t n, int32_t k, int status, const hipblasLtMatmulAlgo_t &algo, size_t ws) {
+        Shape *s = find(m, n, k);
+        if (!s) {
+            s = &shapes[next_shape];
+            next_shape = (next_shape + 1) % SHAPES;
+        }
+        s->m = m;
+        s->n = n;
+        s->k = k;
+        s->status = status;
+        s->algo = algo;
+        s->algo_ws = ws;
+    }
 };
 
 static int lt_grow_workspace(HipblasLtDev *st, size_t need, hipStream_t stream) {
@@ -1837,10 +1868,10 @@ static int lt_run(HipblasLtDev *st, const float *a, const float *b, float *c, in
     const float beta = 0.0f;
     hipblasLtMatmulAlgo_t algo{};
     size_t ws = 0;
-    bool have_algo = st->cache_status == 1 && st->cache_m == m && st->cache_n == n && st->cache_k == k;
-    if (have_algo) {
-        algo = st->algo;
-        ws = st->algo_ws;
+    const HipblasLtDev::Shape *known = st->find(m, n, k);
+    if (known && known->status == 1) {
+        algo = known->algo;
+        ws = known->algo_ws;
         if (out_algos) {
             *out_algos = 1;
         }
@@ -1878,13 +1909,21 @@ static int lt_run(HipblasLtDev *st, const float *a, const float *b, float *c, in
     if (ms != HIPBLAS_STATUS_SUCCESS) {
         return ALLPACA_ERR_DEVICE;
     }
-    st->cache_m = m;
-    st->cache_n = n;
-    st->cache_k = k;
-    st->cache_status = 1;
-    st->algo = algo;
+    st->remember(m, n, k, 1, algo, ws);
     st->algo_ws = ws;
     return ALLPACA_OK;
+}
+
+/* Off unless ALLPACA_HIPBLASLT=1. On two RDNA4 cards (SDK 7.1, Windows) it
+ * matched the fallback below at M = 187 and 512 on one card and offered no
+ * algorithm on the other, while each algorithm lookup cost ~30 ms and the
+ * first call ~2.7 s: a 23-row prefill of 21 layers took 2 s instead of 20 ms. */
+static bool hipblaslt_wanted() {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_HIPBLASLT");
+        return v && v[0] == '1';
+    }();
+    return on;
 }
 
 static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, int32_t m, int32_t n,
@@ -1913,7 +1952,7 @@ static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, in
     if (!st.handle) {
         return ALLPACA_ERR_NOT_IMPLEMENTED;
     }
-    if (st.cache_status == 2 && st.cache_m == m && st.cache_n == n && st.cache_k == k) {
+    if (const HipblasLtDev::Shape *known = st.find(m, n, k); known && known->status == 2) {
         return ALLPACA_ERR_NOT_IMPLEMENTED;
     }
     int algos = 0;
@@ -1926,10 +1965,7 @@ static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, in
         }
         return ALLPACA_OK;
     }
-    st.cache_m = m;
-    st.cache_n = n;
-    st.cache_k = k;
-    st.cache_status = 2;
+    st.remember(m, n, k, 2, hipblasLtMatmulAlgo_t{}, 0);
     if (!logged_miss) {
         logged_miss = true;
         std::fprintf(stderr, "allpaca: hipBLASLt F32 GEMM miss m=%d n=%d k=%d algos=%d\n", m, n, k,
@@ -1973,7 +2009,7 @@ static int launch_gemm_nt(const float *a, const float *b, float *c, int32_t m, i
     clear_last_error();
 #ifdef ALLPACA_HAS_HIPBLASLT
     /* M=1 lm_head: hipBLASLt was ~378 ms vs ~0.5 ms custom GEMV. Keep Lt for wide/prefill only. */
-    if (m > 8) {
+    if (m > 8 && hipblaslt_wanted()) {
         int rc = launch_gemm_nt_hipblaslt(a, b, c, m, n, k, stream);
         if (rc == ALLPACA_OK) {
             return ALLPACA_OK;

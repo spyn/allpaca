@@ -5796,7 +5796,7 @@ impl HipWorkspace {
         g.ops.clear();
         g.lm_head_ns = 0;
         g.full = g.forwards % PROFILE_EVERY == 1
-            || std::env::var("ALLPACA_PROFILE_ALL").is_ok_and(|v| v == "1");
+            || std::env::var("ALLPACA_PROFILE_ALL").is_ok_and(|v| v == "1" || v == "2");
         g.forwards = g.forwards.wrapping_add(1);
         self.profiling.store(u64::from(g.full), Ordering::Relaxed);
         g.wall_start = Some(std::time::Instant::now());
