@@ -3702,6 +3702,21 @@ __device__ inline uint32_t rocmfp4_levels_i8x4(uint32_t code) {
     return (mag ^ neg) + (neg & 0x01010101u);
 }
 
+/* Which order the rows' activation loads take in the kernel below. Same
+ * arithmetic either way; only the generated code differs. Measured on Qwen3.8
+ * 27B prefill (679 tokens):
+ *   - clang 24 (ROCm 10.1) waits for each row's loads in turn when they sit
+ *     inside the row loop, 5.63 s; with every row's loads issued first, 4.95 s.
+ *   - clang 21 (SDK 7.1) already overlaps them, 4.96 s; loads-first costs it
+ *     about 2.5% (5.10 s). */
+#ifndef ALLPACA_FP4_LOADS_FIRST
+#if defined(__clang_major__) && __clang_major__ >= 22
+#define ALLPACA_FP4_LOADS_FIRST 1
+#else
+#define ALLPACA_FP4_LOADS_FIRST 0
+#endif
+#endif
+
 /* ROCmFP4 GEMV on int8 activations (the K-quant int8 scheme, llama.cpp
  * mmvq): A is quantized once per GEMV to int8 with one f32 scale per 32
  * values, and each lane takes whole 32-weight blocks: two signed dot4 chains
@@ -3749,6 +3764,27 @@ __global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, con
                 wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
                 wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
             }
+#if ALLPACA_FP4_LOADS_FIRST
+            uint32_t al[MR][4], ah[MR][4];
+            float ds[MR];
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                kq_load_u32s<4>(arow[r] + ib * 32, al[r]);
+                kq_load_u32s<4>(arow[r] + ib * 32 + 16, ah[r]);
+                ds[r] = drow[r][ib];
+            }
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                int32_t dl = 0, dh = 0;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    dl = i8dot4(al[r][t], wl[t], dl);
+                    dh = i8dot4(ah[r][t], wh[t], dh);
+                }
+                acc[r] = acc[r] + ds[r] * (d0 * static_cast<float>(dl) +
+                                           d1 * static_cast<float>(dh));
+            }
+#else
 #pragma unroll
             for (int r = 0; r < MR; ++r) {
                 uint32_t al[4], ah[4];
@@ -3763,6 +3799,7 @@ __global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, con
                 acc[r] = acc[r] + drow[r][ib] * (d0 * static_cast<float>(dl) +
                                                  d1 * static_cast<float>(dh));
             }
+#endif
         }
     }
 #pragma unroll
