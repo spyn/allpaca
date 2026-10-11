@@ -814,9 +814,30 @@ pub fn decode_launch_list(data: &[u8]) -> Result<LaunchList, RpcError> {
 
 /// Length-prefixed request: cmd u8 | size u64 | payload.
 pub fn write_request<W: Write>(w: &mut W, cmd: Cmd, payload: &[u8]) -> Result<(), RpcError> {
-    w.write_all(&[cmd as u8])?;
-    w.write_all(&(payload.len() as u64).to_le_bytes())?;
-    w.write_all(payload)?;
+    write_frame(w, cmd as u8, payload)
+}
+
+/// Frames up to this size leave in a single write.
+const ONE_WRITE_FRAME: usize = 64 * 1024;
+
+/// Tag u8 | size u64 | payload. The sockets run with TCP_NODELAY, so every
+/// write is its own segment: writing the tag, the size and the payload
+/// separately put three segments on the wire per message. A frame that fits
+/// is copied into one buffer and sent with one write; a large one (a tensor
+/// upload) sends the 9-byte head and then the payload, without the copy.
+fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> Result<(), RpcError> {
+    let mut head = [0u8; 9];
+    head[0] = tag;
+    head[1..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    if payload.len() <= ONE_WRITE_FRAME {
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.extend_from_slice(&head);
+        frame.extend_from_slice(payload);
+        w.write_all(&frame)?;
+    } else {
+        w.write_all(&head)?;
+        w.write_all(payload)?;
+    }
     w.flush()?;
     Ok(())
 }
@@ -838,11 +859,7 @@ pub fn read_request<R: Read>(r: &mut R) -> Result<(Cmd, Vec<u8>), RpcError> {
 
 /// Reply: status u8 | size u64 | payload.
 pub fn write_reply<W: Write>(w: &mut W, status: u8, payload: &[u8]) -> Result<(), RpcError> {
-    w.write_all(&[status])?;
-    w.write_all(&(payload.len() as u64).to_le_bytes())?;
-    w.write_all(payload)?;
-    w.flush()?;
-    Ok(())
+    write_frame(w, status, payload)
 }
 
 pub fn read_reply<R: Read>(r: &mut R) -> Result<(u8, Vec<u8>), RpcError> {
@@ -882,4 +899,52 @@ pub fn check_hello(reply: &HelloReply) -> Result<(), RpcError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// Records every write call, as a TCP_NODELAY socket would send them.
+    #[derive(Default)]
+    struct Segments(Vec<Vec<u8>>);
+
+    impl Write for Segments {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_request_and_its_reply_each_leave_in_one_write() {
+        let payload: Vec<u8> = (0..8300u32).map(|i| i as u8).collect();
+        let mut wire = Segments::default();
+        write_request(&mut wire, Cmd::Hello, &payload).unwrap();
+        assert_eq!(wire.0.len(), 1, "request writes");
+        let (cmd, body) = read_request(&mut wire.0[0].as_slice()).unwrap();
+        assert!(matches!(cmd, Cmd::Hello));
+        assert_eq!(body, payload);
+
+        let mut wire = Segments::default();
+        write_reply(&mut wire, STATUS_OK, &payload).unwrap();
+        assert_eq!(wire.0.len(), 1, "reply writes");
+        let (status, body) = read_reply(&mut wire.0[0].as_slice()).unwrap();
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(body, payload);
+    }
+
+    #[test]
+    fn a_large_frame_is_not_copied_and_still_round_trips() {
+        let payload = vec![7u8; 300 * 1024];
+        let mut wire = Segments::default();
+        write_request(&mut wire, Cmd::Hello, &payload).unwrap();
+        assert_eq!(wire.0.len(), 2, "head, then the payload as given");
+        let bytes = wire.0.concat();
+        let (_, body) = read_request(&mut bytes.as_slice()).unwrap();
+        assert_eq!(body, payload);
+    }
 }
