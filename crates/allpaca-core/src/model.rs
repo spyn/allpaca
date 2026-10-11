@@ -7579,6 +7579,11 @@ impl TinyModel {
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(trace) = recurrent.as_deref_mut().and_then(|r| r.trace.as_mut()) {
+                if trace.enter(pos, layer_idx, self.layers.len(), &mut x) {
+                    continue;
+                }
+            }
             if let Some(rpc) = &self.rpc {
                 if rpc.is_remote(layer_idx) {
                     if rpc.is_span_start(layer_idx) {
@@ -7934,6 +7939,9 @@ impl TinyModel {
                     return Ok(());
                 }
             }
+        }
+        if let Some(trace) = recurrent.as_deref_mut().and_then(|r| r.trace.as_mut()) {
+            trace.enter(pos, self.layers.len(), self.layers.len(), &mut x);
         }
 
         rmsnorm_dispatch(

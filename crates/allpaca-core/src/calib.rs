@@ -205,6 +205,19 @@ pub(crate) mod tests {
     /// weights drawn from `-attn_out..attn_out`: near zero, attention
     /// adds almost nothing to the residual.
     pub(crate) fn write_tiny_calib_gguf_with(path: &Path, dim: usize, ff: usize, attn_out: f32) {
+        write_tiny_calib_gguf_shape(path, dim, ff, attn_out, 1, false);
+    }
+
+    /// [`write_tiny_calib_gguf_with`] with `blocks` blocks and, with
+    /// `own_head`, an `output.weight` separate from the embedding table.
+    pub(crate) fn write_tiny_calib_gguf_shape(
+        path: &Path,
+        dim: usize,
+        ff: usize,
+        attn_out: f32,
+        blocks: usize,
+        own_head: bool,
+    ) {
         let vocab = 6usize;
         let mut meta = HashMap::new();
         let mut put = |k: &str, v: GgufValue| {
@@ -213,7 +226,7 @@ pub(crate) mod tests {
         put("general.architecture", GgufValue::String("llama".into()));
         put("llama.vocab_size", GgufValue::Uint32(vocab as u32));
         put("llama.embedding_length", GgufValue::Uint32(dim as u32));
-        put("llama.block_count", GgufValue::Uint32(1));
+        put("llama.block_count", GgufValue::Uint32(blocks as u32));
         put("llama.attention.head_count", GgufValue::Uint32(4));
         put("llama.attention.head_count_kv", GgufValue::Uint32(4));
         put("llama.feed_forward_length", GgufValue::Uint32(ff as u32));
@@ -240,22 +253,29 @@ pub(crate) mod tests {
         };
         // Dimensions in ggml order: the row length (the input width) first.
         let (d, f, v) = (dim as u64, ff as u64, vocab as u64);
-        let owned: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
-            ("token_embd.weight", vec![d, v], rand(vocab * dim, 1.0)),
-            ("blk.0.attn_norm.weight", vec![d], vec![1.0; dim]),
-            ("blk.0.attn_q.weight", vec![d, d], rand(dim * dim, 0.3)),
-            ("blk.0.attn_k.weight", vec![d, d], rand(dim * dim, 0.3)),
-            ("blk.0.attn_v.weight", vec![d, d], rand(dim * dim, 0.3)),
-            ("blk.0.attn_output.weight", vec![d, d], rand(dim * dim, attn_out)),
-            ("blk.0.ffn_norm.weight", vec![d], vec![1.0; dim]),
-            ("blk.0.ffn_gate.weight", vec![d, f], rand(ff * dim, 0.3)),
-            ("blk.0.ffn_up.weight", vec![d, f], rand(ff * dim, 0.3)),
-            ("blk.0.ffn_down.weight", vec![f, d], rand(dim * ff, 0.3)),
-            ("output_norm.weight", vec![d], vec![1.0; dim]),
-        ];
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> =
+            vec![("token_embd.weight".into(), vec![d, v], rand(vocab * dim, 1.0))];
+        for b in 0..blocks {
+            let mut add = |part: &str, dims: Vec<u64>, data: Vec<f32>| {
+                owned.push((format!("blk.{b}.{part}.weight"), dims, data));
+            };
+            add("attn_norm", vec![d], vec![1.0; dim]);
+            add("attn_q", vec![d, d], rand(dim * dim, 0.3));
+            add("attn_k", vec![d, d], rand(dim * dim, 0.3));
+            add("attn_v", vec![d, d], rand(dim * dim, 0.3));
+            add("attn_output", vec![d, d], rand(dim * dim, attn_out));
+            add("ffn_norm", vec![d], vec![1.0; dim]);
+            add("ffn_gate", vec![d, f], rand(ff * dim, 0.3));
+            add("ffn_up", vec![d, f], rand(ff * dim, 0.3));
+            add("ffn_down", vec![f, d], rand(dim * ff, 0.3));
+        }
+        owned.push(("output_norm.weight".into(), vec![d], vec![1.0; dim]));
+        if own_head {
+            owned.push(("output.weight".into(), vec![d, v], rand(vocab * dim, 1.0)));
+        }
         let views: Vec<GgufWriteTensor<'_>> = owned
             .iter()
-            .map(|(name, dims, data)| GgufWriteTensor { name: (*name).into(), dims: dims.clone(), data })
+            .map(|(name, dims, data)| GgufWriteTensor { name: name.clone(), dims: dims.clone(), data })
             .collect();
         write_gguf(path, &meta, &views).unwrap();
     }
