@@ -15417,8 +15417,14 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
 
     #[test]
     fn engine_speculative_generate_from_tiny_written_draft_gguf() {
-        let target = std::env::temp_dir().join("allpaca_target_for_draft.gguf");
-        let draft = std::env::temp_dir().join("allpaca_tiny_draft.gguf");
+        // Two folders down from the temp folder: sidecar discovery looks beside
+        // the target and at the files of the folder above, and other tests
+        // write `allpaca_dspark_*.gguf` files into the temp folder.
+        let dir = std::env::temp_dir().join(format!("allpaca_draft_gguf_{}", std::process::id()));
+        let model_dir = dir.join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let target = model_dir.join("target.gguf");
+        let draft = model_dir.join("draft.gguf");
         write_tiny_target_gguf(&target);
         write_tiny_target_gguf(&draft);
         let mut cfg = Config::compiled_defaults();
@@ -15447,8 +15453,7 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
             )
             .expect("speculative generate with a written draft GGUF must run");
         assert!(!out.token_ids.is_empty());
-        let _ = std::fs::remove_file(target);
-        let _ = std::fs::remove_file(draft);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
