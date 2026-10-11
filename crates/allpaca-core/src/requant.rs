@@ -90,6 +90,8 @@ pub struct Options {
     /// instead of each matrix's own error: only matrices the probe can
     /// swap are requantised, the rest are copied.
     pub probe: Option<ProbeTexts>,
+    /// Called after each matrix is measured: matrices done, of how many, its name.
+    pub progress: Option<fn(usize, usize, &str)>,
 }
 
 /// Calibration texts for the sensitivity probe.
@@ -110,6 +112,7 @@ impl Default for Options {
             stats: None,
             damping: 0.01,
             probe: None,
+            progress: None,
         }
     }
 }
@@ -157,6 +160,17 @@ fn matrix_shape(dims: &[u64], min_weights: usize) -> Option<(usize, usize)> {
 
 /// Requantise `input` into `output`.
 pub fn requantise(input: &Path, output: &Path, opts: &Options) -> Result<Report, AllpacaError> {
+    Ok(requantise_each(input, &[(output, opts.avg_bits)], opts)?.remove(0))
+}
+
+/// Requantise `input` once per `(output, average bits)`. Every matrix's
+/// options are measured once for all of them, which is nearly all of the
+/// work. `opts.avg_bits` is not used.
+pub fn requantise_each(
+    input: &Path,
+    outputs: &[(&Path, f64)],
+    opts: &Options,
+) -> Result<Vec<Report>, AllpacaError> {
     let file = GgufFile::open(input)?;
     let mut probe = match &opts.probe {
         Some(p) => {
@@ -212,98 +226,106 @@ pub fn requantise(input: &Path, output: &Path, opts: &Options) -> Result<Report,
         errors.push(row);
         calibrated.push(h.is_some());
         divergence.push(moved);
+        if let Some(progress) = opts.progress {
+            progress(errors.len(), candidates.len(), name);
+        }
     }
     // The probe holds the whole model in F32: not needed past here.
     let probed = probe.take().is_some();
-    let problem = Problem {
-        costs: Target::ALL.iter().map(|t| t.bits()).collect(),
-        weights: candidates.iter().map(|&(_, rows, cols)| (rows * cols) as f64).collect(),
-        budget: opts.avg_bits,
-    };
+    let weights: Vec<f64> = candidates.iter().map(|&(_, rows, cols)| (rows * cols) as f64).collect();
     // The loss of a matrix's option: how far it moved the model's predictions
     // when probed, otherwise its error weighted by its size.
-    let mean_weight = problem.weights.iter().sum::<f64>() / candidates.len() as f64;
+    let mean_weight = weights.iter().sum::<f64>() / candidates.len() as f64;
     let loss: Vec<f64> = if probed {
         divergence.iter().flatten().copied().collect()
     } else {
         errors
             .iter()
-            .zip(&problem.weights)
+            .zip(&weights)
             .flat_map(|(row, w)| row.iter().map(move |e| e * w / mean_weight))
             .collect()
     };
-    // The loss is one term per matrix and option, so the knapsack optimum is exact.
     let gain: Vec<f64> = loss.iter().map(|l| -l).collect();
-    let assignment = knapsack(&problem, &gain, opts.resolution)?;
+    let mut reports = Vec::with_capacity(outputs.len());
+    for &(output, avg_bits) in outputs {
+        let problem = Problem {
+            costs: Target::ALL.iter().map(|t| t.bits()).collect(),
+            weights: weights.clone(),
+            budget: avg_bits,
+        };
+        // The loss is one term per matrix and option, so the knapsack optimum is exact.
+        let assignment = knapsack(&problem, &gain, opts.resolution)?;
 
-    let chosen = |i: usize| candidates.iter().position(|c| c.0 == i).map(|at| Target::ALL[assignment[at]]);
-    let declared: Vec<GgufStreamTensor> = file
-        .tensors
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let n = t.n_elements() as usize;
-            let (ggml_type_id, nbytes) = match chosen(i) {
-                Some(Target::Q2_0) => (GgmlType::Q2_0 as u32, n / 64 * 18),
-                Some(Target::Q4_0) => (GgmlType::Q4_0 as u32, n / 32 * 18),
-                Some(Target::Q8_0) => (GgmlType::Q8_0 as u32, n / 32 * 34),
-                None => (t.ggml_type_id, t.nbytes()),
-            };
-            GgufStreamTensor {
-                name: t.name.clone(),
-                // The parser holds ggml order (innermost first); the writers take the reverse.
-                dims: t.dims.iter().rev().copied().collect(),
-                ggml_type_id,
-                nbytes,
-            }
-        })
-        .collect();
-    let mut metadata = file.metadata.clone();
-    metadata.insert(
-        "general.description".into(),
-        GgufValue::String(format!(
-            "requantised by Allpaca (GSQ 2-bit + RCO allocation) to {:.2} bits per weight on average",
-            opts.avg_bits
-        )),
-    );
-    for split in ["split.no", "split.count", "split.tensors.count"] {
-        metadata.remove(split);
-    }
-    let mut writer = GgufStreamWriter::create(output, &metadata, &declared)?;
-    for (i, t) in file.tensors.iter().enumerate() {
-        match chosen(i) {
-            Some(Target::Q2_0) => {
-                let at = candidates.iter().position(|c| c.0 == i).expect("chosen");
-                writer.write_tensor(&two_bit[at])?;
-            }
-            Some(target) => {
-                let (_, rows, cols) = candidates[candidates.iter().position(|c| c.0 == i).expect("chosen")];
-                let w = file.tensor_f32(&t.name)?;
-                writer.write_tensor(&target.quantise(&w, rows, cols, &Gram::Identity, &opts.gsq)?)?;
-            }
-            None => writer.write_tensor(file.tensor_bytes(&t.name)?)?,
-        }
-    }
-    writer.finish()?;
-    Ok(Report {
-        choices: candidates
+        let chosen = |i: usize| candidates.iter().position(|c| c.0 == i).map(|at| Target::ALL[assignment[at]]);
+        let declared: Vec<GgufStreamTensor> = file
+            .tensors
             .iter()
-            .zip(&assignment)
-            .zip(&errors)
-            .zip(&calibrated)
-            .zip(&divergence)
-            .map(|((((&(i, rows, cols), &o), row), &calibrated), moved)| Choice {
-                name: file.tensors[i].name.clone(),
-                weights: rows * cols,
-                target: Target::ALL[o],
-                relative_error: *row,
-                calibrated,
-                divergence: probed.then_some(*moved),
+            .enumerate()
+            .map(|(i, t)| {
+                let n = t.n_elements() as usize;
+                let (ggml_type_id, nbytes) = match chosen(i) {
+                    Some(Target::Q2_0) => (GgmlType::Q2_0 as u32, n / 64 * 18),
+                    Some(Target::Q4_0) => (GgmlType::Q4_0 as u32, n / 32 * 18),
+                    Some(Target::Q8_0) => (GgmlType::Q8_0 as u32, n / 32 * 34),
+                    None => (t.ggml_type_id, t.nbytes()),
+                };
+                GgufStreamTensor {
+                    name: t.name.clone(),
+                    // The parser holds ggml order (innermost first); the writers take the reverse.
+                    dims: t.dims.iter().rev().copied().collect(),
+                    ggml_type_id,
+                    nbytes,
+                }
             })
-            .collect(),
-        copied: file.tensors.len() - candidates.len(),
-        calibrated: calibrated.iter().filter(|c| **c).count(),
-    })
+            .collect();
+        let mut metadata = file.metadata.clone();
+        metadata.insert(
+            "general.description".into(),
+            GgufValue::String(format!(
+                "requantised by Allpaca (GSQ 2-bit + RCO allocation) to {:.2} bits per weight on average",
+                avg_bits
+            )),
+        );
+        for split in ["split.no", "split.count", "split.tensors.count"] {
+            metadata.remove(split);
+        }
+        let mut writer = GgufStreamWriter::create(output, &metadata, &declared)?;
+        for (i, t) in file.tensors.iter().enumerate() {
+            match chosen(i) {
+                Some(Target::Q2_0) => {
+                    let at = candidates.iter().position(|c| c.0 == i).expect("chosen");
+                    writer.write_tensor(&two_bit[at])?;
+                }
+                Some(target) => {
+                    let (_, rows, cols) = candidates[candidates.iter().position(|c| c.0 == i).expect("chosen")];
+                    let w = file.tensor_f32(&t.name)?;
+                    writer.write_tensor(&target.quantise(&w, rows, cols, &Gram::Identity, &opts.gsq)?)?;
+                }
+                None => writer.write_tensor(file.tensor_bytes(&t.name)?)?,
+            }
+        }
+        writer.finish()?;
+        reports.push(Report {
+            choices: candidates
+                .iter()
+                .zip(&assignment)
+                .zip(&errors)
+                .zip(&calibrated)
+                .zip(&divergence)
+                .map(|((((&(i, rows, cols), &o), row), &calibrated), moved)| Choice {
+                    name: file.tensors[i].name.clone(),
+                    weights: rows * cols,
+                    target: Target::ALL[o],
+                    relative_error: *row,
+                    calibrated,
+                    divergence: probed.then_some(*moved),
+                })
+                .collect(),
+            copied: file.tensors.len() - candidates.len(),
+            calibrated: calibrated.iter().filter(|c| **c).count(),
+        });
+    }
+    Ok(reports)
 }
 
 #[cfg(test)]
@@ -339,6 +361,52 @@ mod tests {
                 ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
             })
             .collect()
+    }
+
+    #[test]
+    fn one_pass_writes_a_file_per_budget() {
+        let dir = std::env::temp_dir();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_each_{tag}-{}.gguf", std::process::id()));
+        let (src, low, high, alone) = (at("in"), at("low"), at("high"), at("alone"));
+        let data: Vec<Vec<f32>> = (0..4).map(|i| noise(64 * 64, 10 + i, 1.0 + i as f32)).collect();
+        let names = ["blk.0.a.weight", "blk.0.b.weight", "blk.0.c.weight", "blk.0.d.weight"];
+        let views: Vec<GgufWriteTensor<'_>> = names
+            .iter()
+            .zip(&data)
+            .map(|(name, data)| GgufWriteTensor {
+                name: (*name).into(),
+                dims: vec![64, 64],
+                data,
+            })
+            .collect();
+        let mut meta = HashMap::new();
+        meta.insert("general.architecture".to_string(), GgufValue::String("llama".into()));
+        write_gguf(&src, &meta, &views).unwrap();
+
+        let opts = Options {
+            gsq: GsqConfig {
+                steps: 20,
+                ..GsqConfig::default()
+            },
+            ..Options::default()
+        };
+        // Two matrices at 2.25 bits and two at 4.5; then all four at 4.5.
+        let reports = requantise_each(&src, &[(&low, 3.375), (&high, 4.5)], &opts).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!((reports[0].avg_bits() - 3.375).abs() < 1e-9, "{}", reports[0].avg_bits());
+        assert!((reports[1].avg_bits() - 4.5).abs() < 1e-9, "{}", reports[1].avg_bits());
+        let types = |path: &Path| -> Vec<GgmlType> {
+            let file = GgufFile::open(path).unwrap();
+            names.iter().map(|n| file.tensor(n).unwrap().ggml_type).collect()
+        };
+        assert_eq!(types(&low).iter().filter(|t| **t == GgmlType::Q2_0).count(), 2, "{:?}", types(&low));
+        assert_eq!(types(&high), vec![GgmlType::Q4_0; 4]);
+        // Each file is the one a run of its own would have written.
+        requantise(&src, &alone, &Options { avg_bits: 3.375, ..opts }).unwrap();
+        assert_eq!(std::fs::read(&low).unwrap(), std::fs::read(&alone).unwrap());
+        for path in [src, low, high, alone] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

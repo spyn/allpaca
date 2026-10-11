@@ -3,6 +3,9 @@
 //!
 //!     cargo run --release -p allpaca-core --example requant -- <in.gguf> <out.gguf> [avg bits] [GSQ steps] [calibration.txt]
 //!
+//! Several budgets (`3.0,4.0`) are written from one pass over the model, to
+//! `<out>-3.00.gguf` and `<out>-4.00.gguf`.
+//!
 //! With a calibration text the model reads it first on the CPU (every weight
 //! decoded to F32 in RAM) and each matrix is quantised for its output on the
 //! inputs it got. Paragraphs (split at blank lines) are read separately.
@@ -12,10 +15,19 @@
 //! turn and the text reread (N tokens per paragraph, default 64), which
 //! costs three reads of the text per matrix.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use allpaca_core::gsq::GsqConfig;
-use allpaca_core::requant::{requantise, Options, ProbeTexts};
+use allpaca_core::requant::{requantise_each, Options, ProbeTexts};
+
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+fn progress(done: usize, total: usize, name: &str) {
+    let secs = STARTED.get_or_init(Instant::now).elapsed().as_secs_f64();
+    eprintln!("[{done}/{total}] {name}  {:.0} s, about {:.0} min left", secs, secs / done as f64 * (total - done) as f64 / 60.0);
+}
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,10 +43,25 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let mut opts = Options::default();
-    if let Some(bits) = args.get(2) {
-        opts.avg_bits = bits.parse().expect("avg bits");
-    }
+    let mut opts = Options {
+        progress: Some(progress),
+        ..Options::default()
+    };
+    let budgets: Vec<f64> = match args.get(2) {
+        Some(bits) => bits.split(',').map(|b| b.parse().expect("avg bits")).collect(),
+        None => vec![opts.avg_bits],
+    };
+    let out = Path::new(&args[1]);
+    let outputs: Vec<(PathBuf, f64)> = budgets
+        .iter()
+        .map(|&bits| match budgets.len() {
+            1 => (out.to_path_buf(), bits),
+            _ => {
+                let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("requant");
+                (out.with_file_name(format!("{stem}-{bits:.2}.gguf")), bits)
+            }
+        })
+        .collect();
     if let Some(steps) = args.get(3) {
         opts.gsq = GsqConfig {
             steps: steps.parse().expect("GSQ steps"),
@@ -68,8 +95,18 @@ fn main() {
         eprintln!("--probe needs a calibration text");
         std::process::exit(2);
     }
-    match requantise(Path::new(&args[0]), Path::new(&args[1]), &opts) {
-        Ok(report) => {
+    STARTED.get_or_init(Instant::now);
+    let each: Vec<(&Path, f64)> = outputs.iter().map(|(path, bits)| (path.as_path(), *bits)).collect();
+    let reports = match requantise_each(Path::new(&args[0]), &each, &opts) {
+        Ok(reports) => reports,
+        Err(e) => {
+            eprintln!("requant failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    for (report, (path, _)) in reports.iter().zip(&outputs) {
+        println!("== {}", path.display());
+        {
             for c in &report.choices {
                 println!(
                     "{:<44} {:>10} weights -> {:?}  ({} error Q2_0 {:.4}  Q4_0 {:.4}  Q8_0 {:.6})",
@@ -92,10 +129,6 @@ fn main() {
                 report.calibrated,
                 report.copied
             );
-        }
-        Err(e) => {
-            eprintln!("requant failed: {e}");
-            std::process::exit(1);
         }
     }
 }
