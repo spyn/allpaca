@@ -12233,6 +12233,79 @@ mod tests {
         eprintln!("dev{dev} gdn_step_fused: {us:.1} us ({:.0} GB/s on state r+w)", bytes as f64 / us / 1e3);
     }
 
+    /// Time of one Q4_K and one Q8_0 product for m = 1..=16 rows (decode and verify
+    /// windows), to see where a row count costs more than its neighbours.
+    #[test]
+    #[ignore]
+    fn bench_kquant_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        let dev = std::env::var("BENCH_DEV").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        set_device(dev).unwrap();
+        for (n, k) in [(5120usize, 5120usize), (17408, 5120), (5120, 17408)] {
+            let blocks = n * k / 256;
+            let packed: Vec<u8> = (0..blocks * 144)
+                .map(|i| match i % 144 {
+                    0 | 2 => 0x00,
+                    1 | 3 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w = device_malloc(packed.len(), dev).unwrap();
+            memcpy(w, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+            let x = device_malloc(16 * k * 4, dev).unwrap();
+            let y = device_malloc(16 * n * 4, dev).unwrap();
+            let xs: Vec<f32> = (0..16 * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+            memcpy(x, xs.as_ptr().cast(), 16 * k * 4, MEMCPY_H2D).unwrap();
+            let mut line = format!("dev{dev} q4_k n={n} k={k} us:");
+            for m in 1..=16i32 {
+                let f = || gemm_nt_q4_k_device(x.cast(), w, y.cast(), m, n as i32, k as i32).unwrap();
+                for _ in 0..30 {
+                    f();
+                }
+                stream_synchronize().unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..300 {
+                    f();
+                }
+                stream_synchronize().unwrap();
+                line += &format!(" m{m}={:.0}", t.elapsed().as_secs_f64() * 1e6 / 300.0);
+            }
+            eprintln!("{line}");
+            let b8 = n * k / 32;
+            let p8: Vec<u8> = (0..b8 * 34)
+                .map(|i| match i % 34 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    _ => (i * 7 % 251) as u8,
+                })
+                .collect();
+            let staged = stage_q8_0_blocks(&p8).unwrap();
+            let w8 = device_malloc(staged.len(), dev).unwrap();
+            memcpy(w8, staged.as_ptr(), staged.len(), MEMCPY_H2D).unwrap();
+            let mut line = format!("dev{dev} q8_0 n={n} k={k} us:");
+            for m in 1..=16i32 {
+                let f = || gemm_nt_q8_0_device(x.cast(), w8, y.cast(), m, n as i32, k as i32).unwrap();
+                for _ in 0..30 {
+                    f();
+                }
+                stream_synchronize().unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..300 {
+                    f();
+                }
+                stream_synchronize().unwrap();
+                line += &format!(" m{m}={:.0}", t.elapsed().as_secs_f64() * 1e6 / 300.0);
+            }
+            eprintln!("{line}");
+            device_free(w8, staged.len());
+            device_free(x, 16 * k * 4);
+            device_free(y, 16 * n * 4);
+            device_free(w, packed.len());
+        }
+    }
+
     #[test]
     #[ignore]
     fn bench_gdn_gemv() {
@@ -15976,6 +16049,54 @@ mod tests {
             device_free(db, b.len() * 2);
             device_free(dc, c.len() * 4);
             eprintln!("f16 gemv device {id} ok in {:?}", t0.elapsed());
+        }
+    }
+
+    /// The int8 kernels pick how many rows share a block from the row count
+    /// (1, 2, 4..=8, and several blocks above 8). Every count gives each row
+    /// the bits it gets alone.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn int8_gemv_rows_match_single_rows_for_every_row_count() {
+        if device_count() == 0 || std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            return;
+        }
+        for m in 1usize..=17 {
+            let (n, k) = (37usize, 512usize);
+            let (a, b, _) = fill_q4k_gemm_case(m, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q4_k(a, &b, c, rows, n as i32, k as i32).expect("gemm_nt_q4_k")
+            };
+            let mut out = vec![0.0f32; m * n];
+            run(&a, &mut out, m as i32);
+            assert_rows_match_single("q4_k", run, &a, &out, m, n, k);
+
+            let (a, b, _) = fill_q5k_gemm_case(m, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q5_k(a, &b, c, rows, n as i32, k as i32).expect("gemm_nt_q5_k")
+            };
+            let mut out = vec![0.0f32; m * n];
+            run(&a, &mut out, m as i32);
+            assert_rows_match_single("q5_k", run, &a, &out, m, n, k);
+
+            let (a, b, _) = fill_q6k_gemm_case(m, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q6_k(a, &b, c, rows, n as i32, k as i32).expect("gemm_nt_q6_k")
+            };
+            let mut out = vec![0.0f32; m * n];
+            run(&a, &mut out, m as i32);
+            assert_rows_match_single("q6_k", run, &a, &out, m, n, k);
+
+            if m <= 16 {
+                let (n, k) = (37usize, 5120usize);
+                let (a, b, _) = fill_q8_gemm_case(m + 90, m, n, k);
+                let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                    gemm_nt_q8_0(a, &b, c, rows, n as i32, k as i32).expect("gemm_nt_q8_0")
+                };
+                let mut out = vec![0.0f32; m * n];
+                run(&a, &mut out, m as i32);
+                assert_rows_match_single("q8_0", run, &a, &out, m, n, k);
+            }
         }
     }
 

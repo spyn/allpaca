@@ -3098,6 +3098,16 @@ static KqActScratch *kq_act_acquire(hipStream_t stream, size_t need,
     return &s;
 }
 
+/* Rows that share one weight block load in the int8 kernels. A block costs
+ * the same however many of its rows are live, so the rows are spread evenly
+ * over the fewest blocks of at most 8: m = 5 runs as one block of 5 and
+ * m = 9 as two of 5, not as blocks of 8. */
+static inline int kq_i8_rows_per_block(int m) {
+    const int blocks = (m + 7) / 8;
+    const int mr = (m + blocks - 1) / blocks;
+    return mr == 3 ? 4 : mr;
+}
+
 /* Returns ALLPACA_ERR_INVALID when the int8 path cannot run (caller falls back). */
 template <int QT>
 static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -3122,7 +3132,7 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
     dim3 block(256);
     const int cols = 256 / LPC;
     const unsigned gx = static_cast<unsigned>((n + cols - 1) / cols);
-    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const int mr = kq_i8_rows_per_block(m);
     const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
 #define KQ_I8_LAUNCH(MRV, LPCV)                                                                    \
     hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPCV>), grid, block, 0, stream, aq, ad, \
@@ -3133,6 +3143,12 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
         KQ_I8_LAUNCH(2, LPC);
     } else if (mr == 4) {
         KQ_I8_LAUNCH(4, LPC);
+    } else if (mr == 5) {
+        KQ_I8_LAUNCH(5, LPC);
+    } else if (mr == 6) {
+        KQ_I8_LAUNCH(6, LPC);
+    } else if (mr == 7) {
+        KQ_I8_LAUNCH(7, LPC);
     } else {
         KQ_I8_LAUNCH(8, LPC);
     }
@@ -3234,7 +3250,7 @@ static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m,
     constexpr int LPC = 8;
     dim3 block(256);
     const unsigned gx = static_cast<unsigned>((n + (256 / LPC) - 1) / (256 / LPC));
-    const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
+    const int mr = kq_i8_rows_per_block(m);
     const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
     if (mr == 1) {
         hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<1>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
@@ -3242,6 +3258,12 @@ static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m,
         hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<2>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
     } else if (mr == 4) {
         hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<4>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
+    } else if (mr == 5) {
+        hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<5>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
+    } else if (mr == 6) {
+        hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<6>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
+    } else if (mr == 7) {
+        hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<7>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
     } else {
         hipLaunchKernelGGL(gemv_nt_q8_0_i8_kernel<8>, grid, block, 0, stream, aq, ad, b, c, m, n, k);
     }
