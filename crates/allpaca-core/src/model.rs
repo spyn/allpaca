@@ -8088,10 +8088,14 @@ impl TinyModel {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
             })?;
-            for (i, &token) in tokens.iter().enumerate() {
-                crate::qwen4exp::forward_qwen4_token(self, token, start_pos + i, logits, &mut memory.q4x)?;
-            }
-            return Ok(());
+            return crate::qwen4exp::forward_qwen4_tokens(
+                self,
+                tokens,
+                start_pos,
+                logits,
+                row_logits.as_deref_mut(),
+                &mut memory.q4x,
+            );
         }
         if self.dsv4.is_some() && tokens.len() > 1 {
             return crate::deepseek4::forward_dsv4_tokens(

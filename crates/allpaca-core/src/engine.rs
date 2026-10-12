@@ -2002,7 +2002,17 @@ impl Engine {
                     let g = self.lock()?;
                     g.target.clone()
                 };
-                if let Some(target) = target {
+                if let Some(target) = target.as_ref().filter(|t| t.q4x.is_some()) {
+                    match crate::qwen4_gpu::attach(target, hip, self.draft_hip.as_ref(), None) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "qwen4exp HIP working set failed; CPU forward");
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                } else if let Some(target) = target {
                     match crate::dsv4_gpu::attach(
                         &target,
                         hip,

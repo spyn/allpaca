@@ -15,6 +15,7 @@ mod direct_storage;
 mod draft;
 mod dspark;
 mod dsv4_gpu;
+mod qwen4_gpu;
 mod dsv4_ram;
 mod early_exit;
 pub mod edge0;
