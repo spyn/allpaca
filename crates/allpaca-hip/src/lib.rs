@@ -643,6 +643,61 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_q2_0(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_q2_0_moe_ffn(
+            x: *const f32,
+            pool: *const u8,
+            slots: *const i32,
+            weights: *const f32,
+            n_pick: i32,
+            h: *mut f32,
+            out: *mut f32,
+            dim: i32,
+            ff: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_silu_scale(x: *mut f32, n: i32, s: f32, stream: *mut c_void) -> i32;
+        pub fn allpaca_q4x_stream_norm(
+            x: *const f32,
+            gains: *const f32,
+            xn: *mut f32,
+            hc: i32,
+            dim: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_q4x_gated_mean(
+            xn: *const f32,
+            gate: *const f32,
+            mixed: *mut f32,
+            hc: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_q4x_combine(
+            streams: *mut f32,
+            out: *const f32,
+            logits: *const f32,
+            hc: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_q4x_ffn_sum(
+            routed: *const f32,
+            shared: *const f32,
+            gate: *const f32,
+            out: *mut f32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
         pub fn allpaca_det_silu_mul(
             g: *const f32,
@@ -4148,6 +4203,222 @@ pub fn gemm_nt_q6_k_untiled(
     }
 }
 
+/// Device-pointer NT GEMM with native ggml Q2_0 `b` (`C = A * dequant(B)^T`);
+/// `k` must be whole 64-value blocks.
+pub fn gemm_nt_q2_0_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_q2_0(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q2_0")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q2_0 unavailable".into(),
+        )))
+    }
+}
+
+/// ggml Q2_0: 64 weights in 18 bytes.
+const Q2_0_BLOCK_ELEMS: usize = 64;
+const Q2_0_BLOCK_BYTES: usize = 18;
+
+/// Bytes of one expert slot of ggml Q2_0 blocks: gate `[ff, dim]`, up
+/// `[ff, dim]` and down `[dim, ff]`, each row-major.
+pub fn q2_0_expert_slot_bytes(dim: usize, ff: usize) -> usize {
+    3 * ff * dim / Q2_0_BLOCK_ELEMS * Q2_0_BLOCK_BYTES
+}
+
+/// Routed experts from a pool of Q2_0 slots, all on the device:
+/// `out[dim] = sum_p weights[p] * down_p * (silu(gate_p * x) * (up_p * x))`.
+/// `h` is scratch of `slots.len() * ff` floats; at most 32 picks.
+#[allow(clippy::too_many_arguments)]
+pub fn q2_0_moe_ffn_device(
+    x: *const f32,
+    pool: *const u8,
+    slots: &[i32],
+    weights: &[f32],
+    h: *mut f32,
+    out: *mut f32,
+    dim: i32,
+    ff: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if slots.len() != weights.len() {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q2_0 MoE picks and weights differ in length".into(),
+            )));
+        }
+        let rc = unsafe {
+            ffi::allpaca_q2_0_moe_ffn(
+                x,
+                pool,
+                slots.as_ptr(),
+                weights.as_ptr(),
+                slots.len() as i32,
+                h,
+                out,
+                dim,
+                ff,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "q2_0_moe_ffn")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, pool, slots, weights, h, out, dim, ff);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP q2_0_moe_ffn unavailable".into(),
+        )))
+    }
+}
+
+/// `x[i] = silu(x[i] * s)` on the device.
+pub fn silu_scale_device(x: *mut f32, n: i32, s: f32) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_silu_scale(x, n, s, std::ptr::null_mut()) };
+        status(rc, "silu_scale")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, n, s);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP silu_scale unavailable".into(),
+        )))
+    }
+}
+
+/// The device ops of a `qwen4exp` hyper-connection over `hc` streams of
+/// `dim` floats, stream-major. All pointers are device memory of the bound
+/// device.
+pub mod q4x {
+    use super::*;
+
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    fn unavailable() -> Result<(), AllpacaError> {
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP qwen4exp kernels unavailable".into(),
+        )))
+    }
+
+    /// `xn[s] = x[s] / rms(x[s]) * gains[s]`.
+    pub fn stream_norm(x: *const f32, gains: *const f32, xn: *mut f32, hc: i32, dim: i32, eps: f32) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_q4x_stream_norm(x, gains, xn, hc, dim, eps, std::ptr::null_mut()) };
+            status(rc, "q4x_stream_norm")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (x, gains, xn, hc, dim, eps);
+            unavailable()
+        }
+    }
+
+    /// `mixed[d] = mean over streams of xn[s, d] * sigmoid(gate[s, d])`.
+    pub fn gated_mean(xn: *const f32, gate: *const f32, mixed: *mut f32, hc: i32, dim: i32) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_q4x_gated_mean(xn, gate, mixed, hc, dim, std::ptr::null_mut()) };
+            status(rc, "q4x_gated_mean")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (xn, gate, mixed, hc, dim);
+            unavailable()
+        }
+    }
+
+    /// `streams[s, d] += out[d] * 2 * sigmoid(logits[s] / hc)`.
+    pub fn combine(streams: *mut f32, out: *const f32, logits: *const f32, hc: i32, dim: i32) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_q4x_combine(streams, out, logits, hc, dim, std::ptr::null_mut()) };
+            status(rc, "q4x_combine")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (streams, out, logits, hc, dim);
+            unavailable()
+        }
+    }
+
+    /// `out[d] = routed[d] + sigmoid(gate[0]) * shared[d]`; `routed` or
+    /// `shared` (with `gate`) may be null.
+    pub fn ffn_sum(routed: *const f32, shared: *const f32, gate: *const f32, out: *mut f32, dim: i32) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe { ffi::allpaca_q4x_ffn_sum(routed, shared, gate, out, dim, std::ptr::null_mut()) };
+            status(rc, "q4x_ffn_sum")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (routed, shared, gate, out, dim);
+            unavailable()
+        }
+    }
+}
+
+/// Host-pointer Q2_0 NT GEMM: copies native ggml blocks, runs the kernel, copies back.
+pub fn gemm_nt_q2_0(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let packed_bytes =
+            (n as usize) * (k as usize).div_ceil(Q2_0_BLOCK_ELEMS) * Q2_0_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q2_0 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            gemm_nt_q2_0_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q2_0 unavailable".into(),
+        )))
+    }
+}
+
 /// Host-pointer Q3_K NT GEMM: copies native GGUF blocks, runs the fused kernel, copies back.
 pub fn gemm_nt_q3_k(
     a: &[f32],
@@ -6157,6 +6428,18 @@ impl HipWorkspace {
         k: i32,
     ) -> Result<(), AllpacaError> {
         self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q3_k_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_q2_0_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q2_0_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q5_k_dev(
@@ -14688,6 +14971,241 @@ mod tests {
             blk[108..110].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
         }
         b
+    }
+
+    /// ggml Q2_0 runs natively: the kernel must match CPU dequant + NT GEMM
+    /// for every code, positive and negative block scales, and batch rows
+    /// must equal single rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q2_0_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1, 4, 64), (1, 70, 192), (2, 3, 320), (3, 65, 640), (5, 9, 2560), (8, 130, 448)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, _, _) = fill_q5k_gemm_case(si, m, n, k);
+            let nblocks = n * k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+            let mut b_q = vec![0u8; nblocks * allpaca_cpu::Q2_0_BLOCK_BYTES];
+            let mut seed = 0x9e37_79b9u32.wrapping_mul(si as u32 + 1);
+            for (bi, block) in b_q.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                // Every third block has a negative scale.
+                let d = (0.01 + 0.003 * (bi % 17) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+            }
+            let mut b_deq = vec![0.0f32; n * k];
+            allpaca_cpu::dequant_q2_0(&b_q, n * k, &mut b_deq).unwrap();
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_q2_0(a, &b_q, c, rows, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q2_0 must run when a device is present")
+            };
+            run(&a, &mut hip, m as i32);
+            assert_rows_match_single("q2_0", run, &a, &hip, m, n, k);
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_q2_0 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+        // A row that is not whole blocks is refused, not misread.
+        assert!(gemm_nt_q2_0(&[0.0; 65], &[0u8; 36], &mut [0.0; 1], 1, 1, 65).is_err());
+    }
+
+    /// Routed experts from a pool of Q2_0 slots must match the CPU: dequant
+    /// each picked slot, SwiGLU, weighted sum. `silu_scale` is checked on the way.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q2_0_moe_ffn_matches_cpu_swiglu_of_the_picked_slots() {
+        if device_count() == 0 {
+            return;
+        }
+        for (dim, ff, n_slots, slots, weights) in [
+            (128usize, 64usize, 3usize, vec![2i32], vec![1.0f32]),
+            (320, 192, 6, vec![5, 0, 3], vec![0.5, 0.3, 0.2]),
+            (2560, 640, 4, vec![1, 3, 0, 2], vec![0.4, 0.3, 0.2, 0.1]),
+        ] {
+            let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
+            let mut pool = vec![0u8; n_slots * slot_bytes];
+            let mut seed = 0x51ed_270bu32 ^ dim as u32;
+            for (bi, block) in pool.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                let d = (0.05 + 0.01 * (bi % 13) as f32) * if bi % 5 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+            }
+            let x: Vec<f32> = (0..dim).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.8).collect();
+            // CPU reference.
+            let mut expect = vec![0.0f32; dim];
+            for (slot, w) in slots.iter().zip(&weights) {
+                let bytes = &pool[*slot as usize * slot_bytes..][..slot_bytes];
+                let mut m = vec![0.0f32; 3 * ff * dim];
+                allpaca_cpu::dequant_q2_0(bytes, 3 * ff * dim, &mut m).unwrap();
+                let (gate, rest) = m.split_at(ff * dim);
+                let (up, down) = rest.split_at(ff * dim);
+                let (mut g, mut u) = (vec![0.0f32; ff], vec![0.0f32; ff]);
+                cpu_gemm_nt(&x, gate, &mut g, 1, ff, dim);
+                cpu_gemm_nt(&x, up, &mut u, 1, ff, dim);
+                let h: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+                let mut y = vec![0.0f32; dim];
+                cpu_gemm_nt(&h, down, &mut y, 1, dim, ff);
+                for (e, y) in expect.iter_mut().zip(&y) {
+                    *e += w * y;
+                }
+            }
+            set_device(0).unwrap();
+            let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
+            let floats = dim + slots.len() * ff + dim;
+            let dev = device_malloc(floats * 4, 0).unwrap();
+            let (dx, dh, dout) = unsafe {
+                let p = dev.cast::<f32>();
+                (p, p.add(dim), p.add(dim + slots.len() * ff))
+            };
+            let mut got = vec![0.0f32; dim];
+            let mut silu = x.clone();
+            let run = (|| {
+                memcpy(dx.cast(), x.as_ptr().cast(), dim * 4, MEMCPY_H2D)?;
+                q2_0_moe_ffn_device(dx, dpool.byte_ptr_at(0), &slots, &weights, dh, dout, dim as i32, ff as i32)?;
+                memcpy(got.as_mut_ptr().cast(), dout.cast(), dim * 4, MEMCPY_D2H)?;
+                silu_scale_device(dx, dim as i32, 0.25)?;
+                memcpy(silu.as_mut_ptr().cast(), dx.cast(), dim * 4, MEMCPY_D2H)
+            })();
+            device_free(dev, floats * 4);
+            run.expect("Q2_0 MoE kernels must run when a device is present");
+            for i in 0..dim {
+                assert!(
+                    gemm_close(got[i], expect[i]),
+                    "q2_0_moe_ffn dim {dim} ff {ff} idx {i}: hip {} cpu {}",
+                    got[i],
+                    expect[i]
+                );
+                let v = x[i] * 0.25;
+                assert!((silu[i] - v / (1.0 + (-v).exp())).abs() < 1e-6, "silu_scale idx {i}");
+            }
+            assert!(expect.iter().any(|v| v.abs() > 1e-3), "reference output is all zero");
+        }
+    }
+
+    /// Opt-in: what one small kernel launch costs, queued and with a sync each.
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore]
+    fn bench_kernel_launch() {
+        if device_count() == 0 {
+            return;
+        }
+        let dev: i32 = std::env::var("BENCH_DEV").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        set_device(dev).unwrap();
+        let buf = device_malloc(4096 * 4, dev).unwrap().cast::<f32>();
+        let mut host = [0.0f32; 16];
+        for _ in 0..200 {
+            silu_scale_device(buf, 64, 1.0).unwrap();
+        }
+        stream_synchronize().unwrap();
+        let n = 2000;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            silu_scale_device(buf, 64, 1.0).unwrap();
+        }
+        let queued = start.elapsed();
+        stream_synchronize().unwrap();
+        let done = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            silu_scale_device(buf, 64, 1.0).unwrap();
+            memcpy(host.as_mut_ptr().cast(), buf.cast(), 64, MEMCPY_D2H).unwrap();
+        }
+        let synced = start.elapsed();
+        device_free(buf.cast(), 4096 * 4);
+        eprintln!(
+            "device {dev}: launch {:.1} us to queue, {:.1} us to run; launch + 64-byte download {:.1} us",
+            queued.as_secs_f64() * 1e6 / n as f64,
+            done.as_secs_f64() * 1e6 / n as f64,
+            synced.as_secs_f64() * 1e6 / n as f64
+        );
+    }
+
+    /// The qwen4exp stream kernels against their definitions.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q4x_stream_kernels_match_their_definitions() {
+        if device_count() == 0 {
+            return;
+        }
+        let (hc, dim, eps) = (4usize, 2560usize, 1e-6f32);
+        let n = hc * dim;
+        let wave = |i: usize, a: usize, b: usize| ((i * a % b) as f32 / b as f32 - 0.5) * 3.0;
+        let x: Vec<f32> = (0..n).map(|i| wave(i, 31, 997)).collect();
+        let gains: Vec<f32> = (0..n).map(|i| 1.0 + 0.2 * wave(i, 17, 251)).collect();
+        let gate: Vec<f32> = (0..n).map(|i| wave(i, 13, 409)).collect();
+        let out: Vec<f32> = (0..dim).map(|i| wave(i, 7, 311)).collect();
+        let logits = [0.0f32, 1.5, -2.0, 0.3];
+        let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+        // Layout: x, gains, gate, xn, out, mixed, sum (dim each for the last three), logits.
+        let floats = 4 * n + 3 * dim + hc;
+        set_device(0).unwrap();
+        let dev = device_malloc(floats * 4, 0).unwrap().cast::<f32>();
+        let at = |off: usize| unsafe { dev.add(off) };
+        let (dx, dgains, dgate, dxn, dout, dmixed, dsum, dlogits) =
+            (at(0), at(n), at(2 * n), at(3 * n), at(4 * n), at(4 * n + dim), at(4 * n + 2 * dim), at(4 * n + 3 * dim));
+        let up = |dst: *mut f32, src: &[f32]| memcpy(dst.cast(), src.as_ptr().cast(), src.len() * 4, MEMCPY_H2D);
+        let down = |src: *const f32, len: usize| {
+            let mut v = vec![0.0f32; len];
+            memcpy(v.as_mut_ptr().cast(), src.cast(), len * 4, MEMCPY_D2H).map(|()| v)
+        };
+        let run = (|| {
+            up(dx, &x)?;
+            up(dgains, &gains)?;
+            up(dgate, &gate)?;
+            up(dout, &out)?;
+            up(dlogits, &logits)?;
+            q4x::stream_norm(dx, dgains, dxn, hc as i32, dim as i32, eps)?;
+            q4x::gated_mean(dxn, dgate, dmixed, hc as i32, dim as i32)?;
+            let (xn, mixed) = (down(dxn, n)?, down(dmixed, dim)?);
+            q4x::ffn_sum(dout, dmixed, dlogits.wrapping_add(1), dsum, dim as i32)?;
+            let both = down(dsum, dim)?;
+            q4x::ffn_sum(std::ptr::null(), dmixed, dlogits.wrapping_add(1), dsum, dim as i32)?;
+            let shared_only = down(dsum, dim)?;
+            q4x::ffn_sum(dout, std::ptr::null(), std::ptr::null(), dsum, dim as i32)?;
+            let routed_only = down(dsum, dim)?;
+            q4x::combine(dx, dout, dlogits, hc as i32, dim as i32)?;
+            Ok::<_, AllpacaError>((xn, mixed, both, shared_only, routed_only, down(dx, n)?))
+        })();
+        device_free(dev.cast(), floats * 4);
+        let (xn, mixed, both, shared_only, routed_only, combined) = run.expect("q4x kernels must run when a device is present");
+        let close = |a: f32, b: f32| (a - b).abs() <= 1e-5 + 1e-4 * b.abs();
+        let mut want_xn = vec![0.0f32; n];
+        for s in 0..hc {
+            let row = &x[s * dim..(s + 1) * dim];
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / dim as f32 + eps).sqrt();
+            for d in 0..dim {
+                want_xn[s * dim + d] = row[d] * inv * gains[s * dim + d];
+                assert!(close(xn[s * dim + d], want_xn[s * dim + d]), "stream_norm {s},{d}");
+            }
+        }
+        for d in 0..dim {
+            let want: f32 = (0..hc).map(|s| want_xn[s * dim + d] * sig(gate[s * dim + d])).sum::<f32>() / hc as f32;
+            assert!(close(mixed[d], want), "gated_mean {d}: {} vs {want}", mixed[d]);
+            let shared = sig(logits[1]) * want;
+            assert!(close(both[d], out[d] + shared), "ffn_sum both {d}");
+            assert!(close(shared_only[d], shared), "ffn_sum shared {d}");
+            assert_eq!(routed_only[d], out[d], "ffn_sum routed {d}");
+            for s in 0..hc {
+                let want = x[s * dim + d] + out[d] * 2.0 * sig(logits[s] / hc as f32);
+                assert!(close(combined[s * dim + d], want), "combine {s},{d}");
+            }
+        }
     }
 
     /// The draft lm_head's Q3_K runs natively: fused GEMV must match CPU

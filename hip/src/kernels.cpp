@@ -3539,6 +3539,299 @@ extern "C" int allpaca_gemm_nt_tq2_0(const float *a, const uint8_t *b, float *c,
     return hip_status(hipGetLastError());
 }
 
+/* ggml Q2_0: 64 weights / 18 bytes (f16 d, then 2 bits per weight, weight j in
+ * bits 2*(j%4) of byte j/4). value = d * (code - 1); d may be negative. Each
+ * output column runs on four lanes, lane l taking blocks l, l+4, ... */
+__global__ void gemv_nt_q2_0_kernel(const float *a, const uint8_t *b, float *c, int m, int n,
+                                    int k) {
+    constexpr int LANES = 4;
+    constexpr int COLS = 256 / LANES;
+    __shared__ float part[256];
+    const int row = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid % LANES;
+    const int col = static_cast<int>(blockIdx.x) * COLS + tid / LANES;
+    const int nblocks = k / 64;
+    float acc = 0.f;
+    if (row < m && col < n) {
+        const float *arow = a + static_cast<size_t>(row) * static_cast<size_t>(k);
+        const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+        for (int ib = lane; ib < nblocks; ib += LANES) {
+            const uint8_t *blk = brow + static_cast<size_t>(ib) * 18;
+            const float *x = arow + static_cast<size_t>(ib) * 64;
+            float s = 0.f;
+            for (int j = 0; j < 16; ++j) {
+                const uint32_t q = blk[2 + j];
+                s += (static_cast<float>(q & 3u) - 1.f) * x[4 * j];
+                s += (static_cast<float>((q >> 2) & 3u) - 1.f) * x[4 * j + 1];
+                s += (static_cast<float>((q >> 4) & 3u) - 1.f) * x[4 * j + 2];
+                s += (static_cast<float>(q >> 6) - 1.f) * x[4 * j + 3];
+            }
+            acc += allpaca_f16le_to_f32(blk) * s;
+        }
+    }
+    part[tid] = acc;
+    __syncthreads();
+    if (lane == 0 && row < m && col < n) {
+        c[static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col)] =
+            (part[tid] + part[tid + 1]) + (part[tid + 2] + part[tid + 3]);
+    }
+}
+
+extern "C" int allpaca_gemm_nt_q2_0(const float *a, const uint8_t *b, float *c, int32_t m,
+                                    int32_t n, int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || k % 64 != 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((n + 63) / 64), static_cast<unsigned>(m));
+    hipLaunchKernelGGL(gemv_nt_q2_0_kernel, grid, block, 0, as_stream(stream), a, b, c, m, n, k);
+    return hip_status(hipGetLastError());
+}
+
+/* Dot of one ggml Q2_0 block (18 bytes) with 64 activations, scale applied. */
+__device__ inline float q2_0_block_dot(const uint8_t *blk, const float *x) {
+    float s = 0.f;
+    for (int j = 0; j < 16; ++j) {
+        const uint32_t q = blk[2 + j];
+        s += (static_cast<float>(q & 3u) - 1.f) * x[4 * j];
+        s += (static_cast<float>((q >> 2) & 3u) - 1.f) * x[4 * j + 1];
+        s += (static_cast<float>((q >> 4) & 3u) - 1.f) * x[4 * j + 2];
+        s += (static_cast<float>(q >> 6) - 1.f) * x[4 * j + 3];
+    }
+    return allpaca_f16le_to_f32(blk) * s;
+}
+
+/* Routed experts held as Q2_0 slots: one slot is gate[ff, dim], up[ff, dim],
+ * down[dim, ff], each packed row-major. */
+#define ALLPACA_Q2_MOE_MAX_PICKS 32
+struct Q2MoePicks {
+    int32_t slot[ALLPACA_Q2_MOE_MAX_PICKS];
+    float w[ALLPACA_Q2_MOE_MAX_PICKS];
+};
+
+/* h[p, r] = silu(gate_p[r] . x) * (up_p[r] . x): grid (ff / 64, picks). */
+__global__ void q2_0_moe_gate_up_kernel(const float *x, const uint8_t *pool, Q2MoePicks picks,
+                                        float *h, int dim, int ff, size_t slot_bytes) {
+    constexpr int LANES = 4;
+    __shared__ float pg[256];
+    __shared__ float pu[256];
+    const int p = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid % LANES;
+    const int r = static_cast<int>(blockIdx.x) * (256 / LANES) + tid / LANES;
+    const int nblocks = dim / 64;
+    const size_t row_bytes = static_cast<size_t>(nblocks) * 18;
+    float g = 0.f;
+    float u = 0.f;
+    if (r < ff) {
+        const uint8_t *gate = pool + static_cast<size_t>(picks.slot[p]) * slot_bytes +
+                              static_cast<size_t>(r) * row_bytes;
+        const uint8_t *up = gate + static_cast<size_t>(ff) * row_bytes;
+        for (int ib = lane; ib < nblocks; ib += LANES) {
+            const float *xb = x + static_cast<size_t>(ib) * 64;
+            g += q2_0_block_dot(gate + static_cast<size_t>(ib) * 18, xb);
+            u += q2_0_block_dot(up + static_cast<size_t>(ib) * 18, xb);
+        }
+    }
+    pg[tid] = g;
+    pu[tid] = u;
+    __syncthreads();
+    if (lane == 0 && r < ff) {
+        const float gs = (pg[tid] + pg[tid + 1]) + (pg[tid + 2] + pg[tid + 3]);
+        const float us = (pu[tid] + pu[tid + 1]) + (pu[tid + 2] + pu[tid + 3]);
+        h[static_cast<size_t>(p) * static_cast<size_t>(ff) + static_cast<size_t>(r)] =
+            gs / (1.f + expf(-gs)) * us;
+    }
+}
+
+/* out[c] = sum_p w_p * (down_p[c] . h[p]): grid (dim / 64). */
+__global__ void q2_0_moe_down_kernel(const float *h, const uint8_t *pool, Q2MoePicks picks,
+                                     int n_pick, float *out, int dim, int ff, size_t slot_bytes) {
+    constexpr int LANES = 4;
+    __shared__ float part[256];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid % LANES;
+    const int col = static_cast<int>(blockIdx.x) * (256 / LANES) + tid / LANES;
+    const int nblocks = ff / 64;
+    const size_t down_off = 2 * static_cast<size_t>(ff) * static_cast<size_t>(dim / 64) * 18;
+    float acc = 0.f;
+    if (col < dim) {
+        for (int p = 0; p < n_pick; ++p) {
+            const uint8_t *down = pool + static_cast<size_t>(picks.slot[p]) * slot_bytes + down_off +
+                                  static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
+            const float *hp = h + static_cast<size_t>(p) * static_cast<size_t>(ff);
+            float s = 0.f;
+            for (int ib = lane; ib < nblocks; ib += LANES) {
+                s += q2_0_block_dot(down + static_cast<size_t>(ib) * 18,
+                                    hp + static_cast<size_t>(ib) * 64);
+            }
+            acc += picks.w[p] * s;
+        }
+    }
+    part[tid] = acc;
+    __syncthreads();
+    if (lane == 0 && col < dim) {
+        out[col] = (part[tid] + part[tid + 1]) + (part[tid + 2] + part[tid + 3]);
+    }
+}
+
+extern "C" int allpaca_q2_0_moe_ffn(const float *x, const uint8_t *pool, const int32_t *slots,
+                                    const float *weights, int32_t n_pick, float *h, float *out,
+                                    int32_t dim, int32_t ff, allpaca_stream_t stream) {
+    if (n_pick <= 0 || n_pick > ALLPACA_Q2_MOE_MAX_PICKS || dim <= 0 || ff <= 0 || dim % 64 != 0 ||
+        ff % 64 != 0 || !x || !pool || !slots || !weights || !h || !out) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    Q2MoePicks picks = {};
+    for (int p = 0; p < n_pick; ++p) {
+        if (slots[p] < 0) {
+            return ALLPACA_ERR_INVALID;
+        }
+        picks.slot[p] = slots[p];
+        picks.w[p] = weights[p];
+    }
+    const size_t slot_bytes = 3 * static_cast<size_t>(ff) * static_cast<size_t>(dim / 64) * 18;
+    hipLaunchKernelGGL(q2_0_moe_gate_up_kernel,
+                       dim3(static_cast<unsigned>((ff + 63) / 64), static_cast<unsigned>(n_pick)),
+                       dim3(256), 0, as_stream(stream), x, pool, picks, h, dim, ff, slot_bytes);
+    hipLaunchKernelGGL(q2_0_moe_down_kernel, dim3(static_cast<unsigned>((dim + 63) / 64)), dim3(256),
+                       0, as_stream(stream), h, pool, picks, n_pick, out, dim, ff, slot_bytes);
+    return hip_status(hipGetLastError());
+}
+
+/* x[i] = silu(x[i] * s). */
+__global__ void silu_scale_kernel(float *x, int n, float s) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        const float v = x[i] * s;
+        x[i] = v / (1.f + expf(-v));
+    }
+}
+
+extern "C" int allpaca_silu_scale(float *x, int32_t n, float s, allpaca_stream_t stream) {
+    if (n <= 0 || !x) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(silu_scale_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), 0,
+                       as_stream(stream), x, n, s);
+    return hip_status(hipGetLastError());
+}
+
+/* qwen4exp hyper-connections. Streams are stream-major: x[s * dim + d]. */
+
+/* xn[s] = x[s] / rms(x[s]) * gains[s], one block per stream. */
+__global__ void q4x_stream_norm_kernel(const float *x, const float *gains, float *xn, int dim,
+                                       float eps) {
+    __shared__ float part[256];
+    const int tid = static_cast<int>(threadIdx.x);
+    const size_t base = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(dim);
+    float ss = 0.f;
+    for (int d = tid; d < dim; d += 256) {
+        const float v = x[base + d];
+        ss += v * v;
+    }
+    part[tid] = ss;
+    __syncthreads();
+    for (int step = 128; step > 0; step >>= 1) {
+        if (tid < step) {
+            part[tid] += part[tid + step];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(part[0] / static_cast<float>(dim) + eps);
+    for (int d = tid; d < dim; d += 256) {
+        xn[base + d] = x[base + d] * inv * gains[base + d];
+    }
+}
+
+/* mixed[d] = mean over streams of xn[s, d] * sigmoid(gate[s, d]). */
+__global__ void q4x_gated_mean_kernel(const float *xn, const float *gate, float *mixed, int hc,
+                                      int dim) {
+    const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (d >= dim) {
+        return;
+    }
+    float acc = 0.f;
+    for (int s = 0; s < hc; ++s) {
+        const size_t i = static_cast<size_t>(s) * static_cast<size_t>(dim) + static_cast<size_t>(d);
+        acc += xn[i] / (1.f + expf(-gate[i]));
+    }
+    mixed[d] = acc / static_cast<float>(hc);
+}
+
+/* streams[s, d] += out[d] * 2 * sigmoid(logits[s] / hc). */
+__global__ void q4x_combine_kernel(float *streams, const float *out, const float *logits, int hc,
+                                   int dim) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= hc * dim) {
+        return;
+    }
+    const float w = 2.f / (1.f + expf(-logits[i / dim] / static_cast<float>(hc)));
+    streams[i] += out[i % dim] * w;
+}
+
+/* out[d] = routed[d] + sigmoid(gate[0]) * shared[d]; either part may be null. */
+__global__ void q4x_ffn_sum_kernel(const float *routed, const float *shared, const float *gate,
+                                   float *out, int dim) {
+    const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (d >= dim) {
+        return;
+    }
+    float v = routed ? routed[d] : 0.f;
+    if (shared) {
+        v += shared[d] / (1.f + expf(-gate[0]));
+    }
+    out[d] = v;
+}
+
+extern "C" int allpaca_q4x_stream_norm(const float *x, const float *gains, float *xn, int32_t hc,
+                                       int32_t dim, float eps, allpaca_stream_t stream) {
+    if (hc <= 0 || dim <= 0 || !x || !gains || !xn) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(q4x_stream_norm_kernel, dim3(static_cast<unsigned>(hc)), dim3(256), 0,
+                       as_stream(stream), x, gains, xn, dim, eps);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_q4x_gated_mean(const float *xn, const float *gate, float *mixed, int32_t hc,
+                                      int32_t dim, allpaca_stream_t stream) {
+    if (hc <= 0 || dim <= 0 || !xn || !gate || !mixed) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(q4x_gated_mean_kernel, dim3(static_cast<unsigned>((dim + 255) / 256)),
+                       dim3(256), 0, as_stream(stream), xn, gate, mixed, hc, dim);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_q4x_combine(float *streams, const float *out, const float *logits,
+                                   int32_t hc, int32_t dim, allpaca_stream_t stream) {
+    if (hc <= 0 || dim <= 0 || !streams || !out || !logits) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(q4x_combine_kernel, dim3(static_cast<unsigned>((hc * dim + 255) / 256)),
+                       dim3(256), 0, as_stream(stream), streams, out, logits, hc, dim);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_q4x_ffn_sum(const float *routed, const float *shared, const float *gate,
+                                   float *out, int32_t dim, allpaca_stream_t stream) {
+    if (dim <= 0 || !out || (shared && !gate) || (!routed && !shared)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(q4x_ffn_sum_kernel, dim3(static_cast<unsigned>((dim + 255) / 256)), dim3(256),
+                       0, as_stream(stream), routed, shared, gate, out, dim);
+    return hip_status(hipGetLastError());
+}
+
 /* llama.cpp fixed-point base-3 trit decode for TQ1_0. */
 __device__ inline float tq1_0_decode_trit(uint8_t byte, int digit) {
     static const uint8_t kPow3[5] = {1, 3, 9, 27, 81};
@@ -8845,6 +9138,40 @@ extern "C" int allpaca_gemm_nt_q5_k(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_gemm_nt_q3_k(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_q2_0(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                    int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_q2_0_moe_ffn(const float *, const uint8_t *, const int32_t *, const float *,
+                                    int32_t, float *, float *, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_silu_scale(float *, int32_t, float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_q4x_stream_norm(const float *, const float *, float *, int32_t, int32_t,
+                                       float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_q4x_gated_mean(const float *, const float *, float *, int32_t, int32_t,
+                                      allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_q4x_combine(float *, const float *, const float *, int32_t, int32_t,
+                                   allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_q4x_ffn_sum(const float *, const float *, const float *, float *, int32_t,
+                                   allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
