@@ -924,6 +924,30 @@ impl RpcRuntime {
         })
     }
 
+    /// The first HIP worker that serves the extension `name`: its session
+    /// and the free bytes of its GPUs.
+    pub fn extension_host(&self, name: &str) -> Option<(usize, Vec<u64>)> {
+        let sessions = self.sessions.lock().ok()?;
+        sessions.iter().enumerate().find_map(|(s, session)| {
+            let hip = matches!(session.hello().backend, RpcBackendKind::Hip);
+            (hip && session.has_extension(name)).then(|| (s, session.hello().device_memories()))
+        })
+    }
+
+    /// One call to the extension `name` of worker `session`.
+    pub fn ext(&self, session: usize, name: &str, head: &[u8], data: &[u8]) -> Result<Vec<u8>, AllpacaError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into())))?;
+        let session = sessions
+            .get_mut(session)
+            .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig(format!("no rpc session {session}"))))?;
+        let reply = session.ext(name, head, data).map_err(map_rpc)?;
+        self.h2d_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(reply)
+    }
+
     /// Put one layer's routed experts on a HIP worker GPU as a buffer of
     /// Q2_0 slots (gate | up | down per expert); [`Self::moe_ffn`] then runs
     /// them. Worker GPUs fill in order, so consecutive layers share one.

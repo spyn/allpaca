@@ -65,6 +65,10 @@ const GLOBAL_MATRICES: [&str; 3] = ["output.weight", "output_hc_down.weight", "o
 const GLOBAL_VECTORS: [&str; 1] = ["output_hc_norm.weight"];
 /// VRAM left free on a card after the blocks are placed.
 const CARD_RESERVE: u64 = 1536 * 1024 * 1024;
+/// VRAM a worker's GPU keeps free when the coordinator counts the blocks it
+/// can host, and when the worker places them.
+const WORKER_RESERVE: u64 = 1024 * 1024 * 1024;
+const HOST_RESERVE: u64 = 512 * 1024 * 1024;
 /// Most routed experts one kernel call takes.
 const MAX_PICKS: usize = 32;
 /// Most tokens of a sequence one pass takes.
@@ -104,6 +108,113 @@ fn block_of(name: &str) -> Option<(usize, &str)> {
     Some((blk.parse().ok()?, suffix))
 }
 
+/// What a full-attention block needs of the model's shape.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct AttnShape {
+    pub head_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub rope_dims: usize,
+    pub rope_theta: f32,
+    pub rope_sections: [i32; 4],
+}
+
+impl AttnShape {
+    pub fn of(cfg: &ModelConfig) -> Self {
+        Self {
+            head_dim: cfg.head_dim(),
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            rope_dims: cfg.rope_dims,
+            rope_theta: cfg.rope_theta,
+            rope_sections: cfg.rope_sections,
+        }
+    }
+}
+
+/// What running blocks without the host needs besides their weights.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct ChainShape {
+    /// Routed experts per token and the scale of their weights.
+    pub n_active: usize,
+    pub scale: f32,
+    pub gdn: Option<GdnDims>,
+    pub attn: AttnShape,
+}
+
+/// A block an RPC worker hosts.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct HostedBlock {
+    pub blk: usize,
+    /// Gated DeltaNet, else full attention.
+    pub recurrent: bool,
+    /// Device bytes of its matrices and routed experts.
+    pub bytes: u64,
+}
+
+/// The blocks an RPC worker hosts and the sizes their chain needs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HostedSpec {
+    pub hc: usize,
+    pub dim: usize,
+    pub ff: usize,
+    pub n_experts: usize,
+    pub eps: f32,
+    /// Blocks of the whole model.
+    pub n_blocks: usize,
+    sizes: ActSizes,
+    /// In the order they run.
+    pub blocks: Vec<HostedBlock>,
+    pub shape: ChainShape,
+}
+
+/// Row widths the activation buffer is laid out for.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+struct ActSizes {
+    /// Widest scratch row, the mixers' low dimension, the shared expert's width.
+    wide: usize,
+    low: usize,
+    shared_ff: usize,
+    /// Host products: input and output floats.
+    io_k: usize,
+    io_n: usize,
+}
+
+/// A card's activation buffer for `MAX_ROWS` rows. Every part starts on 64
+/// bytes: some kernels pick their variant by the alignment of their input,
+/// and a token's logits must not depend on how the buffer happens to be
+/// laid out.
+fn layout(hc: usize, dim: usize, ff: usize, n_experts: usize, sizes: &ActSizes) -> Act {
+    let mut act = Act::default();
+    let mut at = 0usize;
+    let mut take = |floats: usize| {
+        let start = at;
+        at += floats.next_multiple_of(16);
+        start
+    };
+    let (r, wide) = (MAX_ROWS, MAX_ROWS * sizes.wide);
+    act.streams = take(r * hc * dim);
+    act.xn = take(r * hc * dim);
+    act.gate = take(r * hc * dim);
+    act.low = take(r * sizes.low);
+    act.x = take(r * (dim + n_experts.max(1)));
+    act.inject = take(r * hc);
+    act.t = [take(wide), take(wide), take(wide), take(wide), take(wide)];
+    act.out = take(r * dim);
+    act.expert_h = take(MAX_PICKS * ff);
+    act.picks = take(r * q4x::PICKS_BYTES / 4);
+    act.routed = take(r * dim);
+    act.shared = take(r * dim);
+    act.shared_gate = take(r * sizes.shared_ff);
+    act.shared_up = take(r * sizes.shared_ff);
+    act.shared_open = take(r);
+    act.io_in = take(sizes.io_k);
+    act.io_out = take(sizes.io_n);
+    act.io_out_floats = sizes.io_n;
+    act.total = at;
+    act
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Encoding {
     F32,
@@ -116,6 +227,20 @@ enum Encoding {
     Q6K,
     /// Staged Q8_0 blocks ([`allpaca_hip::stage_q8_0_gemv`]).
     Q8,
+}
+
+impl Encoding {
+    const ALL: [Self; 9] =
+        [Self::F32, Self::F16, Self::Bf16, Self::Q2_0, Self::Q3K, Self::Q4K, Self::Q5K, Self::Q6K, Self::Q8];
+
+    /// Its number on the wire.
+    fn code(self) -> u8 {
+        Self::ALL.iter().position(|e| *e == self).unwrap_or(0) as u8
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(code as usize).copied()
+    }
 }
 
 /// The encoding a kernel reads `info` in, if any: K-quants need rows of
@@ -235,8 +360,18 @@ fn free_bytes(device: i32) -> u64 {
 /// Split `n_blocks` blocks over the cards: `asked` (expert blocks per card)
 /// when given, else as many as fit. `fixed` is card 0's bytes outside the
 /// blocks, `dense` a block's matrices, `experts` a block's expert pool
-/// (zero when the experts cannot go on a card).
-fn place(n_blocks: usize, budgets: &[u64], asked: Option<&[usize]>, fixed: u64, dense: u64, experts: u64) -> Placement {
+/// (zero when the experts cannot go on a card). The last `remote` blocks
+/// are not on these cards at all.
+fn place(
+    n_blocks: usize,
+    budgets: &[u64],
+    asked: Option<&[usize]>,
+    fixed: u64,
+    dense: u64,
+    experts: u64,
+    remote: usize,
+) -> Placement {
+    let n_blocks = n_blocks - remote.min(n_blocks);
     let two = budgets.len() > 1;
     let (first, second) = match asked {
         Some(asked) => {
@@ -250,7 +385,7 @@ fn place(n_blocks: usize, budgets: &[u64], asked: Option<&[usize]>, fixed: u64, 
             (((budgets[0].saturating_sub(rest) / experts) as usize).min(n_blocks - second), second)
         }
     };
-    let block_card = (0..n_blocks).map(|b| usize::from(b >= first && b < first + second)).collect();
+    let block_card = (0..n_blocks + remote).map(|b| usize::from(b >= first && b < first + second)).collect();
     Placement {
         block_card,
         expert_blocks: [first, second],
@@ -329,6 +464,13 @@ pub struct Qwen4Gpu {
     packed: bool,
     /// Blocks whose routed experts are on an RPC worker.
     remote: Vec<usize>,
+    sizes: ActSizes,
+    /// Device bytes of each block's matrices.
+    block_dense: Vec<u64>,
+    /// Blocks left off the cards for an RPC worker to host whole, and the
+    /// worker's end once it has them.
+    to_host: Vec<usize>,
+    hosted: Option<Arc<crate::qwen4_remote::RemoteBlocks>>,
 }
 
 impl std::fmt::Debug for Qwen4Gpu {
@@ -344,6 +486,9 @@ impl Qwen4Gpu {
     /// Upload the model to `hip` and `second`. `expert_blocks` fixes how
     /// many blocks have their experts on each card; `None` reads
     /// `ALLPACA_Q4X_EXPERT_LAYERS` ("9,21") or fits as many as there is room for.
+    /// `worker` is an RPC worker that can host whole blocks: the free bytes
+    /// of its GPUs and the first block it may take. Blocks without their
+    /// experts on a card are then left for it ([`Self::host_blocks`]).
     pub fn build(
         file: &GgufFile,
         cfg: &ModelConfig,
@@ -351,6 +496,7 @@ impl Qwen4Gpu {
         hip: Arc<HipWorkspace>,
         second: Option<Arc<HipWorkspace>>,
         expert_blocks: Option<&[usize]>,
+        worker: Option<(&[u64], usize)>,
     ) -> Result<Self, AllpacaError> {
         let (dim, ff, n_experts) = (cfg.dim, cfg.ff_dim.max(1), cfg.n_experts);
         let hips: Vec<Arc<HipWorkspace>> = std::iter::once(hip).chain(second).collect();
@@ -388,36 +534,14 @@ impl Qwen4Gpu {
                 }
             }
         }
-        let mut act = Act::default();
-        let mut at = 0usize;
-        // Every part starts on 64 bytes: some kernels pick their variant by
-        // the alignment of their input, and a token's logits must not
-        // depend on how the buffer happens to be laid out.
-        let mut take = |floats: usize| {
-            let start = at;
-            at += floats.next_multiple_of(16);
-            start
+        let sizes = ActSizes {
+            wide,
+            low,
+            shared_ff,
+            io_k,
+            io_n: io_n.max(MAX_ROWS * cfg.vocab_size),
         };
-        let (r, wide, io_n) = (MAX_ROWS, MAX_ROWS * wide, io_n.max(MAX_ROWS * cfg.vocab_size));
-        act.streams = take(r * hc * dim);
-        act.xn = take(r * hc * dim);
-        act.gate = take(r * hc * dim);
-        act.low = take(r * low);
-        act.x = take(r * (dim + n_experts.max(1)));
-        act.inject = take(r * hc);
-        act.t = [take(wide), take(wide), take(wide), take(wide), take(wide)];
-        act.out = take(r * dim);
-        act.expert_h = take(MAX_PICKS * ff);
-        act.picks = take(r * q4x::PICKS_BYTES / 4);
-        act.routed = take(r * dim);
-        act.shared = take(r * dim);
-        act.shared_gate = take(r * shared_ff);
-        act.shared_up = take(r * shared_ff);
-        act.shared_open = take(r);
-        act.io_in = take(io_k);
-        act.io_out = take(io_n);
-        act.io_out_floats = io_n;
-        act.total = at;
+        let act = layout(hc, dim, ff, n_experts, &sizes);
 
         // Routed experts go on a card only as Q2_0 rows of whole blocks.
         let slot = q2_0_expert_slot_bytes(dim, ff);
@@ -437,14 +561,26 @@ impl Qwen4Gpu {
             .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect());
         let asked = expert_blocks.or(from_env.as_deref()).filter(|_| packed);
         let dense = block_dense.iter().copied().max().unwrap_or(0);
-        let placement = place(
-            cfg.n_layers,
-            &budgets,
-            asked,
-            fixed + (act.total * 4 * hips.len()) as u64,
-            dense,
-            pool_bytes,
-        );
+        let fixed = fixed + (act.total * 4 * hips.len()) as u64;
+        // Blocks a worker can host: whole ones, from `first` on, as many as
+        // its GPUs hold. Take as few as leave every other block its experts
+        // on a card.
+        let room = match worker.filter(|_| packed) {
+            Some((free, first)) => free
+                .iter()
+                .map(|bytes| (bytes.saturating_sub(WORKER_RESERVE) / (dense + pool_bytes).max(1)) as usize)
+                .sum::<usize>()
+                .min(cfg.n_layers.saturating_sub(first)),
+            None => 0,
+        };
+        let fits = |remote: usize| {
+            let p = place(cfg.n_layers, &budgets, asked, fixed, dense, pool_bytes, remote);
+            p.expert_blocks[0] + p.expert_blocks[1] + remote >= cfg.n_layers
+        };
+        let remote = (0..room).find(|r| fits(*r)).unwrap_or(room);
+        let placement = place(cfg.n_layers, &budgets, asked, fixed, dense, pool_bytes, remote);
+        let to_host: Vec<usize> = (cfg.n_layers - remote..cfg.n_layers).map(|layer| cfg.gguf_blk(layer)).collect();
+        let hosted_block = |name: &str| block_of(name).is_some_and(|(blk, _)| to_host.contains(&blk));
 
         let mut cards = Vec::new();
         for hip in hips {
@@ -458,7 +594,7 @@ impl Qwen4Gpu {
         let card_of = |name: &str| block_of(name).map_or(0, |(blk, _)| placement.block_card.get(blk).copied().unwrap_or(0));
         let mut matrices = HashMap::new();
         let mut dense_bytes = 0u64;
-        for info in &wanted {
+        for info in wanted.iter().filter(|info| !hosted_block(&info.name)) {
             let (k, n) = shape(info);
             let device = cards[card_of(&info.name)].hip.device;
             let (encoding, bytes) = encode(file, info)?;
@@ -472,7 +608,7 @@ impl Qwen4Gpu {
                 Some((_, suffix)) => BLOCK_VECTORS.contains(&suffix),
                 None => GLOBAL_VECTORS.contains(&info.name.as_str()),
             };
-            if wanted {
+            if wanted && !hosted_block(&info.name) {
                 let values = file.tensor_f32(&info.name)?;
                 let device = cards[card_of(&info.name)].hip.device;
                 vectors.insert(info.name.clone(), DeviceWeights::upload(device, &[&values])?);
@@ -491,6 +627,10 @@ impl Qwen4Gpu {
             eps: cfg.eps,
             packed,
             remote: Vec::new(),
+            sizes,
+            block_dense,
+            to_host,
+            hosted: None,
         };
         let expert_bytes = gpu.upload_experts(file, cfg, slot)?;
         tracing::info!(
@@ -548,6 +688,215 @@ impl Qwen4Gpu {
             }
         }
         Ok(host)
+    }
+
+    /// Give the blocks left off the cards to worker `session` of `rt`:
+    /// their matrices, vectors and routed experts, straight from the file.
+    pub fn host_blocks(
+        &mut self,
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        gdn: Option<GdnDims>,
+        recurrent: &dyn Fn(usize) -> bool,
+        rt: &Arc<crate::rpc_runtime::RpcRuntime>,
+        session: usize,
+    ) -> Result<(), AllpacaError> {
+        use crate::qwen4_remote::{Call, RemoteBlocks};
+        let Some(scale) = crate::model::plain_softmax_routing(cfg).filter(|_| !self.to_host.is_empty()) else {
+            return Ok(());
+        };
+        let slot = q2_0_expert_slot_bytes(self.dim, self.ff);
+        let spec = HostedSpec {
+            hc: self.hc,
+            dim: self.dim,
+            ff: self.ff,
+            n_experts: self.n_experts,
+            eps: self.eps,
+            n_blocks: cfg.n_layers,
+            // The worker multiplies nothing for the host.
+            sizes: ActSizes { io_k: 16, io_n: 16, ..self.sizes },
+            blocks: self
+                .to_host
+                .iter()
+                .map(|&blk| HostedBlock {
+                    blk,
+                    recurrent: recurrent(blk),
+                    bytes: self.block_dense.get(blk).copied().unwrap_or(0) + (self.n_experts * slot) as u64,
+                })
+                .collect(),
+            shape: ChainShape {
+                n_active: cfg.n_active,
+                scale,
+                gdn,
+                attn: AttnShape::of(cfg),
+            },
+        };
+        let host = RemoteBlocks::begin(rt, session, &spec)?;
+        let mut bytes = 0u64;
+        for info in &file.tensors {
+            let Some((blk, suffix)) = block_of(&info.name) else {
+                continue;
+            };
+            if !self.to_host.contains(&blk) {
+                continue;
+            }
+            let name = info.name.clone();
+            if BLOCK_MATRICES.contains(&suffix) && info.dims.len() <= 2 {
+                let (k, n) = shape(info);
+                let (encoding, data) = encode(file, info)?;
+                bytes += data.len() as u64;
+                host.call(&Call::Matrix { name, encoding: encoding.code(), n, k }, &data)?;
+            } else if BLOCK_VECTORS.contains(&suffix) {
+                let data: Vec<u8> = file.tensor_f32(&info.name)?.iter().flat_map(|v| v.to_le_bytes()).collect();
+                host.call(&Call::Vector { name }, &data)?;
+            }
+        }
+        for &blk in &self.to_host {
+            let slots = self.expert_slots(file, blk, slot)?;
+            bytes += slots.len() as u64;
+            host.call(&Call::Pool { blk }, &slots)?;
+        }
+        tracing::info!(blocks = ?self.to_host, mb = bytes >> 20, "qwen4exp: whole blocks on an RPC worker");
+        self.hosted = Some(Arc::new(host));
+        Ok(())
+    }
+
+    /// The worker hosting this model's last blocks, when one does.
+    pub fn hosted(&self) -> Option<&Arc<crate::qwen4_remote::RemoteBlocks>> {
+        self.hosted.as_ref()
+    }
+
+    /// Blocks an RPC worker hosts whole.
+    #[cfg(test)]
+    pub fn hosted_blocks(&self) -> Vec<usize> {
+        self.hosted.as_ref().map(|h| h.blocks().to_vec()).unwrap_or_default()
+    }
+
+    /// The worker's end: an empty chain for `spec`'s blocks on this
+    /// machine's cards, each block on the first card with room for it. The
+    /// weights follow ([`Self::add_matrix`], [`Self::add_vector`], [`Self::add_pool`]).
+    pub fn for_worker(spec: &HostedSpec, hips: Vec<Arc<HipWorkspace>>) -> Result<Self, AllpacaError> {
+        let act = layout(spec.hc, spec.dim, spec.ff, spec.n_experts, &spec.sizes);
+        let mut room: Vec<u64> =
+            hips.iter().map(|h| free_bytes(h.device).saturating_sub(HOST_RESERVE + (act.total * 4) as u64)).collect();
+        let mut block_card = vec![0usize; spec.n_blocks];
+        let mut card = 0usize;
+        for block in &spec.blocks {
+            while room.get(card).is_some_and(|free| *free < block.bytes) {
+                card += 1;
+            }
+            let (Some(free), Some(home)) = (room.get_mut(card), block_card.get_mut(block.blk)) else {
+                return Err(gpu_err(format!("qwen4exp: no room to host block {}", block.blk)));
+            };
+            *free -= block.bytes;
+            *home = card;
+        }
+        let mut cards = Vec::new();
+        for hip in hips {
+            let act = DeviceWeights::alloc(hip.device, act.total * 4)?;
+            cards.push(Card {
+                hip,
+                act,
+                pools: HashMap::new(),
+            });
+        }
+        Ok(Self {
+            cards,
+            placement: Placement {
+                block_card,
+                expert_blocks: [0, 0],
+            },
+            matrices: HashMap::new(),
+            vectors: HashMap::new(),
+            act,
+            hc: spec.hc,
+            dim: spec.dim,
+            ff: spec.ff,
+            n_experts: spec.n_experts,
+            eps: spec.eps,
+            packed: true,
+            remote: Vec::new(),
+            sizes: spec.sizes,
+            block_dense: Vec::new(),
+            to_host: Vec::new(),
+            hosted: None,
+        })
+    }
+
+    /// The card of each of `spec`'s blocks.
+    pub fn hosted_cards(&self, spec: &HostedSpec) -> Vec<usize> {
+        spec.blocks.iter().map(|b| self.card_of(b.blk)).collect()
+    }
+
+    fn device_of(&self, name: &str) -> i32 {
+        self.cards[block_of(name).map_or(0, |(blk, _)| self.card_of(blk))].hip.device
+    }
+
+    /// A matrix in the encoding `code` ([`Encoding::code`]) its kernel reads.
+    pub fn add_matrix(&mut self, name: &str, code: u8, n: usize, k: usize, bytes: &[u8]) -> Result<(), AllpacaError> {
+        let encoding = Encoding::from_code(code).ok_or_else(|| gpu_err(format!("qwen4exp: {name} has encoding {code}")))?;
+        let weights = DeviceWeights::upload_bytes(self.device_of(name), &[bytes])?;
+        self.matrices.insert(name.to_string(), Matrix { weights, encoding, n, k });
+        Ok(())
+    }
+
+    pub fn add_vector(&mut self, name: &str, values: &[f32]) -> Result<(), AllpacaError> {
+        let weights = DeviceWeights::upload(self.device_of(name), &[values])?;
+        self.vectors.insert(name.to_string(), weights);
+        Ok(())
+    }
+
+    /// Block `blk`'s routed experts as Q2_0 slots.
+    pub fn add_pool(&mut self, blk: usize, slots: &[u8]) -> Result<(), AllpacaError> {
+        if slots.len() != self.n_experts * q2_0_expert_slot_bytes(self.dim, self.ff) {
+            return Err(gpu_err(format!("qwen4exp: block {blk}'s expert slots are {} bytes", slots.len())));
+        }
+        let card = self.card_of(blk);
+        let pool = DeviceWeights::upload_bytes(self.cards[card].hip.device, &[slots])?;
+        self.cards[card].pools.insert(blk, pool);
+        Ok(())
+    }
+
+    /// Run `blocks` in order on the streams of `rows` tokens from `pos`, in
+    /// place, without the host: each block routes on its card.
+    pub fn run_blocks(
+        &self,
+        blocks: &[HostedBlock],
+        shape: &ChainShape,
+        pos: usize,
+        rows: usize,
+        state: &mut Qwen4DeviceState,
+        streams: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        let Some(first) = blocks.first() else {
+            return Ok(());
+        };
+        // A token's result must not depend on how many share its pass.
+        let _exact = allpaca_hip::ExactRows::enable();
+        let mut card = self.card_of(first.blk);
+        self.set_streams(card, streams)?;
+        let mut x = Vec::new();
+        for block in blocks {
+            let (blk, home) = (block.blk, self.card_of(block.blk));
+            if home != card {
+                self.get_streams(card, streams)?;
+                self.set_streams(home, streams)?;
+                card = home;
+            }
+            self.mix(card, &format!("blk.{blk}.hc_attn"), true, rows)?;
+            if block.recurrent {
+                let dims = shape.gdn.ok_or_else(|| gpu_err("qwen4exp: no Gated DeltaNet shape".into()))?;
+                self.gdn(blk, &dims, state, rows)?;
+            } else {
+                self.attention(blk, &shape.attn, pos, state, rows)?;
+            }
+            self.combine(card, rows)?;
+            self.mix(card, &format!("blk.{blk}.hc_ffn"), true, rows)?;
+            self.ffn_route(blk, rows, None, &mut x)?;
+            self.ffn_finish_routed(blk, rows, shape.n_active, shape.scale)?;
+            self.combine(card, rows)?;
+        }
+        self.get_streams(card, streams)
     }
 
     /// Put the routed experts of the blocks that have none on a card on
@@ -854,14 +1203,14 @@ impl Qwen4Gpu {
     pub fn attention(
         &self,
         blk: usize,
-        cfg: &ModelConfig,
+        cfg: &AttnShape,
         pos: usize,
         state: &mut Qwen4DeviceState,
         rows: usize,
     ) -> Result<(), AllpacaError> {
         let (card, act, dim) = (&self.cards[self.card_of(blk)], &self.act, self.dim);
         let hip = &card.hip;
-        let (head_dim, n_heads, n_kv) = (cfg.head_dim(), cfg.n_heads, cfg.n_kv_heads.max(1));
+        let (head_dim, n_heads, n_kv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads.max(1));
         let (attn, kv) = (n_heads * head_dim, n_kv * head_dim);
         let name = |s: &str| format!("blk.{blk}.{s}");
         let state = self.block_state(state, blk);
@@ -1108,8 +1457,30 @@ pub fn attach(
     expert_blocks: Option<&[usize]>,
 ) -> Result<(), AllpacaError> {
     let q4 = model.q4x.as_ref().ok_or_else(|| gpu_err("missing qwen4exp weights".into()))?;
-    let mut gpu = Qwen4Gpu::build(q4.gguf()?, &model.config, q4.spec.hc, hip.clone(), second.cloned(), expert_blocks)?;
-    if let Some(rpc) = model.rpc.as_deref() {
+    // A worker that hosts whole blocks takes those after the last n-gram
+    // block (that one needs the host) when the routing can run on a card.
+    // `ALLPACA_Q4X_NO_REMOTE_BLOCKS` keeps every block here.
+    let worker = model
+        .rpc
+        .as_ref()
+        .filter(|_| std::env::var_os("ALLPACA_Q4X_NO_REMOTE_BLOCKS").is_none())
+        .filter(|_| crate::model::plain_softmax_routing(&model.config).is_some())
+        .and_then(|rt| rt.extension_host(crate::qwen4_remote::EXT).map(|(session, free)| (rt, session, free)));
+    let first_free = q4.spec.ple.as_ref().and_then(|p| p.layers.iter().max()).map_or(0, |last| last + 1);
+    let mut gpu = Qwen4Gpu::build(
+        q4.gguf()?,
+        &model.config,
+        q4.spec.hc,
+        hip.clone(),
+        second.cloned(),
+        expert_blocks,
+        worker.as_ref().map(|(_, _, free)| (free.as_slice(), first_free)),
+    )?;
+    if let Some((rt, session, _)) = worker {
+        let recurrent = |blk: usize| q4.spec.is_recurrent(blk);
+        gpu.host_blocks(q4.gguf()?, &model.config, q4.spec.gdn, &recurrent, rt, session)?;
+    }
+    if let Some(rpc) = model.rpc.as_deref().filter(|_| gpu.hosted().is_none()) {
         gpu.send_experts(q4.gguf()?, &model.config, rpc)?;
     }
     *q4.gpu.lock().map_err(|_| gpu_err("qwen4exp gpu lock poisoned".into()))? = Some(gpu);
@@ -1126,19 +1497,19 @@ mod tests {
     fn blocks_fill_the_second_card_first_and_the_rest_keep_their_experts_on_the_host() {
         // 48 blocks of 0.1 GB matrices and 0.7 GB experts; card 0 has 9 GB
         // after 1 GB of fixed data, card 1 has 16 GB.
-        let p = place(48, &[9 * GB, 16 * GB], None, GB, GB / 10, 7 * GB / 10);
+        let p = place(48, &[9 * GB, 16 * GB], None, GB, GB / 10, 7 * GB / 10, 0);
         assert_eq!(p.expert_blocks, [7, 20]);
         assert_eq!(p.block_card[..7], [0; 7]);
         assert_eq!(p.block_card[7..27], [1; 20]);
         assert_eq!(p.block_card[27..], [0; 21]);
         // One card: every block's matrices are there, experts as far as they fit.
-        let p = place(48, &[9 * GB], None, GB, GB / 10, 7 * GB / 10);
+        let p = place(48, &[9 * GB], None, GB, GB / 10, 7 * GB / 10, 0);
         assert_eq!((p.expert_blocks, p.block_card.iter().sum::<usize>()), ([4, 0], 0));
         // Experts that cannot go on a card: matrices only.
-        assert_eq!(place(4, &[9 * GB, 9 * GB], None, 0, GB, 0).expert_blocks, [0, 0]);
+        assert_eq!(place(4, &[9 * GB, 9 * GB], None, 0, GB, 0, 0).expert_blocks, [0, 0]);
         // An explicit split is taken as given, within the block count.
-        let p = place(4, &[GB, GB], Some(&[1, 2]), 0, GB, GB);
+        let p = place(4, &[GB, GB], Some(&[1, 2]), 0, GB, GB, 0);
         assert_eq!((p.expert_blocks, p.block_card), ([1, 2], vec![0, 1, 1, 0]));
-        assert_eq!(place(4, &[GB, GB], Some(&[9, 9]), 0, GB, GB).expert_blocks, [0, 4]);
+        assert_eq!(place(4, &[GB, GB], Some(&[9, 9]), 0, GB, GB, 0).expert_blocks, [0, 4]);
     }
 }

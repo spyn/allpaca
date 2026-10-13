@@ -389,6 +389,8 @@ pub struct Qwen4Memory {
     pub times: Option<Qwen4Times>,
     /// The recurrent states, keys and values when the forward runs on the GPU.
     device: Option<Qwen4DeviceState>,
+    /// This sequence's state on the worker that hosts blocks, when one does.
+    remote: Option<crate::qwen4_remote::RemoteSeq>,
 }
 
 /// Seconds spent in each part of the forward.
@@ -1000,8 +1002,26 @@ fn forward_device(
     // route recorder keep the picking on the host.
     let card_scale = crate::model::plain_softmax_routing(cfg)
         .filter(|_| mem.routes.is_none() && std::env::var_os("ALLPACA_Q4X_HOST_ROUTING").is_none());
+    let mut resume = 0;
     for layer in 0..cfg.n_layers {
+        if layer < resume {
+            continue;
+        }
         let blk = cfg.gguf_blk(layer);
+        // The blocks a worker hosts run there in one round trip.
+        if let Some(host) = gpu.hosted().filter(|h| h.blocks().first() == Some(&blk)) {
+            for &b in host.blocks().iter().filter(|b| !q4.spec.is_recurrent(**b)) {
+                dense_attention_only(q4, b, pos + rows - 1)?;
+            }
+            gpu.get_streams(card, &mut streams)?;
+            let seq = mem.remote.get_or_insert_with(|| host.new_seq());
+            host.run(seq, pos, rows, &mut streams)?;
+            resume = layer + host.blocks().len();
+            card = if resume < cfg.n_layers { gpu.card_of(cfg.gguf_blk(resume)) } else { 0 };
+            gpu.set_streams(card, &streams)?;
+            lap(card, &mut times.ffn_rpc)?;
+            continue;
+        }
         let home = gpu.card_of(blk);
         let ple = q4.spec.ple.as_ref().filter(|p| p.layers.contains(&blk));
         if home != card || ple.is_some() {
@@ -1033,7 +1053,7 @@ fn forward_device(
             gpu.gdn(blk, &dims, device, rows)?;
         } else {
             dense_attention_only(q4, blk, pos + rows - 1)?;
-            gpu.attention(blk, cfg, pos, device, rows)?;
+            gpu.attention(blk, &crate::qwen4_gpu::AttnShape::of(cfg), pos, device, rows)?;
         }
         if wait {
             lap(card, if recurrent { &mut times.gdn } else { &mut times.attention })?;
@@ -1550,6 +1570,71 @@ mod tests {
         // Two passes (16 + 7 tokens), a call per remote block each.
         assert_eq!(rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed), calls + 4);
         drop((remote, rt));
+        worker.join().unwrap();
+    }
+
+    /// With a worker that hosts blocks, the blocks past the cards run whole
+    /// on it: one round trip a pass, the same logits as with every block on
+    /// the card (the worker runs the same kernels), a pass of several
+    /// tokens equal to one at a time, and a copied sequence going its own way.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_blocks_past_the_cards_run_whole_on_an_rpc_worker() {
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension()]).unwrap();
+        });
+        let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let local = tiny_packed_model();
+        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        let on_card = run(&local, &tokens);
+
+        let mut remote = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        {
+            let gpu = remote.q4x.as_ref().unwrap().gpu.lock().unwrap();
+            let gpu = gpu.as_ref().unwrap();
+            assert_eq!(gpu.expert_layers()[0], [0, 1]);
+            assert_eq!(gpu.hosted_blocks(), [2, 3], "a Gated DeltaNet and a full-attention block");
+            assert!(gpu.remote_expert_layers().is_empty());
+        }
+        let trips = || rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
+        let single = run(&remote, &tokens);
+        assert_eq!(trips(), tokens.len() as u64, "one round trip per token");
+        for (i, row) in single.iter().enumerate() {
+            assert_eq!(row, &on_card[i], "token {i}");
+        }
+        let vocab = remote.config.vocab_size;
+        let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+        let mut rows = vec![f32::NAN; tokens.len() * vocab];
+        forward_qwen4_tokens(&remote, &tokens, 0, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, single[i], "row {i}");
+        }
+        assert_eq!(trips(), tokens.len() as u64 + 2, "two passes (16 + 7 tokens)");
+
+        // A copy keeps the state it was taken at while the original moves on.
+        drop(mem);
+        let mut mem = Qwen4Memory::default();
+        for (pos, &t) in tokens[..10].iter().enumerate() {
+            forward_qwen4_token(&remote, t, pos, &mut logits, &mut mem).expect("forward");
+        }
+        let mut fork = mem.clone();
+        forward_qwen4_token(&remote, 3 + (tokens[10] - 2) % 5, 10, &mut logits, &mut mem).expect("other token");
+        assert_ne!(logits, single[10], "the other token gives other logits");
+        forward_qwen4_token(&remote, tokens[10], 10, &mut logits, &mut fork).expect("fork");
+        assert_eq!(logits, single[10], "the copy continues from token 10");
+        drop((mem, fork, remote, rt));
         worker.join().unwrap();
     }
 
