@@ -21,8 +21,8 @@ pub use protocol::{
 };
 pub use session::RpcSession;
 pub use worker::{
-    serve_connection, serve_connection_with_token, serve_listener, serve_listener_with_token,
-    serve_tcp, CpuWorker, WorkerBackend,
+    serve_connection, serve_connection_ext, serve_connection_with_token, serve_listener,
+    serve_listener_ext, serve_listener_with_token, serve_tcp, CpuWorker, Extension, WorkerBackend,
 };
 
 #[cfg(feature = "hip")]
@@ -230,6 +230,54 @@ mod tests {
             return;
         }
         check_grouped_match_single(WorkerBackend::Hip(HipWorker::new(0).unwrap()));
+    }
+
+    /// A worker serves the extensions it was started with and names them in
+    /// its HELLO; a call carries a small head and a bulk payload.
+    #[test]
+    fn loopback_extension_is_announced_and_called() {
+        struct Echo(u32);
+        impl Extension for Echo {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn call(&mut self, head: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+                if head == b"fail" {
+                    return Err("asked to fail".into());
+                }
+                self.0 += 1;
+                let mut out = vec![self.0 as u8];
+                out.extend(head.iter().rev());
+                out.extend((data.len() as u32).to_le_bytes());
+                Ok(out)
+            }
+        }
+        let serve = |exts: Vec<Box<dyn Extension>>| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let worker = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                serve_connection_ext(stream, WorkerBackend::Cpu(CpuWorker::new(1 << 20)), None, exts).unwrap();
+            });
+            (RpcSession::connect_addr(&addr.to_string()).unwrap(), worker)
+        };
+        let (mut client, worker) = serve(vec![Box::new(Echo(0))]);
+        assert!(client.has_extension("echo") && !client.has_extension("other"));
+        let big = vec![7u8; 200_000];
+        assert_eq!(client.ext("echo", b"abc", &big).unwrap(), [&[1u8][..], b"cba", &200_000u32.to_le_bytes()].concat());
+        assert_eq!(client.ext("echo", b"", &[]).unwrap(), [2, 0, 0, 0, 0]);
+        let err = client.ext("echo", b"fail", &[]).unwrap_err().to_string();
+        assert!(err.contains("asked to fail"), "{err}");
+        // The session survives a failed call and an unknown extension.
+        assert!(client.ext("other", b"", &[]).is_err());
+        assert_eq!(client.ext("echo", b"z", &[]).unwrap()[0], 3);
+        drop(client);
+        worker.join().unwrap();
+
+        let (client, worker) = serve(Vec::new());
+        assert!(!client.has_extension("echo"));
+        drop(client);
+        worker.join().unwrap();
     }
 
     /// Q2_0 experts as one buffer of slots (gate | up | down per expert, the

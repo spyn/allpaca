@@ -2399,12 +2399,31 @@ pub fn serve_connection<S: Read + Write>(
     serve_connection_with_token(stream, backend, None)
 }
 
+/// Something a worker serves besides the kernel ABI, under a name it
+/// announces in its HELLO. It lives as long as the connection.
+pub trait Extension: Send {
+    fn name(&self) -> &str;
+    /// One call: `head` is the caller's small header, `data` its bulk payload.
+    fn call(&mut self, head: &[u8], data: &[u8]) -> Result<Vec<u8>, String>;
+}
+
 /// Same as [`serve_connection`], checking an optional HELLO shared secret.
 pub fn serve_connection_with_token<S: Read + Write>(
+    stream: S,
+    backend: WorkerBackend,
+    expected_token: Option<&str>,
+) -> Result<(), RpcError> {
+    serve_connection_ext(stream, backend, expected_token, Vec::new())
+}
+
+/// Same as [`serve_connection_with_token`], also serving `extensions`.
+pub fn serve_connection_ext<S: Read + Write>(
     mut stream: S,
     mut backend: WorkerBackend,
     expected_token: Option<&str>,
+    extensions: Vec<Box<dyn Extension>>,
 ) -> Result<(), RpcError> {
+    let mut extensions = extensions;
     let mut saw_hello = false;
     loop {
         let (cmd, payload) = match read_request(&mut stream) {
@@ -2416,7 +2435,24 @@ pub fn serve_connection_with_token<S: Read + Write>(
             write_reply(&mut stream, STATUS_ERR, b"HELLO required")?;
             return Err(RpcError::Protocol("first command must be HELLO".into()));
         }
-        let result = handle(&mut backend, cmd, &payload, &mut saw_hello, expected_token);
+        let result = match cmd {
+            Cmd::Ext => crate::protocol::decode_ext(&payload).and_then(|(name, head, data)| {
+                let ext = extensions
+                    .iter_mut()
+                    .find(|e| e.name() == name)
+                    .ok_or_else(|| RpcError::Worker(format!("extension {name} is not served")))?;
+                ext.call(head, data).map_err(RpcError::Worker)
+            }),
+            _ => handle(&mut backend, cmd, &payload, &mut saw_hello, expected_token),
+        };
+        let result = match (cmd, result) {
+            (Cmd::Hello, Ok(mut body)) => {
+                let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
+                crate::protocol::append_hello_extensions(&mut body, &names);
+                Ok(body)
+            }
+            (_, result) => result,
+        };
         match result {
             Ok(body) => write_reply(&mut stream, STATUS_OK, &body)?,
             Err(e) => {
@@ -2444,6 +2480,16 @@ pub fn serve_listener_with_token(
     backend: WorkerBackend,
     expected_token: Option<&str>,
 ) -> Result<(), RpcError> {
+    serve_listener_ext(listener, backend, expected_token, Vec::new())
+}
+
+/// Same as [`serve_listener_with_token`], also serving `extensions`.
+pub fn serve_listener_ext(
+    listener: &std::net::TcpListener,
+    backend: WorkerBackend,
+    expected_token: Option<&str>,
+    extensions: Vec<Box<dyn Extension>>,
+) -> Result<(), RpcError> {
     let (stream, addr) = listener.accept()?;
     tracing::info!(%addr, "rpc client connected");
     stream.set_nodelay(true)?;
@@ -2456,7 +2502,7 @@ pub fn serve_listener_with_token(
     if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
         tracing::warn!(error = %e, "rpc keepalive not set");
     }
-    serve_connection_with_token(stream, backend, expected_token)
+    serve_connection_ext(stream, backend, expected_token, extensions)
 }
 
 pub fn serve_tcp(stream: TcpStream, backend: WorkerBackend) -> Result<(), RpcError> {
@@ -2565,6 +2611,7 @@ fn handle(
             Ok(out)
         }
         Cmd::DeviceStats => Ok(crate::protocol::encode_device_stats(&backend.device_stats())),
+        Cmd::Ext => Err(RpcError::Worker("extension calls are served by the connection".into())),
         Cmd::Sync => {
             backend.sync()?;
             Ok(Vec::new())

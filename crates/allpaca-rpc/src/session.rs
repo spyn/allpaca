@@ -13,6 +13,8 @@ pub struct RpcSession {
     hello: HelloReply,
     endpoint: String,
     token: String,
+    /// Extensions the worker announced in its HELLO.
+    extensions: Vec<String>,
 }
 
 impl RpcSession {
@@ -47,6 +49,7 @@ impl RpcSession {
             },
             endpoint: endpoint.to_string(),
             token: token.to_string(),
+            extensions: Vec::new(),
         };
         session.handshake()?;
         Ok(session)
@@ -69,6 +72,7 @@ impl RpcSession {
             ));
         }
         let hello = decode_hello_reply(&body)?;
+        self.extensions = crate::protocol::decode_hello_extensions(&body)?;
         check_hello(&hello)?;
         if hello.kernel_abi_rev == 0 {
             return Err(RpcError::Protocol("worker kernel abi is 0".into()));
@@ -76,6 +80,25 @@ impl RpcSession {
         let _ = KERNEL_ABI_REV;
         self.hello = hello;
         Ok(())
+    }
+
+    /// The worker announced the extension `name` in its HELLO.
+    pub fn has_extension(&self, name: &str) -> bool {
+        self.extensions.iter().any(|e| e == name)
+    }
+
+    /// Call the worker's extension `name` with a small `head` and a bulk
+    /// `data` payload.
+    pub fn ext(&mut self, name: &str, head: &[u8], data: &[u8]) -> Result<Vec<u8>, RpcError> {
+        if !self.has_extension(name) {
+            return Err(RpcError::Protocol(format!("extension {name} is not served")));
+        }
+        crate::protocol::write_ext_request(&mut self.stream, name, head, data)?;
+        let (status, body) = read_reply(&mut self.stream)?;
+        if status != STATUS_OK {
+            return Err(RpcError::Worker(String::from_utf8_lossy(&body).into_owned()));
+        }
+        Ok(body)
     }
 
     pub fn endpoint(&self) -> &str {
