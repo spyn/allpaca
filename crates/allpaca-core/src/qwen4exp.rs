@@ -995,6 +995,11 @@ fn forward_device(
     gpu.set_streams(card, &streams)?;
     let mut scores = vec![0.0f32; rows * n_experts];
     let mut x = Vec::new();
+    // Blocks with their experts on a card pick them there, so nothing of
+    // the block comes back to the host. `ALLPACA_Q4X_HOST_ROUTING` and the
+    // route recorder keep the picking on the host.
+    let card_scale = crate::model::plain_softmax_routing(cfg)
+        .filter(|_| mem.routes.is_none() && std::env::var_os("ALLPACA_Q4X_HOST_ROUTING").is_none());
     for layer in 0..cfg.n_layers {
         let blk = cfg.gguf_blk(layer);
         let home = gpu.card_of(blk);
@@ -1038,7 +1043,17 @@ fn forward_device(
         if wait {
             lap(card, &mut times.mix)?;
         }
-        gpu.ffn_route(blk, rows, &mut scores, &mut x)?;
+        if let Some(scale) = card_scale.filter(|_| gpu.routes_on_card(blk, cfg.n_active)) {
+            gpu.ffn_route(blk, rows, None, &mut x)?;
+            if wait {
+                lap(card, &mut times.route)?;
+            }
+            gpu.ffn_finish_routed(blk, rows, cfg.n_active, scale)?;
+            lap(card, &mut times.ffn_gpu)?;
+            gpu.combine(card, rows)?;
+            continue;
+        }
+        gpu.ffn_route(blk, rows, Some(&mut scores), &mut x)?;
         lap(card, if wait { &mut times.route } else if recurrent { &mut times.gdn } else { &mut times.attention })?;
         let picks: Vec<Vec<(usize, f32)>> = scores
             .chunks_mut(n_experts.max(1))

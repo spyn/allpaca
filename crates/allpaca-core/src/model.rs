@@ -2906,6 +2906,19 @@ pub(crate) fn topk_route(
 /// `select_bias` (`blk.N.exp_probs_b`, empty = none) is DeepSeek-V3's expert
 /// selection bias for sigmoid routers: experts are picked on
 /// `sigmoid(logit) + bias`, and weighted by the unbiased sigmoid.
+/// The weight scale of [`topk_from_logits`] when the routing is the plain
+/// kind a device kernel also does (softmax over all experts, the best by
+/// weight, renormalised over the picks, no groups); `None` otherwise.
+pub(crate) fn plain_softmax_routing(cfg: &ModelConfig) -> Option<f32> {
+    let plain = !cfg.moe_sqrt_softplus
+        && !cfg.moe_sigmoid_gating
+        && !cfg.expert_weights_norm
+        && cfg.n_expert_groups <= 1
+        && cfg.n_active >= 1;
+    let scale = if cfg.expert_weights_scale == 0.0 { 1.0 } else { cfg.expert_weights_scale };
+    plain.then_some(scale)
+}
+
 pub(crate) fn topk_from_logits(
     weights: &mut [f32],
     n_active: usize,

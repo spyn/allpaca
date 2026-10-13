@@ -192,6 +192,8 @@ struct Act {
     t: [usize; 5],
     out: usize,
     expert_h: usize,
+    /// A token's picks when its experts are routed on the card.
+    picks: usize,
     routed: usize,
     shared: usize,
     shared_gate: usize,
@@ -406,6 +408,7 @@ impl Qwen4Gpu {
         act.t = [take(wide), take(wide), take(wide), take(wide), take(wide)];
         act.out = take(r * dim);
         act.expert_h = take(MAX_PICKS * ff);
+        act.picks = take(r * q4x::PICKS_BYTES / 4);
         act.routed = take(r * dim);
         act.shared = take(r * dim);
         act.shared_gate = take(r * shared_ff);
@@ -924,11 +927,24 @@ impl Qwen4Gpu {
         self.launch(card, self.matrix(&name("attn_output.weight"), attn)?, q_full, card.at(act.out), rows)
     }
 
+    /// Whether block `blk`'s routed experts can be picked on its card
+    /// ([`Self::ffn_finish_routed`]).
+    pub fn routes_on_card(&self, blk: usize, n_active: usize) -> bool {
+        self.has_experts(blk) && self.n_experts <= 1024 && (1..=MAX_PICKS.min(self.n_experts)).contains(&n_active)
+    }
+
     /// Start block `blk`'s feed-forward on the mixed inputs of `rows`
-    /// tokens: the router's scores come back in `scores` (a row per token),
-    /// the shared expert runs on the card. `x` also gets the mixed inputs
-    /// when the experts are not on a card.
-    pub fn ffn_route(&self, blk: usize, rows: usize, scores: &mut [f32], x: &mut Vec<f32>) -> Result<(), AllpacaError> {
+    /// tokens: the shared expert runs on the card, and the router's scores
+    /// come back in `scores` (a row per token) unless it is `None` (the
+    /// card will route, [`Self::ffn_finish_routed`]). `x` also gets the
+    /// mixed inputs when the experts are not on a card.
+    pub fn ffn_route(
+        &self,
+        blk: usize,
+        rows: usize,
+        scores: Option<&mut [f32]>,
+        x: &mut Vec<f32>,
+    ) -> Result<(), AllpacaError> {
         let (card, act, dim) = (&self.cards[self.card_of(blk)], &self.act, self.dim);
         let name = |s: &str| format!("blk.{blk}.{s}");
         let (input, n_scores) = (card.at(act.x), rows * self.n_experts);
@@ -946,6 +962,12 @@ impl Qwen4Gpu {
             self.launch(card, open, input, card.at(act.shared_open), rows)?;
         }
         x.clear();
+        let Some(scores) = scores else {
+            return match card.pools.contains_key(&blk) {
+                true => Ok(()),
+                false => Err(gpu_err(format!("qwen4exp: block {blk} has no experts on its card to route to"))),
+            };
+        };
         if card.pools.contains_key(&blk) {
             return self.step(card, "download scores", || card.hip.copy_d2h_f32(device_scores, &mut scores[..n_scores]));
         }
@@ -954,6 +976,67 @@ impl Qwen4Gpu {
         scores[..n_scores].copy_from_slice(&x[rows * dim..]);
         x.truncate(rows * dim);
         Ok(())
+    }
+
+    /// Finish block `blk`'s feed-forward with the routing on the card:
+    /// each token's `n_active` best experts by the scores of
+    /// [`Self::ffn_route`], weights times `scale`, plus the gated shared
+    /// expert. Nothing comes back to the host.
+    pub fn ffn_finish_routed(&self, blk: usize, rows: usize, n_active: usize, scale: f32) -> Result<(), AllpacaError> {
+        let (card, act, dim) = (&self.cards[self.card_of(blk)], &self.act, self.dim);
+        self.check_rows(rows)?;
+        let pool = match card.pools.get(&blk) {
+            Some(pool) if self.routes_on_card(blk, n_active) => pool,
+            _ => return Err(gpu_err(format!("qwen4exp: block {blk} cannot route {n_active} experts on its card"))),
+        };
+        let routed = card.at(act.routed);
+        card.hip.bind()?;
+        for r in 0..rows {
+            // SAFETY: the parts hold MAX_ROWS rows; the scores follow the inputs in use.
+            let (x, scores, picks, out) = unsafe {
+                (
+                    card.at(act.x).add(r * dim),
+                    card.at(act.x).add(rows * dim + r * self.n_experts),
+                    card.at(act.picks).add(r * q4x::PICKS_BYTES / 4),
+                    routed.add(r * dim),
+                )
+            };
+            self.step(card, "routed_experts", || {
+                q4x::routed_experts(
+                    x,
+                    scores,
+                    pool.byte_ptr_at(0),
+                    self.n_experts as i32,
+                    n_active as i32,
+                    scale,
+                    picks.cast(),
+                    card.at(act.expert_h),
+                    out,
+                    dim as i32,
+                    self.ff as i32,
+                )
+            })?;
+        }
+        self.ffn_sum(blk, rows)
+    }
+
+    /// The block outputs: the routed experts' sums plus the gated shared
+    /// expert.
+    fn ffn_sum(&self, blk: usize, rows: usize) -> Result<(), AllpacaError> {
+        let (card, act, dim) = (&self.cards[self.card_of(blk)], &self.act, self.dim);
+        let routed = card.at(act.routed);
+        let shared = self.has(&format!("blk.{blk}.ffn_up_shexp.weight"));
+        card.hip.bind()?;
+        self.step(card, "ffn_sum", || {
+            q4x::ffn_sum(
+                routed,
+                if shared { card.at(act.shared).cast_const() } else { std::ptr::null() },
+                if shared { card.at(act.shared_open).cast_const() } else { std::ptr::null() },
+                card.at(act.out),
+                rows as i32,
+                dim as i32,
+            )
+        })
     }
 
     /// Finish block `blk`'s feed-forward into the block outputs: each
@@ -996,18 +1079,7 @@ impl Qwen4Gpu {
             }
             _ => return Err(gpu_err(format!("qwen4exp: block {blk} has no routed experts to run"))),
         }
-        let shared = self.has(&format!("blk.{blk}.ffn_up_shexp.weight"));
-        card.hip.bind()?;
-        self.step(card, "ffn_sum", || {
-            q4x::ffn_sum(
-                routed,
-                if shared { card.at(act.shared).cast_const() } else { std::ptr::null() },
-                if shared { card.at(act.shared_open).cast_const() } else { std::ptr::null() },
-                card.at(act.out),
-                rows as i32,
-                dim as i32,
-            )
-        })
+        self.ffn_sum(blk, rows)
     }
 
     /// The logits of card 0's mixed inputs through the output matrix
