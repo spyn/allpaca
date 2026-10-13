@@ -15320,6 +15320,94 @@ mod tests {
         );
     }
 
+    /// Opt-in: what the kernels of one Qwen3.8-Flash-Next block cost on a
+    /// device (`ALLPACA_BENCH_DEVICE`, default 0), one token, zeroed
+    /// weights: the two stream mixers, a Gated DeltaNet block's matrices,
+    /// the router with the shared expert, and ten routed experts picked on
+    /// the card. The recurrent step and the small elementwise kernels of
+    /// the block are left out.
+    /// `cargo test --release -p allpaca-hip --features hip --lib q4x_block_cost -- --ignored --nocapture`
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore]
+    fn q4x_block_cost() {
+        let device: i32 = std::env::var("ALLPACA_BENCH_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if device_count() <= device {
+            return;
+        }
+        let (hc, dim, low, ff, n_exp, picks) = (4usize, 2560usize, 320usize, 640usize, 512usize, 10usize);
+        let k = hc * dim;
+        let q3k = |n: usize, k: usize| n * k / 256 * 110;
+        let (value, qkv) = (6144usize, 10240usize);
+        set_device(device).unwrap();
+        let alloc = |bytes: usize| {
+            let ptr = device_malloc(bytes, device).unwrap();
+            device_memset(ptr, 0, bytes).unwrap();
+            ptr
+        };
+        let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
+        let pool = alloc(n_exp * slot_bytes);
+        let (w_down, w_up, w_inject) = (alloc(low * k * 2), alloc(k * low * 2), alloc(hc * k * 2));
+        let (w_qkv, w_gate, w_out) = (alloc(q3k(qkv, dim)), alloc(q3k(value, dim)), alloc(q3k(dim, value)));
+        let (w_alpha, w_router) = (alloc(48 * dim * 2), alloc(n_exp * dim * 2));
+        let (w_shared_in, w_shared_down) = (alloc(q3k(ff, dim)), alloc(slot_bytes / 3));
+        let act = alloc(64 * 12288 * 4).cast::<f32>();
+        let at = |i: usize| unsafe { act.add(i * 12288) };
+        let (r, h, d) = (1i32, hc as i32, dim as i32);
+        let mix = || -> Result<(), AllpacaError> {
+            q4x::stream_norm(at(0), at(1), at(2), r, h, d, 1e-6)?;
+            gemm_nt_bf16_device(at(2), w_down.cast(), at(3), 1, low as i32, k as i32)?;
+            silu_scale_device(at(3), low as i32, 0.25)?;
+            gemm_nt_bf16_device(at(3), w_up.cast(), at(4), 1, k as i32, low as i32)?;
+            q4x::gated_mean(at(2), at(4), at(5), r, h, d)?;
+            gemm_nt_bf16_device(at(2), w_inject.cast(), at(6), 1, h, k as i32)
+        };
+        let gdn = || -> Result<(), AllpacaError> {
+            gemm_nt_q3_k_device(at(5), w_qkv, at(7), 1, qkv as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_gate, at(8), 1, value as i32, d)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(9), 1, 48, d)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(10), 1, 48, d)?;
+            gemm_nt_q3_k_device(at(8), w_out, at(11), 1, d, value as i32)
+        };
+        let route = || -> Result<(), AllpacaError> {
+            gemm_nt_bf16_device(at(5), w_router.cast(), at(12), 1, n_exp as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_shared_in, at(13), 1, ff as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_shared_in, at(14), 1, ff as i32, d)?;
+            gemm_nt_q2_0_device(at(13), w_shared_down, at(15), 1, d, ff as i32)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(16), 1, 1, d)
+        };
+        let experts = || -> Result<(), AllpacaError> {
+            q4x::routed_experts(at(5), at(12), pool, n_exp as i32, picks as i32, 1.0, at(17).cast(), at(18), at(19), d, ff as i32)?;
+            q4x::ffn_sum(at(19), at(15), at(16), at(11), r, d)?;
+            q4x::combine(at(0), at(11), at(6), r, h, d)
+        };
+        let time = |name: &str, f: &dyn Fn() -> Result<(), AllpacaError>| {
+            for _ in 0..20 {
+                f().unwrap();
+            }
+            stream_synchronize().unwrap();
+            let n = 200;
+            let clock = std::time::Instant::now();
+            for _ in 0..n {
+                f().unwrap();
+            }
+            stream_synchronize().unwrap();
+            let us = clock.elapsed().as_secs_f64() * 1e6 / n as f64;
+            eprintln!("BLOCK device {device} {name}: {us:.1} us");
+            us
+        };
+        let total = 2.0 * time("mixer", &mix) + time("deltanet matrices", &gdn) + time("router and shared expert", &route)
+            + time("routed experts, sum, combine", &experts);
+        let whole = time("whole block", &|| {
+            mix()?;
+            gdn()?;
+            mix()?;
+            route()?;
+            experts()
+        });
+        eprintln!("BLOCK device {device} sum of parts {total:.1} us, whole block {whole:.1} us");
+    }
+
     /// The qwen4exp stream kernels against their definitions, on two rows.
     #[cfg(feature = "hip")]
     #[test]
