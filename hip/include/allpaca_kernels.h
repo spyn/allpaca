@@ -204,6 +204,14 @@ int allpaca_q2_0_moe_ffn(const float *x, const uint8_t *pool, const int32_t *slo
                          const float *weights, int32_t n_pick, float *h, float *out, int32_t dim,
                          int32_t ff, allpaca_stream_t stream);
 
+/* One token's routed experts with the routing on the device: the n_pick best of n_experts
+ * `scores` by softmax weight (ties to the lower expert), weights renormalised over the picks and
+ * times `scale`, then allpaca_q2_0_moe_ffn of those picks. `picks` is device scratch of 32 int32
+ * slots followed by 32 float weights and keeps the picks. n_experts <= 1024, n_pick <= 32. */
+int allpaca_q4x_routed_ffn(const float *x, const float *scores, const uint8_t *pool,
+                           int32_t n_experts, int32_t n_pick, float scale, void *picks, float *h,
+                           float *out, int32_t dim, int32_t ff, allpaca_stream_t stream);
+
 /* x[i] = silu(x[i] * s). */
 int allpaca_silu_scale(float *x, int32_t n, float s, allpaca_stream_t stream);
 

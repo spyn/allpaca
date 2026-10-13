@@ -664,6 +664,20 @@ mod ffi {
             ff: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_q4x_routed_ffn(
+            x: *const f32,
+            scores: *const f32,
+            pool: *const u8,
+            n_experts: i32,
+            n_pick: i32,
+            scale: f32,
+            picks: *mut u8,
+            h: *mut f32,
+            out: *mut f32,
+            dim: i32,
+            ff: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_silu_scale(x: *mut f32, n: i32, s: f32, stream: *mut c_void) -> i32;
         pub fn allpaca_q4x_stream_norm(
             x: *const f32,
@@ -4376,6 +4390,58 @@ pub mod q4x {
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
             let _ = (streams, out, logits, rows, hc, dim);
+            unavailable()
+        }
+    }
+
+    /// Bytes of the `picks` scratch of [`routed_experts`]: 32 slots, then
+    /// their 32 weights.
+    pub const PICKS_BYTES: usize = 32 * 8;
+
+    /// One token's routed experts with the routing on the device: the
+    /// `n_pick` best of `n_experts` router `scores` by softmax weight (ties
+    /// to the lower expert), weights renormalised over the picks and times
+    /// `scale`, then the experts from `pool` (Q2_0 slots, as
+    /// [`q2_0_moe_ffn_device`]) into `out`. `picks` is device scratch of
+    /// [`PICKS_BYTES`] and keeps the picks; `h` is scratch of `n_pick * ff`
+    /// floats. At most 1024 experts and 32 picks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn routed_experts(
+        x: *const f32,
+        scores: *const f32,
+        pool: *const u8,
+        n_experts: i32,
+        n_pick: i32,
+        scale: f32,
+        picks: *mut u8,
+        h: *mut f32,
+        out: *mut f32,
+        dim: i32,
+        ff: i32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_q4x_routed_ffn(
+                    x,
+                    scores,
+                    pool,
+                    n_experts,
+                    n_pick,
+                    scale,
+                    picks,
+                    h,
+                    out,
+                    dim,
+                    ff,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "q4x_routed_ffn")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (x, scores, pool, n_experts, n_pick, scale, picks, h, out, dim, ff);
             unavailable()
         }
     }
@@ -15125,6 +15191,91 @@ mod tests {
                 );
                 let v = x[i] * 0.25;
                 assert!((silu[i] - v / (1.0 + (-v).exp())).abs() < 1e-6, "silu_scale idx {i}");
+            }
+            assert!(expect.iter().any(|v| v.abs() > 1e-3), "reference output is all zero");
+        }
+    }
+
+    /// Routing on the device picks the experts the host picks from the same
+    /// scores (ties to the lower expert) and gives the routed-expert output
+    /// of those picks.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q4x_routed_experts_pick_and_weigh_like_the_host() {
+        if device_count() == 0 {
+            return;
+        }
+        for (dim, ff, n_exp, k, scale) in
+            [(128usize, 64usize, 7usize, 1usize, 1.0f32), (320, 192, 40, 5, 1.0), (2560, 640, 512, 10, 2.5)]
+        {
+            let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
+            let mut pool = vec![0u8; n_exp * slot_bytes];
+            let mut seed = 0x9e37_79b9u32 ^ dim as u32;
+            for (bi, block) in pool.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                let d = (0.05 + 0.01 * (bi % 13) as f32) * if bi % 5 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+            }
+            let x: Vec<f32> = (0..dim).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.8).collect();
+            // Scores with ties among the best.
+            let mut scores: Vec<f32> = (0..n_exp).map(|e| ((e * 53 % 97) as f32 / 20.0 - 2.0).round() * 0.5).collect();
+            scores[n_exp - 1] = 3.0;
+            // Host routing: softmax, the k best (ties to the lower expert), renormalise, scale.
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut w: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let sum: f32 = w.iter().sum();
+            w.iter_mut().for_each(|v| *v /= sum);
+            let mut order: Vec<usize> = (0..n_exp).collect();
+            order.sort_by(|&a, &b| w[b].partial_cmp(&w[a]).unwrap().then(a.cmp(&b)));
+            order.truncate(k);
+            let part: f32 = order.iter().map(|&e| w[e]).sum();
+            let slots: Vec<i32> = order.iter().map(|&e| e as i32).collect();
+            let weights: Vec<f32> = order.iter().map(|&e| w[e] / part * scale).collect();
+            set_device(0).unwrap();
+            let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
+            let floats = dim + n_exp + k * ff + 2 * dim + q4x::PICKS_BYTES / 4;
+            let dev = device_malloc(floats * 4, 0).unwrap();
+            let (dx, dscores, dh, dout, dref, dpicks) = unsafe {
+                let p = dev.cast::<f32>();
+                let h = p.add(dim + n_exp);
+                (p, p.add(dim), h, h.add(k * ff), h.add(k * ff + dim), h.add(k * ff + 2 * dim))
+            };
+            let (mut got, mut expect) = (vec![0.0f32; dim], vec![0.0f32; dim]);
+            let mut picks = vec![0u8; q4x::PICKS_BYTES];
+            let run = (|| {
+                memcpy(dx.cast(), x.as_ptr().cast(), dim * 4, MEMCPY_H2D)?;
+                memcpy(dscores.cast(), scores.as_ptr().cast(), n_exp * 4, MEMCPY_H2D)?;
+                q2_0_moe_ffn_device(dx, dpool.byte_ptr_at(0), &slots, &weights, dh, dref, dim as i32, ff as i32)?;
+                q4x::routed_experts(
+                    dx,
+                    dscores,
+                    dpool.byte_ptr_at(0),
+                    n_exp as i32,
+                    k as i32,
+                    scale,
+                    dpicks.cast(),
+                    dh,
+                    dout,
+                    dim as i32,
+                    ff as i32,
+                )?;
+                memcpy(got.as_mut_ptr().cast(), dout.cast(), dim * 4, MEMCPY_D2H)?;
+                memcpy(expect.as_mut_ptr().cast(), dref.cast(), dim * 4, MEMCPY_D2H)?;
+                memcpy(picks.as_mut_ptr().cast(), dpicks.cast(), q4x::PICKS_BYTES, MEMCPY_D2H)
+            })();
+            device_free(dev, floats * 4);
+            run.expect("device routing must run when a device is present");
+            let picked: Vec<i32> = picks[..k * 4].chunks(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+            assert_eq!(picked, slots, "picks for {n_exp} experts");
+            for (p, want) in picks[128..][..k * 4].chunks(4).zip(&weights) {
+                let got = f32::from_le_bytes(p.try_into().unwrap());
+                assert!((got - want).abs() <= 1e-6 * want.abs().max(1e-3), "weight {got} vs {want}");
+            }
+            for i in 0..dim {
+                assert!(gemm_close(got[i], expect[i]), "routed dim {dim} idx {i}: {} vs {}", got[i], expect[i]);
             }
             assert!(expect.iter().any(|v| v.abs() > 1e-3), "reference output is all zero");
         }
