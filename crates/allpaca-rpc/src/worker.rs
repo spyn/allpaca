@@ -2493,6 +2493,7 @@ pub fn serve_listener_ext(
     let (stream, addr) = listener.accept()?;
     tracing::info!(%addr, "rpc client connected");
     stream.set_nodelay(true)?;
+    crate::protocol::widen_socket_buffers(&stream);
     // A coordinator that dies without closing the socket (killed, network
     // drop) would otherwise leave the worker blocked on it forever, never
     // accepting the next client.

@@ -16,7 +16,8 @@ pub use protocol::{
     f32_to_f16_rne, quantize_q8_rows, MoeFfnRequest, MoeX,
     check_rpc_bind, encode_hello_reply, fnv1a64, is_loopback_bind_host, write_reply, BufId, Cmd,
     DeviceStat,
-    HelloReply, HelloRequest, KernelOp, LaunchItem, LaunchList, RpcBackendKind, KERNEL_ABI_REV,
+    HelloReply, HelloRequest, KernelOp, LaunchItem, LaunchList, RpcBackendKind, BUILD_ID, KERNEL_ABI_REV,
+    SOCKET_BUFFER,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
 };
 pub use session::RpcSession;
@@ -263,6 +264,8 @@ mod tests {
         };
         let (mut client, worker) = serve(vec![Box::new(Echo(0))]);
         assert!(client.has_extension("echo") && !client.has_extension("other"));
+        assert_eq!(client.build_id(), Some(BUILD_ID), "a worker of this build");
+        assert!(client.same_build() && BUILD_ID.len() == 16);
         let big = vec![7u8; 200_000];
         assert_eq!(client.ext("echo", b"abc", &big).unwrap(), [&[1u8][..], b"cba", &200_000u32.to_le_bytes()].concat());
         assert_eq!(client.ext("echo", b"", &[]).unwrap(), [2, 0, 0, 0, 0]);
@@ -271,11 +274,22 @@ mod tests {
         // The session survives a failed call and an unknown extension.
         assert!(client.ext("other", b"", &[]).is_err());
         assert_eq!(client.ext("echo", b"z", &[]).unwrap()[0], 3);
+        // Calls sent ahead are answered in order.
+        client.ext_send("echo", b"a", &[]).unwrap();
+        client.ext_send("echo", b"fail", &[]).unwrap();
+        client.ext_send("echo", b"b", &big).unwrap();
+        assert_eq!(client.ext_recv().unwrap()[..2], [4, b'a']);
+        assert!(client.ext_recv().is_err());
+        assert_eq!(client.ext_recv().unwrap()[..2], [5, b'b']);
         drop(client);
         worker.join().unwrap();
 
         let (client, worker) = serve(Vec::new());
         assert!(!client.has_extension("echo"));
+        assert!(client.same_build(), "the build id does not need an extension");
+        // A reply that ends at the device list is from a worker without either.
+        let old = encode_hello_reply(client.hello());
+        assert_eq!(crate::protocol::decode_hello_tail(&old).unwrap(), (Vec::new(), None));
         drop(client);
         worker.join().unwrap();
     }
