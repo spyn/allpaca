@@ -669,6 +669,7 @@ mod ffi {
             x: *const f32,
             gains: *const f32,
             xn: *mut f32,
+            rows: i32,
             hc: i32,
             dim: i32,
             eps: f32,
@@ -678,6 +679,7 @@ mod ffi {
             xn: *const f32,
             gate: *const f32,
             mixed: *mut f32,
+            rows: i32,
             hc: i32,
             dim: i32,
             stream: *mut c_void,
@@ -686,6 +688,7 @@ mod ffi {
             streams: *mut f32,
             out: *const f32,
             logits: *const f32,
+            rows: i32,
             hc: i32,
             dim: i32,
             stream: *mut c_void,
@@ -695,6 +698,7 @@ mod ffi {
             shared: *const f32,
             gate: *const f32,
             out: *mut f32,
+            rows: i32,
             dim: i32,
             stream: *mut c_void,
         ) -> i32;
@@ -4299,9 +4303,9 @@ pub fn silu_scale_device(x: *mut f32, n: i32, s: f32) -> Result<(), AllpacaError
     }
 }
 
-/// The device ops of a `qwen4exp` hyper-connection over `hc` streams of
-/// `dim` floats, stream-major. All pointers are device memory of the bound
-/// device.
+/// The device ops of a `qwen4exp` hyper-connection over `rows` tokens of
+/// `hc` streams of `dim` floats, `x[(r * hc + s) * dim + d]`. All pointers
+/// are device memory of the bound device.
 pub mod q4x {
     use super::*;
 
@@ -4312,59 +4316,88 @@ pub mod q4x {
         )))
     }
 
-    /// `xn[s] = x[s] / rms(x[s]) * gains[s]`.
-    pub fn stream_norm(x: *const f32, gains: *const f32, xn: *mut f32, hc: i32, dim: i32, eps: f32) -> Result<(), AllpacaError> {
+    /// `xn[r, s] = x[r, s] / rms(x[r, s]) * gains[s]`.
+    pub fn stream_norm(
+        x: *const f32,
+        gains: *const f32,
+        xn: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_q4x_stream_norm(x, gains, xn, hc, dim, eps, std::ptr::null_mut()) };
+            let rc = unsafe { ffi::allpaca_q4x_stream_norm(x, gains, xn, rows, hc, dim, eps, std::ptr::null_mut()) };
             status(rc, "q4x_stream_norm")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (x, gains, xn, hc, dim, eps);
+            let _ = (x, gains, xn, rows, hc, dim, eps);
             unavailable()
         }
     }
 
-    /// `mixed[d] = mean over streams of xn[s, d] * sigmoid(gate[s, d])`.
-    pub fn gated_mean(xn: *const f32, gate: *const f32, mixed: *mut f32, hc: i32, dim: i32) -> Result<(), AllpacaError> {
+    /// `mixed[r, d] = mean over streams of xn[r, s, d] * sigmoid(gate[r, s, d])`.
+    pub fn gated_mean(
+        xn: *const f32,
+        gate: *const f32,
+        mixed: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_q4x_gated_mean(xn, gate, mixed, hc, dim, std::ptr::null_mut()) };
+            let rc = unsafe { ffi::allpaca_q4x_gated_mean(xn, gate, mixed, rows, hc, dim, std::ptr::null_mut()) };
             status(rc, "q4x_gated_mean")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (xn, gate, mixed, hc, dim);
+            let _ = (xn, gate, mixed, rows, hc, dim);
             unavailable()
         }
     }
 
-    /// `streams[s, d] += out[d] * 2 * sigmoid(logits[s] / hc)`.
-    pub fn combine(streams: *mut f32, out: *const f32, logits: *const f32, hc: i32, dim: i32) -> Result<(), AllpacaError> {
+    /// `streams[r, s, d] += out[r, d] * 2 * sigmoid(logits[r, s] / hc)`.
+    pub fn combine(
+        streams: *mut f32,
+        out: *const f32,
+        logits: *const f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_q4x_combine(streams, out, logits, hc, dim, std::ptr::null_mut()) };
+            let rc = unsafe { ffi::allpaca_q4x_combine(streams, out, logits, rows, hc, dim, std::ptr::null_mut()) };
             status(rc, "q4x_combine")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (streams, out, logits, hc, dim);
+            let _ = (streams, out, logits, rows, hc, dim);
             unavailable()
         }
     }
 
-    /// `out[d] = routed[d] + sigmoid(gate[0]) * shared[d]`; `routed` or
-    /// `shared` (with `gate`) may be null.
-    pub fn ffn_sum(routed: *const f32, shared: *const f32, gate: *const f32, out: *mut f32, dim: i32) -> Result<(), AllpacaError> {
+    /// `out[r, d] = routed[r, d] + sigmoid(gate[r]) * shared[r, d]`;
+    /// `routed` or `shared` (with `gate`) may be null.
+    pub fn ffn_sum(
+        routed: *const f32,
+        shared: *const f32,
+        gate: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+    ) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe { ffi::allpaca_q4x_ffn_sum(routed, shared, gate, out, dim, std::ptr::null_mut()) };
+            let rc = unsafe { ffi::allpaca_q4x_ffn_sum(routed, shared, gate, out, rows, dim, std::ptr::null_mut()) };
             status(rc, "q4x_ffn_sum")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (routed, shared, gate, out, dim);
+            let _ = (routed, shared, gate, out, rows, dim);
             unavailable()
         }
     }
@@ -15136,74 +15169,83 @@ mod tests {
         );
     }
 
-    /// The qwen4exp stream kernels against their definitions.
+    /// The qwen4exp stream kernels against their definitions, on two rows.
     #[cfg(feature = "hip")]
     #[test]
     fn q4x_stream_kernels_match_their_definitions() {
         if device_count() == 0 {
             return;
         }
-        let (hc, dim, eps) = (4usize, 2560usize, 1e-6f32);
-        let n = hc * dim;
+        let (rows, hc, dim, eps) = (2usize, 4usize, 2560usize, 1e-6f32);
+        let (per_row, n) = (hc * dim, rows * hc * dim);
         let wave = |i: usize, a: usize, b: usize| ((i * a % b) as f32 / b as f32 - 0.5) * 3.0;
         let x: Vec<f32> = (0..n).map(|i| wave(i, 31, 997)).collect();
-        let gains: Vec<f32> = (0..n).map(|i| 1.0 + 0.2 * wave(i, 17, 251)).collect();
+        let gains: Vec<f32> = (0..per_row).map(|i| 1.0 + 0.2 * wave(i, 17, 251)).collect();
         let gate: Vec<f32> = (0..n).map(|i| wave(i, 13, 409)).collect();
-        let out: Vec<f32> = (0..dim).map(|i| wave(i, 7, 311)).collect();
-        let logits = [0.0f32, 1.5, -2.0, 0.3];
+        let out: Vec<f32> = (0..rows * dim).map(|i| wave(i, 7, 311)).collect();
+        let logits = [0.0f32, 1.5, -2.0, 0.3, 0.7, -0.4, 2.5, -1.1];
+        let open = [0.9f32, -1.3];
         let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
-        // Layout: x, gains, gate, xn, out, mixed, sum (dim each for the last three), logits.
-        let floats = 4 * n + 3 * dim + hc;
+        // Layout: x, gate, xn (n each), gains, out, mixed, sum, logits, open.
+        let offs = [0, n, 2 * n, 3 * n, 3 * n + per_row, 3 * n + per_row + rows * dim];
+        let (o_sum, o_logits) = (offs[5] + rows * dim, offs[5] + 2 * rows * dim);
+        let floats = o_logits + rows * hc + rows;
         set_device(0).unwrap();
         let dev = device_malloc(floats * 4, 0).unwrap().cast::<f32>();
         let at = |off: usize| unsafe { dev.add(off) };
-        let (dx, dgains, dgate, dxn, dout, dmixed, dsum, dlogits) =
-            (at(0), at(n), at(2 * n), at(3 * n), at(4 * n), at(4 * n + dim), at(4 * n + 2 * dim), at(4 * n + 3 * dim));
+        let (dx, dgate, dxn, dgains, dout, dmixed, dsum, dlogits, dopen) =
+            (at(0), at(offs[1]), at(offs[2]), at(offs[3]), at(offs[4]), at(offs[5]), at(o_sum), at(o_logits), at(o_logits + rows * hc));
         let up = |dst: *mut f32, src: &[f32]| memcpy(dst.cast(), src.as_ptr().cast(), src.len() * 4, MEMCPY_H2D);
         let down = |src: *const f32, len: usize| {
             let mut v = vec![0.0f32; len];
             memcpy(v.as_mut_ptr().cast(), src.cast(), len * 4, MEMCPY_D2H).map(|()| v)
         };
+        let (r, h, d) = (rows as i32, hc as i32, dim as i32);
         let run = (|| {
             up(dx, &x)?;
             up(dgains, &gains)?;
             up(dgate, &gate)?;
             up(dout, &out)?;
             up(dlogits, &logits)?;
-            q4x::stream_norm(dx, dgains, dxn, hc as i32, dim as i32, eps)?;
-            q4x::gated_mean(dxn, dgate, dmixed, hc as i32, dim as i32)?;
-            let (xn, mixed) = (down(dxn, n)?, down(dmixed, dim)?);
-            q4x::ffn_sum(dout, dmixed, dlogits.wrapping_add(1), dsum, dim as i32)?;
-            let both = down(dsum, dim)?;
-            q4x::ffn_sum(std::ptr::null(), dmixed, dlogits.wrapping_add(1), dsum, dim as i32)?;
-            let shared_only = down(dsum, dim)?;
-            q4x::ffn_sum(dout, std::ptr::null(), std::ptr::null(), dsum, dim as i32)?;
-            let routed_only = down(dsum, dim)?;
-            q4x::combine(dx, dout, dlogits, hc as i32, dim as i32)?;
+            up(dopen, &open)?;
+            q4x::stream_norm(dx, dgains, dxn, r, h, d, eps)?;
+            q4x::gated_mean(dxn, dgate, dmixed, r, h, d)?;
+            let (xn, mixed) = (down(dxn, n)?, down(dmixed, rows * dim)?);
+            q4x::ffn_sum(dout, dmixed, dopen, dsum, r, d)?;
+            let both = down(dsum, rows * dim)?;
+            q4x::ffn_sum(std::ptr::null(), dmixed, dopen, dsum, r, d)?;
+            let shared_only = down(dsum, rows * dim)?;
+            q4x::ffn_sum(dout, std::ptr::null(), std::ptr::null(), dsum, r, d)?;
+            let routed_only = down(dsum, rows * dim)?;
+            q4x::combine(dx, dout, dlogits, r, h, d)?;
             Ok::<_, AllpacaError>((xn, mixed, both, shared_only, routed_only, down(dx, n)?))
         })();
         device_free(dev.cast(), floats * 4);
         let (xn, mixed, both, shared_only, routed_only, combined) = run.expect("q4x kernels must run when a device is present");
         let close = |a: f32, b: f32| (a - b).abs() <= 1e-5 + 1e-4 * b.abs();
         let mut want_xn = vec![0.0f32; n];
-        for s in 0..hc {
-            let row = &x[s * dim..(s + 1) * dim];
+        for stream in 0..rows * hc {
+            let row = &x[stream * dim..(stream + 1) * dim];
             let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / dim as f32 + eps).sqrt();
             for d in 0..dim {
-                want_xn[s * dim + d] = row[d] * inv * gains[s * dim + d];
-                assert!(close(xn[s * dim + d], want_xn[s * dim + d]), "stream_norm {s},{d}");
+                want_xn[stream * dim + d] = row[d] * inv * gains[(stream % hc) * dim + d];
+                assert!(close(xn[stream * dim + d], want_xn[stream * dim + d]), "stream_norm {stream},{d}");
             }
         }
-        for d in 0..dim {
-            let want: f32 = (0..hc).map(|s| want_xn[s * dim + d] * sig(gate[s * dim + d])).sum::<f32>() / hc as f32;
-            assert!(close(mixed[d], want), "gated_mean {d}: {} vs {want}", mixed[d]);
-            let shared = sig(logits[1]) * want;
-            assert!(close(both[d], out[d] + shared), "ffn_sum both {d}");
-            assert!(close(shared_only[d], shared), "ffn_sum shared {d}");
-            assert_eq!(routed_only[d], out[d], "ffn_sum routed {d}");
-            for s in 0..hc {
-                let want = x[s * dim + d] + out[d] * 2.0 * sig(logits[s] / hc as f32);
-                assert!(close(combined[s * dim + d], want), "combine {s},{d}");
+        for row in 0..rows {
+            for d in 0..dim {
+                let i = row * dim + d;
+                let at = |s: usize| (row * hc + s) * dim + d;
+                let want: f32 = (0..hc).map(|s| want_xn[at(s)] * sig(gate[at(s)])).sum::<f32>() / hc as f32;
+                assert!(close(mixed[i], want), "gated_mean {row},{d}: {} vs {want}", mixed[i]);
+                let shared = sig(open[row]) * want;
+                assert!(close(both[i], out[i] + shared), "ffn_sum both {row},{d}");
+                assert!(close(shared_only[i], shared), "ffn_sum shared {row},{d}");
+                assert_eq!(routed_only[i], out[i], "ffn_sum routed {row},{d}");
+                for s in 0..hc {
+                    let want = x[at(s)] + out[i] * 2.0 * sig(logits[row * hc + s] / hc as f32);
+                    assert!(close(combined[at(s)], want), "combine {row},{s},{d}");
+                }
             }
         }
     }

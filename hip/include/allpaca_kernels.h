@@ -207,19 +207,20 @@ int allpaca_q2_0_moe_ffn(const float *x, const uint8_t *pool, const int32_t *slo
 /* x[i] = silu(x[i] * s). */
 int allpaca_silu_scale(float *x, int32_t n, float s, allpaca_stream_t stream);
 
-/* qwen4exp hyper-connections over hc streams of dim floats (stream-major).
- * stream_norm: xn[s] = x[s] / rms(x[s]) * gains[s].
- * gated_mean:  mixed[d] = mean_s xn[s, d] * sigmoid(gate[s, d]).
- * combine:     streams[s, d] += out[d] * 2 * sigmoid(logits[s] / hc).
- * ffn_sum:     out[d] = routed[d] + sigmoid(gate[0]) * shared[d] (either part may be null). */
-int allpaca_q4x_stream_norm(const float *x, const float *gains, float *xn, int32_t hc, int32_t dim,
-                            float eps, allpaca_stream_t stream);
-int allpaca_q4x_gated_mean(const float *xn, const float *gate, float *mixed, int32_t hc,
-                           int32_t dim, allpaca_stream_t stream);
-int allpaca_q4x_combine(float *streams, const float *out, const float *logits, int32_t hc,
-                        int32_t dim, allpaca_stream_t stream);
+/* qwen4exp hyper-connections over `rows` tokens of hc streams of dim floats,
+ * x[(r * hc + s) * dim + d].
+ * stream_norm: xn[r, s] = x[r, s] / rms(x[r, s]) * gains[s].
+ * gated_mean:  mixed[r, d] = mean_s xn[r, s, d] * sigmoid(gate[r, s, d]).
+ * combine:     streams[r, s, d] += out[r, d] * 2 * sigmoid(logits[r, s] / hc).
+ * ffn_sum:     out[r, d] = routed[r, d] + sigmoid(gate[r]) * shared[r, d] (either part may be null). */
+int allpaca_q4x_stream_norm(const float *x, const float *gains, float *xn, int32_t rows, int32_t hc,
+                            int32_t dim, float eps, allpaca_stream_t stream);
+int allpaca_q4x_gated_mean(const float *xn, const float *gate, float *mixed, int32_t rows,
+                           int32_t hc, int32_t dim, allpaca_stream_t stream);
+int allpaca_q4x_combine(float *streams, const float *out, const float *logits, int32_t rows,
+                        int32_t hc, int32_t dim, allpaca_stream_t stream);
 int allpaca_q4x_ffn_sum(const float *routed, const float *shared, const float *gate, float *out,
-                        int32_t dim, allpaca_stream_t stream);
+                        int32_t rows, int32_t dim, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
 /* Softmax top-k MoE routing on the GPU (pair table + shared-expert gate).

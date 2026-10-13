@@ -4106,7 +4106,8 @@ impl Engine {
             && ((self.hip.is_some()
                 && resident.is_some()
                 && target.supports_hip_batched_prefill())
-                || target.dsv4.is_some());
+                || target.dsv4.is_some()
+                || target.q4x.is_some());
         #[cfg(feature = "cuda")]
         let batch_prefill_cuda = !vision_in_chunk
             && toks.len() > 1

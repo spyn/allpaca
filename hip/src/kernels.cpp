@@ -3721,14 +3721,17 @@ extern "C" int allpaca_silu_scale(float *x, int32_t n, float s, allpaca_stream_t
     return hip_status(hipGetLastError());
 }
 
-/* qwen4exp hyper-connections. Streams are stream-major: x[s * dim + d]. */
+/* qwen4exp hyper-connections over `rows` tokens of hc streams of dim floats:
+ * x[(r * hc + s) * dim + d]. */
 
-/* xn[s] = x[s] / rms(x[s]) * gains[s], one block per stream. */
-__global__ void q4x_stream_norm_kernel(const float *x, const float *gains, float *xn, int dim,
-                                       float eps) {
+/* xn[r, s] = x[r, s] / rms(x[r, s]) * gains[s], one block per stream. */
+__global__ void q4x_stream_norm_kernel(const float *x, const float *gains, float *xn, int hc,
+                                       int dim, float eps) {
     __shared__ float part[256];
     const int tid = static_cast<int>(threadIdx.x);
     const size_t base = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(dim);
+    const size_t gbase = static_cast<size_t>(blockIdx.x % static_cast<unsigned>(hc)) *
+                         static_cast<size_t>(dim);
     float ss = 0.f;
     for (int d = tid; d < dim; d += 256) {
         const float v = x[base + d];
@@ -3744,91 +3747,101 @@ __global__ void q4x_stream_norm_kernel(const float *x, const float *gains, float
     }
     const float inv = rsqrtf(part[0] / static_cast<float>(dim) + eps);
     for (int d = tid; d < dim; d += 256) {
-        xn[base + d] = x[base + d] * inv * gains[base + d];
+        xn[base + d] = x[base + d] * inv * gains[gbase + d];
     }
 }
 
-/* mixed[d] = mean over streams of xn[s, d] * sigmoid(gate[s, d]). */
-__global__ void q4x_gated_mean_kernel(const float *xn, const float *gate, float *mixed, int hc,
-                                      int dim) {
-    const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (d >= dim) {
+/* mixed[r, d] = mean over streams of xn[r, s, d] * sigmoid(gate[r, s, d]). */
+__global__ void q4x_gated_mean_kernel(const float *xn, const float *gate, float *mixed, int rows,
+                                      int hc, int dim) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= rows * dim) {
         return;
     }
+    const size_t base = static_cast<size_t>(i / dim) * static_cast<size_t>(hc) *
+                        static_cast<size_t>(dim) + static_cast<size_t>(i % dim);
     float acc = 0.f;
     for (int s = 0; s < hc; ++s) {
-        const size_t i = static_cast<size_t>(s) * static_cast<size_t>(dim) + static_cast<size_t>(d);
-        acc += xn[i] / (1.f + expf(-gate[i]));
+        const size_t at = base + static_cast<size_t>(s) * static_cast<size_t>(dim);
+        acc += xn[at] / (1.f + expf(-gate[at]));
     }
-    mixed[d] = acc / static_cast<float>(hc);
+    mixed[i] = acc / static_cast<float>(hc);
 }
 
-/* streams[s, d] += out[d] * 2 * sigmoid(logits[s] / hc). */
-__global__ void q4x_combine_kernel(float *streams, const float *out, const float *logits, int hc,
-                                   int dim) {
+/* streams[r, s, d] += out[r, d] * 2 * sigmoid(logits[r, s] / hc). */
+__global__ void q4x_combine_kernel(float *streams, const float *out, const float *logits, int rows,
+                                   int hc, int dim) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (i >= hc * dim) {
+    if (i >= rows * hc * dim) {
         return;
     }
-    const float w = 2.f / (1.f + expf(-logits[i / dim] / static_cast<float>(hc)));
-    streams[i] += out[i % dim] * w;
+    const int stream = i / dim;
+    const int row = stream / hc;
+    const float w = 2.f / (1.f + expf(-logits[stream] / static_cast<float>(hc)));
+    streams[i] += out[static_cast<size_t>(row) * static_cast<size_t>(dim) + i % dim] * w;
 }
 
-/* out[d] = routed[d] + sigmoid(gate[0]) * shared[d]; either part may be null. */
+/* out[r, d] = routed[r, d] + sigmoid(gate[r]) * shared[r, d]; either part may be null. */
 __global__ void q4x_ffn_sum_kernel(const float *routed, const float *shared, const float *gate,
-                                   float *out, int dim) {
-    const int d = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (d >= dim) {
+                                   float *out, int rows, int dim) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= rows * dim) {
         return;
     }
-    float v = routed ? routed[d] : 0.f;
+    float v = routed ? routed[i] : 0.f;
     if (shared) {
-        v += shared[d] / (1.f + expf(-gate[0]));
+        v += shared[i] / (1.f + expf(-gate[i / dim]));
     }
-    out[d] = v;
+    out[i] = v;
 }
 
-extern "C" int allpaca_q4x_stream_norm(const float *x, const float *gains, float *xn, int32_t hc,
-                                       int32_t dim, float eps, allpaca_stream_t stream) {
-    if (hc <= 0 || dim <= 0 || !x || !gains || !xn) {
+extern "C" int allpaca_q4x_stream_norm(const float *x, const float *gains, float *xn, int32_t rows,
+                                       int32_t hc, int32_t dim, float eps,
+                                       allpaca_stream_t stream) {
+    if (rows <= 0 || hc <= 0 || dim <= 0 || !x || !gains || !xn) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    hipLaunchKernelGGL(q4x_stream_norm_kernel, dim3(static_cast<unsigned>(hc)), dim3(256), 0,
-                       as_stream(stream), x, gains, xn, dim, eps);
+    hipLaunchKernelGGL(q4x_stream_norm_kernel, dim3(static_cast<unsigned>(rows * hc)), dim3(256), 0,
+                       as_stream(stream), x, gains, xn, hc, dim, eps);
     return hip_status(hipGetLastError());
 }
 
-extern "C" int allpaca_q4x_gated_mean(const float *xn, const float *gate, float *mixed, int32_t hc,
-                                      int32_t dim, allpaca_stream_t stream) {
-    if (hc <= 0 || dim <= 0 || !xn || !gate || !mixed) {
+extern "C" int allpaca_q4x_gated_mean(const float *xn, const float *gate, float *mixed,
+                                      int32_t rows, int32_t hc, int32_t dim,
+                                      allpaca_stream_t stream) {
+    if (rows <= 0 || hc <= 0 || dim <= 0 || !xn || !gate || !mixed) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    hipLaunchKernelGGL(q4x_gated_mean_kernel, dim3(static_cast<unsigned>((dim + 255) / 256)),
-                       dim3(256), 0, as_stream(stream), xn, gate, mixed, hc, dim);
+    hipLaunchKernelGGL(q4x_gated_mean_kernel,
+                       dim3(static_cast<unsigned>((rows * dim + 255) / 256)), dim3(256), 0,
+                       as_stream(stream), xn, gate, mixed, rows, hc, dim);
     return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_q4x_combine(float *streams, const float *out, const float *logits,
-                                   int32_t hc, int32_t dim, allpaca_stream_t stream) {
-    if (hc <= 0 || dim <= 0 || !streams || !out || !logits) {
+                                   int32_t rows, int32_t hc, int32_t dim,
+                                   allpaca_stream_t stream) {
+    if (rows <= 0 || hc <= 0 || dim <= 0 || !streams || !out || !logits) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    hipLaunchKernelGGL(q4x_combine_kernel, dim3(static_cast<unsigned>((hc * dim + 255) / 256)),
-                       dim3(256), 0, as_stream(stream), streams, out, logits, hc, dim);
+    hipLaunchKernelGGL(q4x_combine_kernel,
+                       dim3(static_cast<unsigned>((rows * hc * dim + 255) / 256)), dim3(256), 0,
+                       as_stream(stream), streams, out, logits, rows, hc, dim);
     return hip_status(hipGetLastError());
 }
 
 extern "C" int allpaca_q4x_ffn_sum(const float *routed, const float *shared, const float *gate,
-                                   float *out, int32_t dim, allpaca_stream_t stream) {
-    if (dim <= 0 || !out || (shared && !gate) || (!routed && !shared)) {
+                                   float *out, int32_t rows, int32_t dim,
+                                   allpaca_stream_t stream) {
+    if (rows <= 0 || dim <= 0 || !out || (shared && !gate) || (!routed && !shared)) {
         return ALLPACA_ERR_INVALID;
     }
     clear_last_error();
-    hipLaunchKernelGGL(q4x_ffn_sum_kernel, dim3(static_cast<unsigned>((dim + 255) / 256)), dim3(256),
-                       0, as_stream(stream), routed, shared, gate, out, dim);
+    hipLaunchKernelGGL(q4x_ffn_sum_kernel, dim3(static_cast<unsigned>((rows * dim + 255) / 256)),
+                       dim3(256), 0, as_stream(stream), routed, shared, gate, out, rows, dim);
     return hip_status(hipGetLastError());
 }
 
@@ -9156,22 +9169,22 @@ extern "C" int allpaca_silu_scale(float *, int32_t, float, allpaca_stream_t) {
 }
 
 extern "C" int allpaca_q4x_stream_norm(const float *, const float *, float *, int32_t, int32_t,
-                                       float, allpaca_stream_t) {
+                                       int32_t, float, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
 extern "C" int allpaca_q4x_gated_mean(const float *, const float *, float *, int32_t, int32_t,
-                                      allpaca_stream_t) {
+                                      int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
 extern "C" int allpaca_q4x_combine(float *, const float *, const float *, int32_t, int32_t,
-                                   allpaca_stream_t) {
+                                   int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
 extern "C" int allpaca_q4x_ffn_sum(const float *, const float *, const float *, float *, int32_t,
-                                   allpaca_stream_t) {
+                                   int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
