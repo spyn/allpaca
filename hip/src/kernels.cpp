@@ -6968,6 +6968,16 @@ __global__ void deinterleave_q_gate_kernel(const float *q_full, float *q, float 
     gate[idx] = q_full[src + head_dim];
 }
 
+__global__ void gather_rows_kernel(float *dst, const float *src, const int32_t *rows, int n,
+                                   int row_len) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n * row_len) {
+        return;
+    }
+    const size_t row = static_cast<size_t>(rows[idx / row_len]);
+    dst[idx] = src[row * static_cast<size_t>(row_len) + static_cast<size_t>(idx % row_len)];
+}
+
 __global__ void sigmoid_mul_kernel(float *x, const float *gate, int n) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= n) {
@@ -7602,6 +7612,21 @@ extern "C" int allpaca_deinterleave_q_gate(const float *q_full, float *q, float 
     hipLaunchKernelGGL(deinterleave_q_gate_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), q_full, q, gate,
                        n_heads, head_dim);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_gather_rows(float *dst, const float *src, const int32_t *rows, int32_t n,
+                                   int32_t row_len, allpaca_stream_t stream) {
+    if (!dst || !src || !rows || n <= 0 || row_len <= 0 ||
+        static_cast<int64_t>(n) * row_len > INT32_MAX) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n * row_len + threads - 1) / threads;
+    hipLaunchKernelGGL(gather_rows_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), dst, src, rows, n,
+                       row_len);
     return hip_status(hipGetLastError());
 }
 
@@ -9426,6 +9451,11 @@ extern "C" int allpaca_deinterleave_q_gate(const float *, float *, float *, int3
 }
 
 extern "C" int allpaca_sigmoid_mul(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gather_rows(float *, const float *, const int32_t *, int32_t, int32_t,
+                                   allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

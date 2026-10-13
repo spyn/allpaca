@@ -18,6 +18,7 @@ use crate::deltanet::{
     rmsnorm_heads, sigmoid, silu, GdnDims,
 };
 use crate::model::{topk_from_logits, ModelConfig, TinyModel};
+use crate::qsa::{QsaKeys, QsaShape};
 use crate::qwen4_gpu::{Qwen4DeviceState, Qwen4Gpu};
 
 fn load_err(msg: String) -> AllpacaError {
@@ -92,6 +93,9 @@ pub struct Qwen4Spec {
     /// A full-attention layer every this many layers; the rest are Gated DeltaNet.
     pub full_attention_interval: usize,
     pub indexer_top_k: usize,
+    /// Indexer query heads and key width.
+    pub indexer_heads: usize,
+    pub indexer_dim: usize,
     /// Per layer: cells per indexer block on a full-attention layer (0 = dense).
     pub compress_ratios: Vec<u32>,
     pub ple: Option<PleSpec>,
@@ -153,6 +157,8 @@ impl Qwen4Spec {
             hc,
             full_attention_interval: u("full_attention_interval").unwrap_or(4).max(1),
             indexer_top_k: u("attention.indexer.top_k").unwrap_or(0),
+            indexer_heads: u("attention.indexer.head_count").unwrap_or(0),
+            indexer_dim: u("attention.indexer.key_length").unwrap_or(0),
             compress_ratios: meta_u64_array(file, "qwen4exp.attention.compress_ratios")
                 .into_iter()
                 .map(|r| r as u32)
@@ -373,6 +379,8 @@ struct LayerState {
     /// Keys and values of a full-attention layer, one row per token.
     k: Vec<f32>,
     v: Vec<f32>,
+    /// Its indexer keys, when its attention can turn sparse.
+    qsa: QsaKeys,
 }
 
 /// One sequence's state: the recurrent layers' states, the attention
@@ -502,17 +510,31 @@ fn gdn_layer(
     gemv(&y, &q4.w(&name("ssm_out.weight"))?, cfg.dim)
 }
 
-/// The indexer keeps every block while no more than `top_k` cells exist;
-/// past that the attention is sparse, which is not implemented.
-fn dense_attention_only(q4: &Qwen4Weights, blk: usize, pos: usize) -> Result<(), AllpacaError> {
-    let ratio = q4.spec.compress_ratios.get(blk).copied().unwrap_or(0) as usize;
-    if ratio > 0 && q4.spec.indexer_top_k > 0 && pos >= q4.spec.indexer_top_k {
-        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-            "qwen4exp sparse attention past {} tokens is not implemented",
-            q4.spec.indexer_top_k
-        ))));
+/// The indexer of full-attention block `blk`, when the file has one: its
+/// attention turns sparse past `top_k` cells ([`crate::qsa`]).
+pub(crate) fn qsa_shape(q4: &Qwen4Weights, cfg: &ModelConfig, blk: usize) -> Result<Option<QsaShape>, AllpacaError> {
+    let spec = &q4.spec;
+    let ratio = spec.compress_ratios.get(blk).copied().unwrap_or(0) as usize;
+    if ratio == 0 || !q4.has(&format!("blk.{blk}.indexer.k_proj.weight")) {
+        return Ok(None);
     }
-    Ok(())
+    let (heads, dim, top_k) = (spec.indexer_heads, spec.indexer_dim, spec.indexer_top_k);
+    let n_rot = if cfg.rope_dims > 0 { cfg.rope_dims } else { cfg.head_dim() };
+    if ratio < 2 || top_k == 0 || top_k % ratio != 0 || heads == 0 || dim == 0 || dim % 2 != 0 || n_rot > dim {
+        return Err(load_err(format!(
+            "qwen4exp block {blk}: indexer of {heads} heads of {dim} with budget {top_k} cannot pool {ratio} cells"
+        )));
+    }
+    Ok(Some(QsaShape {
+        ratio,
+        top_k,
+        heads,
+        dim,
+        n_rot,
+        rope_theta: cfg.rope_theta,
+        rope_sections: cfg.rope_sections,
+        eps: cfg.eps,
+    }))
 }
 
 /// Full-attention layer for one token: gated queries, normed and rotated
@@ -527,7 +549,6 @@ fn attn_layer(
 ) -> Result<Vec<f32>, AllpacaError> {
     let (head_dim, n_heads, n_kv) = (cfg.head_dim(), cfg.n_heads, cfg.n_kv_heads.max(1));
     let name = |s: &str| format!("blk.{blk}.{s}");
-    dense_attention_only(q4, blk, pos)?;
     let q_full = gemv(x, &q4.w(&name("attn_q.weight"))?, n_heads * head_dim * 2)?;
     let mut q = vec![0.0f32; n_heads * head_dim];
     let mut gate = vec![0.0f32; n_heads * head_dim];
@@ -548,8 +569,28 @@ fn attn_layer(
     }
     state.k.extend_from_slice(&k);
     state.v.extend_from_slice(&v);
+    // The cells the indexer keeps, once there are more than its budget.
+    let mut cells = None;
+    if let Some(shape) = qsa_shape(q4, cfg, blk)? {
+        let raw = gemv(x, &q4.w(&name("indexer.k_proj.weight"))?, shape.dim)?;
+        state.qsa.push(&shape, &raw, &q4.w(&name("indexer.k_norm.weight"))?)?;
+        if shape.is_sparse(pos) {
+            let mut iq = gemv(x, &q4.w(&name("indexer.q_proj.weight"))?, shape.heads * shape.dim)?;
+            cells = state.qsa.select(&shape, pos, &mut iq, &q4.w(&name("indexer.q_norm.weight"))?)?;
+        }
+    }
     let mut out = vec![0.0f32; n_heads * head_dim];
-    attention(&q, &state.k, &state.v, &mut out, 1, pos + 1, n_heads, n_kv, head_dim, true)?;
+    match cells {
+        None => attention(&q, &state.k, &state.v, &mut out, 1, pos + 1, n_heads, n_kv, head_dim, true)?,
+        Some(cells) => {
+            let row = n_kv * head_dim;
+            let gather = |all: &[f32]| -> Vec<f32> {
+                cells.iter().flat_map(|c| all[*c as usize * row..(*c as usize + 1) * row].iter().copied()).collect()
+            };
+            let (keys, values) = (gather(&state.k), gather(&state.v));
+            attention(&q, &keys, &values, &mut out, 1, cells.len(), n_heads, n_kv, head_dim, true)?;
+        }
+    }
     for (o, g) in out.iter_mut().zip(&gate) {
         *o *= sigmoid(*g);
     }
@@ -1113,9 +1154,6 @@ fn forward_device(
         let blk = cfg.gguf_blk(layer);
         // The blocks a worker hosts run there in one round trip.
         if let Some(host) = gpu.hosted().filter(|h| h.blocks().first() == Some(&blk)) {
-            for &b in host.blocks().iter().filter(|b| !q4.spec.is_recurrent(**b)) {
-                dense_attention_only(q4, b, pos + rows - 1)?;
-            }
             gpu.get_streams(card, &mut streams)?;
             resume = layer + host.blocks().len();
             card = if resume < cfg.n_layers { gpu.card_of(cfg.gguf_blk(resume)) } else { 0 };
@@ -1161,8 +1199,8 @@ fn forward_device(
         if recurrent {
             gpu.gdn(blk, &dims, device, rows)?;
         } else {
-            dense_attention_only(q4, blk, pos + rows - 1)?;
-            gpu.attention(blk, &crate::qwen4_gpu::AttnShape::of(cfg), pos, device, rows)?;
+            let shape = crate::qwen4_gpu::AttnShape::of(cfg, qsa_shape(q4, cfg, blk)?);
+            gpu.attention(blk, &shape, pos, device, rows)?;
         }
         if wait {
             lap(card, if recurrent { &mut times.gdn } else { &mut times.attention })?;
@@ -1233,14 +1271,26 @@ fn forward_device(
 /// full attention), two residual streams, n-gram embeddings at layer 1,
 /// routed and shared experts. Weights are seeded noise, all F32.
 pub fn write_tiny_qwen4exp_gguf(path: &std::path::Path) {
-    write_tiny(path, 16, 8, false);
+    write_tiny(path, 16, 8, false, None);
+}
+
+/// The tiny model with an indexer on its full-attention layer: pools of
+/// two cells, of which the attention keeps `top_k / 2` and the tail.
+pub fn write_tiny_qwen4exp_sparse_gguf(path: &std::path::Path, top_k: usize) {
+    write_tiny(path, 16, 8, false, Some(top_k));
 }
 
 /// The tiny model at width 64 with packed tensors: Q2_0 routed experts and
 /// two Q2_0 matrices, two BF16 mixer matrices and an F16 output head.
 #[cfg(test)]
 pub fn write_tiny_qwen4exp_packed_gguf(path: &std::path::Path) {
-    write_tiny(path, 64, 64, true);
+    write_tiny(path, 64, 64, true, None);
+}
+
+/// The packed tiny model with an indexer that keeps `top_k` cells.
+#[cfg(test)]
+pub fn write_tiny_qwen4exp_packed_sparse_gguf(path: &std::path::Path, top_k: usize) {
+    write_tiny(path, 64, 64, true, Some(top_k));
 }
 
 /// The encoding a tensor of the packed fixture is stored in.
@@ -1258,7 +1308,7 @@ fn packed_type(name: &str) -> Option<allpaca_gguf::GgmlType> {
     }
 }
 
-fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool) {
+fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool, indexer: Option<usize>) {
     use allpaca_gguf::{write_gguf_quant, GgmlType, GgufWriteQuantTensor, GgufWriteTensor};
 
     let (hc, lr, vocab, n_layers) = (2usize, 4usize, 8usize, 4usize);
@@ -1309,6 +1359,14 @@ fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool) {
         ("ple.head_vocab_sizes", u64s(vec![ple_vocab as u64; ple_heads])),
     ] {
         meta.insert(format!("qwen4exp.{key}"), value);
+    }
+    let (idx_heads, idx_dim, idx_ratio) = (2usize, 4usize, 2usize);
+    if let Some(top_k) = indexer {
+        meta.insert("qwen4exp.attention.indexer.top_k".into(), u(top_k));
+        meta.insert("qwen4exp.attention.indexer.head_count".into(), u(idx_heads));
+        meta.insert("qwen4exp.attention.indexer.key_length".into(), u(idx_dim));
+        let ratios = (0..n_layers).map(|l| if (l + 1) % 4 == 0 { idx_ratio as u64 } else { 0 }).collect();
+        meta.insert("qwen4exp.attention.compress_ratios".into(), u64s(ratios));
     }
     meta.insert("general.architecture".into(), GgufValue::String("qwen4exp".into()));
     meta.insert("general.name".into(), GgufValue::String("tiny-qwen4exp".into()));
@@ -1393,6 +1451,16 @@ fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool) {
         t("ffn_gate_shexp.weight", &[ff, dim], noise(ff * dim, 0.3));
         t("ffn_up_shexp.weight", &[ff, dim], noise(ff * dim, 0.3));
         t("ffn_down_shexp.weight", &[dim, ff], noise(dim * ff, 0.3));
+    }
+    // Last, so that the other weights are the same with and without.
+    if indexer.is_some() {
+        for blk in (0..n_layers).filter(|b| (b + 1) % 4 == 0) {
+            let mut t = |name: &str, dims: &[usize], data: Vec<f32>| add(format!("blk.{blk}.indexer.{name}"), dims, data);
+            t("q_proj.weight", &[idx_heads * idx_dim, dim], noise(idx_heads * idx_dim * dim, 0.5));
+            t("k_proj.weight", &[idx_dim, dim], noise(idx_dim * dim, 0.5));
+            t("q_norm.weight", &[idx_dim], vec![1.0; idx_dim]);
+            t("k_norm.weight", &[idx_dim], vec![1.0; idx_dim]);
+        }
     }
     let encoded: Vec<Option<(GgmlType, Vec<u8>)>> = owned
         .iter()
@@ -1536,6 +1604,43 @@ mod tests {
         model
     }
 
+    /// The tiny model whose attention keeps `top_k` cells through its indexer.
+    fn tiny_sparse_model(top_k: usize) -> TinyModel {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_qwen4exp_sparse-{}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        write_tiny_qwen4exp_sparse_gguf(&path, top_k);
+        let file = Arc::new(GgufFile::open(&path).expect("open sparse tiny qwen4exp"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file);
+        let _ = std::fs::remove_file(&path);
+        model
+    }
+
+    #[cfg(feature = "hip")]
+    fn tiny_packed_sparse_model(top_k: usize) -> TinyModel {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_qwen4exp_packed_sparse-{}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        write_tiny_qwen4exp_packed_sparse_gguf(&path, top_k);
+        let file = Arc::new(GgufFile::open(&path).expect("open packed sparse tiny qwen4exp"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file);
+        let _ = std::fs::remove_file(&path);
+        model
+    }
+
+    /// Tokens of the tiny vocabulary without the end-of-sequence token.
+    fn long_tokens(n: usize) -> Vec<u32> {
+        (0..n).map(|i| [3u32, 4, 5, 6, 7, 4, 6][(i * i + i / 3) % 7]).collect()
+    }
+
     #[cfg(feature = "hip")]
     fn tiny_packed_model() -> TinyModel {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1629,6 +1734,94 @@ mod tests {
             let scale = single[i].iter().fold(1.0f32, |m, v| m.max(v.abs()));
             assert!(max_diff(row, &single[i]) <= 0.05 * scale, "mixed row {i} is {} from the card's", max_diff(row, &single[i]));
         }
+    }
+
+    /// Past the indexer's budget the GPU forward keeps the cells the host
+    /// forward keeps: its logits stay the host's, a pass of several tokens
+    /// (some before the budget, some past it) gives what one token at a
+    /// time gives, and a copied sequence goes on from its own keys.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_sparse_attention_on_the_gpu_matches_the_host_forward() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let tokens = long_tokens(40);
+        type Build = fn(usize) -> TinyModel;
+        for (what, build) in [("f32", tiny_sparse_model as Build), ("packed", tiny_packed_sparse_model as Build)] {
+            let (host, gpu, dense) = (build(8), build(8), build(64));
+            crate::qwen4_gpu::attach(&gpu, &hip, None, None).expect("attach");
+            crate::qwen4_gpu::attach(&dense, &hip, None, None).expect("attach");
+            let (want, got, all) = (run(&host, &tokens), run(&gpu, &tokens), run(&dense, &tokens));
+            assert_eq!(got[..9], all[..9], "{what}: every cell is kept up to rank 8");
+            for (pos, (want, got)) in want.iter().zip(&got).enumerate() {
+                let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    max_diff(want, got) <= 2e-3 * scale,
+                    "{what}: logits at {pos} differ by {} (scale {scale})",
+                    max_diff(want, got)
+                );
+                if pos >= 9 {
+                    assert!(max_diff(got, &all[pos]) > 1e-6, "{what}: rank {pos} must drop cells");
+                }
+            }
+            let vocab = gpu.config.vocab_size;
+            let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+            let mut rows = vec![f32::NAN; 37 * vocab];
+            forward_qwen4_tokens(&gpu, &tokens[..3], 0, &mut logits, None, &mut mem).expect("prompt");
+            forward_qwen4_tokens(&gpu, &tokens[3..], 3, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+            for (i, row) in rows.chunks(vocab).enumerate() {
+                assert_eq!(row, got[3 + i], "{what}: row {i}");
+            }
+            // A copy taken past the budget continues like the original.
+            let mut mem = Qwen4Memory::default();
+            forward_qwen4_tokens(&gpu, &tokens[..20], 0, &mut logits, None, &mut mem).expect("first half");
+            let mut fork = mem.clone();
+            forward_qwen4_tokens(&gpu, &[3, 3, 3, 3], 20, &mut logits, None, &mut mem).expect("other tokens");
+            for (pos, &t) in tokens.iter().enumerate().skip(20) {
+                forward_qwen4_token(&gpu, t, pos, &mut logits, &mut fork).expect("fork");
+                assert_eq!(logits, got[pos], "{what}: fork at {pos}");
+            }
+        }
+    }
+
+    /// A worker that hosts a full-attention block keeps its indexer keys
+    /// and selects there: the logits are those of every block on the card.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_sparse_attention_runs_on_the_worker_that_hosts_the_block() {
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
+        });
+        let tokens = long_tokens(40);
+        let local = tiny_packed_sparse_model(8);
+        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        let on_card = run(&local, &tokens);
+
+        let mut remote = tiny_packed_sparse_model(8);
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        assert_eq!(remote.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().hosted_blocks(), [2, 3]);
+        let vocab = remote.config.vocab_size;
+        let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+        let mut rows = vec![f32::NAN; tokens.len() * vocab];
+        forward_qwen4_tokens(&remote, &tokens, 0, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, on_card[i], "row {i}");
+        }
+        drop((mem, remote, rt));
+        worker.join().unwrap();
     }
 
     /// Blocks whose experts are not on a card go to an RPC worker when one
@@ -1970,6 +2163,36 @@ mod tests {
         let mut short = vec![0.0f32; vocab];
         assert!(forward_qwen4_tokens(&model, &[4, 5], 6, &mut logits, Some(&mut short), &mut mem).is_err());
         assert_eq!(mem.tokens(), 6);
+    }
+
+    /// Past its indexer's budget the attention keeps the best pools and
+    /// the tail: the sequence goes on, and from the first token that sees
+    /// more pools than it may keep its logits differ from the same
+    /// weights with a budget that covers everything.
+    #[test]
+    fn tiny_qwen4exp_attends_sparsely_past_its_indexer_budget() {
+        let tokens = long_tokens(14);
+        // Two pools of two cells are kept: rank 5 is the first to see three.
+        let sparse = run(&tiny_sparse_model(4), &tokens);
+        let dense = run(&tiny_sparse_model(64), &tokens);
+        assert!(sparse.iter().flatten().all(|v| v.is_finite()));
+        assert_eq!(sparse[..5], dense[..5], "every cell is kept up to rank 4");
+        for rank in 5..tokens.len() {
+            assert!(max_diff(&sparse[rank], &dense[rank]) > 1e-6, "rank {rank} must drop cells");
+        }
+        // Without pools to drop the indexer changes nothing.
+        assert_eq!(dense, run(&tiny_model(), &tokens));
+        // A run of tokens gives each of them the logits it gets alone.
+        let model = tiny_sparse_model(4);
+        let vocab = model.config.vocab_size;
+        let mut mem = Qwen4Memory::default();
+        let mut logits = vec![0.0f32; vocab];
+        let mut rows = vec![f32::NAN; 10 * vocab];
+        forward_qwen4_tokens(&model, &tokens[..4], 0, &mut logits, None, &mut mem).expect("prompt");
+        forward_qwen4_tokens(&model, &tokens[4..], 4, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, sparse[4 + i], "row {i}");
+        }
     }
 
     #[test]

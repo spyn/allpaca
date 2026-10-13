@@ -969,6 +969,14 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gather_rows(
+            dst: *mut f32,
+            src: *const f32,
+            rows: *const i32,
+            n: i32,
+            row_len: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -12091,6 +12099,37 @@ impl HipWorkspace {
         {
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP deinterleave_q_gate unavailable".into(),
+            )))
+        }
+    }
+
+    /// `dst[i, ..] = src[rows[i], ..]` for `n` rows of `row_len` floats;
+    /// `rows` is a device buffer of `n` row numbers.
+    pub fn gather_rows_device(
+        &self,
+        dst: *mut f32,
+        src: *const f32,
+        rows: *const i32,
+        n: i32,
+        row_len: i32,
+    ) -> Result<(), AllpacaError> {
+        if dst.is_null() || src.is_null() || rows.is_null() || n <= 0 || row_len <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gather_rows".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe { ffi::allpaca_gather_rows(dst, src, rows, n, row_len, std::ptr::null_mut()) };
+                status(rc, "gather_rows")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gather_rows unavailable".into(),
             )))
         }
     }

@@ -15,6 +15,7 @@ mod direct_storage;
 mod draft;
 mod dspark;
 mod dsv4_gpu;
+mod qsa;
 mod qwen4_gpu;
 pub mod qwen4_remote;
 mod dsv4_ram;
