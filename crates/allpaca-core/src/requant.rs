@@ -32,27 +32,77 @@ use crate::sensitivity::Probe;
 pub enum Target {
     /// GSQ onto ggml `Q2_0`: 2.25 bits per weight.
     Q2_0,
+    /// The K-quants, encoded as llama.cpp encodes them
+    /// ([`allpaca_cpu::encode_q4_k`] and the like).
+    Q3K,
     Q4_0,
+    Q4K,
+    Q5K,
+    Q6K,
     Q8_0,
 }
 
 impl Target {
-    pub const ALL: [Target; 3] = [Target::Q2_0, Target::Q4_0, Target::Q8_0];
+    /// Every type, by size.
+    pub const ALL: [Target; 7] =
+        [Target::Q2_0, Target::Q3K, Target::Q4_0, Target::Q4K, Target::Q5K, Target::Q6K, Target::Q8_0];
 
     pub fn bits(self) -> f64 {
         match self {
             Target::Q2_0 => 2.25,
-            Target::Q4_0 => 4.5,
+            Target::Q3K => 3.4375,
+            Target::Q4_0 | Target::Q4K => 4.5,
+            Target::Q5K => 5.5,
+            Target::Q6K => 6.5625,
             Target::Q8_0 => 8.5,
+        }
+    }
+
+    /// The type by the name llama.cpp gives it (`q4_k`, `Q2_0`).
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.name().eq_ignore_ascii_case(name))
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Target::Q2_0 => "Q2_0",
+            Target::Q3K => "Q3_K",
+            Target::Q4_0 => "Q4_0",
+            Target::Q4K => "Q4_K",
+            Target::Q5K => "Q5_K",
+            Target::Q6K => "Q6_K",
+            Target::Q8_0 => "Q8_0",
         }
     }
 
     fn ggml(self) -> GgmlType {
         match self {
             Target::Q2_0 => GgmlType::Q2_0,
+            Target::Q3K => GgmlType::Q3_K,
             Target::Q4_0 => GgmlType::Q4_0,
+            Target::Q4K => GgmlType::Q4_K,
+            Target::Q5K => GgmlType::Q5_K,
+            Target::Q6K => GgmlType::Q6_K,
             Target::Q8_0 => GgmlType::Q8_0,
         }
+    }
+
+    /// Weights and bytes of one block.
+    fn block(self) -> (usize, usize) {
+        match self {
+            Target::Q2_0 => (64, 18),
+            Target::Q3K => (256, allpaca_cpu::Q3_K_BLOCK_BYTES),
+            Target::Q4_0 => (32, 18),
+            Target::Q4K => (256, allpaca_cpu::Q4_K_BLOCK_BYTES),
+            Target::Q5K => (256, allpaca_cpu::Q5_K_BLOCK_BYTES),
+            Target::Q6K => (256, allpaca_cpu::Q6_K_BLOCK_BYTES),
+            Target::Q8_0 => (32, 34),
+        }
+    }
+
+    /// Whether rows of `cols` weights are whole blocks of this type.
+    pub fn fits(self, cols: usize) -> bool {
+        cols % self.block().0 == 0
     }
 
     fn quantise(
@@ -65,7 +115,11 @@ impl Target {
     ) -> Result<Vec<u8>, AllpacaError> {
         Ok(match self {
             Target::Q2_0 => quantise_2bit(w, rows, cols, gram, gsq)?.to_q2_0(),
+            Target::Q3K => allpaca_cpu::encode_q3_k(w),
             Target::Q4_0 => allpaca_gguf::quantize_q4_0(w),
+            Target::Q4K => allpaca_cpu::encode_q4_k(w),
+            Target::Q5K => allpaca_cpu::encode_q5_k(w),
+            Target::Q6K => allpaca_cpu::encode_q6_k(w),
             Target::Q8_0 => allpaca_gguf::quantize_q8_0(w),
         })
     }
@@ -75,6 +129,9 @@ impl Target {
 pub struct Options {
     /// Average bits per weight over the requantised matrices.
     pub avg_bits: f64,
+    /// The types a matrix may take ([`Target::ALL`] by default). A matrix
+    /// is offered those whose blocks its rows are whole numbers of.
+    pub targets: Vec<Target>,
     /// Matrices with fewer weights are copied as they are.
     pub min_weights: usize,
     pub gsq: GsqConfig,
@@ -106,6 +163,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             avg_bits: 3.0,
+            targets: Target::ALL.to_vec(),
             min_weights: 4096,
             gsq: GsqConfig::default(),
             resolution: 4000,
@@ -123,18 +181,20 @@ pub struct Choice {
     pub name: String,
     pub weights: usize,
     pub target: Target,
-    /// Error of each of [`Target::ALL`] relative to the matrix's energy:
-    /// of its output on the measured inputs when `calibrated`, of its
-    /// weights otherwise.
-    pub relative_error: [f64; 3],
+    /// Error of each of [`Report::targets`] relative to the matrix's
+    /// energy: of its output on the measured inputs when `calibrated`, of
+    /// its weights otherwise. `NaN` for a type its rows do not fit.
+    pub relative_error: Vec<f64>,
     pub calibrated: bool,
     /// With a probe: divergence of the model's predictions (nats per
-    /// token) with this matrix alone at each of [`Target::ALL`].
-    pub divergence: Option<[f64; 3]>,
+    /// token) with this matrix alone at each of [`Report::targets`].
+    pub divergence: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Report {
+    /// The types that were offered ([`Options::targets`]).
+    pub targets: Vec<Target>,
     pub choices: Vec<Choice>,
     /// Tensors copied unchanged.
     pub copied: usize,
@@ -150,12 +210,13 @@ impl Report {
     }
 }
 
-/// Rows and row length of a matrix whose rows are whole 64-weight blocks
-/// (ggml lists the row length first), or `None` for anything else.
-fn matrix_shape(dims: &[u64], min_weights: usize) -> Option<(usize, usize)> {
+/// Rows and row length of a matrix whose rows are whole blocks of at
+/// least one of `targets` (ggml lists the row length first), or `None`
+/// for anything else.
+fn matrix_shape(dims: &[u64], min_weights: usize, targets: &[Target]) -> Option<(usize, usize)> {
     let cols = *dims.first()? as usize;
     let n: usize = dims.iter().product::<u64>() as usize;
-    (dims.len() >= 2 && cols % 64 == 0 && n >= min_weights).then(|| (n / cols, cols))
+    (dims.len() >= 2 && cols > 0 && targets.iter().any(|t| t.fits(cols)) && n >= min_weights).then(|| (n / cols, cols))
 }
 
 /// Requantise `input` into `output`.
@@ -172,6 +233,12 @@ pub fn requantise_each(
     opts: &Options,
 ) -> Result<Vec<Report>, AllpacaError> {
     let file = GgufFile::open(input)?;
+    let targets = &opts.targets;
+    if targets.is_empty() || targets.iter().enumerate().any(|(i, t)| targets[..i].contains(t)) {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "requantise: the types to choose from must be one or more, each once".into(),
+        )));
+    }
     let mut probe = match &opts.probe {
         Some(p) => {
             let texts: Vec<&str> = p.texts.iter().map(String::as_str).collect();
@@ -185,11 +252,11 @@ pub fn requantise_each(
         .enumerate()
         .filter(|(_, t)| t.name.ends_with(".weight") && !matches!(t.ggml_type, GgmlType::I32 | GgmlType::Other))
         .filter(|(_, t)| probe.as_ref().is_none_or(|p| p.covers(&t.name)))
-        .filter_map(|(i, t)| matrix_shape(&t.dims, opts.min_weights).map(|(rows, cols)| (i, rows, cols)))
+        .filter_map(|(i, t)| matrix_shape(&t.dims, opts.min_weights, targets).map(|(rows, cols)| (i, rows, cols)))
         .collect();
     if candidates.is_empty() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-            "requantise: the file has no weight matrix with rows of whole 64-weight blocks".into(),
+            "requantise: the file has no weight matrix whose rows are whole blocks of the types asked for".into(),
         )));
     }
     // The measured, damped Gram of a matrix's input, when the run covers it.
@@ -209,10 +276,15 @@ pub fn requantise_each(
         let h = measured(i, cols);
         let gram = h.as_deref().map_or(Gram::Identity, Gram::Full);
         let energy = output_error(&w, &vec![0.0; w.len()], cols, &gram);
-        let mut row = [0.0f64; 3];
-        let mut moved = [0.0f64; 3];
+        // A type the rows do not fit is not an option for this matrix.
+        let mut row = vec![f64::NAN; targets.len()];
+        let mut moved = vec![f64::NAN; targets.len()];
         let mut decoded = vec![0.0f32; w.len()];
-        for (at, target) in Target::ALL.into_iter().enumerate() {
+        let mut kept = Vec::new();
+        for (at, &target) in targets.iter().enumerate() {
+            if !target.fits(cols) {
+                continue;
+            }
             let bytes = target.quantise(&w, rows, cols, &gram, &opts.gsq)?;
             allpaca_gguf::dequant_packed(target.ggml(), &bytes, w.len(), &mut decoded)?;
             row[at] = output_error(&w, &decoded, cols, &gram) / energy.max(1e-30);
@@ -220,9 +292,10 @@ pub fn requantise_each(
                 moved[at] = probe.divergence(name, &decoded)?;
             }
             if target == Target::Q2_0 {
-                two_bit.push(bytes);
+                kept = bytes;
             }
         }
+        two_bit.push(kept);
         errors.push(row);
         calibrated.push(h.is_some());
         divergence.push(moved);
@@ -245,18 +318,19 @@ pub fn requantise_each(
             .flat_map(|(row, w)| row.iter().map(move |e| e * w / mean_weight))
             .collect()
     };
-    let gain: Vec<f64> = loss.iter().map(|l| -l).collect();
+    // What is not an option can never be worth taking.
+    let gain: Vec<f64> = loss.iter().map(|l| if l.is_nan() { f64::NEG_INFINITY } else { -l }).collect();
     let mut reports = Vec::with_capacity(outputs.len());
     for &(output, avg_bits) in outputs {
         let problem = Problem {
-            costs: Target::ALL.iter().map(|t| t.bits()).collect(),
+            costs: targets.iter().map(|t| t.bits()).collect(),
             weights: weights.clone(),
             budget: avg_bits,
         };
         // The loss is one term per matrix and option, so the knapsack optimum is exact.
         let assignment = knapsack(&problem, &gain, opts.resolution)?;
 
-        let chosen = |i: usize| candidates.iter().position(|c| c.0 == i).map(|at| Target::ALL[assignment[at]]);
+        let chosen = |i: usize| candidates.iter().position(|c| c.0 == i).map(|at| targets[assignment[at]]);
         let declared: Vec<GgufStreamTensor> = file
             .tensors
             .iter()
@@ -264,9 +338,7 @@ pub fn requantise_each(
             .map(|(i, t)| {
                 let n = t.n_elements() as usize;
                 let (ggml_type_id, nbytes) = match chosen(i) {
-                    Some(Target::Q2_0) => (GgmlType::Q2_0 as u32, n / 64 * 18),
-                    Some(Target::Q4_0) => (GgmlType::Q4_0 as u32, n / 32 * 18),
-                    Some(Target::Q8_0) => (GgmlType::Q8_0 as u32, n / 32 * 34),
+                    Some(target) => (target.ggml() as u32, n / target.block().0 * target.block().1),
                     None => (t.ggml_type_id, t.nbytes()),
                 };
                 GgufStreamTensor {
@@ -282,7 +354,7 @@ pub fn requantise_each(
         metadata.insert(
             "general.description".into(),
             GgufValue::String(format!(
-                "requantised by Allpaca (GSQ 2-bit + RCO allocation) to {:.2} bits per weight on average",
+                "requantised by Allpaca (GSQ 2-bit, K-quants, RCO allocation) to {:.2} bits per weight on average",
                 avg_bits
             )),
         );
@@ -315,12 +387,13 @@ pub fn requantise_each(
                 .map(|((((&(i, rows, cols), &o), row), &calibrated), moved)| Choice {
                     name: file.tensors[i].name.clone(),
                     weights: rows * cols,
-                    target: Target::ALL[o],
-                    relative_error: *row,
+                    target: targets[o],
+                    relative_error: row.clone(),
                     calibrated,
-                    divergence: probed.then_some(*moved),
+                    divergence: probed.then(|| moved.clone()),
                 })
                 .collect(),
+            targets: targets.clone(),
             copied: file.tensors.len() - candidates.len(),
             calibrated: calibrated.iter().filter(|c| **c).count(),
         });
@@ -339,7 +412,7 @@ mod tests {
         // the next (4 -> 8), so nothing should get 8 bits while anything has 2.
         let weights = [32.0, 32.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0];
         let problem = Problem {
-            costs: Target::ALL.iter().map(|t| t.bits()).collect(),
+            costs: CLASSIC.iter().map(|t| t.bits()).collect(),
             weights: weights.to_vec(),
             budget: 4.0,
         };
@@ -352,6 +425,9 @@ mod tests {
     }
     use allpaca_gguf::{write_gguf, GgufWriteTensor};
     use std::collections::HashMap;
+
+    /// The options before the K-quants: two, four and eight bits.
+    const CLASSIC: [Target; 3] = [Target::Q2_0, Target::Q4_0, Target::Q8_0];
 
     fn noise(n: usize, seed: u32, amp: f32) -> Vec<f32> {
         let mut s = seed.wrapping_mul(2654435761).wrapping_add(1);
@@ -477,6 +553,103 @@ mod tests {
         let _ = std::fs::remove_file(dst);
     }
 
+    fn write_matrices(path: &Path, tensors: &[(&str, Vec<u64>, Vec<f32>)]) {
+        let views: Vec<GgufWriteTensor<'_>> = tensors
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: (*name).into(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        let mut meta = HashMap::new();
+        meta.insert("general.architecture".to_string(), GgufValue::String("llama".into()));
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
+    /// K-quants are options like the others: here three equal matrices may
+    /// take 3 or 5 bits and the budget pays for two at 5. The one whose
+    /// weights three bits hold exactly gets the 3.
+    #[test]
+    fn k_quant_options_are_chosen_under_the_budget() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (src, dst) = (dir.join(format!("allpaca_requant_k_in-{pid}.gguf")), dir.join(format!("allpaca_requant_k_out-{pid}.gguf")));
+        let coarse: Vec<f32> = (0..256 * 256).map(|i| ((i * 5 + i / 16) % 8) as f32 * 0.1 - 0.4).collect();
+        let tensors = vec![
+            ("blk.0.coarse.weight", vec![256, 256], coarse),
+            ("blk.0.a.weight", vec![256, 256], noise(256 * 256, 1, 1.0)),
+            ("blk.0.b.weight", vec![256, 256], noise(256 * 256, 2, 1.0)),
+        ];
+        write_matrices(&src, &tensors);
+        let opts = Options {
+            avg_bits: (3.4375 + 2.0 * 5.5) / 3.0,
+            targets: vec![Target::Q3K, Target::Q5K],
+            ..Options::default()
+        };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        assert_eq!(report.targets, [Target::Q3K, Target::Q5K]);
+        assert!((report.avg_bits() - opts.avg_bits).abs() < 1e-9, "{}", report.avg_bits());
+        let out = GgufFile::open(&dst).unwrap();
+        for (name, want, ggml) in [
+            ("blk.0.coarse.weight", Target::Q3K, GgmlType::Q3_K),
+            ("blk.0.a.weight", Target::Q5K, GgmlType::Q5_K),
+            ("blk.0.b.weight", Target::Q5K, GgmlType::Q5_K),
+        ] {
+            let choice = report.choices.iter().find(|c| c.name == name).unwrap();
+            assert_eq!(choice.target, want, "{name}: {:?}", choice.relative_error);
+            assert_eq!(out.tensor(name).unwrap().ggml_type, ggml);
+            assert_eq!(out.tensor(name).unwrap().dims, vec![256, 256]);
+        }
+        let worst = |name: &str, at: usize| {
+            let decoded = out.tensor_f32(name).unwrap();
+            decoded.iter().zip(&tensors[at].2).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+        };
+        assert!(worst("blk.0.coarse.weight", 0) < 2e-3, "eight-level weights survive three bits: {}", worst("blk.0.coarse.weight", 0));
+        let a = out.tensor_f32("blk.0.a.weight").unwrap();
+        let err: f32 = a.iter().zip(&tensors[1].2).map(|(a, b)| (a - b).powi(2)).sum();
+        let energy: f32 = tensors[1].2.iter().map(|v| v * v).sum();
+        assert!(err / energy < 0.003, "five bits: {}", err / energy);
+        for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A K-quant block is 256 weights of one row: a matrix with shorter
+    /// rows is not offered them, and of two options of the same size the
+    /// one with the lower error is taken.
+    #[test]
+    fn k_quants_need_rows_of_whole_256_weight_blocks() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (src, dst) =
+            (dir.join(format!("allpaca_requant_k256_in-{pid}.gguf")), dir.join(format!("allpaca_requant_k256_out-{pid}.gguf")));
+        let tensors = vec![
+            ("blk.0.wide.weight", vec![256, 64], noise(256 * 64, 5, 1.0)),
+            ("blk.0.narrow.weight", vec![64, 256], noise(256 * 64, 6, 1.0)),
+        ];
+        write_matrices(&src, &tensors);
+        let report = requantise(&src, &dst, &Options { avg_bits: 4.5, ..Options::default() }).unwrap();
+        assert_eq!(report.targets, Target::ALL);
+        let at = |t: Target| Target::ALL.iter().position(|o| *o == t).unwrap();
+        let choice = |name: &str| report.choices.iter().find(|c| c.name == name).unwrap();
+        let (wide, narrow) = (choice("blk.0.wide.weight"), choice("blk.0.narrow.weight"));
+        assert!(wide.relative_error.iter().all(|e| e.is_finite()), "{:?}", wide.relative_error);
+        for t in [Target::Q3K, Target::Q4K, Target::Q5K, Target::Q6K] {
+            assert!(narrow.relative_error[at(t)].is_nan(), "{t:?} is not for rows of 64");
+        }
+        assert_eq!(narrow.target, Target::Q4_0);
+        let better = if wide.relative_error[at(Target::Q4K)] < wide.relative_error[at(Target::Q4_0)] { Target::Q4K } else { Target::Q4_0 };
+        assert_eq!(wide.target, better, "{:?}", wide.relative_error);
+        // More bits, less error, through every option of the wide matrix.
+        let by_bits: Vec<f64> =
+            [Target::Q2_0, Target::Q3K, Target::Q4K, Target::Q5K, Target::Q6K, Target::Q8_0].iter().map(|t| wide.relative_error[at(*t)]).collect();
+        assert!(by_bits.windows(2).all(|w| w[1] < w[0]), "{by_bits:?}");
+        for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// With measured inputs every covered matrix is quantised for its
     /// output on them: the error there is lower than what quantising
     /// the weights alone gives.
@@ -545,13 +718,14 @@ mod tests {
                 texts: vec!["hello world again hello world".into(), "again again hello world".into()],
                 max_tokens: 32,
             }),
+            targets: CLASSIC.to_vec(),
             ..Options::default()
         };
         let report = requantise(&src, &dst, &opts).unwrap();
         assert_eq!(report.choices.len(), 7);
         assert!((report.avg_bits() - 3.6).abs() < 1e-9, "{}", report.avg_bits());
         for c in &report.choices {
-            let d = c.divergence.unwrap_or_else(|| panic!("{} was not probed", c.name));
+            let d = c.divergence.clone().unwrap_or_else(|| panic!("{} was not probed", c.name));
             assert!(d.iter().all(|v| v.is_finite() && *v >= 0.0), "{}: {d:?}", c.name);
             if c.name.contains("attn_") {
                 assert_eq!(c.target, Target::Q2_0, "{}: {d:?}", c.name);
