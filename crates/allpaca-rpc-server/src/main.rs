@@ -63,7 +63,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let backend = open_backend(&cli)?;
         // A coordinator that dies mid-session resets the socket. Its buffers
         // go with the backend; keep serving the next client.
-        match allpaca_rpc::serve_listener_with_token(&listener, backend, token.as_deref()) {
+        // HIP workers also host whole Qwen3.8-Flash-Next (qwen4exp) blocks.
+        let extensions = match backend {
+            #[cfg(feature = "hip")]
+            WorkerBackend::Hip(_) => vec![allpaca_core::qwen4_remote::worker_extension()],
+            _ => Vec::new(),
+        };
+        match allpaca_rpc::serve_listener_ext(&listener, backend, token.as_deref(), extensions) {
             Ok(()) => tracing::info!("rpc client disconnected; waiting for next"),
             Err(e) => tracing::warn!(error = %e, "rpc client dropped; waiting for next"),
         }
