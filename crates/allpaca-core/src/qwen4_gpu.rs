@@ -300,6 +300,11 @@ pub struct Qwen4Gpu {
     ff: usize,
     n_experts: usize,
     eps: f32,
+    /// The routed experts are Q2_0 rows of whole blocks (they can go on a
+    /// card or a worker).
+    packed: bool,
+    /// Blocks whose routed experts are on an RPC worker.
+    remote: Vec<usize>,
 }
 
 impl std::fmt::Debug for Qwen4Gpu {
@@ -460,6 +465,8 @@ impl Qwen4Gpu {
             ff,
             n_experts,
             eps: cfg.eps,
+            packed,
+            remote: Vec::new(),
         };
         let expert_bytes = gpu.upload_experts(file, cfg, slot)?;
         tracing::info!(
@@ -492,23 +499,71 @@ impl Qwen4Gpu {
         for layer in 0..with_experts.min(cfg.n_layers) {
             let blk = cfg.gguf_blk(layer);
             let card = self.placement.block_card[blk];
-            let names = ["gate", "up", "down"].map(|part| format!("blk.{blk}.ffn_{part}_exps.weight"));
-            let parts = [
-                file.tensor_bytes(&names[0])?,
-                file.tensor_bytes(&names[1])?,
-                file.tensor_bytes(&names[2])?,
-            ];
-            let mut host = vec![0u8; self.n_experts * slot];
-            for (e, dst) in host.chunks_exact_mut(slot).enumerate() {
-                for (part, dst) in parts.iter().zip(dst.chunks_exact_mut(matrix)) {
-                    dst.copy_from_slice(&part[e * matrix..(e + 1) * matrix]);
-                }
-            }
+            let host = self.expert_slots(file, blk, slot)?;
             let pool = DeviceWeights::upload_bytes(self.cards[card].hip.device, &[&host])?;
             total += pool.bytes();
             self.cards[card].pools.insert(blk, pool);
         }
         Ok(total)
+    }
+
+    /// Block `blk`'s routed experts as slots: gate, up and down of expert
+    /// `e` together, where the file stacks each of the three by expert.
+    fn expert_slots(&self, file: &GgufFile, blk: usize, slot: usize) -> Result<Vec<u8>, AllpacaError> {
+        let matrix = slot / 3;
+        let names = ["gate", "up", "down"].map(|part| format!("blk.{blk}.ffn_{part}_exps.weight"));
+        let parts = [
+            file.tensor_bytes(&names[0])?,
+            file.tensor_bytes(&names[1])?,
+            file.tensor_bytes(&names[2])?,
+        ];
+        let mut host = vec![0u8; self.n_experts * slot];
+        for (e, dst) in host.chunks_exact_mut(slot).enumerate() {
+            for (part, dst) in parts.iter().zip(dst.chunks_exact_mut(matrix)) {
+                dst.copy_from_slice(&part[e * matrix..(e + 1) * matrix]);
+            }
+        }
+        Ok(host)
+    }
+
+    /// Put the routed experts of the blocks that have none on a card on
+    /// `rpc`'s workers, as far as those have room; the rest stay on the host.
+    pub fn send_experts(
+        &mut self,
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        rpc: &crate::rpc_runtime::RpcRuntime,
+    ) -> Result<(), AllpacaError> {
+        if !self.packed || rpc.session_count() == 0 {
+            return Ok(());
+        }
+        let slot = q2_0_expert_slot_bytes(self.dim, self.ff);
+        let mut bytes = 0u64;
+        for layer in 0..cfg.n_layers {
+            let blk = cfg.gguf_blk(layer);
+            if self.has_experts(blk) {
+                continue;
+            }
+            let slots = self.expert_slots(file, blk, slot)?;
+            if !rpc.put_expert_slots(layer, &slots, self.n_experts, self.dim, self.ff)? {
+                break;
+            }
+            bytes += slots.len() as u64;
+            self.remote.push(blk);
+        }
+        tracing::info!(blocks = self.remote.len(), expert_mb = bytes >> 20, "qwen4exp: routed experts on RPC workers");
+        Ok(())
+    }
+
+    /// Block `blk`'s routed experts are on an RPC worker.
+    pub fn remote_experts(&self, blk: usize) -> bool {
+        self.remote.contains(&blk)
+    }
+
+    /// Blocks whose routed experts are on an RPC worker.
+    #[cfg(test)]
+    pub fn remote_expert_layers(&self) -> Vec<usize> {
+        self.remote.clone()
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -905,7 +960,10 @@ pub fn attach(
     expert_blocks: Option<&[usize]>,
 ) -> Result<(), AllpacaError> {
     let q4 = model.q4x.as_ref().ok_or_else(|| gpu_err("missing qwen4exp weights".into()))?;
-    let gpu = Qwen4Gpu::build(q4.gguf()?, &model.config, q4.spec.hc, hip.clone(), second.cloned(), expert_blocks)?;
+    let mut gpu = Qwen4Gpu::build(q4.gguf()?, &model.config, q4.spec.hc, hip.clone(), second.cloned(), expert_blocks)?;
+    if let Some(rpc) = model.rpc.as_deref() {
+        gpu.send_experts(q4.gguf()?, &model.config, rpc)?;
+    }
     *q4.gpu.lock().map_err(|_| gpu_err("qwen4exp gpu lock poisoned".into()))? = Some(gpu);
     Ok(())
 }

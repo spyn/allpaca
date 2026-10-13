@@ -1455,6 +1455,12 @@ impl Engine {
             self.config.kv.vram_bytes as u64,
             model,
         );
+        if let (Some(rt), true) = (&self.rpc, model.q4x.is_some()) {
+            // No layer plan for this architecture: its GPU working set puts
+            // the routed experts that do not fit the cards on the workers.
+            model.rpc = Some(Arc::clone(rt));
+            return Ok(());
+        }
         if let Some(rt) = &self.rpc {
             rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
             rt.set_expert_homes(&self.config.rpc.expert_homes);

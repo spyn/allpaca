@@ -403,6 +403,8 @@ pub struct Qwen4Times {
     /// Feed-forward of blocks whose routed experts are on a GPU, and of the rest.
     pub ffn_gpu: f32,
     pub ffn_host: f32,
+    /// Feed-forward of blocks whose routed experts are on an RPC worker.
+    pub ffn_rpc: f32,
     /// Router and shared expert up to the scores coming back (GPU forward
     /// with `ALLPACA_Q4X_SYNC_TIMES`).
     pub route: f32,
@@ -863,7 +865,7 @@ pub(crate) fn forward_qwen4_tokens(
         for (pass, chunk) in tokens.chunks(crate::qwen4_gpu::MAX_ROWS).enumerate() {
             let first = pass * crate::qwen4_gpu::MAX_ROWS;
             let rows = row_logits.as_deref_mut().map(|rows| &mut rows[first * vocab..(first + chunk.len()) * vocab]);
-            forward_device(q4, gpu, cfg, chunk, start_pos + first, &mut logits[..vocab], rows, mem)?;
+            forward_device(q4, gpu, model.rpc.as_deref(), cfg, chunk, start_pos + first, &mut logits[..vocab], rows, mem)?;
         }
         return Ok(());
     }
@@ -955,6 +957,7 @@ fn forward_host(
 fn forward_device(
     q4: &Arc<Qwen4Weights>,
     gpu: &Qwen4Gpu,
+    rpc: Option<&crate::rpc_runtime::RpcRuntime>,
     cfg: &ModelConfig,
     tokens: &[u32],
     pos: usize,
@@ -1047,6 +1050,12 @@ fn forward_device(
         if gpu.has_experts(blk) {
             gpu.ffn_finish(blk, &picks, None)?;
             lap(card, &mut times.ffn_gpu)?;
+        } else if let Some(rpc) = rpc.filter(|_| gpu.remote_experts(blk)) {
+            let sums = rpc
+                .moe_ffn(layer, &x, &picks)?
+                .ok_or_else(|| load_err(format!("qwen4exp: block {blk}'s experts are not on a worker")))?;
+            gpu.ffn_finish(blk, &picks, Some(&sums))?;
+            lap(card, &mut times.ffn_rpc)?;
         } else {
             let sums = routed_experts_pooled(q4, cfg, blk, &x, &picks)?;
             gpu.ffn_finish(blk, &picks, Some(&sums))?;
@@ -1478,6 +1487,57 @@ mod tests {
         }
     }
 
+    /// Blocks whose experts are not on a card go to an RPC worker when one
+    /// is connected: passes of several tokens still match single tokens,
+    /// and the logits stay near the all-on-card ones (the worker gets the
+    /// rows rounded to 8 bits).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_experts_off_the_cards_run_on_an_rpc_worker() {
+        use allpaca_rpc::{serve_connection, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"))).unwrap();
+        });
+        let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let local = tiny_packed_model();
+        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        let on_card = run(&local, &tokens);
+
+        let mut remote = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        {
+            let gpu = remote.q4x.as_ref().unwrap().gpu.lock().unwrap();
+            let gpu = gpu.as_ref().unwrap();
+            assert_eq!(gpu.expert_layers()[0], [0, 1]);
+            assert_eq!(gpu.remote_expert_layers(), [2, 3]);
+        }
+        let single = run(&remote, &tokens);
+        let calls = rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(calls, 2 * tokens.len() as u64, "one call per remote block and token");
+        let vocab = remote.config.vocab_size;
+        let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+        let mut rows = vec![f32::NAN; tokens.len() * vocab];
+        forward_qwen4_tokens(&remote, &tokens, 0, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, single[i], "row {i}");
+            let scale = on_card[i].iter().fold(1.0f32, |m, v| m.max(v.abs()));
+            assert!(max_diff(row, &on_card[i]) <= 0.05 * scale, "row {i} is {} from the card's", max_diff(row, &on_card[i]));
+        }
+        // Two passes (16 + 7 tokens), a call per remote block each.
+        assert_eq!(rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed), calls + 4);
+        drop((remote, rt));
+        worker.join().unwrap();
+    }
+
     /// Logits after each token of `tokens`.
     fn run(model: &TinyModel, tokens: &[u32]) -> Vec<Vec<f32>> {
         let mut mem = Qwen4Memory::default();
@@ -1620,6 +1680,12 @@ mod tests {
             let vocab = model.config.vocab_size;
             let first = Arc::new(allpaca_hip::HipWorkspace::new(0, 1 << 20, vocab).expect("card 0"));
             let second = (cards > 1).then(|| Arc::new(allpaca_hip::HipWorkspace::new(1, 1 << 20, vocab).expect("card 1")));
+            // `ALLPACA_Q4X_RPC` = worker (`host:port`, token in `ALLPACA_RPC_TOKEN`) for the experts off the cards.
+            if let Ok(endpoint) = std::env::var("ALLPACA_Q4X_RPC") {
+                let token = std::env::var("ALLPACA_RPC_TOKEN").ok();
+                let rt = crate::rpc_runtime::RpcRuntime::connect(&[endpoint], token.as_deref()).expect("rpc worker");
+                model.rpc = Some(Arc::new(rt));
+            }
             crate::qwen4_gpu::attach(&model, &first, second.as_ref(), None).expect("attach");
             let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
             eprintln!(

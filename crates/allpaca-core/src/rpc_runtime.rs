@@ -35,6 +35,9 @@ pub struct RpcRuntime {
     /// Expert-parallel layout of the loaded model: bytes of each layer's
     /// routed experts and the worker GPUs they may be placed on.
     expert_layout: Mutex<(Vec<u64>, Vec<String>)>,
+    /// Bytes of expert slots put on each (session, worker GPU) by
+    /// [`Self::put_expert_slots`].
+    slot_bytes: Mutex<std::collections::HashMap<(usize, u32), u64>>,
     /// Last worker GPU stats and when they were read.
     gpu_stats: Mutex<(Option<std::time::Instant>, Vec<RemoteGpu>)>,
     /// `rpc.prefill_rows`: rows per batched span call (0 = per token).
@@ -276,6 +279,7 @@ impl RpcRuntime {
             local_budget_mib: Mutex::new(Vec::new()),
             expert_pins: Mutex::new(std::collections::BTreeMap::new()),
             expert_layout: Mutex::new((Vec::new(), Vec::new())),
+            slot_bytes: Mutex::new(std::collections::HashMap::new()),
             gpu_stats: Mutex::new((None, Vec::new())),
             prefill_rows: std::sync::atomic::AtomicUsize::new(128),
             row_scratch: Mutex::new(std::collections::HashMap::new()),
@@ -918,6 +922,65 @@ impl RpcRuntime {
                 f16_out: true,
             },
         })
+    }
+
+    /// Put one layer's routed experts on a HIP worker GPU as a buffer of
+    /// Q2_0 slots (gate | up | down per expert); [`Self::moe_ffn`] then runs
+    /// them. Worker GPUs fill in order, so consecutive layers share one.
+    /// `false` when no HIP worker has room left.
+    pub fn put_expert_slots(
+        &self,
+        layer: usize,
+        slots: &[u8],
+        n_experts: usize,
+        dim: usize,
+        ff: usize,
+    ) -> Result<bool, AllpacaError> {
+        let lock = || AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into()));
+        let mut sessions = self.sessions.lock().map_err(|_| lock())?;
+        let mut placed = self.slot_bytes.lock().map_err(|_| lock())?;
+        let need = slots.len() as u64;
+        let home = sessions.iter().enumerate().find_map(|(s, session)| {
+            if !matches!(session.hello().backend, RpcBackendKind::Hip) {
+                return None;
+            }
+            session.hello().device_memories().iter().enumerate().find_map(|(d, &mem)| {
+                // Leave the worker ~5% and 256 MB for MoeFfn scratch.
+                let room = mem.saturating_sub(mem / 20 + (256 << 20));
+                let used = placed.get(&(s, d as u32)).copied().unwrap_or(0);
+                (room >= used + need).then_some((s, d as u32))
+            })
+        });
+        let Some((session, device)) = home else {
+            return Ok(false);
+        };
+        let pool = sessions[session]
+            .put_tensor(42, &[(slots.len() / n_experts.max(1)) as u32, n_experts as u32], slots, Some(device))
+            .map_err(map_rpc)?;
+        *placed.entry((session, device)).or_default() += need;
+        self.h2d_bytes.fetch_add(need, Ordering::Relaxed);
+        let mut experts = self.experts.lock().map_err(|_| lock())?;
+        if experts.len() <= layer {
+            experts.resize(layer + 1, None);
+        }
+        experts[layer] = Some(RemoteExperts {
+            session,
+            device,
+            // Rows go as int8 blocks unless asked otherwise: a quarter of
+            // the bytes, and float rows of this size have stalled on
+            // retransmits.
+            q8: dim % 32 == 0 && std::env::var_os("ALLPACA_Q4X_RPC_F32").is_none(),
+            req: MoeFfnRequest {
+                gate: pool,
+                up: pool,
+                down: pool,
+                n_experts: n_experts as u32,
+                dim: dim as u32,
+                ff: ff as u32,
+                f16_out: true,
+            },
+        });
+        Ok(true)
     }
 
     /// Where `layer_idx` runs: a worker GPU, or the local HIP device.
