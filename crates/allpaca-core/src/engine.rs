@@ -4405,11 +4405,13 @@ impl Engine {
 
     /// Whether this Engine can batch decode at all: enabled, several Request
     /// slots, a HIP-resident target that supports multi-sequence forwards, and
-    /// no draft model (its per-Request state needs its own forward).
+    /// no draft model (its per-Request state needs its own forward). A
+    /// qwen4exp target keeps its own working set on the cards, not a
+    /// resident model.
     fn batch_decode_enabled(&self, inner: &EngineInner) -> bool {
         self.config.engine.batch_decode
             && self.config.engine.max_active_requests >= 2
-            && inner.target_resident.is_some()
+            && (inner.target_resident.is_some() || inner.target.as_ref().is_some_and(|t| t.q4x.is_some()))
             && inner.draft_model.is_none()
             && match (self.hip.as_deref(), inner.target.as_ref()) {
                 (Some(hip), Some(t)) => t.supports_forward_batch(hip),
@@ -4590,10 +4592,7 @@ impl Engine {
             .target
             .clone()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-        let resident = inner
-            .target_resident
-            .clone()
-            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let resident = inner.target_resident.clone();
         let vocab = target.config.vocab_size;
         let pages: Vec<Vec<Vec<u64>>> = staged
             .iter()
@@ -4618,15 +4617,21 @@ impl Engine {
                     recurrent: rec.as_mut(),
                 })
                 .collect();
-            target.forward_batch(
-                &tokens,
-                &mut segs,
-                &mut inner.kv,
-                &self.metrics,
-                &mut row_logits,
-                hip,
-                &resident,
-            )
+            match resident.as_ref() {
+                _ if target.q4x.is_some() => {
+                    crate::qwen4exp::forward_qwen4_batch(&target, &tokens, &mut segs, &mut row_logits)
+                }
+                Some(resident) => target.forward_batch(
+                    &tokens,
+                    &mut segs,
+                    &mut inner.kv,
+                    &self.metrics,
+                    &mut row_logits,
+                    hip,
+                    resident,
+                ),
+                None => Err(AllpacaError::Fatal(FatalError::NoModel)),
+            }
         };
         let mut spans = Vec::new();
         let mut row0 = 0usize;

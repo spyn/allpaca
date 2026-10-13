@@ -31,6 +31,16 @@ struct Cli {
     /// Shared HELLO secret. Required for non-loopback binds. Env: `ALLPACA_RPC_TOKEN`.
     #[arg(long)]
     token: Option<String>,
+    /// Keep the weights of hosted model blocks in this directory and take
+    /// them from there the next time (HIP workers). Env: `ALLPACA_WORKER_CACHE`.
+    #[arg(long)]
+    cache_dir: Option<std::path::PathBuf>,
+    /// Most disk the weight cache uses, in GiB; the weights used longest ago go first.
+    #[arg(long, default_value_t = 64)]
+    cache_gib: u64,
+    /// Print the fingerprint of the sources this worker was built from and exit.
+    #[arg(long)]
+    build_id: bool,
 }
 
 fn main() {
@@ -46,6 +56,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    if cli.build_id {
+        println!("{}", allpaca_rpc::BUILD_ID);
+        return Ok(());
+    }
     let token = rpc_token(&cli);
     allpaca_rpc::check_rpc_bind(&cli.host, cli.insecure_bind, &token)?;
     if !allpaca_rpc::is_loopback_bind_host(&cli.host) {
@@ -57,7 +71,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = format!("{}:{}", cli.host, cli.port);
     let listener = TcpListener::bind(&addr)?;
-    tracing::info!(%addr, "allpaca-rpc-server listening");
+    tracing::info!(%addr, build = allpaca_rpc::BUILD_ID, "allpaca-rpc-server listening");
     let token = if token.is_empty() { None } else { Some(token) };
     loop {
         let backend = open_backend(&cli)?;
@@ -66,7 +80,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // HIP workers also host whole Qwen3.8-Flash-Next (qwen4exp) blocks.
         let extensions = match backend {
             #[cfg(feature = "hip")]
-            WorkerBackend::Hip(_) => vec![allpaca_core::qwen4_remote::worker_extension()],
+            WorkerBackend::Hip(_) => {
+                let cache = cli
+                    .cache_dir
+                    .clone()
+                    .or_else(|| std::env::var_os("ALLPACA_WORKER_CACHE").map(Into::into))
+                    .map(|dir| allpaca_core::qwen4_remote::WeightCache::new(dir, cli.cache_gib << 30));
+                vec![allpaca_core::qwen4_remote::worker_extension(cache)]
+            }
             _ => Vec::new(),
         };
         match allpaca_rpc::serve_listener_ext(&listener, backend, token.as_deref(), extensions) {

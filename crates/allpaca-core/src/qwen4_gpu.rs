@@ -701,7 +701,7 @@ impl Qwen4Gpu {
         rt: &Arc<crate::rpc_runtime::RpcRuntime>,
         session: usize,
     ) -> Result<(), AllpacaError> {
-        use crate::qwen4_remote::{Call, RemoteBlocks};
+        use crate::qwen4_remote::{RemoteBlocks, Weight};
         let Some(scale) = crate::model::plain_softmax_routing(cfg).filter(|_| !self.to_host.is_empty()) else {
             return Ok(());
         };
@@ -745,18 +745,23 @@ impl Qwen4Gpu {
                 let (k, n) = shape(info);
                 let (encoding, data) = encode(file, info)?;
                 bytes += data.len() as u64;
-                host.call(&Call::Matrix { name, encoding: encoding.code(), n, k }, &data)?;
+                host.send_weight(Weight::Matrix { name, encoding: encoding.code(), n, k }, &data)?;
             } else if BLOCK_VECTORS.contains(&suffix) {
                 let data: Vec<u8> = file.tensor_f32(&info.name)?.iter().flat_map(|v| v.to_le_bytes()).collect();
-                host.call(&Call::Vector { name }, &data)?;
+                host.send_weight(Weight::Vector { name }, &data)?;
             }
         }
         for &blk in &self.to_host {
             let slots = self.expert_slots(file, blk, slot)?;
             bytes += slots.len() as u64;
-            host.call(&Call::Pool { blk }, &slots)?;
+            host.send_weight(Weight::Pool { blk }, &slots)?;
         }
-        tracing::info!(blocks = ?self.to_host, mb = bytes >> 20, "qwen4exp: whole blocks on an RPC worker");
+        tracing::info!(
+            blocks = ?self.to_host,
+            mb = bytes >> 20,
+            from_worker_cache_mb = host.cache_bytes.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            "qwen4exp: whole blocks on an RPC worker"
+        );
         self.hosted = Some(Arc::new(host));
         Ok(())
     }

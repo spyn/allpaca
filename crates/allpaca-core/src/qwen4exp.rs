@@ -867,7 +867,8 @@ pub(crate) fn forward_qwen4_tokens(
         for (pass, chunk) in tokens.chunks(crate::qwen4_gpu::MAX_ROWS).enumerate() {
             let first = pass * crate::qwen4_gpu::MAX_ROWS;
             let rows = row_logits.as_deref_mut().map(|rows| &mut rows[first * vocab..(first + chunk.len()) * vocab]);
-            forward_device(q4, gpu, model.rpc.as_deref(), cfg, chunk, start_pos + first, &mut logits[..vocab], rows, mem)?;
+            let rpc = model.rpc.as_deref();
+            forward_device(q4, gpu, rpc, cfg, chunk, start_pos + first, &mut logits[..vocab], rows, mem, None)?;
         }
         return Ok(());
     }
@@ -879,6 +880,97 @@ pub(crate) fn forward_qwen4_tokens(
         }
     }
     Ok(())
+}
+
+/// One forward over the rows of several sequences (the engine's batched
+/// decode tick): `tokens` holds each sequence's rows in `segs` order and
+/// `row_logits` gets a row of logits per token. Each sequence's rows equal
+/// its own forward. With a worker hosting blocks the sequences are
+/// pipelined: the worker runs one's hosted blocks while this machine runs
+/// the next one's local blocks.
+pub(crate) fn forward_qwen4_batch(
+    model: &TinyModel,
+    tokens: &[u32],
+    segs: &mut [crate::model::SeqRows<'_>],
+    row_logits: &mut [f32],
+) -> Result<(), AllpacaError> {
+    use crate::qwen4_gpu::MAX_ROWS;
+    let q4 = model.q4x.as_ref().ok_or_else(|| load_err("missing qwen4exp weights".into()))?;
+    let (cfg, vocab) = (&model.config, model.config.vocab_size);
+    let no_state = || load_err("qwen4exp needs the sequence's state".into());
+    let mut first_row = Vec::with_capacity(segs.len());
+    let mut row = 0usize;
+    for seg in segs.iter() {
+        first_row.push(row);
+        row += seg.n_rows;
+    }
+    if row != tokens.len() || row_logits.len() < row * vocab {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "qwen4exp batch: rows, tokens and logits do not line up".into(),
+        )));
+    }
+    let mut last = vec![0.0f32; vocab];
+    let guard = q4.gpu.lock().map_err(|_| load_err("qwen4exp gpu lock poisoned".into()))?;
+    let stream_bytes = tokens.len() * q4.spec.hc * cfg.dim * 4;
+    let host = guard
+        .as_ref()
+        .and_then(|gpu| gpu.hosted())
+        .filter(|_| segs.len() > 1 && stream_bytes <= crate::qwen4_remote::PIPE_BYTES)
+        .filter(|_| segs.iter().all(|s| (1..=MAX_ROWS).contains(&s.n_rows)))
+        .cloned();
+    let (Some(host), Some(gpu)) = (host, guard.as_ref()) else {
+        drop(guard);
+        for (seg, &at) in segs.iter_mut().zip(&first_row) {
+            let mem = &mut seg.recurrent.as_deref_mut().ok_or_else(no_state)?.q4x;
+            let rows = &mut row_logits[at * vocab..(at + seg.n_rows) * vocab];
+            forward_qwen4_tokens(model, &tokens[at..at + seg.n_rows], seg.start_pos, &mut last, Some(rows), mem)?;
+        }
+        return Ok(());
+    };
+    let rpc = model.rpc.as_deref();
+    host.pipeline(|pipe| {
+        // Every sequence up to the hosted blocks, handing each to the worker
+        // as soon as it gets there.
+        let mut passes = Vec::with_capacity(segs.len());
+        for (seg, &at) in segs.iter_mut().zip(&first_row) {
+            let mem = &mut seg.recurrent.as_deref_mut().ok_or_else(no_state)?.q4x;
+            if mem.tokens.len() != seg.start_pos {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "qwen4exp sequence memory holds {} tokens, forward is at position {}",
+                    mem.tokens.len(),
+                    seg.start_pos
+                ))));
+            }
+            let (toks, rows) = (&tokens[at..at + seg.n_rows], &mut row_logits[at * vocab..(at + seg.n_rows) * vocab]);
+            let pass = forward_device(q4, gpu, rpc, cfg, toks, seg.start_pos, &mut last, Some(rows), mem, Some(None))?;
+            if let (Some(pass), Some(remote)) = (&pass, mem.remote.as_ref()) {
+                pipe.send(remote, seg.start_pos, seg.n_rows, &pass.streams)?;
+            }
+            passes.push(pass);
+        }
+        // Then each one's result, in the order sent, and its blocks after.
+        for ((seg, &at), pass) in segs.iter_mut().zip(&first_row).zip(passes) {
+            let Some(mut pass) = pass else {
+                continue;
+            };
+            pipe.recv(&mut pass.streams)?;
+            let mem = &mut seg.recurrent.as_deref_mut().ok_or_else(no_state)?.q4x;
+            let (toks, rows) = (&tokens[at..at + seg.n_rows], &mut row_logits[at * vocab..(at + seg.n_rows) * vocab]);
+            if forward_device(q4, gpu, rpc, cfg, toks, seg.start_pos, &mut last, Some(rows), mem, Some(Some(pass)))?.is_some() {
+                return Err(load_err("qwen4exp: a second run of hosted blocks in one pass".into()));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A GPU pass that stopped where the worker's hosted blocks begin.
+struct DevicePass {
+    /// The streams there; the worker's result goes in their place.
+    streams: Vec<f32>,
+    /// Where the pass goes on: the layer after the hosted blocks and its card.
+    resume: usize,
+    card: usize,
 }
 
 fn forward_host(
@@ -955,6 +1047,11 @@ fn forward_host(
 /// they are in. They come to the host where the cards change and for the
 /// n-gram layer; the router's scores come back once per block. `logits`
 /// (one row) gets the last token's, `row_logits` every token's.
+///
+/// `split` is for a caller that talks to the worker hosting blocks itself:
+/// `Some(None)` stops where the hosted blocks begin and returns the pass
+/// there, `Some(Some(pass))` goes on from it once the worker's result is
+/// in `pass.streams`. `None` runs the hosted blocks in place.
 #[allow(clippy::too_many_arguments)]
 fn forward_device(
     q4: &Arc<Qwen4Weights>,
@@ -966,7 +1063,8 @@ fn forward_device(
     logits: &mut [f32],
     row_logits: Option<&mut [f32]>,
     mem: &mut Qwen4Memory,
-) -> Result<(), AllpacaError> {
+    split: Option<Option<DevicePass>>,
+) -> Result<Option<DevicePass>, AllpacaError> {
     let (dim, hc, eps, rows) = (cfg.dim, q4.spec.hc, cfg.eps, tokens.len());
     let (vocab, n_experts) = (cfg.vocab_size, cfg.n_experts);
     let dims = q4.spec.gdn.ok_or_else(|| load_err("qwen4exp has no Gated DeltaNet shape".into()))?;
@@ -986,14 +1084,20 @@ fn forward_device(
         clock = std::time::Instant::now();
         Ok(())
     };
-    let mut streams = Vec::with_capacity(rows * hc * dim);
-    for &token in tokens {
-        let embed = q4.rows("token_embd.weight", token as usize, 1, dim)?;
-        for _ in 0..hc {
-            streams.extend_from_slice(&embed);
+    let stop_at_hosted = split.is_some();
+    let (mut streams, mut card, mut resume) = match split.flatten() {
+        Some(pass) => (pass.streams, pass.card, pass.resume),
+        None => {
+            let mut streams = Vec::with_capacity(rows * hc * dim);
+            for &token in tokens {
+                let embed = q4.rows("token_embd.weight", token as usize, 1, dim)?;
+                for _ in 0..hc {
+                    streams.extend_from_slice(&embed);
+                }
+            }
+            (streams, gpu.card_of(cfg.gguf_blk(0)), 0)
         }
-    }
-    let mut card = gpu.card_of(cfg.gguf_blk(0));
+    };
     gpu.set_streams(card, &streams)?;
     let mut scores = vec![0.0f32; rows * n_experts];
     let mut x = Vec::new();
@@ -1002,7 +1106,6 @@ fn forward_device(
     // route recorder keep the picking on the host.
     let card_scale = crate::model::plain_softmax_routing(cfg)
         .filter(|_| mem.routes.is_none() && std::env::var_os("ALLPACA_Q4X_HOST_ROUTING").is_none());
-    let mut resume = 0;
     for layer in 0..cfg.n_layers {
         if layer < resume {
             continue;
@@ -1014,10 +1117,16 @@ fn forward_device(
                 dense_attention_only(q4, b, pos + rows - 1)?;
             }
             gpu.get_streams(card, &mut streams)?;
-            let seq = mem.remote.get_or_insert_with(|| host.new_seq());
-            host.run(seq, pos, rows, &mut streams)?;
             resume = layer + host.blocks().len();
             card = if resume < cfg.n_layers { gpu.card_of(cfg.gguf_blk(resume)) } else { 0 };
+            let seq = mem.remote.get_or_insert_with(|| host.new_seq());
+            if stop_at_hosted {
+                if mem.times.is_some() {
+                    mem.times = Some(times);
+                }
+                return Ok(Some(DevicePass { streams, resume, card }));
+            }
+            host.run(seq, pos, rows, &mut streams)?;
             gpu.set_streams(card, &streams)?;
             lap(card, &mut times.ffn_rpc)?;
             continue;
@@ -1117,7 +1226,7 @@ fn forward_device(
         mem.times = Some(times);
     }
     mem.tokens.extend(tokens.iter().map(|t| i64::from(*t)));
-    Ok(())
+    Ok(None)
 }
 
 /// Tiny `qwen4exp` GGUF for tests: four layers (three Gated DeltaNet, one
@@ -1590,7 +1699,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
-            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension()]).unwrap();
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
         });
         let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
         let local = tiny_packed_model();
@@ -1607,6 +1716,7 @@ mod tests {
             assert_eq!(gpu.expert_layers()[0], [0, 1]);
             assert_eq!(gpu.hosted_blocks(), [2, 3], "a Gated DeltaNet and a full-attention block");
             assert!(gpu.remote_expert_layers().is_empty());
+            assert_eq!(gpu.hosted().unwrap().cache_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
         }
         let trips = || rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
         let single = run(&remote, &tokens);
@@ -1636,6 +1746,155 @@ mod tests {
         assert_eq!(logits, single[10], "the copy continues from token 10");
         drop((mem, fork, remote, rt));
         worker.join().unwrap();
+    }
+
+    /// Several sequences in one batched forward, pipelined through the
+    /// worker that hosts blocks, each get the logits of their own forward:
+    /// one token each, and a span of several rows next to a single one.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_sequences_batched_through_the_worker_match_their_own_runs() {
+        use crate::anchors::RecurrentState;
+        use crate::model::SeqRows;
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
+        });
+        let mut model = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        model.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+        assert!(model.supports_forward_batch(&hip), "hosted blocks make the batched forward worth it");
+        let vocab = model.config.vocab_size;
+        let seqs: [Vec<u32>; 3] = [
+            (0..8u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect(),
+            (0..8u32).map(|i| 3 + (i * 3 + 1) % 5).collect(),
+            (0..8u32).map(|i| 3 + (i * 2 + i / 2) % 5).collect(),
+        ];
+        let solo: Vec<Vec<Vec<f32>>> = seqs.iter().map(|tokens| run(&model, tokens)).collect();
+        let trips = || rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
+        let before = trips();
+        let mut states: Vec<RecurrentState> = (0..3).map(|_| RecurrentState::zeros(model.config.n_layers, model.config.dim)).collect();
+        // Five ticks of one token for each sequence.
+        for step in 0..5 {
+            let tokens: Vec<u32> = seqs.iter().map(|s| s[step]).collect();
+            let mut rows = vec![f32::NAN; 3 * vocab];
+            let mut segs: Vec<SeqRows<'_>> = states
+                .iter_mut()
+                .map(|state| SeqRows { start_pos: step, n_rows: 1, page_ids: &[], request_id: 0, recurrent: Some(state) })
+                .collect();
+            forward_qwen4_batch(&model, &tokens, &mut segs, &mut rows).expect("batch");
+            for (s, row) in rows.chunks(vocab).enumerate() {
+                assert_eq!(row, solo[s][step], "sequence {s} token {step}");
+            }
+        }
+        assert_eq!(trips() - before, 15, "one round trip per sequence and tick");
+        // A tick with a three-row span for sequence 0 and one row for sequence 1.
+        let tokens: Vec<u32> = seqs[0][5..8].iter().chain(&seqs[1][5..6]).copied().collect();
+        let mut rows = vec![f32::NAN; 4 * vocab];
+        {
+            let (a, rest) = states.split_at_mut(1);
+            let mut segs = vec![
+                SeqRows { start_pos: 5, n_rows: 3, page_ids: &[], request_id: 0, recurrent: Some(&mut a[0]) },
+                SeqRows { start_pos: 5, n_rows: 1, page_ids: &[], request_id: 1, recurrent: Some(&mut rest[0]) },
+            ];
+            forward_qwen4_batch(&model, &tokens, &mut segs, &mut rows).expect("span batch");
+        }
+        for i in 0..3 {
+            assert_eq!(&rows[i * vocab..(i + 1) * vocab], solo[0][5 + i], "span row {i}");
+        }
+        assert_eq!(&rows[3 * vocab..], solo[1][5], "the single row next to the span");
+        drop((states, model, rt));
+        worker.join().unwrap();
+    }
+
+    /// A worker with a weight cache is sent a model's weights once: the
+    /// second coordinator to host the same blocks uploads next to nothing
+    /// and gets the same logits.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_hosted_weights_come_from_the_workers_cache_the_second_time() {
+        use crate::qwen4_remote::{worker_extension, WeightCache};
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        use std::sync::atomic::Ordering;
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let dir = std::env::temp_dir().join(format!("allpaca-weight-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = WeightCache::new(&dir, 1 << 30);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+                serve_connection_ext(stream, backend, None, vec![worker_extension(Some(cache.clone()))]).unwrap();
+            }
+        });
+        let tokens: Vec<u32> = (0..9u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let mut loads = Vec::new();
+        for _ in 0..2 {
+            let mut model = tiny_packed_model();
+            let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr.clone()], None).expect("connect"));
+            model.rpc = Some(rt.clone());
+            crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+            let cached = {
+                let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
+                gpu.as_ref().unwrap().hosted().expect("hosted blocks").cache_bytes.load(Ordering::Relaxed)
+            };
+            loads.push((rt.h2d_bytes.load(Ordering::Relaxed), cached, run(&model, &tokens)));
+        }
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (first, second) = (&loads[0], &loads[1]);
+        // Weights with the same bytes (the tiny model's norm gains) go once even the first time.
+        assert!(first.0 > 10 * first.1, "the first load uploads: {} sent, {} from the cache", first.0, first.1);
+        assert_eq!(second.1, first.0 + first.1, "the second load takes every weight from the cache");
+        assert_eq!(second.0, 0, "and uploads none");
+        assert_eq!(second.2, first.2, "same logits");
+    }
+
+    /// The cache gives back what it was given, drops a damaged file, and
+    /// makes room by deleting the weight used longest ago.
+    #[test]
+    fn weight_cache_checks_what_it_reads_and_stays_under_its_limit() {
+        use crate::qwen4_remote::{weight_key, WeightCache};
+        let dir = std::env::temp_dir().join(format!("allpaca-weight-cache-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = WeightCache::new(&dir, 250);
+        let weight = |seed: u8| -> Vec<u8> { (0..100u8).map(|i| i.wrapping_mul(7).wrapping_add(seed)).collect() };
+        let (a, b, c) = (weight(1), weight(2), weight(3));
+        assert_ne!(weight_key(&a), weight_key(&b));
+        assert_ne!(weight_key(&a[..99]), weight_key(&a), "the length is part of the key");
+        assert_eq!(cache.get(weight_key(&a), 100), None, "nothing yet");
+        cache.put(weight_key(&a), &a);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cache.put(weight_key(&b), &b);
+        assert_eq!(cache.get(weight_key(&a), 100).as_deref(), Some(&a[..]));
+        assert_eq!(cache.get(weight_key(&a), 99), None, "another length is another weight");
+        // `a` was just read, so `b` is the one used longest ago.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cache.put(weight_key(&c), &c);
+        assert_eq!(cache.get(weight_key(&b), 100), None, "the limit of 250 bytes holds two");
+        assert!(cache.get(weight_key(&a), 100).is_some() && cache.get(weight_key(&c), 100).is_some());
+        // A file whose bytes changed is not handed out.
+        let file = std::fs::read_dir(&dir).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with(&format!("{:016x}", weight_key(&c)))).unwrap();
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        bytes[50] ^= 1;
+        std::fs::write(file.path(), bytes).unwrap();
+        assert_eq!(cache.get(weight_key(&c), 100), None);
+        assert!(!file.path().exists(), "and is deleted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Logits after each token of `tokens`.

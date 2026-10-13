@@ -8006,6 +8006,11 @@ impl TinyModel {
     /// on `hip`: the multi-row device path, with every local layer on `hip`
     /// or on the uploaded peer GPU.
     pub fn supports_forward_batch(&self, hip: &HipWorkspace) -> bool {
+        // qwen4exp batches sequences to pipeline them through the worker
+        // that hosts blocks; without one a batch would gain nothing.
+        if let Some(q4) = self.q4x.as_ref() {
+            return q4.gpu.lock().is_ok_and(|gpu| gpu.as_ref().is_some_and(|g| g.hosted().is_some()));
+        }
         if self.dsv4.is_some() || !self.supports_hip_batched_prefill() {
             return false;
         }
@@ -8048,6 +8053,9 @@ impl TinyModel {
             return Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
                 "token {tok} out of vocab"
             ))));
+        }
+        if self.q4x.is_some() {
+            return crate::qwen4exp::forward_qwen4_batch(self, tokens, segs, row_logits);
         }
         let mut last = vec![0.0f32; vocab];
         // Each sequence's rows must match its solo run bit for bit.
