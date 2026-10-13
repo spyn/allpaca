@@ -1749,6 +1749,9 @@ mod tests {
             out.len().saturating_sub(1) as f32 / generating.elapsed().as_secs_f32().max(1e-6)
         );
         eprintln!("Q4X seconds over {} tokens after the prompt: {:?}", out.len().saturating_sub(1), mem.times);
+        for (kind, calls, seconds) in crate::qwen4_gpu::profile_report() {
+            eprintln!("Q4X matrix {kind}: {calls} calls, {:.1} us each, {:.3} s", seconds * 1e6 / calls as f64, seconds);
+        }
         assert!(logits.iter().all(|v| v.is_finite()));
     }
 

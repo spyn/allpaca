@@ -12,8 +12,8 @@
 //! experts, the next on card 1 with theirs, the rest on card 0 with their
 //! experts on the host.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use allpaca_gguf::{GgmlType, GgufFile, TensorInfo};
 use allpaca_hip::{
@@ -71,6 +71,28 @@ const MAX_PICKS: usize = 32;
 pub const MAX_ROWS: usize = 16;
 /// Tokens a full-attention block's key and value buffers start with.
 const KV_START_TOKENS: usize = 256;
+
+/// Launches a profiled matrix product is repeated for.
+const PROFILE_REPEATS: u32 = 16;
+
+/// Calls and seconds per matrix kind (encoding, shape, rows), filled when
+/// `ALLPACA_Q4X_PROFILE` is set.
+fn profile() -> Option<&'static Mutex<BTreeMap<String, (u64, f64)>>> {
+    static PROFILE: OnceLock<Option<Mutex<BTreeMap<String, (u64, f64)>>>> = OnceLock::new();
+    PROFILE
+        .get_or_init(|| std::env::var_os("ALLPACA_Q4X_PROFILE").map(|_| Mutex::default()))
+        .as_ref()
+}
+
+/// The matrix products of the passes so far, slowest kind first:
+/// `(kind, calls, seconds)`. Empty unless `ALLPACA_Q4X_PROFILE` is set.
+pub fn profile_report() -> Vec<(String, u64, f64)> {
+    let mut kinds: Vec<_> = profile()
+        .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (k.clone(), v.0, v.1)).collect())
+        .unwrap_or_default();
+    kinds.sort_by(|a, b| b.2.total_cmp(&a.2));
+    kinds
+}
 
 fn gpu_err(msg: String) -> AllpacaError {
     AllpacaError::Fatal(FatalError::ModelLoad(msg))
@@ -162,9 +184,9 @@ struct Act {
     xn: usize,
     gate: usize,
     low: usize,
-    /// The mixed block input.
+    /// The mixed block input, then the router's scores right after the
+    /// rows in use (one download brings both).
     x: usize,
-    scores: usize,
     inject: usize,
     /// Five scratch rows of `wide` floats.
     t: [usize; 5],
@@ -379,8 +401,7 @@ impl Qwen4Gpu {
         act.xn = take(r * hc * dim);
         act.gate = take(r * hc * dim);
         act.low = take(r * low);
-        act.x = take(r * dim);
-        act.scores = take(r * n_experts.max(1));
+        act.x = take(r * (dim + n_experts.max(1)));
         act.inject = take(r * hc);
         act.t = [take(wide), take(wide), take(wide), take(wide), take(wide)];
         act.out = take(r * dim);
@@ -597,8 +618,49 @@ impl Qwen4Gpu {
             .ok_or_else(|| gpu_err(format!("qwen4exp: {name} is not on the GPU")))
     }
 
-    /// `rows` rows times `m` on `card`.
+    /// `rows` rows times `m` on `card`. With the profile on, the product is
+    /// timed alone on the card, over [`PROFILE_REPEATS`] launches.
     fn launch(&self, card: &Card, m: &Matrix, a: *const f32, c: *mut f32, rows: usize) -> Result<(), AllpacaError> {
+        let Some(profile) = profile() else {
+            return self.launch_once(card, m, a, c, rows);
+        };
+        self.step(card, "one matrix alone", || self.launch_once(card, m, a, c, rows))?;
+        card.hip.bind()?;
+        allpaca_hip::stream_synchronize()?;
+        let clock = std::time::Instant::now();
+        for _ in 0..PROFILE_REPEATS {
+            self.launch_once(card, m, a, c, rows)?;
+        }
+        card.hip.bind()?;
+        allpaca_hip::stream_synchronize()?;
+        let seconds = clock.elapsed().as_secs_f64() / f64::from(PROFILE_REPEATS);
+        let kind = format!("{:?} {}x{} rows {rows}", m.encoding, m.n, m.k);
+        let mut kinds = profile.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = kinds.entry(kind).or_default();
+        *entry = (entry.0 + 1, entry.1 + seconds);
+        Ok(())
+    }
+
+    /// Run one kernel launch `f`; with the profile on, alone on the card
+    /// and timed under `kind` (the time includes the wait for it to end).
+    fn step(&self, card: &Card, kind: &str, f: impl FnOnce() -> Result<(), AllpacaError>) -> Result<(), AllpacaError> {
+        let Some(profile) = profile() else {
+            return f();
+        };
+        card.hip.bind()?;
+        allpaca_hip::stream_synchronize()?;
+        let clock = std::time::Instant::now();
+        f()?;
+        card.hip.bind()?;
+        allpaca_hip::stream_synchronize()?;
+        let seconds = clock.elapsed().as_secs_f64();
+        let mut kinds = profile.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = kinds.entry(format!("kernel {kind}")).or_default();
+        *entry = (entry.0 + 1, entry.1 + seconds);
+        Ok(())
+    }
+
+    fn launch_once(&self, card: &Card, m: &Matrix, a: *const f32, c: *mut f32, rows: usize) -> Result<(), AllpacaError> {
         let hip = &card.hip;
         let (r, n, k) = (rows as i32, m.n as i32, m.k as i32);
         let b = m.weights.byte_ptr_at(0);
@@ -680,12 +742,12 @@ impl Qwen4Gpu {
         let up = self.matrix(&format!("{prefix}_up.weight"), down.n)?;
         let gains = self.vector(&format!("{prefix}_norm.weight"))?;
         card.hip.bind()?;
-        q4x::stream_norm(card.at(act.streams), gains, card.at(act.xn), r, hc, dim, self.eps)?;
+        self.step(card, "stream_norm", || q4x::stream_norm(card.at(act.streams), gains, card.at(act.xn), r, hc, dim, self.eps))?;
         self.launch(card, down, card.at(act.xn), card.at(act.low), rows)?;
-        silu_scale_device(card.at(act.low), (rows * down.n) as i32, 1.0 / self.hc as f32)?;
+        self.step(card, "silu_scale", || silu_scale_device(card.at(act.low), (rows * down.n) as i32, 1.0 / self.hc as f32))?;
         self.launch(card, up, card.at(act.low), card.at(act.gate), rows)?;
         card.hip.bind()?;
-        q4x::gated_mean(card.at(act.xn), card.at(act.gate), card.at(act.x), r, hc, dim)?;
+        self.step(card, "gated_mean", || q4x::gated_mean(card.at(act.xn), card.at(act.gate), card.at(act.x), r, hc, dim))?;
         if inject {
             let w = self.matrix(&format!("{prefix}_inject.weight"), hc_dim)?;
             self.launch(card, w, card.at(act.xn), card.at(act.inject), rows)?;
@@ -698,14 +760,16 @@ impl Qwen4Gpu {
     pub fn combine(&self, card: usize, rows: usize) -> Result<(), AllpacaError> {
         let (card, act) = (&self.cards[card], &self.act);
         card.hip.bind()?;
-        q4x::combine(
-            card.at(act.streams),
-            card.at(act.out),
-            card.at(act.inject),
-            rows as i32,
-            self.hc as i32,
-            self.dim as i32,
-        )
+        self.step(card, "combine", || {
+            q4x::combine(
+                card.at(act.streams),
+                card.at(act.out),
+                card.at(act.inject),
+                rows as i32,
+                self.hc as i32,
+                self.dim as i32,
+            )
+        })
     }
 
     fn block_state<'a>(&self, state: &'a mut Qwen4DeviceState, blk: usize) -> &'a mut BlockState {
@@ -752,33 +816,32 @@ impl Qwen4Gpu {
                     y.add(r * dims.value_dim),
                 )
             };
-            card.hip.gdn_layer_step(
-                qkv,
-                alpha,
-                beta,
-                conv_w,
-                conv,
-                dt_bias,
-                a,
-                rec,
-                y,
-                dims.n_v_heads as i32,
-                dims.n_k_heads as i32,
-                dims.head_v as i32,
-                dims.head_k as i32,
-                dims.conv_kernel as i32,
-                self.eps,
-                false,
-            )?;
+            self.step(card, "gdn_layer_step", || {
+                card.hip.gdn_layer_step(
+                    qkv,
+                    alpha,
+                    beta,
+                    conv_w,
+                    conv,
+                    dt_bias,
+                    a,
+                    rec,
+                    y,
+                    dims.n_v_heads as i32,
+                    dims.n_k_heads as i32,
+                    dims.head_v as i32,
+                    dims.head_k as i32,
+                    dims.conv_kernel as i32,
+                    self.eps,
+                    false,
+                )
+            })?;
         }
-        card.hip.rmsnorm_heads_device(
-            y,
-            self.vector(&name("ssm_norm.weight"))?,
-            (rows * dims.n_v_heads) as i32,
-            dims.head_v as i32,
-            self.eps,
-        )?;
-        card.hip.sigmoid_mul_device(y, z, (rows * dims.value_dim) as i32)?;
+        let gains = self.vector(&name("ssm_norm.weight"))?;
+        self.step(card, "gdn rmsnorm_heads", || {
+            card.hip.rmsnorm_heads_device(y, gains, (rows * dims.n_v_heads) as i32, dims.head_v as i32, self.eps)
+        })?;
+        self.step(card, "gdn sigmoid_mul", || card.hip.sigmoid_mul_device(y, z, (rows * dims.value_dim) as i32))?;
         self.launch(card, self.matrix(&name("ssm_out.weight"), dims.value_dim)?, y, card.at(act.out), rows)
     }
 
@@ -843,18 +906,20 @@ impl Qwen4Gpu {
         hip.copy_d2d_f32(key_rows, k, rows * kv)?;
         hip.copy_d2d_f32(value_rows, v, rows * kv)?;
         // The interleaved queries are spent: their rows take the output.
-        hip.attention_device(
-            q,
-            keys,
-            values,
-            q_full,
-            rows as i32,
-            (pos + rows) as i32,
-            n_heads as i32,
-            n_kv as i32,
-            head_dim as i32,
-            true,
-        )?;
+        self.step(card, "attention", || {
+            hip.attention_device(
+                q,
+                keys,
+                values,
+                q_full,
+                rows as i32,
+                (pos + rows) as i32,
+                n_heads as i32,
+                n_kv as i32,
+                head_dim as i32,
+                true,
+            )
+        })?;
         hip.sigmoid_mul_device(q_full, gate, (rows * attn) as i32)?;
         self.launch(card, self.matrix(&name("attn_output.weight"), attn)?, q_full, card.at(act.out), rows)
     }
@@ -866,24 +931,29 @@ impl Qwen4Gpu {
     pub fn ffn_route(&self, blk: usize, rows: usize, scores: &mut [f32], x: &mut Vec<f32>) -> Result<(), AllpacaError> {
         let (card, act, dim) = (&self.cards[self.card_of(blk)], &self.act, self.dim);
         let name = |s: &str| format!("blk.{blk}.{s}");
-        let input = card.at(act.x);
-        self.launch(card, self.matrix(&name("ffn_gate_inp.weight"), dim)?, input, card.at(act.scores), rows)?;
+        let (input, n_scores) = (card.at(act.x), rows * self.n_experts);
+        // SAFETY: the input part holds MAX_ROWS rows of inputs and of scores.
+        let device_scores = unsafe { input.add(rows * dim) };
+        self.launch(card, self.matrix(&name("ffn_gate_inp.weight"), dim)?, input, device_scores, rows)?;
         if self.has(&name("ffn_up_shexp.weight")) {
             let gate = self.matrix(&name("ffn_gate_shexp.weight"), dim)?;
             let (g, u) = (card.at(act.shared_gate), card.at(act.shared_up));
             self.launch(card, gate, input, g, rows)?;
             self.launch(card, self.matrix(&name("ffn_up_shexp.weight"), dim)?, input, u, rows)?;
-            card.hip.silu_mul_device(g, u, (rows * gate.n) as i32)?;
+            self.step(card, "silu_mul", || card.hip.silu_mul_device(g, u, (rows * gate.n) as i32))?;
             self.launch(card, self.matrix(&name("ffn_down_shexp.weight"), gate.n)?, g, card.at(act.shared), rows)?;
             let open = self.matrix(&name("ffn_gate_inp_shexp.weight"), dim)?;
             self.launch(card, open, input, card.at(act.shared_open), rows)?;
         }
         x.clear();
-        if !card.pools.contains_key(&blk) {
-            x.resize(rows * dim, 0.0);
-            card.hip.copy_d2h_f32(input, x)?;
+        if card.pools.contains_key(&blk) {
+            return self.step(card, "download scores", || card.hip.copy_d2h_f32(device_scores, &mut scores[..n_scores]));
         }
-        card.hip.copy_d2h_f32(card.at(act.scores), &mut scores[..rows * self.n_experts])
+        x.resize(rows * dim + n_scores, 0.0);
+        self.step(card, "download block input and scores", || card.hip.copy_d2h_f32(input, x))?;
+        scores[..n_scores].copy_from_slice(&x[rows * dim..]);
+        x.truncate(rows * dim);
+        Ok(())
     }
 
     /// Finish block `blk`'s feed-forward into the block outputs: each
@@ -900,7 +970,9 @@ impl Qwen4Gpu {
         self.check_rows(rows)?;
         let routed = card.at(act.routed);
         match (card.pools.get(&blk), host_routed) {
-            (_, Some(sums)) if sums.len() == rows * dim => card.hip.copy_h2d_f32(routed, sums)?,
+            (_, Some(sums)) if sums.len() == rows * dim => {
+                self.step(card, "upload expert sums", || card.hip.copy_h2d_f32(routed, sums))?
+            }
             (Some(pool), None) if picks.iter().all(|p| !p.is_empty() && p.len() <= MAX_PICKS) => {
                 card.hip.bind()?;
                 for (r, picks) in picks.iter().enumerate() {
@@ -908,30 +980,34 @@ impl Qwen4Gpu {
                     let weights: Vec<f32> = picks.iter().map(|(_, w)| *w).collect();
                     // SAFETY: the input and routed parts hold MAX_ROWS rows of `dim` floats.
                     let (x, out) = unsafe { (card.at(act.x).add(r * dim), routed.add(r * dim)) };
-                    q2_0_moe_ffn_device(
-                        x,
-                        pool.byte_ptr_at(0),
-                        &slots,
-                        &weights,
-                        card.at(act.expert_h),
-                        out,
-                        dim as i32,
-                        self.ff as i32,
-                    )?;
+                    self.step(card, "q2_0_moe_ffn", || {
+                        q2_0_moe_ffn_device(
+                            x,
+                            pool.byte_ptr_at(0),
+                            &slots,
+                            &weights,
+                            card.at(act.expert_h),
+                            out,
+                            dim as i32,
+                            self.ff as i32,
+                        )
+                    })?;
                 }
             }
             _ => return Err(gpu_err(format!("qwen4exp: block {blk} has no routed experts to run"))),
         }
         let shared = self.has(&format!("blk.{blk}.ffn_up_shexp.weight"));
         card.hip.bind()?;
-        q4x::ffn_sum(
-            routed,
-            if shared { card.at(act.shared).cast_const() } else { std::ptr::null() },
-            if shared { card.at(act.shared_open).cast_const() } else { std::ptr::null() },
-            card.at(act.out),
-            rows as i32,
-            dim as i32,
-        )
+        self.step(card, "ffn_sum", || {
+            q4x::ffn_sum(
+                routed,
+                if shared { card.at(act.shared).cast_const() } else { std::ptr::null() },
+                if shared { card.at(act.shared_open).cast_const() } else { std::ptr::null() },
+                card.at(act.out),
+                rows as i32,
+                dim as i32,
+            )
+        })
     }
 
     /// The logits of card 0's mixed inputs through the output matrix
