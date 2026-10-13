@@ -307,7 +307,9 @@ pub fn write_f32(w: &mut Vec<u8>, v: f32) {
 
 /// One MoE layer's experts on a worker: `gate` / `up` are stacked
 /// `[n_experts][ff][dim]` and `down` `[n_experts][dim][ff]` packed GGUF tensors
-/// (`PutTensor`), each expert an equal byte slice.
+/// (`PutTensor`), each expert an equal byte slice. When all three name one
+/// buffer it holds a slot per expert, gate | up | down: the HIP worker runs
+/// Q2_0 slots (ggml type 42) with its routed-expert kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeFfnRequest {
     pub gate: BufId,

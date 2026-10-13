@@ -690,6 +690,15 @@ impl HipWorker {
             return Err(RpcError::Worker("moe ffn experts span GPUs".into()));
         }
         let gpu = g.gpu;
+        if req.gate == req.up && req.up == req.down {
+            let (pool, bytes, ty) = (g.ptr, g.bytes, g.ggml_type);
+            if ty != 42 || bytes != n_exp * allpaca_hip::q2_0_expert_slot_bytes(dim, ff) || dim % 64 != 0 || ff % 64 != 0 {
+                return Err(RpcError::Worker(format!(
+                    "moe ffn expert slots need Q2_0 rows of whole blocks (ggml type {ty}, {bytes} bytes)"
+                )));
+            }
+            return self.moe_ffn_q2_0_slots(gpu, pool, dim, ff, &x_in.to_f32(), pairs);
+        }
         let (gs, us, ds) = (g.bytes / n_exp, u.bytes / n_exp, d.bytes / n_exp);
         let (gp, up, dp) = (g.ptr, u.ptr, d.ptr);
         let (gt, ut, dt) = (g.ggml_type, u.ggml_type, d.ggml_type);
@@ -733,6 +742,58 @@ impl HipWorker {
         }
         let mut out = vec![0.0f32; rows * dim];
         hip.copy_d2h_f32(acc, &mut out).map_err(bad)?;
+        Ok(out)
+    }
+
+    /// Q2_0 experts in one buffer of slots (gate | up | down per expert):
+    /// one H2D of `x`, each row's picks through the routed-expert kernel in
+    /// the order they were sent, one D2H.
+    fn moe_ffn_q2_0_slots(
+        &mut self,
+        gpu: usize,
+        pool: *mut u8,
+        dim: usize,
+        ff: usize,
+        x: &[f32],
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        const MAX_PICKS: usize = 32;
+        let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+        let rows = x.len() / dim.max(1);
+        let mut picks: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows];
+        for &(row, expert, weight) in pairs {
+            let (slots, weights) = &mut picks[row as usize];
+            slots.push(expert as i32);
+            weights.push(weight);
+        }
+        if picks.iter().any(|(slots, _)| slots.len() > MAX_PICKS) {
+            return Err(RpcError::Worker(format!("moe ffn expert slots take at most {MAX_PICKS} experts per row")));
+        }
+        // Scratch: x, out, the picked experts' hidden rows.
+        let base = self.moe_scratch(gpu, (2 * rows * dim + MAX_PICKS * ff) * 4)?;
+        let at = |i: usize| unsafe { base.add(i) };
+        let hip = &self.gpus[gpu].hip;
+        hip.copy_h2d_f32(base, x).map_err(bad)?;
+        hip.bind().map_err(bad)?;
+        for (r, (slots, weights)) in picks.iter().enumerate().filter(|(_, p)| !p.0.is_empty()) {
+            allpaca_hip::q2_0_moe_ffn_device(
+                at(r * dim),
+                pool,
+                slots,
+                weights,
+                at(2 * rows * dim),
+                at((rows + r) * dim),
+                dim as i32,
+                ff as i32,
+            )
+            .map_err(bad)?;
+        }
+        let mut out = vec![0.0f32; rows * dim];
+        hip.copy_d2h_f32(at(rows * dim), &mut out).map_err(bad)?;
+        // A row without picks was never written.
+        for (r, _) in picks.iter().enumerate().filter(|(_, p)| p.0.is_empty()) {
+            out[r * dim..(r + 1) * dim].fill(0.0);
+        }
         Ok(out)
     }
 
@@ -819,6 +880,7 @@ fn hip_quant_gemm(
         34 => allpaca_hip::gemm_nt_tq1_0_device(a, b, c, m, n, k).map_err(bad),
         35 => allpaca_hip::gemm_nt_tq2_0_device(a, b, c, m, n, k).map_err(bad),
         39 => allpaca_hip::gemm_nt_mxfp4_device(a, b, c, m, n, k).map_err(bad),
+        42 => allpaca_hip::gemm_nt_q2_0_device(a, b, c, m, n, k).map_err(bad),
         100 => allpaca_hip::gemm_nt_rocmfp4_device(a, b, c, m, n, k).map_err(bad),
         101 => allpaca_hip::gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k).map_err(bad),
         200 => allpaca_hip::gemm_nt_p48fp4_device(a, b, c, m, n, k).map_err(bad),
