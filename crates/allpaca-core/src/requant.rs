@@ -426,8 +426,8 @@ pub fn requantise_each(
                 };
                 GgufStreamTensor {
                     name: t.name.clone(),
-                    // The parser holds ggml order (innermost first); the writers take the reverse.
-                    dims: t.dims.iter().rev().copied().collect(),
+                    // ggml order (innermost first), as the parser holds them.
+                    dims: t.dims.clone(),
                     ggml_type_id,
                     nbytes,
                 }
@@ -801,14 +801,15 @@ mod tests {
 
     /// Quantised in order with propagated calibration, a two-bit model's
     /// predictions on the text stay closer to the original's than with
-    /// every matrix quantised alone.
+    /// every matrix quantised alone. Six blocks: with three, each matrix's
+    /// own rounding dominates and there is little for the refit to win.
     #[test]
     fn propagated_calibration_keeps_the_predictions_closer() {
         let dir = std::env::temp_dir();
         let pid = std::process::id();
         let at = |tag: &str| dir.join(format!("allpaca_requant_prop_{tag}-{pid}.gguf"));
         let (src, alone, ordered) = (at("in"), at("alone"), at("ordered"));
-        crate::calib::tests::write_tiny_calib_gguf_shape(&src, 64, 128, 0.3, 3, false);
+        crate::calib::tests::write_tiny_calib_gguf_shape(&src, 64, 128, 0.3, 6, false);
         let texts = ["hello world again hello world again again hello", "again again hello world hello"];
         let stats = crate::calib::capture(&src, &texts).unwrap();
         let base = Options {
@@ -825,7 +826,7 @@ mod tests {
             ridge: 0.01,
         };
         let report = requantise(&src, &ordered, &Options { propagate: Some(settings), ..base.clone() }).unwrap();
-        assert_eq!(report.propagated, 21, "seven matrices in each of three blocks");
+        assert_eq!(report.propagated, 42, "seven matrices in each of six blocks");
         let kl = |path: &Path| crate::sensitivity::divergence_between(&src, path, &texts, 32).unwrap();
         let (apart, together) = (kl(&alone), kl(&ordered));
         assert!(apart > 0.0 && together < 0.95 * apart, "{together} in order, {apart} alone");
@@ -922,6 +923,49 @@ mod tests {
             assert_eq!(a.target, b.target, "{}: full {da:?}, scaled {db:?}", a.name);
         }
         for path in [src, full, scaled] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// An MoE model: the stacked expert tensors and the shared expert are
+    /// probed and given types like the other matrices, and the file reads.
+    #[test]
+    fn expert_tensors_are_probed_and_requantised() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_moe_{tag}-{pid}.gguf"));
+        let (src, dst) = (at("in"), at("out"));
+        crate::calib::tests::write_tiny_calib_gguf_moe(&src, 64, 128, 0.3, 2, false, 4);
+        let texts = vec!["hello world again hello world".to_string(), "again again hello world".to_string()];
+        let opts = Options {
+            avg_bits: 4.0,
+            gsq: GsqConfig { steps: 20, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            probe: Some(ProbeTexts { texts: texts.clone(), max_tokens: 32, scaled: true }),
+            ..Options::default()
+        };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        let names: Vec<&str> = report.choices.iter().map(|c| c.name.as_str()).collect();
+        for name in ["blk.0.ffn_gate_exps.weight", "blk.1.ffn_down_exps.weight", "blk.0.ffn_up_shexp.weight"] {
+            let c = report.choices.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("{name} not in {names:?}"));
+            let d = c.divergence.clone().unwrap();
+            assert!(d.iter().all(|v| v.is_finite() && *v >= 0.0), "{name}: {d:?}");
+        }
+        let experts = report.choices.iter().find(|c| c.name == "blk.0.ffn_gate_exps.weight").unwrap();
+        assert_eq!(experts.weights, 4 * 128 * 64);
+        assert!((report.avg_bits() - 4.0).abs() < 0.05, "{}", report.avg_bits());
+        let out = GgufFile::open(&dst).unwrap();
+        let t = out.tensor("blk.0.ffn_gate_exps.weight").unwrap();
+        assert_eq!(t.ggml_type, experts.target.ggml());
+        // Every tensor keeps its shape, in the file's own order.
+        let input = GgufFile::open(&src).unwrap();
+        for t in &input.tensors {
+            assert_eq!(out.tensor(&t.name).unwrap().dims, t.dims, "{}", t.name);
+        }
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let kl = crate::sensitivity::divergence_between(&src, &dst, &texts, 32).unwrap();
+        assert!(kl.is_finite() && kl > 0.0 && kl < 0.5, "{kl}");
+        for path in [src, dst] {
             let _ = std::fs::remove_file(path);
         }
     }

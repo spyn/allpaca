@@ -3781,6 +3781,25 @@ fn load_gguf_moe_layer(
     Ok((w_router, experts))
 }
 
+/// The router of an MoE layer and an empty slot per expert: the experts
+/// themselves stay packed ([`crate::host_experts::PackedExperts`]).
+fn load_gguf_router_only(file: &GgufFile, layer: usize, n_experts: usize) -> Result<(Vec<f32>, Vec<LayerFfn>), AllpacaError> {
+    let w_router = file
+        .tensor_f32(&format!("blk.{layer}.ffn_gate_inp.weight"))
+        .or_else(|_| file.tensor_f32(&format!("blk.{layer}.ffn_router.weight")))?;
+    Ok((w_router, vec![LayerFfn::default(); n_experts]))
+}
+
+/// The shared expert's sigmoid gate (`ffn_gate_inp_shexp`, one weight per
+/// input), or empty when the layer has none.
+fn load_gguf_shared_gate(file: &GgufFile, layer: usize) -> Result<Vec<f32>, AllpacaError> {
+    let name = format!("blk.{layer}.ffn_gate_inp_shexp.weight");
+    if file.tensor(&name).is_none() {
+        return Ok(Vec::new());
+    }
+    file.tensor_f32(&name)
+}
+
 fn load_gguf_shared_expert(file: &GgufFile, layer: usize) -> Result<LayerFfn, AllpacaError> {
     let up_name = format!("blk.{layer}.ffn_up_shexp.weight");
     if file.tensor(&up_name).is_none() {
@@ -4488,6 +4507,9 @@ pub struct TinyModel {
     pub working_set: Option<Arc<WeightWorkingSet>>,
     pub expert_lru: Option<Arc<ExpertLru>>,
     pub expert_host: Option<Arc<HostExpertPool>>,
+    /// Routed experts left in the file's encoding for the CPU forward and
+    /// decoded per routed expert ([`Self::from_gguf_host_packed_experts`]).
+    pub(crate) packed_experts: Option<Arc<crate::host_experts::PackedExperts>>,
     /// Manifest early-exit capability (from GGUF `allpaca.early_exit.*` or test hook).
     pub early_exit: EarlyExitSpec,
     /// Optional dedicated exit heads (`blk.{i}.exit_head.weight`); empty = shared lm_head.
@@ -4676,6 +4698,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            packed_experts: None,
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
@@ -5036,6 +5059,9 @@ impl TinyModel {
         if let Some(pool) = &self.expert_host {
             return pool.get(id);
         }
+        if let Some(packed) = self.packed_experts.as_ref().filter(|p| p.has_layer(layer_idx)) {
+            return packed.expert(layer_idx, expert);
+        }
         if let Some(ffn) = self
             .layers
             .get(layer_idx)
@@ -5082,6 +5108,9 @@ impl TinyModel {
         let n_exp = self.config.n_experts;
         if let Some(pool) = &self.expert_host {
             return pool.get_layer(layer_idx as u32, n_exp);
+        }
+        if let Some(packed) = self.packed_experts.as_ref().filter(|p| p.has_layer(layer_idx)) {
+            return (0..n_exp).map(|e| packed.expert(layer_idx, e)).collect();
         }
         self.layers
             .get(layer_idx)
@@ -5285,8 +5314,15 @@ impl TinyModel {
                 &mut scratch_h,
                 cfg.moe_relu_sqr,
             )?;
+            // Qwen3-Next / Qwen3.5 MoE gate the shared expert per token.
+            let gate = if layer.shared_gate_inp.len() == dim {
+                let logit: f32 = x_norm.iter().zip(&layer.shared_gate_inp).map(|(a, b)| a * b).sum();
+                1.0 / (1.0 + (-logit).exp())
+            } else {
+                1.0
+            };
             for i in 0..dim {
-                acc[i] += scratch_h[i];
+                acc[i] += gate * scratch_h[i];
             }
         }
         if let Some(e0) = &self.edge0 {
@@ -6506,6 +6542,25 @@ impl TinyModel {
         Self::from_gguf_sized(file, true)
     }
 
+    /// [`Self::from_gguf_host`] with the routed experts left in the file's
+    /// encoding: each is decoded when a token is routed to it. The file
+    /// must stay open (it is memory-mapped), hence the `Arc`.
+    pub fn from_gguf_host_packed_experts(file: Arc<GgufFile>) -> Result<Self, AllpacaError> {
+        let report = file.compat_report();
+        if let Some(reason) = report.reject_reason {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
+        }
+        let cfg = ModelConfig::from_gguf(&file)?;
+        if crate::qwen4exp::file_is_qwen4exp(&file) {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                "qwen4exp has its own forward: no packed host experts".into(),
+            )));
+        }
+        let mut model = Self::from_gguf_cfg_with(&file, cfg, &report, true, true)?;
+        model.packed_experts = crate::host_experts::PackedExperts::from_gguf(file, &model.config).map(Arc::new);
+        Ok(model)
+    }
+
     fn from_gguf_sized(file: &GgufFile, host_all: bool) -> Result<Self, AllpacaError> {
         let report = file.compat_report();
         if let Some(reason) = report.reject_reason {
@@ -6597,6 +6652,18 @@ impl TinyModel {
         cfg: ModelConfig,
         report: &GgufCompatReport,
         host_all: bool,
+    ) -> Result<Self, AllpacaError> {
+        Self::from_gguf_cfg_with(file, cfg, report, host_all, false)
+    }
+
+    /// With `packed_experts`, stacked routed experts are not decoded: the
+    /// caller attaches them packed.
+    fn from_gguf_cfg_with(
+        file: &GgufFile,
+        cfg: ModelConfig,
+        report: &GgufCompatReport,
+        host_all: bool,
+        packed_experts: bool,
     ) -> Result<Self, AllpacaError> {
         let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
         for i in 0..cfg.n_layers {
@@ -6734,7 +6801,7 @@ impl TinyModel {
         }
         // Continue with original host-materialize body — call into remaining logic
         // by temporarily reconstructing what from_gguf did after validation.
-        Self::from_gguf_host_materialize(file, cfg, report, name)
+        Self::from_gguf_host_materialize(file, cfg, report, name, packed_experts)
     }
 
     fn from_gguf_host_materialize(
@@ -6742,7 +6809,16 @@ impl TinyModel {
         cfg: ModelConfig,
         report: &GgufCompatReport,
         name: String,
+        packed_experts: bool,
     ) -> Result<Self, AllpacaError> {
+        // Packed experts are decoded per routed expert: only the router here.
+        let load_moe = |i: usize, n_exp: usize| {
+            if packed_experts && file.tensor(&format!("blk.{i}.ffn_up_exps.weight")).is_some() {
+                load_gguf_router_only(file, i, n_exp)
+            } else {
+                load_gguf_moe_layer(file, i, n_exp)
+            }
+        };
         let embed = file.tensor_f32("token_embd.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -6768,8 +6844,12 @@ impl TinyModel {
                     } else {
                         ones(cfg.dim)
                     };
+                    let has_moe = cfg.n_experts > 0 && file.tensor(&format!("blk.{i}.ffn_gate_inp.weight")).is_some();
+                    let (w_router, experts) = if has_moe { load_moe(i, cfg.n_experts)? } else { (Vec::new(), Vec::new()) };
                     let (w_gate, w_up, w_down, ffn_norm) =
-                        if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
+                        if has_moe {
+                            (Vec::new(), Vec::new(), Vec::new(), gguf_ffn_norm(file, i)?)
+                        } else if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
                             (
                                 file.tensor_f32(&format!("blk.{i}.ffn_gate.weight"))?,
                                 file.tensor_f32(&format!("blk.{i}.ffn_up.weight"))?,
@@ -6803,14 +6883,14 @@ impl TinyModel {
                         w_gate,
                         w_up,
                         w_down,
-                        w_router: Vec::new(),
-                        experts: Vec::new(),
-                        shared_expert: LayerFfn::default(),
-                        expert_bias: Vec::new(),
+                        w_router,
+                        experts,
+                        shared_expert: if has_moe { load_gguf_shared_expert(file, i)? } else { LayerFfn::default() },
+                        expert_bias: if has_moe { load_gguf_expert_bias(file, i)? } else { Vec::new() },
                         attn_out_gate: Vec::new(),
                         attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
-                        shared_gate_inp: Vec::new(),
+                        shared_gate_inp: load_gguf_shared_gate(file, i)?,
                         attn_bias: Default::default(),
                         ffn_post_norm: Vec::new(),
                     }
@@ -6819,7 +6899,7 @@ impl TinyModel {
                     let (w_gate, w_up, w_down, w_router, experts) = if info.moe || cfg.n_experts > 0
                     {
                         let n_exp = cfg.n_experts.max(1);
-                        let (w_router, experts) = load_gguf_moe_layer(file, i, n_exp)?;
+                        let (w_router, experts) = load_moe(i, n_exp)?;
                         (Vec::new(), Vec::new(), Vec::new(), w_router, experts)
                     } else {
                         (
@@ -6853,7 +6933,7 @@ impl TinyModel {
                         attn_out_gate: Vec::new(),
                         attn_sinks: Vec::new(),
                         attn_post_norm: Vec::new(),
-                        shared_gate_inp: Vec::new(),
+                        shared_gate_inp: load_gguf_shared_gate(file, i)?,
                         attn_bias: Default::default(),
                         ffn_post_norm: Vec::new(),
                     }
@@ -6867,7 +6947,7 @@ impl TinyModel {
                                 .tensor(&format!("blk.{i}.ffn_up_exps.weight"))
                                 .is_some());
                     let (w_gate, w_up, w_down, w_router, experts) = if has_moe {
-                        let (w_router, experts) = load_gguf_moe_layer(file, i, cfg.n_experts)?;
+                        let (w_router, experts) = load_moe(i, cfg.n_experts)?;
                         (Vec::new(), Vec::new(), Vec::new(), w_router, experts)
                     } else if file.tensor(&format!("blk.{i}.ffn_gate.weight")).is_some() {
                         (
@@ -6971,7 +7051,7 @@ impl TinyModel {
                         } else {
                             Vec::new()
                         },
-                        shared_gate_inp: Vec::new(),
+                        shared_gate_inp: load_gguf_shared_gate(file, i)?,
                         attn_bias: Default::default(),
                         ffn_post_norm: if file
                             .tensor(&format!("blk.{i}.ffn_post_norm.weight"))
@@ -7028,6 +7108,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            packed_experts: None,
             early_exit,
             exit_heads,
             mtp_nextn: None,
@@ -7189,6 +7270,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            packed_experts: None,
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
@@ -7325,6 +7407,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            packed_experts: None,
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
@@ -7440,6 +7523,7 @@ impl TinyModel {
             working_set: None,
             expert_lru: None,
             expert_host: None,
+            packed_experts: None,
             early_exit: EarlyExitSpec::default(),
             exit_heads: Vec::new(),
             mtp_nextn: None,
@@ -7609,6 +7693,32 @@ impl TinyModel {
                 layer.block,
                 HybridLayerKind::Ssm | HybridLayerKind::DenseFfn | HybridLayerKind::Moe
             ) {
+                if let (HybridLayerKind::Ssm, Some(gdn)) =
+                    (layer.block, layer.gdn.as_ref().filter(|g| !g.w_qkv.is_empty() && hip.is_none()))
+                {
+                    rmsnorm(&x, &layer.attn_norm, cfg.eps, &mut scratch[..dim])?;
+                    let state = recurrent.as_deref_mut().ok_or_else(|| {
+                        AllpacaError::Fatal(FatalError::ModelLoad("a delta-net layer needs recurrent state".into()))
+                    })?;
+                    if state.gdn_state.len() <= layer_idx {
+                        state.gdn_state.resize(layer_idx + 1, Vec::new());
+                        state.gdn_conv.resize(layer_idx + 1, Vec::new());
+                    }
+                    let out = crate::qwen35_host::gdn_step(
+                        gdn,
+                        cfg,
+                        &scratch[..dim],
+                        &mut state.gdn_state[layer_idx],
+                        &mut state.gdn_conv[layer_idx],
+                    )?;
+                    for i in 0..dim {
+                        x[i] += out[i];
+                    }
+                    if !layer.w_gate.is_empty() || !layer.experts.is_empty() {
+                        self.apply_ffn(layer_idx, layer, &mut x, &mut scratch, &mut hidden, hip, resident, Some(metrics), prefill)?;
+                    }
+                    continue;
+                }
                 if layer.block == HybridLayerKind::Ssm {
                     let ssm = layer.ssm.as_ref().ok_or_else(|| {
                         AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -7694,6 +7804,21 @@ impl TinyModel {
                 &mut scratch[..dim],
                 Some(metrics),
             )?;
+            if hip.is_none() && crate::qwen35_host::is_gated_attention(cfg, layer) {
+                let state = recurrent.as_deref_mut().ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::ModelLoad("Qwen3.5 attention on the CPU needs recurrent state".into()))
+                })?;
+                if state.host_kv.len() <= layer_idx {
+                    state.host_kv.resize(layer_idx + 1, Default::default());
+                }
+                let (keys, values) = &mut state.host_kv[layer_idx];
+                let out = crate::qwen35_host::gated_attention_step(layer, cfg, &scratch[..dim], pos, keys, values)?;
+                for i in 0..dim {
+                    x[i] += out[i];
+                }
+                self.apply_ffn(layer_idx, layer, &mut x, &mut scratch, &mut hidden, hip, resident, Some(metrics), prefill)?;
+                continue;
+            }
             if let Some(mla_w) = &layer.mla {
                 if let Some(cache) = &self.mla_cache {
                     let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -7776,6 +7901,15 @@ impl TinyModel {
             add_row_bias(&mut q, &layer.attn_bias[0]);
             add_row_bias(&mut k, &layer.attn_bias[1]);
             add_row_bias(&mut v, &layer.attn_bias[2]);
+            // Per-head RMS norm of the queries and keys (Qwen3, Ling), before RoPE.
+            for (rows, gain, heads) in [(&mut q, &layer.q_norm, cfg.n_heads), (&mut k, &layer.k_norm, cfg.n_kv_heads)] {
+                if gain.len() == head_dim {
+                    for head in rows[..heads * head_dim].chunks_exact_mut(head_dim) {
+                        let raw = head.to_vec();
+                        rmsnorm(&raw, gain, cfg.eps, head)?;
+                    }
+                }
+            }
             let theta = cfg.rope_theta_for_layer(layer_idx);
             let neox = cfg.neox_rot_dims(layer_idx, head_dim).filter(|_| !cfg.uses_imrope());
             if cfg.rope_none {

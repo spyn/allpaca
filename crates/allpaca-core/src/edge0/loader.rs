@@ -361,6 +361,7 @@ fn load_edge0_weights(
         working_set: None,
         expert_lru: None,
         expert_host: None,
+        packed_experts: None,
         early_exit: crate::early_exit::EarlyExitSpec::default(),
         exit_heads: Vec::new(),
         mtp_nextn: None,

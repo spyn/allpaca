@@ -9,12 +9,16 @@
 //!
 //! It runs on the CPU forward with every weight decoded to F32 in RAM, and
 //! covers the token embedding and each block's dense attention and
-//! feed-forward matrices.
+//! feed-forward matrices. In an MoE block it covers each stacked expert
+//! tensor (`ffn_*_exps`, every expert at once) and the shared expert; the
+//! routed experts stay packed in RAM and are decoded per routed expert
+//! ([`crate::host_experts`]), so a 30B MoE model fits.
 //!
 //! A swapped matrix cannot change anything ahead of its own block, so the
 //! first reading keeps every block's input ([`LayerTrace`]) and a probe of
 //! block `b` starts there: the blocks before it are not run again.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -23,7 +27,7 @@ use allpaca_types::{AllpacaError, FatalError};
 
 use crate::anchors::RecurrentState;
 use crate::kv_tier::KvTierManager;
-use crate::model::{alloc_pages_for_seq, TinyModel};
+use crate::model::{alloc_pages_for_seq, ModelConfig, TinyModel};
 use crate::telemetry::Metrics;
 use crate::tokenizer::EngineTokenizer;
 
@@ -106,6 +110,13 @@ impl LayerTrace {
     }
 }
 
+/// What a swap replaced: weights, or a packed stack's earlier replacement
+/// (`None`: the file's own bytes).
+enum Held {
+    Weights(Vec<f32>),
+    Packed(Option<Vec<f32>>),
+}
+
 /// Where a probed tensor lives in the loaded model.
 #[derive(Clone, Copy)]
 enum Slot {
@@ -113,6 +124,23 @@ enum Slot {
     Head,
     /// Layer and which of q, k, v, output, gate, up, down.
     Layer(usize, usize),
+    /// Layer and which of the stacked gate, up, down expert tensors.
+    Experts(usize, usize),
+    /// Layer and which of the shared expert's gate, up, down.
+    Shared(usize, usize),
+}
+
+/// Which matrix of an expert: gate, up, down.
+fn expert_part(ffn: &crate::weight_set::LayerFfn, which: usize) -> &Vec<f32> {
+    [&ffn.w_gate, &ffn.w_up, &ffn.w_down][which]
+}
+
+fn expert_part_mut(ffn: &mut crate::weight_set::LayerFfn, which: usize) -> &mut Vec<f32> {
+    match which {
+        0 => &mut ffn.w_gate,
+        1 => &mut ffn.w_up,
+        _ => &mut ffn.w_down,
+    }
 }
 
 fn bad(msg: impl Into<String>) -> AllpacaError {
@@ -189,7 +217,7 @@ impl Probe {
         // The first block the swap can reach. The embedding is block 0's
         // input, so a swap of it has nothing to start from.
         let from = match self.locate(name) {
-            Some(Slot::Layer(local, _)) => Some(local),
+            Some(Slot::Layer(local, _) | Slot::Experts(local, _) | Slot::Shared(local, _)) => Some(local),
             Some(Slot::Head) => Some(self.model.layers.len()),
             _ => None,
         }
@@ -203,7 +231,7 @@ impl Probe {
             })
         };
         let run = log_probs(&self.model, &self.texts, trace);
-        self.put(name, original);
+        self.restore(name, original);
         let (run, traces) = run?;
         self.block_runs = traces.iter().flatten().map(LayerTrace::ran).sum();
         Ok(mean_divergence(&self.reference, &run, self.model.config.vocab_size))
@@ -218,15 +246,24 @@ impl Probe {
         self.model.config.gguf_blk(layer)
     }
 
-    /// Tensor `name`'s weights as the model holds them now.
-    pub(crate) fn weights(&self, name: &str) -> Option<&[f32]> {
+    /// Tensor `name`'s weights as the model holds them now (a stacked
+    /// expert tensor is put together from its experts).
+    pub(crate) fn weights(&self, name: &str) -> Option<Cow<'_, [f32]>> {
         Some(match self.locate(name)? {
-            Slot::Embed => &self.model.embed,
-            Slot::Head => &self.model.lm_head,
+            Slot::Embed => Cow::Borrowed(&self.model.embed),
+            Slot::Head => Cow::Borrowed(&self.model.lm_head),
             Slot::Layer(local, kind) => {
                 let layer = self.model.layers.get(local)?;
-                [&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w_gate, &layer.w_up, &layer.w_down][kind]
+                Cow::Borrowed([&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w_gate, &layer.w_up, &layer.w_down][kind])
             }
+            Slot::Experts(local, which) => match self.packed(local) {
+                Some(packed) => Cow::Owned(packed.stack(local, which).ok()?),
+                None => {
+                    let experts = &self.model.layers.get(local)?.experts;
+                    Cow::Owned(experts.iter().flat_map(|e| expert_part(e, which).iter().copied()).collect())
+                }
+            },
+            Slot::Shared(local, which) => Cow::Borrowed(expert_part(&self.model.layers.get(local)?.shared_expert, which)),
         })
     }
 
@@ -311,16 +348,26 @@ impl Probe {
         let index: usize = index.parse().ok()?;
         let cfg = &self.model.config;
         let local = (0..cfg.n_layers).find(|l| cfg.gguf_blk(*l) == index)?;
+        let parts = ["ffn_gate", "ffn_up", "ffn_down"];
+        if let Some(which) = parts.iter().position(|p| kind.strip_suffix("_exps") == Some(p)) {
+            return Some(Slot::Experts(local, which));
+        }
+        if let Some(which) = parts.iter().position(|p| kind.strip_suffix("_shexp") == Some(p)) {
+            return Some(Slot::Shared(local, which));
+        }
         let kind = ["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]
             .iter()
             .position(|k| *k == kind)?;
         Some(Slot::Layer(local, kind))
     }
 
-    fn slot(&mut self, at: Slot) -> &mut Vec<f32> {
-        match at {
+    /// The one vector a slot is held in; `None` for stacked experts.
+    fn slot(&mut self, at: Slot) -> Option<&mut Vec<f32>> {
+        Some(match at {
             Slot::Embed => &mut self.model.embed,
             Slot::Head => &mut self.model.lm_head,
+            Slot::Experts(..) => return None,
+            Slot::Shared(local, which) => expert_part_mut(&mut self.model.layers[local].shared_expert, which),
             Slot::Layer(local, kind) => {
                 let layer = &mut self.model.layers[local];
                 match kind {
@@ -333,7 +380,7 @@ impl Probe {
                     _ => &mut layer.w_down,
                 }
             }
-        }
+        })
     }
 
     fn len_of(&self, name: &str) -> Option<usize> {
@@ -344,28 +391,85 @@ impl Probe {
                 let layer = self.model.layers.get(local)?;
                 [&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w_gate, &layer.w_up, &layer.w_down][kind].len()
             }
+            Slot::Experts(local, which) if self.packed(local).is_some() => self.packed(local)?.stack_len(local, which)?,
+            Slot::Experts(local, which) => {
+                let experts = &self.model.layers.get(local)?.experts;
+                // Every expert must hold the matrix for the stack to be swapped.
+                let lens: Vec<usize> = experts.iter().map(|e| expert_part(e, which).len()).collect();
+                if lens.iter().any(|&l| l == 0) {
+                    return None;
+                }
+                lens.iter().sum()
+            }
+            Slot::Shared(local, which) => expert_part(&self.model.layers.get(local)?.shared_expert, which).len(),
         };
         (len > 0).then_some(len)
     }
 
+    /// The packed experts of `layer`, when they are kept packed.
+    fn packed(&self, layer: usize) -> Option<&crate::host_experts::PackedExperts> {
+        self.model.packed_experts.as_deref().filter(|p| p.has_layer(layer))
+    }
+
+    /// Put back what [`Self::put`] returned.
+    fn restore(&mut self, name: &str, held: Held) {
+        match held {
+            Held::Weights(w) => {
+                self.put(name, w);
+            }
+            Held::Packed(previous) => {
+                if let Some(Slot::Experts(local, which)) = self.locate(name) {
+                    if let Some(packed) = self.model.packed_experts.as_mut().and_then(Arc::get_mut) {
+                        packed.swap(local, which, previous);
+                    }
+                }
+            }
+        }
+    }
+
     /// Put `weights` in tensor `name`'s place and return what was there.
-    fn put(&mut self, name: &str, weights: Vec<f32>) -> Vec<f32> {
+    fn put(&mut self, name: &str, weights: Vec<f32>) -> Held {
         if name == "token_embd.weight" && self.tied_head {
             self.model.lm_head = weights.clone();
         }
         match self.locate(name) {
-            Some(at) => std::mem::replace(self.slot(at), weights),
-            None => weights,
+            Some(Slot::Experts(local, which)) if self.packed(local).is_some() => {
+                let packed = self.model.packed_experts.as_mut().and_then(Arc::get_mut).expect("the probe owns its model");
+                Held::Packed(packed.swap(local, which, Some(weights)))
+            }
+            Some(Slot::Experts(local, which)) => {
+                let experts = &mut self.model.layers[local].experts;
+                let mut old = Vec::with_capacity(weights.len());
+                let mut at = 0;
+                for e in experts.iter_mut() {
+                    let part = expert_part_mut(e, which);
+                    let n = part.len();
+                    old.extend_from_slice(part);
+                    part.copy_from_slice(&weights[at..at + n]);
+                    at += n;
+                }
+                Held::Weights(old)
+            }
+            Some(at) => Held::Weights(match self.slot(at) {
+                Some(slot) => std::mem::replace(slot, weights),
+                None => weights,
+            }),
+            None => Held::Weights(weights),
         }
     }
 }
 
 /// A model with every weight in F32 for the CPU forward, its tokenizer,
 /// and whether its output head is the embedding table.
-fn load_host(path: &Path) -> Result<(TinyModel, EngineTokenizer, bool), AllpacaError> {
+pub(crate) fn load_host(path: &Path) -> Result<(TinyModel, EngineTokenizer, bool), AllpacaError> {
     let file = Arc::new(GgufFile::open(path)?);
     let tok = EngineTokenizer::from_gguf(extract_tokenizer(&file)?);
-    let mut model = TinyModel::from_gguf_host(&file)?;
+    // Routed experts stay packed: decoded, a 30B MoE model would not fit.
+    let mut model = if ModelConfig::from_gguf(&file)?.n_experts > 0 {
+        TinyModel::from_gguf_host_packed_experts(file.clone())?
+    } else {
+        TinyModel::from_gguf_host(&file)?
+    };
     if !model.host_weights_ready() {
         return Err(bad("sensitivity probe: this architecture has no CPU forward on F32 weights"));
     }
@@ -428,7 +532,7 @@ fn log_probs(
 }
 
 /// One text's log-probabilities (`positions * vocab`) and its trace afterwards.
-fn text_log_probs(
+pub(crate) fn text_log_probs(
     model: &TinyModel,
     tokens: &[u32],
     trace: Option<LayerTrace>,
@@ -532,6 +636,201 @@ mod tests {
         assert!(probe.divergence("blk.0.attn_q.weight", &[0.0; 7]).is_err());
     }
 
+    /// In an MoE model the probe swaps a block's stacked expert tensors
+    /// (every expert at once) and its shared expert, like any matrix.
+    #[test]
+    fn the_probe_swaps_stacked_experts_and_the_shared_expert() {
+        use crate::calib::tests::write_tiny_calib_gguf_moe;
+        let path = std::env::temp_dir().join(format!("allpaca_probe_moe-{}.gguf", std::process::id()));
+        write_tiny_calib_gguf_moe(&path, 64, 128, 0.3, 2, false, 4);
+        let file = GgufFile::open(&path).unwrap();
+        let mut probe = Probe::open(&path, &["hello world again hello world", "again hello"], 16).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for name in [
+            "blk.0.ffn_gate_exps.weight",
+            "blk.0.ffn_up_exps.weight",
+            "blk.1.ffn_down_exps.weight",
+            "blk.0.ffn_gate_shexp.weight",
+            "blk.1.ffn_up_shexp.weight",
+            "blk.1.ffn_down_shexp.weight",
+        ] {
+            assert!(probe.covers(name), "{name}");
+            let w = file.tensor_f32(name).unwrap();
+            assert_eq!(probe.weights(name).unwrap().as_ref(), w.as_slice(), "{name}: held as in the file");
+            assert!(probe.divergence(name, &w).unwrap() < 1e-9, "{name}: its own weights");
+            let zeros = vec![0.0f32; w.len()];
+            assert!(probe.divergence(name, &zeros).unwrap() > 0.0, "{name}: zeroed moves the output");
+            assert!(probe.divergence(name, &w).unwrap() < 1e-9, "{name}: restored after probing");
+        }
+        assert!(!probe.covers("blk.0.ffn_gate_inp.weight"), "the router stays as it is");
+        let packed = probe.model.packed_experts.as_ref().expect("routed experts stay packed");
+        assert_eq!(packed.swapped(), 0, "no decoded copy is kept once a probe is done");
+    }
+
+    /// Experts left packed and decoded per routed expert give the same
+    /// predictions, bit for bit, as experts decoded at load.
+    #[test]
+    fn packed_experts_read_the_same_as_decoded_ones() {
+        use crate::calib::tests::write_tiny_calib_gguf_moe;
+        let path = std::env::temp_dir().join(format!("allpaca_packed_experts-{}.gguf", std::process::id()));
+        write_tiny_calib_gguf_moe(&path, 64, 128, 0.3, 2, false, 4);
+        let file = Arc::new(GgufFile::open(&path).unwrap());
+        let decoded = TinyModel::from_gguf_host(&file).unwrap();
+        let packed = TinyModel::from_gguf_host_packed_experts(file.clone()).unwrap();
+        assert!(packed.packed_experts.is_some());
+        assert!(packed.layers[0].experts.iter().all(|e| e.w_up.is_empty()), "nothing decoded at load");
+        assert!(!decoded.layers[0].experts[0].w_up.is_empty());
+        let texts = vec![vec![1u32, 3, 4, 5, 3, 4, 5], vec![1, 5, 5, 3]];
+        let (a, _) = log_probs(&decoded, &texts, |_| None).unwrap();
+        let (b, _) = log_probs(&packed, &texts, |_| None).unwrap();
+        drop((decoded, packed, file));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(a.len(), b.len());
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "packed experts read differently");
+    }
+
+    /// Per-head q/k norms (`attn_q_norm`, `attn_k_norm`, as Qwen3 and Ling
+    /// have) are applied on the CPU: with them, scaling the query and key
+    /// projections changes nothing.
+    #[test]
+    fn the_cpu_forward_applies_the_per_head_q_and_k_norms() {
+        use crate::calib::tests::write_tiny_calib_gguf;
+        use allpaca_gguf::{write_gguf, GgufWriteTensor};
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let src = dir.join(format!("allpaca_qknorm_src-{pid}.gguf"));
+        write_tiny_calib_gguf(&src, 64, 128);
+        let file = GgufFile::open(&src).unwrap();
+        // The fixture has 4 heads of 16.
+        let with_norms = |path: &Path, scale: f32| {
+            let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = file
+                .tensors
+                .iter()
+                .map(|t| {
+                    let mut w = file.tensor_f32(&t.name).unwrap();
+                    if t.name.ends_with("attn_q.weight") || t.name.ends_with("attn_k.weight") {
+                        w.iter_mut().for_each(|v| *v *= scale);
+                    }
+                    (t.name.clone(), t.dims.clone(), w)
+                })
+                .collect();
+            let gains: Vec<f32> = (0..16).map(|i| 0.5 + i as f32 / 16.0).collect();
+            owned.push(("blk.0.attn_q_norm.weight".into(), vec![16], gains.clone()));
+            owned.push(("blk.0.attn_k_norm.weight".into(), vec![16], gains.iter().rev().copied().collect()));
+            let views: Vec<GgufWriteTensor<'_>> =
+                owned.iter().map(|(name, dims, data)| GgufWriteTensor { name: name.clone(), dims: dims.clone(), data }).collect();
+            write_gguf(path, &file.metadata, &views).unwrap();
+        };
+        let (plain, scaled) = (dir.join(format!("allpaca_qknorm_1-{pid}.gguf")), dir.join(format!("allpaca_qknorm_10-{pid}.gguf")));
+        with_norms(&plain, 1.0);
+        with_norms(&scaled, 10.0);
+        let read = |path: &Path| {
+            let (model, _, _) = load_host(path).unwrap();
+            log_probs(&model, &[vec![1u32, 3, 4, 5, 3, 4]], |_| None).unwrap().0
+        };
+        let (a, b) = (read(&plain), read(&scaled));
+        for path in [src, plain, scaled] {
+            let _ = std::fs::remove_file(path);
+        }
+        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "scaling q and k moved the predictions by {worst}");
+    }
+
+    /// A copy of GGUF `src` at `dst` with each tensor passed through `edit`
+    /// and `extra` tensors added.
+    fn rewrite_gguf(src: &Path, dst: &Path, edit: impl Fn(&str, &mut Vec<f32>), extra: Vec<(String, Vec<u64>, Vec<f32>)>) {
+        use allpaca_gguf::{write_gguf, GgufWriteTensor};
+        let file = GgufFile::open(src).unwrap();
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = file
+            .tensors
+            .iter()
+            .map(|t| {
+                let mut w = file.tensor_f32(&t.name).unwrap();
+                edit(&t.name, &mut w);
+                (t.name.clone(), t.dims.clone(), w)
+            })
+            .collect();
+        owned.extend(extra);
+        let views: Vec<GgufWriteTensor<'_>> =
+            owned.iter().map(|(name, dims, data)| GgufWriteTensor { name: name.clone(), dims: dims.clone(), data }).collect();
+        write_gguf(dst, &file.metadata, &views).unwrap();
+    }
+
+    /// The shared expert's sigmoid gate (`ffn_gate_inp_shexp`, Qwen3-Next
+    /// and Qwen3.5 MoE) scales its output on the CPU: a gate of zeros
+    /// (sigmoid 0.5) reads as no gate with the shared expert's output halved.
+    #[test]
+    fn the_cpu_forward_gates_the_shared_expert() {
+        use crate::calib::tests::write_tiny_calib_gguf_moe;
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_shexp_gate_{tag}-{pid}.gguf"));
+        let (src, gated, halved) = (at("src"), at("gated"), at("halved"));
+        write_tiny_calib_gguf_moe(&src, 64, 128, 0.3, 1, false, 4);
+        let gate = vec![("blk.0.ffn_gate_inp_shexp.weight".to_string(), vec![64], vec![0.0f32; 64])];
+        rewrite_gguf(&src, &gated, |_, _| {}, gate);
+        rewrite_gguf(
+            &src,
+            &halved,
+            |name, w| {
+                if name == "blk.0.ffn_down_shexp.weight" {
+                    w.iter_mut().for_each(|v| *v *= 0.5);
+                }
+            },
+            Vec::new(),
+        );
+        let read = |path: &Path| {
+            let (model, _, _) = load_host(path).unwrap();
+            log_probs(&model, &[vec![1u32, 3, 4, 5, 3, 4]], |_| None).unwrap().0
+        };
+        let (a, b, plain) = (read(&gated), read(&halved), read(&src));
+        for path in [src, gated, halved] {
+            let _ = std::fs::remove_file(path);
+        }
+        let diff = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(diff(&plain, &b) > 1e-4, "halving the shared expert must show");
+        assert!(diff(&a, &b) < 1e-5, "the gate did not halve the shared expert: {}", diff(&a, &b));
+    }
+
+    /// Gated delta-net blocks with an MoE feed-forward (Qwen3.5 MoE) run
+    /// their experts on the CPU, and the probe covers them.
+    #[test]
+    fn delta_net_blocks_run_their_experts_on_the_cpu() {
+        use crate::calib::tests::write_tiny_qwen35moe_gguf;
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (src, silent) = (dir.join(format!("allpaca_gdn_moe-{pid}.gguf")), dir.join(format!("allpaca_gdn_moe_0-{pid}.gguf")));
+        write_tiny_qwen35moe_gguf(&src, 4);
+        rewrite_gguf(
+            &src,
+            &silent,
+            |name, w| {
+                if name == "blk.0.ffn_down_exps.weight" {
+                    w.iter_mut().for_each(|v| *v = 0.0);
+                }
+            },
+            Vec::new(),
+        );
+        let read = |path: &Path| {
+            let (model, _, _) = load_host(path).unwrap();
+            log_probs(&model, &[vec![1u32, 3, 4, 5, 3, 4]], |_| None).unwrap().0
+        };
+        let (a, b) = (read(&src), read(&silent));
+        let mut probe = Probe::open(&src, &["hello world again hello", "again hello world"], 16).unwrap();
+        let file = GgufFile::open(&src).unwrap();
+        for name in ["blk.0.ffn_up_exps.weight", "blk.1.ffn_down_exps.weight", "blk.0.ffn_gate_shexp.weight"] {
+            assert!(probe.covers(name), "{name}");
+            let w = file.tensor_f32(name).unwrap();
+            assert!(probe.divergence(name, &w).unwrap() < 1e-9, "{name}: its own weights");
+        }
+        drop((probe, file));
+        for path in [src, silent] {
+            let _ = std::fs::remove_file(path);
+        }
+        let diff = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(diff > 1e-4, "silencing block 0's experts changed nothing: they were not run ({diff})");
+    }
+
     /// A probe of a later block starts at that block: fewer blocks run, and
     /// the number is the one a full reading gives.
     #[test]
@@ -566,6 +865,98 @@ mod tests {
             assert_eq!(resumed.to_bits(), full.to_bits(), "{name}: {resumed} vs {full}");
             assert!(probe.divergence(name, &w).unwrap() < 1e-9, "{name}: restored");
         }
+    }
+
+    /// Opt-in check of the CPU forward (experts packed) on a real model:
+    /// greedy continuation of a prompt, to compare with llama.cpp's.
+    /// `ALLPACA_PROBE_MODEL=<gguf> ALLPACA_GREEDY_PROMPT=<text> cargo test --release -p allpaca-core --lib real_cpu_greedy -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_cpu_greedy() {
+        let (Ok(model), Ok(prompt)) = (std::env::var("ALLPACA_PROBE_MODEL"), std::env::var("ALLPACA_GREEDY_PROMPT")) else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        let (model, tok, _) = load_host(Path::new(&model)).unwrap();
+        println!("loaded in {:.1} s", t.elapsed().as_secs_f64());
+        let mut ids = tok.encode(&prompt).unwrap();
+        let vocab = model.config.vocab_size;
+        for _ in 0..16 {
+            let t = std::time::Instant::now();
+            let (lp, _) = log_probs(&model, std::slice::from_ref(&ids), |_| None).unwrap();
+            let last = &lp[lp.len() - vocab..];
+            let next = (0..vocab).max_by(|&a, &b| last[a].total_cmp(&last[b])).unwrap() as u32;
+            ids.push(next);
+            println!("{next:>7} {:?}  ({:.1} s)", tok.decode(&[next]).unwrap_or_default(), t.elapsed().as_secs_f64());
+        }
+    }
+
+    /// Opt-in: perplexity of a real model on the CPU forward, scored as
+    /// `llama-perplexity -c N` scores it (chunks of N tokens, the first
+    /// replaced by BOS, the second half of each scored), to compare.
+    /// `ALLPACA_PROBE_MODEL=<gguf> ALLPACA_PROBE_TEXT=<txt> ALLPACA_PPL_CTX=128 cargo test ... real_cpu_perplexity -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_cpu_perplexity() {
+        let (Ok(model), Ok(text)) = (std::env::var("ALLPACA_PROBE_MODEL"), std::env::var("ALLPACA_PROBE_TEXT")) else {
+            return;
+        };
+        let n_ctx: usize = std::env::var("ALLPACA_PPL_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let (model, tok, _) = load_host(Path::new(&model)).unwrap();
+        let text = std::fs::read_to_string(text).unwrap();
+        let ids = tok.encode(&text).unwrap();
+        let bos = tok.bos_id;
+        let add_bos = bos.is_some_and(|b| ids.first() == Some(&b));
+        let chunks: Vec<Vec<u32>> = ids
+            .chunks_exact(n_ctx)
+            .map(|c| {
+                let mut c = c.to_vec();
+                if let (true, Some(b)) = (add_bos, bos) {
+                    c[0] = b;
+                }
+                c
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let (lp, _) = log_probs(&model, &chunks, |_| None).unwrap();
+        let vocab = model.config.vocab_size;
+        let (mut nll, mut count) = (0.0f64, 0usize);
+        for (c, chunk) in chunks.iter().enumerate() {
+            for pos in n_ctx / 2..n_ctx - 1 {
+                let row = &lp[(c * n_ctx + pos) * vocab..][..vocab];
+                nll -= f64::from(row[chunk[pos + 1] as usize]);
+                count += 1;
+            }
+        }
+        println!(
+            "{} tokens, {} chunks of {n_ctx}, add_bos {add_bos}: PPL = {:.4}  ({:.0} s)",
+            ids.len(),
+            chunks.len(),
+            (nll / count as f64).exp(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// Opt-in: a packed expert of a real model decodes to its slice of the
+    /// whole decoded stack.
+    #[test]
+    #[ignore]
+    fn real_packed_expert_matches_the_decoded_stack() {
+        let Ok(model) = std::env::var("ALLPACA_PROBE_MODEL") else { return };
+        let file = Arc::new(GgufFile::open(Path::new(&model)).unwrap());
+        let cfg = ModelConfig::from_gguf(&file).unwrap();
+        let packed = crate::host_experts::PackedExperts::from_gguf(file.clone(), &cfg).unwrap();
+        let local = (0..cfg.n_layers).find(|&l| packed.has_layer(l)).unwrap();
+        for (part, name) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().enumerate() {
+            let all = file.tensor_f32(&format!("blk.{}.{name}.weight", cfg.gguf_blk(local))).unwrap();
+            let n = all.len() / cfg.n_experts;
+            for e in [0, 5, cfg.n_experts - 1] {
+                let ffn = packed.expert(local, e).unwrap();
+                let got = [&ffn.w_gate, &ffn.w_up, &ffn.w_down][part];
+                assert_eq!(got.as_slice(), &all[e * n..(e + 1) * n], "{name} expert {e}");
+            }
+        }
+        println!("layer {local}: packed experts match");
     }
 
     /// Opt-in timing on a real model:

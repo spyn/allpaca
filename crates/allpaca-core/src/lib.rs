@@ -41,6 +41,8 @@ mod otel;
 mod packed;
 mod qwen4exp;
 pub mod gsq;
+pub(crate) mod host_experts;
+pub(crate) mod qwen35_host;
 pub mod propagate;
 pub mod rco;
 pub mod requant;
