@@ -17,7 +17,8 @@
 //! for every matrix. It still adds the matrices' effects up as if they were
 //! independent.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use allpaca_gguf::{GgmlType, GgufFile, GgufStreamTensor, GgufStreamWriter, GgufValue};
 use allpaca_types::{AllpacaError, FatalError};
@@ -147,6 +148,9 @@ pub struct Options {
     /// instead of each matrix's own error: only matrices the probe can
     /// swap are requantised, the rest are copied.
     pub probe: Option<ProbeTexts>,
+    /// A table of probe measurements: written after a probe, and when it
+    /// exists, read instead of probing (`probe` is then not needed).
+    pub probe_table: Option<PathBuf>,
     /// Once the types are chosen, quantise the blocks' matrices in order,
     /// each for the original outputs on the inputs the ones before it
     /// leave it ([`crate::propagate`]). Needs every weight in F32 in RAM.
@@ -161,6 +165,10 @@ pub struct ProbeTexts {
     pub texts: Vec<String>,
     /// Tokens read of each text.
     pub max_tokens: usize,
+    /// Probe each matrix at its fewest bits only, and take the others as
+    /// that divergence scaled by the matrix's own error: one read of the
+    /// texts per matrix instead of one per type.
+    pub scaled: bool,
 }
 
 impl Default for Options {
@@ -174,6 +182,7 @@ impl Default for Options {
             stats: None,
             damping: 0.01,
             probe: None,
+            probe_table: None,
             propagate: None,
             progress: None,
         }
@@ -226,6 +235,38 @@ fn matrix_shape(dims: &[u64], min_weights: usize, targets: &[Target]) -> Option<
     (dims.len() >= 2 && cols > 0 && targets.iter().any(|t| t.fits(cols)) && n >= min_weights).then(|| (n / cols, cols))
 }
 
+/// One line per matrix and type it fits: name, type, divergence.
+fn write_probe_table<'a>(
+    path: &Path,
+    names: impl Iterator<Item = &'a str>,
+    targets: &[Target],
+    divergence: &[Vec<f64>],
+) -> Result<(), AllpacaError> {
+    let mut text = String::new();
+    for (name, row) in names.zip(divergence) {
+        for (t, d) in targets.iter().zip(row).filter(|(_, d)| !d.is_nan()) {
+            text.push_str(&format!("{name}\t{}\t{d:e}\n", t.name()));
+        }
+    }
+    std::fs::write(path, text).map_err(|e| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", path.display()))))
+}
+
+/// The divergences of a probe table, by matrix and type name.
+fn read_probe_table(path: &Path) -> Result<HashMap<String, HashMap<String, f64>>, AllpacaError> {
+    let bad = |why: String| AllpacaError::Fatal(FatalError::InvalidConfig(format!("{}: {why}", path.display())));
+    let text = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
+    let mut table: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut f = line.split('\t');
+        let (Some(name), Some(target), Some(d), None) = (f.next(), f.next(), f.next(), f.next()) else {
+            return Err(bad(format!("not name, type, divergence: {line}")));
+        };
+        let d: f64 = d.trim().parse().map_err(|_| bad(format!("not a number: {line}")))?;
+        table.entry(name.to_string()).or_default().insert(target.to_uppercase(), d);
+    }
+    Ok(table)
+}
+
 /// Requantise `input` into `output`.
 pub fn requantise(input: &Path, output: &Path, opts: &Options) -> Result<Report, AllpacaError> {
     Ok(requantise_each(input, &[(output, opts.avg_bits)], opts)?.remove(0))
@@ -246,7 +287,13 @@ pub fn requantise_each(
             "requantise: the types to choose from must be one or more, each once".into(),
         )));
     }
+    // A saved table stands in for the probe.
+    let saved = match &opts.probe_table {
+        Some(path) if path.exists() => Some(read_probe_table(path)?),
+        _ => None,
+    };
     let mut probe = match &opts.probe {
+        Some(_) if saved.is_some() => None,
         Some(p) => {
             let texts: Vec<&str> = p.texts.iter().map(String::as_str).collect();
             Some(Probe::open(input, &texts, p.max_tokens)?)
@@ -259,6 +306,7 @@ pub fn requantise_each(
         .enumerate()
         .filter(|(_, t)| t.name.ends_with(".weight") && !matches!(t.ggml_type, GgmlType::I32 | GgmlType::Other))
         .filter(|(_, t)| probe.as_ref().is_none_or(|p| p.covers(&t.name)))
+        .filter(|(_, t)| saved.as_ref().is_none_or(|s| s.contains_key(&t.name)))
         .filter_map(|(i, t)| matrix_shape(&t.dims, opts.min_weights, targets).map(|(rows, cols)| (i, rows, cols)))
         .collect();
     if candidates.is_empty() {
@@ -288,6 +336,14 @@ pub fn requantise_each(
         let mut moved = vec![f64::NAN; targets.len()];
         let mut decoded = vec![0.0f32; w.len()];
         let mut kept = Vec::new();
+        let scaled = opts.probe.as_ref().is_some_and(|p| p.scaled) && probe.is_some();
+        // The type a scaled probe measures: the fewest bits the rows fit.
+        let anchor = targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.fits(cols))
+            .min_by(|a, b| a.1.bits().total_cmp(&b.1.bits()))
+            .map(|(at, _)| at);
         for (at, &target) in targets.iter().enumerate() {
             if !target.fits(cols) {
                 continue;
@@ -295,11 +351,24 @@ pub fn requantise_each(
             let bytes = target.quantise(&w, rows, cols, &gram, &opts.gsq)?;
             allpaca_gguf::dequant_packed(target.ggml(), &bytes, w.len(), &mut decoded)?;
             row[at] = output_error(&w, &decoded, cols, &gram) / energy.max(1e-30);
-            if let Some(probe) = probe.as_mut() {
+            if let Some(probe) = probe.as_mut().filter(|_| !scaled || Some(at) == anchor) {
                 moved[at] = probe.divergence(name, &decoded)?;
+            } else if let Some(saved) = &saved {
+                moved[at] = saved[name.as_str()].get(target.name()).copied().ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                        "requantise: the probe table has no {} for {name}",
+                        target.name()
+                    )))
+                })?;
             }
             if target == Target::Q2_0 {
                 kept = bytes;
+            }
+        }
+        if let (true, Some(anchor)) = (scaled, anchor) {
+            let per_error = if row[anchor] > 0.0 { moved[anchor] / row[anchor] } else { 0.0 };
+            for at in (0..targets.len()).filter(|&at| at != anchor && !row[at].is_nan()) {
+                moved[at] = per_error * row[at];
             }
         }
         two_bit.push(kept);
@@ -312,6 +381,13 @@ pub fn requantise_each(
     }
     // The probe holds the whole model in F32: not needed past here.
     let probed = probe.take().is_some();
+    if probed {
+        if let Some(path) = &opts.probe_table {
+            let names = candidates.iter().map(|&(i, _, _)| file.tensors[i].name.as_str());
+            write_probe_table(path, names, targets, &divergence)?;
+        }
+    }
+    let probed = probed || saved.is_some();
     let weights: Vec<f64> = candidates.iter().map(|&(_, rows, cols)| (rows * cols) as f64).collect();
     // The loss of a matrix's option: how far it moved the model's predictions
     // when probed, otherwise its error weighted by its size.
@@ -782,6 +858,7 @@ mod tests {
             probe: Some(ProbeTexts {
                 texts: vec!["hello world again hello world".into(), "again again hello world".into()],
                 max_tokens: 32,
+                scaled: false,
             }),
             targets: CLASSIC.to_vec(),
             ..Options::default()
@@ -805,6 +882,85 @@ mod tests {
         // The embedding is below the size limit here: copied as it was.
         assert_eq!(out.tensor("token_embd.weight").unwrap().ggml_type, GgmlType::F32);
         for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A scaled probe measures each matrix at its fewest bits only and
+    /// scales that by the matrix's own error for the other types: the
+    /// same choices as the full probe here, from a third of the reads.
+    #[test]
+    fn a_scaled_probe_measures_one_type_and_scales_the_rest() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_scaled_{tag}-{pid}.gguf"));
+        let (src, full, scaled) = (at("in"), at("full"), at("scaled"));
+        crate::calib::tests::write_tiny_calib_gguf_with(&src, 64, 128, 1e-4);
+        let texts = vec!["hello world again hello world".to_string(), "again again hello world".to_string()];
+        let base = Options {
+            avg_bits: 3.6,
+            gsq: GsqConfig { steps: 40, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            probe: Some(ProbeTexts { texts: texts.clone(), max_tokens: 32, scaled: false }),
+            ..Options::default()
+        };
+        let a = requantise(&src, &full, &base).unwrap();
+        let b = requantise(
+            &src,
+            &scaled,
+            &Options { probe: Some(ProbeTexts { texts, max_tokens: 32, scaled: true }), ..base.clone() },
+        )
+        .unwrap();
+        for (a, b) in a.choices.iter().zip(&b.choices) {
+            let (da, db) = (a.divergence.clone().unwrap(), b.divergence.clone().unwrap());
+            // Q2_0 is the fewest bits: measured the same either way.
+            assert_eq!(da[0], db[0], "{}", a.name);
+            for t in 1..db.len() {
+                let want = db[0] * b.relative_error[t] / b.relative_error[0];
+                assert!((db[t] - want).abs() <= 1e-12 * want.abs().max(1.0), "{}: {db:?}", b.name);
+            }
+            assert_eq!(a.target, b.target, "{}: full {da:?}, scaled {db:?}", a.name);
+        }
+        for path in [src, full, scaled] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A probe's measurements are saved to a table, and a run given the
+    /// table takes them from it instead of probing: same types, same file.
+    #[test]
+    fn a_saved_probe_table_stands_in_for_the_probe() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_table_{tag}-{pid}"));
+        let (src, probed, reused, table) = (at("in.gguf"), at("probed.gguf"), at("reused.gguf"), at("table.tsv"));
+        let _ = std::fs::remove_file(&table);
+        crate::calib::tests::write_tiny_calib_gguf_with(&src, 64, 128, 1e-4);
+        let base = Options {
+            avg_bits: 3.6,
+            gsq: GsqConfig { steps: 40, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            probe_table: Some(table.clone()),
+            ..Options::default()
+        };
+        let first = requantise(
+            &src,
+            &probed,
+            &Options {
+                probe: Some(ProbeTexts { texts: vec!["hello world again hello world".into()], max_tokens: 32, scaled: false }),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        assert!(table.exists(), "the probe wrote its table");
+        let second = requantise(&src, &reused, &base).unwrap();
+        assert_eq!(second.choices.len(), first.choices.len());
+        for (a, b) in first.choices.iter().zip(&second.choices) {
+            assert_eq!((&a.name, a.target), (&b.name, b.target));
+            assert_eq!(a.divergence, b.divergence, "{}", a.name);
+        }
+        assert_eq!(std::fs::read(&probed).unwrap(), std::fs::read(&reused).unwrap());
+        for path in [src, probed, reused, table] {
             let _ = std::fs::remove_file(path);
         }
     }

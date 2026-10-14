@@ -13,12 +13,17 @@
 //! `--probe [N]` (needs the calibration text) also chooses the types by
 //! measured sensitivity: each matrix is swapped for each of its options in
 //! turn and the text reread (N tokens per paragraph, default 64), which
-//! costs a read of the text per matrix and type.
+//! costs a read of the text per matrix and type. With `--scaled` it reads
+//! the text once per matrix, at its fewest bits, and scales that by the
+//! matrix's own error for the other types.
 //!
 //! `--propagate [ridge]` (needs the calibration text) quantises the blocks
 //! in order once the types are chosen, each matrix for the original outputs
 //! on the inputs the quantised matrices before it produce. `ridge` (default
 //! 1.0) holds a matrix to its own weights: lower fits the text more closely.
+//!
+//! `--probe-table <file>` saves the probe's measurements to the file, and
+//! when the file exists, reads them from it instead of probing.
 //!
 //! `--types q2_0,q3_k,q4_k,q5_k,q6_k,q8_0` limits the types a matrix may
 //! take (default: all of those and `q4_0`).
@@ -51,6 +56,19 @@ fn main() {
         ridge = Some(given.unwrap_or(1.0));
         args.drain(at..at + 1 + usize::from(given.is_some()));
     }
+    let scaled = args.iter().any(|a| a == "--scaled");
+    args.retain(|a| a != "--scaled");
+    let mut probe_table = None;
+    if let Some(at) = args.iter().position(|a| a == "--probe-table") {
+        match args.get(at + 1) {
+            Some(path) => probe_table = Some(PathBuf::from(path)),
+            None => {
+                eprintln!("--probe-table takes a file");
+                std::process::exit(2);
+            }
+        }
+        args.drain(at..at + 2);
+    }
     let mut types = None;
     if let Some(at) = args.iter().position(|a| a == "--types") {
         let list = args.get(at + 1).cloned().unwrap_or_default();
@@ -66,7 +84,7 @@ fn main() {
     }
     if args.len() < 2 {
         eprintln!(
-            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--types q2_0,q4_k,...]"
+            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--propagate [ridge]] [--types q2_0,q4_k,...]"
         );
         std::process::exit(2);
     }
@@ -74,6 +92,7 @@ fn main() {
         progress: Some(progress),
         ..Options::default()
     };
+    opts.probe_table = probe_table;
     if let Some(types) = types {
         opts.targets = types;
     }
@@ -102,7 +121,7 @@ fn main() {
         let text = std::fs::read_to_string(path).expect("calibration text");
         let texts: Vec<&str> = text.split("\n\n").map(str::trim).filter(|t| !t.is_empty()).collect();
         if let Some(max_tokens) = probe_tokens {
-            opts.probe = Some(ProbeTexts { texts: texts.iter().map(|t| t.to_string()).collect(), max_tokens });
+            opts.probe = Some(ProbeTexts { texts: texts.iter().map(|t| t.to_string()).collect(), max_tokens, scaled });
         }
         if let Some(ridge) = ridge {
             opts.propagate = Some(allpaca_core::propagate::Settings {
