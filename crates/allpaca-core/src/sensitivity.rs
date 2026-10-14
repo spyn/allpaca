@@ -51,6 +51,9 @@ pub enum LayerTrace {
     /// Skip the blocks before `from` and give block `from` its saved input
     /// (`from` = the block count: only the output head runs).
     Resume { from: usize, saved: Arc<Vec<f32>>, ran: usize },
+    /// Run block `at` alone: `input` is what it gets (`[position][dim]`),
+    /// `output` what it hands on. Nothing else runs, the output head included.
+    Block { at: usize, input: Arc<Vec<f32>>, output: Vec<f32> },
 }
 
 impl LayerTrace {
@@ -78,12 +81,27 @@ impl LayerTrace {
                 *ran += usize::from(layer < blocks);
                 false
             }
+            Self::Block { at: block, input, output } => {
+                let row = pos * x.len();
+                if layer == *block {
+                    x.copy_from_slice(&input[row..row + x.len()]);
+                    return false;
+                }
+                if layer == *block + 1 {
+                    if output.len() < row + x.len() {
+                        output.resize(row + x.len(), 0.0);
+                    }
+                    output[row..row + x.len()].copy_from_slice(x);
+                }
+                true
+            }
         }
     }
 
     fn ran(&self) -> usize {
         match self {
             Self::Record { ran, .. } | Self::Resume { ran, .. } => *ran,
+            Self::Block { .. } => 0,
         }
     }
 }
@@ -189,6 +207,93 @@ impl Probe {
         let (run, traces) = run?;
         self.block_runs = traces.iter().flatten().map(LayerTrace::ran).sum();
         Ok(mean_divergence(&self.reference, &run, self.model.config.vocab_size))
+    }
+
+    pub(crate) fn blocks(&self) -> usize {
+        self.model.layers.len()
+    }
+
+    /// The number block `layer` has in the file's tensor names.
+    pub(crate) fn gguf_block(&self, layer: usize) -> usize {
+        self.model.config.gguf_blk(layer)
+    }
+
+    /// Tensor `name`'s weights as the model holds them now.
+    pub(crate) fn weights(&self, name: &str) -> Option<&[f32]> {
+        Some(match self.locate(name)? {
+            Slot::Embed => &self.model.embed,
+            Slot::Head => &self.model.lm_head,
+            Slot::Layer(local, kind) => {
+                let layer = self.model.layers.get(local)?;
+                [&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w_gate, &layer.w_up, &layer.w_down][kind]
+            }
+        })
+    }
+
+    /// Put `weights` in tensor `name`'s place for good.
+    pub(crate) fn replace(&mut self, name: &str, weights: Vec<f32>) {
+        self.put(name, weights);
+    }
+
+    /// Per text, what block `layer` got with the original weights: `[position][dim]`.
+    pub(crate) fn original_inputs(&self, layer: usize) -> Vec<Arc<Vec<f32>>> {
+        let (dim, per) = (self.model.config.dim, self.blocks() + 1);
+        self.saved
+            .iter()
+            .map(|saved| {
+                let row = |pos: usize| &saved[(pos * per + layer) * dim..(pos * per + layer + 1) * dim];
+                Arc::new((0..saved.len() / (per * dim)).flat_map(|pos| row(pos).iter().copied()).collect())
+            })
+            .collect()
+    }
+
+    /// Per text, what the first block gets with the weights as they are now.
+    pub(crate) fn first_inputs(&self) -> Result<Vec<Arc<Vec<f32>>>, AllpacaError> {
+        // A full reading: the recording trace keeps every block's input.
+        let record = |_: usize| Some(LayerTrace::Record { saved: Vec::new(), ran: 0 });
+        let (dim, per) = (self.model.config.dim, self.blocks() + 1);
+        let (_, traces) = log_probs(&self.model, &self.texts, record)?;
+        Ok(traces
+            .into_iter()
+            .map(|trace| match trace {
+                Some(LayerTrace::Record { saved, .. }) => {
+                    Arc::new((0..saved.len() / (per * dim)).flat_map(|pos| saved[pos * per * dim..][..dim].to_vec()).collect())
+                }
+                _ => Arc::new(Vec::new()),
+            })
+            .collect())
+    }
+
+    /// Run block `layer` alone on `inputs` (per text, `[position][dim]`)
+    /// with the weights as they are now. Returns what it hands on, per
+    /// text, and the vectors its matrices were fed, per site, over all
+    /// texts in order.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn block_sites(
+        &self,
+        layer: usize,
+        inputs: &[Arc<Vec<f32>>],
+    ) -> Result<(Vec<Arc<Vec<f32>>>, std::collections::HashMap<crate::calib::Site, Vec<f32>>), AllpacaError> {
+        if layer >= self.blocks() || inputs.len() != self.texts.len() {
+            return Err(bad(format!("probe: no block {layer} or not an input per text")));
+        }
+        self.model.calib.keep(self.gguf_block(layer));
+        // One text after the other, so that the sites' vectors stay in order.
+        let mut outputs = Vec::with_capacity(inputs.len());
+        let mut failed = None;
+        for (tokens, input) in self.texts.iter().zip(inputs) {
+            let trace = LayerTrace::Block { at: layer, input: input.clone(), output: Vec::new() };
+            match text_log_probs(&self.model, tokens, Some(trace)) {
+                Ok((_, Some(LayerTrace::Block { output, .. }))) => outputs.push(Arc::new(output)),
+                Ok(_) => failed = Some(bad("probe: the block trace was lost")),
+                Err(e) => failed = Some(e),
+            }
+            if failed.is_some() {
+                break;
+            }
+        }
+        let sites = self.model.calib.take_kept();
+        failed.map_or(Ok((outputs, sites)), Err)
     }
 
     fn locate(&self, name: &str) -> Option<Slot> {

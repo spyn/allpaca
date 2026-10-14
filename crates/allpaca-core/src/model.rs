@@ -7954,7 +7954,10 @@ impl TinyModel {
             }
         }
         if let Some(trace) = recurrent.as_deref_mut().and_then(|r| r.trace.as_mut()) {
-            trace.enter(pos, self.layers.len(), self.layers.len(), &mut x);
+            // A trace that runs single blocks has no use for the output head.
+            if trace.enter(pos, self.layers.len(), self.layers.len(), &mut x) {
+                return Ok(());
+            }
         }
 
         rmsnorm_dispatch(

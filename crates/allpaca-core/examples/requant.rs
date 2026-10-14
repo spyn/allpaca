@@ -15,6 +15,11 @@
 //! turn and the text reread (N tokens per paragraph, default 64), which
 //! costs a read of the text per matrix and type.
 //!
+//! `--propagate [ridge]` (needs the calibration text) quantises the blocks
+//! in order once the types are chosen, each matrix for the original outputs
+//! on the inputs the quantised matrices before it produce. `ridge` (default
+//! 1.0) holds a matrix to its own weights: lower fits the text more closely.
+//!
 //! `--types q2_0,q3_k,q4_k,q5_k,q6_k,q8_0` limits the types a matrix may
 //! take (default: all of those and `q4_0`).
 
@@ -38,6 +43,12 @@ fn main() {
     if let Some(at) = args.iter().position(|a| a == "--probe") {
         let given = args.get(at + 1).and_then(|v| v.parse::<usize>().ok());
         probe_tokens = Some(given.unwrap_or(64));
+        args.drain(at..at + 1 + usize::from(given.is_some()));
+    }
+    let mut ridge = None;
+    if let Some(at) = args.iter().position(|a| a == "--propagate") {
+        let given = args.get(at + 1).and_then(|v| v.parse::<f32>().ok());
+        ridge = Some(given.unwrap_or(1.0));
         args.drain(at..at + 1 + usize::from(given.is_some()));
     }
     let mut types = None;
@@ -93,6 +104,13 @@ fn main() {
         if let Some(max_tokens) = probe_tokens {
             opts.probe = Some(ProbeTexts { texts: texts.iter().map(|t| t.to_string()).collect(), max_tokens });
         }
+        if let Some(ridge) = ridge {
+            opts.propagate = Some(allpaca_core::propagate::Settings {
+                texts: texts.iter().map(|t| t.to_string()).collect(),
+                max_tokens: 4096,
+                ridge,
+            });
+        }
         let start = std::time::Instant::now();
         match allpaca_core::calib::capture(Path::new(&args[0]), &texts) {
             Ok(stats) => {
@@ -110,8 +128,8 @@ fn main() {
             }
         }
     }
-    if probe_tokens.is_some() && opts.probe.is_none() {
-        eprintln!("--probe needs a calibration text");
+    if (probe_tokens.is_some() && opts.probe.is_none()) || (ridge.is_some() && opts.propagate.is_none()) {
+        eprintln!("--probe and --propagate need a calibration text");
         std::process::exit(2);
     }
     STARTED.get_or_init(Instant::now);
@@ -151,10 +169,11 @@ fn main() {
                 }
             }
             println!(
-                "{} matrices requantised to {:.3} bits per weight on average ({} on measured inputs), {} tensors copied",
+                "{} matrices requantised to {:.3} bits per weight on average ({} on measured inputs, {} in order), {} tensors copied",
                 report.choices.len(),
                 report.avg_bits(),
                 report.calibrated,
+                report.propagated,
                 report.copied
             );
         }

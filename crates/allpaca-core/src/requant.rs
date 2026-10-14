@@ -75,7 +75,7 @@ impl Target {
         }
     }
 
-    fn ggml(self) -> GgmlType {
+    pub(crate) fn ggml(self) -> GgmlType {
         match self {
             Target::Q2_0 => GgmlType::Q2_0,
             Target::Q3K => GgmlType::Q3_K,
@@ -105,7 +105,7 @@ impl Target {
         cols % self.block().0 == 0
     }
 
-    fn quantise(
+    pub(crate) fn quantise(
         self,
         w: &[f32],
         rows: usize,
@@ -147,6 +147,10 @@ pub struct Options {
     /// instead of each matrix's own error: only matrices the probe can
     /// swap are requantised, the rest are copied.
     pub probe: Option<ProbeTexts>,
+    /// Once the types are chosen, quantise the blocks' matrices in order,
+    /// each for the original outputs on the inputs the ones before it
+    /// leave it ([`crate::propagate`]). Needs every weight in F32 in RAM.
+    pub propagate: Option<crate::propagate::Settings>,
     /// Called after each matrix is measured: matrices done, of how many, its name.
     pub progress: Option<fn(usize, usize, &str)>,
 }
@@ -170,6 +174,7 @@ impl Default for Options {
             stats: None,
             damping: 0.01,
             probe: None,
+            propagate: None,
             progress: None,
         }
     }
@@ -200,6 +205,8 @@ pub struct Report {
     pub copied: usize,
     /// Requantised matrices that used measured inputs.
     pub calibrated: usize,
+    /// Matrices quantised in order with propagated calibration.
+    pub propagated: usize,
 }
 
 impl Report {
@@ -361,8 +368,25 @@ pub fn requantise_each(
         for split in ["split.no", "split.count", "split.tensors.count"] {
             metadata.remove(split);
         }
+        // In order, on the inputs the quantised model has: these replace
+        // what each matrix alone was quantised to.
+        let in_order = match &opts.propagate {
+            Some(settings) => {
+                let pick = |name: &str| {
+                    let i = file.tensors.iter().position(|t| t.name == name)?;
+                    let at = candidates.iter().position(|c| c.0 == i)?;
+                    Some((targets[assignment[at]], candidates[at].1, candidates[at].2))
+                };
+                crate::propagate::quantise_in_order(input, settings, &pick, &opts.gsq, opts.damping, opts.progress)?
+            }
+            None => Default::default(),
+        };
         let mut writer = GgufStreamWriter::create(output, &metadata, &declared)?;
         for (i, t) in file.tensors.iter().enumerate() {
+            if let Some(bytes) = in_order.get(&t.name) {
+                writer.write_tensor(bytes)?;
+                continue;
+            }
             match chosen(i) {
                 Some(Target::Q2_0) => {
                     let at = candidates.iter().position(|c| c.0 == i).expect("chosen");
@@ -396,6 +420,7 @@ pub fn requantise_each(
             targets: targets.clone(),
             copied: file.tensors.len() - candidates.len(),
             calibrated: calibrated.iter().filter(|c| **c).count(),
+            propagated: in_order.len(),
         });
     }
     Ok(reports)
@@ -694,6 +719,46 @@ mod tests {
         }
         assert!(tuned_total < 0.9 * plain_total, "{tuned_total} vs {plain_total}");
         for path in [src, plain, tuned] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Quantised in order with propagated calibration, a two-bit model's
+    /// predictions on the text stay closer to the original's than with
+    /// every matrix quantised alone.
+    #[test]
+    fn propagated_calibration_keeps_the_predictions_closer() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_prop_{tag}-{pid}.gguf"));
+        let (src, alone, ordered) = (at("in"), at("alone"), at("ordered"));
+        crate::calib::tests::write_tiny_calib_gguf_shape(&src, 64, 128, 0.3, 3, false);
+        let texts = ["hello world again hello world again again hello", "again again hello world hello"];
+        let stats = crate::calib::capture(&src, &texts).unwrap();
+        let base = Options {
+            avg_bits: 2.25,
+            targets: vec![Target::Q2_0],
+            gsq: GsqConfig { steps: 60, ..GsqConfig::default() },
+            stats: Some(stats),
+            ..Options::default()
+        };
+        requantise(&src, &alone, &base).unwrap();
+        let settings = crate::propagate::Settings {
+            texts: texts.iter().map(|t| t.to_string()).collect(),
+            max_tokens: 32,
+            ridge: 0.01,
+        };
+        let report = requantise(&src, &ordered, &Options { propagate: Some(settings), ..base.clone() }).unwrap();
+        assert_eq!(report.propagated, 21, "seven matrices in each of three blocks");
+        let kl = |path: &Path| crate::sensitivity::divergence_between(&src, path, &texts, 32).unwrap();
+        let (apart, together) = (kl(&alone), kl(&ordered));
+        assert!(apart > 0.0 && together < 0.95 * apart, "{together} in order, {apart} alone");
+        // The same matrices took the same type either way.
+        let (a, b) = (GgufFile::open(&alone).unwrap(), GgufFile::open(&ordered).unwrap());
+        for t in &a.tensors {
+            assert_eq!(b.tensor(&t.name).unwrap().ggml_type, t.ggml_type, "{}", t.name);
+        }
+        for path in [src, alone, ordered] {
             let _ = std::fs::remove_file(path);
         }
     }

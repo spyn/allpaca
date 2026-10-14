@@ -41,6 +41,7 @@ mod otel;
 mod packed;
 mod qwen4exp;
 pub mod gsq;
+pub mod propagate;
 pub mod rco;
 pub mod requant;
 mod rpc_runtime;

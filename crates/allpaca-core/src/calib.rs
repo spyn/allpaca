@@ -145,17 +145,41 @@ impl InputStats {
 pub(crate) struct Tap {
     on: AtomicBool,
     stats: Mutex<InputStats>,
+    /// While set: the vectors of one block's sites, in the order seen.
+    keeping: AtomicBool,
+    kept: Mutex<(usize, HashMap<Site, Vec<f32>>)>,
 }
 
 impl Tap {
     #[inline]
     pub(crate) fn observe(&self, blk: usize, site: Site, x: &[f32]) {
+        if self.keeping.load(Ordering::Relaxed) {
+            if let Ok(mut kept) = self.kept.lock() {
+                if kept.0 == blk {
+                    kept.1.entry(site).or_default().extend_from_slice(x);
+                }
+            }
+        }
         if !self.on.load(Ordering::Relaxed) {
             return;
         }
         if let Ok(mut stats) = self.stats.lock() {
             stats.sites.entry((blk, site)).or_default().add(x);
         }
+    }
+
+    /// Keep every vector block `blk`'s sites see from now on.
+    pub(crate) fn keep(&self, blk: usize) {
+        if let Ok(mut kept) = self.kept.lock() {
+            *kept = (blk, HashMap::new());
+        }
+        self.keeping.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop keeping and hand over what was kept, per site.
+    pub(crate) fn take_kept(&self) -> HashMap<Site, Vec<f32>> {
+        self.keeping.store(false, Ordering::Relaxed);
+        self.kept.lock().map(|mut k| std::mem::take(&mut k.1)).unwrap_or_default()
     }
 
     pub(crate) fn start(&self) {
