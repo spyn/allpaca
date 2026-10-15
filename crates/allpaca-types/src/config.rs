@@ -685,6 +685,10 @@ pub struct PromptCacheSection {
     pub disk_dir: Option<PathBuf>,
     /// Cap on the disk tier's files. 0 = unlimited.
     pub disk_bytes: usize,
+    /// Keep the disk tier's files on the first RPC worker that serves the
+    /// `prompt_cache` store (`allpaca-rpc-server --prompt-cache-gib`)
+    /// instead of `disk_dir`; they then outlive a restart of this side.
+    pub worker: bool,
     /// Models with recurrent state also keep it each time prefill passes
     /// this many more tokens, so an edit inside a long prompt resumes from
     /// the last such point. 0 = only at the end of a prompt.
@@ -698,6 +702,7 @@ impl Default for PromptCacheSection {
             codec: KvCodec::F32,
             disk_dir: None,
             disk_bytes: 16 << 30,
+            worker: false,
             boundary_tokens: 2048,
         }
     }
@@ -1340,5 +1345,6 @@ mod tests {
         assert_eq!(cfg.prompt_cache.disk_bytes, 2048);
         assert_eq!(defaults.prompt_cache.disk_dir, None);
         assert_eq!(defaults.prompt_cache.boundary_tokens, 2048);
+        assert!(!defaults.prompt_cache.worker);
     }
 }

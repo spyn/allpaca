@@ -36,6 +36,9 @@ pub struct RadixCheckpoint {
     /// No recurrent state: the keys and values of any prefix of this
     /// checkpoint's tokens resume that prefix.
     pub(crate) sliceable: bool,
+    /// Only recurrent state: the keys and values come from a longer
+    /// prompt's checkpoint below it.
+    pub(crate) state_only: bool,
 }
 
 impl RadixCheckpoint {
@@ -52,8 +55,12 @@ impl RadixCheckpoint {
             .flatten()
             .map(|l| l.len().saturating_mul(4))
             .sum();
+        let host_kv: usize = r.host_kv.iter().map(|(k, v)| (k.len() + v.len()) * 4).sum();
         let kv: usize = self.kv.iter().map(EncodedRows::bytes).sum();
-        rec.saturating_add(kv).saturating_add(64)
+        rec.saturating_add(host_kv)
+            .saturating_add(r.q4x.host_bytes())
+            .saturating_add(kv)
+            .saturating_add(64)
     }
 
     /// The same checkpoint cut to its first `n` tokens.
@@ -62,6 +69,7 @@ impl RadixCheckpoint {
             recurrent: self.recurrent.clone(),
             kv: self.kv.iter().map(|layer| layer.prefix(n)).collect(),
             sliceable: self.sliceable,
+            state_only: self.state_only,
         }
     }
 }
@@ -69,7 +77,7 @@ impl RadixCheckpoint {
 /// A checkpoint's file in the disk tier.
 #[derive(Debug)]
 struct OnDisk {
-    file: PathBuf,
+    name: String,
     bytes: usize,
     sliceable: bool,
     /// A state checkpoint (no keys and values).
@@ -96,7 +104,7 @@ impl RadixNode {
 
     /// Holds keys and values (not only recurrent state).
     fn has_kv(&self) -> bool {
-        self.checkpoint.as_ref().is_some_and(|cp| !cp.kv.is_empty())
+        self.checkpoint.as_ref().is_some_and(|cp| !cp.state_only)
             || self.on_disk.as_ref().is_some_and(|d| !d.state_only)
     }
 
@@ -106,10 +114,76 @@ impl RadixNode {
     }
 }
 
-/// Where the disk tier keeps its files.
+/// Where the disk tier keeps checkpoint files: a local folder, or a worker
+/// ([`crate::prompt_store::RemoteStore`]).
+pub(crate) trait CheckpointStore: Send + std::fmt::Debug {
+    fn put(&mut self, name: &str, data: &[u8]) -> Result<(), String>;
+    fn get(&mut self, name: &str) -> Option<Vec<u8>>;
+    fn remove(&mut self, name: &str);
+    /// Every checkpoint held, oldest first.
+    fn list(&mut self) -> Result<Vec<Listed>, String>;
+}
+
+/// One file a [`CheckpointStore`] holds.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Listed {
+    pub(crate) name: String,
+    pub(crate) bytes: usize,
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) flags: u8,
+}
+
+/// Checkpoint files in a local folder.
+#[derive(Debug)]
+pub(crate) struct LocalDir {
+    dir: PathBuf,
+}
+
+impl LocalDir {
+    pub(crate) fn open(dir: &Path) -> Result<Self, AllpacaError> {
+        std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
+        Ok(Self { dir: dir.to_path_buf() })
+    }
+}
+
+impl CheckpointStore for LocalDir {
+    fn put(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
+        write_file(&self.dir.join(name), data).map_err(|e| e.to_string())
+    }
+
+    fn get(&mut self, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.dir.join(name)).ok()
+    }
+
+    fn remove(&mut self, name: &str) {
+        let _ = std::fs::remove_file(self.dir.join(name));
+    }
+
+    fn list(&mut self) -> Result<Vec<Listed>, String> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&self.dir).map_err(|e| e.to_string())?.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "ckpt") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Some((tokens, flags)) = read_file_header(&path) else {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            found.push((modified, Listed { name, bytes: meta.len() as usize, tokens, flags }));
+        }
+        found.sort_by_key(|f| f.0);
+        Ok(found.into_iter().map(|(_, l)| l).collect())
+    }
+}
+
+/// The disk tier: a store and its budget.
 #[derive(Debug)]
 struct Disk {
-    dir: PathBuf,
+    store: Box<dyn CheckpointStore>,
     /// 0 = unlimited.
     max_bytes: usize,
     bytes: usize,
@@ -186,48 +260,45 @@ impl KvRadixForest {
         Ok(self)
     }
 
-    /// Write every checkpoint to `dir` as well, read them back when RAM no
-    /// longer holds them, and pick up the files already there. `max_bytes`
-    /// caps the files (0 = unlimited).
+    /// Keep checkpoints in `store` too; see [`Self::open_store`].
+    pub(crate) fn with_store(mut self, store: Box<dyn CheckpointStore>, max_bytes: usize) -> Result<Self, AllpacaError> {
+        self.open_store(store, max_bytes)?;
+        Ok(self)
+    }
+
+    /// [`Self::open_store`] on the folder `dir`.
     pub fn open_disk(&mut self, dir: &Path, max_bytes: usize) -> Result<(), AllpacaError> {
-        std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir(dir).map_err(|e| io_error(dir, e))?.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "ckpt") {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            let Some((tokens, flags)) = read_file_header(&path) else {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            };
-            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            let on_disk = OnDisk {
-                file: path,
-                bytes: meta.len() as usize,
-                sliceable: flags & FLAG_SLICEABLE != 0,
-                state_only: flags & FLAG_STATE_ONLY != 0,
-            };
-            found.push((modified, tokens, on_disk));
-        }
-        found.sort_by_key(|f| f.0);
+        self.open_store(Box::new(LocalDir::open(dir)?), max_bytes)
+    }
+
+    /// Write every checkpoint to `store` as well, read them back when RAM no
+    /// longer holds them, and pick up the ones already there. `max_bytes`
+    /// caps the files (0 = unlimited).
+    pub(crate) fn open_store(&mut self, mut store: Box<dyn CheckpointStore>, max_bytes: usize) -> Result<(), AllpacaError> {
+        let found = store.list().map_err(|e| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!("prompt cache store: {e}")))
+        })?;
         self.disk = Some(Disk {
-            dir: dir.to_path_buf(),
+            store,
             max_bytes,
             bytes: 0,
         });
-        for (_, tokens, on_disk) in found {
-            if tokens.is_empty() {
+        for listed in found {
+            if listed.tokens.is_empty() {
                 continue;
             }
             let stamp = self.touch();
-            let bytes = on_disk.bytes;
-            let node = node_insert(&mut self.root, &mut self.nodes, &tokens);
+            let on_disk = OnDisk {
+                name: listed.name,
+                bytes: listed.bytes,
+                sliceable: listed.flags & FLAG_SLICEABLE != 0,
+                state_only: listed.flags & FLAG_STATE_ONLY != 0,
+            };
+            let node = node_insert(&mut self.root, &mut self.nodes, &listed.tokens);
             node.used_at = stamp;
             let old = node.on_disk.replace(on_disk).map_or(0, |d| d.bytes);
             self.disk_sub(old);
-            self.disk_add(bytes);
+            self.disk_add(listed.bytes);
         }
         self.trim_disk();
         Ok(())
@@ -248,6 +319,7 @@ impl KvRadixForest {
             recurrent,
             kv: kv.iter().map(|rows| EncodedRows::encode(self.codec, rows)).collect(),
             sliceable: false,
+            state_only: false,
         }
     }
 
@@ -300,6 +372,14 @@ impl KvRadixForest {
         }
     }
 
+    /// Delete `file` from the store.
+    fn disk_remove(&mut self, file: &OnDisk) {
+        if let Some(d) = self.disk.as_mut() {
+            d.store.remove(&file.name);
+        }
+        self.disk_sub(file.bytes);
+    }
+
     fn disk_sub(&mut self, bytes: usize) {
         if let Some(d) = self.disk.as_mut() {
             d.bytes = d.bytes.saturating_sub(bytes);
@@ -312,15 +392,15 @@ impl KvRadixForest {
         if tokens.is_empty() {
             return 0;
         }
-        let written = self.disk.as_ref().and_then(|d| {
-            let file = d.dir.join(file_name(tokens));
+        let written = self.disk.as_mut().and_then(|d| {
+            let name = file_name(tokens);
             let data = encode_file(tokens, &cp);
-            match write_file(&file, &data) {
+            match d.store.put(&name, &data) {
                 Ok(()) => Some(OnDisk {
-                    file,
+                    name,
                     bytes: data.len(),
                     sliceable: cp.sliceable,
-                    state_only: cp.kv.is_empty(),
+                    state_only: cp.state_only,
                 }),
                 Err(e) => {
                     tracing::warn!(error = %e, "prompt cache: checkpoint not written to disk");
@@ -366,6 +446,7 @@ impl KvRadixForest {
             recurrent,
             kv: Vec::new(),
             sliceable: false,
+            state_only: true,
         };
         self.insert_checkpoint(tokens, cp);
     }
@@ -414,8 +495,7 @@ impl KvRadixForest {
             self.checkpoint_bytes = self.checkpoint_bytes.saturating_sub(cp.approx_bytes());
         }
         if let Some(file) = file {
-            let _ = std::fs::remove_file(&file.file);
-            self.disk_sub(file.bytes);
+            self.disk_remove(&file);
         }
         self.prune(&path);
         true
@@ -435,8 +515,7 @@ impl KvRadixForest {
             let file = node.on_disk.take().expect("chosen for its file");
             // A file that goes takes its RAM copy with it: the two stay in step.
             let cp = node.checkpoint.take();
-            let _ = std::fs::remove_file(&file.file);
-            self.disk_sub(file.bytes);
+            self.disk_remove(&file);
             if let Some(cp) = cp {
                 self.checkpoint_bytes = self.checkpoint_bytes.saturating_sub(cp.approx_bytes());
             }
@@ -594,11 +673,12 @@ impl KvRadixForest {
     /// checkpoint taken from a longer prompt's checkpoint below it.
     fn resume_at(&mut self, path: &[u32]) -> Option<(usize, RadixCheckpoint)> {
         let mut cp = self.load(path)?;
-        if cp.kv.is_empty() {
+        if cp.state_only {
             let rest = kv_below(node_at(&self.root, path)?)?;
             let mut below = path.to_vec();
             below.extend(rest);
             cp.kv = self.load(&below)?.prefix(path.len()).kv;
+            cp.state_only = false;
         }
         Some((path.len(), cp))
     }
@@ -612,15 +692,17 @@ impl KvRadixForest {
         if let Some(cp) = node.checkpoint.as_ref() {
             return Some(cp.clone());
         }
-        let file = node.on_disk.as_ref()?.file.clone();
-        let cp = std::fs::read(&file)
-            .ok()
+        let name = node.on_disk.as_ref()?.name.clone();
+        let cp = self
+            .disk
+            .as_mut()
+            .and_then(|d| d.store.get(&name))
             .and_then(|bytes| decode_file(&bytes, path));
         let Some(cp) = cp else {
-            tracing::warn!(file = %file.display(), "prompt cache: unreadable checkpoint file dropped");
-            let gone = node.on_disk.take().map_or(0, |d| d.bytes);
-            let _ = std::fs::remove_file(&file);
-            self.disk_sub(gone);
+            tracing::warn!(name, "prompt cache: checkpoint file gone or unreadable");
+            if let Some(file) = node.on_disk.take() {
+                self.disk_remove(&file);
+            }
             self.prune(path);
             return None;
         };
@@ -800,7 +882,7 @@ fn kv_below(node: &RadixNode) -> Option<Vec<u32>> {
 }
 
 const MAGIC: &[u8; 4] = b"APKC";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const FLAG_SLICEABLE: u8 = 1;
 const FLAG_STATE_ONLY: u8 = 2;
 
@@ -831,7 +913,8 @@ fn write_file(file: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// `MAGIC`, version, tokens, flags, per-layer keys and values, then the
-/// recurrent state (layers, ssm_h, ssm_conv, gdn_state, gdn_conv).
+/// recurrent state (layers, ssm_h, ssm_conv, gdn_state, gdn_conv), the host
+/// attention keys and values, and the qwen4exp memory.
 fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     let mut out = Vec::with_capacity(cp.approx_bytes() + tokens.len() * 4 + 64);
     out.extend_from_slice(MAGIC);
@@ -844,7 +927,7 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     if cp.sliceable {
         flags |= FLAG_SLICEABLE;
     }
-    if cp.kv.is_empty() {
+    if cp.state_only {
         flags |= FLAG_STATE_ONLY;
     }
     out.push(flags);
@@ -862,6 +945,16 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
             }
         }
     }
+    out.extend_from_slice(&(r.host_kv.len() as u32).to_le_bytes());
+    for (k, v) in &r.host_kv {
+        crate::kv_codec::write_f32s(&mut out, k);
+        crate::kv_codec::write_f32s(&mut out, v);
+    }
+    let q4x = r.q4x.tokens() > 0;
+    out.push(q4x as u8);
+    if q4x {
+        r.q4x.write_to(&mut out);
+    }
     out
 }
 
@@ -873,6 +966,11 @@ fn read_header(r: &mut Reader<'_>) -> Option<(Vec<u32>, u8)> {
     let tokens = (0..n).map(|_| r.u32()).collect::<Option<Vec<_>>>()?;
     let flags = r.u8()?;
     Some((tokens, flags))
+}
+
+/// Tokens and flags of the checkpoint file `data`.
+pub(crate) fn header_of(data: &[u8]) -> Option<(Vec<u32>, u8)> {
+    read_header(&mut Reader(data))
 }
 
 /// Tokens and flags, reading only the start of the file.
@@ -914,6 +1012,16 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
         }
         groups.push(group);
     }
+    let n_host_kv = r.u32()? as usize;
+    let mut host_kv = Vec::with_capacity(n_host_kv.min(1024));
+    for _ in 0..n_host_kv {
+        host_kv.push((r.f32s()?, r.f32s()?));
+    }
+    let q4x = match r.u8()? {
+        0 => None,
+        1 => Some(crate::qwen4exp::Qwen4Memory::read_from(&mut r)?),
+        _ => return None,
+    };
     if !r.0.is_empty() {
         return None;
     }
@@ -924,10 +1032,15 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
     recurrent.ssm_conv = groups.next()?;
     recurrent.gdn_state = groups.next()?;
     recurrent.gdn_conv = groups.next()?;
+    recurrent.host_kv = host_kv;
+    if let Some(q4x) = q4x {
+        recurrent.q4x = q4x;
+    }
     Some(RadixCheckpoint {
         recurrent,
         kv,
         sliceable: flags & FLAG_SLICEABLE != 0,
+        state_only: flags & FLAG_STATE_ONLY != 0,
     })
 }
 

@@ -932,6 +932,12 @@ impl RpcRuntime {
         })
     }
 
+    /// The first worker (any backend) that serves the extension `name`.
+    pub fn session_serving(&self, name: &str) -> Option<usize> {
+        let sessions = self.sessions.lock().ok()?;
+        sessions.iter().position(|session| session.has_extension(name))
+    }
+
     /// The first HIP worker that serves the extension `name`: its session
     /// and the free bytes of its GPUs.
     pub fn extension_host(&self, name: &str) -> Option<(usize, Vec<u64>)> {

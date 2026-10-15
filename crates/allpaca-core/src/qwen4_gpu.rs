@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use allpaca_gguf::{GgmlType, GgufFile, TensorInfo};
 use allpaca_hip::{
     device_local_headroom, device_memory_info, device_memset, memcpy, q2_0_expert_slot_bytes, q2_0_moe_ffn_device,
-    q4x, set_device, silu_scale_device, DeviceWeights, HipWorkspace, MEMCPY_D2D,
+    q4x, set_device, silu_scale_device, DeviceWeights, HipWorkspace, MEMCPY_D2D, MEMCPY_D2H, MEMCPY_H2D,
 };
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -458,6 +458,154 @@ impl Clone for Qwen4DeviceState {
                 .collect(),
             picked: HashMap::new(),
         }
+    }
+}
+
+/// A sequence's [`Qwen4DeviceState`] read back to the host (for the prompt
+/// cache), to be put on the same cards again.
+#[derive(Debug, Clone, Default)]
+pub struct Qwen4DeviceHost {
+    blocks: Vec<BlockHost>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BlockHost {
+    device: i32,
+    state: Option<Vec<f32>>,
+    conv: Option<Vec<f32>>,
+    /// The rows of `k`, `v` and `ik` that hold tokens.
+    k: Option<Vec<f32>>,
+    v: Option<Vec<f32>>,
+    ik: Option<Vec<f32>>,
+    rows: usize,
+    qsa: QsaKeys,
+}
+
+fn read_back(buf: &Option<DeviceWeights>, floats: usize) -> Result<Option<Vec<f32>>, AllpacaError> {
+    let Some(buf) = buf else {
+        return Ok(None);
+    };
+    let floats = floats.min(buf.bytes() as usize / 4);
+    let mut out = vec![0.0f32; floats];
+    set_device(buf.device())?;
+    memcpy(out.as_mut_ptr().cast(), buf.ptr_at(0).cast(), floats * 4, MEMCPY_D2H)?;
+    Ok(Some(out))
+}
+
+fn put_back(device: i32, values: &Option<Vec<f32>>, floats: usize) -> Result<Option<DeviceWeights>, AllpacaError> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    let buf = zeroed(device, floats.max(values.len()).max(1))?;
+    memcpy(buf.ptr_at(0).cast_mut().cast(), values.as_ptr().cast(), values.len() * 4, MEMCPY_H2D)?;
+    Ok(Some(buf))
+}
+
+impl Qwen4DeviceState {
+    /// Read back what the sequence's first `tokens` tokens left on the cards
+    /// (everything queued on them must have finished).
+    pub fn to_host(&self, tokens: usize) -> Result<Qwen4DeviceHost, AllpacaError> {
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| {
+                let device = [&b.state, &b.conv, &b.k, &b.v, &b.ik]
+                    .into_iter()
+                    .find_map(|w| w.as_ref().map(DeviceWeights::device))
+                    .unwrap_or(0);
+                let rows = tokens.min(b.kv_tokens);
+                let used = |w: &Option<DeviceWeights>| {
+                    w.as_ref()
+                        .map_or(0, |w| w.bytes() as usize / 4 / b.kv_tokens.max(1) * rows)
+                };
+                Ok(BlockHost {
+                    device,
+                    state: read_back(&b.state, usize::MAX)?,
+                    conv: read_back(&b.conv, usize::MAX)?,
+                    k: read_back(&b.k, used(&b.k))?,
+                    v: read_back(&b.v, used(&b.v))?,
+                    ik: read_back(&b.ik, used(&b.ik))?,
+                    rows,
+                    qsa: b.qsa.clone(),
+                })
+            })
+            .collect::<Result<_, AllpacaError>>()?;
+        Ok(Qwen4DeviceHost { blocks })
+    }
+
+    /// Put a state read back by [`Self::to_host`] on its cards again.
+    pub fn from_host(host: &Qwen4DeviceHost) -> Result<Self, AllpacaError> {
+        let blocks = host
+            .blocks
+            .iter()
+            .map(|b| {
+                let capacity = if b.rows == 0 { 0 } else { b.rows.max(KV_START_TOKENS) };
+                let rows_of = |v: &Option<Vec<f32>>| {
+                    v.as_ref().map_or(0, |v| v.len() / b.rows.max(1) * capacity)
+                };
+                Ok(BlockState {
+                    state: put_back(b.device, &b.state, 0)?,
+                    conv: put_back(b.device, &b.conv, 0)?,
+                    k: put_back(b.device, &b.k, rows_of(&b.k))?,
+                    v: put_back(b.device, &b.v, rows_of(&b.v))?,
+                    ik: put_back(b.device, &b.ik, rows_of(&b.ik))?,
+                    kv_tokens: capacity,
+                    qsa: b.qsa.clone(),
+                })
+            })
+            .collect::<Result<_, AllpacaError>>()?;
+        Ok(Self {
+            blocks,
+            picked: HashMap::new(),
+        })
+    }
+}
+
+impl Qwen4DeviceHost {
+    /// Bytes held on the host.
+    pub fn host_bytes(&self) -> usize {
+        self.blocks
+            .iter()
+            .map(|b| {
+                let len = |v: &Option<Vec<f32>>| v.as_ref().map_or(0, Vec::len);
+                (len(&b.state) + len(&b.conv) + len(&b.k) + len(&b.v) + len(&b.ik) + b.qsa.floats()) * 4
+            })
+            .sum()
+    }
+
+    /// Append to a prompt-cache checkpoint file.
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        use crate::kv_codec::write_opt_f32s;
+        out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
+        for b in &self.blocks {
+            out.extend_from_slice(&b.device.to_le_bytes());
+            out.extend_from_slice(&(b.rows as u64).to_le_bytes());
+            for v in [&b.state, &b.conv, &b.k, &b.v, &b.ik] {
+                write_opt_f32s(out, v.as_deref());
+            }
+            b.qsa.write_to(out);
+        }
+    }
+
+    /// What [`Self::write_to`] wrote.
+    pub fn read_from(r: &mut crate::kv_codec::Reader<'_>) -> Option<Self> {
+        let n = r.u32()? as usize;
+        let mut blocks = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            let device = r.u32()? as i32;
+            let rows = usize::try_from(r.u64()?).ok()?;
+            blocks.push(BlockHost {
+                device,
+                rows,
+                state: r.opt_f32s()?,
+                conv: r.opt_f32s()?,
+                k: r.opt_f32s()?,
+                v: r.opt_f32s()?,
+                ik: r.opt_f32s()?,
+                qsa: QsaKeys::read_from(r)?,
+            });
+        }
+        Some(Self { blocks })
     }
 }
 
@@ -1105,6 +1253,11 @@ impl Qwen4Gpu {
     pub fn sync(&self, card: usize) -> Result<(), AllpacaError> {
         self.cards[card].hip.bind()?;
         allpaca_hip::stream_synchronize()
+    }
+
+    /// Wait for everything queued on every card.
+    pub fn sync_all(&self) -> Result<(), AllpacaError> {
+        (0..self.cards.len()).try_for_each(|card| self.sync(card))
     }
 
     /// The streams of the pass's tokens, token-major, to `card`.

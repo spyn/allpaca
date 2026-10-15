@@ -4428,15 +4428,26 @@ impl Engine {
         inner.prompt_cache_key = Some(key);
         inner.kv_radix.reset();
         let pc = &self.config.prompt_cache;
-        let Some(dir) = pc.disk_dir.as_ref() else {
-            return;
-        };
-        // Their state is not part of a checkpoint file.
-        if target.dsv4.is_some() || target.q4x.is_some() {
+        // Its state is not part of a checkpoint file.
+        if target.dsv4.is_some() {
             return;
         }
-        let dir = dir.join(format!("{key:016x}"));
-        if let Err(e) = inner.kv_radix.open_disk(&dir, pc.disk_bytes) {
+        let folder = format!("{key:016x}");
+        let worker = pc.worker.then_some(self.rpc.as_ref()).flatten().and_then(|rt| {
+            let session = rt.session_serving(crate::prompt_store::EXT)?;
+            Some(crate::prompt_store::RemoteStore::new(rt.clone(), session, &folder))
+        });
+        let opened = match (worker, pc.disk_dir.as_ref()) {
+            (Some(store), _) => inner.kv_radix.open_store(Box::new(store), pc.disk_bytes),
+            (None, Some(dir)) => inner.kv_radix.open_disk(&dir.join(&folder), pc.disk_bytes),
+            (None, None) => {
+                if pc.worker {
+                    tracing::warn!("prompt cache: no RPC worker serves the prompt_cache store");
+                }
+                return;
+            }
+        };
+        if let Err(e) = opened {
             tracing::warn!(error = %e, "prompt cache: disk tier not opened");
         }
     }
@@ -4460,6 +4471,32 @@ impl Engine {
             return Ok(());
         };
         inner.kv_radix.insert_state(&tokens, state);
+        Ok(())
+    }
+
+    /// qwen4exp keeps its whole state (keys and values too) in the sequence's
+    /// memory: the checkpoint is a host copy of it.
+    fn capture_qwen4_prompt(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+    ) -> Result<(), AllpacaError> {
+        let active = request(inner, id)?;
+        if !active.vision.is_empty() || active.probe.is_some() {
+            return Ok(());
+        }
+        let Some(state) = active.recurrent.as_ref() else {
+            return Ok(());
+        };
+        let Some(q4x) = state.q4x.for_cache(target)? else {
+            return Ok(());
+        };
+        let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
+        recurrent.q4x = q4x;
+        let tokens = active.tokens[..active.prompt_len].to_vec();
+        let cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
+        inner.kv_radix.insert_checkpoint(&tokens, cp);
         Ok(())
     }
 
@@ -4503,6 +4540,9 @@ impl Engine {
         id: u64,
         target: &TinyModel,
     ) -> Result<(), AllpacaError> {
+        if target.q4x.is_some() {
+            return self.capture_qwen4_prompt(inner, id, target);
+        }
         if !self.prompt_cache_reads_back(inner, id, target)? {
             return Ok(());
         }
@@ -9304,6 +9344,49 @@ mod tests {
         assert!(stats.radix_hits >= 1, "checkpoints on disk must serve a new engine; {stats:?}");
         assert_eq!(hit.token_ids, full.token_ids);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_on_a_worker_serves_a_new_engine() {
+        use allpaca_rpc::{serve_connection_ext, CpuWorker, WorkerBackend};
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let store = Arc::new(Mutex::new(crate::prompt_store::WorkerStore::new(0)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let served = store.clone();
+        std::thread::spawn(move || {
+            // One coordinator after the other, the store outliving each.
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let ext = vec![crate::prompt_store::worker_extension(served.clone())];
+                let _ = serve_connection_ext(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20)), None, ext);
+            }
+        });
+        let plain = || {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            cfg
+        };
+        let with_worker = || {
+            let mut cfg = plain();
+            cfg.rpc.endpoints = vec![addr.clone()];
+            cfg.prompt_cache.worker = true;
+            cfg
+        };
+        let full = Engine::new(plain()).unwrap().generate("hello world hello true", params.clone()).unwrap();
+        Engine::new(with_worker()).unwrap().generate("hello world hello", params.clone()).unwrap();
+        assert!(store.lock().unwrap().bytes() > 0, "checkpoints went to the worker");
+
+        let engine = Engine::new(with_worker()).unwrap();
+        let hit = engine.generate("hello world hello true", params).unwrap();
+        let stats = engine.stats();
+        assert!(stats.radix_hits >= 1, "the worker's checkpoints must serve a new engine; {stats:?}");
+        assert_eq!(hit.token_ids, full.token_ids);
     }
 
     #[test]

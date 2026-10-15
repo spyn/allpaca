@@ -110,6 +110,22 @@ impl EncodedRows {
     }
 }
 
+/// Append a length-prefixed run of floats.
+pub(crate) fn write_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// [`write_f32s`] for something that may be absent.
+pub(crate) fn write_opt_f32s(out: &mut Vec<u8>, values: Option<&[f32]>) {
+    out.push(values.is_some() as u8);
+    if let Some(values) = values {
+        write_f32s(out, values);
+    }
+}
+
 /// Little-endian reads from a byte slice.
 pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
@@ -133,6 +149,26 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn u64(&mut self) -> Option<u64> {
         self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    /// What [`write_f32s`] wrote.
+    pub(crate) fn f32s(&mut self) -> Option<Vec<f32>> {
+        let n = usize::try_from(self.u64()?).ok()?;
+        let raw = self.take(n.checked_mul(4)?)?;
+        Some(
+            raw.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect(),
+        )
+    }
+
+    /// What [`write_opt_f32s`] wrote.
+    pub(crate) fn opt_f32s(&mut self) -> Option<Option<Vec<f32>>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(self.f32s()?)),
+            _ => None,
+        }
     }
 }
 

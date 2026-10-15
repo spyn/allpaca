@@ -19,7 +19,7 @@ use crate::deltanet::{
 };
 use crate::model::{topk_from_logits, ModelConfig, TinyModel};
 use crate::qsa::{QsaKeys, QsaShape};
-use crate::qwen4_gpu::{Qwen4DeviceState, Qwen4Gpu};
+use crate::qwen4_gpu::{Qwen4DeviceHost, Qwen4DeviceState, Qwen4Gpu};
 
 fn load_err(msg: String) -> AllpacaError {
     AllpacaError::Fatal(FatalError::ModelLoad(msg))
@@ -397,6 +397,9 @@ pub struct Qwen4Memory {
     pub times: Option<Qwen4Times>,
     /// The recurrent states, keys and values when the forward runs on the GPU.
     device: Option<Qwen4DeviceState>,
+    /// The same read back to the host (a prompt-cache copy), put on the
+    /// cards by the next GPU forward.
+    device_host: Option<Qwen4DeviceHost>,
     /// This sequence's state on the worker that hosts blocks, when one does.
     remote: Option<crate::qwen4_remote::RemoteSeq>,
 }
@@ -425,6 +428,103 @@ pub struct Qwen4Times {
 impl Qwen4Memory {
     pub fn tokens(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// A copy for the prompt cache that holds nothing on the cards: the
+    /// device state is read back to the host. `None` when part of the
+    /// sequence lives on a worker that hosts blocks.
+    pub(crate) fn for_cache(&self, model: &TinyModel) -> Result<Option<Self>, AllpacaError> {
+        if self.remote.is_some() {
+            return Ok(None);
+        }
+        let device_host = match &self.device {
+            Some(device) => {
+                if let Some(q4) = model.q4x.as_ref() {
+                    if let Some(gpu) = q4.gpu.lock().map_err(|_| load_err("qwen4exp GPU lock".into()))?.as_ref() {
+                        gpu.sync_all()?;
+                    }
+                }
+                Some(device.to_host(self.tokens.len())?)
+            }
+            None => self.device_host.clone(),
+        };
+        Ok(Some(Self {
+            tokens: self.tokens.clone(),
+            layers: self.layers.clone(),
+            ple_history: self.ple_history.clone(),
+            routes: None,
+            times: None,
+            device: None,
+            device_host,
+            remote: None,
+        }))
+    }
+
+    /// Bytes held on the host.
+    pub(crate) fn host_bytes(&self) -> usize {
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| (l.gdn_state.len() + l.gdn_conv.len() + l.k.len() + l.v.len() + l.qsa.floats()) * 4)
+            .sum();
+        self.tokens.len() * 8
+            + layers
+            + self.ple_history.len() * 4
+            + self.device_host.as_ref().map_or(0, Qwen4DeviceHost::host_bytes)
+    }
+
+    /// Append to a prompt-cache checkpoint file (what [`Self::for_cache`]
+    /// keeps).
+    pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
+        use crate::kv_codec::write_f32s;
+        out.extend_from_slice(&(self.tokens.len() as u64).to_le_bytes());
+        for t in &self.tokens {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for l in &self.layers {
+            for v in [&l.gdn_state, &l.gdn_conv, &l.k, &l.v] {
+                write_f32s(out, v);
+            }
+            l.qsa.write_to(out);
+        }
+        write_f32s(out, &self.ple_history);
+        out.push(self.device_host.is_some() as u8);
+        if let Some(host) = &self.device_host {
+            host.write_to(out);
+        }
+    }
+
+    /// What [`Self::write_to`] wrote.
+    pub(crate) fn read_from(r: &mut crate::kv_codec::Reader<'_>) -> Option<Self> {
+        let n = usize::try_from(r.u64()?).ok()?;
+        let tokens = (0..n)
+            .map(|_| r.u64().map(|t| t as i64))
+            .collect::<Option<Vec<_>>>()?;
+        let n_layers = r.u32()? as usize;
+        let mut layers = Vec::with_capacity(n_layers.min(1024));
+        for _ in 0..n_layers {
+            layers.push(LayerState {
+                gdn_state: r.f32s()?,
+                gdn_conv: r.f32s()?,
+                k: r.f32s()?,
+                v: r.f32s()?,
+                qsa: crate::qsa::QsaKeys::read_from(r)?,
+            });
+        }
+        let ple_history = r.f32s()?;
+        let device_host = match r.u8()? {
+            0 => None,
+            1 => Some(Qwen4DeviceHost::read_from(r)?),
+            _ => return None,
+        };
+        Some(Self {
+            tokens,
+            layers,
+            ple_history,
+            device_host,
+            ..Self::default()
+        })
     }
 }
 
@@ -1109,6 +1209,11 @@ fn forward_device(
     let (dim, hc, eps, rows) = (cfg.dim, q4.spec.hc, cfg.eps, tokens.len());
     let (vocab, n_experts) = (cfg.vocab_size, cfg.n_experts);
     let dims = q4.spec.gdn.ok_or_else(|| load_err("qwen4exp has no Gated DeltaNet shape".into()))?;
+    if mem.device.is_none() {
+        if let Some(host) = mem.device_host.take() {
+            mem.device = Some(Qwen4DeviceState::from_host(&host)?);
+        }
+    }
     let device = mem.device.get_or_insert_with(Qwen4DeviceState::default);
     // A token's logits must not depend on how many share its pass.
     let _exact = allpaca_hip::ExactRows::enable();
@@ -2091,6 +2196,46 @@ mod tests {
     }
 
     /// Logits after each token of `tokens`.
+    /// The memory kept for the prompt cache (read back to the host, then
+    /// through its file encoding) carries on exactly as the live memory does.
+    fn carries_on_from_the_cache_copy(model: &TinyModel, what: &str) {
+        let tokens = long_tokens(14);
+        let vocab = model.config.vocab_size;
+        let mut live = Qwen4Memory::default();
+        let mut logits = vec![0.0f32; vocab];
+        forward_qwen4_tokens(model, &tokens[..9], 0, &mut logits, None, &mut live).expect("prefix");
+        let kept = live.for_cache(model).expect("read back").expect("cacheable");
+        assert!(kept.host_bytes() > 0, "{what}");
+        let mut bytes = Vec::new();
+        kept.write_to(&mut bytes);
+        let mut copy = Qwen4Memory::read_from(&mut crate::kv_codec::Reader(&bytes)).expect("decode");
+        assert_eq!(copy.tokens(), 9, "{what}");
+        let (mut want, mut got) = (vec![0.0f32; 5 * vocab], vec![0.0f32; 5 * vocab]);
+        forward_qwen4_tokens(model, &tokens[9..], 9, &mut logits, Some(&mut want), &mut live).expect("live");
+        forward_qwen4_tokens(model, &tokens[9..], 9, &mut logits, Some(&mut got), &mut copy).expect("copy");
+        assert!(want.iter().any(|v| *v != 0.0), "{what}");
+        assert_eq!(got, want, "{what}");
+    }
+
+    #[test]
+    fn qwen4exp_memory_kept_for_the_prompt_cache_carries_on_like_the_live_one() {
+        carries_on_from_the_cache_copy(&tiny_model(), "host");
+        carries_on_from_the_cache_copy(&tiny_sparse_model(2), "host, sparse");
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_memory_kept_for_the_prompt_cache_carries_on_on_the_gpu() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        for (what, model) in [("packed", tiny_packed_model()), ("packed, sparse", tiny_packed_sparse_model(2))] {
+            crate::qwen4_gpu::attach(&model, &hip, None, None).expect("attach");
+            carries_on_from_the_cache_copy(&model, what);
+        }
+    }
+
     fn run(model: &TinyModel, tokens: &[u32]) -> Vec<Vec<f32>> {
         let mut mem = Qwen4Memory::default();
         let mut logits = vec![0.0f32; model.config.vocab_size];

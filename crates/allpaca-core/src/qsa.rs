@@ -63,6 +63,25 @@ pub struct QsaKeys {
 }
 
 impl QsaKeys {
+    /// Floats held (raw and pooled).
+    pub(crate) fn floats(&self) -> usize {
+        self.raw.len() + self.pooled.len()
+    }
+
+    /// Append to a prompt-cache checkpoint file.
+    pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
+        crate::kv_codec::write_f32s(out, &self.raw);
+        crate::kv_codec::write_f32s(out, &self.pooled);
+    }
+
+    /// What [`Self::write_to`] wrote.
+    pub(crate) fn read_from(r: &mut crate::kv_codec::Reader<'_>) -> Option<Self> {
+        Some(Self {
+            raw: r.f32s()?,
+            pooled: r.f32s()?,
+        })
+    }
+
     /// Tokens whose raw key is held.
     pub fn tokens(&self, shape: &QsaShape) -> usize {
         self.raw.len() / shape.dim
