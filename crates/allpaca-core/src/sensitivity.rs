@@ -593,7 +593,7 @@ pub fn divergence_between(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::calib::tests::write_tiny_calib_gguf;
 
@@ -738,7 +738,7 @@ mod tests {
 
     /// A copy of GGUF `src` at `dst` with each tensor passed through `edit`
     /// and `extra` tensors added.
-    fn rewrite_gguf(src: &Path, dst: &Path, edit: impl Fn(&str, &mut Vec<f32>), extra: Vec<(String, Vec<u64>, Vec<f32>)>) {
+    pub(crate) fn rewrite_gguf(src: &Path, dst: &Path, edit: impl Fn(&str, &mut Vec<f32>), extra: Vec<(String, Vec<u64>, Vec<f32>)>) {
         use allpaca_gguf::{write_gguf, GgufWriteTensor};
         let file = GgufFile::open(src).unwrap();
         let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = file

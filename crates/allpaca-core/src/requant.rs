@@ -15,7 +15,8 @@
 //! option of each matrix, alone, moves the model's predictions on
 //! calibration text ([`crate::sensitivity`]): one number in the same unit
 //! for every matrix. It still adds the matrices' effects up as if they were
-//! independent.
+//! independent. Matrices the probe cannot run are estimated from their own
+//! error.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -145,8 +146,9 @@ pub struct Options {
     /// Share of a measured Gram's mean diagonal added to its diagonal.
     pub damping: f32,
     /// Choose the types by measured sensitivity ([`crate::sensitivity`])
-    /// instead of each matrix's own error: only matrices the probe can
-    /// swap are requantised, the rest are copied.
+    /// instead of each matrix's own error. A matrix the probe cannot swap
+    /// counts its own error times the probed matrices' median divergence
+    /// per unit of error.
     pub probe: Option<ProbeTexts>,
     /// A table of probe measurements: written after a probe, and when it
     /// exists, read instead of probing (`probe` is then not needed).
@@ -305,8 +307,6 @@ pub fn requantise_each(
         .iter()
         .enumerate()
         .filter(|(_, t)| t.name.ends_with(".weight") && !matches!(t.ggml_type, GgmlType::I32 | GgmlType::Other))
-        .filter(|(_, t)| probe.as_ref().is_none_or(|p| p.covers(&t.name)))
-        .filter(|(_, t)| saved.as_ref().is_none_or(|s| s.contains_key(&t.name)))
         .filter_map(|(i, t)| matrix_shape(&t.dims, opts.min_weights, targets).map(|(rows, cols)| (i, rows, cols)))
         .collect();
     if candidates.is_empty() {
@@ -325,8 +325,17 @@ pub fn requantise_each(
     let mut two_bit = Vec::with_capacity(candidates.len());
     let mut calibrated = Vec::with_capacity(candidates.len());
     let mut divergence = Vec::with_capacity(candidates.len());
+    // Whether a matrix's divergence is measured (or read from the table);
+    // the others' is estimated from their own error once all are seen.
+    let mut measured_by_probe = Vec::with_capacity(candidates.len());
     for &(i, rows, cols) in &candidates {
         let name = &file.tensors[i].name;
+        let covered = match (&probe, &saved) {
+            (Some(p), _) => p.covers(name),
+            (None, Some(s)) => s.contains_key(name),
+            (None, None) => false,
+        };
+        measured_by_probe.push(covered);
         let w = file.tensor_f32(name)?;
         let h = measured(i, cols);
         let gram = h.as_deref().map_or(Gram::Identity, Gram::Full);
@@ -351,9 +360,9 @@ pub fn requantise_each(
             let bytes = target.quantise(&w, rows, cols, &gram, &opts.gsq)?;
             allpaca_gguf::dequant_packed(target.ggml(), &bytes, w.len(), &mut decoded)?;
             row[at] = output_error(&w, &decoded, cols, &gram) / energy.max(1e-30);
-            if let Some(probe) = probe.as_mut().filter(|_| !scaled || Some(at) == anchor) {
+            if let Some(probe) = probe.as_mut().filter(|_| covered && (!scaled || Some(at) == anchor)) {
                 moved[at] = probe.divergence(name, &decoded)?;
-            } else if let Some(saved) = &saved {
+            } else if let Some(saved) = saved.as_ref().filter(|_| covered) {
                 moved[at] = saved[name.as_str()].get(target.name()).copied().ok_or_else(|| {
                     AllpacaError::Fatal(FatalError::InvalidConfig(format!(
                         "requantise: the probe table has no {} for {name}",
@@ -365,7 +374,7 @@ pub fn requantise_each(
                 kept = bytes;
             }
         }
-        if let (true, Some(anchor)) = (scaled, anchor) {
+        if let (true, true, Some(anchor)) = (covered, scaled, anchor) {
             let per_error = if row[anchor] > 0.0 { moved[anchor] / row[anchor] } else { 0.0 };
             for at in (0..targets.len()).filter(|&at| at != anchor && !row[at].is_nan()) {
                 moved[at] = per_error * row[at];
@@ -383,11 +392,28 @@ pub fn requantise_each(
     let probed = probe.take().is_some();
     if probed {
         if let Some(path) = &opts.probe_table {
-            let names = candidates.iter().map(|&(i, _, _)| file.tensors[i].name.as_str());
-            write_probe_table(path, names, targets, &divergence)?;
+            let measured: Vec<usize> = (0..candidates.len()).filter(|&c| measured_by_probe[c]).collect();
+            let names = measured.iter().map(|&c| file.tensors[candidates[c].0].name.as_str());
+            let rows: Vec<Vec<f64>> = measured.iter().map(|&c| divergence[c].clone()).collect();
+            write_probe_table(path, names, targets, &rows)?;
         }
     }
     let probed = probed || saved.is_some();
+    if probed {
+        // A matrix the probe cannot run (a multi-token-prediction layer, the
+        // fused delta-net projections) moves the predictions by its own
+        // error times the typical divergence per unit of error.
+        let mut per_error: Vec<f64> = (0..candidates.len())
+            .filter(|&c| measured_by_probe[c])
+            .flat_map(|c| errors[c].iter().zip(&divergence[c]).map(|(e, d)| d / e).collect::<Vec<_>>())
+            .filter(|r| r.is_finite())
+            .collect();
+        per_error.sort_by(f64::total_cmp);
+        let typical = per_error.get(per_error.len() / 2).copied().unwrap_or(1.0);
+        for c in (0..candidates.len()).filter(|&c| !measured_by_probe[c]) {
+            divergence[c] = errors[c].iter().map(|e| e * typical).collect();
+        }
+    }
     let weights: Vec<f64> = candidates.iter().map(|&(_, rows, cols)| (rows * cols) as f64).collect();
     // The loss of a matrix's option: how far it moved the model's predictions
     // when probed, otherwise its error weighted by its size.
@@ -966,6 +992,39 @@ mod tests {
         let kl = crate::sensitivity::divergence_between(&src, &dst, &texts, 32).unwrap();
         assert!(kl.is_finite() && kl > 0.0 && kl < 0.5, "{kl}");
         for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A matrix the probe cannot run (here a block past the model's last,
+    /// as a multi-token-prediction layer is) is still requantised, with its
+    /// divergence estimated from its own error, not copied as it was.
+    #[test]
+    fn matrices_the_probe_cannot_run_are_requantised_too() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_unprobed_{tag}-{pid}.gguf"));
+        let (base, src, dst) = (at("base"), at("in"), at("out"));
+        crate::calib::tests::write_tiny_calib_gguf_moe(&base, 64, 128, 0.3, 1, false, 4);
+        let extra = vec![("blk.1.ffn_up_exps.weight".to_string(), vec![64, 128, 4], noise(64 * 128 * 4, 7, 0.3))];
+        crate::sensitivity::tests::rewrite_gguf(&base, &src, |_, _| {}, extra);
+        let texts = vec!["hello world again hello world".to_string(), "again again hello world".to_string()];
+        let opts = Options {
+            avg_bits: 4.0,
+            gsq: GsqConfig { steps: 20, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            probe: Some(ProbeTexts { texts, max_tokens: 32, scaled: true }),
+            ..Options::default()
+        };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        let name = "blk.1.ffn_up_exps.weight";
+        let c = report.choices.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("{name} was copied"));
+        let d = c.divergence.clone().unwrap();
+        assert!(d.iter().all(|v| v.is_finite() && *v >= 0.0), "{d:?}");
+        assert!(d[0] > d[1] && d[1] > d[2], "fewer bits, more divergence: {d:?}");
+        let out = GgufFile::open(&dst).unwrap();
+        assert_eq!(out.tensor(name).unwrap().ggml_type, c.target.ggml());
+        for path in [base, src, dst] {
             let _ = std::fs::remove_file(path);
         }
     }
