@@ -128,6 +128,26 @@ enum Slot {
     Experts(usize, usize),
     /// Layer and which of the shared expert's gate, up, down.
     Shared(usize, usize),
+    /// Layer and which of the gated delta-net projections ([`GDN_PARTS`]).
+    Gdn(usize, usize),
+}
+
+/// The gated delta-net projections by tensor name, in the order of
+/// [`gdn_part`]. A fused `ssm_ba` is reshuffled on load, so it is not here.
+const GDN_PARTS: [&str; 5] = ["attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta", "ssm_out"];
+
+fn gdn_part(gdn: &crate::model::GdnHostWeights, which: usize) -> &Vec<f32> {
+    [&gdn.w_qkv, &gdn.w_z, &gdn.w_alpha, &gdn.w_beta, &gdn.w_out][which]
+}
+
+fn gdn_part_mut(gdn: &mut crate::model::GdnHostWeights, which: usize) -> &mut Vec<f32> {
+    match which {
+        0 => &mut gdn.w_qkv,
+        1 => &mut gdn.w_z,
+        2 => &mut gdn.w_alpha,
+        3 => &mut gdn.w_beta,
+        _ => &mut gdn.w_out,
+    }
 }
 
 /// Which matrix of an expert: gate, up, down.
@@ -217,7 +237,9 @@ impl Probe {
         // The first block the swap can reach. The embedding is block 0's
         // input, so a swap of it has nothing to start from.
         let from = match self.locate(name) {
-            Some(Slot::Layer(local, _) | Slot::Experts(local, _) | Slot::Shared(local, _)) => Some(local),
+            Some(Slot::Layer(local, _) | Slot::Experts(local, _) | Slot::Shared(local, _) | Slot::Gdn(local, _)) => {
+                Some(local)
+            }
             Some(Slot::Head) => Some(self.model.layers.len()),
             _ => None,
         }
@@ -264,6 +286,7 @@ impl Probe {
                 }
             },
             Slot::Shared(local, which) => Cow::Borrowed(expert_part(&self.model.layers.get(local)?.shared_expert, which)),
+            Slot::Gdn(local, which) => Cow::Borrowed(gdn_part(self.model.layers.get(local)?.gdn.as_ref()?, which)),
         })
     }
 
@@ -355,6 +378,9 @@ impl Probe {
         if let Some(which) = parts.iter().position(|p| kind.strip_suffix("_shexp") == Some(p)) {
             return Some(Slot::Shared(local, which));
         }
+        if let Some(which) = GDN_PARTS.iter().position(|p| *p == kind) {
+            return Some(Slot::Gdn(local, which));
+        }
         let kind = ["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]
             .iter()
             .position(|k| *k == kind)?;
@@ -368,6 +394,7 @@ impl Probe {
             Slot::Head => &mut self.model.lm_head,
             Slot::Experts(..) => return None,
             Slot::Shared(local, which) => expert_part_mut(&mut self.model.layers[local].shared_expert, which),
+            Slot::Gdn(local, which) => gdn_part_mut(self.model.layers[local].gdn.as_mut()?, which),
             Slot::Layer(local, kind) => {
                 let layer = &mut self.model.layers[local];
                 match kind {
@@ -402,6 +429,7 @@ impl Probe {
                 lens.iter().sum()
             }
             Slot::Shared(local, which) => expert_part(&self.model.layers.get(local)?.shared_expert, which).len(),
+            Slot::Gdn(local, which) => gdn_part(self.model.layers.get(local)?.gdn.as_ref()?, which).len(),
         };
         (len > 0).then_some(len)
     }
@@ -829,6 +857,27 @@ pub(crate) mod tests {
         }
         let diff = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
         assert!(diff > 1e-4, "silencing block 0's experts changed nothing: they were not run ({diff})");
+    }
+
+    /// The probe swaps the gated delta-net projections of Qwen3.5 blocks.
+    #[test]
+    fn the_probe_swaps_the_delta_net_projections() {
+        use crate::calib::tests::write_tiny_qwen35moe_gguf;
+        let src = std::env::temp_dir().join(format!("allpaca_gdn_probe-{}.gguf", std::process::id()));
+        write_tiny_qwen35moe_gguf(&src, 4);
+        let mut probe = Probe::open(&src, &["hello world again hello", "again hello world"], 16).unwrap();
+        let file = GgufFile::open(&src).unwrap();
+        for kind in ["attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta", "ssm_out"] {
+            let name = format!("blk.1.{kind}.weight");
+            assert!(probe.covers(&name), "{name}");
+            let w = file.tensor_f32(&name).unwrap();
+            assert!(probe.divergence(&name, &w).unwrap() < 1e-9, "{name}: its own weights");
+            let moved = probe.divergence(&name, &vec![0.0; w.len()]).unwrap();
+            assert!(moved > 1e-6, "{name}: zeroed changed nothing ({moved})");
+            assert!(probe.divergence(&name, &w).unwrap() < 1e-9, "{name}: not restored");
+        }
+        drop((probe, file));
+        let _ = std::fs::remove_file(src);
     }
 
     /// A probe of a later block starts at that block: fewer blocks run, and

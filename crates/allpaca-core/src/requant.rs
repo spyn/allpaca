@@ -151,7 +151,8 @@ pub struct Options {
     /// per unit of error.
     pub probe: Option<ProbeTexts>,
     /// A table of probe measurements: written after a probe, and when it
-    /// exists, read instead of probing (`probe` is then not needed).
+    /// exists, read instead of probing (`probe` is then not needed). With
+    /// `probe` too, the probe measures only the matrices the table lacks.
     pub probe_table: Option<PathBuf>,
     /// Once the types are chosen, quantise the blocks' matrices in order,
     /// each for the original outputs on the inputs the ones before it
@@ -289,13 +290,13 @@ pub fn requantise_each(
             "requantise: the types to choose from must be one or more, each once".into(),
         )));
     }
-    // A saved table stands in for the probe.
+    // A saved table stands in for the probe: given probe texts as well,
+    // the probe measures only what the table lacks.
     let saved = match &opts.probe_table {
         Some(path) if path.exists() => Some(read_probe_table(path)?),
         _ => None,
     };
     let mut probe = match &opts.probe {
-        Some(_) if saved.is_some() => None,
         Some(p) => {
             let texts: Vec<&str> = p.texts.iter().map(String::as_str).collect();
             Some(Probe::open(input, &texts, p.max_tokens)?)
@@ -330,11 +331,8 @@ pub fn requantise_each(
     let mut measured_by_probe = Vec::with_capacity(candidates.len());
     for &(i, rows, cols) in &candidates {
         let name = &file.tensors[i].name;
-        let covered = match (&probe, &saved) {
-            (Some(p), _) => p.covers(name),
-            (None, Some(s)) => s.contains_key(name),
-            (None, None) => false,
-        };
+        let from_table = saved.as_ref().is_some_and(|s| s.contains_key(name));
+        let covered = from_table || probe.as_ref().is_some_and(|p| p.covers(name));
         measured_by_probe.push(covered);
         let w = file.tensor_f32(name)?;
         let h = measured(i, cols);
@@ -345,7 +343,7 @@ pub fn requantise_each(
         let mut moved = vec![f64::NAN; targets.len()];
         let mut decoded = vec![0.0f32; w.len()];
         let mut kept = Vec::new();
-        let scaled = opts.probe.as_ref().is_some_and(|p| p.scaled) && probe.is_some();
+        let scaled = opts.probe.as_ref().is_some_and(|p| p.scaled) && probe.is_some() && !from_table;
         // The type a scaled probe measures: the fewest bits the rows fit.
         let anchor = targets
             .iter()
@@ -360,15 +358,15 @@ pub fn requantise_each(
             let bytes = target.quantise(&w, rows, cols, &gram, &opts.gsq)?;
             allpaca_gguf::dequant_packed(target.ggml(), &bytes, w.len(), &mut decoded)?;
             row[at] = output_error(&w, &decoded, cols, &gram) / energy.max(1e-30);
-            if let Some(probe) = probe.as_mut().filter(|_| covered && (!scaled || Some(at) == anchor)) {
-                moved[at] = probe.divergence(name, &decoded)?;
-            } else if let Some(saved) = saved.as_ref().filter(|_| covered) {
+            if let Some(saved) = saved.as_ref().filter(|_| from_table) {
                 moved[at] = saved[name.as_str()].get(target.name()).copied().ok_or_else(|| {
                     AllpacaError::Fatal(FatalError::InvalidConfig(format!(
                         "requantise: the probe table has no {} for {name}",
                         target.name()
                     )))
                 })?;
+            } else if let Some(probe) = probe.as_mut().filter(|_| covered && (!scaled || Some(at) == anchor)) {
+                moved[at] = probe.divergence(name, &decoded)?;
             }
             if target == Target::Q2_0 {
                 kept = bytes;
@@ -1025,6 +1023,46 @@ mod tests {
         let out = GgufFile::open(&dst).unwrap();
         assert_eq!(out.tensor(name).unwrap().ggml_type, c.target.ggml());
         for path in [base, src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Given probe texts as well, a table supplies what it holds and the
+    /// probe measures only what it lacks, then the table holds both.
+    #[test]
+    fn a_probe_fills_in_what_its_table_lacks() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_fill_{tag}-{pid}"));
+        let (src, out, table) = (at("in.gguf"), at("out.gguf"), at("table.tsv"));
+        let _ = std::fs::remove_file(&table);
+        crate::calib::tests::write_tiny_calib_gguf_with(&src, 64, 128, 0.3);
+        let opts = Options {
+            avg_bits: 4.0,
+            gsq: GsqConfig { steps: 20, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            probe: Some(ProbeTexts { texts: vec!["hello world again hello world".into()], max_tokens: 32, scaled: false }),
+            probe_table: Some(table.clone()),
+            ..Options::default()
+        };
+        let first = requantise(&src, &out, &opts).unwrap();
+        let dropped = "blk.0.ffn_up.weight";
+        let full = std::fs::read_to_string(&table).unwrap();
+        let rest: String = full.lines().filter(|l| !l.starts_with(dropped)).map(|l| format!("{l}\n")).collect();
+        assert!(rest.len() < full.len(), "{dropped} was in the table");
+        // A row the probe would not measure the same way: kept as the table has it.
+        let kept = "blk.0.ffn_down.weight";
+        let rest = rest.replace(&format!("{kept}\tQ2_0\t"), &format!("{kept}\tQ2_0\t9.5e0\n#"));
+        let rest: String = rest.lines().filter(|l| !l.starts_with('#')).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&table, rest).unwrap();
+        let second = requantise(&src, &out, &opts).unwrap();
+        let find = |r: &Report, name: &str| r.choices.iter().find(|c| c.name == name).unwrap().divergence.clone().unwrap();
+        assert_eq!(find(&second, dropped), find(&first, dropped), "measured again");
+        assert_eq!(find(&second, kept)[0], 9.5, "taken from the table");
+        let refilled = std::fs::read_to_string(&table).unwrap();
+        assert!(refilled.lines().any(|l| l.starts_with(dropped)), "the table holds the new rows");
+        assert!(refilled.contains(&format!("{kept}\tQ2_0\t9.5e0")), "and keeps its own");
+        for path in [src, out, table] {
             let _ = std::fs::remove_file(path);
         }
     }
