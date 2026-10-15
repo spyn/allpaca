@@ -599,7 +599,9 @@ impl Engine {
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
-            kv_radix: KvRadixForest::with_limits(4096, 64 << 20),
+            // One node per token: the node cap must allow long prompts.
+            kv_radix: KvRadixForest::with_limits(1 << 20, config.prompt_cache.ram_bytes)
+                .with_codec(config.prompt_cache.codec),
             ds_probe: ds_probe.clone(),
             grammar_factory: None,
             last_poll_id: None,
@@ -2842,7 +2844,7 @@ impl Engine {
                 .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
             {
                 if n > prefill_pos {
-                    restore_kv(&mut inner.kv, &pages, &cp.kv, &target.config)?;
+                    restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
                     if let Some(dst) = recurrent.as_mut() {
                         *dst = cp.recurrent;
                     } else if target.config.recurrent {
@@ -4379,11 +4381,54 @@ impl Engine {
         self.metrics
             .prefill_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if end >= total {
+            self.capture_prompt(inner, id, &target)?;
+        }
         if end >= total && inner.flags.ngram_speculation {
             let tokens = request(inner, id)?.tokens.clone();
             inner.ngram.observe(&tokens);
         }
         Ok((end, total))
+    }
+
+    /// Keep a prefilled prompt in the prompt cache. The CPU path captures as
+    /// it goes; on HIP the keys, values and recurrent state are read back once
+    /// here. Left out: models whose state the host cannot read back yet
+    /// (DeepSeek-V4, qwen4exp, layers on RPC workers), and vision or
+    /// decision prompts.
+    fn capture_prompt(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+    ) -> Result<(), AllpacaError> {
+        let Some(hip) = self.hip.as_deref() else {
+            return Ok(());
+        };
+        let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
+        if target.dsv4.is_some() || target.q4x.is_some() || layers_remote {
+            return Ok(());
+        }
+        let active = request_mut(inner, id)?;
+        if !active.vision.is_empty() || active.probe.is_some() {
+            return Ok(());
+        }
+        if let Some(state) = active.recurrent.as_mut() {
+            for_each_gdn_workspace(hip, Some(target), |ws| {
+                ws.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                ws.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                ws.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)
+            })?;
+        }
+        let tokens = active.tokens[..active.prompt_len].to_vec();
+        let pages = active.pages.clone();
+        let state = active
+            .recurrent
+            .clone()
+            .unwrap_or_else(|| RecurrentState::zeros(target.config.n_layers, target.config.dim));
+        inner
+            .kv_radix
+            .capture(&tokens, &state, &inner.kv, &pages, &target.config)
     }
 
     /// Whether this Engine can batch decode at all: enabled, several Request

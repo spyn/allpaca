@@ -87,7 +87,7 @@ impl RecurrentState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct KvRow {
     pub(crate) k: Vec<f32>,
     pub(crate) v: Vec<f32>,
@@ -272,7 +272,15 @@ pub(crate) fn snapshot_kv(
     let kv_width = cfg.n_kv_heads * cfg.head_dim();
     let mut out = Vec::with_capacity(pages.len());
     for layer_pages in pages {
-        let (ks, vs) = crate::model::gather_kv(kv, layer_pages, cfg.n_kv_heads, cfg.head_dim())?;
+        let (mut ks, mut vs) = (Vec::new(), Vec::new());
+        for &id in layer_pages {
+            if kv.get(id).map_or(0, |p| p.filled) == 0 {
+                continue;
+            }
+            let (k, v) = kv.read_kv_for_cache(id, cfg.n_kv_heads, cfg.head_dim())?;
+            ks.extend_from_slice(&k);
+            vs.extend_from_slice(&v);
+        }
         let n = if kv_width == 0 {
             0
         } else {

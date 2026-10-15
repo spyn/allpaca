@@ -8,9 +8,10 @@
 
 use std::collections::HashMap;
 
-use allpaca_types::AllpacaError;
+use allpaca_types::{AllpacaError, KvCodec};
 
 use crate::anchors::{snapshot_kv, KvRow, RecurrentState};
+use crate::kv_codec::EncodedRows;
 use crate::kv_tier::KvTierManager;
 use crate::model::ModelConfig;
 
@@ -18,24 +19,28 @@ use crate::model::ModelConfig;
 #[derive(Debug, Clone)]
 pub struct RadixCheckpoint {
     pub recurrent: RecurrentState,
-    pub kv: Vec<Vec<KvRow>>,
+    /// Per layer, in the forest's [`KvCodec`].
+    pub(crate) kv: Vec<EncodedRows>,
+    /// No recurrent state: the keys and values of any prefix of this
+    /// checkpoint's tokens resume that prefix.
+    pub(crate) sliceable: bool,
 }
 
 impl RadixCheckpoint {
-    /// Approximate resident size of this checkpoint (f32 payload + thin header).
+    /// Keys and values per layer, decoded.
+    pub(crate) fn kv_rows(&self) -> Vec<Vec<KvRow>> {
+        self.kv.iter().map(EncodedRows::decode).collect()
+    }
+
+    /// Approximate resident size of this checkpoint (payload + thin header).
     pub fn approx_bytes(&self) -> usize {
-        let rec: usize = self
-            .recurrent
-            .layers
-            .iter()
+        let r = &self.recurrent;
+        let rec: usize = [&r.layers, &r.ssm_h, &r.ssm_conv, &r.gdn_state, &r.gdn_conv]
+            .into_iter()
+            .flatten()
             .map(|l| l.len().saturating_mul(4))
             .sum();
-        let kv: usize = self
-            .kv
-            .iter()
-            .flatten()
-            .map(|r| (r.k.len() + r.v.len()).saturating_mul(4))
-            .sum();
+        let kv: usize = self.kv.iter().map(EncodedRows::bytes).sum();
         rec.saturating_add(kv).saturating_add(64)
     }
 }
@@ -70,6 +75,8 @@ pub struct KvRadixForest {
     pub skip_tokens: u64,
     /// Nodes removed to stay under node/byte caps.
     pub evictions: u64,
+    /// How checkpoints hold keys and values.
+    codec: KvCodec,
 }
 
 impl Default for KvRadixForest {
@@ -100,6 +107,22 @@ impl KvRadixForest {
             misses: 0,
             skip_tokens: 0,
             evictions: 0,
+            codec: KvCodec::F32,
+        }
+    }
+
+    /// Hold checkpoint keys and values in `codec`.
+    pub fn with_codec(mut self, codec: KvCodec) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// A checkpoint of `kv` (per layer) in this forest's codec.
+    pub(crate) fn checkpoint(&self, recurrent: RecurrentState, kv: Vec<Vec<KvRow>>) -> RadixCheckpoint {
+        RadixCheckpoint {
+            recurrent,
+            kv: kv.iter().map(|rows| EncodedRows::encode(self.codec, rows)).collect(),
+            sliceable: false,
         }
     }
 
@@ -309,10 +332,8 @@ impl KvRadixForest {
         if tokens.is_empty() {
             return Ok(());
         }
-        let cp = RadixCheckpoint {
-            recurrent: recurrent.clone(),
-            kv: snapshot_kv(kv, pages, cfg)?,
-        };
+        let mut cp = self.checkpoint(recurrent.clone(), snapshot_kv(kv, pages, cfg)?);
+        cp.sliceable = !cfg.recurrent;
         self.insert_checkpoint(tokens, cp);
         Ok(())
     }
@@ -334,16 +355,13 @@ impl KvRadixForest {
         if tokens.is_empty() {
             return Ok(());
         }
-        let full = snapshot_kv(kv, pages, cfg)?;
+        let full = self.checkpoint(recurrent.clone(), snapshot_kv(kv, pages, cfg)?);
         for i in 0..tokens.len() {
             let n = i + 1;
-            let sliced = full
-                .iter()
-                .map(|layer| layer[..n.min(layer.len())].to_vec())
-                .collect();
             let cp = RadixCheckpoint {
                 recurrent: recurrent.clone(),
-                kv: sliced,
+                kv: full.kv.iter().map(|layer| layer.prefix(n)).collect(),
+                sliceable: !cfg.recurrent,
             };
             self.insert_checkpoint(&tokens[..n], cp);
         }
@@ -380,6 +398,24 @@ impl KvRadixForest {
                     }
                 }
                 None => break,
+            }
+        }
+        // Deeper than any checkpoint on the path: a sliceable checkpoint
+        // further down (a longer prompt through here) holds this prefix too.
+        let shared = depth.min(max_depth);
+        if shared > best_depth {
+            let mut node = &self.root;
+            for &tok in &tokens[..shared] {
+                node = node.children.get(&tok).expect("walked above");
+            }
+            if let Some(cp) = sliceable_below(node) {
+                best_depth = shared;
+                best_cp = Some(RadixCheckpoint {
+                    recurrent: cp.recurrent.clone(),
+                    kv: cp.kv.iter().map(|layer| layer.prefix(shared)).collect(),
+                    sliceable: true,
+                });
+                best_path_end = 0;
             }
         }
         // LRU touch on the restored checkpoint node.
@@ -422,25 +458,34 @@ impl KvRadixForest {
     }
 }
 
+/// Any sliceable checkpoint at or below `node`.
+fn sliceable_below(node: &RadixNode) -> Option<&RadixCheckpoint> {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if let Some(cp) = n.checkpoint.as_ref().filter(|cp| cp.sliceable) {
+            return Some(cp);
+        }
+        stack.extend(n.children.values().map(|c| &**c));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn empty_cp() -> RadixCheckpoint {
-        RadixCheckpoint {
-            recurrent: RecurrentState::zeros(1, 4),
-            kv: vec![vec![]],
-        }
+        KvRadixForest::new().checkpoint(RecurrentState::zeros(1, 4), vec![vec![]])
     }
 
     fn fat_cp(n: usize) -> RadixCheckpoint {
-        RadixCheckpoint {
-            recurrent: RecurrentState::zeros(1, n),
-            kv: vec![vec![KvRow {
+        KvRadixForest::new().checkpoint(
+            RecurrentState::zeros(1, n),
+            vec![vec![KvRow {
                 k: vec![0.0; n],
                 v: vec![0.0; n],
             }]],
-        }
+        )
     }
 
     #[test]
@@ -527,6 +572,80 @@ mod tests {
         forest.insert_checkpoint(&[1], fat_cp(8));
         let b = forest.checkpoint_bytes();
         assert!(b < a, "replace must shrink tracked bytes: a={a} b={b}");
+    }
+
+    #[test]
+    fn a_q4_forest_holds_a_prefix_in_a_fraction_of_the_bytes() {
+        let rows: Vec<Vec<KvRow>> = (0..3)
+            .map(|layer| {
+                (0..8)
+                    .map(|t| KvRow {
+                        k: (0..64).map(|i| ((layer + t * i) % 11) as f32 - 5.0).collect(),
+                        v: (0..64).map(|i| ((t + i) % 7) as f32 * 0.5).collect(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut exact = KvRadixForest::new();
+        let cp = exact.checkpoint(RecurrentState::zeros(1, 4), rows.clone());
+        exact.insert_checkpoint(&[1, 2, 3], cp);
+        let mut small = KvRadixForest::new().with_codec(KvCodec::Q4);
+        let cp = small.checkpoint(RecurrentState::zeros(1, 4), rows.clone());
+        small.insert_checkpoint(&[1, 2, 3], cp);
+        assert!(
+            small.checkpoint_bytes() * 4 < exact.checkpoint_bytes(),
+            "q4 {} vs f32 {}",
+            small.checkpoint_bytes(),
+            exact.checkpoint_bytes()
+        );
+
+        let (_, cp) = exact.lookup_checkpoint(&[1, 2, 3]).unwrap();
+        assert_eq!(cp.kv_rows(), rows, "f32 restores exactly");
+        let (_, cp) = small.lookup_checkpoint(&[1, 2, 3]).unwrap();
+        let back = cp.kv_rows();
+        assert_eq!(back.len(), 3);
+        for (a, b) in rows.iter().flatten().zip(back.iter().flatten()) {
+            for (x, y) in a.k.iter().chain(&a.v).zip(b.k.iter().chain(&b.v)) {
+                assert!((x - y).abs() <= 0.4, "{x} vs {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn attention_only_checkpoints_serve_any_shared_prefix() {
+        let rows = |n: usize| -> Vec<Vec<KvRow>> {
+            vec![(0..n)
+                .map(|t| KvRow {
+                    k: vec![t as f32; 4],
+                    v: vec![-(t as f32); 4],
+                })
+                .collect()]
+        };
+        let mut forest = KvRadixForest::new();
+        let mut cp = forest.checkpoint(RecurrentState::zeros(1, 4), rows(5));
+        cp.sliceable = true;
+        forest.insert_checkpoint(&[1, 2, 3, 4, 5], cp);
+        let (n, cp) = forest.lookup_checkpoint(&[1, 2, 3, 9, 9]).expect("prefix of a stored prompt");
+        assert_eq!(n, 3);
+        assert_eq!(cp.kv_rows(), rows(3));
+
+        // A recurrent checkpoint only resumes where it was taken.
+        let mut hybrid = KvRadixForest::new();
+        let cp = hybrid.checkpoint(RecurrentState::zeros(1, 4), rows(5));
+        hybrid.insert_checkpoint(&[1, 2, 3, 4, 5], cp);
+        assert!(hybrid.lookup_checkpoint(&[1, 2, 3, 9, 9]).is_none());
+    }
+
+    #[test]
+    fn checkpoint_bytes_count_the_whole_recurrent_state() {
+        let forest = KvRadixForest::new();
+        let bare = forest.checkpoint(RecurrentState::zeros(2, 4), vec![vec![]]).approx_bytes();
+        let mut state = RecurrentState::zeros(2, 4);
+        state.gdn_state = vec![vec![0.0; 1000]; 2];
+        state.gdn_conv = vec![vec![0.0; 100]; 2];
+        state.ssm_h = vec![vec![0.0; 10]; 2];
+        let full = forest.checkpoint(state, vec![vec![]]).approx_bytes();
+        assert_eq!(full - bare, (2 * 1000 + 2 * 100 + 2 * 10) * 4);
     }
 
     #[test]

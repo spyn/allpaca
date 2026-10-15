@@ -25,6 +25,7 @@ mod forest;
 mod grammar;
 mod hf;
 mod kv_nvme;
+mod kv_codec;
 mod kv_radix;
 mod kv_tier;
 mod layer_split;
