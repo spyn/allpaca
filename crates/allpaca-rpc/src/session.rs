@@ -13,6 +13,10 @@ pub struct RpcSession {
     hello: HelloReply,
     endpoint: String,
     token: String,
+    /// Extensions the worker announced in its HELLO.
+    extensions: Vec<String>,
+    /// The worker's [`crate::BUILD_ID`], when it sent one.
+    build_id: Option<String>,
 }
 
 impl RpcSession {
@@ -32,6 +36,7 @@ impl RpcSession {
     pub fn connect_addr_with_token(endpoint: &str, token: &str) -> Result<Self, RpcError> {
         let stream = TcpStream::connect(endpoint)?;
         stream.set_nodelay(true)?;
+        crate::protocol::widen_socket_buffers(&stream);
         let mut session = Self {
             stream,
             hello: HelloReply {
@@ -47,6 +52,8 @@ impl RpcSession {
             },
             endpoint: endpoint.to_string(),
             token: token.to_string(),
+            extensions: Vec::new(),
+            build_id: None,
         };
         session.handshake()?;
         Ok(session)
@@ -69,6 +76,7 @@ impl RpcSession {
             ));
         }
         let hello = decode_hello_reply(&body)?;
+        (self.extensions, self.build_id) = crate::protocol::decode_hello_tail(&body)?;
         check_hello(&hello)?;
         if hello.kernel_abi_rev == 0 {
             return Err(RpcError::Protocol("worker kernel abi is 0".into()));
@@ -76,6 +84,50 @@ impl RpcSession {
         let _ = KERNEL_ABI_REV;
         self.hello = hello;
         Ok(())
+    }
+
+    /// The fingerprint of the sources the worker was built from; `None`
+    /// from a worker too old to send it.
+    pub fn build_id(&self) -> Option<&str> {
+        self.build_id.as_deref()
+    }
+
+    /// The worker was built from the sources this side was built from.
+    pub fn same_build(&self) -> bool {
+        self.build_id() == Some(crate::BUILD_ID)
+    }
+
+    /// The worker announced the extension `name` in its HELLO.
+    pub fn has_extension(&self, name: &str) -> bool {
+        self.extensions.iter().any(|e| e == name)
+    }
+
+    /// Call the worker's extension `name` with a small `head` and a bulk
+    /// `data` payload.
+    pub fn ext(&mut self, name: &str, head: &[u8], data: &[u8]) -> Result<Vec<u8>, RpcError> {
+        self.ext_send(name, head, data)?;
+        self.ext_recv()
+    }
+
+    /// Send a call to the extension `name` without waiting for its reply.
+    /// The worker answers calls in the order they were sent; each one's
+    /// reply is read with [`Self::ext_recv`], and nothing else may use the
+    /// session in between. Keep what is in flight well under the socket
+    /// buffers ([`SOCKET_BUFFER`]).
+    pub fn ext_send(&mut self, name: &str, head: &[u8], data: &[u8]) -> Result<(), RpcError> {
+        if !self.has_extension(name) {
+            return Err(RpcError::Protocol(format!("extension {name} is not served")));
+        }
+        crate::protocol::write_ext_request(&mut self.stream, name, head, data)
+    }
+
+    /// The reply to the oldest call sent with [`Self::ext_send`].
+    pub fn ext_recv(&mut self) -> Result<Vec<u8>, RpcError> {
+        let (status, body) = read_reply(&mut self.stream)?;
+        if status != STATUS_OK {
+            return Err(RpcError::Worker(String::from_utf8_lossy(&body).into_owned()));
+        }
+        Ok(body)
     }
 
     pub fn endpoint(&self) -> &str {

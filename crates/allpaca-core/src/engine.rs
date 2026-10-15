@@ -1460,6 +1460,12 @@ impl Engine {
             self.config.kv.vram_bytes as u64,
             model,
         );
+        if let (Some(rt), true) = (&self.rpc, model.q4x.is_some()) {
+            // No layer plan for this architecture: its GPU working set puts
+            // the routed experts that do not fit the cards on the workers.
+            model.rpc = Some(Arc::clone(rt));
+            return Ok(());
+        }
         if let Some(rt) = &self.rpc {
             rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
             rt.set_expert_homes(&self.config.rpc.expert_homes);
@@ -2007,7 +2013,17 @@ impl Engine {
                     let g = self.lock()?;
                     g.target.clone()
                 };
-                if let Some(target) = target {
+                if let Some(target) = target.as_ref().filter(|t| t.q4x.is_some()) {
+                    match crate::qwen4_gpu::attach(target, hip, self.draft_hip.as_ref(), None) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "qwen4exp HIP working set failed; CPU forward");
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                } else if let Some(target) = target {
                     match crate::dsv4_gpu::attach(
                         &target,
                         hip,
@@ -4102,7 +4118,8 @@ impl Engine {
             && ((self.hip.is_some()
                 && resident.is_some()
                 && target.supports_hip_batched_prefill())
-                || target.dsv4.is_some());
+                || target.dsv4.is_some()
+                || target.q4x.is_some());
         #[cfg(feature = "cuda")]
         let batch_prefill_cuda = !vision_in_chunk
             && toks.len() > 1
@@ -4503,11 +4520,13 @@ impl Engine {
 
     /// Whether this Engine can batch decode at all: enabled, several Request
     /// slots, a HIP-resident target that supports multi-sequence forwards, and
-    /// no draft model (its per-Request state needs its own forward).
+    /// no draft model (its per-Request state needs its own forward). A
+    /// qwen4exp target keeps its own working set on the cards, not a
+    /// resident model.
     fn batch_decode_enabled(&self, inner: &EngineInner) -> bool {
         self.config.engine.batch_decode
             && self.config.engine.max_active_requests >= 2
-            && inner.target_resident.is_some()
+            && (inner.target_resident.is_some() || inner.target.as_ref().is_some_and(|t| t.q4x.is_some()))
             && inner.draft_model.is_none()
             && match (self.hip.as_deref(), inner.target.as_ref()) {
                 (Some(hip), Some(t)) => t.supports_forward_batch(hip),
@@ -4688,10 +4707,7 @@ impl Engine {
             .target
             .clone()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-        let resident = inner
-            .target_resident
-            .clone()
-            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let resident = inner.target_resident.clone();
         let vocab = target.config.vocab_size;
         let pages: Vec<Vec<Vec<u64>>> = staged
             .iter()
@@ -4716,15 +4732,21 @@ impl Engine {
                     recurrent: rec.as_mut(),
                 })
                 .collect();
-            target.forward_batch(
-                &tokens,
-                &mut segs,
-                &mut inner.kv,
-                &self.metrics,
-                &mut row_logits,
-                hip,
-                &resident,
-            )
+            match resident.as_ref() {
+                _ if target.q4x.is_some() => {
+                    crate::qwen4exp::forward_qwen4_batch(&target, &tokens, &mut segs, &mut row_logits)
+                }
+                Some(resident) => target.forward_batch(
+                    &tokens,
+                    &mut segs,
+                    &mut inner.kv,
+                    &self.metrics,
+                    &mut row_logits,
+                    hip,
+                    resident,
+                ),
+                None => Err(AllpacaError::Fatal(FatalError::NoModel)),
+            }
         };
         let mut spans = Vec::new();
         let mut row0 = 0usize;

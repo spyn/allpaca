@@ -56,6 +56,9 @@ pub enum Cmd {
     MoeFfn = 14,
     /// Live per-device stats; reply is [`DeviceStat`] per device.
     DeviceStats = 15,
+    /// A call to a worker extension: its name, a head, then the bulk payload.
+    /// Only sent to workers whose HELLO names the extension.
+    Ext = 16,
 }
 
 impl Cmd {
@@ -77,6 +80,7 @@ impl Cmd {
             13 => Self::PutTensor,
             14 => Self::MoeFfn,
             15 => Self::DeviceStats,
+            16 => Self::Ext,
             _ => return None,
         })
     }
@@ -307,7 +311,9 @@ pub fn write_f32(w: &mut Vec<u8>, v: f32) {
 
 /// One MoE layer's experts on a worker: `gate` / `up` are stacked
 /// `[n_experts][ff][dim]` and `down` `[n_experts][dim][ff]` packed GGUF tensors
-/// (`PutTensor`), each expert an equal byte slice.
+/// (`PutTensor`), each expert an equal byte slice. When all three name one
+/// buffer it holds a slot per expert, gate | up | down: the HIP worker runs
+/// Q2_0 slots (ggml type 42) with its routed-expert kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeFfnRequest {
     pub gate: BufId,
@@ -687,6 +693,81 @@ pub fn encode_hello_reply(r: &HelloReply) -> Vec<u8> {
         write_u64(&mut w, *bytes);
     }
     w
+}
+
+/// A fingerprint of the sources this side was built from (the kernels, the
+/// worker and what it hosts). A coordinator and a worker built from the
+/// same sources have the same one.
+pub const BUILD_ID: &str = env!("ALLPACA_RPC_BUILD_ID");
+
+/// Append the names of a worker's extensions and its [`BUILD_ID`] to its
+/// encoded HELLO reply.
+pub fn append_hello_extensions(reply: &mut Vec<u8>, names: &[&str]) {
+    write_u32(reply, names.len() as u32);
+    for name in names {
+        write_str(reply, name);
+    }
+    write_str(reply, BUILD_ID);
+}
+
+/// The extension names and the build id after a HELLO reply's device list
+/// (none from a worker that does not append them).
+pub fn decode_hello_tail(data: &[u8]) -> Result<(Vec<String>, Option<String>), RpcError> {
+    let mut c = Cursor::new(data);
+    let _ = (c.u16()?, c.u16()?, c.u16()?, c.u32()?, c.u8()?, c.u32()?);
+    c.str()?;
+    c.u64()?;
+    if !c.has_remaining() {
+        return Ok((Vec::new(), None));
+    }
+    for _ in 0..c.u32()? {
+        c.u64()?;
+    }
+    if !c.has_remaining() {
+        return Ok((Vec::new(), None));
+    }
+    let n = c.u32()? as usize;
+    if n > 64 {
+        return Err(RpcError::Protocol("too many rpc extensions".into()));
+    }
+    let names = (0..n).map(|_| c.str()).collect::<Result<Vec<_>, _>>()?;
+    let build = if c.has_remaining() { Some(c.str()?) } else { None };
+    Ok((names, build))
+}
+
+/// The parts of an extension call's payload: name, head, bulk data.
+pub fn decode_ext(payload: &[u8]) -> Result<(String, &[u8], &[u8]), RpcError> {
+    let mut c = Cursor::new(payload);
+    let name = c.str()?;
+    let head = c.bytes()?;
+    Ok((name, head, &payload[c.off..]))
+}
+
+/// Socket buffer size both ends ask for, so a few calls can be in flight
+/// (sent, not yet answered) without either end blocking on a write.
+pub const SOCKET_BUFFER: usize = 2 * 1024 * 1024;
+
+pub fn widen_socket_buffers(stream: &std::net::TcpStream) {
+    let socket = socket2::SockRef::from(stream);
+    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER);
+    let _ = socket.set_send_buffer_size(SOCKET_BUFFER);
+}
+
+/// Send an extension call without copying its bulk `data`.
+pub fn write_ext_request<W: Write>(w: &mut W, name: &str, head: &[u8], data: &[u8]) -> Result<(), RpcError> {
+    let mut front = vec![Cmd::Ext as u8];
+    write_u64(&mut front, (16 + name.len() + head.len() + data.len()) as u64);
+    write_str(&mut front, name);
+    write_bytes(&mut front, head);
+    if data.len() <= ONE_WRITE_FRAME {
+        front.extend_from_slice(data);
+        w.write_all(&front)?;
+    } else {
+        w.write_all(&front)?;
+        w.write_all(data)?;
+    }
+    w.flush()?;
+    Ok(())
 }
 
 pub fn decode_hello_reply(data: &[u8]) -> Result<HelloReply, RpcError> {

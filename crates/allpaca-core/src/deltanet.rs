@@ -24,7 +24,7 @@ pub fn silu(x: f32) -> f32 {
 }
 
 /// Infer GDN dims from GGUF meta + projection widths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GdnDims {
     /// How V heads share K heads when `n_v_heads > n_k_heads`.
     pub k_repeat: KHeadRepeat,
@@ -286,7 +286,7 @@ pub fn rmsnorm_silu_gate(
 }
 
 /// How a Gated DeltaNet's V heads share K heads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum KHeadRepeat {
     /// Qwen3.5 (`ggml_repeat`): the K-head block tiles, `dst[vh] = src[vh % n_k]`.
     #[default]

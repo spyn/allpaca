@@ -17,7 +17,9 @@ use crate::deltanet::{
     conv1d_step, decay_from_alpha, deinterleave_q_gate, expand_k_heads, gated_delta_step_eps,
     rmsnorm_heads, sigmoid, silu, GdnDims,
 };
-use crate::model::{topk_route, ModelConfig, TinyModel};
+use crate::model::{topk_from_logits, ModelConfig, TinyModel};
+use crate::qsa::{QsaKeys, QsaShape};
+use crate::qwen4_gpu::{Qwen4DeviceState, Qwen4Gpu};
 
 fn load_err(msg: String) -> AllpacaError {
     AllpacaError::Fatal(FatalError::ModelLoad(msg))
@@ -91,6 +93,9 @@ pub struct Qwen4Spec {
     /// A full-attention layer every this many layers; the rest are Gated DeltaNet.
     pub full_attention_interval: usize,
     pub indexer_top_k: usize,
+    /// Indexer query heads and key width.
+    pub indexer_heads: usize,
+    pub indexer_dim: usize,
     /// Per layer: cells per indexer block on a full-attention layer (0 = dense).
     pub compress_ratios: Vec<u32>,
     pub ple: Option<PleSpec>,
@@ -152,6 +157,8 @@ impl Qwen4Spec {
             hc,
             full_attention_interval: u("full_attention_interval").unwrap_or(4).max(1),
             indexer_top_k: u("attention.indexer.top_k").unwrap_or(0),
+            indexer_heads: u("attention.indexer.head_count").unwrap_or(0),
+            indexer_dim: u("attention.indexer.key_length").unwrap_or(0),
             compress_ratios: meta_u64_array(file, "qwen4exp.attention.compress_ratios")
                 .into_iter()
                 .map(|r| r as u32)
@@ -219,6 +226,16 @@ pub fn hc_mix(
     }
     let mut gate = vec![0.0f32; hc_dim];
     matmul_nt(&lo, w.up, &mut gate, 1, hc_dim, low_rank)?;
+    let mixed = gated_mean(&xn, &gate, hc, dim);
+    let mut inject = vec![0.0f32; if w.inject.is_some() { hc } else { 0 }];
+    if let Some(w_inject) = w.inject {
+        matmul_nt(&xn, w_inject, &mut inject, 1, hc, hc_dim)?;
+    }
+    Ok((mixed, inject))
+}
+
+/// Mean over the streams of the normed stream times the sigmoid of its gate.
+fn gated_mean(xn: &[f32], gate: &[f32], hc: usize, dim: usize) -> Vec<f32> {
     let mut mixed = vec![0.0f32; dim];
     for (xs, gs) in xn.chunks(dim).zip(gate.chunks(dim)) {
         for ((m, x), g) in mixed.iter_mut().zip(xs).zip(gs) {
@@ -228,11 +245,7 @@ pub fn hc_mix(
     for m in &mut mixed {
         *m /= hc as f32;
     }
-    let mut inject = vec![0.0f32; if w.inject.is_some() { hc } else { 0 }];
-    if let Some(w_inject) = w.inject {
-        matmul_nt(&xn, w_inject, &mut inject, 1, hc, hc_dim)?;
-    }
-    Ok((mixed, inject))
+    mixed
 }
 
 /// Add a block's output to every stream, stream `s` weighted by
@@ -253,6 +266,8 @@ pub struct Qwen4Weights {
     file: Option<Arc<GgufFile>>,
     /// Dense tensors decoded to F32 on first use.
     dense: Mutex<HashMap<String, Arc<Vec<f32>>>>,
+    /// Matrices and experts on the GPU, once attached.
+    pub(crate) gpu: Mutex<Option<Qwen4Gpu>>,
 }
 
 impl std::fmt::Debug for Qwen4Weights {
@@ -271,6 +286,7 @@ impl Qwen4Weights {
             spec,
             file: None,
             dense: Mutex::new(HashMap::new()),
+            gpu: Mutex::new(None),
         })
     }
 
@@ -280,6 +296,10 @@ impl Qwen4Weights {
 
     fn file(&self) -> Result<&GgufFile, AllpacaError> {
         self.file.as_deref().ok_or_else(|| load_err("qwen4exp weights have no GGUF handle".into()))
+    }
+
+    pub(crate) fn gguf(&self) -> Result<&GgufFile, AllpacaError> {
+        self.file()
     }
 
     fn has(&self, name: &str) -> bool {
@@ -323,6 +343,34 @@ impl Qwen4Weights {
     }
 }
 
+impl Qwen4Weights {
+    /// The blocks of `n_rows` rows of `row_len` weights starting at row
+    /// `first` of a `Q2_0` tensor; `None` for another encoding or rows that
+    /// are not whole blocks.
+    fn q2_0_rows(&self, name: &str, first: usize, n_rows: usize, row_len: usize) -> Result<Option<&[u8]>, AllpacaError> {
+        let file = self.file()?;
+        let info = file.tensor(name).ok_or_else(|| load_err(format!("missing tensor {name}")))?;
+        if info.ggml_type != allpaca_gguf::GgmlType::Q2_0 || row_len % allpaca_cpu::Q2_0_BLOCK_ELEMS != 0 {
+            return Ok(None);
+        }
+        let row_bytes = row_len / allpaca_cpu::Q2_0_BLOCK_ELEMS * allpaca_cpu::Q2_0_BLOCK_BYTES;
+        let bytes = file.tensor_bytes(name)?;
+        Ok(bytes.get(first * row_bytes..(first + n_rows) * row_bytes))
+    }
+}
+
+/// SwiGLU of one expert read from its `Q2_0` blocks.
+fn swiglu_q2_0(x: &[f32], gate: &[u8], up: &[u8], down: &[u8], ff: usize, dim: usize) -> Result<Vec<f32>, AllpacaError> {
+    let (mut h, mut u, mut y) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
+    allpaca_cpu::gemv_q2_0(gate, x, &mut h)?;
+    allpaca_cpu::gemv_q2_0(up, x, &mut u)?;
+    for (h, u) in h.iter_mut().zip(&u) {
+        *h = silu(*h) * u;
+    }
+    allpaca_cpu::gemv_q2_0(down, &h, &mut y)?;
+    Ok(y)
+}
+
 /// One sequence's state at one layer.
 #[derive(Debug, Clone, Default)]
 struct LayerState {
@@ -331,6 +379,8 @@ struct LayerState {
     /// Keys and values of a full-attention layer, one row per token.
     k: Vec<f32>,
     v: Vec<f32>,
+    /// Its indexer keys, when its attention can turn sparse.
+    qsa: QsaKeys,
 }
 
 /// One sequence's state: the recurrent layers' states, the attention
@@ -341,6 +391,35 @@ pub struct Qwen4Memory {
     tokens: Vec<i64>,
     layers: Vec<LayerState>,
     ple_history: Vec<f32>,
+    /// When set, every routed (layer, expert) pair is appended, in order.
+    pub routes: Option<Vec<(u16, u16)>>,
+    /// When set, seconds spent per part of the forward are added up.
+    pub times: Option<Qwen4Times>,
+    /// The recurrent states, keys and values when the forward runs on the GPU.
+    device: Option<Qwen4DeviceState>,
+    /// This sequence's state on the worker that hosts blocks, when one does.
+    remote: Option<crate::qwen4_remote::RemoteSeq>,
+}
+
+/// Seconds spent in each part of the forward.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Qwen4Times {
+    pub embed_ple: f32,
+    pub mix: f32,
+    /// On the GPU these two run up to the router's scores coming back, so
+    /// they hold the mixers and the router as well.
+    pub gdn: f32,
+    pub attention: f32,
+    /// Feed-forward of blocks whose routed experts are on a GPU, and of the rest.
+    pub ffn_gpu: f32,
+    pub ffn_host: f32,
+    /// Feed-forward of blocks whose routed experts are on an RPC worker.
+    pub ffn_rpc: f32,
+    /// Router and shared expert up to the scores coming back (GPU forward
+    /// with `ALLPACA_Q4X_SYNC_TIMES`).
+    pub route: f32,
+    pub combine: f32,
+    pub head: f32,
 }
 
 impl Qwen4Memory {
@@ -431,6 +510,33 @@ fn gdn_layer(
     gemv(&y, &q4.w(&name("ssm_out.weight"))?, cfg.dim)
 }
 
+/// The indexer of full-attention block `blk`, when the file has one: its
+/// attention turns sparse past `top_k` cells ([`crate::qsa`]).
+pub(crate) fn qsa_shape(q4: &Qwen4Weights, cfg: &ModelConfig, blk: usize) -> Result<Option<QsaShape>, AllpacaError> {
+    let spec = &q4.spec;
+    let ratio = spec.compress_ratios.get(blk).copied().unwrap_or(0) as usize;
+    if ratio == 0 || !q4.has(&format!("blk.{blk}.indexer.k_proj.weight")) {
+        return Ok(None);
+    }
+    let (heads, dim, top_k) = (spec.indexer_heads, spec.indexer_dim, spec.indexer_top_k);
+    let n_rot = if cfg.rope_dims > 0 { cfg.rope_dims } else { cfg.head_dim() };
+    if ratio < 2 || top_k == 0 || top_k % ratio != 0 || heads == 0 || dim == 0 || dim % 2 != 0 || n_rot > dim {
+        return Err(load_err(format!(
+            "qwen4exp block {blk}: indexer of {heads} heads of {dim} with budget {top_k} cannot pool {ratio} cells"
+        )));
+    }
+    Ok(Some(QsaShape {
+        ratio,
+        top_k,
+        heads,
+        dim,
+        n_rot,
+        rope_theta: cfg.rope_theta,
+        rope_sections: cfg.rope_sections,
+        eps: cfg.eps,
+    }))
+}
+
 /// Full-attention layer for one token: gated queries, normed and rotated
 /// keys, attention over every earlier token of the sequence.
 fn attn_layer(
@@ -443,14 +549,6 @@ fn attn_layer(
 ) -> Result<Vec<f32>, AllpacaError> {
     let (head_dim, n_heads, n_kv) = (cfg.head_dim(), cfg.n_heads, cfg.n_kv_heads.max(1));
     let name = |s: &str| format!("blk.{blk}.{s}");
-    // The indexer keeps every block while no more than `top_k` cells exist.
-    let ratio = q4.spec.compress_ratios.get(blk).copied().unwrap_or(0) as usize;
-    if ratio > 0 && q4.spec.indexer_top_k > 0 && pos >= q4.spec.indexer_top_k {
-        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-            "qwen4exp sparse attention past {} tokens is not implemented",
-            q4.spec.indexer_top_k
-        ))));
-    }
     let q_full = gemv(x, &q4.w(&name("attn_q.weight"))?, n_heads * head_dim * 2)?;
     let mut q = vec![0.0f32; n_heads * head_dim];
     let mut gate = vec![0.0f32; n_heads * head_dim];
@@ -471,8 +569,28 @@ fn attn_layer(
     }
     state.k.extend_from_slice(&k);
     state.v.extend_from_slice(&v);
+    // The cells the indexer keeps, once there are more than its budget.
+    let mut cells = None;
+    if let Some(shape) = qsa_shape(q4, cfg, blk)? {
+        let raw = gemv(x, &q4.w(&name("indexer.k_proj.weight"))?, shape.dim)?;
+        state.qsa.push(&shape, &raw, &q4.w(&name("indexer.k_norm.weight"))?)?;
+        if shape.is_sparse(pos) {
+            let mut iq = gemv(x, &q4.w(&name("indexer.q_proj.weight"))?, shape.heads * shape.dim)?;
+            cells = state.qsa.select(&shape, pos, &mut iq, &q4.w(&name("indexer.q_norm.weight"))?)?;
+        }
+    }
     let mut out = vec![0.0f32; n_heads * head_dim];
-    attention(&q, &state.k, &state.v, &mut out, 1, pos + 1, n_heads, n_kv, head_dim, true)?;
+    match cells {
+        None => attention(&q, &state.k, &state.v, &mut out, 1, pos + 1, n_heads, n_kv, head_dim, true)?,
+        Some(cells) => {
+            let row = n_kv * head_dim;
+            let gather = |all: &[f32]| -> Vec<f32> {
+                cells.iter().flat_map(|c| all[*c as usize * row..(*c as usize + 1) * row].iter().copied()).collect()
+            };
+            let (keys, values) = (gather(&state.k), gather(&state.v));
+            attention(&q, &keys, &values, &mut out, 1, cells.len(), n_heads, n_kv, head_dim, true)?;
+        }
+    }
     for (o, g) in out.iter_mut().zip(&gate) {
         *o *= sigmoid(*g);
     }
@@ -488,23 +606,172 @@ fn swiglu(x: &[f32], gate: &[f32], up: &[f32], down: &[f32], ff: usize, dim: usi
     gemv(&h, down, dim)
 }
 
-/// Routed experts (softmax over all, the top few renormalised) plus the
-/// shared expert behind its own sigmoid gate.
-fn ffn_layer(q4: &Qwen4Weights, cfg: &ModelConfig, blk: usize, x: &[f32]) -> Result<Vec<f32>, AllpacaError> {
+type ExpertJob = Box<dyn FnOnce() + Send>;
+
+/// Threads that run the experts a GPU forward finds off its cards. Each has
+/// its own queue, so handing out a block's experts wakes them all at once.
+struct ExpertPool {
+    workers: Mutex<Vec<std::sync::mpsc::Sender<ExpertJob>>>,
+}
+
+fn expert_pool() -> &'static ExpertPool {
+    static POOL: std::sync::OnceLock<ExpertPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let mut workers = Vec::new();
+        for _ in 0..threads {
+            let (jobs, queue) = std::sync::mpsc::channel::<ExpertJob>();
+            let spawned = std::thread::Builder::new().name("q4x-expert".into()).spawn(move || {
+                for job in queue {
+                    job();
+                }
+            });
+            if spawned.is_ok() {
+                workers.push(jobs);
+            }
+        }
+        ExpertPool {
+            workers: Mutex::new(workers),
+        }
+    })
+}
+
+/// [`routed_experts`] for several tokens at once on the worker pool, with
+/// the `Q2_0` products on 8-bit activations
+/// ([`allpaca_cpu::gemv_q2_0_i8`]). `xs` holds a row of `dim` per token,
+/// `picks` each token's routed experts; the sums come back a row per token.
+fn routed_experts_pooled(
+    q4: &Arc<Qwen4Weights>,
+    cfg: &ModelConfig,
+    blk: usize,
+    xs: &[f32],
+    picks: &[Vec<(usize, f32)>],
+) -> Result<Vec<f32>, AllpacaError> {
     let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
-    let name = |s: &str| format!("blk.{blk}.{s}");
-    let router = q4.w(&name("ffn_gate_inp.weight"))?;
-    let picks = topk_route(x, &router, cfg.n_experts, cfg.n_active, cfg, None, &[]);
-    let mut out = vec![0.0f32; dim];
-    for (e, weight) in picks {
-        let gate = q4.rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?;
-        let up = q4.rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?;
-        let down = q4.rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?;
-        let y = swiglu(x, &gate, &up, &down, ff, dim)?;
-        for (o, y) in out.iter_mut().zip(&y) {
+    let packed = dim % allpaca_cpu::Q2_0_BLOCK_ELEMS == 0;
+    let (done, results) = std::sync::mpsc::channel();
+    let mut slots = Vec::new();
+    {
+        let workers = expert_pool().workers.lock().map_err(|_| load_err("qwen4exp expert pool poisoned".into()))?;
+        let total: usize = picks.iter().map(Vec::len).sum();
+        for (row, (x, picks)) in xs.chunks(dim).zip(picks).enumerate() {
+            let x = Arc::new(x.to_vec());
+            let input = packed.then(|| allpaca_cpu::Q2_0Input::new(&x).map(Arc::new)).transpose()?;
+            for (e, _) in picks {
+                let slot = slots.len();
+                slots.push(row);
+                let (q4, x, input, done, e) = (q4.clone(), x.clone(), input.clone(), done.clone(), *e);
+                let job = move || {
+                    let name = |s: &str| format!("blk.{blk}.{s}");
+                    let y = (|| {
+                        if let (Some(input), Some(gate), Some(up), Some(down)) = (
+                            input.as_deref(),
+                            q4.q2_0_rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?,
+                            q4.q2_0_rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?,
+                            q4.q2_0_rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?,
+                        ) {
+                            let (mut h, mut u, mut y) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
+                            allpaca_cpu::gemv_q2_0_i8(gate, input, &mut h)?;
+                            allpaca_cpu::gemv_q2_0_i8(up, input, &mut u)?;
+                            for (h, u) in h.iter_mut().zip(&u) {
+                                *h = silu(*h) * u;
+                            }
+                            allpaca_cpu::gemv_q2_0_i8(down, &allpaca_cpu::Q2_0Input::new(&h)?, &mut y)?;
+                            return Ok(y);
+                        }
+                        let gate = q4.rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?;
+                        let up = q4.rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?;
+                        let down = q4.rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?;
+                        swiglu(&x, &gate, &up, &down, ff, dim)
+                    })();
+                    let _ = done.send((slot, y));
+                };
+                // The last expert runs here: this thread would only wait.
+                if slot + 1 == total || workers.is_empty() {
+                    job();
+                } else {
+                    let worker = &workers[slot % workers.len()];
+                    worker.send(Box::new(job)).map_err(|_| load_err("qwen4exp expert pool stopped".into()))?;
+                }
+            }
+        }
+    }
+    drop(done);
+    let mut ys: Vec<Option<Vec<f32>>> = vec![None; slots.len()];
+    for (slot, y) in results {
+        ys[slot] = Some(y?);
+    }
+    // Each token's sum keeps its routing order.
+    let weights = picks.iter().flatten().map(|(_, w)| *w);
+    let mut out = vec![0.0f32; picks.len() * dim];
+    for ((row, weight), y) in slots.iter().zip(weights).zip(ys) {
+        let y = y.ok_or_else(|| load_err("qwen4exp expert worker stopped".into()))?;
+        for (o, y) in out[row * dim..(row + 1) * dim].iter_mut().zip(&y) {
             *o += weight * y;
         }
     }
+    Ok(out)
+}
+
+/// The weighted sum of the routed experts `picks` of block `blk` on `x`,
+/// read from the file.
+fn routed_experts(
+    q4: &Qwen4Weights,
+    cfg: &ModelConfig,
+    blk: usize,
+    x: &[f32],
+    picks: &[(usize, f32)],
+) -> Result<Vec<f32>, AllpacaError> {
+    let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
+    let name = |s: &str| format!("blk.{blk}.{s}");
+    let mut out = vec![0.0f32; dim];
+    // One thread per routed expert; the sum keeps the routing order.
+    let expert = |e: usize| -> Result<Vec<f32>, AllpacaError> {
+        if let (Some(gate), Some(up), Some(down)) = (
+            q4.q2_0_rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?,
+            q4.q2_0_rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?,
+            q4.q2_0_rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?,
+        ) {
+            return swiglu_q2_0(x, gate, up, down, ff, dim);
+        }
+        let gate = q4.rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?;
+        let up = q4.rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?;
+        let down = q4.rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?;
+        swiglu(x, &gate, &up, &down, ff, dim)
+    };
+    let ys: Vec<Result<Vec<f32>, AllpacaError>> = std::thread::scope(|scope| {
+        let expert = &expert;
+        let jobs: Vec<_> = picks.iter().map(|(e, _)| scope.spawn(move || expert(*e))).collect();
+        jobs.into_iter()
+            .map(|j| j.join().unwrap_or_else(|_| Err(load_err("qwen4exp expert thread panicked".into()))))
+            .collect()
+    });
+    for ((_, weight), y) in picks.iter().zip(ys) {
+        for (o, y) in out.iter_mut().zip(&y?) {
+            *o += weight * y;
+        }
+    }
+    Ok(out)
+}
+
+/// Routed experts (softmax over all, the top few renormalised) plus the
+/// shared expert behind its own sigmoid gate.
+fn ffn_layer(
+    q4: &Qwen4Weights,
+    cfg: &ModelConfig,
+    blk: usize,
+    x: &[f32],
+    routes: Option<&mut Vec<(u16, u16)>>,
+) -> Result<Vec<f32>, AllpacaError> {
+    let dim = cfg.dim;
+    let name = |s: &str| format!("blk.{blk}.{s}");
+    let router = q4.w(&name("ffn_gate_inp.weight"))?;
+    let mut scores = gemv(x, &router, cfg.n_experts)?;
+    let picks = topk_from_logits(&mut scores, cfg.n_active, cfg, None, &[]);
+    if let Some(routes) = routes {
+        routes.extend(picks.iter().map(|(e, _)| (blk as u16, *e as u16)));
+    }
+    let mut out = routed_experts(q4, cfg, blk, x, &picks)?;
     if q4.has(&name("ffn_up_shexp.weight")) {
         let gate = q4.w(&name("ffn_gate_shexp.weight"))?;
         let up = q4.w(&name("ffn_up_shexp.weight"))?;
@@ -537,17 +804,34 @@ pub fn ple_update(
     dim: usize,
     eps: f32,
 ) -> Result<(), AllpacaError> {
-    let hc_dim = streams.len();
-    let key = grouped_norm(&gemv(emb, key_w, hc_dim)?, norms[0], dim, eps);
-    let query = grouped_norm(streams, norms[1], dim, eps);
+    let key = gemv(emb, key_w, streams.len())?;
     let value = gemv(emb, value_w, dim)?;
+    ple_apply(streams, &key, &value, norms, conv_w, history, ple, dim, eps)
+}
+
+/// [`ple_update`] from the embedding's key and value projections.
+#[allow(clippy::too_many_arguments)]
+fn ple_apply(
+    streams: &mut [f32],
+    key: &[f32],
+    value: &[f32],
+    norms: [&[f32]; 3],
+    conv_w: &[f32],
+    history: &mut Vec<f32>,
+    ple: &PleSpec,
+    dim: usize,
+    eps: f32,
+) -> Result<(), AllpacaError> {
+    let hc_dim = streams.len();
+    let key = grouped_norm(key, norms[0], dim, eps);
+    let query = grouped_norm(streams, norms[1], dim, eps);
     let mut gated = vec![0.0f32; hc_dim];
     for ((dst, k), q) in gated.chunks_mut(dim).zip(key.chunks(dim)).zip(query.chunks(dim)) {
         let s = k.iter().zip(q).map(|(a, b)| a * b).sum::<f32>() / (dim as f32).sqrt();
         // Signed square root before the sigmoid.
         let signed = if s == 0.0 { 0.0 } else { s.signum() * s.abs().max(1e-6).sqrt() };
         let open = sigmoid(signed);
-        for (d, v) in dst.iter_mut().zip(&value) {
+        for (d, v) in dst.iter_mut().zip(value) {
             *d = v * open;
         }
     }
@@ -572,6 +856,16 @@ pub fn ple_update(
     Ok(())
 }
 
+/// The n-gram rows of `token` after `earlier`, gathered from the table.
+fn ple_embedding(q4: &Qwen4Weights, ple: &PleSpec, token: u32, earlier: &[i64]) -> Result<Vec<f32>, AllpacaError> {
+    let prev: Vec<i64> = earlier.iter().rev().take(ple.ngram_size - 1).copied().collect();
+    let mut emb = Vec::with_capacity(ple.n_heads() * ple.head_dim);
+    for row in ple.rows(i64::from(token), &prev) {
+        emb.extend(q4.rows("per_layer_token_embd.weight", row as usize, 1, ple.head_dim)?);
+    }
+    Ok(emb)
+}
+
 /// Forward one token at `pos`; `logits` gets the next-token logits.
 pub(crate) fn forward_qwen4_token(
     model: &TinyModel,
@@ -580,26 +874,168 @@ pub(crate) fn forward_qwen4_token(
     logits: &mut [f32],
     mem: &mut Qwen4Memory,
 ) -> Result<(), AllpacaError> {
+    forward_qwen4_tokens(model, &[token], pos, logits, None, mem)
+}
+
+/// Forward `tokens` from `start_pos`: on the GPU several per pass, on the
+/// host one at a time. `logits` ends with the last token's; `row_logits`,
+/// when given, gets every token's logits, one row of the vocabulary size
+/// each (a draft verify reads them all).
+pub(crate) fn forward_qwen4_tokens(
+    model: &TinyModel,
+    tokens: &[u32],
+    start_pos: usize,
+    logits: &mut [f32],
+    mut row_logits: Option<&mut [f32]>,
+    mem: &mut Qwen4Memory,
+) -> Result<(), AllpacaError> {
     let q4 = model.q4x.as_ref().ok_or_else(|| load_err("missing qwen4exp weights".into()))?;
     let cfg = &model.config;
-    let (dim, hc, eps) = (cfg.dim, q4.spec.hc, cfg.eps);
-    if mem.tokens.len() != pos {
+    let vocab = cfg.vocab_size;
+    if row_logits.as_ref().is_some_and(|rows| rows.len() < tokens.len() * vocab) || logits.len() < vocab {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "qwen4exp logits buffer is smaller than the rows asked for".into(),
+        )));
+    }
+    if mem.tokens.len() != start_pos {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-            "qwen4exp sequence memory holds {} tokens, forward is at position {pos}",
+            "qwen4exp sequence memory holds {} tokens, forward is at position {start_pos}",
             mem.tokens.len()
         ))));
     }
+    let gpu = q4.gpu.lock().map_err(|_| load_err("qwen4exp gpu lock poisoned".into()))?;
+    if let Some(gpu) = gpu.as_ref() {
+        for (pass, chunk) in tokens.chunks(crate::qwen4_gpu::MAX_ROWS).enumerate() {
+            let first = pass * crate::qwen4_gpu::MAX_ROWS;
+            let rows = row_logits.as_deref_mut().map(|rows| &mut rows[first * vocab..(first + chunk.len()) * vocab]);
+            let rpc = model.rpc.as_deref();
+            forward_device(q4, gpu, rpc, cfg, chunk, start_pos + first, &mut logits[..vocab], rows, mem, None)?;
+        }
+        return Ok(());
+    }
+    for (i, &token) in tokens.iter().enumerate() {
+        forward_host(q4, cfg, token, start_pos + i, logits, mem)?;
+        mem.tokens.push(i64::from(token));
+        if let Some(rows) = row_logits.as_deref_mut() {
+            rows[i * vocab..(i + 1) * vocab].copy_from_slice(&logits[..vocab]);
+        }
+    }
+    Ok(())
+}
+
+/// One forward over the rows of several sequences (the engine's batched
+/// decode tick): `tokens` holds each sequence's rows in `segs` order and
+/// `row_logits` gets a row of logits per token. Each sequence's rows equal
+/// its own forward. With a worker hosting blocks the sequences are
+/// pipelined: the worker runs one's hosted blocks while this machine runs
+/// the next one's local blocks.
+pub(crate) fn forward_qwen4_batch(
+    model: &TinyModel,
+    tokens: &[u32],
+    segs: &mut [crate::model::SeqRows<'_>],
+    row_logits: &mut [f32],
+) -> Result<(), AllpacaError> {
+    use crate::qwen4_gpu::MAX_ROWS;
+    let q4 = model.q4x.as_ref().ok_or_else(|| load_err("missing qwen4exp weights".into()))?;
+    let (cfg, vocab) = (&model.config, model.config.vocab_size);
+    let no_state = || load_err("qwen4exp needs the sequence's state".into());
+    let mut first_row = Vec::with_capacity(segs.len());
+    let mut row = 0usize;
+    for seg in segs.iter() {
+        first_row.push(row);
+        row += seg.n_rows;
+    }
+    if row != tokens.len() || row_logits.len() < row * vocab {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "qwen4exp batch: rows, tokens and logits do not line up".into(),
+        )));
+    }
+    let mut last = vec![0.0f32; vocab];
+    let guard = q4.gpu.lock().map_err(|_| load_err("qwen4exp gpu lock poisoned".into()))?;
+    let stream_bytes = tokens.len() * q4.spec.hc * cfg.dim * 4;
+    let host = guard
+        .as_ref()
+        .and_then(|gpu| gpu.hosted())
+        .filter(|_| segs.len() > 1 && stream_bytes <= crate::qwen4_remote::PIPE_BYTES)
+        .filter(|_| segs.iter().all(|s| (1..=MAX_ROWS).contains(&s.n_rows)))
+        .cloned();
+    let (Some(host), Some(gpu)) = (host, guard.as_ref()) else {
+        drop(guard);
+        for (seg, &at) in segs.iter_mut().zip(&first_row) {
+            let mem = &mut seg.recurrent.as_deref_mut().ok_or_else(no_state)?.q4x;
+            let rows = &mut row_logits[at * vocab..(at + seg.n_rows) * vocab];
+            forward_qwen4_tokens(model, &tokens[at..at + seg.n_rows], seg.start_pos, &mut last, Some(rows), mem)?;
+        }
+        return Ok(());
+    };
+    let rpc = model.rpc.as_deref();
+    host.pipeline(|pipe| {
+        // Every sequence up to the hosted blocks, handing each to the worker
+        // as soon as it gets there.
+        let mut passes = Vec::with_capacity(segs.len());
+        for (seg, &at) in segs.iter_mut().zip(&first_row) {
+            let mem = &mut seg.recurrent.as_deref_mut().ok_or_else(no_state)?.q4x;
+            if mem.tokens.len() != seg.start_pos {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "qwen4exp sequence memory holds {} tokens, forward is at position {}",
+                    mem.tokens.len(),
+                    seg.start_pos
+                ))));
+            }
+            let (toks, rows) = (&tokens[at..at + seg.n_rows], &mut row_logits[at * vocab..(at + seg.n_rows) * vocab]);
+            let pass = forward_device(q4, gpu, rpc, cfg, toks, seg.start_pos, &mut last, Some(rows), mem, Some(None))?;
+            if let (Some(pass), Some(remote)) = (&pass, mem.remote.as_ref()) {
+                pipe.send(remote, seg.start_pos, seg.n_rows, &pass.streams)?;
+            }
+            passes.push(pass);
+        }
+        // Then each one's result, in the order sent, and its blocks after.
+        for ((seg, &at), pass) in segs.iter_mut().zip(&first_row).zip(passes) {
+            let Some(mut pass) = pass else {
+                continue;
+            };
+            pipe.recv(&mut pass.streams)?;
+            let mem = &mut seg.recurrent.as_deref_mut().ok_or_else(no_state)?.q4x;
+            let (toks, rows) = (&tokens[at..at + seg.n_rows], &mut row_logits[at * vocab..(at + seg.n_rows) * vocab]);
+            if forward_device(q4, gpu, rpc, cfg, toks, seg.start_pos, &mut last, Some(rows), mem, Some(Some(pass)))?.is_some() {
+                return Err(load_err("qwen4exp: a second run of hosted blocks in one pass".into()));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A GPU pass that stopped where the worker's hosted blocks begin.
+struct DevicePass {
+    /// The streams there; the worker's result goes in their place.
+    streams: Vec<f32>,
+    /// Where the pass goes on: the layer after the hosted blocks and its card.
+    resume: usize,
+    card: usize,
+}
+
+fn forward_host(
+    q4: &Qwen4Weights,
+    cfg: &ModelConfig,
+    token: u32,
+    pos: usize,
+    logits: &mut [f32],
+    mem: &mut Qwen4Memory,
+) -> Result<(), AllpacaError> {
+    let (dim, hc, eps) = (cfg.dim, q4.spec.hc, cfg.eps);
     mem.layers.resize_with(cfg.n_layers, LayerState::default);
+    let mut times = mem.times.unwrap_or_default();
+    let mut clock = std::time::Instant::now();
+    let mut lap = |slot: &mut f32| {
+        *slot += clock.elapsed().as_secs_f32();
+        clock = std::time::Instant::now();
+    };
     let embed = q4.rows("token_embd.weight", token as usize, 1, dim)?;
     let mut streams = embed.repeat(hc);
     for layer in 0..cfg.n_layers {
         let blk = cfg.gguf_blk(layer);
         if let Some(ple) = q4.spec.ple.as_ref().filter(|p| p.layers.contains(&blk)) {
-            let prev: Vec<i64> = mem.tokens.iter().rev().take(ple.ngram_size - 1).copied().collect();
-            let mut emb = Vec::with_capacity(ple.n_heads() * ple.head_dim);
-            for row in ple.rows(i64::from(token), &prev) {
-                emb.extend(q4.rows("per_layer_token_embd.weight", row as usize, 1, ple.head_dim)?);
-            }
+            let emb = ple_embedding(q4, ple, token, &mem.tokens)?;
             let name = |s: &str| format!("blk.{blk}.ple_{s}.weight");
             let (nk, nq, nc) = (q4.w(&name("norm_key"))?, q4.w(&name("norm_query"))?, q4.w(&name("norm_conv"))?);
             ple_update(
@@ -615,37 +1051,272 @@ pub(crate) fn forward_qwen4_token(
                 eps,
             )?;
         }
+        lap(&mut times.embed_ple);
         let (x, inject) = mix(q4, &format!("blk.{blk}.hc_attn"), true, &streams, dim, eps)?;
+        lap(&mut times.mix);
         let out = if q4.spec.is_recurrent(blk) {
-            gdn_layer(q4, cfg, blk, &x, &mut mem.layers[layer])?
+            let out = gdn_layer(q4, cfg, blk, &x, &mut mem.layers[layer])?;
+            lap(&mut times.gdn);
+            out
         } else {
-            attn_layer(q4, cfg, blk, &x, pos, &mut mem.layers[layer])?
+            let out = attn_layer(q4, cfg, blk, &x, pos, &mut mem.layers[layer])?;
+            lap(&mut times.attention);
+            out
         };
         hc_combine(&mut streams, &out, &inject, dim);
+        lap(&mut times.combine);
         let (x, inject) = mix(q4, &format!("blk.{blk}.hc_ffn"), true, &streams, dim, eps)?;
-        let out = ffn_layer(q4, cfg, blk, &x)?;
+        lap(&mut times.mix);
+        let out = ffn_layer(q4, cfg, blk, &x, mem.routes.as_mut())?;
+        lap(&mut times.ffn_host);
         hc_combine(&mut streams, &out, &inject, dim);
+        lap(&mut times.combine);
     }
     // The output mixer stands in for the final norm.
     let (x, _) = mix(q4, "output_hc", false, &streams, dim, eps)?;
     let head = if q4.has("output.weight") { "output.weight" } else { "token_embd.weight" };
     matmul_nt(&x, &q4.w(head)?, logits, 1, cfg.vocab_size, dim)?;
-    mem.tokens.push(i64::from(token));
+    lap(&mut times.head);
+    if mem.times.is_some() {
+        mem.times = Some(times);
+    }
     Ok(())
+}
+
+/// One GPU pass over `tokens` (at most [`crate::qwen4_gpu::MAX_ROWS`])
+/// from `pos`: the streams of all of them stay on the card of the block
+/// they are in. They come to the host where the cards change and for the
+/// n-gram layer; the router's scores come back once per block. `logits`
+/// (one row) gets the last token's, `row_logits` every token's.
+///
+/// `split` is for a caller that talks to the worker hosting blocks itself:
+/// `Some(None)` stops where the hosted blocks begin and returns the pass
+/// there, `Some(Some(pass))` goes on from it once the worker's result is
+/// in `pass.streams`. `None` runs the hosted blocks in place.
+#[allow(clippy::too_many_arguments)]
+fn forward_device(
+    q4: &Arc<Qwen4Weights>,
+    gpu: &Qwen4Gpu,
+    rpc: Option<&crate::rpc_runtime::RpcRuntime>,
+    cfg: &ModelConfig,
+    tokens: &[u32],
+    pos: usize,
+    logits: &mut [f32],
+    row_logits: Option<&mut [f32]>,
+    mem: &mut Qwen4Memory,
+    split: Option<Option<DevicePass>>,
+) -> Result<Option<DevicePass>, AllpacaError> {
+    let (dim, hc, eps, rows) = (cfg.dim, q4.spec.hc, cfg.eps, tokens.len());
+    let (vocab, n_experts) = (cfg.vocab_size, cfg.n_experts);
+    let dims = q4.spec.gdn.ok_or_else(|| load_err("qwen4exp has no Gated DeltaNet shape".into()))?;
+    let device = mem.device.get_or_insert_with(Qwen4DeviceState::default);
+    // A token's logits must not depend on how many share its pass.
+    let _exact = allpaca_hip::ExactRows::enable();
+    let mut times = mem.times.unwrap_or_default();
+    // Kernels are queued: a part's time only shows where the host waits for
+    // the card, unless `ALLPACA_Q4X_SYNC_TIMES` makes every part wait.
+    let wait = mem.times.is_some() && std::env::var_os("ALLPACA_Q4X_SYNC_TIMES").is_some();
+    let mut clock = std::time::Instant::now();
+    let mut lap = |card: usize, slot: &mut f32| -> Result<(), AllpacaError> {
+        if wait {
+            gpu.sync(card)?;
+        }
+        *slot += clock.elapsed().as_secs_f32();
+        clock = std::time::Instant::now();
+        Ok(())
+    };
+    let stop_at_hosted = split.is_some();
+    let (mut streams, mut card, mut resume) = match split.flatten() {
+        Some(pass) => (pass.streams, pass.card, pass.resume),
+        None => {
+            let mut streams = Vec::with_capacity(rows * hc * dim);
+            for &token in tokens {
+                let embed = q4.rows("token_embd.weight", token as usize, 1, dim)?;
+                for _ in 0..hc {
+                    streams.extend_from_slice(&embed);
+                }
+            }
+            (streams, gpu.card_of(cfg.gguf_blk(0)), 0)
+        }
+    };
+    gpu.set_streams(card, &streams)?;
+    let mut scores = vec![0.0f32; rows * n_experts];
+    let mut x = Vec::new();
+    // Blocks with their experts on a card pick them there, so nothing of
+    // the block comes back to the host. `ALLPACA_Q4X_HOST_ROUTING` and the
+    // route recorder keep the picking on the host.
+    let card_scale = crate::model::plain_softmax_routing(cfg)
+        .filter(|_| mem.routes.is_none() && std::env::var_os("ALLPACA_Q4X_HOST_ROUTING").is_none());
+    for layer in 0..cfg.n_layers {
+        if layer < resume {
+            continue;
+        }
+        let blk = cfg.gguf_blk(layer);
+        // The blocks a worker hosts run there in one round trip.
+        if let Some(host) = gpu.hosted().filter(|h| h.blocks().first() == Some(&blk)) {
+            gpu.get_streams(card, &mut streams)?;
+            resume = layer + host.blocks().len();
+            card = if resume < cfg.n_layers { gpu.card_of(cfg.gguf_blk(resume)) } else { 0 };
+            let seq = mem.remote.get_or_insert_with(|| host.new_seq());
+            if stop_at_hosted {
+                if mem.times.is_some() {
+                    mem.times = Some(times);
+                }
+                return Ok(Some(DevicePass { streams, resume, card }));
+            }
+            host.run(seq, pos, rows, &mut streams)?;
+            gpu.set_streams(card, &streams)?;
+            lap(card, &mut times.ffn_rpc)?;
+            continue;
+        }
+        let home = gpu.card_of(blk);
+        let ple = q4.spec.ple.as_ref().filter(|p| p.layers.contains(&blk));
+        if home != card || ple.is_some() {
+            gpu.get_streams(card, &mut streams)?;
+            if let Some(ple) = ple {
+                let name = |s: &str| format!("blk.{blk}.ple_{s}.weight");
+                let (nk, nq, nc) = (q4.w(&name("norm_key"))?, q4.w(&name("norm_query"))?, q4.w(&name("norm_conv"))?);
+                let conv = q4.w(&name("conv1d"))?;
+                // Each token's n-gram reaches back over the ones before it in the pass.
+                let mut earlier = mem.tokens.clone();
+                for (&token, row) in tokens.iter().zip(streams.chunks_mut(hc * dim)) {
+                    let emb = ple_embedding(q4, ple, token, &earlier)?;
+                    let mut kv = gpu.products(&[name("key"), name("value")], &emb)?;
+                    let value = kv.swap_remove(1);
+                    ple_apply(row, &kv[0], &value, [&nk, &nq, &nc], &conv, &mut mem.ple_history, ple, dim, eps)?;
+                    earlier.push(i64::from(token));
+                }
+            }
+            gpu.set_streams(home, &streams)?;
+            card = home;
+        }
+        lap(card, &mut times.embed_ple)?;
+        gpu.mix(card, &format!("blk.{blk}.hc_attn"), true, rows)?;
+        if wait {
+            lap(card, &mut times.mix)?;
+        }
+        let recurrent = q4.spec.is_recurrent(blk);
+        if recurrent {
+            gpu.gdn(blk, &dims, device, rows)?;
+        } else {
+            let shape = crate::qwen4_gpu::AttnShape::of(cfg, qsa_shape(q4, cfg, blk)?);
+            gpu.attention(blk, &shape, pos, device, rows)?;
+        }
+        if wait {
+            lap(card, if recurrent { &mut times.gdn } else { &mut times.attention })?;
+        }
+        gpu.combine(card, rows)?;
+        gpu.mix(card, &format!("blk.{blk}.hc_ffn"), true, rows)?;
+        if wait {
+            lap(card, &mut times.mix)?;
+        }
+        if let Some(scale) = card_scale.filter(|_| gpu.routes_on_card(blk, cfg.n_active)) {
+            gpu.ffn_route(blk, rows, None, &mut x)?;
+            if wait {
+                lap(card, &mut times.route)?;
+            }
+            gpu.ffn_finish_routed(blk, rows, cfg.n_active, scale)?;
+            lap(card, &mut times.ffn_gpu)?;
+            gpu.combine(card, rows)?;
+            continue;
+        }
+        gpu.ffn_route(blk, rows, Some(&mut scores), &mut x)?;
+        lap(card, if wait { &mut times.route } else if recurrent { &mut times.gdn } else { &mut times.attention })?;
+        let picks: Vec<Vec<(usize, f32)>> = scores
+            .chunks_mut(n_experts.max(1))
+            .map(|row| topk_from_logits(row, cfg.n_active, cfg, None, &[]))
+            .collect();
+        if let Some(routes) = mem.routes.as_mut() {
+            routes.extend(picks.iter().flatten().map(|(e, _)| (blk as u16, *e as u16)));
+        }
+        if gpu.has_experts(blk) {
+            gpu.ffn_finish(blk, &picks, None)?;
+            lap(card, &mut times.ffn_gpu)?;
+        } else if let Some(rpc) = rpc.filter(|_| gpu.remote_experts(blk)) {
+            let sums = rpc
+                .moe_ffn(layer, &x, &picks)?
+                .ok_or_else(|| load_err(format!("qwen4exp: block {blk}'s experts are not on a worker")))?;
+            gpu.ffn_finish(blk, &picks, Some(&sums))?;
+            lap(card, &mut times.ffn_rpc)?;
+        } else {
+            let sums = routed_experts_pooled(q4, cfg, blk, &x, &picks)?;
+            gpu.ffn_finish(blk, &picks, Some(&sums))?;
+            lap(card, &mut times.ffn_host)?;
+        }
+        gpu.combine(card, rows)?;
+    }
+    if card != 0 {
+        gpu.get_streams(card, &mut streams)?;
+        gpu.set_streams(0, &streams)?;
+    }
+    // The output mixer stands in for the final norm.
+    gpu.mix(0, "output_hc", false, rows)?;
+    let head = if q4.has("output.weight") { "output.weight" } else { "token_embd.weight" };
+    match row_logits {
+        Some(all) => {
+            gpu.head(head, rows, &mut all[..rows * vocab])?;
+            logits[..vocab].copy_from_slice(&all[(rows - 1) * vocab..rows * vocab]);
+        }
+        None => gpu.head(head, rows, &mut logits[..vocab])?,
+    }
+    lap(0, &mut times.head)?;
+    if mem.times.is_some() {
+        mem.times = Some(times);
+    }
+    mem.tokens.extend(tokens.iter().map(|t| i64::from(*t)));
+    Ok(None)
 }
 
 /// Tiny `qwen4exp` GGUF for tests: four layers (three Gated DeltaNet, one
 /// full attention), two residual streams, n-gram embeddings at layer 1,
 /// routed and shared experts. Weights are seeded noise, all F32.
 pub fn write_tiny_qwen4exp_gguf(path: &std::path::Path) {
-    use allpaca_gguf::{write_gguf, GgufWriteTensor};
+    write_tiny(path, 16, 8, false, None);
+}
 
-    let (dim, hc, lr, vocab, n_layers) = (16usize, 2usize, 4usize, 8usize, 4usize);
+/// The tiny model with an indexer on its full-attention layer: pools of
+/// two cells, of which the attention keeps `top_k / 2` and the tail.
+pub fn write_tiny_qwen4exp_sparse_gguf(path: &std::path::Path, top_k: usize) {
+    write_tiny(path, 16, 8, false, Some(top_k));
+}
+
+/// The tiny model at width 64 with packed tensors: Q2_0 routed experts and
+/// two Q2_0 matrices, two BF16 mixer matrices and an F16 output head.
+#[cfg(test)]
+pub fn write_tiny_qwen4exp_packed_gguf(path: &std::path::Path) {
+    write_tiny(path, 64, 64, true, None);
+}
+
+/// The packed tiny model with an indexer that keeps `top_k` cells.
+#[cfg(test)]
+pub fn write_tiny_qwen4exp_packed_sparse_gguf(path: &std::path::Path, top_k: usize) {
+    write_tiny(path, 64, 64, true, Some(top_k));
+}
+
+/// The encoding a tensor of the packed fixture is stored in.
+fn packed_type(name: &str) -> Option<allpaca_gguf::GgmlType> {
+    use allpaca_gguf::GgmlType;
+    let ends = |suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
+    if ends(&["_exps.weight", "attn_gate.weight", "ffn_gate_shexp.weight"]) {
+        Some(GgmlType::Q2_0)
+    } else if ends(&["hc_attn_down.weight", "hc_ffn_up.weight"]) {
+        Some(GgmlType::BF16)
+    } else if name == "output.weight" {
+        Some(GgmlType::F16)
+    } else {
+        None
+    }
+}
+
+fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool, indexer: Option<usize>) {
+    use allpaca_gguf::{write_gguf_quant, GgmlType, GgufWriteQuantTensor, GgufWriteTensor};
+
+    let (hc, lr, vocab, n_layers) = (2usize, 4usize, 8usize, 4usize);
     let (n_heads, head_dim, n_rot) = (2usize, 8usize, 4usize);
     let (state, n_k, n_v, conv_kernel) = (4usize, 1usize, 2usize, 2usize);
     let (key_dim, value_dim) = (state * n_k, state * n_v);
     let qkv_dim = key_dim * 2 + value_dim;
-    let (n_exp, ff) = (4usize, 8usize);
+    let n_exp = 4usize;
     let (ngram, heads_per, ple_dim, ple_kernel) = (3usize, 2usize, 4usize, 2usize);
     let ple_heads = (ngram - 1) * heads_per;
     let ple_vocab = 7usize;
@@ -689,6 +1360,14 @@ pub fn write_tiny_qwen4exp_gguf(path: &std::path::Path) {
     ] {
         meta.insert(format!("qwen4exp.{key}"), value);
     }
+    let (idx_heads, idx_dim, idx_ratio) = (2usize, 4usize, 2usize);
+    if let Some(top_k) = indexer {
+        meta.insert("qwen4exp.attention.indexer.top_k".into(), u(top_k));
+        meta.insert("qwen4exp.attention.indexer.head_count".into(), u(idx_heads));
+        meta.insert("qwen4exp.attention.indexer.key_length".into(), u(idx_dim));
+        let ratios = (0..n_layers).map(|l| if (l + 1) % 4 == 0 { idx_ratio as u64 } else { 0 }).collect();
+        meta.insert("qwen4exp.attention.compress_ratios".into(), u64s(ratios));
+    }
     meta.insert("general.architecture".into(), GgufValue::String("qwen4exp".into()));
     meta.insert("general.name".into(), GgufValue::String("tiny-qwen4exp".into()));
     meta.insert("tokenizer.ggml.model".into(), GgufValue::String("wordlevel".into()));
@@ -713,11 +1392,12 @@ pub fn write_tiny_qwen4exp_gguf(path: &std::path::Path) {
             })
             .collect()
     };
-    // Dims are listed outermost first, as the writer expects.
+    // Dims are listed outermost first here and stored innermost first, as
+    // GGUF files have them.
     let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
     let mut add = |name: String, dims: &[usize], data: Vec<f32>| {
         assert_eq!(dims.iter().product::<usize>(), data.len(), "{name}");
-        owned.push((name, dims.iter().map(|d| *d as u64).collect(), data));
+        owned.push((name, dims.iter().rev().map(|d| *d as u64).collect(), data));
     };
     add("token_embd.weight".into(), &[vocab, dim], noise(vocab * dim, 1.0));
     add("output.weight".into(), &[vocab, dim], noise(vocab * dim, 0.5));
@@ -772,15 +1452,45 @@ pub fn write_tiny_qwen4exp_gguf(path: &std::path::Path) {
         t("ffn_up_shexp.weight", &[ff, dim], noise(ff * dim, 0.3));
         t("ffn_down_shexp.weight", &[dim, ff], noise(dim * ff, 0.3));
     }
-    let views: Vec<GgufWriteTensor<'_>> = owned
+    // Last, so that the other weights are the same with and without.
+    if indexer.is_some() {
+        for blk in (0..n_layers).filter(|b| (b + 1) % 4 == 0) {
+            let mut t = |name: &str, dims: &[usize], data: Vec<f32>| add(format!("blk.{blk}.indexer.{name}"), dims, data);
+            t("q_proj.weight", &[idx_heads * idx_dim, dim], noise(idx_heads * idx_dim * dim, 0.5));
+            t("k_proj.weight", &[idx_dim, dim], noise(idx_dim * dim, 0.5));
+            t("q_norm.weight", &[idx_dim], vec![1.0; idx_dim]);
+            t("k_norm.weight", &[idx_dim], vec![1.0; idx_dim]);
+        }
+    }
+    let encoded: Vec<Option<(GgmlType, Vec<u8>)>> = owned
         .iter()
-        .map(|(name, dims, data)| GgufWriteTensor {
-            name: name.clone(),
-            dims: dims.clone(),
-            data,
+        .map(|(name, _, data)| {
+            let ty = packed_type(name).filter(|_| packed)?;
+            let bytes = match ty {
+                GgmlType::Q2_0 => allpaca_cpu::quantize_q2_0(data),
+                GgmlType::BF16 => data.iter().flat_map(|v| allpaca_cpu::f32_to_bf16(*v).to_le_bytes()).collect(),
+                _ => data.iter().flat_map(|v| allpaca_cpu::f32_to_f16(*v).to_le_bytes()).collect(),
+            };
+            Some((ty, bytes))
         })
         .collect();
-    write_gguf(path, &meta, &views).expect("write tiny qwen4exp");
+    let (mut plain, mut quant) = (Vec::new(), Vec::new());
+    for ((name, dims, data), encoded) in owned.iter().zip(&encoded) {
+        match encoded {
+            Some((ty, bytes)) => quant.push(GgufWriteQuantTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                ggml_type: *ty,
+                bytes,
+            }),
+            None => plain.push(GgufWriteTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                data,
+            }),
+        }
+    }
+    write_gguf_quant(path, &meta, &plain, &quant).expect("write tiny qwen4exp");
 }
 
 #[cfg(test)]
@@ -894,6 +1604,492 @@ mod tests {
         model
     }
 
+    /// The tiny model whose attention keeps `top_k` cells through its indexer.
+    fn tiny_sparse_model(top_k: usize) -> TinyModel {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_qwen4exp_sparse-{}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        write_tiny_qwen4exp_sparse_gguf(&path, top_k);
+        let file = Arc::new(GgufFile::open(&path).expect("open sparse tiny qwen4exp"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file);
+        let _ = std::fs::remove_file(&path);
+        model
+    }
+
+    #[cfg(feature = "hip")]
+    fn tiny_packed_sparse_model(top_k: usize) -> TinyModel {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_qwen4exp_packed_sparse-{}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        write_tiny_qwen4exp_packed_sparse_gguf(&path, top_k);
+        let file = Arc::new(GgufFile::open(&path).expect("open packed sparse tiny qwen4exp"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file);
+        let _ = std::fs::remove_file(&path);
+        model
+    }
+
+    /// Tokens of the tiny vocabulary without the end-of-sequence token.
+    fn long_tokens(n: usize) -> Vec<u32> {
+        (0..n).map(|i| [3u32, 4, 5, 6, 7, 4, 6][(i * i + i / 3) % 7]).collect()
+    }
+
+    #[cfg(feature = "hip")]
+    fn tiny_packed_model() -> TinyModel {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_qwen4exp_packed-{}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        write_tiny_qwen4exp_packed_gguf(&path);
+        let file = Arc::new(GgufFile::open(&path).expect("open packed tiny qwen4exp"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file);
+        let _ = std::fs::remove_file(&path);
+        model
+    }
+
+    /// With its matrices and routed experts on the GPU, the forward gives
+    /// the host forward's logits: for the F32 model (experts stay on the
+    /// host) and for the packed one (Q2_0 experts in GPU slots).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_on_the_gpu_matches_the_host_forward() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let tokens = [1u32, 3, 4, 5, 3, 6, 7, 4, 4, 5];
+        type Build = fn() -> TinyModel;
+        for (what, build, expert_layers) in [("f32", tiny_model as Build, 0usize), ("packed", tiny_packed_model as Build, 4)] {
+            let (host, gpu) = (build(), build());
+            crate::qwen4_gpu::attach(&gpu, &hip, None, None).expect("attach");
+            {
+                let attached = gpu.q4x.as_ref().unwrap().gpu.lock().unwrap();
+                let attached = attached.as_ref().expect("gpu attached");
+                assert_eq!(attached.expert_layers()[0].len(), expert_layers, "{what}: expert layers on the card");
+                assert!(attached.has("blk.0.hc_attn_down.weight") && attached.has("output.weight"), "{what}");
+            }
+            let (want, got) = (run(&host, &tokens), run(&gpu, &tokens));
+            for (pos, (want, got)) in want.iter().zip(&got).enumerate() {
+                let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                assert!(scale > 1e-3, "{what}: logits at {pos} are all zero");
+                assert!(
+                    max_diff(want, got) <= 2e-3 * scale.max(1.0),
+                    "{what}: logits at {pos} differ by {} (scale {scale})",
+                    max_diff(want, got)
+                );
+            }
+        }
+    }
+
+    /// On the GPU a run of tokens goes through in passes of several: every
+    /// token's logits must be what one token at a time gives, across a pass
+    /// boundary and with a run that starts mid-sequence.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_gpu_passes_of_several_tokens_match_single_tokens() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let model = tiny_packed_model();
+        crate::qwen4_gpu::attach(&model, &hip, None, None).expect("attach");
+        let single = run(&model, &tokens);
+        let vocab = model.config.vocab_size;
+        let mut mem = Qwen4Memory::default();
+        let mut logits = vec![0.0f32; vocab];
+        forward_qwen4_tokens(&model, &tokens[..3], 0, &mut logits, None, &mut mem).expect("first run");
+        assert_eq!(logits, single[2], "last logits of the first run");
+        // Twenty tokens: one full pass and a partial one.
+        let mut rows = vec![f32::NAN; 20 * vocab];
+        forward_qwen4_tokens(&model, &tokens[3..], 3, &mut logits, Some(&mut rows), &mut mem).expect("second run");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, single[3 + i], "row {i}");
+        }
+        assert_eq!(logits, rows[19 * vocab..]);
+        assert_eq!(mem.tokens(), 23);
+
+        // Two blocks' experts on the card, two on the host workers (8-bit
+        // activations): passes of several still match single tokens, and
+        // the whole stays near the all-on-card logits.
+        let mixed = tiny_packed_model();
+        crate::qwen4_gpu::attach(&mixed, &hip, None, Some(&[2])).expect("attach");
+        assert_eq!(mixed.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().expert_layers()[0], [0, 1]);
+        let mixed_single = run(&mixed, &tokens);
+        let mut mem = Qwen4Memory::default();
+        let mut rows = vec![f32::NAN; 23 * vocab];
+        forward_qwen4_tokens(&mixed, &tokens, 0, &mut logits, Some(&mut rows), &mut mem).expect("mixed run");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, mixed_single[i], "mixed row {i}");
+            let scale = single[i].iter().fold(1.0f32, |m, v| m.max(v.abs()));
+            assert!(max_diff(row, &single[i]) <= 0.05 * scale, "mixed row {i} is {} from the card's", max_diff(row, &single[i]));
+        }
+    }
+
+    /// Past the indexer's budget the GPU forward keeps the cells the host
+    /// forward keeps: its logits stay the host's, a pass of several tokens
+    /// (some before the budget, some past it) gives what one token at a
+    /// time gives, and a copied sequence goes on from its own keys.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_sparse_attention_on_the_gpu_matches_the_host_forward() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let tokens = long_tokens(40);
+        type Build = fn(usize) -> TinyModel;
+        for (what, build) in [("f32", tiny_sparse_model as Build), ("packed", tiny_packed_sparse_model as Build)] {
+            let (host, gpu, dense) = (build(8), build(8), build(64));
+            crate::qwen4_gpu::attach(&gpu, &hip, None, None).expect("attach");
+            crate::qwen4_gpu::attach(&dense, &hip, None, None).expect("attach");
+            let (want, got, all) = (run(&host, &tokens), run(&gpu, &tokens), run(&dense, &tokens));
+            assert_eq!(got[..9], all[..9], "{what}: every cell is kept up to rank 8");
+            for (pos, (want, got)) in want.iter().zip(&got).enumerate() {
+                let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    max_diff(want, got) <= 2e-3 * scale,
+                    "{what}: logits at {pos} differ by {} (scale {scale})",
+                    max_diff(want, got)
+                );
+                if pos >= 9 {
+                    assert!(max_diff(got, &all[pos]) > 1e-6, "{what}: rank {pos} must drop cells");
+                }
+            }
+            let vocab = gpu.config.vocab_size;
+            let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+            let mut rows = vec![f32::NAN; 37 * vocab];
+            forward_qwen4_tokens(&gpu, &tokens[..3], 0, &mut logits, None, &mut mem).expect("prompt");
+            forward_qwen4_tokens(&gpu, &tokens[3..], 3, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+            for (i, row) in rows.chunks(vocab).enumerate() {
+                assert_eq!(row, got[3 + i], "{what}: row {i}");
+            }
+            // A copy taken past the budget continues like the original.
+            let mut mem = Qwen4Memory::default();
+            forward_qwen4_tokens(&gpu, &tokens[..20], 0, &mut logits, None, &mut mem).expect("first half");
+            let mut fork = mem.clone();
+            forward_qwen4_tokens(&gpu, &[3, 3, 3, 3], 20, &mut logits, None, &mut mem).expect("other tokens");
+            for (pos, &t) in tokens.iter().enumerate().skip(20) {
+                forward_qwen4_token(&gpu, t, pos, &mut logits, &mut fork).expect("fork");
+                assert_eq!(logits, got[pos], "{what}: fork at {pos}");
+            }
+        }
+    }
+
+    /// A worker that hosts a full-attention block keeps its indexer keys
+    /// and selects there: the logits are those of every block on the card.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_sparse_attention_runs_on_the_worker_that_hosts_the_block() {
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
+        });
+        let tokens = long_tokens(40);
+        let local = tiny_packed_sparse_model(8);
+        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        let on_card = run(&local, &tokens);
+
+        let mut remote = tiny_packed_sparse_model(8);
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        assert_eq!(remote.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().hosted_blocks(), [2, 3]);
+        let vocab = remote.config.vocab_size;
+        let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+        let mut rows = vec![f32::NAN; tokens.len() * vocab];
+        forward_qwen4_tokens(&remote, &tokens, 0, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, on_card[i], "row {i}");
+        }
+        drop((mem, remote, rt));
+        worker.join().unwrap();
+    }
+
+    /// Blocks whose experts are not on a card go to an RPC worker when one
+    /// is connected: passes of several tokens still match single tokens,
+    /// and the logits stay near the all-on-card ones (the worker gets the
+    /// rows rounded to 8 bits).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_experts_off_the_cards_run_on_an_rpc_worker() {
+        use allpaca_rpc::{serve_connection, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"))).unwrap();
+        });
+        let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let local = tiny_packed_model();
+        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        let on_card = run(&local, &tokens);
+
+        let mut remote = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        {
+            let gpu = remote.q4x.as_ref().unwrap().gpu.lock().unwrap();
+            let gpu = gpu.as_ref().unwrap();
+            assert_eq!(gpu.expert_layers()[0], [0, 1]);
+            assert_eq!(gpu.remote_expert_layers(), [2, 3]);
+        }
+        let single = run(&remote, &tokens);
+        let calls = rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(calls, 2 * tokens.len() as u64, "one call per remote block and token");
+        let vocab = remote.config.vocab_size;
+        let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+        let mut rows = vec![f32::NAN; tokens.len() * vocab];
+        forward_qwen4_tokens(&remote, &tokens, 0, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, single[i], "row {i}");
+            let scale = on_card[i].iter().fold(1.0f32, |m, v| m.max(v.abs()));
+            assert!(max_diff(row, &on_card[i]) <= 0.05 * scale, "row {i} is {} from the card's", max_diff(row, &on_card[i]));
+        }
+        // Two passes (16 + 7 tokens), a call per remote block each.
+        assert_eq!(rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed), calls + 4);
+        drop((remote, rt));
+        worker.join().unwrap();
+    }
+
+    /// With a worker that hosts blocks, the blocks past the cards run whole
+    /// on it: one round trip a pass, the same logits as with every block on
+    /// the card (the worker runs the same kernels), a pass of several
+    /// tokens equal to one at a time, and a copied sequence going its own way.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_blocks_past_the_cards_run_whole_on_an_rpc_worker() {
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
+        });
+        let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let local = tiny_packed_model();
+        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        let on_card = run(&local, &tokens);
+
+        let mut remote = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        {
+            let gpu = remote.q4x.as_ref().unwrap().gpu.lock().unwrap();
+            let gpu = gpu.as_ref().unwrap();
+            assert_eq!(gpu.expert_layers()[0], [0, 1]);
+            assert_eq!(gpu.hosted_blocks(), [2, 3], "a Gated DeltaNet and a full-attention block");
+            assert!(gpu.remote_expert_layers().is_empty());
+            assert_eq!(gpu.hosted().unwrap().cache_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let trips = || rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
+        let single = run(&remote, &tokens);
+        assert_eq!(trips(), tokens.len() as u64, "one round trip per token");
+        for (i, row) in single.iter().enumerate() {
+            assert_eq!(row, &on_card[i], "token {i}");
+        }
+        let vocab = remote.config.vocab_size;
+        let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+        let mut rows = vec![f32::NAN; tokens.len() * vocab];
+        forward_qwen4_tokens(&remote, &tokens, 0, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, single[i], "row {i}");
+        }
+        assert_eq!(trips(), tokens.len() as u64 + 2, "two passes (16 + 7 tokens)");
+
+        // A copy keeps the state it was taken at while the original moves on.
+        drop(mem);
+        let mut mem = Qwen4Memory::default();
+        for (pos, &t) in tokens[..10].iter().enumerate() {
+            forward_qwen4_token(&remote, t, pos, &mut logits, &mut mem).expect("forward");
+        }
+        let mut fork = mem.clone();
+        forward_qwen4_token(&remote, 3 + (tokens[10] - 2) % 5, 10, &mut logits, &mut mem).expect("other token");
+        assert_ne!(logits, single[10], "the other token gives other logits");
+        forward_qwen4_token(&remote, tokens[10], 10, &mut logits, &mut fork).expect("fork");
+        assert_eq!(logits, single[10], "the copy continues from token 10");
+        drop((mem, fork, remote, rt));
+        worker.join().unwrap();
+    }
+
+    /// Several sequences in one batched forward, pipelined through the
+    /// worker that hosts blocks, each get the logits of their own forward:
+    /// one token each, and a span of several rows next to a single one.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_sequences_batched_through_the_worker_match_their_own_runs() {
+        use crate::anchors::RecurrentState;
+        use crate::model::SeqRows;
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
+        });
+        let mut model = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        model.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+        assert!(model.supports_forward_batch(&hip), "hosted blocks make the batched forward worth it");
+        let vocab = model.config.vocab_size;
+        let seqs: [Vec<u32>; 3] = [
+            (0..8u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect(),
+            (0..8u32).map(|i| 3 + (i * 3 + 1) % 5).collect(),
+            (0..8u32).map(|i| 3 + (i * 2 + i / 2) % 5).collect(),
+        ];
+        let solo: Vec<Vec<Vec<f32>>> = seqs.iter().map(|tokens| run(&model, tokens)).collect();
+        let trips = || rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
+        let before = trips();
+        let mut states: Vec<RecurrentState> = (0..3).map(|_| RecurrentState::zeros(model.config.n_layers, model.config.dim)).collect();
+        // Five ticks of one token for each sequence.
+        for step in 0..5 {
+            let tokens: Vec<u32> = seqs.iter().map(|s| s[step]).collect();
+            let mut rows = vec![f32::NAN; 3 * vocab];
+            let mut segs: Vec<SeqRows<'_>> = states
+                .iter_mut()
+                .map(|state| SeqRows { start_pos: step, n_rows: 1, page_ids: &[], request_id: 0, recurrent: Some(state) })
+                .collect();
+            forward_qwen4_batch(&model, &tokens, &mut segs, &mut rows).expect("batch");
+            for (s, row) in rows.chunks(vocab).enumerate() {
+                assert_eq!(row, solo[s][step], "sequence {s} token {step}");
+            }
+        }
+        assert_eq!(trips() - before, 15, "one round trip per sequence and tick");
+        // A tick with a three-row span for sequence 0 and one row for sequence 1.
+        let tokens: Vec<u32> = seqs[0][5..8].iter().chain(&seqs[1][5..6]).copied().collect();
+        let mut rows = vec![f32::NAN; 4 * vocab];
+        {
+            let (a, rest) = states.split_at_mut(1);
+            let mut segs = vec![
+                SeqRows { start_pos: 5, n_rows: 3, page_ids: &[], request_id: 0, recurrent: Some(&mut a[0]) },
+                SeqRows { start_pos: 5, n_rows: 1, page_ids: &[], request_id: 1, recurrent: Some(&mut rest[0]) },
+            ];
+            forward_qwen4_batch(&model, &tokens, &mut segs, &mut rows).expect("span batch");
+        }
+        for i in 0..3 {
+            assert_eq!(&rows[i * vocab..(i + 1) * vocab], solo[0][5 + i], "span row {i}");
+        }
+        assert_eq!(&rows[3 * vocab..], solo[1][5], "the single row next to the span");
+        drop((states, model, rt));
+        worker.join().unwrap();
+    }
+
+    /// A worker with a weight cache is sent a model's weights once: the
+    /// second coordinator to host the same blocks uploads next to nothing
+    /// and gets the same logits.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_hosted_weights_come_from_the_workers_cache_the_second_time() {
+        use crate::qwen4_remote::{worker_extension, WeightCache};
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        use std::sync::atomic::Ordering;
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let dir = std::env::temp_dir().join(format!("allpaca-weight-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = WeightCache::new(&dir, 1 << 30);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+                serve_connection_ext(stream, backend, None, vec![worker_extension(Some(cache.clone()))]).unwrap();
+            }
+        });
+        let tokens: Vec<u32> = (0..9u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let mut loads = Vec::new();
+        for _ in 0..2 {
+            let mut model = tiny_packed_model();
+            let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr.clone()], None).expect("connect"));
+            model.rpc = Some(rt.clone());
+            crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+            let cached = {
+                let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
+                gpu.as_ref().unwrap().hosted().expect("hosted blocks").cache_bytes.load(Ordering::Relaxed)
+            };
+            loads.push((rt.h2d_bytes.load(Ordering::Relaxed), cached, run(&model, &tokens)));
+        }
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (first, second) = (&loads[0], &loads[1]);
+        // Weights with the same bytes (the tiny model's norm gains) go once even the first time.
+        assert!(first.0 > 10 * first.1, "the first load uploads: {} sent, {} from the cache", first.0, first.1);
+        assert_eq!(second.1, first.0 + first.1, "the second load takes every weight from the cache");
+        assert_eq!(second.0, 0, "and uploads none");
+        assert_eq!(second.2, first.2, "same logits");
+    }
+
+    /// The cache gives back what it was given, drops a damaged file, and
+    /// makes room by deleting the weight used longest ago.
+    #[test]
+    fn weight_cache_checks_what_it_reads_and_stays_under_its_limit() {
+        use crate::qwen4_remote::{weight_key, WeightCache};
+        let dir = std::env::temp_dir().join(format!("allpaca-weight-cache-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = WeightCache::new(&dir, 250);
+        let weight = |seed: u8| -> Vec<u8> { (0..100u8).map(|i| i.wrapping_mul(7).wrapping_add(seed)).collect() };
+        let (a, b, c) = (weight(1), weight(2), weight(3));
+        assert_ne!(weight_key(&a), weight_key(&b));
+        assert_ne!(weight_key(&a[..99]), weight_key(&a), "the length is part of the key");
+        assert_eq!(cache.get(weight_key(&a), 100), None, "nothing yet");
+        cache.put(weight_key(&a), &a);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cache.put(weight_key(&b), &b);
+        assert_eq!(cache.get(weight_key(&a), 100).as_deref(), Some(&a[..]));
+        assert_eq!(cache.get(weight_key(&a), 99), None, "another length is another weight");
+        // `a` was just read, so `b` is the one used longest ago.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cache.put(weight_key(&c), &c);
+        assert_eq!(cache.get(weight_key(&b), 100), None, "the limit of 250 bytes holds two");
+        assert!(cache.get(weight_key(&a), 100).is_some() && cache.get(weight_key(&c), 100).is_some());
+        // A file whose bytes changed is not handed out.
+        let file = std::fs::read_dir(&dir).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with(&format!("{:016x}", weight_key(&c)))).unwrap();
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        bytes[50] ^= 1;
+        std::fs::write(file.path(), bytes).unwrap();
+        assert_eq!(cache.get(weight_key(&c), 100), None);
+        assert!(!file.path().exists(), "and is deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Logits after each token of `tokens`.
     fn run(model: &TinyModel, tokens: &[u32]) -> Vec<Vec<f32>> {
         let mut mem = Qwen4Memory::default();
@@ -943,6 +2139,60 @@ mod tests {
         let c = run(&model, &[3, 4, 5, 6, 7, 4]);
         assert!(max_diff(&a[5], &c[5]) > 1e-4);
         assert_eq!(a[..5], c[..5]);
+    }
+
+    /// A run of tokens leaves each token's logits in its row: a draft
+    /// verify compares every row with the token drafted after it.
+    #[test]
+    fn tiny_qwen4exp_token_runs_keep_every_rows_logits() {
+        let model = tiny_model();
+        let tokens = [3u32, 4, 5, 6, 7, 3];
+        let single = run(&model, &tokens);
+        let vocab = model.config.vocab_size;
+        let mut mem = Qwen4Memory::default();
+        let mut logits = vec![0.0f32; vocab];
+        let mut rows = vec![f32::NAN; 4 * vocab];
+        forward_qwen4_tokens(&model, &tokens[..2], 0, &mut logits, None, &mut mem).expect("prompt");
+        assert_eq!(logits, single[1]);
+        forward_qwen4_tokens(&model, &tokens[2..], 2, &mut logits, Some(&mut rows), &mut mem).expect("verify");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, single[2 + i], "row {i}");
+        }
+        assert_eq!(logits, single[5]);
+        // Rows that do not fit are refused before anything runs.
+        let mut short = vec![0.0f32; vocab];
+        assert!(forward_qwen4_tokens(&model, &[4, 5], 6, &mut logits, Some(&mut short), &mut mem).is_err());
+        assert_eq!(mem.tokens(), 6);
+    }
+
+    /// Past its indexer's budget the attention keeps the best pools and
+    /// the tail: the sequence goes on, and from the first token that sees
+    /// more pools than it may keep its logits differ from the same
+    /// weights with a budget that covers everything.
+    #[test]
+    fn tiny_qwen4exp_attends_sparsely_past_its_indexer_budget() {
+        let tokens = long_tokens(14);
+        // Two pools of two cells are kept: rank 5 is the first to see three.
+        let sparse = run(&tiny_sparse_model(4), &tokens);
+        let dense = run(&tiny_sparse_model(64), &tokens);
+        assert!(sparse.iter().flatten().all(|v| v.is_finite()));
+        assert_eq!(sparse[..5], dense[..5], "every cell is kept up to rank 4");
+        for rank in 5..tokens.len() {
+            assert!(max_diff(&sparse[rank], &dense[rank]) > 1e-6, "rank {rank} must drop cells");
+        }
+        // Without pools to drop the indexer changes nothing.
+        assert_eq!(dense, run(&tiny_model(), &tokens));
+        // A run of tokens gives each of them the logits it gets alone.
+        let model = tiny_sparse_model(4);
+        let vocab = model.config.vocab_size;
+        let mut mem = Qwen4Memory::default();
+        let mut logits = vec![0.0f32; vocab];
+        let mut rows = vec![f32::NAN; 10 * vocab];
+        forward_qwen4_tokens(&model, &tokens[..4], 0, &mut logits, None, &mut mem).expect("prompt");
+        forward_qwen4_tokens(&model, &tokens[4..], 4, &mut logits, Some(&mut rows), &mut mem).expect("rows");
+        for (i, row) in rows.chunks(vocab).enumerate() {
+            assert_eq!(row, sparse[4 + i], "row {i}");
+        }
     }
 
     #[test]
@@ -1005,12 +2255,55 @@ mod tests {
         let tok = crate::tokenizer::EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).expect("tokenizer"));
         let mut model = TinyModel::from_gguf(&file).expect("model");
         model.bind_gguf(file);
+        // `ALLPACA_Q4X_GPU` = number of cards to put matrices and experts on.
+        #[cfg(feature = "hip")]
+        if let Some(cards) = std::env::var("ALLPACA_Q4X_GPU").ok().and_then(|v| v.parse::<i32>().ok()) {
+            let load = std::time::Instant::now();
+            let vocab = model.config.vocab_size;
+            let first = Arc::new(allpaca_hip::HipWorkspace::new(0, 1 << 20, vocab).expect("card 0"));
+            let second = (cards > 1).then(|| Arc::new(allpaca_hip::HipWorkspace::new(1, 1 << 20, vocab).expect("card 1")));
+            // `ALLPACA_Q4X_RPC` = worker (`host:port`, token in `ALLPACA_RPC_TOKEN`) for the experts off the cards.
+            if let Ok(endpoint) = std::env::var("ALLPACA_Q4X_RPC") {
+                let token = std::env::var("ALLPACA_RPC_TOKEN").ok();
+                let rt = crate::rpc_runtime::RpcRuntime::connect(&[endpoint], token.as_deref()).expect("rpc worker");
+                model.rpc = Some(Arc::new(rt));
+            }
+            crate::qwen4_gpu::attach(&model, &first, second.as_ref(), None).expect("attach");
+            let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
+            eprintln!(
+                "Q4X gpu attached in {:.1}s, expert layers per card {:?}",
+                load.elapsed().as_secs_f32(),
+                gpu.as_ref().unwrap().expert_layers().iter().map(Vec::len).collect::<Vec<_>>()
+            );
+        }
         let mut ids = tok.encode_plain(&prompt).expect("encode");
         eprintln!("Q4X prompt tokens {ids:?}");
         let mut mem = Qwen4Memory::default();
         let mut logits = vec![0.0f32; model.config.vocab_size];
         let start = std::time::Instant::now();
-        let mut pos = 0;
+        let mut generating = start;
+        mem.times = Some(Qwen4Times::default());
+        // `ALLPACA_Q4X_ROWS_CHECK`: the prompt in one run against one token at a time.
+        if std::env::var_os("ALLPACA_Q4X_ROWS_CHECK").is_some() {
+            let vocab = model.config.vocab_size;
+            let mut rows = vec![0.0f32; ids.len() * vocab];
+            forward_qwen4_tokens(&model, &ids, 0, &mut logits, Some(&mut rows), &mut Qwen4Memory::default()).expect("run");
+            let mut one = Qwen4Memory::default();
+            for (i, id) in ids.iter().enumerate() {
+                forward_qwen4_token(&model, *id, i, &mut logits, &mut one).expect("token");
+                let diff = max_diff(&logits, &rows[i * vocab..(i + 1) * vocab]);
+                if diff != 0.0 || i + 1 == ids.len() {
+                    eprintln!("Q4X rows check: token {i} differs by {diff}");
+                }
+            }
+        }
+        // All of the prompt but its last token in one run.
+        let mut pos = ids.len() - 1;
+        forward_qwen4_tokens(&model, &ids[..pos], 0, &mut logits, None, &mut mem).expect("prompt");
+        if pos > 0 {
+            let secs = start.elapsed().as_secs_f32();
+            eprintln!("Q4X prompt: {pos} tokens in {secs:.2}s, {:.1} tok/s", pos as f32 / secs);
+        }
         let mut out = Vec::new();
         while out.len() < n {
             let token = ids[pos];
@@ -1022,16 +2315,63 @@ mod tests {
                 order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]));
                 let top: Vec<(usize, f32, String)> =
                     order[..5].iter().map(|i| (*i, logits[*i], tok.decode_one(*i as u32))).collect();
-                eprintln!("Q4X pos {pos} ({:.1}s) top {top:?}", t.elapsed().as_secs_f32());
+                eprintln!("Q4X pos {pos} ({:.3}s) top {top:?}", t.elapsed().as_secs_f32());
+                if out.is_empty() {
+                    generating = std::time::Instant::now();
+                    mem.times = Some(Qwen4Times::default());
+                }
                 ids.push(order[0] as u32);
                 out.push(order[0] as u32);
             }
         }
         eprintln!(
-            "Q4X generated {out:?} = {:?} in {:.1}s",
+            "Q4X generated {out:?} = {:?} in {:.1}s, {:.2} tok/s after the prompt",
             tok.decode(&out).unwrap_or_default(),
-            start.elapsed().as_secs_f32()
+            start.elapsed().as_secs_f32(),
+            out.len().saturating_sub(1) as f32 / generating.elapsed().as_secs_f32().max(1e-6)
         );
+        eprintln!("Q4X seconds over {} tokens after the prompt: {:?}", out.len().saturating_sub(1), mem.times);
+        for (kind, calls, seconds) in crate::qwen4_gpu::profile_report() {
+            eprintln!("Q4X matrix {kind}: {calls} calls, {:.1} us each, {:.3} s", seconds * 1e6 / calls as f64, seconds);
+        }
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    /// Opt-in: the experts a real qwen4exp file routes to while reading
+    /// texts. `ALLPACA_QWEN4EXP` is the first shard, `ALLPACA_Q4X_TEXTS` a
+    /// file of paragraphs (blank-line separated), `ALLPACA_Q4X_TOKENS` the
+    /// tokens read per paragraph, `ALLPACA_Q4X_ROUTES` the output: one line
+    /// per paragraph of `layer:expert` pairs.
+    #[test]
+    fn real_qwen4exp_routes_when_env_set() {
+        let (Ok(path), Ok(texts), Ok(out)) = (
+            std::env::var("ALLPACA_QWEN4EXP"),
+            std::env::var("ALLPACA_Q4X_TEXTS"),
+            std::env::var("ALLPACA_Q4X_ROUTES"),
+        ) else {
+            return;
+        };
+        let n: usize = std::env::var("ALLPACA_Q4X_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let file = Arc::new(GgufFile::open(std::path::Path::new(&path)).expect("open"));
+        let tok = crate::tokenizer::EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).expect("tokenizer"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file);
+        let texts = std::fs::read_to_string(texts).expect("texts");
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        let mut lines = String::new();
+        for (ti, text) in texts.split("\n\n").map(str::trim).filter(|t| !t.is_empty()).enumerate() {
+            let ids = tok.encode_plain(text).expect("encode");
+            let mut mem = Qwen4Memory { routes: Some(Vec::new()), ..Default::default() };
+            let t = std::time::Instant::now();
+            for (pos, token) in ids.iter().take(n).enumerate() {
+                forward_qwen4_token(&model, *token, pos, &mut logits, &mut mem).expect("forward");
+            }
+            let routes = mem.routes.take().unwrap_or_default();
+            eprintln!("Q4X text {ti}: {} tokens, {} routes, {:.1}s", ids.len().min(n), routes.len(), t.elapsed().as_secs_f32());
+            let line: Vec<String> = routes.iter().map(|(l, e)| format!("{l}:{e}")).collect();
+            lines += &line.join(" ");
+            lines.push('\n');
+            std::fs::write(&out, &lines).expect("write routes");
+        }
     }
 }

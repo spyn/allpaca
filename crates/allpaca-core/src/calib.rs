@@ -11,9 +11,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use allpaca_types::{AllpacaError, Config, FatalError};
+use allpaca_types::{AllpacaError, FatalError};
 
-use crate::engine::Engine;
 
 /// A point of the forward whose vector is the input of one or more matrices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,17 +144,41 @@ impl InputStats {
 pub(crate) struct Tap {
     on: AtomicBool,
     stats: Mutex<InputStats>,
+    /// While set: the vectors of one block's sites, in the order seen.
+    keeping: AtomicBool,
+    kept: Mutex<(usize, HashMap<Site, Vec<f32>>)>,
 }
 
 impl Tap {
     #[inline]
     pub(crate) fn observe(&self, blk: usize, site: Site, x: &[f32]) {
+        if self.keeping.load(Ordering::Relaxed) {
+            if let Ok(mut kept) = self.kept.lock() {
+                if kept.0 == blk {
+                    kept.1.entry(site).or_default().extend_from_slice(x);
+                }
+            }
+        }
         if !self.on.load(Ordering::Relaxed) {
             return;
         }
         if let Ok(mut stats) = self.stats.lock() {
             stats.sites.entry((blk, site)).or_default().add(x);
         }
+    }
+
+    /// Keep every vector block `blk`'s sites see from now on.
+    pub(crate) fn keep(&self, blk: usize) {
+        if let Ok(mut kept) = self.kept.lock() {
+            *kept = (blk, HashMap::new());
+        }
+        self.keeping.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop keeping and hand over what was kept, per site.
+    pub(crate) fn take_kept(&self) -> HashMap<Site, Vec<f32>> {
+        self.keeping.store(false, Ordering::Relaxed);
+        self.kept.lock().map(|mut k| std::mem::take(&mut k.1)).unwrap_or_default()
     }
 
     pub(crate) fn start(&self) {
@@ -172,23 +195,27 @@ impl Tap {
 }
 
 /// Run `texts` through the model at `model` on the CPU and return the input
-/// second moments of its dense attention and feed-forward matrices. Every
-/// weight is decoded to F32 in RAM for the run.
+/// second moments of its dense attention and feed-forward matrices. The
+/// weights are decoded to F32 in RAM for the run, except routed experts,
+/// which stay packed ([`crate::host_experts`]).
 pub fn capture(model: &Path, texts: &[&str]) -> Result<InputStats, AllpacaError> {
     if texts.is_empty() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "calibration needs at least one text".into(),
         )));
     }
-    let mut cfg = Config::compiled_defaults();
-    cfg.model.synthetic = false;
-    cfg.model.path = Some(model.to_path_buf());
-    cfg.engine.cpu_only = true;
-    cfg.engine.determinism_seed = Some(7);
-    cfg.speculative.enabled = false;
-    cfg.weights.host_f32 = true;
-    let engine = Engine::new(cfg)?;
-    engine.capture_input_stats(texts)
+    let (model, tok, _) = crate::sensitivity::load_host(model)?;
+    model.calib.start();
+    let mut run = Ok(());
+    for text in texts {
+        let read = tok.encode(text).and_then(|ids| crate::sensitivity::text_log_probs(&model, &ids, None));
+        if let Err(e) = read {
+            run = Err(e);
+            break;
+        }
+    }
+    let stats = model.calib.finish();
+    run.map(|()| stats)
 }
 
 #[cfg(test)]
@@ -205,6 +232,34 @@ pub(crate) mod tests {
     /// weights drawn from `-attn_out..attn_out`: near zero, attention
     /// adds almost nothing to the residual.
     pub(crate) fn write_tiny_calib_gguf_with(path: &Path, dim: usize, ff: usize, attn_out: f32) {
+        write_tiny_calib_gguf_shape(path, dim, ff, attn_out, 1, false);
+    }
+
+    /// [`write_tiny_calib_gguf_with`] with `blocks` blocks and, with
+    /// `own_head`, an `output.weight` separate from the embedding table.
+    pub(crate) fn write_tiny_calib_gguf_shape(
+        path: &Path,
+        dim: usize,
+        ff: usize,
+        attn_out: f32,
+        blocks: usize,
+        own_head: bool,
+    ) {
+        write_tiny_calib_gguf_moe(path, dim, ff, attn_out, blocks, own_head, 0);
+    }
+
+    /// [`write_tiny_calib_gguf_shape`] whose feed-forward is `experts`
+    /// routed experts (two used per token, stacked `ffn_*_exps` tensors)
+    /// plus a shared expert (`ffn_*_shexp`); 0 keeps the dense one.
+    pub(crate) fn write_tiny_calib_gguf_moe(
+        path: &Path,
+        dim: usize,
+        ff: usize,
+        attn_out: f32,
+        blocks: usize,
+        own_head: bool,
+        experts: usize,
+    ) {
         let vocab = 6usize;
         let mut meta = HashMap::new();
         let mut put = |k: &str, v: GgufValue| {
@@ -213,10 +268,14 @@ pub(crate) mod tests {
         put("general.architecture", GgufValue::String("llama".into()));
         put("llama.vocab_size", GgufValue::Uint32(vocab as u32));
         put("llama.embedding_length", GgufValue::Uint32(dim as u32));
-        put("llama.block_count", GgufValue::Uint32(1));
+        put("llama.block_count", GgufValue::Uint32(blocks as u32));
         put("llama.attention.head_count", GgufValue::Uint32(4));
         put("llama.attention.head_count_kv", GgufValue::Uint32(4));
         put("llama.feed_forward_length", GgufValue::Uint32(ff as u32));
+        if experts > 0 {
+            put("llama.expert_count", GgufValue::Uint32(experts as u32));
+            put("llama.expert_used_count", GgufValue::Uint32(2));
+        }
         put("tokenizer.ggml.model", GgufValue::String("wordlevel".into()));
         put(
             "tokenizer.ggml.tokens",
@@ -240,23 +299,117 @@ pub(crate) mod tests {
         };
         // Dimensions in ggml order: the row length (the input width) first.
         let (d, f, v) = (dim as u64, ff as u64, vocab as u64);
-        let owned: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
-            ("token_embd.weight", vec![d, v], rand(vocab * dim, 1.0)),
-            ("blk.0.attn_norm.weight", vec![d], vec![1.0; dim]),
-            ("blk.0.attn_q.weight", vec![d, d], rand(dim * dim, 0.3)),
-            ("blk.0.attn_k.weight", vec![d, d], rand(dim * dim, 0.3)),
-            ("blk.0.attn_v.weight", vec![d, d], rand(dim * dim, 0.3)),
-            ("blk.0.attn_output.weight", vec![d, d], rand(dim * dim, attn_out)),
-            ("blk.0.ffn_norm.weight", vec![d], vec![1.0; dim]),
-            ("blk.0.ffn_gate.weight", vec![d, f], rand(ff * dim, 0.3)),
-            ("blk.0.ffn_up.weight", vec![d, f], rand(ff * dim, 0.3)),
-            ("blk.0.ffn_down.weight", vec![f, d], rand(dim * ff, 0.3)),
-            ("output_norm.weight", vec![d], vec![1.0; dim]),
-        ];
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> =
+            vec![("token_embd.weight".into(), vec![d, v], rand(vocab * dim, 1.0))];
+        for b in 0..blocks {
+            let mut add = |part: &str, dims: Vec<u64>, data: Vec<f32>| {
+                owned.push((format!("blk.{b}.{part}.weight"), dims, data));
+            };
+            add("attn_norm", vec![d], vec![1.0; dim]);
+            add("attn_q", vec![d, d], rand(dim * dim, 0.3));
+            add("attn_k", vec![d, d], rand(dim * dim, 0.3));
+            add("attn_v", vec![d, d], rand(dim * dim, 0.3));
+            add("attn_output", vec![d, d], rand(dim * dim, attn_out));
+            add("ffn_norm", vec![d], vec![1.0; dim]);
+            if experts == 0 {
+                add("ffn_gate", vec![d, f], rand(ff * dim, 0.3));
+                add("ffn_up", vec![d, f], rand(ff * dim, 0.3));
+                add("ffn_down", vec![f, d], rand(dim * ff, 0.3));
+                continue;
+            }
+            let n = experts as u64;
+            add("ffn_gate_inp", vec![d, n], rand(experts * dim, 1.0));
+            add("ffn_gate_exps", vec![d, f, n], rand(experts * ff * dim, 0.3));
+            add("ffn_up_exps", vec![d, f, n], rand(experts * ff * dim, 0.3));
+            add("ffn_down_exps", vec![f, d, n], rand(experts * dim * ff, 0.3));
+            add("ffn_gate_shexp", vec![d, f], rand(ff * dim, 0.3));
+            add("ffn_up_shexp", vec![d, f], rand(ff * dim, 0.3));
+            add("ffn_down_shexp", vec![f, d], rand(dim * ff, 0.3));
+        }
+        owned.push(("output_norm.weight".into(), vec![d], vec![1.0; dim]));
+        if own_head {
+            owned.push(("output.weight".into(), vec![d, v], rand(vocab * dim, 1.0)));
+        }
         let views: Vec<GgufWriteTensor<'_>> = owned
             .iter()
-            .map(|(name, dims, data)| GgufWriteTensor { name: (*name).into(), dims: dims.clone(), data })
+            .map(|(name, dims, data)| GgufWriteTensor { name: name.clone(), dims: dims.clone(), data })
             .collect();
+        write_gguf(path, &meta, &views).unwrap();
+    }
+
+    /// Two Qwen3.5-MoE (`qwen35moe`) blocks of gated delta-net attention,
+    /// each with `experts` routed experts (two used), a shared expert and
+    /// its sigmoid gate: the layout of Qwen3.5/3.6 35B-A3B, tiny.
+    pub(crate) fn write_tiny_qwen35moe_gguf(path: &Path, experts: usize) {
+        let (dim, vocab, n_v, n_k, head, conv_k, ff) = (16usize, 6usize, 2usize, 2usize, 8usize, 2usize, 24usize);
+        let inner = n_v * head;
+        let qkv_dim = n_k * head * 2 + inner;
+        let mut meta = HashMap::new();
+        let mut put = |k: &str, v: GgufValue| {
+            meta.insert(k.to_string(), v);
+        };
+        let a = "qwen35moe";
+        put("general.architecture", GgufValue::String(a.into()));
+        put(&format!("{a}.vocab_size"), GgufValue::Uint32(vocab as u32));
+        put(&format!("{a}.embedding_length"), GgufValue::Uint32(dim as u32));
+        put(&format!("{a}.block_count"), GgufValue::Uint32(2));
+        put(&format!("{a}.attention.head_count"), GgufValue::Uint32(2));
+        put(&format!("{a}.attention.head_count_kv"), GgufValue::Uint32(1));
+        put(&format!("{a}.expert_count"), GgufValue::Uint32(experts as u32));
+        put(&format!("{a}.expert_used_count"), GgufValue::Uint32(2));
+        put(&format!("{a}.expert_feed_forward_length"), GgufValue::Uint32(ff as u32));
+        put(&format!("{a}.expert_shared_feed_forward_length"), GgufValue::Uint32(ff as u32));
+        put(&format!("{a}.ssm.state_size"), GgufValue::Uint32(head as u32));
+        put(&format!("{a}.ssm.inner_size"), GgufValue::Uint32(inner as u32));
+        put(&format!("{a}.ssm.time_step_rank"), GgufValue::Uint32(n_v as u32));
+        put(&format!("{a}.ssm.group_count"), GgufValue::Uint32(n_k as u32));
+        put(&format!("{a}.ssm.conv_kernel"), GgufValue::Uint32(conv_k as u32));
+        put("tokenizer.ggml.model", GgufValue::String("wordlevel".into()));
+        put(
+            "tokenizer.ggml.tokens",
+            GgufValue::Array(
+                ["<unk>", "<s>", "</s>", "hello", "world", "again"].iter().map(|t| GgufValue::String((*t).into())).collect(),
+            ),
+        );
+        put("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1));
+        put("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2));
+        let mut seed = 0x51ed_270bu32;
+        let mut rand = |n: usize, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
+                })
+                .collect()
+        };
+        let (d, f, n) = (dim as u64, ff as u64, experts as u64);
+        let mut owned: Vec<(String, Vec<u64>, Vec<f32>)> = vec![("token_embd.weight".into(), vec![d, vocab as u64], rand(vocab * dim, 1.0))];
+        for b in 0..2 {
+            let mut add = |part: &str, dims: Vec<u64>, data: Vec<f32>| owned.push((format!("blk.{b}.{part}"), dims, data));
+            add("attn_norm.weight", vec![d], vec![1.0; dim]);
+            add("attn_qkv.weight", vec![d, qkv_dim as u64], rand(qkv_dim * dim, 0.3));
+            add("attn_gate.weight", vec![d, inner as u64], rand(inner * dim, 0.3));
+            add("ssm_alpha.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
+            add("ssm_beta.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
+            add("ssm_out.weight", vec![inner as u64, d], rand(dim * inner, 0.3));
+            add("ssm_a", vec![n_v as u64], vec![-0.5; n_v]);
+            add("ssm_dt.bias", vec![n_v as u64], vec![0.0; n_v]);
+            add("ssm_norm.weight", vec![head as u64], vec![1.0; head]);
+            add("ssm_conv1d.weight", vec![conv_k as u64, qkv_dim as u64], rand(conv_k * qkv_dim, 0.3));
+            add("post_attention_norm.weight", vec![d], vec![1.0; dim]);
+            add("ffn_gate_inp.weight", vec![d, n], rand(experts * dim, 1.0));
+            add("ffn_gate_exps.weight", vec![d, f, n], rand(experts * ff * dim, 0.3));
+            add("ffn_up_exps.weight", vec![d, f, n], rand(experts * ff * dim, 0.3));
+            add("ffn_down_exps.weight", vec![f, d, n], rand(experts * dim * ff, 0.3));
+            add("ffn_gate_inp_shexp.weight", vec![d], rand(dim, 0.3));
+            add("ffn_gate_shexp.weight", vec![d, f], rand(ff * dim, 0.3));
+            add("ffn_up_shexp.weight", vec![d, f], rand(ff * dim, 0.3));
+            add("ffn_down_shexp.weight", vec![f, d], rand(dim * ff, 0.3));
+        }
+        owned.push(("output_norm.weight".into(), vec![d], vec![1.0; dim]));
+        owned.push(("output.weight".into(), vec![d, vocab as u64], rand(vocab * dim, 1.0)));
+        let views: Vec<GgufWriteTensor<'_>> =
+            owned.iter().map(|(name, dims, data)| GgufWriteTensor { name: name.clone(), dims: dims.clone(), data }).collect();
         write_gguf(path, &meta, &views).unwrap();
     }
 

@@ -27,6 +27,11 @@ pub struct RecurrentState {
     pub dsv4: crate::dsv4_attn::Dsv4Memory,
     /// qwen4exp: layer states, attention keys, token history and n-gram conv history.
     pub q4x: crate::qwen4exp::Qwen4Memory,
+    /// Sensitivity probe: save every layer's input, or resume from saved ones.
+    pub trace: Option<crate::sensitivity::LayerTrace>,
+    /// Per-layer keys and values of the CPU Qwen3.5 attention
+    /// ([`crate::qwen35_host`]); empty when unused.
+    pub host_kv: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
 impl RecurrentState {
@@ -39,6 +44,8 @@ impl RecurrentState {
             gdn_conv: vec![Vec::new(); n_layers],
             dsv4: Default::default(),
             q4x: Default::default(),
+            trace: None,
+            host_kv: vec![Default::default(); n_layers],
         }
     }
 

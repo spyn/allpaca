@@ -690,6 +690,15 @@ impl HipWorker {
             return Err(RpcError::Worker("moe ffn experts span GPUs".into()));
         }
         let gpu = g.gpu;
+        if req.gate == req.up && req.up == req.down {
+            let (pool, bytes, ty) = (g.ptr, g.bytes, g.ggml_type);
+            if ty != 42 || bytes != n_exp * allpaca_hip::q2_0_expert_slot_bytes(dim, ff) || dim % 64 != 0 || ff % 64 != 0 {
+                return Err(RpcError::Worker(format!(
+                    "moe ffn expert slots need Q2_0 rows of whole blocks (ggml type {ty}, {bytes} bytes)"
+                )));
+            }
+            return self.moe_ffn_q2_0_slots(gpu, pool, dim, ff, &x_in.to_f32(), pairs);
+        }
         let (gs, us, ds) = (g.bytes / n_exp, u.bytes / n_exp, d.bytes / n_exp);
         let (gp, up, dp) = (g.ptr, u.ptr, d.ptr);
         let (gt, ut, dt) = (g.ggml_type, u.ggml_type, d.ggml_type);
@@ -733,6 +742,58 @@ impl HipWorker {
         }
         let mut out = vec![0.0f32; rows * dim];
         hip.copy_d2h_f32(acc, &mut out).map_err(bad)?;
+        Ok(out)
+    }
+
+    /// Q2_0 experts in one buffer of slots (gate | up | down per expert):
+    /// one H2D of `x`, each row's picks through the routed-expert kernel in
+    /// the order they were sent, one D2H.
+    fn moe_ffn_q2_0_slots(
+        &mut self,
+        gpu: usize,
+        pool: *mut u8,
+        dim: usize,
+        ff: usize,
+        x: &[f32],
+        pairs: &[(u32, u32, f32)],
+    ) -> Result<Vec<f32>, RpcError> {
+        const MAX_PICKS: usize = 32;
+        let bad = |e: allpaca_types::AllpacaError| RpcError::Worker(e.to_string());
+        let rows = x.len() / dim.max(1);
+        let mut picks: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows];
+        for &(row, expert, weight) in pairs {
+            let (slots, weights) = &mut picks[row as usize];
+            slots.push(expert as i32);
+            weights.push(weight);
+        }
+        if picks.iter().any(|(slots, _)| slots.len() > MAX_PICKS) {
+            return Err(RpcError::Worker(format!("moe ffn expert slots take at most {MAX_PICKS} experts per row")));
+        }
+        // Scratch: x, out, the picked experts' hidden rows.
+        let base = self.moe_scratch(gpu, (2 * rows * dim + MAX_PICKS * ff) * 4)?;
+        let at = |i: usize| unsafe { base.add(i) };
+        let hip = &self.gpus[gpu].hip;
+        hip.copy_h2d_f32(base, x).map_err(bad)?;
+        hip.bind().map_err(bad)?;
+        for (r, (slots, weights)) in picks.iter().enumerate().filter(|(_, p)| !p.0.is_empty()) {
+            allpaca_hip::q2_0_moe_ffn_device(
+                at(r * dim),
+                pool,
+                slots,
+                weights,
+                at(2 * rows * dim),
+                at((rows + r) * dim),
+                dim as i32,
+                ff as i32,
+            )
+            .map_err(bad)?;
+        }
+        let mut out = vec![0.0f32; rows * dim];
+        hip.copy_d2h_f32(at(rows * dim), &mut out).map_err(bad)?;
+        // A row without picks was never written.
+        for (r, _) in picks.iter().enumerate().filter(|(_, p)| p.0.is_empty()) {
+            out[r * dim..(r + 1) * dim].fill(0.0);
+        }
         Ok(out)
     }
 
@@ -819,6 +880,7 @@ fn hip_quant_gemm(
         34 => allpaca_hip::gemm_nt_tq1_0_device(a, b, c, m, n, k).map_err(bad),
         35 => allpaca_hip::gemm_nt_tq2_0_device(a, b, c, m, n, k).map_err(bad),
         39 => allpaca_hip::gemm_nt_mxfp4_device(a, b, c, m, n, k).map_err(bad),
+        42 => allpaca_hip::gemm_nt_q2_0_device(a, b, c, m, n, k).map_err(bad),
         100 => allpaca_hip::gemm_nt_rocmfp4_device(a, b, c, m, n, k).map_err(bad),
         101 => allpaca_hip::gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k).map_err(bad),
         200 => allpaca_hip::gemm_nt_p48fp4_device(a, b, c, m, n, k).map_err(bad),
@@ -2337,12 +2399,31 @@ pub fn serve_connection<S: Read + Write>(
     serve_connection_with_token(stream, backend, None)
 }
 
+/// Something a worker serves besides the kernel ABI, under a name it
+/// announces in its HELLO. It lives as long as the connection.
+pub trait Extension: Send {
+    fn name(&self) -> &str;
+    /// One call: `head` is the caller's small header, `data` its bulk payload.
+    fn call(&mut self, head: &[u8], data: &[u8]) -> Result<Vec<u8>, String>;
+}
+
 /// Same as [`serve_connection`], checking an optional HELLO shared secret.
 pub fn serve_connection_with_token<S: Read + Write>(
+    stream: S,
+    backend: WorkerBackend,
+    expected_token: Option<&str>,
+) -> Result<(), RpcError> {
+    serve_connection_ext(stream, backend, expected_token, Vec::new())
+}
+
+/// Same as [`serve_connection_with_token`], also serving `extensions`.
+pub fn serve_connection_ext<S: Read + Write>(
     mut stream: S,
     mut backend: WorkerBackend,
     expected_token: Option<&str>,
+    extensions: Vec<Box<dyn Extension>>,
 ) -> Result<(), RpcError> {
+    let mut extensions = extensions;
     let mut saw_hello = false;
     loop {
         let (cmd, payload) = match read_request(&mut stream) {
@@ -2354,7 +2435,24 @@ pub fn serve_connection_with_token<S: Read + Write>(
             write_reply(&mut stream, STATUS_ERR, b"HELLO required")?;
             return Err(RpcError::Protocol("first command must be HELLO".into()));
         }
-        let result = handle(&mut backend, cmd, &payload, &mut saw_hello, expected_token);
+        let result = match cmd {
+            Cmd::Ext => crate::protocol::decode_ext(&payload).and_then(|(name, head, data)| {
+                let ext = extensions
+                    .iter_mut()
+                    .find(|e| e.name() == name)
+                    .ok_or_else(|| RpcError::Worker(format!("extension {name} is not served")))?;
+                ext.call(head, data).map_err(RpcError::Worker)
+            }),
+            _ => handle(&mut backend, cmd, &payload, &mut saw_hello, expected_token),
+        };
+        let result = match (cmd, result) {
+            (Cmd::Hello, Ok(mut body)) => {
+                let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
+                crate::protocol::append_hello_extensions(&mut body, &names);
+                Ok(body)
+            }
+            (_, result) => result,
+        };
         match result {
             Ok(body) => write_reply(&mut stream, STATUS_OK, &body)?,
             Err(e) => {
@@ -2382,9 +2480,20 @@ pub fn serve_listener_with_token(
     backend: WorkerBackend,
     expected_token: Option<&str>,
 ) -> Result<(), RpcError> {
+    serve_listener_ext(listener, backend, expected_token, Vec::new())
+}
+
+/// Same as [`serve_listener_with_token`], also serving `extensions`.
+pub fn serve_listener_ext(
+    listener: &std::net::TcpListener,
+    backend: WorkerBackend,
+    expected_token: Option<&str>,
+    extensions: Vec<Box<dyn Extension>>,
+) -> Result<(), RpcError> {
     let (stream, addr) = listener.accept()?;
     tracing::info!(%addr, "rpc client connected");
     stream.set_nodelay(true)?;
+    crate::protocol::widen_socket_buffers(&stream);
     // A coordinator that dies without closing the socket (killed, network
     // drop) would otherwise leave the worker blocked on it forever, never
     // accepting the next client.
@@ -2394,7 +2503,7 @@ pub fn serve_listener_with_token(
     if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
         tracing::warn!(error = %e, "rpc keepalive not set");
     }
-    serve_connection_with_token(stream, backend, expected_token)
+    serve_connection_ext(stream, backend, expected_token, extensions)
 }
 
 pub fn serve_tcp(stream: TcpStream, backend: WorkerBackend) -> Result<(), RpcError> {
@@ -2503,6 +2612,7 @@ fn handle(
             Ok(out)
         }
         Cmd::DeviceStats => Ok(crate::protocol::encode_device_stats(&backend.device_stats())),
+        Cmd::Ext => Err(RpcError::Worker("extension calls are served by the connection".into())),
         Cmd::Sync => {
             backend.sync()?;
             Ok(Vec::new())

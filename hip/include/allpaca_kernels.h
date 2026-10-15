@@ -193,6 +193,43 @@ int allpaca_gemm_nt_q6_k_untiled(const float *a, const uint8_t *b, float *c, int
 int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_q2_0[n,k])^T. Native 18-byte ggml Q2_0 blocks, k % 64 == 0. */
+int allpaca_gemm_nt_q2_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                         int32_t k, allpaca_stream_t stream);
+
+/* Routed experts stored as ggml Q2_0 slots (gate[ff, dim], up[ff, dim], down[dim, ff] per slot):
+ * out[dim] = sum_p weights[p] * down_p * (silu(gate_p * x) * (up_p * x)). `slots` and `weights`
+ * are host arrays of n_pick <= 32 entries; `h` is device scratch of n_pick * ff floats. */
+int allpaca_q2_0_moe_ffn(const float *x, const uint8_t *pool, const int32_t *slots,
+                         const float *weights, int32_t n_pick, float *h, float *out, int32_t dim,
+                         int32_t ff, allpaca_stream_t stream);
+
+/* One token's routed experts with the routing on the device: the n_pick best of n_experts
+ * `scores` by softmax weight (ties to the lower expert), weights renormalised over the picks and
+ * times `scale`, then allpaca_q2_0_moe_ffn of those picks. `picks` is device scratch of 32 int32
+ * slots followed by 32 float weights and keeps the picks. n_experts <= 1024, n_pick <= 32. */
+int allpaca_q4x_routed_ffn(const float *x, const float *scores, const uint8_t *pool,
+                           int32_t n_experts, int32_t n_pick, float scale, void *picks, float *h,
+                           float *out, int32_t dim, int32_t ff, allpaca_stream_t stream);
+
+/* x[i] = silu(x[i] * s). */
+int allpaca_silu_scale(float *x, int32_t n, float s, allpaca_stream_t stream);
+
+/* qwen4exp hyper-connections over `rows` tokens of hc streams of dim floats,
+ * x[(r * hc + s) * dim + d].
+ * stream_norm: xn[r, s] = x[r, s] / rms(x[r, s]) * gains[s].
+ * gated_mean:  mixed[r, d] = mean_s xn[r, s, d] * sigmoid(gate[r, s, d]).
+ * combine:     streams[r, s, d] += out[r, d] * 2 * sigmoid(logits[r, s] / hc).
+ * ffn_sum:     out[r, d] = routed[r, d] + sigmoid(gate[r]) * shared[r, d] (either part may be null). */
+int allpaca_q4x_stream_norm(const float *x, const float *gains, float *xn, int32_t rows, int32_t hc,
+                            int32_t dim, float eps, allpaca_stream_t stream);
+int allpaca_q4x_gated_mean(const float *xn, const float *gate, float *mixed, int32_t rows,
+                           int32_t hc, int32_t dim, allpaca_stream_t stream);
+int allpaca_q4x_combine(float *streams, const float *out, const float *logits, int32_t rows,
+                        int32_t hc, int32_t dim, allpaca_stream_t stream);
+int allpaca_q4x_ffn_sum(const float *routed, const float *shared, const float *gate, float *out,
+                        int32_t rows, int32_t dim, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
 /* Softmax top-k MoE routing on the GPU (pair table + shared-expert gate).
  * Optional `disabled` (n_exp bytes) excludes experts; optional `counts`
@@ -297,6 +334,10 @@ int allpaca_relu_sqr(float *x, int32_t n, allpaca_stream_t stream);
 /* Qwen gated-attn: q_full[n_heads][2*head_dim] -> q, gate each [n_heads][head_dim]. */
 int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,
                                 int32_t head_dim, allpaca_stream_t stream);
+
+/* dst[i, :] = src[rows[i], :] for n rows of row_len floats; rows is a device buffer. */
+int allpaca_gather_rows(float *dst, const float *src, const int32_t *rows, int32_t n,
+                        int32_t row_len, allpaca_stream_t stream);
 
 /* x[i] *= sigmoid(gate[i]) in place. */
 int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_stream_t stream);

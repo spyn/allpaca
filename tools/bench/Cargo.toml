@@ -3,9 +3,13 @@ name = "allpaca-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Lightweight CPU-path bench harness"
+description = "Benchmark an Allpaca server: decode speed, first token, text hashes, A/B of configs"
 
 [dependencies]
 allpaca-core.workspace = true
 allpaca-types.workspace = true
 clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
