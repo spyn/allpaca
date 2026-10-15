@@ -71,6 +71,69 @@ impl EncodedRows {
     pub(crate) fn bytes(&self) -> usize {
         self.bytes.len()
     }
+
+    /// Append to a checkpoint file.
+    pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
+        out.push(match self.codec {
+            KvCodec::F32 => 0,
+            KvCodec::F16 => 1,
+            KvCodec::Q8 => 2,
+            KvCodec::Q4 => 3,
+        });
+        out.extend_from_slice(&(self.width as u32).to_le_bytes());
+        out.extend_from_slice(&(self.rows as u32).to_le_bytes());
+        out.extend_from_slice(&(self.bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.bytes);
+    }
+
+    /// Read what [`Self::write_to`] wrote; `None` when it does not add up.
+    pub(crate) fn read_from(r: &mut Reader<'_>) -> Option<Self> {
+        let codec = match r.u8()? {
+            0 => KvCodec::F32,
+            1 => KvCodec::F16,
+            2 => KvCodec::Q8,
+            3 => KvCodec::Q4,
+            _ => return None,
+        };
+        let width = r.u32()? as usize;
+        let rows = r.u32()? as usize;
+        let n = usize::try_from(r.u64()?).ok()?;
+        if n != rows.checked_mul(2 * vector_bytes(codec, width))? {
+            return None;
+        }
+        Some(Self {
+            codec,
+            width,
+            rows,
+            bytes: r.take(n)?.to_vec(),
+        })
+    }
+}
+
+/// Little-endian reads from a byte slice.
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
+
+impl<'a> Reader<'a> {
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if n > self.0.len() {
+            return None;
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Some(head)
+    }
+
+    pub(crate) fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+
+    pub(crate) fn u32(&mut self) -> Option<u32> {
+        self.take(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    pub(crate) fn u64(&mut self) -> Option<u64> {
+        self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
 }
 
 /// Encoded size of one vector of `width` values.

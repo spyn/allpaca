@@ -214,6 +214,8 @@ struct EngineInner {
     anchors: AnchorCache,
     /// GEM radix prefix KV reuse (arbitrary mid-prompt edits).
     kv_radix: KvRadixForest,
+    /// Model and expert mask the prompt cache holds checkpoints for.
+    prompt_cache_key: Option<u64>,
     /// DirectStorage / GDS capability probe at engine start.
     ds_probe: DirectStorageProbe,
     grammar_factory: Option<llguidance::ParserFactory>,
@@ -602,6 +604,7 @@ impl Engine {
             // One node per token: the node cap must allow long prompts.
             kv_radix: KvRadixForest::with_limits(1 << 20, config.prompt_cache.ram_bytes)
                 .with_codec(config.prompt_cache.codec),
+            prompt_cache_key: None,
             ds_probe: ds_probe.clone(),
             grammar_factory: None,
             last_poll_id: None,
@@ -2827,6 +2830,7 @@ impl Engine {
         } else {
             None
         };
+        self.sync_prompt_cache(&mut inner, &target);
         let probe = read.map(|read| DecisionProbe::new(read, &tokens));
         let mut prefill_pos = 0;
         // Soft vision tokens are not text anchors / radix keys yet. A
@@ -4391,6 +4395,30 @@ impl Engine {
         Ok((end, total))
     }
 
+    /// Point the prompt cache at this model and expert mask: a change clears
+    /// it and opens that pair's disk folder.
+    fn sync_prompt_cache(&self, inner: &mut EngineInner, target: &TinyModel) {
+        let disabled = target.expert_controls.disabled();
+        let key = prompt_cache_key(&target.config, self.config.model.path.as_deref(), &disabled);
+        if inner.prompt_cache_key == Some(key) {
+            return;
+        }
+        inner.prompt_cache_key = Some(key);
+        inner.kv_radix.reset();
+        let pc = &self.config.prompt_cache;
+        let Some(dir) = pc.disk_dir.as_ref() else {
+            return;
+        };
+        // Their state is not part of a checkpoint file.
+        if target.dsv4.is_some() || target.q4x.is_some() {
+            return;
+        }
+        let dir = dir.join(format!("{key:016x}"));
+        if let Err(e) = inner.kv_radix.open_disk(&dir, pc.disk_bytes) {
+            tracing::warn!(error = %e, "prompt cache: disk tier not opened");
+        }
+    }
+
     /// Keep a prefilled prompt in the prompt cache. The CPU path captures as
     /// it goes; on HIP the keys, values and recurrent state are read back once
     /// here. Left out: models whose state the host cannot read back yet
@@ -5286,6 +5314,30 @@ fn mtp_text_has_dropped_words(text: &str) -> bool {
 /// slots live on the workspace that ran the layer, so clone / rewind / clear
 /// must reach both or the peer's layers keep state from rejected tokens (and
 /// leak it per request).
+/// Names the prompt cache's disk folder: checkpoints only resume the model
+/// file, shape and expert mask that wrote them.
+fn prompt_cache_key(
+    model: &ModelConfig,
+    file: Option<&std::path::Path>,
+    disabled: &[Vec<u32>],
+) -> u64 {
+    let mut text = format!("{model:?}|{disabled:?}");
+    if let Some((file, meta)) = file.and_then(|f| std::fs::metadata(f).ok().map(|m| (f, m))) {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        text.push_str(&format!("|{}|{}|{modified}", file.display(), meta.len()));
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 fn for_each_gdn_workspace(
     hip: &HipWorkspace,
     target: Option<&TinyModel>,
@@ -9155,6 +9207,54 @@ mod tests {
             stats.radix_skip_tokens >= 1,
             "at least one shared token must be skipped; stats={stats:?}"
         );
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_serves_a_new_engine() {
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let dir = std::env::temp_dir()
+            .join("allpaca_prompt_cache_tests")
+            .join(format!("engine_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = || {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.disk_dir = Some(dir.clone());
+            cfg
+        };
+        let full = {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            Engine::new(cfg).unwrap().generate("hello world hello true", params.clone()).unwrap()
+        };
+        Engine::new(config()).unwrap().generate("hello world hello", params.clone()).unwrap();
+
+        let engine = Engine::new(config()).unwrap();
+        let hit = engine.generate("hello world hello true", params).unwrap();
+        let stats = engine.stats();
+        assert!(stats.radix_hits >= 1, "checkpoints on disk must serve a new engine; {stats:?}");
+        assert_eq!(hit.token_ids, full.token_ids);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_folders_follow_the_model_and_the_expert_mask() {
+        let cfg = ModelConfig::tiny();
+        let base = prompt_cache_key(&cfg, None, &[]);
+        assert_eq!(base, prompt_cache_key(&cfg, None, &[]));
+        assert_ne!(base, prompt_cache_key(&cfg, None, &[vec![3]]));
+        assert_ne!(base, prompt_cache_key(&ModelConfig::tiny_hybrid(), None, &[]));
+        let file = std::env::temp_dir().join(format!("allpaca_pc_key_{}.bin", std::process::id()));
+        std::fs::write(&file, b"one").unwrap();
+        let one = prompt_cache_key(&cfg, Some(&file), &[]);
+        std::fs::write(&file, b"other").unwrap();
+        assert_ne!(one, prompt_cache_key(&cfg, Some(&file), &[]));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

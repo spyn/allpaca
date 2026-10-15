@@ -679,6 +679,12 @@ pub struct PromptCacheSection {
     pub ram_bytes: usize,
     /// Encoding of the keys and values. Anything but `f32` is lossy.
     pub codec: KvCodec,
+    /// Disk tier: checkpoints are also written here (one folder per model
+    /// and expert mask), outlive restarts and come back when RAM drops them.
+    /// None = RAM only.
+    pub disk_dir: Option<PathBuf>,
+    /// Cap on the disk tier's files. 0 = unlimited.
+    pub disk_bytes: usize,
 }
 
 impl Default for PromptCacheSection {
@@ -686,6 +692,8 @@ impl Default for PromptCacheSection {
         Self {
             ram_bytes: 512 << 20,
             codec: KvCodec::F32,
+            disk_dir: None,
+            disk_bytes: 16 << 30,
         }
     }
 }
@@ -1316,10 +1324,15 @@ mod tests {
             [prompt_cache]
             codec = "q4"
             ram_bytes = 1048576
+            disk_dir = "cache/prompts"
+            disk_bytes = 2048
             "#,
         )
         .unwrap();
         assert_eq!(cfg.prompt_cache.codec, KvCodec::Q4);
         assert_eq!(cfg.prompt_cache.ram_bytes, 1 << 20);
+        assert_eq!(cfg.prompt_cache.disk_dir.as_deref(), Some(Path::new("cache/prompts")));
+        assert_eq!(cfg.prompt_cache.disk_bytes, 2048);
+        assert_eq!(defaults.prompt_cache.disk_dir, None);
     }
 }

@@ -7796,3 +7796,46 @@ fn hip_prompt_cache_hit_matches_full_prefill_on_a_real_model() {
         assert_eq!(hit.token_ids, full.token_ids, "a hit must decode as a full prefill");
     }
 }
+
+/// Real model: checkpoints a first engine wrote to the disk tier serve a
+/// second engine, which decodes exactly as a full prefill.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model() {
+    let _guard = large_gguf_lock();
+    let Some(path) = std::env::var_os("ALLPACA_CACHE_GGUF").map(std::path::PathBuf::from) else {
+        eprintln!("skip hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model: set ALLPACA_CACHE_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model: no HIP device");
+        return;
+    }
+    let dir = std::env::temp_dir()
+        .join("allpaca_prompt_cache_tests")
+        .join(format!("real_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let turn = "The river carried silt from the mountains to the plain, and every spring the farmers waited for the flood to leave its dark soil behind. ";
+    let cached = turn.repeat(12).trim_end().to_string();
+    let prompt = format!("{cached} Question: what did the farmers wait for each spring? Answer:");
+    let with_disk = || {
+        let mut cfg = hip_7b_config(path.clone());
+        cfg.prompt_cache.disk_dir = Some(dir.clone());
+        cfg
+    };
+    let full = Engine::new(hip_7b_config(path.clone())).unwrap().generate(&prompt, greedy(24)).unwrap();
+    Engine::new(with_disk()).unwrap().generate(&cached, greedy(2)).unwrap();
+    let engine = Engine::new(with_disk()).unwrap();
+    let started = std::time::Instant::now();
+    let hit = engine.generate(&prompt, greedy(24)).unwrap();
+    let stats = engine.stats();
+    eprintln!(
+        "prompt cache from disk: hits={} skipped={} in {:?}",
+        stats.radix_hits,
+        stats.radix_skip_tokens,
+        started.elapsed()
+    );
+    assert_eq!(stats.radix_hits, 1, "{stats:?}");
+    assert_eq!(hit.token_ids, full.token_ids, "a hit from disk must decode as a full prefill");
+    let _ = std::fs::remove_dir_all(&dir);
+}
