@@ -10,6 +10,11 @@
 //! written to a file named by its tokens: RAM eviction then only drops the
 //! in-memory copy, a lookup reads it back, the files outlive the process, and
 //! a disk budget deletes the coldest files.
+//!
+//! A state checkpoint holds only recurrent state: the keys and values of its
+//! prefix come from any longer prompt's checkpoint below it, so a hybrid
+//! model can keep its state at several points of a prompt while the keys
+//! and values are stored once.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -67,6 +72,8 @@ struct OnDisk {
     file: PathBuf,
     bytes: usize,
     sliceable: bool,
+    /// A state checkpoint (no keys and values).
+    state_only: bool,
 }
 
 /// One node of the radix: the end of `edge`, a run of tokens.
@@ -85,6 +92,12 @@ struct RadixNode {
 impl RadixNode {
     fn holds(&self) -> bool {
         self.checkpoint.is_some() || self.on_disk.is_some()
+    }
+
+    /// Holds keys and values (not only recurrent state).
+    fn has_kv(&self) -> bool {
+        self.checkpoint.as_ref().is_some_and(|cp| !cp.kv.is_empty())
+            || self.on_disk.as_ref().is_some_and(|d| !d.state_only)
     }
 
     fn sliceable(&self) -> bool {
@@ -185,7 +198,7 @@ impl KvRadixForest {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            let Some((tokens, sliceable)) = read_file_header(&path) else {
+            let Some((tokens, flags)) = read_file_header(&path) else {
                 let _ = std::fs::remove_file(&path);
                 continue;
             };
@@ -193,7 +206,8 @@ impl KvRadixForest {
             let on_disk = OnDisk {
                 file: path,
                 bytes: meta.len() as usize,
-                sliceable,
+                sliceable: flags & FLAG_SLICEABLE != 0,
+                state_only: flags & FLAG_STATE_ONLY != 0,
             };
             found.push((modified, tokens, on_disk));
         }
@@ -306,6 +320,7 @@ impl KvRadixForest {
                     file,
                     bytes: data.len(),
                     sliceable: cp.sliceable,
+                    state_only: cp.kv.is_empty(),
                 }),
                 Err(e) => {
                     tracing::warn!(error = %e, "prompt cache: checkpoint not written to disk");
@@ -339,6 +354,20 @@ impl KvRadixForest {
         self.evict_to_cap();
         self.trim_disk();
         added
+    }
+
+    /// Keep the recurrent state at the end of `tokens` (a state checkpoint).
+    /// A checkpoint already there with keys and values is left as it is.
+    pub fn insert_state(&mut self, tokens: &[u32], recurrent: RecurrentState) {
+        if node_at(&self.root, tokens).is_some_and(|n| n.has_kv()) {
+            return;
+        }
+        let cp = RadixCheckpoint {
+            recurrent,
+            kv: Vec::new(),
+            sliceable: false,
+        };
+        self.insert_checkpoint(tokens, cp);
     }
 
     fn evict_to_cap(&mut self) {
@@ -500,12 +529,12 @@ impl KvRadixForest {
         tokens: &[u32],
         max_depth: usize,
     ) -> Option<(usize, RadixCheckpoint)> {
-        // Walk to the deepest node on the path that holds a checkpoint, and
-        // as far as the tokens follow the tree at all.
+        // Walk: every node on the path that holds a checkpoint, and how far
+        // the tokens follow the tree at all.
         let mut node = &self.root;
         let mut depth = 0usize;
-        let mut best = 0usize;
-        // The node the walk ended at or inside, and the path to its parent.
+        let mut held = Vec::new();
+        // The node the walk ended at or inside, and the depth above its edge.
         let mut under: Option<(&RadixNode, usize)> = None;
         while depth < tokens.len() {
             let Some(child) = node.children.get(&tokens[depth]) else {
@@ -524,31 +553,32 @@ impl KvRadixForest {
             }
             node = child;
             if depth <= max_depth && child.holds() {
-                best = depth;
+                held.push(depth);
             }
         }
         let shared = depth.min(max_depth);
-        let mut source = (best > 0).then(|| tokens[..best].to_vec());
-        let mut cut = best;
         // Deeper than any checkpoint on the path: a sliceable checkpoint
         // further down (a longer prompt through here) holds this prefix too.
-        if shared > best {
+        let mut sliced = None;
+        if shared > held.last().copied().unwrap_or(0) {
             if let Some((child, base)) = under {
                 if let Some(rest) = sliceable_below(child) {
                     let mut path = tokens[..base].to_vec();
                     path.extend_from_slice(&child.edge);
                     path.extend(rest);
-                    source = Some(path);
-                    cut = shared;
+                    sliced = Some(path);
                 }
             }
         }
-        let loaded = source.and_then(|path| {
-            let cp = self.load(&path)?;
-            Some(if path.len() > cut { cp.prefix(cut) } else { cp })
-        });
-        match loaded {
-            Some(cp) => {
+        let mut found = sliced.and_then(|path| Some((shared, self.load(&path)?.prefix(shared))));
+        for &d in held.iter().rev() {
+            if found.is_some() {
+                break;
+            }
+            found = self.resume_at(&tokens[..d]);
+        }
+        match found {
+            Some((cut, cp)) => {
                 self.hits += 1;
                 self.skip_tokens += cut as u64;
                 Some((cut, cp))
@@ -558,6 +588,19 @@ impl KvRadixForest {
                 None
             }
         }
+    }
+
+    /// The checkpoint at `path`, with the keys and values of a state
+    /// checkpoint taken from a longer prompt's checkpoint below it.
+    fn resume_at(&mut self, path: &[u32]) -> Option<(usize, RadixCheckpoint)> {
+        let mut cp = self.load(path)?;
+        if cp.kv.is_empty() {
+            let rest = kv_below(node_at(&self.root, path)?)?;
+            let mut below = path.to_vec();
+            below.extend(rest);
+            cp.kv = self.load(&below)?.prefix(path.len()).kv;
+        }
+        Some((path.len(), cp))
     }
 
     /// The checkpoint at `path`, read back from disk when RAM no longer has
@@ -654,6 +697,21 @@ fn node_insert<'a>(root: &'a mut RadixNode, nodes: &mut usize, tokens: &[u32]) -
     node
 }
 
+fn node_at<'a>(root: &'a RadixNode, tokens: &[u32]) -> Option<&'a RadixNode> {
+    let mut node = root;
+    let mut at = 0usize;
+    while at < tokens.len() {
+        let child = node.children.get(&tokens[at])?;
+        let end = at + child.edge.len();
+        if end > tokens.len() || child.edge[..] != tokens[at..end] {
+            return None;
+        }
+        at = end;
+        node = child;
+    }
+    Some(node)
+}
+
 fn node_at_mut<'a>(root: &'a mut RadixNode, tokens: &[u32]) -> Option<&'a mut RadixNode> {
     let mut node = root;
     let mut at = 0usize;
@@ -720,8 +778,31 @@ fn sliceable_below(node: &RadixNode) -> Option<Vec<u32>> {
     None
 }
 
+/// The tokens from the end of `node` to a checkpoint below it that holds
+/// keys and values.
+fn kv_below(node: &RadixNode) -> Option<Vec<u32>> {
+    let mut stack: Vec<(&RadixNode, Vec<u32>)> = node
+        .children
+        .values()
+        .map(|c| (&**c, c.edge.clone()))
+        .collect();
+    while let Some((n, path)) = stack.pop() {
+        if n.has_kv() {
+            return Some(path);
+        }
+        for child in n.children.values() {
+            let mut p = path.clone();
+            p.extend_from_slice(&child.edge);
+            stack.push((&**child, p));
+        }
+    }
+    None
+}
+
 const MAGIC: &[u8; 4] = b"APKC";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const FLAG_SLICEABLE: u8 = 1;
+const FLAG_STATE_ONLY: u8 = 2;
 
 /// Checkpoint file name: a hash of its tokens.
 fn file_name(tokens: &[u32]) -> String {
@@ -749,7 +830,7 @@ fn write_file(file: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, file)
 }
 
-/// `MAGIC`, version, tokens, sliceable, per-layer keys and values, then the
+/// `MAGIC`, version, tokens, flags, per-layer keys and values, then the
 /// recurrent state (layers, ssm_h, ssm_conv, gdn_state, gdn_conv).
 fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     let mut out = Vec::with_capacity(cp.approx_bytes() + tokens.len() * 4 + 64);
@@ -759,7 +840,14 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     for t in tokens {
         out.extend_from_slice(&t.to_le_bytes());
     }
-    out.push(cp.sliceable as u8);
+    let mut flags = 0;
+    if cp.sliceable {
+        flags |= FLAG_SLICEABLE;
+    }
+    if cp.kv.is_empty() {
+        flags |= FLAG_STATE_ONLY;
+    }
+    out.push(flags);
     out.extend_from_slice(&(cp.kv.len() as u32).to_le_bytes());
     for layer in &cp.kv {
         layer.write_to(&mut out);
@@ -777,18 +865,18 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     out
 }
 
-fn read_header(r: &mut Reader<'_>) -> Option<(Vec<u32>, bool)> {
+fn read_header(r: &mut Reader<'_>) -> Option<(Vec<u32>, u8)> {
     if r.take(4)? != MAGIC || r.u32()? != VERSION {
         return None;
     }
     let n = r.u32()? as usize;
     let tokens = (0..n).map(|_| r.u32()).collect::<Option<Vec<_>>>()?;
-    let sliceable = r.u8()? != 0;
-    Some((tokens, sliceable))
+    let flags = r.u8()?;
+    Some((tokens, flags))
 }
 
-/// Tokens and sliceable flag, reading only the start of the file.
-fn read_file_header(path: &Path) -> Option<(Vec<u32>, bool)> {
+/// Tokens and flags, reading only the start of the file.
+fn read_file_header(path: &Path) -> Option<(Vec<u32>, u8)> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 12];
     f.read_exact(&mut head).ok()?;
@@ -803,7 +891,7 @@ fn read_file_header(path: &Path) -> Option<(Vec<u32>, bool)> {
 /// The checkpoint in `bytes`, when it is one and belongs to `tokens`.
 fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
     let mut r = Reader(bytes);
-    let (found, sliceable) = read_header(&mut r)?;
+    let (found, flags) = read_header(&mut r)?;
     if found != tokens {
         return None;
     }
@@ -839,7 +927,7 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
     Some(RadixCheckpoint {
         recurrent,
         kv,
-        sliceable,
+        sliceable: flags & FLAG_SLICEABLE != 0,
     })
 }
 
@@ -1090,6 +1178,52 @@ mod tests {
         assert!(forest.lookup_checkpoint(&[1]).is_some());
         assert!(forest.lookup_checkpoint(&[3]).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn state(v: f32) -> RecurrentState {
+        let mut s = RecurrentState::zeros(1, 4);
+        s.gdn_state = vec![vec![v; 8]];
+        s
+    }
+
+    fn rows_upto(n: usize) -> Vec<Vec<KvRow>> {
+        vec![(0..n)
+            .map(|t| KvRow {
+                k: vec![t as f32; 4],
+                v: vec![-(t as f32); 4],
+            })
+            .collect()]
+    }
+
+    #[test]
+    fn a_state_checkpoint_takes_its_keys_from_a_longer_prompt() {
+        let dir = disk_dir("state");
+        for reopen in [false, true] {
+            let mut forest = KvRadixForest::new().with_disk(&dir, 0).unwrap();
+            if !reopen {
+                let full = forest.checkpoint(state(6.0), rows_upto(6));
+                forest.insert_checkpoint(&[1, 2, 3, 4, 5, 6], full);
+                forest.insert_state(&[1, 2, 3], state(3.0));
+            }
+            let (n, cp) = forest
+                .lookup_checkpoint(&[1, 2, 3, 9, 9])
+                .unwrap_or_else(|| panic!("state checkpoint (reopen {reopen})"));
+            assert_eq!(n, 3);
+            assert_eq!(cp.recurrent.gdn_state, state(3.0).gdn_state, "its own state");
+            assert_eq!(cp.kv_rows(), rows_upto(3), "keys from the longer prompt");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_checkpoint_without_keys_below_is_passed_over() {
+        let mut forest = KvRadixForest::new();
+        let short = forest.checkpoint(state(1.0), rows_upto(1));
+        forest.insert_checkpoint(&[1], short);
+        forest.insert_state(&[1, 2, 3], state(3.0));
+        let (n, cp) = forest.lookup_checkpoint(&[1, 2, 3, 9]).expect("the shorter one");
+        assert_eq!(n, 1);
+        assert_eq!(cp.recurrent.gdn_state, state(1.0).gdn_state);
     }
 
     #[test]

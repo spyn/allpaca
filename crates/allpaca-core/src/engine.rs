@@ -4387,6 +4387,11 @@ impl Engine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if end >= total {
             self.capture_prompt(inner, id, &target)?;
+        } else {
+            let every = self.config.prompt_cache.boundary_tokens;
+            if target.config.recurrent && every > 0 && end / every > start / every {
+                self.capture_state(inner, id, &target, end)?;
+            }
         }
         if end >= total && inner.flags.ngram_speculation {
             let tokens = request(inner, id)?.tokens.clone();
@@ -4419,27 +4424,48 @@ impl Engine {
         }
     }
 
-    /// Keep a prefilled prompt in the prompt cache. The CPU path captures as
-    /// it goes; on HIP the keys, values and recurrent state are read back once
-    /// here. Left out: models whose state the host cannot read back yet
-    /// (DeepSeek-V4, qwen4exp, layers on RPC workers), and vision or
-    /// decision prompts.
-    fn capture_prompt(
+    /// Keep a hybrid's recurrent state after its first `end` prompt tokens
+    /// (a state checkpoint; the keys and values come from the full prompt's
+    /// checkpoint when prefill ends).
+    fn capture_state(
         &self,
         inner: &mut EngineInner,
         id: u64,
         target: &TinyModel,
+        end: usize,
     ) -> Result<(), AllpacaError> {
-        let Some(hip) = self.hip.as_deref() else {
+        if !self.prompt_cache_reads_back(inner, id, target)? {
             return Ok(());
+        }
+        let active = request(inner, id)?;
+        let tokens = active.tokens[..end].to_vec();
+        let Some(state) = active.recurrent.clone() else {
+            return Ok(());
+        };
+        inner.kv_radix.insert_state(&tokens, state);
+        Ok(())
+    }
+
+    /// Whether the prompt cache can take this Request's state on HIP, after
+    /// reading its GDN/Mamba state back to the host. Left out: models whose
+    /// state the host cannot read back yet (DeepSeek-V4, qwen4exp, layers on
+    /// RPC workers), and vision or decision prompts.
+    fn prompt_cache_reads_back(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+    ) -> Result<bool, AllpacaError> {
+        let Some(hip) = self.hip.as_deref() else {
+            return Ok(false);
         };
         let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
         if target.dsv4.is_some() || target.q4x.is_some() || layers_remote {
-            return Ok(());
+            return Ok(false);
         }
         let active = request_mut(inner, id)?;
         if !active.vision.is_empty() || active.probe.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(state) = active.recurrent.as_mut() {
             for_each_gdn_workspace(hip, Some(target), |ws| {
@@ -4448,6 +4474,22 @@ impl Engine {
                 ws.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)
             })?;
         }
+        Ok(true)
+    }
+
+    /// Keep a prefilled prompt in the prompt cache. The CPU path captures as
+    /// it goes; on HIP the keys, values and recurrent state are read back once
+    /// here (see [`Self::prompt_cache_reads_back`] for what is left out).
+    fn capture_prompt(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+    ) -> Result<(), AllpacaError> {
+        if !self.prompt_cache_reads_back(inner, id, target)? {
+            return Ok(());
+        }
+        let active = request(inner, id)?;
         let tokens = active.tokens[..active.prompt_len].to_vec();
         let pages = active.pages.clone();
         let state = active

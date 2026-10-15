@@ -7839,3 +7839,43 @@ fn hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model() {
     assert_eq!(hit.token_ids, full.token_ids, "a hit from disk must decode as a full prefill");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Real hybrid model: an edit inside a long cached prompt resumes from the
+/// last state checkpoint before it and decodes exactly as a full prefill.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model() {
+    let _guard = large_gguf_lock();
+    let Some(path) = std::env::var_os("ALLPACA_CACHE_HYBRID_GGUF").map(std::path::PathBuf::from) else {
+        eprintln!("skip hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model: set ALLPACA_CACHE_HYBRID_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model: no HIP device");
+        return;
+    }
+    let turn = "The river carried silt from the mountains to the plain, and every spring the farmers waited for the flood to leave its dark soil behind. ";
+    let cached = format!("{}The harvest was good that year.", turn.repeat(40));
+    let edited = format!("{}The harvest failed that year. What happened to the harvest?", turn.repeat(40));
+    let config = || {
+        let mut cfg = hip_7b_config(path.clone());
+        cfg.prompt_cache.boundary_tokens = 256;
+        cfg.prefill.chunk_tokens = 256;
+        cfg
+    };
+    let full = Engine::new(config()).unwrap().generate(&edited, greedy(24)).unwrap();
+    let engine = Engine::new(config()).unwrap();
+    engine.generate(&cached, greedy(2)).unwrap();
+    let hit = engine.generate(&edited, greedy(24)).unwrap();
+    let stats = engine.stats();
+    eprintln!(
+        "prompt cache mid-prompt: hits={} skipped={} of {} prompt tokens",
+        stats.radix_hits,
+        stats.radix_skip_tokens,
+        stats.prompt_tokens
+    );
+    assert_eq!(stats.radix_hits, 1, "{stats:?}");
+    assert!(stats.radix_skip_tokens >= 1024, "{stats:?}");
+    assert_eq!(stats.radix_skip_tokens % 256, 0, "resumes at a boundary; {stats:?}");
+    assert_eq!(hit.token_ids, full.token_ids, "a mid-prompt hit must decode as a full prefill");
+}
