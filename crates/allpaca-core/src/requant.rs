@@ -170,7 +170,8 @@ pub struct ProbeTexts {
     pub max_tokens: usize,
     /// Probe each matrix at its fewest bits only, and take the others as
     /// that divergence scaled by the matrix's own error: one read of the
-    /// texts per matrix instead of one per type.
+    /// texts per matrix instead of one per type. A table row is then read
+    /// for its fewest-bits value only.
     pub scaled: bool,
 }
 
@@ -343,7 +344,9 @@ pub fn requantise_each(
         let mut moved = vec![f64::NAN; targets.len()];
         let mut decoded = vec![0.0f32; w.len()];
         let mut kept = Vec::new();
-        let scaled = opts.probe.as_ref().is_some_and(|p| p.scaled) && probe.is_some() && !from_table;
+        // Scaled, a table row gives only the fewest-bits divergence: the
+        // others follow this run's errors (measured inputs change them).
+        let scaled = opts.probe.as_ref().is_some_and(|p| p.scaled) && (probe.is_some() || from_table);
         // The type a scaled probe measures: the fewest bits the rows fit.
         let anchor = targets
             .iter()
@@ -994,6 +997,35 @@ mod tests {
         }
     }
 
+    /// With measured inputs, the stacked experts and the shared expert are
+    /// calibrated like the dense matrices: their errors are of their
+    /// outputs on the inputs the routing gave them.
+    #[test]
+    fn measured_inputs_reach_the_experts() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_moe_cal_{tag}-{pid}.gguf"));
+        let (src, dst) = (at("in"), at("out"));
+        crate::calib::tests::write_tiny_calib_gguf_moe(&src, 64, 128, 0.3, 1, false, 4);
+        let stats = crate::calib::capture(&src, &["hello world again hello world", "again again hello"]).unwrap();
+        let opts = Options {
+            avg_bits: 4.0,
+            gsq: GsqConfig { steps: 8, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            stats: Some(stats),
+            ..Options::default()
+        };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        for kind in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "attn_q"] {
+            let name = format!("blk.0.{kind}.weight");
+            let c = report.choices.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("{name} not requantised"));
+            assert!(c.calibrated, "{name}");
+        }
+        for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// A matrix the probe cannot run (here a block past the model's last,
     /// as a multi-token-prediction layer is) is still requantised, with its
     /// divergence estimated from its own error, not copied as it was.
@@ -1102,6 +1134,50 @@ mod tests {
         }
         assert_eq!(std::fs::read(&probed).unwrap(), std::fs::read(&reused).unwrap());
         for path in [src, probed, reused, table] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A scaled run given a table takes only the fewest-bits type's
+    /// divergence from it, and scales the other types by the errors of
+    /// this run: with measured inputs, those of the outputs on them.
+    #[test]
+    fn a_scaled_run_rescales_its_table_by_the_errors_it_measures() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_rescale_{tag}-{pid}"));
+        let (src, out, table) = (at("in.gguf"), at("out.gguf"), at("table.tsv"));
+        let _ = std::fs::remove_file(&table);
+        crate::calib::tests::write_tiny_calib_gguf_with(&src, 64, 128, 0.3);
+        let texts = vec!["hello world again hello world".to_string(), "again again hello".to_string()];
+        let opts = Options {
+            avg_bits: 4.0,
+            gsq: GsqConfig { steps: 8, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            probe: Some(ProbeTexts { texts: texts.clone(), max_tokens: 32, scaled: true }),
+            probe_table: Some(table.clone()),
+            ..Options::default()
+        };
+        let plain = requantise(&src, &out, &opts).unwrap();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let stats = crate::calib::capture(&src, &refs).unwrap();
+        let tuned = requantise(&src, &out, &Options { stats: Some(stats), ..opts.clone() }).unwrap();
+        let anchor = CLASSIC.iter().position(|t| *t == Target::Q2_0).unwrap();
+        let mut moved = 0;
+        for (a, b) in plain.choices.iter().zip(&tuned.choices) {
+            assert!(b.calibrated, "{}", b.name);
+            let (da, db) = (a.divergence.clone().unwrap(), b.divergence.clone().unwrap());
+            assert_eq!(db[anchor], da[anchor], "{}: the table's measurement", b.name);
+            for t in (0..CLASSIC.len()).filter(|&t| t != anchor) {
+                let want = db[anchor] / b.relative_error[anchor] * b.relative_error[t];
+                assert!((db[t] - want).abs() <= 1e-9 * want.abs().max(1e-12), "{} {t}: {} vs {want}", b.name, db[t]);
+                if (db[t] - da[t]).abs() > 1e-6 * da[t].abs() {
+                    moved += 1;
+                }
+            }
+        }
+        assert!(moved > 0, "the measured inputs changed no estimate");
+        for path in [src, out, table] {
             let _ = std::fs::remove_file(path);
         }
     }
