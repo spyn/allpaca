@@ -17,6 +17,7 @@ pub struct Config {
     pub kv: KvSection,
     pub weights: WeightsSection,
     pub anchors: AnchorsSection,
+    pub prompt_cache: PromptCacheSection,
     pub early_exit: EarlyExitSection,
     pub sampling: SamplingSection,
     pub structured_output: StructuredOutputSection,
@@ -48,6 +49,7 @@ impl Config {
             kv: KvSection::default(),
             weights: WeightsSection::default(),
             anchors: AnchorsSection::default(),
+            prompt_cache: PromptCacheSection::default(),
             early_exit: EarlyExitSection::default(),
             sampling: SamplingSection::default(),
             structured_output: StructuredOutputSection::default(),
@@ -650,6 +652,58 @@ impl Default for AnchorsSection {
         Self {
             slots: 0,
             token_ids: Vec::new(),
+        }
+    }
+}
+
+/// How prompt-cache checkpoints store keys and values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCodec {
+    /// Exact: a cache hit continues exactly as the full prefill would.
+    #[default]
+    F32,
+    F16,
+    /// 8-bit blocks of 32, one scale each (~8.5 bits per value).
+    Q8,
+    /// 4-bit blocks of 32, a scale and a minimum each (~5 bits per value).
+    Q4,
+}
+
+/// Prompt cache: prefixes of earlier prompts kept so a request that shares
+/// one skips its prefill. Recurrent state is always kept in f32.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptCacheSection {
+    /// RAM for checkpoints. 0 = unlimited.
+    pub ram_bytes: usize,
+    /// Encoding of the keys and values. Anything but `f32` is lossy.
+    pub codec: KvCodec,
+    /// Disk tier: checkpoints are also written here (one folder per model
+    /// and expert mask), outlive restarts and come back when RAM drops them.
+    /// None = RAM only.
+    pub disk_dir: Option<PathBuf>,
+    /// Cap on the disk tier's files. 0 = unlimited.
+    pub disk_bytes: usize,
+    /// Keep the disk tier's files on the first RPC worker that serves the
+    /// `prompt_cache` store (`allpaca-rpc-server --prompt-cache-gib`)
+    /// instead of `disk_dir`; they then outlive a restart of this side.
+    pub worker: bool,
+    /// Models with recurrent state also keep it each time prefill passes
+    /// this many more tokens, so an edit inside a long prompt resumes from
+    /// the last such point. 0 = only at the end of a prompt.
+    pub boundary_tokens: usize,
+}
+
+impl Default for PromptCacheSection {
+    fn default() -> Self {
+        Self {
+            ram_bytes: 512 << 20,
+            codec: KvCodec::F32,
+            disk_dir: None,
+            disk_bytes: 16 << 30,
+            worker: false,
+            boundary_tokens: 2048,
         }
     }
 }
@@ -1267,5 +1321,30 @@ mod tests {
         assert_eq!(saved.cache_bytes, 4096);
         assert_eq!(saved.groups, vec!["early"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_keeps_exact_checkpoints_unless_told_otherwise() {
+        let defaults = Config::compiled_defaults();
+        assert_eq!(defaults.prompt_cache.codec, KvCodec::F32);
+        assert_eq!(defaults.prompt_cache.ram_bytes, 512 << 20);
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [prompt_cache]
+            codec = "q4"
+            ram_bytes = 1048576
+            disk_dir = "cache/prompts"
+            disk_bytes = 2048
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.prompt_cache.codec, KvCodec::Q4);
+        assert_eq!(cfg.prompt_cache.ram_bytes, 1 << 20);
+        assert_eq!(cfg.prompt_cache.disk_dir.as_deref(), Some(Path::new("cache/prompts")));
+        assert_eq!(cfg.prompt_cache.disk_bytes, 2048);
+        assert_eq!(defaults.prompt_cache.disk_dir, None);
+        assert_eq!(defaults.prompt_cache.boundary_tokens, 2048);
+        assert!(!defaults.prompt_cache.worker);
     }
 }

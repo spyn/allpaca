@@ -267,6 +267,14 @@ impl RpcRuntime {
         for ep in endpoints {
             tracing::info!(endpoint = %ep, "rpc HELLO");
             let session = RpcSession::connect_addr_with_token(ep, token).map_err(map_rpc)?;
+            if !session.same_build() {
+                tracing::warn!(
+                    endpoint = %ep,
+                    worker = session.build_id().unwrap_or("unknown"),
+                    coordinator = allpaca_rpc::BUILD_ID,
+                    "rpc worker was built from other sources than this coordinator; rebuild it (scripts/deploy-worker.sh)"
+                );
+            }
             sessions.push(session);
         }
         Ok(Self {
@@ -924,6 +932,12 @@ impl RpcRuntime {
         })
     }
 
+    /// The first worker (any backend) that serves the extension `name`.
+    pub fn session_serving(&self, name: &str) -> Option<usize> {
+        let sessions = self.sessions.lock().ok()?;
+        sessions.iter().position(|session| session.has_extension(name))
+    }
+
     /// The first HIP worker that serves the extension `name`: its session
     /// and the free bytes of its GPUs.
     pub fn extension_host(&self, name: &str) -> Option<(usize, Vec<u64>)> {
@@ -932,6 +946,24 @@ impl RpcRuntime {
             let hip = matches!(session.hello().backend, RpcBackendKind::Hip);
             (hip && session.has_extension(name)).then(|| (s, session.hello().device_memories()))
         })
+    }
+
+    /// Run `f` with worker `session` to itself: no other call reaches that
+    /// worker until `f` returns. `f` must not use this runtime (it holds
+    /// the sessions).
+    pub fn with_session<T>(
+        &self,
+        session: usize,
+        f: impl FnOnce(&mut RpcSession) -> Result<T, AllpacaError>,
+    ) -> Result<T, AllpacaError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidConfig("rpc session lock".into())))?;
+        let session = sessions
+            .get_mut(session)
+            .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig(format!("no rpc session {session}"))))?;
+        f(session)
     }
 
     /// One call to the extension `name` of worker `session`.
@@ -2023,7 +2055,7 @@ fn is_dense_attn_ffn(layer: &LayerWeights) -> bool {
     !layer.wq.is_empty() && !layer.w_gate.is_empty() && layer.experts.is_empty()
 }
 
-fn map_rpc(e: allpaca_rpc::RpcError) -> AllpacaError {
+pub(crate) fn map_rpc(e: allpaca_rpc::RpcError) -> AllpacaError {
     AllpacaError::Fatal(FatalError::Io(e.to_string()))
 }
 

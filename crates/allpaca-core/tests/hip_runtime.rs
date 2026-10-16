@@ -7707,3 +7707,175 @@ fn hip_rope_none_matches_cpu_and_differs_from_rope() {
         assert_ne!(cpu, rotated, "{name}: rope_none must change the decode");
     }
 }
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_prompt_cache_hit_decodes_like_a_full_prefill() {
+    let cached = "hello world hello world hello true";
+    // A follow-up turn resumes any model; a mid-prompt edit only resumes
+    // models without recurrent state.
+    let cases = [
+        ("dense extended", ModelConfig::tiny(), "hello world hello world hello true world hello", 7),
+        ("hybrid extended", ModelConfig::tiny_hybrid(), "hello world hello world hello true world hello", 7),
+        ("dense edited", ModelConfig::tiny(), "hello world hello world hello there world", 6),
+    ];
+    for (name, model, prompt, skipped) in cases {
+        let fresh = Engine::new(hip_auto_synthetic()).unwrap();
+        fresh.load_synthetic(model.clone()).unwrap();
+        if hip_gpus(&fresh).is_empty() {
+            eprintln!("skip hip_prompt_cache_hit_decodes_like_a_full_prefill: no HIP device");
+            return;
+        }
+        let full = fresh.generate(prompt, greedy(12)).unwrap();
+
+        let warm = Engine::new(hip_auto_synthetic()).unwrap();
+        warm.load_synthetic(model).unwrap();
+        warm.generate(cached, greedy(4)).unwrap();
+        let hit = warm.generate(prompt, greedy(12)).unwrap();
+        let stats = warm.stats();
+        assert_eq!(stats.radix_hits, 1, "{name}: the cached prefix must hit; {stats:?}");
+        assert_eq!(stats.radix_skip_tokens, skipped, "{name}");
+        assert_eq!(hit.token_ids, full.token_ids, "{name}: a hit must decode as a full prefill");
+    }
+}
+
+/// Real model: a prompt that extends a cached one decodes exactly as a full
+/// prefill. `ALLPACA_CACHE_GGUF` = model path (a hybrid such as Qwen3.5
+/// checks the recurrent state too).
+#[cfg(feature = "hip")]
+#[test]
+fn hip_prompt_cache_hit_matches_full_prefill_on_a_real_model() {
+    let _guard = large_gguf_lock();
+    let Some(path) = std::env::var_os("ALLPACA_CACHE_GGUF").map(std::path::PathBuf::from) else {
+        eprintln!("skip hip_prompt_cache_hit_matches_full_prefill_on_a_real_model: set ALLPACA_CACHE_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_prompt_cache_hit_matches_full_prefill_on_a_real_model: no HIP device");
+        return;
+    }
+    let turn = "The river carried silt from the mountains to the plain, and every \
+                spring the farmers waited for the flood to leave its dark soil behind. ";
+    // Ends on a token boundary: a trailing space would merge into the next word.
+    let cached = turn.repeat(12).trim_end().to_string();
+    let prompt = format!("{cached} Question: what did the farmers wait for each spring? Answer:");
+    // `ALLPACA_CACHE_CODEC` = f16 / q8 / q4 reports how far a lossy hit
+    // follows the full prefill instead of requiring the same tokens.
+    let codec = match std::env::var("ALLPACA_CACHE_CODEC").as_deref() {
+        Ok("f16") => allpaca_types::KvCodec::F16,
+        Ok("q8") => allpaca_types::KvCodec::Q8,
+        Ok("q4") => allpaca_types::KvCodec::Q4,
+        _ => allpaca_types::KvCodec::F32,
+    };
+    let full = {
+        let engine = Engine::new(hip_7b_config(path.clone())).unwrap();
+        engine.generate(&prompt, greedy(24)).unwrap()
+    };
+    let mut cfg = hip_7b_config(path);
+    cfg.prompt_cache.codec = codec;
+    let engine = Engine::new(cfg).unwrap();
+    engine.generate(&cached, greedy(2)).unwrap();
+    let hit = engine.generate(&prompt, greedy(24)).unwrap();
+    let stats = engine.stats();
+    let same = hit
+        .token_ids
+        .iter()
+        .zip(&full.token_ids)
+        .take_while(|(a, b)| a == b)
+        .count();
+    eprintln!(
+        "prompt cache {codec:?}: hits={} skipped={} bytes={} same first {same} of {} tokens",
+        stats.radix_hits,
+        stats.radix_skip_tokens,
+        stats.radix_bytes,
+        full.token_ids.len()
+    );
+    assert_eq!(stats.radix_hits, 1, "{stats:?}");
+    assert!(stats.radix_skip_tokens > 200, "{stats:?}");
+    if codec == allpaca_types::KvCodec::F32 {
+        assert_eq!(hit.token_ids, full.token_ids, "a hit must decode as a full prefill");
+    }
+}
+
+/// Real model: checkpoints a first engine wrote to the disk tier serve a
+/// second engine, which decodes exactly as a full prefill.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model() {
+    let _guard = large_gguf_lock();
+    let Some(path) = std::env::var_os("ALLPACA_CACHE_GGUF").map(std::path::PathBuf::from) else {
+        eprintln!("skip hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model: set ALLPACA_CACHE_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model: no HIP device");
+        return;
+    }
+    let dir = std::env::temp_dir()
+        .join("allpaca_prompt_cache_tests")
+        .join(format!("real_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let turn = "The river carried silt from the mountains to the plain, and every spring the farmers waited for the flood to leave its dark soil behind. ";
+    let cached = turn.repeat(12).trim_end().to_string();
+    let prompt = format!("{cached} Question: what did the farmers wait for each spring? Answer:");
+    let with_disk = || {
+        let mut cfg = hip_7b_config(path.clone());
+        cfg.prompt_cache.disk_dir = Some(dir.clone());
+        cfg
+    };
+    let full = Engine::new(hip_7b_config(path.clone())).unwrap().generate(&prompt, greedy(24)).unwrap();
+    Engine::new(with_disk()).unwrap().generate(&cached, greedy(2)).unwrap();
+    let engine = Engine::new(with_disk()).unwrap();
+    let started = std::time::Instant::now();
+    let hit = engine.generate(&prompt, greedy(24)).unwrap();
+    let stats = engine.stats();
+    eprintln!(
+        "prompt cache from disk: hits={} skipped={} in {:?}",
+        stats.radix_hits,
+        stats.radix_skip_tokens,
+        started.elapsed()
+    );
+    assert_eq!(stats.radix_hits, 1, "{stats:?}");
+    assert_eq!(hit.token_ids, full.token_ids, "a hit from disk must decode as a full prefill");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Real hybrid model: an edit inside a long cached prompt resumes from the
+/// last state checkpoint before it and decodes exactly as a full prefill.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model() {
+    let _guard = large_gguf_lock();
+    let Some(path) = std::env::var_os("ALLPACA_CACHE_HYBRID_GGUF").map(std::path::PathBuf::from) else {
+        eprintln!("skip hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model: set ALLPACA_CACHE_HYBRID_GGUF");
+        return;
+    };
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model: no HIP device");
+        return;
+    }
+    let turn = "The river carried silt from the mountains to the plain, and every spring the farmers waited for the flood to leave its dark soil behind. ";
+    let cached = format!("{}The harvest was good that year.", turn.repeat(40));
+    let edited = format!("{}The harvest failed that year. What happened to the harvest?", turn.repeat(40));
+    let config = || {
+        let mut cfg = hip_7b_config(path.clone());
+        cfg.prompt_cache.boundary_tokens = 256;
+        cfg.prefill.chunk_tokens = 256;
+        cfg
+    };
+    let full = Engine::new(config()).unwrap().generate(&edited, greedy(24)).unwrap();
+    let engine = Engine::new(config()).unwrap();
+    engine.generate(&cached, greedy(2)).unwrap();
+    let hit = engine.generate(&edited, greedy(24)).unwrap();
+    let stats = engine.stats();
+    eprintln!(
+        "prompt cache mid-prompt: hits={} skipped={} of {} prompt tokens",
+        stats.radix_hits,
+        stats.radix_skip_tokens,
+        stats.prompt_tokens
+    );
+    assert_eq!(stats.radix_hits, 1, "{stats:?}");
+    assert!(stats.radix_skip_tokens >= 1024, "{stats:?}");
+    assert_eq!(stats.radix_skip_tokens % 256, 0, "resumes at a boundary; {stats:?}");
+    assert_eq!(hit.token_ids, full.token_ids, "a mid-prompt hit must decode as a full prefill");
+}

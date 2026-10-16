@@ -335,6 +335,10 @@ int allpaca_relu_sqr(float *x, int32_t n, allpaca_stream_t stream);
 int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int32_t n_heads,
                                 int32_t head_dim, allpaca_stream_t stream);
 
+/* dst[i, :] = src[rows[i], :] for n rows of row_len floats; rows is a device buffer. */
+int allpaca_gather_rows(float *dst, const float *src, const int32_t *rows, int32_t n,
+                        int32_t row_len, allpaca_stream_t stream);
+
 /* x[i] *= sigmoid(gate[i]) in place. */
 int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_stream_t stream);
 

@@ -13,14 +13,27 @@
 //! `--probe [N]` (needs the calibration text) also chooses the types by
 //! measured sensitivity: each matrix is swapped for each of its options in
 //! turn and the text reread (N tokens per paragraph, default 64), which
-//! costs three reads of the text per matrix.
+//! costs a read of the text per matrix and type. With `--scaled` it reads
+//! the text once per matrix, at its fewest bits, and scales that by the
+//! matrix's own error for the other types.
+//!
+//! `--propagate [ridge]` (needs the calibration text) quantises the blocks
+//! in order once the types are chosen, each matrix for the original outputs
+//! on the inputs the quantised matrices before it produce. `ridge` (default
+//! 1.0) holds a matrix to its own weights: lower fits the text more closely.
+//!
+//! `--probe-table <file>` saves the probe's measurements to the file, and
+//! when the file exists, reads them from it instead of probing.
+//!
+//! `--types q2_0,q3_k,q4_k,q5_k,q6_k,q8_0` limits the types a matrix may
+//! take (default: all of those and `q4_0`).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use allpaca_core::gsq::GsqConfig;
-use allpaca_core::requant::{requantise_each, Options, ProbeTexts};
+use allpaca_core::requant::{requantise_each, Options, ProbeTexts, Target};
 
 static STARTED: OnceLock<Instant> = OnceLock::new();
 
@@ -37,9 +50,41 @@ fn main() {
         probe_tokens = Some(given.unwrap_or(64));
         args.drain(at..at + 1 + usize::from(given.is_some()));
     }
+    let mut ridge = None;
+    if let Some(at) = args.iter().position(|a| a == "--propagate") {
+        let given = args.get(at + 1).and_then(|v| v.parse::<f32>().ok());
+        ridge = Some(given.unwrap_or(1.0));
+        args.drain(at..at + 1 + usize::from(given.is_some()));
+    }
+    let scaled = args.iter().any(|a| a == "--scaled");
+    args.retain(|a| a != "--scaled");
+    let mut probe_table = None;
+    if let Some(at) = args.iter().position(|a| a == "--probe-table") {
+        match args.get(at + 1) {
+            Some(path) => probe_table = Some(PathBuf::from(path)),
+            None => {
+                eprintln!("--probe-table takes a file");
+                std::process::exit(2);
+            }
+        }
+        args.drain(at..at + 2);
+    }
+    let mut types = None;
+    if let Some(at) = args.iter().position(|a| a == "--types") {
+        let list = args.get(at + 1).cloned().unwrap_or_default();
+        let named: Option<Vec<Target>> = list.split(',').map(|n| Target::named(n.trim())).collect();
+        match named.filter(|t| !t.is_empty()) {
+            Some(named) => types = Some(named),
+            None => {
+                eprintln!("--types takes a list such as q2_0,q4_k,q6_k (got {list:?})");
+                std::process::exit(2);
+            }
+        }
+        args.drain(at..(at + 2).min(args.len()));
+    }
     if args.len() < 2 {
         eprintln!(
-            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]]"
+            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--propagate [ridge]] [--types q2_0,q4_k,...]"
         );
         std::process::exit(2);
     }
@@ -47,6 +92,10 @@ fn main() {
         progress: Some(progress),
         ..Options::default()
     };
+    opts.probe_table = probe_table;
+    if let Some(types) = types {
+        opts.targets = types;
+    }
     let budgets: Vec<f64> = match args.get(2) {
         Some(bits) => bits.split(',').map(|b| b.parse().expect("avg bits")).collect(),
         None => vec![opts.avg_bits],
@@ -72,7 +121,14 @@ fn main() {
         let text = std::fs::read_to_string(path).expect("calibration text");
         let texts: Vec<&str> = text.split("\n\n").map(str::trim).filter(|t| !t.is_empty()).collect();
         if let Some(max_tokens) = probe_tokens {
-            opts.probe = Some(ProbeTexts { texts: texts.iter().map(|t| t.to_string()).collect(), max_tokens });
+            opts.probe = Some(ProbeTexts { texts: texts.iter().map(|t| t.to_string()).collect(), max_tokens, scaled });
+        }
+        if let Some(ridge) = ridge {
+            opts.propagate = Some(allpaca_core::propagate::Settings {
+                texts: texts.iter().map(|t| t.to_string()).collect(),
+                max_tokens: 4096,
+                ridge,
+            });
         }
         let start = std::time::Instant::now();
         match allpaca_core::calib::capture(Path::new(&args[0]), &texts) {
@@ -91,8 +147,8 @@ fn main() {
             }
         }
     }
-    if probe_tokens.is_some() && opts.probe.is_none() {
-        eprintln!("--probe needs a calibration text");
+    if (probe_tokens.is_some() && opts.probe.is_none()) || (ridge.is_some() && opts.propagate.is_none()) {
+        eprintln!("--probe and --propagate need a calibration text");
         std::process::exit(2);
     }
     STARTED.get_or_init(Instant::now);
@@ -107,26 +163,36 @@ fn main() {
     for (report, (path, _)) in reports.iter().zip(&outputs) {
         println!("== {}", path.display());
         {
+            // A type a matrix's rows do not fit has no number.
+            let table = |values: &[f64]| -> String {
+                report
+                    .targets
+                    .iter()
+                    .zip(values)
+                    .filter(|(_, v)| !v.is_nan())
+                    .map(|(t, v)| format!("{} {v:.5}", t.name()))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            };
             for c in &report.choices {
                 println!(
-                    "{:<44} {:>10} weights -> {:?}  ({} error Q2_0 {:.4}  Q4_0 {:.4}  Q8_0 {:.6})",
+                    "{:<44} {:>10} weights -> {}  ({} error {})",
                     c.name,
                     c.weights,
-                    c.target,
+                    c.target.name(),
                     if c.calibrated { "output" } else { "weight" },
-                    c.relative_error[0],
-                    c.relative_error[1],
-                    c.relative_error[2]
+                    table(&c.relative_error)
                 );
-                if let Some(d) = c.divergence {
-                    println!("{:<44} divergence Q2_0 {:.5}  Q4_0 {:.5}  Q8_0 {:.6}", "", d[0], d[1], d[2]);
+                if let Some(d) = &c.divergence {
+                    println!("{:<44} divergence {}", "", table(d));
                 }
             }
             println!(
-                "{} matrices requantised to {:.3} bits per weight on average ({} on measured inputs), {} tensors copied",
+                "{} matrices requantised to {:.3} bits per weight on average ({} on measured inputs, {} in order), {} tensors copied",
                 report.choices.len(),
                 report.avg_bits(),
                 report.calibrated,
+                report.propagated,
                 report.copied
             );
         }

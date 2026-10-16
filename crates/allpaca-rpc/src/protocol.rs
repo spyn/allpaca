@@ -695,35 +695,44 @@ pub fn encode_hello_reply(r: &HelloReply) -> Vec<u8> {
     w
 }
 
-/// Append the names of a worker's extensions to its encoded HELLO reply.
+/// A fingerprint of the sources this side was built from (the kernels, the
+/// worker and what it hosts). A coordinator and a worker built from the
+/// same sources have the same one.
+pub const BUILD_ID: &str = env!("ALLPACA_RPC_BUILD_ID");
+
+/// Append the names of a worker's extensions and its [`BUILD_ID`] to its
+/// encoded HELLO reply.
 pub fn append_hello_extensions(reply: &mut Vec<u8>, names: &[&str]) {
     write_u32(reply, names.len() as u32);
     for name in names {
         write_str(reply, name);
     }
+    write_str(reply, BUILD_ID);
 }
 
-/// The extension names after a HELLO reply's device list (none from a
-/// worker that does not append them).
-pub fn decode_hello_extensions(data: &[u8]) -> Result<Vec<String>, RpcError> {
+/// The extension names and the build id after a HELLO reply's device list
+/// (none from a worker that does not append them).
+pub fn decode_hello_tail(data: &[u8]) -> Result<(Vec<String>, Option<String>), RpcError> {
     let mut c = Cursor::new(data);
     let _ = (c.u16()?, c.u16()?, c.u16()?, c.u32()?, c.u8()?, c.u32()?);
     c.str()?;
     c.u64()?;
     if !c.has_remaining() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     for _ in 0..c.u32()? {
         c.u64()?;
     }
     if !c.has_remaining() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let n = c.u32()? as usize;
     if n > 64 {
         return Err(RpcError::Protocol("too many rpc extensions".into()));
     }
-    (0..n).map(|_| c.str()).collect()
+    let names = (0..n).map(|_| c.str()).collect::<Result<Vec<_>, _>>()?;
+    let build = if c.has_remaining() { Some(c.str()?) } else { None };
+    Ok((names, build))
 }
 
 /// The parts of an extension call's payload: name, head, bulk data.
@@ -732,6 +741,16 @@ pub fn decode_ext(payload: &[u8]) -> Result<(String, &[u8], &[u8]), RpcError> {
     let name = c.str()?;
     let head = c.bytes()?;
     Ok((name, head, &payload[c.off..]))
+}
+
+/// Socket buffer size both ends ask for, so a few calls can be in flight
+/// (sent, not yet answered) without either end blocking on a write.
+pub const SOCKET_BUFFER: usize = 2 * 1024 * 1024;
+
+pub fn widen_socket_buffers(stream: &std::net::TcpStream) {
+    let socket = socket2::SockRef::from(stream);
+    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER);
+    let _ = socket.set_send_buffer_size(SOCKET_BUFFER);
 }
 
 /// Send an extension call without copying its bulk `data`.

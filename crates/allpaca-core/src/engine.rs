@@ -214,6 +214,8 @@ struct EngineInner {
     anchors: AnchorCache,
     /// GEM radix prefix KV reuse (arbitrary mid-prompt edits).
     kv_radix: KvRadixForest,
+    /// Model and expert mask the prompt cache holds checkpoints for.
+    prompt_cache_key: Option<u64>,
     /// DirectStorage / GDS capability probe at engine start.
     ds_probe: DirectStorageProbe,
     grammar_factory: Option<llguidance::ParserFactory>,
@@ -599,7 +601,10 @@ impl Engine {
             draft_kv: DenseKv::default(),
             draft_ahead: None,
             anchors: AnchorCache::new(config.anchors.slots, config.anchors.token_ids.clone()),
-            kv_radix: KvRadixForest::with_limits(4096, 64 << 20),
+            // One node per token: the node cap must allow long prompts.
+            kv_radix: KvRadixForest::with_limits(1 << 20, config.prompt_cache.ram_bytes)
+                .with_codec(config.prompt_cache.codec),
+            prompt_cache_key: None,
             ds_probe: ds_probe.clone(),
             grammar_factory: None,
             last_poll_id: None,
@@ -2841,6 +2846,7 @@ impl Engine {
         } else {
             None
         };
+        self.sync_prompt_cache(&mut inner, &target);
         let probe = read.map(|read| DecisionProbe::new(read, &tokens));
         let mut prefill_pos = 0;
         // Soft vision tokens are not text anchors / radix keys yet. A
@@ -2858,7 +2864,7 @@ impl Engine {
                 .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
             {
                 if n > prefill_pos {
-                    restore_kv(&mut inner.kv, &pages, &cp.kv, &target.config)?;
+                    restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
                     if let Some(dst) = recurrent.as_mut() {
                         *dst = cp.recurrent;
                     } else if target.config.recurrent {
@@ -4396,6 +4402,14 @@ impl Engine {
         self.metrics
             .prefill_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if end >= total {
+            self.capture_prompt(inner, id, &target)?;
+        } else {
+            let every = self.config.prompt_cache.boundary_tokens;
+            if target.config.recurrent && every > 0 && end / every > start / every {
+                self.capture_state(inner, id, &target, end)?;
+            }
+        }
         if end >= total && inner.flags.ngram_speculation {
             let tokens = request(inner, id)?.tokens.clone();
             inner.ngram.observe(&tokens);
@@ -4403,13 +4417,156 @@ impl Engine {
         Ok((end, total))
     }
 
+    /// Point the prompt cache at this model and expert mask: a change clears
+    /// it and opens that pair's disk folder.
+    fn sync_prompt_cache(&self, inner: &mut EngineInner, target: &TinyModel) {
+        let disabled = target.expert_controls.disabled();
+        let key = prompt_cache_key(&target.config, self.config.model.path.as_deref(), &disabled);
+        if inner.prompt_cache_key == Some(key) {
+            return;
+        }
+        inner.prompt_cache_key = Some(key);
+        inner.kv_radix.reset();
+        let pc = &self.config.prompt_cache;
+        // Its state is not part of a checkpoint file.
+        if target.dsv4.is_some() {
+            return;
+        }
+        let folder = format!("{key:016x}");
+        let worker = pc.worker.then_some(self.rpc.as_ref()).flatten().and_then(|rt| {
+            let session = rt.session_serving(crate::prompt_store::EXT)?;
+            Some(crate::prompt_store::RemoteStore::new(rt.clone(), session, &folder))
+        });
+        let opened = match (worker, pc.disk_dir.as_ref()) {
+            (Some(store), _) => inner.kv_radix.open_store(Box::new(store), pc.disk_bytes),
+            (None, Some(dir)) => inner.kv_radix.open_disk(&dir.join(&folder), pc.disk_bytes),
+            (None, None) => {
+                if pc.worker {
+                    tracing::warn!("prompt cache: no RPC worker serves the prompt_cache store");
+                }
+                return;
+            }
+        };
+        if let Err(e) = opened {
+            tracing::warn!(error = %e, "prompt cache: disk tier not opened");
+        }
+    }
+
+    /// Keep a hybrid's recurrent state after its first `end` prompt tokens
+    /// (a state checkpoint; the keys and values come from the full prompt's
+    /// checkpoint when prefill ends).
+    fn capture_state(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+        end: usize,
+    ) -> Result<(), AllpacaError> {
+        if !self.prompt_cache_reads_back(inner, id, target)? {
+            return Ok(());
+        }
+        let active = request(inner, id)?;
+        let tokens = active.tokens[..end].to_vec();
+        let Some(state) = active.recurrent.clone() else {
+            return Ok(());
+        };
+        inner.kv_radix.insert_state(&tokens, state);
+        Ok(())
+    }
+
+    /// qwen4exp keeps its whole state (keys and values too) in the sequence's
+    /// memory: the checkpoint is a host copy of it.
+    fn capture_qwen4_prompt(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+    ) -> Result<(), AllpacaError> {
+        let active = request(inner, id)?;
+        if !active.vision.is_empty() || active.probe.is_some() {
+            return Ok(());
+        }
+        let Some(state) = active.recurrent.as_ref() else {
+            return Ok(());
+        };
+        let Some(q4x) = state.q4x.for_cache(target)? else {
+            return Ok(());
+        };
+        let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
+        recurrent.q4x = q4x;
+        let tokens = active.tokens[..active.prompt_len].to_vec();
+        let cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
+        inner.kv_radix.insert_checkpoint(&tokens, cp);
+        Ok(())
+    }
+
+    /// Whether the prompt cache can take this Request's state on HIP, after
+    /// reading its GDN/Mamba state back to the host. Left out: models whose
+    /// state the host cannot read back yet (DeepSeek-V4, qwen4exp, layers on
+    /// RPC workers), and vision or decision prompts.
+    fn prompt_cache_reads_back(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+    ) -> Result<bool, AllpacaError> {
+        let Some(hip) = self.hip.as_deref() else {
+            return Ok(false);
+        };
+        let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
+        if target.dsv4.is_some() || target.q4x.is_some() || layers_remote {
+            return Ok(false);
+        }
+        let active = request_mut(inner, id)?;
+        if !active.vision.is_empty() || active.probe.is_some() {
+            return Ok(false);
+        }
+        if let Some(state) = active.recurrent.as_mut() {
+            for_each_gdn_workspace(hip, Some(target), |ws| {
+                ws.gdn_sync_request_to_host(id, &mut state.gdn_state)?;
+                ws.gdn_sync_conv_to_host(id, &mut state.gdn_conv)?;
+                ws.mamba2_sync_request_to_host(id, &mut state.ssm_h, &mut state.ssm_conv)
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Keep a prefilled prompt in the prompt cache. The CPU path captures as
+    /// it goes; on HIP the keys, values and recurrent state are read back once
+    /// here (see [`Self::prompt_cache_reads_back`] for what is left out).
+    fn capture_prompt(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+    ) -> Result<(), AllpacaError> {
+        if target.q4x.is_some() {
+            return self.capture_qwen4_prompt(inner, id, target);
+        }
+        if !self.prompt_cache_reads_back(inner, id, target)? {
+            return Ok(());
+        }
+        let active = request(inner, id)?;
+        let tokens = active.tokens[..active.prompt_len].to_vec();
+        let pages = active.pages.clone();
+        let state = active
+            .recurrent
+            .clone()
+            .unwrap_or_else(|| RecurrentState::zeros(target.config.n_layers, target.config.dim));
+        inner
+            .kv_radix
+            .capture(&tokens, &state, &inner.kv, &pages, &target.config)
+    }
+
     /// Whether this Engine can batch decode at all: enabled, several Request
     /// slots, a HIP-resident target that supports multi-sequence forwards, and
-    /// no draft model (its per-Request state needs its own forward).
+    /// no draft model (its per-Request state needs its own forward). A
+    /// qwen4exp target keeps its own working set on the cards, not a
+    /// resident model.
     fn batch_decode_enabled(&self, inner: &EngineInner) -> bool {
         self.config.engine.batch_decode
             && self.config.engine.max_active_requests >= 2
-            && inner.target_resident.is_some()
+            && (inner.target_resident.is_some() || inner.target.as_ref().is_some_and(|t| t.q4x.is_some()))
             && inner.draft_model.is_none()
             && match (self.hip.as_deref(), inner.target.as_ref()) {
                 (Some(hip), Some(t)) => t.supports_forward_batch(hip),
@@ -4590,10 +4747,7 @@ impl Engine {
             .target
             .clone()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
-        let resident = inner
-            .target_resident
-            .clone()
-            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let resident = inner.target_resident.clone();
         let vocab = target.config.vocab_size;
         let pages: Vec<Vec<Vec<u64>>> = staged
             .iter()
@@ -4618,15 +4772,21 @@ impl Engine {
                     recurrent: rec.as_mut(),
                 })
                 .collect();
-            target.forward_batch(
-                &tokens,
-                &mut segs,
-                &mut inner.kv,
-                &self.metrics,
-                &mut row_logits,
-                hip,
-                &resident,
-            )
+            match resident.as_ref() {
+                _ if target.q4x.is_some() => {
+                    crate::qwen4exp::forward_qwen4_batch(&target, &tokens, &mut segs, &mut row_logits)
+                }
+                Some(resident) => target.forward_batch(
+                    &tokens,
+                    &mut segs,
+                    &mut inner.kv,
+                    &self.metrics,
+                    &mut row_logits,
+                    hip,
+                    resident,
+                ),
+                None => Err(AllpacaError::Fatal(FatalError::NoModel)),
+            }
         };
         let mut spans = Vec::new();
         let mut row0 = 0usize;
@@ -5258,6 +5418,30 @@ fn mtp_text_has_dropped_words(text: &str) -> bool {
 /// slots live on the workspace that ran the layer, so clone / rewind / clear
 /// must reach both or the peer's layers keep state from rejected tokens (and
 /// leak it per request).
+/// Names the prompt cache's disk folder: checkpoints only resume the model
+/// file, shape and expert mask that wrote them.
+fn prompt_cache_key(
+    model: &ModelConfig,
+    file: Option<&std::path::Path>,
+    disabled: &[Vec<u32>],
+) -> u64 {
+    let mut text = format!("{model:?}|{disabled:?}");
+    if let Some((file, meta)) = file.and_then(|f| std::fs::metadata(f).ok().map(|m| (f, m))) {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        text.push_str(&format!("|{}|{}|{modified}", file.display(), meta.len()));
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 fn for_each_gdn_workspace(
     hip: &HipWorkspace,
     target: Option<&TinyModel>,
@@ -9127,6 +9311,97 @@ mod tests {
             stats.radix_skip_tokens >= 1,
             "at least one shared token must be skipped; stats={stats:?}"
         );
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_serves_a_new_engine() {
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let dir = std::env::temp_dir()
+            .join("allpaca_prompt_cache_tests")
+            .join(format!("engine_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = || {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.disk_dir = Some(dir.clone());
+            cfg
+        };
+        let full = {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            Engine::new(cfg).unwrap().generate("hello world hello true", params.clone()).unwrap()
+        };
+        Engine::new(config()).unwrap().generate("hello world hello", params.clone()).unwrap();
+
+        let engine = Engine::new(config()).unwrap();
+        let hit = engine.generate("hello world hello true", params).unwrap();
+        let stats = engine.stats();
+        assert!(stats.radix_hits >= 1, "checkpoints on disk must serve a new engine; {stats:?}");
+        assert_eq!(hit.token_ids, full.token_ids);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_on_a_worker_serves_a_new_engine() {
+        use allpaca_rpc::{serve_connection_ext, CpuWorker, WorkerBackend};
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let store = Arc::new(Mutex::new(crate::prompt_store::WorkerStore::new(0)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let served = store.clone();
+        std::thread::spawn(move || {
+            // One coordinator after the other, the store outliving each.
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let ext = vec![crate::prompt_store::worker_extension(served.clone())];
+                let _ = serve_connection_ext(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20)), None, ext);
+            }
+        });
+        let plain = || {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            cfg
+        };
+        let with_worker = || {
+            let mut cfg = plain();
+            cfg.rpc.endpoints = vec![addr.clone()];
+            cfg.prompt_cache.worker = true;
+            cfg
+        };
+        let full = Engine::new(plain()).unwrap().generate("hello world hello true", params.clone()).unwrap();
+        Engine::new(with_worker()).unwrap().generate("hello world hello", params.clone()).unwrap();
+        assert!(store.lock().unwrap().bytes() > 0, "checkpoints went to the worker");
+
+        let engine = Engine::new(with_worker()).unwrap();
+        let hit = engine.generate("hello world hello true", params).unwrap();
+        let stats = engine.stats();
+        assert!(stats.radix_hits >= 1, "the worker's checkpoints must serve a new engine; {stats:?}");
+        assert_eq!(hit.token_ids, full.token_ids);
+    }
+
+    #[test]
+    fn prompt_cache_folders_follow_the_model_and_the_expert_mask() {
+        let cfg = ModelConfig::tiny();
+        let base = prompt_cache_key(&cfg, None, &[]);
+        assert_eq!(base, prompt_cache_key(&cfg, None, &[]));
+        assert_ne!(base, prompt_cache_key(&cfg, None, &[vec![3]]));
+        assert_ne!(base, prompt_cache_key(&ModelConfig::tiny_hybrid(), None, &[]));
+        let file = std::env::temp_dir().join(format!("allpaca_pc_key_{}.bin", std::process::id()));
+        std::fs::write(&file, b"one").unwrap();
+        let one = prompt_cache_key(&cfg, Some(&file), &[]);
+        std::fs::write(&file, b"other").unwrap();
+        assert_ne!(one, prompt_cache_key(&cfg, Some(&file), &[]));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

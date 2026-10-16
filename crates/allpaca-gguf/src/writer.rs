@@ -169,7 +169,8 @@ pub fn write_gguf_quant(
 /// One tensor of a file written by [`GgufStreamWriter`].
 pub struct GgufStreamTensor {
     pub name: String,
-    /// Outermost dimension first, as the other writers take them.
+    /// Innermost dimension (the row length) first: ggml order, as written
+    /// to the file and as [`crate::GgufFile`] reads them back.
     pub dims: Vec<u64>,
     pub ggml_type_id: u32,
     pub nbytes: usize,

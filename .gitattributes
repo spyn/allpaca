@@ -1,0 +1,2 @@
+# Shell scripts run under bash on Windows and Linux: always LF.
+*.sh text eol=lf

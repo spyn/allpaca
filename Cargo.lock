@@ -44,6 +44,10 @@ dependencies = [
  "allpaca-core",
  "allpaca-types",
  "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

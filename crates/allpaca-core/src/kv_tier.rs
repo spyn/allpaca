@@ -100,6 +100,7 @@ pub struct KvTierManager {
     vulkan: Option<Arc<allpaca_vulkan::VulkanWorkspace>>,
     activation_h2d_bytes: AtomicU64,
     activation_d2h_bytes: AtomicU64,
+    cache_d2h_bytes: AtomicU64,
     nvme_prefetches: AtomicU64,
     next_id: u64,
     clock: u64,
@@ -151,6 +152,7 @@ impl KvTierManager {
             },
             activation_h2d_bytes: AtomicU64::new(0),
             activation_d2h_bytes: AtomicU64::new(0),
+            cache_d2h_bytes: AtomicU64::new(0),
             nvme_prefetches: AtomicU64::new(0),
             next_id: 1,
             clock: 1,
@@ -478,6 +480,32 @@ impl KvTierManager {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> Result<(Vec<f32>, Vec<f32>), AllpacaError> {
+        self.read_kv_counted(id, n_kv_heads, head_dim, &self.activation_d2h_bytes)
+    }
+
+    /// [`Self::read_kv`] for a prompt-cache checkpoint: counted apart from
+    /// the forward's activation traffic.
+    pub fn read_kv_for_cache(
+        &self,
+        id: PageId,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), AllpacaError> {
+        self.read_kv_counted(id, n_kv_heads, head_dim, &self.cache_d2h_bytes)
+    }
+
+    /// Device-to-host bytes read for prompt-cache checkpoints.
+    pub fn cache_d2h_bytes(&self) -> u64 {
+        self.cache_d2h_bytes.load(Ordering::Relaxed)
+    }
+
+    fn read_kv_counted(
+        &self,
+        id: PageId,
+        n_kv_heads: usize,
+        head_dim: usize,
+        counter: &AtomicU64,
+    ) -> Result<(Vec<f32>, Vec<f32>), AllpacaError> {
         let page = self.pages.get(&id).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
         })?;
@@ -508,8 +536,7 @@ impl KvTierManager {
                     n * 4,
                     allpaca_hip::MEMCPY_D2H,
                 )?;
-                self.activation_d2h_bytes
-                    .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                counter.fetch_add((n * 8) as u64, Ordering::Relaxed);
                 (k, v)
             }
             DeviceBufferKind::Cuda => {
@@ -532,8 +559,7 @@ impl KvTierManager {
                     n * 4,
                     allpaca_cuda::MEMCPY_D2H,
                 )?;
-                self.activation_d2h_bytes
-                    .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                counter.fetch_add((n * 8) as u64, Ordering::Relaxed);
                 (k, v)
             }
             DeviceBufferKind::Vulkan => {
@@ -551,8 +577,7 @@ impl KvTierManager {
                 let mut v = vec![0.0f32; n];
                 ws.kv_read_f32(page_buf, k_off, &mut k)?;
                 ws.kv_read_f32(page_buf, v_off, &mut v)?;
-                self.activation_d2h_bytes
-                    .fetch_add((n * 8) as u64, Ordering::Relaxed);
+                counter.fetch_add((n * 8) as u64, Ordering::Relaxed);
                 (k, v)
             }
             DeviceBufferKind::CpuVram => (

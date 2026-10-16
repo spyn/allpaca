@@ -29,6 +29,9 @@ pub struct RecurrentState {
     pub q4x: crate::qwen4exp::Qwen4Memory,
     /// Sensitivity probe: save every layer's input, or resume from saved ones.
     pub trace: Option<crate::sensitivity::LayerTrace>,
+    /// Per-layer keys and values of the CPU Qwen3.5 attention
+    /// ([`crate::qwen35_host`]); empty when unused.
+    pub host_kv: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
 impl RecurrentState {
@@ -42,6 +45,7 @@ impl RecurrentState {
             dsv4: Default::default(),
             q4x: Default::default(),
             trace: None,
+            host_kv: vec![Default::default(); n_layers],
         }
     }
 
@@ -90,7 +94,7 @@ impl RecurrentState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct KvRow {
     pub(crate) k: Vec<f32>,
     pub(crate) v: Vec<f32>,
@@ -275,7 +279,15 @@ pub(crate) fn snapshot_kv(
     let kv_width = cfg.n_kv_heads * cfg.head_dim();
     let mut out = Vec::with_capacity(pages.len());
     for layer_pages in pages {
-        let (ks, vs) = crate::model::gather_kv(kv, layer_pages, cfg.n_kv_heads, cfg.head_dim())?;
+        let (mut ks, mut vs) = (Vec::new(), Vec::new());
+        for &id in layer_pages {
+            if kv.get(id).map_or(0, |p| p.filled) == 0 {
+                continue;
+            }
+            let (k, v) = kv.read_kv_for_cache(id, cfg.n_kv_heads, cfg.head_dim())?;
+            ks.extend_from_slice(&k);
+            vs.extend_from_slice(&v);
+        }
         let n = if kv_width == 0 {
             0
         } else {
