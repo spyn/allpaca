@@ -113,8 +113,19 @@ impl EncodedRows {
 /// Append a length-prefixed run of floats.
 pub(crate) fn write_f32s(out: &mut Vec<u8>, values: &[f32]) {
     out.extend_from_slice(&(values.len() as u64).to_le_bytes());
-    for v in values {
-        out.extend_from_slice(&v.to_le_bytes());
+    extend_f32s(out, values);
+}
+
+/// `values` as little-endian bytes, a block at a time: a checkpoint holds
+/// hundreds of MB of them, and one push per value is several times slower.
+pub(crate) fn extend_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    out.reserve(values.len() * 4);
+    let mut block = [0u8; 4096];
+    for chunk in values.chunks(1024) {
+        for (b, v) in block.chunks_exact_mut(4).zip(chunk) {
+            b.copy_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&block[..chunk.len() * 4]);
     }
 }
 

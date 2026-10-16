@@ -660,13 +660,18 @@ impl Default for AnchorsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum KvCodec {
-    /// Exact: a cache hit continues exactly as the full prefill would.
-    #[default]
+    /// The rows as they were: a cache hit differs from the full prefill
+    /// only by the float drift of prefilling the suffix alone.
     F32,
     F16,
-    /// 8-bit blocks of 32, one scale each (~8.5 bits per value).
+    /// 8-bit blocks of 32, one scale each (~8.5 bits per value). Measured
+    /// as close to a full prefill as f32 (KL at the float-drift floor) at a
+    /// quarter of the bytes, so the default.
+    #[default]
     Q8,
     /// 4-bit blocks of 32, a scale and a minimum each (~5 bits per value).
+    /// Lossy: on Llama-3.2-3B ~300x f32's KL, on a hybrid ~10x (its
+    /// recurrent state stays f32).
     Q4,
 }
 
@@ -677,7 +682,8 @@ pub enum KvCodec {
 pub struct PromptCacheSection {
     /// RAM for checkpoints. 0 = unlimited.
     pub ram_bytes: usize,
-    /// Encoding of the keys and values. Anything but `f32` is lossy.
+    /// Encoding of the keys and values (q8 by default; `f32` keeps them as
+    /// they were).
     pub codec: KvCodec,
     /// Disk tier: checkpoints are also written here (one folder per model
     /// and expert mask), outlive restarts and come back when RAM drops them.
@@ -699,7 +705,7 @@ impl Default for PromptCacheSection {
     fn default() -> Self {
         Self {
             ram_bytes: 512 << 20,
-            codec: KvCodec::F32,
+            codec: KvCodec::Q8,
             disk_dir: None,
             disk_bytes: 16 << 30,
             worker: false,
@@ -1324,9 +1330,9 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_keeps_exact_checkpoints_unless_told_otherwise() {
+    fn prompt_cache_keeps_q8_checkpoints_unless_told_otherwise() {
         let defaults = Config::compiled_defaults();
-        assert_eq!(defaults.prompt_cache.codec, KvCodec::F32);
+        assert_eq!(defaults.prompt_cache.codec, KvCodec::Q8);
         assert_eq!(defaults.prompt_cache.ram_bytes, 512 << 20);
 
         let cfg = Config::from_toml_str(

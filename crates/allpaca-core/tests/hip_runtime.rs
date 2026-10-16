@@ -7728,7 +7728,9 @@ fn hip_prompt_cache_hit_decodes_like_a_full_prefill() {
         }
         let full = fresh.generate(prompt, greedy(12)).unwrap();
 
-        let warm = Engine::new(hip_auto_synthetic()).unwrap();
+        let mut cfg = hip_auto_synthetic();
+        cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+        let warm = Engine::new(cfg).unwrap();
         warm.load_synthetic(model).unwrap();
         warm.generate(cached, greedy(4)).unwrap();
         let hit = warm.generate(prompt, greedy(12)).unwrap();
@@ -7797,6 +7799,134 @@ fn hip_prompt_cache_hit_matches_full_prefill_on_a_real_model() {
     }
 }
 
+#[cfg(feature = "hip")]
+#[test]
+fn hip_tapped_logits_are_what_greedy_decode_picked_from() {
+    let engine = Engine::new(hip_auto_synthetic()).unwrap();
+    engine.load_synthetic(ModelConfig::tiny()).unwrap();
+    if hip_gpus(&engine).is_empty() {
+        eprintln!("skip hip_tapped_logits_are_what_greedy_decode_picked_from: no HIP device");
+        return;
+    }
+    engine.tap_logits(true).unwrap();
+    let out = engine.generate("hello world hello", greedy(6)).unwrap();
+    let rows = engine.take_tapped_logits().unwrap();
+    assert_eq!(rows.len(), out.token_ids.len(), "one row per decoded token");
+    for (row, &token) in rows.iter().zip(&out.token_ids) {
+        let best = (0..row.len()).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap();
+        assert_eq!(best as u32, token);
+    }
+    assert!(engine.take_tapped_logits().unwrap().is_empty(), "taking drains the tap");
+}
+
+/// KL(p || q) of two logit rows, in nats.
+fn logits_kl(p: &[f32], q: &[f32]) -> f64 {
+    let log_softmax = |row: &[f32]| {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let sum: f64 = row.iter().map(|&x| (x as f64 - max).exp()).sum();
+        let log_sum = sum.ln() + max;
+        row.iter().map(|&x| x as f64 - log_sum).collect::<Vec<_>>()
+    };
+    let (lp, lq) = (log_softmax(p), log_softmax(q));
+    lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum::<f64>().max(0.0)
+}
+
+/// Real model: how far each checkpoint codec moves the next-token
+/// distribution of a cache hit from a full prefill (KL per decode step,
+/// counted while both runs picked the same tokens). f32 must pick the same
+/// tokens; its KL is the float-drift floor.
+/// `ALLPACA_CACHE_GGUF` = model path, `ALLPACA_CACHE_KL=1` to run.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_prompt_cache_codec_kl_on_a_real_model() {
+    let _guard = large_gguf_lock();
+    let Some(path) = std::env::var_os("ALLPACA_CACHE_GGUF").map(std::path::PathBuf::from) else {
+        eprintln!("skip hip_prompt_cache_codec_kl_on_a_real_model: set ALLPACA_CACHE_GGUF");
+        return;
+    };
+    if std::env::var("ALLPACA_CACHE_KL").ok().as_deref() != Some("1") {
+        eprintln!("skip hip_prompt_cache_codec_kl_on_a_real_model: set ALLPACA_CACHE_KL=1");
+        return;
+    }
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_prompt_cache_codec_kl_on_a_real_model: no HIP device");
+        return;
+    }
+    let steps = 48;
+    let cases = [
+        (
+            "The river carried silt from the mountains to the plain, and every spring the farmers waited for the flood to leave its dark soil behind. ",
+            " Question: what did the farmers wait for each spring? Answer:",
+        ),
+        (
+            "fn parse(input: &str) -> Result<Vec<u32>, String> { input.split(',').map(|s| s.trim().parse::<u32>().map_err(|e| e.to_string())).collect() } ",
+            " // Explain what parse returns for an empty string:",
+        ),
+        (
+            "Meeting notes: the team agreed to move the release to Thursday, Priya owns the migration, and the dashboard stays read-only until the audit closes. ",
+            " Summary of the decisions in one sentence:",
+        ),
+    ];
+    let mut prompts = Vec::new();
+    for (turn, question) in cases {
+        let cached = turn.repeat(8).trim_end().to_string();
+        let prompt = format!("{cached}{question}");
+        let engine = Engine::new(hip_7b_config(path.clone())).unwrap();
+        engine.tap_logits(true).unwrap();
+        let full = engine.generate(&prompt, greedy(steps)).unwrap();
+        let rows = engine.take_tapped_logits().unwrap();
+        prompts.push((cached, prompt, full.token_ids, rows));
+    }
+    for codec in [
+        allpaca_types::KvCodec::F32,
+        allpaca_types::KvCodec::F16,
+        allpaca_types::KvCodec::Q8,
+        allpaca_types::KvCodec::Q4,
+    ] {
+        let (mut sum, mut max, mut n, mut agreed, mut total, mut bytes) = (0.0f64, 0.0f64, 0usize, 0usize, 0usize, 0u64);
+        for (cached, prompt, full_tokens, full_rows) in &prompts {
+            let mut cfg = hip_7b_config(path.clone());
+            cfg.prompt_cache.codec = codec;
+            let engine = Engine::new(cfg).unwrap();
+            engine.generate(cached, greedy(1)).unwrap();
+            engine.tap_logits(true).unwrap();
+            let hit = engine.generate(prompt, greedy(steps)).unwrap();
+            let rows = engine.take_tapped_logits().unwrap();
+            let stats = engine.stats();
+            assert_eq!(stats.radix_hits, 1, "{codec:?}: {stats:?}");
+            bytes += stats.radix_bytes as u64;
+            let same = hit.token_ids.iter().zip(full_tokens).take_while(|(a, b)| a == b).count();
+            agreed += same;
+            total += full_tokens.len();
+            if let (true, Some(row)) = (same < full_tokens.len(), full_rows.get(same)) {
+                let mut sorted = row.clone();
+                sorted.sort_by(|a, b| b.total_cmp(a));
+                eprintln!(
+                    "  {codec:?} diverged at step {same}: full prefill's top-2 logit margin {:.4}",
+                    sorted[0] - sorted[1]
+                );
+            }
+            // Row i was sampled after the same i tokens in both runs.
+            for (p, q) in full_rows.iter().zip(&rows).take((same + 1).min(rows.len())) {
+                let kl = logits_kl(p, q);
+                sum += kl;
+                max = max.max(kl);
+                n += 1;
+            }
+        }
+        let mean = sum / n.max(1) as f64;
+        eprintln!(
+            "prompt cache KL {codec:?}: mean {mean:.6} max {max:.6} over {n} steps; same tokens {agreed}/{total}; cache RAM {bytes} bytes"
+        );
+        // f32 stores the rows as they were; what is left is float drift from
+        // prefilling the suffix alone, the floor the other codecs sit on. It
+        // can flip a near-tie, so the tokens are only reported.
+        if codec == allpaca_types::KvCodec::F32 {
+            assert!(max < 0.05, "f32 drift beyond float noise: {max}");
+        }
+    }
+}
+
 /// Real model: checkpoints a first engine wrote to the disk tier serve a
 /// second engine, which decodes exactly as a full prefill.
 #[cfg(feature = "hip")]
@@ -7820,6 +7950,7 @@ fn hip_prompt_cache_from_disk_matches_full_prefill_on_a_real_model() {
     let prompt = format!("{cached} Question: what did the farmers wait for each spring? Answer:");
     let with_disk = || {
         let mut cfg = hip_7b_config(path.clone());
+        cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
         cfg.prompt_cache.disk_dir = Some(dir.clone());
         cfg
     };
@@ -7859,6 +7990,7 @@ fn hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model() {
     let edited = format!("{}The harvest failed that year. What happened to the harvest?", turn.repeat(40));
     let config = || {
         let mut cfg = hip_7b_config(path.clone());
+        cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
         cfg.prompt_cache.boundary_tokens = 256;
         cfg.prefill.chunk_tokens = 256;
         cfg

@@ -126,7 +126,7 @@ token_ids = []
 # request that shares a prefix skips its prefill.
 [prompt_cache]
 ram_bytes = 536870912        # 512 MiB
-codec = "f32"                # exact; "f16", "q8" or "q4" trade accuracy for size
+codec = "q8"                 # 1/4 of f32's KV bytes at the same KL; "f32", "f16"; "q4" is lossy
 # disk_dir = "cache/prompts" # also keep them on disk, across restarts
 disk_bytes = 17179869184     # 16 GiB
 worker = false               # keep them on an RPC worker's store instead of disk_dir

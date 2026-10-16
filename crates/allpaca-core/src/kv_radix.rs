@@ -118,6 +118,10 @@ impl RadixNode {
 /// ([`crate::prompt_store::RemoteStore`]).
 pub(crate) trait CheckpointStore: Send + std::fmt::Debug {
     fn put(&mut self, name: &str, data: &[u8]) -> Result<(), String>;
+    /// [`Self::put`] of a buffer the store may keep.
+    fn put_owned(&mut self, name: &str, data: Vec<u8>) -> Result<(), String> {
+        self.put(name, &data)
+    }
     fn get(&mut self, name: &str) -> Option<Vec<u8>>;
     fn remove(&mut self, name: &str);
     /// Every checkpoint held, oldest first.
@@ -177,6 +181,144 @@ impl CheckpointStore for LocalDir {
         }
         found.sort_by_key(|f| f.0);
         Ok(found.into_iter().map(|(_, l)| l).collect())
+    }
+}
+
+/// Files queued for a [`BackgroundStore`]'s writer.
+#[derive(Debug, Default)]
+struct Queued {
+    /// Name -> (put number, data), until the writer has stored it.
+    files: HashMap<String, (u64, std::sync::Arc<Vec<u8>>)>,
+    bytes: usize,
+    puts: u64,
+}
+
+impl Queued {
+    fn take(&mut self, name: &str) -> Option<(u64, std::sync::Arc<Vec<u8>>)> {
+        let file = self.files.remove(name)?;
+        self.bytes -= file.1.len();
+        Some(file)
+    }
+}
+
+#[derive(Debug)]
+enum Job {
+    Put(String, u64),
+    Remove(String),
+}
+
+/// Writes to another store on a thread of its own, so a checkpoint costs
+/// the request only its encoding. Queued files read back from memory,
+/// removals keep their order with the writes, and dropping it waits for
+/// the queue.
+#[derive(Debug)]
+pub(crate) struct BackgroundStore {
+    store: std::sync::Arc<std::sync::Mutex<Box<dyn CheckpointStore>>>,
+    queued: std::sync::Arc<std::sync::Mutex<Queued>>,
+    /// Most bytes waiting; a put past it is refused.
+    max_queued: usize,
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundStore {
+    pub(crate) fn new(store: Box<dyn CheckpointStore>, max_queued: usize) -> Self {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let queued = std::sync::Arc::new(std::sync::Mutex::new(Queued::default()));
+        let (jobs, rx) = std::sync::mpsc::channel::<Job>();
+        let writer = {
+            let (store, queued) = (store.clone(), queued.clone());
+            std::thread::Builder::new()
+                .name("prompt-cache-writer".into())
+                .spawn(move || {
+                    for job in rx {
+                        let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
+                        match job {
+                            Job::Put(name, put) => {
+                                // Replaced or removed since: a later job has it.
+                                let data = {
+                                    let q = queued.lock().unwrap_or_else(|e| e.into_inner());
+                                    match q.files.get(&name) {
+                                        Some((n, data)) if *n == put => data.clone(),
+                                        _ => continue,
+                                    }
+                                };
+                                if let Err(e) = store.put(&name, &data) {
+                                    tracing::warn!(error = %e, name, "prompt cache: checkpoint not written");
+                                }
+                                let mut q = queued.lock().unwrap_or_else(|e| e.into_inner());
+                                if q.files.get(&name).is_some_and(|(n, _)| *n == put) {
+                                    q.take(&name);
+                                }
+                            }
+                            Job::Remove(name) => store.remove(&name),
+                        }
+                    }
+                })
+                .expect("spawn the prompt cache writer")
+        };
+        Self {
+            store,
+            queued,
+            max_queued,
+            jobs: Some(jobs),
+            writer: Some(writer),
+        }
+    }
+}
+
+impl CheckpointStore for BackgroundStore {
+    fn put(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
+        self.put_owned(name, data.to_vec())
+    }
+
+    fn put_owned(&mut self, name: &str, data: Vec<u8>) -> Result<(), String> {
+        let put = {
+            let mut q = self.queued.lock().map_err(|e| e.to_string())?;
+            let replaced = q.files.get(name).map_or(0, |f| f.1.len());
+            if q.bytes - replaced + data.len() > self.max_queued {
+                return Err(format!("{} bytes already queued for writing", q.bytes));
+            }
+            q.take(name);
+            q.puts += 1;
+            let put = q.puts;
+            q.bytes += data.len();
+            q.files.insert(name.to_string(), (put, std::sync::Arc::new(data)));
+            put
+        };
+        self.jobs
+            .as_ref()
+            .and_then(|jobs| jobs.send(Job::Put(name.to_string(), put)).ok())
+            .ok_or_else(|| "the prompt cache writer stopped".to_string())
+    }
+
+    fn get(&mut self, name: &str) -> Option<Vec<u8>> {
+        if let Some((_, data)) = self.queued.lock().ok()?.files.get(name) {
+            return Some(data.as_ref().clone());
+        }
+        self.store.lock().ok()?.get(name)
+    }
+
+    fn remove(&mut self, name: &str) {
+        if let Ok(mut q) = self.queued.lock() {
+            q.take(name);
+        }
+        if let Some(jobs) = self.jobs.as_ref() {
+            let _ = jobs.send(Job::Remove(name.to_string()));
+        }
+    }
+
+    fn list(&mut self) -> Result<Vec<Listed>, String> {
+        self.store.lock().map_err(|e| e.to_string())?.list()
+    }
+}
+
+impl Drop for BackgroundStore {
+    fn drop(&mut self) {
+        self.jobs = None;
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 
@@ -327,6 +469,11 @@ impl KvRadixForest {
         self.hits
     }
 
+    /// How checkpoints hold keys and values.
+    pub fn codec(&self) -> KvCodec {
+        self.codec
+    }
+
     pub fn skip_tokens(&self) -> u64 {
         self.skip_tokens
     }
@@ -395,10 +542,11 @@ impl KvRadixForest {
         let written = self.disk.as_mut().and_then(|d| {
             let name = file_name(tokens);
             let data = encode_file(tokens, &cp);
-            match d.store.put(&name, &data) {
+            let bytes = data.len();
+            match d.store.put_owned(&name, data) {
                 Ok(()) => Some(OnDisk {
                     name,
-                    bytes: data.len(),
+                    bytes,
                     sliceable: cp.sliceable,
                     state_only: cp.state_only,
                 }),
@@ -940,9 +1088,7 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
         out.extend_from_slice(&(group.len() as u32).to_le_bytes());
         for v in group {
             out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            for x in v {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
+            crate::kv_codec::extend_f32s(&mut out, v);
         }
     }
     out.extend_from_slice(&(r.host_kv.len() as u32).to_le_bytes());
@@ -1060,6 +1206,60 @@ mod tests {
                 v: vec![0.0; n],
             }]],
         )
+    }
+
+    /// A store whose writes take `delay`, holding its files where the test
+    /// can see them.
+    #[derive(Debug, Clone, Default)]
+    struct SlowStore {
+        files: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+        delay: std::time::Duration,
+    }
+
+    impl CheckpointStore for SlowStore {
+        fn put(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
+            std::thread::sleep(self.delay);
+            self.files.lock().unwrap().insert(name.to_string(), data.to_vec());
+            Ok(())
+        }
+
+        fn get(&mut self, name: &str) -> Option<Vec<u8>> {
+            self.files.lock().unwrap().get(name).cloned()
+        }
+
+        fn remove(&mut self, name: &str) {
+            self.files.lock().unwrap().remove(name);
+        }
+
+        fn list(&mut self) -> Result<Vec<Listed>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn background_writes_leave_the_request_path_and_finish_on_drop() {
+        let slow = SlowStore { delay: std::time::Duration::from_millis(300), ..Default::default() };
+        let files = slow.files.clone();
+        let mut store = BackgroundStore::new(Box::new(slow), 1 << 20);
+        let started = std::time::Instant::now();
+        store.put("a.ckpt", b"first").unwrap();
+        store.put("b.ckpt", b"second").unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(150), "{:?}", started.elapsed());
+        assert_eq!(store.get("b.ckpt").as_deref(), Some(&b"second"[..]), "a queued file reads back");
+        store.remove("b.ckpt");
+        assert_eq!(store.get("b.ckpt"), None);
+        drop(store);
+        let files = files.lock().unwrap();
+        assert_eq!(files.get("a.ckpt").map(Vec::as_slice), Some(&b"first"[..]), "dropping waits for the queue");
+        assert!(!files.contains_key("b.ckpt"), "a removal after its put wins");
+    }
+
+    #[test]
+    fn background_refuses_writes_past_its_queue_budget() {
+        let slow = SlowStore { delay: std::time::Duration::from_millis(300), ..Default::default() };
+        let mut store = BackgroundStore::new(Box::new(slow), 8);
+        store.put("a.ckpt", b"12345").unwrap();
+        assert!(store.put("b.ckpt", b"12345").is_err(), "10 queued bytes over a budget of 8");
     }
 
     #[test]

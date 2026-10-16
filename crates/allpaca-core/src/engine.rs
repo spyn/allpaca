@@ -232,6 +232,8 @@ struct EngineInner {
     /// Set while `poll` batches decode: `append_and_forward` records the
     /// token here instead of running its own forward.
     staged_decode: Option<Vec<StagedDecode>>,
+    /// Logits each decode step sampled from, while [`Engine::tap_logits`] is on.
+    logit_tap: Option<Vec<Vec<f32>>>,
     /// Consecutive decode steps with expert LRU misses (elastic pressure).
     elastic_miss_streak: u32,
     /// Run [`Engine::rebalance_experts_elastic`] on next idle safe point.
@@ -612,6 +614,7 @@ impl Engine {
             prefer_next: None,
             logits_owner: None,
             staged_decode: None,
+            logit_tap: None,
             elastic_miss_streak: 0,
             elastic_rebalance_pending: false,
             elastic_last_misses: 0,
@@ -985,6 +988,19 @@ impl Engine {
             }
         }
         Some(est)
+    }
+
+    /// Keep a copy of the logits every decode step samples from (or stop and
+    /// drop them), so a test can compare two runs' distributions.
+    pub fn tap_logits(&self, on: bool) -> Result<(), AllpacaError> {
+        self.lock()?.logit_tap = on.then(Vec::new);
+        Ok(())
+    }
+
+    /// The logits tapped since the last call, in decode order.
+    pub fn take_tapped_logits(&self) -> Result<Vec<Vec<f32>>, AllpacaError> {
+        let mut inner = self.lock()?;
+        Ok(inner.logit_tap.as_mut().map(std::mem::take).unwrap_or_default())
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -2859,10 +2875,17 @@ impl Engine {
                 }
                 prefill_pos = n;
             }
-            if let Some((n, cp)) = inner
-                .kv_radix
-                .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
-            {
+            // Decision scores are checked against a reference: they resume
+            // only from checkpoints that hold the rows as they were.
+            let exact_only = probe.is_some() && inner.kv_radix.codec() != allpaca_types::KvCodec::F32;
+            let found = if exact_only {
+                None
+            } else {
+                inner
+                    .kv_radix
+                    .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
+            };
+            if let Some((n, cp)) = found {
                 if n > prefill_pos {
                     restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
                     if let Some(dst) = recurrent.as_mut() {
@@ -4437,9 +4460,9 @@ impl Engine {
             let session = rt.session_serving(crate::prompt_store::EXT)?;
             Some(crate::prompt_store::RemoteStore::new(rt.clone(), session, &folder))
         });
-        let opened = match (worker, pc.disk_dir.as_ref()) {
-            (Some(store), _) => inner.kv_radix.open_store(Box::new(store), pc.disk_bytes),
-            (None, Some(dir)) => inner.kv_radix.open_disk(&dir.join(&folder), pc.disk_bytes),
+        let store: Result<Box<dyn crate::kv_radix::CheckpointStore>, AllpacaError> = match (worker, pc.disk_dir.as_ref()) {
+            (Some(store), _) => Ok(Box::new(store)),
+            (None, Some(dir)) => crate::kv_radix::LocalDir::open(&dir.join(&folder)).map(|d| Box::new(d) as _),
             (None, None) => {
                 if pc.worker {
                     tracing::warn!("prompt cache: no RPC worker serves the prompt_cache store");
@@ -4447,6 +4470,11 @@ impl Engine {
                 return;
             }
         };
+        // Written on a thread of their own, off the request path.
+        let opened = store.and_then(|store| {
+            let store = crate::kv_radix::BackgroundStore::new(store, PROMPT_CACHE_WRITE_QUEUE);
+            inner.kv_radix.open_store(Box::new(store), pc.disk_bytes)
+        });
         if let Err(e) = opened {
             tracing::warn!(error = %e, "prompt cache: disk tier not opened");
         }
@@ -5290,6 +5318,21 @@ fn apply_provider_flags(flags: &mut FeatureFlags, config: &Config) {
     }
 }
 
+/// Most checkpoint bytes waiting for the prompt cache's writer; a checkpoint
+/// past it stays in RAM only.
+const PROMPT_CACHE_WRITE_QUEUE: usize = 2 << 30;
+
+/// Copies the logits about to be sampled while the tap is on.
+fn tap_pending_logits(inner: &mut EngineInner, id: u64) -> Result<(), AllpacaError> {
+    if inner.logit_tap.is_some() {
+        let row = request(inner, id)?.pending_logits.clone();
+        if let Some(tap) = inner.logit_tap.as_mut() {
+            tap.push(row);
+        }
+    }
+    Ok(())
+}
+
 fn request(inner: &EngineInner, id: u64) -> Result<&ActiveRequest, AllpacaError> {
     inner
         .active
@@ -5951,6 +5994,7 @@ fn verify_and_sample(
             }
         }
     }
+    tap_pending_logits(inner, id)?;
     let sampled = {
         let active = request_mut(inner, id)?;
         sample(
@@ -6021,6 +6065,7 @@ fn verify_and_sample(
             let active = request_mut(inner, id)?;
             hip.wait_logits_d2h(&mut active.pending_logits)?;
         }
+        tap_pending_logits(inner, id)?;
         let sampled = {
             let active = request_mut(inner, id)?;
             sample(
@@ -9328,6 +9373,7 @@ mod tests {
         let config = || {
             let mut cfg = test_config();
             cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
             cfg.prompt_cache.disk_dir = Some(dir.clone());
             cfg
         };
@@ -9370,6 +9416,7 @@ mod tests {
         let plain = || {
             let mut cfg = test_config();
             cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
             cfg
         };
         let with_worker = || {
