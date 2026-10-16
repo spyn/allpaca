@@ -867,6 +867,47 @@ mod tests {
         }
     }
 
+    /// Qwen3.5 MoE blocks quantise in order too: the delta-net projections,
+    /// the gated attention and the shared expert are refitted to the inputs
+    /// the quantised blocks before them give. The routed experts (one input
+    /// set per stack, not per expert) and the router are quantised alone.
+    #[test]
+    fn delta_net_and_shared_expert_matrices_are_propagated() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_prop35_{tag}-{pid}.gguf"));
+        let (src, dst) = (at("in"), at("out"));
+        crate::calib::tests::write_tiny_qwen35moe_gguf_sized(&src, 4, true, 64, 32, 64);
+        let texts = ["hello world again hello world again again hello", "again again hello world hello"];
+        let stats = crate::calib::capture(&src, &texts).unwrap();
+        let settings = crate::propagate::Settings {
+            texts: texts.iter().map(|t| t.to_string()).collect(),
+            max_tokens: 32,
+            ridge: 1.0,
+        };
+        let opts = Options {
+            avg_bits: 4.0,
+            targets: CLASSIC.to_vec(),
+            gsq: GsqConfig { steps: 8, ..GsqConfig::default() },
+            min_weights: 128,
+            stats: Some(stats),
+            propagate: Some(settings),
+            ..Options::default()
+        };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        let names: Vec<&str> = report.choices.iter().map(|c| c.name.as_str()).collect();
+        for kind in ["blk.0.attn_qkv", "blk.0.ssm_alpha", "blk.0.ssm_out", "blk.1.attn_q", "blk.1.attn_output", "blk.0.ffn_gate_inp", "blk.1.ffn_down_shexp"] {
+            assert!(names.contains(&format!("{kind}.weight").as_str()), "{kind} not in {names:?}");
+        }
+        let in_order = names.iter().filter(|n| n.starts_with("blk.") && !n.contains("_exps") && !n.contains("gate_inp")).count();
+        assert_eq!(report.propagated, in_order, "every block matrix but the experts and the router: {names:?}");
+        let kl = crate::sensitivity::divergence_between(&src, &dst, &texts, 32).unwrap();
+        assert!(kl.is_finite() && kl > 0.0, "{kl}");
+        for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// With a probe the bits follow what the output is sensitive to. Here
     /// the attention output projection is nearly zero, so the four
     /// attention matrices barely reach the output: they take the two

@@ -380,7 +380,20 @@ pub(crate) mod tests {
     /// `attention_block`, is gated full attention instead (query and gate
     /// interleaved per head, q/k norms, IMRoPE).
     pub(crate) fn write_tiny_qwen35moe_gguf_with(path: &Path, experts: usize, attention_block: bool) {
-        let (dim, vocab, n_v, n_k, head, conv_k, ff) = (16usize, 6usize, 2usize, 2usize, 8usize, 2usize, 24usize);
+        write_tiny_qwen35moe_gguf_sized(path, experts, attention_block, 16, 8, 24);
+    }
+
+    /// [`write_tiny_qwen35moe_gguf_with`] with residual width `dim`,
+    /// delta-net head width `head` and expert width `ff`.
+    pub(crate) fn write_tiny_qwen35moe_gguf_sized(
+        path: &Path,
+        experts: usize,
+        attention_block: bool,
+        dim: usize,
+        head: usize,
+        ff: usize,
+    ) {
+        let (vocab, n_v, n_k, conv_k) = (6usize, 2usize, 2usize, 2usize);
         let inner = n_v * head;
         let qkv_dim = n_k * head * 2 + inner;
         let mut meta = HashMap::new();
@@ -430,13 +443,14 @@ pub(crate) mod tests {
             let mut add = |part: &str, dims: Vec<u64>, data: Vec<f32>| owned.push((format!("blk.{b}.{part}"), dims, data));
             add("attn_norm.weight", vec![d], vec![1.0; dim]);
             if attention_block && b == 1 {
-                // Two heads of 8, one key/value head.
-                add("attn_q.weight", vec![d, 32], rand(32 * dim, 0.3));
-                add("attn_k.weight", vec![d, 8], rand(8 * dim, 0.3));
-                add("attn_v.weight", vec![d, 8], rand(8 * dim, 0.3));
-                add("attn_q_norm.weight", vec![8], vec![1.0; 8]);
-                add("attn_k_norm.weight", vec![8], vec![1.0; 8]);
-                add("attn_output.weight", vec![16, d], rand(dim * 16, 0.3));
+                // Two heads of dim / 2, one key/value head.
+                let hd = dim / 2;
+                add("attn_q.weight", vec![d, 4 * hd as u64], rand(4 * hd * dim, 0.3));
+                add("attn_k.weight", vec![d, hd as u64], rand(hd * dim, 0.3));
+                add("attn_v.weight", vec![d, hd as u64], rand(hd * dim, 0.3));
+                add("attn_q_norm.weight", vec![hd as u64], vec![1.0; hd]);
+                add("attn_k_norm.weight", vec![hd as u64], vec![1.0; hd]);
+                add("attn_output.weight", vec![2 * hd as u64, d], rand(dim * 2 * hd, 0.3));
             } else {
                 add("attn_qkv.weight", vec![d, qkv_dim as u64], rand(qkv_dim * dim, 0.3));
                 add("attn_gate.weight", vec![d, inner as u64], rand(inner * dim, 0.3));
