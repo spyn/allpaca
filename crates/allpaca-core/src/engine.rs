@@ -1455,6 +1455,12 @@ impl Engine {
             self.config.kv.vram_bytes as u64,
             model,
         );
+        if let (Some(rt), true) = (&self.rpc, model.q4x.is_some()) {
+            // No layer plan for this architecture: its GPU working set puts
+            // the routed experts that do not fit the cards on the workers.
+            model.rpc = Some(Arc::clone(rt));
+            return Ok(());
+        }
         if let Some(rt) = &self.rpc {
             rt.set_local_budgets_mib(&self.config.engine.local_vram_budget_mib);
             rt.set_expert_homes(&self.config.rpc.expert_homes);
@@ -2002,7 +2008,17 @@ impl Engine {
                     let g = self.lock()?;
                     g.target.clone()
                 };
-                if let Some(target) = target {
+                if let Some(target) = target.as_ref().filter(|t| t.q4x.is_some()) {
+                    match crate::qwen4_gpu::attach(target, hip, self.draft_hip.as_ref(), None) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "qwen4exp HIP working set failed; CPU forward");
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                } else if let Some(target) = target {
                     match crate::dsv4_gpu::attach(
                         &target,
                         hip,
@@ -4096,7 +4112,8 @@ impl Engine {
             && ((self.hip.is_some()
                 && resident.is_some()
                 && target.supports_hip_batched_prefill())
-                || target.dsv4.is_some());
+                || target.dsv4.is_some()
+                || target.q4x.is_some());
         #[cfg(feature = "cuda")]
         let batch_prefill_cuda = !vision_in_chunk
             && toks.len() > 1

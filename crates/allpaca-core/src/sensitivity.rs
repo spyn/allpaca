@@ -10,6 +10,10 @@
 //! It runs on the CPU forward with every weight decoded to F32 in RAM, and
 //! covers the token embedding and each block's dense attention and
 //! feed-forward matrices.
+//!
+//! A swapped matrix cannot change anything ahead of its own block, so the
+//! first reading keeps every block's input ([`LayerTrace`]) and a probe of
+//! block `b` starts there: the blocks before it are not run again.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +36,56 @@ pub struct Probe {
     texts: Vec<Vec<u32>>,
     /// Log-probabilities of the original weights: `positions * vocab`.
     reference: Vec<f32>,
+    /// Per text, every block's input with the original weights.
+    saved: Vec<Arc<Vec<f32>>>,
+    reuse: bool,
+    block_runs: usize,
+}
+
+/// What the CPU forward does at the top of each block of one text.
+#[derive(Debug, Clone)]
+pub enum LayerTrace {
+    /// Keep each block's input, and the last block's output:
+    /// `[position][block or end][dim]`.
+    Record { saved: Vec<f32>, ran: usize },
+    /// Skip the blocks before `from` and give block `from` its saved input
+    /// (`from` = the block count: only the output head runs).
+    Resume { from: usize, saved: Arc<Vec<f32>>, ran: usize },
+}
+
+impl LayerTrace {
+    /// At the top of block `layer` of position `pos`, or past the last block
+    /// (`layer` = `blocks`): whether to skip the block. `x` is the hidden
+    /// state.
+    pub(crate) fn enter(&mut self, pos: usize, layer: usize, blocks: usize, x: &mut [f32]) -> bool {
+        let at = (pos * (blocks + 1) + layer) * x.len();
+        match self {
+            Self::Record { saved, ran } => {
+                if saved.len() < at + x.len() {
+                    saved.resize(at + x.len(), 0.0);
+                }
+                saved[at..at + x.len()].copy_from_slice(x);
+                *ran += usize::from(layer < blocks);
+                false
+            }
+            Self::Resume { from, saved, ran } => {
+                if layer < *from {
+                    return true;
+                }
+                if layer == *from {
+                    x.copy_from_slice(&saved[at..at + x.len()]);
+                }
+                *ran += usize::from(layer < blocks);
+                false
+            }
+        }
+    }
+
+    fn ran(&self) -> usize {
+        match self {
+            Self::Record { ran, .. } | Self::Resume { ran, .. } => *ran,
+        }
+    }
 }
 
 /// Where a probed tensor lives in the loaded model.
@@ -64,9 +118,37 @@ impl Probe {
         if ids.is_empty() {
             return Err(bad("sensitivity probe: no calibration text of two or more tokens"));
         }
-        let mut probe = Self { model: loaded, tied_head, texts: ids, reference: Vec::new() };
-        probe.reference = log_probs(&probe.model, &probe.texts)?;
+        let mut probe = Self {
+            model: loaded,
+            tied_head,
+            texts: ids,
+            reference: Vec::new(),
+            saved: Vec::new(),
+            reuse: true,
+            block_runs: 0,
+        };
+        let record = |_: usize| Some(LayerTrace::Record { saved: Vec::new(), ran: 0 });
+        let (reference, traces) = log_probs(&probe.model, &probe.texts, record)?;
+        probe.reference = reference;
+        probe.saved = traces
+            .into_iter()
+            .map(|t| match t {
+                Some(LayerTrace::Record { saved, .. }) => Arc::new(saved),
+                _ => Arc::new(Vec::new()),
+            })
+            .collect();
         Ok(probe)
+    }
+
+    /// Whether a probe starts at the swapped matrix's block (the default) or
+    /// reads every text from the first block again. Both give the same number.
+    pub fn set_prefix_reuse(&mut self, reuse: bool) {
+        self.reuse = reuse;
+    }
+
+    /// Blocks run, over all positions, by the last [`Self::divergence`].
+    pub fn block_runs(&self) -> usize {
+        self.block_runs
     }
 
     /// Token positions the divergence is averaged over.
@@ -86,10 +168,27 @@ impl Probe {
         if weights.len() != len {
             return Err(bad(format!("sensitivity probe: {name} holds {len} weights, got {}", weights.len())));
         }
+        // The first block the swap can reach. The embedding is block 0's
+        // input, so a swap of it has nothing to start from.
+        let from = match self.locate(name) {
+            Some(Slot::Layer(local, _)) => Some(local),
+            Some(Slot::Head) => Some(self.model.layers.len()),
+            _ => None,
+        }
+        .filter(|_| self.reuse);
         let original = self.put(name, weights.to_vec());
-        let run = log_probs(&self.model, &self.texts);
+        let saved = &self.saved;
+        let trace = |text: usize| {
+            Some(match from {
+                Some(from) => LayerTrace::Resume { from, saved: saved[text].clone(), ran: 0 },
+                None => LayerTrace::Record { saved: Vec::new(), ran: 0 },
+            })
+        };
+        let run = log_probs(&self.model, &self.texts, trace);
         self.put(name, original);
-        Ok(mean_divergence(&self.reference, &run?, self.model.config.vocab_size))
+        let (run, traces) = run?;
+        self.block_runs = traces.iter().flatten().map(LayerTrace::ran).sum();
+        Ok(mean_divergence(&self.reference, &run, self.model.config.vocab_size))
     }
 
     fn locate(&self, name: &str) -> Option<Slot> {
@@ -180,39 +279,85 @@ fn mean_divergence(reference: &[f32], now: &[f32], vocab: usize) -> f64 {
     (total / (reference.len() / vocab).max(1) as f64).max(0.0)
 }
 
-/// Log-probabilities of every position of `texts`: `positions * vocab`.
-fn log_probs(model: &TinyModel, texts: &[Vec<u32>]) -> Result<Vec<f32>, AllpacaError> {
+/// Log-probabilities of every position of `texts` (`positions * vocab`),
+/// and each text's trace after its run. `trace(i)` is text `i`'s trace.
+/// Texts are independent, so they are read on separate threads.
+fn log_probs(
+    model: &TinyModel,
+    texts: &[Vec<u32>],
+    trace: impl Fn(usize) -> Option<LayerTrace> + Sync,
+) -> Result<(Vec<f32>, Vec<Option<LayerTrace>>), AllpacaError> {
+    type Read = Result<(Vec<f32>, Option<LayerTrace>), AllpacaError>;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(texts.len()).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut reads: Vec<Option<Read>> = (0..texts.len()).map(|_| None).collect();
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let text = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if text >= texts.len() {
+                            return done;
+                        }
+                        done.push((text, text_log_probs(model, &texts[text], trace(text))));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (text, read) in worker.join().expect("probe thread") {
+                reads[text] = Some(read);
+            }
+        }
+    });
+    let mut out = Vec::with_capacity(texts.iter().map(Vec::len).sum::<usize>() * model.config.vocab_size);
+    let mut traces = Vec::with_capacity(texts.len());
+    for read in reads {
+        let (log_probs, trace) = read.expect("every text is read")?;
+        out.extend(log_probs);
+        traces.push(trace);
+    }
+    Ok((out, traces))
+}
+
+/// One text's log-probabilities (`positions * vocab`) and its trace afterwards.
+fn text_log_probs(
+    model: &TinyModel,
+    tokens: &[u32],
+    trace: Option<LayerTrace>,
+) -> Result<(Vec<f32>, Option<LayerTrace>), AllpacaError> {
     let cfg = &model.config;
     let vocab = cfg.vocab_size;
     let metrics = Metrics::default();
-    let mut out = Vec::with_capacity(texts.iter().map(Vec::len).sum::<usize>() * vocab);
+    let mut out = Vec::with_capacity(tokens.len() * vocab);
     let mut logits = vec![0.0f32; vocab];
-    for tokens in texts {
-        let mut kv = KvTierManager::new(1 << 30, 1 << 30, 0.5);
-        let pages = alloc_pages_for_seq(&mut kv, cfg, PAGE_TOKENS, tokens.len(), &metrics)?;
-        let mut state = RecurrentState::zeros(cfg.n_layers, cfg.dim);
-        for (pos, &token) in tokens.iter().enumerate() {
-            model.forward_token(
-                token,
-                pos,
-                &pages,
-                &mut kv,
-                &metrics,
-                &mut logits,
-                None,
-                None,
-                false,
-                Some(&mut state),
-                None,
-                None,
-                None,
-            )?;
-            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let norm = max + logits.iter().map(|l| f64::from(l - max).exp()).sum::<f64>().ln() as f32;
-            out.extend(logits.iter().map(|l| l - norm));
-        }
+    let mut kv = KvTierManager::new(1 << 30, 1 << 30, 0.5);
+    let pages = alloc_pages_for_seq(&mut kv, cfg, PAGE_TOKENS, tokens.len(), &metrics)?;
+    let mut state = RecurrentState::zeros(cfg.n_layers, cfg.dim);
+    state.trace = trace;
+    for (pos, &token) in tokens.iter().enumerate() {
+        model.forward_token(
+            token,
+            pos,
+            &pages,
+            &mut kv,
+            &metrics,
+            &mut logits,
+            None,
+            None,
+            false,
+            Some(&mut state),
+            None,
+            None,
+            None,
+        )?;
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let norm = max + logits.iter().map(|l| f64::from(l - max).exp()).sum::<f64>().ln() as f32;
+        out.extend(logits.iter().map(|l| l - norm));
     }
-    Ok(out)
+    Ok((out, state.trace.take()))
 }
 
 /// Mean divergence (nats per token) of the predictions of the model at
@@ -235,7 +380,7 @@ pub fn divergence_between(
             other.config.vocab_size
         )));
     }
-    Ok(mean_divergence(&reference, &log_probs(&other, &texts)?, vocab))
+    Ok(mean_divergence(&reference, &log_probs(&other, &texts, |_| None)?.0, vocab))
 }
 
 #[cfg(test)]
@@ -280,6 +425,73 @@ mod tests {
         assert!(!probe.covers("output.weight"), "this file ties the head to the embedding");
         assert!(probe.divergence("blk.0.attn_norm.weight", &[1.0; 64]).is_err());
         assert!(probe.divergence("blk.0.attn_q.weight", &[0.0; 7]).is_err());
+    }
+
+    /// A probe of a later block starts at that block: fewer blocks run, and
+    /// the number is the one a full reading gives.
+    #[test]
+    fn a_probe_starts_at_the_swapped_block_and_gives_the_same_number() {
+        use crate::calib::tests::write_tiny_calib_gguf_shape;
+        let path = std::env::temp_dir().join(format!("allpaca_probe_reuse-{}.gguf", std::process::id()));
+        write_tiny_calib_gguf_shape(&path, 64, 128, 0.3, 3, true);
+        let file = GgufFile::open(&path).unwrap();
+        let mut probe = Probe::open(&path, &["hello world again hello world", "again hello"], 16).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let positions = probe.positions();
+        // (tensor, blocks run per position when the probe starts at its block)
+        let cases = [
+            ("token_embd.weight", 3),
+            ("blk.0.attn_q.weight", 3),
+            ("blk.1.ffn_up.weight", 2),
+            ("blk.1.attn_output.weight", 2),
+            ("blk.2.attn_v.weight", 1),
+            ("blk.2.ffn_down.weight", 1),
+            ("output.weight", 0),
+        ];
+        for (name, blocks) in cases {
+            let w = file.tensor_f32(name).unwrap();
+            let changed: Vec<f32> = w.iter().enumerate().map(|(i, v)| v * if i % 2 == 0 { 1.2 } else { 0.8 }).collect();
+            probe.set_prefix_reuse(false);
+            let full = probe.divergence(name, &changed).unwrap();
+            assert_eq!(probe.block_runs(), positions * 3, "{name}: a full reading");
+            probe.set_prefix_reuse(true);
+            let resumed = probe.divergence(name, &changed).unwrap();
+            assert_eq!(probe.block_runs(), positions * blocks, "{name}");
+            assert!(full > 0.0, "{name}: the change moves the output");
+            assert_eq!(resumed.to_bits(), full.to_bits(), "{name}: {resumed} vs {full}");
+            assert!(probe.divergence(name, &w).unwrap() < 1e-9, "{name}: restored");
+        }
+    }
+
+    /// Opt-in timing on a real model:
+    /// `ALLPACA_PROBE_MODEL=<gguf> ALLPACA_PROBE_TEXT=<txt> cargo test --release -p allpaca-core --lib real_probe_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_probe_timing() {
+        let (Ok(model), Ok(text)) = (std::env::var("ALLPACA_PROBE_MODEL"), std::env::var("ALLPACA_PROBE_TEXT")) else {
+            return;
+        };
+        let tokens: usize = std::env::var("ALLPACA_PROBE_TOKENS").ok().and_then(|t| t.parse().ok()).unwrap_or(16);
+        let text = std::fs::read_to_string(text).unwrap();
+        let texts: Vec<&str> = text.split("\n\n").filter(|t| !t.trim().is_empty()).collect();
+        let file = GgufFile::open(Path::new(&model)).unwrap();
+        let t = std::time::Instant::now();
+        let mut probe = Probe::open(Path::new(&model), &texts, tokens).unwrap();
+        println!("open: {} texts, {} positions, {:.1} s", texts.len(), probe.positions(), t.elapsed().as_secs_f64());
+        let blocks = probe.model.config.n_layers;
+        let mut names = vec!["token_embd.weight".to_string()];
+        for b in [0, blocks / 2, blocks - 1] {
+            names.push(format!("blk.{}.ffn_down.weight", probe.model.config.gguf_blk(b)));
+        }
+        for reuse in [false, true] {
+            probe.set_prefix_reuse(reuse);
+            for name in &names {
+                let w: Vec<f32> = file.tensor_f32(name).unwrap().iter().map(|v| v * 1.05).collect();
+                let t = std::time::Instant::now();
+                let d = probe.divergence(name, &w).unwrap();
+                println!("reuse {reuse:5} {name:28} {:7.2} s  kl {d:.6e}  block runs {}", t.elapsed().as_secs_f64(), probe.block_runs());
+            }
+        }
     }
 
     /// A file is no distance from itself, and a 2-bit requantisation of it

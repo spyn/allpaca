@@ -2906,6 +2906,19 @@ pub(crate) fn topk_route(
 /// `select_bias` (`blk.N.exp_probs_b`, empty = none) is DeepSeek-V3's expert
 /// selection bias for sigmoid routers: experts are picked on
 /// `sigmoid(logit) + bias`, and weighted by the unbiased sigmoid.
+/// The weight scale of [`topk_from_logits`] when the routing is the plain
+/// kind a device kernel also does (softmax over all experts, the best by
+/// weight, renormalised over the picks, no groups); `None` otherwise.
+pub(crate) fn plain_softmax_routing(cfg: &ModelConfig) -> Option<f32> {
+    let plain = !cfg.moe_sqrt_softplus
+        && !cfg.moe_sigmoid_gating
+        && !cfg.expert_weights_norm
+        && cfg.n_expert_groups <= 1
+        && cfg.n_active >= 1;
+    let scale = if cfg.expert_weights_scale == 0.0 { 1.0 } else { cfg.expert_weights_scale };
+    plain.then_some(scale)
+}
+
 pub(crate) fn topk_from_logits(
     weights: &mut [f32],
     n_active: usize,
@@ -7579,6 +7592,11 @@ impl TinyModel {
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(trace) = recurrent.as_deref_mut().and_then(|r| r.trace.as_mut()) {
+                if trace.enter(pos, layer_idx, self.layers.len(), &mut x) {
+                    continue;
+                }
+            }
             if let Some(rpc) = &self.rpc {
                 if rpc.is_remote(layer_idx) {
                     if rpc.is_span_start(layer_idx) {
@@ -7935,6 +7953,9 @@ impl TinyModel {
                 }
             }
         }
+        if let Some(trace) = recurrent.as_deref_mut().and_then(|r| r.trace.as_mut()) {
+            trace.enter(pos, self.layers.len(), self.layers.len(), &mut x);
+        }
 
         rmsnorm_dispatch(
             hip,
@@ -8080,10 +8101,14 @@ impl TinyModel {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
             })?;
-            for (i, &token) in tokens.iter().enumerate() {
-                crate::qwen4exp::forward_qwen4_token(self, token, start_pos + i, logits, &mut memory.q4x)?;
-            }
-            return Ok(());
+            return crate::qwen4exp::forward_qwen4_tokens(
+                self,
+                tokens,
+                start_pos,
+                logits,
+                row_logits.as_deref_mut(),
+                &mut memory.q4x,
+            );
         }
         if self.dsv4.is_some() && tokens.len() > 1 {
             return crate::deepseek4::forward_dsv4_tokens(
