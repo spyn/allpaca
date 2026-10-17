@@ -233,6 +233,13 @@ int allpaca_q4x_combine(float *streams, const float *out, const float *logits, i
                         int32_t hc, int32_t dim, allpaca_stream_t stream);
 int allpaca_q4x_ffn_sum(const float *routed, const float *shared, const float *gate, float *out,
                         int32_t rows, int32_t dim, allpaca_stream_t stream);
+/* The n-gram layer of `rows` tokens in order: streams[r] += gated value +
+ * silu(dilated conv), from key[r] (hc * dim), value[r] (dim), the three norm
+ * gains, conv_w[hc * dim, kern] and history[(kern - 1) * ngram, hc * dim]. */
+int allpaca_q4x_ple_apply(float *streams, const float *key, const float *value, const float *nk,
+                          const float *nq, const float *nc, const float *conv_w, float *history,
+                          int32_t rows, int32_t hc, int32_t dim, int32_t kern, int32_t ngram,
+                          float eps, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
 /* Softmax top-k MoE routing on the GPU (pair table + shared-expert gate).

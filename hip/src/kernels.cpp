@@ -4288,6 +4288,97 @@ __global__ void q4x_ffn_sum_kernel(const float *routed, const float *shared, con
     out[i] = v;
 }
 
+/* Sum of v over a block of 256 threads; every thread gets it. */
+__device__ inline float q4x_sum256(float v, float *part) {
+    const int tid = static_cast<int>(threadIdx.x);
+    __syncthreads();
+    part[tid] = v;
+    __syncthreads();
+    for (int step = 128; step > 0; step >>= 1) {
+        if (tid < step) {
+            part[tid] += part[tid + step];
+        }
+        __syncthreads();
+    }
+    return part[0];
+}
+
+/* The n-gram layer of `rows` tokens in order, one block per stream s. A
+ * token's stream is the query of a gate on the normed key; the open value is
+ * normed again into the conv input x, and the stream gets the gated value
+ * plus silu of a conv over x and the conv inputs (kern - 1 - k) * ngram tokens
+ * back. history[hist, hc * dim] holds the last hist conv inputs, oldest first. */
+__global__ void q4x_ple_apply_kernel(float *streams, const float *key, const float *value,
+                                     const float *nk, const float *nq, const float *nc,
+                                     const float *conv_w, float *history, int rows, int hc,
+                                     int dim, int kern, int ngram, float eps) {
+    __shared__ float part[256];
+    const int tid = static_cast<int>(threadIdx.x);
+    const size_t hc_dim = static_cast<size_t>(hc) * static_cast<size_t>(dim);
+    const size_t g = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(dim);
+    const int hist = (kern - 1) * ngram;
+    for (int r = 0; r < rows; ++r) {
+        float *st = streams + static_cast<size_t>(r) * hc_dim + g;
+        const float *k = key + static_cast<size_t>(r) * hc_dim + g;
+        const float *v = value + static_cast<size_t>(r) * static_cast<size_t>(dim);
+        float sk = 0.f, sq = 0.f;
+        for (int d = tid; d < dim; d += 256) {
+            sk += k[d] * k[d];
+            sq += st[d] * st[d];
+        }
+        const float ik = rsqrtf(q4x_sum256(sk, part) / static_cast<float>(dim) + eps);
+        const float iq = rsqrtf(q4x_sum256(sq, part) / static_cast<float>(dim) + eps);
+        float dot = 0.f;
+        for (int d = tid; d < dim; d += 256) {
+            dot += (k[d] * ik * nk[g + d]) * (st[d] * iq * nq[g + d]);
+        }
+        const float s = q4x_sum256(dot, part) / sqrtf(static_cast<float>(dim));
+        // Signed square root before the sigmoid.
+        const float signed_s = s == 0.f ? 0.f : copysignf(sqrtf(fmaxf(fabsf(s), 1e-6f)), s);
+        const float open = 1.f / (1.f + expf(-signed_s));
+        float sg = 0.f;
+        for (int d = tid; d < dim; d += 256) {
+            const float gv = v[d] * open;
+            sg += gv * gv;
+        }
+        const float ig = rsqrtf(q4x_sum256(sg, part) / static_cast<float>(dim) + eps);
+        for (int d = tid; d < dim; d += 256) {
+            const size_t c = g + static_cast<size_t>(d);
+            const float gv = v[d] * open;
+            const float x = gv * ig * nc[c];
+            const float *w = conv_w + c * static_cast<size_t>(kern);
+            float acc = w[kern - 1] * x;
+            for (int t = 0; t < kern - 1; ++t) {
+                const int back = (kern - 1 - t) * ngram;
+                acc += w[t] * history[static_cast<size_t>(hist - back) * hc_dim + c];
+            }
+            st[d] += gv + acc / (1.f + expf(-acc));
+            for (int p = 0; p + 1 < hist; ++p) {
+                history[static_cast<size_t>(p) * hc_dim + c] = history[static_cast<size_t>(p + 1) * hc_dim + c];
+            }
+            if (hist > 0) {
+                history[static_cast<size_t>(hist - 1) * hc_dim + c] = x;
+            }
+        }
+    }
+}
+
+extern "C" int allpaca_q4x_ple_apply(float *streams, const float *key, const float *value,
+                                     const float *nk, const float *nq, const float *nc,
+                                     const float *conv_w, float *history, int32_t rows, int32_t hc,
+                                     int32_t dim, int32_t kern, int32_t ngram, float eps,
+                                     allpaca_stream_t stream) {
+    if (rows <= 0 || hc <= 0 || dim <= 0 || kern <= 0 || ngram <= 0 || !streams || !key || !value ||
+        !nk || !nq || !nc || !conv_w || (kern > 1 && !history)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(q4x_ple_apply_kernel, dim3(static_cast<unsigned>(hc)), dim3(256), 0,
+                       as_stream(stream), streams, key, value, nk, nq, nc, conv_w, history, rows,
+                       hc, dim, kern, ngram, eps);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_q4x_stream_norm(const float *x, const float *gains, float *xn, int32_t rows,
                                        int32_t hc, int32_t dim, float eps,
                                        allpaca_stream_t stream) {
@@ -9688,6 +9779,12 @@ extern "C" int allpaca_silu_scale(float *, int32_t, float, allpaca_stream_t) {
 
 extern "C" int allpaca_q4x_stream_norm(const float *, const float *, float *, int32_t, int32_t,
                                        int32_t, float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_q4x_ple_apply(float *, const float *, const float *, const float *,
+                                     const float *, const float *, const float *, float *, int32_t,
+                                     int32_t, int32_t, int32_t, int32_t, float, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

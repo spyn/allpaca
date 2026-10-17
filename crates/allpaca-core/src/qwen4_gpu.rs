@@ -54,7 +54,7 @@ const BLOCK_MATRICES: [&str; 24] = [
     "ple_value.weight",
 ];
 /// F32 vectors of a block the kernels read.
-const BLOCK_VECTORS: [&str; 8] = [
+const BLOCK_VECTORS: [&str; 12] = [
     "hc_attn_norm.weight",
     "hc_ffn_norm.weight",
     "attn_q_norm.weight",
@@ -63,6 +63,10 @@ const BLOCK_VECTORS: [&str; 8] = [
     "ssm_conv1d.weight",
     "ssm_dt.bias",
     "ssm_a",
+    "ple_norm_key.weight",
+    "ple_norm_query.weight",
+    "ple_norm_conv.weight",
+    "ple_conv1d.weight",
 ];
 /// F32 vectors of a block the host reads (the indexer's norm gains).
 const HOST_VECTORS: [&str; 2] = ["indexer.q_norm.weight", "indexer.k_norm.weight"];
@@ -217,6 +221,7 @@ fn layout(hc: usize, dim: usize, ff: usize, n_experts: usize, sizes: &ActSizes) 
     act.shared_gate = take(r * sizes.shared_ff);
     act.shared_up = take(r * sizes.shared_ff);
     act.shared_open = take(r);
+    act.ple_emb = take(r * sizes.io_k);
     act.io_in = take(sizes.io_k);
     act.io_out = take(sizes.io_n);
     act.io_out_floats = sizes.io_n;
@@ -333,6 +338,8 @@ struct Act {
     shared_gate: usize,
     shared_up: usize,
     shared_open: usize,
+    /// The n-gram block's table rows of the pass's tokens.
+    ple_emb: usize,
     /// Host products: input, then outputs (the logits among them).
     io_in: usize,
     io_out: usize,
@@ -409,6 +416,8 @@ pub struct Qwen4DeviceState {
     /// Per device, once an attention is sparse: the cells a token keeps
     /// (row numbers, then their keys, then their values).
     picked: HashMap<i32, DeviceWeights>,
+    /// The n-gram block's conv history, once a pass has run it.
+    ple: Option<DeviceWeights>,
 }
 
 #[derive(Default)]
@@ -457,6 +466,7 @@ impl Clone for Qwen4DeviceState {
                 })
                 .collect(),
             picked: HashMap::new(),
+            ple: dup(&self.ple),
         }
     }
 }
@@ -557,7 +567,14 @@ impl Qwen4DeviceState {
         Ok(Self {
             blocks,
             picked: HashMap::new(),
+            ple: None,
         })
+    }
+
+    /// The n-gram block's conv history, when it is on a card (everything
+    /// queued there must have finished).
+    pub fn ple_history(&self) -> Result<Option<Vec<f32>>, AllpacaError> {
+        read_back(&self.ple, usize::MAX)
     }
 }
 
@@ -1320,6 +1337,73 @@ impl Qwen4Gpu {
                 rows as i32,
                 self.hc as i32,
                 self.dim as i32,
+            )
+        })
+    }
+
+    /// Put the n-gram block's table rows of the pass's tokens, token-major,
+    /// on `card`.
+    pub fn set_ple_rows(&self, card: usize, emb: &[f32]) -> Result<(), AllpacaError> {
+        if emb.len() > self.act.io_in - self.act.ple_emb {
+            return Err(gpu_err(format!("qwen4exp: {} n-gram table floats do not fit", emb.len())));
+        }
+        let card = &self.cards[card];
+        card.hip.copy_h2d_f32(card.at(self.act.ple_emb), emb)
+    }
+
+    /// The n-gram block `blk` on the streams of `rows` tokens, from the
+    /// table rows [`Self::set_ple_rows`] put on its card. The conv history
+    /// stays on the card; `history` starts it the first time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple(
+        &self,
+        blk: usize,
+        rows: usize,
+        kern: usize,
+        ngram: usize,
+        state: &mut Qwen4DeviceState,
+        history: &[f32],
+    ) -> Result<(), AllpacaError> {
+        self.check_rows(rows)?;
+        let (card, act, hc_dim) = (&self.cards[self.card_of(blk)], &self.act, self.hc * self.dim);
+        let name = |s: &str| format!("blk.{blk}.ple_{s}.weight");
+        let width = self
+            .matrices
+            .get(&name("key"))
+            .map(|m| m.k)
+            .ok_or_else(|| gpu_err(format!("qwen4exp: block {blk}'s n-gram key is not on the GPU")))?;
+        let (key, value) = (self.matrix(&name("key"), width)?, self.matrix(&name("value"), width)?);
+        if key.n != hc_dim || value.n != self.dim || rows * width > act.io_in - act.ple_emb {
+            return Err(gpu_err(format!("qwen4exp: block {blk}'s n-gram products do not fit")));
+        }
+        let norms = [self.vector(&name("norm_key"))?, self.vector(&name("norm_query"))?, self.vector(&name("norm_conv"))?];
+        let conv = self.vector(&name("conv1d"))?;
+        let floats = kern.saturating_sub(1) * ngram * hc_dim;
+        if state.ple.is_none() {
+            let buf = zeroed(card.hip.device, floats.max(1))?;
+            if history.len() == floats && floats > 0 {
+                memcpy(buf.ptr_at(0).cast_mut().cast(), history.as_ptr().cast(), floats * 4, MEMCPY_H2D)?;
+            }
+            state.ple = Some(buf);
+        }
+        let hist = state.ple.as_ref().map_or(std::ptr::null_mut(), |b| b.ptr_at(0).cast_mut());
+        self.launch(card, key, card.at(act.ple_emb), card.at(act.xn), rows)?;
+        self.launch(card, value, card.at(act.ple_emb), card.at(act.out), rows)?;
+        card.hip.bind()?;
+        self.step(card, "ple_apply", || {
+            q4x::ple_apply(
+                card.at(act.streams),
+                card.at(act.xn),
+                card.at(act.out),
+                norms,
+                conv,
+                hist,
+                rows as i32,
+                self.hc as i32,
+                self.dim as i32,
+                kern as i32,
+                ngram as i32,
+                self.eps,
             )
         })
     }

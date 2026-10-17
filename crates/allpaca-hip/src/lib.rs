@@ -717,6 +717,23 @@ mod ffi {
             dim: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_q4x_ple_apply(
+            streams: *mut f32,
+            key: *const f32,
+            value: *const f32,
+            nk: *const f32,
+            nq: *const f32,
+            nc: *const f32,
+            conv_w: *const f32,
+            history: *mut f32,
+            rows: i32,
+            hc: i32,
+            dim: i32,
+            kern: i32,
+            ngram: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
         pub fn allpaca_det_silu_mul(
             g: *const f32,
@@ -4490,6 +4507,57 @@ pub mod q4x {
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
             let _ = (routed, shared, gate, out, rows, dim);
+            unavailable()
+        }
+    }
+
+    /// The n-gram layer of `rows` tokens in order: each stream gets the
+    /// value (`dim` a token) gated by its match with the normed `key`
+    /// (`hc * dim` a token), plus silu of a conv dilated by `ngram` over the
+    /// normed gated values; `history` holds the last `(kern - 1) * ngram`
+    /// of those and moves on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_apply(
+        streams: *mut f32,
+        key: *const f32,
+        value: *const f32,
+        norms: [*const f32; 3],
+        conv_w: *const f32,
+        history: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        kern: i32,
+        ngram: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let [nk, nq, nc] = norms;
+            let rc = unsafe {
+                ffi::allpaca_q4x_ple_apply(
+                    streams,
+                    key,
+                    value,
+                    nk,
+                    nq,
+                    nc,
+                    conv_w,
+                    history,
+                    rows,
+                    hc,
+                    dim,
+                    kern,
+                    ngram,
+                    eps,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "q4x_ple_apply")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (streams, key, value, norms, conv_w, history, rows, hc, dim, kern, ngram, eps);
             unavailable()
         }
     }

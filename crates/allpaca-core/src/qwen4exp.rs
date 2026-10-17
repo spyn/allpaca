@@ -457,21 +457,23 @@ impl Qwen4Memory {
             }
             (None, saved) => saved.clone(),
         };
-        let device_host = match &self.device {
+        let (device_host, ple_history) = match &self.device {
             Some(device) => {
                 if let Some(q4) = model.q4x.as_ref() {
                     if let Some(gpu) = q4.gpu.lock().map_err(|_| load_err("qwen4exp GPU lock".into()))?.as_ref() {
                         gpu.sync_all()?;
                     }
                 }
-                Some(device.to_host(self.tokens.len())?)
+                // The n-gram block's history is on the card once it ran there.
+                let ple = device.ple_history()?.unwrap_or_else(|| self.ple_history.clone());
+                (Some(device.to_host(self.tokens.len())?), ple)
             }
-            None => self.device_host.clone(),
+            None => (self.device_host.clone(), self.ple_history.clone()),
         };
         Ok(Some(Self {
             tokens: self.tokens.clone(),
             layers: self.layers.clone(),
-            ple_history: self.ple_history.clone(),
+            ple_history,
             routes: None,
             times: None,
             device: None,
@@ -1367,6 +1369,21 @@ fn forward_device(
         }
     };
     gpu.set_streams(card, &streams)?;
+    // The n-gram block runs on its card unless `ALLPACA_Q4X_HOST_PLE`; its
+    // table rows go there with the streams.
+    let host_ple = std::env::var_os("ALLPACA_Q4X_HOST_PLE").is_some();
+    if let Some(ple) = q4.spec.ple.as_ref().filter(|_| !host_ple) {
+        let blk = ple.layers[0];
+        if (resume..cfg.n_layers).any(|layer| cfg.gguf_blk(layer) == blk) {
+            let mut earlier = mem.tokens.clone();
+            let mut emb = Vec::with_capacity(rows * ple.n_heads() * ple.head_dim);
+            for &token in tokens {
+                emb.extend(ple_embedding(q4, ple, token, &earlier)?);
+                earlier.push(i64::from(token));
+            }
+            gpu.set_ple_rows(gpu.card_of(blk), &emb)?;
+        }
+    }
     let mut scores = vec![0.0f32; rows * n_experts];
     let mut x = Vec::new();
     // Blocks with their experts on a card pick them there, so nothing of
@@ -1401,9 +1418,9 @@ fn forward_device(
         }
         let home = gpu.card_of(blk);
         let ple = q4.spec.ple.as_ref().filter(|p| p.layers.contains(&blk));
-        if home != card || ple.is_some() {
+        if home != card || (ple.is_some() && host_ple) {
             gpu.get_streams(card, &mut streams)?;
-            if let Some(ple) = ple {
+            if let Some(ple) = ple.filter(|_| host_ple) {
                 let name = |s: &str| format!("blk.{blk}.ple_{s}.weight");
                 let (nk, nq, nc) = (q4.w(&name("norm_key"))?, q4.w(&name("norm_query"))?, q4.w(&name("norm_conv"))?);
                 let conv = q4.w(&name("conv1d"))?;
@@ -1419,6 +1436,9 @@ fn forward_device(
             }
             gpu.set_streams(home, &streams)?;
             card = home;
+        }
+        if let Some(ple) = ple.filter(|_| !host_ple) {
+            gpu.ple(blk, rows, ple.conv_kernel, ple.ngram_size, device, &mem.ple_history)?;
         }
         lap(card, &mut times.embed_ple)?;
         gpu.mix(card, &format!("blk.{blk}.hc_attn"), true, rows)?;
