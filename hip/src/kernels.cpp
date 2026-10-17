@@ -2176,6 +2176,58 @@ __global__ void gemv_nt_bf16_wide_kernel(const float *a, const uint16_t *b, floa
     }
 }
 
+/* gemv_nt_bf16_wide_kernel for 2..8 rows a block (grid y = blocks of 8 rows): every row shares
+ * each weight load and sums as it would alone. On the MI50 at 16 rows: 10240x320 157 -> 113 us,
+ * 512x2560 89 -> 66 us; one row stays on the wide kernel (this one is slower there). */
+__global__ void gemv_nt_bf16_wide_rows_kernel(const float *a, const uint16_t *b, float *c, int m,
+                                              int n, int k) {
+    constexpr int GROUPS = 8;
+    constexpr int MAX_M = 8;
+    const int row0 = static_cast<int>(blockIdx.y) * MAX_M;
+    const int rows = m - row0 < MAX_M ? m - row0 : MAX_M;
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    float acc[MAX_M];
+#pragma unroll
+    for (int r = 0; r < MAX_M; ++r) {
+        acc[r] = 0.f;
+    }
+    if (col < n) {
+        const uint16_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+        for (int p = lane * 8; p < k; p += 256) {
+            const uint4 w = *reinterpret_cast<const uint4 *>(brow + p);
+#pragma unroll
+            for (int r = 0; r < MAX_M; ++r) {
+                if (r < rows) {
+                    const float *arow = a + static_cast<size_t>(row0 + r) * static_cast<size_t>(k);
+                    const float4 x0 = *reinterpret_cast<const float4 *>(arow + p);
+                    const float4 x1 = *reinterpret_cast<const float4 *>(arow + p + 4);
+                    acc[r] += x0.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x)) +
+                              x0.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x >> 16)) +
+                              x0.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y)) +
+                              x0.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y >> 16)) +
+                              x1.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z)) +
+                              x1.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z >> 16)) +
+                              x1.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w)) +
+                              x1.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w >> 16));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MAX_M; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor(v, off, 32);
+        }
+        if (col < n && lane == 0 && r < rows) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + col] = v;
+        }
+    }
+}
+
 /* The same products with a whole block of 256 per output (grid n), every row (m <= 8) in the
  * block so the weights are read once: for few, long rows, where a 32-lane group per output leaves
  * most of the card idle. With grid (n, m) a block takes row blockIdx.y alone. Each row's sums run
@@ -2295,8 +2347,14 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
         (reinterpret_cast<uintptr_t>(b) & 15u) == 0) {
         constexpr int GROUPS = 8;
         dim3 block(GROUPS * 32);
-        dim3 grid(static_cast<unsigned>((n + GROUPS - 1) / GROUPS), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_bf16_wide_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        const unsigned gx = static_cast<unsigned>((n + GROUPS - 1) / GROUPS);
+        if (m > 1) {
+            hipLaunchKernelGGL(gemv_nt_bf16_wide_rows_kernel, dim3(gx, static_cast<unsigned>((m + 7) / 8)),
+                               block, 0, stream, a, b, c, m, n, k);
+        } else {
+            hipLaunchKernelGGL(gemv_nt_bf16_wide_kernel, dim3(gx, 1u), block, 0, stream, a, b, c, m,
+                               n, k);
+        }
     } else if (tiled) {
         constexpr int COLS = 64;
         dim3 block(128);
