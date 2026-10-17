@@ -360,14 +360,17 @@ impl Qwen4Weights {
 }
 
 /// SwiGLU of one expert read from its `Q2_0` blocks.
+/// A `Q2_0` expert's SwiGLU on the input and hidden row rounded to 8 bits
+/// per block, as the expert pool, the GPU kernels and the worker run it.
 fn swiglu_q2_0(x: &[f32], gate: &[u8], up: &[u8], down: &[u8], ff: usize, dim: usize) -> Result<Vec<f32>, AllpacaError> {
     let (mut h, mut u, mut y) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
-    allpaca_cpu::gemv_q2_0(gate, x, &mut h)?;
-    allpaca_cpu::gemv_q2_0(up, x, &mut u)?;
+    let input = allpaca_cpu::Q2_0Input::new(x)?;
+    allpaca_cpu::gemv_q2_0_i8(gate, &input, &mut h)?;
+    allpaca_cpu::gemv_q2_0_i8(up, &input, &mut u)?;
     for (h, u) in h.iter_mut().zip(&u) {
         *h = silu(*h) * u;
     }
-    allpaca_cpu::gemv_q2_0(down, &h, &mut y)?;
+    allpaca_cpu::gemv_q2_0_i8(down, &allpaca_cpu::Q2_0Input::new(&h)?, &mut y)?;
     Ok(y)
 }
 

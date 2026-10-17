@@ -209,7 +209,8 @@ int allpaca_q2_0_moe_ffn(const float *x, const uint8_t *pool, const int32_t *slo
  * picks and times `scale`, then allpaca_q2_0_moe_ffn of those picks. `picks` is device scratch
  * of 32 int32 slots followed by 32 float weights per row and keeps the picks. Rows follow each
  * other: x and out by dim, scores by n_experts, h by n_pick * ff. Each row's result equals its own
- * launch. n_experts <= 1024, n_pick <= 32. */
+ * launch. `h` is scratch of q2_0_moe_scratch_floats(rows, n_pick, dim, ff) floats (allpaca-hip).
+ * n_experts <= 1024, n_pick <= 32. */
 int allpaca_q4x_routed_ffn(const float *x, const float *scores, const uint8_t *pool,
                            int32_t n_experts, int32_t n_pick, float scale, void *picks, float *h,
                            float *out, int32_t dim, int32_t ff, int32_t rows,

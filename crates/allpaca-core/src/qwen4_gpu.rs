@@ -210,7 +210,7 @@ fn layout(hc: usize, dim: usize, ff: usize, n_experts: usize, sizes: &ActSizes) 
     act.inject = take(r * hc);
     act.t = [take(wide), take(wide), take(wide), take(wide), take(wide)];
     act.out = take(r * dim);
-    act.expert_h = take(r * MAX_PICKS * ff);
+    act.expert_h = take(allpaca_hip::q2_0_moe_scratch_floats(r, MAX_PICKS, dim, ff));
     act.picks = take(r * q4x::PICKS_BYTES / 4);
     act.routed = take(r * dim);
     act.shared = take(r * dim);

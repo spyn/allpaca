@@ -3619,9 +3619,105 @@ struct Q2MoePicks {
     float w[ALLPACA_Q2_MOE_MAX_PICKS];
 };
 
+/* c + the dot of four signed bytes of a with four bytes of b (b's bytes are 0..127 or signed;
+ * here they are the 2-bit codes 0..3). */
+__device__ inline int allpaca_dot4_i8(int a, int b, int c) {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__)
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    const int8_t *x = reinterpret_cast<const int8_t *>(&a);
+    const int8_t *y = reinterpret_cast<const int8_t *>(&b);
+    return c + x[0] * y[0] + x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
+#endif
+}
+
+/* A row of activations rounded to 8 bits per 64-value block, as allpaca_cpu's Q2_0Input:
+ * codes round(v * 127 / max|block|), the block's step max / 127 and the sum of its codes. The
+ * codes are kept in dot order: within each 16 values, value 4i + k sits at 4k + i, so the codes
+ * of one 2-bit field of four code bytes line up with one 32-bit word. */
+struct Q2Act {
+    const int8_t *codes;
+    const float *step;
+    const float *sum;
+};
+
+/* The Q2_0 expert kernels' scratch (q2_0_moe_scratch_floats on the Rust side): the hidden rows
+ * h (rows * n_pick * ff), then steps and sums of the inputs and of h, then their codes. */
+struct Q2MoeScratch {
+    float *h;
+    float *x_step, *x_sum, *h_step, *h_sum;
+    int8_t *x_codes, *h_codes;
+};
+
+static Q2MoeScratch q2_moe_scratch(float *base, int rows, int n_pick, int dim, int ff) {
+    const size_t nh = static_cast<size_t>(rows) * n_pick * ff;
+    const size_t nx = static_cast<size_t>(rows) * dim;
+    Q2MoeScratch s;
+    s.h = base;
+    s.x_step = base + nh;
+    s.x_sum = s.x_step + nx / 64;
+    s.h_step = s.x_sum + nx / 64;
+    s.h_sum = s.h_step + nh / 64;
+    s.x_codes = reinterpret_cast<int8_t *>(s.h_sum + nh / 64);
+    s.h_codes = s.x_codes + nx;
+    return s;
+}
+
+/* Round `blocks` 64-value blocks of x to Q2Act form, one thread per block. */
+__global__ void q2_0_round_act_kernel(const float *x, int8_t *codes, float *step, float *sum,
+                                      int blocks) {
+    const int b = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (b >= blocks) {
+        return;
+    }
+    const float *src = x + static_cast<size_t>(b) * 64;
+    int8_t *dst = codes + static_cast<size_t>(b) * 64;
+    float mx = 0.f;
+    for (int j = 0; j < 64; ++j) {
+        mx = fmaxf(mx, fabsf(src[j]));
+    }
+    int total = 0;
+    const bool live = mx > 0.f && isfinite(mx);
+    const float inv = live ? 127.f / mx : 0.f;
+    for (int j = 0; j < 64; ++j) {
+        const int c = live ? static_cast<int>(roundf(src[j] * inv)) : 0;
+        dst[(j & ~15) + 4 * (j & 3) + ((j >> 2) & 3)] = static_cast<int8_t>(c);
+        total += c;
+    }
+    step[b] = live ? mx / 127.f : 0.f;
+    sum[b] = static_cast<float>(total);
+}
+
+static void q2_0_round_act(const float *x, int8_t *codes, float *step, float *sum, size_t n,
+                           hipStream_t stream) {
+    const int blocks = static_cast<int>(n / 64);
+    hipLaunchKernelGGL(q2_0_round_act_kernel, dim3(static_cast<unsigned>((blocks + 255) / 256)),
+                       dim3(256), 0, stream, x, codes, step, sum, blocks);
+}
+
+/* Dot of one Q2_0 block (18 bytes, on two bytes) with block b of a rounded row: the block's
+ * scale times the step times (sum of code * activation code - sum of activation codes), as
+ * allpaca_cpu's gemv_q2_0_i8. */
+__device__ inline float q2_0_block_dot_i8(const uint8_t *blk, const Q2Act &a, size_t b) {
+    const uint16_t *codes = reinterpret_cast<const uint16_t *>(blk + 2);
+    const int *xa = reinterpret_cast<const int *>(a.codes + b * 64);
+    int s = 0;
+    for (int m = 0; m < 4; ++m) {
+        const uint32_t w = static_cast<uint32_t>(codes[2 * m]) |
+                           (static_cast<uint32_t>(codes[2 * m + 1]) << 16);
+        for (int k = 0; k < 4; ++k) {
+            s = allpaca_dot4_i8(xa[4 * m + k], static_cast<int>((w >> (2 * k)) & 0x03030303u), s);
+        }
+    }
+    return allpaca_f16le_to_f32(blk) * a.step[b] * (static_cast<float>(s) - a.sum[b]);
+}
+
 /* h[p, r] = silu(gate_p[r] . x) * (up_p[r] . x): grid (ff / 64, picks). `pg` and `pu` are
  * the block's 256-float shared scratch. */
-__device__ inline void q2_0_moe_gate_up_body(const float *x, const uint8_t *pool,
+__device__ inline void q2_0_moe_gate_up_body(const Q2Act &x, const uint8_t *pool,
                                              const int32_t *slots, float *h, int dim, int ff,
                                              size_t slot_bytes, float *pg, float *pu) {
     constexpr int LANES = 4;
@@ -3638,9 +3734,8 @@ __device__ inline void q2_0_moe_gate_up_body(const float *x, const uint8_t *pool
                               static_cast<size_t>(r) * row_bytes;
         const uint8_t *up = gate + static_cast<size_t>(ff) * row_bytes;
         for (int ib = lane; ib < nblocks; ib += LANES) {
-            const float *xb = x + static_cast<size_t>(ib) * 64;
-            g += q2_0_block_dot(gate + static_cast<size_t>(ib) * 18, xb);
-            u += q2_0_block_dot(up + static_cast<size_t>(ib) * 18, xb);
+            g += q2_0_block_dot_i8(gate + static_cast<size_t>(ib) * 18, x, ib);
+            u += q2_0_block_dot_i8(up + static_cast<size_t>(ib) * 18, x, ib);
         }
     }
     pg[tid] = g;
@@ -3654,7 +3749,7 @@ __device__ inline void q2_0_moe_gate_up_body(const float *x, const uint8_t *pool
     }
 }
 
-__global__ void q2_0_moe_gate_up_kernel(const float *x, const uint8_t *pool, Q2MoePicks picks,
+__global__ void q2_0_moe_gate_up_kernel(Q2Act x, const uint8_t *pool, Q2MoePicks picks,
                                         float *h, int dim, int ff, size_t slot_bytes) {
     __shared__ float pg[256];
     __shared__ float pu[256];
@@ -3666,20 +3761,22 @@ __global__ void q2_0_moe_gate_up_kernel(const float *x, const uint8_t *pool, Q2M
 
 /* The same with the picks in device memory, row blockIdx.z of several: x by dim, picks by
  * ALLPACA_Q4X_PICK_WORDS, h by n_pick (gridDim.y) * ff. */
-__global__ void q2_0_moe_gate_up_dev_kernel(const float *x, const uint8_t *pool,
+__global__ void q2_0_moe_gate_up_dev_kernel(Q2Act x, const uint8_t *pool,
                                             const int32_t *picks, float *h, int dim, int ff,
                                             size_t slot_bytes) {
     __shared__ float pg[256];
     __shared__ float pu[256];
     const size_t row = blockIdx.z;
-    q2_0_moe_gate_up_body(x + row * static_cast<size_t>(dim), pool,
+    const size_t first = row * static_cast<size_t>(dim / 64);
+    const Q2Act xr = {x.codes + first * 64, x.step + first, x.sum + first};
+    q2_0_moe_gate_up_body(xr, pool,
                           picks + row * ALLPACA_Q4X_PICK_WORDS,
                           h + row * gridDim.y * static_cast<size_t>(ff), dim, ff, slot_bytes, pg, pu);
 }
 
 /* out[c] = sum_p w_p * (down_p[c] . h[p]): grid (dim / 64). `part` is the block's 256-float
  * shared scratch. */
-__device__ inline void q2_0_moe_down_body(const float *h, const uint8_t *pool, const int32_t *slots,
+__device__ inline void q2_0_moe_down_body(const Q2Act &h, const uint8_t *pool, const int32_t *slots,
                                           const float *w, int n_pick, float *out, int dim, int ff,
                                           size_t slot_bytes, float *part) {
     constexpr int LANES = 4;
@@ -3693,11 +3790,10 @@ __device__ inline void q2_0_moe_down_body(const float *h, const uint8_t *pool, c
         for (int p = 0; p < n_pick; ++p) {
             const uint8_t *down = pool + static_cast<size_t>(slots[p]) * slot_bytes + down_off +
                                   static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 18;
-            const float *hp = h + static_cast<size_t>(p) * static_cast<size_t>(ff);
+            const size_t first = static_cast<size_t>(p) * static_cast<size_t>(nblocks);
             float s = 0.f;
             for (int ib = lane; ib < nblocks; ib += LANES) {
-                s += q2_0_block_dot(down + static_cast<size_t>(ib) * 18,
-                                    hp + static_cast<size_t>(ib) * 64);
+                s += q2_0_block_dot_i8(down + static_cast<size_t>(ib) * 18, h, first + ib);
             }
             acc += w[p] * s;
         }
@@ -3709,21 +3805,23 @@ __device__ inline void q2_0_moe_down_body(const float *h, const uint8_t *pool, c
     }
 }
 
-__global__ void q2_0_moe_down_kernel(const float *h, const uint8_t *pool, Q2MoePicks picks,
+__global__ void q2_0_moe_down_kernel(Q2Act h, const uint8_t *pool, Q2MoePicks picks,
                                      int n_pick, float *out, int dim, int ff, size_t slot_bytes) {
     __shared__ float part[256];
     q2_0_moe_down_body(h, pool, picks.slot, picks.w, n_pick, out, dim, ff, slot_bytes, part);
 }
 
 /* Row blockIdx.z of several: h by n_pick * ff, picks by ALLPACA_Q4X_PICK_WORDS, out by dim. */
-__global__ void q2_0_moe_down_dev_kernel(const float *h, const uint8_t *pool, const int32_t *picks,
+__global__ void q2_0_moe_down_dev_kernel(Q2Act h, const uint8_t *pool, const int32_t *picks,
                                          int n_pick, float *out, int dim, int ff,
                                          size_t slot_bytes) {
     __shared__ float part[256];
     const size_t row = blockIdx.z;
     const int32_t *slots = picks + row * ALLPACA_Q4X_PICK_WORDS;
     const float *w = reinterpret_cast<const float *>(slots + ALLPACA_Q2_MOE_MAX_PICKS);
-    q2_0_moe_down_body(h + row * static_cast<size_t>(n_pick) * static_cast<size_t>(ff), pool, slots,
+    const size_t first = row * static_cast<size_t>(n_pick) * static_cast<size_t>(ff / 64);
+    const Q2Act hr = {h.codes + first * 64, h.step + first, h.sum + first};
+    q2_0_moe_down_body(hr, pool, slots,
                        w, n_pick, out + row * static_cast<size_t>(dim), dim, ff, slot_bytes, part);
 }
 
@@ -3808,11 +3906,17 @@ extern "C" int allpaca_q2_0_moe_ffn(const float *x, const uint8_t *pool, const i
         picks.w[p] = weights[p];
     }
     const size_t slot_bytes = 3 * static_cast<size_t>(ff) * static_cast<size_t>(dim / 64) * 18;
+    const Q2MoeScratch sc = q2_moe_scratch(h, 1, n_pick, dim, ff);
+    q2_0_round_act(x, sc.x_codes, sc.x_step, sc.x_sum, static_cast<size_t>(dim), as_stream(stream));
+    const Q2Act xa = {sc.x_codes, sc.x_step, sc.x_sum};
     hipLaunchKernelGGL(q2_0_moe_gate_up_kernel,
                        dim3(static_cast<unsigned>((ff + 63) / 64), static_cast<unsigned>(n_pick)),
-                       dim3(256), 0, as_stream(stream), x, pool, picks, h, dim, ff, slot_bytes);
+                       dim3(256), 0, as_stream(stream), xa, pool, picks, sc.h, dim, ff, slot_bytes);
+    q2_0_round_act(sc.h, sc.h_codes, sc.h_step, sc.h_sum, static_cast<size_t>(n_pick) * ff,
+                   as_stream(stream));
+    const Q2Act ha = {sc.h_codes, sc.h_step, sc.h_sum};
     hipLaunchKernelGGL(q2_0_moe_down_kernel, dim3(static_cast<unsigned>((dim + 63) / 64)), dim3(256),
-                       0, as_stream(stream), h, pool, picks, n_pick, out, dim, ff, slot_bytes);
+                       0, as_stream(stream), ha, pool, picks, n_pick, out, dim, ff, slot_bytes);
     return hip_status(hipGetLastError());
 }
 
@@ -3831,11 +3935,18 @@ extern "C" int allpaca_q4x_routed_ffn(const float *x, const float *scores, const
     const unsigned r = static_cast<unsigned>(rows);
     hipLaunchKernelGGL(q4x_route_topk_kernel, dim3(r), dim3(256), 0, as_stream(stream), scores,
                        n_experts, n_pick, scale, slots);
+    const Q2MoeScratch sc = q2_moe_scratch(h, rows, n_pick, dim, ff);
+    q2_0_round_act(x, sc.x_codes, sc.x_step, sc.x_sum, static_cast<size_t>(rows) * dim,
+                   as_stream(stream));
+    const Q2Act xa = {sc.x_codes, sc.x_step, sc.x_sum};
     hipLaunchKernelGGL(q2_0_moe_gate_up_dev_kernel,
                        dim3(static_cast<unsigned>((ff + 63) / 64), static_cast<unsigned>(n_pick), r),
-                       dim3(256), 0, as_stream(stream), x, pool, slots, h, dim, ff, slot_bytes);
+                       dim3(256), 0, as_stream(stream), xa, pool, slots, sc.h, dim, ff, slot_bytes);
+    q2_0_round_act(sc.h, sc.h_codes, sc.h_step, sc.h_sum,
+                   static_cast<size_t>(rows) * n_pick * ff, as_stream(stream));
+    const Q2Act ha = {sc.h_codes, sc.h_step, sc.h_sum};
     hipLaunchKernelGGL(q2_0_moe_down_dev_kernel, dim3(static_cast<unsigned>((dim + 63) / 64), 1, r),
-                       dim3(256), 0, as_stream(stream), h, pool, slots, n_pick, out, dim, ff,
+                       dim3(256), 0, as_stream(stream), ha, pool, slots, n_pick, out, dim, ff,
                        slot_bytes);
     return hip_status(hipGetLastError());
 }

@@ -4264,9 +4264,21 @@ pub fn q2_0_expert_slot_bytes(dim: usize, ff: usize) -> usize {
     3 * ff * dim / Q2_0_BLOCK_ELEMS * Q2_0_BLOCK_BYTES
 }
 
+/// Floats of scratch the Q2_0 expert kernels ([`q2_0_moe_ffn_device`],
+/// [`q4x::routed_experts`]) take for `rows` tokens of `n_pick` experts:
+/// the hidden rows, then the inputs and hidden rows rounded to 8 bits per
+/// 64-value block (codes, steps and code sums).
+pub fn q2_0_moe_scratch_floats(rows: usize, n_pick: usize, dim: usize, ff: usize) -> usize {
+    let (nh, nx) = (rows * n_pick * ff, rows * dim);
+    nh + 2 * nx / Q2_0_BLOCK_ELEMS + 2 * nh / Q2_0_BLOCK_ELEMS + (nx + nh) / 4
+}
+
 /// Routed experts from a pool of Q2_0 slots, all on the device:
-/// `out[dim] = sum_p weights[p] * down_p * (silu(gate_p * x) * (up_p * x))`.
-/// `h` is scratch of `slots.len() * ff` floats; at most 32 picks.
+/// `out[dim] = sum_p weights[p] * down_p * (silu(gate_p * x) * (up_p * x))`,
+/// the products on the input and hidden rows rounded to 8 bits per block
+/// (as [`allpaca_cpu::gemv_q2_0_i8`]). `h` is scratch of
+/// [`q2_0_moe_scratch_floats`]`(1, slots.len(), dim, ff)` floats; at most
+/// 32 picks.
 #[allow(clippy::too_many_arguments)]
 pub fn q2_0_moe_ffn_device(
     x: *const f32,
@@ -4413,8 +4425,9 @@ pub mod q4x {
     /// picks and times `scale`, then the experts from `pool` (Q2_0 slots, as
     /// [`q2_0_moe_ffn_device`]) into `out`. Rows follow each other: `x` and
     /// `out` by `dim`, `scores` by `n_experts`, `picks` by [`PICKS_BYTES`]
-    /// (it keeps the picks), `h` (scratch) by `n_pick * ff` floats. One
-    /// launch for all rows; each row's result is the same as on its own.
+    /// (it keeps the picks). `h` is scratch of
+    /// [`super::q2_0_moe_scratch_floats`]`(rows, n_pick, dim, ff)` floats.
+    /// One launch for all rows; each row's result is the same as on its own.
     /// At most 1024 experts and 32 picks.
     #[allow(clippy::too_many_arguments)]
     pub fn routed_experts(
@@ -15164,8 +15177,10 @@ mod tests {
         assert!(gemm_nt_q2_0(&[0.0; 65], &[0u8; 36], &mut [0.0; 1], 1, 1, 65).is_err());
     }
 
-    /// Routed experts from a pool of Q2_0 slots must match the CPU: dequant
-    /// each picked slot, SwiGLU, weighted sum. `silu_scale` is checked on the way.
+    /// Routed experts from a pool of Q2_0 slots must match the CPU's 8-bit
+    /// products (gemv_q2_0_i8 on the input, then on the hidden row) up to
+    /// the order of the sums, and the float SwiGLU within the rounding.
+    /// `silu_scale` is checked on the way.
     #[cfg(feature = "hip")]
     #[test]
     fn q2_0_moe_ffn_matches_cpu_swiglu_of_the_picked_slots() {
@@ -15207,13 +15222,29 @@ mod tests {
                     *e += w * y;
                 }
             }
+            // The CPU's 8-bit products.
+            let mut expect8 = vec![0.0f32; dim];
+            let input = allpaca_cpu::Q2_0Input::new(&x).unwrap();
+            let third = slot_bytes / 3;
+            for (slot, w) in slots.iter().zip(&weights) {
+                let bytes = &pool[*slot as usize * slot_bytes..][..slot_bytes];
+                let (mut g, mut u, mut y) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
+                allpaca_cpu::gemv_q2_0_i8(&bytes[..third], &input, &mut g).unwrap();
+                allpaca_cpu::gemv_q2_0_i8(&bytes[third..2 * third], &input, &mut u).unwrap();
+                let h: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+                allpaca_cpu::gemv_q2_0_i8(&bytes[2 * third..], &allpaca_cpu::Q2_0Input::new(&h).unwrap(), &mut y).unwrap();
+                for (e, y) in expect8.iter_mut().zip(&y) {
+                    *e += w * y;
+                }
+            }
             set_device(0).unwrap();
             let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
-            let floats = dim + slots.len() * ff + dim;
+            let scratch = q2_0_moe_scratch_floats(1, slots.len(), dim, ff);
+            let floats = dim + scratch + dim;
             let dev = device_malloc(floats * 4, 0).unwrap();
             let (dx, dh, dout) = unsafe {
                 let p = dev.cast::<f32>();
-                (p, p.add(dim), p.add(dim + slots.len() * ff))
+                (p, p.add(dim), p.add(dim + scratch))
             };
             let mut got = vec![0.0f32; dim];
             let mut silu = x.clone();
@@ -15226,9 +15257,16 @@ mod tests {
             })();
             device_free(dev, floats * 4);
             run.expect("Q2_0 MoE kernels must run when a device is present");
+            let scale = expect.iter().fold(1e-3f32, |m, v| m.max(v.abs()));
             for i in 0..dim {
                 assert!(
-                    gemm_close(got[i], expect[i]),
+                    (got[i] - expect8[i]).abs() <= 1e-4 * scale,
+                    "q2_0_moe_ffn dim {dim} ff {ff} idx {i}: hip {} cpu 8-bit {}",
+                    got[i],
+                    expect8[i]
+                );
+                assert!(
+                    (got[i] - expect[i]).abs() <= 0.03 * scale,
                     "q2_0_moe_ffn dim {dim} ff {ff} idx {i}: hip {} cpu {}",
                     got[i],
                     expect[i]
@@ -15280,12 +15318,13 @@ mod tests {
             let weights: Vec<f32> = order.iter().map(|&e| w[e] / part * scale).collect();
             set_device(0).unwrap();
             let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
-            let floats = dim + n_exp + k * ff + 2 * dim + q4x::PICKS_BYTES / 4;
+            let sc = q2_0_moe_scratch_floats(1, k, dim, ff);
+            let floats = dim + n_exp + sc + 2 * dim + q4x::PICKS_BYTES / 4;
             let dev = device_malloc(floats * 4, 0).unwrap();
             let (dx, dscores, dh, dout, dref, dpicks) = unsafe {
                 let p = dev.cast::<f32>();
                 let h = p.add(dim + n_exp);
-                (p, p.add(dim), h, h.add(k * ff), h.add(k * ff + dim), h.add(k * ff + 2 * dim))
+                (p, p.add(dim), h, h.add(sc), h.add(sc + dim), h.add(sc + 2 * dim))
             };
             let (mut got, mut expect) = (vec![0.0f32; dim], vec![0.0f32; dim]);
             let mut picks = vec![0u8; q4x::PICKS_BYTES];
@@ -15351,13 +15390,14 @@ mod tests {
         set_device(0).unwrap();
         let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
         let pick_floats = q4x::PICKS_BYTES / 4;
-        let floats = rows * (dim + n_exp + k * ff + 2 * dim + pick_floats);
+        let sc = q2_0_moe_scratch_floats(rows, k, dim, ff);
+        let floats = rows * (dim + n_exp + 2 * dim + pick_floats) + sc;
         let dev = device_malloc(floats * 4, 0).unwrap();
         let (dx, dscores, dh, dall, done, dpicks) = unsafe {
             let p = dev.cast::<f32>();
             let s = p.add(rows * dim);
             let h = s.add(rows * n_exp);
-            let all = h.add(rows * k * ff);
+            let all = h.add(sc);
             (p, s, h, all, all.add(rows * dim), all.add(2 * rows * dim))
         };
         let (mut together, mut alone) = (vec![0.0f32; rows * dim], vec![0.0f32; rows * dim]);
