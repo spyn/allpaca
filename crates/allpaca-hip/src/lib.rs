@@ -486,6 +486,7 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_q8_0_gemv_rounds_activations(m: i32, n: i32, k: i32) -> i32;
         pub fn allpaca_gemm_nt_q8_0_intdot(
             a: *const f32,
             b: *const u8,
@@ -4856,6 +4857,20 @@ fn gemm_nt_tq_host(
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_tq unavailable".into(),
         )))
+    }
+}
+
+/// Whether a Q8_0 GEMM of this shape on the bound device rounds its input
+/// to int8 first (the int8 GEMV) rather than multiplying it as floats.
+pub fn q8_0_gemv_rounds_activations(m: i32, n: i32, k: i32) -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_q8_0_gemv_rounds_activations(m, n, k) != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (m, n, k);
+        false
     }
 }
 
@@ -12660,10 +12675,15 @@ mod tests {
         };
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert!(read(outs[0]).iter().any(|v| *v != 0.0));
-        // Small weights stay on the f32 GEMV, so the pair launch applies.
-        assert!(paired, "m == 1 must take the paired launch");
-        assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
-        assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        // Small weights stay on the f32 GEMV, so the pair launch applies,
+        // except where the int8 GEMV takes every width (the MI50).
+        set_device(0).expect("bind");
+        let int8 = q8_0_gemv_rounds_activations(1, n as i32, k as i32);
+        assert_eq!(paired, !int8, "m == 1 must take the paired launch on the f32 GEMV");
+        if paired {
+            assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
+            assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        }
 
         // scale_add_copy vs scale_f32 + residual_add + copy_d2d.
         let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -13229,13 +13249,13 @@ mod tests {
     }
 
     /// The activations a Q8_0 GEMV of `m` rows over an `n x k` weight
-    /// actually multiplies: int8-quantized on the wide-row GEMV path
-    /// (m <= 16, k >= 5120, whole 32-value blocks), as given otherwise or
-    /// with ALLPACA_Q8_F32_GEMV=1.
+    /// actually multiplies on device 0: int8-quantized on the int8 GEMV
+    /// (m <= 16 and k >= 5120, or any k on a 64-lane-wavefront card; whole
+    /// 32-value blocks), as given otherwise or with ALLPACA_Q8_F32_GEMV=1.
     #[cfg(feature = "hip")]
-    fn q8_0_gemv_activations(a: &[f32], m: usize, _n: usize, k: usize) -> Vec<f32> {
-        let f32_gemv = std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1");
-        if m <= 16 && k >= 5120 && k % 32 == 0 && !f32_gemv {
+    fn q8_0_gemv_activations(a: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        set_device(0).expect("bind");
+        if q8_0_gemv_rounds_activations(m as i32, n as i32, k as i32) {
             q8_activations(a)
         } else {
             a.to_vec()

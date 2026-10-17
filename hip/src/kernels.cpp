@@ -25,6 +25,7 @@
 
 #if ALLPACA_HAS_HIP
 
+#include <atomic>
 #include <mutex>
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -2332,9 +2333,17 @@ static bool q8_0_i8_enabled() {
     return on;
 }
 
+static bool kq_wave64();
+
+/* On the MI50 (64-lane wavefronts) every width gains: the f32 kernel ran a
+ * 640x2560 weight as 5 blocks (31.8 us; 9 us on int8 with the rounding). */
 static bool q8_0_uses_i8(int32_t n, int32_t k) {
     (void)n;
-    return q8_0_i8_enabled() && k >= Q8_I8_MIN_K;
+    return q8_0_i8_enabled() && (k >= Q8_I8_MIN_K || kq_wave64());
+}
+
+extern "C" int allpaca_q8_0_gemv_rounds_activations(int32_t m, int32_t n, int32_t k) {
+    return m >= 1 && m <= 16 && k % 32 == 0 && q8_0_uses_i8(n, k) ? 1 : 0;
 }
 
 static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -3185,6 +3194,67 @@ static inline int kq_i8_rows_per_block(int m) {
     return mr == 3 ? 4 : mr;
 }
 
+/* Whether the bound device runs 64-lane wavefronts (gfx9, the MI50). */
+static bool kq_wave64() {
+    static std::atomic<int> seen[KQ_ACT_DEVICES] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= KQ_ACT_DEVICES) {
+        return false;
+    }
+    int known = seen[dev].load(std::memory_order_relaxed);
+    if (known == 0) {
+        int lanes = 32;
+        if (hipDeviceGetAttribute(&lanes, hipDeviceAttributeWarpSize, dev) != hipSuccess) {
+            lanes = 32;
+        }
+        known = lanes == 64 ? 2 : 1;
+        seen[dev].store(known, std::memory_order_relaxed);
+    }
+    return known == 2;
+}
+
+/* Lanes per output column of the int8 K-quant GEMV. On the MI50 narrow
+ * outputs left most CUs idle at 8 (Q3_K 640x2560 15 -> 8.5 us at 32) and
+ * Q6_K ran at half speed (2560x6144 69 -> 34 us at 32; 8 rows 228 -> 175 us);
+ * Q4_K/Q5_K gain a little at 16. The choice depends on the weight and the
+ * card only, so every row count sums a column in the same order. */
+static int kq_i8_lanes(int qt, int n) {
+    if ((qt < 3 || qt > 6) || !kq_wave64()) {
+        return 8;
+    }
+    if (n < 2048 || (qt == 6 && n < 7680)) {
+        return 32;
+    }
+    if ((qt == 4 || qt == 5) && n < 7680) {
+        return 16;
+    }
+    return 8;
+}
+
+template <int QT, int LPC>
+static void kq_i8_dispatch(dim3 grid, dim3 block, hipStream_t stream, int mr, const int8_t *aq,
+                           const float *ad, const uint8_t *b, float *c, int m, int n, int k) {
+#define KQ_I8_LAUNCH(MRV)                                                                          \
+    hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPC>), grid, block, 0, stream, aq, ad,   \
+                       b, c, m, n, k)
+    if (mr == 1) {
+        KQ_I8_LAUNCH(1);
+    } else if (mr == 2) {
+        KQ_I8_LAUNCH(2);
+    } else if (mr == 4) {
+        KQ_I8_LAUNCH(4);
+    } else if (mr == 5) {
+        KQ_I8_LAUNCH(5);
+    } else if (mr == 6) {
+        KQ_I8_LAUNCH(6);
+    } else if (mr == 7) {
+        KQ_I8_LAUNCH(7);
+    } else {
+        KQ_I8_LAUNCH(8);
+    }
+#undef KQ_I8_LAUNCH
+}
+
 /* Returns ALLPACA_ERR_INVALID when the int8 path cannot run (caller falls back). */
 template <int QT>
 static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -3204,32 +3274,25 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
                        dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
                        dim3(256), 0, stream, a, aq, ad, m, k);
     // 8 lanes x 32 weights per column: at 32 lanes x 8 weights the per-row
-    // A loads and scale math dominated (Q5_K m=4 cost 1.7x m=1; now ~1.05x).
-    constexpr int LPC = 8;
+    // A loads and scale math dominated on RDNA (Q5_K m=4 cost 1.7x m=1; now
+    // ~1.05x). The MI50 takes more lanes on some weights (kq_i8_lanes).
+    const int lpc = kq_i8_lanes(QT, n);
     dim3 block(256);
-    const int cols = 256 / LPC;
+    const int cols = 256 / lpc;
     const unsigned gx = static_cast<unsigned>((n + cols - 1) / cols);
     const int mr = kq_i8_rows_per_block(m);
     const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
-#define KQ_I8_LAUNCH(MRV, LPCV)                                                                    \
-    hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPCV>), grid, block, 0, stream, aq, ad, \
-                       b, c, m, n, k)
-    if (mr == 1) {
-        KQ_I8_LAUNCH(1, LPC);
-    } else if (mr == 2) {
-        KQ_I8_LAUNCH(2, LPC);
-    } else if (mr == 4) {
-        KQ_I8_LAUNCH(4, LPC);
-    } else if (mr == 5) {
-        KQ_I8_LAUNCH(5, LPC);
-    } else if (mr == 6) {
-        KQ_I8_LAUNCH(6, LPC);
-    } else if (mr == 7) {
-        KQ_I8_LAUNCH(7, LPC);
-    } else {
-        KQ_I8_LAUNCH(8, LPC);
+    if constexpr (QT >= 3 && QT <= 6) {
+        if (lpc == 32) {
+            kq_i8_dispatch<QT, 32>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
+            return hip_status(hipGetLastError());
+        }
+        if (lpc == 16) {
+            kq_i8_dispatch<QT, 16>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
+            return hip_status(hipGetLastError());
+        }
     }
-#undef KQ_I8_LAUNCH
+    kq_i8_dispatch<QT, 8>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
     return hip_status(hipGetLastError());
 }
 
@@ -3325,8 +3388,11 @@ static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m,
                        dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
                        dim3(256), 0, stream, a, aq, ad, m, k);
     constexpr int LPC = 8;
-    dim3 block(256);
-    const unsigned gx = static_cast<unsigned>((n + (256 / LPC) - 1) / (256 / LPC));
+    // Smaller blocks spread narrow weights over the MI50's CUs (640x2560
+    // 7.5 -> 5.9 us); the sum order does not depend on the block size.
+    const int threads = kq_wave64() ? 128 : 256;
+    dim3 block(threads);
+    const unsigned gx = static_cast<unsigned>((n + (threads / LPC) - 1) / (threads / LPC));
     const int mr = kq_i8_rows_per_block(m);
     const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
     if (mr == 1) {
@@ -9659,6 +9725,10 @@ extern "C" int allpaca_gemm_nt(const float *, const float *, float *, int32_t, i
 extern "C" int allpaca_gemm_nt_untiled(const float *, const float *, float *, int32_t, int32_t,
                                        int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_q8_0_gemv_rounds_activations(int32_t, int32_t, int32_t) {
+    return 0;
 }
 
 extern "C" int allpaca_gemm_nt_q8_0(const float *, const uint8_t *, float *, int32_t, int32_t,
