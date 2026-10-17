@@ -210,7 +210,7 @@ fn layout(hc: usize, dim: usize, ff: usize, n_experts: usize, sizes: &ActSizes) 
     act.inject = take(r * hc);
     act.t = [take(wide), take(wide), take(wide), take(wide), take(wide)];
     act.out = take(r * dim);
-    act.expert_h = take(MAX_PICKS * ff);
+    act.expert_h = take(r * MAX_PICKS * ff);
     act.picks = take(r * q4x::PICKS_BYTES / 4);
     act.routed = take(r * dim);
     act.shared = take(r * dim);
@@ -1604,34 +1604,26 @@ impl Qwen4Gpu {
             Some(pool) if self.routes_on_card(blk, n_active) => pool,
             _ => return Err(gpu_err(format!("qwen4exp: block {blk} cannot route {n_active} experts on its card"))),
         };
-        let routed = card.at(act.routed);
         card.hip.bind()?;
-        for r in 0..rows {
-            // SAFETY: the parts hold MAX_ROWS rows; the scores follow the inputs in use.
-            let (x, scores, picks, out) = unsafe {
-                (
-                    card.at(act.x).add(r * dim),
-                    card.at(act.x).add(rows * dim + r * self.n_experts),
-                    card.at(act.picks).add(r * q4x::PICKS_BYTES / 4),
-                    routed.add(r * dim),
-                )
-            };
-            self.step(card, "routed_experts", || {
-                q4x::routed_experts(
-                    x,
-                    scores,
-                    pool.byte_ptr_at(0),
-                    self.n_experts as i32,
-                    n_active as i32,
-                    scale,
-                    picks.cast(),
-                    card.at(act.expert_h),
-                    out,
-                    dim as i32,
-                    self.ff as i32,
-                )
-            })?;
-        }
+        // SAFETY: the input part holds MAX_ROWS rows; the scores follow the inputs in use.
+        let scores = unsafe { card.at(act.x).add(rows * dim) };
+        // Every token in one launch; each one's result is the same as alone.
+        self.step(card, "routed_experts", || {
+            q4x::routed_experts(
+                card.at(act.x),
+                scores,
+                pool.byte_ptr_at(0),
+                self.n_experts as i32,
+                n_active as i32,
+                scale,
+                card.at(act.picks).cast(),
+                card.at(act.expert_h),
+                card.at(act.routed),
+                dim as i32,
+                self.ff as i32,
+                rows as i32,
+            )
+        })?;
         self.ffn_sum(blk, rows)
     }
 

@@ -676,6 +676,7 @@ mod ffi {
             out: *mut f32,
             dim: i32,
             ff: i32,
+            rows: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_silu_scale(x: *mut f32, n: i32, s: f32, stream: *mut c_void) -> i32;
@@ -4406,13 +4407,15 @@ pub mod q4x {
     /// their 32 weights.
     pub const PICKS_BYTES: usize = 32 * 8;
 
-    /// One token's routed experts with the routing on the device: the
-    /// `n_pick` best of `n_experts` router `scores` by softmax weight (ties
-    /// to the lower expert), weights renormalised over the picks and times
-    /// `scale`, then the experts from `pool` (Q2_0 slots, as
-    /// [`q2_0_moe_ffn_device`]) into `out`. `picks` is device scratch of
-    /// [`PICKS_BYTES`] and keeps the picks; `h` is scratch of `n_pick * ff`
-    /// floats. At most 1024 experts and 32 picks.
+    /// Routed experts of `rows` tokens with the routing on the device: per
+    /// token, the `n_pick` best of `n_experts` router `scores` by softmax
+    /// weight (ties to the lower expert), weights renormalised over the
+    /// picks and times `scale`, then the experts from `pool` (Q2_0 slots, as
+    /// [`q2_0_moe_ffn_device`]) into `out`. Rows follow each other: `x` and
+    /// `out` by `dim`, `scores` by `n_experts`, `picks` by [`PICKS_BYTES`]
+    /// (it keeps the picks), `h` (scratch) by `n_pick * ff` floats. One
+    /// launch for all rows; each row's result is the same as on its own.
+    /// At most 1024 experts and 32 picks.
     #[allow(clippy::too_many_arguments)]
     pub fn routed_experts(
         x: *const f32,
@@ -4426,6 +4429,7 @@ pub mod q4x {
         out: *mut f32,
         dim: i32,
         ff: i32,
+        rows: i32,
     ) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -4442,6 +4446,7 @@ pub mod q4x {
                     out,
                     dim,
                     ff,
+                    rows,
                     std::ptr::null_mut(),
                 )
             };
@@ -4449,7 +4454,7 @@ pub mod q4x {
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (x, scores, pool, n_experts, n_pick, scale, picks, h, out, dim, ff);
+            let _ = (x, scores, pool, n_experts, n_pick, scale, picks, h, out, dim, ff, rows);
             unavailable()
         }
     }
@@ -15300,6 +15305,7 @@ mod tests {
                     dout,
                     dim as i32,
                     ff as i32,
+                    1,
                 )?;
                 memcpy(got.as_mut_ptr().cast(), dout.cast(), dim * 4, MEMCPY_D2H)?;
                 memcpy(expect.as_mut_ptr().cast(), dref.cast(), dim * 4, MEMCPY_D2H)?;
@@ -15317,6 +15323,63 @@ mod tests {
                 assert!(gemm_close(got[i], expect[i]), "routed dim {dim} idx {i}: {} vs {}", got[i], expect[i]);
             }
             assert!(expect.iter().any(|v| v.abs() > 1e-3), "reference output is all zero");
+        }
+    }
+
+    /// Several tokens' routed experts in one launch give each token's own
+    /// launch bit for bit.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q4x_routed_experts_of_several_rows_equal_each_row_alone() {
+        if device_count() == 0 {
+            return;
+        }
+        let (dim, ff, n_exp, k, rows) = (320usize, 192usize, 40usize, 5usize, 3usize);
+        let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
+        let mut pool = vec![0u8; n_exp * slot_bytes];
+        let mut seed = 0x51ed_2701u32;
+        for (bi, block) in pool.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+            for byte in block[2..].iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (seed >> 24) as u8;
+            }
+            let d = (0.05 + 0.01 * (bi % 11) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+            block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+        }
+        let x: Vec<f32> = (0..rows * dim).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.8).collect();
+        let scores: Vec<f32> = (0..rows * n_exp).map(|i| ((i * 53 % 97) as f32 / 20.0 - 2.0) * 0.7).collect();
+        set_device(0).unwrap();
+        let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
+        let pick_floats = q4x::PICKS_BYTES / 4;
+        let floats = rows * (dim + n_exp + k * ff + 2 * dim + pick_floats);
+        let dev = device_malloc(floats * 4, 0).unwrap();
+        let (dx, dscores, dh, dall, done, dpicks) = unsafe {
+            let p = dev.cast::<f32>();
+            let s = p.add(rows * dim);
+            let h = s.add(rows * n_exp);
+            let all = h.add(rows * k * ff);
+            (p, s, h, all, all.add(rows * dim), all.add(2 * rows * dim))
+        };
+        let (mut together, mut alone) = (vec![0.0f32; rows * dim], vec![0.0f32; rows * dim]);
+        let run = (|| {
+            memcpy(dx.cast(), x.as_ptr().cast(), rows * dim * 4, MEMCPY_H2D)?;
+            memcpy(dscores.cast(), scores.as_ptr().cast(), rows * n_exp * 4, MEMCPY_H2D)?;
+            let (p, d, k, ff) = (dpool.byte_ptr_at(0), dim as i32, k as i32, ff as i32);
+            q4x::routed_experts(dx, dscores, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, dall, d, ff, rows as i32)?;
+            for r in 0..rows {
+                // SAFETY: each part holds `rows` rows.
+                let (x, s, out) = unsafe { (dx.add(r * dim), dscores.add(r * n_exp), done.add(r * dim)) };
+                q4x::routed_experts(x, s, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, out, d, ff, 1)?;
+            }
+            memcpy(together.as_mut_ptr().cast(), dall.cast(), rows * dim * 4, MEMCPY_D2H)?;
+            memcpy(alone.as_mut_ptr().cast(), done.cast(), rows * dim * 4, MEMCPY_D2H)
+        })();
+        device_free(dev, floats * 4);
+        run.expect("device routing must run when a device is present");
+        for r in 0..rows {
+            let (a, b) = (&together[r * dim..(r + 1) * dim], &alone[r * dim..(r + 1) * dim]);
+            assert!(a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()), "row {r} differs");
+            assert!(b.iter().any(|v| v.abs() > 1e-3), "row {r} is all zero");
         }
     }
 
@@ -15375,6 +15438,9 @@ mod tests {
             return;
         }
         let (hc, dim, low, ff, n_exp, picks) = (4usize, 2560usize, 320usize, 640usize, 512usize, 10usize);
+        // `ALLPACA_BENCH_ROWS` tokens per pass (default 1), row-exact as a forward runs them.
+        let rows: usize = std::env::var("ALLPACA_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let _exact = ExactRows::enable();
         let k = hc * dim;
         let q3k = |n: usize, k: usize| n * k / 256 * 110;
         let (value, qkv) = (6144usize, 10240usize);
@@ -15390,36 +15456,41 @@ mod tests {
         let (w_qkv, w_gate, w_out) = (alloc(q3k(qkv, dim)), alloc(q3k(value, dim)), alloc(q3k(dim, value)));
         let (w_alpha, w_router) = (alloc(48 * dim * 2), alloc(n_exp * dim * 2));
         let (w_shared_in, w_shared_down) = (alloc(q3k(ff, dim)), alloc(slot_bytes / 3));
-        let act = alloc(64 * 12288 * 4).cast::<f32>();
-        let at = |i: usize| unsafe { act.add(i * 12288) };
-        let (r, h, d) = (1i32, hc as i32, dim as i32);
+        let slot = 12288 * rows.max(1);
+        let act = alloc(64 * slot * 4).cast::<f32>();
+        let at = |i: usize| unsafe { act.add(i * slot) };
+        let (r, h, d) = (rows as i32, hc as i32, dim as i32);
+        // Router scores that differ per token, so tokens pick different experts.
+        let scores: Vec<f32> = (0..rows * n_exp).map(|i| ((i * 2_654_435_761usize) % 1000) as f32 * 0.003).collect();
         let mix = || -> Result<(), AllpacaError> {
             q4x::stream_norm(at(0), at(1), at(2), r, h, d, 1e-6)?;
-            gemm_nt_bf16_device(at(2), w_down.cast(), at(3), 1, low as i32, k as i32)?;
-            silu_scale_device(at(3), low as i32, 0.25)?;
-            gemm_nt_bf16_device(at(3), w_up.cast(), at(4), 1, k as i32, low as i32)?;
+            gemm_nt_bf16_device(at(2), w_down.cast(), at(3), r, low as i32, k as i32)?;
+            silu_scale_device(at(3), low as i32 * r, 0.25)?;
+            gemm_nt_bf16_device(at(3), w_up.cast(), at(4), r, k as i32, low as i32)?;
             q4x::gated_mean(at(2), at(4), at(5), r, h, d)?;
-            gemm_nt_bf16_device(at(2), w_inject.cast(), at(6), 1, h, k as i32)
+            gemm_nt_bf16_device(at(2), w_inject.cast(), at(6), r, h, k as i32)
         };
         let gdn = || -> Result<(), AllpacaError> {
-            gemm_nt_q3_k_device(at(5), w_qkv, at(7), 1, qkv as i32, d)?;
-            gemm_nt_q3_k_device(at(5), w_gate, at(8), 1, value as i32, d)?;
-            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(9), 1, 48, d)?;
-            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(10), 1, 48, d)?;
-            gemm_nt_q3_k_device(at(8), w_out, at(11), 1, d, value as i32)
+            gemm_nt_q3_k_device(at(5), w_qkv, at(7), r, qkv as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_gate, at(8), r, value as i32, d)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(9), r, 48, d)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(10), r, 48, d)?;
+            gemm_nt_q3_k_device(at(8), w_out, at(11), r, d, value as i32)
         };
         let route = || -> Result<(), AllpacaError> {
-            gemm_nt_bf16_device(at(5), w_router.cast(), at(12), 1, n_exp as i32, d)?;
-            gemm_nt_q3_k_device(at(5), w_shared_in, at(13), 1, ff as i32, d)?;
-            gemm_nt_q3_k_device(at(5), w_shared_in, at(14), 1, ff as i32, d)?;
-            gemm_nt_q2_0_device(at(13), w_shared_down, at(15), 1, d, ff as i32)?;
-            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(16), 1, 1, d)
+            gemm_nt_bf16_device(at(5), w_router.cast(), at(12), r, n_exp as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_shared_in, at(13), r, ff as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_shared_in, at(14), r, ff as i32, d)?;
+            gemm_nt_q2_0_device(at(13), w_shared_down, at(15), r, d, ff as i32)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(16), r, 1, d)
         };
         let experts = || -> Result<(), AllpacaError> {
-            q4x::routed_experts(at(5), at(12), pool, n_exp as i32, picks as i32, 1.0, at(17).cast(), at(18), at(19), d, ff as i32)?;
+            memcpy(at(12).cast(), at(20).cast(), rows * n_exp * 4, MEMCPY_D2D)?;
+            q4x::routed_experts(at(5), at(12), pool, n_exp as i32, picks as i32, 1.0, at(17).cast(), at(18), at(19), d, ff as i32, r)?;
             q4x::ffn_sum(at(19), at(15), at(16), at(11), r, d)?;
             q4x::combine(at(0), at(11), at(6), r, h, d)
         };
+        memcpy(at(20).cast(), scores.as_ptr().cast(), scores.len() * 4, MEMCPY_H2D).unwrap();
         let time = |name: &str, f: &dyn Fn() -> Result<(), AllpacaError>| {
             for _ in 0..20 {
                 f().unwrap();
@@ -15432,7 +15503,7 @@ mod tests {
             }
             stream_synchronize().unwrap();
             let us = clock.elapsed().as_secs_f64() * 1e6 / n as f64;
-            eprintln!("BLOCK device {device} {name}: {us:.1} us");
+            eprintln!("BLOCK device {device} rows {rows} {name}: {us:.1} us");
             us
         };
         let total = 2.0 * time("mixer", &mix) + time("deltanet matrices", &gdn) + time("router and shared expert", &route)

@@ -737,9 +737,11 @@ fn expert_pool() -> &'static ExpertPool {
 }
 
 /// [`routed_experts`] for several tokens at once on the worker pool, with
-/// the `Q2_0` products on 8-bit activations
-/// ([`allpaca_cpu::gemv_q2_0_i8`]). `xs` holds a row of `dim` per token,
-/// `picks` each token's routed experts; the sums come back a row per token.
+/// the `Q2_0` products on 8-bit activations. `xs` holds a row of `dim` per
+/// token, `picks` each token's routed experts; the sums come back a row per
+/// token. An expert picked by several tokens is one job that reads its
+/// weights once for all of them ([`allpaca_cpu::gemm_q2_0_i8`]); each
+/// token's result is the same as on its own.
 fn routed_experts_pooled(
     q4: &Arc<Qwen4Weights>,
     cfg: &ModelConfig,
@@ -749,62 +751,82 @@ fn routed_experts_pooled(
 ) -> Result<Vec<f32>, AllpacaError> {
     let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
     let packed = dim % allpaca_cpu::Q2_0_BLOCK_ELEMS == 0;
+    let rows: Vec<Arc<Vec<f32>>> = xs.chunks(dim).map(|x| Arc::new(x.to_vec())).collect();
+    let inputs: Vec<Option<Arc<allpaca_cpu::Q2_0Input>>> = rows
+        .iter()
+        .map(|x| packed.then(|| allpaca_cpu::Q2_0Input::new(x).map(Arc::new)).transpose())
+        .collect::<Result<_, _>>()?;
+    // Each expert with the (slot, token) pairs that picked it, in first-pick order.
+    let mut by_expert: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    let mut slot_row = Vec::new();
+    for (row, picks) in picks.iter().enumerate() {
+        for (e, _) in picks {
+            let slot = slot_row.len();
+            slot_row.push(row);
+            match by_expert.iter_mut().find(|(x, _)| x == e) {
+                Some((_, users)) => users.push((slot, row)),
+                None => by_expert.push((*e, vec![(slot, row)])),
+            }
+        }
+    }
     let (done, results) = std::sync::mpsc::channel();
-    let mut slots = Vec::new();
     {
         let workers = expert_pool().workers.lock().map_err(|_| load_err("qwen4exp expert pool poisoned".into()))?;
-        let total: usize = picks.iter().map(Vec::len).sum();
-        for (row, (x, picks)) in xs.chunks(dim).zip(picks).enumerate() {
-            let x = Arc::new(x.to_vec());
-            let input = packed.then(|| allpaca_cpu::Q2_0Input::new(&x).map(Arc::new)).transpose()?;
-            for (e, _) in picks {
-                let slot = slots.len();
-                slots.push(row);
-                let (q4, x, input, done, e) = (q4.clone(), x.clone(), input.clone(), done.clone(), *e);
-                let job = move || {
-                    let name = |s: &str| format!("blk.{blk}.{s}");
-                    let y = (|| {
-                        if let (Some(input), Some(gate), Some(up), Some(down)) = (
-                            input.as_deref(),
-                            q4.q2_0_rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?,
-                            q4.q2_0_rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?,
-                            q4.q2_0_rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?,
-                        ) {
-                            let (mut h, mut u, mut y) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
-                            allpaca_cpu::gemv_q2_0_i8(gate, input, &mut h)?;
-                            allpaca_cpu::gemv_q2_0_i8(up, input, &mut u)?;
-                            for (h, u) in h.iter_mut().zip(&u) {
-                                *h = silu(*h) * u;
-                            }
-                            allpaca_cpu::gemv_q2_0_i8(down, &allpaca_cpu::Q2_0Input::new(&h)?, &mut y)?;
-                            return Ok(y);
+        let jobs = by_expert.len();
+        for (j, (e, users)) in by_expert.into_iter().enumerate() {
+            let (q4, done) = (q4.clone(), done.clone());
+            let xs: Vec<Arc<Vec<f32>>> = users.iter().map(|(_, r)| rows[*r].clone()).collect();
+            let ins: Option<Vec<Arc<allpaca_cpu::Q2_0Input>>> = users.iter().map(|(_, r)| inputs[*r].clone()).collect();
+            let job = move || {
+                let name = |s: &str| format!("blk.{blk}.{s}");
+                let ys = (|| -> Result<Vec<Vec<f32>>, AllpacaError> {
+                    if let (Some(ins), Some(gate), Some(up), Some(down)) = (
+                        ins.as_ref(),
+                        q4.q2_0_rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?,
+                        q4.q2_0_rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?,
+                        q4.q2_0_rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?,
+                    ) {
+                        let n = ins.len();
+                        let refs: Vec<&allpaca_cpu::Q2_0Input> = ins.iter().map(|x| x.as_ref()).collect();
+                        let (mut h, mut u, mut y) = (vec![0.0f32; n * ff], vec![0.0f32; n * ff], vec![0.0f32; n * dim]);
+                        allpaca_cpu::gemm_q2_0_i8(gate, &refs, &mut h)?;
+                        allpaca_cpu::gemm_q2_0_i8(up, &refs, &mut u)?;
+                        for (h, u) in h.iter_mut().zip(&u) {
+                            *h = silu(*h) * u;
                         }
-                        let gate = q4.rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?;
-                        let up = q4.rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?;
-                        let down = q4.rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?;
-                        swiglu(&x, &gate, &up, &down, ff, dim)
-                    })();
-                    let _ = done.send((slot, y));
-                };
-                // The last expert runs here: this thread would only wait.
-                if slot + 1 == total || workers.is_empty() {
-                    job();
-                } else {
-                    let worker = &workers[slot % workers.len()];
-                    worker.send(Box::new(job)).map_err(|_| load_err("qwen4exp expert pool stopped".into()))?;
-                }
+                        let hs: Vec<allpaca_cpu::Q2_0Input> =
+                            h.chunks(ff).map(allpaca_cpu::Q2_0Input::new).collect::<Result<_, _>>()?;
+                        let refs: Vec<&allpaca_cpu::Q2_0Input> = hs.iter().collect();
+                        allpaca_cpu::gemm_q2_0_i8(down, &refs, &mut y)?;
+                        return Ok(y.chunks(dim).map(<[f32]>::to_vec).collect());
+                    }
+                    let gate = q4.rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?;
+                    let up = q4.rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?;
+                    let down = q4.rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?;
+                    xs.iter().map(|x| swiglu(x, &gate, &up, &down, ff, dim)).collect()
+                })();
+                let _ = done.send((users, ys));
+            };
+            // The last expert runs here: this thread would only wait.
+            if j + 1 == jobs || workers.is_empty() {
+                job();
+            } else {
+                let worker = &workers[j % workers.len()];
+                worker.send(Box::new(job)).map_err(|_| load_err("qwen4exp expert pool stopped".into()))?;
             }
         }
     }
     drop(done);
-    let mut ys: Vec<Option<Vec<f32>>> = vec![None; slots.len()];
-    for (slot, y) in results {
-        ys[slot] = Some(y?);
+    let mut ys: Vec<Option<Vec<f32>>> = vec![None; slot_row.len()];
+    for (users, y) in results {
+        for ((slot, _), y) in users.into_iter().zip(y?) {
+            ys[slot] = Some(y);
+        }
     }
     // Each token's sum keeps its routing order.
     let weights = picks.iter().flatten().map(|(_, w)| *w);
     let mut out = vec![0.0f32; picks.len() * dim];
-    for ((row, weight), y) in slots.iter().zip(weights).zip(ys) {
+    for ((row, weight), y) in slot_row.iter().zip(weights).zip(ys) {
         let y = y.ok_or_else(|| load_err("qwen4exp expert worker stopped".into()))?;
         for (o, y) in out[row * dim..(row + 1) * dim].iter_mut().zip(&y) {
             *o += weight * y;
@@ -1005,10 +1027,14 @@ pub(crate) fn forward_qwen4_tokens(
     }
     let gpu = q4.gpu.lock().map_err(|_| load_err("qwen4exp gpu lock poisoned".into()))?;
     if let Some(gpu) = gpu.as_ref() {
+        let rpc = model.rpc.as_deref();
+        if let Some(host) = gpu.hosted().filter(|_| row_logits.is_none() && tokens.len() > crate::qwen4_gpu::MAX_ROWS) {
+            let host = host.clone();
+            return forward_pipelined(q4, gpu, rpc, &host, cfg, tokens, start_pos, logits, mem);
+        }
         for (pass, chunk) in tokens.chunks(crate::qwen4_gpu::MAX_ROWS).enumerate() {
             let first = pass * crate::qwen4_gpu::MAX_ROWS;
             let rows = row_logits.as_deref_mut().map(|rows| &mut rows[first * vocab..(first + chunk.len()) * vocab]);
-            let rpc = model.rpc.as_deref();
             forward_device(q4, gpu, rpc, cfg, chunk, start_pos + first, &mut logits[..vocab], rows, mem, None)?;
         }
         return Ok(());
@@ -1021,6 +1047,56 @@ pub(crate) fn forward_qwen4_tokens(
         }
     }
     Ok(())
+}
+
+/// A prompt through a worker that hosts blocks, in passes that overlap:
+/// while the worker runs one pass's hosted blocks, this machine runs the
+/// next pass's blocks up to them. Each block still sees the passes in
+/// order, so the result is that of one pass after the other. A pass goes
+/// to the worker only once the one before is back, so a single pass is in
+/// flight whatever its size. `logits` gets the last token's.
+#[allow(clippy::too_many_arguments)]
+fn forward_pipelined(
+    q4: &Arc<Qwen4Weights>,
+    gpu: &Qwen4Gpu,
+    rpc: Option<&crate::rpc_runtime::RpcRuntime>,
+    host: &Arc<crate::qwen4_remote::RemoteBlocks>,
+    cfg: &ModelConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    logits: &mut [f32],
+    mem: &mut Qwen4Memory,
+) -> Result<(), AllpacaError> {
+    let (vocab, rows) = (cfg.vocab_size, crate::qwen4_gpu::MAX_ROWS);
+    host.pipeline(|pipe| {
+        // The pass whose hosted blocks the worker has, with its tokens and position.
+        let mut in_flight: Option<(&[u32], usize, DevicePass)> = None;
+        let finish = |pipe: &mut crate::qwen4_remote::Pipe<'_>, mem: &mut Qwen4Memory, logits: &mut [f32], done: Option<(&[u32], usize, DevicePass)>| {
+            let Some((chunk, pos, mut pass)) = done else {
+                return Ok(());
+            };
+            // What this machine waits for the worker shows as `ffn_rpc`.
+            let clock = std::time::Instant::now();
+            pipe.recv(&mut pass.streams)?;
+            if let Some(times) = mem.times.as_mut() {
+                times.ffn_rpc += clock.elapsed().as_secs_f32();
+            }
+            match forward_device(q4, gpu, rpc, cfg, chunk, pos, &mut logits[..vocab], None, mem, Some(Some(pass)))? {
+                Some(_) => Err(load_err("qwen4exp: a second run of hosted blocks in one pass".into())),
+                None => Ok(()),
+            }
+        };
+        for (i, chunk) in tokens.chunks(rows).enumerate() {
+            let pos = start_pos + i * rows;
+            let pass = forward_device(q4, gpu, rpc, cfg, chunk, pos, &mut logits[..vocab], None, mem, Some(None))?
+                .ok_or_else(|| load_err("qwen4exp: a pipelined pass did not reach the hosted blocks".into()))?;
+            finish(pipe, mem, logits, in_flight.take())?;
+            let seq = mem.remote.as_ref().ok_or_else(|| load_err("qwen4exp: no sequence on the worker".into()))?;
+            pipe.send(seq, pos, chunk.len(), &pass.streams)?;
+            in_flight = Some((chunk, pos, pass));
+        }
+        finish(pipe, mem, logits, in_flight.take())
+    })
 }
 
 /// One forward over the rows of several sequences (the engine's batched
@@ -1231,6 +1307,8 @@ fn forward_device(
         Ok(())
     };
     let stop_at_hosted = split.is_some();
+    // A pass that goes on after the worker had its tokens added already.
+    let resumed = matches!(split, Some(Some(_)));
     let (mut streams, mut card, mut resume) = match split.flatten() {
         Some(pass) => (pass.streams, pass.card, pass.resume),
         None => {
@@ -1267,6 +1345,9 @@ fn forward_device(
                 if mem.times.is_some() {
                     mem.times = Some(times);
                 }
+                // The next pass may start before this one ends: its n-gram
+                // embeddings must see these tokens.
+                mem.tokens.extend(tokens.iter().map(|t| i64::from(*t)));
                 return Ok(Some(DevicePass { streams, resume, card }));
             }
             host.run(seq, pos, rows, &mut streams)?;
@@ -1368,7 +1449,9 @@ fn forward_device(
     if mem.times.is_some() {
         mem.times = Some(times);
     }
-    mem.tokens.extend(tokens.iter().map(|t| i64::from(*t)));
+    if !resumed {
+        mem.tokens.extend(tokens.iter().map(|t| i64::from(*t)));
+    }
     Ok(None)
 }
 
@@ -2046,6 +2129,48 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A prompt read without row logits through a worker that hosts blocks
+    /// goes in overlapping passes: the worker runs one pass's blocks while
+    /// the card runs the next one's. The logits and the state it leaves
+    /// are those of one token at a time, n-gram embeddings included.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_prompt_passes_overlap_on_the_worker_and_match_one_at_a_time() {
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
+        });
+        let tokens: Vec<u32> = (0..45u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let mut remote = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        let single = run(&remote, &tokens);
+        let trips = || rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
+        let before = trips();
+        let vocab = remote.config.vocab_size;
+        let passes = (tokens.len() - 1).div_ceil(crate::qwen4_gpu::MAX_ROWS) as u64;
+        assert!(passes >= 3, "{passes} passes");
+        let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
+        let last = tokens.len() - 1;
+        forward_qwen4_tokens(&remote, &tokens[..last], 0, &mut logits, None, &mut mem).expect("prompt");
+        assert_eq!(logits, single[last - 1], "the prompt's last logits");
+        assert_eq!(trips() - before, passes, "one round trip a pass");
+        assert_eq!(mem.tokens(), last);
+        forward_qwen4_token(&remote, tokens[last], last, &mut logits, &mut mem).expect("next");
+        assert_eq!(logits, single[last], "the token after the prompt");
+        drop((mem, remote, rt));
+        worker.join().unwrap();
+    }
+
     /// Several sequences in one batched forward, pipelined through the
     /// worker that hosts blocks, each get the logits of their own forward:
     /// one token each, and a span of several rows next to a single one.
@@ -2448,6 +2573,7 @@ mod tests {
         if pos > 0 {
             let secs = start.elapsed().as_secs_f32();
             eprintln!("Q4X prompt: {pos} tokens in {secs:.2}s, {:.1} tok/s", pos as f32 / secs);
+            eprintln!("Q4X prompt seconds: {:?}", mem.times);
         }
         let mut out = Vec::new();
         while out.len() < n {

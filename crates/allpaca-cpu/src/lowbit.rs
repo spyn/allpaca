@@ -230,6 +230,93 @@ pub fn gemv_q2_0_i8(blocks: &[u8], input: &Q2_0Input, out: &mut [f32]) -> Result
     Ok(())
 }
 
+/// [`gemv_q2_0_i8`] of several inputs (same length) through one read of
+/// the matrix: `out` holds a row of the matrix's rows per input, each equal
+/// bit for bit to that input's own product.
+pub fn gemm_q2_0_i8(blocks: &[u8], inputs: &[&Q2_0Input], out: &mut [f32]) -> Result<(), AllpacaError> {
+    let Some(first) = inputs.first() else {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig("gemm_q2_0_i8 has no inputs".into())));
+    };
+    let n = out.len() / inputs.len();
+    let row_bytes = first.len() / Q2_0_BLOCK_ELEMS * Q2_0_BLOCK_BYTES;
+    if first.is_empty()
+        || out.len() != n * inputs.len()
+        || inputs.iter().any(|x| x.len() != first.len())
+        || blocks.len() < n * row_bytes
+    {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "gemm_q2_0_i8 inputs, rows and matrix do not line up".into(),
+        )));
+    }
+    #[cfg(target_arch = "x86_64")]
+    let wide = std::arch::is_x86_feature_detected!("avx2");
+    let mut dots = [0.0f32; Q2_0_GEMM_INPUTS];
+    for (r, row) in blocks.chunks_exact(row_bytes).take(n).enumerate() {
+        for (group, chunk) in inputs.chunks(Q2_0_GEMM_INPUTS).enumerate() {
+            let dots = &mut dots[..chunk.len()];
+            #[cfg(target_arch = "x86_64")]
+            if wide {
+                // SAFETY: AVX2 was detected above.
+                unsafe { q2_0_rows_dot_i8_avx2(row, chunk, dots) };
+            } else {
+                dots.iter_mut().zip(chunk).for_each(|(d, x)| *d = q2_0_row_dot_i8(row, x));
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            dots.iter_mut().zip(chunk).for_each(|(d, x)| *d = q2_0_row_dot_i8(row, x));
+            for (i, d) in dots.iter().enumerate() {
+                out[(group * Q2_0_GEMM_INPUTS + i) * n + r] = *d;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Inputs [`gemm_q2_0_i8`] takes per decode of a block.
+const Q2_0_GEMM_INPUTS: usize = 8;
+
+/// [`q2_0_row_dot_i8_avx2`] of up to [`Q2_0_GEMM_INPUTS`] inputs, each
+/// block's codes unpacked once; each dot's sums run in the same order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q2_0_rows_dot_i8_avx2(row: &[u8], inputs: &[&Q2_0Input], dots: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let three = _mm_set1_epi8(3);
+    let ones = _mm256_set1_epi16(1);
+    let mut totals = [_mm256_setzero_ps(); Q2_0_GEMM_INPUTS];
+    let mut offsets = [0.0f32; Q2_0_GEMM_INPUTS];
+    for (b, block) in row.chunks_exact(Q2_0_BLOCK_BYTES).enumerate() {
+        let c = _mm_loadu_si128(block.as_ptr().add(2).cast());
+        let f0 = _mm_and_si128(c, three);
+        let f1 = _mm_and_si128(_mm_srli_epi16(c, 2), three);
+        let f2 = _mm_and_si128(_mm_srli_epi16(c, 4), three);
+        let f3 = _mm_and_si128(_mm_srli_epi16(c, 6), three);
+        let (lo01, hi01) = (_mm_unpacklo_epi8(f0, f1), _mm_unpackhi_epi8(f0, f1));
+        let (lo23, hi23) = (_mm_unpacklo_epi8(f2, f3), _mm_unpackhi_epi8(f2, f3));
+        let first = _mm256_set_m128i(_mm_unpackhi_epi16(lo01, lo23), _mm_unpacklo_epi16(lo01, lo23));
+        let second = _mm256_set_m128i(_mm_unpackhi_epi16(hi01, hi23), _mm_unpacklo_epi16(hi01, hi23));
+        let d = block_scale(block);
+        for (i, input) in inputs.iter().enumerate() {
+            let x = input.codes.as_ptr().add(b * Q2_0_BLOCK_ELEMS);
+            let pairs = _mm256_add_epi16(
+                _mm256_maddubs_epi16(first, _mm256_loadu_si256(x.cast())),
+                _mm256_maddubs_epi16(second, _mm256_loadu_si256(x.add(32).cast())),
+            );
+            let scale = d * input.step[b];
+            totals[i] = _mm256_add_ps(
+                totals[i],
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(pairs, ones)), _mm256_set1_ps(scale)),
+            );
+            offsets[i] += scale * input.sum[b];
+        }
+    }
+    for (i, dot) in dots.iter_mut().enumerate() {
+        let total = totals[i];
+        let quad = _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
+        let pair = _mm_add_ps(quad, _mm_movehl_ps(quad, quad));
+        *dot = _mm_cvtss_f32(_mm_add_ss(pair, _mm_shuffle_ps(pair, pair, 1))) - offsets[i];
+    }
+}
+
 /// ggml's reference `Q2_0` quantiser: the scale is the block's largest
 /// magnitude, each weight rounds to the nearest of -1, 0, +1, +2 scales.
 pub fn quantize_q2_0(data: &[f32]) -> Vec<u8> {
@@ -367,6 +454,41 @@ mod tests {
         }
         assert!(Q2_0Input::new(&x[..100]).is_err());
         assert!(gemv_q2_0_i8(&blocks, &input, &mut [0.0; 8]).is_err());
+    }
+
+    /// Several inputs through one read of the matrix give each input's
+    /// [`gemv_q2_0_i8`] bit for bit, for any number of inputs.
+    #[test]
+    fn q2_0_i8_products_of_several_inputs_equal_one_at_a_time() {
+        let (rows, cols) = (7usize, 256usize);
+        let mut blocks = vec![0u8; rows * cols / Q2_0_BLOCK_ELEMS * Q2_0_BLOCK_BYTES];
+        let mut seed = 0x1234_5677u32;
+        for (bi, block) in blocks.chunks_exact_mut(Q2_0_BLOCK_BYTES).enumerate() {
+            for byte in block[2..].iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (seed >> 24) as u8;
+            }
+            let d = (0.03 + 0.01 * (bi % 5) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+            block[..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        }
+        for n_inputs in [1usize, 3, 8, 11, 16] {
+            let inputs: Vec<Q2_0Input> = (0..n_inputs)
+                .map(|i| {
+                    let x: Vec<f32> = (0..cols).map(|j| ((j * 13 + i * 7) % 41) as f32 / 20.0 - 1.0 + i as f32 * 0.1).collect();
+                    Q2_0Input::new(&x).unwrap()
+                })
+                .collect();
+            let refs: Vec<&Q2_0Input> = inputs.iter().collect();
+            let mut got = vec![0.0f32; n_inputs * rows];
+            gemm_q2_0_i8(&blocks, &refs, &mut got).unwrap();
+            for (i, input) in inputs.iter().enumerate() {
+                let mut want = vec![0.0f32; rows];
+                gemv_q2_0_i8(&blocks, input, &mut want).unwrap();
+                let row = &got[i * rows..(i + 1) * rows];
+                assert!(row.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{n_inputs} inputs, input {i}: {row:?} vs {want:?}");
+            }
+        }
+        assert!(gemm_q2_0_i8(&blocks, &[], &mut []).is_err());
     }
 
     /// Opt-in: seconds per expert-sized SwiGLU (640 x 2560 twice, 2560 x 640).
