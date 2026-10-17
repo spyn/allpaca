@@ -15373,53 +15373,55 @@ mod tests {
         if device_count() == 0 {
             return;
         }
-        let (dim, ff, n_exp, k, rows) = (320usize, 192usize, 40usize, 5usize, 3usize);
-        let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
-        let mut pool = vec![0u8; n_exp * slot_bytes];
-        let mut seed = 0x51ed_2701u32;
-        for (bi, block) in pool.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
-            for byte in block[2..].iter_mut() {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                *byte = (seed >> 24) as u8;
+        // The second shape takes the kernels over block pairs.
+        for (dim, ff, n_exp, k, rows) in [(320usize, 192usize, 40usize, 5usize, 3usize), (256, 256, 40, 5, 3)] {
+            let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
+            let mut pool = vec![0u8; n_exp * slot_bytes];
+            let mut seed = 0x51ed_2701u32;
+            for (bi, block) in pool.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                let d = (0.05 + 0.01 * (bi % 11) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
             }
-            let d = (0.05 + 0.01 * (bi % 11) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
-            block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
-        }
-        let x: Vec<f32> = (0..rows * dim).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.8).collect();
-        let scores: Vec<f32> = (0..rows * n_exp).map(|i| ((i * 53 % 97) as f32 / 20.0 - 2.0) * 0.7).collect();
-        set_device(0).unwrap();
-        let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
-        let pick_floats = q4x::PICKS_BYTES / 4;
-        let sc = q2_0_moe_scratch_floats(rows, k, dim, ff);
-        let floats = rows * (dim + n_exp + 2 * dim + pick_floats) + sc;
-        let dev = device_malloc(floats * 4, 0).unwrap();
-        let (dx, dscores, dh, dall, done, dpicks) = unsafe {
-            let p = dev.cast::<f32>();
-            let s = p.add(rows * dim);
-            let h = s.add(rows * n_exp);
-            let all = h.add(sc);
-            (p, s, h, all, all.add(rows * dim), all.add(2 * rows * dim))
-        };
-        let (mut together, mut alone) = (vec![0.0f32; rows * dim], vec![0.0f32; rows * dim]);
-        let run = (|| {
-            memcpy(dx.cast(), x.as_ptr().cast(), rows * dim * 4, MEMCPY_H2D)?;
-            memcpy(dscores.cast(), scores.as_ptr().cast(), rows * n_exp * 4, MEMCPY_H2D)?;
-            let (p, d, k, ff) = (dpool.byte_ptr_at(0), dim as i32, k as i32, ff as i32);
-            q4x::routed_experts(dx, dscores, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, dall, d, ff, rows as i32)?;
+            let x: Vec<f32> = (0..rows * dim).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.8).collect();
+            let scores: Vec<f32> = (0..rows * n_exp).map(|i| ((i * 53 % 97) as f32 / 20.0 - 2.0) * 0.7).collect();
+            set_device(0).unwrap();
+            let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
+            let pick_floats = q4x::PICKS_BYTES / 4;
+            let sc = q2_0_moe_scratch_floats(rows, k, dim, ff);
+            let floats = rows * (dim + n_exp + 2 * dim + pick_floats) + sc;
+            let dev = device_malloc(floats * 4, 0).unwrap();
+            let (dx, dscores, dh, dall, done, dpicks) = unsafe {
+                let p = dev.cast::<f32>();
+                let s = p.add(rows * dim);
+                let h = s.add(rows * n_exp);
+                let all = h.add(sc);
+                (p, s, h, all, all.add(rows * dim), all.add(2 * rows * dim))
+            };
+            let (mut together, mut alone) = (vec![0.0f32; rows * dim], vec![0.0f32; rows * dim]);
+            let run = (|| {
+                memcpy(dx.cast(), x.as_ptr().cast(), rows * dim * 4, MEMCPY_H2D)?;
+                memcpy(dscores.cast(), scores.as_ptr().cast(), rows * n_exp * 4, MEMCPY_H2D)?;
+                let (p, d, k, ff) = (dpool.byte_ptr_at(0), dim as i32, k as i32, ff as i32);
+                q4x::routed_experts(dx, dscores, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, dall, d, ff, rows as i32)?;
+                for r in 0..rows {
+                    // SAFETY: each part holds `rows` rows.
+                    let (x, s, out) = unsafe { (dx.add(r * dim), dscores.add(r * n_exp), done.add(r * dim)) };
+                    q4x::routed_experts(x, s, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, out, d, ff, 1)?;
+                }
+                memcpy(together.as_mut_ptr().cast(), dall.cast(), rows * dim * 4, MEMCPY_D2H)?;
+                memcpy(alone.as_mut_ptr().cast(), done.cast(), rows * dim * 4, MEMCPY_D2H)
+            })();
+            device_free(dev, floats * 4);
+            run.expect("device routing must run when a device is present");
             for r in 0..rows {
-                // SAFETY: each part holds `rows` rows.
-                let (x, s, out) = unsafe { (dx.add(r * dim), dscores.add(r * n_exp), done.add(r * dim)) };
-                q4x::routed_experts(x, s, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, out, d, ff, 1)?;
+                let (a, b) = (&together[r * dim..(r + 1) * dim], &alone[r * dim..(r + 1) * dim]);
+                assert!(a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()), "row {r} differs");
+                assert!(b.iter().any(|v| v.abs() > 1e-3), "row {r} is all zero");
             }
-            memcpy(together.as_mut_ptr().cast(), dall.cast(), rows * dim * 4, MEMCPY_D2H)?;
-            memcpy(alone.as_mut_ptr().cast(), done.cast(), rows * dim * 4, MEMCPY_D2H)
-        })();
-        device_free(dev, floats * 4);
-        run.expect("device routing must run when a device is present");
-        for r in 0..rows {
-            let (a, b) = (&together[r * dim..(r + 1) * dim], &alone[r * dim..(r + 1) * dim]);
-            assert!(a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()), "row {r} differs");
-            assert!(b.iter().any(|v| v.abs() > 1e-3), "row {r} is all zero");
         }
     }
 
@@ -15485,9 +15487,24 @@ mod tests {
         let q3k = |n: usize, k: usize| n * k / 256 * 110;
         let (value, qkv) = (6144usize, 10240usize);
         set_device(device).unwrap();
+        // `ALLPACA_BENCH_RANDOM`: weights of random bytes instead of zeros.
+        let random = std::env::var_os("ALLPACA_BENCH_RANDOM").is_some();
         let alloc = |bytes: usize| {
             let ptr = device_malloc(bytes, device).unwrap();
             device_memset(ptr, 0, bytes).unwrap();
+            if random && bytes > 1 << 16 {
+                let mut seed = bytes as u64 | 1;
+                let host: Vec<u8> = (0..bytes)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        // Small magnitudes: no infinities in the f16 / bf16 scales.
+                        (seed as u8) & 0x3b
+                    })
+                    .collect();
+                memcpy(ptr.cast(), host.as_ptr().cast(), bytes, MEMCPY_H2D).unwrap();
+            }
             ptr
         };
         let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
@@ -15541,9 +15558,10 @@ mod tests {
             for _ in 0..n {
                 f().unwrap();
             }
+            let queued = clock.elapsed().as_secs_f64() * 1e6 / n as f64;
             stream_synchronize().unwrap();
             let us = clock.elapsed().as_secs_f64() * 1e6 / n as f64;
-            eprintln!("BLOCK device {device} rows {rows} {name}: {us:.1} us");
+            eprintln!("BLOCK device {device} rows {rows} {name}: {us:.1} us ({queued:.1} us to queue)");
             us
         };
         let total = 2.0 * time("mixer", &mix) + time("deltanet matrices", &gdn) + time("router and shared expert", &route)
@@ -15556,6 +15574,53 @@ mod tests {
             experts()
         });
         eprintln!("BLOCK device {device} sum of parts {total:.1} us, whole block {whole:.1} us");
+        // `ALLPACA_BENCH_GAP_MS`: whole blocks with the card idle this long between them, as in a
+        // decode where the card waits on others; the time of each block alone, synced.
+        if let Some(gap) = std::env::var("ALLPACA_BENCH_GAP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            let mut sum = 0.0;
+            let n = 50;
+            for _ in 0..n {
+                std::thread::sleep(std::time::Duration::from_millis(gap));
+                let clock = std::time::Instant::now();
+                for _ in 0..8 {
+                    mix().unwrap();
+                    gdn().unwrap();
+                    mix().unwrap();
+                    route().unwrap();
+                    experts().unwrap();
+                }
+                stream_synchronize().unwrap();
+                sum += clock.elapsed().as_secs_f64() * 1e6 / 8.0;
+            }
+            eprintln!("BLOCK device {device} rows {rows} 8 blocks after {gap} ms idle: {:.1} us a block", sum / n as f64);
+        }
+        // `ALLPACA_BENCH_PARTS`: every kernel of a block on its own.
+        if std::env::var_os("ALLPACA_BENCH_PARTS").is_none() {
+            return;
+        }
+        let (lo, kk, ffi) = (low as i32, k as i32, ff as i32);
+        time("stream_norm", &|| q4x::stream_norm(at(0), at(1), at(2), r, h, d, 1e-6));
+        time("bf16 mixer down 320x10240", &|| gemm_nt_bf16_device(at(2), w_down.cast(), at(3), r, lo, kk));
+        time("silu_scale", &|| silu_scale_device(at(3), lo * r, 0.25));
+        time("bf16 mixer up 10240x320", &|| gemm_nt_bf16_device(at(3), w_up.cast(), at(4), r, kk, lo));
+        time("gated_mean", &|| q4x::gated_mean(at(2), at(4), at(5), r, h, d));
+        time("bf16 inject 4x10240", &|| gemm_nt_bf16_device(at(2), w_inject.cast(), at(6), r, h, kk));
+        time("q3_k qkv 10240x2560", &|| gemm_nt_q3_k_device(at(5), w_qkv, at(7), r, qkv as i32, d));
+        time("q3_k gate 6144x2560", &|| gemm_nt_q3_k_device(at(5), w_gate, at(8), r, value as i32, d));
+        time("bf16 alpha 48x2560", &|| gemm_nt_bf16_device(at(5), w_alpha.cast(), at(9), r, 48, d));
+        time("q3_k out 2560x6144", &|| gemm_nt_q3_k_device(at(8), w_out, at(11), r, d, value as i32));
+        time("bf16 router 512x2560", &|| gemm_nt_bf16_device(at(5), w_router.cast(), at(12), r, n_exp as i32, d));
+        time("q3_k shared 640x2560", &|| gemm_nt_q3_k_device(at(5), w_shared_in, at(13), r, ffi, d));
+        time("q2_0 shared down 2560x640", &|| gemm_nt_q2_0_device(at(13), w_shared_down, at(15), r, d, ffi));
+        time("bf16 1x2560", &|| gemm_nt_bf16_device(at(5), w_alpha.cast(), at(16), r, 1, d));
+        time("scores copy", &|| memcpy(at(12).cast(), at(20).cast(), rows * n_exp * 4, MEMCPY_D2D));
+        time("routed experts", &|| {
+            q4x::routed_experts(at(5), at(12), pool, n_exp as i32, picks as i32, 1.0, at(17).cast(), at(18), at(19), d, ffi, r)
+        });
+        time("ffn_sum + combine", &|| {
+            q4x::ffn_sum(at(19), at(15), at(16), at(11), r, d)?;
+            q4x::combine(at(0), at(11), at(6), r, h, d)
+        });
     }
 
     /// The qwen4exp stream kernels against their definitions, on two rows.

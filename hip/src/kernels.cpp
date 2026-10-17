@@ -48,7 +48,10 @@
 #include <system_error>
 #endif
 
-__device__ float allpaca_f16_bits_to_f32(uint16_t h);
+/* IEEE half to float with the hardware conversion (exact, subnormals included). */
+__device__ inline float allpaca_f16_bits_to_f32(uint16_t h) {
+    return static_cast<float>(__builtin_bit_cast(_Float16, h));
+}
 __device__ float allpaca_bf16_bits_to_f32(uint16_t h);
 __device__ float allpaca_f16le_to_f32(const uint8_t *p);
 
@@ -2172,6 +2175,74 @@ __global__ void gemv_nt_bf16_wide_kernel(const float *a, const uint16_t *b, floa
     }
 }
 
+/* The same products with a whole block of 256 per output (grid n), every row (m <= 8) in the
+ * block so the weights are read once: for few, long rows, where a 32-lane group per output leaves
+ * most of the card idle. With grid (n, m) a block takes row blockIdx.y alone. Each row's sums run
+ * as they would alone either way. */
+__global__ void gemv_nt_bf16_splitk_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
+                                           int k) {
+    constexpr int MAX_M = 8;
+    __shared__ float part[MAX_M][8];
+    if (gridDim.y > 1) {
+        a += static_cast<size_t>(blockIdx.y) * static_cast<size_t>(k);
+        c += static_cast<size_t>(blockIdx.y) * static_cast<size_t>(n);
+        m = 1;
+    }
+    const int col = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const uint16_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+    float acc[MAX_M];
+#pragma unroll
+    for (int r = 0; r < MAX_M; ++r) {
+        acc[r] = 0.f;
+    }
+    for (int p = tid * 8; p < k; p += 2048) {
+        const uint4 w = *reinterpret_cast<const uint4 *>(brow + p);
+        const float w0 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x));
+        const float w1 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x >> 16));
+        const float w2 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y));
+        const float w3 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y >> 16));
+        const float w4 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z));
+        const float w5 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z >> 16));
+        const float w6 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w));
+        const float w7 = allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w >> 16));
+#pragma unroll
+        for (int r = 0; r < MAX_M; ++r) {
+            if (r < m) {
+                const float *arow = a + static_cast<size_t>(r) * static_cast<size_t>(k);
+                const float4 x0 = *reinterpret_cast<const float4 *>(arow + p);
+                const float4 x1 = *reinterpret_cast<const float4 *>(arow + p + 4);
+                acc[r] += x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3 + x1.x * w4 + x1.y * w5 +
+                          x1.z * w6 + x1.w * w7;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MAX_M; ++r) {
+        if (r < m) {
+            float v = acc[r];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_xor(v, off, 32);
+            }
+            if (tid % 32 == 0) {
+                part[r][tid / 32] = v;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < m) {
+        const float *q = part[tid];
+        c[static_cast<size_t>(tid) * static_cast<size_t>(n) + col] =
+            ((q[0] + q[1]) + (q[2] + q[3])) + ((q[4] + q[5]) + (q[6] + q[7]));
+    }
+}
+
+/* Whether a BF16 GEMV of this shape takes the split-k kernel (by shape only, so every m agrees). */
+static bool bf16_gemv_splitk(int32_t n, int32_t k) {
+    return (n <= 64 && k >= 2048) || (n <= 1024 && k >= 8192);
+}
+
 /* ALLPACA_BF16_GEMV_WIDE=0 keeps the older shared-tile kernels. */
 static bool bf16_gemv_wide() {
     static const bool on = [] {
@@ -2214,6 +2285,12 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
         return hip_status(hipGetLastError());
     }
     if (bf16_gemv_wide() && k % 8 == 0 && (reinterpret_cast<uintptr_t>(a) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(b) & 15u) == 0 && bf16_gemv_splitk(n, k)) {
+        /* Few outputs: a block per row as well, or the card idles. */
+        const unsigned rows_grid = n <= 64 ? static_cast<unsigned>(m) : 1u;
+        hipLaunchKernelGGL(gemv_nt_bf16_splitk_kernel, dim3(static_cast<unsigned>(n), rows_grid),
+                           dim3(256), 0, stream, a, b, c, m, n, k);
+    } else if (bf16_gemv_wide() && k % 8 == 0 && (reinterpret_cast<uintptr_t>(a) & 15u) == 0 &&
         (reinterpret_cast<uintptr_t>(b) & 15u) == 0) {
         constexpr int GROUPS = 8;
         dim3 block(GROUPS * 32);
@@ -3666,35 +3743,43 @@ static Q2MoeScratch q2_moe_scratch(float *base, int rows, int n_pick, int dim, i
     return s;
 }
 
-/* Round `blocks` 64-value blocks of x to Q2Act form, one thread per block. */
+/* Round `blocks` 64-value blocks of x to Q2Act form: 32 lanes a block, values j and j + 32 on
+ * lane j (the max and the integer sum do not depend on the order). */
 __global__ void q2_0_round_act_kernel(const float *x, int8_t *codes, float *step, float *sum,
                                       int blocks) {
-    const int b = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int b = static_cast<int>(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
+    const int j = static_cast<int>(threadIdx.x % 32);
     if (b >= blocks) {
         return;
     }
     const float *src = x + static_cast<size_t>(b) * 64;
     int8_t *dst = codes + static_cast<size_t>(b) * 64;
-    float mx = 0.f;
-    for (int j = 0; j < 64; ++j) {
-        mx = fmaxf(mx, fabsf(src[j]));
+    const float v0 = src[j];
+    const float v1 = src[j + 32];
+    float mx = fmaxf(fabsf(v0), fabsf(v1));
+    for (int off = 16; off > 0; off >>= 1) {
+        mx = fmaxf(mx, __shfl_xor(mx, off, 32));
     }
-    int total = 0;
     const bool live = mx > 0.f && isfinite(mx);
     const float inv = live ? 127.f / mx : 0.f;
-    for (int j = 0; j < 64; ++j) {
-        const int c = live ? static_cast<int>(roundf(src[j] * inv)) : 0;
-        dst[(j & ~15) + 4 * (j & 3) + ((j >> 2) & 3)] = static_cast<int8_t>(c);
-        total += c;
+    const int c0 = live ? static_cast<int>(roundf(v0 * inv)) : 0;
+    const int c1 = live ? static_cast<int>(roundf(v1 * inv)) : 0;
+    dst[(j & ~15) + 4 * (j & 3) + ((j >> 2) & 3)] = static_cast<int8_t>(c0);
+    dst[32 + (j & ~15) + 4 * (j & 3) + ((j >> 2) & 3)] = static_cast<int8_t>(c1);
+    int total = c0 + c1;
+    for (int off = 16; off > 0; off >>= 1) {
+        total += __shfl_xor(total, off, 32);
     }
-    step[b] = live ? mx / 127.f : 0.f;
-    sum[b] = static_cast<float>(total);
+    if (j == 0) {
+        step[b] = live ? mx / 127.f : 0.f;
+        sum[b] = static_cast<float>(total);
+    }
 }
 
 static void q2_0_round_act(const float *x, int8_t *codes, float *step, float *sum, size_t n,
                            hipStream_t stream) {
     const int blocks = static_cast<int>(n / 64);
-    hipLaunchKernelGGL(q2_0_round_act_kernel, dim3(static_cast<unsigned>((blocks + 255) / 256)),
+    hipLaunchKernelGGL(q2_0_round_act_kernel, dim3(static_cast<unsigned>((blocks + 7) / 8)),
                        dim3(256), 0, stream, x, codes, step, sum, blocks);
 }
 
@@ -3825,66 +3910,210 @@ __global__ void q2_0_moe_down_dev_kernel(Q2Act h, const uint8_t *pool, const int
                        w, n_pick, out + row * static_cast<size_t>(dim), dim, ff, slot_bytes, part);
 }
 
+/* The dot of a pair of Q2_0 blocks (36 bytes from a 4-aligned address) with blocks b and b + 1
+ * of a rounded row, as two q2_0_block_dot_i8 summed. Words: 0 = d0 | codes0[0..1], 1..3 =
+ * codes0[2..13], 4 = codes0[14..15] | d1, 5..8 = codes1. */
+__device__ inline float q2_0_pair_dot_i8(const uint32_t *wd, const Q2Act &a, size_t b) {
+    uint32_t w[9];
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        w[i] = wd[i];
+    }
+    const uint32_t c0[4] = {(w[0] >> 16) | (w[1] << 16), (w[1] >> 16) | (w[2] << 16),
+                            (w[2] >> 16) | (w[3] << 16), (w[3] >> 16) | (w[4] << 16)};
+    const int4 *xa = reinterpret_cast<const int4 *>(a.codes + b * 64);
+    int s0 = 0;
+    int s1 = 0;
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        const int4 a0 = xa[m];
+        const int4 a1 = xa[4 + m];
+        s0 = allpaca_dot4_i8(a0.x, static_cast<int>(c0[m] & 0x03030303u), s0);
+        s0 = allpaca_dot4_i8(a0.y, static_cast<int>((c0[m] >> 2) & 0x03030303u), s0);
+        s0 = allpaca_dot4_i8(a0.z, static_cast<int>((c0[m] >> 4) & 0x03030303u), s0);
+        s0 = allpaca_dot4_i8(a0.w, static_cast<int>((c0[m] >> 6) & 0x03030303u), s0);
+        s1 = allpaca_dot4_i8(a1.x, static_cast<int>(w[5 + m] & 0x03030303u), s1);
+        s1 = allpaca_dot4_i8(a1.y, static_cast<int>((w[5 + m] >> 2) & 0x03030303u), s1);
+        s1 = allpaca_dot4_i8(a1.z, static_cast<int>((w[5 + m] >> 4) & 0x03030303u), s1);
+        s1 = allpaca_dot4_i8(a1.w, static_cast<int>((w[5 + m] >> 6) & 0x03030303u), s1);
+    }
+    const float d0 = allpaca_f16_bits_to_f32(static_cast<uint16_t>(w[0] & 0xffffu));
+    const float d1 = allpaca_f16_bits_to_f32(static_cast<uint16_t>(w[4] >> 16));
+    return d0 * a.step[b] * (static_cast<float>(s0) - a.sum[b]) +
+           d1 * a.step[b + 1] * (static_cast<float>(s1) - a.sum[b + 1]);
+}
+
+/* The sum over groups of L lanes (L <= 32); every lane of the group gets it. */
+template <int L> __device__ inline float q2_lane_sum(float v) {
+#pragma unroll
+    for (int off = L / 2; off > 0; off >>= 1) {
+        v += __shfl_xor(v, off, L);
+    }
+    return v;
+}
+
+/* q2_0_moe_gate_up_dev_kernel over block pairs: L lanes per hidden row, 256 / L rows a block.
+ * Needs dim % 128 == 0, a 4-aligned pool and 16-aligned codes (q2_0_pairs_fit). */
+template <int L>
+__global__ void q2_0_moe_gate_up_pairs_kernel(Q2Act x, const uint8_t *pool, const int32_t *picks,
+                                              float *h, int dim, int ff, size_t slot_bytes) {
+    const size_t row = blockIdx.z;
+    const int p = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid % L;
+    const int r = static_cast<int>(blockIdx.x) * (256 / L) + tid / L;
+    const size_t first = row * static_cast<size_t>(dim / 64);
+    const Q2Act xr = {x.codes + first * 64, x.step + first, x.sum + first};
+    const int32_t *slots = picks + row * ALLPACA_Q4X_PICK_WORDS;
+    float g = 0.f;
+    float u = 0.f;
+    if (r < ff) {
+        const size_t row_words = static_cast<size_t>(dim / 64) * 18 / 4;
+        const uint32_t *gate =
+            reinterpret_cast<const uint32_t *>(pool + static_cast<size_t>(slots[p]) * slot_bytes) +
+            static_cast<size_t>(r) * row_words;
+        const uint32_t *up = gate + static_cast<size_t>(ff) * row_words;
+        for (int q = lane; q < dim / 128; q += L) {
+            g += q2_0_pair_dot_i8(gate + 9 * q, xr, 2 * static_cast<size_t>(q));
+            u += q2_0_pair_dot_i8(up + 9 * q, xr, 2 * static_cast<size_t>(q));
+        }
+    }
+    g = q2_lane_sum<L>(g);
+    u = q2_lane_sum<L>(u);
+    if (lane == 0 && r < ff) {
+        h[(row * gridDim.y + static_cast<size_t>(p)) * static_cast<size_t>(ff) + static_cast<size_t>(r)] =
+            g / (1.f + expf(-g)) * u;
+    }
+}
+
+/* q2_0_moe_down_dev_kernel over block pairs: L lanes per output column share every (pick,
+ * pair). Needs ff % 128 == 0 as well. */
+template <int L>
+__global__ void q2_0_moe_down_pairs_kernel(Q2Act h, const uint8_t *pool, const int32_t *picks,
+                                           int n_pick, float *out, int dim, int ff,
+                                           size_t slot_bytes) {
+    const size_t row = blockIdx.z;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid % L;
+    const int col = static_cast<int>(blockIdx.x) * (256 / L) + tid / L;
+    const int32_t *slots = picks + row * ALLPACA_Q4X_PICK_WORDS;
+    const float *w = reinterpret_cast<const float *>(slots + ALLPACA_Q2_MOE_MAX_PICKS);
+    const int npairs = ff / 128;
+    const size_t first = row * static_cast<size_t>(n_pick) * static_cast<size_t>(ff / 64);
+    const Q2Act hr = {h.codes + first * 64, h.step + first, h.sum + first};
+    const size_t down_off = 2 * static_cast<size_t>(ff) * static_cast<size_t>(dim / 64) * 18;
+    const size_t col_words = static_cast<size_t>(ff / 64) * 18 / 4;
+    float acc = 0.f;
+    if (col < dim) {
+        for (int j = lane; j < n_pick * npairs; j += L) {
+            const int p = j / npairs;
+            const int q = j % npairs;
+            const uint32_t *down =
+                reinterpret_cast<const uint32_t *>(pool + static_cast<size_t>(slots[p]) * slot_bytes +
+                                                   down_off) +
+                static_cast<size_t>(col) * col_words;
+            acc += w[p] * q2_0_pair_dot_i8(down + 9 * q, hr,
+                                           static_cast<size_t>(p) * (ff / 64) + 2 * static_cast<size_t>(q));
+        }
+    }
+    acc = q2_lane_sum<L>(acc);
+    if (lane == 0 && col < dim) {
+        out[row * static_cast<size_t>(dim) + static_cast<size_t>(col)] = acc;
+    }
+}
+
+/* Whether the pair kernels can run on these shapes and pointers. */
+static bool q2_0_pairs_fit(const uint8_t *pool, const Q2MoeScratch &sc, int dim, int ff) {
+    return dim % 128 == 0 && ff % 128 == 0 && reinterpret_cast<uintptr_t>(pool) % 4 == 0 &&
+           reinterpret_cast<uintptr_t>(sc.x_codes) % 16 == 0 &&
+           reinterpret_cast<uintptr_t>(sc.h_codes) % 16 == 0;
+}
+
 /* Softmax over n router scores, the k best by weight (ties to the lower expert) into
  * slots[0..k], their weights renormalised over the picks and times `scale` into w[0..k]. One
- * block of 256 threads; the sums run in expert order on one thread, as the host's do. */
+ * group of 32 lanes, the scores in registers (expert lane + 32 i on lane `lane`); the sums run
+ * in expert order on one lane, as the host's do. */
 #define ALLPACA_Q4X_MAX_EXPERTS 1024
 __global__ void q4x_route_topk_kernel(const float *scores, int n, int k, float scale,
                                       int32_t *picks) {
+    constexpr int PER = ALLPACA_Q4X_MAX_EXPERTS / 32;
     __shared__ float p[ALLPACA_Q4X_MAX_EXPERTS];
-    __shared__ float red[2];
-    const int tid = static_cast<int>(threadIdx.x);
+    __shared__ float picked[ALLPACA_Q2_MOE_MAX_PICKS];
+    const int lane = static_cast<int>(threadIdx.x);
     /* Row blockIdx.x of several: scores by n, picks by ALLPACA_Q4X_PICK_WORDS. */
     scores += static_cast<size_t>(blockIdx.x) * static_cast<size_t>(n);
     int32_t *slots = picks + static_cast<size_t>(blockIdx.x) * ALLPACA_Q4X_PICK_WORDS;
     float *w = reinterpret_cast<float *>(slots + ALLPACA_Q2_MOE_MAX_PICKS);
-    for (int e = tid; e < n; e += 256) {
-        p[e] = scores[e];
+    float v[PER];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int e = lane + 32 * i;
+        v[i] = e < n ? scores[e] : -INFINITY;
+        mx = fmaxf(mx, v[i]);
     }
-    __syncthreads();
-    if (tid == 0) {
-        float mx = p[0];
-        for (int e = 1; e < n; ++e) {
-            mx = fmaxf(mx, p[e]);
+    for (int off = 16; off > 0; off >>= 1) {
+        mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+    }
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int e = lane + 32 * i;
+        if (e < n) {
+            v[i] = expf(v[i] - mx);
+            p[e] = v[i];
         }
-        red[0] = mx;
     }
     __syncthreads();
-    for (int e = tid; e < n; e += 256) {
-        p[e] = expf(p[e] - red[0]);
-    }
-    __syncthreads();
-    if (tid == 0) {
-        float sum = 0.f;
+    float sum = 0.f;
+    if (lane == 0) {
         for (int e = 0; e < n; ++e) {
             sum += p[e];
         }
-        red[1] = fmaxf(sum, 1e-9f);
+        sum = fmaxf(sum, 1e-9f);
     }
-    __syncthreads();
-    for (int e = tid; e < n; e += 256) {
-        p[e] /= red[1];
+    sum = __shfl(sum, 0, 32);
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        v[i] = lane + 32 * i < n ? v[i] / sum : -1.f;
     }
-    __syncthreads();
-    for (int e = tid; e < n; e += 256) {
-        const float v = p[e];
-        int rank = 0;
-        for (int j = 0; j < n; ++j) {
-            rank += (p[j] > v || (p[j] == v && j < e)) ? 1 : 0;
+    /* k rounds of the best left: the larger weight, then the lower expert. */
+    for (int r = 0; r < k; ++r) {
+        float bv = -1.f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            if (v[i] > bv) {
+                bv = v[i];
+                bi = lane + 32 * i;
+            }
         }
-        if (rank < k) {
-            slots[rank] = e;
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off, 32);
+            const int oi = __shfl_xor(bi, off, 32);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            if (lane + 32 * i == bi) {
+                v[i] = -1.f;
+            }
+        }
+        if (lane == 0) {
+            slots[r] = bi;
+            picked[r] = bv;
         }
     }
-    __syncthreads();
-    if (tid == 0) {
+    if (lane == 0) {
         float part = 0.f;
         for (int r = 0; r < k; ++r) {
-            part += p[slots[r]];
+            part += picked[r];
         }
         part = fmaxf(part, 1e-9f);
         for (int r = 0; r < k; ++r) {
-            w[r] = p[slots[r]] / part * scale;
+            w[r] = picked[r] / part * scale;
         }
     }
 }
@@ -3933,21 +4162,36 @@ extern "C" int allpaca_q4x_routed_ffn(const float *x, const float *scores, const
     int32_t *slots = static_cast<int32_t *>(picks);
     const size_t slot_bytes = 3 * static_cast<size_t>(ff) * static_cast<size_t>(dim / 64) * 18;
     const unsigned r = static_cast<unsigned>(rows);
-    hipLaunchKernelGGL(q4x_route_topk_kernel, dim3(r), dim3(256), 0, as_stream(stream), scores,
+    hipLaunchKernelGGL(q4x_route_topk_kernel, dim3(r), dim3(32), 0, as_stream(stream), scores,
                        n_experts, n_pick, scale, slots);
     const Q2MoeScratch sc = q2_moe_scratch(h, rows, n_pick, dim, ff);
     q2_0_round_act(x, sc.x_codes, sc.x_step, sc.x_sum, static_cast<size_t>(rows) * dim,
                    as_stream(stream));
     const Q2Act xa = {sc.x_codes, sc.x_step, sc.x_sum};
-    hipLaunchKernelGGL(q2_0_moe_gate_up_dev_kernel,
-                       dim3(static_cast<unsigned>((ff + 63) / 64), static_cast<unsigned>(n_pick), r),
-                       dim3(256), 0, as_stream(stream), xa, pool, slots, sc.h, dim, ff, slot_bytes);
+    const bool pairs = q2_0_pairs_fit(pool, sc, dim, ff);
+    const unsigned picks_n = static_cast<unsigned>(n_pick);
+    /* The same lanes for any number of rows, so a row's sums do not depend on its company. */
+    if (pairs) {
+        hipLaunchKernelGGL(q2_0_moe_gate_up_pairs_kernel<32>,
+                           dim3(static_cast<unsigned>((ff + 7) / 8), picks_n, r), dim3(256), 0,
+                           as_stream(stream), xa, pool, slots, sc.h, dim, ff, slot_bytes);
+    } else {
+        hipLaunchKernelGGL(q2_0_moe_gate_up_dev_kernel,
+                           dim3(static_cast<unsigned>((ff + 63) / 64), picks_n, r), dim3(256), 0,
+                           as_stream(stream), xa, pool, slots, sc.h, dim, ff, slot_bytes);
+    }
     q2_0_round_act(sc.h, sc.h_codes, sc.h_step, sc.h_sum,
                    static_cast<size_t>(rows) * n_pick * ff, as_stream(stream));
     const Q2Act ha = {sc.h_codes, sc.h_step, sc.h_sum};
-    hipLaunchKernelGGL(q2_0_moe_down_dev_kernel, dim3(static_cast<unsigned>((dim + 63) / 64), 1, r),
-                       dim3(256), 0, as_stream(stream), ha, pool, slots, n_pick, out, dim, ff,
-                       slot_bytes);
+    if (pairs) {
+        hipLaunchKernelGGL(q2_0_moe_down_pairs_kernel<16>,
+                           dim3(static_cast<unsigned>((dim + 15) / 16), 1, r), dim3(256), 0,
+                           as_stream(stream), ha, pool, slots, n_pick, out, dim, ff, slot_bytes);
+    } else {
+        hipLaunchKernelGGL(q2_0_moe_down_dev_kernel,
+                           dim3(static_cast<unsigned>((dim + 63) / 64), 1, r), dim3(256), 0,
+                           as_stream(stream), ha, pool, slots, n_pick, out, dim, ff, slot_bytes);
+    }
     return hip_status(hipGetLastError());
 }
 
@@ -5798,6 +6042,24 @@ static void retain_default_pool(int32_t device) {
     (void)hipMemPoolSetAttribute(pool, hipMemPoolAttrReleaseThreshold, &thresh);
 }
 
+/* Device buffers as physically contiguous allocations: the default on Windows only. On Linux
+ * (ROCm 6.2, MI50) kernels read contiguous buffers at about half the speed of hipMalloc ones.
+ * ALLPACA_HIP_CONTIGUOUS=0/1 overrides. */
+static bool hip_malloc_contiguous() {
+    static const bool on = [] {
+        const char *v = std::getenv("ALLPACA_HIP_CONTIGUOUS");
+        if (v && v[0]) {
+            return v[0] != '0';
+        }
+#if defined(_WIN32)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return on;
+}
+
 extern "C" int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device) {
     if (!ptr || bytes == 0) {
         return ALLPACA_ERR_INVALID;
@@ -5808,7 +6070,8 @@ extern "C" int allpaca_hip_malloc(void **ptr, size_t bytes, int32_t device) {
     }
     retain_default_pool(device);
     *ptr = nullptr;
-    err = hipExtMallocWithFlags(ptr, bytes, hipDeviceMallocContiguous);
+    err = hip_malloc_contiguous() ? hipExtMallocWithFlags(ptr, bytes, hipDeviceMallocContiguous)
+                                  : hipErrorUnknown;
     if (err != hipSuccess || *ptr == nullptr) {
         err = hipMalloc(ptr, bytes);
     }
@@ -8023,31 +8286,6 @@ __device__ float allpaca_bf16_bits_to_f32(uint16_t h) {
         float f;
     } conv;
     conv.u = static_cast<uint32_t>(h) << 16;
-    return conv.f;
-}
-
-__device__ float allpaca_f16_bits_to_f32(uint16_t h) {
-    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u) << 16);
-    const uint32_t exp = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x3ffu;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            float f = (static_cast<float>(mant) / 1024.0f) * (1.0f / 16384.0f);
-            return (h & 0x8000u) ? -f : f;
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    union {
-        uint32_t u;
-        float f;
-    } conv;
-    conv.u = bits;
     return conv.f;
 }
 

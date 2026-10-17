@@ -962,6 +962,15 @@ impl Qwen4Gpu {
             hips.iter().map(|h| free_bytes(h.device).saturating_sub(HOST_RESERVE + (act.total * 4) as u64)).collect();
         let mut block_card = vec![0usize; spec.n_blocks];
         let mut card = 0usize;
+        // `ALLPACA_Q4X_WORKER_SPREAD`: runs of about equal bytes on every card,
+        // instead of filling the first card before the next.
+        if std::env::var_os("ALLPACA_Q4X_WORKER_SPREAD").is_some() && room.len() > 1 {
+            let share = spec.blocks.iter().map(|b| b.bytes).sum::<u64>().div_ceil(room.len() as u64);
+            let last = room.len() - 1;
+            for free in &mut room[..last] {
+                *free = (*free).min(share);
+            }
+        }
         for block in &spec.blocks {
             while room.get(card).is_some_and(|free| *free < block.bytes) {
                 card += 1;
