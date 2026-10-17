@@ -405,6 +405,9 @@ pub struct Qwen4Memory {
     device_host: Option<Qwen4DeviceHost>,
     /// This sequence's state on the worker that hosts blocks, when one does.
     remote: Option<crate::qwen4_remote::RemoteSeq>,
+    /// A prompt-cache copy's state on that worker, kept there
+    /// ([`Self::for_cache`]); [`Self::restore_remote`] makes it a sequence.
+    remote_saved: Option<Arc<crate::qwen4_remote::RemoteSaved>>,
 }
 
 /// Seconds spent in each part of the forward.
@@ -434,12 +437,26 @@ impl Qwen4Memory {
     }
 
     /// A copy for the prompt cache that holds nothing on the cards: the
-    /// device state is read back to the host. `None` when part of the
-    /// sequence lives on a worker that hosts blocks.
+    /// device state is read back to the host, and the state on a worker
+    /// that hosts blocks is kept there ([`crate::qwen4_remote::RemoteSaved`]).
+    /// `None` when that worker has no room for it.
     pub(crate) fn for_cache(&self, model: &TinyModel) -> Result<Option<Self>, AllpacaError> {
-        if self.remote.is_some() {
-            return Ok(None);
-        }
+        let remote_saved = match (&self.remote, &self.remote_saved) {
+            (Some(seq), _) => {
+                let host = match model.q4x.as_ref() {
+                    Some(q4) => q4.gpu.lock().map_err(|_| load_err("qwen4exp GPU lock".into()))?.as_ref().and_then(|g| g.hosted()).cloned(),
+                    None => None,
+                };
+                let Some(host) = host else {
+                    return Ok(None);
+                };
+                match host.save(seq, self.tokens.len())? {
+                    Some(saved) => Some(Arc::new(saved)),
+                    None => return Ok(None),
+                }
+            }
+            (None, saved) => saved.clone(),
+        };
         let device_host = match &self.device {
             Some(device) => {
                 if let Some(q4) = model.q4x.as_ref() {
@@ -460,7 +477,27 @@ impl Qwen4Memory {
             device: None,
             device_host,
             remote: None,
+            remote_saved,
         }))
+    }
+
+    /// Whether a prompt-cache copy can go to a file: not when part of it is
+    /// kept on a worker.
+    pub(crate) fn persistable(&self) -> bool {
+        self.remote.is_none() && self.remote_saved.is_none()
+    }
+
+    /// Make a restored prompt-cache copy's state on the worker a sequence
+    /// of its own. `false` when the worker no longer has it: the copy must
+    /// not be used. `true` when there was nothing to restore.
+    pub(crate) fn restore_remote(&mut self) -> Result<bool, AllpacaError> {
+        let Some(saved) = self.remote_saved.take() else {
+            return Ok(true);
+        };
+        let seq = saved.host().load(&saved)?;
+        let restored = seq.is_some();
+        self.remote = seq;
+        Ok(restored)
     }
 
     /// Bytes held on the host.
@@ -492,7 +529,8 @@ impl Qwen4Memory {
             l.qsa.write_to(out);
         }
         write_f32s(out, &self.ple_history);
-        out.push(self.device_host.is_some() as u8);
+        // A copy with part of it on a worker cannot be read back from a file.
+        out.push(if !self.persistable() { 2 } else { self.device_host.is_some() as u8 });
         if let Some(host) = &self.device_host {
             host.write_to(out);
         }
@@ -1027,6 +1065,9 @@ pub(crate) fn forward_qwen4_tokens(
             "qwen4exp sequence memory holds {} tokens, forward is at position {start_pos}",
             mem.tokens.len()
         ))));
+    }
+    if !mem.restore_remote()? {
+        return Err(load_err("qwen4exp: the worker no longer keeps this sequence's state".into()));
     }
     let gpu = q4.gpu.lock().map_err(|_| load_err("qwen4exp gpu lock poisoned".into()))?;
     if let Some(gpu) = gpu.as_ref() {
@@ -2362,6 +2403,68 @@ mod tests {
             crate::qwen4_gpu::attach(&model, &hip, None, None).expect("attach");
             carries_on_from_the_cache_copy(&model, what);
         }
+    }
+
+    /// A sequence whose last blocks a worker hosts is kept for the prompt
+    /// cache with those blocks' state saved on the worker: a copy restored
+    /// from it carries on exactly as the live sequence, as often as it is
+    /// restored. It stays out of files (the worker's part is not in them).
+    /// A worker with no room for it makes the sequence uncacheable, and a
+    /// copy whose saved part the worker lost says so when restored.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_memory_with_hosted_blocks_is_kept_with_their_state_on_the_worker() {
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let start = |saved_bytes: usize| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+                let ext = crate::qwen4_remote::worker_extension_saving(None, saved_bytes);
+                serve_connection_ext(stream, backend, None, vec![ext]).unwrap();
+            });
+            let mut model = tiny_packed_model();
+            let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+            model.rpc = Some(rt);
+            crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+            assert_eq!(model.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().hosted_blocks(), [2, 3]);
+            (model, worker)
+        };
+        let tokens = long_tokens(14);
+        let (model, worker) = start(64 << 20);
+        let vocab = model.config.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        let mut live = Qwen4Memory::default();
+        forward_qwen4_tokens(&model, &tokens[..9], 0, &mut logits, None, &mut live).expect("prefix");
+        let kept = live.for_cache(&model).expect("save").expect("cacheable with the worker's part saved");
+        assert!(!kept.persistable(), "the worker's part is not in a file");
+        let mut bytes = Vec::new();
+        kept.write_to(&mut bytes);
+        assert!(Qwen4Memory::read_from(&mut crate::kv_codec::Reader(&bytes)).is_none(), "and a file of it is refused");
+        let mut want = vec![0.0f32; 5 * vocab];
+        forward_qwen4_tokens(&model, &tokens[9..], 9, &mut logits, Some(&mut want), &mut live).expect("live");
+        for round in 0..2 {
+            let mut copy = kept.clone();
+            assert!(copy.restore_remote().expect("restore"), "round {round}");
+            let mut got = vec![0.0f32; 5 * vocab];
+            forward_qwen4_tokens(&model, &tokens[9..], 9, &mut logits, Some(&mut got), &mut copy).expect("copy");
+            assert_eq!(got, want, "round {round}");
+        }
+        drop((live, kept, model));
+        worker.join().unwrap();
+
+        // No room on the worker: not cacheable.
+        let (model, worker) = start(1);
+        let mut live = Qwen4Memory::default();
+        forward_qwen4_tokens(&model, &tokens[..9], 0, &mut logits, None, &mut live).expect("prefix");
+        assert!(live.for_cache(&model).expect("save").is_none());
+        drop((live, model));
+        worker.join().unwrap();
     }
 
     fn run(model: &TinyModel, tokens: &[u32]) -> Vec<Vec<f32>> {

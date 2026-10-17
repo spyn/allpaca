@@ -539,7 +539,8 @@ impl KvRadixForest {
         if tokens.is_empty() {
             return 0;
         }
-        let written = self.disk.as_mut().and_then(|d| {
+        // A checkpoint with part of its state on a worker stays in RAM.
+        let written = self.disk.as_mut().filter(|_| cp.recurrent.q4x.persistable()).and_then(|d| {
             let name = file_name(tokens);
             let data = encode_file(tokens, &cp);
             let bytes = data.len();
