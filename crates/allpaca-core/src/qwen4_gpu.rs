@@ -1442,7 +1442,31 @@ impl Qwen4Gpu {
             self.vector(&name("ssm_dt.bias"))?,
             self.vector(&name("ssm_a"))?,
         );
-        for r in 0..rows {
+        // All the pass's tokens in one go, the state kept on chip between them.
+        let mut stepped = false;
+        self.step(card, "gdn_steps", || {
+            stepped = card.hip.gdn_steps(
+                qkv,
+                alpha,
+                beta,
+                conv_w,
+                conv,
+                dt_bias,
+                a,
+                rec,
+                y,
+                dims.n_v_heads as i32,
+                dims.n_k_heads as i32,
+                dims.head_v as i32,
+                dims.head_k as i32,
+                dims.conv_kernel as i32,
+                self.eps,
+                false,
+                rows as i32,
+            )?;
+            Ok(())
+        })?;
+        for r in (0..rows).filter(|_| !stepped) {
             // SAFETY: each scratch row holds MAX_ROWS rows of at least these widths.
             let (qkv, alpha, beta, y) = unsafe {
                 (

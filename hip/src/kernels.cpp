@@ -3215,18 +3215,16 @@ static bool kq_wave64() {
 
 /* Lanes per output column of the int8 K-quant GEMV. On the MI50 narrow
  * outputs left most CUs idle at 8 (Q3_K 640x2560 15 -> 8.5 us at 32) and
- * Q6_K ran at half speed (2560x6144 69 -> 34 us at 32; 8 rows 228 -> 175 us);
- * Q4_K/Q5_K gain a little at 16. The choice depends on the weight and the
- * card only, so every row count sums a column in the same order. */
+ * Q6_K ran at half speed (2560x6144 69 -> 34 us at 32; 16 rows 243 -> 289 us).
+ * Q4_K/Q5_K stay at 8: 16 lanes saved 3-4 us a token but cost 16-row passes
+ * ~1.8x. The choice depends on the weight and the card only, so every row
+ * count sums a column in the same order. */
 static int kq_i8_lanes(int qt, int n) {
     if ((qt < 3 || qt > 6) || !kq_wave64()) {
         return 8;
     }
     if (n < 2048 || (qt == 6 && n < 7680)) {
         return 32;
-    }
-    if ((qt == 4 || qt == 5) && n < 7680) {
-        return 16;
     }
     return 8;
 }
@@ -7798,6 +7796,213 @@ extern "C" int allpaca_gdn_step_fused(const float *qkv, const float *conv_w, flo
     return hip_status(hipGetLastError());
 }
 
+/* gdn_step_prep_kernel for `rows` tokens in order, in place: x[r] (qkv_dim)
+ * becomes the token's conv output, alpha[r] (n_v) its decay and beta[r] its
+ * sigmoid; each channel walks the tokens with its own history. */
+__global__ void gdn_steps_prep_kernel(float *x, const float *kernel, float *conv_state,
+                                      int qkv_dim, int conv_kernel, float *alpha,
+                                      const float *dt_bias, const float *a, float *beta, int n_v,
+                                      int rows) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= qkv_dim) {
+        const int h = i - qkv_dim;
+        if (h < n_v) {
+            for (int r = 0; r < rows; ++r) {
+                const size_t at = static_cast<size_t>(r) * n_v + h;
+                alpha[at] = expf(gdn_softplus(alpha[at] + dt_bias[h]) * a[h]);
+                beta[at] = 1.0f / (1.0f + expf(-beta[at]));
+            }
+        }
+        return;
+    }
+    const int c = i;
+    const int hist = conv_kernel - 1;
+    for (int r = 0; r < rows; ++r) {
+        float *xr = x + static_cast<size_t>(r) * qkv_dim;
+        const float in = xr[c];
+        float acc = 0.0f;
+        for (int j = 0; j < hist; ++j) {
+            acc += kernel[j + c * conv_kernel] * conv_state[j * qkv_dim + c];
+        }
+        acc += kernel[(conv_kernel - 1) + c * conv_kernel] * in;
+        xr[c] = gdn_silu(acc);
+        if (hist > 0) {
+            for (int j = 0; j < hist - 1; ++j) {
+                conv_state[j * qkv_dim + c] = conv_state[(j + 1) * qkv_dim + c];
+            }
+            conv_state[(hist - 1) * qkv_dim + c] = in;
+        }
+    }
+}
+
+/* gdn_qk_l2norm_kernel on token blockIdx.y's q and k, `stride` floats apart. */
+__global__ void gdn_qk_l2norm_rows_kernel(float *q, float *k, int n_heads, int head_k, float eps,
+                                          int stride) {
+    const size_t off = static_cast<size_t>(blockIdx.y) * static_cast<size_t>(stride);
+    const int h = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (h >= n_heads) {
+        return;
+    }
+    float *q_h = q + off + static_cast<size_t>(h) * head_k;
+    float *k_h = k + off + static_cast<size_t>(h) * head_k;
+    float ss_q = 0.f, ss_k = 0.f;
+    for (int j = lane; j < head_k; j += 32) {
+        ss_q += q_h[j] * q_h[j];
+        ss_k += k_h[j] * k_h[j];
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        ss_q += __shfl_xor(ss_q, o, 32);
+        ss_k += __shfl_xor(ss_k, o, 32);
+    }
+    const float sq = rsqrtf(ss_q + eps) * rsqrtf(static_cast<float>(head_k));
+    const float sk = rsqrtf(ss_k + eps);
+    for (int j = lane; j < head_k; j += 32) {
+        q_h[j] *= sq;
+        k_h[j] *= sk;
+    }
+}
+
+/* gated_delta_step_warp_kernel for `rows` tokens in order: a warp keeps its
+ * state rows in registers across the tokens, so the state is read and
+ * written once a pass, not once a token. Token r's q, k and v start at
+ * qkv + r * stride; its decay and beta at r * n_v_heads; its output at
+ * out + r * n_v_heads * head_v. Each token's arithmetic is the one-token
+ * kernel's, so a pass gives the bits its tokens give one at a time. */
+template <int NJ>
+__global__ void gated_delta_steps_warp_kernel(const float *qkv, int stride, int key_dim,
+                                              const float *decay, const float *beta,
+                                              float *state, float *out, int n_v_heads,
+                                              int head_v, int head_k, int n_k, int interleave,
+                                              int rows) {
+    const int h = static_cast<int>(blockIdx.x);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    if (h >= n_v_heads) {
+        return;
+    }
+    const int kh = n_k > 0 ? (interleave ? h / (n_v_heads / n_k) : h % n_k) : h;
+    const int row0 = (static_cast<int>(blockIdx.y) * GDN_WARPS + warp) * GDN_ROWS_PER_WARP;
+    float st[GDN_ROWS_PER_WARP][NJ];
+#pragma unroll
+    for (int r = 0; r < GDN_ROWS_PER_WARP; ++r) {
+        const int i = row0 + r;
+#pragma unroll
+        for (int t = 0; t < NJ; ++t) {
+            st[r][t] = i < head_v
+                           ? state[(static_cast<size_t>(h) * head_v + i) * head_k + lane * NJ + t]
+                           : 0.f;
+        }
+    }
+    for (int tok = 0; tok < rows; ++tok) {
+        const float *base = qkv + static_cast<size_t>(tok) * static_cast<size_t>(stride);
+        const float *q_h = base + static_cast<size_t>(kh) * head_k + lane * NJ;
+        const float *k_h = base + key_dim + static_cast<size_t>(kh) * head_k + lane * NJ;
+        const float *v = base + 2 * static_cast<size_t>(key_dim);
+        float qv[NJ], kv[NJ];
+#pragma unroll
+        for (int t = 0; t < NJ; ++t) {
+            qv[t] = q_h[t];
+            kv[t] = k_h[t];
+        }
+        const float g = decay[static_cast<size_t>(tok) * n_v_heads + h];
+        const float b = beta[static_cast<size_t>(tok) * n_v_heads + h];
+        float *out_t = out + static_cast<size_t>(tok) * n_v_heads * head_v;
+#pragma unroll
+        for (int r = 0; r < GDN_ROWS_PER_WARP; ++r) {
+            const int i = row0 + r;
+            if (i >= head_v) {
+                break;
+            }
+            float s[NJ];
+            float acc = 0.f;
+#pragma unroll
+            for (int t = 0; t < NJ; ++t) {
+                s[t] = st[r][t] * g;
+                acc += s[t] * kv[t];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                acc += __shfl_xor(acc, o, 32);
+            }
+            const float delta = b * (v[static_cast<size_t>(h) * head_v + i] - acc);
+            float y = 0.f;
+#pragma unroll
+            for (int t = 0; t < NJ; ++t) {
+                s[t] += delta * kv[t];
+                st[r][t] = s[t];
+                y += s[t] * qv[t];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                y += __shfl_xor(y, o, 32);
+            }
+            if (lane == 0) {
+                out_t[static_cast<size_t>(h) * head_v + i] = y;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < GDN_ROWS_PER_WARP; ++r) {
+        const int i = row0 + r;
+        if (i < head_v) {
+#pragma unroll
+            for (int t = 0; t < NJ; ++t) {
+                state[(static_cast<size_t>(h) * head_v + i) * head_k + lane * NJ + t] = st[r][t];
+            }
+        }
+    }
+}
+
+/* allpaca_gdn_step_fused for `rows` tokens in three launches, in place:
+ * qkv[r] (2 * n_k * head_k + n_v * head_v floats) becomes the token's
+ * normed conv output, alpha[r] (n_v) its decay, beta[r] its sigmoid; out[r]
+ * gets n_v * head_v. Bit-identical to `rows` one-token steps. */
+extern "C" int allpaca_gdn_steps(float *qkv, const float *conv_w, float *conv_state, float *alpha,
+                                 const float *dt_bias, const float *a, float *beta, float *state,
+                                 float *out, int32_t n_v, int32_t n_k, int32_t head_v,
+                                 int32_t head_k, int32_t conv_kernel, float eps,
+                                 int32_t interleave, int32_t rows, allpaca_stream_t stream) {
+    const int nj = head_k % 32 == 0 ? head_k / 32 : 0;
+    if (!qkv || !conv_w || !conv_state || !alpha || !dt_bias || !a || !beta || !state || !out ||
+        n_v <= 0 || n_k <= 0 || n_v % n_k != 0 || head_v <= 0 || conv_kernel <= 0 || rows <= 0 ||
+        !(nj == 1 || nj == 2 || nj == 4 || nj == 8)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipStream_t s = as_stream(stream);
+    const int key_dim = n_k * head_k;
+    const int qkv_dim = 2 * key_dim + n_v * head_v;
+    const int threads = 256;
+    const int blocks = (qkv_dim + n_v + threads - 1) / threads;
+    hipLaunchKernelGGL(gdn_steps_prep_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, s, qkv, conv_w, conv_state,
+                       qkv_dim, conv_kernel, alpha, dt_bias, a, beta, n_v, rows);
+    hipLaunchKernelGGL(gdn_qk_l2norm_rows_kernel,
+                       dim3(static_cast<unsigned>(n_k), static_cast<unsigned>(rows)), dim3(32), 0,
+                       s, qkv, qkv + key_dim, n_k, head_k, eps, qkv_dim);
+    constexpr int rows_per_block = GDN_WARPS * GDN_ROWS_PER_WARP;
+    const dim3 grid(static_cast<unsigned>(n_v),
+                    static_cast<unsigned>((head_v + rows_per_block - 1) / rows_per_block));
+    const dim3 block(32 * GDN_WARPS);
+#define GDN_STEPS(NJV)                                                                             \
+    hipLaunchKernelGGL(gated_delta_steps_warp_kernel<NJV>, grid, block, 0, s, qkv, qkv_dim,      \
+                       key_dim, alpha, beta, state, out, n_v, head_v, head_k, n_k, interleave,   \
+                       rows)
+    if (nj == 1) {
+        GDN_STEPS(1);
+    } else if (nj == 2) {
+        GDN_STEPS(2);
+    } else if (nj == 4) {
+        GDN_STEPS(4);
+    } else {
+        GDN_STEPS(8);
+    }
+#undef GDN_STEPS
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state,
                                        float *out, int32_t qkv_dim, int32_t conv_kernel,
                                        allpaca_stream_t stream) {
@@ -10091,6 +10296,13 @@ extern "C" int allpaca_gdn_step_fused(const float *, const float *, float *, flo
                                       const float *, const float *, const float *, float *, float *,
                                       float *, float *, int32_t, int32_t, int32_t, int32_t, int32_t,
                                       float, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gdn_steps(float *, const float *, float *, float *, const float *,
+                                 const float *, float *, float *, float *, int32_t, int32_t,
+                                 int32_t, int32_t, int32_t, float, int32_t, int32_t,
+                                 allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
