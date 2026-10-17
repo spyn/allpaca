@@ -2708,8 +2708,12 @@ mod tests {
             forward_qwen4_token(&model, token, pos, &mut logits, &mut mem).expect("forward");
             pos += 1;
             if pos == ids.len() {
+                // Only the top five are needed; sorting the whole vocabulary
+                // took as long as the forward on a slow CPU.
                 let mut order: Vec<usize> = (0..logits.len()).collect();
-                order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]));
+                let by_logit = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
+                order.select_nth_unstable_by(4, by_logit);
+                order[..5].sort_by(by_logit);
                 let top: Vec<(usize, f32, String)> =
                     order[..5].iter().map(|i| (*i, logits[*i], tok.decode_one(*i as u32))).collect();
                 eprintln!("Q4X pos {pos} ({:.3}s) top {top:?}", t.elapsed().as_secs_f32());
