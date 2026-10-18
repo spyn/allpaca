@@ -8,6 +8,7 @@
 use allpaca_cpu::{attention, matmul_nt, rope_imrope_neox};
 use allpaca_types::{AllpacaError, FatalError};
 
+use crate::calib::{Site, Tap};
 use crate::deltanet::{
     conv1d_step, decay_from_alpha, deinterleave_q_gate, expand_k_heads_as, gated_delta_step_eps, rmsnorm_heads, sigmoid,
     silu,
@@ -22,15 +23,18 @@ fn gemv(x: &[f32], w: &[f32], n: usize) -> Result<Vec<f32>, AllpacaError> {
 
 /// The gated delta-net step for one token: `x` is the block's normed
 /// input; `state` and `conv` the layer's recurrent state and conv history
-/// (sized on first use). Returns what the block adds to the residual.
+/// (sized on first use); `tap` records block `blk`'s matrix inputs.
+/// Returns what the block adds to the residual.
 pub(crate) fn gdn_step(
     gdn: &GdnHostWeights,
     cfg: &ModelConfig,
     x: &[f32],
     state: &mut Vec<f32>,
     conv_history: &mut Vec<f32>,
+    (tap, blk): (&Tap, usize),
 ) -> Result<Vec<f32>, AllpacaError> {
     let dims = &gdn.dims;
+    tap.observe(blk, Site::AttnIn, x);
     let qkv = gemv(x, &gdn.w_qkv, dims.qkv_dim)?;
     let z = gemv(x, &gdn.w_z, dims.value_dim)?;
     let alpha = gemv(x, &gdn.w_alpha, dims.n_v_heads)?;
@@ -68,6 +72,7 @@ pub(crate) fn gdn_step(
     for (y, z) in y.iter_mut().zip(&z) {
         *y *= silu(*z);
     }
+    tap.observe(blk, Site::AttnOut, &y);
     gemv(&y, &gdn.w_out, cfg.dim)
 }
 
@@ -79,7 +84,8 @@ pub(crate) fn is_gated_attention(cfg: &ModelConfig, layer: &LayerWeights) -> boo
 }
 
 /// Gated full attention for the token at `pos`: `x` is the block's normed
-/// input; `keys` and `values` the layer's cache, which this extends.
+/// input; `keys` and `values` the layer's cache, which this extends; `tap`
+/// records block `blk`'s matrix inputs.
 pub(crate) fn gated_attention_step(
     layer: &LayerWeights,
     cfg: &ModelConfig,
@@ -87,8 +93,10 @@ pub(crate) fn gated_attention_step(
     pos: usize,
     keys: &mut Vec<f32>,
     values: &mut Vec<f32>,
+    (tap, blk): (&Tap, usize),
 ) -> Result<Vec<f32>, AllpacaError> {
     let (head_dim, n_heads, n_kv) = (cfg.head_dim(), cfg.n_heads, cfg.n_kv_heads.max(1));
+    tap.observe(blk, Site::AttnIn, x);
     let q_full = gemv(x, &layer.wq, n_heads * head_dim * 2)?;
     let mut q = vec![0.0f32; n_heads * head_dim];
     let mut gate = vec![0.0f32; n_heads * head_dim];
@@ -114,5 +122,6 @@ pub(crate) fn gated_attention_step(
     for (o, g) in out.iter_mut().zip(&gate) {
         *o *= sigmoid(*g);
     }
+    tap.observe(blk, Site::AttnOut, &out);
     gemv(&out, &layer.wo, cfg.dim)
 }
