@@ -202,12 +202,17 @@ impl Refit {
 }
 
 /// The matrices of a block by the input they read, in the order the data
-/// flows through the block.
-const STAGES: [(Site, &[&str]); 4] = [
-    (Site::AttnIn, &["attn_q", "attn_k", "attn_v"]),
-    (Site::AttnOut, &["attn_output"]),
+/// flows through the block: attention or the delta-net, then the dense
+/// feed-forward or the shared expert. Routed experts are not here (their
+/// stack's recorded inputs are not split by expert), nor is the router (the
+/// probe cannot swap it): both are quantised alone.
+const STAGES: [(Site, &[&str]); 6] = [
+    (Site::AttnIn, &["attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta"]),
+    (Site::AttnOut, &["attn_output", "ssm_out"]),
     (Site::FfnIn, &["ffn_gate", "ffn_up"]),
     (Site::FfnAct, &["ffn_down"]),
+    (Site::ShexpIn, &["ffn_gate_shexp", "ffn_up_shexp"]),
+    (Site::ShexpAct, &["ffn_down_shexp"]),
 ];
 
 /// Quantise the block matrices of the model at `input` in order, each for

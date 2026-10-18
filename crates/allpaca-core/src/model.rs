@@ -2707,6 +2707,30 @@ pub(crate) fn expert_mlp_rows(
     matmul_nt(&gate, &ffn.w_down, out, m, dim, ff_dim)
 }
 
+/// What an expert's down projection reads for input `x`: its gated
+/// activations ([`expert_mlp`] without the last product).
+pub(crate) fn expert_activations(
+    x: &[f32],
+    ffn: &LayerFfn,
+    ff_dim: usize,
+    dim: usize,
+    relu_sqr_act: bool,
+) -> Result<Vec<f32>, AllpacaError> {
+    let mut up = vec![0.0f32; ff_dim];
+    matmul_nt(x, &ffn.w_up, &mut up, 1, ff_dim, dim)?;
+    if ffn.w_gate.is_empty() {
+        let act = if relu_sqr_act { relu_sqr } else { silu };
+        up.iter_mut().for_each(|v| *v = act(*v));
+        return Ok(up);
+    }
+    let mut gate = vec![0.0f32; ff_dim];
+    matmul_nt(x, &ffn.w_gate, &mut gate, 1, ff_dim, dim)?;
+    for (g, u) in gate.iter_mut().zip(&up) {
+        *g = silu(*g) * u;
+    }
+    Ok(gate)
+}
+
 pub(crate) fn measure_expert_host_bandwidth(ffn: &LayerFfn, ff_dim: usize, dim: usize) -> f64 {
     use std::time::Instant;
     if ffn.bytes() == 0 || dim == 0 || ff_dim == 0 {
@@ -5185,6 +5209,7 @@ impl TinyModel {
                 self.prefetch_moe_layers(layer_idx)?;
             }
             rmsnorm(x, &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
+            self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::FfnIn, &scratch[..dim]);
             let moe_out = self.moe_hidden(layer_idx, layer, &scratch[..dim])?;
             for i in 0..dim {
                 x[i] += moe_out[i];
@@ -5295,6 +5320,14 @@ impl TinyModel {
             } else {
                 host
             };
+            if self.calib.wants() {
+                // The output moves by the routing weight times the
+                // expert's own error: weigh its inputs by its square.
+                let blk = cfg.gguf_blk(layer_idx);
+                let act = expert_activations(x_norm, &ffn, cfg.ff_dim, dim, cfg.moe_relu_sqr)?;
+                self.calib.observe_weighted(blk, crate::calib::Site::ExpIn, x_norm, w * w);
+                self.calib.observe_weighted(blk, crate::calib::Site::ExpAct, &act, w * w);
+            }
             self.run_expert_mlp_numa(id, x_norm, &ffn, cfg.ff_dim, dim, &mut scratch_h, None)?;
             for i in 0..dim {
                 acc[i] += w * scratch_h[i];
@@ -5321,6 +5354,12 @@ impl TinyModel {
             } else {
                 1.0
             };
+            if self.calib.wants() {
+                let blk = cfg.gguf_blk(layer_idx);
+                let act = expert_activations(x_norm, &layer.shared_expert, sff, dim, cfg.moe_relu_sqr)?;
+                self.calib.observe_weighted(blk, crate::calib::Site::ShexpIn, x_norm, gate * gate);
+                self.calib.observe_weighted(blk, crate::calib::Site::ShexpAct, &act, gate * gate);
+            }
             for i in 0..dim {
                 acc[i] += gate * scratch_h[i];
             }
@@ -7710,6 +7749,7 @@ impl TinyModel {
                         &scratch[..dim],
                         &mut state.gdn_state[layer_idx],
                         &mut state.gdn_conv[layer_idx],
+                        (&self.calib, cfg.gguf_blk(layer_idx)),
                     )?;
                     for i in 0..dim {
                         x[i] += out[i];
@@ -7812,7 +7852,15 @@ impl TinyModel {
                     state.host_kv.resize(layer_idx + 1, Default::default());
                 }
                 let (keys, values) = &mut state.host_kv[layer_idx];
-                let out = crate::qwen35_host::gated_attention_step(layer, cfg, &scratch[..dim], pos, keys, values)?;
+                let out = crate::qwen35_host::gated_attention_step(
+                    layer,
+                    cfg,
+                    &scratch[..dim],
+                    pos,
+                    keys,
+                    values,
+                    (&self.calib, cfg.gguf_blk(layer_idx)),
+                )?;
                 for i in 0..dim {
                     x[i] += out[i];
                 }
