@@ -436,6 +436,11 @@ impl Qwen4Memory {
         self.tokens.len()
     }
 
+    /// The tokens this memory has read, in order.
+    pub(crate) fn token_ids(&self) -> &[i64] {
+        &self.tokens
+    }
+
     /// A copy for the prompt cache that holds nothing on the cards: the
     /// device state is read back to the host, and the state on a worker
     /// that hosts blocks is kept there ([`crate::qwen4_remote::RemoteSaved`]).
