@@ -353,6 +353,23 @@ int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int3
 int allpaca_gather_rows(float *dst, const float *src, const int32_t *rows, int32_t n,
                         int32_t row_len, allpaca_stream_t stream);
 
+/* QSA indexer: pools [first, first + n) of `ratio` raw keys each (dim
+ * floats per key), their mean normed with `gain` and rotated to the pool's
+ * first position, into pooled[pool * dim]. */
+int allpaca_qsa_pool(const float *raw, const float *gain, float *pooled, int32_t first, int32_t n,
+                     int32_t ratio, int32_t dim, int32_t n_rot, float theta, const int32_t sections[4],
+                     float eps, allpaca_stream_t stream);
+
+/* QSA indexer selection for `rows` tokens from position `pos`: q (rows x
+ * heads x dim) is normed and rotated in place, the visible pooled keys are
+ * scored into scores (score_stride per row), and each row that sees more
+ * than top_pools pools gets its cells (best pools ascending, ratio cells
+ * each, then the incomplete tail) at cells[row * stride]. */
+int allpaca_qsa_select(float *q, const float *gain, const float *pooled, float *scores, int32_t *cells,
+                       int32_t rows, int32_t pos, int32_t heads, int32_t dim, int32_t n_rot, float theta,
+                       const int32_t sections[4], float eps, int32_t ratio, int32_t top_pools, int32_t stride,
+                       int32_t score_stride, allpaca_stream_t stream);
+
 /* x[i] *= sigmoid(gate[i]) in place. */
 int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n, allpaca_stream_t stream);
 
