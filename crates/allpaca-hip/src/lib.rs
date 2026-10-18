@@ -18064,7 +18064,7 @@ mod tests {
             (17, 50, 2, 2, 96, true),
             (11, 70, 4, 4, 256, true),
             (6, 33, 4, 2, 128, false),
-            // Several 256-key chunks: one-row calls fold them in parallel
+            // Several 128-key chunks: one-row calls fold them in parallel
             // (split + merge), multi-row calls fold them in the Q-tiled kernel.
             (5, 1000, 8, 2, 128, true),
             (3, 2049, 4, 4, 64, true),
@@ -18073,6 +18073,8 @@ mod tests {
             // One-row calls share each key among the query heads of a
             // key/value head, 8 to a block: 10 per head leaves a part block.
             (3, 600, 20, 2, 256, true),
+            // A head dim the float4 path cannot take.
+            (7, 300, 4, 2, 6, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()
