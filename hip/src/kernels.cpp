@@ -1551,6 +1551,75 @@ __global__ void __launch_bounds__(32) attention_split_kernel(const float *q, con
     }
 }
 
+/* Query heads per attention_split_gqa_kernel block (a warp each). */
+constexpr int ATTN_GQA_HEADS = 8;
+
+/* attention_split_kernel for one query whose heads share key/value heads:
+ * a block takes up to ATTN_GQA_HEADS query heads of one key/value head and
+ * one chunk, stages `tile` keys of K and V in LDS at a time, and every warp
+ * steps its row from there, so each key is read once per block instead of
+ * once per query head. Per row, the steps and their order are those of
+ * attention_split_kernel, and the partials go to the same place. */
+__global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kernel(
+    const float *q, const float *k, const float *v, float *part, int n_kv, int n_heads, int n_kv_heads,
+    int head_dim, int causal, const uint8_t *mask, const float *sinks, int n_chunks, int tile) {
+    extern __shared__ float attn_lds[];
+    float *k_lds = attn_lds;
+    float *v_lds = attn_lds + static_cast<size_t>(tile) * head_dim;
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int per_kv = n_heads / n_kv_heads;
+    const int groups = (per_kv + ATTN_GQA_HEADS - 1) / ATTN_GQA_HEADS;
+    const int kv_h = static_cast<int>(blockIdx.x) / groups;
+    const int h0 = kv_h * per_kv + (static_cast<int>(blockIdx.x) % groups) * ATTN_GQA_HEADS;
+    const int h_end = min(kv_h * per_kv + per_kv, h0 + ATTN_GQA_HEADS);
+    const int h = h0 + warp;
+    const bool active = h < h_end;
+    const int c = static_cast<int>(blockIdx.y);
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int t_max = attn_row_tmax(0, 1, n_kv, causal);
+    const float *qh = q + static_cast<size_t>(active ? h : h0) * head_dim;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+    const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
+                      (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
+    const int nvec = vec4 ? head_dim / 4 : head_dim;
+    AttnRow r;
+    attn_row_init(r, qh, lane, head_dim, nvec, vec4, c == 0 ? sinks : nullptr, active ? h : h0);
+    const int t_end = mask ? n_kv : min(n_kv, t_max + 1);
+    const int t1 = min(t_end, (c + 1) * ATTN_CHUNK);
+    const int n_tile = tile * head_dim;
+    for (int t0 = c * ATTN_CHUNK; t0 < t1; t0 += tile) {
+        __syncthreads();
+        for (int e = static_cast<int>(threadIdx.x); e < n_tile; e += static_cast<int>(blockDim.x)) {
+            const int t = t0 + e / head_dim;
+            const size_t src = static_cast<size_t>(t) * kv_stride + static_cast<size_t>(kv_h) * head_dim +
+                               static_cast<size_t>(e % head_dim);
+            k_lds[e] = t < t1 ? k[src] : 0.0f;
+            v_lds[e] = t < t1 ? v[src] : 0.0f;
+        }
+        __syncthreads();
+        const int stop = min(t1, t0 + tile);
+        for (int t = t0; t < stop; ++t) {
+            const bool valid = mask ? mask[t] != 0 : t <= t_max;
+            const float *kh = k_lds + static_cast<size_t>(t - t0) * head_dim;
+            const float *vh = v_lds + static_cast<size_t>(t - t0) * head_dim;
+            attn_row_step(r, kh, vh, valid, lane, head_dim, nvec, vec4, scale);
+        }
+    }
+    if (!active) {
+        return;
+    }
+    float *dst = part + (static_cast<size_t>(h) * n_chunks + c) * ATTN_PART;
+#pragma unroll
+    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+        dst[lane * ATTN_MAX_DPT + i] = r.acc[i];
+    }
+    if (lane == 0) {
+        dst[32 * ATTN_MAX_DPT] = r.m;
+        dst[32 * ATTN_MAX_DPT + 1] = r.l;
+    }
+}
+
 /* Folds a row's chunk partials in ascending order and writes the row. */
 __global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, const float *part, float *out, int n_heads,
                                        int head_dim, int n_chunks) {
@@ -1633,10 +1702,21 @@ static void launch_attention(const float *q, const float *k, const float *v, flo
             }
             if (ok) {
                 s.stream = stream;
-                hipLaunchKernelGGL(attention_split_kernel,
-                                   dim3(1, static_cast<unsigned>(n_heads), static_cast<unsigned>(n_chunks)),
-                                   dim3(32), 0, stream, q, k, v, s.p, n_q, n_kv, n_heads, n_kv_heads,
-                                   head_dim, causal, mask, sinks, n_chunks);
+                const int per_kv = n_heads / n_kv_heads;
+                if (per_kv >= 2 && tile >= 1) {
+                    /* Heads that share a key/value head read each key once. */
+                    const int groups = (per_kv + ATTN_GQA_HEADS - 1) / ATTN_GQA_HEADS;
+                    const size_t lds = 2 * static_cast<size_t>(tile) * head_dim * sizeof(float);
+                    hipLaunchKernelGGL(attention_split_gqa_kernel,
+                                       dim3(static_cast<unsigned>(n_kv_heads * groups), static_cast<unsigned>(n_chunks)),
+                                       dim3(32 * ATTN_GQA_HEADS), lds, stream, q, k, v, s.p, n_kv, n_heads,
+                                       n_kv_heads, head_dim, causal, mask, sinks, n_chunks, tile);
+                } else {
+                    hipLaunchKernelGGL(attention_split_kernel,
+                                       dim3(1, static_cast<unsigned>(n_heads), static_cast<unsigned>(n_chunks)),
+                                       dim3(32), 0, stream, q, k, v, s.p, n_q, n_kv, n_heads, n_kv_heads,
+                                       head_dim, causal, mask, sinks, n_chunks);
+                }
                 hipLaunchKernelGGL(attention_merge_kernel, dim3(1, static_cast<unsigned>(n_heads)),
                                    dim3(32), 0, stream, q, s.p, out, n_heads, head_dim, n_chunks);
                 return;
@@ -8811,6 +8891,283 @@ extern "C" int allpaca_gather_rows(float *dst, const float *src, const int32_t *
     return hip_status(hipGetLastError());
 }
 
+/* QSA (qwen4exp sparse attention) indexer on the card.
+ * qsa_norm_rope: RMS norm with gain, then IMRoPE at `pos`, of one dim-wide
+ * vector held in LDS by a block of 256 (same reduction tree as
+ * rmsnorm_heads_kernel). */
+__device__ void qsa_norm_rope(float *v, const float *gain, int dim, int n_rot, int pos, float theta,
+                              int s0, int s1, int s2, int s3, float eps, float *red) {
+    const int tid = static_cast<int>(threadIdx.x);
+    float sum = 0.0f;
+    for (int i = tid; i < dim; i += 256) {
+        sum += v[i] * v[i];
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            red[tid] += red[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / static_cast<float>(dim) + eps);
+    for (int i = tid; i < dim; i += 256) {
+        v[i] = v[i] * inv * gain[i];
+    }
+    __syncthreads();
+    const int half = n_rot / 2;
+    for (int i = tid; i < half; i += 256) {
+        rope_imrope_pair(v, i, half, n_rot, pos, pos, pos, theta, s0, s1, s2, s3);
+    }
+    __syncthreads();
+}
+
+#define QSA_MAX_DIM 512
+
+/* Pool p of `ratio` raw keys: their mean, normed and rotated to p * ratio. */
+__global__ __launch_bounds__(256) void qsa_pool_kernel(const float *raw, const float *gain, float *pooled,
+                                                       int first, int ratio, int dim, int n_rot, float theta,
+                                                       int s0, int s1, int s2, int s3, float eps) {
+    __shared__ float v[QSA_MAX_DIM];
+    __shared__ float red[256];
+    const int pool = first + static_cast<int>(blockIdx.x);
+    const float *members = raw + static_cast<size_t>(pool) * ratio * dim;
+    const float inv = 1.0f / static_cast<float>(ratio);
+    for (int i = static_cast<int>(threadIdx.x); i < dim; i += 256) {
+        float s = 0.0f;
+        for (int m = 0; m < ratio; ++m) {
+            s += members[static_cast<size_t>(m) * dim + i];
+        }
+        v[i] = s * inv;
+    }
+    __syncthreads();
+    qsa_norm_rope(v, gain, dim, n_rot, pool * ratio, theta, s0, s1, s2, s3, eps, red);
+    for (int i = static_cast<int>(threadIdx.x); i < dim; i += 256) {
+        pooled[static_cast<size_t>(pool) * dim + i] = v[i];
+    }
+}
+
+/* Indexer query head blockIdx.x (of row blockIdx.x / heads), in place. */
+__global__ __launch_bounds__(256) void qsa_query_kernel(float *q, const float *gain, int heads, int dim, int n_rot,
+                                                        int pos, float theta, int s0, int s1, int s2, int s3,
+                                                        float eps) {
+    __shared__ float v[QSA_MAX_DIM];
+    __shared__ float red[256];
+    float *head = q + static_cast<size_t>(blockIdx.x) * dim;
+    for (int i = static_cast<int>(threadIdx.x); i < dim; i += 256) {
+        v[i] = head[i];
+    }
+    __syncthreads();
+    qsa_norm_rope(v, gain, dim, n_rot, pos + static_cast<int>(blockIdx.x) / heads, theta, s0, s1, s2, s3, eps, red);
+    for (int i = static_cast<int>(threadIdx.x); i < dim; i += 256) {
+        head[i] = v[i];
+    }
+}
+
+#define QSA_SCORE_POOLS 64
+#define QSA_SCORE_THREADS 256
+
+/* LDS of a qsa_score_kernel block: the row's queries, its pools' keys in
+ * rows padded by one float (so a thread per pool reads its own bank), and
+ * the per-head sums. */
+static size_t qsa_score_lds_bytes(int heads, int dim) {
+    return (static_cast<size_t>(heads) * dim + static_cast<size_t>(QSA_SCORE_POOLS) * (dim + 1) +
+            static_cast<size_t>(QSA_SCORE_POOLS) * heads) *
+           sizeof(float);
+}
+
+/* A pool's score for row blockIdx.y: its key against every query head,
+ * negative products dropped, the rest summed, each sum in sequence order
+ * and without fused multiply-adds (like the host's). The block's keys are
+ * staged in LDS first (coalesced reads instead of each thread walking its
+ * own key through global memory); a thread per (pool, head) product, then
+ * a thread per pool adds the heads in order. */
+__global__ __launch_bounds__(QSA_SCORE_THREADS) void qsa_score_kernel(const float *q, const float *pooled,
+                                                                      float *scores, int pos, int heads, int dim,
+                                                                      int ratio, int top_pools, int score_stride,
+                                                                      float scale) {
+    extern __shared__ float qs[];
+    const int r = static_cast<int>(blockIdx.y);
+    const int visible = (pos + r + 1) / ratio;
+    const int first = static_cast<int>(blockIdx.x) * QSA_SCORE_POOLS;
+    if (visible <= top_pools || first >= visible) {
+        return;
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+    float *ks = qs + heads * dim;
+    float *hs = ks + QSA_SCORE_POOLS * (dim + 1);
+    const float *qr = q + static_cast<size_t>(r) * heads * dim;
+    for (int i = tid; i < heads * dim; i += QSA_SCORE_THREADS) {
+        qs[i] = qr[i];
+    }
+    const int n = min(QSA_SCORE_POOLS, visible - first);
+    const float *src = pooled + static_cast<size_t>(first) * dim;
+    for (int i = tid; i < n * dim; i += QSA_SCORE_THREADS) {
+        ks[(i / dim) * (dim + 1) + i % dim] = src[i];
+    }
+    __syncthreads();
+    {
+#pragma clang fp contract(off)
+        for (int j = tid; j < QSA_SCORE_POOLS * heads; j += QSA_SCORE_THREADS) {
+            const int pool = j % QSA_SCORE_POOLS, h = j / QSA_SCORE_POOLS;
+            if (pool < n) {
+                const float *qh = qs + h * dim;
+                const float *key = ks + pool * (dim + 1);
+                float s = 0.0f;
+                for (int i = 0; i < dim; ++i) {
+                    s = s + qh[i] * key[i];
+                }
+                hs[h * QSA_SCORE_POOLS + pool] = s;
+            }
+        }
+        __syncthreads();
+        if (tid < n) {
+            float total = 0.0f;
+            for (int h = 0; h < heads; ++h) {
+                total = total + fmaxf(hs[h * QSA_SCORE_POOLS + tid], 0.0f) * scale;
+            }
+            scores[static_cast<size_t>(r) * score_stride + first + tid] = total;
+        }
+    }
+}
+
+#define QSA_SELECT_THREADS 256
+static_assert(QSA_SELECT_THREADS == 256, "a thread per histogram bin");
+
+/* Row blockIdx.x's cells: the `top_pools` best pools (of equal scores the
+ * earlier pool wins) in ascending order, `ratio` cells each, then the
+ * incomplete tail. A radix select on the scores' bits (never negative, so
+ * they order as unsigned) finds the last score kept, then a scan in pool
+ * order places the kept pools. */
+__global__ __launch_bounds__(QSA_SELECT_THREADS) void qsa_select_kernel(const float *scores, int32_t *cells, int pos,
+                                                                        int ratio, int top_pools, int stride,
+                                                                        int score_stride) {
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t scan[QSA_SELECT_THREADS];
+    __shared__ uint32_t sel[2];
+    const int r = static_cast<int>(blockIdx.x);
+    const int rank = pos + r;
+    const int visible = (rank + 1) / ratio;
+    if (visible <= top_pools) {
+        return;
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+    const uint32_t *keys = reinterpret_cast<const uint32_t *>(scores + static_cast<size_t>(r) * score_stride);
+    auto key_of = [&](int p) {
+        const uint32_t k = keys[p];
+        return (k & 0x80000000u) ? 0u : k;
+    };
+    uint32_t prefix = 0, mask = 0, remaining = static_cast<uint32_t>(top_pools);
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        hist[tid] = 0;
+        __syncthreads();
+        for (int p = tid; p < visible; p += QSA_SELECT_THREADS) {
+            const uint32_t k = key_of(p);
+            if ((k & mask) == prefix) {
+                atomicAdd(&hist[(k >> shift) & 255u], 1u);
+            }
+        }
+        __syncthreads();
+        // The bin the `remaining`-th best score falls in: thread t holds the
+        // count of bins 255 - t and up (an inclusive scan from the top).
+        scan[tid] = hist[255 - tid];
+        __syncthreads();
+        for (int off = 1; off < 256; off <<= 1) {
+            const uint32_t add = tid >= off ? scan[tid - off] : 0u;
+            __syncthreads();
+            scan[tid] += add;
+            __syncthreads();
+        }
+        const uint32_t above = tid > 0 ? scan[tid - 1] : 0u;
+        if (above < remaining && scan[tid] >= remaining) {
+            sel[0] = static_cast<uint32_t>(255 - tid);
+            sel[1] = remaining - above;
+        }
+        __syncthreads();
+        prefix |= sel[0] << shift;
+        mask |= 255u << shift;
+        remaining = sel[1];
+        __syncthreads();
+    }
+    // `prefix` is the score of the last pool kept; of that score the
+    // earliest `remaining` pools are kept.
+    const uint32_t threshold = prefix, ties = remaining;
+    uint32_t kept = 0, tied = 0;
+    for (int base = 0; base < visible; base += QSA_SELECT_THREADS) {
+        const int p = base + tid;
+        const uint32_t k = p < visible ? key_of(p) : 0u;
+        const uint32_t is_tie = (p < visible && k == threshold) ? 1u : 0u;
+        const uint32_t above = (p < visible && k > threshold) ? 1u : 0u;
+        // Inclusive scan of ties (low half) and pools above (high half).
+        scan[tid] = is_tie | (above << 16);
+        __syncthreads();
+        for (int off = 1; off < QSA_SELECT_THREADS; off <<= 1) {
+            const uint32_t add = tid >= off ? scan[tid - off] : 0u;
+            __syncthreads();
+            scan[tid] += add;
+            __syncthreads();
+        }
+        const uint32_t ties_before = tied + (scan[tid] & 0xffffu) - is_tie;
+        const bool keep = above || (is_tie && ties_before < ties);
+        if (keep) {
+            const uint32_t at = kept + (scan[tid] >> 16) - above + min(ties_before, ties) - min(tied, ties);
+            int32_t *out = cells + static_cast<size_t>(r) * stride + static_cast<size_t>(at) * ratio;
+            for (int i = 0; i < ratio; ++i) {
+                out[i] = p * ratio + i;
+            }
+        }
+        const uint32_t chunk = scan[QSA_SELECT_THREADS - 1];
+        const uint32_t chunk_ties = chunk & 0xffffu;
+        kept += (chunk >> 16) + min(tied + chunk_ties, ties) - min(tied, ties);
+        tied += chunk_ties;
+        __syncthreads();
+    }
+    for (int c = visible * ratio + tid; c <= rank; c += QSA_SELECT_THREADS) {
+        cells[static_cast<size_t>(r) * stride + top_pools * ratio + (c - visible * ratio)] = c;
+    }
+}
+
+extern "C" int allpaca_qsa_pool(const float *raw, const float *gain, float *pooled, int32_t first, int32_t n,
+                                int32_t ratio, int32_t dim, int32_t n_rot, float theta, const int32_t sections[4],
+                                float eps, allpaca_stream_t stream) {
+    if (!raw || !gain || !pooled || !sections || first < 0 || n <= 0 || ratio <= 0 || dim <= 0 ||
+        dim > QSA_MAX_DIM || n_rot <= 0 || n_rot > dim || (n_rot & 1) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(qsa_pool_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, as_stream(stream), raw, gain,
+                       pooled, first, ratio, dim, n_rot, theta, sections[0], sections[1], sections[2], sections[3],
+                       eps);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_qsa_select(float *q, const float *gain, const float *pooled, float *scores, int32_t *cells,
+                                  int32_t rows, int32_t pos, int32_t heads, int32_t dim, int32_t n_rot, float theta,
+                                  const int32_t sections[4], float eps, int32_t ratio, int32_t top_pools,
+                                  int32_t stride, int32_t score_stride, allpaca_stream_t stream) {
+    const int64_t last = static_cast<int64_t>(pos) + rows;
+    if (!q || !gain || !pooled || !scores || !cells || !sections || rows <= 0 || pos < 0 || heads <= 0 ||
+        dim <= 0 || dim > QSA_MAX_DIM || n_rot <= 0 || n_rot > dim || (n_rot & 1) != 0 || ratio <= 0 ||
+        top_pools <= 0 || top_pools >= 65536 || last > INT32_MAX || stride < top_pools * ratio + ratio - 1 ||
+        score_stride < last / ratio || qsa_score_lds_bytes(heads, dim) > 65536) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const auto st = as_stream(stream);
+    hipLaunchKernelGGL(qsa_query_kernel, dim3(static_cast<unsigned>(rows * heads)), dim3(256), 0, st, q, gain, heads,
+                       dim, n_rot, pos, theta, sections[0], sections[1], sections[2], sections[3], eps);
+    const int most = static_cast<int>(last / ratio);
+    const float scale = 1.0f / sqrtf(static_cast<float>(dim));
+    hipLaunchKernelGGL(qsa_score_kernel,
+                       dim3(static_cast<unsigned>((most + QSA_SCORE_POOLS - 1) / QSA_SCORE_POOLS),
+                            static_cast<unsigned>(rows)),
+                       dim3(QSA_SCORE_THREADS), qsa_score_lds_bytes(heads, dim), st, q, pooled, scores, pos, heads, dim,
+                       ratio, top_pools, score_stride, scale);
+    hipLaunchKernelGGL(qsa_select_kernel, dim3(static_cast<unsigned>(rows)), dim3(QSA_SELECT_THREADS), 0, st, scores,
+                       cells, pos, ratio, top_pools, stride, score_stride);
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_sigmoid_mul(float *x, const float *gate, int32_t n,
                                    allpaca_stream_t stream) {
     if (!x || !gate || n <= 0) {
@@ -10622,6 +10979,17 @@ extern "C" int allpaca_sigmoid_mul(float *, const float *, int32_t, allpaca_stre
 
 extern "C" int allpaca_gather_rows(float *, const float *, const int32_t *, int32_t, int32_t,
                                    allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_qsa_pool(const float *, const float *, float *, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                float, const int32_t *, float, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_qsa_select(float *, const float *, const float *, float *, int32_t *, int32_t, int32_t,
+                                  int32_t, int32_t, int32_t, float, const int32_t *, float, int32_t, int32_t,
+                                  int32_t, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

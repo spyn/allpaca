@@ -996,6 +996,40 @@ mod ffi {
             row_len: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_qsa_pool(
+            raw: *const f32,
+            gain: *const f32,
+            pooled: *mut f32,
+            first: i32,
+            n: i32,
+            ratio: i32,
+            dim: i32,
+            n_rot: i32,
+            theta: f32,
+            sections: *const i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_qsa_select(
+            q: *mut f32,
+            gain: *const f32,
+            pooled: *const f32,
+            scores: *mut f32,
+            cells: *mut i32,
+            rows: i32,
+            pos: i32,
+            heads: i32,
+            dim: i32,
+            n_rot: i32,
+            theta: f32,
+            sections: *const i32,
+            eps: f32,
+            ratio: i32,
+            top_pools: i32,
+            stride: i32,
+            score_stride: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_scale_heads_sigmoid(
             attn: *mut f32,
             scores: *const f32,
@@ -3052,6 +3086,22 @@ impl PinnedBuf {
         }
         Ok(self.ptr)
     }
+}
+
+/// The shape of a QSA indexer (`qwen4exp` sparse attention) for
+/// [`HipWorkspace::qsa_pool_device`] and [`HipWorkspace::qsa_select_device`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QsaDims {
+    /// Cells per pool and pools a token keeps.
+    pub ratio: i32,
+    pub top_pools: i32,
+    /// Query heads and the width of a key.
+    pub heads: i32,
+    pub dim: i32,
+    pub n_rot: i32,
+    pub theta: f32,
+    pub sections: [i32; 4],
+    pub eps: f32,
 }
 
 /// A pair table built on the device by [`moe_route_softmax_topk_device`]:
@@ -12320,6 +12370,109 @@ impl HipWorkspace {
         }
     }
 
+    /// QSA indexer: pools `first..first + n` of `dims.ratio` raw keys each
+    /// (`raw`, `dims.dim` floats per token), the mean normed with `gain` and
+    /// rotated to the pool's first position, into `pooled` (a row per pool).
+    pub fn qsa_pool_device(
+        &self,
+        raw: *const f32,
+        gain: *const f32,
+        pooled: *mut f32,
+        first: i32,
+        n: i32,
+        dims: &QsaDims,
+    ) -> Result<(), AllpacaError> {
+        if raw.is_null() || gain.is_null() || pooled.is_null() || first < 0 || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("invalid qsa_pool".into())));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_qsa_pool(
+                        raw,
+                        gain,
+                        pooled,
+                        first,
+                        n,
+                        dims.ratio,
+                        dims.dim,
+                        dims.n_rot,
+                        dims.theta,
+                        dims.sections.as_ptr(),
+                        dims.eps,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "qsa_pool")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("HIP qsa_pool unavailable".into())))
+        }
+    }
+
+    /// QSA indexer selection for `rows` tokens from position `pos`: their
+    /// queries `q` (`dims.heads * dims.dim` floats a row) are normed and
+    /// rotated in place, the pooled keys each sees are scored into `scores`
+    /// (`score_stride` floats a row), and every row that sees more than
+    /// `dims.top_pools` pools gets the cells it keeps at `cells[row * stride]`:
+    /// the best pools in ascending order (of equal scores the earlier one),
+    /// `dims.ratio` cells each, then the cells that fill no pool yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_select_device(
+        &self,
+        q: *mut f32,
+        gain: *const f32,
+        pooled: *const f32,
+        scores: *mut f32,
+        cells: *mut i32,
+        rows: i32,
+        pos: i32,
+        dims: &QsaDims,
+        stride: i32,
+        score_stride: i32,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || gain.is_null() || pooled.is_null() || scores.is_null() || cells.is_null() || rows <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("invalid qsa_select".into())));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_qsa_select(
+                        q,
+                        gain,
+                        pooled,
+                        scores,
+                        cells,
+                        rows,
+                        pos,
+                        dims.heads,
+                        dims.dim,
+                        dims.n_rot,
+                        dims.theta,
+                        dims.sections.as_ptr(),
+                        dims.eps,
+                        dims.ratio,
+                        dims.top_pools,
+                        stride,
+                        score_stride,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "qsa_select")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("HIP qsa_select unavailable".into())))
+        }
+    }
+
     pub fn sigmoid_mul_device(
         &self,
         x: *mut f32,
@@ -17353,6 +17506,138 @@ mod tests {
         }
     }
 
+    /// The QSA indexer on the card keeps the cells the host's rule keeps:
+    /// scores in sequence order (bit for bit from the card's own normed
+    /// queries), the best pools ascending with the earlier of equal scores,
+    /// then the tail. Ties straddle the select kernel's 1024-pool chunks,
+    /// and a zero query scores every pool the same. Pooling and the query
+    /// rotation stay near a host computation.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qsa_selection_on_the_card_keeps_the_host_rule_cells() {
+        if device_count() == 0 {
+            return;
+        }
+        let ws = HipWorkspace::new(0, 1 << 20, 16).unwrap();
+        let (heads, dim, n_rot) = (2usize, 64usize, 32usize);
+        let wave = |i: usize, seed: f32| ((i as f32 * 0.61 + seed).sin() * 1.7 + (i as f32 * 0.13).cos()) * 0.5;
+        let rope = |v: &mut [f32], pos: usize| {
+            let half = n_rot / 2;
+            for i in 0..half {
+                let angle = pos as f32 * 10000f32.powf(-2.0 * i as f32 / n_rot as f32);
+                let (s, c) = (angle as f64).sin_cos();
+                let (a, b) = (v[i] as f64, v[i + half] as f64);
+                v[i] = (a * c - b * s) as f32;
+                v[i + half] = (a * s + b * c) as f32;
+            }
+        };
+        let norm = |v: &mut [f32], gain: &[f32]| {
+            let inv = 1.0 / (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32 + 1e-6).sqrt();
+            v.iter_mut().zip(gain).for_each(|(x, g)| *x *= inv * g);
+        };
+        let gain: Vec<f32> = (0..dim).map(|i| 0.8 + 0.01 * i as f32).collect();
+        for (pos, rows, top_pools, period) in [(33usize, 4usize, 8usize, 5usize), (5000, 3, 300, 97), (5000, 2, 8, 3)] {
+            let dims = QsaDims {
+                ratio: 4,
+                top_pools: top_pools as i32,
+                heads: heads as i32,
+                dim: dim as i32,
+                n_rot: n_rot as i32,
+                theta: 10000.0,
+                sections: [0; 4],
+                eps: 1e-6,
+            };
+            let tokens = pos + rows;
+            let n_pools = tokens / 4;
+            let raw: Vec<f32> = (0..tokens * dim).map(|i| wave(i, 0.3)).collect();
+            let raw_d = DeviceWeights::upload(0, &[&raw]).unwrap();
+            let gain_d = DeviceWeights::upload(0, &[&gain]).unwrap();
+            let pooled_d = DeviceWeights::alloc(0, n_pools * dim * 4).unwrap();
+            ws.qsa_pool_device(raw_d.ptr_at(0), gain_d.ptr_at(0), pooled_d.ptr_at(0).cast_mut(), 0, n_pools as i32, &dims)
+                .unwrap();
+            let mut pooled = vec![0.0f32; n_pools * dim];
+            ws.copy_d2h_f32(pooled_d.ptr_at(0), &mut pooled).unwrap();
+            for p in [0, 1, n_pools - 1] {
+                let mut want: Vec<f32> =
+                    (0..dim).map(|i| (0..4).map(|m| raw[(p * 4 + m) * dim + i]).sum::<f32>() / 4.0).collect();
+                norm(&mut want, &gain);
+                rope(&mut want, p * 4);
+                let got = &pooled[p * dim..(p + 1) * dim];
+                let err = want.iter().zip(got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(err < 1e-4, "pool {p} is {err} from the host's");
+            }
+            // Ties need equal pooled keys: every pool repeats one of the
+            // first `period`.
+            for p in period..n_pools {
+                pooled.copy_within((p % period) * dim..(p % period + 1) * dim, p * dim);
+            }
+            ws.copy_h2d_f32(pooled_d.ptr_at(0).cast_mut(), &pooled).unwrap();
+            // The last row's query is zero: every pool scores 0.
+            let mut q: Vec<f32> = (0..rows * heads * dim).map(|i| wave(i, 1.1)).collect();
+            q[(rows - 1) * heads * dim..].fill(0.0);
+            let q_host = q.clone();
+            let stride = top_pools * 4 + 3;
+            let (q_d, scores_d) = (DeviceWeights::upload(0, &[&q]).unwrap(), DeviceWeights::alloc(0, rows * n_pools * 4).unwrap());
+            let cells_d = DeviceWeights::alloc(0, rows * stride * 4).unwrap();
+            ws.qsa_select_device(
+                q_d.ptr_at(0).cast_mut(),
+                gain_d.ptr_at(0),
+                pooled_d.ptr_at(0),
+                scores_d.ptr_at(0).cast_mut(),
+                cells_d.ptr_at(0).cast_mut().cast(),
+                rows as i32,
+                pos as i32,
+                &dims,
+                stride as i32,
+                n_pools as i32,
+            )
+            .unwrap();
+            ws.copy_d2h_f32(q_d.ptr_at(0), &mut q).unwrap();
+            let (mut scores, mut cell_bits) = (vec![0.0f32; rows * n_pools], vec![0.0f32; rows * stride]);
+            ws.copy_d2h_f32(scores_d.ptr_at(0), &mut scores).unwrap();
+            ws.copy_d2h_f32(cells_d.ptr_at(0), &mut cell_bits).unwrap();
+            for r in 0..rows {
+                let rank = pos + r;
+                let mut want_q = q_host[r * heads * dim..(r + 1) * heads * dim].to_vec();
+                for head in want_q.chunks_mut(dim) {
+                    norm(head, &gain);
+                    rope(head, rank);
+                }
+                let got_q = &q[r * heads * dim..(r + 1) * heads * dim];
+                let err = want_q.iter().zip(got_q).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(err < 1e-4, "row {r}: query is {err} from the host's");
+                let visible = (rank + 1) / 4;
+                if visible <= top_pools {
+                    continue;
+                }
+                let scale = 1.0 / (dim as f32).sqrt();
+                let want_scores: Vec<f32> = (0..visible)
+                    .map(|p| {
+                        let key = &pooled[p * dim..(p + 1) * dim];
+                        got_q.chunks(dim).fold(0.0f32, |t, h| {
+                            t + h.iter().zip(key).fold(0.0f32, |s, (a, b)| s + a * b).max(0.0) * scale
+                        })
+                    })
+                    .collect();
+                let got_scores = &scores[r * n_pools..r * n_pools + visible];
+                assert_eq!(
+                    want_scores.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    got_scores.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "row {r}: scores"
+                );
+                let mut order: Vec<usize> = (0..visible).collect();
+                order.sort_by(|a, b| want_scores[*b].total_cmp(&want_scores[*a]).then(a.cmp(b)));
+                let mut pools = order[..top_pools].to_vec();
+                pools.sort_unstable();
+                let mut want: Vec<i32> = pools.iter().flat_map(|p| (0..4).map(move |i| (p * 4 + i) as i32)).collect();
+                want.extend((visible * 4..=rank).map(|c| c as i32));
+                let got: Vec<i32> =
+                    cell_bits[r * stride..r * stride + want.len()].iter().map(|v| v.to_bits() as i32).collect();
+                assert_eq!(got, want, "pos {pos}, row {r}: cells");
+            }
+        }
+    }
+
     /// Prefill passes of 9+ rows take the LDS-tiled int8 K-quant GEMV on
     /// wave64 cards: every row must still match its single-row result bit for
     /// bit, at both lane counts (narrow and wide outputs) and across tiles.
@@ -17785,6 +18070,9 @@ mod tests {
             (3, 2049, 4, 4, 64, true),
             (2, 700, 4, 1, 128, false),
             (9, 513, 2, 2, 96, true),
+            // One-row calls share each key among the query heads of a
+            // key/value head, 8 to a block: 10 per head leaves a part block.
+            (3, 600, 20, 2, 256, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()

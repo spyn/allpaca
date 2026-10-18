@@ -54,7 +54,7 @@ const BLOCK_MATRICES: [&str; 24] = [
     "ple_value.weight",
 ];
 /// F32 vectors of a block the kernels read.
-const BLOCK_VECTORS: [&str; 12] = [
+const BLOCK_VECTORS: [&str; 14] = [
     "hc_attn_norm.weight",
     "hc_ffn_norm.weight",
     "attn_q_norm.weight",
@@ -67,9 +67,9 @@ const BLOCK_VECTORS: [&str; 12] = [
     "ple_norm_query.weight",
     "ple_norm_conv.weight",
     "ple_conv1d.weight",
+    "indexer.q_norm.weight",
+    "indexer.k_norm.weight",
 ];
-/// F32 vectors of a block the host reads (the indexer's norm gains).
-const HOST_VECTORS: [&str; 2] = ["indexer.q_norm.weight", "indexer.k_norm.weight"];
 const GLOBAL_MATRICES: [&str; 3] = ["output.weight", "output_hc_down.weight", "output_hc_up.weight"];
 const GLOBAL_VECTORS: [&str; 1] = ["output_hc_norm.weight"];
 /// VRAM left free on a card after the blocks are placed.
@@ -413,9 +413,11 @@ fn place(
 #[derive(Default)]
 pub struct Qwen4DeviceState {
     blocks: Vec<BlockState>,
-    /// Per device, once an attention is sparse: the cells a token keeps
-    /// (row numbers, then their keys, then their values).
+    /// Per device, once an attention is sparse: the cells the tokens of a
+    /// pass keep (row numbers), then one token's keys and values of them.
     picked: HashMap<i32, DeviceWeights>,
+    /// Per device: the indexer's pool scores for the tokens of a pass.
+    scores: HashMap<i32, DeviceWeights>,
     /// The n-gram block's conv history, once a pass has run it.
     ple: Option<DeviceWeights>,
 }
@@ -429,8 +431,11 @@ struct BlockState {
     /// Raw indexer keys, one row per token like `k` and `v`.
     ik: Option<DeviceWeights>,
     kv_tokens: usize,
-    /// The indexer keys the host has read back to select with.
-    qsa: QsaKeys,
+    /// Pooled indexer keys, a row per complete pool, and how many are
+    /// pooled (they follow from `ik`, so they are pooled again after a
+    /// restore).
+    pk: Option<DeviceWeights>,
+    pooled: usize,
 }
 
 fn zeroed(device: i32, floats: usize) -> Result<DeviceWeights, AllpacaError> {
@@ -462,10 +467,12 @@ impl Clone for Qwen4DeviceState {
                     v: dup(&b.v),
                     ik: dup(&b.ik),
                     kv_tokens: b.kv_tokens,
-                    qsa: b.qsa.clone(),
+                    pk: dup(&b.pk),
+                    pooled: b.pooled,
                 })
                 .collect(),
             picked: HashMap::new(),
+            scores: HashMap::new(),
             ple: dup(&self.ple),
         }
     }
@@ -488,7 +495,6 @@ struct BlockHost {
     v: Option<Vec<f32>>,
     ik: Option<Vec<f32>>,
     rows: usize,
-    qsa: QsaKeys,
 }
 
 fn read_back(buf: &Option<DeviceWeights>, floats: usize) -> Result<Option<Vec<f32>>, AllpacaError> {
@@ -536,7 +542,6 @@ impl Qwen4DeviceState {
                     v: read_back(&b.v, used(&b.v))?,
                     ik: read_back(&b.ik, used(&b.ik))?,
                     rows,
-                    qsa: b.qsa.clone(),
                 })
             })
             .collect::<Result<_, AllpacaError>>()?;
@@ -560,13 +565,15 @@ impl Qwen4DeviceState {
                     v: put_back(b.device, &b.v, rows_of(&b.v))?,
                     ik: put_back(b.device, &b.ik, rows_of(&b.ik))?,
                     kv_tokens: capacity,
-                    qsa: b.qsa.clone(),
+                    pk: None,
+                    pooled: 0,
                 })
             })
             .collect::<Result<_, AllpacaError>>()?;
         Ok(Self {
             blocks,
             picked: HashMap::new(),
+            scores: HashMap::new(),
             ple: None,
         })
     }
@@ -585,7 +592,7 @@ impl Qwen4DeviceHost {
             .iter()
             .map(|b| {
                 let len = |v: &Option<Vec<f32>>| v.as_ref().map_or(0, Vec::len);
-                (len(&b.state) + len(&b.conv) + len(&b.k) + len(&b.v) + len(&b.ik) + b.qsa.floats()) * 4
+                (len(&b.state) + len(&b.conv) + len(&b.k) + len(&b.v) + len(&b.ik)) * 4
             })
             .sum()
     }
@@ -600,7 +607,9 @@ impl Qwen4DeviceHost {
             for v in [&b.state, &b.conv, &b.k, &b.v, &b.ik] {
                 write_opt_f32s(out, v.as_deref());
             }
-            b.qsa.write_to(out);
+            // Where the host's copy of the indexer keys was kept: the pooled
+            // keys now follow from `ik` on the card.
+            QsaKeys::default().write_to(out);
         }
     }
 
@@ -619,8 +628,8 @@ impl Qwen4DeviceHost {
                 k: r.opt_f32s()?,
                 v: r.opt_f32s()?,
                 ik: r.opt_f32s()?,
-                qsa: QsaKeys::read_from(r)?,
             });
+            QsaKeys::read_from(r)?;
         }
         Some(Self { blocks })
     }
@@ -637,8 +646,6 @@ pub struct Qwen4Gpu {
     placement: Placement,
     matrices: HashMap<String, Matrix>,
     vectors: HashMap<String, DeviceWeights>,
-    /// [`HOST_VECTORS`] by tensor name.
-    host_vectors: HashMap<String, Vec<f32>>,
     act: Act,
     hc: usize,
     dim: usize,
@@ -789,7 +796,6 @@ impl Qwen4Gpu {
             matrices.insert(info.name.clone(), Matrix { weights, encoding, n, k });
         }
         let mut vectors = HashMap::new();
-        let mut host_vectors = HashMap::new();
         for info in &file.tensors {
             let wanted = match block_of(&info.name) {
                 Some((_, suffix)) => BLOCK_VECTORS.contains(&suffix),
@@ -800,17 +806,12 @@ impl Qwen4Gpu {
                 let device = cards[card_of(&info.name)].hip.device;
                 vectors.insert(info.name.clone(), DeviceWeights::upload(device, &[&values])?);
             }
-            let for_host = block_of(&info.name).is_some_and(|(_, suffix)| HOST_VECTORS.contains(&suffix));
-            if for_host && !hosted_block(&info.name) {
-                host_vectors.insert(info.name.clone(), file.tensor_f32(&info.name)?);
-            }
         }
         let mut gpu = Self {
             cards,
             placement,
             matrices,
             vectors,
-            host_vectors,
             act,
             hc,
             dim,
@@ -939,7 +940,7 @@ impl Qwen4Gpu {
                 let (encoding, data) = encode(file, info)?;
                 bytes += data.len() as u64;
                 host.send_weight(Weight::Matrix { name, encoding: encoding.code(), n, k }, &data)?;
-            } else if BLOCK_VECTORS.contains(&suffix) || HOST_VECTORS.contains(&suffix) {
+            } else if BLOCK_VECTORS.contains(&suffix) {
                 let data: Vec<u8> = file.tensor_f32(&info.name)?.iter().flat_map(|v| v.to_le_bytes()).collect();
                 host.send_weight(Weight::Vector { name }, &data)?;
             }
@@ -1015,7 +1016,6 @@ impl Qwen4Gpu {
             },
             matrices: HashMap::new(),
             vectors: HashMap::new(),
-            host_vectors: HashMap::new(),
             act,
             hc: spec.hc,
             dim: spec.dim,
@@ -1049,10 +1049,6 @@ impl Qwen4Gpu {
     }
 
     pub fn add_vector(&mut self, name: &str, values: &[f32]) -> Result<(), AllpacaError> {
-        if block_of(name).is_some_and(|(_, suffix)| HOST_VECTORS.contains(&suffix)) {
-            self.host_vectors.insert(name.to_string(), values.to_vec());
-            return Ok(());
-        }
         let weights = DeviceWeights::upload(self.device_of(name), &[values])?;
         self.vectors.insert(name.to_string(), weights);
         Ok(())
@@ -1505,13 +1501,6 @@ impl Qwen4Gpu {
         self.launch(card, self.matrix(&name("ssm_out.weight"), dims.value_dim)?, y, card.at(act.out), rows)
     }
 
-    fn host_vector(&self, name: &str) -> Result<&[f32], AllpacaError> {
-        self.host_vectors
-            .get(name)
-            .map(Vec::as_slice)
-            .ok_or_else(|| gpu_err(format!("qwen4exp: {name} is not held on the host")))
-    }
-
     /// Full-attention block `blk` on the mixed inputs of `rows` tokens from
     /// position `pos`: gated queries, normed and rotated keys, each token
     /// attending to the sequence up to itself, or, past its indexer's
@@ -1534,18 +1523,38 @@ impl Qwen4Gpu {
             return Err(gpu_err(format!("qwen4exp: block {blk}'s indexer queries are wider than the model")));
         }
         let sparse = qsa.filter(|shape| shape.is_sparse(pos + rows - 1));
-        // Row numbers, keys and values of the cells a token keeps.
+        // Row numbers of the cells each token of the pass keeps, one
+        // token's keys and values of them, and the pool scores.
         let picked = match &sparse {
             Some(shape) => {
-                let cells = shape.max_cells().next_multiple_of(16);
+                let stride = shape.max_cells().next_multiple_of(16);
                 let buf = match state.picked.entry(hip.device) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(DeviceWeights::alloc(hip.device, cells * (1 + 2 * kv) * 4)?)
+                        e.insert(DeviceWeights::alloc(hip.device, stride * (MAX_ROWS + 2 * kv) * 4)?)
                     }
                 };
                 let at = |floats: usize| buf.ptr_at(floats * 4).cast_mut();
-                Some((at(0), at(cells), at(cells * (1 + kv))))
+                let (rows_at, keys_at) = (at(0), at(stride * MAX_ROWS));
+                let values_at = at(stride * (MAX_ROWS + kv));
+                let score_stride = (pos + rows) / shape.ratio;
+                let scores = match state.scores.entry(hip.device) {
+                    std::collections::hash_map::Entry::Occupied(e) if e.get().bytes() as usize >= rows * score_stride * 4 => {
+                        e.into_mut()
+                    }
+                    entry => {
+                        let floats = MAX_ROWS * (2 * score_stride).max(4096);
+                        let buf = DeviceWeights::alloc(hip.device, floats * 4)?;
+                        match entry {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                e.insert(buf);
+                                e.into_mut()
+                            }
+                            std::collections::hash_map::Entry::Vacant(e) => e.insert(buf),
+                        }
+                    }
+                };
+                Some((rows_at.cast::<i32>(), keys_at, values_at, stride, scores.ptr_at(0).cast_mut(), score_stride))
             }
             None => None,
         };
@@ -1553,16 +1562,28 @@ impl Qwen4Gpu {
         if state.kv_tokens < pos + rows {
             let tokens = (2 * state.kv_tokens).max(KV_START_TOKENS).max(pos + rows);
             let key_dim = qsa.map_or(0, |shape| shape.dim);
-            for (buf, width) in [(&mut state.k, kv), (&mut state.v, kv), (&mut state.ik, key_dim)] {
-                if width == 0 {
+            let pools = qsa.map_or(0, |shape| tokens / shape.ratio);
+            for (buf, floats) in [
+                (&mut state.k, tokens * kv),
+                (&mut state.v, tokens * kv),
+                (&mut state.ik, tokens * key_dim),
+                (&mut state.pk, pools * key_dim),
+            ] {
+                if floats == 0 {
                     continue;
                 }
                 *buf = Some(match buf.as_ref() {
-                    Some(old) => copy_of(old, tokens * width * 4)?,
-                    None => DeviceWeights::alloc(hip.device, tokens * width * 4)?,
+                    Some(old) => copy_of(old, floats * 4)?,
+                    None => DeviceWeights::alloc(hip.device, floats * 4)?,
                 });
             }
             state.kv_tokens = tokens;
+        }
+        // A restored state brings its raw indexer keys, not the pooled ones.
+        if let (Some(shape), None) = (&qsa, &state.pk) {
+            let floats = (state.kv_tokens / shape.ratio).max(1) * shape.dim;
+            state.pk = Some(DeviceWeights::alloc(hip.device, floats * 4)?);
+            state.pooled = 0;
         }
         let (keys, values) = match (&state.k, &state.v) {
             (Some(k), Some(v)) => (k.ptr_at(0).cast_mut(), v.ptr_at(0).cast_mut()),
@@ -1623,34 +1644,62 @@ impl Qwen4Gpu {
             })
         };
         match (&sparse, picked) {
-            (Some(shape), Some((rows_at, keys_at, values_at))) => {
+            (Some(shape), Some((rows_at, keys_at, values_at, stride, scores, score_stride))) => {
                 self.launch(card, self.matrix(&name("indexer.q_proj.weight"), dim)?, x, index_q, rows)?;
-                // The keys the host has not read yet, then the queries.
-                let have = state.qsa.tokens(shape);
-                let raw = state.ik.as_ref().ok_or_else(|| gpu_err(format!("qwen4exp: block {blk} has no indexer keys")))?;
-                let mut fresh = vec![0.0f32; (pos + rows - have) * shape.dim];
-                hip.copy_d2h_f32(raw.ptr_at(have * shape.dim * 4), &mut fresh)?;
-                state.qsa.push(shape, &fresh, self.host_vector(&name("indexer.k_norm.weight"))?)?;
-                let width = shape.heads * shape.dim;
-                let mut queries = vec![0.0f32; rows * width];
-                hip.copy_d2h_f32(index_q, &mut queries)?;
-                let q_norm = self.host_vector(&name("indexer.q_norm.weight"))?;
+                // Pool what the pass's last token sees, then select on the
+                // card: nothing comes back to the host.
+                let dims = allpaca_hip::QsaDims {
+                    ratio: shape.ratio as i32,
+                    top_pools: shape.top_pools() as i32,
+                    heads: shape.heads as i32,
+                    dim: shape.dim as i32,
+                    n_rot: shape.n_rot as i32,
+                    theta: shape.rope_theta,
+                    sections: shape.rope_sections,
+                    eps: shape.eps,
+                };
+                let no_keys = || gpu_err(format!("qwen4exp: block {blk} has no indexer keys"));
+                let (raw, pooled) = (state.ik.as_ref().ok_or_else(no_keys)?, state.pk.as_ref().ok_or_else(no_keys)?);
+                let pools = (pos + rows) / shape.ratio;
+                if state.pooled < pools {
+                    let (first, n) = (state.pooled as i32, (pools - state.pooled) as i32);
+                    let gain = self.vector(&name("indexer.k_norm.weight"))?;
+                    self.step(card, "qsa pool", || {
+                        hip.qsa_pool_device(raw.ptr_at(0), gain, pooled.ptr_at(0).cast_mut(), first, n, &dims)
+                    })?;
+                    state.pooled = pools;
+                }
+                let gain = self.vector(&name("indexer.q_norm.weight"))?;
+                self.step(card, "qsa select", || {
+                    hip.qsa_select_device(
+                        index_q,
+                        gain,
+                        pooled.ptr_at(0),
+                        scores,
+                        rows_at,
+                        rows as i32,
+                        pos as i32,
+                        &dims,
+                        stride as i32,
+                        score_stride as i32,
+                    )
+                })?;
                 // One token at a time: each keeps its own cells.
-                for (r, query) in queries.chunks_mut(width).enumerate() {
+                for r in 0..rows {
                     // SAFETY: the scratch rows hold `rows` rows of `attn` floats.
                     let (q, out) = unsafe { (q.add(r * attn), q_full.add(r * attn)) };
-                    match state.qsa.select(shape, pos + r, query, q_norm)? {
-                        None => attend(q, keys, values, out, 1, pos + r + 1)?,
-                        Some(cells) => {
-                            // SAFETY: row numbers are plain 32-bit values, copied as such.
-                            let bits = unsafe { std::slice::from_raw_parts(cells.as_ptr().cast::<f32>(), cells.len()) };
-                            hip.copy_h2d_f32(rows_at, bits)?;
-                            let n = cells.len() as i32;
-                            hip.gather_rows_device(keys_at, keys, rows_at.cast(), n, kv as i32)?;
-                            hip.gather_rows_device(values_at, values, rows_at.cast(), n, kv as i32)?;
-                            attend(q, keys_at, values_at, out, 1, cells.len())?;
-                        }
+                    let rank = pos + r;
+                    if !shape.is_sparse(rank) {
+                        attend(q, keys, values, out, 1, rank + 1)?;
+                        continue;
                     }
+                    // The best pools, then the cells that fill no pool yet.
+                    let n = shape.top_pools() * shape.ratio + (rank + 1) % shape.ratio;
+                    // SAFETY: the row numbers hold MAX_ROWS rows of `stride`.
+                    let cells = unsafe { rows_at.add(r * stride) };
+                    hip.gather_rows_device(keys_at, keys, cells, n as i32, kv as i32)?;
+                    hip.gather_rows_device(values_at, values, cells, n as i32, kv as i32)?;
+                    attend(q, keys_at, values_at, out, 1, n)?;
                 }
             }
             _ => attend(q, keys, values, q_full, rows, pos + rows)?,
