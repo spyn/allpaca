@@ -15609,8 +15609,11 @@ mod tests {
         if device_count() == 0 {
             return;
         }
-        // The second shape takes the kernels over block pairs.
-        for (dim, ff, n_exp, k, rows) in [(320usize, 192usize, 40usize, 5usize, 3usize), (256, 256, 40, 5, 3)] {
+        // The second and third shapes take the kernels over block pairs; the third is
+        // Flash-Next's, a prefill pass of 16 rows over 64 experts.
+        for (dim, ff, n_exp, k, rows) in
+            [(320usize, 192usize, 40usize, 5usize, 3usize), (256, 256, 40, 5, 3), (2560, 640, 64, 10, 16)]
+        {
             let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
             let mut pool = vec![0u8; n_exp * slot_bytes];
             let mut seed = 0x51ed_2701u32;
@@ -17346,6 +17349,43 @@ mod tests {
                 let mut out = vec![0.0f32; m * n];
                 run(&a, &mut out, m as i32);
                 assert_rows_match_single("q8_0", run, &a, &out, m, n, k);
+            }
+        }
+    }
+
+    /// Prefill passes of 9+ rows take the LDS-tiled int8 K-quant GEMV on
+    /// wave64 cards: every row must still match its single-row result bit for
+    /// bit, at both lane counts (narrow and wide outputs) and across tiles.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn int8_gemv_row_tiles_match_single_rows() {
+        if device_count() == 0 || std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let k = 512usize;
+        for n in [37usize, 2050] {
+            for m in [9usize, 12, 16, 17, 33] {
+                let (a, _, _) = fill_q5k_gemm_case(m, m, n, k);
+                let b3 = fill_q3k_blocks(m, n, k);
+                let (_, b4, _) = fill_q4k_gemm_case(m, 1, n, k);
+                let (_, b5, _) = fill_q5k_gemm_case(m, 1, n, k);
+                let (_, b6, _) = fill_q6k_gemm_case(m, 1, n, k);
+                type Gemm =
+                    fn(&[f32], &[u8], &mut [f32], i32, i32, i32) -> Result<(), AllpacaError>;
+                let kinds: [(&str, &[u8], Gemm); 4] = [
+                    ("q3_k", &b3, gemm_nt_q3_k),
+                    ("q4_k", &b4, gemm_nt_q4_k),
+                    ("q5_k", &b5, gemm_nt_q5_k),
+                    ("q6_k", &b6, gemm_nt_q6_k),
+                ];
+                for (name, b, gemm) in kinds {
+                    let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                        gemm(a, b, c, rows, n as i32, k as i32).expect(name)
+                    };
+                    let mut out = vec![0.0f32; m * n];
+                    run(&a, &mut out, m as i32);
+                    assert_rows_match_single(name, run, &a, &out, m, n, k);
+                }
             }
         }
     }
