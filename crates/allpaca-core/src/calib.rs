@@ -4,7 +4,8 @@
 //! A quantiser that only sees the weights minimises `|W - Q|^2`. What the model
 //! feels is `|(W - Q) x|^2` over the inputs `x` it really gets, which is
 //! `tr((W - Q) H (W - Q)^T)` with `H = E[x x^T]`. [`capture`] measures `H` for
-//! every dense attention and feed-forward matrix on the CPU forward.
+//! the attention, delta-net and feed-forward matrices on the CPU forward,
+//! routed and shared experts included.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,23 +18,38 @@ use allpaca_types::{AllpacaError, FatalError};
 /// A point of the forward whose vector is the input of one or more matrices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Site {
-    /// Normed residual: `attn_q`, `attn_k`, `attn_v`.
+    /// Normed residual: `attn_q`, `attn_k`, `attn_v`, and the delta-net
+    /// projections `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`.
     AttnIn,
-    /// Attention result: `attn_output`.
+    /// Attention result: `attn_output`; the delta-net's gated heads: `ssm_out`.
     AttnOut,
-    /// Normed residual: `ffn_gate`, `ffn_up`.
+    /// Normed residual: `ffn_gate`, `ffn_up`, the router `ffn_gate_inp`.
     FfnIn,
     /// Gated activations: `ffn_down`.
     FfnAct,
+    /// Normed residual once per routed expert, weighted by the square of
+    /// its routing weight: the stacked `ffn_gate_exps`, `ffn_up_exps`.
+    ExpIn,
+    /// A routed expert's activations, weighted the same: `ffn_down_exps`.
+    ExpAct,
+    /// Normed residual weighted by the square of the shared expert's gate:
+    /// `ffn_gate_shexp`, `ffn_up_shexp`.
+    ShexpIn,
+    /// The shared expert's activations, weighted the same: `ffn_down_shexp`.
+    ShexpAct,
 }
 
 impl Site {
     fn of_tensor(kind: &str) -> Option<Self> {
         Some(match kind {
-            "attn_q" | "attn_k" | "attn_v" => Self::AttnIn,
-            "attn_output" => Self::AttnOut,
-            "ffn_gate" | "ffn_up" => Self::FfnIn,
+            "attn_q" | "attn_k" | "attn_v" | "attn_qkv" | "attn_gate" | "ssm_alpha" | "ssm_beta" => Self::AttnIn,
+            "attn_output" | "ssm_out" => Self::AttnOut,
+            "ffn_gate" | "ffn_up" | "ffn_gate_inp" => Self::FfnIn,
             "ffn_down" => Self::FfnAct,
+            "ffn_gate_exps" | "ffn_up_exps" => Self::ExpIn,
+            "ffn_down_exps" => Self::ExpAct,
+            "ffn_gate_shexp" | "ffn_up_shexp" => Self::ShexpIn,
+            "ffn_down_shexp" => Self::ShexpAct,
             _ => return None,
         })
     }
@@ -43,12 +59,14 @@ impl Site {
 struct Moments {
     cols: usize,
     count: u64,
-    /// Upper triangle of the sum of `x x^T`, row-major (`j >= i`).
+    /// Sum of the inputs' weights: the mean's denominator.
+    weight: f64,
+    /// Upper triangle of the weighted sum of `x x^T`, row-major (`j >= i`).
     sum: Vec<f32>,
 }
 
 impl Moments {
-    fn add(&mut self, x: &[f32]) {
+    fn add(&mut self, x: &[f32], weight: f32) {
         let n = x.len();
         if self.sum.is_empty() {
             self.cols = n;
@@ -59,7 +77,7 @@ impl Moments {
         }
         let mut at = 0;
         for i in 0..n {
-            let xi = x[i];
+            let xi = weight * x[i];
             let row = &mut self.sum[at..at + n - i];
             for (s, xj) in row.iter_mut().zip(&x[i..]) {
                 *s += xi * xj;
@@ -67,6 +85,7 @@ impl Moments {
             at += n - i;
         }
         self.count += 1;
+        self.weight += weight as f64;
     }
 }
 
@@ -74,7 +93,7 @@ impl Moments {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputGram {
     pub cols: usize,
-    /// Input vectors averaged.
+    /// Input vectors averaged (each routed expert's input counts once).
     pub count: u64,
     /// `cols * cols`, symmetric.
     pub mean: Vec<f32>,
@@ -111,11 +130,11 @@ impl InputStats {
             return None;
         }
         let m = self.sites.get(&(index.parse().ok()?, Site::of_tensor(kind)?))?;
-        if m.count == 0 {
+        if m.count == 0 || m.weight <= 0.0 {
             return None;
         }
         let n = m.cols;
-        let scale = 1.0 / m.count as f32;
+        let scale = (1.0 / m.weight) as f32;
         let mut mean = vec![0.0f32; n * n];
         let mut at = 0;
         for i in 0..n {
@@ -150,8 +169,21 @@ pub(crate) struct Tap {
 }
 
 impl Tap {
+    /// Whether anything is recorded: a site whose vector costs work of
+    /// its own (an expert's activations) is skipped otherwise.
+    #[inline]
+    pub(crate) fn wants(&self) -> bool {
+        self.on.load(Ordering::Relaxed) || self.keeping.load(Ordering::Relaxed)
+    }
+
     #[inline]
     pub(crate) fn observe(&self, blk: usize, site: Site, x: &[f32]) {
+        self.observe_weighted(blk, site, x, 1.0);
+    }
+
+    /// [`Self::observe`] of an input whose share of the mean is `weight`.
+    #[inline]
+    pub(crate) fn observe_weighted(&self, blk: usize, site: Site, x: &[f32], weight: f32) {
         if self.keeping.load(Ordering::Relaxed) {
             if let Ok(mut kept) = self.kept.lock() {
                 if kept.0 == blk {
@@ -163,7 +195,7 @@ impl Tap {
             return;
         }
         if let Ok(mut stats) = self.stats.lock() {
-            stats.sites.entry((blk, site)).or_default().add(x);
+            stats.sites.entry((blk, site)).or_default().add(x, weight);
         }
     }
 
@@ -341,7 +373,27 @@ pub(crate) mod tests {
     /// each with `experts` routed experts (two used), a shared expert and
     /// its sigmoid gate: the layout of Qwen3.5/3.6 35B-A3B, tiny.
     pub(crate) fn write_tiny_qwen35moe_gguf(path: &Path, experts: usize) {
-        let (dim, vocab, n_v, n_k, head, conv_k, ff) = (16usize, 6usize, 2usize, 2usize, 8usize, 2usize, 24usize);
+        write_tiny_qwen35moe_gguf_with(path, experts, false);
+    }
+
+    /// [`write_tiny_qwen35moe_gguf`] whose second block, with
+    /// `attention_block`, is gated full attention instead (query and gate
+    /// interleaved per head, q/k norms, IMRoPE).
+    pub(crate) fn write_tiny_qwen35moe_gguf_with(path: &Path, experts: usize, attention_block: bool) {
+        write_tiny_qwen35moe_gguf_sized(path, experts, attention_block, 16, 8, 24);
+    }
+
+    /// [`write_tiny_qwen35moe_gguf_with`] with residual width `dim`,
+    /// delta-net head width `head` and expert width `ff`.
+    pub(crate) fn write_tiny_qwen35moe_gguf_sized(
+        path: &Path,
+        experts: usize,
+        attention_block: bool,
+        dim: usize,
+        head: usize,
+        ff: usize,
+    ) {
+        let (vocab, n_v, n_k, conv_k) = (6usize, 2usize, 2usize, 2usize);
         let inner = n_v * head;
         let qkv_dim = n_k * head * 2 + inner;
         let mut meta = HashMap::new();
@@ -364,6 +416,9 @@ pub(crate) mod tests {
         put(&format!("{a}.ssm.time_step_rank"), GgufValue::Uint32(n_v as u32));
         put(&format!("{a}.ssm.group_count"), GgufValue::Uint32(n_k as u32));
         put(&format!("{a}.ssm.conv_kernel"), GgufValue::Uint32(conv_k as u32));
+        if attention_block {
+            put(&format!("{a}.rope.dimension_sections"), GgufValue::Array([2i32, 2, 0, 0].map(GgufValue::Int32).to_vec()));
+        }
         put("tokenizer.ggml.model", GgufValue::String("wordlevel".into()));
         put(
             "tokenizer.ggml.tokens",
@@ -387,15 +442,26 @@ pub(crate) mod tests {
         for b in 0..2 {
             let mut add = |part: &str, dims: Vec<u64>, data: Vec<f32>| owned.push((format!("blk.{b}.{part}"), dims, data));
             add("attn_norm.weight", vec![d], vec![1.0; dim]);
-            add("attn_qkv.weight", vec![d, qkv_dim as u64], rand(qkv_dim * dim, 0.3));
-            add("attn_gate.weight", vec![d, inner as u64], rand(inner * dim, 0.3));
-            add("ssm_alpha.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
-            add("ssm_beta.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
-            add("ssm_out.weight", vec![inner as u64, d], rand(dim * inner, 0.3));
-            add("ssm_a", vec![n_v as u64], vec![-0.5; n_v]);
-            add("ssm_dt.bias", vec![n_v as u64], vec![0.0; n_v]);
-            add("ssm_norm.weight", vec![head as u64], vec![1.0; head]);
-            add("ssm_conv1d.weight", vec![conv_k as u64, qkv_dim as u64], rand(conv_k * qkv_dim, 0.3));
+            if attention_block && b == 1 {
+                // Two heads of dim / 2, one key/value head.
+                let hd = dim / 2;
+                add("attn_q.weight", vec![d, 4 * hd as u64], rand(4 * hd * dim, 0.3));
+                add("attn_k.weight", vec![d, hd as u64], rand(hd * dim, 0.3));
+                add("attn_v.weight", vec![d, hd as u64], rand(hd * dim, 0.3));
+                add("attn_q_norm.weight", vec![hd as u64], vec![1.0; hd]);
+                add("attn_k_norm.weight", vec![hd as u64], vec![1.0; hd]);
+                add("attn_output.weight", vec![2 * hd as u64, d], rand(dim * 2 * hd, 0.3));
+            } else {
+                add("attn_qkv.weight", vec![d, qkv_dim as u64], rand(qkv_dim * dim, 0.3));
+                add("attn_gate.weight", vec![d, inner as u64], rand(inner * dim, 0.3));
+                add("ssm_alpha.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
+                add("ssm_beta.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
+                add("ssm_out.weight", vec![inner as u64, d], rand(dim * inner, 0.3));
+                add("ssm_a", vec![n_v as u64], vec![-0.5; n_v]);
+                add("ssm_dt.bias", vec![n_v as u64], vec![0.0; n_v]);
+                add("ssm_norm.weight", vec![head as u64], vec![1.0; head]);
+                add("ssm_conv1d.weight", vec![conv_k as u64, qkv_dim as u64], rand(conv_k * qkv_dim, 0.3));
+            }
             add("post_attention_norm.weight", vec![d], vec![1.0; dim]);
             add("ffn_gate_inp.weight", vec![d, n], rand(experts * dim, 1.0));
             add("ffn_gate_exps.weight", vec![d, f, n], rand(experts * ff * dim, 0.3));
@@ -458,5 +524,93 @@ pub(crate) mod tests {
         assert!(stats.gram("blk.0.attn_norm.weight").is_none());
         assert!(stats.gram("token_embd.weight").is_none());
         assert!(stats.gram("blk.7.attn_q.weight").is_none());
+    }
+
+    fn assert_gram_shape(g: &InputGram, what: &str) {
+        assert_eq!(g.mean.len(), g.cols * g.cols, "{what}");
+        for i in 0..g.cols {
+            assert!(g.mean[i * g.cols + i] >= 0.0, "{what} diagonal");
+            for j in 0..i {
+                assert_eq!(g.mean[i * g.cols + j], g.mean[j * g.cols + i], "{what} symmetry");
+            }
+        }
+    }
+
+    /// Qwen3.5 blocks: the delta-net projections read the normed residual
+    /// and `ssm_out` the gated head outputs; the gated full-attention
+    /// block's projections read the normed residual and its output
+    /// projection the gated attention.
+    #[test]
+    fn capture_measures_the_delta_net_and_gated_attention_inputs() {
+        let path = std::env::temp_dir().join(format!("allpaca_calib_q35-{}.gguf", std::process::id()));
+        write_tiny_qwen35moe_gguf_with(&path, 4, true);
+        let stats = capture(&path, &["hello world again hello", "world hello"]).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let gram = |name: &str| stats.gram(&format!("{name}.weight")).unwrap_or_else(|| panic!("no {name}"));
+
+        let qkv = gram("blk.0.attn_qkv");
+        assert_eq!(qkv.cols, 16);
+        assert!(qkv.count >= 6, "one input per prompt token, got {}", qkv.count);
+        for kind in ["attn_gate", "ssm_alpha", "ssm_beta"] {
+            assert_eq!(gram(&format!("blk.0.{kind}")), qkv, "{kind}");
+        }
+        assert!((trace(&qkv) - 16.0).abs() < 1e-2, "delta-net input trace {}", trace(&qkv));
+        let out = gram("blk.0.ssm_out");
+        assert_eq!((out.cols, out.count), (16, qkv.count));
+        assert!(trace(&out) > 0.0);
+
+        let q = gram("blk.1.attn_q");
+        assert_eq!((q.cols, q.count), (16, qkv.count));
+        assert_eq!(gram("blk.1.attn_k"), q);
+        assert_eq!(gram("blk.1.attn_v"), q);
+        assert!((trace(&q) - 16.0).abs() < 1e-2, "attention input trace {}", trace(&q));
+        let o = gram("blk.1.attn_output");
+        assert_eq!((o.cols, o.count), (16, qkv.count));
+        assert!(trace(&o) > 0.0);
+        for g in [&qkv, &out, &q, &o] {
+            assert_gram_shape(g, "qwen35");
+        }
+    }
+
+    /// Routed experts: the router and the stacked gate/up read the normed
+    /// residual, the stacked down projection the activations of every
+    /// routed expert (one input per token and routed expert), and the
+    /// shared expert its own.
+    #[test]
+    fn capture_measures_the_inputs_of_routed_and_shared_experts() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (llama, q35) = (dir.join(format!("allpaca_calib_moe-{pid}.gguf")), dir.join(format!("allpaca_calib_q35moe-{pid}.gguf")));
+        write_tiny_calib_gguf_moe(&llama, 8, 16, 0.3, 1, false, 4);
+        write_tiny_qwen35moe_gguf(&q35, 4);
+        for (path, dim, ff) in [(&llama, 8usize, 16usize), (&q35, 16, 24)] {
+            let stats = capture(path, &["hello world again hello", "world hello"]).unwrap();
+            let _ = std::fs::remove_file(path);
+            let gram = |kind: &str| stats.gram(&format!("blk.0.{kind}.weight")).unwrap_or_else(|| panic!("{path:?}: no {kind}"));
+            let input = gram("ffn_gate_inp");
+            assert_eq!(input.cols, dim);
+            assert!(input.count >= 6, "one input per prompt token, got {}", input.count);
+            assert!((trace(&input) - dim as f32).abs() < 1e-2, "router input trace {}", trace(&input));
+
+            let exps = gram("ffn_gate_exps");
+            assert_eq!(gram("ffn_up_exps"), exps);
+            assert_eq!((exps.cols, exps.count), (dim, 2 * input.count), "two experts used per token");
+            // Normed inputs, however they are weighted.
+            assert!((trace(&exps) - dim as f32).abs() < 1e-2, "expert input trace {}", trace(&exps));
+            let down = gram("ffn_down_exps");
+            assert_eq!((down.cols, down.count), (ff, 2 * input.count));
+            assert!(trace(&down) > 0.0);
+
+            let sh = gram("ffn_gate_shexp");
+            assert_eq!(gram("ffn_up_shexp"), sh);
+            assert_eq!((sh.cols, sh.count), (dim, input.count));
+            let sh_down = gram("ffn_down_shexp");
+            assert_eq!((sh_down.cols, sh_down.count), (ff, input.count));
+            assert!(trace(&sh_down) > 0.0);
+            assert_ne!(sh_down, down, "the shared expert's activations are its own");
+            for g in [&input, &exps, &down, &sh, &sh_down] {
+                assert_gram_shape(g, "moe");
+            }
+        }
     }
 }
