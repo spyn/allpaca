@@ -366,6 +366,9 @@ impl Drop for RequestHandle {
             });
         }
         if let Ok(mut guard) = self.inner.lock() {
+            if let Err(e) = capture_qwen4_reply(&mut guard, self.id) {
+                tracing::warn!(error = %e, "prompt cache: a reply's end state was not kept");
+            }
             if let Some(active) = guard.active.remove(&self.id) {
                 for layer in active.pages {
                     for page in layer {
@@ -383,6 +386,42 @@ impl Drop for RequestHandle {
             }
         }
     }
+}
+
+/// When a qwen4exp Request ends, keep its state after every token it has read
+/// (the prompt and all of the reply but the token it ended on): the
+/// conversation's next turn starts with them, so it resumes there instead of
+/// after the first turn's prompt.
+fn capture_qwen4_reply(inner: &mut EngineInner, id: u64) -> Result<(), AllpacaError> {
+    let Some(target) = inner.target.clone().filter(|t| t.q4x.is_some()) else {
+        return Ok(());
+    };
+    let Some(active) = inner.active.get(&id) else {
+        return Ok(());
+    };
+    if !active.vision.is_empty() || active.probe.is_some() {
+        return Ok(());
+    }
+    let Some(state) = active.recurrent.as_ref() else {
+        return Ok(());
+    };
+    let read = state.q4x.token_ids();
+    let n = read.len();
+    if n <= active.prompt_len
+        || n > active.tokens.len()
+        || !read.iter().zip(&active.tokens).all(|(&a, &b)| a == i64::from(b))
+    {
+        return Ok(());
+    }
+    let Some(q4x) = state.q4x.for_cache(&target)? else {
+        return Ok(());
+    };
+    let tokens = active.tokens[..n].to_vec();
+    let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
+    recurrent.q4x = q4x;
+    let cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
+    inner.kv_radix.insert_checkpoint(&tokens, cp);
+    Ok(())
 }
 
 fn rpc_hello_token(config: &Config) -> String {
