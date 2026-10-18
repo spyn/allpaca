@@ -204,13 +204,17 @@ int allpaca_q2_0_moe_ffn(const float *x, const uint8_t *pool, const int32_t *slo
                          const float *weights, int32_t n_pick, float *h, float *out, int32_t dim,
                          int32_t ff, allpaca_stream_t stream);
 
-/* One token's routed experts with the routing on the device: the n_pick best of n_experts
- * `scores` by softmax weight (ties to the lower expert), weights renormalised over the picks and
- * times `scale`, then allpaca_q2_0_moe_ffn of those picks. `picks` is device scratch of 32 int32
- * slots followed by 32 float weights and keeps the picks. n_experts <= 1024, n_pick <= 32. */
+/* Routed experts of `rows` tokens with the routing on the device: per token, the n_pick best of
+ * n_experts `scores` by softmax weight (ties to the lower expert), weights renormalised over the
+ * picks and times `scale`, then allpaca_q2_0_moe_ffn of those picks. `picks` is device scratch
+ * of 32 int32 slots followed by 32 float weights per row and keeps the picks. Rows follow each
+ * other: x and out by dim, scores by n_experts, h by n_pick * ff. Each row's result equals its own
+ * launch. `h` is scratch of q2_0_moe_scratch_floats(rows, n_pick, dim, ff) floats (allpaca-hip).
+ * n_experts <= 1024, n_pick <= 32. */
 int allpaca_q4x_routed_ffn(const float *x, const float *scores, const uint8_t *pool,
                            int32_t n_experts, int32_t n_pick, float scale, void *picks, float *h,
-                           float *out, int32_t dim, int32_t ff, allpaca_stream_t stream);
+                           float *out, int32_t dim, int32_t ff, int32_t rows,
+                           allpaca_stream_t stream);
 
 /* x[i] = silu(x[i] * s). */
 int allpaca_silu_scale(float *x, int32_t n, float s, allpaca_stream_t stream);
@@ -229,6 +233,13 @@ int allpaca_q4x_combine(float *streams, const float *out, const float *logits, i
                         int32_t hc, int32_t dim, allpaca_stream_t stream);
 int allpaca_q4x_ffn_sum(const float *routed, const float *shared, const float *gate, float *out,
                         int32_t rows, int32_t dim, allpaca_stream_t stream);
+/* The n-gram layer of `rows` tokens in order: streams[r] += gated value +
+ * silu(dilated conv), from key[r] (hc * dim), value[r] (dim), the three norm
+ * gains, conv_w[hc * dim, kern] and history[(kern - 1) * ngram, hc * dim]. */
+int allpaca_q4x_ple_apply(float *streams, const float *key, const float *value, const float *nk,
+                          const float *nq, const float *nc, const float *conv_w, float *history,
+                          int32_t rows, int32_t hc, int32_t dim, int32_t kern, int32_t ngram,
+                          float eps, allpaca_stream_t stream);
 
 /* C[m,n] = A[m,k] * dequant(B_q5_k[n,k])^T. Native 176-byte Q5_K super-blocks (GEM mixed-quant). */
 /* Softmax top-k MoE routing on the GPU (pair table + shared-expert gate).

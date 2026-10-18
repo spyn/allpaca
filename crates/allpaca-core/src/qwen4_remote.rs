@@ -20,7 +20,7 @@ use allpaca_hip::HipWorkspace;
 use allpaca_types::{AllpacaError, FatalError};
 use serde::{Deserialize, Serialize};
 
-use crate::qwen4_gpu::{HostedSpec, Qwen4DeviceState, Qwen4Gpu};
+use crate::qwen4_gpu::{HostedSpec, Qwen4DeviceHost, Qwen4DeviceState, Qwen4Gpu};
 use crate::rpc_runtime::RpcRuntime;
 
 /// The extension's name in a worker's HELLO.
@@ -42,6 +42,14 @@ pub(crate) enum Call {
     /// Sequence `dst` becomes a copy of `src`.
     CloneSeq { src: u64, dst: u64 },
     DropSeq { seq: u64 },
+    /// Keep a copy of sequence `seq` after its first `tokens` tokens in the
+    /// worker's RAM as `id`, for the prompt cache. Reply 1 when kept, 0 when
+    /// it does not fit.
+    SaveSeq { seq: u64, id: u64, tokens: usize },
+    /// Sequence `seq` becomes the copy kept as `id`. Reply 1, or 0 when the
+    /// worker no longer has it.
+    LoadSeq { id: u64, seq: u64 },
+    DropSaved { id: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -171,6 +179,52 @@ struct BlockHost {
     spec: Option<HostedSpec>,
     seqs: HashMap<u64, Qwen4DeviceState>,
     cache: Option<WeightCache>,
+    saved: SavedSeqs,
+}
+
+/// Sequence states kept in RAM for coordinators' prompt caches, by id; the
+/// ones used longest ago go first when `max_bytes` would be passed.
+#[derive(Default)]
+struct SavedSeqs {
+    max_bytes: usize,
+    bytes: usize,
+    clock: u64,
+    states: HashMap<u64, (Qwen4DeviceHost, u64)>,
+}
+
+impl SavedSeqs {
+    fn put(&mut self, id: u64, state: Qwen4DeviceHost) -> bool {
+        let size = state.host_bytes();
+        if size > self.max_bytes {
+            return false;
+        }
+        self.drop_id(id);
+        while self.bytes + size > self.max_bytes {
+            let Some(oldest) = self.states.iter().min_by_key(|(_, (_, used))| *used).map(|(id, _)| *id) else {
+                break;
+            };
+            self.drop_id(oldest);
+        }
+        self.clock += 1;
+        self.bytes += size;
+        self.states.insert(id, (state, self.clock));
+        true
+    }
+
+    fn get(&mut self, id: u64) -> Option<&Qwen4DeviceHost> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.states.get_mut(&id).map(|(state, used)| {
+            *used = clock;
+            &*state
+        })
+    }
+
+    fn drop_id(&mut self, id: u64) {
+        if let Some((state, _)) = self.states.remove(&id) {
+            self.bytes -= state.host_bytes();
+        }
+    }
 }
 
 fn add_weight(gpu: &mut Qwen4Gpu, item: &Weight, data: &[u8]) -> Result<(), AllpacaError> {
@@ -230,6 +284,21 @@ impl BlockHost {
                 None => drop(self.seqs.remove(&dst)),
             },
             Call::DropSeq { seq } => drop(self.seqs.remove(&seq)),
+            Call::SaveSeq { seq, id, tokens } => {
+                let Some(state) = self.seqs.get(&seq) else {
+                    return Ok(vec![0]);
+                };
+                gpu.sync_all()?;
+                return Ok(vec![u8::from(self.saved.put(id, state.to_host(tokens)?))]);
+            }
+            Call::LoadSeq { id, seq } => {
+                let Some(saved) = self.saved.get(id) else {
+                    return Ok(vec![0]);
+                };
+                self.seqs.insert(seq, Qwen4DeviceState::from_host(saved)?);
+                return Ok(vec![1]);
+            }
+            Call::DropSaved { id } => self.saved.drop_id(id),
         }
         Ok(Vec::new())
     }
@@ -247,10 +316,20 @@ impl allpaca_rpc::Extension for BlockHost {
 
 /// The extension a HIP worker serves to host `qwen4exp` blocks. With
 /// `cache` it keeps the weights it is sent on disk and takes them from
-/// there the next time.
+/// there the next time. It keeps no sequences for prompt caches.
 pub fn worker_extension(cache: Option<WeightCache>) -> Box<dyn allpaca_rpc::Extension> {
+    worker_extension_saving(cache, 0)
+}
+
+/// [`worker_extension`] that also keeps up to `saved_bytes` of sequence
+/// states in RAM for coordinators' prompt caches ([`RemoteSaved`]).
+pub fn worker_extension_saving(cache: Option<WeightCache>, saved_bytes: usize) -> Box<dyn allpaca_rpc::Extension> {
     Box::new(BlockHost {
         cache,
+        saved: SavedSeqs {
+            max_bytes: saved_bytes,
+            ..SavedSeqs::default()
+        },
         ..BlockHost::default()
     })
 }
@@ -307,6 +386,25 @@ impl RemoteBlocks {
     /// The hosted blocks, in the order they run.
     pub fn blocks(&self) -> &[usize] {
         &self.blks
+    }
+
+    /// Keep a copy of `seq` after its first `tokens` tokens on the worker,
+    /// for the prompt cache. `None` when the worker has no room for it.
+    pub fn save(self: &Arc<Self>, seq: &RemoteSeq, tokens: usize) -> Result<Option<RemoteSaved>, AllpacaError> {
+        if seq.lost {
+            return Ok(None);
+        }
+        let id = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let reply = self.call(&Call::SaveSeq { seq: seq.id, id, tokens }, &[])?;
+        Ok((reply.first() == Some(&1)).then(|| RemoteSaved { host: self.clone(), id }))
+    }
+
+    /// A new sequence that starts from `saved`. `None` when the worker no
+    /// longer has it (it made room, or it restarted).
+    pub fn load(self: &Arc<Self>, saved: &RemoteSaved) -> Result<Option<RemoteSeq>, AllpacaError> {
+        let seq = self.new_seq();
+        let reply = self.call(&Call::LoadSeq { id: saved.id, seq: seq.id }, &[])?;
+        Ok((reply.first() == Some(&1)).then_some(seq))
     }
 
     /// A new sequence; its state on the worker starts with its first pass.
@@ -395,6 +493,27 @@ impl Pipe<'_> {
         streams.copy_from_slice(&floats(&reply));
         self.roundtrips.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+/// A sequence state kept on the worker that hosts blocks, for the prompt
+/// cache ([`RemoteBlocks::save`]). Dropping it frees it there.
+#[derive(Debug)]
+pub struct RemoteSaved {
+    host: Arc<RemoteBlocks>,
+    id: u64,
+}
+
+impl RemoteSaved {
+    /// The worker that keeps it.
+    pub fn host(&self) -> &Arc<RemoteBlocks> {
+        &self.host
+    }
+}
+
+impl Drop for RemoteSaved {
+    fn drop(&mut self) {
+        let _ = self.host.call(&Call::DropSaved { id: self.id }, &[]);
     }
 }
 

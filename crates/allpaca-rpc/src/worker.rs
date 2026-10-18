@@ -769,8 +769,9 @@ impl HipWorker {
         if picks.iter().any(|(slots, _)| slots.len() > MAX_PICKS) {
             return Err(RpcError::Worker(format!("moe ffn expert slots take at most {MAX_PICKS} experts per row")));
         }
-        // Scratch: x, out, the picked experts' hidden rows.
-        let base = self.moe_scratch(gpu, (2 * rows * dim + MAX_PICKS * ff) * 4)?;
+        // Scratch: x, out, then the kernel's own (the picked experts' hidden rows).
+        let scratch = allpaca_hip::q2_0_moe_scratch_floats(1, MAX_PICKS, dim, ff);
+        let base = self.moe_scratch(gpu, (2 * rows * dim + scratch) * 4)?;
         let at = |i: usize| unsafe { base.add(i) };
         let hip = &self.gpus[gpu].hip;
         hip.copy_h2d_f32(base, x).map_err(bad)?;

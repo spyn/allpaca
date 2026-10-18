@@ -2885,6 +2885,19 @@ impl Engine {
                     .kv_radix
                     .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
             };
+            // A qwen4exp checkpoint whose hosted blocks' state the worker
+            // has lost is a miss.
+            let found = match found {
+                Some((n, mut cp)) if target.q4x.is_some() => match cp.recurrent.q4x.restore_remote() {
+                    Ok(true) => Some((n, cp)),
+                    Ok(false) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "prompt cache: the worker's part of a checkpoint did not load");
+                        None
+                    }
+                },
+                found => found,
+            };
             if let Some((n, cp)) = found {
                 if n > prefill_pos {
                     restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
@@ -4092,6 +4105,10 @@ impl Engine {
         id: u64,
     ) -> Result<(usize, usize), AllpacaError> {
         let chunk = self.config.prefill.chunk_tokens.max(1);
+        // qwen4exp resumes only where a checkpoint was taken, and a request
+        // still has to forward its last prompt token: the checkpoint goes one
+        // token before the end, so the same prompt again finds it.
+        let q4x = inner.target.as_ref().is_some_and(|t| t.q4x.is_some());
         let (start, total, toks, pages) = {
             let active = request_mut(inner, id)?;
             let start = active.prefill_pos;
@@ -4099,7 +4116,8 @@ impl Engine {
             if start >= total {
                 return Ok((start, total));
             }
-            let end = (start + chunk).min(total);
+            let stop = if q4x && start + 1 < total { total - 1 } else { total };
+            let end = (start + chunk).min(stop);
             (
                 start,
                 total,
@@ -4425,7 +4443,11 @@ impl Engine {
         self.metrics
             .prefill_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if end >= total {
+        if q4x {
+            if end + 1 == total {
+                self.capture_qwen4_prompt(inner, id, &target, end)?;
+            }
+        } else if end >= total {
             self.capture_prompt(inner, id, &target)?;
         } else {
             let every = self.config.prompt_cache.boundary_tokens;
@@ -4503,12 +4525,14 @@ impl Engine {
     }
 
     /// qwen4exp keeps its whole state (keys and values too) in the sequence's
-    /// memory: the checkpoint is a host copy of it.
+    /// memory: the checkpoint is a host copy of it after the first `end`
+    /// prompt tokens.
     fn capture_qwen4_prompt(
         &self,
         inner: &mut EngineInner,
         id: u64,
         target: &TinyModel,
+        end: usize,
     ) -> Result<(), AllpacaError> {
         let active = request(inner, id)?;
         if !active.vision.is_empty() || active.probe.is_some() {
@@ -4522,7 +4546,7 @@ impl Engine {
         };
         let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
         recurrent.q4x = q4x;
-        let tokens = active.tokens[..active.prompt_len].to_vec();
+        let tokens = active.tokens[..end].to_vec();
         let cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
         inner.kv_radix.insert_checkpoint(&tokens, cp);
         Ok(())
@@ -4569,7 +4593,8 @@ impl Engine {
         target: &TinyModel,
     ) -> Result<(), AllpacaError> {
         if target.q4x.is_some() {
-            return self.capture_qwen4_prompt(inner, id, target);
+            let end = request(inner, id)?.prompt_len;
+            return self.capture_qwen4_prompt(inner, id, target, end);
         }
         if !self.prompt_cache_reads_back(inner, id, target)? {
             return Ok(());
