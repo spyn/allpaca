@@ -486,6 +486,7 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_q8_0_gemv_rounds_activations(m: i32, n: i32, k: i32) -> i32;
         pub fn allpaca_gemm_nt_q8_0_intdot(
             a: *const f32,
             b: *const u8,
@@ -1132,6 +1133,26 @@ mod ffi {
             n_heads: i32,
             head_dim: i32,
             eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gdn_steps(
+            qkv: *mut f32,
+            conv_w: *const f32,
+            conv_state: *mut f32,
+            alpha: *mut f32,
+            dt_bias: *const f32,
+            a: *const f32,
+            beta: *mut f32,
+            state: *mut f32,
+            out: *mut f32,
+            n_v: i32,
+            n_k: i32,
+            head_v: i32,
+            head_k: i32,
+            conv_kernel: i32,
+            eps: f32,
+            interleave: i32,
+            rows: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gdn_step_fused(
@@ -4856,6 +4877,20 @@ fn gemm_nt_tq_host(
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_tq unavailable".into(),
         )))
+    }
+}
+
+/// Whether a Q8_0 GEMM of this shape on the bound device rounds its input
+/// to int8 first (the int8 GEMV) rather than multiplying it as floats.
+pub fn q8_0_gemv_rounds_activations(m: i32, n: i32, k: i32) -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_q8_0_gemv_rounds_activations(m, n, k) != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (m, n, k);
+        false
     }
 }
 
@@ -11393,6 +11428,71 @@ impl HipWorkspace {
         )
     }
 
+    /// [`Self::gdn_layer_step`] for `rows` tokens in order, in place:
+    /// `qkv` (a row per token) becomes the normed conv outputs, `alpha` the
+    /// decays and `beta` the sigmoids; `y` gets a row per token. The state
+    /// stays in registers across the tokens. Bit-identical to `rows`
+    /// one-token steps; `Ok(false)` when the head width does not fit the
+    /// kernel (step the tokens one at a time instead).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_steps(
+        &self,
+        qkv: *mut f32,
+        alpha: *mut f32,
+        beta: *mut f32,
+        conv_w: *const f32,
+        conv_state: *mut f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        state: *mut f32,
+        y: *mut f32,
+        n_v_heads: i32,
+        n_k_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        conv_kernel: i32,
+        eps: f32,
+        k_interleave: bool,
+        rows: i32,
+    ) -> Result<bool, AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.bind()?;
+            let rc = unsafe {
+                ffi::allpaca_gdn_steps(
+                    qkv,
+                    conv_w,
+                    conv_state,
+                    alpha,
+                    dt_bias,
+                    a,
+                    beta,
+                    state,
+                    y,
+                    n_v_heads,
+                    n_k_heads,
+                    head_v,
+                    head_k,
+                    conv_kernel,
+                    eps,
+                    i32::from(k_interleave),
+                    rows,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc == ALLPACA_ERR_INVALID {
+                return Ok(false);
+            }
+            status(rc, "gdn_steps").map(|()| true)
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (qkv, alpha, beta, conv_w, conv_state, dt_bias, a, state, y);
+            let _ = (n_v_heads, n_k_heads, head_v, head_k, conv_kernel, eps, k_interleave, rows);
+            Ok(false)
+        }
+    }
+
     /// [`Self::gdn_layer_step`] as separate launches (conv, shift, 2x expand,
     /// decay/β, L2 norm, delta step): the fallback, and the reference the
     /// fused path is tested against.
@@ -12660,10 +12760,15 @@ mod tests {
         };
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert!(read(outs[0]).iter().any(|v| *v != 0.0));
-        // Small weights stay on the f32 GEMV, so the pair launch applies.
-        assert!(paired, "m == 1 must take the paired launch");
-        assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
-        assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        // Small weights stay on the f32 GEMV, so the pair launch applies,
+        // except where the int8 GEMV takes every width (the MI50).
+        set_device(0).expect("bind");
+        let int8 = q8_0_gemv_rounds_activations(1, n as i32, k as i32);
+        assert_eq!(paired, !int8, "m == 1 must take the paired launch on the f32 GEMV");
+        if paired {
+            assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
+            assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        }
 
         // scale_add_copy vs scale_f32 + residual_add + copy_d2d.
         let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -12686,6 +12791,69 @@ mod tests {
         device_free(gd, g.len());
         device_free(ud, u.len());
         device_free(xd, k * 4);
+    }
+
+    /// Several tokens through `gdn_steps` leave the outputs, the recurrent
+    /// state and the conv history one-token steps leave, bit for bit.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gdn_steps_of_several_tokens_match_one_token_steps() {
+        if device_count() == 0 {
+            return;
+        }
+        let ws = HipWorkspace::new(0, 8 << 20, 16).unwrap();
+        let (n_v, n_k, hv, hk, ck, rows) = (4usize, 2usize, 64usize, 64usize, 4usize, 5usize);
+        let qkv_dim = 2 * n_k * hk + n_v * hv;
+        let noise = |n: usize, seed: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| (((i * 7919 + seed * 104729) % 2003) as f32 / 1001.5 - 1.0) * scale).collect()
+        };
+        let up = |v: &[f32]| {
+            let p = device_malloc(v.len() * 4, 0).unwrap();
+            memcpy(p, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D).unwrap();
+            p.cast::<f32>()
+        };
+        let down = |p: *mut f32, n: usize| {
+            let mut v = vec![0.0f32; n];
+            memcpy(v.as_mut_ptr().cast(), p.cast(), n * 4, MEMCPY_D2H).unwrap();
+            v
+        };
+        let (qkv, alpha, beta) = (noise(rows * qkv_dim, 1, 0.8), noise(rows * n_v, 2, 1.0), noise(rows * n_v, 3, 1.0));
+        let (conv_w, dt, a) = (noise(qkv_dim * ck, 4, 0.5), noise(n_v, 5, 0.3), noise(n_v, 6, 0.5));
+        let (state0, conv0) = (noise(n_v * hv * hk, 7, 0.2), noise(qkv_dim * (ck - 1), 8, 0.4));
+        let (conv_w, dt, a) = (up(&conv_w), up(&dt), up(&a));
+        set_device(0).unwrap();
+
+        // One token at a time.
+        let (st1, cv1, y1) = (up(&state0), up(&conv0), up(&vec![0.0; rows * n_v * hv]));
+        for r in 0..rows {
+            let (q, al, be) = (
+                up(&qkv[r * qkv_dim..][..qkv_dim]),
+                up(&alpha[r * n_v..][..n_v]),
+                up(&beta[r * n_v..][..n_v]),
+            );
+            let y = unsafe { y1.add(r * n_v * hv) };
+            ws.gdn_layer_step(
+                q, al, be, conv_w, cv1, dt, a, st1, y, n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32,
+                1e-6, false,
+            )
+            .unwrap();
+        }
+        // All of them in one call.
+        let (st2, cv2, y2) = (up(&state0), up(&conv0), up(&vec![0.0; rows * n_v * hv]));
+        let (q, al, be) = (up(&qkv), up(&alpha), up(&beta));
+        let ran = ws
+            .gdn_steps(
+                q, al, be, conv_w, cv2, dt, a, st2, y2, n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32,
+                1e-6, false, rows as i32,
+            )
+            .unwrap();
+        assert!(ran, "head_k {hk} fits the multi-token kernel");
+        stream_synchronize().unwrap();
+        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        assert!(down(y1, rows * n_v * hv).iter().any(|v| *v != 0.0));
+        assert_eq!(bits(down(y1, rows * n_v * hv)), bits(down(y2, rows * n_v * hv)), "outputs differ");
+        assert_eq!(bits(down(st1, n_v * hv * hk)), bits(down(st2, n_v * hv * hk)), "states differ");
+        assert_eq!(bits(down(cv1, conv0.len())), bits(down(cv2, conv0.len())), "conv histories differ");
     }
 
     /// One fused GDN decode step at Qwen3.8-27B dims (48 v-heads, 16 k-heads,
@@ -13229,13 +13397,13 @@ mod tests {
     }
 
     /// The activations a Q8_0 GEMV of `m` rows over an `n x k` weight
-    /// actually multiplies: int8-quantized on the wide-row GEMV path
-    /// (m <= 16, k >= 5120, whole 32-value blocks), as given otherwise or
-    /// with ALLPACA_Q8_F32_GEMV=1.
+    /// actually multiplies on device 0: int8-quantized on the int8 GEMV
+    /// (m <= 16 and k >= 5120, or any k on a 64-lane-wavefront card; whole
+    /// 32-value blocks), as given otherwise or with ALLPACA_Q8_F32_GEMV=1.
     #[cfg(feature = "hip")]
-    fn q8_0_gemv_activations(a: &[f32], m: usize, _n: usize, k: usize) -> Vec<f32> {
-        let f32_gemv = std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1");
-        if m <= 16 && k >= 5120 && k % 32 == 0 && !f32_gemv {
+    fn q8_0_gemv_activations(a: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        set_device(0).expect("bind");
+        if q8_0_gemv_rounds_activations(m as i32, n as i32, k as i32) {
             q8_activations(a)
         } else {
             a.to_vec()

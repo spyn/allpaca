@@ -133,6 +133,9 @@ int allpaca_gemm_nt_untiled(const float *a, const float *b, float *c, int32_t m,
  * B is 36-byte staged Q8_0, not raw GGUF. M>8 uses a tiled kernel. */
 int allpaca_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
+/* 1 when allpaca_gemm_nt_q8_0 of this shape on the bound device rounds A to
+ * int8 first (the int8 GEMV), 0 when it multiplies float A. */
+int allpaca_q8_0_gemv_rounds_activations(int32_t m, int32_t n, int32_t k);
 
 /* Integer A×Q8 GEMV (quantize A tiles, int32 MAC). Not the decode default. */
 int allpaca_gemm_nt_q8_0_intdot(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,

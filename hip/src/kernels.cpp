@@ -25,6 +25,7 @@
 
 #if ALLPACA_HAS_HIP
 
+#include <atomic>
 #include <mutex>
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -2175,6 +2176,58 @@ __global__ void gemv_nt_bf16_wide_kernel(const float *a, const uint16_t *b, floa
     }
 }
 
+/* gemv_nt_bf16_wide_kernel for 2..8 rows a block (grid y = blocks of 8 rows): every row shares
+ * each weight load and sums as it would alone. On the MI50 at 16 rows: 10240x320 157 -> 113 us,
+ * 512x2560 89 -> 66 us; one row stays on the wide kernel (this one is slower there). */
+__global__ void gemv_nt_bf16_wide_rows_kernel(const float *a, const uint16_t *b, float *c, int m,
+                                              int n, int k) {
+    constexpr int GROUPS = 8;
+    constexpr int MAX_M = 8;
+    const int row0 = static_cast<int>(blockIdx.y) * MAX_M;
+    const int rows = m - row0 < MAX_M ? m - row0 : MAX_M;
+    const int grp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int col = static_cast<int>(blockIdx.x) * GROUPS + grp;
+    float acc[MAX_M];
+#pragma unroll
+    for (int r = 0; r < MAX_M; ++r) {
+        acc[r] = 0.f;
+    }
+    if (col < n) {
+        const uint16_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
+        for (int p = lane * 8; p < k; p += 256) {
+            const uint4 w = *reinterpret_cast<const uint4 *>(brow + p);
+#pragma unroll
+            for (int r = 0; r < MAX_M; ++r) {
+                if (r < rows) {
+                    const float *arow = a + static_cast<size_t>(row0 + r) * static_cast<size_t>(k);
+                    const float4 x0 = *reinterpret_cast<const float4 *>(arow + p);
+                    const float4 x1 = *reinterpret_cast<const float4 *>(arow + p + 4);
+                    acc[r] += x0.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x)) +
+                              x0.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.x >> 16)) +
+                              x0.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y)) +
+                              x0.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.y >> 16)) +
+                              x1.x * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z)) +
+                              x1.y * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.z >> 16)) +
+                              x1.z * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w)) +
+                              x1.w * allpaca_bf16_bits_to_f32(static_cast<uint16_t>(w.w >> 16));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MAX_M; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor(v, off, 32);
+        }
+        if (col < n && lane == 0 && r < rows) {
+            c[static_cast<size_t>(row0 + r) * static_cast<size_t>(n) + col] = v;
+        }
+    }
+}
+
 /* The same products with a whole block of 256 per output (grid n), every row (m <= 8) in the
  * block so the weights are read once: for few, long rows, where a 32-lane group per output leaves
  * most of the card idle. With grid (n, m) a block takes row blockIdx.y alone. Each row's sums run
@@ -2294,8 +2347,14 @@ static int launch_gemm_nt_bf16(const float *a, const uint16_t *b, float *c, int3
         (reinterpret_cast<uintptr_t>(b) & 15u) == 0) {
         constexpr int GROUPS = 8;
         dim3 block(GROUPS * 32);
-        dim3 grid(static_cast<unsigned>((n + GROUPS - 1) / GROUPS), static_cast<unsigned>(m));
-        hipLaunchKernelGGL(gemv_nt_bf16_wide_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+        const unsigned gx = static_cast<unsigned>((n + GROUPS - 1) / GROUPS);
+        if (m > 1) {
+            hipLaunchKernelGGL(gemv_nt_bf16_wide_rows_kernel, dim3(gx, static_cast<unsigned>((m + 7) / 8)),
+                               block, 0, stream, a, b, c, m, n, k);
+        } else {
+            hipLaunchKernelGGL(gemv_nt_bf16_wide_kernel, dim3(gx, 1u), block, 0, stream, a, b, c, m,
+                               n, k);
+        }
     } else if (tiled) {
         constexpr int COLS = 64;
         dim3 block(128);
@@ -2332,9 +2391,17 @@ static bool q8_0_i8_enabled() {
     return on;
 }
 
+static bool kq_wave64();
+
+/* On the MI50 (64-lane wavefronts) every width gains: the f32 kernel ran a
+ * 640x2560 weight as 5 blocks (31.8 us; 9 us on int8 with the rounding). */
 static bool q8_0_uses_i8(int32_t n, int32_t k) {
     (void)n;
-    return q8_0_i8_enabled() && k >= Q8_I8_MIN_K;
+    return q8_0_i8_enabled() && (k >= Q8_I8_MIN_K || kq_wave64());
+}
+
+extern "C" int allpaca_q8_0_gemv_rounds_activations(int32_t m, int32_t n, int32_t k) {
+    return m >= 1 && m <= 16 && k % 32 == 0 && q8_0_uses_i8(n, k) ? 1 : 0;
 }
 
 static int launch_gemm_nt_q8_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -3185,6 +3252,65 @@ static inline int kq_i8_rows_per_block(int m) {
     return mr == 3 ? 4 : mr;
 }
 
+/* Whether the bound device runs 64-lane wavefronts (gfx9, the MI50). */
+static bool kq_wave64() {
+    static std::atomic<int> seen[KQ_ACT_DEVICES] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= KQ_ACT_DEVICES) {
+        return false;
+    }
+    int known = seen[dev].load(std::memory_order_relaxed);
+    if (known == 0) {
+        int lanes = 32;
+        if (hipDeviceGetAttribute(&lanes, hipDeviceAttributeWarpSize, dev) != hipSuccess) {
+            lanes = 32;
+        }
+        known = lanes == 64 ? 2 : 1;
+        seen[dev].store(known, std::memory_order_relaxed);
+    }
+    return known == 2;
+}
+
+/* Lanes per output column of the int8 K-quant GEMV. On the MI50 narrow
+ * outputs left most CUs idle at 8 (Q3_K 640x2560 15 -> 8.5 us at 32) and
+ * Q6_K ran at half speed (2560x6144 69 -> 34 us at 32; 16 rows 243 -> 289 us).
+ * Q4_K/Q5_K stay at 8: 16 lanes saved 3-4 us a token but cost 16-row passes
+ * ~1.8x. The choice depends on the weight and the card only, so every row
+ * count sums a column in the same order. */
+static int kq_i8_lanes(int qt, int n) {
+    if ((qt < 3 || qt > 6) || !kq_wave64()) {
+        return 8;
+    }
+    if (n < 2048 || (qt == 6 && n < 7680)) {
+        return 32;
+    }
+    return 8;
+}
+
+template <int QT, int LPC>
+static void kq_i8_dispatch(dim3 grid, dim3 block, hipStream_t stream, int mr, const int8_t *aq,
+                           const float *ad, const uint8_t *b, float *c, int m, int n, int k) {
+#define KQ_I8_LAUNCH(MRV)                                                                          \
+    hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPC>), grid, block, 0, stream, aq, ad,   \
+                       b, c, m, n, k)
+    if (mr == 1) {
+        KQ_I8_LAUNCH(1);
+    } else if (mr == 2) {
+        KQ_I8_LAUNCH(2);
+    } else if (mr == 4) {
+        KQ_I8_LAUNCH(4);
+    } else if (mr == 5) {
+        KQ_I8_LAUNCH(5);
+    } else if (mr == 6) {
+        KQ_I8_LAUNCH(6);
+    } else if (mr == 7) {
+        KQ_I8_LAUNCH(7);
+    } else {
+        KQ_I8_LAUNCH(8);
+    }
+#undef KQ_I8_LAUNCH
+}
+
 /* Returns ALLPACA_ERR_INVALID when the int8 path cannot run (caller falls back). */
 template <int QT>
 static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
@@ -3204,32 +3330,25 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
                        dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
                        dim3(256), 0, stream, a, aq, ad, m, k);
     // 8 lanes x 32 weights per column: at 32 lanes x 8 weights the per-row
-    // A loads and scale math dominated (Q5_K m=4 cost 1.7x m=1; now ~1.05x).
-    constexpr int LPC = 8;
+    // A loads and scale math dominated on RDNA (Q5_K m=4 cost 1.7x m=1; now
+    // ~1.05x). The MI50 takes more lanes on some weights (kq_i8_lanes).
+    const int lpc = kq_i8_lanes(QT, n);
     dim3 block(256);
-    const int cols = 256 / LPC;
+    const int cols = 256 / lpc;
     const unsigned gx = static_cast<unsigned>((n + cols - 1) / cols);
     const int mr = kq_i8_rows_per_block(m);
     const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
-#define KQ_I8_LAUNCH(MRV, LPCV)                                                                    \
-    hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPCV>), grid, block, 0, stream, aq, ad, \
-                       b, c, m, n, k)
-    if (mr == 1) {
-        KQ_I8_LAUNCH(1, LPC);
-    } else if (mr == 2) {
-        KQ_I8_LAUNCH(2, LPC);
-    } else if (mr == 4) {
-        KQ_I8_LAUNCH(4, LPC);
-    } else if (mr == 5) {
-        KQ_I8_LAUNCH(5, LPC);
-    } else if (mr == 6) {
-        KQ_I8_LAUNCH(6, LPC);
-    } else if (mr == 7) {
-        KQ_I8_LAUNCH(7, LPC);
-    } else {
-        KQ_I8_LAUNCH(8, LPC);
+    if constexpr (QT >= 3 && QT <= 6) {
+        if (lpc == 32) {
+            kq_i8_dispatch<QT, 32>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
+            return hip_status(hipGetLastError());
+        }
+        if (lpc == 16) {
+            kq_i8_dispatch<QT, 16>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
+            return hip_status(hipGetLastError());
+        }
     }
-#undef KQ_I8_LAUNCH
+    kq_i8_dispatch<QT, 8>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
     return hip_status(hipGetLastError());
 }
 
@@ -3325,8 +3444,11 @@ static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m,
                        dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
                        dim3(256), 0, stream, a, aq, ad, m, k);
     constexpr int LPC = 8;
-    dim3 block(256);
-    const unsigned gx = static_cast<unsigned>((n + (256 / LPC) - 1) / (256 / LPC));
+    // Smaller blocks spread narrow weights over the MI50's CUs (640x2560
+    // 7.5 -> 5.9 us); the sum order does not depend on the block size.
+    const int threads = kq_wave64() ? 128 : 256;
+    dim3 block(threads);
+    const unsigned gx = static_cast<unsigned>((n + (threads / LPC) - 1) / (threads / LPC));
     const int mr = kq_i8_rows_per_block(m);
     const dim3 grid(gx, static_cast<unsigned>((m + mr - 1) / mr));
     if (mr == 1) {
@@ -7732,6 +7854,213 @@ extern "C" int allpaca_gdn_step_fused(const float *qkv, const float *conv_w, flo
     return hip_status(hipGetLastError());
 }
 
+/* gdn_step_prep_kernel for `rows` tokens in order, in place: x[r] (qkv_dim)
+ * becomes the token's conv output, alpha[r] (n_v) its decay and beta[r] its
+ * sigmoid; each channel walks the tokens with its own history. */
+__global__ void gdn_steps_prep_kernel(float *x, const float *kernel, float *conv_state,
+                                      int qkv_dim, int conv_kernel, float *alpha,
+                                      const float *dt_bias, const float *a, float *beta, int n_v,
+                                      int rows) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= qkv_dim) {
+        const int h = i - qkv_dim;
+        if (h < n_v) {
+            for (int r = 0; r < rows; ++r) {
+                const size_t at = static_cast<size_t>(r) * n_v + h;
+                alpha[at] = expf(gdn_softplus(alpha[at] + dt_bias[h]) * a[h]);
+                beta[at] = 1.0f / (1.0f + expf(-beta[at]));
+            }
+        }
+        return;
+    }
+    const int c = i;
+    const int hist = conv_kernel - 1;
+    for (int r = 0; r < rows; ++r) {
+        float *xr = x + static_cast<size_t>(r) * qkv_dim;
+        const float in = xr[c];
+        float acc = 0.0f;
+        for (int j = 0; j < hist; ++j) {
+            acc += kernel[j + c * conv_kernel] * conv_state[j * qkv_dim + c];
+        }
+        acc += kernel[(conv_kernel - 1) + c * conv_kernel] * in;
+        xr[c] = gdn_silu(acc);
+        if (hist > 0) {
+            for (int j = 0; j < hist - 1; ++j) {
+                conv_state[j * qkv_dim + c] = conv_state[(j + 1) * qkv_dim + c];
+            }
+            conv_state[(hist - 1) * qkv_dim + c] = in;
+        }
+    }
+}
+
+/* gdn_qk_l2norm_kernel on token blockIdx.y's q and k, `stride` floats apart. */
+__global__ void gdn_qk_l2norm_rows_kernel(float *q, float *k, int n_heads, int head_k, float eps,
+                                          int stride) {
+    const size_t off = static_cast<size_t>(blockIdx.y) * static_cast<size_t>(stride);
+    const int h = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (h >= n_heads) {
+        return;
+    }
+    float *q_h = q + off + static_cast<size_t>(h) * head_k;
+    float *k_h = k + off + static_cast<size_t>(h) * head_k;
+    float ss_q = 0.f, ss_k = 0.f;
+    for (int j = lane; j < head_k; j += 32) {
+        ss_q += q_h[j] * q_h[j];
+        ss_k += k_h[j] * k_h[j];
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        ss_q += __shfl_xor(ss_q, o, 32);
+        ss_k += __shfl_xor(ss_k, o, 32);
+    }
+    const float sq = rsqrtf(ss_q + eps) * rsqrtf(static_cast<float>(head_k));
+    const float sk = rsqrtf(ss_k + eps);
+    for (int j = lane; j < head_k; j += 32) {
+        q_h[j] *= sq;
+        k_h[j] *= sk;
+    }
+}
+
+/* gated_delta_step_warp_kernel for `rows` tokens in order: a warp keeps its
+ * state rows in registers across the tokens, so the state is read and
+ * written once a pass, not once a token. Token r's q, k and v start at
+ * qkv + r * stride; its decay and beta at r * n_v_heads; its output at
+ * out + r * n_v_heads * head_v. Each token's arithmetic is the one-token
+ * kernel's, so a pass gives the bits its tokens give one at a time. */
+template <int NJ>
+__global__ void gated_delta_steps_warp_kernel(const float *qkv, int stride, int key_dim,
+                                              const float *decay, const float *beta,
+                                              float *state, float *out, int n_v_heads,
+                                              int head_v, int head_k, int n_k, int interleave,
+                                              int rows) {
+    const int h = static_cast<int>(blockIdx.x);
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    if (h >= n_v_heads) {
+        return;
+    }
+    const int kh = n_k > 0 ? (interleave ? h / (n_v_heads / n_k) : h % n_k) : h;
+    const int row0 = (static_cast<int>(blockIdx.y) * GDN_WARPS + warp) * GDN_ROWS_PER_WARP;
+    float st[GDN_ROWS_PER_WARP][NJ];
+#pragma unroll
+    for (int r = 0; r < GDN_ROWS_PER_WARP; ++r) {
+        const int i = row0 + r;
+#pragma unroll
+        for (int t = 0; t < NJ; ++t) {
+            st[r][t] = i < head_v
+                           ? state[(static_cast<size_t>(h) * head_v + i) * head_k + lane * NJ + t]
+                           : 0.f;
+        }
+    }
+    for (int tok = 0; tok < rows; ++tok) {
+        const float *base = qkv + static_cast<size_t>(tok) * static_cast<size_t>(stride);
+        const float *q_h = base + static_cast<size_t>(kh) * head_k + lane * NJ;
+        const float *k_h = base + key_dim + static_cast<size_t>(kh) * head_k + lane * NJ;
+        const float *v = base + 2 * static_cast<size_t>(key_dim);
+        float qv[NJ], kv[NJ];
+#pragma unroll
+        for (int t = 0; t < NJ; ++t) {
+            qv[t] = q_h[t];
+            kv[t] = k_h[t];
+        }
+        const float g = decay[static_cast<size_t>(tok) * n_v_heads + h];
+        const float b = beta[static_cast<size_t>(tok) * n_v_heads + h];
+        float *out_t = out + static_cast<size_t>(tok) * n_v_heads * head_v;
+#pragma unroll
+        for (int r = 0; r < GDN_ROWS_PER_WARP; ++r) {
+            const int i = row0 + r;
+            if (i >= head_v) {
+                break;
+            }
+            float s[NJ];
+            float acc = 0.f;
+#pragma unroll
+            for (int t = 0; t < NJ; ++t) {
+                s[t] = st[r][t] * g;
+                acc += s[t] * kv[t];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                acc += __shfl_xor(acc, o, 32);
+            }
+            const float delta = b * (v[static_cast<size_t>(h) * head_v + i] - acc);
+            float y = 0.f;
+#pragma unroll
+            for (int t = 0; t < NJ; ++t) {
+                s[t] += delta * kv[t];
+                st[r][t] = s[t];
+                y += s[t] * qv[t];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                y += __shfl_xor(y, o, 32);
+            }
+            if (lane == 0) {
+                out_t[static_cast<size_t>(h) * head_v + i] = y;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < GDN_ROWS_PER_WARP; ++r) {
+        const int i = row0 + r;
+        if (i < head_v) {
+#pragma unroll
+            for (int t = 0; t < NJ; ++t) {
+                state[(static_cast<size_t>(h) * head_v + i) * head_k + lane * NJ + t] = st[r][t];
+            }
+        }
+    }
+}
+
+/* allpaca_gdn_step_fused for `rows` tokens in three launches, in place:
+ * qkv[r] (2 * n_k * head_k + n_v * head_v floats) becomes the token's
+ * normed conv output, alpha[r] (n_v) its decay, beta[r] its sigmoid; out[r]
+ * gets n_v * head_v. Bit-identical to `rows` one-token steps. */
+extern "C" int allpaca_gdn_steps(float *qkv, const float *conv_w, float *conv_state, float *alpha,
+                                 const float *dt_bias, const float *a, float *beta, float *state,
+                                 float *out, int32_t n_v, int32_t n_k, int32_t head_v,
+                                 int32_t head_k, int32_t conv_kernel, float eps,
+                                 int32_t interleave, int32_t rows, allpaca_stream_t stream) {
+    const int nj = head_k % 32 == 0 ? head_k / 32 : 0;
+    if (!qkv || !conv_w || !conv_state || !alpha || !dt_bias || !a || !beta || !state || !out ||
+        n_v <= 0 || n_k <= 0 || n_v % n_k != 0 || head_v <= 0 || conv_kernel <= 0 || rows <= 0 ||
+        !(nj == 1 || nj == 2 || nj == 4 || nj == 8)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipStream_t s = as_stream(stream);
+    const int key_dim = n_k * head_k;
+    const int qkv_dim = 2 * key_dim + n_v * head_v;
+    const int threads = 256;
+    const int blocks = (qkv_dim + n_v + threads - 1) / threads;
+    hipLaunchKernelGGL(gdn_steps_prep_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, s, qkv, conv_w, conv_state,
+                       qkv_dim, conv_kernel, alpha, dt_bias, a, beta, n_v, rows);
+    hipLaunchKernelGGL(gdn_qk_l2norm_rows_kernel,
+                       dim3(static_cast<unsigned>(n_k), static_cast<unsigned>(rows)), dim3(32), 0,
+                       s, qkv, qkv + key_dim, n_k, head_k, eps, qkv_dim);
+    constexpr int rows_per_block = GDN_WARPS * GDN_ROWS_PER_WARP;
+    const dim3 grid(static_cast<unsigned>(n_v),
+                    static_cast<unsigned>((head_v + rows_per_block - 1) / rows_per_block));
+    const dim3 block(32 * GDN_WARPS);
+#define GDN_STEPS(NJV)                                                                             \
+    hipLaunchKernelGGL(gated_delta_steps_warp_kernel<NJV>, grid, block, 0, s, qkv, qkv_dim,      \
+                       key_dim, alpha, beta, state, out, n_v, head_v, head_k, n_k, interleave,   \
+                       rows)
+    if (nj == 1) {
+        GDN_STEPS(1);
+    } else if (nj == 2) {
+        GDN_STEPS(2);
+    } else if (nj == 4) {
+        GDN_STEPS(4);
+    } else {
+        GDN_STEPS(8);
+    }
+#undef GDN_STEPS
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_gdn_conv1d_step(const float *x, const float *kernel, float *conv_state,
                                        float *out, int32_t qkv_dim, int32_t conv_kernel,
                                        allpaca_stream_t stream) {
@@ -9661,6 +9990,10 @@ extern "C" int allpaca_gemm_nt_untiled(const float *, const float *, float *, in
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_q8_0_gemv_rounds_activations(int32_t, int32_t, int32_t) {
+    return 0;
+}
+
 extern "C" int allpaca_gemm_nt_q8_0(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
@@ -10021,6 +10354,13 @@ extern "C" int allpaca_gdn_step_fused(const float *, const float *, float *, flo
                                       const float *, const float *, const float *, float *, float *,
                                       float *, float *, int32_t, int32_t, int32_t, int32_t, int32_t,
                                       float, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gdn_steps(float *, const float *, float *, float *, const float *,
+                                 const float *, float *, float *, float *, int32_t, int32_t,
+                                 int32_t, int32_t, int32_t, float, int32_t, int32_t,
+                                 allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
