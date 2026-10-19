@@ -396,6 +396,13 @@ pub struct Qwen4Memory {
     ple_history: Vec<f32>,
     /// When set, every routed (layer, expert) pair is appended, in order.
     pub routes: Option<Vec<(u16, u16)>>,
+    /// When set, experts marked `true` (index `blk * n_experts + expert`)
+    /// are never picked; the router's weights renormalise over the rest.
+    pub expert_mask: Option<Arc<Vec<bool>>>,
+    /// When set, per `blk * n_experts + expert`: times picked, the sum of its
+    /// routing weights, and the sum of weight x the L2 norm of its output
+    /// (REAP saliency). Host forward only.
+    pub saliency: Option<Vec<[f64; 3]>>,
     /// When set, seconds spent per part of the forward are added up.
     pub times: Option<Qwen4Times>,
     /// The recurrent states, keys and values when the forward runs on the GPU.
@@ -480,6 +487,8 @@ impl Qwen4Memory {
             layers: self.layers.clone(),
             ple_history,
             routes: None,
+            expert_mask: None,
+            saliency: None,
             times: None,
             device: None,
             device_host,
@@ -892,10 +901,26 @@ fn routed_experts(
     x: &[f32],
     picks: &[(usize, f32)],
 ) -> Result<Vec<f32>, AllpacaError> {
+    let mut out = vec![0.0f32; cfg.dim];
+    // The sum keeps the routing order.
+    for ((_, weight), y) in picks.iter().zip(expert_outputs(q4, cfg, blk, x, picks)?) {
+        for (o, y) in out.iter_mut().zip(&y) {
+            *o += weight * y;
+        }
+    }
+    Ok(out)
+}
+
+/// Each picked expert's output, in pick order (one thread per expert).
+fn expert_outputs(
+    q4: &Qwen4Weights,
+    cfg: &ModelConfig,
+    blk: usize,
+    x: &[f32],
+    picks: &[(usize, f32)],
+) -> Result<Vec<Vec<f32>>, AllpacaError> {
     let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
     let name = |s: &str| format!("blk.{blk}.{s}");
-    let mut out = vec![0.0f32; dim];
-    // One thread per routed expert; the sum keeps the routing order.
     let expert = |e: usize| -> Result<Vec<f32>, AllpacaError> {
         if let (Some(gate), Some(up), Some(down)) = (
             q4.q2_0_rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?,
@@ -916,12 +941,12 @@ fn routed_experts(
             .map(|j| j.join().unwrap_or_else(|_| Err(load_err("qwen4exp expert thread panicked".into()))))
             .collect()
     });
-    for ((_, weight), y) in picks.iter().zip(ys) {
-        for (o, y) in out.iter_mut().zip(&y?) {
-            *o += weight * y;
-        }
-    }
-    Ok(out)
+    ys.into_iter().collect()
+}
+
+/// Block `blk`'s part of an expert mask ([`Qwen4Memory::expert_mask`]).
+fn block_mask(mask: Option<&Arc<Vec<bool>>>, blk: usize, n_experts: usize) -> Option<&[bool]> {
+    mask.and_then(|m| m.get(blk * n_experts..(blk + 1) * n_experts))
 }
 
 /// Routed experts (softmax over all, the top few renormalised) plus the
@@ -931,17 +956,35 @@ fn ffn_layer(
     cfg: &ModelConfig,
     blk: usize,
     x: &[f32],
-    routes: Option<&mut Vec<(u16, u16)>>,
+    mem: &mut Qwen4Memory,
 ) -> Result<Vec<f32>, AllpacaError> {
     let dim = cfg.dim;
     let name = |s: &str| format!("blk.{blk}.{s}");
     let router = q4.w(&name("ffn_gate_inp.weight"))?;
     let mut scores = gemv(x, &router, cfg.n_experts)?;
-    let picks = topk_from_logits(&mut scores, cfg.n_active, cfg, None, &[]);
-    if let Some(routes) = routes {
+    let picks = topk_from_logits(&mut scores, cfg.n_active, cfg, block_mask(mem.expert_mask.as_ref(), blk, cfg.n_experts), &[]);
+    if let Some(routes) = mem.routes.as_mut() {
         routes.extend(picks.iter().map(|(e, _)| (blk as u16, *e as u16)));
     }
-    let mut out = routed_experts(q4, cfg, blk, x, &picks)?;
+    let mut out = match mem.saliency.as_mut() {
+        Some(sal) => {
+            let ys = expert_outputs(q4, cfg, blk, x, &picks)?;
+            let mut out = vec![0.0f32; dim];
+            for ((e, weight), y) in picks.iter().zip(&ys) {
+                let norm = y.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>().sqrt();
+                if let Some(slot) = sal.get_mut(blk * cfg.n_experts + e) {
+                    slot[0] += 1.0;
+                    slot[1] += f64::from(*weight);
+                    slot[2] += f64::from(*weight) * norm;
+                }
+                for (o, y) in out.iter_mut().zip(y) {
+                    *o += weight * y;
+                }
+            }
+            out
+        }
+        None => routed_experts(q4, cfg, blk, x, &picks)?,
+    };
     if q4.has(&name("ffn_up_shexp.weight")) {
         let gate = q4.w(&name("ffn_gate_shexp.weight"))?;
         let up = q4.w(&name("ffn_up_shexp.weight"))?;
@@ -1294,7 +1337,7 @@ fn forward_host(
         lap(&mut times.combine);
         let (x, inject) = mix(q4, &format!("blk.{blk}.hc_ffn"), true, &streams, dim, eps)?;
         lap(&mut times.mix);
-        let out = ffn_layer(q4, cfg, blk, &x, mem.routes.as_mut())?;
+        let out = ffn_layer(q4, cfg, blk, &x, mem)?;
         lap(&mut times.ffn_host);
         hc_combine(&mut streams, &out, &inject, dim);
         lap(&mut times.combine);
@@ -1395,7 +1438,9 @@ fn forward_device(
     // the block comes back to the host. `ALLPACA_Q4X_HOST_ROUTING` and the
     // route recorder keep the picking on the host.
     let card_scale = crate::model::plain_softmax_routing(cfg)
-        .filter(|_| mem.routes.is_none() && std::env::var_os("ALLPACA_Q4X_HOST_ROUTING").is_none());
+        .filter(|_| {
+            mem.routes.is_none() && mem.expert_mask.is_none() && std::env::var_os("ALLPACA_Q4X_HOST_ROUTING").is_none()
+        });
     for layer in 0..cfg.n_layers {
         if layer < resume {
             continue;
@@ -1403,6 +1448,9 @@ fn forward_device(
         let blk = cfg.gguf_blk(layer);
         // The blocks a worker hosts run there in one round trip.
         if let Some(host) = gpu.hosted().filter(|h| h.blocks().first() == Some(&blk)) {
+            if mem.expert_mask.is_some() {
+                return Err(load_err("qwen4exp: an expert mask does not reach blocks a worker hosts".into()));
+            }
             gpu.get_streams(card, &mut streams)?;
             resume = layer + host.blocks().len();
             card = if resume < cfg.n_layers { gpu.card_of(cfg.gguf_blk(resume)) } else { 0 };
@@ -1479,7 +1527,7 @@ fn forward_device(
         lap(card, if wait { &mut times.route } else if recurrent { &mut times.gdn } else { &mut times.attention })?;
         let picks: Vec<Vec<(usize, f32)>> = scores
             .chunks_mut(n_experts.max(1))
-            .map(|row| topk_from_logits(row, cfg.n_active, cfg, None, &[]))
+            .map(|row| topk_from_logits(row, cfg.n_active, cfg, block_mask(mem.expert_mask.as_ref(), blk, n_experts), &[]))
             .collect();
         if let Some(routes) = mem.routes.as_mut() {
             routes.extend(picks.iter().flatten().map(|(e, _)| (blk as u16, *e as u16)));
@@ -2641,6 +2689,205 @@ mod tests {
         assert!((third[1] - (3.0 * gate + silu(3.0 * tap))).abs() < 1e-4, "{third:?}");
     }
 
+    /// A masked expert is never picked, the rest still are, and the saliency
+    /// recorder counts exactly the recorded routes.
+    #[test]
+    fn tiny_qwen4exp_expert_mask_keeps_experts_out() {
+        let model = tiny_model();
+        let n_experts = model.config.n_experts;
+        let n_blocks = model.config.n_layers;
+        let tokens = [3u32, 4, 5, 6, 7, 3, 5, 4];
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        let read = |mem: &mut Qwen4Memory, logits: &mut Vec<f32>| -> Vec<Vec<f32>> {
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(pos, &t)| {
+                    forward_qwen4_token(&model, t, pos, logits, mem).expect("forward");
+                    logits.clone()
+                })
+                .collect()
+        };
+        let mut plain = Qwen4Memory {
+            routes: Some(Vec::new()),
+            saliency: Some(vec![[0.0; 3]; n_blocks * n_experts]),
+            ..Default::default()
+        };
+        let a = read(&mut plain, &mut logits);
+        let routes = plain.routes.take().unwrap();
+        let sal = plain.saliency.take().unwrap();
+        for (i, slot) in sal.iter().enumerate() {
+            let picked = routes.iter().filter(|(l, e)| usize::from(*l) * n_experts + usize::from(*e) == i).count();
+            assert_eq!(slot[0], picked as f64, "slot {i}");
+            assert!(slot[1] >= 0.0 && slot[2] >= 0.0);
+            assert_eq!(slot[1] > 0.0, picked > 0);
+        }
+        // Mask the most used expert of every block.
+        let mut mask = vec![false; n_blocks * n_experts];
+        for blk in 0..n_blocks {
+            let hot = (0..n_experts).max_by(|x, y| sal[blk * n_experts + x][0].total_cmp(&sal[blk * n_experts + y][0]));
+            mask[blk * n_experts + hot.unwrap()] = true;
+        }
+        let mut masked = Qwen4Memory {
+            routes: Some(Vec::new()),
+            expert_mask: Some(Arc::new(mask.clone())),
+            ..Default::default()
+        };
+        let b = read(&mut masked, &mut logits);
+        let routes = masked.routes.take().unwrap();
+        assert_eq!(routes.len(), tokens.len() * n_blocks * model.config.n_active);
+        assert!(routes.iter().all(|(l, e)| !mask[usize::from(*l) * n_experts + usize::from(*e)]));
+        assert!(a.iter().zip(&b).any(|(x, y)| max_diff(x, y) > 1e-6), "masking the hottest experts changed nothing");
+    }
+
+    /// `ALLPACA_Q4X_GPU` = number of cards to put matrices and experts on;
+    /// `ALLPACA_Q4X_RPC` = worker (`host:port`, token in `ALLPACA_RPC_TOKEN`)
+    /// for the experts off the cards. Neither: the host forward.
+    fn attach_from_env(model: &mut TinyModel) {
+        #[cfg(feature = "hip")]
+        if let Some(cards) = std::env::var("ALLPACA_Q4X_GPU").ok().and_then(|v| v.parse::<i32>().ok()) {
+            let load = std::time::Instant::now();
+            let vocab = model.config.vocab_size;
+            let first = Arc::new(allpaca_hip::HipWorkspace::new(0, 1 << 20, vocab).expect("card 0"));
+            let second = (cards > 1).then(|| Arc::new(allpaca_hip::HipWorkspace::new(1, 1 << 20, vocab).expect("card 1")));
+            if let Ok(endpoint) = std::env::var("ALLPACA_Q4X_RPC") {
+                let token = std::env::var("ALLPACA_RPC_TOKEN").ok();
+                let rt = crate::rpc_runtime::RpcRuntime::connect(&[endpoint], token.as_deref()).expect("rpc worker");
+                model.rpc = Some(Arc::new(rt));
+            }
+            crate::qwen4_gpu::attach(model, &first, second.as_ref(), None).expect("attach");
+            let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
+            eprintln!(
+                "Q4X gpu attached in {:.1}s, expert layers per card {:?}",
+                load.elapsed().as_secs_f32(),
+                gpu.as_ref().unwrap().expert_layers().iter().map(Vec::len).collect::<Vec<_>>()
+            );
+        }
+        #[cfg(not(feature = "hip"))]
+        let _ = model;
+    }
+
+    /// Opt-in: what pruning experts costs on a real qwen4exp file.
+    /// `ALLPACA_QWEN4EXP` is the first shard, `ALLPACA_Q4X_TOKENS` the tokens
+    /// read per paragraph (blank-line separated). Without the scores file
+    /// `ALLPACA_Q4X_PRUNE_SCORES`, the host forward reads `ALLPACA_Q4X_TEXTS`
+    /// and writes it (`blk expert picks sum_weight sum_weight_x_norm` per
+    /// line). With it, every paragraph of `ALLPACA_Q4X_HELDOUT` is read
+    /// whole and with each block's least salient fraction of experts masked
+    /// (`ALLPACA_Q4X_PRUNE`, e.g. `0.125,0.25,0.5`), by REAP saliency (mean
+    /// weight x output norm over its picks) and by pick count, and the mean
+    /// KL to the unmasked reading and top-1 agreement are printed.
+    #[test]
+    fn real_qwen4exp_expert_pruning_when_env_set() {
+        let (Ok(path), Ok(scores_path)) = (std::env::var("ALLPACA_QWEN4EXP"), std::env::var("ALLPACA_Q4X_PRUNE_SCORES"))
+        else {
+            return;
+        };
+        let n: usize = std::env::var("ALLPACA_Q4X_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(192);
+        let file = Arc::new(GgufFile::open(std::path::Path::new(&path)).expect("open"));
+        let tok = crate::tokenizer::EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).expect("tokenizer"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file);
+        let (n_experts, n_blocks, vocab) = (model.config.n_experts, model.config.n_layers, model.config.vocab_size);
+        let paragraphs = |var: &str| -> Vec<Vec<u32>> {
+            let text = std::fs::read_to_string(std::env::var(var).expect(var)).expect("texts").replace("\r\n", "\n");
+            text.split("\n\n")
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| tok.encode_plain(t).expect("encode").into_iter().take(n).collect())
+                .collect()
+        };
+        let scores_file = std::path::Path::new(&scores_path);
+        if !scores_file.exists() {
+            let mut sal = vec![[0.0f64; 3]; n_blocks * n_experts];
+            let mut logits = vec![0.0f32; vocab];
+            for (pi, ids) in paragraphs("ALLPACA_Q4X_TEXTS").iter().enumerate() {
+                let t = std::time::Instant::now();
+                let mut mem = Qwen4Memory { saliency: Some(std::mem::take(&mut sal)), ..Default::default() };
+                for (pos, token) in ids.iter().enumerate() {
+                    forward_qwen4_token(&model, *token, pos, &mut logits, &mut mem).expect("forward");
+                }
+                sal = mem.saliency.take().unwrap();
+                eprintln!("Q4X prune score: paragraph {pi}, {} tokens, {:.0}s", ids.len(), t.elapsed().as_secs_f32());
+            }
+            let mut lines = String::new();
+            for (i, [count, w, wn]) in sal.iter().enumerate() {
+                lines += &format!("{}\t{}\t{count}\t{w}\t{wn}\n", i / n_experts, i % n_experts);
+            }
+            std::fs::write(scores_file, lines).expect("write scores");
+            return;
+        }
+        let mut sal = vec![[0.0f64; 3]; n_blocks * n_experts];
+        for line in std::fs::read_to_string(scores_file).expect("scores").lines() {
+            let f: Vec<f64> = line.split('\t').map(|v| v.parse().expect("number")).collect();
+            sal[f[0] as usize * n_experts + f[1] as usize] = [f[2], f[3], f[4]];
+        }
+        let fractions: Vec<f64> = std::env::var("ALLPACA_Q4X_PRUNE")
+            .unwrap_or_else(|_| "0.125,0.25,0.5".into())
+            .split(',')
+            .map(|v| v.parse().expect("fraction"))
+            .collect();
+        // Each block's `fraction` of experts with the lowest `key` (ties: lower index first).
+        let mask_by = |fraction: f64, key: &dyn Fn(&[f64; 3]) -> f64| -> Arc<Vec<bool>> {
+            let mut mask = vec![false; n_blocks * n_experts];
+            let cut = ((fraction * n_experts as f64).round() as usize).min(n_experts);
+            for blk in 0..n_blocks {
+                let row = &sal[blk * n_experts..(blk + 1) * n_experts];
+                let mut order: Vec<usize> = (0..n_experts).collect();
+                order.sort_by(|a, b| key(&row[*a]).total_cmp(&key(&row[*b])).then(a.cmp(b)));
+                for e in &order[..cut] {
+                    mask[blk * n_experts + e] = true;
+                }
+            }
+            Arc::new(mask)
+        };
+        let reap = |s: &[f64; 3]| if s[0] > 0.0 { s[2] / s[0] } else { 0.0 };
+        let freq = |s: &[f64; 3]| s[0];
+        let mut runs: Vec<(String, Arc<Vec<bool>>)> = Vec::new();
+        for f in &fractions {
+            runs.push((format!("reap {f}"), mask_by(*f, &reap)));
+            runs.push((format!("freq {f}"), mask_by(*f, &freq)));
+        }
+        attach_from_env(&mut model);
+        let log_softmax = |row: &[f32]| -> Vec<f64> {
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let sum: f64 = row.iter().map(|v| (*v as f64 - max).exp()).sum();
+            row.iter().map(|v| *v as f64 - max - sum.ln()).collect()
+        };
+        let top = |v: &[f64]| (0..v.len()).max_by(|x, y| v[*x].total_cmp(&v[*y])).unwrap_or(0);
+        let mut logits = vec![0.0f32; vocab];
+        let mut totals = vec![(0.0f64, 0usize, 0usize); runs.len()];
+        for (pi, ids) in paragraphs("ALLPACA_Q4X_HELDOUT").iter().enumerate() {
+            let mut reference = vec![0.0f32; ids.len() * vocab];
+            forward_qwen4_tokens(&model, ids, 0, &mut logits, Some(&mut reference), &mut Qwen4Memory::default())
+                .expect("reference");
+            let reference: Vec<Vec<f64>> = reference.chunks(vocab).map(log_softmax).collect();
+            let mut line = format!("Q4X prune paragraph {pi} ({} tokens):", ids.len());
+            for ((name, mask), total) in runs.iter().zip(totals.iter_mut()) {
+                let mut rows = vec![0.0f32; ids.len() * vocab];
+                let mut mem = Qwen4Memory { expert_mask: Some(mask.clone()), ..Default::default() };
+                forward_qwen4_tokens(&model, ids, 0, &mut logits, Some(&mut rows), &mut mem).expect("masked");
+                let mut kl = 0.0f64;
+                for (p, q) in reference.iter().zip(rows.chunks(vocab).map(log_softmax)) {
+                    kl += p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum::<f64>();
+                    total.2 += usize::from(top(p) == top(&q));
+                }
+                total.0 += kl;
+                total.1 += ids.len();
+                line += &format!(" | {name} {:.4}", kl / ids.len() as f64);
+            }
+            eprintln!("{line}");
+        }
+        for ((name, mask), (kl, count, agree)) in runs.iter().zip(&totals) {
+            let pruned = mask.iter().filter(|m| **m).count();
+            eprintln!(
+                "Q4X prune {name}: {pruned} experts masked, KL {:.4} nats/token, top-1 {:.1}% over {count} tokens",
+                kl / *count as f64,
+                100.0 * *agree as f64 / *count as f64
+            );
+        }
+    }
+
     /// Opt-in: greedy continuation of a prompt on a real qwen4exp file, to
     /// compare with llama.cpp. `ALLPACA_QWEN4EXP` is the first shard's path,
     /// `ALLPACA_QWEN4EXP_PROMPT` the raw prompt, `ALLPACA_QWEN4EXP_N` the
@@ -2656,27 +2903,7 @@ mod tests {
         let tok = crate::tokenizer::EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).expect("tokenizer"));
         let mut model = TinyModel::from_gguf(&file).expect("model");
         model.bind_gguf(file);
-        // `ALLPACA_Q4X_GPU` = number of cards to put matrices and experts on.
-        #[cfg(feature = "hip")]
-        if let Some(cards) = std::env::var("ALLPACA_Q4X_GPU").ok().and_then(|v| v.parse::<i32>().ok()) {
-            let load = std::time::Instant::now();
-            let vocab = model.config.vocab_size;
-            let first = Arc::new(allpaca_hip::HipWorkspace::new(0, 1 << 20, vocab).expect("card 0"));
-            let second = (cards > 1).then(|| Arc::new(allpaca_hip::HipWorkspace::new(1, 1 << 20, vocab).expect("card 1")));
-            // `ALLPACA_Q4X_RPC` = worker (`host:port`, token in `ALLPACA_RPC_TOKEN`) for the experts off the cards.
-            if let Ok(endpoint) = std::env::var("ALLPACA_Q4X_RPC") {
-                let token = std::env::var("ALLPACA_RPC_TOKEN").ok();
-                let rt = crate::rpc_runtime::RpcRuntime::connect(&[endpoint], token.as_deref()).expect("rpc worker");
-                model.rpc = Some(Arc::new(rt));
-            }
-            crate::qwen4_gpu::attach(&model, &first, second.as_ref(), None).expect("attach");
-            let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
-            eprintln!(
-                "Q4X gpu attached in {:.1}s, expert layers per card {:?}",
-                load.elapsed().as_secs_f32(),
-                gpu.as_ref().unwrap().expert_layers().iter().map(Vec::len).collect::<Vec<_>>()
-            );
-        }
+        attach_from_env(&mut model);
         let mut ids = tok.encode_plain(&prompt).expect("encode");
         eprintln!("Q4X prompt tokens {ids:?}");
         let mut mem = Qwen4Memory::default();
