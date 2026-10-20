@@ -237,6 +237,10 @@ pub fn capture(model: &Path, texts: &[&str]) -> Result<InputStats, AllpacaError>
         )));
     }
     let (model, tok, _) = crate::sensitivity::load_host(model)?;
+    // A qwen4exp model's own forward has no input sites: nothing to measure.
+    if model.q4x.is_some() {
+        return Ok(InputStats::default());
+    }
     model.calib.start();
     let mut run = Ok(());
     for text in texts {

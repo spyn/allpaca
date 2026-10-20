@@ -25,7 +25,7 @@ use allpaca_gguf::{GgmlType, GgufFile, GgufStreamTensor, GgufStreamWriter, GgufV
 use allpaca_types::{AllpacaError, FatalError};
 
 use crate::calib::InputStats;
-use crate::gsq::{output_error, quantise_2bit, Gram, GsqConfig};
+use crate::gsq::{output_energy, output_error, quantise_2bit, Gram, GsqConfig};
 use crate::rco::{knapsack, Problem};
 use crate::sensitivity::Probe;
 
@@ -136,6 +136,9 @@ pub struct Options {
     pub targets: Vec<Target>,
     /// Matrices with fewer weights are copied as they are.
     pub min_weights: usize,
+    /// Tensors whose name contains one of these are copied as they are. A
+    /// `qwen4exp` file adds [`QWEN4EXP_KEEP`].
+    pub keep: Vec<String>,
     pub gsq: GsqConfig,
     /// Steps of the budget the allocation is solved in.
     pub resolution: usize,
@@ -181,6 +184,7 @@ impl Default for Options {
             avg_bits: 3.0,
             targets: Target::ALL.to_vec(),
             min_weights: 4096,
+            keep: Vec::new(),
             gsq: GsqConfig::default(),
             resolution: 4000,
             stats: None,
@@ -230,6 +234,81 @@ impl Report {
     }
 }
 
+/// What a `qwen4exp` file (Qwen3.8-Flash-Next) keeps as it is: the
+/// routers, the sparse-attention indexer, the residual streams' inject
+/// gates, the delta-net's gate projections and conv, and the n-gram table
+/// (half the file's weights, already 4-bit, and read a row at a time).
+pub const QWEN4EXP_KEEP: [&str; 7] =
+    ["ffn_gate_inp", "indexer.", "_inject.", "ssm_alpha", "ssm_beta", "ssm_conv1d", "per_layer_token_embd"];
+
+/// 2-bit results larger than this go to a file until they are written out.
+const TWO_BIT_IN_RAM: usize = 64 << 20;
+
+/// The 2-bit result of each matrix, kept for writing out: in RAM while
+/// small, the rest in a file beside the first output (an MoE model's 2-bit
+/// experts can outgrow the RAM). The file is removed when this is dropped.
+struct TwoBit {
+    path: PathBuf,
+    /// Results up to this many bytes stay in RAM.
+    in_ram: usize,
+    file: Option<std::fs::File>,
+    kept: Vec<Kept>,
+}
+
+enum Kept {
+    Ram(Vec<u8>),
+    Spilled { at: u64, len: usize },
+}
+
+impl TwoBit {
+    fn new(beside: &Path, in_ram: usize) -> Self {
+        let mut name = beside.file_name().unwrap_or_default().to_os_string();
+        name.push(".2bit-spill");
+        Self { path: beside.with_file_name(name), in_ram, file: None, kept: Vec::new() }
+    }
+
+    fn push(&mut self, bytes: Vec<u8>) -> Result<(), AllpacaError> {
+        use std::io::{Seek, SeekFrom, Write};
+        if bytes.len() <= self.in_ram {
+            self.kept.push(Kept::Ram(bytes));
+            return Ok(());
+        }
+        let io = |e: std::io::Error| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", self.path.display())));
+        if self.file.is_none() {
+            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&self.path);
+            self.file = Some(file.map_err(io)?);
+        }
+        let file = self.file.as_mut().expect("opened");
+        let at = file.seek(SeekFrom::End(0)).map_err(io)?;
+        file.write_all(&bytes).map_err(io)?;
+        self.kept.push(Kept::Spilled { at, len: bytes.len() });
+        Ok(())
+    }
+
+    fn get(&mut self, i: usize) -> Result<std::borrow::Cow<'_, [u8]>, AllpacaError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let io = |e: std::io::Error| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", self.path.display())));
+        match &self.kept[i] {
+            Kept::Ram(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+            &Kept::Spilled { at, len } => {
+                let file = self.file.as_mut().expect("a spilled result has its file");
+                let mut bytes = vec![0u8; len];
+                file.seek(SeekFrom::Start(at)).map_err(io)?;
+                file.read_exact(&mut bytes).map_err(io)?;
+                Ok(std::borrow::Cow::Owned(bytes))
+            }
+        }
+    }
+}
+
+impl Drop for TwoBit {
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Rows and row length of a matrix whose rows are whole blocks of at
 /// least one of `targets` (ggml lists the row length first), or `None`
 /// for anything else.
@@ -255,12 +334,32 @@ fn write_probe_table<'a>(
     std::fs::write(path, text).map_err(|e| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", path.display()))))
 }
 
-/// The divergences of a probe table, by matrix and type name.
+/// Add one matrix's lines to a probe table, in one write.
+fn append_probe_table(path: &Path, name: &str, targets: &[Target], divergence: &[f64]) -> Result<(), AllpacaError> {
+    use std::io::Write;
+    let mut text = String::new();
+    for (t, d) in targets.iter().zip(divergence).filter(|(_, d)| !d.is_nan()) {
+        text.push_str(&format!("{name}\t{}\t{d:e}\n", t.name()));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .map_err(|e| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", path.display()))))
+}
+
+/// The divergences of a probe table, by matrix and type name. A last line
+/// cut short (a run stopped while writing it) is left out.
 fn read_probe_table(path: &Path) -> Result<HashMap<String, HashMap<String, f64>>, AllpacaError> {
     let bad = |why: String| AllpacaError::Fatal(FatalError::InvalidConfig(format!("{}: {why}", path.display())));
     let text = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
     let mut table: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    let whole = match text.ends_with('\n') {
+        true => text.as_str(),
+        false => text.rfind('\n').map_or("", |at| &text[..=at]),
+    };
+    for line in whole.lines().filter(|l| !l.trim().is_empty()) {
         let mut f = line.split('\t');
         let (Some(name), Some(target), Some(d), None) = (f.next(), f.next(), f.next(), f.next()) else {
             return Err(bad(format!("not name, type, divergence: {line}")));
@@ -304,11 +403,16 @@ pub fn requantise_each(
         }
         None => None,
     };
+    let mut keep = opts.keep.clone();
+    if crate::qwen4exp::file_is_qwen4exp(&file) {
+        keep.extend(QWEN4EXP_KEEP.iter().map(|k| k.to_string()));
+    }
     let candidates: Vec<(usize, usize, usize)> = file
         .tensors
         .iter()
         .enumerate()
         .filter(|(_, t)| t.name.ends_with(".weight") && !matches!(t.ggml_type, GgmlType::I32 | GgmlType::Other))
+        .filter(|(_, t)| !keep.iter().any(|k| t.name.contains(k.as_str())))
         .filter_map(|(i, t)| matrix_shape(&t.dims, opts.min_weights, targets).map(|(rows, cols)| (i, rows, cols)))
         .collect();
     if candidates.is_empty() {
@@ -324,7 +428,7 @@ pub fn requantise_each(
     // Error of every option for every matrix. The 2-bit result is kept: it
     // is small, and the search that makes it is the slow part.
     let mut errors = Vec::with_capacity(candidates.len());
-    let mut two_bit = Vec::with_capacity(candidates.len());
+    let mut two_bit = TwoBit::new(outputs.first().map_or(input, |o| o.0), TWO_BIT_IN_RAM);
     let mut calibrated = Vec::with_capacity(candidates.len());
     let mut divergence = Vec::with_capacity(candidates.len());
     // Whether a matrix's divergence is measured (or read from the table);
@@ -338,7 +442,7 @@ pub fn requantise_each(
         let w = file.tensor_f32(name)?;
         let h = measured(i, cols);
         let gram = h.as_deref().map_or(Gram::Identity, Gram::Full);
-        let energy = output_error(&w, &vec![0.0; w.len()], cols, &gram);
+        let energy = output_energy(&w, cols, &gram);
         // A type the rows do not fit is not an option for this matrix.
         let mut row = vec![f64::NAN; targets.len()];
         let mut moved = vec![f64::NAN; targets.len()];
@@ -369,7 +473,10 @@ pub fn requantise_each(
                     )))
                 })?;
             } else if let Some(probe) = probe.as_mut().filter(|_| covered && (!scaled || Some(at) == anchor)) {
-                moved[at] = probe.divergence(name, &decoded)?;
+                let (d, back) = probe.divergence_of(name, std::mem::take(&mut decoded))?;
+                moved[at] = d;
+                decoded = back;
+                decoded.resize(w.len(), 0.0);
             }
             if target == Target::Q2_0 {
                 kept = bytes;
@@ -381,7 +488,12 @@ pub fn requantise_each(
                 moved[at] = per_error * row[at];
             }
         }
-        two_bit.push(kept);
+        // Measured now: kept in the table at once, so a run that is stopped
+        // carries on from it.
+        if let (Some(path), Some(_), false, true) = (&opts.probe_table, probe.as_ref(), from_table, covered) {
+            append_probe_table(path, name, targets, &moved)?;
+        }
+        two_bit.push(kept)?;
         errors.push(row);
         calibrated.push(h.is_some());
         divergence.push(moved);
@@ -493,7 +605,7 @@ pub fn requantise_each(
             match chosen(i) {
                 Some(Target::Q2_0) => {
                     let at = candidates.iter().position(|c| c.0 == i).expect("chosen");
-                    writer.write_tensor(&two_bit[at])?;
+                    writer.write_tensor(&two_bit.get(at)?)?;
                 }
                 Some(target) => {
                     let (_, rows, cols) = candidates[candidates.iter().position(|c| c.0 == i).expect("chosen")];
@@ -565,6 +677,52 @@ mod tests {
                 ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
             })
             .collect()
+    }
+
+    #[test]
+    fn a_qwen4exp_file_keeps_its_routers_indexer_and_ngram_table() {
+        let dir = std::env::temp_dir();
+        let (src, dst) = (
+            dir.join(format!("allpaca_requant_q4x_in-{}.gguf", std::process::id())),
+            dir.join(format!("allpaca_requant_q4x_out-{}.gguf", std::process::id())),
+        );
+        crate::qwen4exp::write_tiny_qwen4exp_gguf(&src);
+        let opts = Options { avg_bits: 8.5, targets: vec![Target::Q8_0], min_weights: 0, ..Options::default() };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        let (before, after) = (GgufFile::open(&src).unwrap(), GgufFile::open(&dst).unwrap());
+        let mut kept = 0;
+        for t in &before.tensors {
+            let now = after.tensor(&t.name).unwrap().ggml_type;
+            if QWEN4EXP_KEEP.iter().any(|k| t.name.contains(k)) {
+                assert_eq!(now, t.ggml_type, "{} is kept", t.name);
+                kept += 1;
+            }
+        }
+        assert!(kept > 0 && report.choices.iter().all(|c| !QWEN4EXP_KEEP.iter().any(|k| c.name.contains(k))));
+        // The tiny model's rows are 16 wide but for the streams' mixers (32).
+        assert!(report.choices.iter().any(|c| c.name.ends_with("hc_attn_down.weight")), "the rest is requantised");
+        drop((before, after));
+        for path in [src, dst] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn large_two_bit_results_wait_in_a_file_that_is_removed_after() {
+        let beside = std::env::temp_dir().join(format!("allpaca_two_bit-{}.gguf", std::process::id()));
+        let mut store = TwoBit::new(&beside, 4);
+        let results = [vec![1u8, 2, 3], vec![9u8; 10], vec![], vec![7u8; 5], vec![4u8, 5]];
+        for r in &results {
+            store.push(r.clone()).unwrap();
+        }
+        let spill = store.path.clone();
+        assert!(spill.exists(), "the two larger results went to {}", spill.display());
+        assert_eq!(std::fs::metadata(&spill).unwrap().len(), 15);
+        for i in [3, 0, 1, 4, 2, 1] {
+            assert_eq!(store.get(i).unwrap().as_ref(), results[i].as_slice(), "result {i}");
+        }
+        drop(store);
+        assert!(!spill.exists(), "removed with the store");
     }
 
     #[test]
@@ -1175,6 +1333,49 @@ mod tests {
         }
         assert_eq!(std::fs::read(&probed).unwrap(), std::fs::read(&reused).unwrap());
         for path in [src, probed, reused, table] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// The table grows as the probe measures, so a run stopped part way
+    /// (even in the middle of a line) carries on from it and probes only
+    /// the matrices it lacks: same types, same file.
+    #[test]
+    fn a_stopped_probe_carries_on_from_its_table() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let at = |tag: &str| dir.join(format!("allpaca_requant_resume_{tag}-{pid}"));
+        let (src, whole, resumed, table) = (at("in.gguf"), at("whole.gguf"), at("resumed.gguf"), at("table.tsv"));
+        let _ = std::fs::remove_file(&table);
+        crate::calib::tests::write_tiny_calib_gguf_with(&src, 64, 128, 1e-4);
+        let opts = Options {
+            avg_bits: 3.6,
+            gsq: GsqConfig { steps: 8, ..GsqConfig::default() },
+            targets: CLASSIC.to_vec(),
+            probe: Some(ProbeTexts { texts: vec!["hello world again hello world".into()], max_tokens: 32, scaled: true }),
+            probe_table: Some(table.clone()),
+            ..Options::default()
+        };
+        let first = requantise(&src, &whole, &opts).unwrap();
+        let text = std::fs::read_to_string(&table).unwrap();
+        let first_name = text.lines().next().unwrap().split('\t').next().unwrap().to_string();
+        // What a run stopped after its first matrix, half way through the next line, leaves.
+        let mut cut: String = text.lines().filter(|l| l.starts_with(&format!("{first_name}\t"))).map(|l| format!("{l}\n")).collect();
+        let next = text.lines().find(|l| !l.starts_with(&format!("{first_name}\t"))).unwrap();
+        cut.push_str(&next[..next.len() / 2]);
+        std::fs::write(&table, cut).unwrap();
+        let second = requantise(&src, &resumed, &opts).unwrap();
+        for (a, b) in first.choices.iter().zip(&second.choices) {
+            assert_eq!((&a.name, a.target), (&b.name, b.target));
+            assert_eq!(a.divergence, b.divergence, "{}", a.name);
+        }
+        assert_eq!(std::fs::read(&whole).unwrap(), std::fs::read(&resumed).unwrap());
+        assert_eq!(read_probe_table(&table).unwrap(), read_probe_table(&{
+            let again = at("again.tsv");
+            std::fs::write(&again, &text).unwrap();
+            again
+        }).unwrap(), "the table is whole again");
+        for path in [src, whole, resumed, table, at("again.tsv")] {
             let _ = std::fs::remove_file(path);
         }
     }
