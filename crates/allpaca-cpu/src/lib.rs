@@ -1,11 +1,13 @@
 //! CPU fallback for every kernel the control plane may call.
 
+mod iq3s;
 mod kernels;
 mod kquant;
 mod lowbit;
 mod mxfp4_expert;
 mod p48fp4;
 
+pub use iq3s::{dequant_iq3_s, IQ3_S_BLOCK_BYTES, IQ3_S_BLOCK_ELEMS};
 pub use kquant::{encode_q3_k, encode_q4_k, encode_q5_k, encode_q6_k};
 pub use lowbit::{
     dequant_q1_0, dequant_q2_0, gemm_q2_0_i8, gemv_q2_0, gemv_q2_0_i8, quantize_q1_0, quantize_q2_0, Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMS,

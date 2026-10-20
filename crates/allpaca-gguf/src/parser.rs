@@ -198,6 +198,8 @@ pub enum GgmlType {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    /// ggml IQ3_S (ggml_type_id=21): Unsloth's UD files keep experts in it.
+    IQ3_S = 21,
     /// Unsloth / ggml IQ4_NL (ggml_type_id=20).
     IQ4_NL = 20,
     /// Unsloth / ggml IQ4_XS (ggml_type_id=23).
@@ -272,6 +274,7 @@ pub fn dequant_packed(
         GgmlType::Q4_K => allpaca_cpu::dequant_q4_k(bytes, n, out),
         GgmlType::Q5_K => allpaca_cpu::dequant_q5_k(bytes, n, out),
         GgmlType::Q6_K => allpaca_cpu::dequant_q6_k(bytes, n, out),
+        GgmlType::IQ3_S => allpaca_cpu::dequant_iq3_s(bytes, n, out),
         GgmlType::IQ4_NL => allpaca_cpu::dequant_iq4_nl(bytes, n, out),
         GgmlType::IQ4_XS => allpaca_cpu::dequant_iq4_xs(bytes, n, out),
         GgmlType::TQ1_0 => allpaca_cpu::dequant_tq1_0(bytes, n, out),
@@ -305,6 +308,7 @@ impl GgmlType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             20 => Self::IQ4_NL,
+            21 => Self::IQ3_S,
             23 => Self::IQ4_XS,
             26 => Self::I32,
             30 => Self::BF16,
@@ -375,6 +379,9 @@ impl TensorInfo {
             GgmlType::Q6_K => n
                 .div_ceil(allpaca_cpu::Q6_K_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q6_K_BLOCK_BYTES),
+            GgmlType::IQ3_S => n
+                .div_ceil(allpaca_cpu::IQ3_S_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ3_S_BLOCK_BYTES),
             GgmlType::IQ4_NL => n
                 .div_ceil(allpaca_cpu::IQ4_NL_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::IQ4_NL_BLOCK_BYTES),
@@ -737,6 +744,7 @@ impl GgufFile {
             GgmlType::Q6_K as u32,
             GgmlType::IQ4_NL as u32,
             GgmlType::IQ4_XS as u32,
+            GgmlType::IQ3_S as u32,
             GgmlType::I32 as u32,
             GgmlType::BF16 as u32,
             GgmlType::MXFP4 as u32,
@@ -757,7 +765,7 @@ impl GgufFile {
         let mut reasons = Vec::new();
         if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/ROCmFP4)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/ROCmFP4)"
             ));
         }
         let llama_family = matches!(
@@ -1009,6 +1017,17 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_q6_k(&mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::IQ3_S => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} IQ3_S out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_iq3_s(&mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
             GgmlType::IQ4_NL => {
