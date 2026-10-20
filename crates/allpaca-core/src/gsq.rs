@@ -249,11 +249,13 @@ impl Rng {
         Self(x | 1)
     }
 
+    /// Strictly inside (0, 1). With 24 bits the top draw, `2^24 - 0.5`,
+    /// rounds to `2^24` in f32: a 1.0 makes the Gumbel noise infinite.
     fn uniform(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
-        ((self.0 >> 40) as f32 + 0.5) / (1u64 << 24) as f32
+        ((self.0 >> 41) as f32 + 0.5) / (1u64 << 23) as f32
     }
 
     fn gumbel(&mut self) -> f32 {
@@ -618,6 +620,16 @@ mod tests {
         assert_eq!(quantised_error(&w, &whole, &gram), full);
         assert_eq!(output_error(&w, &whole.weights(), cols, &gram), full);
         assert_eq!(output_energy(&w, cols, &Gram::Identity), output_error(&w, &vec![0.0; w.len()], cols, &Gram::Identity));
+    }
+
+    /// Real matrices draw tens of millions of samples a step: none may be
+    /// infinite (a uniform draw of 1.0 once made every training NaN).
+    #[test]
+    fn gumbel_noise_stays_finite_over_many_draws() {
+        let mut rng = Rng::for_row(0, 0, 0);
+        for _ in 0..1 << 25 {
+            assert!(rng.gumbel().is_finite());
+        }
     }
 
     #[test]
