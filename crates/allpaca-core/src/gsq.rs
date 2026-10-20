@@ -96,15 +96,58 @@ impl Quantised {
     }
 }
 
+/// Weights handled at a time where a whole matrix would take gigabytes
+/// (the search keeps about 23 floats per weight).
+const CHUNK_WEIGHTS: usize = 1 << 24;
+
 /// Output error of `q` against `w`: `sum over rows of (w - q) H (w - q)^T`.
 pub fn output_error(w: &[f32], q: &[f32], cols: usize, gram: &Gram<'_>) -> f64 {
-    let d: Vec<f32> = w.iter().zip(q).map(|(a, b)| a - b).collect();
+    let mut total = 0.0f64;
+    for (w, q) in w.chunks(chunk_rows(cols) * cols).zip(q.chunks(chunk_rows(cols) * cols)) {
+        add_output_error(&mut total, w, |i| q[i], cols, gram);
+    }
+    total
+}
+
+/// [`output_error`] against zero: the output's own size.
+pub fn output_energy(w: &[f32], cols: usize, gram: &Gram<'_>) -> f64 {
+    let mut total = 0.0f64;
+    for w in w.chunks(chunk_rows(cols) * cols) {
+        add_output_error(&mut total, w, |_| 0.0, cols, gram);
+    }
+    total
+}
+
+/// [`output_error`] of a quantised matrix, decoded a chunk of rows at a time.
+pub fn quantised_error(w: &[f32], q: &Quantised, gram: &Gram<'_>) -> f64 {
+    let (cols, gpr) = (q.cols, q.groups_per_row());
+    let mut total = 0.0f64;
+    let rows = chunk_rows(cols);
+    for (c, w) in w.chunks(rows * cols).enumerate() {
+        let (first, groups) = (c * rows * cols, c * rows * gpr);
+        let value = |i: usize| {
+            let at = first + i;
+            VALUES[usize::from(q.index[at])] * q.scales[groups + (i / cols) * gpr + (i % cols) / Q2_0_BLOCK_ELEMS]
+        };
+        add_output_error(&mut total, w, value, cols, gram);
+    }
+    total
+}
+
+fn chunk_rows(cols: usize) -> usize {
+    (CHUNK_WEIGHTS / cols.max(1)).max(1)
+}
+
+/// Add whole rows' error to `total`, element by element in order.
+fn add_output_error(total: &mut f64, w: &[f32], q: impl Fn(usize) -> f32, cols: usize, gram: &Gram<'_>) {
+    let d: Vec<f32> = w.iter().enumerate().map(|(i, a)| a - q(i)).collect();
     let Gram::Full(_) = gram else {
-        return d.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        *total = d.iter().fold(*total, |t, v| t + f64::from(*v) * f64::from(*v));
+        return;
     };
     let mut hd = vec![0.0f32; d.len()];
     rows_times_gram(&d, cols, gram, &mut hd);
-    d.iter().zip(&hd).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()
+    *total = d.iter().zip(&hd).fold(*total, |t, (a, b)| t + f64::from(*a) * f64::from(*b));
 }
 
 /// `out = d H` for every row of `d` (rows of `cols`), on all cores when the
@@ -139,12 +182,36 @@ fn nearest(x: f32) -> u8 {
     (x.round().clamp(-2.0, 1.0) + 2.0) as u8
 }
 
+/// Threads for a pass over `n` values, each on its own (the result does not
+/// depend on the split).
+fn pass_threads(n: usize) -> usize {
+    if n < (1 << 16) {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |t| t.get())
+    }
+}
+
 /// Rounding to the grid with, per group, the scale (of either sign) that
-/// gives the least squared error: where the search starts.
+/// gives the least squared error: where the search starts. Groups are
+/// spread over the cores.
 fn round_with_best_scales(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
     let mut index = vec![0u8; w.len()];
-    let mut scales = Vec::with_capacity(w.len() / Q2_0_BLOCK_ELEMS);
-    for (src, dst) in w.chunks(Q2_0_BLOCK_ELEMS).zip(index.chunks_mut(Q2_0_BLOCK_ELEMS)) {
+    let mut scales = vec![0.0f32; w.len().div_ceil(Q2_0_BLOCK_ELEMS)];
+    let groups = scales.len();
+    let per = groups.div_ceil(pass_threads(w.len())).max(1);
+    std::thread::scope(|s| {
+        let parts = w.chunks(per * Q2_0_BLOCK_ELEMS).zip(index.chunks_mut(per * Q2_0_BLOCK_ELEMS)).zip(scales.chunks_mut(per));
+        for ((w, index), scales) in parts {
+            s.spawn(move || round_groups(w, index, scales));
+        }
+    });
+    (index, scales)
+}
+
+fn round_groups(w: &[f32], index: &mut [u8], scales: &mut [f32]) {
+    let groups = w.chunks(Q2_0_BLOCK_ELEMS).zip(index.chunks_mut(Q2_0_BLOCK_ELEMS)).zip(scales.iter_mut());
+    for ((src, dst), scale) in groups {
         let amax = src.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let mut best = (f32::INFINITY, 0.0f32);
         if amax > 0.0 {
@@ -162,9 +229,8 @@ fn round_with_best_scales(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
         for (d, v) in dst.iter_mut().zip(src) {
             *d = if s == 0.0 { 2 } else { nearest(v / s) };
         }
-        scales.push(s);
+        *scale = s;
     }
-    (index, scales)
 }
 
 struct Rng(u64);
@@ -208,14 +274,25 @@ impl Adam {
         }
     }
 
+    /// One step for every parameter, spread over the cores.
     fn step(&mut self, params: &mut [f32], grad: &[f32], lr: f32, t: i32) {
         let (b1, b2) = (0.9f32, 0.999f32);
         let (c1, c2) = (1.0 - b1.powi(t), 1.0 - b2.powi(t));
-        for i in 0..params.len() {
-            self.m[i] = b1 * self.m[i] + (1.0 - b1) * grad[i];
-            self.v[i] = b2 * self.v[i] + (1.0 - b2) * grad[i] * grad[i];
-            params[i] -= lr * (self.m[i] / c1) / ((self.v[i] / c2).sqrt() + 1e-8);
-        }
+        let run = |m: &mut [f32], v: &mut [f32], params: &mut [f32], grad: &[f32]| {
+            for i in 0..params.len() {
+                m[i] = b1 * m[i] + (1.0 - b1) * grad[i];
+                v[i] = b2 * v[i] + (1.0 - b2) * grad[i] * grad[i];
+                params[i] -= lr * (m[i] / c1) / ((v[i] / c2).sqrt() + 1e-8);
+            }
+        };
+        let per = params.len().div_ceil(pass_threads(params.len())).max(1);
+        std::thread::scope(|s| {
+            let parts = self.m.chunks_mut(per).zip(self.v.chunks_mut(per)).zip(params.chunks_mut(per)).zip(grad.chunks(per));
+            for (((m, v), p), g) in parts {
+                let run = &run;
+                s.spawn(move || run(m, v, p, g));
+            }
+        });
     }
 }
 
@@ -229,6 +306,18 @@ pub fn quantise_2bit(
     gram: &Gram<'_>,
     cfg: &GsqConfig,
 ) -> Result<Quantised, AllpacaError> {
+    quantise_2bit_by(w, rows, cols, gram, cfg, chunk_rows(cols))
+}
+
+/// [`quantise_2bit`] training `per` rows at a time.
+fn quantise_2bit_by(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    gram: &Gram<'_>,
+    cfg: &GsqConfig,
+    per: usize,
+) -> Result<Quantised, AllpacaError> {
     let bad = |msg: &str| AllpacaError::Fatal(FatalError::InvalidConfig(format!("GSQ: {msg}")));
     if w.len() != rows * cols || cols == 0 || cols % Q2_0_BLOCK_ELEMS != 0 {
         return Err(bad("weights must be rows * cols with cols a multiple of 64"));
@@ -239,7 +328,6 @@ pub fn quantise_2bit(
         }
     }
     let gpr = cols / Q2_0_BLOCK_ELEMS;
-    let group_of = |i: usize| (i / cols) * gpr + (i % cols) / Q2_0_BLOCK_ELEMS;
     let (index0, scales0) = round_with_best_scales(w);
     let start = Quantised {
         rows,
@@ -247,21 +335,74 @@ pub fn quantise_2bit(
         index: index0,
         scales: scales0,
     };
-    let start_err = output_error(w, &start.weights(), cols, gram);
+    // Scales move in proportion to their size.
+    let scale_unit = start.scales.iter().map(|s| s.abs()).sum::<f32>() / start.scales.len().max(1) as f32;
+    // Rows train on their own (each has its own noise), so a large matrix
+    // goes a chunk of rows at a time: the same result in less memory.
+    let mut index = Vec::with_capacity(w.len());
+    let mut scales = Vec::with_capacity(start.scales.len());
+    for first in (0..rows).step_by(per.max(1)) {
+        let n_rows = per.min(rows - first);
+        let (i, s) = train(
+            &w[first * cols..(first + n_rows) * cols],
+            first,
+            cols,
+            &start.scales[first * gpr..(first + n_rows) * gpr],
+            scale_unit,
+            gram,
+            cfg,
+        );
+        index.extend(i);
+        scales.extend(s);
+    }
+    let trained = Quantised {
+        rows,
+        cols,
+        index,
+        scales,
+    };
+    if quantised_error(w, &trained, gram) < quantised_error(w, &start, gram) {
+        Ok(trained)
+    } else {
+        Ok(start)
+    }
+}
 
+/// The search on whole rows of a matrix, the first being row `row0`, from
+/// `start_scales`: each weight's grid index and the trained scales.
+fn train(
+    w: &[f32],
+    row0: usize,
+    cols: usize,
+    start_scales: &[f32],
+    scale_unit: f32,
+    gram: &Gram<'_>,
+    cfg: &GsqConfig,
+) -> (Vec<u8>, Vec<f32>) {
+    let rows = w.len() / cols;
+    let gpr = cols / Q2_0_BLOCK_ELEMS;
     // Logits favour each weight's nearest grid values at the starting scale.
     let n = w.len();
     let mut logits = vec![0.0f32; n * 4];
-    for i in 0..n {
-        let s = start.scales[group_of(i)];
-        let x = if s == 0.0 { 0.0 } else { w[i] / s };
-        let raw: Vec<f32> = VALUES.iter().map(|v| -0.5 * (x - v).powi(2)).collect();
-        let mean = raw.iter().sum::<f32>() / 4.0;
-        for k in 0..4 {
-            logits[i * 4 + k] = (raw[k] - mean) * cfg.init_strength;
+    // Whole groups per thread (a group's weights are consecutive).
+    let per_groups = n.div_ceil(Q2_0_BLOCK_ELEMS).div_ceil(pass_threads(n)).max(1);
+    let per_weights = per_groups * Q2_0_BLOCK_ELEMS;
+    std::thread::scope(|scope| {
+        for ((w, logits), scales) in w.chunks(per_weights).zip(logits.chunks_mut(per_weights * 4)).zip(start_scales.chunks(per_groups)) {
+            scope.spawn(move || {
+                for (i, x) in w.iter().enumerate() {
+                    let s = scales[i / Q2_0_BLOCK_ELEMS];
+                    let x = if s == 0.0 { 0.0 } else { x / s };
+                    let raw = VALUES.map(|v| -0.5 * (x - v).powi(2));
+                    let mean = raw.iter().sum::<f32>() / 4.0;
+                    for k in 0..4 {
+                        logits[i * 4 + k] = (raw[k] - mean) * cfg.init_strength;
+                    }
+                }
+            });
         }
-    }
-    let mut scales = start.scales.clone();
+    });
+    let mut scales = start_scales.to_vec();
     // Rows are independent in everything but the Gram product: whole rows
     // per thread once the matrix is large enough to pay for the threads.
     let threads = if n < (1 << 16) { 1 } else { std::thread::available_parallelism().map_or(1, |t| t.get()).min(rows) };
@@ -273,15 +414,13 @@ pub fn quantise_2bit(
     let mut grad_logits = vec![0.0f32; n * 4];
     let mut grad_scales = vec![0.0f32; scales.len()];
     let mut diff = vec![0.0f32; n];
-    // Scales move in proportion to their size.
-    let scale_unit = scales.iter().map(|s| s.abs()).sum::<f32>() / scales.len().max(1) as f32;
     for step in 0..cfg.steps {
         let frac = step as f32 / cfg.steps.max(2).saturating_sub(1) as f32;
         let tau = cfg.temperature.0 * (cfg.temperature.1 / cfg.temperature.0).powf(frac);
         // Relaxed sample of every weight: softmax((logits + Gumbel noise) / tau).
         let sample = |first_row: usize, logits: &[f32], probs: &mut [f32], soft: &mut [f32]| {
             for (r, soft_row) in soft.chunks_mut(cols).enumerate() {
-                let mut rng = Rng::for_row(cfg.seed, step, first_row + r);
+                let mut rng = Rng::for_row(cfg.seed, step, row0 + first_row + r);
                 for (c, s) in soft_row.iter_mut().enumerate() {
                     let at = (r * cols + c) * 4;
                     let mut z = [0.0f32; 4];
@@ -315,9 +454,17 @@ pub fn quantise_2bit(
             });
         }
         // d(error)/d(output) = 2 (q - w) H per row.
-        for i in 0..n {
-            diff[i] = soft[i] * scales[group_of(i)] - w[i];
-        }
+        std::thread::scope(|scope| {
+            let parts =
+                diff.chunks_mut(per_weights).zip(soft.chunks(per_weights)).zip(w.chunks(per_weights)).zip(scales.chunks(per_groups));
+            for (((diff, soft), w), scales) in parts {
+                scope.spawn(move || {
+                    for (i, d) in diff.iter_mut().enumerate() {
+                        *d = soft[i] * scales[i / Q2_0_BLOCK_ELEMS] - w[i];
+                    }
+                });
+            }
+        });
         rows_times_gram(&diff, cols, gram, &mut grad_out);
         grad_scales.fill(0.0);
         // Chain rule through the scale and the softmax; a chunk's groups are its own.
@@ -368,17 +515,7 @@ pub fn quantise_2bit(
         .chunks(4)
         .map(|l| (0..4u8).max_by(|a, b| l[usize::from(*a)].total_cmp(&l[usize::from(*b)])).unwrap_or(2))
         .collect();
-    let trained = Quantised {
-        rows,
-        cols,
-        index,
-        scales,
-    };
-    if output_error(w, &trained.weights(), cols, gram) < start_err {
-        Ok(trained)
-    } else {
-        Ok(start)
-    }
+    (index, scales)
 }
 
 #[cfg(test)]
@@ -458,9 +595,81 @@ mod tests {
         assert!((packed - after).abs() < 0.02 * after.max(1e-6), "{packed} vs {after}");
     }
 
+    /// Rows trained a few at a time give the matrix trained whole, and the
+    /// error summed a chunk at a time is the whole one's.
+    #[test]
+    fn training_rows_in_chunks_gives_the_same_result() {
+        let (rows, cols) = (7usize, 128usize);
+        let w = noise(rows * cols, 21);
+        let h = correlated_gram(cols, 4);
+        let gram = Gram::Full(&h);
+        let cfg = GsqConfig { steps: 40, ..GsqConfig::default() };
+        let whole = quantise_2bit_by(&w, rows, cols, &gram, &cfg, rows).unwrap();
+        for per in [1, 3, 5] {
+            assert_eq!(quantise_2bit_by(&w, rows, cols, &gram, &cfg, per).unwrap(), whole, "{per} rows at a time");
+        }
+        let full: f64 = {
+            let q = whole.weights();
+            let d: Vec<f32> = w.iter().zip(&q).map(|(a, b)| a - b).collect();
+            let mut hd = vec![0.0f32; d.len()];
+            rows_times_gram(&d, cols, &gram, &mut hd);
+            d.iter().zip(&hd).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()
+        };
+        assert_eq!(quantised_error(&w, &whole, &gram), full);
+        assert_eq!(output_error(&w, &whole.weights(), cols, &gram), full);
+        assert_eq!(output_energy(&w, cols, &Gram::Identity), output_error(&w, &vec![0.0; w.len()], cols, &Gram::Identity));
+    }
+
     #[test]
     fn shapes_that_are_not_whole_blocks_are_refused() {
         assert!(quantise_2bit(&[0.0; 60], 1, 60, &Gram::Identity, &GsqConfig::default()).is_err());
         assert!(quantise_2bit(&[0.0; 64], 1, 64, &Gram::Full(&[0.0; 9]), &GsqConfig::default()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+
+    /// Opt-in: where the search's time goes on a large matrix
+    /// (`ALLPACA_GSQ_TIMING=1`).
+    #[test]
+    fn gsq_phase_timing_when_env_set() {
+        if std::env::var("ALLPACA_GSQ_TIMING").is_err() {
+            return;
+        }
+        let (rows, cols) = (16384usize, 2048usize);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.1
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let start = round_with_best_scales(&w);
+        eprintln!("round_with_best_scales {:.2} s", t.elapsed().as_secs_f32());
+        let t = std::time::Instant::now();
+        let mut adam = Adam::new(w.len() * 4);
+        let mut p = vec![0.0f32; w.len() * 4];
+        let g = vec![0.01f32; w.len() * 4];
+        adam.step(&mut p, &g, 0.05, 1);
+        eprintln!("one Adam step {:.2} s", t.elapsed().as_secs_f32());
+        let t = std::time::Instant::now();
+        let q = quantise_2bit(&w, rows, cols, &Gram::Identity, &GsqConfig { steps: 8, ..GsqConfig::default() }).unwrap();
+        eprintln!("quantise_2bit (8 steps) {:.2} s for {} weights", t.elapsed().as_secs_f32(), w.len());
+        let t = std::time::Instant::now();
+        let _ = quantised_error(&w, &q, &Gram::Identity);
+        eprintln!("quantised_error {:.2} s", t.elapsed().as_secs_f32());
+        let t = std::time::Instant::now();
+        let bytes = allpaca_cpu::encode_q4_k(&w);
+        let mut d = vec![0.0f32; w.len()];
+        eprintln!("encode_q4_k {:.2} s", t.elapsed().as_secs_f32());
+        let t = std::time::Instant::now();
+        allpaca_gguf::dequant_packed(allpaca_gguf::GgmlType::Q4_K, &bytes, w.len(), &mut d).unwrap();
+        eprintln!("dequant q4_k {:.2} s", t.elapsed().as_secs_f32());
+        drop(start);
     }
 }
