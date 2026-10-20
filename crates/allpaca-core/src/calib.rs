@@ -87,6 +87,66 @@ impl Moments {
         self.count += 1;
         self.weight += weight as f64;
     }
+
+    /// [`Self::add`] of each `cols`-wide row of `xs` with its weight, on all
+    /// cores: each sum still takes the rows in order, so it is the same.
+    fn add_rows(&mut self, xs: &[f32], cols: usize, weights: &[f32]) {
+        if cols == 0 || xs.is_empty() {
+            return;
+        }
+        if self.sum.is_empty() {
+            self.cols = cols;
+            self.sum = vec![0.0; cols * (cols + 1) / 2];
+        }
+        if cols != self.cols {
+            return;
+        }
+        let n = cols;
+        let rows = |sum: &mut [f32], first: usize| {
+            let mut at = 0;
+            for i in first.. {
+                if at >= sum.len() {
+                    break;
+                }
+                let row = &mut sum[at..at + n - i];
+                for (x, w) in xs.chunks(n).zip(weights) {
+                    let xi = w * x[i];
+                    for (s, xj) in row.iter_mut().zip(&x[i..]) {
+                        *s += xi * xj;
+                    }
+                }
+                at += n - i;
+            }
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+        if threads < 2 || xs.len() / n * self.sum.len() < (1 << 22) {
+            rows(&mut self.sum, 0);
+        } else {
+            // Upper-triangle rows split into runs of about equal area.
+            let share = self.sum.len().div_ceil(threads);
+            let mut runs = Vec::new();
+            let (mut rest, mut first) = (&mut self.sum[..], 0);
+            while first < n {
+                let (mut len, mut i) = (0, first);
+                while i < n && (len < share || len == 0) {
+                    len += n - i;
+                    i += 1;
+                }
+                let (run, tail) = rest.split_at_mut(len);
+                runs.push((run, first));
+                rest = tail;
+                first = i;
+            }
+            std::thread::scope(|s| {
+                for (run, first) in runs {
+                    let rows = &rows;
+                    s.spawn(move || rows(run, first));
+                }
+            });
+        }
+        self.count += weights.len().min(xs.len() / n) as u64;
+        self.weight += weights.iter().take(xs.len() / n).map(|w| f64::from(*w)).sum::<f64>();
+    }
 }
 
 /// `E[x x^T]` of one matrix's input.
@@ -199,6 +259,32 @@ impl Tap {
         }
     }
 
+    /// [`Self::observe_weighted`] of each `cols`-wide row of `xs`, row `i`
+    /// with `weights[i]` (all 1 when `None`).
+    pub(crate) fn observe_rows(&self, blk: usize, site: Site, xs: &[f32], cols: usize, weights: Option<&[f32]>) {
+        if self.keeping.load(Ordering::Relaxed) {
+            if let Ok(mut kept) = self.kept.lock() {
+                if kept.0 == blk {
+                    kept.1.entry(site).or_default().extend_from_slice(xs);
+                }
+            }
+        }
+        if !self.on.load(Ordering::Relaxed) || cols == 0 {
+            return;
+        }
+        let ones;
+        let weights = match weights {
+            Some(w) => w,
+            None => {
+                ones = vec![1.0f32; xs.len() / cols];
+                &ones
+            }
+        };
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.sites.entry((blk, site)).or_default().add_rows(xs, cols, weights);
+        }
+    }
+
     /// Keep every vector block `blk`'s sites see from now on.
     pub(crate) fn keep(&self, blk: usize) {
         if let Ok(mut kept) = self.kept.lock() {
@@ -237,14 +323,18 @@ pub fn capture(model: &Path, texts: &[&str]) -> Result<InputStats, AllpacaError>
         )));
     }
     let (model, tok, _) = crate::sensitivity::load_host(model)?;
-    // A qwen4exp model's own forward has no input sites: nothing to measure.
-    if model.q4x.is_some() {
-        return Ok(InputStats::default());
-    }
     model.calib.start();
     let mut run = Ok(());
     for text in texts {
-        let read = tok.encode(text).and_then(|ids| crate::sensitivity::text_log_probs(&model, &ids, None));
+        let read = tok.encode(text).and_then(|ids| match model.q4x.is_some() {
+            // Its host forward block by block, where the sites are.
+            true => {
+                let mut logits = vec![0.0f32; ids.len() * model.config.vocab_size];
+                let mut mems = [crate::qwen4exp::Qwen4Memory::traced(None)];
+                crate::qwen4exp::forward_qwen4_host_rows(&model, &[&ids], &mut mems, &mut logits)
+            }
+            false => crate::sensitivity::text_log_probs(&model, &ids, None).map(drop),
+        });
         if let Err(e) = read {
             run = Err(e);
             break;
@@ -615,6 +705,74 @@ pub(crate) mod tests {
             for g in [&input, &exps, &down, &sh, &sh_down] {
                 assert_gram_shape(g, "moe");
             }
+        }
+    }
+
+    /// Rows added together, on several threads, sum to the same bits as
+    /// one at a time.
+    #[test]
+    fn rows_added_together_equal_one_at_a_time() {
+        let (cols, rows) = (300usize, 200usize);
+        let xs: Vec<f32> = (0..cols * rows).map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0).collect();
+        let weights: Vec<f32> = (0..rows).map(|r| 0.1 + (r % 7) as f32 * 0.3).collect();
+        let (mut one, mut all) = (Moments::default(), Moments::default());
+        for (x, w) in xs.chunks(cols).zip(&weights) {
+            one.add(x, *w);
+        }
+        all.add_rows(&xs[..cols * 3], cols, &weights[..3]);
+        all.add_rows(&xs[cols * 3..], cols, &weights[3..]);
+        assert_eq!((one.cols, one.count), (all.cols, all.count));
+        assert_eq!(one.weight, all.weight);
+        assert!(one.sum.iter().zip(&all.sum).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    /// A qwen4exp model's host forward measures the input of every matrix
+    /// a site covers, at that matrix's width, without changing its output.
+    #[test]
+    fn capture_measures_the_qwen4exp_sites() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (plain, packed) = (dir.join(format!("allpaca_calib_q4x-{pid}.gguf")), dir.join(format!("allpaca_calib_q4xp-{pid}.gguf")));
+        crate::qwen4exp::write_tiny_qwen4exp_gguf(&plain);
+        crate::qwen4exp::write_tiny_qwen4exp_packed_gguf(&packed);
+        let texts = ["hello world again hello", "world hello"];
+        for path in [&plain, &packed] {
+            let stats = capture(path, &texts).unwrap();
+            let file = allpaca_gguf::GgufFile::open(path).unwrap();
+            let (model, tok, _) = crate::sensitivity::load_host(path).unwrap();
+            let ids = tok.encode(texts[0]).unwrap();
+            let tokens = (ids.len() + tok.encode(texts[1]).unwrap().len()) as u64;
+            let n_active = model.config.n_active as u64;
+            let mut seen = 0;
+            for t in &file.tensors {
+                let kind = t.name.split('.').nth(2).unwrap_or("");
+                if !t.name.starts_with("blk.") || Site::of_tensor(kind).is_none() {
+                    continue;
+                }
+                let g = stats.gram(&t.name).unwrap_or_else(|| panic!("{path:?}: no input for {}", t.name));
+                assert_eq!(g.cols as u64, t.dims[0], "{}", t.name);
+                let per_token = if kind.ends_with("_exps") { n_active } else { 1 };
+                assert_eq!(g.count, tokens * per_token, "{}", t.name);
+                assert!(trace(&g) > 0.0, "{}", t.name);
+                assert_gram_shape(&g, &t.name);
+                seen += 1;
+            }
+            assert!(seen >= 30, "{path:?}: {seen} matrices");
+
+            // The forward reads the same with the tap on.
+            let vocab = model.config.vocab_size;
+            let run = |on: bool| {
+                let mut logits = vec![0.0f32; ids.len() * vocab];
+                let mut mems = [crate::qwen4exp::Qwen4Memory::traced(None)];
+                if on {
+                    model.calib.start();
+                }
+                crate::qwen4exp::forward_qwen4_host_rows(&model, &[&ids], &mut mems, &mut logits).unwrap();
+                let _ = model.calib.finish();
+                logits
+            };
+            assert!(run(false).iter().zip(&run(true)).all(|(a, b)| a.to_bits() == b.to_bits()), "{path:?}");
+            let _ = std::fs::remove_file(path);
         }
     }
 }

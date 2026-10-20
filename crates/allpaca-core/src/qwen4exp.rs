@@ -899,14 +899,19 @@ fn expert_pool() -> &'static ExpertPool {
 /// token, `picks` each token's routed experts; the sums come back a row per
 /// token. An expert picked by several tokens is one job that reads its
 /// weights once for all of them ([`allpaca_cpu::gemm_q2_0_i8`]); each
-/// token's result is the same as on its own.
+/// token's result is the same as on its own. A calibration `tap` gets each
+/// routed expert's input and activations, weighted by its routing weight
+/// squared.
 fn routed_experts_pooled(
     q4: &Arc<Qwen4Weights>,
     cfg: &ModelConfig,
     blk: usize,
     xs: &[f32],
     picks: &[Vec<(usize, f32)>],
+    tap: Option<&crate::calib::Tap>,
 ) -> Result<Vec<f32>, AllpacaError> {
+    let tap = tap.filter(|t| t.wants());
+    let acts = tap.is_some();
     let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
     let packed = dim % allpaca_cpu::Q2_0_BLOCK_ELEMS == 0;
     let rows: Vec<Arc<Vec<f32>>> = xs.chunks(dim).map(|x| Arc::new(x.to_vec())).collect();
@@ -937,7 +942,7 @@ fn routed_experts_pooled(
             let ins: Option<Vec<Arc<allpaca_cpu::Q2_0Input>>> = users.iter().map(|(_, r)| inputs[*r].clone()).collect();
             let job = move || {
                 let name = |s: &str| format!("blk.{blk}.{s}");
-                let ys = (|| -> Result<Vec<Vec<f32>>, AllpacaError> {
+                let ys = (|| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), AllpacaError> {
                     if let (Some(ins), Some(gate), Some(up), Some(down)) = (
                         ins.as_ref(),
                         q4.q2_0_rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?,
@@ -956,12 +961,28 @@ fn routed_experts_pooled(
                             h.chunks(ff).map(allpaca_cpu::Q2_0Input::new).collect::<Result<_, _>>()?;
                         let refs: Vec<&allpaca_cpu::Q2_0Input> = hs.iter().collect();
                         allpaca_cpu::gemm_q2_0_i8(down, &refs, &mut y)?;
-                        return Ok(y.chunks(dim).map(<[f32]>::to_vec).collect());
+                        let kept = if acts { h.chunks(ff).map(<[f32]>::to_vec).collect() } else { Vec::new() };
+                        return Ok((y.chunks(dim).map(<[f32]>::to_vec).collect(), kept));
                     }
                     let gate = q4.rows(&name("ffn_gate_exps.weight"), e * ff, ff, dim)?;
                     let up = q4.rows(&name("ffn_up_exps.weight"), e * ff, ff, dim)?;
                     let down = q4.rows(&name("ffn_down_exps.weight"), e * dim, dim, ff)?;
-                    xs.iter().map(|x| swiglu(x, &gate, &up, &down, ff, dim)).collect()
+                    if !acts {
+                        let ys = xs.iter().map(|x| swiglu(x, &gate, &up, &down, ff, dim)).collect::<Result<_, _>>()?;
+                        return Ok((ys, Vec::new()));
+                    }
+                    // swiglu with the activations kept.
+                    let (mut ys, mut kept) = (Vec::new(), Vec::new());
+                    for x in &xs {
+                        let mut h = gemv(x, &gate, ff)?;
+                        let u = gemv(x, &up, ff)?;
+                        for (h, u) in h.iter_mut().zip(&u) {
+                            *h = silu(*h) * u;
+                        }
+                        ys.push(gemv(&h, &down, dim)?);
+                        kept.push(h);
+                    }
+                    Ok((ys, kept))
                 })();
                 let _ = done.send((users, ys));
             };
@@ -976,10 +997,22 @@ fn routed_experts_pooled(
     }
     drop(done);
     let mut ys: Vec<Option<Vec<f32>>> = vec![None; slot_row.len()];
+    let mut hs: Vec<Vec<f32>> = vec![Vec::new(); if acts { slot_row.len() } else { 0 }];
     for (users, y) in results {
-        for ((slot, _), y) in users.into_iter().zip(y?) {
-            ys[slot] = Some(y);
+        let (y, h) = y?;
+        for ((slot, _), y) in users.iter().zip(y) {
+            ys[*slot] = Some(y);
         }
+        for ((slot, _), h) in users.iter().zip(h) {
+            hs[*slot] = h;
+        }
+    }
+    if let Some(tap) = tap {
+        // In slot order: tokens in order, each token's picks in routing order.
+        let w2: Vec<f32> = picks.iter().flatten().map(|(_, w)| w * w).collect();
+        let ins: Vec<f32> = slot_row.iter().flat_map(|r| xs[r * dim..(r + 1) * dim].iter().copied()).collect();
+        tap.observe_rows(blk, crate::calib::Site::ExpIn, &ins, dim, Some(&w2));
+        tap.observe_rows(blk, crate::calib::Site::ExpAct, &hs.concat(), ff, Some(&w2));
     }
     // Each token's sum keeps its routing order.
     let weights = picks.iter().flatten().map(|(_, w)| *w);
@@ -1515,10 +1548,12 @@ fn gdn_rows(
     x: &[f32],
     rows: &[HostRow],
     mems: &mut [Qwen4Memory],
+    tap: &crate::calib::Tap,
 ) -> Result<Vec<f32>, AllpacaError> {
     let dims = q4.spec.gdn.ok_or_else(|| load_err("qwen4exp has no Gated DeltaNet shape".into()))?;
     let name = |s: &str| format!("blk.{blk}.{s}");
     let n = rows.len();
+    tap.observe_rows(blk, crate::calib::Site::AttnIn, x, cfg.dim, None);
     let qkv = gemv_rows(x, &q4.w(&name("attn_qkv.weight"))?, n, dims.qkv_dim)?;
     let z = gemv_rows(x, &q4.w(&name("attn_gate.weight"))?, n, dims.value_dim)?;
     let alpha = gemv_rows(x, &q4.w(&name("ssm_alpha.weight"))?, n, dims.n_v_heads)?;
@@ -1563,6 +1598,7 @@ fn gdn_rows(
             *y *= sigmoid(*z);
         }
     }
+    tap.observe_rows(blk, crate::calib::Site::AttnOut, &ys, dims.value_dim, None);
     gemv_rows(&ys, &q4.w(&name("ssm_out.weight"))?, n, cfg.dim)
 }
 
@@ -1576,11 +1612,13 @@ fn attn_rows(
     x: &[f32],
     rows: &[HostRow],
     mems: &mut [Qwen4Memory],
+    tap: &crate::calib::Tap,
 ) -> Result<Vec<f32>, AllpacaError> {
     let (head_dim, n_heads, n_kv) = (cfg.head_dim(), cfg.n_heads, cfg.n_kv_heads.max(1));
     let name = |s: &str| format!("blk.{blk}.{s}");
     let n = rows.len();
     let (q_width, kv_width) = (n_heads * head_dim, n_kv * head_dim);
+    tap.observe_rows(blk, crate::calib::Site::AttnIn, x, cfg.dim, None);
     let q_full = gemv_rows(x, &q4.w(&name("attn_q.weight"))?, n, q_width * 2)?;
     let k_all = gemv_rows(x, &q4.w(&name("attn_k.weight"))?, n, kv_width)?;
     let v_all = gemv_rows(x, &q4.w(&name("attn_v.weight"))?, n, kv_width)?;
@@ -1645,6 +1683,7 @@ fn attn_rows(
             *o *= sigmoid(*g);
         }
     }
+    tap.observe_rows(blk, crate::calib::Site::AttnOut, &outs, q_width, None);
     gemv_rows(&outs, &q4.w(&name("attn_output.weight"))?, n, cfg.dim)
 }
 
@@ -1657,6 +1696,7 @@ fn ffn_rows(
     x: &[f32],
     rows: &[HostRow],
     mems: &mut [Qwen4Memory],
+    tap: &crate::calib::Tap,
 ) -> Result<Vec<f32>, AllpacaError> {
     let (dim, n) = (cfg.dim, rows.len());
     if rows.iter().any(|r| mems[r.seq].saliency.is_some()) {
@@ -1668,6 +1708,7 @@ fn ffn_rows(
         return Ok(out);
     }
     let name = |s: &str| format!("blk.{blk}.{s}");
+    tap.observe_rows(blk, crate::calib::Site::FfnIn, x, dim, None);
     let mut scores = gemv_rows(x, &q4.w(&name("ffn_gate_inp.weight"))?, n, cfg.n_experts)?;
     let mut picks = Vec::with_capacity(n);
     for (row, scores) in rows.iter().zip(scores.chunks_mut(cfg.n_experts)) {
@@ -1678,7 +1719,7 @@ fn ffn_rows(
         }
         picks.push(row_picks);
     }
-    let mut out = routed_experts_pooled(q4, cfg, blk, x, &picks)?;
+    let mut out = routed_experts_pooled(q4, cfg, blk, x, &picks, Some(tap))?;
     if q4.has(&name("ffn_up_shexp.weight")) {
         let gate = q4.w(&name("ffn_gate_shexp.weight"))?;
         let up = q4.w(&name("ffn_up_shexp.weight"))?;
@@ -1691,8 +1732,13 @@ fn ffn_rows(
         }
         let y = gemv_rows(&h, &down, n, dim)?;
         let gate_inp = q4.w(&name("ffn_gate_inp_shexp.weight"))?;
-        for ((o, y), x) in out.chunks_mut(dim).zip(y.chunks(dim)).zip(x.chunks(dim)) {
-            let open = sigmoid(x.iter().zip(gate_inp.iter()).map(|(a, b)| a * b).sum());
+        let opens: Vec<f32> = x.chunks(dim).map(|x| sigmoid(x.iter().zip(gate_inp.iter()).map(|(a, b)| a * b).sum())).collect();
+        if tap.wants() {
+            let w2: Vec<f32> = opens.iter().map(|o| o * o).collect();
+            tap.observe_rows(blk, crate::calib::Site::ShexpIn, x, dim, Some(&w2));
+            tap.observe_rows(blk, crate::calib::Site::ShexpAct, &h, ff, Some(&w2));
+        }
+        for ((o, y), open) in out.chunks_mut(dim).zip(y.chunks(dim)).zip(&opens) {
             for (o, y) in o.iter_mut().zip(y) {
                 *o += open * y;
             }
@@ -1785,14 +1831,14 @@ pub(crate) fn forward_qwen4_host_rows(
         }
         let (x, inject) = mix_rows(q4, &format!("blk.{blk}.hc_attn"), true, &s, n, dim, eps)?;
         let out = match q4.spec.is_recurrent(blk) {
-            true => gdn_rows(q4, cfg, blk, layer, &x, &act, mems)?,
-            false => attn_rows(q4, cfg, blk, layer, &x, &act, mems)?,
+            true => gdn_rows(q4, cfg, blk, layer, &x, &act, mems, &model.calib)?,
+            false => attn_rows(q4, cfg, blk, layer, &x, &act, mems, &model.calib)?,
         };
         for ((s, out), inject) in s.chunks_mut(hc_dim).zip(out.chunks(dim)).zip(inject.chunks(hc)) {
             hc_combine(s, out, inject, dim);
         }
         let (x, inject) = mix_rows(q4, &format!("blk.{blk}.hc_ffn"), true, &s, n, dim, eps)?;
-        let out = ffn_rows(q4, cfg, blk, &x, &act, mems)?;
+        let out = ffn_rows(q4, cfg, blk, &x, &act, mems, &model.calib)?;
         for ((s, out), inject) in s.chunks_mut(hc_dim).zip(out.chunks(dim)).zip(inject.chunks(hc)) {
             hc_combine(s, out, inject, dim);
         }
@@ -2005,7 +2051,7 @@ fn forward_device(
             gpu.ffn_finish(blk, &picks, Some(&sums))?;
             lap(card, &mut times.ffn_rpc)?;
         } else {
-            let sums = routed_experts_pooled(q4, cfg, blk, &x, &picks)?;
+            let sums = routed_experts_pooled(q4, cfg, blk, &x, &picks, None)?;
             gpu.ffn_finish(blk, &picks, Some(&sums))?;
             lap(card, &mut times.ffn_host)?;
         }
