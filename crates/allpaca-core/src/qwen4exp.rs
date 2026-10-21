@@ -1011,8 +1011,8 @@ fn routed_experts_pooled(
         // In slot order: tokens in order, each token's picks in routing order.
         let w2: Vec<f32> = picks.iter().flatten().map(|(_, w)| w * w).collect();
         let ins: Vec<f32> = slot_row.iter().flat_map(|r| xs[r * dim..(r + 1) * dim].iter().copied()).collect();
-        tap.observe_rows(blk, crate::calib::Site::ExpIn, &ins, dim, Some(&w2));
-        tap.observe_rows(blk, crate::calib::Site::ExpAct, &hs.concat(), ff, Some(&w2));
+        let experts: Vec<usize> = picks.iter().flatten().map(|(e, _)| *e).collect();
+        tap.observe_experts(blk, &ins, dim, &hs.concat(), ff, &experts, &w2);
     }
     // Each token's sum keeps its routing order.
     let weights = picks.iter().flatten().map(|(_, w)| *w);

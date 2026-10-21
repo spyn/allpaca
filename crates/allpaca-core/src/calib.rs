@@ -37,6 +37,10 @@ pub(crate) enum Site {
     ShexpIn,
     /// The shared expert's activations, weighted the same: `ffn_down_shexp`.
     ShexpAct,
+    /// [`Self::ExpIn`] of one routed expert only ([`capture_experts`]).
+    ExpertIn(u16),
+    /// [`Self::ExpAct`] of one routed expert only.
+    ExpertAct(u16),
 }
 
 impl Site {
@@ -189,7 +193,36 @@ impl InputStats {
         if blk != "blk" || tail != "weight" || parts.next().is_some() {
             return None;
         }
-        let m = self.sites.get(&(index.parse().ok()?, Site::of_tensor(kind)?))?;
+        Self::mean(self.sites.get(&(index.parse().ok()?, Site::of_tensor(kind)?))?)
+    }
+
+    /// The Gram of routed expert `expert`'s own input to the stacked GGUF
+    /// tensor `name` (`blk.<i>.ffn_*_exps.weight`), when
+    /// [`capture_experts`] measured its block.
+    pub fn expert_gram(&self, name: &str, expert: usize) -> Option<InputGram> {
+        let mut parts = name.split('.');
+        let (blk, index, kind, tail) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        if blk != "blk" || tail != "weight" || parts.next().is_some() {
+            return None;
+        }
+        let e = u16::try_from(expert).ok()?;
+        let site = match Site::of_tensor(kind)? {
+            Site::ExpIn => Site::ExpertIn(e),
+            Site::ExpAct => Site::ExpertAct(e),
+            _ => return None,
+        };
+        Self::mean(self.sites.get(&(index.parse().ok()?, site))?)
+    }
+
+    /// Inputs routed expert `expert` of block `blk` was measured on.
+    pub fn expert_count(&self, blk: usize, expert: usize) -> u64 {
+        u16::try_from(expert)
+            .ok()
+            .and_then(|e| self.sites.get(&(blk, Site::ExpertIn(e))))
+            .map_or(0, |m| m.count)
+    }
+
+    fn mean(m: &Moments) -> Option<InputGram> {
         if m.count == 0 || m.weight <= 0.0 {
             return None;
         }
@@ -226,6 +259,8 @@ pub(crate) struct Tap {
     /// While set: the vectors of one block's sites, in the order seen.
     keeping: AtomicBool,
     kept: Mutex<(usize, HashMap<Site, Vec<f32>>)>,
+    /// Blocks whose routed experts also get a Gram each.
+    expert_blocks: Mutex<Vec<usize>>,
 }
 
 impl Tap {
@@ -285,6 +320,46 @@ impl Tap {
         }
     }
 
+    /// Routed experts' inputs `ins` (`dim` wide) and activations `acts`
+    /// (`ff` wide), one row per slot: [`Site::ExpIn`] and [`Site::ExpAct`]
+    /// weighted by `w2`, and in a block [`capture_experts`] asked for,
+    /// each expert's own rows too (`experts[i]` is slot `i`'s expert).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_experts(
+        &self,
+        blk: usize,
+        ins: &[f32],
+        dim: usize,
+        acts: &[f32],
+        ff: usize,
+        experts: &[usize],
+        w2: &[f32],
+    ) {
+        self.observe_rows(blk, Site::ExpIn, ins, dim, Some(w2));
+        self.observe_rows(blk, Site::ExpAct, acts, ff, Some(w2));
+        if !self.on.load(Ordering::Relaxed) || !self.expert_blocks.lock().is_ok_and(|b| b.contains(&blk)) {
+            return;
+        }
+        let mut slots: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (slot, e) in experts.iter().enumerate() {
+            slots.entry(*e).or_default().push(slot);
+        }
+        let gather = |rows: &[usize], xs: &[f32], cols: usize| -> Vec<f32> {
+            rows.iter().flat_map(|r| xs[r * cols..(r + 1) * cols].iter().copied()).collect()
+        };
+        let mut order: Vec<_> = slots.into_iter().collect();
+        order.sort_unstable_by_key(|(e, _)| *e);
+        for (e, rows) in order {
+            let Ok(e) = u16::try_from(e) else { continue };
+            let w: Vec<f32> = rows.iter().map(|r| w2[*r]).collect();
+            let (x, h) = (gather(&rows, ins, dim), gather(&rows, acts, ff));
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.sites.entry((blk, Site::ExpertIn(e))).or_default().add_rows(&x, dim, &w);
+                stats.sites.entry((blk, Site::ExpertAct(e))).or_default().add_rows(&h, ff, &w);
+            }
+        }
+    }
+
     /// Keep every vector block `blk`'s sites see from now on.
     pub(crate) fn keep(&self, blk: usize) {
         if let Ok(mut kept) = self.kept.lock() {
@@ -317,12 +392,22 @@ impl Tap {
 /// weights are decoded to F32 in RAM for the run, except routed experts,
 /// which stay packed ([`crate::host_experts`]).
 pub fn capture(model: &Path, texts: &[&str]) -> Result<InputStats, AllpacaError> {
+    capture_experts(model, texts, &[])
+}
+
+/// [`capture`], and for the blocks in `expert_blocks` a Gram of each routed
+/// expert's own inputs as well ([`InputStats::expert_gram`]): about 7 GB a
+/// block for Qwen3.8-Flash-Next's 512 experts.
+pub fn capture_experts(model: &Path, texts: &[&str], expert_blocks: &[usize]) -> Result<InputStats, AllpacaError> {
     if texts.is_empty() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "calibration needs at least one text".into(),
         )));
     }
     let (model, tok, _) = crate::sensitivity::load_host(model)?;
+    if let Ok(mut blocks) = model.calib.expert_blocks.lock() {
+        *blocks = expert_blocks.to_vec();
+    }
     model.calib.start();
     let mut run = Ok(());
     for text in texts {
@@ -774,5 +859,41 @@ pub(crate) mod tests {
             assert!(run(false).iter().zip(&run(true)).all(|(a, b)| a.to_bits() == b.to_bits()), "{path:?}");
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn capture_experts_splits_the_pooled_inputs_by_expert() {
+        let path = std::env::temp_dir().join(format!("allpaca_calib_q4xe-{}.gguf", std::process::id()));
+        crate::qwen4exp::write_tiny_qwen4exp_gguf(&path);
+        let texts = ["hello world again hello", "world hello"];
+        let stats = capture_experts(&path, &texts, &[0]).unwrap();
+        let (model, _, _) = crate::sensitivity::load_host(&path).unwrap();
+        let file = allpaca_gguf::GgufFile::open(&path).unwrap();
+        let n = model.config.n_experts;
+        for kind in ["ffn_up_exps", "ffn_down_exps"] {
+            let name = format!("blk.0.{kind}.weight");
+            let pooled = stats.gram(&name).unwrap();
+            let mut total = 0;
+            for e in 0..n {
+                let count = stats.expert_count(0, e);
+                match stats.expert_gram(&name, e) {
+                    Some(g) => {
+                        assert_eq!((g.cols, g.count), (pooled.cols, count), "{name} expert {e}");
+                        assert_gram_shape(&g, &name);
+                    }
+                    None => assert_eq!(count, 0, "{name} expert {e}"),
+                }
+                total += count;
+            }
+            assert_eq!(total, pooled.count, "{name}");
+            // Blocks not asked for keep the pooled Gram only.
+            if file.tensors.iter().any(|t| t.name == format!("blk.1.{kind}.weight")) {
+                assert!((0..n).all(|e| stats.expert_gram(&format!("blk.1.{kind}.weight"), e).is_none()));
+            }
+        }
+        // Without blocks asked for, no expert has its own.
+        let plain = capture(&path, &texts).unwrap();
+        assert!((0..n).all(|e| plain.expert_count(0, e) == 0));
+        let _ = std::fs::remove_file(&path);
     }
 }
