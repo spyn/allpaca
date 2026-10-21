@@ -17,7 +17,7 @@ use allpaca_cpu::{f32_to_f16, Q2_0_BLOCK_BYTES, Q2_0_BLOCK_ELEMS};
 use allpaca_types::{AllpacaError, FatalError};
 
 /// The grid, in units of the group's scale.
-const VALUES: [f32; 4] = [-2.0, -1.0, 0.0, 1.0];
+pub(crate) const VALUES: [f32; 4] = [-2.0, -1.0, 0.0, 1.0];
 
 /// Training settings.
 #[derive(Debug, Clone)]
@@ -29,6 +29,9 @@ pub struct GsqConfig {
     /// How sharply the initial logits favour the nearest grid value.
     pub init_strength: f32,
     pub seed: u64,
+    /// Matrices with more weights than this keep their start untrained:
+    /// a step costs a few microseconds a weight on the CPU.
+    pub max_trained: usize,
 }
 
 impl Default for GsqConfig {
@@ -39,6 +42,7 @@ impl Default for GsqConfig {
             temperature: (1.0, 0.05),
             init_strength: 4.0,
             seed: 0,
+            max_trained: 1 << 22,
         }
     }
 }
@@ -178,7 +182,7 @@ fn rows_times_gram(d: &[f32], cols: usize, gram: &Gram<'_>, out: &mut [f32]) {
     });
 }
 
-fn nearest(x: f32) -> u8 {
+pub(crate) fn nearest(x: f32) -> u8 {
     (x.round().clamp(-2.0, 1.0) + 2.0) as u8
 }
 
@@ -209,7 +213,7 @@ fn round_with_best_scales(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
     (index, scales)
 }
 
-fn round_groups(w: &[f32], index: &mut [u8], scales: &mut [f32]) {
+pub(crate) fn round_groups(w: &[f32], index: &mut [u8], scales: &mut [f32]) {
     let groups = w.chunks(Q2_0_BLOCK_ELEMS).zip(index.chunks_mut(Q2_0_BLOCK_ELEMS)).zip(scales.iter_mut());
     for ((src, dst), scale) in groups {
         let amax = src.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -331,12 +335,24 @@ fn quantise_2bit_by(
     }
     let gpr = cols / Q2_0_BLOCK_ELEMS;
     let (index0, scales0) = round_with_best_scales(w);
-    let start = Quantised {
+    let mut start = Quantised {
         rows,
         cols,
         index: index0,
         scales: scales0,
     };
+    let mut start_error = quantised_error(w, &start, gram);
+    // Against measured inputs GPTQ starts closer, as in the reference.
+    if let Gram::Full(h) = gram {
+        let gptq = crate::gptq::gptq_2bit(w, rows, cols, h)?;
+        let e = quantised_error(w, &gptq, gram);
+        if e < start_error {
+            (start, start_error) = (gptq, e);
+        }
+    }
+    if cfg.steps == 0 || w.len() > cfg.max_trained {
+        return Ok(start);
+    }
     // Scales move in proportion to their size.
     let scale_unit = start.scales.iter().map(|s| s.abs()).sum::<f32>() / start.scales.len().max(1) as f32;
     // Rows train on their own (each has its own noise), so a large matrix
@@ -349,6 +365,7 @@ fn quantise_2bit_by(
             &w[first * cols..(first + n_rows) * cols],
             first,
             cols,
+            &start.index[first * cols..(first + n_rows) * cols],
             &start.scales[first * gpr..(first + n_rows) * gpr],
             scale_unit,
             gram,
@@ -363,7 +380,7 @@ fn quantise_2bit_by(
         index,
         scales,
     };
-    if quantised_error(w, &trained, gram) < quantised_error(w, &start, gram) {
+    if quantised_error(w, &trained, gram) < start_error {
         Ok(trained)
     } else {
         Ok(start)
@@ -371,11 +388,14 @@ fn quantise_2bit_by(
 }
 
 /// The search on whole rows of a matrix, the first being row `row0`, from
-/// `start_scales`: each weight's grid index and the trained scales.
+/// `start_index` and `start_scales`: each weight's grid index and the
+/// trained scales.
+#[allow(clippy::too_many_arguments)]
 fn train(
     w: &[f32],
     row0: usize,
     cols: usize,
+    start_index: &[u8],
     start_scales: &[f32],
     scale_unit: f32,
     gram: &Gram<'_>,
@@ -383,18 +403,26 @@ fn train(
 ) -> (Vec<u8>, Vec<f32>) {
     let rows = w.len() / cols;
     let gpr = cols / Q2_0_BLOCK_ELEMS;
-    // Logits favour each weight's nearest grid values at the starting scale.
+    // Logits favour each weight's start value, by how far the weight is
+    // from the grid values at the starting scale (its nearest's place
+    // taken by the start's choice: the same when the start is rounding).
     let n = w.len();
     let mut logits = vec![0.0f32; n * 4];
     // Whole groups per thread (a group's weights are consecutive).
     let per_groups = n.div_ceil(Q2_0_BLOCK_ELEMS).div_ceil(pass_threads(n)).max(1);
     let per_weights = per_groups * Q2_0_BLOCK_ELEMS;
     std::thread::scope(|scope| {
-        for ((w, logits), scales) in w.chunks(per_weights).zip(logits.chunks_mut(per_weights * 4)).zip(start_scales.chunks(per_groups)) {
+        let parts = w
+            .chunks(per_weights)
+            .zip(logits.chunks_mut(per_weights * 4))
+            .zip(start_scales.chunks(per_groups))
+            .zip(start_index.chunks(per_weights));
+        for (((w, logits), scales), index) in parts {
             scope.spawn(move || {
                 for (i, x) in w.iter().enumerate() {
                     let s = scales[i / Q2_0_BLOCK_ELEMS];
                     let x = if s == 0.0 { 0.0 } else { x / s };
+                    let x = x - VALUES[usize::from(nearest(x))] + VALUES[usize::from(index[i])];
                     let raw = VALUES.map(|v| -0.5 * (x - v).powi(2));
                     let mean = raw.iter().sum::<f32>() / 4.0;
                     for k in 0..4 {
