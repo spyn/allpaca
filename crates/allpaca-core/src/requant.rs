@@ -405,13 +405,6 @@ pub fn requantise_each(
         Some(path) if path.exists() => Some(read_probe_table(path)?),
         _ => None,
     };
-    let mut probe = match &opts.probe {
-        Some(p) => {
-            let texts: Vec<&str> = p.texts.iter().map(String::as_str).collect();
-            Some(Probe::open(input, &texts, p.max_tokens)?)
-        }
-        None => None,
-    };
     let mut keep = opts.keep.clone();
     let qwen4exp = crate::qwen4exp::file_is_qwen4exp(&file);
     if qwen4exp {
@@ -439,6 +432,16 @@ pub fn requantise_each(
             "requantise: the file has no weight matrix whose rows are whole blocks of the types asked for".into(),
         )));
     }
+    // Opened only for what the table lacks: on a model larger than RAM its
+    // reference reading is not free.
+    let lacking = candidates.iter().any(|&(i, _, _)| !saved.as_ref().is_some_and(|s| s.contains_key(&file.tensors[i].name)));
+    let mut probe = match &opts.probe {
+        Some(p) if lacking => {
+            let texts: Vec<&str> = p.texts.iter().map(String::as_str).collect();
+            Some(Probe::open(input, &texts, p.max_tokens)?)
+        }
+        _ => None,
+    };
     // The measured, damped Gram of a matrix's input, when the run covers it.
     let measured = |i: usize, cols: usize| -> Option<Vec<f32>> {
         let gram = opts.stats.as_ref()?.gram(&file.tensors[i].name)?;
