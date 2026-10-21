@@ -2123,6 +2123,15 @@ fn packed_type(name: &str) -> Option<allpaca_gguf::GgmlType> {
 }
 
 fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool, indexer: Option<usize>) {
+    write_tiny_ple(path, dim, ff, packed, indexer, 4);
+}
+
+/// The tiny model with n-gram table rows `ple_dim` wide (32 fits IQ4_NL blocks).
+pub fn write_tiny_qwen4exp_wide_ple_gguf(path: &std::path::Path) {
+    write_tiny_ple(path, 16, 8, false, None, 32);
+}
+
+fn write_tiny_ple(path: &std::path::Path, dim: usize, ff: usize, packed: bool, indexer: Option<usize>, ple_dim: usize) {
     use allpaca_gguf::{write_gguf_quant, GgmlType, GgufWriteQuantTensor, GgufWriteTensor};
 
     let (hc, lr, vocab, n_layers) = (2usize, 4usize, 8usize, 4usize);
@@ -2131,7 +2140,7 @@ fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool, index
     let (key_dim, value_dim) = (state * n_k, state * n_v);
     let qkv_dim = key_dim * 2 + value_dim;
     let n_exp = 4usize;
-    let (ngram, heads_per, ple_dim, ple_kernel) = (3usize, 2usize, 4usize, 2usize);
+    let (ngram, heads_per, ple_kernel) = (3usize, 2usize, 2usize);
     let ple_heads = (ngram - 1) * heads_per;
     let ple_vocab = 7usize;
     let hc_dim = hc * dim;

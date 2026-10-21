@@ -243,6 +243,13 @@ impl Report {
 pub const QWEN4EXP_KEEP: [&str; 7] =
     ["ffn_gate_inp", "indexer.", "_inject.", "ssm_alpha", "ssm_beta", "ssm_conv1d", "per_layer_token_embd"];
 
+/// What a `qwen4exp` file keeps at 4 bits: written as IQ4_NL when its
+/// source holds it wider (a Q8_0 model's n-gram table is 54 GB).
+pub const QWEN4EXP_4BIT: [&str; 1] = ["per_layer_token_embd"];
+
+/// Weights encoded at a time when a kept table is narrowed to IQ4_NL.
+const NARROW_CHUNK: usize = 1 << 24;
+
 /// 2-bit results larger than this go to a file until they are written out.
 const TWO_BIT_IN_RAM: usize = 64 << 20;
 
@@ -406,9 +413,19 @@ pub fn requantise_each(
         None => None,
     };
     let mut keep = opts.keep.clone();
-    if crate::qwen4exp::file_is_qwen4exp(&file) {
+    let qwen4exp = crate::qwen4exp::file_is_qwen4exp(&file);
+    if qwen4exp {
         keep.extend(QWEN4EXP_KEEP.iter().map(|k| k.to_string()));
     }
+    // A kept table written as IQ4_NL instead of its wider source type.
+    let narrowed = |t: &allpaca_gguf::TensorInfo| {
+        let n = t.n_elements() as usize;
+        qwen4exp
+            && QWEN4EXP_4BIT.iter().any(|k| t.name.contains(k))
+            && t.dims.first().is_some_and(|w| w % allpaca_cpu::IQ4_NL_BLOCK_ELEMS as u64 == 0)
+            && n > 0
+            && t.nbytes() * 8 > n * 9 / 2
+    };
     let candidates: Vec<(usize, usize, usize)> = file
         .tensors
         .iter()
@@ -563,6 +580,10 @@ pub fn requantise_each(
                 let n = t.n_elements() as usize;
                 let (ggml_type_id, nbytes) = match chosen(i) {
                     Some(target) => (target.ggml() as u32, n / target.block().0 * target.block().1),
+                    None if narrowed(t) => (
+                        GgmlType::IQ4_NL as u32,
+                        n / allpaca_cpu::IQ4_NL_BLOCK_ELEMS * allpaca_cpu::IQ4_NL_BLOCK_BYTES,
+                    ),
                     None => (t.ggml_type_id, t.nbytes()),
                 };
                 GgufStreamTensor {
@@ -614,6 +635,17 @@ pub fn requantise_each(
                     let w = file.tensor_f32(&t.name)?;
                     writer.write_tensor(&target.quantise(&w, rows, cols, &Gram::Identity, &opts.gsq)?)?;
                 }
+                None if narrowed(t) => {
+                    let (n, bytes) = (t.n_elements() as usize, file.tensor_bytes(&t.name)?);
+                    writer.write_tensor_parts((0..n).step_by(NARROW_CHUNK).map(|start| {
+                        let len = NARROW_CHUNK.min(n - start);
+                        // Every source block size divides the chunk; the last ends the tensor.
+                        let at = |e: usize| (bytes.len() as u128 * e as u128 / n as u128) as usize;
+                        let mut w = vec![0.0f32; len];
+                        allpaca_gguf::dequant_packed(t.ggml_type, &bytes[at(start)..at(start + len)], len, &mut w)?;
+                        Ok(encode_iq4_nl_threaded(&w))
+                    }))?;
+                }
                 None => writer.write_tensor(file.tensor_bytes(&t.name)?)?,
             }
         }
@@ -641,6 +673,16 @@ pub fn requantise_each(
         });
     }
     Ok(reports)
+}
+
+/// [`allpaca_cpu::quantize_iq4_nl`] on all cores.
+fn encode_iq4_nl_threaded(w: &[f32]) -> Vec<u8> {
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    let per = w.len().div_ceil(threads).next_multiple_of(allpaca_cpu::IQ4_NL_BLOCK_ELEMS).max(allpaca_cpu::IQ4_NL_BLOCK_ELEMS);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = w.chunks(per).map(|c| s.spawn(move || allpaca_cpu::quantize_iq4_nl(c))).collect();
+        parts.into_iter().flat_map(|p| p.join().expect("iq4_nl thread")).collect()
+    })
 }
 
 #[cfg(test)]
@@ -688,19 +730,30 @@ mod tests {
             dir.join(format!("allpaca_requant_q4x_in-{}.gguf", std::process::id())),
             dir.join(format!("allpaca_requant_q4x_out-{}.gguf", std::process::id())),
         );
-        crate::qwen4exp::write_tiny_qwen4exp_gguf(&src);
+        crate::qwen4exp::write_tiny_qwen4exp_wide_ple_gguf(&src);
         let opts = Options { avg_bits: 8.5, targets: vec![Target::Q8_0], min_weights: 0, ..Options::default() };
         let report = requantise(&src, &dst, &opts).unwrap();
         let (before, after) = (GgufFile::open(&src).unwrap(), GgufFile::open(&dst).unwrap());
-        let mut kept = 0;
+        let (mut kept, mut narrowed) = (0, 0);
         for t in &before.tensors {
             let now = after.tensor(&t.name).unwrap().ggml_type;
             if QWEN4EXP_KEEP.iter().any(|k| t.name.contains(k)) {
-                assert_eq!(now, t.ggml_type, "{} is kept", t.name);
                 kept += 1;
+                let n = t.n_elements() as usize;
+                if QWEN4EXP_4BIT.iter().any(|k| t.name.contains(k)) && t.nbytes() * 8 > n * 9 / 2 && t.dims[0] % 32 == 0 {
+                    // Narrowed to 4 bits, and close to what it was.
+                    assert_eq!(now, GgmlType::IQ4_NL, "{}", t.name);
+                    let (a, b) = (before.tensor_f32(&t.name).unwrap(), after.tensor_f32(&t.name).unwrap());
+                    let err = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>() / a.iter().map(|x| x * x).sum::<f32>();
+                    assert!(err < 0.01, "{}: {err}", t.name);
+                    narrowed += 1;
+                    continue;
+                }
+                assert_eq!(now, t.ggml_type, "{} is kept", t.name);
             }
         }
         assert!(kept > 0 && report.choices.iter().all(|c| !QWEN4EXP_KEEP.iter().any(|k| c.name.contains(k))));
+        assert_eq!(narrowed, 1, "the n-gram table");
         // The tiny model's rows are 16 wide but for the streams' mixers (32).
         assert!(report.choices.iter().any(|c| c.name.ends_with("hc_attn_down.weight")), "the rest is requantised");
         drop((before, after));
