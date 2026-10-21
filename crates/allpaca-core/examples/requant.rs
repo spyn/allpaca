@@ -25,6 +25,9 @@
 //! `--probe-table <file>` saves the probe's measurements to the file, and
 //! when the file exists, reads them from it instead of probing.
 //!
+//! `--no-measure` keeps the calibration text for `--probe` and
+//! `--propagate` only: matrices are quantised and scored on their weights.
+//!
 //! `--stats <file>` saves the calibration statistics to the file, and when
 //! the file exists, reads them from it instead of reading the text.
 //!
@@ -59,6 +62,8 @@ fn main() {
         ridge = Some(given.unwrap_or(1.0));
         args.drain(at..at + 1 + usize::from(given.is_some()));
     }
+    let no_measure = args.iter().any(|a| a == "--no-measure");
+    args.retain(|a| a != "--no-measure");
     let scaled = args.iter().any(|a| a == "--scaled");
     args.retain(|a| a != "--scaled");
     let mut probe_table = None;
@@ -98,7 +103,7 @@ fn main() {
     }
     if args.len() < 2 {
         eprintln!(
-            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--stats file] [--propagate [ridge]] [--types q2_0,q4_k,...]"
+            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--stats file] [--no-measure] [--propagate [ridge]] [--types q2_0,q4_k,...]"
         );
         std::process::exit(2);
     }
@@ -145,15 +150,24 @@ fn main() {
             });
         }
         let start = std::time::Instant::now();
-        let read = match stats_file.as_deref().filter(|p| p.exists()) {
-            Some(saved) => allpaca_core::calib::InputStats::load(saved),
-            None => allpaca_core::calib::capture(Path::new(&args[0]), &texts).and_then(|stats| match &stats_file {
-                Some(path) => stats.save(path).map(|()| stats),
-                None => Ok(stats),
-            }),
+        let read = match stats_file.as_deref().filter(|_| no_measure) {
+            Some(_) => {
+                eprintln!("--no-measure and --stats do not go together");
+                std::process::exit(2);
+            }
+            None if no_measure => Ok(None),
+            None => match stats_file.as_deref().filter(|p| p.exists()) {
+                Some(saved) => allpaca_core::calib::InputStats::load(saved),
+                None => allpaca_core::calib::capture(Path::new(&args[0]), &texts).and_then(|stats| match &stats_file {
+                    Some(path) => stats.save(path).map(|()| stats),
+                    None => Ok(stats),
+                }),
+            }
+            .map(Some),
         };
         match read {
-            Ok(stats) => {
+            Ok(None) => {}
+            Ok(Some(stats)) => {
                 println!(
                     "calibration: {} texts, {} input sites measured in {:.0} s",
                     texts.len(),
