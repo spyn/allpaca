@@ -249,6 +249,108 @@ impl InputStats {
     pub fn is_empty(&self) -> bool {
         self.sites.is_empty()
     }
+
+    /// Write the statistics to `path`, for [`Self::load`]: a capture of a
+    /// large model takes an hour.
+    pub fn save(&self, path: &Path) -> Result<(), AllpacaError> {
+        use std::io::Write;
+        let io = |e: std::io::Error| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", path.display())));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path).map_err(io)?);
+        let mut keys: Vec<_> = self.sites.keys().copied().collect();
+        keys.sort_unstable_by_key(|(blk, site)| (*blk, site.tag()));
+        out.write_all(STATS_MAGIC).map_err(io)?;
+        out.write_all(&(keys.len() as u64).to_le_bytes()).map_err(io)?;
+        for key in keys {
+            let m = &self.sites[&key];
+            let (tag, expert) = key.1.tag();
+            out.write_all(&(key.0 as u64).to_le_bytes()).map_err(io)?;
+            out.write_all(&[tag]).map_err(io)?;
+            out.write_all(&expert.to_le_bytes()).map_err(io)?;
+            out.write_all(&(m.cols as u64).to_le_bytes()).map_err(io)?;
+            out.write_all(&m.count.to_le_bytes()).map_err(io)?;
+            out.write_all(&m.weight.to_le_bytes()).map_err(io)?;
+            out.write_all(&(m.sum.len() as u64).to_le_bytes()).map_err(io)?;
+            for chunk in m.sum.chunks(1 << 16) {
+                let bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+                out.write_all(&bytes).map_err(io)?;
+            }
+        }
+        out.flush().map_err(io)
+    }
+
+    /// Statistics [`Self::save`] wrote.
+    pub fn load(path: &Path) -> Result<Self, AllpacaError> {
+        use std::io::Read;
+        let io = |e: std::io::Error| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", path.display())));
+        let bad = |what: &str| AllpacaError::Fatal(FatalError::InvalidConfig(format!("{}: {what}", path.display())));
+        let mut input = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+        let mut magic = [0u8; 8];
+        input.read_exact(&mut magic).map_err(io)?;
+        if &magic != STATS_MAGIC {
+            return Err(bad("not calibration statistics"));
+        }
+        let mut u64_of = |input: &mut std::io::BufReader<std::fs::File>| -> Result<u64, AllpacaError> {
+            let mut b = [0u8; 8];
+            input.read_exact(&mut b).map_err(io)?;
+            Ok(u64::from_le_bytes(b))
+        };
+        let n = u64_of(&mut input)?;
+        let mut sites = HashMap::new();
+        for _ in 0..n {
+            let blk = u64_of(&mut input)? as usize;
+            let mut tag = [0u8; 3];
+            input.read_exact(&mut tag).map_err(io)?;
+            let site = Site::of_tag(tag[0], u16::from_le_bytes([tag[1], tag[2]])).ok_or_else(|| bad("unknown site"))?;
+            let cols = u64_of(&mut input)? as usize;
+            let count = u64_of(&mut input)?;
+            let weight = f64::from_bits(u64_of(&mut input)?);
+            let len = u64_of(&mut input)? as usize;
+            if len != cols * (cols + 1) / 2 {
+                return Err(bad("a sum of the wrong size"));
+            }
+            let mut bytes = vec![0u8; len * 4];
+            input.read_exact(&mut bytes).map_err(io)?;
+            let sum = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            sites.insert((blk, site), Moments { cols, count, weight, sum });
+        }
+        Ok(Self { sites })
+    }
+}
+
+const STATS_MAGIC: &[u8; 8] = b"APCALIB1";
+
+impl Site {
+    /// The site's number in a saved file, and its expert.
+    fn tag(self) -> (u8, u16) {
+        match self {
+            Self::AttnIn => (0, 0),
+            Self::AttnOut => (1, 0),
+            Self::FfnIn => (2, 0),
+            Self::FfnAct => (3, 0),
+            Self::ExpIn => (4, 0),
+            Self::ExpAct => (5, 0),
+            Self::ShexpIn => (6, 0),
+            Self::ShexpAct => (7, 0),
+            Self::ExpertIn(e) => (8, e),
+            Self::ExpertAct(e) => (9, e),
+        }
+    }
+
+    fn of_tag(tag: u8, expert: u16) -> Option<Self> {
+        Some(match tag {
+            0 => Self::AttnIn,
+            1 => Self::AttnOut,
+            2 => Self::FfnIn,
+            3 => Self::FfnAct,
+            4 => Self::ExpIn,
+            5 => Self::ExpAct,
+            6 => Self::ShexpIn,
+            7 => Self::ShexpAct,
+            8 => Self::ExpertIn(expert),
+            9 => Self::ExpertAct(expert),
+            _ => return None,
+        })
+    }
 }
 
 /// The model's recording point: off except during [`capture`].
@@ -894,6 +996,21 @@ pub(crate) mod tests {
         // Without blocks asked for, no expert has its own.
         let plain = capture(&path, &texts).unwrap();
         assert!((0..n).all(|e| plain.expert_count(0, e) == 0));
+
+        // Saved and loaded, every Gram reads the same.
+        let saved = path.with_extension("stats");
+        stats.save(&saved).unwrap();
+        let back = InputStats::load(&saved).unwrap();
+        assert_eq!(back.len(), stats.len());
+        for t in &file.tensors {
+            assert_eq!(back.gram(&t.name), stats.gram(&t.name), "{}", t.name);
+            for e in 0..n {
+                assert_eq!(back.expert_gram(&t.name, e), stats.expert_gram(&t.name, e), "{} expert {e}", t.name);
+            }
+        }
+        std::fs::write(&saved, b"not stats").unwrap();
+        assert!(InputStats::load(&saved).is_err());
+        let _ = std::fs::remove_file(&saved);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -25,6 +25,9 @@
 //! `--probe-table <file>` saves the probe's measurements to the file, and
 //! when the file exists, reads them from it instead of probing.
 //!
+//! `--stats <file>` saves the calibration statistics to the file, and when
+//! the file exists, reads them from it instead of reading the text.
+//!
 //! `--types q2_0,q3_k,q4_k,q5_k,q6_k,q8_0` limits the types a matrix may
 //! take (default: all of those and `q4_0`).
 
@@ -69,6 +72,17 @@ fn main() {
         }
         args.drain(at..at + 2);
     }
+    let mut stats_file = None;
+    if let Some(at) = args.iter().position(|a| a == "--stats") {
+        match args.get(at + 1) {
+            Some(path) => stats_file = Some(PathBuf::from(path)),
+            None => {
+                eprintln!("--stats takes a file");
+                std::process::exit(2);
+            }
+        }
+        args.drain(at..at + 2);
+    }
     let mut types = None;
     if let Some(at) = args.iter().position(|a| a == "--types") {
         let list = args.get(at + 1).cloned().unwrap_or_default();
@@ -84,7 +98,7 @@ fn main() {
     }
     if args.len() < 2 {
         eprintln!(
-            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--propagate [ridge]] [--types q2_0,q4_k,...]"
+            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--stats file] [--propagate [ridge]] [--types q2_0,q4_k,...]"
         );
         std::process::exit(2);
     }
@@ -131,7 +145,14 @@ fn main() {
             });
         }
         let start = std::time::Instant::now();
-        match allpaca_core::calib::capture(Path::new(&args[0]), &texts) {
+        let read = match stats_file.as_deref().filter(|p| p.exists()) {
+            Some(saved) => allpaca_core::calib::InputStats::load(saved),
+            None => allpaca_core::calib::capture(Path::new(&args[0]), &texts).and_then(|stats| match &stats_file {
+                Some(path) => stats.save(path).map(|()| stats),
+                None => Ok(stats),
+            }),
+        };
+        match read {
             Ok(stats) => {
                 println!(
                     "calibration: {} texts, {} input sites measured in {:.0} s",
