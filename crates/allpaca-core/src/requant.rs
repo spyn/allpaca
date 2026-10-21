@@ -147,6 +147,8 @@ pub struct Options {
     /// the others by their plain squared error.
     pub stats: Option<InputStats>,
     /// Share of a measured Gram's mean diagonal added to its diagonal.
+    /// GPTQ fits a lightly damped Gram's text: on Flash-Next, damping 1.0
+    /// gave the lowest output error on held-out text of 0.01, 0.1 and 1.0.
     pub damping: f32,
     /// Choose the types by measured sensitivity ([`crate::sensitivity`])
     /// instead of each matrix's own error. A matrix the probe cannot swap
@@ -188,7 +190,7 @@ impl Default for Options {
             gsq: GsqConfig::default(),
             resolution: 4000,
             stats: None,
-            damping: 0.01,
+            damping: 1.0,
             probe: None,
             probe_table: None,
             propagate: None,
