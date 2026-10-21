@@ -21,7 +21,7 @@ fn main() {
         eprintln!("usage: quant_kld <reference.gguf> <text.txt> <other.gguf>... [--tokens N]");
         std::process::exit(2);
     }
-    let text = std::fs::read_to_string(&args[1]).expect("text file");
+    let text = std::fs::read_to_string(&args[1]).expect("text file").replace("\r\n", "\n");
     let texts: Vec<&str> = text.split("\n\n").map(str::trim).filter(|t| !t.is_empty()).collect();
     for other in &args[2..] {
         let start = std::time::Instant::now();

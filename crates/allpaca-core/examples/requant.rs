@@ -118,7 +118,7 @@ fn main() {
         };
     }
     if let Some(path) = args.get(4) {
-        let text = std::fs::read_to_string(path).expect("calibration text");
+        let text = std::fs::read_to_string(path).expect("calibration text").replace("\r\n", "\n");
         let texts: Vec<&str> = text.split("\n\n").map(str::trim).filter(|t| !t.is_empty()).collect();
         if let Some(max_tokens) = probe_tokens {
             opts.probe = Some(ProbeTexts { texts: texts.iter().map(|t| t.to_string()).collect(), max_tokens, scaled });
