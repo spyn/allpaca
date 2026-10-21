@@ -511,24 +511,39 @@ pub fn capture_experts(model: &Path, texts: &[&str], expert_blocks: &[usize]) ->
         *blocks = expert_blocks.to_vec();
     }
     model.calib.start();
-    let mut run = Ok(());
-    for text in texts {
-        let read = tok.encode(text).and_then(|ids| match model.q4x.is_some() {
-            // Its host forward block by block, where the sites are.
-            true => {
-                let mut logits = vec![0.0f32; ids.len() * model.config.vocab_size];
-                let mut mems = [crate::qwen4exp::Qwen4Memory::traced(None)];
-                crate::qwen4exp::forward_qwen4_host_rows(&model, &[&ids], &mut mems, &mut logits)
-            }
-            false => crate::sensitivity::text_log_probs(&model, &ids, None).map(drop),
-        });
-        if let Err(e) = read {
-            run = Err(e);
-            break;
-        }
-    }
+    let run = read_texts(&model, &tok, texts, BATCH_LOGIT_BYTES);
     let stats = model.calib.finish();
     run.map(|()| stats)
+}
+
+/// Logits a qwen4exp batch may hold: texts read together take each
+/// block's weights from disk once, for a model larger than RAM.
+const BATCH_LOGIT_BYTES: usize = 2 << 30;
+
+fn read_texts(model: &crate::TinyModel, tok: &crate::EngineTokenizer, texts: &[&str], logit_bytes: usize) -> Result<(), AllpacaError> {
+    let ids = texts.iter().map(|t| tok.encode(t)).collect::<Result<Vec<_>, _>>()?;
+    if model.q4x.is_none() {
+        return ids.iter().try_for_each(|ids| crate::sensitivity::text_log_probs(model, ids, None).map(drop));
+    }
+    // Its host forward block by block, where the sites are, on as many
+    // texts at once as the logits budget allows.
+    let vocab = model.config.vocab_size;
+    let per_batch = (logit_bytes / 4 / vocab.max(1)).max(1);
+    let mut at = 0;
+    while at < ids.len() {
+        let mut end = at + 1;
+        let mut tokens = ids[at].len();
+        while end < ids.len() && tokens + ids[end].len() <= per_batch {
+            tokens += ids[end].len();
+            end += 1;
+        }
+        let seqs: Vec<&[u32]> = ids[at..end].iter().map(Vec::as_slice).collect();
+        let mut mems: Vec<_> = seqs.iter().map(|_| crate::qwen4exp::Qwen4Memory::traced(None)).collect();
+        let mut logits = vec![0.0f32; tokens * vocab];
+        crate::qwen4exp::forward_qwen4_host_rows(model, &seqs, &mut mems, &mut logits)?;
+        at = end;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -996,6 +1011,19 @@ pub(crate) mod tests {
         // Without blocks asked for, no expert has its own.
         let plain = capture(&path, &texts).unwrap();
         assert!((0..n).all(|e| plain.expert_count(0, e) == 0));
+
+        // Read one text at a time, every Gram is the same.
+        let (model, tok, _) = crate::sensitivity::load_host(&path).unwrap();
+        *model.calib.expert_blocks.lock().unwrap() = vec![0];
+        model.calib.start();
+        read_texts(&model, &tok, &texts, 1).unwrap();
+        let alone = model.calib.finish();
+        for t in &file.tensors {
+            assert_eq!(alone.gram(&t.name), stats.gram(&t.name), "{}", t.name);
+            for e in 0..n {
+                assert_eq!(alone.expert_gram(&t.name, e), stats.expert_gram(&t.name, e), "{} expert {e}", t.name);
+            }
+        }
 
         // Saved and loaded, every Gram reads the same.
         let saved = path.with_extension("stats");
