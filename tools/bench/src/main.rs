@@ -10,7 +10,9 @@
 //! speed drifts by several percent over minutes, so "all of A, then all of
 //! B" measures the drift as well.
 
+mod roofline;
 mod serve;
+mod snap;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -132,9 +134,16 @@ fn record(out: Option<&Path>, sample: &Sample) {
 }
 
 fn run(target: &Target, tag: &str, load: &Load, first_round: usize, rounds: usize) -> Result<Vec<Sample>, String> {
-    serve::run(target, tag, &prompts(load)?, first_round, rounds, load.concurrency, load.warmup, &mut |s| {
-        record(load.out.as_deref(), s)
-    })
+    serve::run(
+        target,
+        tag,
+        &prompts(load)?,
+        first_round,
+        rounds,
+        load.concurrency,
+        load.warmup,
+        &mut |s| record(load.out.as_deref(), s),
+    )
 }
 
 /// A started server; stopped when dropped.
@@ -212,7 +221,7 @@ fn ab(configs: &[PathBuf], server: &Path, load_timeout: u64, load: &Load) -> Res
             drop(running);
         }
     }
-    println!("\n{}", serve::table(&serve::summarize(&samples)));
+    println!("\n{}", serve::report_text(&samples));
     Ok(())
 }
 
@@ -226,7 +235,7 @@ fn report(file: &Path, tags: &[String]) -> Result<(), String> {
     if samples.is_empty() {
         return Err(format!("{} has no samples", file.display()));
     }
-    print!("{}", serve::table(&serve::summarize(&samples)));
+    print!("{}", serve::report_text(&samples));
     Ok(())
 }
 
@@ -265,7 +274,7 @@ fn main() {
             let key = key.or_else(|| std::env::var("ALLPACA_BENCH_KEY").ok()).unwrap_or_default();
             let target = Target { url, key, max_tokens: load.tokens };
             run(&target, &tag, &load, 1, load.rounds)
-                .map(|samples| println!("\n{}", serve::table(&serve::summarize(&samples))))
+                .map(|samples| println!("\n{}", serve::report_text(&samples)))
         }
         Cmd::Ab { configs, server, load_timeout, load } => ab(&configs, &server, load_timeout, &load),
         Cmd::Report { file, tag } => report(&file, &tag),
