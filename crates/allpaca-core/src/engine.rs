@@ -544,6 +544,14 @@ impl Engine {
         }
         config.apply_tune_overlay();
         config.validate()?;
+        let experimental_on = config.experimental.enabled_names();
+        if !experimental_on.is_empty() {
+            tracing::warn!(
+                options = %experimental_on.join(", "),
+                exactness = %config.experimental.exactness(),
+                "experimental options are on; output may leave the exact path"
+            );
+        }
         let mut inventory = DeviceInventory::discover(&config);
         scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
@@ -1355,7 +1363,7 @@ impl Engine {
         } else {
             "p2p_unavailable"
         };
-        self.metrics.snapshot(
+        let mut snap = self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
             self.inventory.p2p_capable,
@@ -1370,7 +1378,9 @@ impl Engine {
             model_id,
             backend,
             draft_depth,
-        )
+        );
+        snap.exactness = self.config.experimental.exactness().as_str().into();
+        snap
     }
 
     pub fn model_id(&self) -> String {

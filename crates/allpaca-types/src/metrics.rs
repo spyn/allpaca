@@ -1,9 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+fn default_exactness() -> String {
+    "exact".into()
+}
+
 /// In-memory telemetry snapshot exposed by `GET /stats`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub pipeline_mode: String,
+    /// `"exact"`, `"distribution-exact"`, or `"lossy"` from `[experimental]`.
+    #[serde(default = "default_exactness")]
+    pub exactness: String,
     pub transfer_path: String,
     /// True when a GPU pair can access peers after enable + re-query.
     pub p2p_capable: bool,
