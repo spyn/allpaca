@@ -32,6 +32,11 @@ pub struct GsqConfig {
     /// Matrices with more weights than this keep their start untrained:
     /// a step costs a few microseconds a weight on the CPU.
     pub max_trained: usize,
+    /// Each group's rounding scale times this, rounded again. The scale
+    /// with the least weight error clips the largest weights, which the
+    /// model needs: on Qwen3.8-Flash-Next's Q2_0 experts 1.15 cut KL to
+    /// the Q8_0 from 0.110 to 0.097 (1.07 gave 0.0995, 1.25 0.110).
+    pub stretch: f32,
 }
 
 impl Default for GsqConfig {
@@ -43,6 +48,7 @@ impl Default for GsqConfig {
             init_strength: 4.0,
             seed: 0,
             max_trained: 1 << 22,
+            stretch: 1.0,
         }
     }
 }
@@ -213,6 +219,24 @@ fn round_with_best_scales(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
     (index, scales)
 }
 
+/// Each group's scale times `stretch`, and its weights rounded to it.
+fn stretch_groups(w: &[f32], index: &mut [u8], scales: &mut [f32], stretch: f32) {
+    let per = scales.len().div_ceil(pass_threads(w.len())).max(1);
+    std::thread::scope(|s| {
+        let parts = w.chunks(per * Q2_0_BLOCK_ELEMS).zip(index.chunks_mut(per * Q2_0_BLOCK_ELEMS)).zip(scales.chunks_mut(per));
+        for ((w, index), scales) in parts {
+            s.spawn(move || {
+                for ((src, dst), scale) in w.chunks(Q2_0_BLOCK_ELEMS).zip(index.chunks_mut(Q2_0_BLOCK_ELEMS)).zip(scales.iter_mut()) {
+                    *scale *= stretch;
+                    for (d, v) in dst.iter_mut().zip(src) {
+                        *d = if *scale == 0.0 { 2 } else { nearest(v / *scale) };
+                    }
+                }
+            });
+        }
+    });
+}
+
 pub(crate) fn round_groups(w: &[f32], index: &mut [u8], scales: &mut [f32]) {
     let groups = w.chunks(Q2_0_BLOCK_ELEMS).zip(index.chunks_mut(Q2_0_BLOCK_ELEMS)).zip(scales.iter_mut());
     for ((src, dst), scale) in groups {
@@ -334,7 +358,10 @@ fn quantise_2bit_by(
         }
     }
     let gpr = cols / Q2_0_BLOCK_ELEMS;
-    let (index0, scales0) = round_with_best_scales(w);
+    let (mut index0, mut scales0) = round_with_best_scales(w);
+    if cfg.stretch != 1.0 {
+        stretch_groups(w, &mut index0, &mut scales0, cfg.stretch);
+    }
     let mut start = Quantised {
         rows,
         cols,
@@ -652,6 +679,24 @@ mod tests {
 
     /// Real matrices draw tens of millions of samples a step: none may be
     /// infinite (a uniform draw of 1.0 once made every training NaN).
+    #[test]
+    fn a_stretched_start_clips_less_and_is_kept() {
+        let (rows, cols) = (8, 256);
+        let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 997) as f32 / 997.0 - 0.5) * if i % 61 == 0 { 6.0 } else { 1.0 }).collect();
+        let at = |stretch: f32| {
+            quantise_2bit(&w, rows, cols, &Gram::Identity, &GsqConfig { steps: 0, stretch, ..GsqConfig::default() }).unwrap()
+        };
+        let (plain, wide) = (at(1.0), at(1.15));
+        for (p, s) in plain.scales.iter().zip(&wide.scales) {
+            assert!((s - p * 1.15).abs() <= 1e-6 * p.abs().max(1.0), "{p} -> {s}");
+        }
+        // More weight error (rounding's scale minimises it), and the largest weights kept closer.
+        let err = |q: &Quantised| w.iter().zip(q.weights()).map(|(a, b)| (a - b).powi(2)).sum::<f32>();
+        assert!(err(&wide) > err(&plain));
+        let outliers = |q: &Quantised| w.iter().zip(q.weights()).step_by(61).map(|(a, b)| (a - b).powi(2)).sum::<f32>();
+        assert!(outliers(&wide) < outliers(&plain), "{} vs {}", outliers(&wide), outliers(&plain));
+    }
+
     #[test]
     fn gumbel_noise_stays_finite_over_many_draws() {
         let mut rng = Rng::for_row(0, 0, 0);

@@ -25,6 +25,9 @@
 //! `--probe-table <file>` saves the probe's measurements to the file, and
 //! when the file exists, reads them from it instead of probing.
 //!
+//! `--stretch <k>` rounds 2-bit groups to their least-error scale times
+//! k (1.15 suited Qwen3.8-Flash-Next's experts; default 1).
+//!
 //! `--no-measure` keeps the calibration text for `--probe` and
 //! `--propagate` only: matrices are quantised and scored on their weights.
 //!
@@ -61,6 +64,14 @@ fn main() {
         let given = args.get(at + 1).and_then(|v| v.parse::<f32>().ok());
         ridge = Some(given.unwrap_or(1.0));
         args.drain(at..at + 1 + usize::from(given.is_some()));
+    }
+    let mut stretch = 1.0f32;
+    if let Some(at) = args.iter().position(|a| a == "--stretch") {
+        stretch = args.get(at + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+            eprintln!("--stretch takes a number such as 1.15");
+            std::process::exit(2);
+        });
+        args.drain(at..at + 2);
     }
     let no_measure = args.iter().any(|a| a == "--no-measure");
     args.retain(|a| a != "--no-measure");
@@ -103,7 +114,7 @@ fn main() {
     }
     if args.len() < 2 {
         eprintln!(
-            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--stats file] [--no-measure] [--propagate [ridge]] [--types q2_0,q4_k,...]"
+            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--stats file] [--no-measure] [--stretch k] [--propagate [ridge]] [--types q2_0,q4_k,...]"
         );
         std::process::exit(2);
     }
@@ -136,6 +147,7 @@ fn main() {
             ..opts.gsq
         };
     }
+    opts.gsq.stretch = stretch;
     if let Some(path) = args.get(4) {
         let text = std::fs::read_to_string(path).expect("calibration text").replace("\r\n", "\n");
         let texts: Vec<&str> = text.split("\n\n").map(str::trim).filter(|t| !t.is_empty()).collect();
