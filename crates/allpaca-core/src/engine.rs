@@ -1194,23 +1194,25 @@ impl Engine {
                 )
             }
         };
+        // Copy the RPC counters whenever workers are attached: expert-parallel
+        // placement makes round trips without `placed_remote()` layers.
+        if let Some(rt) = &self.rpc {
+            self.metrics.rpc_roundtrips.store(
+                rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.rpc_activation_bytes.store(
+                rt.activation_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.rpc_h2d_bytes.store(
+                rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         let (backend, device_memory_bytes) =
             if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
-                if let Some(rt) = &self.rpc {
-                    self.metrics.rpc_roundtrips.store(
-                        rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    self.metrics.rpc_activation_bytes.store(
-                        rt.activation_bytes
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    self.metrics.rpc_h2d_bytes.store(
-                        rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
                 ("rpc".into(), allpaca_hip::allocated_bytes())
             } else if self.hip.is_some() {
                 ("hip".into(), allpaca_hip::allocated_bytes())
