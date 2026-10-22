@@ -6646,6 +6646,21 @@ extern "C" int allpaca_hip_device_arch(int32_t id, char *arch, int32_t arch_len,
     return ALLPACA_OK;
 }
 
+/* hipDeviceProp_t::multiProcessorCount: CUs on CDNA/GCN, WGPs on RDNA. */
+extern "C" int allpaca_hip_device_multiprocessors(int32_t id, int32_t *count) {
+    if (!count) {
+        return ALLPACA_ERR_INVALID;
+    }
+    hipDeviceProp_t prop{};
+    hipError_t err = hipGetDeviceProperties(&prop, id);
+    if (err != hipSuccess) {
+        *count = 0;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *count = prop.multiProcessorCount;
+    return ALLPACA_OK;
+}
+
 extern "C" int allpaca_hip_can_p2p(int32_t src, int32_t dst, int32_t *can) {
     if (!can) {
         return ALLPACA_ERR_INVALID;
@@ -10693,6 +10708,13 @@ extern "C" int allpaca_hip_device_props(int32_t, char *, int32_t, uint64_t *, do
 }
 
 extern "C" int allpaca_hip_device_arch(int32_t, char *, int32_t, int32_t *) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_device_multiprocessors(int32_t, int32_t *count) {
+    if (count) {
+        *count = 0;
+    }
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

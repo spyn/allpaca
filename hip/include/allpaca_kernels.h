@@ -30,6 +30,9 @@ int allpaca_hip_device_props(int32_t id, char *name, int32_t name_len, uint64_t 
 
 int allpaca_hip_device_arch(int32_t id, char *arch, int32_t arch_len, int32_t *l2_bytes);
 
+/* multiProcessorCount: compute units on GCN/CDNA, work-group processors on RDNA. */
+int allpaca_hip_device_multiprocessors(int32_t id, int32_t *count);
+
 int allpaca_hip_can_p2p(int32_t src, int32_t dst, int32_t *can);
 
 int allpaca_hip_enable_peer_access(int32_t src, int32_t dst);
