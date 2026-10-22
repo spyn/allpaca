@@ -17,6 +17,12 @@
 //! A swapped matrix cannot change anything ahead of its own block, so the
 //! first reading keeps every block's input ([`LayerTrace`]) and a probe of
 //! block `b` starts there: the blocks before it are not run again.
+//!
+//! A `qwen4exp` model (Qwen3.8-Flash-Next) runs on its own host forward,
+//! which reads every tensor from the file and can be told to read one from
+//! given weights instead ([`crate::qwen4exp::Qwen4Weights::swap`]): any of
+//! its matrices but the n-gram table can be probed. Its blocks' input is the
+//! residual streams.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -115,6 +121,8 @@ impl LayerTrace {
 enum Held {
     Weights(Vec<f32>),
     Packed(Option<Vec<f32>>),
+    /// A `qwen4exp` tensor's earlier replacement (`None`: the file).
+    Q4x(Option<Arc<Vec<f32>>>),
 }
 
 /// Where a probed tensor lives in the loaded model.
@@ -230,21 +238,30 @@ impl Probe {
     /// Mean divergence of the predictions, in nats per token, with tensor
     /// `name` holding `weights` instead of its own. The model is left as it was.
     pub fn divergence(&mut self, name: &str, weights: &[f32]) -> Result<f64, AllpacaError> {
+        self.divergence_of(name, weights.to_vec()).map(|(d, _)| d)
+    }
+
+    /// [`Self::divergence`] without a copy of `weights`: they are handed back
+    /// with the divergence (a large matrix's weights take gigabytes).
+    pub fn divergence_of(&mut self, name: &str, weights: Vec<f32>) -> Result<(f64, Vec<f32>), AllpacaError> {
         let len = self.len_of(name).ok_or_else(|| bad(format!("sensitivity probe: no matrix {name}")))?;
         if weights.len() != len {
             return Err(bad(format!("sensitivity probe: {name} holds {len} weights, got {}", weights.len())));
         }
         // The first block the swap can reach. The embedding is block 0's
         // input, so a swap of it has nothing to start from.
-        let from = match self.locate(name) {
+        let from = match self.q4x_tensor(name) {
+            Some((from, _)) => from,
+            None => match self.locate(name) {
             Some(Slot::Layer(local, _) | Slot::Experts(local, _) | Slot::Shared(local, _) | Slot::Gdn(local, _)) => {
                 Some(local)
             }
             Some(Slot::Head) => Some(self.model.layers.len()),
             _ => None,
+            },
         }
         .filter(|_| self.reuse);
-        let original = self.put(name, weights.to_vec());
+        let original = self.put(name, weights);
         let saved = &self.saved;
         let trace = |text: usize| {
             Some(match from {
@@ -253,14 +270,17 @@ impl Probe {
             })
         };
         let run = log_probs(&self.model, &self.texts, trace);
-        self.restore(name, original);
+        let weights = self.restore(name, original).unwrap_or_default();
         let (run, traces) = run?;
         self.block_runs = traces.iter().flatten().map(LayerTrace::ran).sum();
-        Ok(mean_divergence(&self.reference, &run, self.model.config.vocab_size))
+        Ok((mean_divergence(&self.reference, &run, self.model.config.vocab_size), weights))
     }
 
     pub(crate) fn blocks(&self) -> usize {
-        self.model.layers.len()
+        match self.model.q4x {
+            Some(_) => self.model.config.n_layers,
+            None => self.model.layers.len(),
+        }
     }
 
     /// The number block `layer` has in the file's tensor names.
@@ -271,6 +291,9 @@ impl Probe {
     /// Tensor `name`'s weights as the model holds them now (a stacked
     /// expert tensor is put together from its experts).
     pub(crate) fn weights(&self, name: &str) -> Option<Cow<'_, [f32]>> {
+        if let Some(q4) = self.model.q4x.as_ref().filter(|_| self.q4x_tensor(name).is_some()) {
+            return Some(Cow::Owned(q4.current(name).ok()?.to_vec()));
+        }
         Some(match self.locate(name)? {
             Slot::Embed => Cow::Borrowed(&self.model.embed),
             Slot::Head => Cow::Borrowed(&self.model.lm_head),
@@ -337,6 +360,9 @@ impl Probe {
         if layer >= self.blocks() || inputs.len() != self.texts.len() {
             return Err(bad(format!("probe: no block {layer} or not an input per text")));
         }
+        if self.model.q4x.is_some() {
+            return Err(bad("probe: a qwen4exp block has no calibration sites"));
+        }
         self.model.calib.keep(self.gguf_block(layer));
         // One text after the other, so that the sites' vectors stay in order.
         let mut outputs = Vec::with_capacity(inputs.len());
@@ -354,6 +380,28 @@ impl Probe {
         }
         let sites = self.model.calib.take_kept();
         failed.map_or(Ok((outputs, sites)), Err)
+    }
+
+    /// A `qwen4exp` model's tensor `name` the probe can swap: the first block
+    /// it can change (the block count for the output head and its mixer;
+    /// `None` for the token embedding, which every block sees) and its
+    /// weights. Not the n-gram table: too large to hold in F32.
+    fn q4x_tensor(&self, name: &str) -> Option<(Option<usize>, usize)> {
+        let info = self.model.q4x.as_ref()?.gguf().ok()?.tensor(name)?;
+        if info.dims.len() < 2 || name.starts_with("per_layer_token_embd") {
+            return None;
+        }
+        let n = info.n_elements() as usize;
+        let cfg = &self.model.config;
+        if name == "token_embd.weight" {
+            return Some((None, n));
+        }
+        if name == "output.weight" || name.starts_with("output_hc") {
+            return Some((Some(cfg.n_layers), n));
+        }
+        let index: usize = name.strip_prefix("blk.")?.split('.').next()?.parse().ok()?;
+        let local = (0..cfg.n_layers).find(|l| cfg.gguf_blk(*l) == index)?;
+        Some((Some(local), n))
     }
 
     fn locate(&self, name: &str) -> Option<Slot> {
@@ -411,6 +459,9 @@ impl Probe {
     }
 
     fn len_of(&self, name: &str) -> Option<usize> {
+        if self.model.q4x.is_some() {
+            return self.q4x_tensor(name).map(|(_, n)| n);
+        }
         let len = match self.locate(name)? {
             Slot::Embed => self.model.embed.len(),
             Slot::Head => self.model.lm_head.len(),
@@ -439,24 +490,31 @@ impl Probe {
         self.model.packed_experts.as_deref().filter(|p| p.has_layer(layer))
     }
 
-    /// Put back what [`Self::put`] returned.
-    fn restore(&mut self, name: &str, held: Held) {
+    /// Put back what [`Self::put`] returned, and give back the weights it put in.
+    fn restore(&mut self, name: &str, held: Held) -> Option<Vec<f32>> {
         match held {
-            Held::Weights(w) => {
-                self.put(name, w);
+            Held::Weights(w) => match self.put(name, w) {
+                Held::Weights(put) => Some(put),
+                _ => None,
+            },
+            Held::Q4x(previous) => {
+                let put = self.model.q4x.as_ref()?.swap(name, previous).ok()??;
+                Some(Arc::try_unwrap(put).unwrap_or_else(|shared| shared.to_vec()))
             }
             Held::Packed(previous) => {
-                if let Some(Slot::Experts(local, which)) = self.locate(name) {
-                    if let Some(packed) = self.model.packed_experts.as_mut().and_then(Arc::get_mut) {
-                        packed.swap(local, which, previous);
-                    }
-                }
+                let Some(Slot::Experts(local, which)) = self.locate(name) else {
+                    return None;
+                };
+                self.model.packed_experts.as_mut().and_then(Arc::get_mut)?.swap(local, which, previous)
             }
         }
     }
 
     /// Put `weights` in tensor `name`'s place and return what was there.
     fn put(&mut self, name: &str, weights: Vec<f32>) -> Held {
+        if let Some(q4) = self.model.q4x.as_ref() {
+            return Held::Q4x(q4.swap(name, Some(Arc::new(weights))).unwrap_or(None));
+        }
         if name == "token_embd.weight" && self.tied_head {
             self.model.lm_head = weights.clone();
         }
@@ -492,6 +550,18 @@ impl Probe {
 pub(crate) fn load_host(path: &Path) -> Result<(TinyModel, EngineTokenizer, bool), AllpacaError> {
     let file = Arc::new(GgufFile::open(path)?);
     let tok = EngineTokenizer::from_gguf(extract_tokenizer(&file)?);
+    let tied_head = file.tensor("output.weight").is_none();
+    if crate::qwen4exp::file_is_qwen4exp(&file) {
+        // Its own host forward reads the file as it goes, decoding each
+        // dense matrix on use: kept in F32, a large one's would not fit
+        // beside what the requantiser holds.
+        let mut model = TinyModel::from_gguf(&file)?;
+        model.bind_gguf(file);
+        if let Some(q4) = model.q4x.as_ref() {
+            q4.keep_dense(false)?;
+        }
+        return Ok((model, tok, tied_head));
+    }
     // Routed experts stay packed: decoded, a 30B MoE model would not fit.
     let mut model = if ModelConfig::from_gguf(&file)?.n_experts > 0 {
         TinyModel::from_gguf_host_packed_experts(file.clone())?
@@ -501,7 +571,6 @@ pub(crate) fn load_host(path: &Path) -> Result<(TinyModel, EngineTokenizer, bool
     if !model.host_weights_ready() {
         return Err(bad("sensitivity probe: this architecture has no CPU forward on F32 weights"));
     }
-    let tied_head = file.tensor("output.weight").is_none();
     model.bind_gguf(file);
     Ok((model, tok, tied_head))
 }
@@ -525,6 +594,16 @@ fn log_probs(
     trace: impl Fn(usize) -> Option<LayerTrace> + Sync,
 ) -> Result<(Vec<f32>, Vec<Option<LayerTrace>>), AllpacaError> {
     type Read = Result<(Vec<f32>, Option<LayerTrace>), AllpacaError>;
+    if model.q4x.is_some() {
+        // All texts block by block: each matrix and expert is read once a block.
+        let vocab = model.config.vocab_size;
+        let mut mems: Vec<_> = (0..texts.len()).map(|i| crate::qwen4exp::Qwen4Memory::traced(trace(i))).collect();
+        let seqs: Vec<&[u32]> = texts.iter().map(Vec::as_slice).collect();
+        let mut out = vec![0.0f32; texts.iter().map(Vec::len).sum::<usize>() * vocab];
+        crate::qwen4exp::forward_qwen4_host_rows(model, &seqs, &mut mems, &mut out)?;
+        out.chunks_mut(vocab).for_each(normalise_logits);
+        return Ok((out, mems.iter_mut().map(|m| m.trace.take()).collect()));
+    }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(texts.len()).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut reads: Vec<Option<Read>> = (0..texts.len()).map(|_| None).collect();
@@ -559,6 +638,13 @@ fn log_probs(
     Ok((out, traces))
 }
 
+/// Logits to log-probabilities, in place.
+fn normalise_logits(logits: &mut [f32]) {
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let norm = max + logits.iter().map(|l| f64::from(*l - max).exp()).sum::<f64>().ln() as f32;
+    logits.iter_mut().for_each(|l| *l -= norm);
+}
+
 /// One text's log-probabilities (`positions * vocab`) and its trace afterwards.
 pub(crate) fn text_log_probs(
     model: &TinyModel,
@@ -570,6 +656,19 @@ pub(crate) fn text_log_probs(
     let metrics = Metrics::default();
     let mut out = Vec::with_capacity(tokens.len() * vocab);
     let mut logits = vec![0.0f32; vocab];
+    let normalise = |logits: &[f32], out: &mut Vec<f32>| {
+        let at = out.len();
+        out.extend_from_slice(logits);
+        normalise_logits(&mut out[at..]);
+    };
+    if model.q4x.is_some() {
+        let mut mem = crate::qwen4exp::Qwen4Memory::traced(trace);
+        for (pos, &token) in tokens.iter().enumerate() {
+            crate::qwen4exp::forward_qwen4_token(model, token, pos, &mut logits, &mut mem)?;
+            normalise(&logits, &mut out);
+        }
+        return Ok((out, mem.trace.take()));
+    }
     let mut kv = KvTierManager::new(1 << 30, 1 << 30, 0.5);
     let pages = alloc_pages_for_seq(&mut kv, cfg, PAGE_TOKENS, tokens.len(), &metrics)?;
     let mut state = RecurrentState::zeros(cfg.n_layers, cfg.dim);
@@ -590,9 +689,7 @@ pub(crate) fn text_log_probs(
             None,
             None,
         )?;
-        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let norm = max + logits.iter().map(|l| f64::from(l - max).exp()).sum::<f64>().ln() as f32;
-        out.extend(logits.iter().map(|l| l - norm));
+        normalise(&logits, &mut out);
     }
     Ok((out, state.trace.take()))
 }
@@ -662,6 +759,50 @@ pub(crate) mod tests {
         assert!(!probe.covers("output.weight"), "this file ties the head to the embedding");
         assert!(probe.divergence("blk.0.attn_norm.weight", &[1.0; 64]).is_err());
         assert!(probe.divergence("blk.0.attn_q.weight", &[0.0; 7]).is_err());
+    }
+
+    /// A qwen4exp model is probed through its own host forward's swaps: any
+    /// matrix but the n-gram table, read again from the block it is in.
+    #[test]
+    fn the_probe_swaps_qwen4exp_tensors_and_resumes_at_their_block() {
+        let path = std::env::temp_dir().join(format!("allpaca_probe_q4x-{}.gguf", std::process::id()));
+        crate::qwen4exp::write_tiny_qwen4exp_gguf(&path);
+        let file = GgufFile::open(&path).unwrap();
+        let mut probe = Probe::open(&path, &["hello a b c d a b", "c d hello a"], 16).unwrap();
+        let names: Vec<String> = file.tensors.iter().map(|t| t.name.clone()).filter(|n| probe.covers(n)).collect();
+        for kind in [
+            "token_embd.weight",
+            "output.weight",
+            "output_hc_up.weight",
+            "attn_qkv.weight",
+            "attn_q.weight",
+            "ffn_gate_exps.weight",
+            "ffn_down_shexp.weight",
+            "ple_key.weight",
+        ] {
+            assert!(names.iter().any(|n| n.ends_with(kind)), "{kind} is probed: {names:?}");
+        }
+        assert!(!probe.covers("per_layer_token_embd.weight"));
+        assert!(!probe.covers("blk.0.hc_attn_norm.weight"), "not a matrix");
+        let mut moved = 0;
+        for name in &names {
+            let w = file.tensor_f32(name).unwrap();
+            assert_eq!(probe.weights(name).unwrap().as_ref(), w.as_slice(), "{name}");
+            assert!(probe.divergence(name, &w).unwrap() < 1e-9, "{name}: its own weights");
+            let zeros = vec![0.0f32; w.len()];
+            let resumed = probe.divergence(name, &zeros).unwrap();
+            let resumed_runs = probe.block_runs();
+            probe.set_prefix_reuse(false);
+            let full = probe.divergence(name, &zeros).unwrap();
+            assert!(probe.block_runs() >= resumed_runs, "{name}");
+            probe.set_prefix_reuse(true);
+            assert_eq!(resumed, full, "{name}: read from its block as from the start");
+            assert!(probe.divergence(name, &w).unwrap() < 1e-9, "{name}: restored after probing");
+            moved += usize::from(resumed > 0.0);
+        }
+        assert!(moved * 2 > names.len(), "zeroing most matrices moves the output: {moved} of {}", names.len());
+        drop((probe, file));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// In an MoE model the probe swaps a block's stacked expert tensors
@@ -1028,11 +1169,18 @@ pub(crate) mod tests {
         for b in [0, blocks / 2, blocks - 1] {
             names.push(format!("blk.{}.ffn_down.weight", probe.model.config.gguf_blk(b)));
         }
-        for reuse in [false, true] {
+        // `ALLPACA_PROBE_NAMES` (comma separated): these instead, prefix reuse only.
+        let mut reuses = vec![false, true];
+        if let Ok(given) = std::env::var("ALLPACA_PROBE_NAMES") {
+            names = given.split(',').map(str::to_string).collect();
+            reuses = vec![true];
+        }
+        for reuse in reuses {
             probe.set_prefix_reuse(reuse);
             for name in &names {
                 let w: Vec<f32> = file.tensor_f32(name).unwrap().iter().map(|v| v * 1.05).collect();
                 let t = std::time::Instant::now();
+                eprintln!("probing {name}");
                 let d = probe.divergence(name, &w).unwrap();
                 println!("reuse {reuse:5} {name:28} {:7.2} s  kl {d:.6e}  block runs {}", t.elapsed().as_secs_f64(), probe.block_runs());
             }

@@ -1,11 +1,13 @@
 //! CPU fallback for every kernel the control plane may call.
 
+mod iq3s;
 mod kernels;
 mod kquant;
 mod lowbit;
 mod mxfp4_expert;
 mod p48fp4;
 
+pub use iq3s::{dequant_iq3_s, IQ3_S_BLOCK_BYTES, IQ3_S_BLOCK_ELEMS};
 pub use kquant::{encode_q3_k, encode_q4_k, encode_q5_k, encode_q6_k};
 pub use lowbit::{
     dequant_q1_0, dequant_q2_0, gemm_q2_0_i8, gemv_q2_0, gemv_q2_0_i8, quantize_q1_0, quantize_q2_0, Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMS,
@@ -24,7 +26,7 @@ pub use kernels::{
     dequant_q6_k, dequant_q8_0, dequant_q8_1, dequant_rocmfp4, dequant_rocmfp4_fast, dequant_tq1_0,
     dequant_tq2_0,
     e8m0_to_fp32, e8m0_to_fp32_half, f16_to_f32, f32_to_bf16, f32_to_f16, gelu, gemm, matmul,
-    matmul_nt, quantize_mxfp4, quantize_q4_0, quantize_q4_k, quantize_q5_k, quantize_q6_k,
+    matmul_nt, quantize_iq4_nl, quantize_mxfp4, quantize_q4_0, quantize_q4_k, quantize_q5_k, quantize_q6_k,
     quantize_q8_0, quantize_rocmfp4, quantize_rocmfp4_fast, quantize_tq2_0, rmsnorm, rocmfp4_scale, rocmfp4_scale_is_valid,
     rope, rope_imrope_neox, rope_imrope_neox_at, rope_imrope_neox_heads, rope_imrope_neox_heads_at, rope_offset, rope_offset_back, silu, softmax,
     CpuBackend, IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMS, IQ4_XS_BLOCK_BYTES, IQ4_XS_BLOCK_ELEMS,
