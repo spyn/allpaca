@@ -391,6 +391,8 @@ impl Metrics {
             mtp_process_skips: self.mtp_process_skips.load(Ordering::Relaxed),
             draft_depth,
             rpc_roundtrips: self.rpc_roundtrips.load(Ordering::Relaxed),
+            // Filled by `Engine::stats` from the RPC runtime's session counters.
+            rpc_workers: Vec::new(),
             rpc_activation_bytes: self.rpc_activation_bytes.load(Ordering::Relaxed),
             rpc_h2d_bytes: self.rpc_h2d_bytes.load(Ordering::Relaxed),
             vision_bytes_on_device: self.vision_bytes_on_device.load(Ordering::Relaxed),

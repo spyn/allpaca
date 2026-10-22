@@ -19,6 +19,8 @@ pub struct RpcRuntime {
     sessions: Mutex<Vec<RpcSession>>,
     /// Worker `host:port` per session index (readable while a session is busy).
     endpoints: Vec<String>,
+    /// Each session's call counters, readable while the session is busy.
+    counters: Vec<(Arc<allpaca_rpc::CallCounters>, Arc<allpaca_rpc::CallCounters>)>,
     plan: Mutex<LayerPlan>,
     remote: Mutex<Vec<Option<RemoteLayer>>>,
     /// Expert-parallel MoE: layers whose routed experts live on a worker.
@@ -277,9 +279,11 @@ impl RpcRuntime {
             }
             sessions.push(session);
         }
+        let counters = sessions.iter().map(RpcSession::counters).collect();
         Ok(Self {
             sessions: Mutex::new(sessions),
             endpoints: endpoints.to_vec(),
+            counters,
             plan: Mutex::new(LayerPlan::all_local(0)),
             remote: Mutex::new(Vec::new()),
             experts: Mutex::new(Vec::new()),
@@ -339,6 +343,27 @@ impl RpcRuntime {
 
     /// A layer was uploaded to a worker. A split plan alone does not count:
     /// large GGUFs skip host-F32 layers and stay on the local device.
+    /// Calls to each worker since connect, in endpoint order. Never waits on a
+    /// busy session.
+    pub fn worker_calls(&self) -> Vec<allpaca_types::RpcWorkerCalls> {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        self.endpoints
+            .iter()
+            .zip(&self.counters)
+            .map(|(endpoint, (calls, ext))| allpaca_types::RpcWorkerCalls {
+                endpoint: endpoint.clone(),
+                calls: load(&calls.calls),
+                wall_us: load(&calls.wall_us),
+                bytes_out: load(&calls.bytes_out),
+                bytes_in: load(&calls.bytes_in),
+                ext_calls: load(&ext.calls),
+                ext_wait_us: load(&ext.wall_us),
+                ext_bytes_out: load(&ext.bytes_out),
+                ext_bytes_in: load(&ext.bytes_in),
+            })
+            .collect()
+    }
+
     pub fn placed_remote(&self) -> bool {
         self.remote
             .lock()
