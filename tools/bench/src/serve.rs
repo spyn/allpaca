@@ -32,6 +32,9 @@ pub struct Target {
 /// One GPU (or RPC card) that held weights for a start, for the roofline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceBand {
+    /// Inventory key (`hip:0`, `cuda:1`, …). Empty in older jsonl.
+    #[serde(default)]
+    pub device: String,
     pub name: String,
     /// Peak memory bandwidth in GB/s (published table or inventory).
     pub peak_gbs: f64,
@@ -61,9 +64,12 @@ pub struct Sample {
     /// Weight bytes read per decode token (dense = resident; MoE = active).
     #[serde(default)]
     pub weight_bytes: u64,
-    /// KV bytes read per decode token.
+    /// KV bytes read per decode token (or device pool upper bound).
     #[serde(default)]
     pub kv_bytes: u64,
+    /// True when `kv_bytes` is the whole device KV pool, not a per-sequence estimate.
+    #[serde(default)]
+    pub kv_is_pool: bool,
     /// Devices that held weights for this start. Empty = no roofline line.
     #[serde(default)]
     pub devices: Vec<DeviceBand>,
@@ -152,6 +158,7 @@ fn now_unix() -> u64 {
 pub fn apply_snap(sample: &mut Sample, snap: &RooflineSnap) {
     sample.weight_bytes = snap.weight_bytes;
     sample.kv_bytes = snap.kv_bytes;
+    sample.kv_is_pool = snap.kv_is_pool;
     sample.devices = snap.devices.clone();
 }
 
@@ -175,7 +182,7 @@ pub fn run(
         let warm = Target { max_tokens: warmup_tokens, ..target.clone() };
         chat(&warm, prompts.first().map_or(PROMPTS[0], String::as_str))?;
     }
-    let snap = match snap::fetch(target) {
+    let snap = match snap::fetch(target, warmup_tokens as u64) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("allpaca-bench: roofline snap skipped: {e}");
@@ -208,6 +215,7 @@ pub fn run(
                     concurrency: group.len(),
                     weight_bytes: 0,
                     kv_bytes: 0,
+                    kv_is_pool: false,
                     devices: Vec::new(),
                 };
                 if let Some(snap) = &snap {
@@ -317,7 +325,8 @@ pub fn table(summaries: &[Summary]) -> String {
     out
 }
 
-/// One fresh server start (`tag` + `round`), for the roofline section.
+/// One `(tag, round)` group for the roofline section (an `ab` fresh start,
+/// or one round of `run` against a long-lived server).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreshStart {
     pub tag: String,
@@ -325,6 +334,7 @@ pub struct FreshStart {
     pub rate_median: f64,
     pub weight_bytes: u64,
     pub kv_bytes: u64,
+    pub kv_is_pool: bool,
     pub devices: Vec<DeviceBand>,
 }
 
@@ -351,6 +361,7 @@ pub fn fresh_starts(samples: &[Sample]) -> Vec<FreshStart> {
                 rate_median: median(rates),
                 weight_bytes: first.weight_bytes,
                 kv_bytes: first.kv_bytes,
+                kv_is_pool: first.kv_is_pool,
                 devices: first.devices.clone(),
             }
         })
@@ -377,41 +388,67 @@ fn format_gb(bytes: f64) -> String {
     format!("{:.2} GB", bytes / 1e9)
 }
 
-/// Roofline lines for each fresh start, or empty when no sample recorded bytes.
+/// Spread `kv` across devices in proportion to their weight bytes.
+fn distribute_kv(weight_parts: &[(u64, f64)], kv: u64) -> Vec<(u64, f64)> {
+    let total_w: u64 = weight_parts.iter().map(|(w, _)| *w).sum();
+    if total_w == 0 || kv == 0 {
+        return weight_parts.to_vec();
+    }
+    let mut left = kv;
+    let n = weight_parts.len();
+    weight_parts
+        .iter()
+        .enumerate()
+        .map(|(i, &(w, peak))| {
+            let share = if i + 1 == n {
+                left
+            } else {
+                let s = (kv as u128 * w as u128 / total_w as u128) as u64;
+                left = left.saturating_sub(s);
+                s
+            };
+            (w.saturating_add(share), peak)
+        })
+        .collect()
+}
+
+/// Roofline lines per `(tag, round)`, or empty when no sample recorded bytes.
 pub fn roofline_table(starts: &[FreshStart]) -> String {
     if starts.is_empty() {
         return String::new();
     }
-    let mut out = String::from("fresh starts (bytes/token, effective GB/s, % of peak)\n");
+    let mut out = String::from("roofline by round (bytes/token, effective GB/s, % of peak)\n");
     out += &format!(
         "{:<20} {:>5} {:>8} {:>12} {:>10} {:>8} {:>8}  {}\n",
         "tag", "round", "tok/s", "bytes/tok", "GB/s", "% peak", "peak", "devices"
     );
+    let mut any_pool_kv = false;
     for s in starts {
+        any_pool_kv |= s.kv_is_pool;
         let bpt = roofline::bytes_per_token(s.weight_bytes, s.kv_bytes);
         let gbs = roofline::effective_gbs(bpt, s.rate_median);
         let (pct, peak_label, device_note) = if s.devices.len() > 1
             && s.devices.iter().any(|d| d.weight_bytes > 0)
         {
-            let parts: Vec<(u64, f64)> = s
+            let weight_parts: Vec<(u64, f64)> = s
                 .devices
                 .iter()
-                .map(|d| {
-                    let w = if d.weight_bytes > 0 { d.weight_bytes } else { 0 };
-                    (w, d.peak_gbs)
-                })
+                .map(|d| (d.weight_bytes, d.peak_gbs))
                 .collect();
-            // Put KV on the first (usually fastest) card for the split ceiling.
-            let mut parts = parts;
-            if let Some(first) = parts.first_mut() {
-                first.0 = first.0.saturating_add(s.kv_bytes);
-            }
+            let parts = distribute_kv(&weight_parts, s.kv_bytes);
             let ceiling = split_ceiling_tok_s(&parts);
             let pct = if ceiling > 0.0 { s.rate_median / ceiling * 100.0 } else { 0.0 };
             let note = s
                 .devices
                 .iter()
-                .map(|d| format!("{}@{:.0}", d.name, d.peak_gbs))
+                .map(|d| {
+                    let key = if d.device.is_empty() {
+                        d.name.as_str()
+                    } else {
+                        d.device.as_str()
+                    };
+                    format!("{key}@{:.0}", d.peak_gbs)
+                })
                 .collect::<Vec<_>>()
                 .join("+");
             (pct, "split".to_string(), note)
@@ -425,17 +462,25 @@ pub fn roofline_table(starts: &[FreshStart]) -> String {
             let name = s.devices.first().map(|d| d.name.as_str()).unwrap_or("?");
             (pct, format!("{peak:.0}"), name.to_string())
         };
+        let bytes_col = if s.kv_is_pool {
+            format!("≤{}/tok", format_gb(bpt))
+        } else {
+            format!("{}/tok", format_gb(bpt))
+        };
         out += &format!(
             "{:<20} {:>5} {:>8.2} {:>12} {:>10.1} {:>7.1}% {:>8}  {}\n",
             s.tag,
             s.round,
             s.rate_median,
-            format_gb(bpt) + "/tok",
+            bytes_col,
             gbs,
             pct,
             peak_label,
             device_note
         );
+    }
+    if any_pool_kv {
+        out += "note: ≤ marks KV from the device pool (upper bound; not per-sequence)\n";
     }
     out
 }
@@ -468,6 +513,7 @@ mod tests {
             concurrency: 1,
             weight_bytes: 0,
             kv_bytes: 0,
+            kv_is_pool: false,
             devices: Vec::new(),
         }
     }
@@ -534,12 +580,17 @@ mod tests {
     fn with_roofline(mut s: Sample, weight: u64, kv: u64, device: &str, peak: f64) -> Sample {
         s.weight_bytes = weight;
         s.kv_bytes = kv;
-        s.devices = vec![DeviceBand { name: device.into(), peak_gbs: peak, weight_bytes: weight }];
+        s.devices = vec![DeviceBand {
+            device: format!("hip:0"),
+            name: device.into(),
+            peak_gbs: peak,
+            weight_bytes: weight,
+        }];
         s
     }
 
     #[test]
-    fn report_lists_each_fresh_start_with_bytes_gbs_and_pct_of_peak() {
+    fn report_lists_each_round_with_bytes_gbs_and_pct_of_peak() {
         // Two ab rounds on the 9070: same bytes, different rates — listed apart.
         let samples = vec![
             with_roofline(sample("ornith", 1, 0, 36.0, "aa"), 9_500_000_000, 0, "RX 9070", 640.0),
@@ -548,7 +599,7 @@ mod tests {
             with_roofline(sample("ornith", 2, 1, 36.0, "bb"), 9_500_000_000, 0, "RX 9070", 640.0),
         ];
         let text = report_text(&samples);
-        assert!(text.contains("fresh starts"), "{text}");
+        assert!(text.contains("roofline by round"), "{text}");
         let starts: Vec<&str> = text
             .lines()
             .filter(|l| l.trim_start().starts_with("ornith") && l.contains("GB/tok"))
@@ -566,19 +617,29 @@ mod tests {
         let samples = vec![sample("base", 1, 0, 16.0, "aa")];
         let text = report_text(&samples);
         assert!(text.contains("median"), "{text}");
-        assert!(!text.contains("fresh starts"), "no roofline without bytes: {text}");
+        assert!(!text.contains("roofline by round"), "no roofline without bytes: {text}");
     }
 
     #[test]
-    fn layer_split_fresh_start_reports_share_of_split_ceiling() {
+    fn layer_split_reports_share_of_split_ceiling() {
         // 10 GB on 640 + 6 GB on 320 → ceiling ≈ 1/(10/640e9 + 6/320e9) ≈ 29.1 tok/s.
         // Measured 17.9 → ~61% of ceiling.
         let mut s = sample("q38", 1, 0, 17.9, "aa");
         s.weight_bytes = 16_000_000_000;
         s.kv_bytes = 0;
         s.devices = vec![
-            DeviceBand { name: "RX 9070".into(), peak_gbs: 640.0, weight_bytes: 10_000_000_000 },
-            DeviceBand { name: "RX 9060 XT".into(), peak_gbs: 320.0, weight_bytes: 6_000_000_000 },
+            DeviceBand {
+                device: "hip:0".into(),
+                name: "RX 9070".into(),
+                peak_gbs: 640.0,
+                weight_bytes: 10_000_000_000,
+            },
+            DeviceBand {
+                device: "hip:1".into(),
+                name: "RX 9060 XT".into(),
+                peak_gbs: 320.0,
+                weight_bytes: 6_000_000_000,
+            },
         ];
         let text = report_text(&[s]);
         let line = text.lines().find(|l| l.contains("q38") && l.contains("GB/tok")).unwrap();

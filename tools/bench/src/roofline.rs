@@ -32,7 +32,6 @@ pub fn bytes_per_token(weight_bytes: u64, kv_bytes: u64) -> f64 {
 
 /// MoE: shared (attention / routers / dense) plus the top-k experts each
 /// MoE layer touches, not the full resident expert pool.
-#[allow(dead_code)] // used by unit tests; snap uses the n_active/n_experts fraction today
 pub fn moe_active_weight_bytes(
     shared_bytes: u64,
     expert_slot_bytes: u64,

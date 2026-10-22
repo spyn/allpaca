@@ -773,6 +773,15 @@ impl Engine {
         self.rpc.as_ref().map(|r| r.remote_gpu_stats()).unwrap_or_default()
     }
 
+    /// Bytes of one routed expert's weights (gate+up+down), or 0 when the
+    /// loaded model has no MoE experts. Used by the bench roofline.
+    pub fn expert_slot_bytes(&self) -> u64 {
+        self.lock()
+            .ok()
+            .and_then(|inner| inner.target.as_ref().map(|m| m.expert_slot_bytes() as u64))
+            .unwrap_or(0)
+    }
+
     /// The loaded target's expert controls, sized to its routed experts.
     /// `None` when no model is loaded.
     pub fn expert_controls(&self) -> Option<Arc<crate::expert_controls::ExpertControls>> {
