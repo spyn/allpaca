@@ -186,22 +186,6 @@ fn local_reserve_bytes(total: u64) -> u64 {
     (768u64 << 20) + total / 32
 }
 
-/// KV a model must still have room for on the first GPU before every layer
-/// goes there instead of being split (1 GiB, or the whole budget if smaller).
-const ONE_CARD_KV_FLOOR: u64 = 1 << 30;
-
-/// Whether the model's layer weights fit the first GPU's budget with
-/// [`ONE_CARD_KV_FLOOR`] of KV to spare.
-///
-/// A split makes every token cross to a slower card and back; a KV page that
-/// does not fit later spills to pinned DRAM, which only costs at long context.
-/// So weights take the fast card first, and the full `kv_vram_bytes` is not
-/// reserved ahead of them. On xeres Ornith-9B Q8 ran 48.7 tok/s on the RX 9070
-/// alone against 38.9 split (board D2).
-fn fits_first_card(layer_weights: u64, first_budget: u64, kv_vram_bytes: u64) -> bool {
-    let kv_floor = kv_vram_bytes.min(ONE_CARD_KV_FLOOR);
-    layer_weights.saturating_add(kv_floor) <= first_budget
-}
 
 /// VRAM left for KV pages on `devices` now, after weights are loaded, less the
 /// same reserve the layer plan keeps. KV past this would land in WDDM's silent
@@ -242,7 +226,6 @@ fn plan_local_by_bytes(
     pinned_mib: &[u64],
 ) -> LayerPlan {
     let (mut layer_bytes, globals) = crate::model::gguf_device_bytes(file, &model.config);
-    let layer_weights: u64 = layer_bytes.iter().sum();
     let n_attn = is_full_attn.iter().filter(|a| **a).count().max(1) as u64;
     let kv_share = kv_vram_bytes / n_attn;
     for (bytes, attn) in layer_bytes.iter_mut().zip(is_full_attn) {
@@ -274,17 +257,12 @@ fn plan_local_by_bytes(
         );
         budgets.push(budget);
     }
-    // An operator's pinned budgets are an explicit split: keep them.
-    let pinned_any = (0..local_ids.len()).any(|slot| pinned_budget(pinned_mib, slot).is_some());
-    if !pinned_any && fits_first_card(layer_weights, budgets[0], kv_vram_bytes) {
-        tracing::info!(
-            hip = local_ids[0],
-            weights_mib = layer_weights >> 20,
-            budget_mib = budgets[0] >> 20,
-            "every layer fits the first GPU with KV to spare: no split"
-        );
-        return LayerPlan::all_local(layer_bytes.len());
-    }
+    // Each attention layer keeps its share of `kv_vram_bytes` on its own card,
+    // even when the weights alone would fit the first GPU. Measured on xeres
+    // (board D4, Ornith-9B Q8): all on the RX 9070 decodes 39.3 tok/s against
+    // 31.5 split at 10K tokens, but 10.9 against 22.7 at 20K and 2.5 against
+    // 16.8 at 35K, once KV past the card's room moves to DRAM. Short-context
+    // users can pin `engine.local_vram_budget_mib` for the one-card layout.
     let plan = crate::layer_split::plan_local_fill(&layer_bytes, &budgets);
     let need: u64 = layer_bytes.iter().sum::<u64>() + globals;
     let have: u64 = budgets.iter().sum::<u64>() + globals;
@@ -2234,21 +2212,7 @@ fn memcpy_at(dst: BufId, src: BufId, dst_off: i32, nbytes: i32) -> LaunchItem {
 
 #[cfg(test)]
 mod tests {
-    use super::{fits_first_card, pinned_budget};
-
-    #[test]
-    fn a_model_that_fits_the_first_card_with_kv_to_spare_is_not_split() {
-        const GIB: u64 = 1 << 30;
-        // Ornith-9B on xeres: ~7.4 GB of layers, 9.0 GB budget on the RX 9070,
-        // a 4 GiB KV budget. The old plan reserved all 4 GiB and split it.
-        assert!(fits_first_card(7 * GIB + GIB / 2, 9 * GIB, 4 * GIB));
-        // Too tight to keep 1 GiB of KV: split as before.
-        assert!(!fits_first_card(8 * GIB + GIB / 2, 9 * GIB, 4 * GIB));
-        // Qwen3.8-27B: ~18 GB of layers never fits one 16 GB card.
-        assert!(!fits_first_card(18 * GIB, 9 * GIB + GIB / 2, 4 * GIB));
-        // A small KV budget only needs itself as the floor.
-        assert!(fits_first_card(8 * GIB + GIB / 2, 9 * GIB, GIB / 4));
-    }
+    use super::pinned_budget;
 
     #[test]
     fn pinned_budget_overrides_only_set_slots() {

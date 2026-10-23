@@ -2909,10 +2909,11 @@ impl Engine {
             // than `kv.vram_bytes` there.
             if !inner.kv_vram_capped {
                 inner.kv_vram_capped = true;
+                // The cards of the layers that keep KV (see `kv_layer_mask`).
                 let attn_devs: Vec<i32> = devs
                     .iter()
-                    .zip(&target.layers)
-                    .filter(|(_, l)| l.block == allpaca_gguf::HybridLayerKind::Attention)
+                    .zip(kv_layer_mask(&target))
+                    .filter(|(_, keeps)| *keeps)
                     .map(|(d, _)| *d)
                     .collect();
                 let room = crate::rpc_runtime::kv_vram_headroom(&attn_devs) as usize;
