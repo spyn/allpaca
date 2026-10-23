@@ -352,6 +352,7 @@ mod ffi {
     use std::os::raw::c_void;
 
     extern "C" {
+        pub fn allpaca_hip_kernel_launches() -> u64;
         pub fn allpaca_hip_device_count(count: *mut i32) -> i32;
         pub fn allpaca_hip_device_props(
             id: i32,
@@ -1397,6 +1398,18 @@ mod ffi {
 /// True when this build linked a HIP-compiled `allpaca_kernels` library.
 pub fn runtime_linked() -> bool {
     cfg!(all(feature = "hip", allpaca_hip_runtime))
+}
+
+/// HIP kernels launched by this process so far, on every device (0 without HIP).
+pub fn kernel_launches() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_hip_kernel_launches() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
 }
 
 pub fn device_count() -> i32 {
@@ -12814,6 +12827,24 @@ mod tests {
         for dev in 0..device_count() {
             assert!(device_multiprocessors(dev).is_some_and(|n| n > 0), "hip{dev}");
         }
+    }
+
+    #[test]
+    fn kernel_launches_counts_a_launch() {
+        if device_count() == 0 {
+            return;
+        }
+        let Ok(hip) = HipWorkspace::new(0, 1 << 20, 8) else { return };
+        let n = 256usize;
+        let x = device_malloc(n * 4, 0).unwrap();
+        let r = device_malloc(n * 4, 0).unwrap();
+        let before = kernel_launches();
+        hip.residual_add(x.cast(), r.cast(), n as i32).unwrap();
+        // Other tests may launch at the same time, so only a lower bound holds.
+        let after = kernel_launches();
+        device_free(x, n * 4);
+        device_free(r, n * 4);
+        assert!(after > before);
     }
 
     /// Small host<->device copy latency: pageable `hipMemcpy` vs a pinned

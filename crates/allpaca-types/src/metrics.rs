@@ -1,5 +1,26 @@
 use serde::{Deserialize, Serialize};
 
+/// Calls to one RPC worker since connect, as the coordinator sees them.
+/// `wall_us` is network plus worker time; the split needs worker-side timing.
+/// Byte counts are payloads, without frame headers, and a call that fails on
+/// I/O is not counted: both are fine for per-token rates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcWorkerCalls {
+    pub endpoint: String,
+    /// Request/reply commands (MoeFfn, RunSpan, uploads, ...).
+    pub calls: u64,
+    pub wall_us: u64,
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+    /// Extension calls (hosted Flash-Next blocks); `ext_wait_us` counts only
+    /// the wait for each reply, because pipelined calls overlap.
+    pub ext_calls: u64,
+    pub ext_wait_us: u64,
+    /// Extension and raw stream bytes.
+    pub ext_bytes_out: u64,
+    pub ext_bytes_in: u64,
+}
+
 /// In-memory telemetry snapshot exposed by `GET /stats`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
@@ -95,6 +116,12 @@ pub struct StatsSnapshot {
     pub other_gpu_us: f64,
     /// Last/EMA HIP decode: host-side time (D2H logits, bookkeeping) in microseconds.
     pub host_us: f64,
+    /// HIP kernels launched by this process so far, all devices (0 without HIP).
+    /// Counts `kernels.cpp` launches only: kernels that rocBLAS / hipBLASLt
+    /// launch inside a library call are not seen. Includes prefill, so take
+    /// kernels per token from a difference over decode only.
+    #[serde(default)]
+    pub hip_kernel_launches: u64,
     /// Dense FFN layers pinned in the weight working set (0 = full resident / unset).
     #[serde(default)]
     pub weight_pinned_layers: u64,
@@ -316,6 +343,9 @@ pub struct StatsSnapshot {
     /// RPC LaunchList round-trips (0 when no remote workers).
     #[serde(default)]
     pub rpc_roundtrips: u64,
+    /// Calls to each RPC worker since connect, in endpoint order.
+    #[serde(default)]
+    pub rpc_workers: Vec<RpcWorkerCalls>,
     /// Hidden-state bytes bounced through the coordinator (H2D+D2H).
     #[serde(default)]
     pub rpc_activation_bytes: u64,
