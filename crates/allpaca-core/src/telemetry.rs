@@ -310,6 +310,7 @@ impl Metrics {
             residual_gpu_ops: self.residual_gpu_ops.load(Ordering::Relaxed),
             activation_h2d_bytes: self.activation_h2d_bytes.load(Ordering::Relaxed),
             activation_d2h_bytes: self.activation_d2h_bytes.load(Ordering::Relaxed),
+            hip_kernel_launches: allpaca_hip::kernel_launches(),
             q8_gemm_us: self.q8_gemm_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             attention_us: self.attention_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             lm_head_us: self.lm_head_ns.load(Ordering::Relaxed) as f64 / 1_000.0,

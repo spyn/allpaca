@@ -95,6 +95,12 @@ pub struct StatsSnapshot {
     pub other_gpu_us: f64,
     /// Last/EMA HIP decode: host-side time (D2H logits, bookkeeping) in microseconds.
     pub host_us: f64,
+    /// HIP kernels launched by this process so far, all devices (0 without HIP).
+    /// Counts `kernels.cpp` launches only: kernels that rocBLAS / hipBLASLt
+    /// launch inside a library call are not seen. Includes prefill, so take
+    /// kernels per token from a difference over decode only.
+    #[serde(default)]
+    pub hip_kernel_launches: u64,
     /// Dense FFN layers pinned in the weight working set (0 = full resident / unset).
     #[serde(default)]
     pub weight_pinned_layers: u64,

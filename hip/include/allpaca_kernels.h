@@ -25,6 +25,9 @@ typedef void *allpaca_stream_t;
 
 int allpaca_hip_device_count(int32_t *count);
 
+/* Kernels launched by this library since process start (0 without HIP). */
+uint64_t allpaca_hip_kernel_launches(void);
+
 int allpaca_hip_device_props(int32_t id, char *name, int32_t name_len, uint64_t *memory_bytes,
                              double *bandwidth_gbps);
 
