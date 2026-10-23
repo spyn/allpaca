@@ -12272,6 +12272,20 @@ impl Lcg {
     }
 }
 
+/// Which layers keep KV pages: every layer except recurrent ones (SSM or
+/// Gated DeltaNet), which never write KV. A model without a per-layer list
+/// keeps pages on every layer.
+pub fn kv_layer_mask(model: &TinyModel) -> Vec<bool> {
+    if model.layers.len() != model.config.n_layers {
+        return vec![true; model.config.n_layers];
+    }
+    model
+        .layers
+        .iter()
+        .map(|l| !(l.block == HybridLayerKind::Ssm || l.gdn.is_some() || l.ssm.is_some()))
+        .collect()
+}
+
 /// Allocate one page per layer covering `n_tokens` (rounded up to page_tokens).
 pub fn alloc_pages_for_seq(
     kv: &mut KvTierManager,
@@ -12280,9 +12294,27 @@ pub fn alloc_pages_for_seq(
     n_tokens: usize,
     metrics: &Metrics,
 ) -> Result<Vec<Vec<u64>>, AllpacaError> {
+    alloc_pages_for_seq_masked(kv, cfg, page_tokens, n_tokens, None, metrics)
+}
+
+/// [`alloc_pages_for_seq`] for the layers `keeps` marks (see
+/// [`kv_layer_mask`]); the others get an empty page list. A hybrid model with
+/// 8 attention layers of 32 otherwise takes 4x the KV it uses.
+pub fn alloc_pages_for_seq_masked(
+    kv: &mut KvTierManager,
+    cfg: &ModelConfig,
+    page_tokens: u32,
+    n_tokens: usize,
+    keeps: Option<&[bool]>,
+    metrics: &Metrics,
+) -> Result<Vec<Vec<u64>>, AllpacaError> {
     let n_pages = n_tokens.div_ceil(page_tokens as usize).max(1);
     let mut pages = Vec::with_capacity(cfg.n_layers);
     for layer in 0..cfg.n_layers {
+        if keeps.is_some_and(|k| !k.get(layer).copied().unwrap_or(true)) {
+            pages.push(Vec::new());
+            continue;
+        }
         let mut layer_pages = Vec::with_capacity(n_pages);
         for p in 0..n_pages {
             layer_pages.push(kv.alloc_page(
@@ -12309,6 +12341,11 @@ pub fn ensure_pages(
 ) -> Result<(), AllpacaError> {
     let need = pos / page_tokens as usize;
     for (layer, layer_pages) in pages.iter_mut().enumerate() {
+        // An empty list is a layer without KV (see `kv_layer_mask`): a layer
+        // that keeps KV always has at least one page.
+        if layer_pages.is_empty() {
+            continue;
+        }
         while layer_pages.len() <= need {
             let idx = layer_pages.len() as u32;
             layer_pages.push(kv.alloc_page(
@@ -12987,6 +13024,41 @@ mod lightning_moe_tests {
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_softcap_tests {
     use super::*;
+
+    #[test]
+    fn only_recurrent_layers_go_without_kv_pages() {
+        for model in [TinyModel::synthetic_gdn_hybrid(5), TinyModel::synthetic_ssm_hybrid(5)] {
+            let keeps = kv_layer_mask(&model);
+            assert_eq!(keeps.len(), model.config.n_layers);
+            for (layer, keep) in model.layers.iter().zip(&keeps) {
+                let recurrent =
+                    layer.block == HybridLayerKind::Ssm || layer.gdn.is_some() || layer.ssm.is_some();
+                assert_eq!(*keep, !recurrent);
+            }
+            assert!(keeps.iter().any(|k| *k) && keeps.iter().any(|k| !*k), "a hybrid has both");
+            let metrics = Metrics::default();
+            let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 1.0);
+            let mut pages = alloc_pages_for_seq_masked(&mut kv, &model.config, 4, 9, Some(&keeps), &metrics)
+                .expect("pages");
+            for (layer_pages, keep) in pages.iter().zip(&keeps) {
+                assert_eq!(layer_pages.len(), if *keep { 3 } else { 0 });
+            }
+            // Growing the sequence adds pages only where KV is kept.
+            ensure_pages(&mut kv, &model.config, 4, &mut pages, 16, &metrics).expect("grow");
+            for (layer_pages, keep) in pages.iter().zip(&keeps) {
+                assert_eq!(layer_pages.len(), if *keep { 5 } else { 0 });
+            }
+        }
+        // Attention that is not the `Attention` block (MLA, MoE layers) keeps its pages.
+        for model in [TinyModel::synthetic_mla_hybrid(5), TinyModel::synthetic_moe_shared(5)] {
+            let keeps = kv_layer_mask(&model);
+            for (layer, keep) in model.layers.iter().zip(&keeps) {
+                if layer.gdn.is_none() && layer.ssm.is_none() && layer.block != HybridLayerKind::Ssm {
+                    assert!(*keep);
+                }
+            }
+        }
+    }
 
     #[test]
     fn cuda_final_logit_softcap_bounds_logits_when_device_present() {
