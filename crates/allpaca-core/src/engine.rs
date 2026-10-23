@@ -1357,7 +1357,7 @@ impl Engine {
         } else {
             "p2p_unavailable"
         };
-        self.metrics.snapshot(
+        let mut snapshot = self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
             self.inventory.p2p_capable,
@@ -1372,7 +1372,11 @@ impl Engine {
             model_id,
             backend,
             draft_depth,
-        )
+        );
+        if let Some(rt) = &self.rpc {
+            snapshot.rpc_workers = rt.worker_calls();
+        }
+        snapshot
     }
 
     pub fn model_id(&self) -> String {
