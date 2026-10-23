@@ -544,6 +544,14 @@ impl Engine {
         }
         config.apply_tune_overlay();
         config.validate()?;
+        let experimental_on = config.experimental.enabled_names();
+        if !experimental_on.is_empty() {
+            tracing::warn!(
+                options = %experimental_on.join(", "),
+                exactness = %config.exactness(),
+                "experimental options are on; output may leave the exact path"
+            );
+        }
         let mut inventory = DeviceInventory::discover(&config);
         scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
@@ -1373,6 +1381,7 @@ impl Engine {
             backend,
             draft_depth,
         );
+        snapshot.exactness = self.config.exactness().as_str().into();
         if let Some(rt) = &self.rpc {
             snapshot.rpc_workers = rt.worker_calls();
         }

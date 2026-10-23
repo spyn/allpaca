@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_exactness() -> String {
+    "exact".into()
+}
+
 /// Calls to one RPC worker since connect, as the coordinator sees them.
 /// `wall_us` is network plus worker time; the split needs worker-side timing.
 /// Byte counts are payloads, without frame headers, and a call that fails on
@@ -25,6 +29,10 @@ pub struct RpcWorkerCalls {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub pipeline_mode: String,
+    /// `"exact"`, `"distribution-exact"`, or `"lossy"` from `[experimental]`
+    /// at the configured `[sampling].temperature`.
+    #[serde(default = "default_exactness")]
+    pub exactness: String,
     pub transfer_path: String,
     /// True when a GPU pair can access peers after enable + re-query.
     pub p2p_capable: bool,
