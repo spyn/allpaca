@@ -44,6 +44,13 @@ pub struct Sample {
     pub at: u64,
     /// Requests running at the same time, this one included.
     pub concurrency: usize,
+    /// From `/stats` `exactness`: `exact`, `distribution-exact`, or `lossy`.
+    #[serde(default = "exact_default")]
+    pub exactness: String,
+}
+
+fn exact_default() -> String {
+    "exact".into()
 }
 
 /// The text a streamed chat chunk adds (reasoning and content), if any.
@@ -144,6 +151,7 @@ pub fn run(
         let warm = Target { max_tokens: warmup_tokens, ..target.clone() };
         chat(&warm, prompts.first().map_or(PROMPTS[0], String::as_str))?;
     }
+    let exactness = fetch_exactness(target).unwrap_or_else(|_| "exact".into());
     let concurrency = concurrency.max(1);
     let mut samples = Vec::new();
     for round in first_round..first_round + rounds {
@@ -168,6 +176,7 @@ pub fn run(
                     sha,
                     at: now_unix(),
                     concurrency: group.len(),
+                    exactness: exactness.clone(),
                 };
                 seen(&sample);
                 samples.push(sample);
@@ -175,6 +184,26 @@ pub fn run(
         }
     }
     Ok(samples)
+}
+
+/// Read `/stats.exactness` from a running server.
+fn fetch_exactness(target: &Target) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = client
+        .get(format!("{}/stats", target.url.trim_end_matches('/')))
+        .bearer_auth(&target.key)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .map_err(|e| e.to_string())?;
+    Ok(body
+        .get("exactness")
+        .and_then(|v| v.as_str())
+        .unwrap_or("exact")
+        .to_string())
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -200,6 +229,8 @@ pub struct Summary {
     /// The hash of each prompt's text, or `None` for a prompt whose text
     /// was not the same every round.
     pub shas: Vec<Option<String>>,
+    /// Exactness level recorded on this tag's samples.
+    pub exactness: String,
 }
 
 /// One summary per tag, in order of first appearance.
@@ -231,6 +262,7 @@ pub fn summarize(samples: &[Sample]) -> Vec<Summary> {
                 first_token_median_s: median(of_tag.iter().map(|s| s.first_token_s).collect()),
                 concurrency: of_tag.iter().map(|s| s.concurrency).max().unwrap_or(1),
                 shas,
+                exactness: of_tag.first().map(|s| s.exactness.clone()).unwrap_or_else(exact_default),
             }
         })
         .collect()
@@ -253,6 +285,9 @@ pub fn table(summaries: &[Summary]) -> String {
         let text = match (s.shas.iter().all(Option::is_some), base) {
             (false, _) => "differs between rounds".to_string(),
             (true, Some(b)) if b.tag != s.tag && b.shas == s.shas => "same as first".to_string(),
+            (true, Some(b)) if b.tag != s.tag && s.exactness != "exact" => {
+                format!("relaxed: {}", s.exactness)
+            }
             (true, Some(b)) if b.tag != s.tag => "differs from first".to_string(),
             _ => s.shas.iter().flatten().cloned().collect::<Vec<_>>().join(" "),
         };
@@ -288,6 +323,7 @@ mod tests {
             sha: sha.into(),
             at: 0,
             concurrency: 1,
+            exactness: "exact".into(),
         }
     }
 
@@ -348,5 +384,30 @@ mod tests {
         // Two at once at 14 each is 28 in total: +60% on the base's 17.5.
         assert!(row("pair").contains("28.00") && row("pair").contains("+60.0%"), "{table}");
         assert!(row("pair").ends_with("same as first"), "{table}");
+    }
+
+    #[test]
+    fn a_relaxed_run_hash_mismatch_is_labeled_not_a_failure() {
+        let samples = vec![
+            sample("exact", 1, 0, 16.0, "aa"),
+            Sample {
+                exactness: "distribution-exact".into(),
+                ..sample("rej", 1, 0, 18.0, "zz")
+            },
+            Sample {
+                exactness: "lossy".into(),
+                ..sample("tail", 1, 0, 19.0, "yy")
+            },
+        ];
+        let out = table(&summarize(&samples));
+        let row = |tag: &str| out.lines().find(|l| l.starts_with(tag)).unwrap().to_string();
+        assert!(row("rej").ends_with("relaxed: distribution-exact"), "{out}");
+        assert!(row("tail").ends_with("lossy") && row("tail").contains("relaxed:"), "{out}");
+        let other = Sample { exactness: "exact".into(), ..sample("other", 1, 0, 20.0, "xx") };
+        let out2 = table(&summarize(&[sample("exact", 1, 0, 16.0, "aa"), other]));
+        assert!(
+            out2.lines().find(|l| l.starts_with("other")).unwrap().ends_with("differs from first"),
+            "{out2}"
+        );
     }
 }

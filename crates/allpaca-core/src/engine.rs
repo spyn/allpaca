@@ -38,7 +38,7 @@ use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
-    alloc_pages_for_seq, ensure_pages, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
+    alloc_pages_for_seq, alloc_pages_for_seq_masked, ensure_pages, kv_layer_mask, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
     TinyModel,
 };
 use crate::packed::{temp_pack_path, HostExpertPool, PackedStore};
@@ -546,6 +546,14 @@ impl Engine {
         }
         config.apply_tune_overlay();
         config.validate()?;
+        let experimental_on = config.experimental.enabled_names();
+        if !experimental_on.is_empty() {
+            tracing::warn!(
+                options = %experimental_on.join(", "),
+                exactness = %config.exactness(),
+                "experimental options are on; output may leave the exact path"
+            );
+        }
         let mut inventory = DeviceInventory::discover(&config);
         scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
@@ -1376,6 +1384,7 @@ impl Engine {
             backend,
             draft_depth,
         );
+        snapshot.exactness = self.config.exactness().as_str().into();
         if let Some(rt) = &self.rpc {
             snapshot.rpc_workers = rt.worker_calls();
         }
@@ -2932,11 +2941,14 @@ impl Engine {
                 }
             }
         }
-        let pages = alloc_pages_for_seq(
+        // Recurrent (SSM / Gated DeltaNet) layers write no KV: no pages for them.
+        let keeps = kv_layer_mask(&target);
+        let pages = alloc_pages_for_seq_masked(
             &mut inner.kv,
             &target.config,
             page_tokens,
             tokens.len() + params.max_tokens,
+            Some(&keeps),
             &self.metrics,
         )?;
         let mut recurrent = if target.config.recurrent {
@@ -6579,10 +6591,11 @@ fn packed_linear_verify_span(
     let start_pos = request(inner, id)?.tokens.len();
     let vision = request(inner, id)?.vision.clone();
     let vision_ref = (!vision.is_empty()).then_some(&*vision);
+    // The first layer with pages: a recurrent layer keeps none.
     let page_tokens = request(inner, id)?
         .pages
-        .first()
-        .and_then(|layer| layer.first())
+        .iter()
+        .find_map(|layer| layer.first())
         .and_then(|page_id| inner.kv.get(*page_id))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);
@@ -7157,10 +7170,11 @@ fn append_and_forward(
     #[cfg(feature = "vulkan")] vulkan: Option<&allpaca_vulkan::VulkanWorkspace>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
+    // The first layer with pages: a recurrent layer keeps none.
     let page_tokens = request(inner, id)?
         .pages
-        .first()
-        .and_then(|layer| layer.first())
+        .iter()
+        .find_map(|layer| layer.first())
         .and_then(|page_id| inner.kv.get(*page_id))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);

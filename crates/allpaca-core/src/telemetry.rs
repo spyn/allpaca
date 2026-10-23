@@ -257,6 +257,7 @@ impl Metrics {
         };
         StatsSnapshot {
             pipeline_mode: pipeline_mode.to_string(),
+            exactness: "exact".into(),
             transfer_path: transfer_path.to_string(),
             p2p_capable,
             p2p_enabled,
