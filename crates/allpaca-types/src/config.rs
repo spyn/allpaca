@@ -45,6 +45,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Exactness of a run at the configured default temperature. Requests that
+    /// override the temperature are not reflected.
+    pub fn exactness(&self) -> ExactnessLevel {
+        self.experimental.exactness(self.sampling.temperature)
+    }
+
     pub fn compiled_defaults() -> Self {
         Self {
             engine: EngineSection::default(),
@@ -597,11 +603,12 @@ impl ExperimentalSection {
         out
     }
 
-    /// Exactness of a run with these options. Lossy wins over distribution-exact.
-    pub fn exactness(&self) -> ExactnessLevel {
+    /// Exactness of a run with these options at `temperature`. Lossy wins over
+    /// distribution-exact; rejection sampling keeps greedy decoding exact.
+    pub fn exactness(&self, temperature: f32) -> ExactnessLevel {
         if self.route_tail_skip || self.row_variant_kernels || self.chunked_gdn {
             ExactnessLevel::Lossy
-        } else if self.rejection_sampling {
+        } else if self.rejection_sampling && temperature > 0.0 {
             ExactnessLevel::DistributionExact
         } else {
             ExactnessLevel::Exact
@@ -1031,7 +1038,7 @@ mod tests {
         assert_eq!(defaults.experimental.route_tail_skip_rank, 7);
         assert!(!defaults.experimental.row_variant_kernels);
         assert!(!defaults.experimental.chunked_gdn);
-        assert_eq!(defaults.experimental.exactness(), ExactnessLevel::Exact);
+        assert_eq!(defaults.exactness(), ExactnessLevel::Exact);
         assert!(defaults.experimental.enabled_names().is_empty());
 
         let cfg = Config::from_toml_str(
@@ -1046,7 +1053,7 @@ mod tests {
         assert!(cfg.experimental.rejection_sampling);
         assert!(cfg.experimental.route_tail_skip);
         assert_eq!(cfg.experimental.route_tail_skip_rank, 5);
-        assert_eq!(cfg.experimental.exactness(), ExactnessLevel::Lossy);
+        assert_eq!(cfg.exactness(), ExactnessLevel::Lossy);
         assert_eq!(
             cfg.experimental.enabled_names(),
             ["rejection_sampling", "route_tail_skip"]
@@ -1054,12 +1061,40 @@ mod tests {
 
         let dist = Config::from_toml_str(
             r#"
+            [sampling]
+            temperature = 0.7
             [experimental]
             rejection_sampling = true
             "#,
         )
         .unwrap();
-        assert_eq!(dist.experimental.exactness(), ExactnessLevel::DistributionExact);
+        assert_eq!(dist.exactness(), ExactnessLevel::DistributionExact);
+    }
+
+    #[test]
+    fn rejection_sampling_is_exact_when_greedy() {
+        let greedy = Config::from_toml_str(
+            r#"
+            [sampling]
+            temperature = 0.0
+            [experimental]
+            rejection_sampling = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(greedy.exactness(), ExactnessLevel::Exact);
+
+        let lossy = Config::from_toml_str(
+            r#"
+            [sampling]
+            temperature = 0.0
+            [experimental]
+            rejection_sampling = true
+            chunked_gdn = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(lossy.exactness(), ExactnessLevel::Lossy);
     }
 
     #[test]

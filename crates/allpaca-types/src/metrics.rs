@@ -8,7 +8,8 @@ fn default_exactness() -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub pipeline_mode: String,
-    /// `"exact"`, `"distribution-exact"`, or `"lossy"` from `[experimental]`.
+    /// `"exact"`, `"distribution-exact"`, or `"lossy"` from `[experimental]`
+    /// at the configured `[sampling].temperature`.
     #[serde(default = "default_exactness")]
     pub exactness: String,
     pub transfer_path: String,

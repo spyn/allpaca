@@ -548,7 +548,7 @@ impl Engine {
         if !experimental_on.is_empty() {
             tracing::warn!(
                 options = %experimental_on.join(", "),
-                exactness = %config.experimental.exactness(),
+                exactness = %config.exactness(),
                 "experimental options are on; output may leave the exact path"
             );
         }
@@ -1379,7 +1379,7 @@ impl Engine {
             backend,
             draft_depth,
         );
-        snap.exactness = self.config.experimental.exactness().as_str().into();
+        snap.exactness = self.config.exactness().as_str().into();
         snap
     }
 
