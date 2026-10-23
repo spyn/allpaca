@@ -19,6 +19,8 @@ pub struct RpcRuntime {
     sessions: Mutex<Vec<RpcSession>>,
     /// Worker `host:port` per session index (readable while a session is busy).
     endpoints: Vec<String>,
+    /// Each worker's build id from its HELLO, per session index.
+    builds: Vec<Option<String>>,
     /// Each session's call counters, readable while the session is busy.
     counters: Vec<(Arc<allpaca_rpc::CallCounters>, Arc<allpaca_rpc::CallCounters>)>,
     plan: Mutex<LayerPlan>,
@@ -303,9 +305,11 @@ impl RpcRuntime {
             sessions.push(session);
         }
         let counters = sessions.iter().map(RpcSession::counters).collect();
+        let builds = sessions.iter().map(|s| s.build_id().map(str::to_string)).collect();
         Ok(Self {
             sessions: Mutex::new(sessions),
             endpoints: endpoints.to_vec(),
+            builds,
             counters,
             plan: Mutex::new(LayerPlan::all_local(0)),
             remote: Mutex::new(Vec::new()),
@@ -323,6 +327,12 @@ impl RpcRuntime {
             activation_bytes: AtomicU64::new(0),
             h2d_bytes: AtomicU64::new(0),
         })
+    }
+
+    /// Each worker's endpoint and the build id its HELLO gave (`None` for a
+    /// worker too old to send one), in session order.
+    pub fn worker_builds(&self) -> Vec<(String, Option<String>)> {
+        self.endpoints.iter().cloned().zip(self.builds.iter().cloned()).collect()
     }
 
     pub fn apply_hello_to_inventory(
