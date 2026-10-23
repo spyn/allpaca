@@ -151,8 +151,19 @@ impl LocalDir {
 }
 
 impl CheckpointStore for LocalDir {
+    /// Makes the folder again if it is gone (another server's prune of a
+    /// folder it judged unused).
     fn put(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
-        write_file(&self.dir.join(name), data).map_err(|e| e.to_string())
+        let file = self.dir.join(name);
+        write_file(&file, data)
+            .or_else(|e| {
+                if self.dir.is_dir() {
+                    return Err(e);
+                }
+                std::fs::create_dir_all(&self.dir)?;
+                write_file(&file, data)
+            })
+            .map_err(|e| e.to_string())
     }
 
     fn get(&mut self, name: &str) -> Option<Vec<u8>> {
@@ -1235,6 +1246,18 @@ mod tests {
         fn list(&mut self) -> Result<Vec<Listed>, String> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn a_local_folder_deleted_under_the_store_comes_back_on_the_next_write() {
+        let dir = std::env::temp_dir().join(format!("allpaca_localdir_gone_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = LocalDir::open(&dir).unwrap();
+        // Another server pruned it.
+        std::fs::remove_dir_all(&dir).unwrap();
+        store.put("a.ckpt", b"data").expect("the folder is made again");
+        assert_eq!(store.get("a.ckpt").as_deref(), Some(&b"data"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

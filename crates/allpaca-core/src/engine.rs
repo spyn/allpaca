@@ -218,6 +218,8 @@ struct EngineInner {
     kv_radix: KvRadixForest,
     /// Model and expert mask the prompt cache holds checkpoints for.
     prompt_cache_key: Option<u64>,
+    /// Keeps the open local disk folder marked used.
+    prompt_cache_touch: Option<PromptCacheTouch>,
     /// DirectStorage / GDS capability probe at engine start.
     ds_probe: DirectStorageProbe,
     grammar_factory: Option<llguidance::ParserFactory>,
@@ -684,6 +686,7 @@ impl Engine {
             kv_radix: KvRadixForest::with_limits(1 << 20, config.prompt_cache.ram_bytes)
                 .with_codec(config.prompt_cache.codec),
             prompt_cache_key: None,
+            prompt_cache_touch: None,
             ds_probe: ds_probe.clone(),
             grammar_factory: None,
             last_poll_id: None,
@@ -4635,9 +4638,13 @@ impl Engine {
         );
         let key = fnv1a(&fingerprint);
         if inner.prompt_cache_key == Some(key) {
+            if let Some(touch) = inner.prompt_cache_touch.as_mut() {
+                touch.touch_if_due(PROMPT_CACHE_TOUCH_EVERY);
+            }
             return;
         }
         inner.prompt_cache_key = Some(key);
+        inner.prompt_cache_touch = None;
         inner.kv_radix.reset();
         let pc = &self.config.prompt_cache;
         // Its state is not part of a checkpoint file.
@@ -4658,8 +4665,10 @@ impl Engine {
         });
         let store: Result<Box<dyn crate::kv_radix::CheckpointStore>, AllpacaError> = match (worker, pc.disk_dir.as_ref()) {
             (Some(store), _) => Ok(Box::new(store)),
-            (None, Some(dir)) => open_prompt_cache_folder(dir, &folder, &fingerprint, pc.disk_bytes as u64)
-                .map(|d| Box::new(d) as _),
+            (None, Some(dir)) => open_prompt_cache_folder(dir, &folder, &fingerprint, pc.disk_bytes as u64).map(|d| {
+                inner.prompt_cache_touch = Some(PromptCacheTouch::new(dir.join(&folder)));
+                Box::new(d) as _
+            }),
             (None, None) => {
                 if pc.worker {
                     tracing::warn!("prompt cache: no RPC worker serves the prompt_cache store");
@@ -5709,6 +5718,11 @@ fn mtp_text_has_dropped_words(text: &str) -> bool {
 ///   cold prefill.
 /// - `plan` is [`Engine::prompt_cache_plan`]: the device that runs each
 ///   layer and its experts. CPU, RDNA and MI50 results are not bitwise equal.
+///   This over-keys on purpose: the automatic local layer split is sized
+///   from free VRAM at load, which on xeres moves with the desktop (WDDM), so
+///   restarts of the same build and config can land on another split and
+///   miss. A lower hit rate after a restart is expected, not a bug; keying
+///   less would need the 9070 and 9060 XT proven bitwise equal.
 /// - The placement and weight options that pick a device or kernel for a
 ///   layer, or change the weights themselves (`edge0_no_lora`,
 ///   `edge0_no_prerouter`), are keyed raw as well, so a change misses even
@@ -5816,12 +5830,52 @@ fn fnv1a(text: &str) -> u64 {
     h
 }
 
-/// How long a prompt-cache folder nobody opens is kept.
-const PROMPT_CACHE_FOLDER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
+/// How long a prompt-cache folder nobody uses is kept. A server that has the
+/// folder open touches its `key.txt` at least every
+/// [`PROMPT_CACHE_TOUCH_EVERY`] while it admits requests.
+const PROMPT_CACHE_FOLDER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+/// A folder used this recently may belong to another running server (two
+/// servers sharing one `disk_dir`): it is never pruned for the byte budget.
+const PROMPT_CACHE_FOLDER_RECENT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// How often a server touches its open folder's `key.txt`.
+const PROMPT_CACHE_TOUCH_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Marks the open prompt-cache folder used: sets its `key.txt`'s
+/// modification time, so [`prune_prompt_cache_folders`] in another server
+/// sees it live even when this one only reads.
+#[derive(Debug)]
+struct PromptCacheTouch {
+    key_file: std::path::PathBuf,
+    last: std::time::Instant,
+}
+
+impl PromptCacheTouch {
+    /// For the folder `dir`, whose `key.txt` was just written.
+    fn new(dir: std::path::PathBuf) -> Self {
+        Self {
+            key_file: dir.join("key.txt"),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn touch_if_due(&mut self, every: std::time::Duration) {
+        if self.last.elapsed() < every {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        let touched = std::fs::File::options()
+            .write(true)
+            .open(&self.key_file)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        if let Err(e) = touched {
+            tracing::debug!(error = %e, file = %self.key_file.display(), "prompt cache: key.txt not touched");
+        }
+    }
+}
 
 /// Open the prompt cache's local folder `keep` under `root`, write its
 /// `key.txt` (the fingerprint text, so an operator can tell folders apart;
-/// rewriting it marks the folder used) and prune the other folders:
+/// writing it marks the folder used) and prune the other folders:
 /// [`prune_prompt_cache_folders`].
 fn open_prompt_cache_folder(
     root: &std::path::Path,
@@ -5834,21 +5888,32 @@ fn open_prompt_cache_folder(
     if let Err(e) = std::fs::write(dir.join("key.txt"), fingerprint) {
         tracing::warn!(error = %e, "prompt cache: key.txt not written");
     }
-    prune_prompt_cache_folders(root, keep, budget, PROMPT_CACHE_FOLDER_MAX_AGE, std::time::SystemTime::now());
+    prune_prompt_cache_folders(
+        root,
+        keep,
+        budget,
+        PROMPT_CACHE_FOLDER_MAX_AGE,
+        PROMPT_CACHE_FOLDER_RECENT,
+        std::time::SystemTime::now(),
+    );
     Ok(opened)
 }
 
 /// Delete the prompt-cache folders under `root` other than `keep` (folders
 /// named by 16 hex digits; other names are left alone) that were last used
 /// more than `max_age` before `now`, then the least recently used of the rest
-/// until they hold at most `budget` bytes together (0 = no byte limit).
-/// A folder's last use is its newest file's modification time. Each rebuild
-/// or settings change opens a new folder, so without this they pile up.
+/// until their checkpoints (`*.ckpt`) total at most `budget` bytes (0 = no
+/// byte limit). A folder used within `recent` is never deleted for the
+/// budget: another running server may have it open. A folder's last use is
+/// the newest modification time of its `key.txt` (touched by the server that
+/// has it open, [`PromptCacheTouch`]) and its checkpoints. Each rebuild or
+/// settings change opens a new folder, so without this they pile up.
 fn prune_prompt_cache_folders(
     root: &std::path::Path,
     keep: &str,
     budget: u64,
     max_age: std::time::Duration,
+    recent: std::time::Duration,
     now: std::time::SystemTime,
 ) {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -5863,8 +5928,15 @@ fn prune_prompt_cache_folders(
         }
         let (mut used, mut bytes) = (std::time::UNIX_EPOCH, 0u64);
         for file in std::fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+            let path = file.path();
+            let ckpt = path.extension().is_some_and(|e| e == "ckpt");
+            if !ckpt && file.file_name() != "key.txt" {
+                continue;
+            }
             if let Ok(meta) = file.metadata() {
-                bytes += meta.len();
+                if ckpt {
+                    bytes += meta.len();
+                }
                 used = used.max(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
             }
         }
@@ -5874,8 +5946,10 @@ fn prune_prompt_cache_folders(
     folders.sort_by(|a, b| b.0.cmp(&a.0));
     let mut kept = 0u64;
     for (used, bytes, path) in folders {
-        let stale = now.duration_since(used).is_ok_and(|age| age > max_age);
-        let over = budget > 0 && kept + bytes > budget;
+        // A modification time in the future reads as just used.
+        let age = now.duration_since(used).unwrap_or_default();
+        let stale = age > max_age;
+        let over = budget > 0 && kept + bytes > budget && age > recent;
         if stale || over {
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => tracing::info!(folder = %path.display(), bytes, "prompt cache: old folder removed"),
@@ -9944,45 +10018,86 @@ mod tests {
         assert_eq!(reference, s(&rejection, "hip:0:a;0=hip:0:a"), "sampling only");
     }
 
-    #[test]
-    fn prompt_cache_folder_holds_its_key_and_old_folders_are_pruned() {
+    /// Set `path`'s modification time to `secs` seconds ago.
+    fn age_file(path: &std::path::Path, secs: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    fn prune_test_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir()
             .join("allpaca_prompt_cache_tests")
-            .join(format!("prune_{}", std::process::id()));
+            .join(format!("{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let folder = |name: &str, bytes: usize| {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("a.ckpt"), vec![0u8; bytes]).unwrap();
-            d
-        };
-        let other = folder("00000000000000aa", 100);
-        let older = folder("00000000000000bb", 100);
-        let unrelated = folder("not-a-cache-folder", 100);
-        // `older` was last used before `other`.
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(older.join("a.ckpt"))
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
-        let dir = open_prompt_cache_folder(&root, "00000000000000cc", "fingerprint text", 150).unwrap();
+        root
+    }
+
+    /// A cache folder `name` under `root` holding one `bytes`-byte
+    /// checkpoint last written `secs` seconds ago.
+    fn cache_folder(root: &std::path::Path, name: &str, bytes: usize, secs: u64) -> std::path::PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.ckpt"), vec![0u8; bytes]).unwrap();
+        age_file(&d.join("a.ckpt"), secs);
+        d
+    }
+
+    const DAY: u64 = 24 * 3600;
+
+    #[test]
+    fn prompt_cache_folder_holds_its_key_and_old_folders_are_pruned() {
+        let root = prune_test_root("prune");
+        // Another live server's folder, alone over the budget.
+        let live = cache_folder(&root, "00000000000000dd", 1000, 0);
+        let other = cache_folder(&root, "00000000000000aa", 100, 2 * DAY);
+        // Not checkpoints: a write in progress and the key are not budgeted.
+        std::fs::write(other.join("b.tmp"), vec![0u8; 500]).unwrap();
+        std::fs::write(other.join("key.txt"), "other").unwrap();
+        age_file(&other.join("b.tmp"), 2 * DAY);
+        age_file(&other.join("key.txt"), 2 * DAY);
+        let older = cache_folder(&root, "00000000000000bb", 100, 3 * DAY);
+        let unrelated = cache_folder(&root, "not-a-cache-folder", 100, 3 * DAY);
+        let dir = open_prompt_cache_folder(&root, "00000000000000cc", "fingerprint text", 1150).unwrap();
         drop(dir);
         assert_eq!(
             std::fs::read_to_string(root.join("00000000000000cc").join("key.txt")).unwrap(),
             "fingerprint text"
         );
-        assert!(other.exists(), "the most recently used folder fits the budget");
+        assert!(live.exists(), "a folder used within the last day is never budget-pruned");
+        assert!(other.exists(), "only checkpoint bytes count: 1000 + 100 fits");
         assert!(!older.exists(), "least recently used past the budget");
         assert!(unrelated.exists(), "only 16-hex-digit folders are pruned");
         assert!(root.join("00000000000000cc").exists(), "the open folder stays");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-        // By age, whatever the budget.
-        let now = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600);
-        prune_prompt_cache_folders(&root, "00000000000000cc", 0, std::time::Duration::from_secs(3600), now);
-        assert!(!other.exists(), "unused for longer than the maximum age");
-        assert!(root.join("00000000000000cc").exists());
+    #[test]
+    fn prompt_cache_folders_unused_too_long_are_pruned_by_their_key_touch() {
+        let root = prune_test_root("prune_age");
+        // A server that only reads keeps touching its key.txt.
+        let reading = cache_folder(&root, "00000000000000ee", 100, 40 * DAY);
+        std::fs::write(reading.join("key.txt"), "reading").unwrap();
+        let unused = cache_folder(&root, "00000000000000ff", 100, 40 * DAY);
+        let now = std::time::SystemTime::now();
+        let (max_age, recent) = (std::time::Duration::from_secs(30 * DAY), std::time::Duration::from_secs(DAY));
+        prune_prompt_cache_folders(&root, "00000000000000cc", 0, max_age, recent, now);
+        assert!(reading.exists(), "its key was touched today");
+        assert!(!unused.exists(), "unused for longer than the maximum age");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_cache_key_touch_marks_the_folder_used() {
+        let root = prune_test_root("touch");
+        let dir = root.join("00000000000000cc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("key.txt"), "k").unwrap();
+        age_file(&dir.join("key.txt"), 2 * DAY);
+        let mut touch = PromptCacheTouch::new(dir.clone());
+        touch.touch_if_due(std::time::Duration::ZERO);
+        let modified = std::fs::metadata(dir.join("key.txt")).unwrap().modified().unwrap();
+        let age = std::time::SystemTime::now().duration_since(modified).unwrap_or_default();
+        assert!(age < std::time::Duration::from_secs(3600), "touched now; age {age:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
