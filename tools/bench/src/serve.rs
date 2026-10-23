@@ -70,6 +70,9 @@ pub struct Sample {
     /// True when `kv_bytes` is the whole device KV pool, not a per-sequence estimate.
     #[serde(default)]
     pub kv_is_pool: bool,
+    /// True for an MoE model whose active weight bytes are unknown.
+    #[serde(default)]
+    pub weights_unknown: bool,
     /// Devices that held weights for this start. Empty = no roofline line.
     #[serde(default)]
     pub devices: Vec<DeviceBand>,
@@ -159,6 +162,7 @@ pub fn apply_snap(sample: &mut Sample, snap: &RooflineSnap) {
     sample.weight_bytes = snap.weight_bytes;
     sample.kv_bytes = snap.kv_bytes;
     sample.kv_is_pool = snap.kv_is_pool;
+    sample.weights_unknown = snap.weights_unknown;
     sample.devices = snap.devices.clone();
 }
 
@@ -216,6 +220,7 @@ pub fn run(
                     weight_bytes: 0,
                     kv_bytes: 0,
                     kv_is_pool: false,
+                    weights_unknown: false,
                     devices: Vec::new(),
                 };
                 if let Some(snap) = &snap {
@@ -335,6 +340,7 @@ pub struct FreshStart {
     pub weight_bytes: u64,
     pub kv_bytes: u64,
     pub kv_is_pool: bool,
+    pub weights_unknown: bool,
     pub devices: Vec<DeviceBand>,
 }
 
@@ -342,7 +348,7 @@ pub struct FreshStart {
 pub fn fresh_starts(samples: &[Sample]) -> Vec<FreshStart> {
     let mut keys: Vec<(String, usize)> = Vec::new();
     for s in samples {
-        if s.weight_bytes == 0 && s.kv_bytes == 0 {
+        if s.weight_bytes == 0 && s.kv_bytes == 0 && !s.weights_unknown {
             continue;
         }
         let key = (s.tag.clone(), s.round);
@@ -362,6 +368,7 @@ pub fn fresh_starts(samples: &[Sample]) -> Vec<FreshStart> {
                 weight_bytes: first.weight_bytes,
                 kv_bytes: first.kv_bytes,
                 kv_is_pool: first.kv_is_pool,
+                weights_unknown: first.weights_unknown,
                 devices: first.devices.clone(),
             }
         })
@@ -423,7 +430,16 @@ pub fn roofline_table(starts: &[FreshStart]) -> String {
         "tag", "round", "tok/s", "bytes/tok", "GB/s", "% peak", "peak", "devices"
     );
     let mut any_pool_kv = false;
+    let mut any_unknown = false;
     for s in starts {
+        if s.weights_unknown {
+            any_unknown = true;
+            out += &format!(
+                "{:<20} {:>5} {:>8.2} {:>12} {:>10} {:>8} {:>8}  {}\n",
+                s.tag, s.round, s.rate_median, "n/a", "n/a", "n/a", "", ""
+            );
+            continue;
+        }
         any_pool_kv |= s.kv_is_pool;
         let bpt = roofline::bytes_per_token(s.weight_bytes, s.kv_bytes);
         let gbs = roofline::effective_gbs(bpt, s.rate_median);
@@ -482,6 +498,9 @@ pub fn roofline_table(starts: &[FreshStart]) -> String {
     if any_pool_kv {
         out += "note: ≤ marks KV from the device pool (upper bound; not per-sequence)\n";
     }
+    if any_unknown {
+        out += "note: n/a marks an MoE model with its expert size unknown to the server\n";
+    }
     out
 }
 
@@ -514,6 +533,7 @@ mod tests {
             weight_bytes: 0,
             kv_bytes: 0,
             kv_is_pool: false,
+            weights_unknown: false,
             devices: Vec::new(),
         }
     }
@@ -610,6 +630,16 @@ mod tests {
         // Round 1 median 36.7 → ~54.5% of 640; round 2 median 35.5 → ~52.7%.
         assert!(starts[0].contains("54.") || starts[0].contains("55."), "round1 pct: {}", starts[0]);
         assert!(starts[1].contains("52.") || starts[1].contains("53."), "round2 pct: {}", starts[1]);
+    }
+
+    #[test]
+    fn moe_with_unknown_weights_prints_na_not_a_dense_figure() {
+        let mut s = with_roofline(sample("o35", 1, 0, 39.3, "aa"), 0, 0, "RX 9070", 640.0);
+        s.weights_unknown = true;
+        let text = report_text(&[s]);
+        let line = text.lines().find(|l| l.starts_with("o35") && l.contains("n/a")).unwrap_or_else(|| panic!("{text}"));
+        assert!(!line.contains('%'), "{line}");
+        assert!(text.contains("expert size unknown"), "{text}");
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub struct RooflineSnap {
     /// True when `kv_bytes` is the whole device KV pool (upper bound), not
     /// an estimate for the sequence being decoded.
     pub kv_is_pool: bool,
+    /// True for an MoE model whose expert size the server could not report:
+    /// the weight bytes are then unknown, not dense.
+    pub weights_unknown: bool,
     pub devices: Vec<DeviceBand>,
 }
 
@@ -53,6 +56,23 @@ struct SettingsBody {
     placement: Vec<PlacementBits>,
     #[serde(default)]
     kv: Option<KvBits>,
+    /// Each layer's experts and their device; present for expert-parallel runs.
+    #[serde(default)]
+    expert_placement: Option<ExpertLayoutBits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpertLayoutBits {
+    #[serde(default)]
+    layers: Vec<ExpertHomeBits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpertHomeBits {
+    #[serde(default)]
+    device: String,
+    #[serde(default)]
+    bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +87,12 @@ struct ExpertBits {
     expert_slot_bytes: u64,
 }
 
+impl ExpertBits {
+    fn is_moe(&self) -> bool {
+        self.n_experts > 0 && self.n_active > 0 && self.n_active < self.n_experts
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PlacementBits {
     #[serde(default)]
@@ -75,6 +101,8 @@ struct PlacementBits {
     name: String,
     #[serde(default)]
     weight_bytes: Option<u64>,
+    #[serde(default)]
+    n_layers: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,9 +131,11 @@ impl KvBits {
 
 /// Build a snap from `/v1/status` and optional `/v1/model/settings` JSON.
 ///
-/// Dense models use resident weight bytes. MoE models use
-/// `shared + n_active × slot × n_layers` when `expert_slot_bytes` is known,
-/// so attention / embeddings / LM head are not scaled by the expert fraction.
+/// Dense models use resident weight bytes. MoE models charge each card its
+/// shared bytes plus `n_active / n_experts` of the experts it holds, so
+/// attention / embeddings / LM head are not scaled by the expert fraction.
+/// Experts held by RPC workers are read there, not on a local card. An MoE
+/// model whose expert size is unknown sets `weights_unknown`.
 ///
 /// `context_hint` is the tokens already on the warm sequence (warm-up length);
 /// when settings expose a KV estimate, that yields KV bytes for the decode
@@ -124,7 +154,17 @@ pub fn from_json(
         .map(|s| serde_json::from_str(s).map_err(|e| e.to_string()))
         .transpose()?;
 
-    let mut weight = moe_or_dense_weight(stats.weight_bytes_on_device, settings.as_ref().and_then(|s| s.experts.as_ref()));
+    let experts = settings.as_ref().and_then(|s| s.experts.as_ref()).filter(|ex| ex.is_moe());
+    let layout = settings.as_ref().and_then(|s| s.expert_placement.as_ref());
+    let n_layers = experts.map_or(0, |ex| ex.n_layers);
+    let mut weights_unknown = false;
+    let mut active = |resident: u64, device: Option<&str>, card_layers: u64| {
+        active_weight(resident, device, card_layers, experts, layout).unwrap_or_else(|| {
+            weights_unknown = true;
+            0
+        })
+    };
+    let mut weight = active(stats.weight_bytes_on_device, None, n_layers);
 
     let (kv_bytes, kv_is_pool) = match settings.as_ref().and_then(|s| s.kv.as_ref()) {
         Some(kv) if kv.full_bytes_per_token > 0 || kv.swa_bytes_per_token > 0 => {
@@ -137,7 +177,7 @@ pub fn from_json(
     let mut devices: Vec<DeviceBand> = status
         .devices
         .iter()
-        .filter(|d| is_accelerator(d))
+        .filter(|d| is_accelerator(d) && !d.name.starts_with("rpc["))
         .map(|d| DeviceBand {
             device: device_key(d),
             name: d.name.clone(),
@@ -150,9 +190,9 @@ pub fn from_json(
     // placement `device` key (`hip:0`), not the card name — identical MI50s
     // / K80s share a name.
     if let Some(settings) = &settings {
-        for p in &settings.placement {
+        for p in settings.placement.iter().filter(|p| !p.device.starts_with("rpc:")) {
             let Some(wb) = p.weight_bytes else { continue };
-            let scaled = moe_or_dense_weight(wb, settings.experts.as_ref());
+            let scaled = active(wb, Some(&p.device), p.n_layers);
             if let Some(dev) = devices.iter_mut().find(|d| d.device == p.device) {
                 dev.weight_bytes = scaled;
             } else if !p.device.is_empty() || !p.name.is_empty() {
@@ -182,29 +222,55 @@ pub fn from_json(
         devices[0].weight_bytes = weight;
     }
 
+    if weights_unknown {
+        weight = 0;
+        for d in &mut devices {
+            d.weight_bytes = 0;
+        }
+    }
+
     Ok(RooflineSnap {
         weight_bytes: weight,
         kv_bytes,
         kv_is_pool,
+        weights_unknown,
         devices,
     })
 }
 
-/// Active weights for MoE when slot size is known; else resident (dense).
-fn moe_or_dense_weight(resident: u64, experts: Option<&ExpertBits>) -> u64 {
+/// Weight bytes one decode token reads out of `resident` on `device` (`None`:
+/// every local card), which holds `card_layers` layers. `None` when the model
+/// is MoE and neither the expert layout nor the slot size is known.
+fn active_weight(
+    resident: u64,
+    device: Option<&str>,
+    card_layers: u64,
+    experts: Option<&ExpertBits>,
+    layout: Option<&ExpertLayoutBits>,
+) -> Option<u64> {
     let Some(ex) = experts else {
-        return resident;
+        return Some(resident);
     };
-    if ex.n_experts == 0 || ex.n_active == 0 || ex.n_active >= ex.n_experts || ex.expert_slot_bytes == 0 || ex.n_layers == 0
-    {
-        return resident;
+    if let Some(layout) = layout.filter(|l| !l.layers.is_empty()) {
+        let here = layout.layers.iter().filter(|h| match device {
+            Some(dev) => h.device == dev,
+            None => !h.device.starts_with("rpc:"),
+        });
+        let (pool, read) = here.fold((0u64, 0u64), |(pool, read), h| {
+            let share = (h.bytes as u128 * ex.n_active as u128 / ex.n_experts as u128) as u64;
+            (pool.saturating_add(h.bytes), read.saturating_add(share))
+        });
+        return Some(resident.saturating_sub(pool).saturating_add(read));
+    }
+    if ex.expert_slot_bytes == 0 {
+        return None;
     }
     let pool = ex
         .expert_slot_bytes
         .saturating_mul(ex.n_experts)
-        .saturating_mul(ex.n_layers);
+        .saturating_mul(card_layers);
     let shared = resident.saturating_sub(pool);
-    roofline::moe_active_weight_bytes(shared, ex.expert_slot_bytes, ex.n_active, ex.n_layers)
+    Some(roofline::moe_active_weight_bytes(shared, ex.expert_slot_bytes, ex.n_active, card_layers))
 }
 
 fn device_key(d: &DeviceBits) -> String {
@@ -337,6 +403,76 @@ mod tests {
         assert_eq!(snap.devices[1].weight_bytes, 6_000_000_000);
         assert_eq!(snap.devices[0].peak_gbs, 1024.0);
         assert_eq!(snap.weight_bytes, 16_000_000_000);
+    }
+
+    const XERES_STATUS: &str = r#"{
+        "stats": {"weight_bytes_on_device": 21850000000, "kv_bytes_on_device": 0},
+        "devices": [
+            {"id": 0, "kind": "HipGpu", "name": "AMD Radeon RX 9070", "bandwidth_gbps": 640.0},
+            {"id": 1, "kind": "HipGpu", "name": "AMD Radeon RX 9060 XT", "bandwidth_gbps": 320.0},
+            {"id": 1000, "kind": "HipGpu", "name": "rpc[192.168.69.2:50052#0]", "bandwidth_gbps": 1.0},
+            {"id": 1001, "kind": "HipGpu", "name": "rpc[192.168.69.2:50052#1]", "bandwidth_gbps": 1.0}
+        ]
+    }"#;
+
+    #[test]
+    fn moe_with_unknown_slot_size_is_not_reported_as_dense() {
+        let settings = r#"{
+            "experts": {"n_layers": 40, "n_experts": 256, "n_active": 8, "expert_slot_bytes": 0},
+            "placement": [
+                {"device": "hip:0", "name": "AMD Radeon RX 9070", "weight_bytes": 9000000000, "n_layers": 20},
+                {"device": "hip:1", "name": "AMD Radeon RX 9060 XT", "weight_bytes": 12850000000, "n_layers": 20}
+            ]
+        }"#;
+        let snap = from_json(XERES_STATUS, Some(settings), 40).unwrap();
+        assert!(snap.weights_unknown);
+    }
+
+    #[test]
+    fn moe_split_charges_each_card_only_its_own_expert_layers() {
+        // 40 layers of 600 MB experts: 10 on the 9070, 11 on the 9060 XT, 19 on sunny.
+        let mut layers = Vec::new();
+        layers.extend(std::iter::repeat(r#"{"device": "hip:0", "bytes": 600000000}"#).take(10));
+        layers.extend(std::iter::repeat(r#"{"device": "hip:1", "bytes": 600000000}"#).take(11));
+        layers.extend(std::iter::repeat(r#"{"device": "rpc:192.168.69.2:50052/0", "bytes": 600000000}"#).take(19));
+        let settings = format!(
+            r#"{{
+            "experts": {{"n_layers": 40, "n_experts": 256, "n_active": 8, "expert_slot_bytes": 0}},
+            "placement": [
+                {{"device": "hip:0", "name": "AMD Radeon RX 9070", "weight_bytes": 9000000000, "n_layers": 20}},
+                {{"device": "hip:1", "name": "AMD Radeon RX 9060 XT", "weight_bytes": 12850000000, "n_layers": 20}},
+                {{"device": "rpc:192.168.69.2:50052/0", "name": "AMD Instinct MI50", "weight_bytes": null, "n_layers": 0, "expert_layers": 19}}
+            ],
+            "expert_placement": {{"layers": [{}], "workers": []}}
+            }}"#,
+            layers.join(",")
+        );
+        let snap = from_json(XERES_STATUS, Some(&settings), 40).unwrap();
+        assert!(!snap.weights_unknown);
+        let active = |n: u64| n * 600_000_000 * 8 / 256;
+        let want0 = 9_000_000_000 - 10 * 600_000_000 + active(10);
+        let want1 = 12_850_000_000 - 11 * 600_000_000 + active(11);
+        assert_eq!(snap.devices.len(), 2, "remote GPUs are not local devices: {:?}", snap.devices);
+        assert_eq!(snap.devices[0].weight_bytes, want0);
+        assert_eq!(snap.devices[1].weight_bytes, want1);
+        assert_eq!(snap.weight_bytes, want0 + want1);
+    }
+
+    #[test]
+    fn local_moe_without_layout_uses_each_cards_layer_count() {
+        let slot = 1_000_000u64;
+        let settings = r#"{
+            "experts": {"n_layers": 40, "n_experts": 128, "n_active": 8, "expert_slot_bytes": 1000000},
+            "placement": [
+                {"device": "hip:0", "name": "AMD Radeon RX 9070", "weight_bytes": 9000000000, "n_layers": 28},
+                {"device": "hip:1", "name": "AMD Radeon RX 9060 XT", "weight_bytes": 5000000000, "n_layers": 12}
+            ]
+        }"#;
+        let snap = from_json(XERES_STATUS, Some(settings), 40).unwrap();
+        let card = |w: u64, nl: u64| w - slot * 128 * nl + slot * 8 * nl;
+        assert_eq!(snap.devices.len(), 2);
+        assert_eq!(snap.devices[0].weight_bytes, card(9_000_000_000, 28));
+        assert_eq!(snap.devices[1].weight_bytes, card(5_000_000_000, 12));
     }
 
     #[test]
