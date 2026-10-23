@@ -15566,6 +15566,88 @@ mod tests {
         assert!(gemm_nt_q2_0(&[0.0; 65], &[0u8; 36], &mut [0.0; 1], 1, 1, 65).is_err());
     }
 
+    /// One Q2_0 block, same product order as `q2_0_block_dot`: byte `w` then
+    /// its high half, each crumb as `(code - 1) * activation`, scale last.
+    #[cfg(feature = "hip")]
+    fn q2_0_block_dot_host(blk: &[u8], x: &[f32]) -> f32 {
+        let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let mut s = 0.0f32;
+        for w in 0..8 {
+            let pair = u32::from(u16::from_le_bytes([blk[2 + 2 * w], blk[3 + 2 * w]]));
+            for half in 0..2 {
+                let q = pair >> (8 * half);
+                let base = (2 * w + half) * 4;
+                for shift in 0..4 {
+                    let code = f32::from(((q >> (2 * shift)) & 3) as u8) - 1.0;
+                    s = code.mul_add(x[base + shift], s);
+                }
+            }
+        }
+        d * s
+    }
+
+    /// Host copy of `gemv_nt_q2_0_kernel`: four lanes take blocks `lane, lane+4, ...`
+    /// and the column is `(lane0 + lane1) + (lane2 + lane3)`.
+    #[cfg(feature = "hip")]
+    fn q2_0_gemv_lane_sum(a: &[f32], b: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let nblocks = k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+        let stride = allpaca_cpu::Q2_0_BLOCK_BYTES;
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            let arow = &a[row * k..(row + 1) * k];
+            for col in 0..n {
+                let brow = &b[col * nblocks * stride..(col + 1) * nblocks * stride];
+                let mut lanes = [0.0f32; 4];
+                for (ib, blk) in brow.chunks_exact(stride).enumerate() {
+                    lanes[ib % 4] += q2_0_block_dot_host(blk, &arow[ib * 64..(ib + 1) * 64]);
+                }
+                c[row * n + col] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            }
+        }
+        c
+    }
+
+    /// Public Q2_0 GEMV must keep the four-lane sum's bits. A packed-byte
+    /// unpack that changes a product or the add order fails here.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q2_0_matches_the_four_lane_sum_bit_for_bit() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1usize, 4usize, 64usize), (1, 70, 192), (2, 3, 320), (3, 65, 128)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            let nblocks = n * k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+            let mut b_q = vec![0u8; nblocks * allpaca_cpu::Q2_0_BLOCK_BYTES];
+            let mut seed = 0x9e37_79b9u32.wrapping_mul(si as u32 + 1);
+            for (bi, block) in b_q.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                let d = (0.01 + 0.003 * (bi % 17) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+            }
+            let host = q2_0_gemv_lane_sum(&a, &b_q, m, n, k);
+            let mut hip = vec![0.0f32; m * n];
+            gemm_nt_q2_0(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q2_0 must run when a device is present");
+            for i in 0..m * n {
+                assert_eq!(
+                    hip[i].to_bits(),
+                    host[i].to_bits(),
+                    "q2_0 lane-sum bits {m}x{n}x{k} idx={i} hip={} host={}",
+                    hip[i],
+                    host[i]
+                );
+            }
+        }
+    }
+
     /// Routed experts from a pool of Q2_0 slots must match the CPU's 8-bit
     /// products (gemv_q2_0_i8 on the input, then on the hidden row) up to
     /// the order of the sums, and the float SwiGLU within the rounding.
