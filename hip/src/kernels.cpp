@@ -1930,92 +1930,115 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
     const float scale = rsqrtf(static_cast<float>(head_dim));
     const size_t q_stride = static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
-
-    for (int d0 = 0; d0 < head_dim; d0 += 16) {
-        float m_run[8];
-        float l_run[8];
-        f32x8 acc;
+    /* head_dim <= 128, so at most eight 16-wide output tiles. Scores are
+     * computed once per key tile and reused for every output tile. */
+    constexpr int kMaxDTiles = 8;
+    const int n_dtiles = (head_dim + 15) / 16;
+    float m_run[8];
+    float l_run[8];
+    f32x8 acc[kMaxDTiles];
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        m_run[g] = -1.0e30f;
+        l_run[g] = 0.0f;
+    }
+#pragma unroll
+    for (int dt = 0; dt < kMaxDTiles; ++dt) {
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
-            m_run[g] = -1.0e30f;
-            l_run[g] = 0.0f;
-            acc[g] = 0.0f;
+            acc[dt][g] = 0.0f;
         }
-        for (int k0 = 0; k0 < n_kv; k0 += 16) {
-            f32x8 scores;
-#pragma unroll
-            for (int g = 0; g < 8; ++g) {
-                scores[g] = 0.0f;
-            }
-            for (int p0 = 0; p0 < head_dim; p0 += 16) {
-                f16x8 a_frag;
-                f16x8 b_frag;
-#pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    const int kd = p0 + 8 * (lane / 16) + e;
-                    const int qrow = row0 + (lane % 16);
-                    const int token = k0 + (lane % 16);
-                    a_frag[e] = static_cast<_Float16>(0.0f);
-                    b_frag[e] = static_cast<_Float16>(0.0f);
-                    if (qrow < n_q && kd < head_dim) {
-                        a_frag[e] = static_cast<_Float16>(
-                            q[(static_cast<size_t>(qrow) * n_heads + h) * head_dim + kd]);
-                    }
-                    if (token < n_kv && kd < head_dim) {
-                        b_frag[e] = static_cast<_Float16>(
-                            k[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + kd]);
-                    }
-                }
-                scores = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frag, b_frag, scores);
-            }
+    }
 
-            float p_lane[8];
-            float alpha[8];
+    for (int k0 = 0; k0 < n_kv; k0 += 16) {
+        f32x8 scores;
 #pragma unroll
-            for (int g = 0; g < 8; ++g) {
-                const int qrow = row0 + (lane / 16) * 8 + g;
-                const int token = k0 + (lane % 16);
-                const int t_max = qrow < n_q ? attn_row_tmax(qrow, n_q, n_kv, causal) : -1;
-                const bool valid = qrow < n_q && token < n_kv && token <= t_max;
-                const float s = valid ? scores[g] * scale : -1.0e30f;
-                float vmax = s;
-#pragma unroll
-                for (int off = 1; off < 16; off <<= 1) {
-                    vmax = fmaxf(vmax, __shfl_xor(vmax, off, 32));
-                }
-                const float m_new = fmaxf(m_run[g], vmax);
-                alpha[g] = __expf(m_run[g] - m_new);
-                const float p = valid ? __expf(s - m_new) : 0.0f;
-                float l_tile = p;
-#pragma unroll
-                for (int off = 1; off < 16; off <<= 1) {
-                    l_tile += __shfl_xor(l_tile, off, 32);
-                }
-                l_run[g] = alpha[g] * l_run[g] + l_tile;
-                m_run[g] = m_new;
-                p_lane[g] = p;
-                acc[g] *= alpha[g];
-            }
-
+        for (int g = 0; g < 8; ++g) {
+            scores[g] = 0.0f;
+        }
+        for (int p0 = 0; p0 < head_dim; p0 += 16) {
             f16x8 a_frag;
+            f16x8 b_frag;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
+                const int kd = p0 + 8 * (lane / 16) + e;
+                const int qrow = row0 + (lane % 16);
+                const int token = k0 + (lane % 16);
                 a_frag[e] = static_cast<_Float16>(0.0f);
-            }
-#pragma unroll
-            for (int gsrc = 0; gsrc < 8; ++gsrc) {
-                const float vreg = p_lane[gsrc];
-#pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    const int r = lane % 16;
-                    const int kk = 8 * (lane / 16) + e;
-                    const int src = (r / 8) * 16 + kk;
-                    const float got = __shfl(vreg, src, 32);
-                    if ((r % 8) == gsrc) {
-                        a_frag[e] = static_cast<_Float16>(got);
-                    }
+                b_frag[e] = static_cast<_Float16>(0.0f);
+                if (qrow < n_q && kd < head_dim) {
+                    a_frag[e] = static_cast<_Float16>(
+                        q[(static_cast<size_t>(qrow) * n_heads + h) * head_dim + kd]);
+                }
+                if (token < n_kv && kd < head_dim) {
+                    b_frag[e] = static_cast<_Float16>(
+                        k[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + kd]);
                 }
             }
+            scores = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frag, b_frag, scores);
+        }
+
+        float p_lane[8];
+        float alpha[8];
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int qrow = row0 + (lane / 16) * 8 + g;
+            const int token = k0 + (lane % 16);
+            const int t_max = qrow < n_q ? attn_row_tmax(qrow, n_q, n_kv, causal) : -1;
+            const bool valid = qrow < n_q && token < n_kv && token <= t_max;
+            const float s = valid ? scores[g] * scale : -1.0e30f;
+            float vmax = s;
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) {
+                vmax = fmaxf(vmax, __shfl_xor(vmax, off, 32));
+            }
+            const float m_new = fmaxf(m_run[g], vmax);
+            alpha[g] = __expf(m_run[g] - m_new);
+            const float p = valid ? __expf(s - m_new) : 0.0f;
+            float l_tile = p;
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) {
+                l_tile += __shfl_xor(l_tile, off, 32);
+            }
+            l_run[g] = alpha[g] * l_run[g] + l_tile;
+            m_run[g] = m_new;
+            p_lane[g] = p;
+        }
+#pragma unroll
+        for (int dt = 0; dt < kMaxDTiles; ++dt) {
+            if (dt < n_dtiles) {
+#pragma unroll
+                for (int g = 0; g < 8; ++g) {
+                    acc[dt][g] *= alpha[g];
+                }
+            }
+        }
+
+        f16x8 p_frag;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            p_frag[e] = static_cast<_Float16>(0.0f);
+        }
+#pragma unroll
+        for (int gsrc = 0; gsrc < 8; ++gsrc) {
+            const float vreg = p_lane[gsrc];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int r = lane % 16;
+                const int kk = 8 * (lane / 16) + e;
+                const int src = (r / 8) * 16 + kk;
+                const float got = __shfl(vreg, src, 32);
+                if ((r % 8) == gsrc) {
+                    p_frag[e] = static_cast<_Float16>(got);
+                }
+            }
+        }
+#pragma unroll
+        for (int dt = 0; dt < kMaxDTiles; ++dt) {
+            if (dt >= n_dtiles) {
+                continue;
+            }
+            const int d0 = dt * 16;
             f16x8 b_frag;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
@@ -2027,15 +2050,22 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
                         v[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + d]);
                 }
             }
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frag, b_frag, acc);
+            acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_frag, b_frag, acc[dt]);
         }
+    }
+#pragma unroll
+    for (int dt = 0; dt < kMaxDTiles; ++dt) {
+        if (dt >= n_dtiles) {
+            continue;
+        }
+        const int d0 = dt * 16;
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
             const int qrow = row0 + (lane / 16) * 8 + g;
             const int d = d0 + (lane % 16);
             if (qrow < n_q && d < head_dim && l_run[g] > 0.0f) {
                 out[static_cast<size_t>(qrow) * q_stride + static_cast<size_t>(h) * head_dim + d] =
-                    acc[g] / l_run[g];
+                    acc[dt][g] / l_run[g];
             }
         }
     }
