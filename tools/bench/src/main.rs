@@ -152,6 +152,16 @@ struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
+        // Windows leaves the process running after Child::kill, so the next
+        // round would time the same server. taskkill /T is what actually stops it.
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &self.0.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = self.0.wait();
     }
 }
@@ -171,18 +181,45 @@ fn start(server: &Path, config: &Path, timeout: Duration) -> Result<(Server, Tar
         key,
         max_tokens: 0,
     };
-    let child = Command::new(server)
-        .arg("--config")
-        .arg(config)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{}: {e}", server.display()))?;
-    let mut server = Server(child);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
+    // A previous server can still be answering on this port. Starting now would
+    // time that process and report a fresh start.
+    let down_by = Instant::now() + Duration::from_secs(20);
+    while client
+        .get(format!("{}/v1/models", target.url))
+        .bearer_auth(&target.key)
+        .send()
+        .is_ok_and(|r| r.status().is_success())
+    {
+        if Instant::now() > down_by {
+            return Err(format!(
+                "{}: port {} is still serving, so this would not be a fresh start",
+                config.display(),
+                cfg.http.port
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // A null stdout crashes the HIP server on Windows (exit 0xffffffff) before
+    // it listens. Keep the log beside the config so a failed start is readable.
+    let log_path = config.with_extension("server.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let err = log.try_clone().map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let child = Command::new(server)
+        .arg("--config")
+        .arg(config)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .map_err(|e| format!("{}: {e}", server.display()))?;
+    let mut server = Server(child);
     let started = Instant::now();
     loop {
         if let Ok(Some(status)) = server.0.try_wait() {
