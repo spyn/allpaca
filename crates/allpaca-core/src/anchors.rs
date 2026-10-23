@@ -240,8 +240,9 @@ pub fn restore_kv(
     rows: &[Vec<KvRow>],
     cfg: &ModelConfig,
 ) -> Result<(), AllpacaError> {
+    // The first layer with pages: a recurrent layer keeps none.
     let page_tokens = kv
-        .get(pages.first().and_then(|l| l.first()).copied().unwrap_or(0))
+        .get(pages.iter().find_map(|l| l.first()).copied().unwrap_or(0))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);
     for (layer, layer_rows) in rows.iter().enumerate() {
