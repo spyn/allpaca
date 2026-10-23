@@ -1202,23 +1202,25 @@ impl Engine {
                 )
             }
         };
+        // Copy the RPC counters whenever workers are attached: expert-parallel
+        // placement makes round trips without `placed_remote()` layers.
+        if let Some(rt) = &self.rpc {
+            self.metrics.rpc_roundtrips.store(
+                rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.rpc_activation_bytes.store(
+                rt.activation_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.rpc_h2d_bytes.store(
+                rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         let (backend, device_memory_bytes) =
             if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
-                if let Some(rt) = &self.rpc {
-                    self.metrics.rpc_roundtrips.store(
-                        rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    self.metrics.rpc_activation_bytes.store(
-                        rt.activation_bytes
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    self.metrics.rpc_h2d_bytes.store(
-                        rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
                 ("rpc".into(), allpaca_hip::allocated_bytes())
             } else if self.hip.is_some() {
                 ("hip".into(), allpaca_hip::allocated_bytes())
@@ -1363,7 +1365,7 @@ impl Engine {
         } else {
             "p2p_unavailable"
         };
-        let mut snap = self.metrics.snapshot(
+        let mut snapshot = self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
             self.inventory.p2p_capable,
@@ -1379,8 +1381,11 @@ impl Engine {
             backend,
             draft_depth,
         );
-        snap.exactness = self.config.exactness().as_str().into();
-        snap
+        snapshot.exactness = self.config.exactness().as_str().into();
+        if let Some(rt) = &self.rpc {
+            snapshot.rpc_workers = rt.worker_calls();
+        }
+        snapshot
     }
 
     pub fn model_id(&self) -> String {
@@ -3038,18 +3043,28 @@ impl Engine {
         self.metrics
             .prompt_tokens
             .fetch_add(prompt_len as u64, std::sync::atomic::Ordering::Relaxed);
-        // One chunk only — remaining prompt tokens continue in `step` so a
-        // second Request can admit / decode between chunks.
-        // Another Request's decode logits may still be in flight: land them
-        // before this prefill's forward reuses the pinned logits slot.
-        self.drain_foreign_logits(&mut inner, id)?;
-        self.prefill_chunk(&mut inner, id)?;
-        Ok(RequestHandle {
+        // The Request is in `active` now: from here on a failure must drop
+        // its handle, which gives back the slot and the KV pages.
+        let handle = RequestHandle {
             id,
             inner: Arc::clone(&self.inner),
             metrics: Arc::clone(&self.metrics),
             hip: self.hip.clone(),
-        })
+        };
+        // One chunk only — remaining prompt tokens continue in `step` so a
+        // second Request can admit / decode between chunks.
+        // Another Request's decode logits may still be in flight: land them
+        // before this prefill's forward reuses the pinned logits slot.
+        let admitted = self
+            .drain_foreign_logits(&mut inner, id)
+            .and_then(|()| self.prefill_chunk(&mut inner, id));
+        if let Err(e) = admitted {
+            // `Drop` takes the engine lock.
+            drop(inner);
+            drop(handle);
+            return Err(e);
+        }
+        Ok(handle)
     }
 
     fn hip_workspace_for_device(&self, device: i32) -> Option<&HipWorkspace> {
@@ -10601,6 +10616,38 @@ mod tests {
         engine
             .begin_request("world", params)
             .expect("lock released after Request handle drop");
+    }
+
+    /// A Request whose first prefill fails must give its slot back: before,
+    /// one failure (an MTP draft with nowhere to run) left every later
+    /// Request answered "another request is already active".
+    #[test]
+    fn failed_admission_releases_the_request_slot() {
+        let engine = test_engine();
+        {
+            let mut inner = engine.lock().unwrap();
+            let target = inner.target.as_ref().unwrap();
+            let mut draft = (**target).clone();
+            // An MTP draft with neither host weights nor a resident upload:
+            // the state a large-GGUF MTP drafter on the target's own card is in.
+            draft.config.gguf_layer_base = draft.config.n_layers;
+            draft.embed = Vec::new();
+            inner.draft_model = Some(Arc::new(draft));
+            inner.draft_resident = None;
+        }
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            ..GenerationParams::default()
+        };
+        let first = engine.begin_request("hello", params.clone());
+        assert!(first.is_err(), "the broken draft must fail admission");
+        let second = engine.begin_request("world", params).unwrap_err();
+        assert!(
+            !matches!(second, AllpacaError::Transient(TransientError::RequestBusy)),
+            "the failed Request still holds its slot"
+        );
+        assert_eq!(engine.lock().unwrap().active.len(), 0);
     }
 
     #[test]

@@ -311,6 +311,7 @@ impl Metrics {
             residual_gpu_ops: self.residual_gpu_ops.load(Ordering::Relaxed),
             activation_h2d_bytes: self.activation_h2d_bytes.load(Ordering::Relaxed),
             activation_d2h_bytes: self.activation_d2h_bytes.load(Ordering::Relaxed),
+            hip_kernel_launches: allpaca_hip::kernel_launches(),
             q8_gemm_us: self.q8_gemm_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             attention_us: self.attention_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
             lm_head_us: self.lm_head_ns.load(Ordering::Relaxed) as f64 / 1_000.0,
@@ -391,6 +392,8 @@ impl Metrics {
             mtp_process_skips: self.mtp_process_skips.load(Ordering::Relaxed),
             draft_depth,
             rpc_roundtrips: self.rpc_roundtrips.load(Ordering::Relaxed),
+            // Filled by `Engine::stats` from the RPC runtime's session counters.
+            rpc_workers: Vec::new(),
             rpc_activation_bytes: self.rpc_activation_bytes.load(Ordering::Relaxed),
             rpc_h2d_bytes: self.rpc_h2d_bytes.load(Ordering::Relaxed),
             vision_bytes_on_device: self.vision_bytes_on_device.load(Ordering::Relaxed),

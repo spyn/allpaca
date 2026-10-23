@@ -27,6 +27,17 @@
 
 #include <atomic>
 #include <mutex>
+
+/* Every kernel launch in this file goes through hipLaunchKernelGGL; count them
+ * (process-wide, relaxed) so `/stats` can report launches per token. */
+static std::atomic<uint64_t> g_kernel_launches{0};
+#undef hipLaunchKernelGGL
+#define hipLaunchKernelGGL(kernelName, ...)                                  \
+    do {                                                                     \
+        g_kernel_launches.fetch_add(1, std::memory_order_relaxed);           \
+        hipLaunchKernelGGLInternal((kernelName), __VA_ARGS__);               \
+    } while (0)
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -6581,6 +6592,10 @@ extern "C" int allpaca_gemm_nt_q5_k_untiled(const float *a, const uint8_t *b, fl
     return hip_status(hipGetLastError());
 }
 
+extern "C" uint64_t allpaca_hip_kernel_launches(void) {
+    return g_kernel_launches.load(std::memory_order_relaxed);
+}
+
 extern "C" int allpaca_hip_device_count(int32_t *count) {
     if (!count) {
         return ALLPACA_ERR_INVALID;
@@ -6643,6 +6658,21 @@ extern "C" int allpaca_hip_device_arch(int32_t id, char *arch, int32_t arch_len,
     if (l2_bytes) {
         *l2_bytes = prop.l2CacheSize;
     }
+    return ALLPACA_OK;
+}
+
+/* hipDeviceProp_t::multiProcessorCount: CUs on CDNA/GCN, WGPs on RDNA. */
+extern "C" int allpaca_hip_device_multiprocessors(int32_t id, int32_t *count) {
+    if (!count) {
+        return ALLPACA_ERR_INVALID;
+    }
+    hipDeviceProp_t prop{};
+    hipError_t err = hipGetDeviceProperties(&prop, id);
+    if (err != hipSuccess) {
+        *count = 0;
+        return ALLPACA_ERR_DEVICE;
+    }
+    *count = prop.multiProcessorCount;
     return ALLPACA_OK;
 }
 
@@ -10681,6 +10711,8 @@ extern "C" int allpaca_moe_ffn_kquant(const float *, const int8_t *, const float
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" uint64_t allpaca_hip_kernel_launches(void) { return 0; }
+
 extern "C" int allpaca_hip_device_count(int32_t *count) {
     if (count) {
         *count = 0;
@@ -10693,6 +10725,13 @@ extern "C" int allpaca_hip_device_props(int32_t, char *, int32_t, uint64_t *, do
 }
 
 extern "C" int allpaca_hip_device_arch(int32_t, char *, int32_t, int32_t *) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_device_multiprocessors(int32_t, int32_t *count) {
+    if (count) {
+        *count = 0;
+    }
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
