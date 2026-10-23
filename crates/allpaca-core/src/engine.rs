@@ -287,6 +287,29 @@ pub struct Engine {
     /// Last values `stats` / `model_id` read under `inner`, served while a
     /// prefill holds the engine lock.
     read_side: Arc<Mutex<ReadSide>>,
+    /// One routed expert's bytes in the loaded GGUF, for models whose experts
+    /// sit only in fused device buffers (no per-expert host objects).
+    gguf_expert_slot: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// One routed expert's gate+up+down bytes as `file` stores them, from the
+/// first block with stacked experts; 0 when it has none.
+fn gguf_expert_slot_bytes(file: &GgufFile, n_experts: usize) -> u64 {
+    let is_stack = |name: &str| name.contains(".ffn_") && name.ends_with("_exps.weight");
+    let Some(first) = file.tensors.iter().find(|t| is_stack(&t.name)) else {
+        return 0;
+    };
+    if n_experts == 0 {
+        return 0;
+    }
+    let block = &first.name[..first.name.find(".ffn_").unwrap_or(0)];
+    let stack: usize = file
+        .tensors
+        .iter()
+        .filter(|t| is_stack(&t.name) && t.name.split_once(".ffn_").is_some_and(|(b, _)| b == block))
+        .map(|t| t.nbytes())
+        .sum();
+    (stack / n_experts) as u64
 }
 
 /// Starts the GPU BLAS library on `device` from a background thread while the
@@ -686,6 +709,7 @@ impl Engine {
             rpc,
             poll_tick: Arc::new(Mutex::new(())),
             read_side: Arc::new(Mutex::new(ReadSide::default())),
+            gguf_expert_slot: Arc::default(),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -779,6 +803,21 @@ impl Engine {
     /// Live stats for every GPU on the RPC workers (empty without RPC).
     pub fn remote_gpus(&self) -> Vec<crate::rpc_runtime::RemoteGpu> {
         self.rpc.as_ref().map(|r| r.remote_gpu_stats()).unwrap_or_default()
+    }
+
+    /// Bytes of one routed expert's weights (gate+up+down), or 0 when the
+    /// loaded model has no MoE experts. Used by the bench roofline.
+    pub fn expert_slot_bytes(&self) -> u64 {
+        let held = self
+            .lock()
+            .ok()
+            .and_then(|inner| inner.target.as_ref().map(|m| m.expert_slot_bytes() as u64))
+            .unwrap_or(0);
+        if held > 0 {
+            held
+        } else {
+            self.gguf_expert_slot.load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     /// The loaded target's expert controls, sized to its routed experts.
@@ -1899,6 +1938,10 @@ impl Engine {
         } else {
             TinyModel::from_gguf(&file)?
         };
+        self.gguf_expert_slot.store(
+            gguf_expert_slot_bytes(&file, model.config.n_experts),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         model.bind_gguf(file.clone());
         #[cfg(feature = "cuda")]
         let has_cuda = self.cuda.is_some();
@@ -15973,6 +16016,17 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
             )
             .expect("GGUF generate must still work");
         assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn gguf_expert_slot_bytes_reads_the_stacked_tensors() {
+        let path = std::env::temp_dir().join("allpaca_moe_slot_bytes.gguf");
+        write_tiny_moe_gguf(&path);
+        let file = GgufFile::open(&path).unwrap();
+        // 4 F32 experts, each gate + up (16×8) and down (8×16).
+        assert_eq!(gguf_expert_slot_bytes(&file, 4), 3 * 16 * 8 * 4);
+        assert_eq!(gguf_expert_slot_bytes(&file, 0), 0);
         let _ = std::fs::remove_file(path);
     }
 

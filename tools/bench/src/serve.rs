@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::roofline;
+use crate::snap::{self, RooflineSnap};
+
 /// The prompts used when none are given: code, explanation, prose.
 pub const PROMPTS: [&str; 3] = [
     "Write a Python function that parses an ISO 8601 date string without using datetime, with tests.",
@@ -24,6 +27,20 @@ pub struct Target {
     pub url: String,
     pub key: String,
     pub max_tokens: usize,
+}
+
+/// One GPU (or RPC card) that held weights for a start, for the roofline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceBand {
+    /// Inventory key (`hip:0`, `cuda:1`, …). Empty in older jsonl.
+    #[serde(default)]
+    pub device: String,
+    pub name: String,
+    /// Peak memory bandwidth in GB/s (published table or inventory).
+    pub peak_gbs: f64,
+    /// Weight bytes on this device for the bytes/token split. 0 = unknown.
+    #[serde(default)]
+    pub weight_bytes: u64,
 }
 
 /// One request's result.
@@ -44,6 +61,21 @@ pub struct Sample {
     pub at: u64,
     /// Requests running at the same time, this one included.
     pub concurrency: usize,
+    /// Weight bytes read per decode token (dense = resident; MoE = active).
+    #[serde(default)]
+    pub weight_bytes: u64,
+    /// KV bytes read per decode token (or device pool upper bound).
+    #[serde(default)]
+    pub kv_bytes: u64,
+    /// True when `kv_bytes` is the whole device KV pool, not a per-sequence estimate.
+    #[serde(default)]
+    pub kv_is_pool: bool,
+    /// True for an MoE model whose active weight bytes are unknown.
+    #[serde(default)]
+    pub weights_unknown: bool,
+    /// Devices that held weights for this start. Empty = no roofline line.
+    #[serde(default)]
+    pub devices: Vec<DeviceBand>,
     /// From `/stats` `exactness`: `exact`, `distribution-exact`, or `lossy`.
     #[serde(default = "exact_default")]
     pub exactness: String,
@@ -132,10 +164,20 @@ fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// Copy roofline fields from a server snap onto a sample.
+pub fn apply_snap(sample: &mut Sample, snap: &RooflineSnap) {
+    sample.weight_bytes = snap.weight_bytes;
+    sample.kv_bytes = snap.kv_bytes;
+    sample.kv_is_pool = snap.kv_is_pool;
+    sample.weights_unknown = snap.weights_unknown;
+    sample.devices = snap.devices.clone();
+}
+
 /// `rounds` rounds of `prompts` against `target`, numbered from
 /// `first_round`, `concurrency` requests at a time (the prompts of a round
 /// are spread over them), after one short warm-up request. Each sample is
-/// handed to `seen` as it arrives.
+/// handed to `seen` as it arrives. After warm-up, `/v1/status` (and
+/// settings) fill bytes/device fields for the roofline report.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     target: &Target,
@@ -151,6 +193,13 @@ pub fn run(
         let warm = Target { max_tokens: warmup_tokens, ..target.clone() };
         chat(&warm, prompts.first().map_or(PROMPTS[0], String::as_str))?;
     }
+    let snap = match snap::fetch(target, warmup_tokens as u64) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("allpaca-bench: roofline snap skipped: {e}");
+            None
+        }
+    };
     let exactness = fetch_exactness(target).unwrap_or_else(|_| "exact".into());
     let concurrency = concurrency.max(1);
     let mut samples = Vec::new();
@@ -166,7 +215,7 @@ pub fn run(
             });
             for (prompt, result) in results {
                 let (first_token_s, pieces, rate, sha) = result?;
-                let sample = Sample {
+                let mut sample = Sample {
                     tag: tag.to_string(),
                     round,
                     prompt,
@@ -176,8 +225,16 @@ pub fn run(
                     sha,
                     at: now_unix(),
                     concurrency: group.len(),
+                    weight_bytes: 0,
+                    kv_bytes: 0,
+                    kv_is_pool: false,
+                    weights_unknown: false,
+                    devices: Vec::new(),
                     exactness: exactness.clone(),
                 };
+                if let Some(snap) = &snap {
+                    apply_snap(&mut sample, snap);
+                }
                 seen(&sample);
                 samples.push(sample);
             }
@@ -308,6 +365,191 @@ pub fn table(summaries: &[Summary]) -> String {
     out
 }
 
+/// One `(tag, round)` group for the roofline section (an `ab` fresh start,
+/// or one round of `run` against a long-lived server).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshStart {
+    pub tag: String,
+    pub round: usize,
+    pub rate_median: f64,
+    pub weight_bytes: u64,
+    pub kv_bytes: u64,
+    pub kv_is_pool: bool,
+    pub weights_unknown: bool,
+    pub devices: Vec<DeviceBand>,
+}
+
+/// One row per `(tag, round)` that recorded weight bytes, in first-seen order.
+pub fn fresh_starts(samples: &[Sample]) -> Vec<FreshStart> {
+    let mut keys: Vec<(String, usize)> = Vec::new();
+    for s in samples {
+        if s.weight_bytes == 0 && s.kv_bytes == 0 && !s.weights_unknown {
+            continue;
+        }
+        let key = (s.tag.clone(), s.round);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys.into_iter()
+        .map(|(tag, round)| {
+            let of: Vec<&Sample> = samples.iter().filter(|s| s.tag == tag && s.round == round).collect();
+            let rates: Vec<f64> = of.iter().map(|s| s.rate).collect();
+            let first = of[0];
+            FreshStart {
+                tag,
+                round,
+                rate_median: median(rates),
+                weight_bytes: first.weight_bytes,
+                kv_bytes: first.kv_bytes,
+                kv_is_pool: first.kv_is_pool,
+                weights_unknown: first.weights_unknown,
+                devices: first.devices.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Ceiling tok/s from per-device bytes and peaks: 1 / Σ(Bᵢ / peakᵢ).
+pub fn split_ceiling_tok_s(parts: &[(u64, f64)]) -> f64 {
+    let mut secs = 0.0;
+    for &(bytes, peak) in parts {
+        if peak <= 0.0 || bytes == 0 {
+            continue;
+        }
+        secs += bytes as f64 / (peak * 1e9);
+    }
+    if secs <= 0.0 {
+        0.0
+    } else {
+        1.0 / secs
+    }
+}
+
+fn format_gb(bytes: f64) -> String {
+    format!("{:.2} GB", bytes / 1e9)
+}
+
+/// Spread `kv` across devices in proportion to their weight bytes.
+fn distribute_kv(weight_parts: &[(u64, f64)], kv: u64) -> Vec<(u64, f64)> {
+    let total_w: u64 = weight_parts.iter().map(|(w, _)| *w).sum();
+    if total_w == 0 || kv == 0 {
+        return weight_parts.to_vec();
+    }
+    let mut left = kv;
+    let n = weight_parts.len();
+    weight_parts
+        .iter()
+        .enumerate()
+        .map(|(i, &(w, peak))| {
+            let share = if i + 1 == n {
+                left
+            } else {
+                let s = (kv as u128 * w as u128 / total_w as u128) as u64;
+                left = left.saturating_sub(s);
+                s
+            };
+            (w.saturating_add(share), peak)
+        })
+        .collect()
+}
+
+/// Roofline lines per `(tag, round)`, or empty when no sample recorded bytes.
+pub fn roofline_table(starts: &[FreshStart]) -> String {
+    if starts.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("roofline by round (bytes/token, effective GB/s, % of peak)\n");
+    out += &format!(
+        "{:<20} {:>5} {:>8} {:>12} {:>10} {:>8} {:>8}  {}\n",
+        "tag", "round", "tok/s", "bytes/tok", "GB/s", "% peak", "peak", "devices"
+    );
+    let mut any_pool_kv = false;
+    let mut any_unknown = false;
+    for s in starts {
+        if s.weights_unknown {
+            any_unknown = true;
+            out += &format!(
+                "{:<20} {:>5} {:>8.2} {:>12} {:>10} {:>8} {:>8}  {}\n",
+                s.tag, s.round, s.rate_median, "n/a", "n/a", "n/a", "", ""
+            );
+            continue;
+        }
+        any_pool_kv |= s.kv_is_pool;
+        let bpt = roofline::bytes_per_token(s.weight_bytes, s.kv_bytes);
+        let gbs = roofline::effective_gbs(bpt, s.rate_median);
+        let (pct, peak_label, device_note) = if s.devices.len() > 1
+            && s.devices.iter().any(|d| d.weight_bytes > 0)
+        {
+            let weight_parts: Vec<(u64, f64)> = s
+                .devices
+                .iter()
+                .map(|d| (d.weight_bytes, d.peak_gbs))
+                .collect();
+            let parts = distribute_kv(&weight_parts, s.kv_bytes);
+            let ceiling = split_ceiling_tok_s(&parts);
+            let pct = if ceiling > 0.0 { s.rate_median / ceiling * 100.0 } else { 0.0 };
+            let note = s
+                .devices
+                .iter()
+                .map(|d| {
+                    let key = if d.device.is_empty() {
+                        d.name.as_str()
+                    } else {
+                        d.device.as_str()
+                    };
+                    format!("{key}@{:.0}", d.peak_gbs)
+                })
+                .collect::<Vec<_>>()
+                .join("+");
+            (pct, "split".to_string(), note)
+        } else {
+            let peak = s
+                .devices
+                .first()
+                .map(|d| roofline::peak_for(&d.name, d.peak_gbs))
+                .unwrap_or(0.0);
+            let pct = roofline::pct_of_peak(gbs, peak);
+            let name = s.devices.first().map(|d| d.name.as_str()).unwrap_or("?");
+            (pct, format!("{peak:.0}"), name.to_string())
+        };
+        let bytes_col = if s.kv_is_pool {
+            format!("≤{}/tok", format_gb(bpt))
+        } else {
+            format!("{}/tok", format_gb(bpt))
+        };
+        out += &format!(
+            "{:<20} {:>5} {:>8.2} {:>12} {:>10.1} {:>7.1}% {:>8}  {}\n",
+            s.tag,
+            s.round,
+            s.rate_median,
+            bytes_col,
+            gbs,
+            pct,
+            peak_label,
+            device_note
+        );
+    }
+    if any_pool_kv {
+        out += "note: ≤ marks KV from the device pool (upper bound; not per-sequence)\n";
+    }
+    if any_unknown {
+        out += "note: n/a marks an MoE model with its expert size unknown to the server\n";
+    }
+    out
+}
+
+/// Rate summary plus roofline fresh-start lines when bytes were recorded.
+pub fn report_text(samples: &[Sample]) -> String {
+    let mut out = table(&summarize(samples));
+    let roof = roofline_table(&fresh_starts(samples));
+    if !roof.is_empty() {
+        out.push('\n');
+        out.push_str(&roof);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +565,11 @@ mod tests {
             sha: sha.into(),
             at: 0,
             concurrency: 1,
+            weight_bytes: 0,
+            kv_bytes: 0,
+            kv_is_pool: false,
+            weights_unknown: false,
+            devices: Vec::new(),
             exactness: "exact".into(),
         }
     }
@@ -384,6 +631,86 @@ mod tests {
         // Two at once at 14 each is 28 in total: +60% on the base's 17.5.
         assert!(row("pair").contains("28.00") && row("pair").contains("+60.0%"), "{table}");
         assert!(row("pair").ends_with("same as first"), "{table}");
+    }
+
+    fn with_roofline(mut s: Sample, weight: u64, kv: u64, device: &str, peak: f64) -> Sample {
+        s.weight_bytes = weight;
+        s.kv_bytes = kv;
+        s.devices = vec![DeviceBand {
+            device: format!("hip:0"),
+            name: device.into(),
+            peak_gbs: peak,
+            weight_bytes: weight,
+        }];
+        s
+    }
+
+    #[test]
+    fn report_lists_each_round_with_bytes_gbs_and_pct_of_peak() {
+        // Two ab rounds on the 9070: same bytes, different rates — listed apart.
+        let samples = vec![
+            with_roofline(sample("ornith", 1, 0, 36.0, "aa"), 9_500_000_000, 0, "RX 9070", 640.0),
+            with_roofline(sample("ornith", 1, 1, 37.4, "bb"), 9_500_000_000, 0, "RX 9070", 640.0),
+            with_roofline(sample("ornith", 2, 0, 35.0, "aa"), 9_500_000_000, 0, "RX 9070", 640.0),
+            with_roofline(sample("ornith", 2, 1, 36.0, "bb"), 9_500_000_000, 0, "RX 9070", 640.0),
+        ];
+        let text = report_text(&samples);
+        assert!(text.contains("roofline by round"), "{text}");
+        let starts: Vec<&str> = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("ornith") && l.contains("GB/tok"))
+            .collect();
+        assert_eq!(starts.len(), 2, "{text}");
+        assert!(starts[0].contains("9.50 GB/tok") && starts[0].contains("640") && starts[0].contains('%'), "{text}");
+        assert!(starts[1].contains("9.50 GB/tok"), "{text}");
+        // Round 1 median 36.7 → ~54.5% of 640; round 2 median 35.5 → ~52.7%.
+        assert!(starts[0].contains("54.") || starts[0].contains("55."), "round1 pct: {}", starts[0]);
+        assert!(starts[1].contains("52.") || starts[1].contains("53."), "round2 pct: {}", starts[1]);
+    }
+
+    #[test]
+    fn moe_with_unknown_weights_prints_na_not_a_dense_figure() {
+        let mut s = with_roofline(sample("o35", 1, 0, 39.3, "aa"), 0, 0, "RX 9070", 640.0);
+        s.weights_unknown = true;
+        let text = report_text(&[s]);
+        let line = text.lines().find(|l| l.starts_with("o35") && l.contains("n/a")).unwrap_or_else(|| panic!("{text}"));
+        assert!(!line.contains('%'), "{line}");
+        assert!(text.contains("expert size unknown"), "{text}");
+    }
+
+    #[test]
+    fn old_jsonl_without_bytes_still_prints_the_rate_table() {
+        let samples = vec![sample("base", 1, 0, 16.0, "aa")];
+        let text = report_text(&samples);
+        assert!(text.contains("median"), "{text}");
+        assert!(!text.contains("roofline by round"), "no roofline without bytes: {text}");
+    }
+
+    #[test]
+    fn layer_split_reports_share_of_split_ceiling() {
+        // 10 GB on 640 + 6 GB on 320 → ceiling ≈ 1/(10/640e9 + 6/320e9) ≈ 29.1 tok/s.
+        // Measured 17.9 → ~61% of ceiling.
+        let mut s = sample("q38", 1, 0, 17.9, "aa");
+        s.weight_bytes = 16_000_000_000;
+        s.kv_bytes = 0;
+        s.devices = vec![
+            DeviceBand {
+                device: "hip:0".into(),
+                name: "RX 9070".into(),
+                peak_gbs: 640.0,
+                weight_bytes: 10_000_000_000,
+            },
+            DeviceBand {
+                device: "hip:1".into(),
+                name: "RX 9060 XT".into(),
+                peak_gbs: 320.0,
+                weight_bytes: 6_000_000_000,
+            },
+        ];
+        let text = report_text(&[s]);
+        let line = text.lines().find(|l| l.contains("q38") && l.contains("GB/tok")).unwrap();
+        assert!(line.contains("split"), "{line}");
+        assert!(line.contains("61.") || line.contains("62.") || line.contains("60."), "{line}");
     }
 
     #[test]

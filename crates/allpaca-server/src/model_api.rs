@@ -25,6 +25,9 @@ struct ExpertInfo {
     n_layers: usize,
     n_experts: usize,
     n_active: usize,
+    /// Bytes of one expert's gate+up+down (0 when unknown). Bench roofline
+    /// uses this so only routed experts are scaled by n_active/n_experts.
+    expert_slot_bytes: u64,
     recording: bool,
     disabled_total: usize,
 }
@@ -68,12 +71,14 @@ fn bad_request(msg: impl Into<String>) -> Response {
 fn settings_body(state: &AppState) -> SettingsBody {
     let settings = state.settings.get();
     let engine = state.engine();
-    let experts = engine.as_ref().and_then(|e| e.expert_controls()).and_then(|ctl| {
+    let experts = engine.as_ref().and_then(|e| {
+        let ctl = e.expert_controls()?;
         let shape = ctl.shape();
         (shape.n_experts > 0).then(|| ExpertInfo {
             n_layers: shape.n_layers,
             n_experts: shape.n_experts,
             n_active: shape.n_active,
+            expert_slot_bytes: e.expert_slot_bytes(),
             recording: ctl.recording(),
             disabled_total: ctl.disabled().iter().map(Vec::len).sum(),
         })
