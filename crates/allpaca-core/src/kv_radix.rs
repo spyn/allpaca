@@ -141,12 +141,27 @@ pub(crate) struct Listed {
 #[derive(Debug)]
 pub(crate) struct LocalDir {
     dir: PathBuf,
+    /// Text of the folder's `key.txt`, written again if the folder is.
+    key: Option<String>,
 }
+
+/// The file in a checkpoint folder that names what its checkpoints belong to.
+pub(crate) const KEY_FILE: &str = "key.txt";
 
 impl LocalDir {
     pub(crate) fn open(dir: &Path) -> Result<Self, AllpacaError> {
         std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
-        Ok(Self { dir: dir.to_path_buf() })
+        Ok(Self { dir: dir.to_path_buf(), key: None })
+    }
+
+    /// Write `text` to the folder's [`KEY_FILE`] now and whenever the folder
+    /// has to be made again.
+    pub(crate) fn with_key(mut self, text: &str) -> Self {
+        if let Err(e) = std::fs::write(self.dir.join(KEY_FILE), text) {
+            tracing::warn!(error = %e, dir = %self.dir.display(), "checkpoint folder: key.txt not written");
+        }
+        self.key = Some(text.to_string());
+        self
     }
 }
 
@@ -161,6 +176,9 @@ impl CheckpointStore for LocalDir {
                     return Err(e);
                 }
                 std::fs::create_dir_all(&self.dir)?;
+                if let Some(key) = &self.key {
+                    std::fs::write(self.dir.join(KEY_FILE), key)?;
+                }
                 write_file(&file, data)
             })
             .map_err(|e| e.to_string())

@@ -4666,7 +4666,7 @@ impl Engine {
         let store: Result<Box<dyn crate::kv_radix::CheckpointStore>, AllpacaError> = match (worker, pc.disk_dir.as_ref()) {
             (Some(store), _) => Ok(Box::new(store)),
             (None, Some(dir)) => open_prompt_cache_folder(dir, &folder, &fingerprint, pc.disk_bytes as u64).map(|d| {
-                inner.prompt_cache_touch = Some(PromptCacheTouch::new(dir.join(&folder)));
+                inner.prompt_cache_touch = Some(PromptCacheTouch::new(dir.join(&folder), fingerprint.clone()));
                 Box::new(d) as _
             }),
             (None, None) => {
@@ -5842,18 +5842,21 @@ const PROMPT_CACHE_TOUCH_EVERY: std::time::Duration = std::time::Duration::from_
 
 /// Marks the open prompt-cache folder used: sets its `key.txt`'s
 /// modification time, so [`prune_prompt_cache_folders`] in another server
-/// sees it live even when this one only reads.
+/// sees it live even when this one only reads. A missing `key.txt` (the
+/// folder pruned and made again) is written again from `fingerprint`.
 #[derive(Debug)]
 struct PromptCacheTouch {
     key_file: std::path::PathBuf,
+    fingerprint: String,
     last: std::time::Instant,
 }
 
 impl PromptCacheTouch {
-    /// For the folder `dir`, whose `key.txt` was just written.
-    fn new(dir: std::path::PathBuf) -> Self {
+    /// For the folder `dir`, whose `key.txt` holds `fingerprint`.
+    fn new(dir: std::path::PathBuf, fingerprint: String) -> Self {
         Self {
-            key_file: dir.join("key.txt"),
+            key_file: dir.join(crate::kv_radix::KEY_FILE),
+            fingerprint,
             last: std::time::Instant::now(),
         }
     }
@@ -5863,10 +5866,19 @@ impl PromptCacheTouch {
             return;
         }
         self.last = std::time::Instant::now();
-        let touched = std::fs::File::options()
-            .write(true)
-            .open(&self.key_file)
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        let touched = if self.key_file.exists() {
+            std::fs::File::options()
+                .write(true)
+                .open(&self.key_file)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+        } else {
+            // Only into a folder that exists: the store makes it again on its
+            // next write.
+            match self.key_file.parent() {
+                Some(dir) if dir.is_dir() => std::fs::write(&self.key_file, &self.fingerprint),
+                _ => Ok(()),
+            }
+        };
         if let Err(e) = touched {
             tracing::debug!(error = %e, file = %self.key_file.display(), "prompt cache: key.txt not touched");
         }
@@ -5884,10 +5896,7 @@ fn open_prompt_cache_folder(
     budget: u64,
 ) -> Result<crate::kv_radix::LocalDir, AllpacaError> {
     let dir = root.join(keep);
-    let opened = crate::kv_radix::LocalDir::open(&dir)?;
-    if let Err(e) = std::fs::write(dir.join("key.txt"), fingerprint) {
-        tracing::warn!(error = %e, "prompt cache: key.txt not written");
-    }
+    let opened = crate::kv_radix::LocalDir::open(&dir)?.with_key(fingerprint);
     prune_prompt_cache_folders(
         root,
         keep,
@@ -10087,17 +10096,55 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_folder_used_today_is_not_pruned_for_the_budget() {
+        let root = prune_test_root("prune_recent");
+        // Another live server's folder, alone over the budget.
+        let live = cache_folder(&root, "00000000000000dd", 2000, 0);
+        let other = cache_folder(&root, "00000000000000aa", 100, 2 * DAY);
+        drop(open_prompt_cache_folder(&root, "00000000000000cc", "k", 1150).unwrap());
+        assert!(live.exists(), "used within the last day: never budget-pruned");
+        assert!(!other.exists(), "past the budget and not recent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn prompt_cache_key_touch_marks_the_folder_used() {
         let root = prune_test_root("touch");
         let dir = root.join("00000000000000cc");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("key.txt"), "k").unwrap();
         age_file(&dir.join("key.txt"), 2 * DAY);
-        let mut touch = PromptCacheTouch::new(dir.clone());
+        let mut touch = PromptCacheTouch::new(dir.clone(), "k".into());
         touch.touch_if_due(std::time::Duration::ZERO);
         let modified = std::fs::metadata(dir.join("key.txt")).unwrap().modified().unwrap();
         let age = std::time::SystemTime::now().duration_since(modified).unwrap_or_default();
         assert!(age < std::time::Duration::from_secs(3600), "touched now; age {age:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_cache_key_touch_writes_a_missing_key_again() {
+        let root = prune_test_root("touch_missing");
+        let dir = root.join("00000000000000cc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut touch = PromptCacheTouch::new(dir.clone(), "fingerprint text".into());
+        touch.touch_if_due(std::time::Duration::ZERO);
+        assert_eq!(std::fs::read_to_string(dir.join("key.txt")).unwrap(), "fingerprint text");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_cache_folder_recreated_after_a_prune_gets_its_key_back() {
+        use crate::kv_radix::CheckpointStore as _;
+        let root = prune_test_root("recreated_key");
+        let mut store = open_prompt_cache_folder(&root, "00000000000000cc", "fingerprint text", 0).unwrap();
+        // Another server pruned it.
+        std::fs::remove_dir_all(root.join("00000000000000cc")).unwrap();
+        store.put("a.ckpt", b"data").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("00000000000000cc").join("key.txt")).unwrap(),
+            "fingerprint text"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
