@@ -13309,6 +13309,58 @@ mod tests {
             for w in w4 {
                 device_free(w, p4.len());
             }
+            // Q2_0, 18-byte blocks of 64 (P5). Same rotation as the K-quant rows.
+            let p2: Vec<u8> = (0..n * k / 64 * 18)
+                .map(|i| match i % 18 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w2: Vec<*mut u8> = (0..copies_for(p2.len()))
+                .map(|_| {
+                    let w = device_malloc(p2.len(), dev).unwrap();
+                    memcpy(w, p2.as_ptr(), p2.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q2_0_device(x.cast(), w2[i % w2.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q2_0 gemv", format!("n={n} k={k} m={m}"), p2.len(), us);
+            }
+            for w in w2 {
+                device_free(w, p2.len());
+            }
+            // Q3_K, 110-byte super-blocks (P5).
+            let p3: Vec<u8> = (0..n * k / 256 * 110)
+                .map(|i| match i % 110 {
+                    108 => 0x00,
+                    109 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w3: Vec<*mut u8> = (0..copies_for(p3.len()))
+                .map(|_| {
+                    let w = device_malloc(p3.len(), dev).unwrap();
+                    memcpy(w, p3.as_ptr(), p3.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q3_k_device(x.cast(), w3[i % w3.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q3_k gemv", format!("n={n} k={k} m={m}"), p3.len(), us);
+            }
+            for w in w3 {
+                device_free(w, p3.len());
+            }
             device_free(x, 8 * k * 4);
             device_free(y, 8 * n * 4);
             // Decode attention, one query row, f32 KV (32 q heads, 8 kv heads, hd 128).
