@@ -31,20 +31,31 @@
 /* Every kernel launch in this file goes through hipLaunchKernelGGL; count them
  * (process-wide, relaxed) so `/stats` can report launches per token. */
 static std::atomic<uint64_t> g_kernel_launches{0};
+/* Launches and device writes enqueued by the calling thread (see `KqActCopy`). */
+static thread_local uint64_t t_device_writes = 0;
 #undef hipLaunchKernelGGL
 #define hipLaunchKernelGGL(kernelName, ...)                                  \
     do {                                                                     \
-        g_kernel_launches.fetch_add(1, std::memory_order_relaxed);           \
         hipLaunchKernelGGLInternal((kernelName), __VA_ARGS__);               \
+        g_kernel_launches.fetch_add(1, std::memory_order_relaxed);           \
+        ++t_device_writes;                                                   \
     } while (0)
 
 /* Device writes that are not our kernel launches: copies, memsets, BLAS calls
- * and DirectStorage. With the launch count this is an epoch that moves on
- * every enqueue that may change device memory, so a cached int8 activation is
- * reused only while it cannot be stale (see `kq_act_quantize`). */
+ * and DirectStorage, plus frees and host registrations (they change what an
+ * address holds). With the launch count this is an epoch that moves on every
+ * enqueue that may change device memory, so a cached int8 activation is
+ * reused only while it cannot be stale (see `KqActCopy`). The HIP runtime
+ * calls that write are redirected to counted forms below the includes, so a
+ * new one cannot skip the count; other writers call `note_device_write`.
+ * Every count comes after its enqueue: a write another thread enqueues
+ * behind a quantize then always moves the epoch after the quantize read it. */
 static std::atomic<uint64_t> g_dev_writes{0};
-static std::atomic<uint64_t> g_act_quant_reuses{0};
-static inline void note_device_write() { g_dev_writes.fetch_add(1, std::memory_order_relaxed); }
+static thread_local uint64_t t_act_quant_reuses = 0;
+static inline void note_device_write() {
+    g_dev_writes.fetch_add(1, std::memory_order_relaxed);
+    ++t_device_writes;
+}
 static inline uint64_t device_write_epoch() {
     return g_kernel_launches.load(std::memory_order_relaxed) +
            g_dev_writes.load(std::memory_order_relaxed);
@@ -70,6 +81,62 @@ static inline uint64_t device_write_epoch() {
 #include <hipblaslt/hipblaslt.h>
 #include <filesystem>
 #include <system_error>
+#endif
+
+/* Counted forms of every HIP runtime call that may change device memory or
+ * what an address holds (see `note_device_write`). A copy to the host writes
+ * no device memory and is not counted. */
+template <typename Call> static inline auto counted_write(Call call) {
+    auto r = call();
+    note_device_write();
+    return r;
+}
+static inline hipError_t counted_hip_memcpy(void *dst, const void *src, size_t bytes,
+                                            hipMemcpyKind kind) {
+    const hipError_t err = ::hipMemcpy(dst, src, bytes, kind);
+    if (kind != hipMemcpyDeviceToHost) {
+        note_device_write();
+    }
+    return err;
+}
+static inline hipError_t counted_hip_memcpy_async(void *dst, const void *src, size_t bytes,
+                                                  hipMemcpyKind kind, hipStream_t stream) {
+    const hipError_t err = ::hipMemcpyAsync(dst, src, bytes, kind, stream);
+    if (kind != hipMemcpyDeviceToHost) {
+        note_device_write();
+    }
+    return err;
+}
+#define hipMemcpy(...) counted_hip_memcpy(__VA_ARGS__)
+#define hipMemcpyAsync(...) counted_hip_memcpy_async(__VA_ARGS__)
+#define ALLPACA_COUNTED_WRITE(name, ...) counted_write([&] { return ::name(__VA_ARGS__); })
+#define hipMemcpyPeer(...) ALLPACA_COUNTED_WRITE(hipMemcpyPeer, __VA_ARGS__)
+#define hipMemcpyPeerAsync(...) ALLPACA_COUNTED_WRITE(hipMemcpyPeerAsync, __VA_ARGS__)
+#define hipMemcpy2D(...) ALLPACA_COUNTED_WRITE(hipMemcpy2D, __VA_ARGS__)
+#define hipMemcpy2DAsync(...) ALLPACA_COUNTED_WRITE(hipMemcpy2DAsync, __VA_ARGS__)
+#define hipMemset(...) ALLPACA_COUNTED_WRITE(hipMemset, __VA_ARGS__)
+#define hipMemsetAsync(...) ALLPACA_COUNTED_WRITE(hipMemsetAsync, __VA_ARGS__)
+#define hipMemsetD32Async(...) ALLPACA_COUNTED_WRITE(hipMemsetD32Async, __VA_ARGS__)
+/* Frees and host (un)registrations can also hand an address to another kind
+ * of memory, so they move this count too (see `KqActCopy`). */
+static std::atomic<uint64_t> g_address_changes{0};
+template <typename Call> static inline auto counted_remap(Call call) {
+    auto r = call();
+    g_address_changes.fetch_add(1, std::memory_order_relaxed);
+    note_device_write();
+    return r;
+}
+#define ALLPACA_COUNTED_REMAP(name, ...) counted_remap([&] { return ::name(__VA_ARGS__); })
+#define hipFree(...) ALLPACA_COUNTED_REMAP(hipFree, __VA_ARGS__)
+#define hipFreeAsync(...) ALLPACA_COUNTED_REMAP(hipFreeAsync, __VA_ARGS__)
+#define hipHostFree(...) ALLPACA_COUNTED_REMAP(hipHostFree, __VA_ARGS__)
+#define hipHostRegister(...) ALLPACA_COUNTED_REMAP(hipHostRegister, __VA_ARGS__)
+#define hipHostUnregister(...) ALLPACA_COUNTED_REMAP(hipHostUnregister, __VA_ARGS__)
+#ifdef ALLPACA_HAS_ROCBLAS
+#define rocblas_sgemm(...) ALLPACA_COUNTED_WRITE(rocblas_sgemm, __VA_ARGS__)
+#endif
+#ifdef ALLPACA_HAS_HIPBLASLT
+#define hipblasLtMatmul(...) ALLPACA_COUNTED_WRITE(hipblasLtMatmul, __VA_ARGS__)
 #endif
 
 /* IEEE half to float with the hardware conversion (exact, subnormals included). */
@@ -1914,7 +1981,6 @@ static int launch_gemm_nt_rocblas(const float *a, const float *b, float *c, int3
     const float beta = 0.0f;
     rocblas_status st = rocblas_set_stream(d.handle, stream);
     if (st == rocblas_status_success) {
-        note_device_write();
         st = rocblas_sgemm(d.handle, rocblas_operation_transpose, rocblas_operation_none, n, m, k,
                            &alpha, b, k, a, k, &beta, c, n);
     }
@@ -2151,7 +2217,6 @@ static int lt_run(HipblasLtDev *st, const float *a, const float *b, float *c, in
     if (lt_grow_workspace(st, ws, stream) != ALLPACA_OK) {
         return ALLPACA_ERR_DEVICE;
     }
-    note_device_write();
     hipblasStatus_t ms =
         hipblasLtMatmul(st->handle, d.desc, &alpha, b, d.a, a, d.b, &beta, c, d.c, c, d.c, &algo,
                         st->workspace, st->workspace_bytes, stream);
@@ -3605,12 +3670,13 @@ struct KqActScratch {
     size_t cap = 0;
     hipStream_t stream = nullptr;
     hipEvent_t handoff = nullptr;
-    /* The activation the int8 rows hold (see `kq_act_quantize`). */
+    /* The activation the int8 rows hold (see `KqActCopy`). */
     const float *src = nullptr;
     int src_m = 0;
     int src_k = 0;
     hipStream_t src_stream = nullptr;
     bool src_device = false;
+    uint64_t src_addresses = ~uint64_t(0);
     uint64_t epoch = 0;
 };
 static KqActScratch g_kq_act[KQ_ACT_DEVICES];
@@ -3654,55 +3720,85 @@ static KqActScratch *kq_act_acquire(hipStream_t stream, size_t need,
     return &s;
 }
 
-/* Quantize the m x k activation `a` into the scratch's int8 rows `aq` and
- * per-block scales `ad`, unless they already hold exactly it: same source,
+/* The int8 copy of an m x k activation `a` in the scratch's rows `aq` and
+ * per-block scales `ad`, for one GEMV writing the m x n output `c`; hold it
+ * inside the scratch lock until that GEMV is enqueued. The constructor
+ * quantizes `a` unless the scratch already holds exactly it: same source,
  * shape and stream, a source in device memory (a host or managed buffer can
  * change without any enqueue), and no device write enqueued since the GEMV
- * that last read the copy (`KqActSeal`). GEMVs sharing one input (q/k/v,
- * gate/up) then quantize it once, with the same bits. ALLPACA_KQ_ACT_REUSE=0
- * quantizes every time. */
-static void kq_act_quantize(KqActScratch *s, const float *a, int8_t *aq, float *ad, int m, int k,
-                            hipStream_t stream) {
-    static const bool reuse = [] {
-        const char *v = std::getenv("ALLPACA_KQ_ACT_REUSE");
-        return !(v && v[0] == '0');
-    }();
-    if (reuse && s->src == a && s->src_m == m && s->src_k == k && s->src_stream == stream &&
-        s->src_device && s->epoch == device_write_epoch()) {
-        g_act_quant_reuses.fetch_add(1, std::memory_order_relaxed);
-        return;
+ * that last read the copy. The destructor marks the copy current, unless a
+ * write meanwhile could have changed `a`: one from another thread (the
+ * process-wide count moved more than this thread's), or this GEMV's own
+ * output overlapping `a`. GEMVs sharing one input (q/k/v, gate/up) then
+ * quantize it once, with the same bits. ALLPACA_KQ_ACT_REUSE=0 quantizes
+ * every time. */
+class KqActCopy {
+  public:
+    KqActCopy(KqActScratch *s, const float *a, int8_t *aq, float *ad, int m, int k,
+              hipStream_t stream, const float *c, int n)
+        : s_(s), a_(a), a_end_(a + static_cast<size_t>(m) * k), c_(c),
+          c_end_(c + static_cast<size_t>(m) * n), epoch_(device_write_epoch()),
+          own_(t_device_writes) {
+        if (reuse_enabled() && s->src == a && s->src_m == m && s->src_k == k &&
+            s->src_stream == stream && s->src_device && s->epoch == epoch_) {
+            ++t_act_quant_reuses;
+            return;
+        }
+        const int kb = k / 32;
+        hipLaunchKernelGGL(quantize_rows_q8_kernel,
+                           dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
+                           dim3(256), 0, stream, a, aq, ad, m, k);
+        if (!reuse_enabled() || hipPeekAtLastError() != hipSuccess) {
+            s->src = nullptr;
+            return;
+        }
+        // Looked up again once a free or (un)registration may have given the
+        // address to another kind of memory.
+        const uint64_t addresses = g_address_changes.load(std::memory_order_relaxed);
+        if (s->src != a || s->src_addresses != addresses) {
+            hipPointerAttribute_t attr{};
+            s->src_device = hipPointerGetAttributes(&attr, a) == hipSuccess &&
+                            attr.type == hipMemoryTypeDevice && !attr.isManaged;
+            (void)hipGetLastError();
+            s->src_addresses = addresses;
+        }
+        s->src = a;
+        s->src_m = m;
+        s->src_k = k;
+        s->src_stream = stream;
+        s->epoch = 0;
     }
-    const int kb = k / 32;
-    hipLaunchKernelGGL(quantize_rows_q8_kernel,
-                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
-                       dim3(256), 0, stream, a, aq, ad, m, k);
-    if (hipPeekAtLastError() != hipSuccess) {
-        s->src = nullptr;
-        return;
-    }
-    if (s->src != a) {
-        hipPointerAttribute_t attr{};
-        s->src_device = hipPointerGetAttributes(&attr, a) == hipSuccess &&
-                        attr.type == hipMemoryTypeDevice && !attr.isManaged;
-        (void)hipGetLastError();
-    }
-    s->src = a;
-    s->src_m = m;
-    s->src_k = k;
-    s->src_stream = stream;
-    s->epoch = 0;
-}
 
-/* Marks the scratch's int8 copy current once the GEMV that reads it is
- * enqueued (on every return path); hold it inside the scratch lock. */
-struct KqActSeal {
-    KqActScratch *s;
-    ~KqActSeal() { s->epoch = device_write_epoch(); }
+    ~KqActCopy() {
+        const uint64_t epoch = device_write_epoch();
+        const bool only_ours = epoch - epoch_ == t_device_writes - own_;
+        const auto at = [](const float *p) { return reinterpret_cast<uintptr_t>(p); };
+        const bool overlaps = at(c_) < at(a_end_) && at(a_) < at(c_end_);
+        if (s_->src == a_ && only_ours && !overlaps) {
+            s_->epoch = epoch;
+        } else {
+            s_->src = nullptr;
+        }
+    }
+
+    KqActCopy(const KqActCopy &) = delete;
+    KqActCopy &operator=(const KqActCopy &) = delete;
+
+  private:
+    static bool reuse_enabled() {
+        static const bool on = [] {
+            const char *v = std::getenv("ALLPACA_KQ_ACT_REUSE");
+            return !(v && v[0] == '0');
+        }();
+        return on;
+    }
+
+    KqActScratch *s_;
+    const float *a_, *a_end_, *c_, *c_end_;
+    uint64_t epoch_, own_;
 };
 
-extern "C" uint64_t allpaca_hip_act_quant_reuses(void) {
-    return g_act_quant_reuses.load(std::memory_order_relaxed);
-}
+extern "C" uint64_t allpaca_hip_act_quant_reuses(void) { return t_act_quant_reuses; }
 
 /* Rows that share one weight block load in the int8 kernels. A block costs
  * the same however many of its rows are live, so the rows are spread evenly
@@ -3787,8 +3883,7 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
     uint8_t *base = static_cast<uint8_t *>(scratch->p);
     int8_t *aq = reinterpret_cast<int8_t *>(base);
     float *ad = reinterpret_cast<float *>(base + aq_bytes);
-    kq_act_quantize(scratch, a, aq, ad, m, k, stream);
-    KqActSeal seal{scratch};
+    KqActCopy act(scratch, a, aq, ad, m, k, stream, c, n);
     // 8 lanes x 32 weights per column: at 32 lanes x 8 weights the per-row
     // A loads and scale math dominated on RDNA (Q5_K m=4 cost 1.7x m=1; now
     // ~1.05x). The MI50 takes more lanes on some weights (kq_i8_lanes).
@@ -3914,8 +4009,7 @@ static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m,
     uint8_t *base = static_cast<uint8_t *>(scratch->p);
     int8_t *aq = reinterpret_cast<int8_t *>(base);
     float *ad = reinterpret_cast<float *>(base + aq_bytes);
-    kq_act_quantize(scratch, a, aq, ad, m, k, stream);
-    KqActSeal seal{scratch};
+    KqActCopy act(scratch, a, aq, ad, m, k, stream, c, n);
     constexpr int LPC = 8;
     // Smaller blocks spread narrow weights over the MI50's CUs (640x2560
     // 7.5 -> 5.9 us); the sum order does not depend on the block size.
@@ -5543,8 +5637,7 @@ static int launch_rocmfp4_i8(const float *a, const uint8_t *b, float *c, int32_t
     uint8_t *base = static_cast<uint8_t *>(scratch->p);
     int8_t *aq = reinterpret_cast<int8_t *>(base);
     float *ad = reinterpret_cast<float *>(base + aq_bytes);
-    kq_act_quantize(scratch, a, aq, ad, m, k, stream);
-    KqActSeal seal{scratch};
+    KqActCopy act(scratch, a, aq, ad, m, k, stream, c, n);
     constexpr int COLS = 256 / 8;
     const dim3 block(256);
     const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
@@ -7211,8 +7304,8 @@ extern "C" int allpaca_dstorage_read(void *handle, const uint16_t *path, uint64_
     request.Name = "allpaca expert fill";
 
     const uint64_t fence_value = ++buffer->fence_value;
-    note_device_write();
     buffer->queue->EnqueueRequest(&request);
+    note_device_write();
     buffer->queue->EnqueueSignal(buffer->fence.Get(), fence_value);
     buffer->queue->EnqueueStatus(buffer->status.Get(), 0);
     buffer->queue->Submit();
@@ -7315,11 +7408,13 @@ extern "C" int allpaca_hip_memcpy_batch(void **dsts, void **srcs, size_t *sizes,
     }
     clear_last_error();
     hipStream_t s = as_stream(stream);
-    note_device_write();
     allpaca_memcpy_batch_fn batch = memcpy_batch_fn();
     if (batch) {
         size_t fail_idx = 0;
         hipError_t err = batch(dsts, srcs, sizes, count, nullptr, nullptr, 0, &fail_idx, s);
+        if (to_hip_memcpy_kind(kind) != hipMemcpyDeviceToHost) {
+            note_device_write();
+        }
         if (err != hipSuccess) {
             return ALLPACA_ERR_DEVICE;
         }
@@ -7345,7 +7440,6 @@ extern "C" int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int3
         return ALLPACA_ERR_INVALID;
     }
     const hipMemcpyKind mk = to_hip_memcpy_kind(kind);
-    note_device_write();
     hipError_t err = hipMemcpyAsync(dst, src, bytes, mk, as_stream(stream));
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
@@ -7367,10 +7461,8 @@ extern "C" int allpaca_hip_memset(void *dst, int32_t value, size_t bytes, allpac
     hipStream_t s = as_stream(stream);
     const int fill = value & 0xff;
     if (s) {
-        note_device_write();
         return hip_status(hipMemsetAsync(dst, fill, bytes, s));
     }
-    note_device_write();
     return hip_status(hipMemset(dst, fill, bytes));
 }
 
@@ -7430,7 +7522,6 @@ extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *s
         return ALLPACA_ERR_DEVICE;
     }
     hipStream_t s = as_stream(stream);
-    note_device_write();
     err = hipMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
     if (err != hipSuccess) {
         (void)hipSetDevice(prev);
@@ -7477,7 +7568,6 @@ extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, dou
     (void)allpaca_hip_enable_peer_access(dst, src);
     (void)hipSetDevice(src);
     (void)hipEventRecord(start, nullptr);
-    note_device_write();
     hipError_t peer_err = hipMemcpyPeer(d_dst, dst, d_src, src, bytes);
     (void)hipEventRecord(stop, nullptr);
     (void)hipEventSynchronize(stop);
@@ -7491,7 +7581,6 @@ extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, dou
 
     (void)hipSetDevice(src);
     (void)hipEventRecord(start, nullptr);
-    note_device_write();
     (void)hipMemcpy(h_pin, d_src, bytes, hipMemcpyDeviceToHost);
     (void)hipSetDevice(dst);
     (void)hipMemcpy(d_dst, h_pin, bytes, hipMemcpyHostToDevice);
@@ -7531,7 +7620,6 @@ extern "C" int allpaca_hip_blas_warmup(int32_t device) {
         clear_last_error();
         return ALLPACA_ERR_DEVICE;
     }
-    note_device_write();
     (void)hipMemset(mem, 0, bytes);
     float *buf = static_cast<float *>(mem);
     const int rc = launch_gemm_nt_rocblas(buf, buf + N * N, buf + 2 * N * N, N, N, N, nullptr);
@@ -10422,7 +10510,6 @@ extern "C" int allpaca_copy_async(void *dst, const void *src, size_t bytes,
     if (!dst || !src) {
         return ALLPACA_ERR_INVALID;
     }
-    note_device_write();
     hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDefault, as_stream(stream));
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
