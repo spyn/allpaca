@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 /// Calls to one RPC worker since connect, as the coordinator sees them.
 /// `wall_us` is network plus worker time; the split needs worker-side timing.
+/// Byte counts are payloads, without frame headers, and a call that fails on
+/// I/O is not counted: both are fine for per-token rates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcWorkerCalls {
     pub endpoint: String,

@@ -341,8 +341,6 @@ impl RpcRuntime {
         self.plan.lock().map(|p| p.has_remote()).unwrap_or(false)
     }
 
-    /// A layer was uploaded to a worker. A split plan alone does not count:
-    /// large GGUFs skip host-F32 layers and stay on the local device.
     /// Calls to each worker since connect, in endpoint order. Never waits on a
     /// busy session.
     pub fn worker_calls(&self) -> Vec<allpaca_types::RpcWorkerCalls> {
@@ -364,6 +362,8 @@ impl RpcRuntime {
             .collect()
     }
 
+    /// A layer was uploaded to a worker. A split plan alone does not count:
+    /// large GGUFs skip host-F32 layers and stay on the local device.
     pub fn placed_remote(&self) -> bool {
         self.remote
             .lock()
