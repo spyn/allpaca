@@ -12816,9 +12816,10 @@ mod tests {
         let before = kernel_launches();
         hip.residual_add(x.cast(), r.cast(), n as i32).unwrap();
         // Other tests may launch at the same time, so only a lower bound holds.
-        assert!(kernel_launches() > before);
+        let after = kernel_launches();
         device_free(x, n * 4);
         device_free(r, n * 4);
+        assert!(after > before);
     }
 
     /// Small host<->device copy latency: pageable `hipMemcpy` vs a pinned
