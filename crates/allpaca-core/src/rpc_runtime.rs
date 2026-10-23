@@ -186,6 +186,23 @@ fn local_reserve_bytes(total: u64) -> u64 {
     (768u64 << 20) + total / 32
 }
 
+
+/// VRAM left for KV pages on `devices` now, after weights are loaded, less the
+/// same reserve the layer plan keeps. KV past this would land in WDDM's silent
+/// spill to system memory instead of the pinned DRAM tier.
+pub(crate) fn kv_vram_headroom(devices: &[i32]) -> u64 {
+    let mut uniq = devices.iter().copied().filter(|d| *d >= 0).collect::<Vec<_>>();
+    uniq.sort_unstable();
+    uniq.dedup();
+    uniq.iter()
+        .map(|&dev| {
+            let (hip_free, total) = allpaca_hip::device_memory_info(dev).unwrap_or((0, 0));
+            let free = allpaca_hip::device_local_headroom(dev).map_or(hip_free, |h| h.min(hip_free));
+            free.saturating_sub(local_reserve_bytes(total))
+        })
+        .sum()
+}
+
 /// Place GGUF layers on the local GPUs by measured free VRAM and per-layer bytes.
 ///
 /// The target GPU (first) also carries lm_head / `output_norm`; the second
@@ -240,6 +257,12 @@ fn plan_local_by_bytes(
         );
         budgets.push(budget);
     }
+    // Each attention layer keeps its share of `kv_vram_bytes` on its own card,
+    // even when the weights alone would fit the first GPU. Measured on xeres
+    // (board D4, Ornith-9B Q8): all on the RX 9070 decodes 39.3 tok/s against
+    // 31.5 split at 10K tokens, but 10.9 against 22.7 at 20K and 2.5 against
+    // 16.8 at 35K, once KV past the card's room moves to DRAM. Short-context
+    // users can pin `engine.local_vram_budget_mib` for the one-card layout.
     let plan = crate::layer_split::plan_local_fill(&layer_bytes, &budgets);
     let need: u64 = layer_bytes.iter().sum::<u64>() + globals;
     let have: u64 = budgets.iter().sum::<u64>() + globals;

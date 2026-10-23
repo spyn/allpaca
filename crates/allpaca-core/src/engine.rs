@@ -191,6 +191,8 @@ struct EngineInner {
     flags: FeatureFlags,
     scheduler: Scheduler,
     kv: KvTierManager,
+    /// The KV VRAM budget has been capped to what the GPUs hold after load.
+    kv_vram_capped: bool,
     ring: LogitRing,
     tokenizer: Option<EngineTokenizer>,
     /// Set when the loaded GGUF is a decision model (`<arch>.decision.type`).
@@ -653,6 +655,7 @@ impl Engine {
             flags,
             scheduler,
             kv,
+            kv_vram_capped: false,
             ring,
             tokenizer: None,
             decision: None,
@@ -2943,6 +2946,44 @@ impl Engine {
                 .map(|i| rpc.local_device(i))
                 .collect();
             inner.kv.set_layer_devices(&devs);
+            // Once, with the weights loaded: KV pages past what the cards
+            // still hold must go to the pinned DRAM tier, not WDDM's silent
+            // spill. A plan that keeps a whole model on one card leaves less
+            // than `kv.vram_bytes` there.
+            if !inner.kv_vram_capped {
+                inner.kv_vram_capped = true;
+                // The cards of the layers that keep KV (see `kv_layer_mask`).
+                let attn_devs: Vec<i32> = devs
+                    .iter()
+                    .zip(kv_layer_mask(&target))
+                    .filter(|(_, keeps)| *keeps)
+                    .map(|(d, _)| *d)
+                    .collect();
+                let room = crate::rpc_runtime::kv_vram_headroom(&attn_devs) as usize;
+                let want = self.config.kv.vram_bytes;
+                if room > 0 && room < want {
+                    tracing::info!(
+                        kv_vram_mib = want >> 20,
+                        capped_mib = room >> 20,
+                        "KV VRAM budget capped to what the GPUs hold after load"
+                    );
+                    inner.kv.set_vram_bytes(room, &self.metrics)?;
+                }
+                // VRAM keeps `hot_fraction` of its budget; DRAM must hold the
+                // rest of the configured KV, or the context a request can use
+                // is smaller than `kv.vram_bytes` promises (the default DRAM
+                // tier is 32 MiB).
+                let short = want
+                    .saturating_sub(inner.kv.vram_hot_bytes())
+                    .saturating_sub(inner.kv.dram_capacity_bytes());
+                if short > 0 {
+                    tracing::info!(
+                        dram_added_mib = short >> 20,
+                        "KV DRAM tier grown so the configured KV budget fits"
+                    );
+                    inner.kv.grow_dram_bytes(short);
+                }
+            }
         }
         // Recurrent (SSM / Gated DeltaNet) layers write no KV: no pages for them.
         let keeps = kv_layer_mask(&target);
