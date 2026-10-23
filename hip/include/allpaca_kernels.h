@@ -282,6 +282,11 @@ int allpaca_gemm_nt_q5_k_untiled(const float *a, const uint8_t *b, float *c, int
 int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                         int32_t k, allpaca_stream_t stream);
 
+/* gfx12 f16 WMMA form of allpaca_gemm_nt_f16. One wave32 owns each 16x16 output
+ * tile (v_wmma_f32_16x16x16_f16). Any other device runs allpaca_gemm_nt_f16. */
+int allpaca_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                             int32_t k, allpaca_stream_t stream);
+
 /* Untiled F16 GEMV baseline for §12 before/after tracers. */
 int allpaca_gemm_nt_f16_untiled(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, allpaca_stream_t stream);

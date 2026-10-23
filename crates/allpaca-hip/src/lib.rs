@@ -861,6 +861,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_f16_wmma(
+            a: *const f32,
+            b: *const u16,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_f16_untiled(
             a: *const f32,
             b: *const u16,
@@ -3851,6 +3860,70 @@ pub fn gemm_nt_f16(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_f16 unavailable".into(),
+        )))
+    }
+}
+
+/// gfx12 f16 WMMA form of [`gemm_nt_f16`]: `C[m,n] = f16(A) * dequant(B_f16)^T`.
+///
+/// gfx1200 and gfx1201 run the WMMA tile. Every other device runs [`gemm_nt_f16`].
+pub fn gemm_nt_f16_wmma(
+    a: &[f32],
+    b: &[u16],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let b_n = (n as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        if a.len() < a_n || b.len() < b_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "F16 WMMA GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(b_n * 2, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr().cast(), b_n * 2, MEMCPY_H2D)?;
+            // SAFETY: `da`, `db`, and `dc` are device allocations of `a_n` floats,
+            // `b_n` f16 values, and `c_n` floats on device 0. They stay allocated
+            // until this launch returns and the copies below finish.
+            let rc = unsafe {
+                ffi::allpaca_gemm_nt_f16_wmma(
+                    da.cast(),
+                    db.cast(),
+                    dc.cast(),
+                    m,
+                    n,
+                    k,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "gemm_nt_f16_wmma")?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, b_n * 2);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "gfx12 f16 WMMA GEMM not implemented".into(),
         )))
     }
 }
@@ -17336,6 +17409,52 @@ mod tests {
                     cpu[i]
                 );
             }
+        }
+    }
+
+    /// gfx12 f16 WMMA prefill GEMM matches the existing f16 NT GEMM on one legal tile.
+    ///
+    /// Prefill (`m > 8`) uses `gemm_nt_f16`. The WMMA tile is 16×16×16, so 16×16×16
+    /// is the smallest shape that is both a prefill launch and a WMMA tile. Activations
+    /// are rounded through f16 first: the matrix core multiplies f16×f16, and the
+    /// existing kernel multiplies those same values in f32.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_f16_wmma_prefill_gemm_matches_existing_f16_gemm_on_16x16x16() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let (m, n, k) = (16usize, 16usize, 16usize);
+        let mut a = vec![0.0f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for v in &mut a {
+            *v = super::f16_bits_to_f32(allpaca_cpu::f32_to_f16(*v));
+        }
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+        let mut reference = vec![0.0f32; m * n];
+        let mut wmma = vec![0.0f32; m * n];
+        gemm_nt_f16(&a, &b_f16, &mut reference, m as i32, n as i32, k as i32)
+            .expect("existing f16 prefill GEMM");
+        gemm_nt_f16_wmma(&a, &b_f16, &mut wmma, m as i32, n as i32, k as i32)
+            .expect("gfx12 f16 WMMA prefill GEMM");
+        for i in 0..m * n {
+            assert!(
+                gemm_close(wmma[i], reference[i]),
+                "f16 WMMA mismatch idx={i} wmma={} reference={} arch={arch}",
+                wmma[i],
+                reference[i]
+            );
         }
     }
 

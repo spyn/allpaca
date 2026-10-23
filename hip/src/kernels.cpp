@@ -1156,6 +1156,69 @@ __global__ void gemm_nt_f16_tiled_kernel(const float *a, const uint16_t *b, floa
     }
 }
 
+/* gfx12 f16 WMMA prefill tile. One wave32 computes C[16,16] += A[16,16] * B_nt[16,16]^T
+ * per K panel. A is row-major f32 [m,k] (rounded to f16 on load). B is packed f16
+ * row-major [n,k], which is already the transposed B the WMMA operand wants.
+ *
+ * Lane layout (RDNA4, not the RDNA3 replicated layout): lane L holds A row L%16
+ * and B column L%16 at K positions 8*(L/16) + 0..7. Accumulator element g is
+ * C row (L/16)*8+g, column L%16. Non-gfx12 images leave the body empty; the
+ * host launch sends those devices to the scalar f16 kernel. */
+__global__ void gemm_nt_f16_wmma_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
+                                        int k) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    using f16x8 = __attribute__((ext_vector_type(8))) _Float16;
+    using f32x8 = __attribute__((ext_vector_type(8))) float;
+
+    const int lane = static_cast<int>(threadIdx.x);
+    const int row0 = static_cast<int>(blockIdx.y) * 16;
+    const int col0 = static_cast<int>(blockIdx.x) * 16;
+    const int a_row = row0 + (lane % 16);
+    const int b_col = col0 + (lane % 16);
+    const int k_group = 8 * (lane / 16);
+
+    f32x8 acc;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        acc[g] = 0.0f;
+    }
+    for (int k0 = 0; k0 < k; k0 += 16) {
+        f16x8 a_frag;
+        f16x8 b_frag;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int kp = k0 + k_group + e;
+            a_frag[e] = static_cast<_Float16>(0.0f);
+            b_frag[e] = static_cast<_Float16>(0.0f);
+            if (a_row < m && kp < k) {
+                a_frag[e] = static_cast<_Float16>(a[static_cast<size_t>(a_row) * k + kp]);
+            }
+            if (b_col < n && kp < k) {
+                b_frag[e] = __builtin_bit_cast(_Float16, b[static_cast<size_t>(b_col) * k + kp]);
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frag, b_frag, acc);
+    }
+
+    const int col_out = col0 + (lane % 16);
+    const int row_base = row0 + (lane / 16) * 8;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int row_out = row_base + g;
+        if (row_out < m && col_out < n) {
+            c[static_cast<size_t>(row_out) * n + col_out] = acc[g];
+        }
+    }
+#else
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)m;
+    (void)n;
+    (void)k;
+#endif
+}
+
 __device__ float warp_sum32(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -2318,6 +2381,35 @@ static int launch_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32
                   static_cast<unsigned>(m));
         hipLaunchKernelGGL(gemv_nt_f16_untiled_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     }
+    return hip_status(hipGetLastError());
+}
+
+static int device_arch_is_gfx12(int device) {
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
+        return 0;
+    }
+    return std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
+           std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0;
+}
+
+/* gfx12 launches the WMMA tile. Every other arch keeps the existing f16 kernel. */
+static int launch_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, int32_t m,
+                                   int32_t n, int32_t k, hipStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (!device_arch_is_gfx12(dev)) {
+        return launch_gemm_nt_f16(a, b, c, m, n, k, stream, 1);
+    }
+    clear_last_error();
+    dim3 block(32);
+    dim3 grid(static_cast<unsigned>((n + 15) / 16), static_cast<unsigned>((m + 15) / 16));
+    hipLaunchKernelGGL(gemm_nt_f16_wmma_kernel, grid, block, 0, stream, a, b, c, m, n, k);
     return hip_status(hipGetLastError());
 }
 
@@ -7614,6 +7706,11 @@ extern "C" int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, 
     return launch_gemm_nt_f16(a, b, c, m, n, k, as_stream(stream), 1);
 }
 
+extern "C" int allpaca_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, int32_t m,
+                                       int32_t n, int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_f16_wmma(a, b, c, m, n, k, as_stream(stream));
+}
+
 extern "C" int allpaca_gemm_nt_f16_untiled(const float *a, const uint16_t *b, float *c, int32_t m,
                                            int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_f16(a, b, c, m, n, k, as_stream(stream), 0);
@@ -10974,6 +11071,11 @@ extern "C" int allpaca_gemm_nt_q5_k_untiled(const float *, const uint8_t *, floa
 
 extern "C" int allpaca_gemm_nt_f16(const float *, const uint16_t *, float *, int32_t, int32_t,
                                   int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_f16_wmma(const float *, const uint16_t *, float *, int32_t, int32_t,
+                                       int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
