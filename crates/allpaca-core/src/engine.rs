@@ -577,6 +577,10 @@ impl Engine {
                 "experimental options are on; output may leave the exact path"
             );
         }
+        // Read before anything can replace the executable (the prompt cache's key).
+        if engine_build_id().is_none() {
+            tracing::warn!("build id unreadable (executable path, size or mtime); prompt-cache disk tier off");
+        }
         let mut inventory = DeviceInventory::discover(&config);
         scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
@@ -4613,16 +4617,23 @@ impl Engine {
         Ok((end, total))
     }
 
-    /// Point the prompt cache at this model and expert mask: a change clears
-    /// it and opens that pair's disk folder.
+    /// Point the prompt cache at this model, expert mask, build and settings
+    /// ([`prompt_cache_fingerprint`]): a change clears it and opens the disk
+    /// folder named by their hash. The disk tier stays off when a build id
+    /// is unknown.
     fn sync_prompt_cache(&self, inner: &mut EngineInner, target: &TinyModel) {
         let disabled = target.expert_controls.disabled();
-        let key = prompt_cache_key(
+        let workers = self.rpc.as_ref().map(|rt| rt.worker_builds()).unwrap_or_default();
+        let settings =
+            prompt_cache_settings(&self.config, engine_build_id(), &workers, &self.prompt_cache_plan(target));
+        // Without settings the RAM tier still works under the model key.
+        let fingerprint = prompt_cache_fingerprint(
             &target.config,
             self.config.model.path.as_deref(),
             &disabled,
-            &prompt_cache_settings(&self.config, &engine_build_id()),
+            settings.as_deref().unwrap_or("build=unknown"),
         );
+        let key = fnv1a(&fingerprint);
         if inner.prompt_cache_key == Some(key) {
             return;
         }
@@ -4633,6 +4644,13 @@ impl Engine {
         if target.dsv4.is_some() {
             return;
         }
+        if settings.is_none() && (pc.worker || pc.disk_dir.is_some()) {
+            tracing::warn!(
+                coordinator = engine_build_id().is_some(),
+                "prompt cache: disk tier off, a build id is unknown (this executable's or an RPC worker's)"
+            );
+            return;
+        }
         let folder = format!("{key:016x}");
         let worker = pc.worker.then_some(self.rpc.as_ref()).flatten().and_then(|rt| {
             let session = rt.session_serving(crate::prompt_store::EXT)?;
@@ -4640,7 +4658,8 @@ impl Engine {
         });
         let store: Result<Box<dyn crate::kv_radix::CheckpointStore>, AllpacaError> = match (worker, pc.disk_dir.as_ref()) {
             (Some(store), _) => Ok(Box::new(store)),
-            (None, Some(dir)) => crate::kv_radix::LocalDir::open(&dir.join(&folder)).map(|d| Box::new(d) as _),
+            (None, Some(dir)) => open_prompt_cache_folder(dir, &folder, &fingerprint, pc.disk_bytes as u64)
+                .map(|d| Box::new(d) as _),
             (None, None) => {
                 if pc.worker {
                     tracing::warn!("prompt cache: no RPC worker serves the prompt_cache store");
@@ -4656,6 +4675,48 @@ impl Engine {
         if let Err(e) = opened {
             tracing::warn!(error = %e, "prompt cache: disk tier not opened");
         }
+    }
+
+    /// The device that runs each of `target`'s layers and its routed experts,
+    /// with the local cards' names, for [`prompt_cache_settings`].
+    fn prompt_cache_plan(&self, target: &TinyModel) -> String {
+        use crate::rpc_runtime::LayerHome;
+        use std::fmt::Write as _;
+        let local = |kind: &str, dev: i32| {
+            let name = self
+                .inventory
+                .devices
+                .iter()
+                .find(|d| d.is_gpu() && !d.is_rpc() && d.id == dev)
+                .map_or("", |d| d.name.as_str());
+            format!("{kind}:{dev}:{name}")
+        };
+        let mut primary = "cpu".to_string();
+        if let Some(h) = self.hip.as_ref() {
+            primary = local("hip", h.device);
+        }
+        #[cfg(feature = "cuda")]
+        if self.hip.is_none() {
+            if let Some(c) = self.cuda.as_ref() {
+                primary = local("cuda", c.device);
+            }
+        }
+        let mut plan = primary.clone();
+        let Some(rt) = target.rpc.as_ref() else {
+            return plan;
+        };
+        for l in 0..target.config.n_layers {
+            let body = match rt.layer_home(l) {
+                LayerHome::Remote { endpoint, device } => format!("rpc:{endpoint}/{device}"),
+                LayerHome::Local(dev) if dev >= 0 && self.hip.is_some() => local("hip", dev),
+                LayerHome::Local(_) => primary.clone(),
+            };
+            let _ = write!(plan, ";{l}={body}");
+            if let Some((endpoint, device)) = rt.experts_home(l) {
+                let _ = write!(plan, ",experts=rpc:{endpoint}/{device}");
+            }
+        }
+        plan
     }
 
     /// Keep a hybrid's recurrent state after its first `end` prompt tokens
@@ -5637,52 +5698,91 @@ fn mtp_text_has_dropped_words(text: &str) -> bool {
     t.contains("let me about ") || t.contains("let me words ")
 }
 
-/// Run `f` on every HIP workspace that holds device GDN / Mamba-2 state for
-/// the target: the target GPU, then the local layer-split peer. Recurrent
-/// slots live on the workspace that ran the layer, so clone / rewind / clear
-/// must reach both or the peer's layers keep state from rejected tokens (and
-/// leak it per request).
-/// Names the prompt cache's disk folder: checkpoints only resume the model
-/// file, shape and expert mask that wrote them.
 /// Engine settings that change what a prompt-cache checkpoint means: a
-/// checkpoint written under other settings must not be restored.
+/// checkpoint written under other settings must not be restored. `None`
+/// when a build id is unknown (this engine's `build` or a worker's): an
+/// unknown build cannot tell one build's checkpoints from another's.
 ///
-/// `build` is [`engine_build_id`]: kernels may change their rounding from one
-/// build to the next, and a checkpoint from another build would then not
-/// equal a cold prefill. Page size and which layers keep KV are left out:
-/// a checkpoint holds rows, which restore into any page layout.
-fn prompt_cache_settings(config: &Config, build: &str) -> String {
-    format!(
-        "build={build}|codec={:?}|experimental={:?}",
+/// - `build` is [`engine_build_id`] and `workers` each RPC worker's endpoint
+///   and HELLO build id: kernels may change their rounding from one build to
+///   the next, and a checkpoint from another build would then not equal a
+///   cold prefill.
+/// - `plan` is [`Engine::prompt_cache_plan`]: the device that runs each
+///   layer and its experts. CPU, RDNA and MI50 results are not bitwise equal.
+/// - The placement and weight options that pick a device or kernel for a
+///   layer, or change the weights themselves (`edge0_no_lora`,
+///   `edge0_no_prerouter`), are keyed raw as well, so a change misses even
+///   where the resolved plan does not show it.
+/// - Of the experimental options, those that change prefill numerics.
+///   Rejection sampling only picks tokens, so it is left out.
+///
+/// Page size and which layers keep KV are left out: a checkpoint holds rows,
+/// which restore into any page layout.
+fn prompt_cache_settings(
+    config: &Config,
+    build: Option<&str>,
+    workers: &[(String, Option<String>)],
+    plan: &str,
+) -> Option<String> {
+    let build = build?;
+    let workers = workers
+        .iter()
+        .map(|(endpoint, build)| Some(format!("{endpoint}@{}", build.as_deref()?)))
+        .collect::<Option<Vec<_>>>()?;
+    let x = &config.experimental;
+    let tail_skip = if x.route_tail_skip {
+        format!("rank{}", x.route_tail_skip_rank)
+    } else {
+        "off".into()
+    };
+    let (e, w, m) = (&config.engine, &config.weights, &config.model);
+    Some(format!(
+        "build={build}|workers={workers:?}|codec={:?}\
+         |experimental=row_variant:{},chunked_gdn:{},route_tail_skip:{tail_skip}\
+         |device={:?},cpu_only:{},backend:{},vram_budget_mib:{:?}\
+         |tensor_split={:?}|expert_homes={:?}|host_f32={},miss_policy={:?}\
+         |edge0_no_lora={},edge0_no_prerouter={}|plan={plan}",
         config.prompt_cache.codec,
-        config.experimental.enabled_names()
-    )
+        x.row_variant_kernels,
+        x.chunked_gdn,
+        e.target_device,
+        e.cpu_only,
+        e.gpu_backend,
+        e.local_vram_budget_mib,
+        config.rpc.tensor_split,
+        config.rpc.expert_homes,
+        w.host_f32,
+        w.miss_policy,
+        m.edge0_no_lora,
+        m.edge0_no_prerouter,
+    ))
 }
 
-/// The running executable's path, size and modification time: changes with
-/// every rebuild.
-fn engine_build_id() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            let meta = std::fs::metadata(&exe).ok()?;
-            let modified = meta
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_nanos();
-            Some(format!("{}:{}:{modified}", exe.display(), meta.len()))
-        })
-        .unwrap_or_else(|| "unknown".into())
+/// This executable's build: its path, size and modification time, read once
+/// per process at engine start (a rebuild over the running binary must not
+/// move the cache partway through a run). `None` when they cannot be read;
+/// the disk tier is then off.
+fn engine_build_id() -> Option<&'static str> {
+    static BUILD: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BUILD.get_or_init(read_build_id).as_deref()
 }
 
-fn prompt_cache_key(
+fn read_build_id() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let meta = std::fs::metadata(&exe).ok()?;
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    Some(format!("{}:{}:{modified}", exe.display(), meta.len()))
+}
+
+/// Everything a prompt-cache checkpoint depends on, as text: the model's
+/// shape, its file (path, size, modification time), the expert mask and
+/// `settings` ([`prompt_cache_settings`]). Written to the folder's `key.txt`.
+fn prompt_cache_fingerprint(
     model: &ModelConfig,
     file: Option<&std::path::Path>,
     disabled: &[Vec<u32>],
     settings: &str,
-) -> u64 {
+) -> String {
     let mut text = format!("{model:?}|{disabled:?}|{settings}");
     if let Some((file, meta)) = file.and_then(|f| std::fs::metadata(f).ok().map(|m| (f, m))) {
         let modified = meta
@@ -5692,6 +5792,22 @@ fn prompt_cache_key(
             .map_or(0, |d| d.as_nanos());
         text.push_str(&format!("|{}|{}|{modified}", file.display(), meta.len()));
     }
+    text
+}
+
+/// Names the prompt cache's disk folder: a hash of
+/// [`prompt_cache_fingerprint`], so checkpoints only resume the model, mask
+/// and settings that wrote them.
+fn prompt_cache_key(
+    model: &ModelConfig,
+    file: Option<&std::path::Path>,
+    disabled: &[Vec<u32>],
+    settings: &str,
+) -> u64 {
+    fnv1a(&prompt_cache_fingerprint(model, file, disabled, settings))
+}
+
+fn fnv1a(text: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.bytes() {
         h ^= b as u64;
@@ -5700,6 +5816,82 @@ fn prompt_cache_key(
     h
 }
 
+/// How long a prompt-cache folder nobody opens is kept.
+const PROMPT_CACHE_FOLDER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
+
+/// Open the prompt cache's local folder `keep` under `root`, write its
+/// `key.txt` (the fingerprint text, so an operator can tell folders apart;
+/// rewriting it marks the folder used) and prune the other folders:
+/// [`prune_prompt_cache_folders`].
+fn open_prompt_cache_folder(
+    root: &std::path::Path,
+    keep: &str,
+    fingerprint: &str,
+    budget: u64,
+) -> Result<crate::kv_radix::LocalDir, AllpacaError> {
+    let dir = root.join(keep);
+    let opened = crate::kv_radix::LocalDir::open(&dir)?;
+    if let Err(e) = std::fs::write(dir.join("key.txt"), fingerprint) {
+        tracing::warn!(error = %e, "prompt cache: key.txt not written");
+    }
+    prune_prompt_cache_folders(root, keep, budget, PROMPT_CACHE_FOLDER_MAX_AGE, std::time::SystemTime::now());
+    Ok(opened)
+}
+
+/// Delete the prompt-cache folders under `root` other than `keep` (folders
+/// named by 16 hex digits; other names are left alone) that were last used
+/// more than `max_age` before `now`, then the least recently used of the rest
+/// until they hold at most `budget` bytes together (0 = no byte limit).
+/// A folder's last use is its newest file's modification time. Each rebuild
+/// or settings change opens a new folder, so without this they pile up.
+fn prune_prompt_cache_folders(
+    root: &std::path::Path,
+    keep: &str,
+    budget: u64,
+    max_age: std::time::Duration,
+    now: std::time::SystemTime,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut folders = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit());
+        if !ours || name == keep || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let (mut used, mut bytes) = (std::time::UNIX_EPOCH, 0u64);
+        for file in std::fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+            if let Ok(meta) = file.metadata() {
+                bytes += meta.len();
+                used = used.max(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
+            }
+        }
+        folders.push((used, bytes, entry.path()));
+    }
+    // Most recently used first.
+    folders.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut kept = 0u64;
+    for (used, bytes, path) in folders {
+        let stale = now.duration_since(used).is_ok_and(|age| age > max_age);
+        let over = budget > 0 && kept + bytes > budget;
+        if stale || over {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => tracing::info!(folder = %path.display(), bytes, "prompt cache: old folder removed"),
+                Err(e) => tracing::warn!(folder = %path.display(), error = %e, "prompt cache: old folder not removed"),
+            }
+        } else {
+            kept += bytes;
+        }
+    }
+}
+
+/// Run `f` on every HIP workspace that holds device GDN / Mamba-2 state for
+/// the target: the target GPU, then the local layer-split peer. Recurrent
+/// slots live on the workspace that ran the layer, so clone / rewind / clear
+/// must reach both or the peer's layers keep state from rejected tokens (and
+/// leak it per request).
 fn for_each_gdn_workspace(
     hip: &HipWorkspace,
     target: Option<&TinyModel>,
@@ -9609,9 +9801,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A new engine whose settings change what a checkpoint means must not be
-    /// served the checkpoints another engine left on disk.
-    fn assert_disk_cache_not_served_after(name: &str, change: impl Fn(&mut Config)) {
+    /// Prompt-cache hits of an engine built with `base` then `change`, on the
+    /// checkpoints an engine built with `base` alone left on disk.
+    fn disk_cache_hits_after(name: &str, base: &dyn Fn(&mut Config), change: &dyn Fn(&mut Config)) -> u64 {
         let params = GenerationParams {
             max_tokens: 4,
             temperature: 0.0,
@@ -9627,6 +9819,7 @@ mod tests {
             cfg.speculative.enabled = false;
             cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
             cfg.prompt_cache.disk_dir = Some(dir.clone());
+            base(&mut cfg);
             cfg
         };
         Engine::new(config()).unwrap().generate("hello world hello", params.clone()).unwrap();
@@ -9634,27 +9827,163 @@ mod tests {
         change(&mut changed);
         let engine = Engine::new(changed).unwrap();
         engine.generate("hello world hello true", params).unwrap();
-        let stats = engine.stats();
-        assert_eq!(stats.radix_hits, 0, "{name}: a checkpoint from other settings was restored; {stats:?}");
+        let hits = engine.stats().radix_hits;
         let _ = std::fs::remove_dir_all(&dir);
+        hits
+    }
+
+    /// A new engine whose settings change what a checkpoint means must not be
+    /// served the checkpoints another engine left on disk. The same engine
+    /// without the change must be, so an empty disk tier cannot pass.
+    fn assert_disk_cache_not_served_after(name: &str, base: impl Fn(&mut Config), change: impl Fn(&mut Config)) {
+        let same = disk_cache_hits_after(&format!("{name}_same"), &base, &|_| {});
+        assert!(same >= 1, "{name}: unchanged settings must restore from disk; hits={same}");
+        let hits = disk_cache_hits_after(name, &base, &change);
+        assert_eq!(hits, 0, "{name}: a checkpoint from other settings was restored");
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_is_not_served_after_the_codec_changes() {
+        use allpaca_types::KvCodec;
+        // Q8 rows restored by an F32 engine would not equal its cold prefill.
+        assert_disk_cache_not_served_after("codec_q8_f32", |c| c.prompt_cache.codec = KvCodec::Q8, |c| {
+            c.prompt_cache.codec = KvCodec::F32
+        });
+        assert_disk_cache_not_served_after("codec_f32_q8", |c| c.prompt_cache.codec = KvCodec::F32, |c| {
+            c.prompt_cache.codec = KvCodec::Q8
+        });
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_is_not_served_after_an_experimental_option_changes() {
+        assert_disk_cache_not_served_after("experimental", |_| {}, |c| c.experimental.row_variant_kernels = true);
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_is_not_served_after_the_route_tail_skip_rank_changes() {
+        assert_disk_cache_not_served_after(
+            "skip_rank",
+            |c| {
+                c.experimental.route_tail_skip = true;
+                c.experimental.route_tail_skip_rank = 7;
+            },
+            |c| c.experimental.route_tail_skip_rank = 5,
+        );
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_is_still_served_after_rejection_sampling_changes() {
+        // Rejection sampling only picks tokens; prefill rows stay the same.
+        let hits = disk_cache_hits_after("rejection", &|_| {}, &|c| c.experimental.rejection_sampling = true);
+        assert!(hits >= 1, "rejection sampling must not drop valid checkpoints; hits={hits}");
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_is_not_served_after_placement_or_weights_change() {
+        assert_disk_cache_not_served_after("host_f32", |_| {}, |c| c.weights.host_f32 = true);
+        assert_disk_cache_not_served_after("miss_policy", |_| {}, |c| {
+            c.weights.miss_policy = allpaca_types::MissPolicy::Cpu
+        });
+        assert_disk_cache_not_served_after("vram_budget", |_| {}, |c| c.engine.local_vram_budget_mib = vec![512]);
+        assert_disk_cache_not_served_after("edge0_no_lora", |_| {}, |c| c.model.edge0_no_lora = true);
+        assert_disk_cache_not_served_after("edge0_no_prerouter", |_| {}, |c| c.model.edge0_no_prerouter = true);
     }
 
     #[test]
     fn prompt_cache_settings_follow_the_build() {
         let cfg = test_config();
-        assert_eq!(prompt_cache_settings(&cfg, "build-a"), prompt_cache_settings(&cfg, "build-a"));
-        assert_ne!(prompt_cache_settings(&cfg, "build-a"), prompt_cache_settings(&cfg, "build-b"));
-        assert!(!engine_build_id().is_empty());
+        let s = |build| prompt_cache_settings(&cfg, Some(build), &[], "cpu");
+        assert_eq!(s("build-a"), s("build-a"));
+        assert_ne!(s("build-a"), s("build-b"));
+        assert!(engine_build_id().is_some());
+        assert_eq!(engine_build_id(), engine_build_id(), "read once per process");
     }
 
     #[test]
-    fn prompt_cache_on_disk_is_not_served_after_the_codec_changes() {
-        assert_disk_cache_not_served_after("codec", |cfg| cfg.prompt_cache.codec = allpaca_types::KvCodec::Q8);
+    fn prompt_cache_settings_follow_each_workers_build() {
+        let cfg = test_config();
+        let worker = |build: &str| vec![("10.0.0.2:50052".to_string(), Some(build.to_string()))];
+        let s = |w: &[(String, Option<String>)]| prompt_cache_settings(&cfg, Some("c"), w, "cpu");
+        assert_eq!(s(&worker("w1")), s(&worker("w1")));
+        assert_ne!(s(&worker("w1")), s(&worker("w2")), "a rebuilt worker misses");
+        assert_ne!(s(&worker("w1")), s(&[]));
+        let moved = vec![("10.0.0.3:50052".to_string(), Some("w1".to_string()))];
+        assert_ne!(s(&worker("w1")), s(&moved));
     }
 
     #[test]
-    fn prompt_cache_on_disk_is_not_served_after_an_experimental_option_changes() {
-        assert_disk_cache_not_served_after("experimental", |cfg| cfg.experimental.row_variant_kernels = true);
+    fn prompt_cache_has_no_settings_when_a_build_is_unknown() {
+        let cfg = test_config();
+        assert!(prompt_cache_settings(&cfg, None, &[], "cpu").is_none());
+        let old_worker = vec![("10.0.0.2:50052".to_string(), None)];
+        assert!(prompt_cache_settings(&cfg, Some("c"), &old_worker, "cpu").is_none());
+    }
+
+    #[test]
+    fn prompt_cache_settings_follow_the_placement() {
+        let base = test_config();
+        let s = |cfg: &Config, plan: &str| prompt_cache_settings(cfg, Some("c"), &[], plan).unwrap();
+        let reference = s(&base, "hip:0:a;0=hip:0:a");
+        assert_ne!(reference, s(&base, "hip:0:a;0=rpc:w:1/0"), "the resolved plan");
+        let changes: Vec<(&str, Box<dyn Fn(&mut Config)>)> = vec![
+            ("tensor_split", Box::new(|c| c.rpc.tensor_split = Some(vec![1.0, 2.0]))),
+            ("expert_homes", Box::new(|c| {
+                c.rpc.expert_homes.insert("3".into(), "rpc:w:1/0".into());
+            })),
+            ("cpu_only", Box::new(|c| c.engine.cpu_only = !c.engine.cpu_only)),
+            ("target_device", Box::new(|c| c.engine.target_device = allpaca_types::DeviceSelector::Auto)),
+            ("gpu_backend", Box::new(|c| c.engine.gpu_backend = "cuda".into())),
+        ];
+        for (name, change) in changes {
+            let mut cfg = base.clone();
+            change(&mut cfg);
+            assert_ne!(reference, s(&cfg, "hip:0:a;0=hip:0:a"), "{name}");
+        }
+        let mut rejection = base.clone();
+        rejection.experimental.rejection_sampling = true;
+        assert_eq!(reference, s(&rejection, "hip:0:a;0=hip:0:a"), "sampling only");
+    }
+
+    #[test]
+    fn prompt_cache_folder_holds_its_key_and_old_folders_are_pruned() {
+        let root = std::env::temp_dir()
+            .join("allpaca_prompt_cache_tests")
+            .join(format!("prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = |name: &str, bytes: usize| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("a.ckpt"), vec![0u8; bytes]).unwrap();
+            d
+        };
+        let other = folder("00000000000000aa", 100);
+        let older = folder("00000000000000bb", 100);
+        let unrelated = folder("not-a-cache-folder", 100);
+        // `older` was last used before `other`.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(older.join("a.ckpt"))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let dir = open_prompt_cache_folder(&root, "00000000000000cc", "fingerprint text", 150).unwrap();
+        drop(dir);
+        assert_eq!(
+            std::fs::read_to_string(root.join("00000000000000cc").join("key.txt")).unwrap(),
+            "fingerprint text"
+        );
+        assert!(other.exists(), "the most recently used folder fits the budget");
+        assert!(!older.exists(), "least recently used past the budget");
+        assert!(unrelated.exists(), "only 16-hex-digit folders are pruned");
+        assert!(root.join("00000000000000cc").exists(), "the open folder stays");
+
+        // By age, whatever the budget.
+        let now = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600);
+        prune_prompt_cache_folders(&root, "00000000000000cc", 0, std::time::Duration::from_secs(3600), now);
+        assert!(!other.exists(), "unused for longer than the maximum age");
+        assert!(root.join("00000000000000cc").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
