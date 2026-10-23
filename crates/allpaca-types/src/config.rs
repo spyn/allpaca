@@ -13,6 +13,10 @@ use crate::pipeline::{FeatureFlagOverlay, PipelineMode};
 pub struct Config {
     pub engine: EngineSection,
     pub speculative: SpeculativeSection,
+    /// Opt-in techniques that may leave the exact-output path. All off by
+    /// default; the techniques themselves land in P14/P15/P6/B6.
+    #[serde(default)]
+    pub experimental: ExperimentalSection,
     pub prefill: PrefillSection,
     pub kv: KvSection,
     pub weights: WeightsSection,
@@ -41,10 +45,17 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Exactness of a run at the configured default temperature. Requests that
+    /// override the temperature are not reflected.
+    pub fn exactness(&self) -> ExactnessLevel {
+        self.experimental.exactness(self.sampling.temperature)
+    }
+
     pub fn compiled_defaults() -> Self {
         Self {
             engine: EngineSection::default(),
             speculative: SpeculativeSection::default(),
+            experimental: ExperimentalSection::default(),
             prefill: PrefillSection::default(),
             kv: KvSection::default(),
             weights: WeightsSection::default(),
@@ -520,6 +531,91 @@ impl Default for SpeculativeSection {
     }
 }
 
+/// How tightly a run's output must match the exact path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExactnessLevel {
+    /// Spec == no-spec and concurrent == solo, byte for byte.
+    Exact,
+    /// Same distribution, different samples (e.g. rejection sampling at T > 0).
+    DistributionExact,
+    /// Output may change within a measured bound (KL / top-1).
+    Lossy,
+}
+
+impl ExactnessLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::DistributionExact => "distribution-exact",
+            Self::Lossy => "lossy",
+        }
+    }
+}
+
+impl std::fmt::Display for ExactnessLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Opt-in flags for techniques that leave the exact-output path. Fields only;
+/// wiring is P14 / P15 / P6 / B6. Every option defaults to off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalSection {
+    pub rejection_sampling: bool,
+    pub route_tail_skip: bool,
+    /// Rank at or below which missed experts are skipped (Strata default 7).
+    pub route_tail_skip_rank: u32,
+    pub row_variant_kernels: bool,
+    pub chunked_gdn: bool,
+}
+
+impl Default for ExperimentalSection {
+    fn default() -> Self {
+        Self {
+            rejection_sampling: false,
+            route_tail_skip: false,
+            route_tail_skip_rank: 7,
+            row_variant_kernels: false,
+            chunked_gdn: false,
+        }
+    }
+}
+
+impl ExperimentalSection {
+    /// Names of options that are currently on (for the startup warning).
+    pub fn enabled_names(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.rejection_sampling {
+            out.push("rejection_sampling");
+        }
+        if self.route_tail_skip {
+            out.push("route_tail_skip");
+        }
+        if self.row_variant_kernels {
+            out.push("row_variant_kernels");
+        }
+        if self.chunked_gdn {
+            out.push("chunked_gdn");
+        }
+        out
+    }
+
+    /// Exactness of a run with these options at `temperature`. Lossy wins over
+    /// distribution-exact; rejection sampling keeps greedy decoding exact.
+    pub fn exactness(&self, temperature: f32) -> ExactnessLevel {
+        if self.route_tail_skip || self.row_variant_kernels || self.chunked_gdn {
+            ExactnessLevel::Lossy
+        } else if self.rejection_sampling && temperature > 0.0 {
+            ExactnessLevel::DistributionExact
+        } else {
+            ExactnessLevel::Exact
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KvSection {
@@ -933,6 +1029,73 @@ pub struct CliOverrides {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experimental_defaults_are_off_and_exact() {
+        let defaults = Config::compiled_defaults();
+        assert!(!defaults.experimental.rejection_sampling);
+        assert!(!defaults.experimental.route_tail_skip);
+        assert_eq!(defaults.experimental.route_tail_skip_rank, 7);
+        assert!(!defaults.experimental.row_variant_kernels);
+        assert!(!defaults.experimental.chunked_gdn);
+        assert_eq!(defaults.exactness(), ExactnessLevel::Exact);
+        assert!(defaults.experimental.enabled_names().is_empty());
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [experimental]
+            rejection_sampling = true
+            route_tail_skip = true
+            route_tail_skip_rank = 5
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.experimental.rejection_sampling);
+        assert!(cfg.experimental.route_tail_skip);
+        assert_eq!(cfg.experimental.route_tail_skip_rank, 5);
+        assert_eq!(cfg.exactness(), ExactnessLevel::Lossy);
+        assert_eq!(
+            cfg.experimental.enabled_names(),
+            ["rejection_sampling", "route_tail_skip"]
+        );
+
+        let dist = Config::from_toml_str(
+            r#"
+            [sampling]
+            temperature = 0.7
+            [experimental]
+            rejection_sampling = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(dist.exactness(), ExactnessLevel::DistributionExact);
+    }
+
+    #[test]
+    fn rejection_sampling_is_exact_when_greedy() {
+        let greedy = Config::from_toml_str(
+            r#"
+            [sampling]
+            temperature = 0.0
+            [experimental]
+            rejection_sampling = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(greedy.exactness(), ExactnessLevel::Exact);
+
+        let lossy = Config::from_toml_str(
+            r#"
+            [sampling]
+            temperature = 0.0
+            [experimental]
+            rejection_sampling = true
+            chunked_gdn = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(lossy.exactness(), ExactnessLevel::Lossy);
+    }
 
     #[test]
     fn compiled_defaults_then_toml_then_cli() {

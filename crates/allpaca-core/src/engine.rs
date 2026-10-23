@@ -38,7 +38,7 @@ use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
-    alloc_pages_for_seq, ensure_pages, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
+    alloc_pages_for_seq_masked, ensure_pages, kv_layer_mask, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
     TinyModel,
 };
 use crate::packed::{temp_pack_path, HostExpertPool, PackedStore};
@@ -191,6 +191,8 @@ struct EngineInner {
     flags: FeatureFlags,
     scheduler: Scheduler,
     kv: KvTierManager,
+    /// The KV VRAM budget has been capped to what the GPUs hold after load.
+    kv_vram_capped: bool,
     ring: LogitRing,
     tokenizer: Option<EngineTokenizer>,
     /// Set when the loaded GGUF is a decision model (`<arch>.decision.type`).
@@ -287,6 +289,29 @@ pub struct Engine {
     /// Last values `stats` / `model_id` read under `inner`, served while a
     /// prefill holds the engine lock.
     read_side: Arc<Mutex<ReadSide>>,
+    /// One routed expert's bytes in the loaded GGUF, for models whose experts
+    /// sit only in fused device buffers (no per-expert host objects).
+    gguf_expert_slot: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// One routed expert's gate+up+down bytes as `file` stores them, from the
+/// first block with stacked experts; 0 when it has none.
+fn gguf_expert_slot_bytes(file: &GgufFile, n_experts: usize) -> u64 {
+    let is_stack = |name: &str| name.contains(".ffn_") && name.ends_with("_exps.weight");
+    let Some(first) = file.tensors.iter().find(|t| is_stack(&t.name)) else {
+        return 0;
+    };
+    if n_experts == 0 {
+        return 0;
+    }
+    let block = &first.name[..first.name.find(".ffn_").unwrap_or(0)];
+    let stack: usize = file
+        .tensors
+        .iter()
+        .filter(|t| is_stack(&t.name) && t.name.split_once(".ffn_").is_some_and(|(b, _)| b == block))
+        .map(|t| t.nbytes())
+        .sum();
+    (stack / n_experts) as u64
 }
 
 /// Starts the GPU BLAS library on `device` from a background thread while the
@@ -544,6 +569,14 @@ impl Engine {
         }
         config.apply_tune_overlay();
         config.validate()?;
+        let experimental_on = config.experimental.enabled_names();
+        if !experimental_on.is_empty() {
+            tracing::warn!(
+                options = %experimental_on.join(", "),
+                exactness = %config.exactness(),
+                "experimental options are on; output may leave the exact path"
+            );
+        }
         let mut inventory = DeviceInventory::discover(&config);
         scale_kv_vram_from_inventory(&mut config, &inventory);
         let rpc = if config.rpc.endpoints.is_empty() {
@@ -622,6 +655,7 @@ impl Engine {
             flags,
             scheduler,
             kv,
+            kv_vram_capped: false,
             ring,
             tokenizer: None,
             decision: None,
@@ -678,6 +712,7 @@ impl Engine {
             rpc,
             poll_tick: Arc::new(Mutex::new(())),
             read_side: Arc::new(Mutex::new(ReadSide::default())),
+            gguf_expert_slot: Arc::default(),
         };
         if config.model.synthetic {
             engine.load_synthetic(ModelConfig::tiny())?;
@@ -771,6 +806,21 @@ impl Engine {
     /// Live stats for every GPU on the RPC workers (empty without RPC).
     pub fn remote_gpus(&self) -> Vec<crate::rpc_runtime::RemoteGpu> {
         self.rpc.as_ref().map(|r| r.remote_gpu_stats()).unwrap_or_default()
+    }
+
+    /// Bytes of one routed expert's weights (gate+up+down), or 0 when the
+    /// loaded model has no MoE experts. Used by the bench roofline.
+    pub fn expert_slot_bytes(&self) -> u64 {
+        let held = self
+            .lock()
+            .ok()
+            .and_then(|inner| inner.target.as_ref().map(|m| m.expert_slot_bytes() as u64))
+            .unwrap_or(0);
+        if held > 0 {
+            held
+        } else {
+            self.gguf_expert_slot.load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     /// The loaded target's expert controls, sized to its routed experts.
@@ -1194,23 +1244,25 @@ impl Engine {
                 )
             }
         };
+        // Copy the RPC counters whenever workers are attached: expert-parallel
+        // placement makes round trips without `placed_remote()` layers.
+        if let Some(rt) = &self.rpc {
+            self.metrics.rpc_roundtrips.store(
+                rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.rpc_activation_bytes.store(
+                rt.activation_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.metrics.rpc_h2d_bytes.store(
+                rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         let (backend, device_memory_bytes) =
             if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) {
-                if let Some(rt) = &self.rpc {
-                    self.metrics.rpc_roundtrips.store(
-                        rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    self.metrics.rpc_activation_bytes.store(
-                        rt.activation_bytes
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    self.metrics.rpc_h2d_bytes.store(
-                        rt.h2d_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
                 ("rpc".into(), allpaca_hip::allocated_bytes())
             } else if self.hip.is_some() {
                 ("hip".into(), allpaca_hip::allocated_bytes())
@@ -1355,7 +1407,7 @@ impl Engine {
         } else {
             "p2p_unavailable"
         };
-        self.metrics.snapshot(
+        let mut snapshot = self.metrics.snapshot(
             &format!("{:?}", self.inventory.pipeline_mode),
             &format!("{:?}", self.inventory.transfer_path),
             self.inventory.p2p_capable,
@@ -1370,7 +1422,12 @@ impl Engine {
             model_id,
             backend,
             draft_depth,
-        )
+        );
+        snapshot.exactness = self.config.exactness().as_str().into();
+        if let Some(rt) = &self.rpc {
+            snapshot.rpc_workers = rt.worker_calls();
+        }
+        snapshot
     }
 
     pub fn model_id(&self) -> String {
@@ -1884,6 +1941,10 @@ impl Engine {
         } else {
             TinyModel::from_gguf(&file)?
         };
+        self.gguf_expert_slot.store(
+            gguf_expert_slot_bytes(&file, model.config.n_experts),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         model.bind_gguf(file.clone());
         #[cfg(feature = "cuda")]
         let has_cuda = self.cuda.is_some();
@@ -2885,12 +2946,53 @@ impl Engine {
                 .map(|i| rpc.local_device(i))
                 .collect();
             inner.kv.set_layer_devices(&devs);
+            // Once, with the weights loaded: KV pages past what the cards
+            // still hold must go to the pinned DRAM tier, not WDDM's silent
+            // spill. A plan that keeps a whole model on one card leaves less
+            // than `kv.vram_bytes` there.
+            if !inner.kv_vram_capped {
+                inner.kv_vram_capped = true;
+                // The cards of the layers that keep KV (see `kv_layer_mask`).
+                let attn_devs: Vec<i32> = devs
+                    .iter()
+                    .zip(kv_layer_mask(&target))
+                    .filter(|(_, keeps)| *keeps)
+                    .map(|(d, _)| *d)
+                    .collect();
+                let room = crate::rpc_runtime::kv_vram_headroom(&attn_devs) as usize;
+                let want = self.config.kv.vram_bytes;
+                if room > 0 && room < want {
+                    tracing::info!(
+                        kv_vram_mib = want >> 20,
+                        capped_mib = room >> 20,
+                        "KV VRAM budget capped to what the GPUs hold after load"
+                    );
+                    inner.kv.set_vram_bytes(room, &self.metrics)?;
+                }
+                // VRAM keeps `hot_fraction` of its budget; DRAM must hold the
+                // rest of the configured KV, or the context a request can use
+                // is smaller than `kv.vram_bytes` promises (the default DRAM
+                // tier is 32 MiB).
+                let short = want
+                    .saturating_sub(inner.kv.vram_hot_bytes())
+                    .saturating_sub(inner.kv.dram_capacity_bytes());
+                if short > 0 {
+                    tracing::info!(
+                        dram_added_mib = short >> 20,
+                        "KV DRAM tier grown so the configured KV budget fits"
+                    );
+                    inner.kv.grow_dram_bytes(short);
+                }
+            }
         }
-        let pages = alloc_pages_for_seq(
+        // Recurrent (SSM / Gated DeltaNet) layers write no KV: no pages for them.
+        let keeps = kv_layer_mask(&target);
+        let pages = alloc_pages_for_seq_masked(
             &mut inner.kv,
             &target.config,
             page_tokens,
             tokens.len() + params.max_tokens,
+            Some(&keeps),
             &self.metrics,
         )?;
         let mut recurrent = if target.config.recurrent {
@@ -3028,18 +3130,28 @@ impl Engine {
         self.metrics
             .prompt_tokens
             .fetch_add(prompt_len as u64, std::sync::atomic::Ordering::Relaxed);
-        // One chunk only — remaining prompt tokens continue in `step` so a
-        // second Request can admit / decode between chunks.
-        // Another Request's decode logits may still be in flight: land them
-        // before this prefill's forward reuses the pinned logits slot.
-        self.drain_foreign_logits(&mut inner, id)?;
-        self.prefill_chunk(&mut inner, id)?;
-        Ok(RequestHandle {
+        // The Request is in `active` now: from here on a failure must drop
+        // its handle, which gives back the slot and the KV pages.
+        let handle = RequestHandle {
             id,
             inner: Arc::clone(&self.inner),
             metrics: Arc::clone(&self.metrics),
             hip: self.hip.clone(),
-        })
+        };
+        // One chunk only — remaining prompt tokens continue in `step` so a
+        // second Request can admit / decode between chunks.
+        // Another Request's decode logits may still be in flight: land them
+        // before this prefill's forward reuses the pinned logits slot.
+        let admitted = self
+            .drain_foreign_logits(&mut inner, id)
+            .and_then(|()| self.prefill_chunk(&mut inner, id));
+        if let Err(e) = admitted {
+            // `Drop` takes the engine lock.
+            drop(inner);
+            drop(handle);
+            return Err(e);
+        }
+        Ok(handle)
     }
 
     fn hip_workspace_for_device(&self, device: i32) -> Option<&HipWorkspace> {
@@ -6523,10 +6635,11 @@ fn packed_linear_verify_span(
     let start_pos = request(inner, id)?.tokens.len();
     let vision = request(inner, id)?.vision.clone();
     let vision_ref = (!vision.is_empty()).then_some(&*vision);
+    // The first layer with pages: a recurrent layer keeps none.
     let page_tokens = request(inner, id)?
         .pages
-        .first()
-        .and_then(|layer| layer.first())
+        .iter()
+        .find_map(|layer| layer.first())
         .and_then(|page_id| inner.kv.get(*page_id))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);
@@ -7101,10 +7214,11 @@ fn append_and_forward(
     #[cfg(feature = "vulkan")] vulkan: Option<&allpaca_vulkan::VulkanWorkspace>,
 ) -> Result<(), AllpacaError> {
     let pos = request(inner, id)?.tokens.len();
+    // The first layer with pages: a recurrent layer keeps none.
     let page_tokens = request(inner, id)?
         .pages
-        .first()
-        .and_then(|layer| layer.first())
+        .iter()
+        .find_map(|layer| layer.first())
         .and_then(|page_id| inner.kv.get(*page_id))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);
@@ -10591,6 +10705,38 @@ mod tests {
         engine
             .begin_request("world", params)
             .expect("lock released after Request handle drop");
+    }
+
+    /// A Request whose first prefill fails must give its slot back: before,
+    /// one failure (an MTP draft with nowhere to run) left every later
+    /// Request answered "another request is already active".
+    #[test]
+    fn failed_admission_releases_the_request_slot() {
+        let engine = test_engine();
+        {
+            let mut inner = engine.lock().unwrap();
+            let target = inner.target.as_ref().unwrap();
+            let mut draft = (**target).clone();
+            // An MTP draft with neither host weights nor a resident upload:
+            // the state a large-GGUF MTP drafter on the target's own card is in.
+            draft.config.gguf_layer_base = draft.config.n_layers;
+            draft.embed = Vec::new();
+            inner.draft_model = Some(Arc::new(draft));
+            inner.draft_resident = None;
+        }
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            ..GenerationParams::default()
+        };
+        let first = engine.begin_request("hello", params.clone());
+        assert!(first.is_err(), "the broken draft must fail admission");
+        let second = engine.begin_request("world", params).unwrap_err();
+        assert!(
+            !matches!(second, AllpacaError::Transient(TransientError::RequestBusy)),
+            "the failed Request still holds its slot"
+        );
+        assert_eq!(engine.lock().unwrap().active.len(), 0);
     }
 
     #[test]
@@ -15916,6 +16062,17 @@ draft acceptance rate = 0.77 (10 accepted / 13 generated)
             )
             .expect("GGUF generate must still work");
         assert!(!out.token_ids.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn gguf_expert_slot_bytes_reads_the_stacked_tensors() {
+        let path = std::env::temp_dir().join("allpaca_moe_slot_bytes.gguf");
+        write_tiny_moe_gguf(&path);
+        let file = GgufFile::open(&path).unwrap();
+        // 4 F32 experts, each gate + up (16×8) and down (8×16).
+        assert_eq!(gguf_expert_slot_bytes(&file, 4), 3 * 16 * 8 * 4);
+        assert_eq!(gguf_expert_slot_bytes(&file, 0), 0);
         let _ = std::fs::remove_file(path);
     }
 

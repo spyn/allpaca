@@ -71,6 +71,13 @@ impl BufferPool {
     fn slice_mut(&mut self, off: usize, len: usize) -> &mut [f32] {
         &mut self.data[off..off + len]
     }
+
+    /// Add capacity. Offsets stay valid; the buffer may move, so no pointer
+    /// into it may be held across this call.
+    fn grow(&mut self, extra_bytes: usize) {
+        self.capacity += extra_bytes / 4;
+        self.data.resize(self.capacity, 0.0);
+    }
 }
 
 struct CudaPageAlloc {
@@ -1554,6 +1561,23 @@ impl KvTierManager {
         Ok(())
     }
 
+    /// Give the DRAM tier `extra_bytes` more room, for KV that a lower VRAM
+    /// budget no longer holds, so the context a request can use stays the same.
+    pub fn grow_dram_bytes(&mut self, extra_bytes: usize) {
+        self.dram.grow(extra_bytes);
+    }
+
+    /// Bytes the DRAM tier can hold.
+    pub fn dram_capacity_bytes(&self) -> usize {
+        self.dram.capacity * 4
+    }
+
+    /// Bytes of KV that stay in VRAM before pages move to DRAM: the VRAM
+    /// budget times `hot_fraction`.
+    pub fn vram_hot_bytes(&self) -> usize {
+        (((self.vram_capacity as f32) * self.hot_fraction) as usize) * 4
+    }
+
     /// Spill lowest-priority VRAM KV pages to DRAM until `want_bytes` are freed
     /// (attention-trim / H2O-style cold shrink for expert VRAM headroom).
     /// Returns bytes actually migrated. Capacity is left unchanged — this is a
@@ -1879,6 +1903,34 @@ mod tests {
             "elastic shrink must spill KV to DRAM; vram={vram_after} dram={dram_after}"
         );
         assert!(vram_after < vram_before);
+    }
+
+    #[test]
+    fn capping_vram_and_growing_dram_keeps_the_kv_capacity() {
+        // One page here is 4 tokens × 1 head × 4 dims × K+V = 32 floats = 128 B.
+        let page = 128usize;
+        let fill = |kv: &mut KvTierManager, n: u32| {
+            let metrics = Metrics::default();
+            (0..n).all(|i| kv.alloc_page(0, i, 4, 1, 4, &metrics).is_ok())
+        };
+        // 8 pages of VRAM budget and 1 of DRAM: 8 pages fit.
+        let mut kv = KvTierManager::new(8 * page, page, 1.0);
+        assert!(fill(&mut kv, 8));
+        // Capped to 4 pages of VRAM without growing DRAM, 8 pages no longer fit.
+        let mut kv = KvTierManager::new(8 * page, page, 1.0);
+        kv.set_vram_bytes(4 * page, &Metrics::default()).unwrap();
+        assert!(!fill(&mut kv, 8), "the cap alone shrinks the context");
+        // The engine's cap moves the difference to DRAM: 8 pages fit again.
+        let mut kv = KvTierManager::new(8 * page, page, 1.0);
+        kv.set_vram_bytes(4 * page, &Metrics::default()).unwrap();
+        kv.grow_dram_bytes(4 * page);
+        assert!(fill(&mut kv, 8));
+        let (vram, dram) = kv.counts();
+        assert!(vram <= 4 && dram >= 4, "vram={vram} dram={dram}");
+        // Only `hot_fraction` of the VRAM budget holds pages before DRAM takes over.
+        let kv = KvTierManager::new(8 * page, page, 0.75);
+        assert_eq!(kv.vram_hot_bytes(), 6 * page);
+        assert_eq!(kv.dram_capacity_bytes(), page);
     }
 
     #[test]
