@@ -17458,6 +17458,52 @@ mod tests {
         }
     }
 
+    /// Wider and ragged prefill shapes still match the existing f16 NT GEMM.
+    ///
+    /// `m > 8` is the prefill launch. Tiles past a multiple of 16, a second K
+    /// panel, and a row count just above the decode cutoff are all legal.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_f16_wmma_prefill_gemm_matches_existing_f16_gemm_on_more_shapes() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let shapes = [(32usize, 32usize, 32usize), (16, 48, 16), (24, 20, 40), (9, 16, 32)];
+        for (si, (m, n, k)) in shapes.into_iter().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 43) % 50) as f32 * 0.02 - 0.5;
+            }
+            for v in &mut a {
+                *v = super::f16_bits_to_f32(allpaca_cpu::f32_to_f16(*v));
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 11) % 50) as f32 * 0.02 - 0.5;
+            }
+            let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+            let mut reference = vec![0.0f32; m * n];
+            let mut wmma = vec![0.0f32; m * n];
+            gemm_nt_f16(&a, &b_f16, &mut reference, m as i32, n as i32, k as i32)
+                .expect("existing f16 prefill GEMM");
+            gemm_nt_f16_wmma(&a, &b_f16, &mut wmma, m as i32, n as i32, k as i32)
+                .expect("gfx12 f16 WMMA prefill GEMM");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(wmma[i], reference[i]),
+                    "f16 WMMA mismatch shape {m}x{n}x{k} idx={i} wmma={} reference={} arch={arch}",
+                    wmma[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
     /// F16 decode GEMV at lm_head-ish n must stay in the same ballpark as F32 GEMV.
     #[cfg(feature = "hip")]
     #[test]
