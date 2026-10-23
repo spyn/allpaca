@@ -4617,7 +4617,12 @@ impl Engine {
     /// it and opens that pair's disk folder.
     fn sync_prompt_cache(&self, inner: &mut EngineInner, target: &TinyModel) {
         let disabled = target.expert_controls.disabled();
-        let key = prompt_cache_key(&target.config, self.config.model.path.as_deref(), &disabled);
+        let key = prompt_cache_key(
+            &target.config,
+            self.config.model.path.as_deref(),
+            &disabled,
+            &prompt_cache_settings(&self.config, &engine_build_id()),
+        );
         if inner.prompt_cache_key == Some(key) {
             return;
         }
@@ -5639,12 +5644,46 @@ fn mtp_text_has_dropped_words(text: &str) -> bool {
 /// leak it per request).
 /// Names the prompt cache's disk folder: checkpoints only resume the model
 /// file, shape and expert mask that wrote them.
+/// Engine settings that change what a prompt-cache checkpoint means: a
+/// checkpoint written under other settings must not be restored.
+///
+/// `build` is [`engine_build_id`]: kernels may change their rounding from one
+/// build to the next, and a checkpoint from another build would then not
+/// equal a cold prefill. Page size and which layers keep KV are left out:
+/// a checkpoint holds rows, which restore into any page layout.
+fn prompt_cache_settings(config: &Config, build: &str) -> String {
+    format!(
+        "build={build}|codec={:?}|experimental={:?}",
+        config.prompt_cache.codec,
+        config.experimental.enabled_names()
+    )
+}
+
+/// The running executable's path, size and modification time: changes with
+/// every rebuild.
+fn engine_build_id() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let meta = std::fs::metadata(&exe).ok()?;
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some(format!("{}:{}:{modified}", exe.display(), meta.len()))
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn prompt_cache_key(
     model: &ModelConfig,
     file: Option<&std::path::Path>,
     disabled: &[Vec<u32>],
+    settings: &str,
 ) -> u64 {
-    let mut text = format!("{model:?}|{disabled:?}");
+    let mut text = format!("{model:?}|{disabled:?}|{settings}");
     if let Some((file, meta)) = file.and_then(|f| std::fs::metadata(f).ok().map(|m| (f, m))) {
         let modified = meta
             .modified()
@@ -9570,6 +9609,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A new engine whose settings change what a checkpoint means must not be
+    /// served the checkpoints another engine left on disk.
+    fn assert_disk_cache_not_served_after(name: &str, change: impl Fn(&mut Config)) {
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let dir = std::env::temp_dir()
+            .join("allpaca_prompt_cache_tests")
+            .join(format!("{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = || {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            cfg.prompt_cache.disk_dir = Some(dir.clone());
+            cfg
+        };
+        Engine::new(config()).unwrap().generate("hello world hello", params.clone()).unwrap();
+        let mut changed = config();
+        change(&mut changed);
+        let engine = Engine::new(changed).unwrap();
+        engine.generate("hello world hello true", params).unwrap();
+        let stats = engine.stats();
+        assert_eq!(stats.radix_hits, 0, "{name}: a checkpoint from other settings was restored; {stats:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_settings_follow_the_build() {
+        let cfg = test_config();
+        assert_eq!(prompt_cache_settings(&cfg, "build-a"), prompt_cache_settings(&cfg, "build-a"));
+        assert_ne!(prompt_cache_settings(&cfg, "build-a"), prompt_cache_settings(&cfg, "build-b"));
+        assert!(!engine_build_id().is_empty());
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_is_not_served_after_the_codec_changes() {
+        assert_disk_cache_not_served_after("codec", |cfg| cfg.prompt_cache.codec = allpaca_types::KvCodec::Q8);
+    }
+
+    #[test]
+    fn prompt_cache_on_disk_is_not_served_after_an_experimental_option_changes() {
+        assert_disk_cache_not_served_after("experimental", |cfg| cfg.experimental.row_variant_kernels = true);
+    }
+
     #[test]
     fn prompt_cache_on_a_worker_serves_a_new_engine() {
         use allpaca_rpc::{serve_connection_ext, CpuWorker, WorkerBackend};
@@ -9617,15 +9704,15 @@ mod tests {
     #[test]
     fn prompt_cache_folders_follow_the_model_and_the_expert_mask() {
         let cfg = ModelConfig::tiny();
-        let base = prompt_cache_key(&cfg, None, &[]);
-        assert_eq!(base, prompt_cache_key(&cfg, None, &[]));
-        assert_ne!(base, prompt_cache_key(&cfg, None, &[vec![3]]));
-        assert_ne!(base, prompt_cache_key(&ModelConfig::tiny_hybrid(), None, &[]));
+        let base = prompt_cache_key(&cfg, None, &[], "");
+        assert_eq!(base, prompt_cache_key(&cfg, None, &[], ""));
+        assert_ne!(base, prompt_cache_key(&cfg, None, &[vec![3]], ""));
+        assert_ne!(base, prompt_cache_key(&ModelConfig::tiny_hybrid(), None, &[], ""));
         let file = std::env::temp_dir().join(format!("allpaca_pc_key_{}.bin", std::process::id()));
         std::fs::write(&file, b"one").unwrap();
-        let one = prompt_cache_key(&cfg, Some(&file), &[]);
+        let one = prompt_cache_key(&cfg, Some(&file), &[], "");
         std::fs::write(&file, b"other").unwrap();
-        assert_ne!(one, prompt_cache_key(&cfg, Some(&file), &[]));
+        assert_ne!(one, prompt_cache_key(&cfg, Some(&file), &[], ""));
         let _ = std::fs::remove_file(&file);
     }
 
