@@ -367,6 +367,7 @@ mod ffi {
             arch_len: i32,
             l2_bytes: *mut i32,
         ) -> i32;
+        pub fn allpaca_hip_device_multiprocessors(id: i32, count: *mut i32) -> i32;
         pub fn allpaca_hip_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
         pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
@@ -1491,6 +1492,23 @@ pub fn device_gcn_arch(id: i32) -> Option<(String, usize)> {
             return None;
         }
         Some((arch, l2.max(0) as usize))
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// `multiProcessorCount`: compute units on GCN/CDNA (MI50: 60), work-group
+/// processors on RDNA (RX 9070: 28, RX 9060 XT: 16). Size occupancy-bound
+/// grids from this, not from a constant.
+pub fn device_multiprocessors(id: i32) -> Option<u32> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let mut count = 0i32;
+        let rc = unsafe { ffi::allpaca_hip_device_multiprocessors(id, &mut count) };
+        (rc == ALLPACA_OK && count > 0).then_some(count as u32)
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
@@ -12805,6 +12823,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_device_reports_its_multiprocessors() {
+        for dev in 0..device_count() {
+            assert!(device_multiprocessors(dev).is_some_and(|n| n > 0), "hip{dev}");
+        }
+    }
+
+    #[test]
     fn kernel_launches_counts_a_launch() {
         if device_count() == 0 {
             return;
@@ -13162,6 +13187,205 @@ mod tests {
             device_free(x, 16 * k * 4);
             device_free(y, 16 * n * 4);
             device_free(w, packed.len());
+        }
+    }
+
+    /// Published peak bandwidth by ISA, for the % column of [`bench_kernel_matrix`]
+    /// (HIP's own figure is wrong on Windows: 80.6 GB/s for an RX 9070).
+    fn published_peak_gbs(arch: &str) -> Option<f64> {
+        match arch.split(':').next().unwrap_or(arch) {
+            "gfx1201" => Some(640.0), // RX 9070 / 9070 XT / R9700
+            "gfx1200" => Some(320.0), // RX 9060 XT
+            "gfx906" => Some(1024.0), // MI50
+            _ => None,
+        }
+    }
+
+    /// The same kernels and shapes on every HIP device, one column each, so a
+    /// kernel change is measured on gfx1201, gfx1200 and gfx906 alike (board D3).
+    /// Weights rotate through copies past 192 MB so the RDNA 64 MB Infinity
+    /// Cache cannot serve them. `BENCH_OUT=file.csv` also writes one CSV row per
+    /// (kernel, device) for before/after diffs, and `BENCH_DEVICES=1,2` picks
+    /// devices (on sunny GPU0 is full of worker weights by design):
+    /// `cargo test --release -p allpaca-hip --features hip --lib bench_kernel_matrix -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_kernel_matrix() {
+        let devs: Vec<i32> = match std::env::var("BENCH_DEVICES") {
+            Ok(list) => list.split(',').filter_map(|d| d.trim().parse().ok()).collect(),
+            Err(_) => (0..device_count()).collect(),
+        };
+        let n_dev = devs.len();
+        if n_dev == 0 {
+            return;
+        }
+        const ROTATE_BYTES: usize = 192 << 20;
+        let copies_for = |bytes: usize| ROTATE_BYTES.div_ceil(bytes.max(1)).clamp(1, 64);
+        let time_us = |iters: usize, f: &mut dyn FnMut()| {
+            for _ in 0..10 {
+                f();
+            }
+            stream_synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            stream_synchronize().unwrap();
+            t.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        // (kernel, shape, bytes read per call, µs per device)
+        let mut rows: Vec<(String, String, usize, Vec<f64>)> = Vec::new();
+        let mut heads = Vec::new();
+        let infos = enumerate_devices();
+        for (col, &dev) in devs.iter().enumerate() {
+            set_device(dev).unwrap();
+            let arch = device_gcn_arch(dev).map(|(a, _)| a).unwrap_or_default();
+            let mps = device_multiprocessors(dev).unwrap_or(0);
+            let name = infos.iter().find(|d| d.id == dev).map(|d| d.name.clone()).unwrap_or_default();
+            heads.push((dev, name, arch, mps));
+            let mut row = 0usize;
+            let mut push = |kernel: &str, shape: String, bytes: usize, us: f64| {
+                if col == 0 {
+                    rows.push((kernel.into(), shape, bytes, vec![f64::NAN; n_dev]));
+                }
+                rows[row].3[col] = us;
+                row += 1;
+            };
+            let (n, k) = (5120usize, 5120usize);
+            let x = device_malloc(8 * k * 4, dev).unwrap();
+            let y = device_malloc(8 * n * 4, dev).unwrap();
+            let xs: Vec<f32> = (0..8 * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+            memcpy(x, xs.as_ptr().cast(), 8 * k * 4, MEMCPY_H2D).unwrap();
+            // Q8_0, staged 36-byte blocks.
+            let p8: Vec<u8> = (0..n * k / 32 * 34)
+                .map(|i| match i % 34 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    _ => (i * 7 % 251) as u8,
+                })
+                .collect();
+            let staged = stage_q8_0_blocks(&p8).unwrap();
+            let w8: Vec<*mut u8> = (0..copies_for(staged.len()))
+                .map(|_| {
+                    let w = device_malloc(staged.len(), dev).unwrap();
+                    memcpy(w, staged.as_ptr(), staged.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q8_0_device(x.cast(), w8[i % w8.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q8_0 gemv", format!("n={n} k={k} m={m}"), staged.len(), us);
+            }
+            for w in w8 {
+                device_free(w, staged.len());
+            }
+            // Q4_K, 144-byte super-blocks.
+            let p4: Vec<u8> = (0..n * k / 256 * 144)
+                .map(|i| match i % 144 {
+                    0 | 2 => 0x00,
+                    1 | 3 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w4: Vec<*mut u8> = (0..copies_for(p4.len()))
+                .map(|_| {
+                    let w = device_malloc(p4.len(), dev).unwrap();
+                    memcpy(w, p4.as_ptr(), p4.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q4_k_device(x.cast(), w4[i % w4.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q4_k gemv", format!("n={n} k={k} m={m}"), p4.len(), us);
+            }
+            for w in w4 {
+                device_free(w, p4.len());
+            }
+            device_free(x, 8 * k * 4);
+            device_free(y, 8 * n * 4);
+            // Decode attention, one query row, f32 KV (32 q heads, 8 kv heads, hd 128).
+            let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+            let (nh, nkv, hd) = (32usize, 8usize, 128usize);
+            let q = device_malloc(nh * hd * 4, dev).unwrap();
+            let out = device_malloc(nh * hd * 4, dev).unwrap();
+            memcpy(q, vec![0.01f32; nh * hd].as_ptr().cast(), nh * hd * 4, MEMCPY_H2D).unwrap();
+            for n_kv in [512usize, 4096, 32768] {
+                let kv_bytes = n_kv * nkv * hd * 4;
+                let kvs: Vec<(*mut u8, *mut u8)> = (0..copies_for(2 * kv_bytes))
+                    .map(|_| {
+                        let kp = device_malloc(kv_bytes, dev).unwrap();
+                        let vp = device_malloc(kv_bytes, dev).unwrap();
+                        let fill = vec![0.01f32; n_kv * nkv * hd];
+                        memcpy(kp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                        memcpy(vp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                        (kp, vp)
+                    })
+                    .collect();
+                let mut i = 0usize;
+                let iters = if n_kv >= 32768 { 50 } else { 200 };
+                let us = time_us(iters, &mut || {
+                    let (kp, vp) = kvs[i % kvs.len()];
+                    ws.attention_device(
+                        q.cast(), kp.cast(), vp.cast(), out.cast(), 1, n_kv as i32,
+                        nh as i32, nkv as i32, hd as i32, true,
+                    )
+                    .unwrap();
+                    i += 1;
+                });
+                push("attention decode", format!("n_kv={n_kv} {nh}/{nkv} heads hd={hd} f32"), 2 * kv_bytes, us);
+                for (kp, vp) in kvs {
+                    device_free(kp, kv_bytes);
+                    device_free(vp, kv_bytes);
+                }
+            }
+            device_free(q, nh * hd * 4);
+            device_free(out, nh * hd * 4);
+            // A tiny kernel: the per-launch floor.
+            let a = device_malloc(2048 * 4, dev).unwrap();
+            let b = device_malloc(2048 * 4, dev).unwrap();
+            let us = time_us(2000, &mut || copy_f32_kernel(a.cast(), b.cast(), 2048).unwrap());
+            push("copy_f32 (launch floor)", "n=2048".into(), 2048 * 4, us);
+            device_free(a, 2048 * 4);
+            device_free(b, 2048 * 4);
+        }
+
+        let mut table = String::from("| kernel | shape |");
+        let mut rule = String::from("|---|---|");
+        for (dev, name, arch, mps) in &heads {
+            table += &format!(" hip{dev} {name} ({arch}, {mps} MPs) µs (GB/s, % peak) |");
+            rule += "---|";
+        }
+        table += "\n";
+        table += &rule;
+        table += "\n";
+        let mut csv = String::from("kernel,shape,device,arch,multiprocessors,us,gbs,pct_peak\n");
+        for (kernel, shape, bytes, us) in &rows {
+            table += &format!("| {kernel} | {shape} |");
+            for (col, t) in us.iter().enumerate() {
+                let gbs = *bytes as f64 / t / 1e3;
+                let (dev, _, arch, mps) = &heads[col];
+                let pct = published_peak_gbs(arch).map(|p| gbs / p * 100.0);
+                let pct_s = pct.map_or("?".into(), |p| format!("{p:.0}%"));
+                table += &format!(" {t:.1} ({gbs:.0}, {pct_s}) |");
+                csv += &format!(
+                    "{kernel},{shape},{dev},{arch},{mps},{t:.2},{gbs:.1},{}\n",
+                    pct.map_or(String::new(), |p| format!("{p:.1}"))
+                );
+            }
+            table += "\n";
+        }
+        eprintln!("\n{table}");
+        if let Ok(path) = std::env::var("BENCH_OUT") {
+            std::fs::write(&path, csv).unwrap();
+            eprintln!("wrote {path}");
         }
     }
 
