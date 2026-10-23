@@ -38,6 +38,18 @@ static std::atomic<uint64_t> g_kernel_launches{0};
         hipLaunchKernelGGLInternal((kernelName), __VA_ARGS__);               \
     } while (0)
 
+/* Device writes that are not our kernel launches: copies, memsets, BLAS calls
+ * and DirectStorage. With the launch count this is an epoch that moves on
+ * every enqueue that may change device memory, so a cached int8 activation is
+ * reused only while it cannot be stale (see `kq_act_quantize`). */
+static std::atomic<uint64_t> g_dev_writes{0};
+static std::atomic<uint64_t> g_act_quant_reuses{0};
+static inline void note_device_write() { g_dev_writes.fetch_add(1, std::memory_order_relaxed); }
+static inline uint64_t device_write_epoch() {
+    return g_kernel_launches.load(std::memory_order_relaxed) +
+           g_dev_writes.load(std::memory_order_relaxed);
+}
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1902,6 +1914,7 @@ static int launch_gemm_nt_rocblas(const float *a, const float *b, float *c, int3
     const float beta = 0.0f;
     rocblas_status st = rocblas_set_stream(d.handle, stream);
     if (st == rocblas_status_success) {
+        note_device_write();
         st = rocblas_sgemm(d.handle, rocblas_operation_transpose, rocblas_operation_none, n, m, k,
                            &alpha, b, k, a, k, &beta, c, n);
     }
@@ -2138,6 +2151,7 @@ static int lt_run(HipblasLtDev *st, const float *a, const float *b, float *c, in
     if (lt_grow_workspace(st, ws, stream) != ALLPACA_OK) {
         return ALLPACA_ERR_DEVICE;
     }
+    note_device_write();
     hipblasStatus_t ms =
         hipblasLtMatmul(st->handle, d.desc, &alpha, b, d.a, a, d.b, &beta, c, d.c, c, d.c, &algo,
                         st->workspace, st->workspace_bytes, stream);
@@ -3591,6 +3605,13 @@ struct KqActScratch {
     size_t cap = 0;
     hipStream_t stream = nullptr;
     hipEvent_t handoff = nullptr;
+    /* The activation the int8 rows hold (see `kq_act_quantize`). */
+    const float *src = nullptr;
+    int src_m = 0;
+    int src_k = 0;
+    hipStream_t src_stream = nullptr;
+    bool src_device = false;
+    uint64_t epoch = 0;
 };
 static KqActScratch g_kq_act[KQ_ACT_DEVICES];
 
@@ -3622,6 +3643,7 @@ static KqActScratch *kq_act_acquire(hipStream_t stream, size_t need,
             s.cap = 0;
         }
         const size_t cap = need > (size_t(1) << 20) ? need : (size_t(1) << 20);
+        s.src = nullptr;
         if (hipMalloc(&s.p, cap) != hipSuccess) {
             s.p = nullptr;
             return nullptr;
@@ -3630,6 +3652,56 @@ static KqActScratch *kq_act_acquire(hipStream_t stream, size_t need,
     }
     s.stream = stream;
     return &s;
+}
+
+/* Quantize the m x k activation `a` into the scratch's int8 rows `aq` and
+ * per-block scales `ad`, unless they already hold exactly it: same source,
+ * shape and stream, a source in device memory (a host or managed buffer can
+ * change without any enqueue), and no device write enqueued since the GEMV
+ * that last read the copy (`KqActSeal`). GEMVs sharing one input (q/k/v,
+ * gate/up) then quantize it once, with the same bits. ALLPACA_KQ_ACT_REUSE=0
+ * quantizes every time. */
+static void kq_act_quantize(KqActScratch *s, const float *a, int8_t *aq, float *ad, int m, int k,
+                            hipStream_t stream) {
+    static const bool reuse = [] {
+        const char *v = std::getenv("ALLPACA_KQ_ACT_REUSE");
+        return !(v && v[0] == '0');
+    }();
+    if (reuse && s->src == a && s->src_m == m && s->src_k == k && s->src_stream == stream &&
+        s->src_device && s->epoch == device_write_epoch()) {
+        g_act_quant_reuses.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const int kb = k / 32;
+    hipLaunchKernelGGL(quantize_rows_q8_kernel,
+                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
+                       dim3(256), 0, stream, a, aq, ad, m, k);
+    if (hipPeekAtLastError() != hipSuccess) {
+        s->src = nullptr;
+        return;
+    }
+    if (s->src != a) {
+        hipPointerAttribute_t attr{};
+        s->src_device = hipPointerGetAttributes(&attr, a) == hipSuccess &&
+                        attr.type == hipMemoryTypeDevice && !attr.isManaged;
+        (void)hipGetLastError();
+    }
+    s->src = a;
+    s->src_m = m;
+    s->src_k = k;
+    s->src_stream = stream;
+    s->epoch = 0;
+}
+
+/* Marks the scratch's int8 copy current once the GEMV that reads it is
+ * enqueued (on every return path); hold it inside the scratch lock. */
+struct KqActSeal {
+    KqActScratch *s;
+    ~KqActSeal() { s->epoch = device_write_epoch(); }
+};
+
+extern "C" uint64_t allpaca_hip_act_quant_reuses(void) {
+    return g_act_quant_reuses.load(std::memory_order_relaxed);
 }
 
 /* Rows that share one weight block load in the int8 kernels. A block costs
@@ -3715,10 +3787,8 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
     uint8_t *base = static_cast<uint8_t *>(scratch->p);
     int8_t *aq = reinterpret_cast<int8_t *>(base);
     float *ad = reinterpret_cast<float *>(base + aq_bytes);
-    const int kb = k / 32;
-    hipLaunchKernelGGL(quantize_rows_q8_kernel,
-                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
-                       dim3(256), 0, stream, a, aq, ad, m, k);
+    kq_act_quantize(scratch, a, aq, ad, m, k, stream);
+    KqActSeal seal{scratch};
     // 8 lanes x 32 weights per column: at 32 lanes x 8 weights the per-row
     // A loads and scale math dominated on RDNA (Q5_K m=4 cost 1.7x m=1; now
     // ~1.05x). The MI50 takes more lanes on some weights (kq_i8_lanes).
@@ -3844,10 +3914,8 @@ static int launch_q8_0_i8(const float *a, const uint8_t *b, float *c, int32_t m,
     uint8_t *base = static_cast<uint8_t *>(scratch->p);
     int8_t *aq = reinterpret_cast<int8_t *>(base);
     float *ad = reinterpret_cast<float *>(base + aq_bytes);
-    const int kb = k / 32;
-    hipLaunchKernelGGL(quantize_rows_q8_kernel,
-                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
-                       dim3(256), 0, stream, a, aq, ad, m, k);
+    kq_act_quantize(scratch, a, aq, ad, m, k, stream);
+    KqActSeal seal{scratch};
     constexpr int LPC = 8;
     // Smaller blocks spread narrow weights over the MI50's CUs (640x2560
     // 7.5 -> 5.9 us); the sum order does not depend on the block size.
@@ -5475,10 +5543,8 @@ static int launch_rocmfp4_i8(const float *a, const uint8_t *b, float *c, int32_t
     uint8_t *base = static_cast<uint8_t *>(scratch->p);
     int8_t *aq = reinterpret_cast<int8_t *>(base);
     float *ad = reinterpret_cast<float *>(base + aq_bytes);
-    const int kb = k / 32;
-    hipLaunchKernelGGL(quantize_rows_q8_kernel,
-                       dim3(static_cast<unsigned>((kb + 7) / 8), static_cast<unsigned>(m)),
-                       dim3(256), 0, stream, a, aq, ad, m, k);
+    kq_act_quantize(scratch, a, aq, ad, m, k, stream);
+    KqActSeal seal{scratch};
     constexpr int COLS = 256 / 8;
     const dim3 block(256);
     const int mr = m == 1 ? 1 : (m == 2 ? 2 : (m <= 4 ? 4 : 8));
@@ -7145,6 +7211,7 @@ extern "C" int allpaca_dstorage_read(void *handle, const uint16_t *path, uint64_
     request.Name = "allpaca expert fill";
 
     const uint64_t fence_value = ++buffer->fence_value;
+    note_device_write();
     buffer->queue->EnqueueRequest(&request);
     buffer->queue->EnqueueSignal(buffer->fence.Get(), fence_value);
     buffer->queue->EnqueueStatus(buffer->status.Get(), 0);
@@ -7248,6 +7315,7 @@ extern "C" int allpaca_hip_memcpy_batch(void **dsts, void **srcs, size_t *sizes,
     }
     clear_last_error();
     hipStream_t s = as_stream(stream);
+    note_device_write();
     allpaca_memcpy_batch_fn batch = memcpy_batch_fn();
     if (batch) {
         size_t fail_idx = 0;
@@ -7277,6 +7345,7 @@ extern "C" int allpaca_hip_memcpy(void *dst, const void *src, size_t bytes, int3
         return ALLPACA_ERR_INVALID;
     }
     const hipMemcpyKind mk = to_hip_memcpy_kind(kind);
+    note_device_write();
     hipError_t err = hipMemcpyAsync(dst, src, bytes, mk, as_stream(stream));
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
@@ -7298,8 +7367,10 @@ extern "C" int allpaca_hip_memset(void *dst, int32_t value, size_t bytes, allpac
     hipStream_t s = as_stream(stream);
     const int fill = value & 0xff;
     if (s) {
+        note_device_write();
         return hip_status(hipMemsetAsync(dst, fill, bytes, s));
     }
+    note_device_write();
     return hip_status(hipMemset(dst, fill, bytes));
 }
 
@@ -7359,6 +7430,7 @@ extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *s
         return ALLPACA_ERR_DEVICE;
     }
     hipStream_t s = as_stream(stream);
+    note_device_write();
     err = hipMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
     if (err != hipSuccess) {
         (void)hipSetDevice(prev);
@@ -7405,6 +7477,7 @@ extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, dou
     (void)allpaca_hip_enable_peer_access(dst, src);
     (void)hipSetDevice(src);
     (void)hipEventRecord(start, nullptr);
+    note_device_write();
     hipError_t peer_err = hipMemcpyPeer(d_dst, dst, d_src, src, bytes);
     (void)hipEventRecord(stop, nullptr);
     (void)hipEventSynchronize(stop);
@@ -7418,6 +7491,7 @@ extern "C" int allpaca_hip_benchmark(int32_t src, int32_t dst, size_t bytes, dou
 
     (void)hipSetDevice(src);
     (void)hipEventRecord(start, nullptr);
+    note_device_write();
     (void)hipMemcpy(h_pin, d_src, bytes, hipMemcpyDeviceToHost);
     (void)hipSetDevice(dst);
     (void)hipMemcpy(d_dst, h_pin, bytes, hipMemcpyHostToDevice);
@@ -7457,6 +7531,7 @@ extern "C" int allpaca_hip_blas_warmup(int32_t device) {
         clear_last_error();
         return ALLPACA_ERR_DEVICE;
     }
+    note_device_write();
     (void)hipMemset(mem, 0, bytes);
     float *buf = static_cast<float *>(mem);
     const int rc = launch_gemm_nt_rocblas(buf, buf + N * N, buf + 2 * N * N, N, N, N, nullptr);
@@ -10347,6 +10422,7 @@ extern "C" int allpaca_copy_async(void *dst, const void *src, size_t bytes,
     if (!dst || !src) {
         return ALLPACA_ERR_INVALID;
     }
+    note_device_write();
     hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDefault, as_stream(stream));
     if (err != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
@@ -10712,6 +10788,8 @@ extern "C" int allpaca_moe_ffn_kquant(const float *, const int8_t *, const float
 }
 
 extern "C" uint64_t allpaca_hip_kernel_launches(void) { return 0; }
+
+extern "C" uint64_t allpaca_hip_act_quant_reuses(void) { return 0; }
 
 extern "C" int allpaca_hip_device_count(int32_t *count) {
     if (count) {
