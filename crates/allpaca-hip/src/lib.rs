@@ -16178,6 +16178,139 @@ mod tests {
         }
     }
 
+    /// int8 codes and scales, one scale per 32 values, as `quantize_rows_q8_kernel`.
+    #[cfg(feature = "hip")]
+    fn q3_k_q8_row(row: &[f32]) -> (Vec<i8>, Vec<f32>) {
+        let mut codes = Vec::with_capacity(row.len());
+        let mut scales = Vec::with_capacity(row.len() / 32);
+        for block in row.chunks_exact(32) {
+            let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+            scales.push(d);
+            for v in block {
+                let q = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                codes.push(q as i8);
+            }
+        }
+        (codes, scales)
+    }
+
+    #[cfg(feature = "hip")]
+    fn q3_k_i8dot4(a: u32, b: u32, c: i32) -> i32 {
+        let mut acc = c;
+        for i in 0..4 {
+            let av = ((a >> (8 * i)) & 0xff) as u8 as i8 as i32;
+            let bv = ((b >> (8 * i)) & 0xff) as u8 as i8 as i32;
+            acc += av * bv;
+        }
+        acc
+    }
+
+    #[cfg(feature = "hip")]
+    fn q3_k_u32(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// `__shfl_down` over a width of 8: each step adds the lane `off` above,
+    /// and lanes with no such source keep their value. Lane 0 is the column.
+    #[cfg(feature = "hip")]
+    fn q3_k_reduce8(mut lanes: [f32; 8]) -> f32 {
+        let mut off = 4;
+        while off > 0 {
+            let old = lanes;
+            for i in 0..8 {
+                let src = i + off;
+                lanes[i] = if src < 8 { old[i] + old[src] } else { old[i] };
+            }
+            off >>= 1;
+        }
+        lanes[0]
+    }
+
+    /// Host copy of the 8-lane Q3_K int8 GEMV (`kquant_i8_block` QT=3, LPC=8).
+    /// Each lane sums `s * act_scale * (dot(q, a) - 4 * sum(a))`, low half then
+    /// high half, then the width-8 shuffle. RDNA (wave32) launches this shape.
+    #[cfg(feature = "hip")]
+    fn q3_k_gemv_eight_lanes(a: &[f32], b: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let nblocks = k / 256;
+        let stride = Q3_K_BLOCK_BYTES;
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            let (codes, scales) = q3_k_q8_row(&a[row * k..(row + 1) * k]);
+            for col in 0..n {
+                let brow = &b[col * nblocks * stride..(col + 1) * nblocks * stride];
+                let mut lanes = [0.0f32; 8];
+                for (sl, lane) in lanes.iter_mut().enumerate() {
+                    let g = sl / 2;
+                    let j0 = (sl % 2) * 16;
+                    for ib in 0..nblocks {
+                        let blk = &brow[ib * stride..(ib + 1) * stride];
+                        let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
+                        let sc = &blk[96..108];
+                        for h in 0..2 {
+                            let mut dot = 0i32;
+                            let mut sum = 0i32;
+                            for t in 0..4 {
+                                let qs = q3_k_u32(&blk[32 + h * 32 + j0 + 4 * t..]);
+                                let hm = q3_k_u32(&blk[j0 + 4 * t..]);
+                                let q = ((qs >> (2 * g)) & 0x0303_0303)
+                                    | (((hm >> (4 * h + g)) & 0x0101_0101) << 2);
+                                let bi = ib * 8 + h * 4 + g;
+                                let at = bi * 32 + j0 + 4 * t;
+                                let av = u32::from_le_bytes([
+                                    codes[at] as u8,
+                                    codes[at + 1] as u8,
+                                    codes[at + 2] as u8,
+                                    codes[at + 3] as u8,
+                                ]);
+                                dot = q3_k_i8dot4(av, q, dot);
+                                sum = q3_k_i8dot4(av, 0x0101_0101, sum);
+                            }
+                            let is = h * 8 + 2 * g + j0 / 16;
+                            let s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) as i32
+                                | ((((sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3) as i32) << 4);
+                            let s = d * (s6 - 32) as f32;
+                            let bi = ib * 8 + h * 4 + g;
+                            let partial = (dot - 4 * sum) as f32;
+                            *lane = (s * scales[bi]).mul_add(partial, *lane);
+                        }
+                    }
+                }
+                c[row * n + col] = q3_k_reduce8(lanes);
+            }
+        }
+        c
+    }
+
+    /// Q3_K GEMV on 8-lane devices must keep this sum's bits. A packed-byte
+    /// subtract that changes a product or the add order fails here.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q3_k_matches_the_eight_lane_sum_bit_for_bit() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1usize, 4usize, 256usize), (2, 3, 512), (1, 7, 256), (4, 5, 768)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, _, _) = fill_q5k_gemm_case(si, m, n, k);
+            let b_q = fill_q3k_blocks(si, n, k);
+            let host = q3_k_gemv_eight_lanes(&a, &b_q, m, n, k);
+            let mut hip = vec![0.0f32; m * n];
+            gemm_nt_q3_k(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q3_k must run when a device is present");
+            for i in 0..m * n {
+                assert_eq!(
+                    hip[i].to_bits(),
+                    host[i].to_bits(),
+                    "q3_k lane-sum bits {m}x{n}x{k} idx={i} hip={} host={}",
+                    hip[i],
+                    host[i]
+                );
+            }
+        }
+    }
+
     /// The draft lm_head's Q3_K runs natively: fused GEMV must match CPU
     /// dequant x q8 activations, and batch rows must equal single rows.
     #[cfg(feature = "hip")]

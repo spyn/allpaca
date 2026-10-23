@@ -3098,6 +3098,17 @@ __device__ inline void kq_load_u32s(const void *p, uint32_t (&v)[NC]) {
     }
 }
 
+/* Packed-byte subtract without saturation (llama.cpp #27962, #29478).
+ * Q3_K codes are 0..7, so subtracting 4 stays in int8 and
+ * `dot4(q - 4, a)` equals `dot4(q, a) - 4 * sum(a)`. */
+__device__ inline uint32_t allpaca_vsub4(uint32_t a, uint32_t b) {
+    const uint32_t a_large = a | 0x80808080u;
+    const uint32_t b_small = b & 0x7f7f7f7fu;
+    const uint32_t low7 = a_large - b_small;
+    const uint32_t flip = (a ^ ~b) & 0x80808080u;
+    return low7 ^ flip;
+}
+
 /* One block of the int8 K-quant GEMV: columns from `bx`, rows `row0 .. +MR`. */
 template <int QT, int MR, int LPC>
 __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const uint8_t *b,
@@ -3206,7 +3217,9 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                     for (int t = 0; t < NC; ++t) {
                         const uint32_t qs = kq_u32_from_u16(blk + 32 + h * 32 + j0 + 4 * t);
                         const uint32_t hm = kq_u32_from_u16(blk + j0 + 4 * t);
-                        q[t] = ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
+                        const uint32_t v =
+                            ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
+                        q[t] = allpaca_vsub4(v, 0x04040404u);
                     }
                     const int is = h * 8 + 2 * g + j0 / 16;
                     const int s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) |
@@ -3217,13 +3230,12 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                     for (int r = 0; r < MR; ++r) {
                         uint32_t av[NC];
                         kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av);
-                        int32_t dot = 0, sum = 0;
+                        int32_t dot = 0;
 #pragma unroll
                         for (int t = 0; t < NC; ++t) {
                             dot = i8dot4(av[t], q[t], dot);
-                            sum = i8dot4(av[t], ONES, sum);
                         }
-                        acc[r] += s * drow[r][bi] * static_cast<float>(dot - 4 * sum);
+                        acc[r] += s * drow[r][bi] * static_cast<float>(dot);
                     }
                 }
             } else if constexpr (QT == 6) {
@@ -3450,7 +3462,7 @@ __global__ __launch_bounds__(256) void gemv_nt_kquant_i8_tile_kernel(
                         const uint32_t hm = kq_u32_from_u16(blk + j0 + 4 * t);
                         const uint32_t v =
                             ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
-                        q[t] = ((v | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
+                        q[t] = allpaca_vsub4(v, 0x04040404u);
                     }
                     const int is = h * 8 + 2 * g + j0 / 16;
                     const int s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) |
