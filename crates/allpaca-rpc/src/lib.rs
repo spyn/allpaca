@@ -20,7 +20,7 @@ pub use protocol::{
     SOCKET_BUFFER,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
 };
-pub use session::RpcSession;
+pub use session::{CallCounters, RpcSession};
 pub use worker::{
     serve_connection, serve_connection_ext, serve_connection_with_token, serve_listener,
     serve_listener_ext, serve_listener_with_token, serve_tcp, CpuWorker, Extension, WorkerBackend,
@@ -92,6 +92,31 @@ mod tests {
     #[test]
     fn fnv_stable() {
         assert_ne!(fnv1a64(b"abc"), fnv1a64(b"abd"));
+    }
+
+    #[test]
+    fn session_counts_calls_and_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let (calls, ext) = client.counters();
+        // The HELLO handshake is not a counted call.
+        assert_eq!(calls.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let buf = client.alloc(1024).unwrap();
+        client.h2d(buf, 0, &[7u8; 1000]).unwrap();
+        let back = client.d2h(buf, 0, 1000).unwrap();
+        assert_eq!(back, vec![7u8; 1000]);
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(load(&calls.calls), 3);
+        assert!(load(&calls.bytes_out) >= 1000, "the upload counts as sent");
+        assert!(load(&calls.bytes_in) >= 1000, "the download counts as received");
+        assert_eq!(load(&ext.calls), 0);
+        drop(client);
+        worker.join().unwrap();
     }
 
     #[test]
