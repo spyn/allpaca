@@ -38,7 +38,7 @@ use crate::kv_tier::KvTierManager;
 use crate::logits_ring::LogitRing;
 use crate::micro_batch::{plan_micro_batch, ActiveLayerHint, LayerStagger, StaggerPhase};
 use crate::model::{
-    alloc_pages_for_seq, alloc_pages_for_seq_masked, ensure_pages, kv_layer_mask, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
+    alloc_pages_for_seq_masked, ensure_pages, kv_layer_mask, DenseKv, DeviceDecodeSide, ModelConfig, ResidentModel,
     TinyModel,
 };
 use crate::packed::{temp_pack_path, HostExpertPool, PackedStore};
