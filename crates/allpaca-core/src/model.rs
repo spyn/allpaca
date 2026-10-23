@@ -9430,9 +9430,10 @@ impl TinyModel {
             .and_then(|s| s.mrope)
             .map_or([pos; 3], |m| m.rope_pos(pos))
             .map(|p| p as i32);
+        // The first layer with pages: a recurrent layer keeps none.
         let page_tokens = page_ids
-            .first()
-            .and_then(|p| p.first())
+            .iter()
+            .find_map(|p| p.first())
             .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
             .unwrap_or(128);
         let max_kv = page_ids
@@ -10051,10 +10052,11 @@ impl TinyModel {
                 )));
             }
         }
+        // The first layer with pages: a recurrent layer keeps none.
         let page_tokens = segs[0]
             .page_ids
-            .first()
-            .and_then(|p| p.first())
+            .iter()
+            .find_map(|p| p.first())
             .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
             .unwrap_or(128);
         let max_kv = segs
@@ -13021,8 +13023,8 @@ mod lightning_moe_tests {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
-mod cuda_softcap_tests {
+#[cfg(test)]
+mod kv_page_mask_tests {
     use super::*;
 
     #[test]
@@ -13059,6 +13061,11 @@ mod cuda_softcap_tests {
             }
         }
     }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_softcap_tests {
+    use super::*;
 
     #[test]
     fn cuda_final_logit_softcap_bounds_logits_when_device_present() {
