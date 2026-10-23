@@ -287,6 +287,13 @@ int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, 
 int allpaca_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                              int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A_i8[m,k] * B_i8[n,k]^T, int32 accumulate, stored as f32.
+ * The WMMA entry is gfx1200/gfx1201; every other device runs the scalar kernel. */
+int allpaca_gemm_nt_i8(const int8_t *a, const int8_t *b, float *c, int32_t m, int32_t n, int32_t k,
+                       allpaca_stream_t stream);
+int allpaca_gemm_nt_i8_wmma(const int8_t *a, const int8_t *b, float *c, int32_t m, int32_t n,
+                            int32_t k, allpaca_stream_t stream);
+
 /* Untiled F16 GEMV baseline for §12 before/after tracers. */
 int allpaca_gemm_nt_f16_untiled(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, allpaca_stream_t stream);
@@ -315,6 +322,12 @@ int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);
+
+/* gfx12 WMMA flash prefill. Falls back to allpaca_attention off gfx12, for a
+ * single query, or when head_dim is not a 16-multiple up to 128. */
+int allpaca_attention_wmma_prefill(const float *q, const float *k, const float *v, float *out,
+                                   int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                   int32_t head_dim, int32_t causal, allpaca_stream_t stream);
 
 /* Online-softmax attention with a virtual sink logit per head (`sinks[n_heads]`; null = none). */
 int allpaca_attention_sinks(const float *q, const float *k, const float *v, float *out, int32_t n_q,

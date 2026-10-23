@@ -870,6 +870,24 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_i8(
+            a: *const i8,
+            b: *const i8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_i8_wmma(
+            a: *const i8,
+            b: *const i8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_f16_untiled(
             a: *const f32,
             b: *const u16,
@@ -898,6 +916,19 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_attention(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_q: i32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            causal: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_attention_wmma_prefill(
             q: *const f32,
             k: *const f32,
             v: *const f32,
@@ -2607,6 +2638,80 @@ pub fn gemm_nt_f16_device(
     }
 }
 
+/// Device-pointer gfx12 f16 WMMA. Non-gfx12 and exact-row mode use [`gemm_nt_f16_device`].
+pub fn gemm_nt_f16_wmma_device(
+    a: *const f32,
+    b: *const u16,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: callers pass device pointers for `m*k` floats, `n*k` f16 values,
+        // and `m*n` floats on the current device. The launch finishes before return.
+        let rc = unsafe { ffi::allpaca_gemm_nt_f16_wmma(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_f16_wmma")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "gfx12 f16 WMMA GEMM not implemented".into(),
+        )))
+    }
+}
+
+/// Device-pointer int8 NT GEMM, scalar reference for [`gemm_nt_i8_wmma_device`].
+pub fn gemm_nt_i8_device(
+    a: *const i8,
+    b: *const i8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: callers pass device pointers for `m*k` and `n*k` int8 values and
+        // `m*n` floats on the current device. The launch finishes before return.
+        let rc = unsafe { ffi::allpaca_gemm_nt_i8(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_i8")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_i8 unavailable".into(),
+        )))
+    }
+}
+
+/// Device-pointer gfx12 int8 WMMA. Other devices run [`gemm_nt_i8_device`].
+pub fn gemm_nt_i8_wmma_device(
+    a: *const i8,
+    b: *const i8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: same pointer contract as [`gemm_nt_i8_device`].
+        let rc = unsafe { ffi::allpaca_gemm_nt_i8_wmma(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_i8_wmma")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "gfx12 int8 WMMA GEMM not implemented".into(),
+        )))
+    }
+}
+
 /// Untiled F16 GEMV baseline (§12 before/after).
 pub fn gemm_nt_f16_untiled_device(
     a: *const f32,
@@ -3926,6 +4031,82 @@ pub fn gemm_nt_f16_wmma(
             "gfx12 f16 WMMA GEMM not implemented".into(),
         )))
     }
+}
+
+fn i8_host_gemm(
+    a: &[i8],
+    b: &[i8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+    wmma: bool,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let b_n = (n as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        if a.len() < a_n || b.len() < b_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "int8 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n, 0)?;
+        let db = device_malloc(b_n, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr().cast(), b_n, MEMCPY_H2D)?;
+            if wmma {
+                gemm_nt_i8_wmma_device(da.cast(), db.cast(), dc.cast(), m, n, k)?;
+            } else {
+                gemm_nt_i8_device(da.cast(), db.cast(), dc.cast(), m, n, k)?;
+            }
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n);
+        device_free(db, b_n);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k, wmma);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_i8 unavailable".into(),
+        )))
+    }
+}
+
+/// Scalar int8 NT GEMM: `C[m,n] = A_i8[m,k] * B_i8[n,k]^T`.
+pub fn gemm_nt_i8(
+    a: &[i8],
+    b: &[i8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    i8_host_gemm(a, b, c, m, n, k, false)
+}
+
+/// gfx12 int8 WMMA form of [`gemm_nt_i8`]. Other devices run the scalar kernel.
+pub fn gemm_nt_i8_wmma(
+    a: &[i8],
+    b: &[i8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    i8_host_gemm(a, b, c, m, n, k, true)
 }
 
 /// Host-pointer BF16 NT GEMM: copies packed bfloat16 `b`, runs the kernel, copies back.
@@ -5549,6 +5730,14 @@ pub fn embed_gather_rocmfp4_rows(
     }
 }
 
+fn gfx12_wmma_prefill(device: i32, n_q: i32, head_dim: i32) -> bool {
+    n_q > 1
+        && (16..=128).contains(&head_dim)
+        && head_dim % 16 == 0
+        && device_gcn_arch(device)
+            .is_some_and(|(name, _)| name.starts_with("gfx1200") || name.starts_with("gfx1201"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     q: &[f32],
@@ -5563,7 +5752,27 @@ pub fn attention(
     causal: bool,
 ) -> Result<(), AllpacaError> {
     attention_on(
-        0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+        0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, false,
+    )
+}
+
+/// gfx12 WMMA flash prefill. Off gfx12, for one query, or for an unsupported
+/// head dimension, this is [`attention`].
+#[allow(clippy::too_many_arguments)]
+pub fn attention_wmma_prefill(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: i32,
+    n_kv: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    causal: bool,
+) -> Result<(), AllpacaError> {
+    attention_on(
+        0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, true,
     )
 }
 
@@ -5580,6 +5789,7 @@ fn attention_on(
     n_kv_heads: i32,
     head_dim: i32,
     causal: bool,
+    wmma_prefill: bool,
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -5596,20 +5806,38 @@ fn attention_on(
             memcpy(dq, q.as_ptr().cast(), q_bytes, MEMCPY_H2D)?;
             memcpy(dk, k.as_ptr().cast(), k_bytes, MEMCPY_H2D)?;
             memcpy(dv, v.as_ptr().cast(), v_bytes, MEMCPY_H2D)?;
+            // SAFETY: dq/dk/dv/dout are device allocations of the host slices on
+            // `device`, freed after this launch returns.
             let rc = unsafe {
-                ffi::allpaca_attention(
-                    dq.cast(),
-                    dk.cast(),
-                    dv.cast(),
-                    dout.cast(),
-                    n_q,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    i32::from(causal),
-                    std::ptr::null_mut(),
-                )
+                if wmma_prefill {
+                    ffi::allpaca_attention_wmma_prefill(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                } else {
+                    ffi::allpaca_attention(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                }
             };
             status(rc, "attention")?;
             memcpy(out.as_mut_ptr().cast(), dout, o_bytes, MEMCPY_D2H)
@@ -5623,7 +5851,7 @@ fn attention_on(
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
         let _ = (
-            device, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            device, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, wmma_prefill,
         );
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP attention unavailable; use CPU fallback".into(),
@@ -6819,7 +7047,13 @@ impl HipWorkspace {
         } else {
             DecodeOp::OtherGpu
         };
-        self.timed_gpu(op, || gemm_nt_f16_device(a, b, c, m, n, k))
+        self.timed_gpu(op, || {
+            if m > 8 {
+                gemm_nt_f16_wmma_device(a, b, c, m, n, k)
+            } else {
+                gemm_nt_f16_device(a, b, c, m, n, k)
+            }
+        })
     }
 
     /// Dense weights of a model whose "BF16" tensors are Q8_0 in the file:
@@ -8485,6 +8719,7 @@ impl HipWorkspace {
         causal: bool,
     ) -> Result<(), AllpacaError> {
         let need = (q.len() + k.len() + v.len() + out.len()) * 4;
+        let wmma = gfx12_wmma_prefill(self.device, n_q, head_dim);
         if need > self.scratch_bytes {
             return attention_on(
                 self.device,
@@ -8498,6 +8733,7 @@ impl HipWorkspace {
                 n_kv_heads,
                 head_dim,
                 causal,
+                wmma,
             );
         }
         self.bind()?;
@@ -8511,20 +8747,37 @@ impl HipWorkspace {
         self.add_h2d((q.len() + k.len() + v.len()) * 4);
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
+            // SAFETY: scratch spans q, k, v, and out on this workspace device.
             let rc = unsafe {
-                ffi::allpaca_attention(
-                    dq.cast(),
-                    dk.cast(),
-                    dv.cast(),
-                    dout.cast(),
-                    n_q,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    i32::from(causal),
-                    std::ptr::null_mut(),
-                )
+                if wmma {
+                    ffi::allpaca_attention_wmma_prefill(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                } else {
+                    ffi::allpaca_attention(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                }
             };
             status(rc, "attention")?;
             memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)?;
@@ -8546,6 +8799,7 @@ impl HipWorkspace {
                 n_kv_heads,
                 head_dim,
                 causal,
+                wmma,
             )
         }
     }
@@ -12634,20 +12888,39 @@ impl HipWorkspace {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
             self.timed_gpu(DecodeOp::Attention, || {
+                let wmma = gfx12_wmma_prefill(self.device, n_q, head_dim);
+                // SAFETY: q, k, v, and out are device pointers checked non-null
+                // above, sized by the caller for this workspace's current device.
                 let rc = unsafe {
-                    ffi::allpaca_attention(
-                        q,
-                        k,
-                        v,
-                        out,
-                        n_q,
-                        n_kv,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        i32::from(causal),
-                        std::ptr::null_mut(),
-                    )
+                    if wmma {
+                        ffi::allpaca_attention_wmma_prefill(
+                            q,
+                            k,
+                            v,
+                            out,
+                            n_q,
+                            n_kv,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            i32::from(causal),
+                            std::ptr::null_mut(),
+                        )
+                    } else {
+                        ffi::allpaca_attention(
+                            q,
+                            k,
+                            v,
+                            out,
+                            n_q,
+                            n_kv,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            i32::from(causal),
+                            std::ptr::null_mut(),
+                        )
+                    }
                 };
                 status(rc, "attention")
             })
@@ -17497,6 +17770,95 @@ mod tests {
                 assert!(
                     gemm_close(wmma[i], reference[i]),
                     "f16 WMMA mismatch shape {m}x{n}x{k} idx={i} wmma={} reference={} arch={arch}",
+                    wmma[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    /// gfx12 int8 WMMA must match the scalar int8 GEMM. Small values stay exact in f32.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_i8_wmma_prefill_gemm_matches_scalar_i8_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let shapes = [(16usize, 16usize, 16usize), (32, 16, 32), (24, 20, 40)];
+        for (si, (m, n, k)) in shapes.into_iter().enumerate() {
+            let a: Vec<i8> = (0..m * k)
+                .map(|i| ((i * 3 + si * 5) % 15) as i8 - 7)
+                .collect();
+            let b: Vec<i8> = (0..n * k)
+                .map(|i| ((i * 7 + si) % 15) as i8 - 7)
+                .collect();
+            let mut reference = vec![0.0f32; m * n];
+            let mut wmma = vec![0.0f32; m * n];
+            gemm_nt_i8(&a, &b, &mut reference, m as i32, n as i32, k as i32)
+                .expect("scalar int8 GEMM");
+            gemm_nt_i8_wmma(&a, &b, &mut wmma, m as i32, n as i32, k as i32)
+                .expect("gfx12 int8 WMMA GEMM");
+            for i in 0..m * n {
+                assert_eq!(
+                    wmma[i], reference[i],
+                    "int8 WMMA mismatch shape {m}x{n}x{k} idx={i} arch={arch}"
+                );
+            }
+        }
+    }
+
+    /// Prefill WMMA attention must match the decode attention kernel, and must not
+    /// rewrite the K or V the caller passed in.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_wmma_prefill_attention_matches_decode_attention() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let cases = [
+            (4i32, 4i32, 2i32, 1i32, 16i32),
+            (32, 48, 2, 1, 32),
+        ];
+        for (ci, (n_q, n_kv, n_heads, n_kv_heads, head_dim)) in cases.into_iter().enumerate() {
+            let q_n = (n_q * n_heads * head_dim) as usize;
+            let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
+            let q: Vec<f32> = (0..q_n)
+                .map(|i| ((i * 5 + ci * 3) % 21) as f32 * 0.05 - 0.5)
+                .collect();
+            let k: Vec<f32> = (0..kv_n)
+                .map(|i| ((i * 7 + ci) % 21) as f32 * 0.05 - 0.4)
+                .collect();
+            let v: Vec<f32> = (0..kv_n)
+                .map(|i| ((i * 11 + ci * 2) % 21) as f32 * 0.05 - 0.3)
+                .collect();
+            let k_before = k.clone();
+            let v_before = v.clone();
+            let mut reference = vec![0.0f32; q_n];
+            let mut wmma = vec![0.0f32; q_n];
+            attention(
+                &q, &k, &v, &mut reference, n_q, n_kv, n_heads, n_kv_heads, head_dim, true,
+            )
+            .expect("decode attention");
+            attention_wmma_prefill(
+                &q, &k, &v, &mut wmma, n_q, n_kv, n_heads, n_kv_heads, head_dim, true,
+            )
+            .expect("gfx12 WMMA prefill attention");
+            assert_eq!(k, k_before, "prefill rewrote K");
+            assert_eq!(v, v_before, "prefill rewrote V");
+            for i in 0..q_n {
+                assert!(
+                    gemm_close(wmma[i], reference[i]),
+                    "prefill attention mismatch case {ci} idx={i} wmma={} decode={} arch={arch}",
                     wmma[i],
                     reference[i]
                 );
