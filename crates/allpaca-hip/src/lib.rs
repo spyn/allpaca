@@ -799,6 +799,7 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gelu_tanh_mul(gate: *mut f32, up: *const f32, n: i32, stream: *mut c_void) -> i32;
+        pub fn allpaca_softcap(x: *mut f32, n: i32, cap: f32, stream: *mut c_void) -> i32;
         pub fn allpaca_dflash_conv(
             h: *const f32,
             dynamic: *const f32,
@@ -3354,6 +3355,22 @@ pub fn rope_neox_ff_rows_device(
         let _ = (x, n_tok, n_heads, head_dim, start_pos, theta, ff);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP rope_neox_ff_rows unavailable".into(),
+        )))
+    }
+}
+
+/// `x = cap * tanh(x / cap)` over `n` device floats.
+pub fn softcap_device(x: *mut f32, n: usize, cap: f32) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_softcap(x, n as i32, cap, std::ptr::null_mut()) };
+        status(rc, "softcap")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, n, cap);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP softcap unavailable".into(),
         )))
     }
 }

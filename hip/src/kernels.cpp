@@ -10483,6 +10483,24 @@ extern "C" int allpaca_rope_neox_ff_rows(float *x, int32_t n_tok, int32_t n_head
     return hip_status(hipGetLastError());
 }
 
+/* x = cap * tanh(x / cap) (final logit softcap). */
+__global__ void softcap_kernel(float *x, int n, float cap) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx < n) {
+        x[idx] = cap * tanhf(x[idx] / cap);
+    }
+}
+
+extern "C" int allpaca_softcap(float *x, int32_t n, float cap, allpaca_stream_t stream) {
+    if (!x || n <= 0 || !(cap > 0.0f)) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(softcap_kernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), 0,
+                       as_stream(stream), x, n, cap);
+    return hip_status(hipGetLastError());
+}
+
 /* gate = gelu_tanh(gate) * up (ggml_gelu, PyTorch's gelu "tanh"). */
 __global__ void gelu_tanh_mul_kernel(float *gate, const float *up, int n) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -11304,6 +11322,10 @@ extern "C" int allpaca_rope_neox_ff_rows(float *, int32_t, int32_t, int32_t, int
 }
 
 extern "C" int allpaca_gelu_tanh_mul(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_softcap(float *, int32_t, float, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

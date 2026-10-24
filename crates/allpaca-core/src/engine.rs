@@ -1974,12 +1974,11 @@ impl Engine {
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut draft_reuses_target_gguf = false;
-        // A DFlash2 draft's file name also reads as a DSpark sidecar.
-        let draft_path_is_dspark = !self
-            .config
-            .speculative
-            .providers
-            .contains(&DraftProviderKind::Dflash2)
+        // A DFlash / DFlash2 draft's file name also reads as a DSpark sidecar.
+        let block_draft = self.config.speculative.providers.iter().any(|p| {
+            matches!(p, DraftProviderKind::Dflash2 | DraftProviderKind::Dflash1)
+        });
+        let draft_path_is_dspark = !block_draft
             && self.config.model.draft_path.as_ref().is_some_and(|p| {
                 is_dspark_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or(""))
             });
@@ -1990,11 +1989,7 @@ impl Engine {
             Some(tok) => crate::decision::DecisionModel::from_gguf(&file, tok)?.map(Arc::new),
             None => None,
         };
-        let draft_path_is_dflash2 = self
-            .config
-            .speculative
-            .providers
-            .contains(&DraftProviderKind::Dflash2);
+        let draft_path_is_dflash2 = block_draft;
         if let Some(draft_path) = &self.config.model.draft_path {
             if !draft_path_is_dspark && !draft_path_is_dflash2 {
                 let opened =
@@ -2068,6 +2063,10 @@ impl Engine {
         };
         if let Some(dsp) = dspark_path {
             match GgufFile::open(&dsp) {
+                Ok(f) if !draft_path_is_dspark && !allpaca_gguf::sidecar_matches_target(&f, &file) => {
+                    // Found by name next to the target but built for another model.
+                    tracing::info!(path = %dsp.display(), "skipping a DSpark sidecar whose shape does not match the target");
+                }
                 Ok(f) if crate::dflash2::Dflash2Spec::from_gguf(&f).is_some() => {
                     // A DFlash2 draft is not a DSpark sidecar; it attaches
                     // only through `providers = ["dflash2"]`.
@@ -2206,6 +2205,8 @@ impl Engine {
                     self.upload_resident_from_gguf(None, None)?;
                 }
             }
+            // gemma4's device chain can host a DFlash draft's head.
+            self.attach_dflash2();
             return self.note_early_exit_gate();
         }
         let draft_ref = if draft_reuses_target_gguf {
@@ -2222,13 +2223,9 @@ impl Engine {
     /// (the target GPU when there is none). It reads the target's embeddings
     /// and lm_head in place and taps its layer inputs.
     fn attach_dflash2(&self) {
-        if !self.config.speculative.enabled
-            || !self
-                .config
-                .speculative
-                .providers
-                .contains(&DraftProviderKind::Dflash2)
-        {
+        let providers = &self.config.speculative.providers;
+        let plain = providers.contains(&DraftProviderKind::Dflash1);
+        if !self.config.speculative.enabled || !(plain || providers.contains(&DraftProviderKind::Dflash2)) {
             return;
         }
         let loaded = (|| -> Result<crate::dflash2::Dflash2Provider, AllpacaError> {
@@ -2245,6 +2242,14 @@ impl Engine {
                     resolved.display()
                 )))
             })?;
+            if spec.plain != plain {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "{} is a {} draft; use providers = [\"{}\"]",
+                    resolved.display(),
+                    if spec.plain { "plain DFlash" } else { "DFlash2" },
+                    if spec.plain { "dflash1" } else { "dflash2" }
+                ))));
+            }
             let (target, resident) = {
                 let g = self.lock()?;
                 (g.target.clone(), g.target_resident.clone())
@@ -2255,7 +2260,6 @@ impl Engine {
                     "DFlash2 needs the target resident on HIP".into(),
                 ))
             };
-            let resident = resident.ok_or_else(no_hip)?;
             let target_hip = self.hip.clone().ok_or_else(no_hip)?;
             if spec.dim != target.config.dim {
                 return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
@@ -2272,19 +2276,19 @@ impl Engine {
                         .map_or(target_hip.device, |h| h.device)
                 });
             let hip = Arc::new(HipWorkspace::new(device, 8 * 1024 * 1024, 256)?);
-            let head = crate::dflash2::ResidentHead::new(
-                target_hip,
-                resident,
-                target.config.dim,
-                target.config.vocab_size,
-                spec.block_size,
-            )?;
-            crate::dflash2::Dflash2Provider::load(
-                &file,
-                hip,
-                Arc::clone(&target.layer_capture),
-                Box::new(head),
-            )
+            let head: Box<dyn crate::dflash2::TargetHead> = if target.g4.is_some() {
+                // gemma4 keeps its head in its own device chain.
+                Box::new(crate::gemma4_gpu::Gemma4Head::new(Arc::clone(&target), spec.block_size)?)
+            } else {
+                Box::new(crate::dflash2::ResidentHead::new(
+                    target_hip,
+                    resident.ok_or_else(no_hip)?,
+                    target.config.dim,
+                    target.config.vocab_size,
+                    spec.block_size,
+                )?)
+            };
+            crate::dflash2::Dflash2Provider::load(&file, hip, Arc::clone(&target.layer_capture), head)
         })();
         match loaded {
             Ok(p) => {

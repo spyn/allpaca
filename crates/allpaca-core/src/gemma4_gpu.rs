@@ -16,7 +16,7 @@ use allpaca_gguf::{GgmlType, GgufFile};
 use allpaca_hip::{memcpy, set_device, DeviceWeights, HipWorkspace, MEMCPY_D2D};
 use allpaca_types::{AllpacaError, DegradedError};
 
-use crate::gemma4::{load_err, softcap, Gemma4Memory, Gemma4Spec, Gemma4Weights};
+use crate::gemma4::{load_err, Gemma4Memory, Gemma4Spec, Gemma4Weights};
 use crate::model::TinyModel;
 
 /// Rows per device pass; longer prompts run as several.
@@ -555,8 +555,10 @@ impl Gemma4Gpu {
             let a = unsafe { s.xn.add(first * dim) };
             let _scope = hip.lm_head_scope();
             self.head.gemm(hip, a, s.logits, n)?;
+            if sp.softcap > 0.0 {
+                allpaca_hip::softcap_device(s.logits, n * vocab, sp.softcap)?;
+            }
             hip.copy_d2h_f32(s.logits, &mut out[..n * vocab])?;
-            softcap(&mut out[..n * vocab], sp.softcap);
             Ok(())
         };
         match row_logits {
@@ -577,6 +579,92 @@ impl Gemma4Gpu {
     /// RMS norm without a gain over `rows` rows of `n` (device, in place).
     fn rmsnorm_plain(&self, x: *mut f32, rows: usize, n: usize, eps: f32) -> Result<(), AllpacaError> {
         self.hip.rmsnorm_heads_device(x, self.ones.ptr_at(0), rows as i32, n as i32, eps)
+    }
+}
+
+/// The gemma4 target's embeddings and output head for a DFlash draft
+/// ([`crate::dflash2::TargetHead`]): raw `token_embd` rows (the draft applies
+/// its own embedding scale) and the top-k of the head's logits, before the
+/// softcap (monotonic, so the order is the same).
+pub struct Gemma4Head {
+    model: Arc<TinyModel>,
+    rows: usize,
+    a: DeviceWeights,
+    out: DeviceWeights,
+    cand_v: DeviceWeights,
+    cand_i: DeviceWeights,
+}
+
+impl Gemma4Head {
+    pub fn new(model: Arc<TinyModel>, rows: usize) -> Result<Self, AllpacaError> {
+        let w = model.g4.as_ref().ok_or_else(|| load_err("not a gemma4 target".into()))?;
+        let (dim, vocab) = (w.spec.dim, w.spec.vocab);
+        let dev = {
+            let gpu = w.gpu.lock().map_err(|_| load_err("gemma4 gpu lock poisoned".into()))?;
+            gpu.as_ref().ok_or_else(|| load_err("gemma4 head needs the device chain".into()))?.device()
+        };
+        let cands = rows * vocab.div_ceil(crate::dflash2::TOPK_CHUNK) * crate::dflash2::TOPK_MAX * 4;
+        Ok(Self {
+            a: DeviceWeights::alloc(dev, rows * dim * 4)?,
+            out: DeviceWeights::alloc(dev, rows * vocab * 4)?,
+            cand_v: DeviceWeights::alloc(dev, cands)?,
+            cand_i: DeviceWeights::alloc(dev, cands)?,
+            model,
+            rows,
+        })
+    }
+}
+
+impl crate::dflash2::TargetHead for Gemma4Head {
+    fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, AllpacaError> {
+        let w = self.model.g4.as_ref().ok_or_else(|| load_err("not a gemma4 target".into()))?;
+        let dim = w.spec.dim;
+        let mut out = Vec::with_capacity(tokens.len() * dim);
+        for &t in tokens {
+            out.extend_from_slice(&w.row("token_embd.weight", t as usize, dim)?);
+        }
+        Ok(out)
+    }
+
+    fn topk_rows(&self, hidden: &[f32], rows: usize, k: usize) -> Result<Vec<Vec<(usize, f32)>>, AllpacaError> {
+        use crate::dflash2::{top_k_desc, TOPK_CHUNK, TOPK_MAX};
+        if rows == 0 || rows > self.rows {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(format!(
+                "gemma4 head: {rows} rows (max {})",
+                self.rows
+            ))));
+        }
+        let w = self.model.g4.as_ref().ok_or_else(|| load_err("not a gemma4 target".into()))?;
+        let (dim, vocab) = (w.spec.dim, w.spec.vocab);
+        let k = k.clamp(1, TOPK_MAX);
+        let gpu = w.gpu.lock().map_err(|_| load_err("gemma4 gpu lock poisoned".into()))?;
+        let gpu = gpu.as_ref().ok_or_else(|| load_err("gemma4 head needs the device chain".into()))?;
+        let hip = &*gpu.hip;
+        hip.bind()?;
+        let (a, out) = (self.a.ptr_at(0) as *mut f32, self.out.ptr_at(0) as *mut f32);
+        hip.copy_h2d_f32(a, &hidden[..rows * dim])?;
+        {
+            let _scope = hip.lm_head_scope();
+            gpu.head.gemm(hip, a, out, rows)?;
+        }
+        let chunks = vocab.div_ceil(TOPK_CHUNK);
+        allpaca_hip::topk_chunks_device(out, rows, vocab, TOPK_CHUNK, k, self.cand_v.ptr_at(0) as *mut f32, self.cand_i.ptr_at(0) as *mut i32)?;
+        let n = rows * chunks * k;
+        let (mut v, mut i) = (vec![0.0f32; n], vec![0.0f32; n]);
+        hip.copy_d2h_f32(self.cand_v.ptr_at(0), &mut v)?;
+        hip.copy_d2h_f32(self.cand_i.ptr_at(0), &mut i)?;
+        Ok((0..rows)
+            .map(|r| {
+                let (vr, ir) = (&v[r * chunks * k..(r + 1) * chunks * k], &i[r * chunks * k..(r + 1) * chunks * k]);
+                top_k_desc(vr, k)
+                    .into_iter()
+                    .filter_map(|j| {
+                        let id = ir[j].to_bits() as i32;
+                        (id >= 0).then_some((id as usize, vr[j]))
+                    })
+                    .collect()
+            })
+            .collect())
     }
 }
 
