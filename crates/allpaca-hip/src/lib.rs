@@ -13468,6 +13468,90 @@ mod tests {
         }
     }
 
+    /// Q2_0 and Q3_K GEMVs (board P5) at m = 1, 2, 4, 8 on a dense 5120² shape
+    /// and an MoE expert shape (n = 640, k = 2560), on every device or
+    /// `BENCH_DEVICES`. Weights rotate past 192 MB as in `bench_kernel_matrix`.
+    /// Each line is `lowbit,<kernel>,<shape>,hip<dev>,<arch>,<µs>`, and
+    /// `BENCH_OUT=file.csv` writes the same rows, so main and a branch can be
+    /// run in turn and compared:
+    /// `cargo test --release -p allpaca-hip --features hip --lib bench_lowbit_gemv -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_lowbit_gemv() {
+        let devs: Vec<i32> = match std::env::var("BENCH_DEVICES") {
+            Ok(list) => list.split(',').filter_map(|d| d.trim().parse().ok()).collect(),
+            Err(_) => (0..device_count()).collect(),
+        };
+        const ROTATE_BYTES: usize = 192 << 20;
+        let mut csv = String::from("kernel,shape,device,arch,us\n");
+        for &dev in &devs {
+            set_device(dev).unwrap();
+            let arch = device_gcn_arch(dev).map(|(a, _)| a).unwrap_or_default();
+            for (n, k) in [(5120usize, 5120usize), (640, 2560)] {
+                let x = device_malloc(8 * k * 4, dev).unwrap();
+                let y = device_malloc(8 * n * 4, dev).unwrap();
+                let xs: Vec<f32> = (0..8 * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+                memcpy(x, xs.as_ptr().cast(), 8 * k * 4, MEMCPY_H2D).unwrap();
+                let p2: Vec<u8> = (0..n * k / 64 * 18)
+                    .map(|i| match i % 18 {
+                        0 => 0x00,
+                        1 => 0x1c,
+                        j => (i * 7 % 251 + j) as u8,
+                    })
+                    .collect();
+                let p3: Vec<u8> = (0..n * k / 256 * 110)
+                    .map(|i| match i % 110 {
+                        108 => 0x00,
+                        109 => 0x1c,
+                        j => (i * 7 % 251 + j) as u8,
+                    })
+                    .collect();
+                for (kernel, packed) in [("q2_0 gemv", &p2), ("q3_k gemv", &p3)] {
+                    let copies = ROTATE_BYTES.div_ceil(packed.len()).clamp(1, 64);
+                    let ws: Vec<*mut u8> = (0..copies)
+                        .map(|_| {
+                            let w = device_malloc(packed.len(), dev).unwrap();
+                            memcpy(w, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+                            w
+                        })
+                        .collect();
+                    for m in [1i32, 2, 4, 8] {
+                        let call = |i: usize| {
+                            let w = ws[i % ws.len()];
+                            if kernel == "q2_0 gemv" {
+                                gemm_nt_q2_0_device(x.cast(), w, y.cast(), m, n as i32, k as i32).unwrap();
+                            } else {
+                                gemm_nt_q3_k_device(x.cast(), w, y.cast(), m, n as i32, k as i32).unwrap();
+                            }
+                        };
+                        for i in 0..10 {
+                            call(i);
+                        }
+                        stream_synchronize().unwrap();
+                        let iters = 200usize;
+                        let t = std::time::Instant::now();
+                        for i in 0..iters {
+                            call(i);
+                        }
+                        stream_synchronize().unwrap();
+                        let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                        let shape = format!("n={n} k={k} m={m}");
+                        eprintln!("lowbit,{kernel},{shape},hip{dev},{arch},{us:.2}");
+                        csv += &format!("{kernel},{shape},{dev},{arch},{us:.2}\n");
+                    }
+                    for w in ws {
+                        device_free(w, packed.len());
+                    }
+                }
+                device_free(x, 8 * k * 4);
+                device_free(y, 8 * n * 4);
+            }
+        }
+        if let Ok(path) = std::env::var("BENCH_OUT") {
+            std::fs::write(&path, csv).unwrap();
+        }
+    }
+
     #[test]
     #[ignore]
     fn bench_gdn_gemv() {
