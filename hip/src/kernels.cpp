@@ -4167,35 +4167,12 @@ extern "C" int allpaca_gemm_nt_tq2_0(const float *a, const uint8_t *b, float *c,
 /* ggml Q2_0: 64 weights / 18 bytes (f16 d, then 2 bits per weight, weight j in
  * bits 2*(j%4) of byte j/4). value = d * (code - 1); d may be negative. Each
  * output column runs on four lanes, lane l taking blocks l, l+4, ... */
-/* Four 2-bit crumbs in the low byte of `q`, as signed bytes (code - 1): -1, 0, 1, 2.
- * `v_perm_b32` picks them from the table 0x020100FF. Both sources are that table, so
- * the operand order does not matter. Selector byte k is crumb k (llama.cpp #29927
- * spreads packed bits into those selector bytes the same way for Q1_0). */
-__device__ inline uint32_t q2_0_perm_codes(uint32_t q) {
-#if defined(__AMDGCN__)
-    const uint32_t indices = (q & 0x03u) | ((q & 0x0cu) << 6) | ((q & 0x30u) << 12) |
-                             ((q & 0xc0u) << 18);
-    return __builtin_amdgcn_perm(0x020100ffu, 0x020100ffu, indices);
-#else
-    uint32_t out = 0;
-    for (int s = 0; s < 4; ++s) {
-        const int code = static_cast<int>((q >> (2 * s)) & 3u) - 1;
-        out |= static_cast<uint32_t>(code & 0xff) << (8 * s);
-    }
-    return out;
-#endif
-}
-
-/* Signed byte `shift/8` of a perm result, as the float the scalar products multiply. */
-__device__ inline float q2_0_perm_lane(uint32_t packed, int shift) {
-    const int byte = static_cast<int>((packed >> shift) & 0xffu);
-    return static_cast<float>(byte - ((byte & 0x80) << 1));
-}
-
 /* Dot of one ggml Q2_0 block (18 bytes) with 64 activations, scale applied. With the block on
  * two bytes and the activations on sixteen, the codes load two at a time and the activations four
- * at a time; the sums run in the same order either way. The perm only replaces the crumb unpack;
- * each product is still (code - 1) times that activation, low crumb first. */
+ * at a time; the sums run in the same order either way. The crumbs stay as
+ * `float(q >> s & 3) - 1`, which compiles to v_cvt_f32_ubyte plus a subtract: a v_perm_b32 to
+ * signed bytes (llama.cpp #29927) then needs a sign fix and a convert per crumb, and measured
+ * 1.6-1.9x slower on gfx1200/gfx1201 and 1.2-1.6x on gfx906 (board P5, 2026-10-24). */
 __device__ inline float q2_0_block_dot(const uint8_t *blk, const float *x) {
     float s = 0.f;
     if ((reinterpret_cast<uintptr_t>(blk) & 1u) == 0 && (reinterpret_cast<uintptr_t>(x) & 15u) == 0) {
@@ -4204,21 +4181,21 @@ __device__ inline float q2_0_block_dot(const uint8_t *blk, const float *x) {
         for (int w = 0; w < 8; ++w) {
             const uint32_t pair = codes[w];
             for (int half = 0; half < 2; ++half) {
-                const uint32_t packed = q2_0_perm_codes((pair >> (8 * half)) & 0xffu);
+                const uint32_t q = (pair >> (8 * half)) & 0xffu;
                 const float4 v = xv[2 * w + half];
-                s += q2_0_perm_lane(packed, 0) * v.x;
-                s += q2_0_perm_lane(packed, 8) * v.y;
-                s += q2_0_perm_lane(packed, 16) * v.z;
-                s += q2_0_perm_lane(packed, 24) * v.w;
+                s += (static_cast<float>(q & 3u) - 1.f) * v.x;
+                s += (static_cast<float>((q >> 2) & 3u) - 1.f) * v.y;
+                s += (static_cast<float>((q >> 4) & 3u) - 1.f) * v.z;
+                s += (static_cast<float>(q >> 6) - 1.f) * v.w;
             }
         }
     } else {
         for (int j = 0; j < 16; ++j) {
-            const uint32_t packed = q2_0_perm_codes(blk[2 + j]);
-            s += q2_0_perm_lane(packed, 0) * x[4 * j];
-            s += q2_0_perm_lane(packed, 8) * x[4 * j + 1];
-            s += q2_0_perm_lane(packed, 16) * x[4 * j + 2];
-            s += q2_0_perm_lane(packed, 24) * x[4 * j + 3];
+            const uint32_t q = blk[2 + j];
+            s += (static_cast<float>(q & 3u) - 1.f) * x[4 * j];
+            s += (static_cast<float>((q >> 2) & 3u) - 1.f) * x[4 * j + 1];
+            s += (static_cast<float>((q >> 4) & 3u) - 1.f) * x[4 * j + 2];
+            s += (static_cast<float>(q >> 6) - 1.f) * x[4 * j + 3];
         }
     }
     return allpaca_f16le_to_f32(blk) * s;
