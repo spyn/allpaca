@@ -3222,8 +3222,9 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                 const float d = allpaca_f16le_to_f32(blk + 108);
                 const uint8_t *sc = blk + 96;
                 // `q - 4` packed saves a dot per word: 0.45-0.64x the time at 8 rows on
-                // RDNA4 and 0.88x on the MI50, but on the MI50 1-2 rows ran 15% slower,
-                // so gfx9 keeps `dot(q) - 4 * dot(1)` there. Both give the same int32.
+                // RDNA4 and 0.87x on the MI50, but on the MI50 2 rows of 5120^2 ran 12%
+                // slower (65.3 -> 73.2 us), so gfx9 keeps `dot(q) - 4 * dot(1)` up to 2
+                // rows. Both give the same int32.
 #if defined(__GFX9__)
                 constexpr bool SUB4 = MR > 2;
 #else
