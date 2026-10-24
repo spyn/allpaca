@@ -352,6 +352,8 @@ mod ffi {
     use std::os::raw::c_void;
 
     extern "C" {
+        pub fn allpaca_hip_kernel_launches() -> u64;
+        pub fn allpaca_hip_act_quant_reuses() -> u64;
         pub fn allpaca_hip_device_count(count: *mut i32) -> i32;
         pub fn allpaca_hip_device_props(
             id: i32,
@@ -366,6 +368,7 @@ mod ffi {
             arch_len: i32,
             l2_bytes: *mut i32,
         ) -> i32;
+        pub fn allpaca_hip_device_multiprocessors(id: i32, count: *mut i32) -> i32;
         pub fn allpaca_hip_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
         pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
@@ -1438,6 +1441,31 @@ pub fn runtime_linked() -> bool {
     cfg!(all(feature = "hip", allpaca_hip_runtime))
 }
 
+/// HIP kernels launched by this process so far, on every device (0 without HIP).
+pub fn kernel_launches() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_hip_kernel_launches() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
+/// Int8 GEMVs on the calling thread that reused another GEMV's int8 copy of
+/// their activation instead of quantizing it again (0 without HIP).
+pub fn act_quant_reuses() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_hip_act_quant_reuses() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
 pub fn device_count() -> i32 {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -1518,6 +1546,23 @@ pub fn device_gcn_arch(id: i32) -> Option<(String, usize)> {
             return None;
         }
         Some((arch, l2.max(0) as usize))
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// `multiProcessorCount`: compute units on GCN/CDNA (MI50: 60), work-group
+/// processors on RDNA (RX 9070: 28, RX 9060 XT: 16). Size occupancy-bound
+/// grids from this, not from a constant.
+pub fn device_multiprocessors(id: i32) -> Option<u32> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let mut count = 0i32;
+        let rc = unsafe { ffi::allpaca_hip_device_multiprocessors(id, &mut count) };
+        (rc == ALLPACA_OK && count > 0).then_some(count as u32)
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
@@ -13137,6 +13182,405 @@ impl Drop for HipWorkspace {
 mod tests {
     use super::*;
 
+    /// Q4_K bytes with sane super-block scales, for the int8 GEMV path.
+    fn q4_k_weights(n: usize, k: usize, seed: usize) -> Vec<u8> {
+        (0..n * k / 256 * 144)
+            .map(|i| match i % 144 {
+                0 | 2 => 0x00,
+                1 | 3 => 0x1c,
+                j => ((i * 7 + seed * 13) % 251 + j) as u8,
+            })
+            .collect()
+    }
+
+    fn download(p: *const u8, n: usize) -> Vec<f32> {
+        let mut out = vec![0f32; n];
+        stream_synchronize().unwrap();
+        memcpy(out.as_mut_ptr().cast(), p, n * 4, MEMCPY_D2H).unwrap();
+        out
+    }
+
+    fn act_reuse_disabled() -> bool {
+        std::env::var("ALLPACA_KQ_ACT_REUSE").is_ok_and(|v| v.starts_with('0'))
+    }
+
+    fn dev_buf(bytes: &[u8]) -> DeviceWeights {
+        let b = DeviceWeights::alloc(0, bytes.len()).unwrap();
+        b.copy_h2d(0, bytes).unwrap();
+        b
+    }
+
+    fn dev_ptr(b: &DeviceWeights) -> *mut f32 {
+        b.ptr_at(0).cast_mut()
+    }
+
+    fn x_new(k: usize) -> Vec<f32> {
+        (0..k)
+            .map(|i| ((i * 29 % 89) as f32 - 44.0) * 0.02)
+            .collect()
+    }
+
+    /// GEMVs that read one activation quantize it to int8 once (q/k/v,
+    /// gate/up), with the same bits as quantizing it for each of them, across
+    /// the K-quant, Q8_0 and ROCmFP4 launchers.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemvs_on_one_activation_share_its_int8_copy() {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        set_device(0).unwrap();
+        // k = 5120 so Q8_0 takes its int8 GEMV too.
+        let (n, k) = (256usize, 5120usize);
+        let xs: Vec<f32> = (0..k)
+            .map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let rows: Vec<Vec<f32>> = (0..n)
+            .map(|r| {
+                (0..k)
+                    .map(|i| (((i * 7 + r * 31) % 61) as f32 - 30.0) * 0.003)
+                    .collect()
+            })
+            .collect();
+        let q8_raw: Vec<u8> = rows.iter().flat_map(|r| quantize_q8_0(r)).collect();
+        let q8_bytes = stage_q8_0_gemv(&q8_raw, n, k).unwrap();
+        let fp4_bytes: Vec<u8> = rows
+            .iter()
+            .flat_map(|r| allpaca_cpu::quantize_rocmfp4(r))
+            .collect();
+        let x = dev_buf(bytemuck_f32(&xs));
+        let wq4 = dev_buf(&q4_k_weights(n, k, 1));
+        let wq8 = dev_buf(&q8_bytes);
+        let wfp4 = dev_buf(&fp4_bytes);
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let (xp, cp) = (dev_ptr(&x), dev_ptr(&c));
+        let (m, n_, k_) = (1, n as i32, k as i32);
+        let q4 = || gemm_nt_q4_k_device(xp, wq4.byte_ptr_at(0), cp, m, n_, k_).unwrap();
+        let q8 = || gemm_nt_q8_0_device(xp, wq8.byte_ptr_at(0), cp, m, n_, k_).unwrap();
+        let f4 = || gemm_nt_rocmfp4_device(xp, wfp4.byte_ptr_at(0), cp, m, n_, k_).unwrap();
+        let mut pairs: Vec<(&str, &dyn Fn(), &dyn Fn())> = vec![
+            ("q4_k -> q4_k", &q4, &q4),
+            ("q4_k -> rocmfp4", &q4, &f4),
+            ("rocmfp4 -> q4_k", &f4, &q4),
+        ];
+        if !std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            pairs.push(("q8_0 -> rocmfp4", &q8, &f4));
+            pairs.push(("rocmfp4 -> q8_0", &f4, &q8));
+        }
+        for (name, first, second) in pairs {
+            // Kernels other tests launch in parallel end the sharing, so only
+            // some attempts share: one is enough.
+            let mut shared = false;
+            for _ in 0..50 {
+                // The reference: a device write before the call forces a fresh quantize.
+                x.copy_h2d(0, bytemuck_f32(&xs)).unwrap();
+                second();
+                let fresh = download(cp.cast(), n);
+                first();
+                let before = act_quant_reuses();
+                second();
+                let reused = act_quant_reuses() > before;
+                assert_eq!(
+                    download(cp.cast(), n),
+                    fresh,
+                    "{name}: a shared copy must give the same bits"
+                );
+                if reused {
+                    shared = true;
+                    break;
+                }
+            }
+            assert!(
+                shared,
+                "{name}: the second GEMV on an unchanged activation never reused its copy"
+            );
+        }
+    }
+
+    /// After `write` changes the activation, the next GEMV quantizes it again
+    /// and sees the new values. Each attempt first checks that, without the
+    /// write, the GEMV would have reused its int8 copy.
+    fn assert_write_requantizes(name: &str, write: &dyn Fn(*mut f32)) {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        set_device(0).unwrap();
+        let (n, k) = (256usize, 512usize);
+        let x_old: Vec<f32> = (0..k)
+            .map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let x = dev_buf(bytemuck_f32(&x_old));
+        let copy = DeviceWeights::alloc(0, k * 4).unwrap();
+        let w = dev_buf(&q4_k_weights(n, k, 3));
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let (xp, cp) = (dev_ptr(&x), dev_ptr(&c));
+        let gemv = |a: *const f32| {
+            gemm_nt_q4_k_device(a, w.byte_ptr_at(0), cp, 1, n as i32, k as i32).unwrap()
+        };
+        let mut proven = false;
+        for _ in 0..50 {
+            x.copy_h2d(0, bytemuck_f32(&x_old)).unwrap();
+            gemv(xp);
+            let before = act_quant_reuses();
+            gemv(xp);
+            let control = act_quant_reuses() > before;
+            let old = download(cp.cast(), n);
+            write(xp);
+            let before = act_quant_reuses();
+            gemv(xp);
+            assert_eq!(
+                act_quant_reuses(),
+                before,
+                "{name}: reused the copy of the old values"
+            );
+            let got = download(cp.cast(), n);
+            // The reference: the new values at another address.
+            memcpy(dev_ptr(&copy).cast(), xp.cast(), k * 4, MEMCPY_D2D).unwrap();
+            gemv(copy.ptr_at(0));
+            let want = download(cp.cast(), n);
+            assert_eq!(
+                got, want,
+                "{name}: the GEMV after the write must see the new values"
+            );
+            assert_ne!(got, old, "{name}: the write must change the activation");
+            if control {
+                proven = true;
+                break;
+            }
+        }
+        assert!(
+            proven,
+            "{name}: without the write the GEMV never reused its copy"
+        );
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_copy_is_quantized_again() {
+        let src = x_new(512);
+        assert_write_requantizes("H2D copy", &|x| {
+            memcpy(x.cast(), bytemuck_f32(&src).as_ptr(), 512 * 4, MEMCPY_H2D).unwrap()
+        });
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_kernel_is_quantized_again() {
+        if device_count() == 0 {
+            return;
+        }
+        let src = dev_buf(bytemuck_f32(&x_new(512)));
+        assert_write_requantizes("kernel", &|x| {
+            copy_f32_kernel(x, src.ptr_at(0), 512).unwrap()
+        });
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_memset_is_quantized_again() {
+        assert_write_requantizes("memset", &|x| {
+            device_memset(x.cast(), 0x3c, 512 * 4).unwrap()
+        });
+    }
+
+    /// A GEMV whose output overlaps its input rewrites that input.
+    #[test]
+    fn an_activation_overwritten_by_its_own_gemv_is_quantized_again() {
+        if device_count() == 0 {
+            return;
+        }
+        let w = dev_buf(&q4_k_weights(512, 512, 5));
+        assert_write_requantizes("in-place GEMV", &|x| {
+            gemm_nt_q4_k_device(x, w.byte_ptr_at(0), x, 1, 512, 512).unwrap()
+        });
+    }
+
+    /// An f32 GEMM (rocBLAS / hipBLASLt where linked) writing the activation.
+    #[test]
+    fn an_activation_written_by_an_f32_gemm_is_quantized_again() {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        let (rows, k) = (16usize, 512usize);
+        let av: Vec<f32> = (0..rows * k).map(|i| (i % 37) as f32 * 0.01).collect();
+        let a = dev_buf(bytemuck_f32(&av));
+        let half: Vec<f32> = (0..k * k)
+            .map(|i| if i / k == i % k { 0.5 } else { 0.0 })
+            .collect();
+        let b = dev_buf(bytemuck_f32(&half));
+        // The activation is row 0 of the GEMM's output.
+        let out = DeviceWeights::alloc(0, rows * k * 4).unwrap();
+        let op = dev_ptr(&out);
+        let (r, kk) = (rows as i32, k as i32);
+        let gemm = || gemm_nt_device(a.ptr_at(0), b.ptr_at(0), op, r, kk, kk).unwrap();
+        // Start the BLAS library before the loop.
+        gemm();
+        let w = dev_buf(&q4_k_weights(256, k, 7));
+        let c = DeviceWeights::alloc(0, 256 * 4).unwrap();
+        let mut proven = false;
+        for _ in 0..50 {
+            device_memset(op.cast(), 0, rows * k * 4).unwrap();
+            let gemv = || {
+                gemm_nt_q4_k_device(op, w.byte_ptr_at(0), dev_ptr(&c), 1, 256, kk).unwrap();
+                download(dev_ptr(&c).cast(), 256)
+            };
+            gemv();
+            let before = act_quant_reuses();
+            gemv();
+            let control = act_quant_reuses() > before;
+            gemm();
+            let before = act_quant_reuses();
+            let got = gemv();
+            assert_eq!(
+                act_quant_reuses(),
+                before,
+                "reused the copy after an f32 GEMM wrote it"
+            );
+            let fresh = dev_buf(bytemuck_f32(&download(op.cast(), k)));
+            gemm_nt_q4_k_device(fresh.ptr_at(0), w.byte_ptr_at(0), dev_ptr(&c), 1, 256, kk)
+                .unwrap();
+            assert_eq!(got, download(dev_ptr(&c).cast(), 256));
+            if control {
+                proven = true;
+                break;
+            }
+        }
+        assert!(proven, "without the GEMM the GEMV never reused its copy");
+    }
+
+    /// A write on another stream, ordered before the GEMV by an event.
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn an_activation_rewritten_on_another_stream_is_quantized_again() {
+        if device_count() == 0 {
+            return;
+        }
+        set_device(0).unwrap();
+        let src = dev_buf(bytemuck_f32(&x_new(512)));
+        // Made at the first write: created while other test threads start
+        // up, the stream hung the whole test process.
+        let side = std::cell::OnceCell::new();
+        assert_write_requantizes("side-stream copy", &|x| {
+            let (h2d, ev) =
+                side.get_or_init(|| (H2dStream::new().unwrap(), event_create().unwrap()));
+            memcpy_on(x.cast(), src.byte_ptr_at(0), 512 * 4, MEMCPY_D2D, h2d.raw()).unwrap();
+            event_record_on(*ev, h2d.raw()).unwrap();
+            stream_wait_event(std::ptr::null_mut(), *ev).unwrap();
+        });
+        if let Some((_, ev)) = side.get() {
+            unsafe {
+                let _ = ffi::allpaca_hip_event_destroy(*ev);
+            }
+        }
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_peer_copy_is_quantized_again() {
+        if device_count() < 2 {
+            return;
+        }
+        let src = DeviceWeights::alloc(1, 512 * 4).unwrap();
+        src.copy_h2d(0, bytemuck_f32(&x_new(512))).unwrap();
+        set_device(0).unwrap();
+        assert_write_requantizes("peer copy", &|x| {
+            memcpy_peer(x.cast(), 0, src.byte_ptr_at(0), 1, 512 * 4).unwrap();
+            set_device(0).unwrap();
+        });
+    }
+
+    /// A freed activation's address may come back for another buffer: the
+    /// copy of the old one must not be reused for it.
+    #[test]
+    fn a_freed_activations_copy_is_not_reused() {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        set_device(0).unwrap();
+        let (n, k) = (256usize, 512usize);
+        let xs = x_new(k);
+        let w = dev_buf(&q4_k_weights(n, k, 4));
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let gemv = |a: *const f32| {
+            gemm_nt_q4_k_device(a, w.byte_ptr_at(0), dev_ptr(&c), 1, n as i32, k as i32).unwrap()
+        };
+        let mut x = dev_buf(bytemuck_f32(&xs));
+        let mut same_address = false;
+        for _ in 0..20 {
+            let old = dev_ptr(&x);
+            gemv(old);
+            drop(x);
+            x = DeviceWeights::alloc(0, k * 4).unwrap();
+            same_address |= dev_ptr(&x) == old;
+            let before = act_quant_reuses();
+            gemv(dev_ptr(&x));
+            assert_eq!(
+                act_quant_reuses(),
+                before,
+                "reused the copy of a freed buffer"
+            );
+            x.copy_h2d(0, bytemuck_f32(&xs)).unwrap();
+        }
+        if !same_address {
+            eprintln!("the allocator never handed the freed address back; nothing was tested");
+        }
+    }
+
+    /// The host can change a host-mapped activation without any enqueue, so
+    /// its int8 copy is never reused.
+    #[test]
+    fn a_host_activation_is_quantized_every_time() {
+        if device_count() == 0 {
+            return;
+        }
+        set_device(0).unwrap();
+        let (n, k) = (256usize, 512usize);
+        let w = dev_buf(&q4_k_weights(n, k, 6));
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let gemv = |a: *const f32| {
+            gemm_nt_q4_k_device(a, w.byte_ptr_at(0), dev_ptr(&c), 1, n as i32, k as i32).unwrap();
+            download(dev_ptr(&c).cast(), n)
+        };
+        let want = gemv(dev_buf(bytemuck_f32(&x_new(k))).ptr_at(0));
+        let mut pinned = PinnedBuf::default();
+        let hx = pinned.ensure(k * 4).unwrap().cast::<f32>();
+        let host = unsafe { std::slice::from_raw_parts_mut(hx, k) };
+        host.copy_from_slice(&(0..k).map(|i| i as f32 * 0.001).collect::<Vec<_>>());
+        gemv(hx);
+        host.copy_from_slice(&x_new(k));
+        let before = act_quant_reuses();
+        let got = gemv(hx);
+        let reused = act_quant_reuses() > before;
+        host_free(hx.cast());
+        assert!(!reused, "reused the copy of a host buffer");
+        assert_eq!(got, want);
+    }
+
+    fn bytemuck_f32(v: &[f32]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 4) }
+    }
+
+    #[test]
+    fn every_device_reports_its_multiprocessors() {
+        for dev in 0..device_count() {
+            assert!(device_multiprocessors(dev).is_some_and(|n| n > 0), "hip{dev}");
+        }
+    }
+
+    #[test]
+    fn kernel_launches_counts_a_launch() {
+        if device_count() == 0 {
+            return;
+        }
+        let Ok(hip) = HipWorkspace::new(0, 1 << 20, 8) else { return };
+        let n = 256usize;
+        let x = device_malloc(n * 4, 0).unwrap();
+        let r = device_malloc(n * 4, 0).unwrap();
+        let before = kernel_launches();
+        hip.residual_add(x.cast(), r.cast(), n as i32).unwrap();
+        // Other tests may launch at the same time, so only a lower bound holds.
+        let after = kernel_launches();
+        device_free(x, n * 4);
+        device_free(r, n * 4);
+        assert!(after > before);
+    }
+
     /// Small host<->device copy latency: pageable `hipMemcpy` vs a pinned
     /// staging buffer. `cargo test --release -p allpaca-hip --features hip --lib bench_small_copies -- --ignored --nocapture`
     #[test]
@@ -13477,6 +13921,205 @@ mod tests {
             device_free(x, 16 * k * 4);
             device_free(y, 16 * n * 4);
             device_free(w, packed.len());
+        }
+    }
+
+    /// Published peak bandwidth by ISA, for the % column of [`bench_kernel_matrix`]
+    /// (HIP's own figure is wrong on Windows: 80.6 GB/s for an RX 9070).
+    fn published_peak_gbs(arch: &str) -> Option<f64> {
+        match arch.split(':').next().unwrap_or(arch) {
+            "gfx1201" => Some(640.0), // RX 9070 / 9070 XT / R9700
+            "gfx1200" => Some(320.0), // RX 9060 XT
+            "gfx906" => Some(1024.0), // MI50
+            _ => None,
+        }
+    }
+
+    /// The same kernels and shapes on every HIP device, one column each, so a
+    /// kernel change is measured on gfx1201, gfx1200 and gfx906 alike (board D3).
+    /// Weights rotate through copies past 192 MB so the RDNA 64 MB Infinity
+    /// Cache cannot serve them. `BENCH_OUT=file.csv` also writes one CSV row per
+    /// (kernel, device) for before/after diffs, and `BENCH_DEVICES=1,2` picks
+    /// devices (on sunny GPU0 is full of worker weights by design):
+    /// `cargo test --release -p allpaca-hip --features hip --lib bench_kernel_matrix -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_kernel_matrix() {
+        let devs: Vec<i32> = match std::env::var("BENCH_DEVICES") {
+            Ok(list) => list.split(',').filter_map(|d| d.trim().parse().ok()).collect(),
+            Err(_) => (0..device_count()).collect(),
+        };
+        let n_dev = devs.len();
+        if n_dev == 0 {
+            return;
+        }
+        const ROTATE_BYTES: usize = 192 << 20;
+        let copies_for = |bytes: usize| ROTATE_BYTES.div_ceil(bytes.max(1)).clamp(1, 64);
+        let time_us = |iters: usize, f: &mut dyn FnMut()| {
+            for _ in 0..10 {
+                f();
+            }
+            stream_synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            stream_synchronize().unwrap();
+            t.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        // (kernel, shape, bytes read per call, µs per device)
+        let mut rows: Vec<(String, String, usize, Vec<f64>)> = Vec::new();
+        let mut heads = Vec::new();
+        let infos = enumerate_devices();
+        for (col, &dev) in devs.iter().enumerate() {
+            set_device(dev).unwrap();
+            let arch = device_gcn_arch(dev).map(|(a, _)| a).unwrap_or_default();
+            let mps = device_multiprocessors(dev).unwrap_or(0);
+            let name = infos.iter().find(|d| d.id == dev).map(|d| d.name.clone()).unwrap_or_default();
+            heads.push((dev, name, arch, mps));
+            let mut row = 0usize;
+            let mut push = |kernel: &str, shape: String, bytes: usize, us: f64| {
+                if col == 0 {
+                    rows.push((kernel.into(), shape, bytes, vec![f64::NAN; n_dev]));
+                }
+                rows[row].3[col] = us;
+                row += 1;
+            };
+            let (n, k) = (5120usize, 5120usize);
+            let x = device_malloc(8 * k * 4, dev).unwrap();
+            let y = device_malloc(8 * n * 4, dev).unwrap();
+            let xs: Vec<f32> = (0..8 * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+            memcpy(x, xs.as_ptr().cast(), 8 * k * 4, MEMCPY_H2D).unwrap();
+            // Q8_0, staged 36-byte blocks.
+            let p8: Vec<u8> = (0..n * k / 32 * 34)
+                .map(|i| match i % 34 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    _ => (i * 7 % 251) as u8,
+                })
+                .collect();
+            let staged = stage_q8_0_blocks(&p8).unwrap();
+            let w8: Vec<*mut u8> = (0..copies_for(staged.len()))
+                .map(|_| {
+                    let w = device_malloc(staged.len(), dev).unwrap();
+                    memcpy(w, staged.as_ptr(), staged.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q8_0_device(x.cast(), w8[i % w8.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q8_0 gemv", format!("n={n} k={k} m={m}"), staged.len(), us);
+            }
+            for w in w8 {
+                device_free(w, staged.len());
+            }
+            // Q4_K, 144-byte super-blocks.
+            let p4: Vec<u8> = (0..n * k / 256 * 144)
+                .map(|i| match i % 144 {
+                    0 | 2 => 0x00,
+                    1 | 3 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w4: Vec<*mut u8> = (0..copies_for(p4.len()))
+                .map(|_| {
+                    let w = device_malloc(p4.len(), dev).unwrap();
+                    memcpy(w, p4.as_ptr(), p4.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q4_k_device(x.cast(), w4[i % w4.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q4_k gemv", format!("n={n} k={k} m={m}"), p4.len(), us);
+            }
+            for w in w4 {
+                device_free(w, p4.len());
+            }
+            device_free(x, 8 * k * 4);
+            device_free(y, 8 * n * 4);
+            // Decode attention, one query row, f32 KV (32 q heads, 8 kv heads, hd 128).
+            let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+            let (nh, nkv, hd) = (32usize, 8usize, 128usize);
+            let q = device_malloc(nh * hd * 4, dev).unwrap();
+            let out = device_malloc(nh * hd * 4, dev).unwrap();
+            memcpy(q, vec![0.01f32; nh * hd].as_ptr().cast(), nh * hd * 4, MEMCPY_H2D).unwrap();
+            for n_kv in [512usize, 4096, 32768] {
+                let kv_bytes = n_kv * nkv * hd * 4;
+                let kvs: Vec<(*mut u8, *mut u8)> = (0..copies_for(2 * kv_bytes))
+                    .map(|_| {
+                        let kp = device_malloc(kv_bytes, dev).unwrap();
+                        let vp = device_malloc(kv_bytes, dev).unwrap();
+                        let fill = vec![0.01f32; n_kv * nkv * hd];
+                        memcpy(kp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                        memcpy(vp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                        (kp, vp)
+                    })
+                    .collect();
+                let mut i = 0usize;
+                let iters = if n_kv >= 32768 { 50 } else { 200 };
+                let us = time_us(iters, &mut || {
+                    let (kp, vp) = kvs[i % kvs.len()];
+                    ws.attention_device(
+                        q.cast(), kp.cast(), vp.cast(), out.cast(), 1, n_kv as i32,
+                        nh as i32, nkv as i32, hd as i32, true,
+                    )
+                    .unwrap();
+                    i += 1;
+                });
+                push("attention decode", format!("n_kv={n_kv} {nh}/{nkv} heads hd={hd} f32"), 2 * kv_bytes, us);
+                for (kp, vp) in kvs {
+                    device_free(kp, kv_bytes);
+                    device_free(vp, kv_bytes);
+                }
+            }
+            device_free(q, nh * hd * 4);
+            device_free(out, nh * hd * 4);
+            // A tiny kernel: the per-launch floor.
+            let a = device_malloc(2048 * 4, dev).unwrap();
+            let b = device_malloc(2048 * 4, dev).unwrap();
+            let us = time_us(2000, &mut || copy_f32_kernel(a.cast(), b.cast(), 2048).unwrap());
+            push("copy_f32 (launch floor)", "n=2048".into(), 2048 * 4, us);
+            device_free(a, 2048 * 4);
+            device_free(b, 2048 * 4);
+        }
+
+        let mut table = String::from("| kernel | shape |");
+        let mut rule = String::from("|---|---|");
+        for (dev, name, arch, mps) in &heads {
+            table += &format!(" hip{dev} {name} ({arch}, {mps} MPs) µs (GB/s, % peak) |");
+            rule += "---|";
+        }
+        table += "\n";
+        table += &rule;
+        table += "\n";
+        let mut csv = String::from("kernel,shape,device,arch,multiprocessors,us,gbs,pct_peak\n");
+        for (kernel, shape, bytes, us) in &rows {
+            table += &format!("| {kernel} | {shape} |");
+            for (col, t) in us.iter().enumerate() {
+                let gbs = *bytes as f64 / t / 1e3;
+                let (dev, _, arch, mps) = &heads[col];
+                let pct = published_peak_gbs(arch).map(|p| gbs / p * 100.0);
+                let pct_s = pct.map_or("?".into(), |p| format!("{p:.0}%"));
+                table += &format!(" {t:.1} ({gbs:.0}, {pct_s}) |");
+                csv += &format!(
+                    "{kernel},{shape},{dev},{arch},{mps},{t:.2},{gbs:.1},{}\n",
+                    pct.map_or(String::new(), |p| format!("{p:.1}"))
+                );
+            }
+            table += "\n";
+        }
+        eprintln!("\n{table}");
+        if let Ok(path) = std::env::var("BENCH_OUT") {
+            std::fs::write(&path, csv).unwrap();
+            eprintln!("wrote {path}");
         }
     }
 
