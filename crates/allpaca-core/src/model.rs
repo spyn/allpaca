@@ -3148,7 +3148,7 @@ fn gguf_rope_neox(arch: &str) -> bool {
         "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "qwen3next" | "qwen4exp"
             | "phi2"
             | "phi3"
-            | "gemma" | "gemma2" | "gemma3" | "starcoder2" | "stablelm" | "gptneox" | "falcon"
+            | "gemma" | "gemma2" | "gemma3" | "gemma4" | "starcoder2" | "stablelm" | "gptneox" | "falcon"
             | "olmo2" | "nemotron" | "bailingmoe2"
     )
 }
@@ -4544,6 +4544,8 @@ pub struct TinyModel {
     pub(crate) dsv4: Option<Arc<crate::deepseek4::Dsv4Weights>>,
     /// qwen4exp runs on its own host forward ([`crate::qwen4exp`]).
     pub(crate) q4x: Option<Arc<crate::qwen4exp::Qwen4Weights>>,
+    /// gemma4 runs on its own forward ([`crate::gemma4`]).
+    pub(crate) g4: Option<Arc<crate::gemma4::Gemma4Weights>>,
     /// Records matrix inputs during a calibration run ([`crate::calib`]).
     pub(crate) calib: Arc<crate::calib::Tap>,
     /// Shared RPC runtime when layers are offloaded to remote workers.
@@ -4728,6 +4730,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            g4: None,
             calib: Default::default(),
             rpc: None,
             edge0: None,
@@ -5048,6 +5051,11 @@ impl TinyModel {
 
     /// Keep a GGUF handle for lazy DeepSeek-V4 MLA / expert / lm_head gathers.
     pub(crate) fn bind_gguf(&mut self, file: Arc<GgufFile>) {
+        if let Some(g4) = &mut self.g4 {
+            if let Some(inner) = Arc::get_mut(g4) {
+                inner.attach_gguf(file.clone());
+            }
+        }
         if let Some(q4x) = &mut self.q4x {
             if let Some(inner) = Arc::get_mut(q4x) {
                 inner.attach_gguf(file.clone());
@@ -6615,6 +6623,16 @@ impl TinyModel {
             model.q4x = Some(Arc::new(weights));
             return Ok(model);
         }
+        if crate::gemma4::file_is_gemma4(file) {
+            // Its own K/V layout (two head dims, shared blocks) and forward.
+            let weights = crate::gemma4::Gemma4Weights::from_gguf(file)?;
+            let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
+            let mut model = Self::skeleton_hybrid(cfg, name, &report, Some(file));
+            // The sequence state carries the K/V ([`crate::gemma4::Gemma4Memory`]).
+            model.config.recurrent = true;
+            model.g4 = Some(Arc::new(weights));
+            return Ok(model);
+        }
         Self::from_gguf_cfg(file, cfg, &report, host_all)
     }
 
@@ -7153,6 +7171,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            g4: None,
             calib: Default::default(),
             rpc: None,
             edge0: None,
@@ -7315,6 +7334,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            g4: None,
             calib: Default::default(),
             rpc: None,
             edge0: None,
@@ -7452,6 +7472,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            g4: None,
             calib: Default::default(),
             rpc: None,
             edge0: None,
@@ -7568,6 +7589,7 @@ impl TinyModel {
             mtp_nextn: None,
             dsv4: None,
             q4x: None,
+            g4: None,
             calib: Default::default(),
             rpc: None,
             edge0: None,
@@ -7643,6 +7665,12 @@ impl TinyModel {
                 AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
             })?;
             return crate::qwen4exp::forward_qwen4_token(self, token, pos, logits, &mut memory.q4x);
+        }
+        if self.g4.is_some() {
+            let memory = recurrent.as_deref_mut().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("gemma4 needs the sequence's state".into()))
+            })?;
+            return crate::gemma4::forward_tokens(self, &[token], pos, logits, None, &mut memory.g4);
         }
         if self.dsv4.is_some() {
             return crate::deepseek4::forward_dsv4_token(
@@ -8196,6 +8224,10 @@ impl TinyModel {
         if let Some(q4) = self.q4x.as_ref() {
             return q4.gpu.lock().is_ok_and(|gpu| gpu.as_ref().is_some_and(|g| g.hosted().is_some()));
         }
+        if let Some(g4) = self.g4.as_ref() {
+            // Each sequence's rows run as their own pass, so a batch is exact.
+            return g4.gpu.lock().is_ok_and(|gpu| gpu.is_some());
+        }
         if self.dsv4.is_some() || !self.supports_hip_batched_prefill() {
             return false;
         }
@@ -8241,6 +8273,9 @@ impl TinyModel {
         }
         if self.q4x.is_some() {
             return crate::qwen4exp::forward_qwen4_batch(self, tokens, segs, row_logits);
+        }
+        if self.g4.is_some() {
+            return crate::gemma4::forward_batch(self, tokens, segs, row_logits);
         }
         let mut last = vec![0.0f32; vocab];
         // Each sequence's rows must match its solo run bit for bit.
@@ -8290,6 +8325,12 @@ impl TinyModel {
         }
         let mrope = vision.and_then(VisionSeq::mrope);
         let dim = self.config.dim;
+        if self.g4.is_some() {
+            let memory = recurrent.as_deref_mut().ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::ModelLoad("gemma4 needs the sequence's state".into()))
+            })?;
+            return crate::gemma4::forward_tokens(self, tokens, start_pos, logits, row_logits.as_deref_mut(), &mut memory.g4);
+        }
         if self.q4x.is_some() {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
@@ -12278,6 +12319,10 @@ impl Lcg {
 /// Gated DeltaNet), which never write KV. A model without a per-layer list
 /// keeps pages on every layer.
 pub fn kv_layer_mask(model: &TinyModel) -> Vec<bool> {
+    if model.g4.is_some() {
+        // gemma4 keeps its K/V in the sequence state.
+        return vec![false; model.config.n_layers];
+    }
     if model.layers.len() != model.config.n_layers {
         return vec![true; model.config.n_layers];
     }

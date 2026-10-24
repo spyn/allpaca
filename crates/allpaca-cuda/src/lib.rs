@@ -37,7 +37,8 @@ fn f16_bits_to_f32(h: u16) -> f32 {
     let exp = (h >> 10) & 0x1f;
     let mant = u32::from(h & 0x3ff);
     let bits = if exp == 0 {
-        sign
+        // Zero or subnormal: mant * 2^-24.
+        sign | (mant as f32 * (1.0 / 16_777_216.0)).to_bits()
     } else if exp == 31 {
         sign | 0x7f80_0000 | (mant << 13)
     } else {

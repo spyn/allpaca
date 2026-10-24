@@ -788,6 +788,7 @@ impl GgufFile {
                 | "spark2_5"
                 | "gemma2"
                 | "gemma3"
+                | "gemma4"
                 | "deepseek2"
                 | "deepseek4"
                 | "deepseek_v4"

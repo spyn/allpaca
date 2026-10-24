@@ -1962,13 +1962,14 @@ impl Engine {
             && !has_cuda
             && model.dsv4.is_none()
             && model.q4x.is_none()
+            && model.g4.is_none()
         {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "large GGUF requires HIP or CUDA (host F32 materialize is skipped to avoid OOM)"
                     .into(),
             )));
         }
-        let skip_hip = model.dsv4.is_some() || model.q4x.is_some();
+        let skip_hip = model.dsv4.is_some() || model.q4x.is_some() || model.g4.is_some();
         self.apply_weight_working_set(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
@@ -2136,7 +2137,17 @@ impl Engine {
                     let g = self.lock()?;
                     g.target.clone()
                 };
-                if let Some(target) = target.as_ref().filter(|t| t.q4x.is_some()) {
+                if let Some(target) = target.as_ref().filter(|t| t.g4.is_some()) {
+                    match crate::gemma4::attach_gpu(target, Arc::clone(hip)) {
+                        Ok(()) => tracing::info!("gemma4: device chain on HIP device {}", hip.device),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "gemma4 HIP device chain failed; CPU forward");
+                            self.metrics
+                                .degraded_events
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                } else if let Some(target) = target.as_ref().filter(|t| t.q4x.is_some()) {
                     match crate::qwen4_gpu::attach(target, hip, self.draft_hip.as_ref(), None) {
                         Ok(()) => {}
                         Err(e) => {
@@ -4318,7 +4329,8 @@ impl Engine {
                 && resident.is_some()
                 && target.supports_hip_batched_prefill())
                 || target.dsv4.is_some()
-                || target.q4x.is_some());
+                || target.q4x.is_some()
+                || target.g4.is_some());
         #[cfg(feature = "cuda")]
         let batch_prefill_cuda = !vision_in_chunk
             && toks.len() > 1
@@ -4792,7 +4804,7 @@ impl Engine {
             return Ok(false);
         };
         let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
-        if target.dsv4.is_some() || target.q4x.is_some() || layers_remote {
+        if target.dsv4.is_some() || target.q4x.is_some() || target.g4.is_some() || layers_remote {
             return Ok(false);
         }
         let active = request_mut(inner, id)?;
@@ -4822,6 +4834,11 @@ impl Engine {
             let end = request(inner, id)?.prompt_len;
             return self.capture_qwen4_prompt(inner, id, target, end);
         }
+        if target.g4.is_some() {
+            // gemma4's K/V lives in its sequence state on the card; the
+            // prompt cache does not hold it yet.
+            return Ok(());
+        }
         if !self.prompt_cache_reads_back(inner, id, target)? {
             return Ok(());
         }
@@ -4845,7 +4862,7 @@ impl Engine {
     fn batch_decode_enabled(&self, inner: &EngineInner) -> bool {
         self.config.engine.batch_decode
             && self.config.engine.max_active_requests >= 2
-            && (inner.target_resident.is_some() || inner.target.as_ref().is_some_and(|t| t.q4x.is_some()))
+            && (inner.target_resident.is_some() || inner.target.as_ref().is_some_and(|t| t.q4x.is_some() || t.g4.is_some()))
             && inner.draft_model.is_none()
             && match (self.hip.as_deref(), inner.target.as_ref()) {
                 (Some(hip), Some(t)) => t.supports_forward_batch(hip),
@@ -5055,6 +5072,7 @@ impl Engine {
                 _ if target.q4x.is_some() => {
                     crate::qwen4exp::forward_qwen4_batch(&target, &tokens, &mut segs, &mut row_logits)
                 }
+                _ if target.g4.is_some() => crate::gemma4::forward_batch(&target, &tokens, &mut segs, &mut row_logits),
                 Some(resident) => target.forward_batch(
                     &tokens,
                     &mut segs,
@@ -6992,14 +7010,16 @@ fn packed_linear_verify_span(
             })?;
         }
     }
-    let rec_before = recurrent.clone();
+    // gemma4's state is K/V only: a reject truncates it (finish_linear_span).
+    let g4 = target.g4.is_some();
+    let rec_before = if g4 { None } else { recurrent.clone() };
     let pending_h = request(inner, id)?.last_hidden.clone();
     // One packed forward over the span when a partial accept can be rewound
     // from the device GDN journal. Otherwise (host GDN state, Mamba-2 slots)
     // forward one token at a time and stop at the reject, so no rewind is needed.
     let journal_rewind = device_gdn_cloned > 0
         && hip.is_some_and(|h| gdn_all_can_replay(h, &target, id, 0));
-    let incremental_gdn = recurrent.is_some() && !journal_rewind;
+    let incremental_gdn = recurrent.is_some() && !journal_rewind && !g4;
     let mut produced = vec![first];
     let mut accepted = 1u64;
     let mut keep = 1usize;
@@ -7259,6 +7279,9 @@ fn finish_linear_span(
     inner
         .kv
         .rewind_filled(&pages, start_pos + keep, page_tokens as usize);
+    if let (Some(g4), Some(state)) = (target.g4.as_ref(), recurrent.as_mut()) {
+        state.g4.truncate(start_pos + keep, &g4.spec);
+    }
     if journal_rewind && keep < span.len() {
         let hip = hip.expect("journal rewind needs HIP");
         if gdn_all_can_replay(hip, &target, id, keep) {

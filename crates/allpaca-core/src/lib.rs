@@ -23,6 +23,8 @@ mod dsv4_ram;
 mod early_exit;
 pub mod edge0;
 mod engine;
+mod gemma4;
+mod gemma4_gpu;
 mod expert_batch;
 pub mod expert_controls;
 mod forest;

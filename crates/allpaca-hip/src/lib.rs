@@ -54,7 +54,10 @@ fn f16_bits_to_f32(h: u16) -> f32 {
     let exp = (h >> 10) & 0x1f;
     let mant = u32::from(h & 0x3ff);
     let bits = if exp == 0 {
-        sign
+        // Zero or subnormal: mant * 2^-24 (gemma4's PLE gates have such
+        // Q8_0 scales; flushing them zeroed whole rows).
+        let mag = mant as f32 * (1.0 / 16_777_216.0);
+        sign | mag.to_bits()
     } else if exp == 31 {
         sign | 0x7f80_0000 | (mant << 13)
     } else {
@@ -785,6 +788,17 @@ mod ffi {
             theta: f32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_rope_neox_ff_rows(
+            x: *mut f32,
+            n_tok: i32,
+            n_heads: i32,
+            head_dim: i32,
+            start_pos: i32,
+            theta: f32,
+            ff: *const f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gelu_tanh_mul(gate: *mut f32, up: *const f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_dflash_conv(
             h: *const f32,
             dynamic: *const f32,
@@ -3303,6 +3317,59 @@ pub fn rope_neox_rows_device(
         let _ = (x, n_tok, n_heads, head_dim, start_pos, theta);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP rope_neox_rows unavailable".into(),
+        )))
+    }
+}
+
+/// [`rope_neox_rows_device`] with llama.cpp frequency factors: pair `i`
+/// turns by `pos * theta^(-2i/head_dim) / ff[i]` (`ff` a device pointer to
+/// `head_dim / 2` floats, or null for none).
+pub fn rope_neox_ff_rows_device(
+    x: *mut f32,
+    n_tok: usize,
+    n_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    theta: f32,
+    ff: *const f32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe {
+            ffi::allpaca_rope_neox_ff_rows(
+                x,
+                n_tok as i32,
+                n_heads as i32,
+                head_dim as i32,
+                start_pos as i32,
+                theta,
+                ff,
+                std::ptr::null_mut(),
+            )
+        };
+        status(rc, "rope_neox_ff_rows")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (x, n_tok, n_heads, head_dim, start_pos, theta, ff);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP rope_neox_ff_rows unavailable".into(),
+        )))
+    }
+}
+
+/// `gate = gelu_tanh(gate) * up` over `n` device floats.
+pub fn gelu_tanh_mul_device(gate: *mut f32, up: *const f32, n: usize) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gelu_tanh_mul(gate, up, n as i32, std::ptr::null_mut()) };
+        status(rc, "gelu_tanh_mul")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (gate, up, n);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gelu_tanh_mul unavailable".into(),
         )))
     }
 }
@@ -13991,6 +14058,16 @@ mod tests {
         assert!((scale - 1.0).abs() < 1e-3, "staged scale {scale}");
         assert_eq!(staged[Q8_STAGED_QS], 5);
         assert_eq!(staged[Q8_STAGED_QS + 31], 0xfb);
+    }
+
+    #[test]
+    fn stage_q8_0_blocks_keeps_subnormal_scales() {
+        // f16 0x0001 = 2^-24, 0x83ff = -(1023 * 2^-24): subnormal, not zero.
+        for (bits, want) in [(0x0001u16, 2f32.powi(-24)), (0x83ff, -1023.0 * 2f32.powi(-24)), (0x0000, 0.0)] {
+            let staged = stage_q8_0_blocks(&pack_q8_block(bits, 1)).unwrap();
+            let scale = f32::from_le_bytes(staged[0..4].try_into().unwrap());
+            assert_eq!(scale, want, "f16 {bits:#06x}");
+        }
     }
 
     fn pack_q8_block(scale_f16: u16, qs0: u8) -> Vec<u8> {

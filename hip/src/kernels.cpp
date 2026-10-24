@@ -10442,6 +10442,70 @@ extern "C" int allpaca_rope_neox_rows(float *x, int32_t n_tok, int32_t n_heads, 
     return hip_status(hipGetLastError());
 }
 
+/* NeoX RoPE as rope_neox_rows_kernel with llama.cpp's frequency factors:
+ * pair i turns by pos * theta^(-2i/head_dim) / ff[i] (gemma4's proportional
+ * rope; ff null = all ones). */
+__global__ void rope_neox_ff_rows_kernel(float *x, int n_tok, int n_heads, int head_dim, int start_pos,
+                                         float theta, const float *ff) {
+    const int tok = static_cast<int>(blockIdx.y);
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int half = head_dim / 2;
+    if (tok >= n_tok || idx >= n_heads * half) {
+        return;
+    }
+    const int h = idx / half;
+    const int i = idx % half;
+    float *hvec = x + (static_cast<size_t>(tok) * n_heads + h) * static_cast<size_t>(head_dim);
+    float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    if (ff) {
+        freq = freq / ff[i];
+    }
+    const float angle = static_cast<float>(start_pos + tok) * freq;
+    const float sn = sinf(angle);
+    const float cs = cosf(angle);
+    const float a = hvec[i];
+    const float b = hvec[i + half];
+    hvec[i] = a * cs - b * sn;
+    hvec[i + half] = a * sn + b * cs;
+}
+
+extern "C" int allpaca_rope_neox_ff_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
+                                         int32_t start_pos, float theta, const float *ff,
+                                         allpaca_stream_t stream) {
+    if (!x || n_tok <= 0 || n_heads <= 0 || head_dim <= 0 || (head_dim & 1) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int total = n_heads * (head_dim / 2);
+    hipLaunchKernelGGL(rope_neox_ff_rows_kernel,
+                       dim3(static_cast<unsigned>((total + 255) / 256), static_cast<unsigned>(n_tok)),
+                       dim3(256), 0, as_stream(stream), x, n_tok, n_heads, head_dim, start_pos, theta, ff);
+    return hip_status(hipGetLastError());
+}
+
+/* gate = gelu_tanh(gate) * up (ggml_gelu, PyTorch's gelu "tanh"). */
+__global__ void gelu_tanh_mul_kernel(float *gate, const float *up, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    const float g = gate[idx];
+    const float gelu = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+    gate[idx] = gelu * up[idx];
+}
+
+extern "C" int allpaca_gelu_tanh_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream) {
+    if (!gate || !up || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(gelu_tanh_mul_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
+    return hip_status(hipGetLastError());
+}
+
 /* DFlash2 two-tap dynamic convolution along each block of `block` rows:
  * out[t][c] = sum_tap (dyn[t][g + groups*(tap + kernel*side)] + base[c + dim*(tap + kernel*side)])
  *             * h[t - tap][c], taps that would cross the block start skipped. */
@@ -11231,6 +11295,15 @@ extern "C" int allpaca_topk_chunks(const float *, int32_t, int32_t, int32_t, int
 
 extern "C" int allpaca_rope_neox_rows(float *, int32_t, int32_t, int32_t, int32_t, float,
                                       allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_rope_neox_ff_rows(float *, int32_t, int32_t, int32_t, int32_t, float,
+                                         const float *, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gelu_tanh_mul(float *, const float *, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
