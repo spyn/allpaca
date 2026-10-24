@@ -3221,6 +3221,14 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                 // hmask[32] qs[64] scales[12] d: weight = d * (sc - 32) * (q2 | h << 2 - 4).
                 const float d = allpaca_f16le_to_f32(blk + 108);
                 const uint8_t *sc = blk + 96;
+                // `q - 4` packed saves a dot per word: 0.45-0.64x the time at 8 rows on
+                // RDNA4 and 0.88x on the MI50, but on the MI50 1-2 rows ran 15% slower,
+                // so gfx9 keeps `dot(q) - 4 * dot(1)` there. Both give the same int32.
+#if defined(__GFX9__)
+                constexpr bool SUB4 = MR > 2;
+#else
+                constexpr bool SUB4 = true;
+#endif
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     uint32_t q[NC];
@@ -3230,7 +3238,7 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                         const uint32_t hm = kq_u32_from_u16(blk + j0 + 4 * t);
                         const uint32_t v =
                             ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
-                        q[t] = allpaca_vsub4(v, 0x04040404u);
+                        q[t] = SUB4 ? allpaca_vsub4(v, 0x04040404u) : v;
                     }
                     const int is = h * 8 + 2 * g + j0 / 16;
                     const int s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) |
@@ -3241,12 +3249,15 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                     for (int r = 0; r < MR; ++r) {
                         uint32_t av[NC];
                         kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av);
-                        int32_t dot = 0;
+                        int32_t dot = 0, sum = 0;
 #pragma unroll
                         for (int t = 0; t < NC; ++t) {
                             dot = i8dot4(av[t], q[t], dot);
+                            if constexpr (!SUB4) {
+                                sum = i8dot4(av[t], ONES, sum);
+                            }
                         }
-                        acc[r] += s * drow[r][bi] * static_cast<float>(dot);
+                        acc[r] += s * drow[r][bi] * static_cast<float>(dot - 4 * sum);
                     }
                 }
             } else if constexpr (QT == 6) {
