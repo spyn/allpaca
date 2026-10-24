@@ -3030,7 +3030,11 @@ impl Engine {
         let mut prefill_pos = 0;
         // Soft vision tokens are not text anchors / radix keys yet. A
         // decision request that reads hidden states forwards every token.
-        if vision_seq.is_empty() && !probe.as_ref().is_some_and(|p| !p.positions.is_empty()) {
+        // gemma4's K/V is in its sequence state, which checkpoints do not hold.
+        if vision_seq.is_empty()
+            && !probe.as_ref().is_some_and(|p| !p.positions.is_empty())
+            && target.g4.is_none()
+        {
             if let Some((state, rows, n)) = inner.anchors.lookup(&tokens) {
                 restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
                 if let Some(dst) = recurrent.as_mut() {
@@ -4576,7 +4580,7 @@ impl Engine {
                         })?;
                     }
                 }
-                if sync_host_gdn && self.hip.is_none() {
+                if sync_host_gdn && self.hip.is_none() && target.g4.is_none() {
                     let prefix = request(inner, id)?.tokens[..=pos].to_vec();
                     let pages_now = request(inner, id)?.pages.clone();
                     let state_ref = recurrent.clone().unwrap_or_else(|| {

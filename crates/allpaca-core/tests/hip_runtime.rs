@@ -37,6 +37,34 @@ fn greedy(max_tokens: usize) -> GenerationParams {
     }
 }
 
+/// gemma4 keeps its K/V in its sequence state, which the prompt cache does
+/// not store: on the CPU path (where prefill captures checkpoints) a repeat
+/// prompt must never hit, and must give the same tokens.
+#[test]
+fn gemma4_never_hits_the_prompt_cache() {
+    let path = std::env::temp_dir().join(format!("allpaca_g4_cpu_cache_{}.gguf", std::process::id()));
+    allpaca_core::write_tiny_gemma4_gguf(&path, 2);
+    let mut cfg = Config::compiled_defaults();
+    cfg.model.path = Some(path);
+    cfg.model.synthetic = false;
+    cfg.engine.cpu_only = true;
+    cfg.engine.determinism_seed = Some(7);
+    cfg.speculative.enabled = false;
+    let engine = Engine::new(cfg).expect("tiny gemma4 must load on the CPU");
+    let prompt = "t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12";
+    let first = engine.generate(prompt, greedy(8)).unwrap().token_ids;
+    let again = engine.generate(prompt, greedy(8)).unwrap().token_ids;
+    let longer = engine.generate(&format!("{prompt} t13 t14"), greedy(8)).unwrap().token_ids;
+    // A one-token prompt takes the per-token prefill, which captures checkpoints.
+    let short = engine.generate("t3", greedy(4)).unwrap().token_ids;
+    let after = engine.generate("t3 t4 t5", greedy(4)).unwrap().token_ids;
+    assert_eq!((short.len(), after.len()), (4, 4));
+    assert_eq!(first, again);
+    assert_eq!(longer.len(), 8);
+    let stats = engine.stats();
+    assert_eq!((stats.radix_hits, stats.anchor_hits), (0, 0), "gemma4 must not resume from the prompt cache: {stats:?}");
+}
+
 #[test]
 fn cpu_only_generate_reports_cpu_backend() {
     let engine = Engine::new(cpu_only_synthetic()).unwrap();
