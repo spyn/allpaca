@@ -23,6 +23,25 @@
 #define ALLPACA_HAS_HIP 0
 #endif
 
+/* Register slots per attention-row lane in the fixed-size kernel (the flash
+ * kernel, and the DPT = ATTN_MAX_DPT template instantiation). */
+constexpr int ATTN_MAX_DPT = 16;
+
+/* Attention-kernel template bucket for a head_dim: ceil(head_dim/32) rounded
+ * up to a compiled instantiation. 0 is the per-row flash kernel (head_dim
+ * outside 1..=32 * ATTN_MAX_DPT). Pure arithmetic, defined outside the HIP
+ * gate so stub builds export the same value; it both picks the kernel and
+ * sizes the chunk-partial scratch of a call. */
+static constexpr int attn_dpt_bucket(int head_dim) {
+    if (head_dim <= 0 || head_dim > 32 * ATTN_MAX_DPT) {
+        return 0;
+    }
+    const int dpt = (head_dim + 31) / 32;
+    return dpt <= 4 ? 4 : dpt <= 8 ? 8 : 16;
+}
+
+extern "C" int32_t allpaca_attn_dpt(int32_t head_dim) { return attn_dpt_bucket(head_dim); }
+
 #if ALLPACA_HAS_HIP
 
 #include <atomic>
@@ -1260,7 +1279,6 @@ __device__ float warp_sum32(float v) {
  * arithmetic so the split and Q-tiled kernels run the same instructions on
  * the same values: a row's result does not depend on which kernel, or how
  * many rows, computed it. */
-constexpr int ATTN_MAX_DPT = 16;
 
 struct AttnRow {
     float qreg[ATTN_MAX_DPT];
