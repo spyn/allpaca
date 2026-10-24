@@ -64,10 +64,10 @@ impl Mat {
             GgmlType::Q4_K => (Kind::Q4K, raw.to_vec()),
             GgmlType::Q5_K => (Kind::Q5K, raw.to_vec()),
             GgmlType::Q6_K => (Kind::Q6K, raw.to_vec()),
-            _ => {
-                // Any other encoding: requantised to Q8_0 (rows are whole blocks).
-                let q = allpaca_gguf::quantize_q8_0(&file.tensor_f32(name)?);
-                (Kind::Q8, allpaca_hip::stage_q8_0_blocks(&q)?)
+            other => {
+                return Err(load_err(format!(
+                    "gemma4: {name} is {other:?}, which no GPU kernel here reads"
+                )))
             }
         };
         let row_bytes = bytes.len() / n.max(1);

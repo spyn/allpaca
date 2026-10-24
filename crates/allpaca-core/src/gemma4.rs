@@ -106,6 +106,13 @@ impl Gemma4Spec {
                     .ok_or_else(|| load_err(format!("gemma4: blk.{l}.ffn_gate.weight missing")))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Rope turns whole heads (the global blocks' unrotated pairs come
+        // from rope_freqs, not from a shorter rope width).
+        for (key, hd) in [("rope.dimension_count", head_dim), ("rope.dimension_count_swa", head_dim_swa)] {
+            if let Some(n) = u(key).filter(|&n| n != hd) {
+                return Err(load_err(format!("gemma4: {a}.{key} = {n}, but the head dim is {hd}")));
+            }
+        }
         let f = |k: &str| file.meta_f32(&format!("{a}.{k}"));
         let rope_theta = f("rope.freq_base").unwrap_or(1_000_000.0);
         Ok(Self {

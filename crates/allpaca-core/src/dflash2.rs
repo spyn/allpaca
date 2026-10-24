@@ -56,6 +56,8 @@ pub struct Dflash2Spec {
     pub plain: bool,
     /// Scale on the block's token embeddings (`dflash.embedding_scale`).
     pub embedding_scale: f32,
+    /// Tokens in the draft's own vocabulary, when it carries one.
+    pub vocab: Option<usize>,
 }
 
 impl Dflash2Spec {
@@ -105,6 +107,10 @@ impl Dflash2Spec {
             mask_token: file.meta_u32("tokenizer.ggml.mask_token_id")?,
             plain,
             embedding_scale: file.meta_f32("dflash.embedding_scale").unwrap_or(1.0),
+            vocab: match file.metadata.get("tokenizer.ggml.tokens") {
+                Some(allpaca_gguf::GgufValue::Array(items)) => Some(items.len()),
+                _ => None,
+            },
         };
         ((plain || spec.dim % spec.conv_group == 0)
             && spec.block_size >= 2
@@ -132,6 +138,60 @@ impl Dflash2Spec {
     pub fn ring_slots(&self) -> usize {
         self.window + RING_SLACK
     }
+}
+
+/// What a file nominated as a DSpark sidecar turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarKind {
+    /// A DSpark sidecar for this target.
+    Dspark,
+    /// A block draft (plain DFlash or DFlash2): attaches only through
+    /// `providers = ["dflash1"]` / `["dflash2"]`.
+    BlockDraft { plain: bool },
+    /// Built for another model (width or vocabulary differ).
+    Mismatch,
+}
+
+/// Classify a nominated sidecar by its content, for a target of hidden
+/// width `dim` and `vocab` tokens.
+pub(crate) fn classify_sidecar(file: &GgufFile, dim: usize, vocab: usize) -> SidecarKind {
+    if let Some(spec) = Dflash2Spec::from_gguf(file) {
+        return SidecarKind::BlockDraft { plain: spec.plain };
+    }
+    if allpaca_gguf::sidecar_matches_target(file, dim, vocab) {
+        SidecarKind::Dspark
+    } else {
+        SidecarKind::Mismatch
+    }
+}
+
+/// Whether a block draft fits the configured providers and the target
+/// (hidden width `dim`, `vocab` tokens).
+pub(crate) fn check_block_draft(
+    spec: &Dflash2Spec,
+    providers: &[allpaca_types::DraftProviderKind],
+    dim: usize,
+    vocab: usize,
+) -> Result<(), AllpacaError> {
+    use allpaca_types::DraftProviderKind as K;
+    let (kind, provider) = if spec.plain { ("plain DFlash", K::Dflash1) } else { ("DFlash2", K::Dflash2) };
+    let bad = |msg: String| Err(AllpacaError::Fatal(FatalError::InvalidConfig(msg)));
+    if !providers.contains(&provider) {
+        return bad(format!(
+            "the draft is a {kind} draft; use providers = [\"{}\"]",
+            if spec.plain { "dflash1" } else { "dflash2" }
+        ));
+    }
+    if spec.dim != dim {
+        return bad(format!("{kind} draft width {} != target {dim}", spec.dim));
+    }
+    if spec.vocab.is_some_and(|v| v != vocab) {
+        return bad(format!("{kind} draft vocabulary {} != target {vocab}", spec.vocab.unwrap_or(0)));
+    }
+    if spec.mask_token as usize >= vocab {
+        return bad(format!("{kind} draft mask token {} is outside the target's {vocab} tokens", spec.mask_token));
+    }
+    Ok(())
 }
 
 /// One target row's features: the residual entering each captured layer.
@@ -1320,6 +1380,71 @@ mod tests {
                 .collect();
             assert_eq!(got, top_k_desc(&x[r * n..(r + 1) * n], k), "row {r}");
         }
+    }
+
+    /// A metadata-only draft GGUF: `tensors` named (shape [1]), dim 64.
+    fn sidecar_file(tag: &str, tensors: &[&str], vocab: usize, dim: u32) -> GgufFile {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        let path = std::env::temp_dir().join(format!("allpaca_sidecar_{tag}_{}.gguf", std::process::id()));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("general.architecture".into(), GgufValue::String("dflash".into()));
+        let u = |v: u32| GgufValue::Uint32(v);
+        for (k, v) in [
+            ("block_count", u(1)),
+            ("embedding_length", u(dim)),
+            ("feed_forward_length", u(128)),
+            ("attention.head_count", u(4)),
+            ("attention.head_count_kv", u(2)),
+            ("block_size", u(8)),
+        ] {
+            meta.insert(format!("dflash.{k}"), v);
+        }
+        meta.insert("dflash.target_layers".into(), GgufValue::Array(vec![u(1), u(2)]));
+        meta.insert("tokenizer.ggml.mask_token_id".into(), u(4));
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array((0..vocab).map(|i| GgufValue::String(format!("t{i}"))).collect()),
+        );
+        let one = [0.0f32];
+        let ts: Vec<GgufWriteTensor<'_>> = tensors
+            .iter()
+            .map(|n| GgufWriteTensor { name: (*n).into(), dims: vec![1], data: &one })
+            .collect();
+        write_gguf(&path, &meta, &ts).unwrap();
+        GgufFile::open(&path).unwrap()
+    }
+
+    #[test]
+    fn nominated_sidecars_are_classified_by_content() {
+        let plain = sidecar_file("plain", &["fc.weight", "blk.0.attn_q.weight"], 32, 64);
+        let dflash2 = sidecar_file("d2", &["fc.weight", "selector_hidden.weight", "blk.0.attn_q.weight"], 32, 64);
+        let dspark = sidecar_file("dspark", &["fc.weight", "markov_w1.weight", "blk.0.attn_q.weight"], 32, 64);
+        // A DeepSeek DSpark (hyper-connections) named like a DFlash file.
+        let dsv4 = sidecar_file("dsv4_named_dflash", &["fc.weight", "hc_head_fn.weight", "blk.0.attn_q.weight"], 32, 64);
+        assert_eq!(classify_sidecar(&plain, 64, 32), SidecarKind::BlockDraft { plain: true });
+        assert_eq!(classify_sidecar(&dflash2, 64, 32), SidecarKind::BlockDraft { plain: false });
+        assert_eq!(classify_sidecar(&dspark, 64, 32), SidecarKind::Dspark);
+        assert_eq!(classify_sidecar(&dsv4, 64, 32), SidecarKind::Dspark);
+        assert_eq!(classify_sidecar(&dspark, 128, 32), SidecarKind::Mismatch);
+        assert_eq!(classify_sidecar(&dsv4, 64, 33), SidecarKind::Mismatch);
+    }
+
+    #[test]
+    fn block_draft_attach_checks_provider_shape_and_vocab() {
+        use allpaca_types::DraftProviderKind as K;
+        let plain = Dflash2Spec::from_gguf(&sidecar_file("chk_plain", &["fc.weight", "blk.0.attn_q.weight"], 32, 64)).unwrap();
+        let d2 = Dflash2Spec::from_gguf(&sidecar_file("chk_d2", &["fc.weight", "selector_hidden.weight", "blk.0.attn_q.weight"], 32, 64)).unwrap();
+        assert!(check_block_draft(&plain, &[K::Dflash1], 64, 32).is_ok());
+        assert!(check_block_draft(&plain, &[K::Dflash2], 64, 32).is_err(), "a plain draft needs dflash1");
+        assert!(check_block_draft(&d2, &[K::Dflash1], 64, 32).is_err(), "a DFlash2 draft needs dflash2");
+        // Listing both accepts either kind.
+        assert!(check_block_draft(&d2, &[K::Dflash1, K::Dflash2], 64, 32).is_ok());
+        assert!(check_block_draft(&plain, &[K::Dflash1, K::Dflash2], 64, 32).is_ok());
+        assert!(check_block_draft(&plain, &[K::Dflash1], 128, 32).is_err(), "width");
+        assert!(check_block_draft(&plain, &[K::Dflash1], 64, 40).is_err(), "vocabulary");
+        let mut tiny = plain.clone();
+        tiny.vocab = None;
+        assert!(check_block_draft(&tiny, &[K::Dflash1], 64, 4).is_err(), "mask token 4 outside 4 tokens");
     }
 
     #[test]

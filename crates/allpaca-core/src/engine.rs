@@ -2054,59 +2054,66 @@ impl Engine {
                 }
             }
         }
-        let dspark_path = if draft_path_is_dspark {
-            self.config.model.draft_path.clone()
+        // Names only nominate DSpark sidecars: each is read and the first
+        // that is a DSpark for this target (by content) is taken.
+        let dspark_candidates: Vec<std::path::PathBuf> = if draft_path_is_dspark {
+            self.config.model.draft_path.clone().into_iter().collect()
         } else if draft_path_is_dflash2 {
-            None
+            Vec::new()
         } else {
-            discover_dspark_sidecar(path)
+            allpaca_gguf::discover_dspark_candidates(path)
         };
-        if let Some(dsp) = dspark_path {
-            match GgufFile::open(&dsp) {
-                Ok(f) if !draft_path_is_dspark && !allpaca_gguf::sidecar_matches_target(&f, &file) => {
-                    // Found by name next to the target but built for another model.
-                    tracing::info!(path = %dsp.display(), "skipping a DSpark sidecar whose shape does not match the target");
+        let mut dspark_loaded = false;
+        for dsp in dspark_candidates {
+            let f = match GgufFile::open(&dsp) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(path = %dsp.display(), error = %e, "DSpark sidecar open failed");
+                    self.metrics
+                        .degraded_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
                 }
-                Ok(f) if crate::dflash2::Dflash2Spec::from_gguf(&f).is_some() => {
-                    // A DFlash2 draft is not a DSpark sidecar; it attaches
-                    // only through `providers = ["dflash2"]`.
-                    tracing::info!(path = %dsp.display(), "skipping DFlash2 draft found as a DSpark sidecar");
+            };
+            match crate::dflash2::classify_sidecar(&f, model.config.dim, model.config.vocab_size) {
+                crate::dflash2::SidecarKind::BlockDraft { plain } => {
+                    // A block draft attaches only through its provider.
+                    tracing::info!(
+                        path = %dsp.display(),
+                        "skipping a {} draft found as a DSpark sidecar (it attaches through providers = [\"{}\"])",
+                        if plain { "plain DFlash" } else { "DFlash2" },
+                        if plain { "dflash1" } else { "dflash2" }
+                    );
+                    continue;
                 }
-                Ok(f) => {
-                    let draft = if crate::dspark::file_is_dspark(&f) {
-                        None
-                    } else {
-                        TinyModel::from_gguf(&f)
-                            .ok()
-                            .filter(|m| m.host_weights_ready())
-                    };
-                    match crate::dspark::DsparkProvider::from_gguf(&f, draft) {
-                        Ok(p) => {
-                            tracing::info!(path = %dsp.display(), "loaded DSpark sidecar");
-                            inner.dspark = Some(p);
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "DSpark sidecar failed; continuing without DSpark");
-                            self.metrics
-                                .degraded_events
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                crate::dflash2::SidecarKind::Mismatch => {
+                    tracing::info!(path = %dsp.display(), "skipping a DSpark sidecar built for another model (width or vocabulary differ)");
+                    continue;
+                }
+                crate::dflash2::SidecarKind::Dspark => {}
+            }
+            let draft = if crate::dspark::file_is_dspark(&f) {
+                None
+            } else {
+                TinyModel::from_gguf(&f).ok().filter(|m| m.host_weights_ready())
+            };
+            match crate::dspark::DsparkProvider::from_gguf(&f, draft) {
+                Ok(p) => {
+                    tracing::info!(path = %dsp.display(), "loaded DSpark sidecar");
+                    inner.dspark = Some(p);
+                    dspark_loaded = true;
+                    break;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "DSpark sidecar open failed; continuing without DSpark");
+                    tracing::warn!(error = %e, "DSpark sidecar failed; continuing without DSpark");
                     self.metrics
                         .degraded_events
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-        } else if self
-            .config
-            .speculative
-            .providers
-            .contains(&DraftProviderKind::Dspark)
-        {
-            tracing::warn!("DSpark requested but no dspark-*.gguf sidecar next to the target");
+        }
+        if !dspark_loaded && self.config.speculative.providers.contains(&DraftProviderKind::Dspark) {
+            tracing::warn!("DSpark requested but no DSpark sidecar for this target next to it");
             self.metrics
                 .degraded_events
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2242,14 +2249,6 @@ impl Engine {
                     resolved.display()
                 )))
             })?;
-            if spec.plain != plain {
-                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-                    "{} is a {} draft; use providers = [\"{}\"]",
-                    resolved.display(),
-                    if spec.plain { "plain DFlash" } else { "DFlash2" },
-                    if spec.plain { "dflash1" } else { "dflash2" }
-                ))));
-            }
             let (target, resident) = {
                 let g = self.lock()?;
                 (g.target.clone(), g.target_resident.clone())
@@ -2261,12 +2260,13 @@ impl Engine {
                 ))
             };
             let target_hip = self.hip.clone().ok_or_else(no_hip)?;
-            if spec.dim != target.config.dim {
-                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                    "DFlash2 width {} != target {}",
-                    spec.dim, target.config.dim
-                ))));
-            }
+            crate::dflash2::check_block_draft(&spec, providers, target.config.dim, target.config.vocab_size)
+                .map_err(|e| match e {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(m)) => {
+                        AllpacaError::Fatal(FatalError::InvalidConfig(format!("{}: {m}", resolved.display())))
+                    }
+                    other => other,
+                })?;
             let device = std::env::var("ALLPACA_DFLASH2_DEVICE")
                 .ok()
                 .and_then(|v| v.parse::<i32>().ok())

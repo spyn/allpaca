@@ -1277,29 +1277,18 @@ pub fn is_dflash2_filename(name: &str) -> bool {
     l.contains("dflash2") || l.contains("dflash-2")
 }
 
-/// A plain DFlash draft (`dflash-*.gguf`, llama.cpp `draft-dflash`): a
-/// draft named by `model.draft_path`, never auto-attached as a DSpark sidecar.
-pub fn is_plain_dflash_filename(name: &str) -> bool {
-    let l = name.to_ascii_lowercase();
-    l.contains("dflash") && !l.contains("dspark") && !is_dflash2_filename(name)
-}
-
-/// Whether a sidecar found by name next to `target` was built for it: the
-/// same hidden width and, when both carry one, the same vocabulary size. A
-/// DSpark file in a shared models folder must not attach to another model.
-pub fn sidecar_matches_target(sidecar: &GgufFile, target: &GgufFile) -> bool {
-    let width = |f: &GgufFile| {
-        let arch = f.architecture().unwrap_or("llama");
-        f.meta_u32(&format!("{arch}.embedding_length"))
-    };
-    let vocab = |f: &GgufFile| match f.metadata.get("tokenizer.ggml.tokens") {
+/// Whether a sidecar found by name next to a target was built for it: its
+/// hidden width equals the target's `dim` and, when it carries a
+/// vocabulary, that has the target's `vocab` tokens. A DSpark file in a
+/// shared models folder must not attach to another model.
+pub fn sidecar_matches_target(sidecar: &GgufFile, dim: usize, vocab: usize) -> bool {
+    let arch = sidecar.architecture().unwrap_or("dflash");
+    let width = sidecar.meta_u32(&format!("{arch}.embedding_length")).map(|v| v as usize);
+    let tokens = match sidecar.metadata.get("tokenizer.ggml.tokens") {
         Some(GgufValue::Array(items)) => Some(items.len()),
         _ => None,
     };
-    let same = |a: Option<usize>, b: Option<usize>| a.zip(b).is_none_or(|(a, b)| a == b);
-    width(sidecar).is_some()
-        && width(sidecar) == width(target)
-        && same(vocab(sidecar), vocab(target))
+    width == Some(dim) && tokens.is_none_or(|n| n == vocab)
 }
 
 pub fn is_split_gguf_name(name: &str) -> bool {
@@ -1381,12 +1370,23 @@ fn collect_split_shards(dir: &Path, nested: u32, found: &mut Vec<std::path::Path
 /// level below a shared models directory, that directory's other folders hold
 /// other models, and their sidecars must not attach to this one.
 pub fn discover_dspark_sidecar(target: &Path) -> Option<std::path::PathBuf> {
+    discover_dspark_candidates(target).into_iter().next()
+}
+
+/// Every file [`discover_dspark_sidecar`] could pick, best first. The name
+/// only nominates a file: the caller reads each and takes the first that is
+/// a DSpark sidecar for this target (a plain DFlash draft is also named
+/// `dflash-*`, and a DSpark may be named `*DFlash*`).
+pub fn discover_dspark_candidates(target: &Path) -> Vec<std::path::PathBuf> {
     let own = if target.is_file() {
-        target.parent()?
+        let Some(dir) = target.parent() else {
+            return Vec::new();
+        };
+        dir
     } else if target.is_dir() {
         target
     } else {
-        return None;
+        return Vec::new();
     };
     let mut hits = Vec::new();
     collect_dspark_files(own, 1, &mut hits);
@@ -1396,7 +1396,7 @@ pub fn discover_dspark_sidecar(target: &Path) -> Option<std::path::PathBuf> {
     }
     hits.sort_by(|a, b| dspark_hit_rank(a).cmp(&dspark_hit_rank(b)));
     hits.dedup();
-    hits.into_iter().next()
+    hits
 }
 
 fn dspark_hit_rank(path: &Path) -> (u8, String) {
@@ -1429,7 +1429,6 @@ fn collect_dspark_files(dir: &Path, nested: u32, hits: &mut Vec<std::path::PathB
         if path.extension().and_then(|e| e.to_str()) == Some("gguf")
             && is_dspark_filename(name)
             && !is_dflash2_filename(name)
-            && !is_plain_dflash_filename(name)
         {
             hits.push(path);
         }
@@ -2754,17 +2753,20 @@ mod tests {
     }
 
     #[test]
-    fn dspark_discovery_skips_a_plain_dflash_draft_beside_the_target() {
-        let root = std::env::temp_dir().join(format!("allpaca_dspark_plain_{}", std::process::id()));
+    fn dspark_candidates_include_every_dflash_and_dspark_name_best_first() {
+        let root = std::env::temp_dir().join(format!("allpaca_dspark_cands_{}", std::process::id()));
         let model_dir = root.join("NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF");
         std::fs::create_dir_all(&model_dir).unwrap();
         let target = model_dir.join("NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q4_K_XL.gguf");
         std::fs::write(&target, b"x").unwrap();
-        std::fs::write(model_dir.join("dflash-NVIDIA-Nemotron-3.5-Bolt-E4B-Q8_0.gguf"), b"x").unwrap();
-        assert!(is_plain_dflash_filename("dflash-NVIDIA-Nemotron-3.5-Bolt-E4B-Q8_0.gguf"));
-        assert!(!is_plain_dflash_filename("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"));
-        assert!(!is_plain_dflash_filename("Qwen3.8-27B-DFlash2-Q8_0.gguf"));
-        assert_eq!(discover_dspark_sidecar(&target), None);
+        let plain = model_dir.join("dflash-NVIDIA-Nemotron-3.5-Bolt-E4B-Q8_0.gguf");
+        let named = model_dir.join("DeepSeek-V4-Flash-DFlash-BF16.gguf");
+        std::fs::write(&plain, b"x").unwrap();
+        std::fs::write(&named, b"x").unwrap();
+        std::fs::write(model_dir.join("Qwen3.8-27B-DFlash2-Q8_0.gguf"), b"x").unwrap();
+        // Names only nominate: both are candidates (Q8_0 first), DFlash2 never.
+        assert_eq!(discover_dspark_candidates(&target), vec![plain.clone(), named]);
+        assert_eq!(discover_dspark_sidecar(&target), Some(plain));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2784,13 +2786,10 @@ mod tests {
             crate::writer::write_gguf(&path, &meta, &[]).unwrap();
             GgufFile::open(&path).unwrap()
         };
-        let dsv4 = write("dsv4.gguf", "deepseek4", 4096, 16);
-        let llama = write("llama.gguf", "llama", 3072, 32);
         let dspark = write("dspark-x.gguf", "dflash", 4096, 16);
-        assert!(sidecar_matches_target(&dspark, &dsv4));
-        assert!(!sidecar_matches_target(&dspark, &llama), "a DeepSeek DSpark must not attach to Llama");
-        let other_vocab = write("dspark-y.gguf", "dflash", 4096, 20);
-        assert!(!sidecar_matches_target(&other_vocab, &dsv4));
+        assert!(sidecar_matches_target(&dspark, 4096, 16));
+        assert!(!sidecar_matches_target(&dspark, 3072, 32), "a DeepSeek DSpark must not attach to Llama");
+        assert!(!sidecar_matches_target(&dspark, 4096, 20), "vocab differs");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
