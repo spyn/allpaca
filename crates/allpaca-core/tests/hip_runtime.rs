@@ -7599,10 +7599,19 @@ fn hip_concurrent_requests_match_solo_greedy() {
         eprintln!("skip hip_concurrent_requests_match_solo_greedy: no Qwen2.5-Coder-0.5B or HIP");
         return;
     }
-    // (batched decode, n-gram speculation): n-gram verify spans ride in the
-    // batched forward too.
-    for (batch_decode, ngram) in [(true, false), (false, false), (true, true)] {
+    // (batched decode, n-gram speculation, experimental.row_variant_kernels):
+    // n-gram verify spans ride in the batched forward too. With the option on,
+    // prefill may take the gfx12 WMMA attention, but batched decode and verify
+    // must still match solo.
+    for (batch_decode, ngram, row_variant) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+        (true, true, true),
+    ] {
         let mut cfg = hip_7b_config(path.clone());
+        cfg.experimental.row_variant_kernels = row_variant;
         cfg.engine.max_active_requests = 3;
         cfg.engine.batch_decode = batch_decode;
         // Small pages: sequences span several, as long chats do.
