@@ -2055,10 +2055,12 @@ static AttnPartScratch g_attn_part[ATTN_PART_DEVICES];
  * f32 accumulation; the online softmax is the attn_row_step recurrence (max,
  * exp, rescale) per 16-key tile. Q, K, P and V are rounded to f16, so a row's
  * bits differ from the decode kernels (relative error ~1e-3): the engine runs
- * this kernel only in prefill with the option on. Overflow is not possible:
- * each Q row (over head_dim), each K row (one token, over head_dim) and each
- * V column of a 16-token tile is scaled by a power of two into [2^13, 2^14)
- * before rounding, and the scale is taken out exactly in f32.
+ * this kernel only in prefill with the option on. Each Q row and each K row
+ * (one token, over head_dim) is scaled by a power of two into [2^13, 2^14)
+ * before rounding and the scale is taken out exactly in f32; each V row (one
+ * token) is scaled down only, with the inverse folded into P. Every scale
+ * depends on one row or token alone, so a row's bits do not depend on keys
+ * past its causal limit.
  *
  * Q fragments stay in registers for the whole key loop. The loop stops at the
  * causal limit of the block's last row. K and V are only read. head_dim must
@@ -2206,6 +2208,36 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
             p_lane[g] = p;
         }
 
+        /* V scale, per token so a row never depends on keys past its causal
+         * limit (a scale shared over a 16-key tile did): lane L takes token
+         * k0 + L%16's largest |v| over head_dim (lane L^16 the other half) and
+         * scales that token's V down by a power of two when it would not fit
+         * f16 (never up, at most 2^15). The inverse goes into P, which stays
+         * <= 2^15. V past 2^29 still overflows f16. */
+        float v_tmax = 0.0f;
+        if (k_tok < n_kv) {
+            const float *vr = v + static_cast<size_t>(k_tok) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+            for (int dt = 0; dt < n_dtiles; ++dt) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    v_tmax = fmaxf(v_tmax, fabsf(vr[dt * 16 + half + e]));
+                }
+            }
+        }
+        v_tmax = fmaxf(v_tmax, __shfl_xor(v_tmax, 16, 32));
+        int v_sh = wmma_f16_shift(v_tmax);
+        v_sh = v_sh > 0 ? 0 : (v_sh < -15 ? -15 : v_sh);
+        /* This lane's P and V operands cover tokens k0 + half + e; token
+         * k0 + j's shift lives in lane j. */
+        float tok_vs[8];
+        float tok_pinv[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int sh = __shfl(v_sh, half + e, 32);
+            tok_vs[e] = ldexpf(1.0f, sh);
+            tok_pinv[e] = ldexpf(1.0f, -sh);
+        }
+
         /* P as the A operand: lane L needs row L%16 at tokens half + 0..7. */
         f16x8 p_frag;
 #pragma unroll
@@ -2221,7 +2253,7 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
                 const int src = (r / 8) * 16 + half + e;
                 const float got = __shfl(vreg, src, 32);
                 if ((r % 8) == gsrc) {
-                    p_frag[e] = static_cast<_Float16>(got);
+                    p_frag[e] = static_cast<_Float16>(got * tok_pinv[e]);
                 }
             }
         }
@@ -2230,38 +2262,24 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
             if (dt >= n_dtiles) {
                 continue;
             }
-            /* V: this lane's B column is dim dt*16 + lane%16, tokens k0 + half + 0..7;
-             * lane L^16 holds the other 8 tokens of the column. */
+            /* V: this lane's B column is dim dt*16 + lane%16, tokens k0 + half + 0..7
+             * (lane L^16 holds the other 8 tokens of the column), each scaled
+             * by its own token's power of two. */
             const int d = dt * 16 + (lane % 16);
-            float vv[8];
-            float vmax = 0.0f;
-#pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int token = k0 + half + e;
-                vv[e] = token < n_kv
-                            ? v[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + d]
-                            : 0.0f;
-                vmax = fmaxf(vmax, fabsf(vv[e]));
-            }
-            vmax = fmaxf(vmax, __shfl_xor(vmax, 16, 32));
-            const int v_sh = wmma_f16_shift(vmax);
-            const float vs = ldexpf(1.0f, v_sh);
             f16x8 b_frag;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                b_frag[e] = static_cast<_Float16>(vv[e] * vs);
+                const int token = k0 + half + e;
+                const float vv = token < n_kv
+                                     ? v[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + d]
+                                     : 0.0f;
+                b_frag[e] = static_cast<_Float16>(vv * tok_vs[e]);
             }
-            f32x8 pv;
 #pragma unroll
             for (int g = 0; g < 8; ++g) {
-                pv[g] = 0.0f;
+                acc[dt][g] *= alpha[g];
             }
-            pv = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_frag, b_frag, pv);
-            const float v_unscale = ldexpf(1.0f, -v_sh);
-#pragma unroll
-            for (int g = 0; g < 8; ++g) {
-                acc[dt][g] = acc[dt][g] * alpha[g] + pv[g] * v_unscale;
-            }
+            acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_frag, b_frag, acc[dt]);
         }
     }
 #pragma unroll

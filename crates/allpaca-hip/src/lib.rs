@@ -19353,6 +19353,61 @@ mod tests {
         }
     }
 
+    /// A row's WMMA attention output must not depend on keys past its causal
+    /// limit: the same rows over the same visible keys give the same bits
+    /// whether or not the call also carries later tokens (larger, in the same
+    /// 16-key tile and beyond). Otherwise a prompt-cache hit, or a prompt that
+    /// shares a prefix, would get prefix KV other than a cold prefill's.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_wmma_prefill_attention_row_ignores_later_tokens() {
+        if device_count() == 0 || !device_is_gfx12_by_name(0) {
+            return;
+        }
+        // (n_q, n_kv, extra trailing tokens, heads, kv heads, head_dim)
+        for (ci, (n_q, n_kv, extra, nh, nkv, hd)) in
+            [(21usize, 40usize, 11usize, 4usize, 1usize, 64usize), (16, 16, 5, 8, 2, 128), (9, 300, 20, 2, 1, 64)]
+                .into_iter()
+                .enumerate()
+        {
+            let (q2n, kv2n) = (n_q + extra, n_kv + extra);
+            let q = wmma_test_values(q2n * nh * hd, 31 + ci as u64);
+            let mut k = wmma_test_values(kv2n * nkv * hd, 37 + ci as u64);
+            let mut v = wmma_test_values(kv2n * nkv * hd, 41 + ci as u64);
+            // Later tokens are far larger (V by 2^30), so a scale shared with
+            // them would push the visible V into f16 subnormals.
+            for t in n_kv..kv2n {
+                for x in &mut k[t * nkv * hd..(t + 1) * nkv * hd] {
+                    *x *= 40.0;
+                }
+                for x in &mut v[t * nkv * hd..(t + 1) * nkv * hd] {
+                    *x *= (1u64 << 30) as f32; // pushes a shared scale into f16 subnormals
+                }
+            }
+            let row = nh * hd;
+            let mut short = vec![0.0f32; n_q * row];
+            attention_wmma_prefill(
+                &q[..n_q * row], &k[..n_kv * nkv * hd], &v[..n_kv * nkv * hd], &mut short,
+                n_q as i32, n_kv as i32, nh as i32, nkv as i32, hd as i32, true,
+            )
+            .unwrap();
+            let mut long = vec![0.0f32; q2n * row];
+            attention_wmma_prefill(&q, &k, &v, &mut long, q2n as i32, kv2n as i32, nh as i32, nkv as i32, hd as i32, true)
+                .unwrap();
+            for i in 0..n_q * row {
+                assert_eq!(
+                    short[i].to_bits(),
+                    long[i].to_bits(),
+                    "case {ci}: row {} col {} changed with later tokens: {} vs {}",
+                    i / row,
+                    i % row,
+                    short[i],
+                    long[i]
+                );
+            }
+        }
+    }
+
     /// Dispatch: `HipWorkspace::attention_device` and `gemm_nt_f16_dev` launch
     /// the WMMA kernels only inside a [`PrefillWmma`] scope, only on gfx12,
     /// never for one query row or under [`ExactRows`], and the scope restores
