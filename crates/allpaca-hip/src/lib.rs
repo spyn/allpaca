@@ -353,6 +353,11 @@ mod ffi {
 
     extern "C" {
         pub fn allpaca_hip_kernel_launches() -> u64;
+        pub fn allpaca_hip_device_is_gfx12(device: i32) -> i32;
+        pub fn allpaca_hip_set_prefill_wmma(on: i32) -> i32;
+        pub fn allpaca_hip_prefill_wmma_active() -> i32;
+        pub fn allpaca_hip_wmma_launches() -> u64;
+        pub fn allpaca_hip_thread_wmma_launches() -> u64;
         pub fn allpaca_hip_act_quant_reuses() -> u64;
         pub fn allpaca_hip_device_count(count: *mut i32) -> i32;
         pub fn allpaca_hip_device_props(
@@ -1439,6 +1444,97 @@ mod ffi {
 /// True when this build linked a HIP-compiled `allpaca_kernels` library.
 pub fn runtime_linked() -> bool {
     cfg!(all(feature = "hip", allpaca_hip_runtime))
+}
+
+/// gfx1200 / gfx1201 (RDNA4), cached per device by the kernel library.
+pub fn device_is_gfx12(device: i32) -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: plain query; an unknown device answers 0.
+        unsafe { ffi::allpaca_hip_device_is_gfx12(device) != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = device;
+        false
+    }
+}
+
+/// gfx12 WMMA kernels launched by this process so far (0 without HIP).
+pub fn wmma_launches() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: reads an atomic counter.
+        unsafe { ffi::allpaca_hip_wmma_launches() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
+/// gfx12 WMMA kernels this thread has launched (0 without HIP).
+pub fn thread_wmma_launches() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: reads a thread-local counter.
+        unsafe { ffi::allpaca_hip_thread_wmma_launches() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
+/// Whether this thread is inside a [`PrefillWmma`] scope and not in
+/// [`ExactRows`] mode.
+pub fn prefill_wmma_active() -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: reads thread-local flags.
+        unsafe { ffi::allpaca_hip_prefill_wmma_active() != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        false
+    }
+}
+
+/// Prefill WMMA scope (`experimental.row_variant_kernels`): while it lives,
+/// this thread's prefill GEMMs over F16 weights (m > 8) and multi-row
+/// attention run on the gfx12 WMMA kernels. Those give a row other bits than
+/// the decode kernels, so the engine opens it only around a prompt's prefill
+/// forward, never around decode, speculative verify or batched forwards, and
+/// only when the option is on. [`ExactRows`] wins over it. Dropping it
+/// restores whatever was set before, so scopes nest.
+pub struct PrefillWmma {
+    #[cfg_attr(not(all(feature = "hip", allpaca_hip_runtime)), allow(dead_code))]
+    prev: i32,
+}
+
+impl PrefillWmma {
+    pub fn enable() -> Self {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            // SAFETY: sets a thread-local flag.
+            let prev = unsafe { ffi::allpaca_hip_set_prefill_wmma(1) };
+            PrefillWmma { prev }
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            PrefillWmma { prev: 0 }
+        }
+    }
+}
+
+impl Drop for PrefillWmma {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        // SAFETY: sets a thread-local flag.
+        unsafe {
+            ffi::allpaca_hip_set_prefill_wmma(self.prev);
+        }
+    }
 }
 
 /// HIP kernels launched by this process so far, on every device (0 without HIP).
@@ -2684,6 +2780,7 @@ pub fn gemm_nt_f16_device(
 }
 
 /// Device-pointer gfx12 f16 WMMA. Non-gfx12 and exact-row mode use [`gemm_nt_f16_device`].
+/// It launches WMMA whenever called; forwards call it only inside a [`PrefillWmma`] scope.
 pub fn gemm_nt_f16_wmma_device(
     a: *const f32,
     b: *const u16,
@@ -2734,6 +2831,9 @@ pub fn gemm_nt_i8_device(
 }
 
 /// Device-pointer gfx12 int8 WMMA. Other devices run [`gemm_nt_i8_device`].
+///
+/// Not used by any forward yet: a tested building block for a future int8
+/// (Q8_0) prefill GEMM, which would go under the same [`PrefillWmma`] scope.
 pub fn gemm_nt_i8_wmma_device(
     a: *const i8,
     b: *const i8,
@@ -4014,7 +4114,10 @@ pub fn gemm_nt_f16(
     }
 }
 
-/// gfx12 f16 WMMA form of [`gemm_nt_f16`]: `C[m,n] = f16(A) * dequant(B_f16)^T`.
+/// gfx12 f16 WMMA form of [`gemm_nt_f16`]: `C[m,n] = A * dequant(B_f16)^T`, A kept
+/// at ~f32 precision (row-scaled hi/lo f16 split). Kernel test entry: a forward
+/// reaches this kernel only through [`HipWorkspace::gemm_nt_f16_dev`] inside a
+/// [`PrefillWmma`] scope.
 ///
 /// gfx1200 and gfx1201 run the WMMA tile. Every other device runs [`gemm_nt_f16`].
 pub fn gemm_nt_f16_wmma(
@@ -4143,6 +4246,7 @@ pub fn gemm_nt_i8(
 }
 
 /// gfx12 int8 WMMA form of [`gemm_nt_i8`]. Other devices run the scalar kernel.
+/// Not used by any forward yet (see [`gemm_nt_i8_wmma_device`]).
 pub fn gemm_nt_i8_wmma(
     a: &[i8],
     b: &[i8],
@@ -5775,12 +5879,15 @@ pub fn embed_gather_rocmfp4_rows(
     }
 }
 
+/// WMMA prefill attention for this launch: inside a [`PrefillWmma`] scope
+/// (not [`ExactRows`]), several query rows, a head_dim the kernel takes, and
+/// a gfx12 device. Decode, verify and batched forwards never open the scope.
 fn gfx12_wmma_prefill(device: i32, n_q: i32, head_dim: i32) -> bool {
     n_q > 1
         && (16..=128).contains(&head_dim)
         && head_dim % 16 == 0
-        && device_gcn_arch(device)
-            .is_some_and(|(name, _)| name.starts_with("gfx1200") || name.starts_with("gfx1201"))
+        && prefill_wmma_active()
+        && device_is_gfx12(device)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5801,7 +5908,8 @@ pub fn attention(
     )
 }
 
-/// gfx12 WMMA flash prefill. Off gfx12, for one query, or for an unsupported
+/// gfx12 WMMA flash prefill (kernel test entry; it does not check the
+/// [`PrefillWmma`] scope). Off gfx12, for one query, or for an unsupported
 /// head dimension, this is [`attention`].
 #[allow(clippy::too_many_arguments)]
 pub fn attention_wmma_prefill(
@@ -7092,8 +7200,11 @@ impl HipWorkspace {
         } else {
             DecodeOp::OtherGpu
         };
+        // WMMA only for a prefill forward with the experimental option on
+        // (see `PrefillWmma`); every other forward keeps the exact kernels.
+        let wmma = m > 8 && prefill_wmma_active() && device_is_gfx12(self.device);
         self.timed_gpu(op, || {
-            if m > 8 {
+            if wmma {
                 gemm_nt_f16_wmma_device(a, b, c, m, n, k)
             } else {
                 gemm_nt_f16_device(a, b, c, m, n, k)
@@ -18505,6 +18616,263 @@ mod tests {
                     wmma[i],
                     reference[i]
                 );
+            }
+        }
+    }
+
+    /// Deterministic values in [-0.5, 0.5) for the WMMA tests.
+    fn wmma_test_values(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    fn device_is_gfx12_by_name(dev: i32) -> bool {
+        device_gcn_arch(dev)
+            .is_some_and(|(name, _)| name.starts_with("gfx1200") || name.starts_with("gfx1201"))
+    }
+
+    /// The cached arch answer equals the device's name on every device, and
+    /// asking again gives the same answer.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn device_is_gfx12_matches_the_device_arch_name() {
+        for dev in 0..device_count() {
+            let want = device_is_gfx12_by_name(dev);
+            assert_eq!(device_is_gfx12(dev), want, "device {dev}");
+            assert_eq!(device_is_gfx12(dev), want, "device {dev}, cached");
+        }
+        assert!(!device_is_gfx12(-1));
+        assert!(!device_is_gfx12(1000));
+    }
+
+    /// The f16 WMMA GEMM must keep f32 precision on activations that are not
+    /// f16 values: magnitudes past 65504 (f16 max) and fine fractions. It is
+    /// compared with an f64 host product of the same f32 A and f16 B, at the
+    /// tolerance an f32 dot product earns (not the f16 one).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_f16_wmma_gemm_keeps_f32_precision_on_unrounded_large_a() {
+        if device_count() == 0 || !device_is_gfx12_by_name(0) {
+            return;
+        }
+        for (si, (m, n, k)) in [(32usize, 48usize, 80usize), (17, 16, 33), (9, 20, 16)].into_iter().enumerate() {
+            let mut a = wmma_test_values(m * k, 11 + si as u64);
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = match i % 5 {
+                    0 => *v * 4.0e5,                     // past f16 max
+                    1 => 1.0 + *v * 1.0e-4,              // fraction below f16 resolution
+                    2 => *v * 7.0e4 + 0.123_456_7,
+                    3 => *v * 1.0e-3,
+                    _ => *v,
+                };
+            }
+            let b_f = wmma_test_values(n * k, 97 + si as u64);
+            let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+            let b_back: Vec<f64> = b_f16.iter().map(|&h| f64::from(super::f16_bits_to_f32(h))).collect();
+            let mut got = vec![0.0f32; m * n];
+            gemm_nt_f16_wmma(&a, &b_f16, &mut got, m as i32, n as i32, k as i32)
+                .expect("gfx12 f16 WMMA GEMM");
+            for r in 0..m {
+                for c in 0..n {
+                    let (mut exact, mut mag) = (0.0f64, 0.0f64);
+                    for p in 0..k {
+                        let t = f64::from(a[r * k + p]) * b_back[c * k + p];
+                        exact += t;
+                        mag += t.abs();
+                    }
+                    let g = f64::from(got[r * n + c]);
+                    assert!(g.is_finite(), "shape {m}x{n}x{k} ({r},{c}) not finite: {g}");
+                    assert!(
+                        (g - exact).abs() <= 2.0e-6 * mag + 1.0e-30,
+                        "shape {m}x{n}x{k} ({r},{c}) got={g} exact={exact} mag={mag}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// f64 host attention, causal rows bottom-right aligned like the kernels.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_f64_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q: usize,
+        n_kv: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        causal: bool,
+    ) -> Vec<f32> {
+        let group = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut out = vec![0.0f32; n_q * n_heads * head_dim];
+        for i in 0..n_q {
+            let t_max = if causal { i + n_kv.saturating_sub(n_q) } else { n_kv - 1 };
+            for h in 0..n_heads {
+                let kvh = h / group;
+                let qr = &q[(i * n_heads + h) * head_dim..][..head_dim];
+                let s: Vec<f64> = (0..=t_max)
+                    .map(|t| {
+                        let kr = &k[(t * n_kv_heads + kvh) * head_dim..][..head_dim];
+                        scale * qr.iter().zip(kr).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum::<f64>()
+                    })
+                    .collect();
+                let mx = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let w: Vec<f64> = s.iter().map(|&x| (x - mx).exp()).collect();
+                let l: f64 = w.iter().sum();
+                for d in 0..head_dim {
+                    let acc: f64 = (0..=t_max)
+                        .map(|t| w[t] * f64::from(v[(t * n_kv_heads + kvh) * head_dim + d]))
+                        .sum();
+                    out[(i * n_heads + h) * head_dim + d] = (acc / l) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// WMMA prefill attention against an f64 reference over the shapes prefill
+    /// meets: head_dim 64 and 128, GQA 4:1 and 8:1, more keys than ATTN_CHUNK,
+    /// a chunk that starts mid-sequence at an offset that is not a multiple of
+    /// 16, a non-causal case, and magnitudes past f16 range (Q and V scaled up
+    /// by 2^17, K scaled down by 2^-17 so the scores stay the same). The
+    /// tolerance is f16-level (inputs round to f16): 0.5% of max |V|.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_wmma_prefill_attention_matches_f64_reference_across_shapes() {
+        if device_count() == 0 || !device_is_gfx12_by_name(0) {
+            return;
+        }
+        // (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, large)
+        let cases = [
+            (32usize, 32usize, 4usize, 1usize, 64usize, true, false),
+            (40, 40, 8, 1, 128, true, false),
+            (300, 300, 2, 1, 64, true, false),
+            (21, 300, 4, 1, 64, true, false),
+            (19, 45, 8, 2, 128, true, false),
+            (24, 40, 4, 2, 64, false, false),
+            (37, 70, 4, 1, 64, true, true),
+            (16, 16, 8, 1, 128, true, true),
+        ];
+        for (ci, (n_q, n_kv, nh, nkv, hd, causal, large)) in cases.into_iter().enumerate() {
+            let mut q = wmma_test_values(n_q * nh * hd, 3 + ci as u64);
+            let mut k = wmma_test_values(n_kv * nkv * hd, 5 + ci as u64);
+            let mut v = wmma_test_values(n_kv * nkv * hd, 7 + ci as u64);
+            if large {
+                let up = (1u32 << 17) as f32;
+                q.iter_mut().for_each(|x| *x *= up);
+                k.iter_mut().for_each(|x| *x /= up);
+                v.iter_mut().for_each(|x| *x *= up);
+            }
+            let reference = attention_f64_reference(&q, &k, &v, n_q, n_kv, nh, nkv, hd, causal);
+            let mut got = vec![f32::NAN; q.len()];
+            attention_wmma_prefill(
+                &q, &k, &v, &mut got, n_q as i32, n_kv as i32, nh as i32, nkv as i32, hd as i32, causal,
+            )
+            .expect("gfx12 WMMA prefill attention");
+            let vmax = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            for i in 0..got.len() {
+                assert!(
+                    got[i].is_finite() && (got[i] - reference[i]).abs() <= 5.0e-3 * vmax,
+                    "case {ci} (n_q={n_q} n_kv={n_kv} heads={nh}/{nkv} hd={hd} causal={causal} large={large}) \
+                     idx={i} got={} ref={}",
+                    got[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    /// Dispatch: `HipWorkspace::attention_device` and `gemm_nt_f16_dev` launch
+    /// the WMMA kernels only inside a [`PrefillWmma`] scope, only on gfx12,
+    /// never for one query row or under [`ExactRows`], and the scope restores
+    /// what it found when it ends (nested scopes included).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn prefill_wmma_scope_gates_wmma_dispatch() {
+        for dev in 0..device_count() {
+            let gfx12 = device_is_gfx12_by_name(dev);
+            let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+            let (n_q, n_kv, nh, nkv, hd) = (32usize, 48usize, 4usize, 1usize, 64usize);
+            let (m, n, k) = (32usize, 48usize, 64usize);
+            let q = wmma_test_values(n_q * nh * hd, 1);
+            let kk = wmma_test_values(n_kv * nkv * hd, 2);
+            let vv = wmma_test_values(n_kv * nkv * hd, 3);
+            let a = wmma_test_values(m * k, 4);
+            let b: Vec<u16> = wmma_test_values(n * k, 5).into_iter().map(allpaca_cpu::f32_to_f16).collect();
+            let up = |host: &[f32]| {
+                let p = device_malloc(host.len() * 4, dev).unwrap();
+                memcpy(p, host.as_ptr().cast(), host.len() * 4, MEMCPY_H2D).unwrap();
+                p
+            };
+            let (dq, dk, dv, da) = (up(&q), up(&kk), up(&vv), up(&a));
+            let db = device_malloc(b.len() * 2, dev).unwrap();
+            memcpy(db, b.as_ptr().cast(), b.len() * 2, MEMCPY_H2D).unwrap();
+            let dout = device_malloc(q.len() * 4, dev).unwrap();
+            let dc = device_malloc(m * n * 4, dev).unwrap();
+            let run = |rows: usize| -> u64 {
+                let before = thread_wmma_launches();
+                ws.attention_device(
+                    dq.cast(), dk.cast(), dv.cast(), dout.cast(), rows as i32, n_kv as i32,
+                    nh as i32, nkv as i32, hd as i32, true,
+                )
+                .unwrap();
+                ws.gemm_nt_f16_dev(da.cast(), db.cast(), dc.cast(), rows as i32, n as i32, k as i32)
+                    .unwrap();
+                stream_synchronize().unwrap();
+                thread_wmma_launches() - before
+            };
+            let read = || {
+                let mut o = vec![0.0f32; q.len()];
+                let mut cc = vec![0.0f32; m * n];
+                memcpy(o.as_mut_ptr().cast(), dout, o.len() * 4, MEMCPY_D2H).unwrap();
+                memcpy(cc.as_mut_ptr().cast(), dc, cc.len() * 4, MEMCPY_D2H).unwrap();
+                (o, cc)
+            };
+            assert_eq!(run(n_q), 0, "device {dev}: WMMA launched with no prefill scope");
+            let (exact_attn, exact_gemm) = read();
+            {
+                let _outer = PrefillWmma::enable();
+                {
+                    let _inner = PrefillWmma::enable();
+                }
+                assert!(prefill_wmma_active(), "a nested scope must restore the outer one");
+                let want = if gfx12 { 2 } else { 0 };
+                assert_eq!(run(n_q), want, "device {dev} (gfx12={gfx12}): prefill scope");
+                // Same numbers within WMMA tolerance on this device (f16-level
+                // for attention, near-f32 for the GEMM).
+                let (w_attn, w_gemm) = read();
+                for (i, (&g, &e)) in w_attn.iter().zip(&exact_attn).enumerate() {
+                    assert!((g - e).abs() <= 3.0e-3, "device {dev} attention idx={i} wmma={g} exact={e}");
+                }
+                for (i, (&g, &e)) in w_gemm.iter().zip(&exact_gemm).enumerate() {
+                    assert!(gemm_close(g, e), "device {dev} gemm idx={i} wmma={g} exact={e}");
+                }
+                assert_eq!(run(1), 0, "device {dev}: one query row must not take WMMA");
+                {
+                    let _exact = ExactRows::enable();
+                    assert!(!prefill_wmma_active(), "ExactRows wins over the prefill scope");
+                    assert_eq!(run(n_q), 0, "device {dev}: WMMA launched under ExactRows");
+                }
+            }
+            assert!(!prefill_wmma_active());
+            assert_eq!(run(n_q), 0, "device {dev}: WMMA launched after the scope ended");
+            for (p, bytes) in [
+                (dq, q.len() * 4),
+                (dk, kk.len() * 4),
+                (dv, vv.len() * 4),
+                (da, a.len() * 4),
+                (db, b.len() * 2),
+                (dout, q.len() * 4),
+                (dc, m * n * 4),
+            ] {
+                device_free(p, bytes);
             }
         }
     }

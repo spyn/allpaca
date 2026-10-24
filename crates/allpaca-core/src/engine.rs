@@ -4339,7 +4339,16 @@ impl Engine {
         if batch_prefill_hip {
             let mtp = mtp_draft_active(inner);
             let mut row_hiddens = Vec::new();
-            target.forward_tokens(
+            // experimental.row_variant_kernels: this prompt forward (and only
+            // it: not decode, verify, batched ticks or the MTP pass below) may
+            // run the gfx12 WMMA GEMM / attention. Their rows differ from the
+            // decode kernels' bits, so the option is off by default.
+            let wmma_scope = self
+                .config
+                .experimental
+                .row_variant_kernels
+                .then(allpaca_hip::PrefillWmma::enable);
+            let forwarded = target.forward_tokens(
                 &toks,
                 start,
                 &pages,
@@ -4354,7 +4363,9 @@ impl Engine {
                 (mtp || !probed.is_empty()).then_some(&mut row_hiddens),
                 id,
                 vision_ref,
-            )?;
+            );
+            drop(wmma_scope);
+            forwarded?;
             if row_hiddens.len() == toks.len() * dim {
                 for pos in &probed {
                     probed_rows.extend_from_slice(&row_hiddens[(pos - start) * dim..][..dim]);

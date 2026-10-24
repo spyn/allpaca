@@ -1695,6 +1695,211 @@ fn write_packed_f16_gguf_with_rope_dims(path: &std::path::Path, rope_dims: u32) 
     .unwrap();
 }
 
+/// Two-layer F16 llama with varied weights for the gfx12 WMMA tests:
+/// head_dim 64 (a WMMA shape), GQA 4:1, F16 GEMMs (the WMMA GEMM's input),
+/// and 40 words so a prompt gives a wide prefill.
+#[cfg(feature = "hip")]
+fn write_varied_f16_llama(path: &std::path::Path) {
+    use allpaca_gguf::{write_gguf_quant, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let (dim, n_heads, n_kv_heads, ff, vocab, layers) = (256usize, 4usize, 1usize, 512usize, 40usize, 2usize);
+    let kv_dim = dim / n_heads * n_kv_heads;
+    let mut seed = 0x5eed_u64;
+    let mut values = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                (((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5) * scale
+            })
+            .collect()
+    };
+    let mut meta = HashMap::new();
+    meta.insert("general.architecture".into(), GgufValue::String("llama".into()));
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(layers as u32));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(n_heads as u32));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(n_kv_heads as u32));
+    meta.insert("llama.feed_forward_length".into(), GgufValue::Uint32(ff as u32));
+    meta.insert("tokenizer.ggml.model".into(), GgufValue::String("wordlevel".into()));
+    let mut tokens = vec![
+        GgufValue::String("<unk>".into()),
+        GgufValue::String("<s>".into()),
+        GgufValue::String("</s>".into()),
+    ];
+    tokens.extend((3..vocab).map(|i| GgufValue::String(format!("w{i}"))));
+    meta.insert("tokenizer.ggml.tokens".into(), GgufValue::Array(tokens));
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let f16 = allpaca_gguf::GgmlType::F16;
+    let w = 2.0 / (dim as f32).sqrt();
+    let mut quant: Vec<(String, Vec<u64>, Vec<u8>)> = vec![(
+        "token_embd.weight".into(),
+        vec![vocab as u64, dim as u64],
+        allpaca_gguf::quantize_f16(&values(vocab * dim, 2.0)),
+    )];
+    for l in 0..layers {
+        for (name, rows, cols) in [
+            ("attn_q", dim, dim),
+            ("attn_k", kv_dim, dim),
+            ("attn_v", kv_dim, dim),
+            ("attn_output", dim, dim),
+            ("ffn_gate", ff, dim),
+            ("ffn_up", ff, dim),
+            ("ffn_down", dim, ff),
+        ] {
+            quant.push((
+                format!("blk.{l}.{name}.weight"),
+                vec![rows as u64, cols as u64],
+                allpaca_gguf::quantize_f16(&values(rows * cols, w)),
+            ));
+        }
+    }
+    let ones = vec![1.0f32; dim];
+    let mut plain: Vec<GgufWriteTensor> = vec![GgufWriteTensor {
+        name: "output_norm.weight".into(),
+        dims: vec![dim as u64],
+        data: &ones,
+    }];
+    for l in 0..layers {
+        for norm in ["attn_norm", "ffn_norm"] {
+            plain.push(GgufWriteTensor {
+                name: format!("blk.{l}.{norm}.weight"),
+                dims: vec![dim as u64],
+                data: &ones,
+            });
+        }
+    }
+    let quant_refs: Vec<GgufWriteQuantTensor> = quant
+        .iter()
+        .map(|(name, dims, bytes)| GgufWriteQuantTensor {
+            name: name.clone(),
+            dims: dims.clone(),
+            ggml_type: f16,
+            bytes,
+        })
+        .collect();
+    write_gguf_quant(path, &meta, &plain, &quant_refs).unwrap();
+}
+
+/// gfx12 WMMA tests read the process-wide WMMA launch counter; run them one
+/// at a time so one test's launches don't land in another's window.
+#[cfg(feature = "hip")]
+static WMMA_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "hip")]
+fn wmma_prompt() -> String {
+    (0..40).map(|i| format!("w{}", 3 + (i * 7) % 37)).collect::<Vec<_>>().join(" ")
+}
+
+/// Engine config for the WMMA tests: the varied F16 llama, optionally with
+/// itself as the draft model (packed linear verify spans of several rows).
+#[cfg(feature = "hip")]
+fn wmma_engine_config(dir: &std::path::Path, spec: bool, row_variant: bool) -> Config {
+    let target = dir.join("wmma_target.gguf");
+    let draft = dir.join("wmma_draft.gguf");
+    if !target.exists() {
+        write_varied_f16_llama(&target);
+        write_varied_f16_llama(&draft);
+    }
+    let mut cfg = hip_7b_config(target);
+    cfg.kv.page_tokens = 16;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    cfg.kv.dram_bytes = 64 * 1024 * 1024;
+    cfg.experimental.row_variant_kernels = row_variant;
+    if spec {
+        cfg.model.draft_path = Some(draft);
+        cfg.speculative.enabled = true;
+        cfg.features.draft_model_speculation = Some(true);
+        cfg.features.ngram_speculation = Some(false);
+        cfg.features.tree_speculation = Some(false);
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 4;
+    }
+    cfg
+}
+
+#[cfg(feature = "hip")]
+fn wmma_test_dir(tag: &str) -> std::path::PathBuf {
+    // Two folders below temp: sidecar discovery reads the model's folder and
+    // the files of the one above (see hip-test-flakes).
+    let dir = std::env::temp_dir()
+        .join(format!("allpaca_wmma_{tag}_{}", std::process::id()))
+        .join("model");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Runs `generate` on a fresh engine; returns (tokens, WMMA launches, stats).
+#[cfg(feature = "hip")]
+fn wmma_generate(cfg: Config, max_tokens: usize) -> Option<(Vec<u32>, u64, allpaca_types::StatsSnapshot)> {
+    let engine = Engine::new(cfg).expect("varied F16 llama must load");
+    if hip_gpus(&engine).is_empty() {
+        return None;
+    }
+    let before = allpaca_hip::wmma_launches();
+    let out = engine.generate(&wmma_prompt(), greedy(max_tokens)).expect("generate");
+    let launches = allpaca_hip::wmma_launches() - before;
+    Some((out.token_ids, launches, engine.stats()))
+}
+
+#[cfg(feature = "hip")]
+fn any_gfx12() -> bool {
+    (0..allpaca_hip::device_count()).any(allpaca_hip::device_is_gfx12)
+}
+
+/// With `experimental.row_variant_kernels` off (the default) no WMMA kernel
+/// runs at all, in prefill, decode or packed verify, and speculative output
+/// equals plain greedy output.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gfx12_wmma_off_by_default_never_launches_and_spec_matches_plain() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip: no HIP device");
+        return;
+    }
+    let _lock = WMMA_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = wmma_test_dir("off");
+    assert!(!Config::compiled_defaults().experimental.row_variant_kernels);
+    let Some((plain, plain_wmma, _)) = wmma_generate(wmma_engine_config(&dir, false, false), 24) else {
+        return;
+    };
+    let (spec, spec_wmma, stats) = wmma_generate(wmma_engine_config(&dir, true, false), 24).unwrap();
+    assert!(stats.linear_packed_verifies > 0, "the draft must pack verify spans; stats={stats:?}");
+    assert_eq!(plain_wmma, 0, "WMMA ran with the option off (plain)");
+    assert_eq!(spec_wmma, 0, "WMMA ran with the option off (spec)");
+    assert_eq!(spec, plain, "spec != no-spec with the option off");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// With the option on, WMMA runs in prefill (on gfx12) and nowhere else:
+/// a 24-token speculative generate launches exactly as many WMMA kernels as
+/// a 1-token one with the same prompt (decode and verify add none), and
+/// speculative output still equals plain output with the option on.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gfx12_wmma_on_runs_in_prefill_only() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip: no HIP device");
+        return;
+    }
+    let _lock = WMMA_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = wmma_test_dir("on");
+    let Some((plain, _, _)) = wmma_generate(wmma_engine_config(&dir, false, true), 24) else {
+        return;
+    };
+    let (_, prefill_only, _) = wmma_generate(wmma_engine_config(&dir, true, true), 1).unwrap();
+    let (spec, spec_wmma, stats) = wmma_generate(wmma_engine_config(&dir, true, true), 24).unwrap();
+    assert!(stats.linear_packed_verifies > 0, "the draft must pack verify spans; stats={stats:?}");
+    if any_gfx12() {
+        assert!(prefill_only > 0, "the option is on but prefill launched no WMMA");
+    }
+    assert_eq!(spec_wmma, prefill_only, "decode or verify launched WMMA kernels");
+    assert_eq!(spec, plain, "spec != no-spec with the option on");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
 #[cfg(feature = "hip")]
 fn write_tiny_f32_gguf(path: &std::path::Path) {
     use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};

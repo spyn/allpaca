@@ -1246,16 +1246,37 @@ __global__ void gemm_nt_f16_tiled_kernel(const float *a, const uint16_t *b, floa
     }
 }
 
-/* gfx12 f16 WMMA prefill tile. One wave32 computes C[16,16] += A[16,16] * B_nt[16,16]^T
- * per K panel. A is row-major f32 [m,k] (rounded to f16 on load). B is packed f16
- * row-major [n,k], which is already the transposed B the WMMA operand wants.
+/* Power-of-two exponent that brings `amax` into [2^13, 2^14): scaled values
+ * then fit f16 (max 65504) with room for the hi/lo split, and scaling by a
+ * power of two is exact. Zero, inf and NaN rows are left unscaled; the shift
+ * is clamped so the scale itself stays a normal float. */
+__device__ __forceinline__ int wmma_f16_shift(float amax) {
+    if (!(amax > 0.0f) || !isfinite(amax)) {
+        return 0;
+    }
+    int e = 0;
+    (void)frexpf(amax, &e); /* amax = f * 2^e, f in [0.5, 1) */
+    const int sh = 14 - e;
+    return sh < -100 ? -100 : (sh > 100 ? 100 : sh);
+}
+
+/* gfx12 f16 WMMA prefill tile (experimental.row_variant_kernels). One wave32
+ * computes C[16,16] = A[16,k] * B_nt[16,k]^T. B is packed f16 row-major [n,k],
+ * already the transposed operand WMMA wants. A is f32 and is NOT rounded to
+ * f16: each row is scaled by a power of two so its largest |a| lies in
+ * [2^13, 2^14), then split as a*s = hi + lo with hi = f16(a*s) and
+ * lo = f16(a*s - hi). Two WMMAs (hi*B, lo*B) accumulate in f32; hi*b and
+ * lo*b are exact in f32, so A keeps ~22 bits and no value overflows f16.
+ * The row's result is unscaled exactly at the end.
  *
  * Lane layout (RDNA4, not the RDNA3 replicated layout): lane L holds A row L%16
  * and B column L%16 at K positions 8*(L/16) + 0..7. Accumulator element g is
- * C row (L/16)*8+g, column L%16. Non-gfx12 images leave the body empty; the
- * host launch sends those devices to the scalar f16 kernel. */
-__global__ void gemm_nt_f16_wmma_kernel(const float *a, const uint16_t *b, float *c, int m, int n,
-                                        int k) {
+ * C row (L/16)*8+g, column L%16. A row's result depends only on that row, but
+ * its bits differ from the decode GEMV's, hence the experimental gate.
+ * Non-gfx12 images leave the body empty; the host launch sends those devices
+ * to the scalar f16 kernel. */
+__global__ void __launch_bounds__(32) gemm_nt_f16_wmma_kernel(const float *a, const uint16_t *b, float *c,
+                                                              int m, int n, int k) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     using f16x8 = __attribute__((ext_vector_type(8))) _Float16;
     using f32x8 = __attribute__((ext_vector_type(8))) float;
@@ -1266,6 +1287,24 @@ __global__ void gemm_nt_f16_wmma_kernel(const float *a, const uint16_t *b, float
     const int a_row = row0 + (lane % 16);
     const int b_col = col0 + (lane % 16);
     const int k_group = 8 * (lane / 16);
+    const float *ar = a + static_cast<size_t>(a_row < m ? a_row : 0) * k;
+
+    /* Row scale: this lane sees half the row's K positions, lane L^16 the rest. */
+    float amax = 0.0f;
+    if (a_row < m) {
+        for (int k0 = 0; k0 < k; k0 += 16) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int kp = k0 + k_group + e;
+                if (kp < k) {
+                    amax = fmaxf(amax, fabsf(ar[kp]));
+                }
+            }
+        }
+    }
+    amax = fmaxf(amax, __shfl_xor(amax, 16, 32));
+    const int sh = wmma_f16_shift(amax);
+    const float s = ldexpf(1.0f, sh);
 
     f32x8 acc;
 #pragma unroll
@@ -1273,30 +1312,37 @@ __global__ void gemm_nt_f16_wmma_kernel(const float *a, const uint16_t *b, float
         acc[g] = 0.0f;
     }
     for (int k0 = 0; k0 < k; k0 += 16) {
-        f16x8 a_frag;
+        f16x8 hi_frag;
+        f16x8 lo_frag;
         f16x8 b_frag;
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const int kp = k0 + k_group + e;
-            a_frag[e] = static_cast<_Float16>(0.0f);
-            b_frag[e] = static_cast<_Float16>(0.0f);
+            float x = 0.0f;
             if (a_row < m && kp < k) {
-                a_frag[e] = static_cast<_Float16>(a[static_cast<size_t>(a_row) * k + kp]);
+                x = ar[kp] * s;
             }
+            const _Float16 hi = static_cast<_Float16>(x);
+            hi_frag[e] = hi;
+            lo_frag[e] = static_cast<_Float16>(x - static_cast<float>(hi));
+            b_frag[e] = static_cast<_Float16>(0.0f);
             if (b_col < n && kp < k) {
                 b_frag[e] = __builtin_bit_cast(_Float16, b[static_cast<size_t>(b_col) * k + kp]);
             }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frag, b_frag, acc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(hi_frag, b_frag, acc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(lo_frag, b_frag, acc);
     }
 
     const int col_out = col0 + (lane % 16);
     const int row_base = row0 + (lane / 16) * 8;
 #pragma unroll
     for (int g = 0; g < 8; ++g) {
+        /* Row (L/16)*8+g's shift lives in lane (L/16)*8+g. */
+        const int row_sh = __shfl(sh, (lane / 16) * 8 + g, 32);
         const int row_out = row_base + g;
         if (row_out < m && col_out < n) {
-            c[static_cast<size_t>(row_out) * n + col_out] = acc[g];
+            c[static_cast<size_t>(row_out) * n + col_out] = ldexpf(acc[g], -row_sh);
         }
     }
 #else
@@ -1334,7 +1380,12 @@ __device__ __forceinline__ int allpaca_pack_i8x4(int8_t e0, int8_t e1, int8_t e2
 
 /* gfx12 int8 WMMA. Same tile geometry as the f16 kernel: lane L owns A row L%16
  * and B column L%16, eight int8 at K 8*(L/16)+0..7, packed little-endian into
- * two 32-bit registers. Accumulator element g is C row (L/16)*8+g, column L%16. */
+ * two 32-bit registers. Accumulator element g is C row (L/16)*8+g, column L%16.
+ *
+ * NOT USED YET: a building block for a future int8 (Q8_0) prefill GEMM. No
+ * forward calls it; only its unit test does. Wiring it in needs the int8
+ * activation quantize and per-block scales, under the same experimental
+ * prefill scope as the f16 WMMA GEMM. */
 __global__ void gemm_nt_i8_wmma_kernel(const int8_t *a, const int8_t *b, float *c, int m, int n,
                                        int k) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
@@ -1994,15 +2045,20 @@ struct AttnPartScratch {
 };
 static AttnPartScratch g_attn_part[ATTN_PART_DEVICES];
 
-/* One query: attention_split_gqa_kernel, its chunks in parallel plus a merge
- * when the row is longer than one chunk. Several rows: the Q-tiled kernel.
- * Both give a row the same bits. Head dims past 32 * ATTN_MAX_DPT take the
- * per-row kernel, whichever the row count. */
-/* gfx12 WMMA flash prefill. One wave owns 16 query rows of one head. QK and PV
- * are v_wmma_f32_16x16x16_f16 tiles; the online softmax is the same recurrence
- * as attn_row_step (max, exp, rescale) so a row does not depend on tile size.
- * K and V are only read. head_dim must be a multiple of 16 and at most 128.
- * Other devices do not launch this kernel. */
+/* gfx12 WMMA flash prefill (experimental.row_variant_kernels). One wave owns 16
+ * query rows of one head. QK^T and PV are v_wmma_f32_16x16x16_f16 tiles with
+ * f32 accumulation; the online softmax is the attn_row_step recurrence (max,
+ * exp, rescale) per 16-key tile. Q, K, P and V are rounded to f16, so a row's
+ * bits differ from the decode kernels (relative error ~1e-3): the engine runs
+ * this kernel only in prefill with the option on. Overflow is not possible:
+ * each Q row (over head_dim), each K row (one token, over head_dim) and each
+ * V column of a 16-token tile is scaled by a power of two into [2^13, 2^14)
+ * before rounding, and the scale is taken out exactly in f32.
+ *
+ * Q fragments stay in registers for the whole key loop. The loop stops at the
+ * causal limit of the block's last row. K and V are only read. head_dim must
+ * be a multiple of 16 and at most 128 (the host checks). Non-gfx12 images
+ * leave the body empty; other devices do not launch this kernel. */
 __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float *q, const float *k,
                                                                     const float *v, float *out, int n_q,
                                                                     int n_kv, int n_heads, int n_kv_heads,
@@ -2020,10 +2076,45 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
     const float scale = rsqrtf(static_cast<float>(head_dim));
     const size_t q_stride = static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
-    /* head_dim <= 128, so at most eight 16-wide output tiles. Scores are
-     * computed once per key tile and reused for every output tile. */
+    /* head_dim <= 128: at most eight 16-wide tiles of the head. */
     constexpr int kMaxDTiles = 8;
-    const int n_dtiles = (head_dim + 15) / 16;
+    const int n_dtiles = head_dim / 16;
+    const int half = 8 * (lane / 16); /* this lane's K offset inside a 16-panel */
+
+    /* Q: this lane holds row row0 + lane%16, dims dt*16 + half + 0..7. */
+    const int q_row = row0 + (lane % 16);
+    const float *qr = q + (static_cast<size_t>(q_row < n_q ? q_row : 0) * n_heads + h) * head_dim;
+    float qmax = 0.0f;
+#pragma unroll
+    for (int dt = 0; dt < kMaxDTiles; ++dt) {
+        if (dt < n_dtiles && q_row < n_q) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                qmax = fmaxf(qmax, fabsf(qr[dt * 16 + half + e]));
+            }
+        }
+    }
+    qmax = fmaxf(qmax, __shfl_xor(qmax, 16, 32));
+    const int q_sh = wmma_f16_shift(qmax);
+    const float qs = ldexpf(1.0f, q_sh);
+    f16x8 q_frag[kMaxDTiles];
+#pragma unroll
+    for (int dt = 0; dt < kMaxDTiles; ++dt) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            q_frag[dt][e] = static_cast<_Float16>(0.0f);
+            if (dt < n_dtiles && q_row < n_q) {
+                q_frag[dt][e] = static_cast<_Float16>(qr[dt * 16 + half + e] * qs);
+            }
+        }
+    }
+    /* Accumulator element g is row (L/16)*8+g; its Q shift lives in that lane. */
+    float row_unscale[8];
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        row_unscale[g] = ldexpf(scale, -__shfl(q_sh, (lane / 16) * 8 + g, 32));
+    }
+
     float m_run[8];
     float l_run[8];
     f32x8 acc[kMaxDTiles];
@@ -2040,43 +2131,58 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
         }
     }
 
-    for (int k0 = 0; k0 < n_kv; k0 += 16) {
+    /* Keys past the last row's causal limit are masked for every row here. */
+    const int last_row = (row0 + 15 < n_q ? row0 + 15 : n_q - 1);
+    const int t_lim = attn_row_tmax(last_row, n_q, n_kv, causal) + 1;
+    const int t_end = t_lim < n_kv ? t_lim : n_kv;
+
+    for (int k0 = 0; k0 < t_end; k0 += 16) {
+        /* K: this lane's B column is token k0 + lane%16 (dims as for Q). */
+        const int k_tok = k0 + (lane % 16);
+        const float *kr = k + static_cast<size_t>(k_tok < n_kv ? k_tok : 0) * kv_stride +
+                          static_cast<size_t>(kv_h) * head_dim;
+        float kmax = 0.0f;
+        if (k_tok < n_kv) {
+            for (int dt = 0; dt < n_dtiles; ++dt) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    kmax = fmaxf(kmax, fabsf(kr[dt * 16 + half + e]));
+                }
+            }
+        }
+        kmax = fmaxf(kmax, __shfl_xor(kmax, 16, 32));
+        const int k_sh = wmma_f16_shift(kmax);
+        const float ks = ldexpf(1.0f, k_sh);
         f32x8 scores;
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
             scores[g] = 0.0f;
         }
-        for (int p0 = 0; p0 < head_dim; p0 += 16) {
-            f16x8 a_frag;
-            f16x8 b_frag;
 #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int kd = p0 + 8 * (lane / 16) + e;
-                const int qrow = row0 + (lane % 16);
-                const int token = k0 + (lane % 16);
-                a_frag[e] = static_cast<_Float16>(0.0f);
-                b_frag[e] = static_cast<_Float16>(0.0f);
-                if (qrow < n_q && kd < head_dim) {
-                    a_frag[e] = static_cast<_Float16>(
-                        q[(static_cast<size_t>(qrow) * n_heads + h) * head_dim + kd]);
+        for (int dt = 0; dt < kMaxDTiles; ++dt) {
+            if (dt < n_dtiles) {
+                f16x8 b_frag;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    b_frag[e] = static_cast<_Float16>(0.0f);
+                    if (k_tok < n_kv) {
+                        b_frag[e] = static_cast<_Float16>(kr[dt * 16 + half + e] * ks);
+                    }
                 }
-                if (token < n_kv && kd < head_dim) {
-                    b_frag[e] = static_cast<_Float16>(
-                        k[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + kd]);
-                }
+                scores = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_frag[dt], b_frag, scores);
             }
-            scores = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frag, b_frag, scores);
         }
+        /* Score element g: row (L/16)*8+g, token k_tok (this lane's column). */
+        const float tok_unscale = ldexpf(1.0f, -k_sh);
 
         float p_lane[8];
         float alpha[8];
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
             const int qrow = row0 + (lane / 16) * 8 + g;
-            const int token = k0 + (lane % 16);
             const int t_max = qrow < n_q ? attn_row_tmax(qrow, n_q, n_kv, causal) : -1;
-            const bool valid = qrow < n_q && token < n_kv && token <= t_max;
-            const float s = valid ? scores[g] * scale : -1.0e30f;
+            const bool valid = qrow < n_q && k_tok < n_kv && k_tok <= t_max;
+            const float s = valid ? (scores[g] * row_unscale[g]) * tok_unscale : -1.0e30f;
             float vmax = s;
 #pragma unroll
             for (int off = 1; off < 16; off <<= 1) {
@@ -2094,16 +2200,8 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
             m_run[g] = m_new;
             p_lane[g] = p;
         }
-#pragma unroll
-        for (int dt = 0; dt < kMaxDTiles; ++dt) {
-            if (dt < n_dtiles) {
-#pragma unroll
-                for (int g = 0; g < 8; ++g) {
-                    acc[dt][g] *= alpha[g];
-                }
-            }
-        }
 
+        /* P as the A operand: lane L needs row L%16 at tokens half + 0..7. */
         f16x8 p_frag;
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
@@ -2115,8 +2213,7 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 const int r = lane % 16;
-                const int kk = 8 * (lane / 16) + e;
-                const int src = (r / 8) * 16 + kk;
+                const int src = (r / 8) * 16 + half + e;
                 const float got = __shfl(vreg, src, 32);
                 if ((r % 8) == gsrc) {
                     p_frag[e] = static_cast<_Float16>(got);
@@ -2128,19 +2225,38 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
             if (dt >= n_dtiles) {
                 continue;
             }
-            const int d0 = dt * 16;
+            /* V: this lane's B column is dim dt*16 + lane%16, tokens k0 + half + 0..7;
+             * lane L^16 holds the other 8 tokens of the column. */
+            const int d = dt * 16 + (lane % 16);
+            float vv[8];
+            float vmax = 0.0f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int token = k0 + half + e;
+                vv[e] = token < n_kv
+                            ? v[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + d]
+                            : 0.0f;
+                vmax = fmaxf(vmax, fabsf(vv[e]));
+            }
+            vmax = fmaxf(vmax, __shfl_xor(vmax, 16, 32));
+            const int v_sh = wmma_f16_shift(vmax);
+            const float vs = ldexpf(1.0f, v_sh);
             f16x8 b_frag;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const int token = k0 + 8 * (lane / 16) + e;
-                const int d = d0 + (lane % 16);
-                b_frag[e] = static_cast<_Float16>(0.0f);
-                if (token < n_kv && d < head_dim) {
-                    b_frag[e] = static_cast<_Float16>(
-                        v[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + d]);
-                }
+                b_frag[e] = static_cast<_Float16>(vv[e] * vs);
             }
-            acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_frag, b_frag, acc[dt]);
+            f32x8 pv;
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                pv[g] = 0.0f;
+            }
+            pv = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_frag, b_frag, pv);
+            const float v_unscale = ldexpf(1.0f, -v_sh);
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                acc[dt][g] = acc[dt][g] * alpha[g] + pv[g] * v_unscale;
+            }
         }
     }
 #pragma unroll
@@ -2153,7 +2269,7 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
         for (int g = 0; g < 8; ++g) {
             const int qrow = row0 + (lane / 16) * 8 + g;
             const int d = d0 + (lane % 16);
-            if (qrow < n_q && d < head_dim && l_run[g] > 0.0f) {
+            if (qrow < n_q && l_run[g] > 0.0f) {
                 out[static_cast<size_t>(qrow) * q_stride + static_cast<size_t>(h) * head_dim + d] =
                     acc[dt][g] / l_run[g];
             }
@@ -2173,6 +2289,10 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
 #endif
 }
 
+/* One query: attention_split_gqa_kernel, its chunks in parallel plus a merge
+ * when the row is longer than one chunk. Several rows: the Q-tiled kernel.
+ * Both give a row the same bits. Head dims past 32 * ATTN_MAX_DPT take the
+ * per-row kernel, whichever the row count. */
 static void launch_attention(const float *q, const float *k, const float *v, float *out, int n_q,
                              int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
                              const uint8_t *mask, const float *sinks, hipStream_t stream) {
@@ -2726,14 +2846,63 @@ static int launch_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32
     return hip_status(hipGetLastError());
 }
 
+/* gfx1200 / gfx1201 (RDNA4, the WMMA kernels' target), cached per device:
+ * hipGetDeviceProperties is far too slow to call on every launch.
+ * 0 = not asked yet, 1 = no, 2 = yes. Devices past the table are asked
+ * every time (none exist on our machines). */
+constexpr int GFX12_CACHE_DEVICES = 16;
+static std::atomic<int> g_gfx12_arch[GFX12_CACHE_DEVICES];
+
 static int device_arch_is_gfx12(int device) {
+    if (device < 0) {
+        return 0;
+    }
+    if (device < GFX12_CACHE_DEVICES) {
+        const int cached = g_gfx12_arch[device].load(std::memory_order_relaxed);
+        if (cached != 0) {
+            return cached == 2;
+        }
+    }
     hipDeviceProp_t prop{};
     if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
         return 0;
     }
-    return std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
-           std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0;
+    const int yes = std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
+                    std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0;
+    if (device < GFX12_CACHE_DEVICES) {
+        g_gfx12_arch[device].store(yes ? 2 : 1, std::memory_order_relaxed);
+    }
+    return yes;
 }
+
+extern "C" int32_t allpaca_hip_device_is_gfx12(int32_t device) { return device_arch_is_gfx12(device); }
+
+/* Prefill WMMA scope (experimental.row_variant_kernels). The WMMA GEMM and
+ * attention give a row other bits than the decode kernels, so the engine
+ * opens this scope only around a prompt's prefill chunk, never around decode,
+ * verify or batched forwards, and only when the option is on. Exact-row mode
+ * wins over it. Per calling thread, like g_exact_rows. */
+static thread_local int g_prefill_wmma = 0;
+
+/* Returns the previous value so a scope can restore it. */
+extern "C" int32_t allpaca_hip_set_prefill_wmma(int32_t on) {
+    const int prev = g_prefill_wmma;
+    g_prefill_wmma = on != 0;
+    return prev;
+}
+
+extern "C" int32_t allpaca_hip_prefill_wmma_active(void) { return g_prefill_wmma && !g_exact_rows; }
+
+/* WMMA kernel launches: process-wide and by the calling thread (tests). */
+static std::atomic<uint64_t> g_wmma_launches{0};
+static thread_local uint64_t t_wmma_launches = 0;
+static inline void note_wmma_launch() {
+    g_wmma_launches.fetch_add(1, std::memory_order_relaxed);
+    ++t_wmma_launches;
+}
+
+extern "C" uint64_t allpaca_hip_wmma_launches(void) { return g_wmma_launches.load(std::memory_order_relaxed); }
+extern "C" uint64_t allpaca_hip_thread_wmma_launches(void) { return t_wmma_launches; }
 
 /* gfx12 launches the WMMA tile. Every other arch keeps the existing f16 kernel. */
 static int launch_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, int32_t m,
@@ -2753,6 +2922,7 @@ static int launch_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, 
     dim3 block(32);
     dim3 grid(static_cast<unsigned>((n + 15) / 16), static_cast<unsigned>((m + 15) / 16));
     hipLaunchKernelGGL(gemm_nt_f16_wmma_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    note_wmma_launch();
     return hip_status(hipGetLastError());
 }
 
@@ -2784,6 +2954,7 @@ static int launch_gemm_nt_i8_wmma(const int8_t *a, const int8_t *b, float *c, in
     dim3 block(32);
     dim3 grid(static_cast<unsigned>((n + 15) / 16), static_cast<unsigned>((m + 15) / 16));
     hipLaunchKernelGGL(gemm_nt_i8_wmma_kernel, grid, block, 0, stream, a, b, c, m, n, k);
+    note_wmma_launch();
     return hip_status(hipGetLastError());
 }
 
@@ -8251,6 +8422,7 @@ extern "C" int allpaca_attention_wmma_prefill(const float *q, const float *k, co
     dim3 grid(static_cast<unsigned>((n_q + 15) / 16), static_cast<unsigned>(n_heads));
     hipLaunchKernelGGL(attention_wmma_prefill_kernel, grid, block, 0, as_stream(stream), q, k, v, out, n_q,
                        n_kv, n_heads, n_kv_heads, head_dim, causal);
+    note_wmma_launch();
     return hip_status(hipGetLastError());
 }
 
@@ -11289,6 +11461,11 @@ extern "C" int allpaca_moe_ffn_kquant(const float *, const int8_t *, const float
 }
 
 extern "C" uint64_t allpaca_hip_kernel_launches(void) { return 0; }
+extern "C" int32_t allpaca_hip_device_is_gfx12(int32_t) { return 0; }
+extern "C" int32_t allpaca_hip_set_prefill_wmma(int32_t) { return 0; }
+extern "C" int32_t allpaca_hip_prefill_wmma_active(void) { return 0; }
+extern "C" uint64_t allpaca_hip_wmma_launches(void) { return 0; }
+extern "C" uint64_t allpaca_hip_thread_wmma_launches(void) { return 0; }
 
 extern "C" uint64_t allpaca_hip_act_quant_reuses(void) { return 0; }
 
