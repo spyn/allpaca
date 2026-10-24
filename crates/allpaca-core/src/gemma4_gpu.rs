@@ -152,70 +152,212 @@ struct Scratch {
 // device chain is only driven under the weights' GPU lock.
 unsafe impl Send for Scratch {}
 
+/// Device bytes of every gemma4 sequence's K/V, for the stats.
+static KV_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes of gemma4 K/V on the cards now.
+pub(crate) fn kv_device_bytes() -> u64 {
+    KV_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Global blocks' K/V grows in steps of this many tokens.
+const GLOBAL_STEP: usize = 4096;
+/// VRAM left free on the card when global K/V grows.
+const KV_RESERVE: u64 = 512 << 20;
+
+/// A K or V buffer, counted in [`KV_BYTES`].
+struct KvBuf(DeviceWeights);
+
+impl KvBuf {
+    fn alloc(device: i32, bytes: usize) -> Result<Self, AllpacaError> {
+        let w = DeviceWeights::alloc(device, bytes)?;
+        KV_BYTES.fetch_add(w.bytes(), std::sync::atomic::Ordering::Relaxed);
+        Ok(Self(w))
+    }
+}
+
+impl Drop for KvBuf {
+    fn drop(&mut self) {
+        KV_BYTES.fetch_sub(self.0.bytes(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// One sequence's keys and values on the card, per block that writes them.
+///
+/// Global blocks keep every position (row = position), growing in
+/// [`GLOBAL_STEP`] steps. SWA blocks keep a window of `swa_rows` rows whose
+/// row 0 is position `swa_base`, a multiple of the attention chunk: when a
+/// pass would run past its end, the rows still visible move down to a new
+/// base (also chunk-aligned), so attention reads the same keys from the same
+/// chunk boundaries and the bits do not change.
 pub struct Gemma4DeviceKv {
     device: i32,
-    k: Vec<DeviceWeights>,
-    v: Vec<DeviceWeights>,
-    /// Tokens each buffer holds room for.
+    k: Vec<KvBuf>,
+    v: Vec<KvBuf>,
+    /// Tokens the global buffers hold room for.
     cap: usize,
+    swa_rows: usize,
+    swa_base: usize,
+    /// Scratch for moving one SWA buffer's rows.
+    tmp: Option<KvBuf>,
+    /// A deep copy that could not be made: every forward fails.
+    lost: bool,
 }
 
 impl std::fmt::Debug for Gemma4DeviceKv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Gemma4DeviceKv").field("cap", &self.cap).finish_non_exhaustive()
+        f.debug_struct("Gemma4DeviceKv")
+            .field("cap", &self.cap)
+            .field("swa_base", &self.swa_base)
+            .field("lost", &self.lost)
+            .finish_non_exhaustive()
     }
 }
 
-fn copy_of(src: &DeviceWeights, bytes: usize) -> Result<DeviceWeights, AllpacaError> {
-    let dst = DeviceWeights::alloc(src.device(), bytes.max(src.bytes() as usize))?;
+fn copy_into(dst: &DeviceWeights, dst_off: usize, src: &DeviceWeights, src_off: usize, bytes: usize) -> Result<(), AllpacaError> {
+    if bytes == 0 {
+        return Ok(());
+    }
     set_device(src.device())?;
-    memcpy(dst.ptr_at(0).cast_mut().cast(), src.ptr_at(0).cast(), src.bytes() as usize, MEMCPY_D2D)?;
+    memcpy(dst.byte_ptr_at(dst_off).cast_mut(), src.byte_ptr_at(src_off), bytes, MEMCPY_D2D)
+}
+
+fn copy_of(src: &KvBuf, bytes: usize) -> Result<KvBuf, AllpacaError> {
+    let dst = KvBuf::alloc(src.0.device(), bytes.max(src.0.bytes() as usize))?;
+    copy_into(&dst.0, 0, &src.0, 0, src.0.bytes() as usize)?;
     Ok(dst)
 }
 
 impl Clone for Gemma4DeviceKv {
-    /// A deep copy on the same card.
+    /// A deep copy on the same card. When the card has no room for one the
+    /// copy is marked lost: its next forward fails instead of reading
+    /// another sequence's keys.
     fn clone(&self) -> Self {
-        let dup = |w: &DeviceWeights| copy_of(w, 0).expect("copy gemma4 device K/V");
-        Self {
-            device: self.device,
-            k: self.k.iter().map(dup).collect(),
-            v: self.v.iter().map(dup).collect(),
-            cap: self.cap,
+        match self.try_clone() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "gemma4: copying a sequence's device K/V failed");
+                Self {
+                    device: self.device,
+                    k: Vec::new(),
+                    v: Vec::new(),
+                    cap: 0,
+                    swa_rows: self.swa_rows,
+                    swa_base: 0,
+                    tmp: None,
+                    lost: true,
+                }
+            }
         }
     }
 }
 
 impl Gemma4DeviceKv {
-    fn new(spec: &Gemma4Spec, device: i32, cap: usize) -> Result<Self, AllpacaError> {
-        let mut k = Vec::with_capacity(spec.kv_layers);
-        let mut v = Vec::with_capacity(spec.kv_layers);
-        for l in 0..spec.kv_layers {
-            let bytes = cap * spec.kv_row(l) * 4;
-            k.push(DeviceWeights::alloc(device, bytes)?);
-            v.push(DeviceWeights::alloc(device, bytes)?);
-        }
-        Ok(Self { device, k, v, cap })
+    /// Rows of an SWA block's buffer: the window, a pass, and two chunks of
+    /// slack (one for the aligned start, one so a rejected tail can step back).
+    pub(crate) fn swa_rows_for(spec: &Gemma4Spec) -> usize {
+        (spec.window + MAX_ROWS + 2 * ATTN_CHUNK).div_ceil(ATTN_CHUNK) * ATTN_CHUNK
     }
 
-    /// Room for `tokens`, keeping what the buffers hold.
-    fn reserve(&mut self, spec: &Gemma4Spec, tokens: usize) -> Result<(), AllpacaError> {
-        if tokens <= self.cap {
-            return Ok(());
-        }
-        let cap = tokens.max(self.cap * 2);
+    fn new(spec: &Gemma4Spec, device: i32, cap: usize, swa_rows: usize) -> Result<Self, AllpacaError> {
+        let cap = cap.div_ceil(GLOBAL_STEP) * GLOBAL_STEP;
+        let mut k = Vec::with_capacity(spec.kv_layers);
+        let mut v = Vec::with_capacity(spec.kv_layers);
+        let mut tmp_bytes = 0;
         for l in 0..spec.kv_layers {
-            let bytes = cap * spec.kv_row(l) * 4;
-            self.k[l] = copy_of(&self.k[l], bytes)?;
-            self.v[l] = copy_of(&self.v[l], bytes)?;
+            let rows = if spec.swa[l] { swa_rows } else { cap };
+            let bytes = rows * spec.kv_row(l) * 4;
+            if spec.swa[l] {
+                tmp_bytes = tmp_bytes.max(bytes);
+            }
+            k.push(KvBuf::alloc(device, bytes)?);
+            v.push(KvBuf::alloc(device, bytes)?);
         }
-        self.cap = cap;
+        let tmp = if tmp_bytes > 0 { Some(KvBuf::alloc(device, tmp_bytes)?) } else { None };
+        Ok(Self { device, k, v, cap, swa_rows, swa_base: 0, tmp, lost: false })
+    }
+
+    fn try_clone(&self) -> Result<Self, AllpacaError> {
+        Ok(Self {
+            device: self.device,
+            k: self.k.iter().map(|w| copy_of(w, 0)).collect::<Result<_, _>>()?,
+            v: self.v.iter().map(|w| copy_of(w, 0)).collect::<Result<_, _>>()?,
+            cap: self.cap,
+            swa_rows: self.swa_rows,
+            swa_base: self.swa_base,
+            tmp: match &self.tmp {
+                Some(t) => Some(KvBuf::alloc(self.device, t.0.bytes() as usize)?),
+                None => None,
+            },
+            lost: self.lost,
+        })
+    }
+
+    /// Byte offset of position `pos` in block `l`'s buffers.
+    fn offset(&self, spec: &Gemma4Spec, l: usize, pos: usize) -> usize {
+        let row = if spec.swa[l] { pos - self.swa_base } else { pos };
+        row * spec.kv_row(l) * 4
+    }
+
+    /// Room for a pass writing positions `start..end` whose SWA queries
+    /// read from `swa_lo` on; `start` tokens are held.
+    fn reserve(&mut self, spec: &Gemma4Spec, start: usize, end: usize, swa_lo: usize) -> Result<(), AllpacaError> {
+        if self.lost {
+            return Err(load_err("gemma4: this sequence's device K/V copy was lost".into()));
+        }
+        if end > self.cap {
+            let cap = end.div_ceil(GLOBAL_STEP) * GLOBAL_STEP;
+            let grow: u64 = (0..spec.kv_layers)
+                .filter(|&l| !spec.swa[l])
+                .map(|l| (2 * cap * spec.kv_row(l) * 4) as u64)
+                .sum();
+            let headroom = allpaca_hip::device_local_headroom(self.device)
+                .or_else(|| allpaca_hip::device_memory_info(self.device).ok().map(|(free, _)| free));
+            if headroom.is_some_and(|h| h < grow + KV_RESERVE) {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(format!(
+                    "gemma4: K/V for {end} tokens needs {} MiB more than the card has free",
+                    (grow + KV_RESERVE - headroom.unwrap_or(0)) >> 20
+                ))));
+            }
+            for l in (0..spec.kv_layers).filter(|&l| !spec.swa[l]) {
+                let bytes = cap * spec.kv_row(l) * 4;
+                self.k[l] = copy_of(&self.k[l], bytes)?;
+                self.v[l] = copy_of(&self.v[l], bytes)?;
+            }
+            self.cap = cap;
+        }
+        if swa_lo < self.swa_base {
+            return Err(load_err(format!(
+                "gemma4: SWA keys from {swa_lo} were dropped (buffer starts at {})",
+                self.swa_base
+            )));
+        }
+        if end - self.swa_base > self.swa_rows {
+            // Keep one chunk before the window so a rejected tail can step back.
+            let base = swa_lo.saturating_sub(ATTN_CHUNK).max(self.swa_base);
+            if end - base > self.swa_rows || base > start {
+                return Err(load_err(format!("gemma4: a pass of {} rows does not fit the SWA buffer", end - start)));
+            }
+            let tmp = self.tmp.as_ref().ok_or_else(|| load_err("gemma4: no SWA scratch".into()))?;
+            for l in (0..spec.kv_layers).filter(|&l| spec.swa[l]) {
+                let row = spec.kv_row(l) * 4;
+                let (from, n) = ((base - self.swa_base) * row, (start - base) * row);
+                for buf in [&self.k[l], &self.v[l]] {
+                    copy_into(&tmp.0, 0, &buf.0, from, n)?;
+                    copy_into(&buf.0, 0, &tmp.0, 0, n)?;
+                }
+            }
+            self.swa_base = base;
+        }
         Ok(())
     }
 
     pub(crate) fn device_bytes(&self) -> u64 {
-        self.k.iter().chain(&self.v).map(DeviceWeights::bytes).sum()
+        self.k.iter().chain(&self.v).chain(&self.tmp).map(|w| w.0.bytes()).sum()
+    }
+
+    pub(crate) fn swa_base(&self) -> usize {
+        self.swa_base
     }
 }
 
@@ -229,6 +371,8 @@ pub struct Gemma4Gpu {
     rope_ff: Option<DeviceWeights>,
     /// Ones, the gain of V's weightless RMS norm.
     ones: DeviceWeights,
+    /// Rows of a new sequence's SWA buffers ([`Gemma4DeviceKv::swa_rows_for`]).
+    swa_rows: usize,
     scratch: Scratch,
     weight_bytes: u64,
 }
@@ -299,6 +443,7 @@ impl Gemma4Gpu {
             head,
             rope_ff,
             ones,
+            swa_rows: Gemma4DeviceKv::swa_rows_for(spec),
             scratch,
             weight_bytes,
         })
@@ -352,6 +497,12 @@ impl Gemma4Gpu {
 
     pub(crate) fn device(&self) -> i32 {
         self.hip.device
+    }
+
+    /// Test hook: SWA buffers of new sequences get `rows` rows.
+    #[cfg(test)]
+    pub(crate) fn set_swa_rows(&mut self, rows: usize) {
+        self.swa_rows = rows;
     }
 
     pub(crate) fn weight_bytes(&self) -> u64 {
@@ -409,11 +560,15 @@ impl Gemma4Gpu {
                 "gemma4 sequence K/V is on another card".into(),
             )));
         }
+        // The SWA key window of this pass: from a chunk-aligned start up to
+        // the last row, with a mask per row.
+        let swa_lo = (start_pos + 1).saturating_sub(sp.window) / ATTN_CHUNK * ATTN_CHUNK;
+        let swa_n = end - swa_lo;
         if mem.device.is_none() {
-            mem.device = Some(Gemma4DeviceKv::new(sp, hip.device, KV_START.max(end))?);
+            mem.device = Some(Gemma4DeviceKv::new(sp, hip.device, KV_START.max(end), self.swa_rows)?);
         }
-        let kv = mem.device.as_mut().expect("device K/V");
-        kv.reserve(sp, end)?;
+        let kv = mem.device.as_mut().ok_or_else(|| load_err("gemma4: no device K/V".into()))?;
+        kv.reserve(sp, start_pos, end, swa_lo)?;
 
         // Embeddings on the host: the scaled token rows and the PLE rows,
         // the latter laid out [layer][row][ple_dim].
@@ -443,10 +598,6 @@ impl Gemma4Gpu {
             hip.scale_f32(s.ple, n, std::f32::consts::FRAC_1_SQRT_2)?;
         }
 
-        // The SWA key window of this pass: from a chunk-aligned start up to
-        // the last row, with a mask per row.
-        let swa_lo = (start_pos + 1).saturating_sub(sp.window) / ATTN_CHUNK * ATTN_CHUNK;
-        let swa_n = end - swa_lo;
         if sp.swa.iter().any(|&b| b) {
             let mut mask = vec![0u8; m * swa_n];
             for r in 0..m {
@@ -478,8 +629,9 @@ impl Gemma4Gpu {
             // The kernels scale scores by 1/sqrt(hd); gemma4 uses 1.
             hip.scale_f32(s.q, m * sp.n_heads * hd, (hd as f32).sqrt())?;
             if let (Some(wk), Some(kn)) = (&ly.wk, &ly.k_norm) {
-                let kd = kv.k[l].ptr_at(start_pos * kv_row * 4) as *mut f32;
-                let vd = kv.v[l].ptr_at(start_pos * kv_row * 4) as *mut f32;
+                let at = kv.offset(sp, l, start_pos);
+                let kd = kv.k[l].0.ptr_at(at) as *mut f32;
+                let vd = kv.v[l].0.ptr_at(at) as *mut f32;
                 wk.gemm(hip, s.xn, kd, m)?;
                 match &ly.wv {
                     Some(wv) => wv.gemm(hip, s.xn, vd, m)?,
@@ -491,13 +643,13 @@ impl Gemma4Gpu {
                 allpaca_hip::rope_neox_ff_rows_device(kd, m, sp.n_kv_heads, hd, start_pos, theta, ff)?;
             }
             let src = sp.kv_source(l);
-            let (kb, vb) = (&kv.k[src], &kv.v[src]);
+            let (kb, vb) = (&kv.k[src].0, &kv.v[src].0);
             let (h, kvh) = (sp.n_heads as i32, sp.n_kv_heads as i32);
             if sp.swa[l] {
                 hip.attention_device_masked(
                     s.q,
-                    kb.ptr_at(swa_lo * kv_row * 4),
-                    vb.ptr_at(swa_lo * kv_row * 4),
+                    kb.ptr_at(kv.offset(sp, src, swa_lo)),
+                    vb.ptr_at(kv.offset(sp, src, swa_lo)),
                     s.attn,
                     mi,
                     swa_n as i32,

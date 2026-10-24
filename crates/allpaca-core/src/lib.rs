@@ -78,6 +78,8 @@ pub use deepseek4::{
     write_tiny_deepseek4_ctx_gguf, write_tiny_deepseek4_gguf, write_tiny_deepseek4_packed_gguf,
     write_tiny_deepseek4_q8_gguf, TinyDsv4Ctx,
 };
+#[doc(hidden)]
+pub use gemma4::write_tiny_gemma4_gguf;
 pub use device_manager::{detect_pipeline_mode, suggested_kv_vram_bytes, DeviceInventory};
 pub use draft::{DraftModelProvider, DraftProvider, NGramProvider};
 pub use early_exit::{

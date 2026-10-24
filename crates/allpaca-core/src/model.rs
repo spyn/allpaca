@@ -7670,7 +7670,9 @@ impl TinyModel {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("gemma4 needs the sequence's state".into()))
             })?;
-            return crate::gemma4::forward_tokens(self, &[token], pos, logits, None, &mut memory.g4);
+            let r = crate::gemma4::forward_tokens(self, &[token], pos, logits, None, &mut memory.g4);
+            metrics.kv_bytes_on_device.store(crate::gemma4_gpu::kv_device_bytes(), std::sync::atomic::Ordering::Relaxed);
+            return r;
         }
         if self.dsv4.is_some() {
             return crate::deepseek4::forward_dsv4_token(
@@ -8275,7 +8277,9 @@ impl TinyModel {
             return crate::qwen4exp::forward_qwen4_batch(self, tokens, segs, row_logits);
         }
         if self.g4.is_some() {
-            return crate::gemma4::forward_batch(self, tokens, segs, row_logits);
+            let r = crate::gemma4::forward_batch(self, tokens, segs, row_logits);
+            metrics.kv_bytes_on_device.store(crate::gemma4_gpu::kv_device_bytes(), std::sync::atomic::Ordering::Relaxed);
+            return r;
         }
         let mut last = vec![0.0f32; vocab];
         // Each sequence's rows must match its solo run bit for bit.
@@ -8329,7 +8333,9 @@ impl TinyModel {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("gemma4 needs the sequence's state".into()))
             })?;
-            return crate::gemma4::forward_tokens(self, tokens, start_pos, logits, row_logits.as_deref_mut(), &mut memory.g4);
+            let r = crate::gemma4::forward_tokens(self, tokens, start_pos, logits, row_logits.as_deref_mut(), &mut memory.g4);
+            metrics.kv_bytes_on_device.store(crate::gemma4_gpu::kv_device_bytes(), std::sync::atomic::Ordering::Relaxed);
+            return r;
         }
         if self.q4x.is_some() {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {

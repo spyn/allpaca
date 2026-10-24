@@ -580,7 +580,7 @@ pub(crate) fn attach_gpu(model: &TinyModel, hip: Arc<allpaca_hip::HipWorkspace>)
 
 /// Write a tiny gemma4 GGUF for tests: `n_layers` blocks, the last
 /// `shared` sharing K/V, SWA on all but every third block, PLE, softcap.
-#[cfg(test)]
+#[doc(hidden)]
 pub fn write_tiny_gemma4_gguf(path: &std::path::Path, shared: usize) {
     use allpaca_gguf::{write_gguf_quant, GgmlType, GgufWriteQuantTensor, GgufWriteTensor};
     let (dim, ff, vocab, n_layers, n_heads, n_kv, hd, hd_swa, pd) = (32usize, 64usize, 40usize, 6usize, 2usize, 1usize, 16usize, 8usize, 4usize);
@@ -835,7 +835,9 @@ mod tests {
         let mut last = vec![0.0f32; vocab];
         // Positions 250..258 and 380..388 straddle the 128-key chunks and
         // move the SWA window start.
-        for prefix in [250usize, 380] {
+        // The window's chunk-aligned start moves inside both spans (window 5:
+        // it is 128 up to position 259 and 256 from 260; 256 up to 387, 384 from 388).
+        for prefix in [255usize, 385] {
             let toks: Vec<u32> = toks.iter().cycle().take(prefix + 8).copied().collect();
             let mut a = Gemma4Memory::default();
             forward_tokens(&model, &toks[..prefix], 0, &mut last, None, &mut a).unwrap();
@@ -942,6 +944,150 @@ mod tests {
                 n = want.len()
             );
             assert!(cpu.max(vulkan) >= between, "{case}");
+        }
+    }
+
+    fn gpu_of(model: &TinyModel) -> std::sync::MutexGuard<'_, Option<crate::gemma4_gpu::Gemma4Gpu>> {
+        model.g4.as_ref().unwrap().gpu.lock().unwrap()
+    }
+
+    /// Prefill `n` tokens in passes of `pass`, then `steps` decode rows;
+    /// every row's logits.
+    fn run_rows(model: &TinyModel, n: usize, pass: usize, steps: usize) -> (Vec<f32>, Gemma4Memory) {
+        let vocab = model.config.vocab_size;
+        let toks = prompt(n + steps);
+        let mut mem = Gemma4Memory::default();
+        let mut rows = vec![0.0f32; (n + steps) * vocab];
+        let mut last = vec![0.0f32; vocab];
+        let mut at = 0;
+        while at < n + steps {
+            let len = if at < n { pass.min(n - at) } else { 1 };
+            forward_tokens(model, &toks[at..at + len], at, &mut last, Some(&mut rows[at * vocab..(at + len) * vocab]), &mut mem).unwrap();
+            at += len;
+        }
+        (rows, mem)
+    }
+
+    #[test]
+    fn gpu_swa_buffer_shift_keeps_the_bits() {
+        let shifted = tiny(2, "gpu_shift_a");
+        let wide = tiny(2, "gpu_shift_b");
+        if !on_gpu(&shifted) || !on_gpu(&wide) {
+            return;
+        }
+        gpu_of(&wide).as_mut().unwrap().set_swa_rows(1 << 14);
+        let (a, ma) = run_rows(&shifted, 1500, 200, 40);
+        let (b, mb) = run_rows(&wide, 1500, 200, 40);
+        let (da, db) = (ma.device.as_ref().unwrap(), mb.device.as_ref().unwrap());
+        assert!(da.swa_base() > 0, "the default SWA buffer must have moved");
+        assert_eq!(db.swa_base(), 0);
+        assert_eq!(a, b, "moving the SWA rows must not change a bit");
+        // A rejected tail after a move: truncate 8 and redo them.
+        let mut m2 = ma.clone();
+        let sp = shifted.g4.as_ref().unwrap().spec.clone();
+        m2.truncate(1532, &sp);
+        let vocab = shifted.config.vocab_size;
+        let toks = prompt(1540);
+        let mut redo = vec![0.0f32; 8 * vocab];
+        let mut last = vec![0.0f32; vocab];
+        forward_tokens(&shifted, &toks[1532..], 1532, &mut last, Some(&mut redo), &mut m2).unwrap();
+        assert_eq!(&redo[..], &a[1532 * vocab..1540 * vocab]);
+    }
+
+    #[test]
+    fn gpu_long_prompt_keeps_swa_memory_bounded() {
+        let model = tiny(2, "gpu_long");
+        if !on_gpu(&model) {
+            return;
+        }
+        let sp = model.g4.as_ref().unwrap().spec.clone();
+        let toks = prompt(40_000);
+        let mut mem = Gemma4Memory::default();
+        let mut last = vec![0.0f32; model.config.vocab_size];
+        forward_tokens(&model, &toks, 0, &mut last, None, &mut mem).unwrap();
+        let kv = mem.device.as_ref().unwrap();
+        let swa_rows = crate::gemma4_gpu::Gemma4DeviceKv::swa_rows_for(&sp);
+        let cap = 40_000usize.div_ceil(4096) * 4096;
+        let want: usize = (0..sp.kv_layers)
+            .map(|l| 2 * 4 * sp.kv_row(l) * if sp.swa[l] { swa_rows } else { cap })
+            .sum::<usize>()
+            + 4 * swa_rows * (0..sp.kv_layers).filter(|&l| sp.swa[l]).map(|l| sp.kv_row(l)).max().unwrap();
+        assert_eq!(kv.device_bytes() as usize, want, "SWA buffers stay {swa_rows} rows; globals grow in 4096-token steps");
+        assert!(kv.swa_base() > 39_000 - swa_rows);
+        assert!(crate::gemma4_gpu::kv_device_bytes() >= kv.device_bytes());
+        assert!(last.iter().all(|v| v.is_finite()));
+    }
+
+    fn device_vec(hip: &allpaca_hip::HipWorkspace, v: &[f32]) -> allpaca_hip::DeviceWeights {
+        let w = allpaca_hip::DeviceWeights::alloc(hip.device, v.len() * 4).unwrap();
+        hip.copy_h2d_f32(w.ptr_at(0) as *mut f32, v).unwrap();
+        w
+    }
+
+    fn from_device(hip: &allpaca_hip::HipWorkspace, w: &allpaca_hip::DeviceWeights, n: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; n];
+        hip.copy_d2h_f32(w.ptr_at(0), &mut out).unwrap();
+        out
+    }
+
+    fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+        let worst = got.iter().zip(want).map(|(a, b)| (a - b).abs() / b.abs().max(1.0)).fold(0.0f32, f32::max);
+        assert!(worst <= tol, "{what}: worst relative error {worst}");
+    }
+
+    #[test]
+    fn gpu_kernels_match_the_host_at_gemma4_head_dims() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            eprintln!("gemma4 GPU test skipped: no HIP device");
+            return;
+        };
+        let val = |i: usize, salt: usize| (((i * 7919 + salt) % 997) as f32 - 498.0) / 97.0;
+        for hd in [256usize, 512] {
+            let (rows, heads) = (5usize, 3usize);
+            let x: Vec<f32> = (0..rows * heads * hd).map(|i| val(i, hd)).collect();
+            // Proportional rope: a quarter of the pairs turn.
+            let ff: Vec<f32> = (0..hd / 2).map(|i| if i < hd / 8 { 1.0 } else { 1e30 }).collect();
+            for (theta, ffs) in [(10_000.0f32, None), (1_000_000.0, Some(&ff))] {
+                let d = device_vec(&hip, &x);
+                let fd = ffs.map(|f| device_vec(&hip, f));
+                allpaca_hip::rope_neox_ff_rows_device(d.ptr_at(0) as *mut f32, rows, heads, hd, 777, theta, fd.as_ref().map_or(std::ptr::null(), |f| f.ptr_at(0))).unwrap();
+                let mut want = x.clone();
+                for (r, row) in want.chunks_mut(heads * hd).enumerate() {
+                    for head in row.chunks_mut(hd) {
+                        rope_neox_ff(head, 777 + r, theta, ffs.map(|f| f.as_slice()));
+                    }
+                }
+                close(&from_device(&hip, &d, x.len()), &want, 1e-3, &format!("rope hd {hd}"));
+            }
+            let up: Vec<f32> = (0..x.len()).map(|i| val(i, 3)).collect();
+            let (g, u) = (device_vec(&hip, &x), device_vec(&hip, &up));
+            allpaca_hip::gelu_tanh_mul_device(g.ptr_at(0) as *mut f32, u.ptr_at(0), x.len()).unwrap();
+            let want: Vec<f32> = x.iter().zip(&up).map(|(a, b)| gelu_tanh(*a) * b).collect();
+            close(&from_device(&hip, &g, x.len()), &want, 1e-5, "gelu_tanh_mul");
+            let big: Vec<f32> = x.iter().map(|v| v * 20.0).collect();
+            let c = device_vec(&hip, &big);
+            allpaca_hip::softcap_device(c.ptr_at(0) as *mut f32, big.len(), 30.0).unwrap();
+            let mut want = big.clone();
+            softcap(&mut want, 30.0);
+            close(&from_device(&hip, &c, big.len()), &want, 1e-5, "softcap");
+            // Attention at this head dim (the 512 case is the widest LDS
+            // tile): causal over 300 keys, 8 query heads on 2 KV heads,
+            // queries pre-scaled by sqrt(hd) as the chain does.
+            let (n_q, n_kv, h, kvh) = (4usize, 300usize, 8usize, 2usize);
+            let q: Vec<f32> = (0..n_q * h * hd).map(|i| val(i, 11) * 0.05).collect();
+            let k: Vec<f32> = (0..n_kv * kvh * hd).map(|i| val(i, 13) * 0.05).collect();
+            let v: Vec<f32> = (0..n_kv * kvh * hd).map(|i| val(i, 17)).collect();
+            let s = (hd as f32).sqrt();
+            let qs: Vec<f32> = q.iter().map(|x| x * s).collect();
+            let (qd, kd, vd) = (device_vec(&hip, &qs), device_vec(&hip, &k), device_vec(&hip, &v));
+            let od = device_vec(&hip, &vec![0.0; n_q * h * hd]);
+            hip.attention_device(qd.ptr_at(0), kd.ptr_at(0), vd.ptr_at(0), od.ptr_at(0) as *mut f32, n_q as i32, n_kv as i32, h as i32, kvh as i32, hd as i32, true).unwrap();
+            let got = from_device(&hip, &od, n_q * h * hd);
+            for r in 0..n_q {
+                let pos = n_kv - n_q + r;
+                let want = attend(&q[r * h * hd..(r + 1) * h * hd], &k, &v, 0, pos, h, kvh, hd);
+                close(&got[r * h * hd..(r + 1) * h * hd], &want, 1e-4, &format!("attention hd {hd} row {r}"));
+            }
         }
     }
 
