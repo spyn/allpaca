@@ -152,8 +152,9 @@ struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        // Windows leaves the process running after Child::kill, so the next
-        // round would time the same server. taskkill /T is what actually stops it.
+        // Child::kill ends only this process. taskkill /T also ends any process
+        // it started, in case one of them holds the port. Neither waits for the
+        // port to close; `start` checks that before the next server starts.
         #[cfg(windows)]
         {
             let _ = Command::new("taskkill")
@@ -164,6 +165,17 @@ impl Drop for Server {
         }
         let _ = self.0.wait();
     }
+}
+
+/// Whether something still serves HTTP at `target`. Any response counts, a 401
+/// or 503 too: an old server with another password is still running. Only a
+/// failed connection means the port is free.
+fn port_answers(client: &reqwest::blocking::Client, target: &Target) -> bool {
+    client
+        .get(format!("{}/v1/models", target.url))
+        .bearer_auth(&target.key)
+        .send()
+        .is_ok()
 }
 
 /// Start `server` with `config` and wait until it answers.
@@ -188,12 +200,7 @@ fn start(server: &Path, config: &Path, timeout: Duration) -> Result<(Server, Tar
     // A previous server can still be answering on this port. Starting now would
     // time that process and report a fresh start.
     let down_by = Instant::now() + Duration::from_secs(20);
-    while client
-        .get(format!("{}/v1/models", target.url))
-        .bearer_auth(&target.key)
-        .send()
-        .is_ok_and(|r| r.status().is_success())
-    {
+    while port_answers(&client, &target) {
         if Instant::now() > down_by {
             return Err(format!(
                 "{}: port {} is still serving, so this would not be a fresh start",
@@ -323,5 +330,48 @@ fn main() {
     if let Err(e) = result {
         eprintln!("allpaca-bench: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A server on a free local port that answers every request with `status`.
+    fn answering(status: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        url
+    }
+
+    fn client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap()
+    }
+
+    fn target(url: String) -> Target {
+        Target { url, key: "wrong".into(), max_tokens: 0 }
+    }
+
+    #[test]
+    fn an_old_server_refusing_the_key_still_counts_as_serving() {
+        assert!(port_answers(&client(), &target(answering("401 Unauthorized"))));
+        assert!(port_answers(&client(), &target(answering("503 Service Unavailable"))));
+        assert!(port_answers(&client(), &target(answering("200 OK"))));
+    }
+
+    #[test]
+    fn a_closed_port_is_gone() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert!(!port_answers(&client(), &target(format!("http://127.0.0.1:{port}"))));
     }
 }

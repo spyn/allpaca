@@ -3954,6 +3954,15 @@ extern "C" int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, 
     return launch_gemm_nt_q3_k(a, b, c, m, n, k, as_stream(stream));
 }
 
+/* Lanes per column the int8 K-quant GEMV launches for type `qt` (3..6) and `n`
+ * outputs on the bound device, so host models can sum in the same order. */
+extern "C" int allpaca_kquant_i8_lanes(int32_t qt, int32_t n) {
+    if (qt < 3 || qt > 6 || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return kq_i8_lanes(qt, n);
+}
+
 /* One thread per output column. Native 144-byte Q4_K super-blocks along K.
  * Baseline: each column re-reads A from global (no LDS tile). */
 __global__ void gemv_nt_q4_k_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
@@ -10990,6 +10999,10 @@ extern "C" int allpaca_gemm_nt_q5_k(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_gemm_nt_q3_k(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_kquant_i8_lanes(int32_t, int32_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
