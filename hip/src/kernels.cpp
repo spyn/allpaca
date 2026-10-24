@@ -3188,6 +3188,17 @@ __device__ inline void kq_load_u32s(const void *p, uint32_t (&v)[NC]) {
     }
 }
 
+/* Packed-byte subtract without saturation (llama.cpp #27962, #29478).
+ * Q3_K codes are 0..7, so subtracting 4 stays in int8 and
+ * `dot4(q - 4, a)` equals `dot4(q, a) - 4 * sum(a)`. */
+__device__ inline uint32_t allpaca_vsub4(uint32_t a, uint32_t b) {
+    const uint32_t a_large = a | 0x80808080u;
+    const uint32_t b_small = b & 0x7f7f7f7fu;
+    const uint32_t low7 = a_large - b_small;
+    const uint32_t flip = (a ^ ~b) & 0x80808080u;
+    return low7 ^ flip;
+}
+
 /* One block of the int8 K-quant GEMV: columns from `bx`, rows `row0 .. +MR`. */
 template <int QT, int MR, int LPC>
 __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const uint8_t *b,
@@ -3289,6 +3300,15 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                 // hmask[32] qs[64] scales[12] d: weight = d * (sc - 32) * (q2 | h << 2 - 4).
                 const float d = allpaca_f16le_to_f32(blk + 108);
                 const uint8_t *sc = blk + 96;
+                // `q - 4` packed saves a dot per word: 0.45-0.64x the time at 8 rows on
+                // RDNA4 and 0.87x on the MI50, but on the MI50 2 rows of 5120^2 ran 12%
+                // slower (65.3 -> 73.2 us), so gfx9 keeps `dot(q) - 4 * dot(1)` up to 2
+                // rows. Both give the same int32.
+#if defined(__GFX9__)
+                constexpr bool SUB4 = MR > 2;
+#else
+                constexpr bool SUB4 = true;
+#endif
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     uint32_t q[NC];
@@ -3296,7 +3316,9 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                     for (int t = 0; t < NC; ++t) {
                         const uint32_t qs = kq_u32_from_u16(blk + 32 + h * 32 + j0 + 4 * t);
                         const uint32_t hm = kq_u32_from_u16(blk + j0 + 4 * t);
-                        q[t] = ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
+                        const uint32_t v =
+                            ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
+                        q[t] = SUB4 ? allpaca_vsub4(v, 0x04040404u) : v;
                     }
                     const int is = h * 8 + 2 * g + j0 / 16;
                     const int s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) |
@@ -3311,7 +3333,9 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
 #pragma unroll
                         for (int t = 0; t < NC; ++t) {
                             dot = i8dot4(av[t], q[t], dot);
-                            sum = i8dot4(av[t], ONES, sum);
+                            if constexpr (!SUB4) {
+                                sum = i8dot4(av[t], ONES, sum);
+                            }
                         }
                         acc[r] += s * drow[r][bi] * static_cast<float>(dot - 4 * sum);
                     }
@@ -3540,7 +3564,7 @@ __global__ __launch_bounds__(256) void gemv_nt_kquant_i8_tile_kernel(
                         const uint32_t hm = kq_u32_from_u16(blk + j0 + 4 * t);
                         const uint32_t v =
                             ((qs >> (2 * g)) & 0x03030303u) | (((hm >> (4 * h + g)) & ONES) << 2);
-                        q[t] = ((v | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
+                        q[t] = allpaca_vsub4(v, 0x04040404u);
                     }
                     const int is = h * 8 + 2 * g + j0 / 16;
                     const int s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) |
@@ -4104,6 +4128,15 @@ extern "C" int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, 
     return launch_gemm_nt_q3_k(a, b, c, m, n, k, as_stream(stream));
 }
 
+/* Lanes per column the int8 K-quant GEMV launches for type `qt` (3..6) and `n`
+ * outputs on the bound device, so host models can sum in the same order. */
+extern "C" int allpaca_kquant_i8_lanes(int32_t qt, int32_t n) {
+    if (qt < 3 || qt > 6 || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    return kq_i8_lanes(qt, n);
+}
+
 /* One thread per output column. Native 144-byte Q4_K super-blocks along K.
  * Baseline: each column re-reads A from global (no LDS tile). */
 __global__ void gemv_nt_q4_k_untiled_kernel(const float *a, const uint8_t *b, float *c, int m,
@@ -4310,7 +4343,10 @@ extern "C" int allpaca_gemm_nt_tq2_0(const float *a, const uint8_t *b, float *c,
  * output column runs on four lanes, lane l taking blocks l, l+4, ... */
 /* Dot of one ggml Q2_0 block (18 bytes) with 64 activations, scale applied. With the block on
  * two bytes and the activations on sixteen, the codes load two at a time and the activations four
- * at a time; the sums run in the same order either way. */
+ * at a time; the sums run in the same order either way. The crumbs stay as
+ * `float(q >> s & 3) - 1`, which compiles to v_cvt_f32_ubyte plus a subtract: a v_perm_b32 to
+ * signed bytes (llama.cpp #29927) then needs a sign fix and a convert per crumb, and measured
+ * 1.6-1.9x slower on gfx1200/gfx1201 and 1.2-1.6x on gfx906 (board P5, 2026-10-24). */
 __device__ inline float q2_0_block_dot(const uint8_t *blk, const float *x) {
     float s = 0.f;
     if ((reinterpret_cast<uintptr_t>(blk) & 1u) == 0 && (reinterpret_cast<uintptr_t>(x) & 15u) == 0) {
@@ -11117,6 +11153,10 @@ extern "C" int allpaca_gemm_nt_q5_k(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_gemm_nt_q3_k(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_kquant_i8_lanes(int32_t, int32_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

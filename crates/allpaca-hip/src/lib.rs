@@ -647,6 +647,7 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_kquant_i8_lanes(qt: i32, n: i32) -> i32;
         pub fn allpaca_gemm_nt_q2_0(
             a: *const f32,
             b: *const u8,
@@ -4773,6 +4774,32 @@ pub fn gemm_nt_q3_k(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q3_k unavailable".into(),
+        )))
+    }
+}
+
+/// Lanes per output column that the int8 K-quant GEMV launches on `device`
+/// for GGUF K-quant type `qt` (3 = Q3_K .. 6 = Q6_K) and `n` output columns:
+/// 8 on RDNA, up to 32 on wave64 cards (the MI50). The order of a column's
+/// sums follows it, so host models of the kernel need it.
+pub fn kquant_i8_lanes(device: i32, qt: i32, n: i32) -> Result<usize, AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        set_device(device)?;
+        let rc = unsafe { ffi::allpaca_kquant_i8_lanes(qt, n) };
+        if rc > 0 {
+            return Ok(rc as usize);
+        }
+        status(rc, "kquant_i8_lanes")?;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP kquant_i8_lanes returned no lanes".into(),
+        )))
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (device, qt, n);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP kquant_i8_lanes unavailable".into(),
         )))
     }
 }
@@ -13697,6 +13724,58 @@ mod tests {
             for w in w4 {
                 device_free(w, p4.len());
             }
+            // Q2_0, 18-byte blocks of 64 (P5). Same rotation as the K-quant rows.
+            let p2: Vec<u8> = (0..n * k / 64 * 18)
+                .map(|i| match i % 18 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w2: Vec<*mut u8> = (0..copies_for(p2.len()))
+                .map(|_| {
+                    let w = device_malloc(p2.len(), dev).unwrap();
+                    memcpy(w, p2.as_ptr(), p2.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q2_0_device(x.cast(), w2[i % w2.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q2_0 gemv", format!("n={n} k={k} m={m}"), p2.len(), us);
+            }
+            for w in w2 {
+                device_free(w, p2.len());
+            }
+            // Q3_K, 110-byte super-blocks (P5).
+            let p3: Vec<u8> = (0..n * k / 256 * 110)
+                .map(|i| match i % 110 {
+                    108 => 0x00,
+                    109 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w3: Vec<*mut u8> = (0..copies_for(p3.len()))
+                .map(|_| {
+                    let w = device_malloc(p3.len(), dev).unwrap();
+                    memcpy(w, p3.as_ptr(), p3.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q3_k_device(x.cast(), w3[i % w3.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q3_k gemv", format!("n={n} k={k} m={m}"), p3.len(), us);
+            }
+            for w in w3 {
+                device_free(w, p3.len());
+            }
             device_free(x, 8 * k * 4);
             device_free(y, 8 * n * 4);
             // Decode attention, one query row, f32 KV (32 q heads, 8 kv heads, hd 128).
@@ -13774,6 +13853,90 @@ mod tests {
         if let Ok(path) = std::env::var("BENCH_OUT") {
             std::fs::write(&path, csv).unwrap();
             eprintln!("wrote {path}");
+        }
+    }
+
+    /// Q2_0 and Q3_K GEMVs (board P5) at m = 1, 2, 4, 8 on a dense 5120² shape
+    /// and an MoE expert shape (n = 640, k = 2560), on every device or
+    /// `BENCH_DEVICES`. Weights rotate past 192 MB as in `bench_kernel_matrix`.
+    /// Each line is `lowbit,<kernel>,<shape>,hip<dev>,<arch>,<µs>`, and
+    /// `BENCH_OUT=file.csv` writes the same rows, so main and a branch can be
+    /// run in turn and compared:
+    /// `cargo test --release -p allpaca-hip --features hip --lib bench_lowbit_gemv -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_lowbit_gemv() {
+        let devs: Vec<i32> = match std::env::var("BENCH_DEVICES") {
+            Ok(list) => list.split(',').filter_map(|d| d.trim().parse().ok()).collect(),
+            Err(_) => (0..device_count()).collect(),
+        };
+        const ROTATE_BYTES: usize = 192 << 20;
+        let mut csv = String::from("kernel,shape,device,arch,us\n");
+        for &dev in &devs {
+            set_device(dev).unwrap();
+            let arch = device_gcn_arch(dev).map(|(a, _)| a).unwrap_or_default();
+            for (n, k) in [(5120usize, 5120usize), (640, 2560)] {
+                let x = device_malloc(8 * k * 4, dev).unwrap();
+                let y = device_malloc(8 * n * 4, dev).unwrap();
+                let xs: Vec<f32> = (0..8 * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+                memcpy(x, xs.as_ptr().cast(), 8 * k * 4, MEMCPY_H2D).unwrap();
+                let p2: Vec<u8> = (0..n * k / 64 * 18)
+                    .map(|i| match i % 18 {
+                        0 => 0x00,
+                        1 => 0x1c,
+                        j => (i * 7 % 251 + j) as u8,
+                    })
+                    .collect();
+                let p3: Vec<u8> = (0..n * k / 256 * 110)
+                    .map(|i| match i % 110 {
+                        108 => 0x00,
+                        109 => 0x1c,
+                        j => (i * 7 % 251 + j) as u8,
+                    })
+                    .collect();
+                for (kernel, packed) in [("q2_0 gemv", &p2), ("q3_k gemv", &p3)] {
+                    let copies = ROTATE_BYTES.div_ceil(packed.len()).clamp(1, 64);
+                    let ws: Vec<*mut u8> = (0..copies)
+                        .map(|_| {
+                            let w = device_malloc(packed.len(), dev).unwrap();
+                            memcpy(w, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+                            w
+                        })
+                        .collect();
+                    for m in [1i32, 2, 4, 8] {
+                        let call = |i: usize| {
+                            let w = ws[i % ws.len()];
+                            if kernel == "q2_0 gemv" {
+                                gemm_nt_q2_0_device(x.cast(), w, y.cast(), m, n as i32, k as i32).unwrap();
+                            } else {
+                                gemm_nt_q3_k_device(x.cast(), w, y.cast(), m, n as i32, k as i32).unwrap();
+                            }
+                        };
+                        for i in 0..10 {
+                            call(i);
+                        }
+                        stream_synchronize().unwrap();
+                        let iters = 200usize;
+                        let t = std::time::Instant::now();
+                        for i in 0..iters {
+                            call(i);
+                        }
+                        stream_synchronize().unwrap();
+                        let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                        let shape = format!("n={n} k={k} m={m}");
+                        eprintln!("lowbit,{kernel},{shape},hip{dev},{arch},{us:.2}");
+                        csv += &format!("{kernel},{shape},{dev},{arch},{us:.2}\n");
+                    }
+                    for w in ws {
+                        device_free(w, packed.len());
+                    }
+                }
+                device_free(x, 8 * k * 4);
+                device_free(y, 8 * n * 4);
+            }
+        }
+        if let Ok(path) = std::env::var("BENCH_OUT") {
+            std::fs::write(&path, csv).unwrap();
         }
     }
 
@@ -16209,6 +16372,146 @@ mod tests {
         assert!(gemm_nt_q2_0(&[0.0; 65], &[0u8; 36], &mut [0.0; 1], 1, 1, 65).is_err());
     }
 
+    /// One Q2_0 block added to a lane's `acc`, same product order as
+    /// `q2_0_block_dot`: byte `w` then its high half, each crumb as
+    /// `(code - 1) * activation`, then `fma(d, s, acc)`: the kernel's
+    /// `acc += q2_0_block_dot(..)` contracts the scale into the lane sum.
+    #[cfg(feature = "hip")]
+    fn q2_0_block_dot_host(blk: &[u8], x: &[f32], acc: f32) -> f32 {
+        let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let mut s = 0.0f32;
+        for w in 0..8 {
+            let pair = u32::from(u16::from_le_bytes([blk[2 + 2 * w], blk[3 + 2 * w]]));
+            for half in 0..2 {
+                let q = pair >> (8 * half);
+                let base = (2 * w + half) * 4;
+                for shift in 0..4 {
+                    let code = f32::from(((q >> (2 * shift)) & 3) as u8) - 1.0;
+                    s = code.mul_add(x[base + shift], s);
+                }
+            }
+        }
+        d.mul_add(s, acc)
+    }
+
+    /// Host copy of `gemv_nt_q2_0_kernel`: four lanes take blocks `lane, lane+4, ...`
+    /// and the column is `(lane0 + lane1) + (lane2 + lane3)`.
+    #[cfg(feature = "hip")]
+    fn q2_0_gemv_lane_sum(a: &[f32], b: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let nblocks = k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+        let stride = allpaca_cpu::Q2_0_BLOCK_BYTES;
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            let arow = &a[row * k..(row + 1) * k];
+            for col in 0..n {
+                let brow = &b[col * nblocks * stride..(col + 1) * nblocks * stride];
+                let mut lanes = [0.0f32; 4];
+                for (ib, blk) in brow.chunks_exact(stride).enumerate() {
+                    let lane = &mut lanes[ib % 4];
+                    *lane = q2_0_block_dot_host(blk, &arow[ib * 64..(ib + 1) * 64], *lane);
+                }
+                c[row * n + col] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            }
+        }
+        c
+    }
+
+    /// Public Q2_0 GEMV must keep the four-lane sum's bits. A packed-byte
+    /// unpack that changes a product or the add order fails here.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q2_0_matches_the_four_lane_sum_bit_for_bit() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1usize, 4usize, 64usize), (1, 70, 192), (2, 3, 320), (3, 65, 128), (2, 9, 1024)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            let nblocks = n * k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+            let mut b_q = vec![0u8; nblocks * allpaca_cpu::Q2_0_BLOCK_BYTES];
+            let mut seed = 0x9e37_79b9u32.wrapping_mul(si as u32 + 1);
+            for (bi, block) in b_q.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                let d = (0.01 + 0.003 * (bi % 17) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+            }
+            let host = q2_0_gemv_lane_sum(&a, &b_q, m, n, k);
+            let mut hip = vec![0.0f32; m * n];
+            gemm_nt_q2_0(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q2_0 must run when a device is present");
+            for i in 0..m * n {
+                assert_eq!(
+                    hip[i].to_bits(),
+                    host[i].to_bits(),
+                    "q2_0 lane-sum bits {m}x{n}x{k} idx={i} hip={} host={}",
+                    hip[i],
+                    host[i]
+                );
+            }
+        }
+    }
+
+    /// Weights at an odd address and activations off a 16-byte boundary take
+    /// the byte-at-a-time branch of `q2_0_block_dot`; it must give the same
+    /// bits as the aligned one (the four-lane host sum).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q2_0_unaligned_inputs_keep_the_lane_sum_bits() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, n, k) = (2usize, 5usize, 320usize);
+        let mut a = vec![0.0f32; m * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 29 + 5) % 61) as f32 * 0.017 - 0.5;
+        }
+        let nblocks = n * k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+        let mut b_q = vec![0u8; nblocks * allpaca_cpu::Q2_0_BLOCK_BYTES];
+        let mut seed = 0x2545_f491u32;
+        for (bi, block) in b_q.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+            for byte in block[2..].iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (seed >> 24) as u8;
+            }
+            let d = (0.02 + 0.001 * (bi % 13) as f32) * if bi % 4 == 1 { -1.0 } else { 1.0 };
+            block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+        }
+        let host = q2_0_gemv_lane_sum(&a, &b_q, m, n, k);
+        set_device(0).unwrap();
+        let (a_bytes, b_bytes, c_bytes) = (m * k * 4, b_q.len(), m * n * 4);
+        let da = device_malloc(a_bytes + 16, 0).unwrap();
+        let db = device_malloc(b_bytes + 16, 0).unwrap();
+        let dc = device_malloc(c_bytes, 0).unwrap();
+        // hipMalloc is at least 256-byte aligned: +4 and +1 break the 16- and 2-byte tests.
+        let (a_at, b_at) = unsafe { (da.add(4), db.add(1)) };
+        assert_eq!(a_at as usize % 16, 4);
+        assert_eq!(b_at as usize % 2, 1);
+        memcpy(a_at, a.as_ptr().cast(), a_bytes, MEMCPY_H2D).unwrap();
+        memcpy(b_at, b_q.as_ptr(), b_bytes, MEMCPY_H2D).unwrap();
+        let run = gemm_nt_q2_0_device(a_at.cast(), b_at, dc.cast(), m as i32, n as i32, k as i32);
+        let mut hip = vec![0.0f32; m * n];
+        let back = run.and_then(|()| memcpy(hip.as_mut_ptr().cast(), dc, c_bytes, MEMCPY_D2H));
+        device_free(da, a_bytes + 16);
+        device_free(db, b_bytes + 16);
+        device_free(dc, c_bytes);
+        back.expect("unaligned Q2_0 GEMV");
+        for i in 0..m * n {
+            assert_eq!(
+                hip[i].to_bits(),
+                host[i].to_bits(),
+                "unaligned q2_0 idx={i} hip={} host={}",
+                hip[i],
+                host[i]
+            );
+        }
+    }
+
     /// Routed experts from a pool of Q2_0 slots must match the CPU's 8-bit
     /// products (gemv_q2_0_i8 on the input, then on the hidden row) up to
     /// the order of the sums, and the float SwiGLU within the rounding.
@@ -16734,6 +17037,216 @@ mod tests {
                 for s in 0..hc {
                     let want = x[at(s)] + out[i] * 2.0 * sig(logits[row * hc + s] / hc as f32);
                     assert!(close(combined[at(s)], want), "combine {row},{s},{d}");
+                }
+            }
+        }
+    }
+
+    /// int8 codes and scales, one scale per 32 values, as `quantize_rows_q8_kernel`.
+    #[cfg(feature = "hip")]
+    fn q3_k_q8_row(row: &[f32]) -> (Vec<i8>, Vec<f32>) {
+        let mut codes = Vec::with_capacity(row.len());
+        let mut scales = Vec::with_capacity(row.len() / 32);
+        for block in row.chunks_exact(32) {
+            let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+            scales.push(d);
+            for v in block {
+                let q = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                codes.push(q as i8);
+            }
+        }
+        (codes, scales)
+    }
+
+    #[cfg(feature = "hip")]
+    fn q3_k_i8dot4(a: u32, b: u32, c: i32) -> i32 {
+        let mut acc = c;
+        for i in 0..4 {
+            let av = ((a >> (8 * i)) & 0xff) as u8 as i8 as i32;
+            let bv = ((b >> (8 * i)) & 0xff) as u8 as i8 as i32;
+            acc += av * bv;
+        }
+        acc
+    }
+
+    #[cfg(feature = "hip")]
+    fn q3_k_u32(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// `__shfl_down(v, off, lanes)` halving from `lanes / 2`: each step adds the
+    /// lane `off` above. Lanes with no such source never feed lane 0, which
+    /// holds the column.
+    #[cfg(feature = "hip")]
+    fn q3_k_reduce_lanes(mut lanes: Vec<f32>) -> f32 {
+        let width = lanes.len();
+        let mut off = width / 2;
+        while off > 0 {
+            let old = lanes.clone();
+            for i in 0..width {
+                let src = i + off;
+                lanes[i] = if src < width { old[i] + old[src] } else { old[i] };
+            }
+            off >>= 1;
+        }
+        lanes[0]
+    }
+
+    /// Host copy of the Q3_K int8 GEMV (`kquant_i8_block` QT=3) at `lpc` lanes
+    /// per column, as `kq_i8_lanes` picks them: lane `sl` takes 32-value group
+    /// `g = sl / (lpc / 4)` and `128 / lpc` values from `j0` in it. Each lane sums
+    /// `s * act_scale * (dot(q, a) - 4 * sum(a))`, low half then high half, then
+    /// the width-`lpc` shuffle. RDNA launches 8 lanes; the MI50 32 when n < 2048.
+    #[cfg(feature = "hip")]
+    fn q3_k_gemv_lane_sum(
+        a: &[f32],
+        b: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        lpc: usize,
+    ) -> Vec<f32> {
+        assert!(matches!(lpc, 8 | 16 | 32), "Q3_K int8 GEMV lanes {lpc}");
+        let w = 128 / lpc;
+        let nc = w / 4;
+        let lpg = lpc / 4;
+        let nblocks = k / 256;
+        let stride = Q3_K_BLOCK_BYTES;
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            let (codes, scales) = q3_k_q8_row(&a[row * k..(row + 1) * k]);
+            for col in 0..n {
+                let brow = &b[col * nblocks * stride..(col + 1) * nblocks * stride];
+                let mut lanes = vec![0.0f32; lpc];
+                for (sl, lane) in lanes.iter_mut().enumerate() {
+                    let g = sl / lpg;
+                    let j0 = (sl % lpg) * w;
+                    for ib in 0..nblocks {
+                        let blk = &brow[ib * stride..(ib + 1) * stride];
+                        let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
+                        let sc = &blk[96..108];
+                        for h in 0..2 {
+                            let mut dot = 0i32;
+                            let mut sum = 0i32;
+                            let bi = ib * 8 + h * 4 + g;
+                            for t in 0..nc {
+                                let qs = q3_k_u32(&blk[32 + h * 32 + j0 + 4 * t..]);
+                                let hm = q3_k_u32(&blk[j0 + 4 * t..]);
+                                let q = ((qs >> (2 * g)) & 0x0303_0303)
+                                    | (((hm >> (4 * h + g)) & 0x0101_0101) << 2);
+                                let at = bi * 32 + j0 + 4 * t;
+                                let av = u32::from_le_bytes([
+                                    codes[at] as u8,
+                                    codes[at + 1] as u8,
+                                    codes[at + 2] as u8,
+                                    codes[at + 3] as u8,
+                                ]);
+                                dot = q3_k_i8dot4(av, q, dot);
+                                sum = q3_k_i8dot4(av, 0x0101_0101, sum);
+                            }
+                            let is = h * 8 + 2 * g + j0 / 16;
+                            let s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) as i32
+                                | ((((sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3) as i32) << 4);
+                            let s = d * (s6 - 32) as f32;
+                            let partial = (dot - 4 * sum) as f32;
+                            *lane = (s * scales[bi]).mul_add(partial, *lane);
+                        }
+                    }
+                }
+                c[row * n + col] = q3_k_reduce_lanes(lanes);
+            }
+        }
+        c
+    }
+
+    /// The lane model only proves something if the lane count matters: on
+    /// this shape 8 and 32 lanes give different bits somewhere.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q3_k_lane_model_depends_on_the_lane_count() {
+        let (m, n, k) = (2usize, 7usize, 768usize);
+        let (a, _, _) = fill_q5k_gemm_case(3, m, n, k);
+        let b_q = fill_q3k_blocks(3, n, k);
+        let eight = q3_k_gemv_lane_sum(&a, &b_q, m, n, k, 8);
+        let wide = q3_k_gemv_lane_sum(&a, &b_q, m, n, k, 32);
+        assert!(
+            eight.iter().zip(&wide).any(|(x, y)| x.to_bits() != y.to_bits()),
+            "8- and 32-lane sums agree bit for bit; the test cannot tell them apart"
+        );
+        for (x, y) in eight.iter().zip(&wide) {
+            assert!((x - y).abs() <= 1e-3 * x.abs().max(1.0), "8 lanes {x} vs 32 lanes {y}");
+        }
+    }
+
+    /// Q3_K GEMV must keep the bits of the lane sum the kernel really launches
+    /// (`kquant_i8_lanes` asks the device), on every arch: 8 lanes on RDNA, 32 on
+    /// the MI50 below n = 2048. A packed-byte subtract that changes a product or
+    /// the add order fails here.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q3_k_matches_the_launched_lane_sum_bit_for_bit() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (1usize, 4usize, 256usize),
+            (2, 3, 512),
+            (1, 7, 256),
+            (4, 5, 768),
+            (1, 2048, 256),
+        ];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let lpc = kquant_i8_lanes(0, 3, n as i32).expect("Q3_K int8 lane count");
+            let (a, _, _) = fill_q5k_gemm_case(si, m, n, k);
+            let b_q = fill_q3k_blocks(si, n, k);
+            let host = q3_k_gemv_lane_sum(&a, &b_q, m, n, k, lpc);
+            let mut hip = vec![0.0f32; m * n];
+            gemm_nt_q3_k(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q3_k must run when a device is present");
+            for i in 0..m * n {
+                assert_eq!(
+                    hip[i].to_bits(),
+                    host[i].to_bits(),
+                    "q3_k {lpc}-lane sum bits {m}x{n}x{k} idx={i} hip={} host={}",
+                    hip[i],
+                    host[i]
+                );
+            }
+        }
+    }
+
+    /// A verify batch must give each row the bits it gets alone: m = 9..16
+    /// runs the tile kernel on the MI50 and blocks of 5-8 rows on RDNA.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q3_k_batch_rows_equal_single_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(9usize, 7usize, 512usize), (16, 5, 768), (12, 2048, 256)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let (a, _, _) = fill_q5k_gemm_case(si + 7, m, n, k);
+            let b_q = fill_q3k_blocks(si + 7, n, k);
+            let mut batch = vec![0.0f32; m * n];
+            gemm_nt_q3_k(&a, &b_q, &mut batch, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q3_k batch");
+            for r in 0..m {
+                let mut one = vec![0.0f32; n];
+                gemm_nt_q3_k(&a[r * k..(r + 1) * k], &b_q, &mut one, 1, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q3_k single row");
+                for col in 0..n {
+                    assert_eq!(
+                        batch[r * n + col].to_bits(),
+                        one[col].to_bits(),
+                        "q3_k m={m} n={n} k={k} row {r} col {col}: batch {} vs alone {}",
+                        batch[r * n + col],
+                        one[col]
+                    );
                 }
             }
         }
