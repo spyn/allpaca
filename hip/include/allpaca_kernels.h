@@ -308,8 +308,8 @@ int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, 
 /* gfx12 f16 WMMA form of allpaca_gemm_nt_f16. One wave32 owns each 16x16 output
  * tile (v_wmma_f32_16x16x16_f16). A keeps ~f32 precision (row-scaled hi/lo f16
  * split, no f16 overflow). Exact-row mode and any other device run
- * allpaca_gemm_nt_f16. Callers in a forward use it only inside the prefill
- * WMMA scope (experimental.row_variant_kernels). */
+ * allpaca_gemm_nt_f16. Not used by any forward (slower than the F16 prefill
+ * path as written); a future caller must sit inside the prefill WMMA scope. */
 int allpaca_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                              int32_t k, allpaca_stream_t stream);
 

@@ -1696,7 +1696,7 @@ fn write_packed_f16_gguf_with_rope_dims(path: &std::path::Path, rope_dims: u32) 
 }
 
 /// Two-layer F16 llama with varied weights for the gfx12 WMMA tests:
-/// head_dim 64 (a WMMA shape), GQA 4:1, F16 GEMMs (the WMMA GEMM's input),
+/// head_dim 64 (a WMMA attention shape), GQA 4:1, F16 weights,
 /// and 40 words so a prompt gives a wide prefill.
 #[cfg(feature = "hip")]
 fn write_varied_f16_llama(path: &std::path::Path) {

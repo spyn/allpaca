@@ -1501,8 +1501,8 @@ pub fn prefill_wmma_active() -> bool {
 }
 
 /// Prefill WMMA scope (`experimental.row_variant_kernels`): while it lives,
-/// this thread's prefill GEMMs over F16 weights (m > 8) and multi-row
-/// attention run on the gfx12 WMMA kernels. Those give a row other bits than
+/// this thread's multi-row attention runs on the gfx12 WMMA flash kernel
+/// (the WMMA GEMMs are building blocks no forward calls yet). It gives a row other bits than
 /// the decode kernels, so the engine opens it only around a prompt's prefill
 /// forward, never around decode, speculative verify or batched forwards, and
 /// only when the option is on. [`ExactRows`] wins over it. Dropping it
@@ -2780,7 +2780,8 @@ pub fn gemm_nt_f16_device(
 }
 
 /// Device-pointer gfx12 f16 WMMA. Non-gfx12 and exact-row mode use [`gemm_nt_f16_device`].
-/// It launches WMMA whenever called; forwards call it only inside a [`PrefillWmma`] scope.
+/// Not used by any forward: a tested building block (slower than the current
+/// F16 prefill GEMM as written; one wave per 16x16 tile, no LDS reuse).
 pub fn gemm_nt_f16_wmma_device(
     a: *const f32,
     b: *const u16,
@@ -4115,9 +4116,8 @@ pub fn gemm_nt_f16(
 }
 
 /// gfx12 f16 WMMA form of [`gemm_nt_f16`]: `C[m,n] = A * dequant(B_f16)^T`, A kept
-/// at ~f32 precision (row-scaled hi/lo f16 split). Kernel test entry: a forward
-/// reaches this kernel only through [`HipWorkspace::gemm_nt_f16_dev`] inside a
-/// [`PrefillWmma`] scope.
+/// at ~f32 precision (row-scaled hi/lo f16 split). Kernel test entry; no
+/// forward calls it (it was ~4x slower than the existing F16 prefill path).
 ///
 /// gfx1200 and gfx1201 run the WMMA tile. Every other device runs [`gemm_nt_f16`].
 pub fn gemm_nt_f16_wmma(
@@ -7200,16 +7200,10 @@ impl HipWorkspace {
         } else {
             DecodeOp::OtherGpu
         };
-        // WMMA only for a prefill forward with the experimental option on
-        // (see `PrefillWmma`); every other forward keeps the exact kernels.
-        let wmma = m > 8 && prefill_wmma_active() && device_is_gfx12(self.device);
-        self.timed_gpu(op, || {
-            if wmma {
-                gemm_nt_f16_wmma_device(a, b, c, m, n, k)
-            } else {
-                gemm_nt_f16_device(a, b, c, m, n, k)
-            }
-        })
+        // The gfx12 f16 WMMA GEMM (`gemm_nt_f16_wmma_device`) is not routed
+        // here: on Llama-3.2-3B F16 it made prefill ~4x slower than this path
+        // (measured 2026-10-24, B3). It stays a tested building block.
+        self.timed_gpu(op, || gemm_nt_f16_device(a, b, c, m, n, k))
     }
 
     /// Dense weights of a model whose "BF16" tensors are Q8_0 in the file:
@@ -14193,6 +14187,63 @@ mod tests {
             }
             device_free(q, nh * hd * 4);
             device_free(out, nh * hd * 4);
+            // B3: prefill f16 GEMM and prefill attention, exact kernels vs the
+            // gfx12 WMMA kernels (PrefillWmma scope; other devices fall back,
+            // so both rows time the exact kernel there). Llama-3.2-3B shapes.
+            for wmma in [false, true] {
+                let tag = if wmma { "wmma" } else { "exact" };
+                let _scope = wmma.then(PrefillWmma::enable);
+                let (m, n, k) = (512usize, 3072usize, 3072usize);
+                let a = device_malloc(m * k * 4, dev).unwrap();
+                let c = device_malloc(m * n * 4, dev).unwrap();
+                let w = device_malloc(n * k * 2, dev).unwrap();
+                let av: Vec<f32> = (0..m * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+                memcpy(a, av.as_ptr().cast(), m * k * 4, MEMCPY_H2D).unwrap();
+                let wv: Vec<u16> = (0..n * k).map(|i| allpaca_cpu::f32_to_f16(((i * 7 % 89) as f32 - 44.0) * 0.001)).collect();
+                memcpy(w, wv.as_ptr().cast(), n * k * 2, MEMCPY_H2D).unwrap();
+                let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+                let us = time_us(20, &mut || {
+                    if wmma {
+                        gemm_nt_f16_wmma_device(a.cast(), w.cast(), c.cast(), m as i32, n as i32, k as i32)
+                            .unwrap();
+                    } else {
+                        ws.gemm_nt_f16_dev(a.cast(), w.cast(), c.cast(), m as i32, n as i32, k as i32).unwrap();
+                    }
+                });
+                push(&format!("f16 prefill gemm ({tag})"), format!("m={m} n={n} k={k}"), n * k * 2, us);
+                device_free(a, m * k * 4);
+                device_free(c, m * n * 4);
+                device_free(w, n * k * 2);
+                let (nh, nkv, hd, n_q) = (24usize, 8usize, 128usize, 512usize);
+                let q = device_malloc(n_q * nh * hd * 4, dev).unwrap();
+                let out = device_malloc(n_q * nh * hd * 4, dev).unwrap();
+                memcpy(q, vec![0.01f32; n_q * nh * hd].as_ptr().cast(), n_q * nh * hd * 4, MEMCPY_H2D).unwrap();
+                for n_kv in [512usize, 4096] {
+                    let kv_bytes = n_kv * nkv * hd * 4;
+                    let kp = device_malloc(kv_bytes, dev).unwrap();
+                    let vp = device_malloc(kv_bytes, dev).unwrap();
+                    let fill: Vec<f32> = (0..n_kv * nkv * hd).map(|i| ((i * 11 % 83) as f32 - 41.0) * 0.01).collect();
+                    memcpy(kp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                    memcpy(vp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                    let us = time_us(10, &mut || {
+                        ws.attention_device(
+                            q.cast(), kp.cast(), vp.cast(), out.cast(), n_q as i32, n_kv as i32,
+                            nh as i32, nkv as i32, hd as i32, true,
+                        )
+                        .unwrap();
+                    });
+                    push(
+                        &format!("attention prefill ({tag})"),
+                        format!("n_q={n_q} n_kv={n_kv} {nh}/{nkv} heads hd={hd} causal"),
+                        2 * kv_bytes,
+                        us,
+                    );
+                    device_free(kp, kv_bytes);
+                    device_free(vp, kv_bytes);
+                }
+                device_free(q, n_q * nh * hd * 4);
+                device_free(out, n_q * nh * hd * 4);
+            }
             // A tiny kernel: the per-launch floor.
             let a = device_malloc(2048 * 4, dev).unwrap();
             let b = device_malloc(2048 * 4, dev).unwrap();
@@ -18843,7 +18894,8 @@ mod tests {
                     let _inner = PrefillWmma::enable();
                 }
                 assert!(prefill_wmma_active(), "a nested scope must restore the outer one");
-                let want = if gfx12 { 2 } else { 0 };
+                // Attention only: the f16 WMMA GEMM is not routed (see gemm_nt_f16_dev).
+                let want = if gfx12 { 1 } else { 0 };
                 assert_eq!(run(n_q), want, "device {dev} (gfx12={gfx12}): prefill scope");
                 // Same numbers within WMMA tolerance on this device (f16-level
                 // for attention, near-f32 for the GEMM).

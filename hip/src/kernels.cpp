@@ -1272,7 +1272,12 @@ __device__ __forceinline__ int wmma_f16_shift(float amax) {
  * Lane layout (RDNA4, not the RDNA3 replicated layout): lane L holds A row L%16
  * and B column L%16 at K positions 8*(L/16) + 0..7. Accumulator element g is
  * C row (L/16)*8+g, column L%16. A row's result depends only on that row, but
- * its bits differ from the decode GEMV's, hence the experimental gate.
+ * its bits differ from the decode GEMV's.
+ *
+ * NOT USED BY ANY FORWARD: on Llama-3.2-3B F16 prefill it was ~4x slower than
+ * the existing F16 path (one wave per tile, no LDS reuse of A or B), so it is
+ * a tested building block. Any future caller must sit inside the prefill WMMA
+ * scope (experimental.row_variant_kernels).
  * Non-gfx12 images leave the body empty; the host launch sends those devices
  * to the scalar f16 kernel. */
 __global__ void __launch_bounds__(32) gemm_nt_f16_wmma_kernel(const float *a, const uint16_t *b, float *c,
@@ -2877,8 +2882,8 @@ static int device_arch_is_gfx12(int device) {
 
 extern "C" int32_t allpaca_hip_device_is_gfx12(int32_t device) { return device_arch_is_gfx12(device); }
 
-/* Prefill WMMA scope (experimental.row_variant_kernels). The WMMA GEMM and
- * attention give a row other bits than the decode kernels, so the engine
+/* Prefill WMMA scope (experimental.row_variant_kernels). WMMA attention
+ * gives a row other bits than the decode kernels, so the engine
  * opens this scope only around a prompt's prefill chunk, never around decode,
  * verify or batched forwards, and only when the option is on. Exact-row mode
  * wins over it. Per calling thread, like g_exact_rows. */

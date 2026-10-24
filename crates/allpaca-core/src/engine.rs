@@ -4341,7 +4341,7 @@ impl Engine {
             let mut row_hiddens = Vec::new();
             // experimental.row_variant_kernels: this prompt forward (and only
             // it: not decode, verify, batched ticks or the MTP pass below) may
-            // run the gfx12 WMMA GEMM / attention. Their rows differ from the
+            // run the gfx12 WMMA flash attention. Its rows differ from the
             // decode kernels' bits, so the option is off by default.
             let wmma_scope = self
                 .config
