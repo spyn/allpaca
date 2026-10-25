@@ -28,6 +28,18 @@ int allpaca_hip_device_count(int32_t *count);
 /* Kernels launched by this library since process start (0 without HIP). */
 uint64_t allpaca_hip_kernel_launches(void);
 
+/* gfx1200 / gfx1201, cached per device (0 without HIP). */
+int32_t allpaca_hip_device_is_gfx12(int32_t device);
+
+/* Prefill WMMA scope on the calling thread (experimental.row_variant_kernels).
+ * set returns the previous value; active is the scope and not exact-row mode. */
+int32_t allpaca_hip_set_prefill_wmma(int32_t on);
+int32_t allpaca_hip_prefill_wmma_active(void);
+
+/* WMMA kernel launches since process start, and by the calling thread. */
+uint64_t allpaca_hip_wmma_launches(void);
+uint64_t allpaca_hip_thread_wmma_launches(void);
+
 /* Int8 GEMVs on the calling thread that reused the int8 copy of an activation
  * another GEMV had already quantized, instead of quantizing it again (0
  * without HIP). */
@@ -299,6 +311,22 @@ int allpaca_gemm_nt_q5_k_untiled(const float *a, const uint8_t *b, float *c, int
 int allpaca_gemm_nt_f16(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                         int32_t k, allpaca_stream_t stream);
 
+/* gfx12 f16 WMMA form of allpaca_gemm_nt_f16. One wave32 owns each 16x16 output
+ * tile (v_wmma_f32_16x16x16_f16). A keeps ~f32 precision (row-scaled hi/lo f16
+ * split, no f16 overflow). Exact-row mode and any other device run
+ * allpaca_gemm_nt_f16. Not used by any forward (slower than the F16 prefill
+ * path as written); a future caller must sit inside the prefill WMMA scope. */
+int allpaca_gemm_nt_f16_wmma(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
+                             int32_t k, allpaca_stream_t stream);
+
+/* C[m,n] = A_i8[m,k] * B_i8[n,k]^T, int32 accumulate, stored as f32.
+ * The WMMA entry is gfx1200/gfx1201; every other device runs the scalar kernel.
+ * Not used by any forward yet: a tested building block for int8 prefill. */
+int allpaca_gemm_nt_i8(const int8_t *a, const int8_t *b, float *c, int32_t m, int32_t n, int32_t k,
+                       allpaca_stream_t stream);
+int allpaca_gemm_nt_i8_wmma(const int8_t *a, const int8_t *b, float *c, int32_t m, int32_t n,
+                            int32_t k, allpaca_stream_t stream);
+
 /* Untiled F16 GEMV baseline for §12 before/after tracers. */
 int allpaca_gemm_nt_f16_untiled(const float *a, const uint16_t *b, float *c, int32_t m, int32_t n,
                                 int32_t k, allpaca_stream_t stream);
@@ -327,6 +355,14 @@ int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);
+
+/* gfx12 WMMA flash prefill: f16 Q/K/P/V tiles (power-of-two scaled, no
+ * overflow), f32 accumulate; bits differ from allpaca_attention. Falls back to
+ * allpaca_attention off gfx12, for a single query, or when head_dim is not a
+ * 16-multiple up to 128. Used in a forward only inside the prefill WMMA scope. */
+int allpaca_attention_wmma_prefill(const float *q, const float *k, const float *v, float *out,
+                                   int32_t n_q, int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                   int32_t head_dim, int32_t causal, allpaca_stream_t stream);
 
 /* Online-softmax attention with a virtual sink logit per head (`sinks[n_heads]`; null = none). */
 int allpaca_attention_sinks(const float *q, const float *k, const float *v, float *out, int32_t n_q,
