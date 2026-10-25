@@ -509,7 +509,8 @@ impl Gemma4Gpu {
         self.weight_bytes
     }
 
-    /// Forward `tokens` from `start_pos`, in passes of at most [`MAX_ROWS`].
+    /// Forward `tokens` from `start_pos`; row-logit passes are capped at
+    /// [`EXACT_ROWS`], other prefill passes at [`MAX_ROWS`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
@@ -528,8 +529,9 @@ impl Gemma4Gpu {
                 mem.tokens()
             ))));
         }
-        for (pass, chunk) in tokens.chunks(MAX_ROWS).enumerate() {
-            let first = pass * MAX_ROWS;
+        let pass_rows = if row_logits.is_some() { EXACT_ROWS } else { MAX_ROWS };
+        for (pass, chunk) in tokens.chunks(pass_rows).enumerate() {
+            let first = pass * pass_rows;
             let rows = row_logits.as_deref_mut().map(|r| &mut r[first * vocab..(first + chunk.len()) * vocab]);
             self.pass(model, w, chunk, start_pos + first, &mut logits[..vocab], rows, mem)?;
         }

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use allpaca_gguf::{discover_dspark_sidecar, extract_tokenizer, is_dspark_filename, GgufFile};
+use allpaca_gguf::{extract_tokenizer, is_dspark_filename, GgufFile};
 use allpaca_onnx::OnnxFile;
 use allpaca_safetensors::{
     discover_checkpoint, load_hf_config, load_tokenizer_sidecar, resolve_sidecar, CheckpointKind,

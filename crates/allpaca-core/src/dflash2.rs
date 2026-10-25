@@ -65,10 +65,18 @@ impl Dflash2Spec {
         let plain = file.tensor("selector_hidden.weight").is_none();
         // A plain DFlash draft has none of DSpark's Markov or hyper-connection
         // tensors and none of DFlash2's convolutions.
+        let has_markov = [
+            "markov_w1.weight",
+            "dspark.markov_w1.weight",
+            "markov_w1",
+            "dspark.markov_w1",
+        ]
+        .into_iter()
+        .any(|name| file.tensor(name).is_some());
         if plain
             && (file.architecture() != Some("dflash")
                 || file.tensor("fc.weight").is_none()
-                || file.tensor("markov_w1.weight").is_some()
+                || has_markov
                 || file.tensor("hc_head_fn.weight").is_some()
                 || file.tensor("blk.0.attn_conv_proj.weight").is_some()
                 || file.tensor("blk.0.attn_q.weight").is_none())
@@ -1419,11 +1427,13 @@ mod tests {
         let plain = sidecar_file("plain", &["fc.weight", "blk.0.attn_q.weight"], 32, 64);
         let dflash2 = sidecar_file("d2", &["fc.weight", "selector_hidden.weight", "blk.0.attn_q.weight"], 32, 64);
         let dspark = sidecar_file("dspark", &["fc.weight", "markov_w1.weight", "blk.0.attn_q.weight"], 32, 64);
+        let dspark_alias = sidecar_file("dspark_alias", &["fc.weight", "dspark.markov_w1", "blk.0.attn_q.weight"], 32, 64);
         // A DeepSeek DSpark (hyper-connections) named like a DFlash file.
         let dsv4 = sidecar_file("dsv4_named_dflash", &["fc.weight", "hc_head_fn.weight", "blk.0.attn_q.weight"], 32, 64);
         assert_eq!(classify_sidecar(&plain, 64, 32), SidecarKind::BlockDraft { plain: true });
         assert_eq!(classify_sidecar(&dflash2, 64, 32), SidecarKind::BlockDraft { plain: false });
         assert_eq!(classify_sidecar(&dspark, 64, 32), SidecarKind::Dspark);
+        assert_eq!(classify_sidecar(&dspark_alias, 64, 32), SidecarKind::Dspark);
         assert_eq!(classify_sidecar(&dsv4, 64, 32), SidecarKind::Dspark);
         assert_eq!(classify_sidecar(&dspark, 128, 32), SidecarKind::Mismatch);
         assert_eq!(classify_sidecar(&dsv4, 64, 33), SidecarKind::Mismatch);

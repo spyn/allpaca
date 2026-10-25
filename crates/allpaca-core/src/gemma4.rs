@@ -862,6 +862,19 @@ mod tests {
             forward_tokens(&model, &[toks[prefix + 3]], prefix + 3, &mut last, Some(&mut again), &mut b).unwrap();
             assert_eq!(&again[..], &one[3 * vocab..4 * vocab]);
         }
+
+        let prefix = 255;
+        let toks: Vec<u32> = toks.iter().cycle().take(prefix + 17).copied().collect();
+        let mut a = Gemma4Memory::default();
+        forward_tokens(&model, &toks[..prefix], 0, &mut last, None, &mut a).unwrap();
+        let mut b = a.clone();
+        let mut one = vec![0.0f32; 17 * vocab];
+        for i in 0..17 {
+            forward_tokens(&model, &[toks[prefix + i]], prefix + i, &mut last, Some(&mut one[i * vocab..(i + 1) * vocab]), &mut a).unwrap();
+        }
+        let mut packed = vec![0.0f32; 17 * vocab];
+        forward_tokens(&model, &toks[prefix..], prefix, &mut last, Some(&mut packed), &mut b).unwrap();
+        assert_eq!(one, packed, "a 17-row verify must remain row-exact");
     }
 
     /// The real model on hip0 against llama.cpp's greedy tokens

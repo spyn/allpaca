@@ -1277,10 +1277,10 @@ pub fn is_dflash2_filename(name: &str) -> bool {
     l.contains("dflash2") || l.contains("dflash-2")
 }
 
-/// Whether a sidecar found by name next to a target was built for it: its
-/// hidden width equals the target's `dim` and, when it carries a
-/// vocabulary, that has the target's `vocab` tokens. A DSpark file in a
-/// shared models folder must not attach to another model.
+/// Whether a sidecar found by name next to a target was built for it: any
+/// declared hidden width equals the target's `dim` and any declared vocabulary
+/// has the target's `vocab` tokens. Older DSpark files without this metadata
+/// remain eligible; a file that declares another model's shape is rejected.
 pub fn sidecar_matches_target(sidecar: &GgufFile, dim: usize, vocab: usize) -> bool {
     let arch = sidecar.architecture().unwrap_or("dflash");
     let width = sidecar.meta_u32(&format!("{arch}.embedding_length")).map(|v| v as usize);
@@ -1288,7 +1288,7 @@ pub fn sidecar_matches_target(sidecar: &GgufFile, dim: usize, vocab: usize) -> b
         Some(GgufValue::Array(items)) => Some(items.len()),
         _ => None,
     };
-    width == Some(dim) && tokens.is_none_or(|n| n == vocab)
+    width.is_none_or(|n| n == dim) && tokens.is_none_or(|n| n == vocab)
 }
 
 pub fn is_split_gguf_name(name: &str) -> bool {
@@ -2790,6 +2790,12 @@ mod tests {
         assert!(sidecar_matches_target(&dspark, 4096, 16));
         assert!(!sidecar_matches_target(&dspark, 3072, 32), "a DeepSeek DSpark must not attach to Llama");
         assert!(!sidecar_matches_target(&dspark, 4096, 20), "vocab differs");
+        let legacy_path = dir.join("dspark-legacy.gguf");
+        let mut legacy_meta = HashMap::new();
+        legacy_meta.insert("general.architecture".into(), GgufValue::String("dflash".into()));
+        crate::writer::write_gguf(&legacy_path, &legacy_meta, &[]).unwrap();
+        let legacy = GgufFile::open(&legacy_path).unwrap();
+        assert!(sidecar_matches_target(&legacy, 4096, 16), "legacy DSpark metadata is optional");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
