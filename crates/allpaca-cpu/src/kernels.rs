@@ -119,26 +119,51 @@ pub fn matmul_nt(
         return Ok(());
     }
     // Columns `first..` of every output row, written to `y` (rows of `width`).
+    // Each weight row is read once for all input rows; every output is one
+    // `dot` whatever the split, so the result does not depend on it.
     let run = |first: usize, width: usize, y: &mut [f32]| {
-        for (x_row, y_row) in x.chunks(k).zip(y.chunks_mut(width)) {
-            for (out, w_row) in y_row.iter_mut().zip(w_t[first * k..].chunks(k)) {
-                *out = dot(x_row, w_row);
+        for (j, w_row) in w_t[first * k..].chunks(k).take(width).enumerate() {
+            for (r, x_row) in x.chunks(k).enumerate() {
+                y[r * width + j] = dot(x_row, w_row);
             }
         }
     };
     let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).min(n / 64);
-    if threads < 2 || rows != 1 || n * k < MATMUL_NT_THREADED {
+    if threads < 2 || rows * n * k < MATMUL_NT_THREADED {
         run(0, n, y);
         return Ok(());
     }
-    // One input row against a large matrix (a projection or the output
-    // head at decode): split the outputs across the cores.
+    // A large product (a projection or the output head): split the output
+    // columns across the cores, each writing its own copy of their rows.
     let per = n.div_ceil(threads);
-    std::thread::scope(|s| {
-        for (i, chunk) in y.chunks_mut(per).enumerate() {
-            s.spawn(move || run(i * per, chunk.len(), chunk));
-        }
+    if rows == 1 {
+        std::thread::scope(|s| {
+            for (i, chunk) in y.chunks_mut(per).enumerate() {
+                s.spawn(move || run(i * per, chunk.len(), chunk));
+            }
+        });
+        return Ok(());
+    }
+    let parts: Vec<(usize, Vec<f32>)> = std::thread::scope(|s| {
+        let jobs: Vec<_> = (0..n)
+            .step_by(per)
+            .map(|first| {
+                let width = per.min(n - first);
+                s.spawn(move || {
+                    let mut part = vec![0.0f32; rows * width];
+                    run(first, width, &mut part);
+                    (first, part)
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().expect("matmul_nt thread")).collect()
     });
+    for (first, part) in parts {
+        let width = part.len() / rows;
+        for (y_row, p_row) in y.chunks_mut(n).zip(part.chunks(width)) {
+            y_row[first..first + width].copy_from_slice(p_row);
+        }
+    }
     Ok(())
 }
 
@@ -911,6 +936,58 @@ pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
             let q_lo = quant_nibble(data, start + j, inv);
             let q_hi = quant_nibble(data, start + j + 16, inv);
             out[off + 2 + j] = q_lo | (q_hi << 4);
+        }
+    }
+    out
+}
+
+/// Quantize to GGUF IQ4_NL (ggml_type_id=20): per 32 values an f16 scale
+/// and a 4-bit index into [`KVALUES_IQ4NL`]. Each block tries scales
+/// around `max / -127` and keeps the one whose least-squares refit leaves
+/// the smallest error, as llama.cpp's quantiser does without an imatrix.
+pub fn quantize_iq4_nl(data: &[f32]) -> Vec<u8> {
+    let n_blocks = data.len().div_ceil(IQ4_NL_BLOCK_ELEMS);
+    let mut out = vec![0u8; n_blocks * IQ4_NL_BLOCK_BYTES];
+    let nearest = |x: f32| -> u8 {
+        // The table is sorted: the first value above x, or the one before it.
+        let above = KVALUES_IQ4NL.partition_point(|v| *v < x).min(15);
+        if above > 0 && x - KVALUES_IQ4NL[above - 1] < KVALUES_IQ4NL[above] - x {
+            (above - 1) as u8
+        } else {
+            above as u8
+        }
+    };
+    for (b, block) in out.chunks_exact_mut(IQ4_NL_BLOCK_BYTES).enumerate() {
+        let start = b * IQ4_NL_BLOCK_ELEMS;
+        let mut x = [0.0f32; IQ4_NL_BLOCK_ELEMS];
+        for (v, d) in x.iter_mut().zip(data.iter().skip(start)) {
+            *v = *d;
+        }
+        // The value of largest magnitude, with its sign.
+        let max = x.iter().copied().fold(0.0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+        let mut best = (0.0f32, [0u8; IQ4_NL_BLOCK_ELEMS]);
+        if max != 0.0 {
+            let mut best_score = -1.0f32;
+            for step in -7..=7 {
+                let inv = (KVALUES_IQ4NL[0] + step as f32) / max;
+                let mut q = [0u8; IQ4_NL_BLOCK_ELEMS];
+                let (mut sumqx, mut sumq2) = (0.0f32, 0.0f32);
+                for (qi, v) in q.iter_mut().zip(&x) {
+                    *qi = nearest(v * inv);
+                    let k = KVALUES_IQ4NL[usize::from(*qi)];
+                    sumqx += k * v;
+                    sumq2 += k * k;
+                }
+                // The refit scale sumqx / sumq2 removes sumqx^2 / sumq2 of the energy.
+                if sumq2 > 0.0 && sumqx * sumqx / sumq2 > best_score {
+                    best_score = sumqx * sumqx / sumq2;
+                    best = (sumqx / sumq2, q);
+                }
+            }
+        }
+        block[..2].copy_from_slice(&f32_to_f16(best.0).to_le_bytes());
+        for j in 0..16 {
+            block[2 + j] = best.1[j] | (best.1[j + 16] << 4);
         }
     }
     out
@@ -2205,6 +2282,24 @@ pub fn dequant_q8_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn iq4_nl_round_trips_and_beats_q4_0() {
+        let data: Vec<f32> = (0..4096).map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * (1.0 + (i % 5) as f32)).collect();
+        let packed = super::quantize_iq4_nl(&data);
+        assert_eq!(packed.len(), 4096 / 32 * super::IQ4_NL_BLOCK_BYTES);
+        let mut back = vec![0.0f32; data.len()];
+        super::dequant_iq4_nl(&packed, data.len(), &mut back).unwrap();
+        let err = |q: &[f32]| data.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / data.iter().map(|a| a * a).sum::<f32>();
+        let mut q4 = vec![0.0f32; data.len()];
+        super::dequant_q4_0(&super::quantize_q4_0(&data), data.len(), &mut q4).unwrap();
+        assert!(err(&back) < 0.01, "iq4_nl error {}", err(&back));
+        assert!(err(&back) < err(&q4), "iq4_nl {} vs q4_0 {}", err(&back), err(&q4));
+        // An all-zero block stays zero.
+        let zero = super::quantize_iq4_nl(&[0.0; 32]);
+        super::dequant_iq4_nl(&zero, 32, &mut back[..32]).unwrap();
+        assert!(back[..32].iter().all(|v| *v == 0.0));
+    }
+
     use super::*;
 
     /// `matmul_nt` against sums in f64, at a small size and at one large
@@ -2226,6 +2321,25 @@ mod tests {
                         "rows {rows} n {n} k {k} at ({r}, {j}): {got} vs {want}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Rows multiplied together, threaded or not, each equal one row on its
+    /// own bit for bit (the batched host forward relies on it).
+    #[test]
+    fn matmul_nt_rows_together_equal_each_row_alone() {
+        for (rows, n, k) in [(7usize, 2100usize, 1203usize), (5, 37, 64)] {
+            let value = |i: usize, salt: usize| (((i * 2654435761 + salt * 40503) % 2001) as f32 - 1000.0) / 500.0;
+            let x: Vec<f32> = (0..rows * k).map(|i| value(i, 3)).collect();
+            let w: Vec<f32> = (0..n * k).map(|i| value(i, 4)).collect();
+            let mut together = vec![0.0f32; rows * n];
+            matmul_nt(&x, &w, &mut together, rows, n, k).unwrap();
+            for r in 0..rows {
+                let mut alone = vec![0.0f32; n];
+                matmul_nt(&x[r * k..(r + 1) * k], &w, &mut alone, 1, n, k).unwrap();
+                let same = alone.iter().zip(&together[r * n..(r + 1) * n]).all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "rows {rows} n {n} k {k}: row {r}");
             }
         }
     }

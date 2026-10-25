@@ -2707,6 +2707,30 @@ pub(crate) fn expert_mlp_rows(
     matmul_nt(&gate, &ffn.w_down, out, m, dim, ff_dim)
 }
 
+/// What an expert's down projection reads for input `x`: its gated
+/// activations ([`expert_mlp`] without the last product).
+pub(crate) fn expert_activations(
+    x: &[f32],
+    ffn: &LayerFfn,
+    ff_dim: usize,
+    dim: usize,
+    relu_sqr_act: bool,
+) -> Result<Vec<f32>, AllpacaError> {
+    let mut up = vec![0.0f32; ff_dim];
+    matmul_nt(x, &ffn.w_up, &mut up, 1, ff_dim, dim)?;
+    if ffn.w_gate.is_empty() {
+        let act = if relu_sqr_act { relu_sqr } else { silu };
+        up.iter_mut().for_each(|v| *v = act(*v));
+        return Ok(up);
+    }
+    let mut gate = vec![0.0f32; ff_dim];
+    matmul_nt(x, &ffn.w_gate, &mut gate, 1, ff_dim, dim)?;
+    for (g, u) in gate.iter_mut().zip(&up) {
+        *g = silu(*g) * u;
+    }
+    Ok(gate)
+}
+
 pub(crate) fn measure_expert_host_bandwidth(ffn: &LayerFfn, ff_dim: usize, dim: usize) -> f64 {
     use std::time::Instant;
     if ffn.bytes() == 0 || dim == 0 || ff_dim == 0 {
@@ -5185,6 +5209,7 @@ impl TinyModel {
                 self.prefetch_moe_layers(layer_idx)?;
             }
             rmsnorm(x, &layer.ffn_norm, cfg.eps, &mut scratch[..dim])?;
+            self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::FfnIn, &scratch[..dim]);
             let moe_out = self.moe_hidden(layer_idx, layer, &scratch[..dim])?;
             for i in 0..dim {
                 x[i] += moe_out[i];
@@ -5295,6 +5320,14 @@ impl TinyModel {
             } else {
                 host
             };
+            if self.calib.wants() {
+                // The output moves by the routing weight times the
+                // expert's own error: weigh its inputs by its square.
+                let blk = cfg.gguf_blk(layer_idx);
+                let act = expert_activations(x_norm, &ffn, cfg.ff_dim, dim, cfg.moe_relu_sqr)?;
+                self.calib.observe_weighted(blk, crate::calib::Site::ExpIn, x_norm, w * w);
+                self.calib.observe_weighted(blk, crate::calib::Site::ExpAct, &act, w * w);
+            }
             self.run_expert_mlp_numa(id, x_norm, &ffn, cfg.ff_dim, dim, &mut scratch_h, None)?;
             for i in 0..dim {
                 acc[i] += w * scratch_h[i];
@@ -5321,6 +5354,12 @@ impl TinyModel {
             } else {
                 1.0
             };
+            if self.calib.wants() {
+                let blk = cfg.gguf_blk(layer_idx);
+                let act = expert_activations(x_norm, &layer.shared_expert, sff, dim, cfg.moe_relu_sqr)?;
+                self.calib.observe_weighted(blk, crate::calib::Site::ShexpIn, x_norm, gate * gate);
+                self.calib.observe_weighted(blk, crate::calib::Site::ShexpAct, &act, gate * gate);
+            }
             for i in 0..dim {
                 acc[i] += gate * scratch_h[i];
             }
@@ -7710,6 +7749,7 @@ impl TinyModel {
                         &scratch[..dim],
                         &mut state.gdn_state[layer_idx],
                         &mut state.gdn_conv[layer_idx],
+                        (&self.calib, cfg.gguf_blk(layer_idx)),
                     )?;
                     for i in 0..dim {
                         x[i] += out[i];
@@ -7812,7 +7852,15 @@ impl TinyModel {
                     state.host_kv.resize(layer_idx + 1, Default::default());
                 }
                 let (keys, values) = &mut state.host_kv[layer_idx];
-                let out = crate::qwen35_host::gated_attention_step(layer, cfg, &scratch[..dim], pos, keys, values)?;
+                let out = crate::qwen35_host::gated_attention_step(
+                    layer,
+                    cfg,
+                    &scratch[..dim],
+                    pos,
+                    keys,
+                    values,
+                    (&self.calib, cfg.gguf_blk(layer_idx)),
+                )?;
                 for i in 0..dim {
                     x[i] += out[i];
                 }
@@ -9382,9 +9430,10 @@ impl TinyModel {
             .and_then(|s| s.mrope)
             .map_or([pos; 3], |m| m.rope_pos(pos))
             .map(|p| p as i32);
+        // The first layer with pages: a recurrent layer keeps none.
         let page_tokens = page_ids
-            .first()
-            .and_then(|p| p.first())
+            .iter()
+            .find_map(|p| p.first())
             .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
             .unwrap_or(128);
         let max_kv = page_ids
@@ -10003,10 +10052,11 @@ impl TinyModel {
                 )));
             }
         }
+        // The first layer with pages: a recurrent layer keeps none.
         let page_tokens = segs[0]
             .page_ids
-            .first()
-            .and_then(|p| p.first())
+            .iter()
+            .find_map(|p| p.first())
             .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
             .unwrap_or(128);
         let max_kv = segs
@@ -12224,6 +12274,20 @@ impl Lcg {
     }
 }
 
+/// Which layers keep KV pages: every layer except recurrent ones (SSM or
+/// Gated DeltaNet), which never write KV. A model without a per-layer list
+/// keeps pages on every layer.
+pub fn kv_layer_mask(model: &TinyModel) -> Vec<bool> {
+    if model.layers.len() != model.config.n_layers {
+        return vec![true; model.config.n_layers];
+    }
+    model
+        .layers
+        .iter()
+        .map(|l| !(l.block == HybridLayerKind::Ssm || l.gdn.is_some() || l.ssm.is_some()))
+        .collect()
+}
+
 /// Allocate one page per layer covering `n_tokens` (rounded up to page_tokens).
 pub fn alloc_pages_for_seq(
     kv: &mut KvTierManager,
@@ -12232,9 +12296,27 @@ pub fn alloc_pages_for_seq(
     n_tokens: usize,
     metrics: &Metrics,
 ) -> Result<Vec<Vec<u64>>, AllpacaError> {
+    alloc_pages_for_seq_masked(kv, cfg, page_tokens, n_tokens, None, metrics)
+}
+
+/// [`alloc_pages_for_seq`] for the layers `keeps` marks (see
+/// [`kv_layer_mask`]); the others get an empty page list. A hybrid model with
+/// 8 attention layers of 32 otherwise takes 4x the KV it uses.
+pub fn alloc_pages_for_seq_masked(
+    kv: &mut KvTierManager,
+    cfg: &ModelConfig,
+    page_tokens: u32,
+    n_tokens: usize,
+    keeps: Option<&[bool]>,
+    metrics: &Metrics,
+) -> Result<Vec<Vec<u64>>, AllpacaError> {
     let n_pages = n_tokens.div_ceil(page_tokens as usize).max(1);
     let mut pages = Vec::with_capacity(cfg.n_layers);
     for layer in 0..cfg.n_layers {
+        if keeps.is_some_and(|k| !k.get(layer).copied().unwrap_or(true)) {
+            pages.push(Vec::new());
+            continue;
+        }
         let mut layer_pages = Vec::with_capacity(n_pages);
         for p in 0..n_pages {
             layer_pages.push(kv.alloc_page(
@@ -12261,6 +12343,11 @@ pub fn ensure_pages(
 ) -> Result<(), AllpacaError> {
     let need = pos / page_tokens as usize;
     for (layer, layer_pages) in pages.iter_mut().enumerate() {
+        // An empty list is a layer without KV (see `kv_layer_mask`): a layer
+        // that keeps KV always has at least one page.
+        if layer_pages.is_empty() {
+            continue;
+        }
         while layer_pages.len() <= need {
             let idx = layer_pages.len() as u32;
             layer_pages.push(kv.alloc_page(
@@ -12933,6 +13020,46 @@ mod lightning_moe_tests {
         expert_mlp(&x, &ffn, ff, dim, &mut out, true).unwrap();
         assert!((out[0] - 4.0).abs() < 1e-5, "{out:?}");
         assert!(out[1].abs() < 1e-5, "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod kv_page_mask_tests {
+    use super::*;
+
+    #[test]
+    fn only_recurrent_layers_go_without_kv_pages() {
+        for model in [TinyModel::synthetic_gdn_hybrid(5), TinyModel::synthetic_ssm_hybrid(5)] {
+            let keeps = kv_layer_mask(&model);
+            assert_eq!(keeps.len(), model.config.n_layers);
+            for (layer, keep) in model.layers.iter().zip(&keeps) {
+                let recurrent =
+                    layer.block == HybridLayerKind::Ssm || layer.gdn.is_some() || layer.ssm.is_some();
+                assert_eq!(*keep, !recurrent);
+            }
+            assert!(keeps.iter().any(|k| *k) && keeps.iter().any(|k| !*k), "a hybrid has both");
+            let metrics = Metrics::default();
+            let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 1.0);
+            let mut pages = alloc_pages_for_seq_masked(&mut kv, &model.config, 4, 9, Some(&keeps), &metrics)
+                .expect("pages");
+            for (layer_pages, keep) in pages.iter().zip(&keeps) {
+                assert_eq!(layer_pages.len(), if *keep { 3 } else { 0 });
+            }
+            // Growing the sequence adds pages only where KV is kept.
+            ensure_pages(&mut kv, &model.config, 4, &mut pages, 16, &metrics).expect("grow");
+            for (layer_pages, keep) in pages.iter().zip(&keeps) {
+                assert_eq!(layer_pages.len(), if *keep { 5 } else { 0 });
+            }
+        }
+        // Attention that is not the `Attention` block (MLA, MoE layers) keeps its pages.
+        for model in [TinyModel::synthetic_mla_hybrid(5), TinyModel::synthetic_moe_shared(5)] {
+            let keeps = kv_layer_mask(&model);
+            for (layer, keep) in model.layers.iter().zip(&keeps) {
+                if layer.gdn.is_none() && layer.ssm.is_none() && layer.block != HybridLayerKind::Ssm {
+                    assert!(*keep);
+                }
+            }
+        }
     }
 }
 

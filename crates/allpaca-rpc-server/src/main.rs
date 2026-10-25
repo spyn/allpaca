@@ -39,7 +39,8 @@ struct Cli {
     #[arg(long, default_value_t = 64)]
     cache_gib: u64,
     /// Keep coordinators' prompt-cache checkpoints in this much RAM, in GiB
-    /// (their `[prompt_cache] worker = true`). 0 = not served.
+    /// (their `[prompt_cache] worker = true`), and as much again of the
+    /// state of the Flash-Next blocks it hosts. 0 = not served.
     #[arg(long, default_value_t = 0)]
     prompt_cache_gib: u64,
     /// Print the fingerprint of the sources this worker was built from and exit.
@@ -96,7 +97,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .clone()
                     .or_else(|| std::env::var_os("ALLPACA_WORKER_CACHE").map(Into::into))
                     .map(|dir| allpaca_core::qwen4_remote::WeightCache::new(dir, cli.cache_gib << 30));
-                vec![allpaca_core::qwen4_remote::worker_extension(cache)]
+                // Coordinators' prompt caches keep Flash-Next blocks' state here too.
+                vec![allpaca_core::qwen4_remote::worker_extension_saving(
+                    cache,
+                    (cli.prompt_cache_gib << 30) as usize,
+                )]
             }
             _ => Vec::new(),
         };

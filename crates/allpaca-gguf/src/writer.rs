@@ -244,6 +244,36 @@ impl GgufStreamWriter {
         Ok(())
     }
 
+    /// The next declared tensor's bytes in parts, for a tensor too large to
+    /// hold at once: together they must be its size.
+    pub fn write_tensor_parts(
+        &mut self,
+        parts: impl IntoIterator<Item = Result<Vec<u8>, AllpacaError>>,
+    ) -> Result<(), AllpacaError> {
+        let size = *self.sizes.get(self.next).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig(format!("GGUF has no tensor {} declared", self.next)))
+        })?;
+        let mut written = 0usize;
+        for part in parts {
+            let part = part?;
+            written += part.len();
+            if written > size {
+                break;
+            }
+            self.file.write_all(&part).map_err(FatalError::from)?;
+        }
+        if written != size {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "GGUF tensor {} takes {size} bytes, got {written}",
+                self.next
+            ))));
+        }
+        let pad = size.next_multiple_of(Self::ALIGN) - size;
+        self.file.write_all(&[0u8; Self::ALIGN][..pad]).map_err(FatalError::from)?;
+        self.next += 1;
+        Ok(())
+    }
+
     /// Flush; every declared tensor must have been written.
     pub fn finish(mut self) -> Result<(), AllpacaError> {
         if self.next != self.sizes.len() {

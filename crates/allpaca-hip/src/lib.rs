@@ -365,6 +365,13 @@ mod ffi {
     use std::os::raw::c_void;
 
     extern "C" {
+        pub fn allpaca_hip_kernel_launches() -> u64;
+        pub fn allpaca_hip_device_is_gfx12(device: i32) -> i32;
+        pub fn allpaca_hip_set_prefill_wmma(on: i32) -> i32;
+        pub fn allpaca_hip_prefill_wmma_active() -> i32;
+        pub fn allpaca_hip_wmma_launches() -> u64;
+        pub fn allpaca_hip_thread_wmma_launches() -> u64;
+        pub fn allpaca_hip_act_quant_reuses() -> u64;
         pub fn allpaca_hip_device_count(count: *mut i32) -> i32;
         pub fn allpaca_hip_device_props(
             id: i32,
@@ -379,6 +386,7 @@ mod ffi {
             arch_len: i32,
             l2_bytes: *mut i32,
         ) -> i32;
+        pub fn allpaca_hip_device_multiprocessors(id: i32, count: *mut i32) -> i32;
         pub fn allpaca_hip_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
         pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
@@ -499,6 +507,7 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_q8_0_gemv_rounds_activations(m: i32, n: i32, k: i32) -> i32;
         pub fn allpaca_gemm_nt_q8_0_intdot(
             a: *const f32,
             b: *const u8,
@@ -656,6 +665,7 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_kquant_i8_lanes(qt: i32, n: i32) -> i32;
         pub fn allpaca_gemm_nt_q2_0(
             a: *const f32,
             b: *const u8,
@@ -689,6 +699,7 @@ mod ffi {
             out: *mut f32,
             dim: i32,
             ff: i32,
+            rows: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_silu_scale(x: *mut f32, n: i32, s: f32, stream: *mut c_void) -> i32;
@@ -727,6 +738,23 @@ mod ffi {
             out: *mut f32,
             rows: i32,
             dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_q4x_ple_apply(
+            streams: *mut f32,
+            key: *const f32,
+            value: *const f32,
+            nk: *const f32,
+            nq: *const f32,
+            nc: *const f32,
+            conv_w: *const f32,
+            history: *mut f32,
+            rows: i32,
+            hc: i32,
+            dim: i32,
+            kern: i32,
+            ngram: i32,
+            eps: f32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_moe_ffn_scratch_bytes(rows: i32, dim: i32, ff: i32, pairs: i32) -> u64;
@@ -855,6 +883,33 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_f16_wmma(
+            a: *const f32,
+            b: *const u16,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_i8(
+            a: *const i8,
+            b: *const i8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_i8_wmma(
+            a: *const i8,
+            b: *const i8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_f16_untiled(
             a: *const f32,
             b: *const u16,
@@ -883,6 +938,19 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_attention(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_q: i32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            causal: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_attention_wmma_prefill(
             q: *const f32,
             k: *const f32,
             v: *const f32,
@@ -988,6 +1056,40 @@ mod ffi {
             rows: *const i32,
             n: i32,
             row_len: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_qsa_pool(
+            raw: *const f32,
+            gain: *const f32,
+            pooled: *mut f32,
+            first: i32,
+            n: i32,
+            ratio: i32,
+            dim: i32,
+            n_rot: i32,
+            theta: f32,
+            sections: *const i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_qsa_select(
+            q: *mut f32,
+            gain: *const f32,
+            pooled: *const f32,
+            scores: *mut f32,
+            cells: *mut i32,
+            rows: i32,
+            pos: i32,
+            heads: i32,
+            dim: i32,
+            n_rot: i32,
+            theta: f32,
+            sections: *const i32,
+            eps: f32,
+            ratio: i32,
+            top_pools: i32,
+            stride: i32,
+            score_stride: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_scale_heads_sigmoid(
@@ -1127,6 +1229,26 @@ mod ffi {
             n_heads: i32,
             head_dim: i32,
             eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gdn_steps(
+            qkv: *mut f32,
+            conv_w: *const f32,
+            conv_state: *mut f32,
+            alpha: *mut f32,
+            dt_bias: *const f32,
+            a: *const f32,
+            beta: *mut f32,
+            state: *mut f32,
+            out: *mut f32,
+            n_v: i32,
+            n_k: i32,
+            head_v: i32,
+            head_k: i32,
+            conv_kernel: i32,
+            eps: f32,
+            interleave: i32,
+            rows: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gdn_step_fused(
@@ -1338,6 +1460,122 @@ pub fn runtime_linked() -> bool {
     cfg!(all(feature = "hip", allpaca_hip_runtime))
 }
 
+/// gfx1200 / gfx1201 (RDNA4), cached per device by the kernel library.
+pub fn device_is_gfx12(device: i32) -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: plain query; an unknown device answers 0.
+        unsafe { ffi::allpaca_hip_device_is_gfx12(device) != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = device;
+        false
+    }
+}
+
+/// gfx12 WMMA kernels launched by this process so far (0 without HIP).
+pub fn wmma_launches() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: reads an atomic counter.
+        unsafe { ffi::allpaca_hip_wmma_launches() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
+/// gfx12 WMMA kernels this thread has launched (0 without HIP).
+pub fn thread_wmma_launches() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: reads a thread-local counter.
+        unsafe { ffi::allpaca_hip_thread_wmma_launches() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
+/// Whether this thread is inside a [`PrefillWmma`] scope and not in
+/// [`ExactRows`] mode.
+pub fn prefill_wmma_active() -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: reads thread-local flags.
+        unsafe { ffi::allpaca_hip_prefill_wmma_active() != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        false
+    }
+}
+
+/// Prefill WMMA scope (`experimental.row_variant_kernels`): while it lives,
+/// this thread's multi-row attention runs on the gfx12 WMMA flash kernel
+/// (the WMMA GEMMs are building blocks no forward calls yet). It gives a row other bits than
+/// the decode kernels, so the engine opens it only around a prompt's prefill
+/// forward, never around decode, speculative verify or batched forwards, and
+/// only when the option is on. [`ExactRows`] wins over it. Dropping it
+/// restores whatever was set before, so scopes nest.
+pub struct PrefillWmma {
+    #[cfg_attr(not(all(feature = "hip", allpaca_hip_runtime)), allow(dead_code))]
+    prev: i32,
+}
+
+impl PrefillWmma {
+    pub fn enable() -> Self {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            // SAFETY: sets a thread-local flag.
+            let prev = unsafe { ffi::allpaca_hip_set_prefill_wmma(1) };
+            PrefillWmma { prev }
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            PrefillWmma { prev: 0 }
+        }
+    }
+}
+
+impl Drop for PrefillWmma {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        // SAFETY: sets a thread-local flag.
+        unsafe {
+            ffi::allpaca_hip_set_prefill_wmma(self.prev);
+        }
+    }
+}
+
+/// HIP kernels launched by this process so far, on every device (0 without HIP).
+pub fn kernel_launches() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_hip_kernel_launches() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
+/// Int8 GEMVs on the calling thread that reused another GEMV's int8 copy of
+/// their activation instead of quantizing it again (0 without HIP).
+pub fn act_quant_reuses() -> u64 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_hip_act_quant_reuses() }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        0
+    }
+}
+
 pub fn device_count() -> i32 {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -1418,6 +1656,23 @@ pub fn device_gcn_arch(id: i32) -> Option<(String, usize)> {
             return None;
         }
         Some((arch, l2.max(0) as usize))
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// `multiProcessorCount`: compute units on GCN/CDNA (MI50: 60), work-group
+/// processors on RDNA (RX 9070: 28, RX 9060 XT: 16). Size occupancy-bound
+/// grids from this, not from a constant.
+pub fn device_multiprocessors(id: i32) -> Option<u32> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let mut count = 0i32;
+        let rc = unsafe { ffi::allpaca_hip_device_multiprocessors(id, &mut count) };
+        (rc == ALLPACA_OK && count > 0).then_some(count as u32)
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
@@ -2538,6 +2793,85 @@ pub fn gemm_nt_f16_device(
     }
 }
 
+/// Device-pointer gfx12 f16 WMMA. Non-gfx12 and exact-row mode use [`gemm_nt_f16_device`].
+/// Not used by any forward: a tested building block (slower than the current
+/// F16 prefill GEMM as written; one wave per 16x16 tile, no LDS reuse).
+pub fn gemm_nt_f16_wmma_device(
+    a: *const f32,
+    b: *const u16,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: callers pass device pointers for `m*k` floats, `n*k` f16 values,
+        // and `m*n` floats on the current device. The launch finishes before return.
+        let rc = unsafe { ffi::allpaca_gemm_nt_f16_wmma(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_f16_wmma")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "gfx12 f16 WMMA GEMM not implemented".into(),
+        )))
+    }
+}
+
+/// Device-pointer int8 NT GEMM, scalar reference for [`gemm_nt_i8_wmma_device`].
+pub fn gemm_nt_i8_device(
+    a: *const i8,
+    b: *const i8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: callers pass device pointers for `m*k` and `n*k` int8 values and
+        // `m*n` floats on the current device. The launch finishes before return.
+        let rc = unsafe { ffi::allpaca_gemm_nt_i8(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_i8")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_i8 unavailable".into(),
+        )))
+    }
+}
+
+/// Device-pointer gfx12 int8 WMMA. Other devices run [`gemm_nt_i8_device`].
+///
+/// Not used by any forward yet: a tested building block for a future int8
+/// (Q8_0) prefill GEMM, which would go under the same [`PrefillWmma`] scope.
+pub fn gemm_nt_i8_wmma_device(
+    a: *const i8,
+    b: *const i8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        // SAFETY: same pointer contract as [`gemm_nt_i8_device`].
+        let rc = unsafe { ffi::allpaca_gemm_nt_i8_wmma(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_i8_wmma")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "gfx12 int8 WMMA GEMM not implemented".into(),
+        )))
+    }
+}
+
 /// Untiled F16 GEMV baseline (§12 before/after).
 pub fn gemm_nt_f16_untiled_device(
     a: *const f32,
@@ -3026,6 +3360,22 @@ impl PinnedBuf {
         }
         Ok(self.ptr)
     }
+}
+
+/// The shape of a QSA indexer (`qwen4exp` sparse attention) for
+/// [`HipWorkspace::qsa_pool_device`] and [`HipWorkspace::qsa_select_device`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QsaDims {
+    /// Cells per pool and pools a token keeps.
+    pub ratio: i32,
+    pub top_pools: i32,
+    /// Query heads and the width of a key.
+    pub heads: i32,
+    pub dim: i32,
+    pub n_rot: i32,
+    pub theta: f32,
+    pub sections: [i32; 4],
+    pub eps: f32,
 }
 
 /// A pair table built on the device by [`moe_route_softmax_topk_device`]:
@@ -3779,6 +4129,149 @@ pub fn gemm_nt_f16(
     }
 }
 
+/// gfx12 f16 WMMA form of [`gemm_nt_f16`]: `C[m,n] = A * dequant(B_f16)^T`, A kept
+/// at ~f32 precision (row-scaled hi/lo f16 split). Kernel test entry; no
+/// forward calls it (it was ~4x slower than the existing F16 prefill path).
+///
+/// gfx1200 and gfx1201 run the WMMA tile. Every other device runs [`gemm_nt_f16`].
+pub fn gemm_nt_f16_wmma(
+    a: &[f32],
+    b: &[u16],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let b_n = (n as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        if a.len() < a_n || b.len() < b_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "F16 WMMA GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(b_n * 2, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr().cast(), b_n * 2, MEMCPY_H2D)?;
+            // SAFETY: `da`, `db`, and `dc` are device allocations of `a_n` floats,
+            // `b_n` f16 values, and `c_n` floats on device 0. They stay allocated
+            // until this launch returns and the copies below finish.
+            let rc = unsafe {
+                ffi::allpaca_gemm_nt_f16_wmma(
+                    da.cast(),
+                    db.cast(),
+                    dc.cast(),
+                    m,
+                    n,
+                    k,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "gemm_nt_f16_wmma")?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, b_n * 2);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "gfx12 f16 WMMA GEMM not implemented".into(),
+        )))
+    }
+}
+
+fn i8_host_gemm(
+    a: &[i8],
+    b: &[i8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+    wmma: bool,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let b_n = (n as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        if a.len() < a_n || b.len() < b_n || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "int8 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n, 0)?;
+        let db = device_malloc(b_n, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr().cast(), b_n, MEMCPY_H2D)?;
+            if wmma {
+                gemm_nt_i8_wmma_device(da.cast(), db.cast(), dc.cast(), m, n, k)?;
+            } else {
+                gemm_nt_i8_device(da.cast(), db.cast(), dc.cast(), m, n, k)?;
+            }
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n);
+        device_free(db, b_n);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k, wmma);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_i8 unavailable".into(),
+        )))
+    }
+}
+
+/// Scalar int8 NT GEMM: `C[m,n] = A_i8[m,k] * B_i8[n,k]^T`.
+pub fn gemm_nt_i8(
+    a: &[i8],
+    b: &[i8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    i8_host_gemm(a, b, c, m, n, k, false)
+}
+
+/// gfx12 int8 WMMA form of [`gemm_nt_i8`]. Other devices run the scalar kernel.
+/// Not used by any forward yet (see [`gemm_nt_i8_wmma_device`]).
+pub fn gemm_nt_i8_wmma(
+    a: &[i8],
+    b: &[i8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    i8_host_gemm(a, b, c, m, n, k, true)
+}
+
 /// Host-pointer BF16 NT GEMM: copies packed bfloat16 `b`, runs the kernel, copies back.
 pub fn gemm_nt_bf16(
     a: &[f32],
@@ -4276,9 +4769,21 @@ pub fn q2_0_expert_slot_bytes(dim: usize, ff: usize) -> usize {
     3 * ff * dim / Q2_0_BLOCK_ELEMS * Q2_0_BLOCK_BYTES
 }
 
+/// Floats of scratch the Q2_0 expert kernels ([`q2_0_moe_ffn_device`],
+/// [`q4x::routed_experts`]) take for `rows` tokens of `n_pick` experts:
+/// the hidden rows, then the inputs and hidden rows rounded to 8 bits per
+/// 64-value block (codes, steps and code sums).
+pub fn q2_0_moe_scratch_floats(rows: usize, n_pick: usize, dim: usize, ff: usize) -> usize {
+    let (nh, nx) = (rows * n_pick * ff, rows * dim);
+    nh + 2 * nx / Q2_0_BLOCK_ELEMS + 2 * nh / Q2_0_BLOCK_ELEMS + (nx + nh) / 4
+}
+
 /// Routed experts from a pool of Q2_0 slots, all on the device:
-/// `out[dim] = sum_p weights[p] * down_p * (silu(gate_p * x) * (up_p * x))`.
-/// `h` is scratch of `slots.len() * ff` floats; at most 32 picks.
+/// `out[dim] = sum_p weights[p] * down_p * (silu(gate_p * x) * (up_p * x))`,
+/// the products on the input and hidden rows rounded to 8 bits per block
+/// (as [`allpaca_cpu::gemv_q2_0_i8`]). `h` is scratch of
+/// [`q2_0_moe_scratch_floats`]`(1, slots.len(), dim, ff)` floats; at most
+/// 32 picks.
 #[allow(clippy::too_many_arguments)]
 pub fn q2_0_moe_ffn_device(
     x: *const f32,
@@ -4419,13 +4924,16 @@ pub mod q4x {
     /// their 32 weights.
     pub const PICKS_BYTES: usize = 32 * 8;
 
-    /// One token's routed experts with the routing on the device: the
-    /// `n_pick` best of `n_experts` router `scores` by softmax weight (ties
-    /// to the lower expert), weights renormalised over the picks and times
-    /// `scale`, then the experts from `pool` (Q2_0 slots, as
-    /// [`q2_0_moe_ffn_device`]) into `out`. `picks` is device scratch of
-    /// [`PICKS_BYTES`] and keeps the picks; `h` is scratch of `n_pick * ff`
-    /// floats. At most 1024 experts and 32 picks.
+    /// Routed experts of `rows` tokens with the routing on the device: per
+    /// token, the `n_pick` best of `n_experts` router `scores` by softmax
+    /// weight (ties to the lower expert), weights renormalised over the
+    /// picks and times `scale`, then the experts from `pool` (Q2_0 slots, as
+    /// [`q2_0_moe_ffn_device`]) into `out`. Rows follow each other: `x` and
+    /// `out` by `dim`, `scores` by `n_experts`, `picks` by [`PICKS_BYTES`]
+    /// (it keeps the picks). `h` is scratch of
+    /// [`super::q2_0_moe_scratch_floats`]`(rows, n_pick, dim, ff)` floats.
+    /// One launch for all rows; each row's result is the same as on its own.
+    /// At most 1024 experts and 32 picks.
     #[allow(clippy::too_many_arguments)]
     pub fn routed_experts(
         x: *const f32,
@@ -4439,6 +4947,7 @@ pub mod q4x {
         out: *mut f32,
         dim: i32,
         ff: i32,
+        rows: i32,
     ) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -4455,6 +4964,7 @@ pub mod q4x {
                     out,
                     dim,
                     ff,
+                    rows,
                     std::ptr::null_mut(),
                 )
             };
@@ -4462,7 +4972,7 @@ pub mod q4x {
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
-            let _ = (x, scores, pool, n_experts, n_pick, scale, picks, h, out, dim, ff);
+            let _ = (x, scores, pool, n_experts, n_pick, scale, picks, h, out, dim, ff, rows);
             unavailable()
         }
     }
@@ -4485,6 +4995,57 @@ pub mod q4x {
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
             let _ = (routed, shared, gate, out, rows, dim);
+            unavailable()
+        }
+    }
+
+    /// The n-gram layer of `rows` tokens in order: each stream gets the
+    /// value (`dim` a token) gated by its match with the normed `key`
+    /// (`hc * dim` a token), plus silu of a conv dilated by `ngram` over the
+    /// normed gated values; `history` holds the last `(kern - 1) * ngram`
+    /// of those and moves on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_apply(
+        streams: *mut f32,
+        key: *const f32,
+        value: *const f32,
+        norms: [*const f32; 3],
+        conv_w: *const f32,
+        history: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        kern: i32,
+        ngram: i32,
+        eps: f32,
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let [nk, nq, nc] = norms;
+            let rc = unsafe {
+                ffi::allpaca_q4x_ple_apply(
+                    streams,
+                    key,
+                    value,
+                    nk,
+                    nq,
+                    nc,
+                    conv_w,
+                    history,
+                    rows,
+                    hc,
+                    dim,
+                    kern,
+                    ngram,
+                    eps,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "q4x_ple_apply")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (streams, key, value, norms, conv_w, history, rows, hc, dim, kern, ngram, eps);
             unavailable()
         }
     }
@@ -4584,6 +5145,32 @@ pub fn gemm_nt_q3_k(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q3_k unavailable".into(),
+        )))
+    }
+}
+
+/// Lanes per output column that the int8 K-quant GEMV launches on `device`
+/// for GGUF K-quant type `qt` (3 = Q3_K .. 6 = Q6_K) and `n` output columns:
+/// 8 on RDNA, up to 32 on wave64 cards (the MI50). The order of a column's
+/// sums follows it, so host models of the kernel need it.
+pub fn kquant_i8_lanes(device: i32, qt: i32, n: i32) -> Result<usize, AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        set_device(device)?;
+        let rc = unsafe { ffi::allpaca_kquant_i8_lanes(qt, n) };
+        if rc > 0 {
+            return Ok(rc as usize);
+        }
+        status(rc, "kquant_i8_lanes")?;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP kquant_i8_lanes returned no lanes".into(),
+        )))
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (device, qt, n);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP kquant_i8_lanes unavailable".into(),
         )))
     }
 }
@@ -4783,6 +5370,20 @@ fn gemm_nt_tq_host(
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_tq unavailable".into(),
         )))
+    }
+}
+
+/// Whether a Q8_0 GEMM of this shape on the bound device rounds its input
+/// to int8 first (the int8 GEMV) rather than multiplying it as floats.
+pub fn q8_0_gemv_rounds_activations(m: i32, n: i32, k: i32) -> bool {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_q8_0_gemv_rounds_activations(m, n, k) != 0 }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (m, n, k);
+        false
     }
 }
 
@@ -5318,6 +5919,17 @@ pub fn embed_gather_rocmfp4_rows(
     }
 }
 
+/// WMMA prefill attention for this launch: inside a [`PrefillWmma`] scope
+/// (not [`ExactRows`]), several query rows, a head_dim the kernel takes, and
+/// a gfx12 device. Decode, verify and batched forwards never open the scope.
+fn gfx12_wmma_prefill(device: i32, n_q: i32, head_dim: i32) -> bool {
+    n_q > 1
+        && (16..=128).contains(&head_dim)
+        && head_dim % 16 == 0
+        && prefill_wmma_active()
+        && device_is_gfx12(device)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     q: &[f32],
@@ -5332,7 +5944,28 @@ pub fn attention(
     causal: bool,
 ) -> Result<(), AllpacaError> {
     attention_on(
-        0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+        0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, false,
+    )
+}
+
+/// gfx12 WMMA flash prefill (kernel test entry; it does not check the
+/// [`PrefillWmma`] scope). Off gfx12, for one query, or for an unsupported
+/// head dimension, this is [`attention`].
+#[allow(clippy::too_many_arguments)]
+pub fn attention_wmma_prefill(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: i32,
+    n_kv: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    causal: bool,
+) -> Result<(), AllpacaError> {
+    attention_on(
+        0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, true,
     )
 }
 
@@ -5349,6 +5982,7 @@ fn attention_on(
     n_kv_heads: i32,
     head_dim: i32,
     causal: bool,
+    wmma_prefill: bool,
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
@@ -5365,20 +5999,38 @@ fn attention_on(
             memcpy(dq, q.as_ptr().cast(), q_bytes, MEMCPY_H2D)?;
             memcpy(dk, k.as_ptr().cast(), k_bytes, MEMCPY_H2D)?;
             memcpy(dv, v.as_ptr().cast(), v_bytes, MEMCPY_H2D)?;
+            // SAFETY: dq/dk/dv/dout are device allocations of the host slices on
+            // `device`, freed after this launch returns.
             let rc = unsafe {
-                ffi::allpaca_attention(
-                    dq.cast(),
-                    dk.cast(),
-                    dv.cast(),
-                    dout.cast(),
-                    n_q,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    i32::from(causal),
-                    std::ptr::null_mut(),
-                )
+                if wmma_prefill {
+                    ffi::allpaca_attention_wmma_prefill(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                } else {
+                    ffi::allpaca_attention(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                }
             };
             status(rc, "attention")?;
             memcpy(out.as_mut_ptr().cast(), dout, o_bytes, MEMCPY_D2H)
@@ -5392,7 +6044,7 @@ fn attention_on(
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
         let _ = (
-            device, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            device, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, wmma_prefill,
         );
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP attention unavailable; use CPU fallback".into(),
@@ -6588,6 +7240,9 @@ impl HipWorkspace {
         } else {
             DecodeOp::OtherGpu
         };
+        // The gfx12 f16 WMMA GEMM (`gemm_nt_f16_wmma_device`) is not routed
+        // here: on Llama-3.2-3B F16 it made prefill ~4x slower than this path
+        // (measured 2026-10-24, B3). It stays a tested building block.
         self.timed_gpu(op, || gemm_nt_f16_device(a, b, c, m, n, k))
     }
 
@@ -8253,6 +8908,7 @@ impl HipWorkspace {
         causal: bool,
     ) -> Result<(), AllpacaError> {
         let need = (q.len() + k.len() + v.len() + out.len()) * 4;
+        let wmma = gfx12_wmma_prefill(self.device, n_q, head_dim);
         if need > self.scratch_bytes {
             return attention_on(
                 self.device,
@@ -8266,6 +8922,7 @@ impl HipWorkspace {
                 n_kv_heads,
                 head_dim,
                 causal,
+                wmma,
             );
         }
         self.bind()?;
@@ -8279,20 +8936,37 @@ impl HipWorkspace {
         self.add_h2d((q.len() + k.len() + v.len()) * 4);
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
+            // SAFETY: scratch spans q, k, v, and out on this workspace device.
             let rc = unsafe {
-                ffi::allpaca_attention(
-                    dq.cast(),
-                    dk.cast(),
-                    dv.cast(),
-                    dout.cast(),
-                    n_q,
-                    n_kv,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    i32::from(causal),
-                    std::ptr::null_mut(),
-                )
+                if wmma {
+                    ffi::allpaca_attention_wmma_prefill(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                } else {
+                    ffi::allpaca_attention(
+                        dq.cast(),
+                        dk.cast(),
+                        dv.cast(),
+                        dout.cast(),
+                        n_q,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        i32::from(causal),
+                        std::ptr::null_mut(),
+                    )
+                }
             };
             status(rc, "attention")?;
             memcpy(out.as_mut_ptr().cast(), dout, out.len() * 4, MEMCPY_D2H)?;
@@ -8314,6 +8988,7 @@ impl HipWorkspace {
                 n_kv_heads,
                 head_dim,
                 causal,
+                wmma,
             )
         }
     }
@@ -11319,6 +11994,71 @@ impl HipWorkspace {
         )
     }
 
+    /// [`Self::gdn_layer_step`] for `rows` tokens in order, in place:
+    /// `qkv` (a row per token) becomes the normed conv outputs, `alpha` the
+    /// decays and `beta` the sigmoids; `y` gets a row per token. The state
+    /// stays in registers across the tokens. Bit-identical to `rows`
+    /// one-token steps; `Ok(false)` when the head width does not fit the
+    /// kernel (step the tokens one at a time instead).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_steps(
+        &self,
+        qkv: *mut f32,
+        alpha: *mut f32,
+        beta: *mut f32,
+        conv_w: *const f32,
+        conv_state: *mut f32,
+        dt_bias: *const f32,
+        a: *const f32,
+        state: *mut f32,
+        y: *mut f32,
+        n_v_heads: i32,
+        n_k_heads: i32,
+        head_v: i32,
+        head_k: i32,
+        conv_kernel: i32,
+        eps: f32,
+        k_interleave: bool,
+        rows: i32,
+    ) -> Result<bool, AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.bind()?;
+            let rc = unsafe {
+                ffi::allpaca_gdn_steps(
+                    qkv,
+                    conv_w,
+                    conv_state,
+                    alpha,
+                    dt_bias,
+                    a,
+                    beta,
+                    state,
+                    y,
+                    n_v_heads,
+                    n_k_heads,
+                    head_v,
+                    head_k,
+                    conv_kernel,
+                    eps,
+                    i32::from(k_interleave),
+                    rows,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc == ALLPACA_ERR_INVALID {
+                return Ok(false);
+            }
+            status(rc, "gdn_steps").map(|()| true)
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (qkv, alpha, beta, conv_w, conv_state, dt_bias, a, state, y);
+            let _ = (n_v_heads, n_k_heads, head_v, head_k, conv_kernel, eps, k_interleave, rows);
+            Ok(false)
+        }
+    }
+
     /// [`Self::gdn_layer_step`] as separate launches (conv, shift, 2x expand,
     /// decay/β, L2 norm, delta step): the fallback, and the reference the
     /// fused path is tested against.
@@ -12146,6 +12886,109 @@ impl HipWorkspace {
         }
     }
 
+    /// QSA indexer: pools `first..first + n` of `dims.ratio` raw keys each
+    /// (`raw`, `dims.dim` floats per token), the mean normed with `gain` and
+    /// rotated to the pool's first position, into `pooled` (a row per pool).
+    pub fn qsa_pool_device(
+        &self,
+        raw: *const f32,
+        gain: *const f32,
+        pooled: *mut f32,
+        first: i32,
+        n: i32,
+        dims: &QsaDims,
+    ) -> Result<(), AllpacaError> {
+        if raw.is_null() || gain.is_null() || pooled.is_null() || first < 0 || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("invalid qsa_pool".into())));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_qsa_pool(
+                        raw,
+                        gain,
+                        pooled,
+                        first,
+                        n,
+                        dims.ratio,
+                        dims.dim,
+                        dims.n_rot,
+                        dims.theta,
+                        dims.sections.as_ptr(),
+                        dims.eps,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "qsa_pool")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("HIP qsa_pool unavailable".into())))
+        }
+    }
+
+    /// QSA indexer selection for `rows` tokens from position `pos`: their
+    /// queries `q` (`dims.heads * dims.dim` floats a row) are normed and
+    /// rotated in place, the pooled keys each sees are scored into `scores`
+    /// (`score_stride` floats a row), and every row that sees more than
+    /// `dims.top_pools` pools gets the cells it keeps at `cells[row * stride]`:
+    /// the best pools in ascending order (of equal scores the earlier one),
+    /// `dims.ratio` cells each, then the cells that fill no pool yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_select_device(
+        &self,
+        q: *mut f32,
+        gain: *const f32,
+        pooled: *const f32,
+        scores: *mut f32,
+        cells: *mut i32,
+        rows: i32,
+        pos: i32,
+        dims: &QsaDims,
+        stride: i32,
+        score_stride: i32,
+    ) -> Result<(), AllpacaError> {
+        if q.is_null() || gain.is_null() || pooled.is_null() || scores.is_null() || cells.is_null() || rows <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("invalid qsa_select".into())));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_qsa_select(
+                        q,
+                        gain,
+                        pooled,
+                        scores,
+                        cells,
+                        rows,
+                        pos,
+                        dims.heads,
+                        dims.dim,
+                        dims.n_rot,
+                        dims.theta,
+                        dims.sections.as_ptr(),
+                        dims.eps,
+                        dims.ratio,
+                        dims.top_pools,
+                        stride,
+                        score_stride,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "qsa_select")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled("HIP qsa_select unavailable".into())))
+        }
+    }
+
     pub fn sigmoid_mul_device(
         &self,
         x: *mut f32,
@@ -12234,20 +13077,39 @@ impl HipWorkspace {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
             self.timed_gpu(DecodeOp::Attention, || {
+                let wmma = gfx12_wmma_prefill(self.device, n_q, head_dim);
+                // SAFETY: q, k, v, and out are device pointers checked non-null
+                // above, sized by the caller for this workspace's current device.
                 let rc = unsafe {
-                    ffi::allpaca_attention(
-                        q,
-                        k,
-                        v,
-                        out,
-                        n_q,
-                        n_kv,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        i32::from(causal),
-                        std::ptr::null_mut(),
-                    )
+                    if wmma {
+                        ffi::allpaca_attention_wmma_prefill(
+                            q,
+                            k,
+                            v,
+                            out,
+                            n_q,
+                            n_kv,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            i32::from(causal),
+                            std::ptr::null_mut(),
+                        )
+                    } else {
+                        ffi::allpaca_attention(
+                            q,
+                            k,
+                            v,
+                            out,
+                            n_q,
+                            n_kv,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            i32::from(causal),
+                            std::ptr::null_mut(),
+                        )
+                    }
                 };
                 status(rc, "attention")
             })
@@ -12464,6 +13326,405 @@ impl Drop for HipWorkspace {
 mod tests {
     use super::*;
 
+    /// Q4_K bytes with sane super-block scales, for the int8 GEMV path.
+    fn q4_k_weights(n: usize, k: usize, seed: usize) -> Vec<u8> {
+        (0..n * k / 256 * 144)
+            .map(|i| match i % 144 {
+                0 | 2 => 0x00,
+                1 | 3 => 0x1c,
+                j => ((i * 7 + seed * 13) % 251 + j) as u8,
+            })
+            .collect()
+    }
+
+    fn download(p: *const u8, n: usize) -> Vec<f32> {
+        let mut out = vec![0f32; n];
+        stream_synchronize().unwrap();
+        memcpy(out.as_mut_ptr().cast(), p, n * 4, MEMCPY_D2H).unwrap();
+        out
+    }
+
+    fn act_reuse_disabled() -> bool {
+        std::env::var("ALLPACA_KQ_ACT_REUSE").is_ok_and(|v| v.starts_with('0'))
+    }
+
+    fn dev_buf(bytes: &[u8]) -> DeviceWeights {
+        let b = DeviceWeights::alloc(0, bytes.len()).unwrap();
+        b.copy_h2d(0, bytes).unwrap();
+        b
+    }
+
+    fn dev_ptr(b: &DeviceWeights) -> *mut f32 {
+        b.ptr_at(0).cast_mut()
+    }
+
+    fn x_new(k: usize) -> Vec<f32> {
+        (0..k)
+            .map(|i| ((i * 29 % 89) as f32 - 44.0) * 0.02)
+            .collect()
+    }
+
+    /// GEMVs that read one activation quantize it to int8 once (q/k/v,
+    /// gate/up), with the same bits as quantizing it for each of them, across
+    /// the K-quant, Q8_0 and ROCmFP4 launchers.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemvs_on_one_activation_share_its_int8_copy() {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        set_device(0).unwrap();
+        // k = 5120 so Q8_0 takes its int8 GEMV too.
+        let (n, k) = (256usize, 5120usize);
+        let xs: Vec<f32> = (0..k)
+            .map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let rows: Vec<Vec<f32>> = (0..n)
+            .map(|r| {
+                (0..k)
+                    .map(|i| (((i * 7 + r * 31) % 61) as f32 - 30.0) * 0.003)
+                    .collect()
+            })
+            .collect();
+        let q8_raw: Vec<u8> = rows.iter().flat_map(|r| quantize_q8_0(r)).collect();
+        let q8_bytes = stage_q8_0_gemv(&q8_raw, n, k).unwrap();
+        let fp4_bytes: Vec<u8> = rows
+            .iter()
+            .flat_map(|r| allpaca_cpu::quantize_rocmfp4(r))
+            .collect();
+        let x = dev_buf(bytemuck_f32(&xs));
+        let wq4 = dev_buf(&q4_k_weights(n, k, 1));
+        let wq8 = dev_buf(&q8_bytes);
+        let wfp4 = dev_buf(&fp4_bytes);
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let (xp, cp) = (dev_ptr(&x), dev_ptr(&c));
+        let (m, n_, k_) = (1, n as i32, k as i32);
+        let q4 = || gemm_nt_q4_k_device(xp, wq4.byte_ptr_at(0), cp, m, n_, k_).unwrap();
+        let q8 = || gemm_nt_q8_0_device(xp, wq8.byte_ptr_at(0), cp, m, n_, k_).unwrap();
+        let f4 = || gemm_nt_rocmfp4_device(xp, wfp4.byte_ptr_at(0), cp, m, n_, k_).unwrap();
+        let mut pairs: Vec<(&str, &dyn Fn(), &dyn Fn())> = vec![
+            ("q4_k -> q4_k", &q4, &q4),
+            ("q4_k -> rocmfp4", &q4, &f4),
+            ("rocmfp4 -> q4_k", &f4, &q4),
+        ];
+        if !std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            pairs.push(("q8_0 -> rocmfp4", &q8, &f4));
+            pairs.push(("rocmfp4 -> q8_0", &f4, &q8));
+        }
+        for (name, first, second) in pairs {
+            // Kernels other tests launch in parallel end the sharing, so only
+            // some attempts share: one is enough.
+            let mut shared = false;
+            for _ in 0..50 {
+                // The reference: a device write before the call forces a fresh quantize.
+                x.copy_h2d(0, bytemuck_f32(&xs)).unwrap();
+                second();
+                let fresh = download(cp.cast(), n);
+                first();
+                let before = act_quant_reuses();
+                second();
+                let reused = act_quant_reuses() > before;
+                assert_eq!(
+                    download(cp.cast(), n),
+                    fresh,
+                    "{name}: a shared copy must give the same bits"
+                );
+                if reused {
+                    shared = true;
+                    break;
+                }
+            }
+            assert!(
+                shared,
+                "{name}: the second GEMV on an unchanged activation never reused its copy"
+            );
+        }
+    }
+
+    /// After `write` changes the activation, the next GEMV quantizes it again
+    /// and sees the new values. Each attempt first checks that, without the
+    /// write, the GEMV would have reused its int8 copy.
+    fn assert_write_requantizes(name: &str, write: &dyn Fn(*mut f32)) {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        set_device(0).unwrap();
+        let (n, k) = (256usize, 512usize);
+        let x_old: Vec<f32> = (0..k)
+            .map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let x = dev_buf(bytemuck_f32(&x_old));
+        let copy = DeviceWeights::alloc(0, k * 4).unwrap();
+        let w = dev_buf(&q4_k_weights(n, k, 3));
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let (xp, cp) = (dev_ptr(&x), dev_ptr(&c));
+        let gemv = |a: *const f32| {
+            gemm_nt_q4_k_device(a, w.byte_ptr_at(0), cp, 1, n as i32, k as i32).unwrap()
+        };
+        let mut proven = false;
+        for _ in 0..50 {
+            x.copy_h2d(0, bytemuck_f32(&x_old)).unwrap();
+            gemv(xp);
+            let before = act_quant_reuses();
+            gemv(xp);
+            let control = act_quant_reuses() > before;
+            let old = download(cp.cast(), n);
+            write(xp);
+            let before = act_quant_reuses();
+            gemv(xp);
+            assert_eq!(
+                act_quant_reuses(),
+                before,
+                "{name}: reused the copy of the old values"
+            );
+            let got = download(cp.cast(), n);
+            // The reference: the new values at another address.
+            memcpy(dev_ptr(&copy).cast(), xp.cast(), k * 4, MEMCPY_D2D).unwrap();
+            gemv(copy.ptr_at(0));
+            let want = download(cp.cast(), n);
+            assert_eq!(
+                got, want,
+                "{name}: the GEMV after the write must see the new values"
+            );
+            assert_ne!(got, old, "{name}: the write must change the activation");
+            if control {
+                proven = true;
+                break;
+            }
+        }
+        assert!(
+            proven,
+            "{name}: without the write the GEMV never reused its copy"
+        );
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_copy_is_quantized_again() {
+        let src = x_new(512);
+        assert_write_requantizes("H2D copy", &|x| {
+            memcpy(x.cast(), bytemuck_f32(&src).as_ptr(), 512 * 4, MEMCPY_H2D).unwrap()
+        });
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_kernel_is_quantized_again() {
+        if device_count() == 0 {
+            return;
+        }
+        let src = dev_buf(bytemuck_f32(&x_new(512)));
+        assert_write_requantizes("kernel", &|x| {
+            copy_f32_kernel(x, src.ptr_at(0), 512).unwrap()
+        });
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_memset_is_quantized_again() {
+        assert_write_requantizes("memset", &|x| {
+            device_memset(x.cast(), 0x3c, 512 * 4).unwrap()
+        });
+    }
+
+    /// A GEMV whose output overlaps its input rewrites that input.
+    #[test]
+    fn an_activation_overwritten_by_its_own_gemv_is_quantized_again() {
+        if device_count() == 0 {
+            return;
+        }
+        let w = dev_buf(&q4_k_weights(512, 512, 5));
+        assert_write_requantizes("in-place GEMV", &|x| {
+            gemm_nt_q4_k_device(x, w.byte_ptr_at(0), x, 1, 512, 512).unwrap()
+        });
+    }
+
+    /// An f32 GEMM (rocBLAS / hipBLASLt where linked) writing the activation.
+    #[test]
+    fn an_activation_written_by_an_f32_gemm_is_quantized_again() {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        let (rows, k) = (16usize, 512usize);
+        let av: Vec<f32> = (0..rows * k).map(|i| (i % 37) as f32 * 0.01).collect();
+        let a = dev_buf(bytemuck_f32(&av));
+        let half: Vec<f32> = (0..k * k)
+            .map(|i| if i / k == i % k { 0.5 } else { 0.0 })
+            .collect();
+        let b = dev_buf(bytemuck_f32(&half));
+        // The activation is row 0 of the GEMM's output.
+        let out = DeviceWeights::alloc(0, rows * k * 4).unwrap();
+        let op = dev_ptr(&out);
+        let (r, kk) = (rows as i32, k as i32);
+        let gemm = || gemm_nt_device(a.ptr_at(0), b.ptr_at(0), op, r, kk, kk).unwrap();
+        // Start the BLAS library before the loop.
+        gemm();
+        let w = dev_buf(&q4_k_weights(256, k, 7));
+        let c = DeviceWeights::alloc(0, 256 * 4).unwrap();
+        let mut proven = false;
+        for _ in 0..50 {
+            device_memset(op.cast(), 0, rows * k * 4).unwrap();
+            let gemv = || {
+                gemm_nt_q4_k_device(op, w.byte_ptr_at(0), dev_ptr(&c), 1, 256, kk).unwrap();
+                download(dev_ptr(&c).cast(), 256)
+            };
+            gemv();
+            let before = act_quant_reuses();
+            gemv();
+            let control = act_quant_reuses() > before;
+            gemm();
+            let before = act_quant_reuses();
+            let got = gemv();
+            assert_eq!(
+                act_quant_reuses(),
+                before,
+                "reused the copy after an f32 GEMM wrote it"
+            );
+            let fresh = dev_buf(bytemuck_f32(&download(op.cast(), k)));
+            gemm_nt_q4_k_device(fresh.ptr_at(0), w.byte_ptr_at(0), dev_ptr(&c), 1, 256, kk)
+                .unwrap();
+            assert_eq!(got, download(dev_ptr(&c).cast(), 256));
+            if control {
+                proven = true;
+                break;
+            }
+        }
+        assert!(proven, "without the GEMM the GEMV never reused its copy");
+    }
+
+    /// A write on another stream, ordered before the GEMV by an event.
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn an_activation_rewritten_on_another_stream_is_quantized_again() {
+        if device_count() == 0 {
+            return;
+        }
+        set_device(0).unwrap();
+        let src = dev_buf(bytemuck_f32(&x_new(512)));
+        // Made at the first write: created while other test threads start
+        // up, the stream hung the whole test process.
+        let side = std::cell::OnceCell::new();
+        assert_write_requantizes("side-stream copy", &|x| {
+            let (h2d, ev) =
+                side.get_or_init(|| (H2dStream::new().unwrap(), event_create().unwrap()));
+            memcpy_on(x.cast(), src.byte_ptr_at(0), 512 * 4, MEMCPY_D2D, h2d.raw()).unwrap();
+            event_record_on(*ev, h2d.raw()).unwrap();
+            stream_wait_event(std::ptr::null_mut(), *ev).unwrap();
+        });
+        if let Some((_, ev)) = side.get() {
+            unsafe {
+                let _ = ffi::allpaca_hip_event_destroy(*ev);
+            }
+        }
+    }
+
+    #[test]
+    fn an_activation_rewritten_by_a_peer_copy_is_quantized_again() {
+        if device_count() < 2 {
+            return;
+        }
+        let src = DeviceWeights::alloc(1, 512 * 4).unwrap();
+        src.copy_h2d(0, bytemuck_f32(&x_new(512))).unwrap();
+        set_device(0).unwrap();
+        assert_write_requantizes("peer copy", &|x| {
+            memcpy_peer(x.cast(), 0, src.byte_ptr_at(0), 1, 512 * 4).unwrap();
+            set_device(0).unwrap();
+        });
+    }
+
+    /// A freed activation's address may come back for another buffer: the
+    /// copy of the old one must not be reused for it.
+    #[test]
+    fn a_freed_activations_copy_is_not_reused() {
+        if device_count() == 0 || act_reuse_disabled() {
+            return;
+        }
+        set_device(0).unwrap();
+        let (n, k) = (256usize, 512usize);
+        let xs = x_new(k);
+        let w = dev_buf(&q4_k_weights(n, k, 4));
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let gemv = |a: *const f32| {
+            gemm_nt_q4_k_device(a, w.byte_ptr_at(0), dev_ptr(&c), 1, n as i32, k as i32).unwrap()
+        };
+        let mut x = dev_buf(bytemuck_f32(&xs));
+        let mut same_address = false;
+        for _ in 0..20 {
+            let old = dev_ptr(&x);
+            gemv(old);
+            drop(x);
+            x = DeviceWeights::alloc(0, k * 4).unwrap();
+            same_address |= dev_ptr(&x) == old;
+            let before = act_quant_reuses();
+            gemv(dev_ptr(&x));
+            assert_eq!(
+                act_quant_reuses(),
+                before,
+                "reused the copy of a freed buffer"
+            );
+            x.copy_h2d(0, bytemuck_f32(&xs)).unwrap();
+        }
+        if !same_address {
+            eprintln!("the allocator never handed the freed address back; nothing was tested");
+        }
+    }
+
+    /// The host can change a host-mapped activation without any enqueue, so
+    /// its int8 copy is never reused.
+    #[test]
+    fn a_host_activation_is_quantized_every_time() {
+        if device_count() == 0 {
+            return;
+        }
+        set_device(0).unwrap();
+        let (n, k) = (256usize, 512usize);
+        let w = dev_buf(&q4_k_weights(n, k, 6));
+        let c = DeviceWeights::alloc(0, n * 4).unwrap();
+        let gemv = |a: *const f32| {
+            gemm_nt_q4_k_device(a, w.byte_ptr_at(0), dev_ptr(&c), 1, n as i32, k as i32).unwrap();
+            download(dev_ptr(&c).cast(), n)
+        };
+        let want = gemv(dev_buf(bytemuck_f32(&x_new(k))).ptr_at(0));
+        let mut pinned = PinnedBuf::default();
+        let hx = pinned.ensure(k * 4).unwrap().cast::<f32>();
+        let host = unsafe { std::slice::from_raw_parts_mut(hx, k) };
+        host.copy_from_slice(&(0..k).map(|i| i as f32 * 0.001).collect::<Vec<_>>());
+        gemv(hx);
+        host.copy_from_slice(&x_new(k));
+        let before = act_quant_reuses();
+        let got = gemv(hx);
+        let reused = act_quant_reuses() > before;
+        host_free(hx.cast());
+        assert!(!reused, "reused the copy of a host buffer");
+        assert_eq!(got, want);
+    }
+
+    fn bytemuck_f32(v: &[f32]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 4) }
+    }
+
+    #[test]
+    fn every_device_reports_its_multiprocessors() {
+        for dev in 0..device_count() {
+            assert!(device_multiprocessors(dev).is_some_and(|n| n > 0), "hip{dev}");
+        }
+    }
+
+    #[test]
+    fn kernel_launches_counts_a_launch() {
+        if device_count() == 0 {
+            return;
+        }
+        let Ok(hip) = HipWorkspace::new(0, 1 << 20, 8) else { return };
+        let n = 256usize;
+        let x = device_malloc(n * 4, 0).unwrap();
+        let r = device_malloc(n * 4, 0).unwrap();
+        let before = kernel_launches();
+        hip.residual_add(x.cast(), r.cast(), n as i32).unwrap();
+        // Other tests may launch at the same time, so only a lower bound holds.
+        let after = kernel_launches();
+        device_free(x, n * 4);
+        device_free(r, n * 4);
+        assert!(after > before);
+    }
+
     /// Small host<->device copy latency: pageable `hipMemcpy` vs a pinned
     /// staging buffer. `cargo test --release -p allpaca-hip --features hip --lib bench_small_copies -- --ignored --nocapture`
     #[test]
@@ -12586,10 +13847,15 @@ mod tests {
         };
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert!(read(outs[0]).iter().any(|v| *v != 0.0));
-        // Small weights stay on the f32 GEMV, so the pair launch applies.
-        assert!(paired, "m == 1 must take the paired launch");
-        assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
-        assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        // Small weights stay on the f32 GEMV, so the pair launch applies,
+        // except where the int8 GEMV takes every width (the MI50).
+        set_device(0).expect("bind");
+        let int8 = q8_0_gemv_rounds_activations(1, n as i32, k as i32);
+        assert_eq!(paired, !int8, "m == 1 must take the paired launch on the f32 GEMV");
+        if paired {
+            assert_eq!(bits(&read(outs[0])), bits(&read(outs[2])), "paired gate differs");
+            assert_eq!(bits(&read(outs[1])), bits(&read(outs[3])), "paired up differs");
+        }
 
         // scale_add_copy vs scale_f32 + residual_add + copy_d2d.
         let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -12612,6 +13878,69 @@ mod tests {
         device_free(gd, g.len());
         device_free(ud, u.len());
         device_free(xd, k * 4);
+    }
+
+    /// Several tokens through `gdn_steps` leave the outputs, the recurrent
+    /// state and the conv history one-token steps leave, bit for bit.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gdn_steps_of_several_tokens_match_one_token_steps() {
+        if device_count() == 0 {
+            return;
+        }
+        let ws = HipWorkspace::new(0, 8 << 20, 16).unwrap();
+        let (n_v, n_k, hv, hk, ck, rows) = (4usize, 2usize, 64usize, 64usize, 4usize, 5usize);
+        let qkv_dim = 2 * n_k * hk + n_v * hv;
+        let noise = |n: usize, seed: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| (((i * 7919 + seed * 104729) % 2003) as f32 / 1001.5 - 1.0) * scale).collect()
+        };
+        let up = |v: &[f32]| {
+            let p = device_malloc(v.len() * 4, 0).unwrap();
+            memcpy(p, v.as_ptr().cast(), v.len() * 4, MEMCPY_H2D).unwrap();
+            p.cast::<f32>()
+        };
+        let down = |p: *mut f32, n: usize| {
+            let mut v = vec![0.0f32; n];
+            memcpy(v.as_mut_ptr().cast(), p.cast(), n * 4, MEMCPY_D2H).unwrap();
+            v
+        };
+        let (qkv, alpha, beta) = (noise(rows * qkv_dim, 1, 0.8), noise(rows * n_v, 2, 1.0), noise(rows * n_v, 3, 1.0));
+        let (conv_w, dt, a) = (noise(qkv_dim * ck, 4, 0.5), noise(n_v, 5, 0.3), noise(n_v, 6, 0.5));
+        let (state0, conv0) = (noise(n_v * hv * hk, 7, 0.2), noise(qkv_dim * (ck - 1), 8, 0.4));
+        let (conv_w, dt, a) = (up(&conv_w), up(&dt), up(&a));
+        set_device(0).unwrap();
+
+        // One token at a time.
+        let (st1, cv1, y1) = (up(&state0), up(&conv0), up(&vec![0.0; rows * n_v * hv]));
+        for r in 0..rows {
+            let (q, al, be) = (
+                up(&qkv[r * qkv_dim..][..qkv_dim]),
+                up(&alpha[r * n_v..][..n_v]),
+                up(&beta[r * n_v..][..n_v]),
+            );
+            let y = unsafe { y1.add(r * n_v * hv) };
+            ws.gdn_layer_step(
+                q, al, be, conv_w, cv1, dt, a, st1, y, n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32,
+                1e-6, false,
+            )
+            .unwrap();
+        }
+        // All of them in one call.
+        let (st2, cv2, y2) = (up(&state0), up(&conv0), up(&vec![0.0; rows * n_v * hv]));
+        let (q, al, be) = (up(&qkv), up(&alpha), up(&beta));
+        let ran = ws
+            .gdn_steps(
+                q, al, be, conv_w, cv2, dt, a, st2, y2, n_v as i32, n_k as i32, hv as i32, hk as i32, ck as i32,
+                1e-6, false, rows as i32,
+            )
+            .unwrap();
+        assert!(ran, "head_k {hk} fits the multi-token kernel");
+        stream_synchronize().unwrap();
+        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        assert!(down(y1, rows * n_v * hv).iter().any(|v| *v != 0.0));
+        assert_eq!(bits(down(y1, rows * n_v * hv)), bits(down(y2, rows * n_v * hv)), "outputs differ");
+        assert_eq!(bits(down(st1, n_v * hv * hk)), bits(down(st2, n_v * hv * hk)), "states differ");
+        assert_eq!(bits(down(cv1, conv0.len())), bits(down(cv2, conv0.len())), "conv histories differ");
     }
 
     /// One fused GDN decode step at Qwen3.8-27B dims (48 v-heads, 16 k-heads,
@@ -12736,6 +14065,398 @@ mod tests {
             device_free(x, 16 * k * 4);
             device_free(y, 16 * n * 4);
             device_free(w, packed.len());
+        }
+    }
+
+    /// Published peak bandwidth by ISA, for the % column of [`bench_kernel_matrix`]
+    /// (HIP's own figure is wrong on Windows: 80.6 GB/s for an RX 9070).
+    fn published_peak_gbs(arch: &str) -> Option<f64> {
+        match arch.split(':').next().unwrap_or(arch) {
+            "gfx1201" => Some(640.0), // RX 9070 / 9070 XT / R9700
+            "gfx1200" => Some(320.0), // RX 9060 XT
+            "gfx906" => Some(1024.0), // MI50
+            _ => None,
+        }
+    }
+
+    /// The same kernels and shapes on every HIP device, one column each, so a
+    /// kernel change is measured on gfx1201, gfx1200 and gfx906 alike (board D3).
+    /// Weights rotate through copies past 192 MB so the RDNA 64 MB Infinity
+    /// Cache cannot serve them. `BENCH_OUT=file.csv` also writes one CSV row per
+    /// (kernel, device) for before/after diffs, and `BENCH_DEVICES=1,2` picks
+    /// devices (on sunny GPU0 is full of worker weights by design):
+    /// `cargo test --release -p allpaca-hip --features hip --lib bench_kernel_matrix -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_kernel_matrix() {
+        let devs: Vec<i32> = match std::env::var("BENCH_DEVICES") {
+            Ok(list) => list.split(',').filter_map(|d| d.trim().parse().ok()).collect(),
+            Err(_) => (0..device_count()).collect(),
+        };
+        let n_dev = devs.len();
+        if n_dev == 0 {
+            return;
+        }
+        const ROTATE_BYTES: usize = 192 << 20;
+        let copies_for = |bytes: usize| ROTATE_BYTES.div_ceil(bytes.max(1)).clamp(1, 64);
+        let time_us = |iters: usize, f: &mut dyn FnMut()| {
+            for _ in 0..10 {
+                f();
+            }
+            stream_synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            stream_synchronize().unwrap();
+            t.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        // (kernel, shape, bytes read per call, µs per device)
+        let mut rows: Vec<(String, String, usize, Vec<f64>)> = Vec::new();
+        let mut heads = Vec::new();
+        let infos = enumerate_devices();
+        for (col, &dev) in devs.iter().enumerate() {
+            set_device(dev).unwrap();
+            let arch = device_gcn_arch(dev).map(|(a, _)| a).unwrap_or_default();
+            let mps = device_multiprocessors(dev).unwrap_or(0);
+            let name = infos.iter().find(|d| d.id == dev).map(|d| d.name.clone()).unwrap_or_default();
+            heads.push((dev, name, arch, mps));
+            let mut row = 0usize;
+            let mut push = |kernel: &str, shape: String, bytes: usize, us: f64| {
+                if col == 0 {
+                    rows.push((kernel.into(), shape, bytes, vec![f64::NAN; n_dev]));
+                }
+                rows[row].3[col] = us;
+                row += 1;
+            };
+            let (n, k) = (5120usize, 5120usize);
+            let x = device_malloc(8 * k * 4, dev).unwrap();
+            let y = device_malloc(8 * n * 4, dev).unwrap();
+            let xs: Vec<f32> = (0..8 * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+            memcpy(x, xs.as_ptr().cast(), 8 * k * 4, MEMCPY_H2D).unwrap();
+            // Q8_0, staged 36-byte blocks.
+            let p8: Vec<u8> = (0..n * k / 32 * 34)
+                .map(|i| match i % 34 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    _ => (i * 7 % 251) as u8,
+                })
+                .collect();
+            let staged = stage_q8_0_blocks(&p8).unwrap();
+            let w8: Vec<*mut u8> = (0..copies_for(staged.len()))
+                .map(|_| {
+                    let w = device_malloc(staged.len(), dev).unwrap();
+                    memcpy(w, staged.as_ptr(), staged.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q8_0_device(x.cast(), w8[i % w8.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q8_0 gemv", format!("n={n} k={k} m={m}"), staged.len(), us);
+            }
+            for w in w8 {
+                device_free(w, staged.len());
+            }
+            // Q4_K, 144-byte super-blocks.
+            let p4: Vec<u8> = (0..n * k / 256 * 144)
+                .map(|i| match i % 144 {
+                    0 | 2 => 0x00,
+                    1 | 3 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w4: Vec<*mut u8> = (0..copies_for(p4.len()))
+                .map(|_| {
+                    let w = device_malloc(p4.len(), dev).unwrap();
+                    memcpy(w, p4.as_ptr(), p4.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q4_k_device(x.cast(), w4[i % w4.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q4_k gemv", format!("n={n} k={k} m={m}"), p4.len(), us);
+            }
+            for w in w4 {
+                device_free(w, p4.len());
+            }
+            // Q2_0, 18-byte blocks of 64 (P5). Same rotation as the K-quant rows.
+            let p2: Vec<u8> = (0..n * k / 64 * 18)
+                .map(|i| match i % 18 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w2: Vec<*mut u8> = (0..copies_for(p2.len()))
+                .map(|_| {
+                    let w = device_malloc(p2.len(), dev).unwrap();
+                    memcpy(w, p2.as_ptr(), p2.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q2_0_device(x.cast(), w2[i % w2.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q2_0 gemv", format!("n={n} k={k} m={m}"), p2.len(), us);
+            }
+            for w in w2 {
+                device_free(w, p2.len());
+            }
+            // Q3_K, 110-byte super-blocks (P5).
+            let p3: Vec<u8> = (0..n * k / 256 * 110)
+                .map(|i| match i % 110 {
+                    108 => 0x00,
+                    109 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w3: Vec<*mut u8> = (0..copies_for(p3.len()))
+                .map(|_| {
+                    let w = device_malloc(p3.len(), dev).unwrap();
+                    memcpy(w, p3.as_ptr(), p3.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q3_k_device(x.cast(), w3[i % w3.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q3_k gemv", format!("n={n} k={k} m={m}"), p3.len(), us);
+            }
+            for w in w3 {
+                device_free(w, p3.len());
+            }
+            device_free(x, 8 * k * 4);
+            device_free(y, 8 * n * 4);
+            // Decode attention, one query row, f32 KV (32 q heads, 8 kv heads, hd 128).
+            let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+            let (nh, nkv, hd) = (32usize, 8usize, 128usize);
+            let q = device_malloc(nh * hd * 4, dev).unwrap();
+            let out = device_malloc(nh * hd * 4, dev).unwrap();
+            memcpy(q, vec![0.01f32; nh * hd].as_ptr().cast(), nh * hd * 4, MEMCPY_H2D).unwrap();
+            for n_kv in [512usize, 4096, 32768] {
+                let kv_bytes = n_kv * nkv * hd * 4;
+                let kvs: Vec<(*mut u8, *mut u8)> = (0..copies_for(2 * kv_bytes))
+                    .map(|_| {
+                        let kp = device_malloc(kv_bytes, dev).unwrap();
+                        let vp = device_malloc(kv_bytes, dev).unwrap();
+                        let fill = vec![0.01f32; n_kv * nkv * hd];
+                        memcpy(kp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                        memcpy(vp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                        (kp, vp)
+                    })
+                    .collect();
+                let mut i = 0usize;
+                let iters = if n_kv >= 32768 { 50 } else { 200 };
+                let us = time_us(iters, &mut || {
+                    let (kp, vp) = kvs[i % kvs.len()];
+                    ws.attention_device(
+                        q.cast(), kp.cast(), vp.cast(), out.cast(), 1, n_kv as i32,
+                        nh as i32, nkv as i32, hd as i32, true,
+                    )
+                    .unwrap();
+                    i += 1;
+                });
+                push("attention decode", format!("n_kv={n_kv} {nh}/{nkv} heads hd={hd} f32"), 2 * kv_bytes, us);
+                for (kp, vp) in kvs {
+                    device_free(kp, kv_bytes);
+                    device_free(vp, kv_bytes);
+                }
+            }
+            device_free(q, nh * hd * 4);
+            device_free(out, nh * hd * 4);
+            // B3: prefill f16 GEMM and prefill attention, exact kernels vs the
+            // gfx12 WMMA kernels (PrefillWmma scope; other devices fall back,
+            // so both rows time the exact kernel there). Llama-3.2-3B shapes.
+            for wmma in [false, true] {
+                let tag = if wmma { "wmma" } else { "exact" };
+                let _scope = wmma.then(PrefillWmma::enable);
+                let (m, n, k) = (512usize, 3072usize, 3072usize);
+                let a = device_malloc(m * k * 4, dev).unwrap();
+                let c = device_malloc(m * n * 4, dev).unwrap();
+                let w = device_malloc(n * k * 2, dev).unwrap();
+                let av: Vec<f32> = (0..m * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+                memcpy(a, av.as_ptr().cast(), m * k * 4, MEMCPY_H2D).unwrap();
+                let wv: Vec<u16> = (0..n * k).map(|i| allpaca_cpu::f32_to_f16(((i * 7 % 89) as f32 - 44.0) * 0.001)).collect();
+                memcpy(w, wv.as_ptr().cast(), n * k * 2, MEMCPY_H2D).unwrap();
+                let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+                let us = time_us(20, &mut || {
+                    if wmma {
+                        gemm_nt_f16_wmma_device(a.cast(), w.cast(), c.cast(), m as i32, n as i32, k as i32)
+                            .unwrap();
+                    } else {
+                        ws.gemm_nt_f16_dev(a.cast(), w.cast(), c.cast(), m as i32, n as i32, k as i32).unwrap();
+                    }
+                });
+                push(&format!("f16 prefill gemm ({tag})"), format!("m={m} n={n} k={k}"), n * k * 2, us);
+                device_free(a, m * k * 4);
+                device_free(c, m * n * 4);
+                device_free(w, n * k * 2);
+                let (nh, nkv, hd, n_q) = (24usize, 8usize, 128usize, 512usize);
+                let q = device_malloc(n_q * nh * hd * 4, dev).unwrap();
+                let out = device_malloc(n_q * nh * hd * 4, dev).unwrap();
+                memcpy(q, vec![0.01f32; n_q * nh * hd].as_ptr().cast(), n_q * nh * hd * 4, MEMCPY_H2D).unwrap();
+                for n_kv in [512usize, 4096] {
+                    let kv_bytes = n_kv * nkv * hd * 4;
+                    let kp = device_malloc(kv_bytes, dev).unwrap();
+                    let vp = device_malloc(kv_bytes, dev).unwrap();
+                    let fill: Vec<f32> = (0..n_kv * nkv * hd).map(|i| ((i * 11 % 83) as f32 - 41.0) * 0.01).collect();
+                    memcpy(kp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                    memcpy(vp, fill.as_ptr().cast(), kv_bytes, MEMCPY_H2D).unwrap();
+                    let us = time_us(10, &mut || {
+                        ws.attention_device(
+                            q.cast(), kp.cast(), vp.cast(), out.cast(), n_q as i32, n_kv as i32,
+                            nh as i32, nkv as i32, hd as i32, true,
+                        )
+                        .unwrap();
+                    });
+                    push(
+                        &format!("attention prefill ({tag})"),
+                        format!("n_q={n_q} n_kv={n_kv} {nh}/{nkv} heads hd={hd} causal"),
+                        2 * kv_bytes,
+                        us,
+                    );
+                    device_free(kp, kv_bytes);
+                    device_free(vp, kv_bytes);
+                }
+                device_free(q, n_q * nh * hd * 4);
+                device_free(out, n_q * nh * hd * 4);
+            }
+            // A tiny kernel: the per-launch floor.
+            let a = device_malloc(2048 * 4, dev).unwrap();
+            let b = device_malloc(2048 * 4, dev).unwrap();
+            let us = time_us(2000, &mut || copy_f32_kernel(a.cast(), b.cast(), 2048).unwrap());
+            push("copy_f32 (launch floor)", "n=2048".into(), 2048 * 4, us);
+            device_free(a, 2048 * 4);
+            device_free(b, 2048 * 4);
+        }
+
+        let mut table = String::from("| kernel | shape |");
+        let mut rule = String::from("|---|---|");
+        for (dev, name, arch, mps) in &heads {
+            table += &format!(" hip{dev} {name} ({arch}, {mps} MPs) µs (GB/s, % peak) |");
+            rule += "---|";
+        }
+        table += "\n";
+        table += &rule;
+        table += "\n";
+        let mut csv = String::from("kernel,shape,device,arch,multiprocessors,us,gbs,pct_peak\n");
+        for (kernel, shape, bytes, us) in &rows {
+            table += &format!("| {kernel} | {shape} |");
+            for (col, t) in us.iter().enumerate() {
+                let gbs = *bytes as f64 / t / 1e3;
+                let (dev, _, arch, mps) = &heads[col];
+                let pct = published_peak_gbs(arch).map(|p| gbs / p * 100.0);
+                let pct_s = pct.map_or("?".into(), |p| format!("{p:.0}%"));
+                table += &format!(" {t:.1} ({gbs:.0}, {pct_s}) |");
+                csv += &format!(
+                    "{kernel},{shape},{dev},{arch},{mps},{t:.2},{gbs:.1},{}\n",
+                    pct.map_or(String::new(), |p| format!("{p:.1}"))
+                );
+            }
+            table += "\n";
+        }
+        eprintln!("\n{table}");
+        if let Ok(path) = std::env::var("BENCH_OUT") {
+            std::fs::write(&path, csv).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
+    /// Q2_0 and Q3_K GEMVs (board P5) at m = 1, 2, 4, 8 on a dense 5120² shape
+    /// and an MoE expert shape (n = 640, k = 2560), on every device or
+    /// `BENCH_DEVICES`. Weights rotate past 192 MB as in `bench_kernel_matrix`.
+    /// Each line is `lowbit,<kernel>,<shape>,hip<dev>,<arch>,<µs>`, and
+    /// `BENCH_OUT=file.csv` writes the same rows, so main and a branch can be
+    /// run in turn and compared:
+    /// `cargo test --release -p allpaca-hip --features hip --lib bench_lowbit_gemv -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_lowbit_gemv() {
+        let devs: Vec<i32> = match std::env::var("BENCH_DEVICES") {
+            Ok(list) => list.split(',').filter_map(|d| d.trim().parse().ok()).collect(),
+            Err(_) => (0..device_count()).collect(),
+        };
+        const ROTATE_BYTES: usize = 192 << 20;
+        let mut csv = String::from("kernel,shape,device,arch,us\n");
+        for &dev in &devs {
+            set_device(dev).unwrap();
+            let arch = device_gcn_arch(dev).map(|(a, _)| a).unwrap_or_default();
+            for (n, k) in [(5120usize, 5120usize), (640, 2560)] {
+                let x = device_malloc(8 * k * 4, dev).unwrap();
+                let y = device_malloc(8 * n * 4, dev).unwrap();
+                let xs: Vec<f32> = (0..8 * k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+                memcpy(x, xs.as_ptr().cast(), 8 * k * 4, MEMCPY_H2D).unwrap();
+                let p2: Vec<u8> = (0..n * k / 64 * 18)
+                    .map(|i| match i % 18 {
+                        0 => 0x00,
+                        1 => 0x1c,
+                        j => (i * 7 % 251 + j) as u8,
+                    })
+                    .collect();
+                let p3: Vec<u8> = (0..n * k / 256 * 110)
+                    .map(|i| match i % 110 {
+                        108 => 0x00,
+                        109 => 0x1c,
+                        j => (i * 7 % 251 + j) as u8,
+                    })
+                    .collect();
+                for (kernel, packed) in [("q2_0 gemv", &p2), ("q3_k gemv", &p3)] {
+                    let copies = ROTATE_BYTES.div_ceil(packed.len()).clamp(1, 64);
+                    let ws: Vec<*mut u8> = (0..copies)
+                        .map(|_| {
+                            let w = device_malloc(packed.len(), dev).unwrap();
+                            memcpy(w, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+                            w
+                        })
+                        .collect();
+                    for m in [1i32, 2, 4, 8] {
+                        let call = |i: usize| {
+                            let w = ws[i % ws.len()];
+                            if kernel == "q2_0 gemv" {
+                                gemm_nt_q2_0_device(x.cast(), w, y.cast(), m, n as i32, k as i32).unwrap();
+                            } else {
+                                gemm_nt_q3_k_device(x.cast(), w, y.cast(), m, n as i32, k as i32).unwrap();
+                            }
+                        };
+                        for i in 0..10 {
+                            call(i);
+                        }
+                        stream_synchronize().unwrap();
+                        let iters = 200usize;
+                        let t = std::time::Instant::now();
+                        for i in 0..iters {
+                            call(i);
+                        }
+                        stream_synchronize().unwrap();
+                        let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                        let shape = format!("n={n} k={k} m={m}");
+                        eprintln!("lowbit,{kernel},{shape},hip{dev},{arch},{us:.2}");
+                        csv += &format!("{kernel},{shape},{dev},{arch},{us:.2}\n");
+                    }
+                    for w in ws {
+                        device_free(w, packed.len());
+                    }
+                }
+                device_free(x, 8 * k * 4);
+                device_free(y, 8 * n * 4);
+            }
+        }
+        if let Ok(path) = std::env::var("BENCH_OUT") {
+            std::fs::write(&path, csv).unwrap();
         }
     }
 
@@ -13155,13 +14876,13 @@ mod tests {
     }
 
     /// The activations a Q8_0 GEMV of `m` rows over an `n x k` weight
-    /// actually multiplies: int8-quantized on the wide-row GEMV path
-    /// (m <= 16, k >= 5120, whole 32-value blocks), as given otherwise or
-    /// with ALLPACA_Q8_F32_GEMV=1.
+    /// actually multiplies on device 0: int8-quantized on the int8 GEMV
+    /// (m <= 16 and k >= 5120, or any k on a 64-lane-wavefront card; whole
+    /// 32-value blocks), as given otherwise or with ALLPACA_Q8_F32_GEMV=1.
     #[cfg(feature = "hip")]
-    fn q8_0_gemv_activations(a: &[f32], m: usize, _n: usize, k: usize) -> Vec<f32> {
-        let f32_gemv = std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1");
-        if m <= 16 && k >= 5120 && k % 32 == 0 && !f32_gemv {
+    fn q8_0_gemv_activations(a: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        set_device(0).expect("bind");
+        if q8_0_gemv_rounds_activations(m as i32, n as i32, k as i32) {
             q8_activations(a)
         } else {
             a.to_vec()
@@ -15202,8 +16923,150 @@ mod tests {
         assert!(gemm_nt_q2_0(&[0.0; 65], &[0u8; 36], &mut [0.0; 1], 1, 1, 65).is_err());
     }
 
-    /// Routed experts from a pool of Q2_0 slots must match the CPU: dequant
-    /// each picked slot, SwiGLU, weighted sum. `silu_scale` is checked on the way.
+    /// One Q2_0 block added to a lane's `acc`, same product order as
+    /// `q2_0_block_dot`: byte `w` then its high half, each crumb as
+    /// `(code - 1) * activation`, then `fma(d, s, acc)`: the kernel's
+    /// `acc += q2_0_block_dot(..)` contracts the scale into the lane sum.
+    #[cfg(feature = "hip")]
+    fn q2_0_block_dot_host(blk: &[u8], x: &[f32], acc: f32) -> f32 {
+        let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let mut s = 0.0f32;
+        for w in 0..8 {
+            let pair = u32::from(u16::from_le_bytes([blk[2 + 2 * w], blk[3 + 2 * w]]));
+            for half in 0..2 {
+                let q = pair >> (8 * half);
+                let base = (2 * w + half) * 4;
+                for shift in 0..4 {
+                    let code = f32::from(((q >> (2 * shift)) & 3) as u8) - 1.0;
+                    s = code.mul_add(x[base + shift], s);
+                }
+            }
+        }
+        d.mul_add(s, acc)
+    }
+
+    /// Host copy of `gemv_nt_q2_0_kernel`: four lanes take blocks `lane, lane+4, ...`
+    /// and the column is `(lane0 + lane1) + (lane2 + lane3)`.
+    #[cfg(feature = "hip")]
+    fn q2_0_gemv_lane_sum(a: &[f32], b: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let nblocks = k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+        let stride = allpaca_cpu::Q2_0_BLOCK_BYTES;
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            let arow = &a[row * k..(row + 1) * k];
+            for col in 0..n {
+                let brow = &b[col * nblocks * stride..(col + 1) * nblocks * stride];
+                let mut lanes = [0.0f32; 4];
+                for (ib, blk) in brow.chunks_exact(stride).enumerate() {
+                    let lane = &mut lanes[ib % 4];
+                    *lane = q2_0_block_dot_host(blk, &arow[ib * 64..(ib + 1) * 64], *lane);
+                }
+                c[row * n + col] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            }
+        }
+        c
+    }
+
+    /// Public Q2_0 GEMV must keep the four-lane sum's bits. A packed-byte
+    /// unpack that changes a product or the add order fails here.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q2_0_matches_the_four_lane_sum_bit_for_bit() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1usize, 4usize, 64usize), (1, 70, 192), (2, 3, 320), (3, 65, 128), (2, 9, 1024)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            let nblocks = n * k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+            let mut b_q = vec![0u8; nblocks * allpaca_cpu::Q2_0_BLOCK_BYTES];
+            let mut seed = 0x9e37_79b9u32.wrapping_mul(si as u32 + 1);
+            for (bi, block) in b_q.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                let d = (0.01 + 0.003 * (bi % 17) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+            }
+            let host = q2_0_gemv_lane_sum(&a, &b_q, m, n, k);
+            let mut hip = vec![0.0f32; m * n];
+            gemm_nt_q2_0(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q2_0 must run when a device is present");
+            for i in 0..m * n {
+                assert_eq!(
+                    hip[i].to_bits(),
+                    host[i].to_bits(),
+                    "q2_0 lane-sum bits {m}x{n}x{k} idx={i} hip={} host={}",
+                    hip[i],
+                    host[i]
+                );
+            }
+        }
+    }
+
+    /// Weights at an odd address and activations off a 16-byte boundary take
+    /// the byte-at-a-time branch of `q2_0_block_dot`; it must give the same
+    /// bits as the aligned one (the four-lane host sum).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q2_0_unaligned_inputs_keep_the_lane_sum_bits() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, n, k) = (2usize, 5usize, 320usize);
+        let mut a = vec![0.0f32; m * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 29 + 5) % 61) as f32 * 0.017 - 0.5;
+        }
+        let nblocks = n * k / allpaca_cpu::Q2_0_BLOCK_ELEMS;
+        let mut b_q = vec![0u8; nblocks * allpaca_cpu::Q2_0_BLOCK_BYTES];
+        let mut seed = 0x2545_f491u32;
+        for (bi, block) in b_q.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+            for byte in block[2..].iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (seed >> 24) as u8;
+            }
+            let d = (0.02 + 0.001 * (bi % 13) as f32) * if bi % 4 == 1 { -1.0 } else { 1.0 };
+            block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+        }
+        let host = q2_0_gemv_lane_sum(&a, &b_q, m, n, k);
+        set_device(0).unwrap();
+        let (a_bytes, b_bytes, c_bytes) = (m * k * 4, b_q.len(), m * n * 4);
+        let da = device_malloc(a_bytes + 16, 0).unwrap();
+        let db = device_malloc(b_bytes + 16, 0).unwrap();
+        let dc = device_malloc(c_bytes, 0).unwrap();
+        // hipMalloc is at least 256-byte aligned: +4 and +1 break the 16- and 2-byte tests.
+        let (a_at, b_at) = unsafe { (da.add(4), db.add(1)) };
+        assert_eq!(a_at as usize % 16, 4);
+        assert_eq!(b_at as usize % 2, 1);
+        memcpy(a_at, a.as_ptr().cast(), a_bytes, MEMCPY_H2D).unwrap();
+        memcpy(b_at, b_q.as_ptr(), b_bytes, MEMCPY_H2D).unwrap();
+        let run = gemm_nt_q2_0_device(a_at.cast(), b_at, dc.cast(), m as i32, n as i32, k as i32);
+        let mut hip = vec![0.0f32; m * n];
+        let back = run.and_then(|()| memcpy(hip.as_mut_ptr().cast(), dc, c_bytes, MEMCPY_D2H));
+        device_free(da, a_bytes + 16);
+        device_free(db, b_bytes + 16);
+        device_free(dc, c_bytes);
+        back.expect("unaligned Q2_0 GEMV");
+        for i in 0..m * n {
+            assert_eq!(
+                hip[i].to_bits(),
+                host[i].to_bits(),
+                "unaligned q2_0 idx={i} hip={} host={}",
+                hip[i],
+                host[i]
+            );
+        }
+    }
+
+    /// Routed experts from a pool of Q2_0 slots must match the CPU's 8-bit
+    /// products (gemv_q2_0_i8 on the input, then on the hidden row) up to
+    /// the order of the sums, and the float SwiGLU within the rounding.
+    /// `silu_scale` is checked on the way.
     #[cfg(feature = "hip")]
     #[test]
     fn q2_0_moe_ffn_matches_cpu_swiglu_of_the_picked_slots() {
@@ -15245,13 +17108,29 @@ mod tests {
                     *e += w * y;
                 }
             }
+            // The CPU's 8-bit products.
+            let mut expect8 = vec![0.0f32; dim];
+            let input = allpaca_cpu::Q2_0Input::new(&x).unwrap();
+            let third = slot_bytes / 3;
+            for (slot, w) in slots.iter().zip(&weights) {
+                let bytes = &pool[*slot as usize * slot_bytes..][..slot_bytes];
+                let (mut g, mut u, mut y) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
+                allpaca_cpu::gemv_q2_0_i8(&bytes[..third], &input, &mut g).unwrap();
+                allpaca_cpu::gemv_q2_0_i8(&bytes[third..2 * third], &input, &mut u).unwrap();
+                let h: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+                allpaca_cpu::gemv_q2_0_i8(&bytes[2 * third..], &allpaca_cpu::Q2_0Input::new(&h).unwrap(), &mut y).unwrap();
+                for (e, y) in expect8.iter_mut().zip(&y) {
+                    *e += w * y;
+                }
+            }
             set_device(0).unwrap();
             let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
-            let floats = dim + slots.len() * ff + dim;
+            let scratch = q2_0_moe_scratch_floats(1, slots.len(), dim, ff);
+            let floats = dim + scratch + dim;
             let dev = device_malloc(floats * 4, 0).unwrap();
             let (dx, dh, dout) = unsafe {
                 let p = dev.cast::<f32>();
-                (p, p.add(dim), p.add(dim + slots.len() * ff))
+                (p, p.add(dim), p.add(dim + scratch))
             };
             let mut got = vec![0.0f32; dim];
             let mut silu = x.clone();
@@ -15264,9 +17143,16 @@ mod tests {
             })();
             device_free(dev, floats * 4);
             run.expect("Q2_0 MoE kernels must run when a device is present");
+            let scale = expect.iter().fold(1e-3f32, |m, v| m.max(v.abs()));
             for i in 0..dim {
                 assert!(
-                    gemm_close(got[i], expect[i]),
+                    (got[i] - expect8[i]).abs() <= 1e-4 * scale,
+                    "q2_0_moe_ffn dim {dim} ff {ff} idx {i}: hip {} cpu 8-bit {}",
+                    got[i],
+                    expect8[i]
+                );
+                assert!(
+                    (got[i] - expect[i]).abs() <= 0.03 * scale,
                     "q2_0_moe_ffn dim {dim} ff {ff} idx {i}: hip {} cpu {}",
                     got[i],
                     expect[i]
@@ -15318,12 +17204,13 @@ mod tests {
             let weights: Vec<f32> = order.iter().map(|&e| w[e] / part * scale).collect();
             set_device(0).unwrap();
             let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
-            let floats = dim + n_exp + k * ff + 2 * dim + q4x::PICKS_BYTES / 4;
+            let sc = q2_0_moe_scratch_floats(1, k, dim, ff);
+            let floats = dim + n_exp + sc + 2 * dim + q4x::PICKS_BYTES / 4;
             let dev = device_malloc(floats * 4, 0).unwrap();
             let (dx, dscores, dh, dout, dref, dpicks) = unsafe {
                 let p = dev.cast::<f32>();
                 let h = p.add(dim + n_exp);
-                (p, p.add(dim), h, h.add(k * ff), h.add(k * ff + dim), h.add(k * ff + 2 * dim))
+                (p, p.add(dim), h, h.add(sc), h.add(sc + dim), h.add(sc + 2 * dim))
             };
             let (mut got, mut expect) = (vec![0.0f32; dim], vec![0.0f32; dim]);
             let mut picks = vec![0u8; q4x::PICKS_BYTES];
@@ -15343,6 +17230,7 @@ mod tests {
                     dout,
                     dim as i32,
                     ff as i32,
+                    1,
                 )?;
                 memcpy(got.as_mut_ptr().cast(), dout.cast(), dim * 4, MEMCPY_D2H)?;
                 memcpy(expect.as_mut_ptr().cast(), dref.cast(), dim * 4, MEMCPY_D2H)?;
@@ -15360,6 +17248,69 @@ mod tests {
                 assert!(gemm_close(got[i], expect[i]), "routed dim {dim} idx {i}: {} vs {}", got[i], expect[i]);
             }
             assert!(expect.iter().any(|v| v.abs() > 1e-3), "reference output is all zero");
+        }
+    }
+
+    /// Several tokens' routed experts in one launch give each token's own
+    /// launch bit for bit.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q4x_routed_experts_of_several_rows_equal_each_row_alone() {
+        if device_count() == 0 {
+            return;
+        }
+        // The second and third shapes take the kernels over block pairs; the third is
+        // Flash-Next's, a prefill pass of 16 rows over 64 experts.
+        for (dim, ff, n_exp, k, rows) in
+            [(320usize, 192usize, 40usize, 5usize, 3usize), (256, 256, 40, 5, 3), (2560, 640, 64, 10, 16)]
+        {
+            let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
+            let mut pool = vec![0u8; n_exp * slot_bytes];
+            let mut seed = 0x51ed_2701u32;
+            for (bi, block) in pool.chunks_exact_mut(allpaca_cpu::Q2_0_BLOCK_BYTES).enumerate() {
+                for byte in block[2..].iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (seed >> 24) as u8;
+                }
+                let d = (0.05 + 0.01 * (bi % 11) as f32) * if bi % 3 == 0 { -1.0 } else { 1.0 };
+                block[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+            }
+            let x: Vec<f32> = (0..rows * dim).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.8).collect();
+            let scores: Vec<f32> = (0..rows * n_exp).map(|i| ((i * 53 % 97) as f32 / 20.0 - 2.0) * 0.7).collect();
+            set_device(0).unwrap();
+            let dpool = DeviceWeights::upload_bytes(0, &[&pool]).unwrap();
+            let pick_floats = q4x::PICKS_BYTES / 4;
+            let sc = q2_0_moe_scratch_floats(rows, k, dim, ff);
+            let floats = rows * (dim + n_exp + 2 * dim + pick_floats) + sc;
+            let dev = device_malloc(floats * 4, 0).unwrap();
+            let (dx, dscores, dh, dall, done, dpicks) = unsafe {
+                let p = dev.cast::<f32>();
+                let s = p.add(rows * dim);
+                let h = s.add(rows * n_exp);
+                let all = h.add(sc);
+                (p, s, h, all, all.add(rows * dim), all.add(2 * rows * dim))
+            };
+            let (mut together, mut alone) = (vec![0.0f32; rows * dim], vec![0.0f32; rows * dim]);
+            let run = (|| {
+                memcpy(dx.cast(), x.as_ptr().cast(), rows * dim * 4, MEMCPY_H2D)?;
+                memcpy(dscores.cast(), scores.as_ptr().cast(), rows * n_exp * 4, MEMCPY_H2D)?;
+                let (p, d, k, ff) = (dpool.byte_ptr_at(0), dim as i32, k as i32, ff as i32);
+                q4x::routed_experts(dx, dscores, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, dall, d, ff, rows as i32)?;
+                for r in 0..rows {
+                    // SAFETY: each part holds `rows` rows.
+                    let (x, s, out) = unsafe { (dx.add(r * dim), dscores.add(r * n_exp), done.add(r * dim)) };
+                    q4x::routed_experts(x, s, p, n_exp as i32, k, 1.5, dpicks.cast(), dh, out, d, ff, 1)?;
+                }
+                memcpy(together.as_mut_ptr().cast(), dall.cast(), rows * dim * 4, MEMCPY_D2H)?;
+                memcpy(alone.as_mut_ptr().cast(), done.cast(), rows * dim * 4, MEMCPY_D2H)
+            })();
+            device_free(dev, floats * 4);
+            run.expect("device routing must run when a device is present");
+            for r in 0..rows {
+                let (a, b) = (&together[r * dim..(r + 1) * dim], &alone[r * dim..(r + 1) * dim]);
+                assert!(a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()), "row {r} differs");
+                assert!(b.iter().any(|v| v.abs() > 1e-3), "row {r} is all zero");
+            }
         }
     }
 
@@ -15418,13 +17369,31 @@ mod tests {
             return;
         }
         let (hc, dim, low, ff, n_exp, picks) = (4usize, 2560usize, 320usize, 640usize, 512usize, 10usize);
+        // `ALLPACA_BENCH_ROWS` tokens per pass (default 1), row-exact as a forward runs them.
+        let rows: usize = std::env::var("ALLPACA_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let _exact = ExactRows::enable();
         let k = hc * dim;
         let q3k = |n: usize, k: usize| n * k / 256 * 110;
         let (value, qkv) = (6144usize, 10240usize);
         set_device(device).unwrap();
+        // `ALLPACA_BENCH_RANDOM`: weights of random bytes instead of zeros.
+        let random = std::env::var_os("ALLPACA_BENCH_RANDOM").is_some();
         let alloc = |bytes: usize| {
             let ptr = device_malloc(bytes, device).unwrap();
             device_memset(ptr, 0, bytes).unwrap();
+            if random && bytes > 1 << 16 {
+                let mut seed = bytes as u64 | 1;
+                let host: Vec<u8> = (0..bytes)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        // Small magnitudes: no infinities in the f16 / bf16 scales.
+                        (seed as u8) & 0x3b
+                    })
+                    .collect();
+                memcpy(ptr.cast(), host.as_ptr().cast(), bytes, MEMCPY_H2D).unwrap();
+            }
             ptr
         };
         let slot_bytes = q2_0_expert_slot_bytes(dim, ff);
@@ -15433,36 +17402,41 @@ mod tests {
         let (w_qkv, w_gate, w_out) = (alloc(q3k(qkv, dim)), alloc(q3k(value, dim)), alloc(q3k(dim, value)));
         let (w_alpha, w_router) = (alloc(48 * dim * 2), alloc(n_exp * dim * 2));
         let (w_shared_in, w_shared_down) = (alloc(q3k(ff, dim)), alloc(slot_bytes / 3));
-        let act = alloc(64 * 12288 * 4).cast::<f32>();
-        let at = |i: usize| unsafe { act.add(i * 12288) };
-        let (r, h, d) = (1i32, hc as i32, dim as i32);
+        let slot = 12288 * rows.max(1);
+        let act = alloc(64 * slot * 4).cast::<f32>();
+        let at = |i: usize| unsafe { act.add(i * slot) };
+        let (r, h, d) = (rows as i32, hc as i32, dim as i32);
+        // Router scores that differ per token, so tokens pick different experts.
+        let scores: Vec<f32> = (0..rows * n_exp).map(|i| ((i * 2_654_435_761usize) % 1000) as f32 * 0.003).collect();
         let mix = || -> Result<(), AllpacaError> {
             q4x::stream_norm(at(0), at(1), at(2), r, h, d, 1e-6)?;
-            gemm_nt_bf16_device(at(2), w_down.cast(), at(3), 1, low as i32, k as i32)?;
-            silu_scale_device(at(3), low as i32, 0.25)?;
-            gemm_nt_bf16_device(at(3), w_up.cast(), at(4), 1, k as i32, low as i32)?;
+            gemm_nt_bf16_device(at(2), w_down.cast(), at(3), r, low as i32, k as i32)?;
+            silu_scale_device(at(3), low as i32 * r, 0.25)?;
+            gemm_nt_bf16_device(at(3), w_up.cast(), at(4), r, k as i32, low as i32)?;
             q4x::gated_mean(at(2), at(4), at(5), r, h, d)?;
-            gemm_nt_bf16_device(at(2), w_inject.cast(), at(6), 1, h, k as i32)
+            gemm_nt_bf16_device(at(2), w_inject.cast(), at(6), r, h, k as i32)
         };
         let gdn = || -> Result<(), AllpacaError> {
-            gemm_nt_q3_k_device(at(5), w_qkv, at(7), 1, qkv as i32, d)?;
-            gemm_nt_q3_k_device(at(5), w_gate, at(8), 1, value as i32, d)?;
-            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(9), 1, 48, d)?;
-            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(10), 1, 48, d)?;
-            gemm_nt_q3_k_device(at(8), w_out, at(11), 1, d, value as i32)
+            gemm_nt_q3_k_device(at(5), w_qkv, at(7), r, qkv as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_gate, at(8), r, value as i32, d)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(9), r, 48, d)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(10), r, 48, d)?;
+            gemm_nt_q3_k_device(at(8), w_out, at(11), r, d, value as i32)
         };
         let route = || -> Result<(), AllpacaError> {
-            gemm_nt_bf16_device(at(5), w_router.cast(), at(12), 1, n_exp as i32, d)?;
-            gemm_nt_q3_k_device(at(5), w_shared_in, at(13), 1, ff as i32, d)?;
-            gemm_nt_q3_k_device(at(5), w_shared_in, at(14), 1, ff as i32, d)?;
-            gemm_nt_q2_0_device(at(13), w_shared_down, at(15), 1, d, ff as i32)?;
-            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(16), 1, 1, d)
+            gemm_nt_bf16_device(at(5), w_router.cast(), at(12), r, n_exp as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_shared_in, at(13), r, ff as i32, d)?;
+            gemm_nt_q3_k_device(at(5), w_shared_in, at(14), r, ff as i32, d)?;
+            gemm_nt_q2_0_device(at(13), w_shared_down, at(15), r, d, ff as i32)?;
+            gemm_nt_bf16_device(at(5), w_alpha.cast(), at(16), r, 1, d)
         };
         let experts = || -> Result<(), AllpacaError> {
-            q4x::routed_experts(at(5), at(12), pool, n_exp as i32, picks as i32, 1.0, at(17).cast(), at(18), at(19), d, ff as i32)?;
+            memcpy(at(12).cast(), at(20).cast(), rows * n_exp * 4, MEMCPY_D2D)?;
+            q4x::routed_experts(at(5), at(12), pool, n_exp as i32, picks as i32, 1.0, at(17).cast(), at(18), at(19), d, ff as i32, r)?;
             q4x::ffn_sum(at(19), at(15), at(16), at(11), r, d)?;
             q4x::combine(at(0), at(11), at(6), r, h, d)
         };
+        memcpy(at(20).cast(), scores.as_ptr().cast(), scores.len() * 4, MEMCPY_H2D).unwrap();
         let time = |name: &str, f: &dyn Fn() -> Result<(), AllpacaError>| {
             for _ in 0..20 {
                 f().unwrap();
@@ -15473,9 +17447,10 @@ mod tests {
             for _ in 0..n {
                 f().unwrap();
             }
+            let queued = clock.elapsed().as_secs_f64() * 1e6 / n as f64;
             stream_synchronize().unwrap();
             let us = clock.elapsed().as_secs_f64() * 1e6 / n as f64;
-            eprintln!("BLOCK device {device} {name}: {us:.1} us");
+            eprintln!("BLOCK device {device} rows {rows} {name}: {us:.1} us ({queued:.1} us to queue)");
             us
         };
         let total = 2.0 * time("mixer", &mix) + time("deltanet matrices", &gdn) + time("router and shared expert", &route)
@@ -15488,6 +17463,53 @@ mod tests {
             experts()
         });
         eprintln!("BLOCK device {device} sum of parts {total:.1} us, whole block {whole:.1} us");
+        // `ALLPACA_BENCH_GAP_MS`: whole blocks with the card idle this long between them, as in a
+        // decode where the card waits on others; the time of each block alone, synced.
+        if let Some(gap) = std::env::var("ALLPACA_BENCH_GAP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            let mut sum = 0.0;
+            let n = 50;
+            for _ in 0..n {
+                std::thread::sleep(std::time::Duration::from_millis(gap));
+                let clock = std::time::Instant::now();
+                for _ in 0..8 {
+                    mix().unwrap();
+                    gdn().unwrap();
+                    mix().unwrap();
+                    route().unwrap();
+                    experts().unwrap();
+                }
+                stream_synchronize().unwrap();
+                sum += clock.elapsed().as_secs_f64() * 1e6 / 8.0;
+            }
+            eprintln!("BLOCK device {device} rows {rows} 8 blocks after {gap} ms idle: {:.1} us a block", sum / n as f64);
+        }
+        // `ALLPACA_BENCH_PARTS`: every kernel of a block on its own.
+        if std::env::var_os("ALLPACA_BENCH_PARTS").is_none() {
+            return;
+        }
+        let (lo, kk, ffi) = (low as i32, k as i32, ff as i32);
+        time("stream_norm", &|| q4x::stream_norm(at(0), at(1), at(2), r, h, d, 1e-6));
+        time("bf16 mixer down 320x10240", &|| gemm_nt_bf16_device(at(2), w_down.cast(), at(3), r, lo, kk));
+        time("silu_scale", &|| silu_scale_device(at(3), lo * r, 0.25));
+        time("bf16 mixer up 10240x320", &|| gemm_nt_bf16_device(at(3), w_up.cast(), at(4), r, kk, lo));
+        time("gated_mean", &|| q4x::gated_mean(at(2), at(4), at(5), r, h, d));
+        time("bf16 inject 4x10240", &|| gemm_nt_bf16_device(at(2), w_inject.cast(), at(6), r, h, kk));
+        time("q3_k qkv 10240x2560", &|| gemm_nt_q3_k_device(at(5), w_qkv, at(7), r, qkv as i32, d));
+        time("q3_k gate 6144x2560", &|| gemm_nt_q3_k_device(at(5), w_gate, at(8), r, value as i32, d));
+        time("bf16 alpha 48x2560", &|| gemm_nt_bf16_device(at(5), w_alpha.cast(), at(9), r, 48, d));
+        time("q3_k out 2560x6144", &|| gemm_nt_q3_k_device(at(8), w_out, at(11), r, d, value as i32));
+        time("bf16 router 512x2560", &|| gemm_nt_bf16_device(at(5), w_router.cast(), at(12), r, n_exp as i32, d));
+        time("q3_k shared 640x2560", &|| gemm_nt_q3_k_device(at(5), w_shared_in, at(13), r, ffi, d));
+        time("q2_0 shared down 2560x640", &|| gemm_nt_q2_0_device(at(13), w_shared_down, at(15), r, d, ffi));
+        time("bf16 1x2560", &|| gemm_nt_bf16_device(at(5), w_alpha.cast(), at(16), r, 1, d));
+        time("scores copy", &|| memcpy(at(12).cast(), at(20).cast(), rows * n_exp * 4, MEMCPY_D2D));
+        time("routed experts", &|| {
+            q4x::routed_experts(at(5), at(12), pool, n_exp as i32, picks as i32, 1.0, at(17).cast(), at(18), at(19), d, ffi, r)
+        });
+        time("ffn_sum + combine", &|| {
+            q4x::ffn_sum(at(19), at(15), at(16), at(11), r, d)?;
+            q4x::combine(at(0), at(11), at(6), r, h, d)
+        });
     }
 
     /// The qwen4exp stream kernels against their definitions, on two rows.
@@ -15566,6 +17588,216 @@ mod tests {
                 for s in 0..hc {
                     let want = x[at(s)] + out[i] * 2.0 * sig(logits[row * hc + s] / hc as f32);
                     assert!(close(combined[at(s)], want), "combine {row},{s},{d}");
+                }
+            }
+        }
+    }
+
+    /// int8 codes and scales, one scale per 32 values, as `quantize_rows_q8_kernel`.
+    #[cfg(feature = "hip")]
+    fn q3_k_q8_row(row: &[f32]) -> (Vec<i8>, Vec<f32>) {
+        let mut codes = Vec::with_capacity(row.len());
+        let mut scales = Vec::with_capacity(row.len() / 32);
+        for block in row.chunks_exact(32) {
+            let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+            scales.push(d);
+            for v in block {
+                let q = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                codes.push(q as i8);
+            }
+        }
+        (codes, scales)
+    }
+
+    #[cfg(feature = "hip")]
+    fn q3_k_i8dot4(a: u32, b: u32, c: i32) -> i32 {
+        let mut acc = c;
+        for i in 0..4 {
+            let av = ((a >> (8 * i)) & 0xff) as u8 as i8 as i32;
+            let bv = ((b >> (8 * i)) & 0xff) as u8 as i8 as i32;
+            acc += av * bv;
+        }
+        acc
+    }
+
+    #[cfg(feature = "hip")]
+    fn q3_k_u32(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// `__shfl_down(v, off, lanes)` halving from `lanes / 2`: each step adds the
+    /// lane `off` above. Lanes with no such source never feed lane 0, which
+    /// holds the column.
+    #[cfg(feature = "hip")]
+    fn q3_k_reduce_lanes(mut lanes: Vec<f32>) -> f32 {
+        let width = lanes.len();
+        let mut off = width / 2;
+        while off > 0 {
+            let old = lanes.clone();
+            for i in 0..width {
+                let src = i + off;
+                lanes[i] = if src < width { old[i] + old[src] } else { old[i] };
+            }
+            off >>= 1;
+        }
+        lanes[0]
+    }
+
+    /// Host copy of the Q3_K int8 GEMV (`kquant_i8_block` QT=3) at `lpc` lanes
+    /// per column, as `kq_i8_lanes` picks them: lane `sl` takes 32-value group
+    /// `g = sl / (lpc / 4)` and `128 / lpc` values from `j0` in it. Each lane sums
+    /// `s * act_scale * (dot(q, a) - 4 * sum(a))`, low half then high half, then
+    /// the width-`lpc` shuffle. RDNA launches 8 lanes; the MI50 32 when n < 2048.
+    #[cfg(feature = "hip")]
+    fn q3_k_gemv_lane_sum(
+        a: &[f32],
+        b: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        lpc: usize,
+    ) -> Vec<f32> {
+        assert!(matches!(lpc, 8 | 16 | 32), "Q3_K int8 GEMV lanes {lpc}");
+        let w = 128 / lpc;
+        let nc = w / 4;
+        let lpg = lpc / 4;
+        let nblocks = k / 256;
+        let stride = Q3_K_BLOCK_BYTES;
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            let (codes, scales) = q3_k_q8_row(&a[row * k..(row + 1) * k]);
+            for col in 0..n {
+                let brow = &b[col * nblocks * stride..(col + 1) * nblocks * stride];
+                let mut lanes = vec![0.0f32; lpc];
+                for (sl, lane) in lanes.iter_mut().enumerate() {
+                    let g = sl / lpg;
+                    let j0 = (sl % lpg) * w;
+                    for ib in 0..nblocks {
+                        let blk = &brow[ib * stride..(ib + 1) * stride];
+                        let d = allpaca_cpu::f16_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
+                        let sc = &blk[96..108];
+                        for h in 0..2 {
+                            let mut dot = 0i32;
+                            let mut sum = 0i32;
+                            let bi = ib * 8 + h * 4 + g;
+                            for t in 0..nc {
+                                let qs = q3_k_u32(&blk[32 + h * 32 + j0 + 4 * t..]);
+                                let hm = q3_k_u32(&blk[j0 + 4 * t..]);
+                                let q = ((qs >> (2 * g)) & 0x0303_0303)
+                                    | (((hm >> (4 * h + g)) & 0x0101_0101) << 2);
+                                let at = bi * 32 + j0 + 4 * t;
+                                let av = u32::from_le_bytes([
+                                    codes[at] as u8,
+                                    codes[at + 1] as u8,
+                                    codes[at + 2] as u8,
+                                    codes[at + 3] as u8,
+                                ]);
+                                dot = q3_k_i8dot4(av, q, dot);
+                                sum = q3_k_i8dot4(av, 0x0101_0101, sum);
+                            }
+                            let is = h * 8 + 2 * g + j0 / 16;
+                            let s6 = ((sc[is & 7] >> (4 * (is >> 3))) & 0xF) as i32
+                                | ((((sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3) as i32) << 4);
+                            let s = d * (s6 - 32) as f32;
+                            let partial = (dot - 4 * sum) as f32;
+                            *lane = (s * scales[bi]).mul_add(partial, *lane);
+                        }
+                    }
+                }
+                c[row * n + col] = q3_k_reduce_lanes(lanes);
+            }
+        }
+        c
+    }
+
+    /// The lane model only proves something if the lane count matters: on
+    /// this shape 8 and 32 lanes give different bits somewhere.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q3_k_lane_model_depends_on_the_lane_count() {
+        let (m, n, k) = (2usize, 7usize, 768usize);
+        let (a, _, _) = fill_q5k_gemm_case(3, m, n, k);
+        let b_q = fill_q3k_blocks(3, n, k);
+        let eight = q3_k_gemv_lane_sum(&a, &b_q, m, n, k, 8);
+        let wide = q3_k_gemv_lane_sum(&a, &b_q, m, n, k, 32);
+        assert!(
+            eight.iter().zip(&wide).any(|(x, y)| x.to_bits() != y.to_bits()),
+            "8- and 32-lane sums agree bit for bit; the test cannot tell them apart"
+        );
+        for (x, y) in eight.iter().zip(&wide) {
+            assert!((x - y).abs() <= 1e-3 * x.abs().max(1.0), "8 lanes {x} vs 32 lanes {y}");
+        }
+    }
+
+    /// Q3_K GEMV must keep the bits of the lane sum the kernel really launches
+    /// (`kquant_i8_lanes` asks the device), on every arch: 8 lanes on RDNA, 32 on
+    /// the MI50 below n = 2048. A packed-byte subtract that changes a product or
+    /// the add order fails here.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q3_k_matches_the_launched_lane_sum_bit_for_bit() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [
+            (1usize, 4usize, 256usize),
+            (2, 3, 512),
+            (1, 7, 256),
+            (4, 5, 768),
+            (1, 2048, 256),
+        ];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let lpc = kquant_i8_lanes(0, 3, n as i32).expect("Q3_K int8 lane count");
+            let (a, _, _) = fill_q5k_gemm_case(si, m, n, k);
+            let b_q = fill_q3k_blocks(si, n, k);
+            let host = q3_k_gemv_lane_sum(&a, &b_q, m, n, k, lpc);
+            let mut hip = vec![0.0f32; m * n];
+            gemm_nt_q3_k(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q3_k must run when a device is present");
+            for i in 0..m * n {
+                assert_eq!(
+                    hip[i].to_bits(),
+                    host[i].to_bits(),
+                    "q3_k {lpc}-lane sum bits {m}x{n}x{k} idx={i} hip={} host={}",
+                    hip[i],
+                    host[i]
+                );
+            }
+        }
+    }
+
+    /// A verify batch must give each row the bits it gets alone: m = 9..16
+    /// runs the tile kernel on the MI50 and blocks of 5-8 rows on RDNA.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q3_k_batch_rows_equal_single_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(9usize, 7usize, 512usize), (16, 5, 768), (12, 2048, 256)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let (a, _, _) = fill_q5k_gemm_case(si + 7, m, n, k);
+            let b_q = fill_q3k_blocks(si + 7, n, k);
+            let mut batch = vec![0.0f32; m * n];
+            gemm_nt_q3_k(&a, &b_q, &mut batch, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q3_k batch");
+            for r in 0..m {
+                let mut one = vec![0.0f32; n];
+                gemm_nt_q3_k(&a[r * k..(r + 1) * k], &b_q, &mut one, 1, n as i32, k as i32)
+                    .expect("HIP gemm_nt_q3_k single row");
+                for col in 0..n {
+                    assert_eq!(
+                        batch[r * n + col].to_bits(),
+                        one[col].to_bits(),
+                        "q3_k m={m} n={n} k={k} row {r} col {col}: batch {} vs alone {}",
+                        batch[r * n + col],
+                        one[col]
+                    );
                 }
             }
         }
@@ -16814,6 +19046,500 @@ mod tests {
         }
     }
 
+    /// gfx12 f16 WMMA prefill GEMM matches the existing f16 NT GEMM on one legal tile.
+    ///
+    /// Prefill (`m > 8`) uses `gemm_nt_f16`. The WMMA tile is 16×16×16, so 16×16×16
+    /// is the smallest shape that is both a prefill launch and a WMMA tile. Activations
+    /// are rounded through f16 first: the matrix core multiplies f16×f16, and the
+    /// existing kernel multiplies those same values in f32.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_f16_wmma_prefill_gemm_matches_existing_f16_gemm_on_16x16x16() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let (m, n, k) = (16usize, 16usize, 16usize);
+        let mut a = vec![0.0f32; m * k];
+        let mut b_f = vec![0.0f32; n * k];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 17) % 50) as f32 * 0.02 - 0.5;
+        }
+        for v in &mut a {
+            *v = super::f16_bits_to_f32(allpaca_cpu::f32_to_f16(*v));
+        }
+        for (i, v) in b_f.iter_mut().enumerate() {
+            *v = ((i * 13) % 50) as f32 * 0.02 - 0.5;
+        }
+        let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+        let mut reference = vec![0.0f32; m * n];
+        let mut wmma = vec![0.0f32; m * n];
+        gemm_nt_f16(&a, &b_f16, &mut reference, m as i32, n as i32, k as i32)
+            .expect("existing f16 prefill GEMM");
+        gemm_nt_f16_wmma(&a, &b_f16, &mut wmma, m as i32, n as i32, k as i32)
+            .expect("gfx12 f16 WMMA prefill GEMM");
+        for i in 0..m * n {
+            assert!(
+                gemm_close(wmma[i], reference[i]),
+                "f16 WMMA mismatch idx={i} wmma={} reference={} arch={arch}",
+                wmma[i],
+                reference[i]
+            );
+        }
+    }
+
+    /// Wider and ragged prefill shapes still match the existing f16 NT GEMM.
+    ///
+    /// `m > 8` is the prefill launch. Tiles past a multiple of 16, a second K
+    /// panel, and a row count just above the decode cutoff are all legal.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_f16_wmma_prefill_gemm_matches_existing_f16_gemm_on_more_shapes() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let shapes = [(32usize, 32usize, 32usize), (16, 48, 16), (24, 20, 40), (9, 16, 32)];
+        for (si, (m, n, k)) in shapes.into_iter().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 43) % 50) as f32 * 0.02 - 0.5;
+            }
+            for v in &mut a {
+                *v = super::f16_bits_to_f32(allpaca_cpu::f32_to_f16(*v));
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 11) % 50) as f32 * 0.02 - 0.5;
+            }
+            let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+            let mut reference = vec![0.0f32; m * n];
+            let mut wmma = vec![0.0f32; m * n];
+            gemm_nt_f16(&a, &b_f16, &mut reference, m as i32, n as i32, k as i32)
+                .expect("existing f16 prefill GEMM");
+            gemm_nt_f16_wmma(&a, &b_f16, &mut wmma, m as i32, n as i32, k as i32)
+                .expect("gfx12 f16 WMMA prefill GEMM");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(wmma[i], reference[i]),
+                    "f16 WMMA mismatch shape {m}x{n}x{k} idx={i} wmma={} reference={} arch={arch}",
+                    wmma[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    /// gfx12 int8 WMMA must match the scalar int8 GEMM. Small values stay exact in f32.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_i8_wmma_prefill_gemm_matches_scalar_i8_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let shapes = [(16usize, 16usize, 16usize), (32, 16, 32), (24, 20, 40)];
+        for (si, (m, n, k)) in shapes.into_iter().enumerate() {
+            let a: Vec<i8> = (0..m * k)
+                .map(|i| ((i * 3 + si * 5) % 15) as i8 - 7)
+                .collect();
+            let b: Vec<i8> = (0..n * k)
+                .map(|i| ((i * 7 + si) % 15) as i8 - 7)
+                .collect();
+            let mut reference = vec![0.0f32; m * n];
+            let mut wmma = vec![0.0f32; m * n];
+            gemm_nt_i8(&a, &b, &mut reference, m as i32, n as i32, k as i32)
+                .expect("scalar int8 GEMM");
+            gemm_nt_i8_wmma(&a, &b, &mut wmma, m as i32, n as i32, k as i32)
+                .expect("gfx12 int8 WMMA GEMM");
+            for i in 0..m * n {
+                assert_eq!(
+                    wmma[i], reference[i],
+                    "int8 WMMA mismatch shape {m}x{n}x{k} idx={i} arch={arch}"
+                );
+            }
+        }
+    }
+
+    /// Prefill WMMA attention must match the decode attention kernel, and must not
+    /// rewrite the K or V the caller passed in.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_wmma_prefill_attention_matches_decode_attention() {
+        if device_count() == 0 {
+            return;
+        }
+        let arch = device_gcn_arch(0).map(|(name, _)| name).unwrap_or_default();
+        let gfx12 = arch.starts_with("gfx1200") || arch.starts_with("gfx1201");
+        if !gfx12 {
+            return;
+        }
+        let cases = [
+            (4i32, 4i32, 2i32, 1i32, 16i32),
+            (32, 48, 2, 1, 32),
+        ];
+        for (ci, (n_q, n_kv, n_heads, n_kv_heads, head_dim)) in cases.into_iter().enumerate() {
+            let q_n = (n_q * n_heads * head_dim) as usize;
+            let kv_n = (n_kv * n_kv_heads * head_dim) as usize;
+            let q: Vec<f32> = (0..q_n)
+                .map(|i| ((i * 5 + ci * 3) % 21) as f32 * 0.05 - 0.5)
+                .collect();
+            let k: Vec<f32> = (0..kv_n)
+                .map(|i| ((i * 7 + ci) % 21) as f32 * 0.05 - 0.4)
+                .collect();
+            let v: Vec<f32> = (0..kv_n)
+                .map(|i| ((i * 11 + ci * 2) % 21) as f32 * 0.05 - 0.3)
+                .collect();
+            let k_before = k.clone();
+            let v_before = v.clone();
+            let mut reference = vec![0.0f32; q_n];
+            let mut wmma = vec![0.0f32; q_n];
+            attention(
+                &q, &k, &v, &mut reference, n_q, n_kv, n_heads, n_kv_heads, head_dim, true,
+            )
+            .expect("decode attention");
+            attention_wmma_prefill(
+                &q, &k, &v, &mut wmma, n_q, n_kv, n_heads, n_kv_heads, head_dim, true,
+            )
+            .expect("gfx12 WMMA prefill attention");
+            assert_eq!(k, k_before, "prefill rewrote K");
+            assert_eq!(v, v_before, "prefill rewrote V");
+            for i in 0..q_n {
+                assert!(
+                    gemm_close(wmma[i], reference[i]),
+                    "prefill attention mismatch case {ci} idx={i} wmma={} decode={} arch={arch}",
+                    wmma[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    /// Deterministic values in [-0.5, 0.5) for the WMMA tests.
+    fn wmma_test_values(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    fn device_is_gfx12_by_name(dev: i32) -> bool {
+        device_gcn_arch(dev)
+            .is_some_and(|(name, _)| name.starts_with("gfx1200") || name.starts_with("gfx1201"))
+    }
+
+    /// The cached arch answer equals the device's name on every device, and
+    /// asking again gives the same answer.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn device_is_gfx12_matches_the_device_arch_name() {
+        for dev in 0..device_count() {
+            let want = device_is_gfx12_by_name(dev);
+            assert_eq!(device_is_gfx12(dev), want, "device {dev}");
+            assert_eq!(device_is_gfx12(dev), want, "device {dev}, cached");
+        }
+        assert!(!device_is_gfx12(-1));
+        assert!(!device_is_gfx12(1000));
+    }
+
+    /// The f16 WMMA GEMM must keep f32 precision on activations that are not
+    /// f16 values: magnitudes past 65504 (f16 max) and fine fractions. It is
+    /// compared with an f64 host product of the same f32 A and f16 B, at the
+    /// tolerance an f32 dot product earns (not the f16 one).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_f16_wmma_gemm_keeps_f32_precision_on_unrounded_large_a() {
+        if device_count() == 0 || !device_is_gfx12_by_name(0) {
+            return;
+        }
+        for (si, (m, n, k)) in [(32usize, 48usize, 80usize), (17, 16, 33), (9, 20, 16)].into_iter().enumerate() {
+            let mut a = wmma_test_values(m * k, 11 + si as u64);
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = match i % 5 {
+                    0 => *v * 4.0e5,                     // past f16 max
+                    1 => 1.0 + *v * 1.0e-4,              // fraction below f16 resolution
+                    2 => *v * 7.0e4 + 0.123_456_7,
+                    3 => *v * 1.0e-3,
+                    _ => *v,
+                };
+            }
+            let b_f = wmma_test_values(n * k, 97 + si as u64);
+            let b_f16: Vec<u16> = b_f.iter().copied().map(allpaca_cpu::f32_to_f16).collect();
+            let b_back: Vec<f64> = b_f16.iter().map(|&h| f64::from(super::f16_bits_to_f32(h))).collect();
+            let mut got = vec![0.0f32; m * n];
+            gemm_nt_f16_wmma(&a, &b_f16, &mut got, m as i32, n as i32, k as i32)
+                .expect("gfx12 f16 WMMA GEMM");
+            for r in 0..m {
+                for c in 0..n {
+                    let (mut exact, mut mag) = (0.0f64, 0.0f64);
+                    for p in 0..k {
+                        let t = f64::from(a[r * k + p]) * b_back[c * k + p];
+                        exact += t;
+                        mag += t.abs();
+                    }
+                    let g = f64::from(got[r * n + c]);
+                    assert!(g.is_finite(), "shape {m}x{n}x{k} ({r},{c}) not finite: {g}");
+                    assert!(
+                        (g - exact).abs() <= 2.0e-6 * mag + 1.0e-30,
+                        "shape {m}x{n}x{k} ({r},{c}) got={g} exact={exact} mag={mag}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// f64 host attention, causal rows bottom-right aligned like the kernels.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_f64_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q: usize,
+        n_kv: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        causal: bool,
+    ) -> Vec<f32> {
+        let group = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut out = vec![0.0f32; n_q * n_heads * head_dim];
+        for i in 0..n_q {
+            let t_max = if causal { i + n_kv.saturating_sub(n_q) } else { n_kv - 1 };
+            for h in 0..n_heads {
+                let kvh = h / group;
+                let qr = &q[(i * n_heads + h) * head_dim..][..head_dim];
+                let s: Vec<f64> = (0..=t_max)
+                    .map(|t| {
+                        let kr = &k[(t * n_kv_heads + kvh) * head_dim..][..head_dim];
+                        scale * qr.iter().zip(kr).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum::<f64>()
+                    })
+                    .collect();
+                let mx = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let w: Vec<f64> = s.iter().map(|&x| (x - mx).exp()).collect();
+                let l: f64 = w.iter().sum();
+                for d in 0..head_dim {
+                    let acc: f64 = (0..=t_max)
+                        .map(|t| w[t] * f64::from(v[(t * n_kv_heads + kvh) * head_dim + d]))
+                        .sum();
+                    out[(i * n_heads + h) * head_dim + d] = (acc / l) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// WMMA prefill attention against an f64 reference over the shapes prefill
+    /// meets: head_dim 64 and 128, GQA 4:1 and 8:1, more keys than ATTN_CHUNK,
+    /// a chunk that starts mid-sequence at an offset that is not a multiple of
+    /// 16, a non-causal case, and magnitudes past f16 range (Q and V scaled up
+    /// by 2^17, K scaled down by 2^-17 so the scores stay the same). The
+    /// tolerance is f16-level (inputs round to f16): 0.5% of max |V|.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_wmma_prefill_attention_matches_f64_reference_across_shapes() {
+        if device_count() == 0 || !device_is_gfx12_by_name(0) {
+            return;
+        }
+        // (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, large)
+        let cases = [
+            (32usize, 32usize, 4usize, 1usize, 64usize, true, false),
+            (40, 40, 8, 1, 128, true, false),
+            (300, 300, 2, 1, 64, true, false),
+            (21, 300, 4, 1, 64, true, false),
+            (19, 45, 8, 2, 128, true, false),
+            (24, 40, 4, 2, 64, false, false),
+            (37, 70, 4, 1, 64, true, true),
+            (16, 16, 8, 1, 128, true, true),
+        ];
+        for (ci, (n_q, n_kv, nh, nkv, hd, causal, large)) in cases.into_iter().enumerate() {
+            let mut q = wmma_test_values(n_q * nh * hd, 3 + ci as u64);
+            let mut k = wmma_test_values(n_kv * nkv * hd, 5 + ci as u64);
+            let mut v = wmma_test_values(n_kv * nkv * hd, 7 + ci as u64);
+            if large {
+                let up = (1u32 << 17) as f32;
+                q.iter_mut().for_each(|x| *x *= up);
+                k.iter_mut().for_each(|x| *x /= up);
+                v.iter_mut().for_each(|x| *x *= up);
+            }
+            let reference = attention_f64_reference(&q, &k, &v, n_q, n_kv, nh, nkv, hd, causal);
+            let mut got = vec![f32::NAN; q.len()];
+            attention_wmma_prefill(
+                &q, &k, &v, &mut got, n_q as i32, n_kv as i32, nh as i32, nkv as i32, hd as i32, causal,
+            )
+            .expect("gfx12 WMMA prefill attention");
+            let vmax = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            for i in 0..got.len() {
+                assert!(
+                    got[i].is_finite() && (got[i] - reference[i]).abs() <= 5.0e-3 * vmax,
+                    "case {ci} (n_q={n_q} n_kv={n_kv} heads={nh}/{nkv} hd={hd} causal={causal} large={large}) \
+                     idx={i} got={} ref={}",
+                    got[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    /// A row's WMMA attention output must not depend on keys past its causal
+    /// limit: the same rows over the same visible keys give the same bits
+    /// whether or not the call also carries later tokens (larger, in the same
+    /// 16-key tile and beyond). Otherwise a prompt-cache hit, or a prompt that
+    /// shares a prefix, would get prefix KV other than a cold prefill's.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_wmma_prefill_attention_row_ignores_later_tokens() {
+        if device_count() == 0 || !device_is_gfx12_by_name(0) {
+            return;
+        }
+        // (n_q, n_kv, extra trailing tokens, heads, kv heads, head_dim)
+        for (ci, (n_q, n_kv, extra, nh, nkv, hd)) in
+            [(21usize, 40usize, 11usize, 4usize, 1usize, 64usize), (16, 16, 5, 8, 2, 128), (9, 300, 20, 2, 1, 64)]
+                .into_iter()
+                .enumerate()
+        {
+            let (q2n, kv2n) = (n_q + extra, n_kv + extra);
+            let q = wmma_test_values(q2n * nh * hd, 31 + ci as u64);
+            let mut k = wmma_test_values(kv2n * nkv * hd, 37 + ci as u64);
+            let mut v = wmma_test_values(kv2n * nkv * hd, 41 + ci as u64);
+            // Later tokens are far larger (V by 2^30), so a scale shared with
+            // them would push the visible V into f16 subnormals.
+            for t in n_kv..kv2n {
+                for x in &mut k[t * nkv * hd..(t + 1) * nkv * hd] {
+                    *x *= 40.0;
+                }
+                for x in &mut v[t * nkv * hd..(t + 1) * nkv * hd] {
+                    *x *= (1u64 << 30) as f32; // pushes a shared scale into f16 subnormals
+                }
+            }
+            let row = nh * hd;
+            let mut short = vec![0.0f32; n_q * row];
+            attention_wmma_prefill(
+                &q[..n_q * row], &k[..n_kv * nkv * hd], &v[..n_kv * nkv * hd], &mut short,
+                n_q as i32, n_kv as i32, nh as i32, nkv as i32, hd as i32, true,
+            )
+            .unwrap();
+            let mut long = vec![0.0f32; q2n * row];
+            attention_wmma_prefill(&q, &k, &v, &mut long, q2n as i32, kv2n as i32, nh as i32, nkv as i32, hd as i32, true)
+                .unwrap();
+            for i in 0..n_q * row {
+                assert_eq!(
+                    short[i].to_bits(),
+                    long[i].to_bits(),
+                    "case {ci}: row {} col {} changed with later tokens: {} vs {}",
+                    i / row,
+                    i % row,
+                    short[i],
+                    long[i]
+                );
+            }
+        }
+    }
+
+    /// Dispatch: `HipWorkspace::attention_device` and `gemm_nt_f16_dev` launch
+    /// the WMMA kernels only inside a [`PrefillWmma`] scope, only on gfx12,
+    /// never for one query row or under [`ExactRows`], and the scope restores
+    /// what it found when it ends (nested scopes included).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn prefill_wmma_scope_gates_wmma_dispatch() {
+        for dev in 0..device_count() {
+            let gfx12 = device_is_gfx12_by_name(dev);
+            let ws = HipWorkspace::new(dev, 8 << 20, 16).unwrap();
+            let (n_q, n_kv, nh, nkv, hd) = (32usize, 48usize, 4usize, 1usize, 64usize);
+            let (m, n, k) = (32usize, 48usize, 64usize);
+            let q = wmma_test_values(n_q * nh * hd, 1);
+            let kk = wmma_test_values(n_kv * nkv * hd, 2);
+            let vv = wmma_test_values(n_kv * nkv * hd, 3);
+            let a = wmma_test_values(m * k, 4);
+            let b: Vec<u16> = wmma_test_values(n * k, 5).into_iter().map(allpaca_cpu::f32_to_f16).collect();
+            let up = |host: &[f32]| {
+                let p = device_malloc(host.len() * 4, dev).unwrap();
+                memcpy(p, host.as_ptr().cast(), host.len() * 4, MEMCPY_H2D).unwrap();
+                p
+            };
+            let (dq, dk, dv, da) = (up(&q), up(&kk), up(&vv), up(&a));
+            let db = device_malloc(b.len() * 2, dev).unwrap();
+            memcpy(db, b.as_ptr().cast(), b.len() * 2, MEMCPY_H2D).unwrap();
+            let dout = device_malloc(q.len() * 4, dev).unwrap();
+            let dc = device_malloc(m * n * 4, dev).unwrap();
+            let run = |rows: usize| -> u64 {
+                let before = thread_wmma_launches();
+                ws.attention_device(
+                    dq.cast(), dk.cast(), dv.cast(), dout.cast(), rows as i32, n_kv as i32,
+                    nh as i32, nkv as i32, hd as i32, true,
+                )
+                .unwrap();
+                ws.gemm_nt_f16_dev(da.cast(), db.cast(), dc.cast(), rows as i32, n as i32, k as i32)
+                    .unwrap();
+                stream_synchronize().unwrap();
+                thread_wmma_launches() - before
+            };
+            let read = || {
+                let mut o = vec![0.0f32; q.len()];
+                let mut cc = vec![0.0f32; m * n];
+                memcpy(o.as_mut_ptr().cast(), dout, o.len() * 4, MEMCPY_D2H).unwrap();
+                memcpy(cc.as_mut_ptr().cast(), dc, cc.len() * 4, MEMCPY_D2H).unwrap();
+                (o, cc)
+            };
+            assert_eq!(run(n_q), 0, "device {dev}: WMMA launched with no prefill scope");
+            let (exact_attn, exact_gemm) = read();
+            {
+                let _outer = PrefillWmma::enable();
+                {
+                    let _inner = PrefillWmma::enable();
+                }
+                assert!(prefill_wmma_active(), "a nested scope must restore the outer one");
+                // Attention only: the f16 WMMA GEMM is not routed (see gemm_nt_f16_dev).
+                let want = if gfx12 { 1 } else { 0 };
+                assert_eq!(run(n_q), want, "device {dev} (gfx12={gfx12}): prefill scope");
+                // Same numbers within WMMA tolerance on this device (f16-level
+                // for attention, near-f32 for the GEMM).
+                let (w_attn, w_gemm) = read();
+                for (i, (&g, &e)) in w_attn.iter().zip(&exact_attn).enumerate() {
+                    assert!((g - e).abs() <= 3.0e-3, "device {dev} attention idx={i} wmma={g} exact={e}");
+                }
+                for (i, (&g, &e)) in w_gemm.iter().zip(&exact_gemm).enumerate() {
+                    assert!(gemm_close(g, e), "device {dev} gemm idx={i} wmma={g} exact={e}");
+                }
+                assert_eq!(run(1), 0, "device {dev}: one query row must not take WMMA");
+                {
+                    let _exact = ExactRows::enable();
+                    assert!(!prefill_wmma_active(), "ExactRows wins over the prefill scope");
+                    assert_eq!(run(n_q), 0, "device {dev}: WMMA launched under ExactRows");
+                }
+            }
+            assert!(!prefill_wmma_active());
+            assert_eq!(run(n_q), 0, "device {dev}: WMMA launched after the scope ended");
+            for (p, bytes) in [
+                (dq, q.len() * 4),
+                (dk, kk.len() * 4),
+                (dv, vv.len() * 4),
+                (da, a.len() * 4),
+                (db, b.len() * 2),
+                (dout, q.len() * 4),
+                (dc, m * n * 4),
+            ] {
+                device_free(p, bytes);
+            }
+        }
+    }
+
     /// F16 decode GEMV at lm_head-ish n must stay in the same ballpark as F32 GEMV.
     #[cfg(feature = "hip")]
     #[test]
@@ -16977,6 +19703,175 @@ mod tests {
                 let mut out = vec![0.0f32; m * n];
                 run(&a, &mut out, m as i32);
                 assert_rows_match_single("q8_0", run, &a, &out, m, n, k);
+            }
+        }
+    }
+
+    /// The QSA indexer on the card keeps the cells the host's rule keeps:
+    /// scores in sequence order (bit for bit from the card's own normed
+    /// queries), the best pools ascending with the earlier of equal scores,
+    /// then the tail. Ties straddle the select kernel's 1024-pool chunks,
+    /// and a zero query scores every pool the same. Pooling and the query
+    /// rotation stay near a host computation.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qsa_selection_on_the_card_keeps_the_host_rule_cells() {
+        if device_count() == 0 {
+            return;
+        }
+        let ws = HipWorkspace::new(0, 1 << 20, 16).unwrap();
+        let (heads, dim, n_rot) = (2usize, 64usize, 32usize);
+        let wave = |i: usize, seed: f32| ((i as f32 * 0.61 + seed).sin() * 1.7 + (i as f32 * 0.13).cos()) * 0.5;
+        let rope = |v: &mut [f32], pos: usize| {
+            let half = n_rot / 2;
+            for i in 0..half {
+                let angle = pos as f32 * 10000f32.powf(-2.0 * i as f32 / n_rot as f32);
+                let (s, c) = (angle as f64).sin_cos();
+                let (a, b) = (v[i] as f64, v[i + half] as f64);
+                v[i] = (a * c - b * s) as f32;
+                v[i + half] = (a * s + b * c) as f32;
+            }
+        };
+        let norm = |v: &mut [f32], gain: &[f32]| {
+            let inv = 1.0 / (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32 + 1e-6).sqrt();
+            v.iter_mut().zip(gain).for_each(|(x, g)| *x *= inv * g);
+        };
+        let gain: Vec<f32> = (0..dim).map(|i| 0.8 + 0.01 * i as f32).collect();
+        for (pos, rows, top_pools, period) in [(33usize, 4usize, 8usize, 5usize), (5000, 3, 300, 97), (5000, 2, 8, 3)] {
+            let dims = QsaDims {
+                ratio: 4,
+                top_pools: top_pools as i32,
+                heads: heads as i32,
+                dim: dim as i32,
+                n_rot: n_rot as i32,
+                theta: 10000.0,
+                sections: [0; 4],
+                eps: 1e-6,
+            };
+            let tokens = pos + rows;
+            let n_pools = tokens / 4;
+            let raw: Vec<f32> = (0..tokens * dim).map(|i| wave(i, 0.3)).collect();
+            let raw_d = DeviceWeights::upload(0, &[&raw]).unwrap();
+            let gain_d = DeviceWeights::upload(0, &[&gain]).unwrap();
+            let pooled_d = DeviceWeights::alloc(0, n_pools * dim * 4).unwrap();
+            ws.qsa_pool_device(raw_d.ptr_at(0), gain_d.ptr_at(0), pooled_d.ptr_at(0).cast_mut(), 0, n_pools as i32, &dims)
+                .unwrap();
+            let mut pooled = vec![0.0f32; n_pools * dim];
+            ws.copy_d2h_f32(pooled_d.ptr_at(0), &mut pooled).unwrap();
+            for p in [0, 1, n_pools - 1] {
+                let mut want: Vec<f32> =
+                    (0..dim).map(|i| (0..4).map(|m| raw[(p * 4 + m) * dim + i]).sum::<f32>() / 4.0).collect();
+                norm(&mut want, &gain);
+                rope(&mut want, p * 4);
+                let got = &pooled[p * dim..(p + 1) * dim];
+                let err = want.iter().zip(got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(err < 1e-4, "pool {p} is {err} from the host's");
+            }
+            // Ties need equal pooled keys: every pool repeats one of the
+            // first `period`.
+            for p in period..n_pools {
+                pooled.copy_within((p % period) * dim..(p % period + 1) * dim, p * dim);
+            }
+            ws.copy_h2d_f32(pooled_d.ptr_at(0).cast_mut(), &pooled).unwrap();
+            // The last row's query is zero: every pool scores 0.
+            let mut q: Vec<f32> = (0..rows * heads * dim).map(|i| wave(i, 1.1)).collect();
+            q[(rows - 1) * heads * dim..].fill(0.0);
+            let q_host = q.clone();
+            let stride = top_pools * 4 + 3;
+            let (q_d, scores_d) = (DeviceWeights::upload(0, &[&q]).unwrap(), DeviceWeights::alloc(0, rows * n_pools * 4).unwrap());
+            let cells_d = DeviceWeights::alloc(0, rows * stride * 4).unwrap();
+            ws.qsa_select_device(
+                q_d.ptr_at(0).cast_mut(),
+                gain_d.ptr_at(0),
+                pooled_d.ptr_at(0),
+                scores_d.ptr_at(0).cast_mut(),
+                cells_d.ptr_at(0).cast_mut().cast(),
+                rows as i32,
+                pos as i32,
+                &dims,
+                stride as i32,
+                n_pools as i32,
+            )
+            .unwrap();
+            ws.copy_d2h_f32(q_d.ptr_at(0), &mut q).unwrap();
+            let (mut scores, mut cell_bits) = (vec![0.0f32; rows * n_pools], vec![0.0f32; rows * stride]);
+            ws.copy_d2h_f32(scores_d.ptr_at(0), &mut scores).unwrap();
+            ws.copy_d2h_f32(cells_d.ptr_at(0), &mut cell_bits).unwrap();
+            for r in 0..rows {
+                let rank = pos + r;
+                let mut want_q = q_host[r * heads * dim..(r + 1) * heads * dim].to_vec();
+                for head in want_q.chunks_mut(dim) {
+                    norm(head, &gain);
+                    rope(head, rank);
+                }
+                let got_q = &q[r * heads * dim..(r + 1) * heads * dim];
+                let err = want_q.iter().zip(got_q).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(err < 1e-4, "row {r}: query is {err} from the host's");
+                let visible = (rank + 1) / 4;
+                if visible <= top_pools {
+                    continue;
+                }
+                let scale = 1.0 / (dim as f32).sqrt();
+                let want_scores: Vec<f32> = (0..visible)
+                    .map(|p| {
+                        let key = &pooled[p * dim..(p + 1) * dim];
+                        got_q.chunks(dim).fold(0.0f32, |t, h| {
+                            t + h.iter().zip(key).fold(0.0f32, |s, (a, b)| s + a * b).max(0.0) * scale
+                        })
+                    })
+                    .collect();
+                let got_scores = &scores[r * n_pools..r * n_pools + visible];
+                assert_eq!(
+                    want_scores.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    got_scores.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "row {r}: scores"
+                );
+                let mut order: Vec<usize> = (0..visible).collect();
+                order.sort_by(|a, b| want_scores[*b].total_cmp(&want_scores[*a]).then(a.cmp(b)));
+                let mut pools = order[..top_pools].to_vec();
+                pools.sort_unstable();
+                let mut want: Vec<i32> = pools.iter().flat_map(|p| (0..4).map(move |i| (p * 4 + i) as i32)).collect();
+                want.extend((visible * 4..=rank).map(|c| c as i32));
+                let got: Vec<i32> =
+                    cell_bits[r * stride..r * stride + want.len()].iter().map(|v| v.to_bits() as i32).collect();
+                assert_eq!(got, want, "pos {pos}, row {r}: cells");
+            }
+        }
+    }
+
+    /// Prefill passes of 9+ rows take the LDS-tiled int8 K-quant GEMV on
+    /// wave64 cards: every row must still match its single-row result bit for
+    /// bit, at both lane counts (narrow and wide outputs) and across tiles.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn int8_gemv_row_tiles_match_single_rows() {
+        if device_count() == 0 || std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let k = 512usize;
+        for n in [37usize, 2050] {
+            for m in [9usize, 12, 16, 17, 33] {
+                let (a, _, _) = fill_q5k_gemm_case(m, m, n, k);
+                let b3 = fill_q3k_blocks(m, n, k);
+                let (_, b4, _) = fill_q4k_gemm_case(m, 1, n, k);
+                let (_, b5, _) = fill_q5k_gemm_case(m, 1, n, k);
+                let (_, b6, _) = fill_q6k_gemm_case(m, 1, n, k);
+                type Gemm =
+                    fn(&[f32], &[u8], &mut [f32], i32, i32, i32) -> Result<(), AllpacaError>;
+                let kinds: [(&str, &[u8], Gemm); 4] = [
+                    ("q3_k", &b3, gemm_nt_q3_k),
+                    ("q4_k", &b4, gemm_nt_q4_k),
+                    ("q5_k", &b5, gemm_nt_q5_k),
+                    ("q6_k", &b6, gemm_nt_q6_k),
+                ];
+                for (name, b, gemm) in kinds {
+                    let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                        gemm(a, b, c, rows, n as i32, k as i32).expect(name)
+                    };
+                    let mut out = vec![0.0f32; m * n];
+                    run(&a, &mut out, m as i32);
+                    assert_rows_match_single(name, run, &a, &out, m, n, k);
+                }
             }
         }
     }
@@ -17370,12 +20265,17 @@ mod tests {
             (17, 50, 2, 2, 96, true),
             (11, 70, 4, 4, 256, true),
             (6, 33, 4, 2, 128, false),
-            // Several 256-key chunks: one-row calls fold them in parallel
+            // Several 128-key chunks: one-row calls fold them in parallel
             // (split + merge), multi-row calls fold them in the Q-tiled kernel.
             (5, 1000, 8, 2, 128, true),
             (3, 2049, 4, 4, 64, true),
             (2, 700, 4, 1, 128, false),
             (9, 513, 2, 2, 96, true),
+            // One-row calls share each key among the query heads of a
+            // key/value head, 8 to a block: 10 per head leaves a part block.
+            (3, 600, 20, 2, 256, true),
+            // A head dim the float4 path cannot take.
+            (7, 300, 4, 2, 6, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()

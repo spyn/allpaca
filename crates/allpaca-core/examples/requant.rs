@@ -25,6 +25,15 @@
 //! `--probe-table <file>` saves the probe's measurements to the file, and
 //! when the file exists, reads them from it instead of probing.
 //!
+//! `--stretch <k>` rounds 2-bit groups to their least-error scale times
+//! k (1.15 suited Qwen3.8-Flash-Next's experts; default 1).
+//!
+//! `--no-measure` keeps the calibration text for `--probe` and
+//! `--propagate` only: matrices are quantised and scored on their weights.
+//!
+//! `--stats <file>` saves the calibration statistics to the file, and when
+//! the file exists, reads them from it instead of reading the text.
+//!
 //! `--types q2_0,q3_k,q4_k,q5_k,q6_k,q8_0` limits the types a matrix may
 //! take (default: all of those and `q4_0`).
 
@@ -56,6 +65,16 @@ fn main() {
         ridge = Some(given.unwrap_or(1.0));
         args.drain(at..at + 1 + usize::from(given.is_some()));
     }
+    let mut stretch = 1.0f32;
+    if let Some(at) = args.iter().position(|a| a == "--stretch") {
+        stretch = args.get(at + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+            eprintln!("--stretch takes a number such as 1.15");
+            std::process::exit(2);
+        });
+        args.drain(at..at + 2);
+    }
+    let no_measure = args.iter().any(|a| a == "--no-measure");
+    args.retain(|a| a != "--no-measure");
     let scaled = args.iter().any(|a| a == "--scaled");
     args.retain(|a| a != "--scaled");
     let mut probe_table = None;
@@ -64,6 +83,17 @@ fn main() {
             Some(path) => probe_table = Some(PathBuf::from(path)),
             None => {
                 eprintln!("--probe-table takes a file");
+                std::process::exit(2);
+            }
+        }
+        args.drain(at..at + 2);
+    }
+    let mut stats_file = None;
+    if let Some(at) = args.iter().position(|a| a == "--stats") {
+        match args.get(at + 1) {
+            Some(path) => stats_file = Some(PathBuf::from(path)),
+            None => {
+                eprintln!("--stats takes a file");
                 std::process::exit(2);
             }
         }
@@ -84,7 +114,7 @@ fn main() {
     }
     if args.len() < 2 {
         eprintln!(
-            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--propagate [ridge]] [--types q2_0,q4_k,...]"
+            "usage: requant <in.gguf> <out.gguf> [avg bits, default 3.0] [GSQ steps, default 300] [calibration.txt] [--probe [tokens]] [--scaled] [--probe-table file] [--stats file] [--no-measure] [--stretch k] [--propagate [ridge]] [--types q2_0,q4_k,...]"
         );
         std::process::exit(2);
     }
@@ -117,8 +147,9 @@ fn main() {
             ..opts.gsq
         };
     }
+    opts.gsq.stretch = stretch;
     if let Some(path) = args.get(4) {
-        let text = std::fs::read_to_string(path).expect("calibration text");
+        let text = std::fs::read_to_string(path).expect("calibration text").replace("\r\n", "\n");
         let texts: Vec<&str> = text.split("\n\n").map(str::trim).filter(|t| !t.is_empty()).collect();
         if let Some(max_tokens) = probe_tokens {
             opts.probe = Some(ProbeTexts { texts: texts.iter().map(|t| t.to_string()).collect(), max_tokens, scaled });
@@ -131,8 +162,24 @@ fn main() {
             });
         }
         let start = std::time::Instant::now();
-        match allpaca_core::calib::capture(Path::new(&args[0]), &texts) {
-            Ok(stats) => {
+        let read = match stats_file.as_deref().filter(|_| no_measure) {
+            Some(_) => {
+                eprintln!("--no-measure and --stats do not go together");
+                std::process::exit(2);
+            }
+            None if no_measure => Ok(None),
+            None => match stats_file.as_deref().filter(|p| p.exists()) {
+                Some(saved) => allpaca_core::calib::InputStats::load(saved),
+                None => allpaca_core::calib::capture(Path::new(&args[0]), &texts).and_then(|stats| match &stats_file {
+                    Some(path) => stats.save(path).map(|()| stats),
+                    None => Ok(stats),
+                }),
+            }
+            .map(Some),
+        };
+        match read {
+            Ok(None) => {}
+            Ok(Some(stats)) => {
                 println!(
                     "calibration: {} texts, {} input sites measured in {:.0} s",
                     texts.len(),

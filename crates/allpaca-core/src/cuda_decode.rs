@@ -1635,9 +1635,10 @@ impl TinyModel {
                 "logits buffer smaller than vocab".into(),
             )));
         }
+        // The first layer with pages: a recurrent layer keeps none.
         let page_tokens = page_ids
-            .first()
-            .and_then(|p| p.first())
+            .iter()
+            .find_map(|p| p.first())
             .and_then(|id| kv.get(*id).map(|p| p.capacity_tokens as usize))
             .unwrap_or(128);
         let seq_end = start_pos + n_tok;

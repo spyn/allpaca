@@ -1,11 +1,33 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::protocol::{
     check_hello, decode_hello_reply, encode_hello_req, encode_launch_list, read_reply,
     write_request, BufId, Cmd, HelloReply, HelloRequest, LaunchList, RpcError, KERNEL_ABI_REV,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_OK,
 };
+
+/// Calls to one worker since connect, readable while the session is busy.
+/// `wall_us` is coordinator wall time per call: network plus worker work.
+#[derive(Debug, Default)]
+pub struct CallCounters {
+    pub calls: AtomicU64,
+    pub wall_us: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub bytes_in: AtomicU64,
+}
+
+impl CallCounters {
+    fn add(&self, started: std::time::Instant, bytes_out: usize, bytes_in: usize) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.wall_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.bytes_out.fetch_add(bytes_out as u64, Ordering::Relaxed);
+        self.bytes_in.fetch_add(bytes_in as u64, Ordering::Relaxed);
+    }
+}
 
 /// Coordinator-side TCP session to one `rpc-server`.
 pub struct RpcSession {
@@ -17,6 +39,11 @@ pub struct RpcSession {
     extensions: Vec<String>,
     /// The worker's [`crate::BUILD_ID`], when it sent one.
     build_id: Option<String>,
+    /// Request/reply commands (MoeFfn, RunSpan, uploads, ...).
+    calls: Arc<CallCounters>,
+    /// Extension calls and raw streams: `wall_us` counts only the wait for
+    /// each reply, since pipelined calls overlap.
+    ext_calls: Arc<CallCounters>,
 }
 
 impl RpcSession {
@@ -54,6 +81,8 @@ impl RpcSession {
             token: token.to_string(),
             extensions: Vec::new(),
             build_id: None,
+            calls: Arc::default(),
+            ext_calls: Arc::default(),
         };
         session.handshake()?;
         Ok(session)
@@ -118,12 +147,17 @@ impl RpcSession {
         if !self.has_extension(name) {
             return Err(RpcError::Protocol(format!("extension {name} is not served")));
         }
+        self.ext_calls
+            .bytes_out
+            .fetch_add((head.len() + data.len()) as u64, Ordering::Relaxed);
         crate::protocol::write_ext_request(&mut self.stream, name, head, data)
     }
 
     /// The reply to the oldest call sent with [`Self::ext_send`].
     pub fn ext_recv(&mut self) -> Result<Vec<u8>, RpcError> {
+        let started = std::time::Instant::now();
         let (status, body) = read_reply(&mut self.stream)?;
+        self.ext_calls.add(started, 0, body.len());
         if status != STATUS_OK {
             return Err(RpcError::Worker(String::from_utf8_lossy(&body).into_owned()));
         }
@@ -138,9 +172,17 @@ impl RpcSession {
         &self.hello
     }
 
+    /// Counters for this session: `(request/reply commands, extension calls
+    /// and raw streams)`. The handles stay valid while the session is busy.
+    pub fn counters(&self) -> (Arc<CallCounters>, Arc<CallCounters>) {
+        (Arc::clone(&self.calls), Arc::clone(&self.ext_calls))
+    }
+
     fn rpc(&mut self, cmd: Cmd, payload: &[u8]) -> Result<Vec<u8>, RpcError> {
+        let started = std::time::Instant::now();
         write_request(&mut self.stream, cmd, payload)?;
         let (status, body) = read_reply(&mut self.stream)?;
+        self.calls.add(started, payload.len(), body.len());
         if status != STATUS_OK {
             return Err(RpcError::Worker(
                 String::from_utf8_lossy(&body).into_owned(),
@@ -301,13 +343,17 @@ impl RpcSession {
 
 impl Read for RpcSession {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.read(buf)
+        let n = self.stream.read(buf)?;
+        self.ext_calls.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
     }
 }
 
 impl Write for RpcSession {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.write(buf)
+        let n = self.stream.write(buf)?;
+        self.ext_calls.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

@@ -141,18 +141,47 @@ pub(crate) struct Listed {
 #[derive(Debug)]
 pub(crate) struct LocalDir {
     dir: PathBuf,
+    /// Text of the folder's `key.txt`, written again if the folder is.
+    key: Option<String>,
 }
+
+/// The file in a checkpoint folder that names what its checkpoints belong to.
+pub(crate) const KEY_FILE: &str = "key.txt";
 
 impl LocalDir {
     pub(crate) fn open(dir: &Path) -> Result<Self, AllpacaError> {
         std::fs::create_dir_all(dir).map_err(|e| io_error(dir, e))?;
-        Ok(Self { dir: dir.to_path_buf() })
+        Ok(Self { dir: dir.to_path_buf(), key: None })
+    }
+
+    /// Write `text` to the folder's [`KEY_FILE`] now and whenever the folder
+    /// has to be made again.
+    pub(crate) fn with_key(mut self, text: &str) -> Self {
+        if let Err(e) = std::fs::write(self.dir.join(KEY_FILE), text) {
+            tracing::warn!(error = %e, dir = %self.dir.display(), "checkpoint folder: key.txt not written");
+        }
+        self.key = Some(text.to_string());
+        self
     }
 }
 
 impl CheckpointStore for LocalDir {
+    /// Makes the folder again if it is gone (another server's prune of a
+    /// folder it judged unused).
     fn put(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
-        write_file(&self.dir.join(name), data).map_err(|e| e.to_string())
+        let file = self.dir.join(name);
+        write_file(&file, data)
+            .or_else(|e| {
+                if self.dir.is_dir() {
+                    return Err(e);
+                }
+                std::fs::create_dir_all(&self.dir)?;
+                if let Some(key) = &self.key {
+                    std::fs::write(self.dir.join(KEY_FILE), key)?;
+                }
+                write_file(&file, data)
+            })
+            .map_err(|e| e.to_string())
     }
 
     fn get(&mut self, name: &str) -> Option<Vec<u8>> {
@@ -539,7 +568,8 @@ impl KvRadixForest {
         if tokens.is_empty() {
             return 0;
         }
-        let written = self.disk.as_mut().and_then(|d| {
+        // A checkpoint with part of its state on a worker stays in RAM.
+        let written = self.disk.as_mut().filter(|_| cp.recurrent.q4x.persistable()).and_then(|d| {
             let name = file_name(tokens);
             let data = encode_file(tokens, &cp);
             let bytes = data.len();
@@ -1234,6 +1264,18 @@ mod tests {
         fn list(&mut self) -> Result<Vec<Listed>, String> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn a_local_folder_deleted_under_the_store_comes_back_on_the_next_write() {
+        let dir = std::env::temp_dir().join(format!("allpaca_localdir_gone_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = LocalDir::open(&dir).unwrap();
+        // Another server pruned it.
+        std::fs::remove_dir_all(&dir).unwrap();
+        store.put("a.ckpt", b"data").expect("the folder is made again");
+        assert_eq!(store.get("a.ckpt").as_deref(), Some(&b"data"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

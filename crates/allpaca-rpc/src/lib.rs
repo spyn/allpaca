@@ -20,7 +20,7 @@ pub use protocol::{
     SOCKET_BUFFER,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
 };
-pub use session::RpcSession;
+pub use session::{CallCounters, RpcSession};
 pub use worker::{
     serve_connection, serve_connection_ext, serve_connection_with_token, serve_listener,
     serve_listener_ext, serve_listener_with_token, serve_tcp, CpuWorker, Extension, WorkerBackend,
@@ -92,6 +92,31 @@ mod tests {
     #[test]
     fn fnv_stable() {
         assert_ne!(fnv1a64(b"abc"), fnv1a64(b"abd"));
+    }
+
+    #[test]
+    fn session_counts_calls_and_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Cpu(CpuWorker::new(64 << 20))).unwrap();
+        });
+        let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let (calls, ext) = client.counters();
+        // The HELLO handshake is not a counted call.
+        assert_eq!(calls.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let buf = client.alloc(1024).unwrap();
+        client.h2d(buf, 0, &[7u8; 1000]).unwrap();
+        let back = client.d2h(buf, 0, 1000).unwrap();
+        assert_eq!(back, vec![7u8; 1000]);
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(load(&calls.calls), 3);
+        assert!(load(&calls.bytes_out) >= 1000, "the upload counts as sent");
+        assert!(load(&calls.bytes_in) >= 1000, "the download counts as received");
+        assert_eq!(load(&ext.calls), 0);
+        drop(client);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -339,7 +364,8 @@ mod tests {
             allpaca_cpu::dequant_q2_0(&allpaca_cpu::quantize_q2_0(m), w.len(), &mut w).unwrap();
             w
         };
-        let mut want = vec![0.0f32; rows * dim];
+        // The float SwiGLU, and the CPU's on rows rounded to 8 bits per block (as the kernels run).
+        let (mut want, mut want8) = (vec![0.0f32; rows * dim], vec![0.0f32; rows * dim]);
         for &(row, e, wgt) in &pairs {
             let (r, [gate, up, down]) = (row as usize, parts(e as usize));
             let xr = &x[r * dim..(r + 1) * dim];
@@ -348,22 +374,31 @@ mod tests {
             allpaca_cpu::matmul_nt(xr, &held(&up), &mut u, 1, ff, dim).unwrap();
             let h: Vec<f32> = g.iter().zip(&u).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
             allpaca_cpu::matmul_nt(&h, &held(&down), &mut o, 1, dim, ff).unwrap();
+            let input = allpaca_cpu::Q2_0Input::new(xr).unwrap();
+            let q = |m: &[f32]| allpaca_cpu::quantize_q2_0(m);
+            allpaca_cpu::gemv_q2_0_i8(&q(&gate), &input, &mut g).unwrap();
+            allpaca_cpu::gemv_q2_0_i8(&q(&up), &input, &mut u).unwrap();
+            let h: Vec<f32> = g.iter().zip(&u).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+            let mut o8 = vec![0.0f32; dim];
+            allpaca_cpu::gemv_q2_0_i8(&q(&down), &allpaca_cpu::Q2_0Input::new(&h).unwrap(), &mut o8).unwrap();
             for i in 0..dim {
                 want[r * dim + i] += wgt * o[i];
+                want8[r * dim + i] += wgt * o8[i];
             }
         }
         let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(scale > 0.1, "reference is near zero ({scale})");
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!((g - w).abs() <= 1e-3 * scale, "out[{i}] {g} vs {w}");
+        for (i, ((g, w), w8)) in got.iter().zip(&want).zip(&want8).enumerate() {
+            assert!((g - w8).abs() <= 1e-4 * scale, "out[{i}] {g} vs 8-bit {w8}");
+            assert!((g - w).abs() <= 0.03 * scale, "out[{i}] {g} vs {w}");
         }
         assert!(got[2 * dim..].iter().all(|v| *v == 0.0), "unrouted row must be zero");
         // A row alone gives the bits it gives among others.
         let one = client.moe_ffn(req, &x[dim..2 * dim], false, &[(0, 3, 1.0), (0, 1, 0.5)]).unwrap();
         assert!(one.iter().zip(&got[dim..2 * dim]).all(|(a, b)| a.to_bits() == b.to_bits()), "row 1 alone differs");
-        // Int8 rows are the same rows rounded to 8 bits.
+        // Int8 rows are the same rows rounded to 8 bits (on the wire, then again per block).
         let q8 = client.moe_ffn(req, &x, true, &pairs).unwrap();
-        for (i, (g, w)) in q8.iter().zip(&want).enumerate() {
+        for (i, (g, w)) in q8.iter().zip(&want8).enumerate() {
             assert!((g - w).abs() <= 2e-2 * scale, "q8 out[{i}] {g} vs {w}");
         }
         drop(client);

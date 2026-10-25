@@ -4,7 +4,8 @@
 //! A quantiser that only sees the weights minimises `|W - Q|^2`. What the model
 //! feels is `|(W - Q) x|^2` over the inputs `x` it really gets, which is
 //! `tr((W - Q) H (W - Q)^T)` with `H = E[x x^T]`. [`capture`] measures `H` for
-//! every dense attention and feed-forward matrix on the CPU forward.
+//! the attention, delta-net and feed-forward matrices on the CPU forward,
+//! routed and shared experts included.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,23 +18,42 @@ use allpaca_types::{AllpacaError, FatalError};
 /// A point of the forward whose vector is the input of one or more matrices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Site {
-    /// Normed residual: `attn_q`, `attn_k`, `attn_v`.
+    /// Normed residual: `attn_q`, `attn_k`, `attn_v`, and the delta-net
+    /// projections `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`.
     AttnIn,
-    /// Attention result: `attn_output`.
+    /// Attention result: `attn_output`; the delta-net's gated heads: `ssm_out`.
     AttnOut,
-    /// Normed residual: `ffn_gate`, `ffn_up`.
+    /// Normed residual: `ffn_gate`, `ffn_up`, the router `ffn_gate_inp`.
     FfnIn,
     /// Gated activations: `ffn_down`.
     FfnAct,
+    /// Normed residual once per routed expert, weighted by the square of
+    /// its routing weight: the stacked `ffn_gate_exps`, `ffn_up_exps`.
+    ExpIn,
+    /// A routed expert's activations, weighted the same: `ffn_down_exps`.
+    ExpAct,
+    /// Normed residual weighted by the square of the shared expert's gate:
+    /// `ffn_gate_shexp`, `ffn_up_shexp`.
+    ShexpIn,
+    /// The shared expert's activations, weighted the same: `ffn_down_shexp`.
+    ShexpAct,
+    /// [`Self::ExpIn`] of one routed expert only ([`capture_experts`]).
+    ExpertIn(u16),
+    /// [`Self::ExpAct`] of one routed expert only.
+    ExpertAct(u16),
 }
 
 impl Site {
     fn of_tensor(kind: &str) -> Option<Self> {
         Some(match kind {
-            "attn_q" | "attn_k" | "attn_v" => Self::AttnIn,
-            "attn_output" => Self::AttnOut,
-            "ffn_gate" | "ffn_up" => Self::FfnIn,
+            "attn_q" | "attn_k" | "attn_v" | "attn_qkv" | "attn_gate" | "ssm_alpha" | "ssm_beta" => Self::AttnIn,
+            "attn_output" | "ssm_out" => Self::AttnOut,
+            "ffn_gate" | "ffn_up" | "ffn_gate_inp" => Self::FfnIn,
             "ffn_down" => Self::FfnAct,
+            "ffn_gate_exps" | "ffn_up_exps" => Self::ExpIn,
+            "ffn_down_exps" => Self::ExpAct,
+            "ffn_gate_shexp" | "ffn_up_shexp" => Self::ShexpIn,
+            "ffn_down_shexp" => Self::ShexpAct,
             _ => return None,
         })
     }
@@ -43,12 +63,14 @@ impl Site {
 struct Moments {
     cols: usize,
     count: u64,
-    /// Upper triangle of the sum of `x x^T`, row-major (`j >= i`).
+    /// Sum of the inputs' weights: the mean's denominator.
+    weight: f64,
+    /// Upper triangle of the weighted sum of `x x^T`, row-major (`j >= i`).
     sum: Vec<f32>,
 }
 
 impl Moments {
-    fn add(&mut self, x: &[f32]) {
+    fn add(&mut self, x: &[f32], weight: f32) {
         let n = x.len();
         if self.sum.is_empty() {
             self.cols = n;
@@ -59,7 +81,7 @@ impl Moments {
         }
         let mut at = 0;
         for i in 0..n {
-            let xi = x[i];
+            let xi = weight * x[i];
             let row = &mut self.sum[at..at + n - i];
             for (s, xj) in row.iter_mut().zip(&x[i..]) {
                 *s += xi * xj;
@@ -67,6 +89,67 @@ impl Moments {
             at += n - i;
         }
         self.count += 1;
+        self.weight += weight as f64;
+    }
+
+    /// [`Self::add`] of each `cols`-wide row of `xs` with its weight, on all
+    /// cores: each sum still takes the rows in order, so it is the same.
+    fn add_rows(&mut self, xs: &[f32], cols: usize, weights: &[f32]) {
+        if cols == 0 || xs.is_empty() {
+            return;
+        }
+        if self.sum.is_empty() {
+            self.cols = cols;
+            self.sum = vec![0.0; cols * (cols + 1) / 2];
+        }
+        if cols != self.cols {
+            return;
+        }
+        let n = cols;
+        let rows = |sum: &mut [f32], first: usize| {
+            let mut at = 0;
+            for i in first.. {
+                if at >= sum.len() {
+                    break;
+                }
+                let row = &mut sum[at..at + n - i];
+                for (x, w) in xs.chunks(n).zip(weights) {
+                    let xi = w * x[i];
+                    for (s, xj) in row.iter_mut().zip(&x[i..]) {
+                        *s += xi * xj;
+                    }
+                }
+                at += n - i;
+            }
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+        if threads < 2 || xs.len() / n * self.sum.len() < (1 << 22) {
+            rows(&mut self.sum, 0);
+        } else {
+            // Upper-triangle rows split into runs of about equal area.
+            let share = self.sum.len().div_ceil(threads);
+            let mut runs = Vec::new();
+            let (mut rest, mut first) = (&mut self.sum[..], 0);
+            while first < n {
+                let (mut len, mut i) = (0, first);
+                while i < n && (len < share || len == 0) {
+                    len += n - i;
+                    i += 1;
+                }
+                let (run, tail) = rest.split_at_mut(len);
+                runs.push((run, first));
+                rest = tail;
+                first = i;
+            }
+            std::thread::scope(|s| {
+                for (run, first) in runs {
+                    let rows = &rows;
+                    s.spawn(move || rows(run, first));
+                }
+            });
+        }
+        self.count += weights.len().min(xs.len() / n) as u64;
+        self.weight += weights.iter().take(xs.len() / n).map(|w| f64::from(*w)).sum::<f64>();
     }
 }
 
@@ -74,7 +157,7 @@ impl Moments {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputGram {
     pub cols: usize,
-    /// Input vectors averaged.
+    /// Input vectors averaged (each routed expert's input counts once).
     pub count: u64,
     /// `cols * cols`, symmetric.
     pub mean: Vec<f32>,
@@ -110,12 +193,41 @@ impl InputStats {
         if blk != "blk" || tail != "weight" || parts.next().is_some() {
             return None;
         }
-        let m = self.sites.get(&(index.parse().ok()?, Site::of_tensor(kind)?))?;
-        if m.count == 0 {
+        Self::mean(self.sites.get(&(index.parse().ok()?, Site::of_tensor(kind)?))?)
+    }
+
+    /// The Gram of routed expert `expert`'s own input to the stacked GGUF
+    /// tensor `name` (`blk.<i>.ffn_*_exps.weight`), when
+    /// [`capture_experts`] measured its block.
+    pub fn expert_gram(&self, name: &str, expert: usize) -> Option<InputGram> {
+        let mut parts = name.split('.');
+        let (blk, index, kind, tail) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        if blk != "blk" || tail != "weight" || parts.next().is_some() {
+            return None;
+        }
+        let e = u16::try_from(expert).ok()?;
+        let site = match Site::of_tensor(kind)? {
+            Site::ExpIn => Site::ExpertIn(e),
+            Site::ExpAct => Site::ExpertAct(e),
+            _ => return None,
+        };
+        Self::mean(self.sites.get(&(index.parse().ok()?, site))?)
+    }
+
+    /// Inputs routed expert `expert` of block `blk` was measured on.
+    pub fn expert_count(&self, blk: usize, expert: usize) -> u64 {
+        u16::try_from(expert)
+            .ok()
+            .and_then(|e| self.sites.get(&(blk, Site::ExpertIn(e))))
+            .map_or(0, |m| m.count)
+    }
+
+    fn mean(m: &Moments) -> Option<InputGram> {
+        if m.count == 0 || m.weight <= 0.0 {
             return None;
         }
         let n = m.cols;
-        let scale = 1.0 / m.count as f32;
+        let scale = (1.0 / m.weight) as f32;
         let mut mean = vec![0.0f32; n * n];
         let mut at = 0;
         for i in 0..n {
@@ -137,6 +249,108 @@ impl InputStats {
     pub fn is_empty(&self) -> bool {
         self.sites.is_empty()
     }
+
+    /// Write the statistics to `path`, for [`Self::load`]: a capture of a
+    /// large model takes an hour.
+    pub fn save(&self, path: &Path) -> Result<(), AllpacaError> {
+        use std::io::Write;
+        let io = |e: std::io::Error| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", path.display())));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path).map_err(io)?);
+        let mut keys: Vec<_> = self.sites.keys().copied().collect();
+        keys.sort_unstable_by_key(|(blk, site)| (*blk, site.tag()));
+        out.write_all(STATS_MAGIC).map_err(io)?;
+        out.write_all(&(keys.len() as u64).to_le_bytes()).map_err(io)?;
+        for key in keys {
+            let m = &self.sites[&key];
+            let (tag, expert) = key.1.tag();
+            out.write_all(&(key.0 as u64).to_le_bytes()).map_err(io)?;
+            out.write_all(&[tag]).map_err(io)?;
+            out.write_all(&expert.to_le_bytes()).map_err(io)?;
+            out.write_all(&(m.cols as u64).to_le_bytes()).map_err(io)?;
+            out.write_all(&m.count.to_le_bytes()).map_err(io)?;
+            out.write_all(&m.weight.to_le_bytes()).map_err(io)?;
+            out.write_all(&(m.sum.len() as u64).to_le_bytes()).map_err(io)?;
+            for chunk in m.sum.chunks(1 << 16) {
+                let bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+                out.write_all(&bytes).map_err(io)?;
+            }
+        }
+        out.flush().map_err(io)
+    }
+
+    /// Statistics [`Self::save`] wrote.
+    pub fn load(path: &Path) -> Result<Self, AllpacaError> {
+        use std::io::Read;
+        let io = |e: std::io::Error| AllpacaError::Fatal(FatalError::Io(format!("{}: {e}", path.display())));
+        let bad = |what: &str| AllpacaError::Fatal(FatalError::InvalidConfig(format!("{}: {what}", path.display())));
+        let mut input = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+        let mut magic = [0u8; 8];
+        input.read_exact(&mut magic).map_err(io)?;
+        if &magic != STATS_MAGIC {
+            return Err(bad("not calibration statistics"));
+        }
+        let mut u64_of = |input: &mut std::io::BufReader<std::fs::File>| -> Result<u64, AllpacaError> {
+            let mut b = [0u8; 8];
+            input.read_exact(&mut b).map_err(io)?;
+            Ok(u64::from_le_bytes(b))
+        };
+        let n = u64_of(&mut input)?;
+        let mut sites = HashMap::new();
+        for _ in 0..n {
+            let blk = u64_of(&mut input)? as usize;
+            let mut tag = [0u8; 3];
+            input.read_exact(&mut tag).map_err(io)?;
+            let site = Site::of_tag(tag[0], u16::from_le_bytes([tag[1], tag[2]])).ok_or_else(|| bad("unknown site"))?;
+            let cols = u64_of(&mut input)? as usize;
+            let count = u64_of(&mut input)?;
+            let weight = f64::from_bits(u64_of(&mut input)?);
+            let len = u64_of(&mut input)? as usize;
+            if len != cols * (cols + 1) / 2 {
+                return Err(bad("a sum of the wrong size"));
+            }
+            let mut bytes = vec![0u8; len * 4];
+            input.read_exact(&mut bytes).map_err(io)?;
+            let sum = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            sites.insert((blk, site), Moments { cols, count, weight, sum });
+        }
+        Ok(Self { sites })
+    }
+}
+
+const STATS_MAGIC: &[u8; 8] = b"APCALIB1";
+
+impl Site {
+    /// The site's number in a saved file, and its expert.
+    fn tag(self) -> (u8, u16) {
+        match self {
+            Self::AttnIn => (0, 0),
+            Self::AttnOut => (1, 0),
+            Self::FfnIn => (2, 0),
+            Self::FfnAct => (3, 0),
+            Self::ExpIn => (4, 0),
+            Self::ExpAct => (5, 0),
+            Self::ShexpIn => (6, 0),
+            Self::ShexpAct => (7, 0),
+            Self::ExpertIn(e) => (8, e),
+            Self::ExpertAct(e) => (9, e),
+        }
+    }
+
+    fn of_tag(tag: u8, expert: u16) -> Option<Self> {
+        Some(match tag {
+            0 => Self::AttnIn,
+            1 => Self::AttnOut,
+            2 => Self::FfnIn,
+            3 => Self::FfnAct,
+            4 => Self::ExpIn,
+            5 => Self::ExpAct,
+            6 => Self::ShexpIn,
+            7 => Self::ShexpAct,
+            8 => Self::ExpertIn(expert),
+            9 => Self::ExpertAct(expert),
+            _ => return None,
+        })
+    }
 }
 
 /// The model's recording point: off except during [`capture`].
@@ -147,11 +361,26 @@ pub(crate) struct Tap {
     /// While set: the vectors of one block's sites, in the order seen.
     keeping: AtomicBool,
     kept: Mutex<(usize, HashMap<Site, Vec<f32>>)>,
+    /// Blocks whose routed experts also get a Gram each.
+    expert_blocks: Mutex<Vec<usize>>,
 }
 
 impl Tap {
+    /// Whether anything is recorded: a site whose vector costs work of
+    /// its own (an expert's activations) is skipped otherwise.
+    #[inline]
+    pub(crate) fn wants(&self) -> bool {
+        self.on.load(Ordering::Relaxed) || self.keeping.load(Ordering::Relaxed)
+    }
+
     #[inline]
     pub(crate) fn observe(&self, blk: usize, site: Site, x: &[f32]) {
+        self.observe_weighted(blk, site, x, 1.0);
+    }
+
+    /// [`Self::observe`] of an input whose share of the mean is `weight`.
+    #[inline]
+    pub(crate) fn observe_weighted(&self, blk: usize, site: Site, x: &[f32], weight: f32) {
         if self.keeping.load(Ordering::Relaxed) {
             if let Ok(mut kept) = self.kept.lock() {
                 if kept.0 == blk {
@@ -163,7 +392,73 @@ impl Tap {
             return;
         }
         if let Ok(mut stats) = self.stats.lock() {
-            stats.sites.entry((blk, site)).or_default().add(x);
+            stats.sites.entry((blk, site)).or_default().add(x, weight);
+        }
+    }
+
+    /// [`Self::observe_weighted`] of each `cols`-wide row of `xs`, row `i`
+    /// with `weights[i]` (all 1 when `None`).
+    pub(crate) fn observe_rows(&self, blk: usize, site: Site, xs: &[f32], cols: usize, weights: Option<&[f32]>) {
+        if self.keeping.load(Ordering::Relaxed) {
+            if let Ok(mut kept) = self.kept.lock() {
+                if kept.0 == blk {
+                    kept.1.entry(site).or_default().extend_from_slice(xs);
+                }
+            }
+        }
+        if !self.on.load(Ordering::Relaxed) || cols == 0 {
+            return;
+        }
+        let ones;
+        let weights = match weights {
+            Some(w) => w,
+            None => {
+                ones = vec![1.0f32; xs.len() / cols];
+                &ones
+            }
+        };
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.sites.entry((blk, site)).or_default().add_rows(xs, cols, weights);
+        }
+    }
+
+    /// Routed experts' inputs `ins` (`dim` wide) and activations `acts`
+    /// (`ff` wide), one row per slot: [`Site::ExpIn`] and [`Site::ExpAct`]
+    /// weighted by `w2`, and in a block [`capture_experts`] asked for,
+    /// each expert's own rows too (`experts[i]` is slot `i`'s expert).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_experts(
+        &self,
+        blk: usize,
+        ins: &[f32],
+        dim: usize,
+        acts: &[f32],
+        ff: usize,
+        experts: &[usize],
+        w2: &[f32],
+    ) {
+        self.observe_rows(blk, Site::ExpIn, ins, dim, Some(w2));
+        self.observe_rows(blk, Site::ExpAct, acts, ff, Some(w2));
+        if !self.on.load(Ordering::Relaxed) || !self.expert_blocks.lock().is_ok_and(|b| b.contains(&blk)) {
+            return;
+        }
+        let mut slots: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (slot, e) in experts.iter().enumerate() {
+            slots.entry(*e).or_default().push(slot);
+        }
+        let gather = |rows: &[usize], xs: &[f32], cols: usize| -> Vec<f32> {
+            rows.iter().flat_map(|r| xs[r * cols..(r + 1) * cols].iter().copied()).collect()
+        };
+        let mut order: Vec<_> = slots.into_iter().collect();
+        order.sort_unstable_by_key(|(e, _)| *e);
+        for (e, rows) in order {
+            let Ok(e) = u16::try_from(e) else { continue };
+            let w: Vec<f32> = rows.iter().map(|r| w2[*r]).collect();
+            let (x, h) = (gather(&rows, ins, dim), gather(&rows, acts, ff));
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.sites.entry((blk, Site::ExpertIn(e))).or_default().add_rows(&x, dim, &w);
+                stats.sites.entry((blk, Site::ExpertAct(e))).or_default().add_rows(&h, ff, &w);
+            }
         }
     }
 
@@ -199,23 +494,56 @@ impl Tap {
 /// weights are decoded to F32 in RAM for the run, except routed experts,
 /// which stay packed ([`crate::host_experts`]).
 pub fn capture(model: &Path, texts: &[&str]) -> Result<InputStats, AllpacaError> {
+    capture_experts(model, texts, &[])
+}
+
+/// [`capture`], and for the blocks in `expert_blocks` a Gram of each routed
+/// expert's own inputs as well ([`InputStats::expert_gram`]): about 7 GB a
+/// block for Qwen3.8-Flash-Next's 512 experts.
+pub fn capture_experts(model: &Path, texts: &[&str], expert_blocks: &[usize]) -> Result<InputStats, AllpacaError> {
     if texts.is_empty() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "calibration needs at least one text".into(),
         )));
     }
     let (model, tok, _) = crate::sensitivity::load_host(model)?;
-    model.calib.start();
-    let mut run = Ok(());
-    for text in texts {
-        let read = tok.encode(text).and_then(|ids| crate::sensitivity::text_log_probs(&model, &ids, None));
-        if let Err(e) = read {
-            run = Err(e);
-            break;
-        }
+    if let Ok(mut blocks) = model.calib.expert_blocks.lock() {
+        *blocks = expert_blocks.to_vec();
     }
+    model.calib.start();
+    let run = read_texts(&model, &tok, texts, BATCH_LOGIT_BYTES);
     let stats = model.calib.finish();
     run.map(|()| stats)
+}
+
+/// Logits a qwen4exp batch may hold: texts read together take each
+/// block's weights from disk once, for a model larger than RAM.
+const BATCH_LOGIT_BYTES: usize = 2 << 30;
+
+fn read_texts(model: &crate::TinyModel, tok: &crate::EngineTokenizer, texts: &[&str], logit_bytes: usize) -> Result<(), AllpacaError> {
+    let ids = texts.iter().map(|t| tok.encode(t)).collect::<Result<Vec<_>, _>>()?;
+    if model.q4x.is_none() {
+        return ids.iter().try_for_each(|ids| crate::sensitivity::text_log_probs(model, ids, None).map(drop));
+    }
+    // Its host forward block by block, where the sites are, on as many
+    // texts at once as the logits budget allows.
+    let vocab = model.config.vocab_size;
+    let per_batch = (logit_bytes / 4 / vocab.max(1)).max(1);
+    let mut at = 0;
+    while at < ids.len() {
+        let mut end = at + 1;
+        let mut tokens = ids[at].len();
+        while end < ids.len() && tokens + ids[end].len() <= per_batch {
+            tokens += ids[end].len();
+            end += 1;
+        }
+        let seqs: Vec<&[u32]> = ids[at..end].iter().map(Vec::as_slice).collect();
+        let mut mems: Vec<_> = seqs.iter().map(|_| crate::qwen4exp::Qwen4Memory::traced(None)).collect();
+        let mut logits = vec![0.0f32; tokens * vocab];
+        crate::qwen4exp::forward_qwen4_host_rows(model, &seqs, &mut mems, &mut logits)?;
+        at = end;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -341,7 +669,27 @@ pub(crate) mod tests {
     /// each with `experts` routed experts (two used), a shared expert and
     /// its sigmoid gate: the layout of Qwen3.5/3.6 35B-A3B, tiny.
     pub(crate) fn write_tiny_qwen35moe_gguf(path: &Path, experts: usize) {
-        let (dim, vocab, n_v, n_k, head, conv_k, ff) = (16usize, 6usize, 2usize, 2usize, 8usize, 2usize, 24usize);
+        write_tiny_qwen35moe_gguf_with(path, experts, false);
+    }
+
+    /// [`write_tiny_qwen35moe_gguf`] whose second block, with
+    /// `attention_block`, is gated full attention instead (query and gate
+    /// interleaved per head, q/k norms, IMRoPE).
+    pub(crate) fn write_tiny_qwen35moe_gguf_with(path: &Path, experts: usize, attention_block: bool) {
+        write_tiny_qwen35moe_gguf_sized(path, experts, attention_block, 16, 8, 24);
+    }
+
+    /// [`write_tiny_qwen35moe_gguf_with`] with residual width `dim`,
+    /// delta-net head width `head` and expert width `ff`.
+    pub(crate) fn write_tiny_qwen35moe_gguf_sized(
+        path: &Path,
+        experts: usize,
+        attention_block: bool,
+        dim: usize,
+        head: usize,
+        ff: usize,
+    ) {
+        let (vocab, n_v, n_k, conv_k) = (6usize, 2usize, 2usize, 2usize);
         let inner = n_v * head;
         let qkv_dim = n_k * head * 2 + inner;
         let mut meta = HashMap::new();
@@ -364,6 +712,9 @@ pub(crate) mod tests {
         put(&format!("{a}.ssm.time_step_rank"), GgufValue::Uint32(n_v as u32));
         put(&format!("{a}.ssm.group_count"), GgufValue::Uint32(n_k as u32));
         put(&format!("{a}.ssm.conv_kernel"), GgufValue::Uint32(conv_k as u32));
+        if attention_block {
+            put(&format!("{a}.rope.dimension_sections"), GgufValue::Array([2i32, 2, 0, 0].map(GgufValue::Int32).to_vec()));
+        }
         put("tokenizer.ggml.model", GgufValue::String("wordlevel".into()));
         put(
             "tokenizer.ggml.tokens",
@@ -387,15 +738,26 @@ pub(crate) mod tests {
         for b in 0..2 {
             let mut add = |part: &str, dims: Vec<u64>, data: Vec<f32>| owned.push((format!("blk.{b}.{part}"), dims, data));
             add("attn_norm.weight", vec![d], vec![1.0; dim]);
-            add("attn_qkv.weight", vec![d, qkv_dim as u64], rand(qkv_dim * dim, 0.3));
-            add("attn_gate.weight", vec![d, inner as u64], rand(inner * dim, 0.3));
-            add("ssm_alpha.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
-            add("ssm_beta.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
-            add("ssm_out.weight", vec![inner as u64, d], rand(dim * inner, 0.3));
-            add("ssm_a", vec![n_v as u64], vec![-0.5; n_v]);
-            add("ssm_dt.bias", vec![n_v as u64], vec![0.0; n_v]);
-            add("ssm_norm.weight", vec![head as u64], vec![1.0; head]);
-            add("ssm_conv1d.weight", vec![conv_k as u64, qkv_dim as u64], rand(conv_k * qkv_dim, 0.3));
+            if attention_block && b == 1 {
+                // Two heads of dim / 2, one key/value head.
+                let hd = dim / 2;
+                add("attn_q.weight", vec![d, 4 * hd as u64], rand(4 * hd * dim, 0.3));
+                add("attn_k.weight", vec![d, hd as u64], rand(hd * dim, 0.3));
+                add("attn_v.weight", vec![d, hd as u64], rand(hd * dim, 0.3));
+                add("attn_q_norm.weight", vec![hd as u64], vec![1.0; hd]);
+                add("attn_k_norm.weight", vec![hd as u64], vec![1.0; hd]);
+                add("attn_output.weight", vec![2 * hd as u64, d], rand(dim * 2 * hd, 0.3));
+            } else {
+                add("attn_qkv.weight", vec![d, qkv_dim as u64], rand(qkv_dim * dim, 0.3));
+                add("attn_gate.weight", vec![d, inner as u64], rand(inner * dim, 0.3));
+                add("ssm_alpha.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
+                add("ssm_beta.weight", vec![d, n_v as u64], rand(n_v * dim, 0.3));
+                add("ssm_out.weight", vec![inner as u64, d], rand(dim * inner, 0.3));
+                add("ssm_a", vec![n_v as u64], vec![-0.5; n_v]);
+                add("ssm_dt.bias", vec![n_v as u64], vec![0.0; n_v]);
+                add("ssm_norm.weight", vec![head as u64], vec![1.0; head]);
+                add("ssm_conv1d.weight", vec![conv_k as u64, qkv_dim as u64], rand(conv_k * qkv_dim, 0.3));
+            }
             add("post_attention_norm.weight", vec![d], vec![1.0; dim]);
             add("ffn_gate_inp.weight", vec![d, n], rand(experts * dim, 1.0));
             add("ffn_gate_exps.weight", vec![d, f, n], rand(experts * ff * dim, 0.3));
@@ -458,5 +820,225 @@ pub(crate) mod tests {
         assert!(stats.gram("blk.0.attn_norm.weight").is_none());
         assert!(stats.gram("token_embd.weight").is_none());
         assert!(stats.gram("blk.7.attn_q.weight").is_none());
+    }
+
+    fn assert_gram_shape(g: &InputGram, what: &str) {
+        assert_eq!(g.mean.len(), g.cols * g.cols, "{what}");
+        for i in 0..g.cols {
+            assert!(g.mean[i * g.cols + i] >= 0.0, "{what} diagonal");
+            for j in 0..i {
+                assert_eq!(g.mean[i * g.cols + j], g.mean[j * g.cols + i], "{what} symmetry");
+            }
+        }
+    }
+
+    /// Qwen3.5 blocks: the delta-net projections read the normed residual
+    /// and `ssm_out` the gated head outputs; the gated full-attention
+    /// block's projections read the normed residual and its output
+    /// projection the gated attention.
+    #[test]
+    fn capture_measures_the_delta_net_and_gated_attention_inputs() {
+        let path = std::env::temp_dir().join(format!("allpaca_calib_q35-{}.gguf", std::process::id()));
+        write_tiny_qwen35moe_gguf_with(&path, 4, true);
+        let stats = capture(&path, &["hello world again hello", "world hello"]).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let gram = |name: &str| stats.gram(&format!("{name}.weight")).unwrap_or_else(|| panic!("no {name}"));
+
+        let qkv = gram("blk.0.attn_qkv");
+        assert_eq!(qkv.cols, 16);
+        assert!(qkv.count >= 6, "one input per prompt token, got {}", qkv.count);
+        for kind in ["attn_gate", "ssm_alpha", "ssm_beta"] {
+            assert_eq!(gram(&format!("blk.0.{kind}")), qkv, "{kind}");
+        }
+        assert!((trace(&qkv) - 16.0).abs() < 1e-2, "delta-net input trace {}", trace(&qkv));
+        let out = gram("blk.0.ssm_out");
+        assert_eq!((out.cols, out.count), (16, qkv.count));
+        assert!(trace(&out) > 0.0);
+
+        let q = gram("blk.1.attn_q");
+        assert_eq!((q.cols, q.count), (16, qkv.count));
+        assert_eq!(gram("blk.1.attn_k"), q);
+        assert_eq!(gram("blk.1.attn_v"), q);
+        assert!((trace(&q) - 16.0).abs() < 1e-2, "attention input trace {}", trace(&q));
+        let o = gram("blk.1.attn_output");
+        assert_eq!((o.cols, o.count), (16, qkv.count));
+        assert!(trace(&o) > 0.0);
+        for g in [&qkv, &out, &q, &o] {
+            assert_gram_shape(g, "qwen35");
+        }
+    }
+
+    /// Routed experts: the router and the stacked gate/up read the normed
+    /// residual, the stacked down projection the activations of every
+    /// routed expert (one input per token and routed expert), and the
+    /// shared expert its own.
+    #[test]
+    fn capture_measures_the_inputs_of_routed_and_shared_experts() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (llama, q35) = (dir.join(format!("allpaca_calib_moe-{pid}.gguf")), dir.join(format!("allpaca_calib_q35moe-{pid}.gguf")));
+        write_tiny_calib_gguf_moe(&llama, 8, 16, 0.3, 1, false, 4);
+        write_tiny_qwen35moe_gguf(&q35, 4);
+        for (path, dim, ff) in [(&llama, 8usize, 16usize), (&q35, 16, 24)] {
+            let stats = capture(path, &["hello world again hello", "world hello"]).unwrap();
+            let _ = std::fs::remove_file(path);
+            let gram = |kind: &str| stats.gram(&format!("blk.0.{kind}.weight")).unwrap_or_else(|| panic!("{path:?}: no {kind}"));
+            let input = gram("ffn_gate_inp");
+            assert_eq!(input.cols, dim);
+            assert!(input.count >= 6, "one input per prompt token, got {}", input.count);
+            assert!((trace(&input) - dim as f32).abs() < 1e-2, "router input trace {}", trace(&input));
+
+            let exps = gram("ffn_gate_exps");
+            assert_eq!(gram("ffn_up_exps"), exps);
+            assert_eq!((exps.cols, exps.count), (dim, 2 * input.count), "two experts used per token");
+            // Normed inputs, however they are weighted.
+            assert!((trace(&exps) - dim as f32).abs() < 1e-2, "expert input trace {}", trace(&exps));
+            let down = gram("ffn_down_exps");
+            assert_eq!((down.cols, down.count), (ff, 2 * input.count));
+            assert!(trace(&down) > 0.0);
+
+            let sh = gram("ffn_gate_shexp");
+            assert_eq!(gram("ffn_up_shexp"), sh);
+            assert_eq!((sh.cols, sh.count), (dim, input.count));
+            let sh_down = gram("ffn_down_shexp");
+            assert_eq!((sh_down.cols, sh_down.count), (ff, input.count));
+            assert!(trace(&sh_down) > 0.0);
+            assert_ne!(sh_down, down, "the shared expert's activations are its own");
+            for g in [&input, &exps, &down, &sh, &sh_down] {
+                assert_gram_shape(g, "moe");
+            }
+        }
+    }
+
+    /// Rows added together, on several threads, sum to the same bits as
+    /// one at a time.
+    #[test]
+    fn rows_added_together_equal_one_at_a_time() {
+        let (cols, rows) = (300usize, 200usize);
+        let xs: Vec<f32> = (0..cols * rows).map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0).collect();
+        let weights: Vec<f32> = (0..rows).map(|r| 0.1 + (r % 7) as f32 * 0.3).collect();
+        let (mut one, mut all) = (Moments::default(), Moments::default());
+        for (x, w) in xs.chunks(cols).zip(&weights) {
+            one.add(x, *w);
+        }
+        all.add_rows(&xs[..cols * 3], cols, &weights[..3]);
+        all.add_rows(&xs[cols * 3..], cols, &weights[3..]);
+        assert_eq!((one.cols, one.count), (all.cols, all.count));
+        assert_eq!(one.weight, all.weight);
+        assert!(one.sum.iter().zip(&all.sum).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    /// A qwen4exp model's host forward measures the input of every matrix
+    /// a site covers, at that matrix's width, without changing its output.
+    #[test]
+    fn capture_measures_the_qwen4exp_sites() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (plain, packed) = (dir.join(format!("allpaca_calib_q4x-{pid}.gguf")), dir.join(format!("allpaca_calib_q4xp-{pid}.gguf")));
+        crate::qwen4exp::write_tiny_qwen4exp_gguf(&plain);
+        crate::qwen4exp::write_tiny_qwen4exp_packed_gguf(&packed);
+        let texts = ["hello world again hello", "world hello"];
+        for path in [&plain, &packed] {
+            let stats = capture(path, &texts).unwrap();
+            let file = allpaca_gguf::GgufFile::open(path).unwrap();
+            let (model, tok, _) = crate::sensitivity::load_host(path).unwrap();
+            let ids = tok.encode(texts[0]).unwrap();
+            let tokens = (ids.len() + tok.encode(texts[1]).unwrap().len()) as u64;
+            let n_active = model.config.n_active as u64;
+            let mut seen = 0;
+            for t in &file.tensors {
+                let kind = t.name.split('.').nth(2).unwrap_or("");
+                if !t.name.starts_with("blk.") || Site::of_tensor(kind).is_none() {
+                    continue;
+                }
+                let g = stats.gram(&t.name).unwrap_or_else(|| panic!("{path:?}: no input for {}", t.name));
+                assert_eq!(g.cols as u64, t.dims[0], "{}", t.name);
+                let per_token = if kind.ends_with("_exps") { n_active } else { 1 };
+                assert_eq!(g.count, tokens * per_token, "{}", t.name);
+                assert!(trace(&g) > 0.0, "{}", t.name);
+                assert_gram_shape(&g, &t.name);
+                seen += 1;
+            }
+            assert!(seen >= 30, "{path:?}: {seen} matrices");
+
+            // The forward reads the same with the tap on.
+            let vocab = model.config.vocab_size;
+            let run = |on: bool| {
+                let mut logits = vec![0.0f32; ids.len() * vocab];
+                let mut mems = [crate::qwen4exp::Qwen4Memory::traced(None)];
+                if on {
+                    model.calib.start();
+                }
+                crate::qwen4exp::forward_qwen4_host_rows(&model, &[&ids], &mut mems, &mut logits).unwrap();
+                let _ = model.calib.finish();
+                logits
+            };
+            assert!(run(false).iter().zip(&run(true)).all(|(a, b)| a.to_bits() == b.to_bits()), "{path:?}");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn capture_experts_splits_the_pooled_inputs_by_expert() {
+        let path = std::env::temp_dir().join(format!("allpaca_calib_q4xe-{}.gguf", std::process::id()));
+        crate::qwen4exp::write_tiny_qwen4exp_gguf(&path);
+        let texts = ["hello world again hello", "world hello"];
+        let stats = capture_experts(&path, &texts, &[0]).unwrap();
+        let (model, _, _) = crate::sensitivity::load_host(&path).unwrap();
+        let file = allpaca_gguf::GgufFile::open(&path).unwrap();
+        let n = model.config.n_experts;
+        for kind in ["ffn_up_exps", "ffn_down_exps"] {
+            let name = format!("blk.0.{kind}.weight");
+            let pooled = stats.gram(&name).unwrap();
+            let mut total = 0;
+            for e in 0..n {
+                let count = stats.expert_count(0, e);
+                match stats.expert_gram(&name, e) {
+                    Some(g) => {
+                        assert_eq!((g.cols, g.count), (pooled.cols, count), "{name} expert {e}");
+                        assert_gram_shape(&g, &name);
+                    }
+                    None => assert_eq!(count, 0, "{name} expert {e}"),
+                }
+                total += count;
+            }
+            assert_eq!(total, pooled.count, "{name}");
+            // Blocks not asked for keep the pooled Gram only.
+            if file.tensors.iter().any(|t| t.name == format!("blk.1.{kind}.weight")) {
+                assert!((0..n).all(|e| stats.expert_gram(&format!("blk.1.{kind}.weight"), e).is_none()));
+            }
+        }
+        // Without blocks asked for, no expert has its own.
+        let plain = capture(&path, &texts).unwrap();
+        assert!((0..n).all(|e| plain.expert_count(0, e) == 0));
+
+        // Read one text at a time, every Gram is the same.
+        let (model, tok, _) = crate::sensitivity::load_host(&path).unwrap();
+        *model.calib.expert_blocks.lock().unwrap() = vec![0];
+        model.calib.start();
+        read_texts(&model, &tok, &texts, 1).unwrap();
+        let alone = model.calib.finish();
+        for t in &file.tensors {
+            assert_eq!(alone.gram(&t.name), stats.gram(&t.name), "{}", t.name);
+            for e in 0..n {
+                assert_eq!(alone.expert_gram(&t.name, e), stats.expert_gram(&t.name, e), "{} expert {e}", t.name);
+            }
+        }
+
+        // Saved and loaded, every Gram reads the same.
+        let saved = path.with_extension("stats");
+        stats.save(&saved).unwrap();
+        let back = InputStats::load(&saved).unwrap();
+        assert_eq!(back.len(), stats.len());
+        for t in &file.tensors {
+            assert_eq!(back.gram(&t.name), stats.gram(&t.name), "{}", t.name);
+            for e in 0..n {
+                assert_eq!(back.expert_gram(&t.name, e), stats.expert_gram(&t.name, e), "{} expert {e}", t.name);
+            }
+        }
+        std::fs::write(&saved, b"not stats").unwrap();
+        assert!(InputStats::load(&saved).is_err());
+        let _ = std::fs::remove_file(&saved);
+        let _ = std::fs::remove_file(&path);
     }
 }

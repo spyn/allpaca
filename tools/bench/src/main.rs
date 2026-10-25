@@ -10,7 +10,9 @@
 //! speed drifts by several percent over minutes, so "all of A, then all of
 //! B" measures the drift as well.
 
+mod roofline;
 mod serve;
+mod snap;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -132,9 +134,16 @@ fn record(out: Option<&Path>, sample: &Sample) {
 }
 
 fn run(target: &Target, tag: &str, load: &Load, first_round: usize, rounds: usize) -> Result<Vec<Sample>, String> {
-    serve::run(target, tag, &prompts(load)?, first_round, rounds, load.concurrency, load.warmup, &mut |s| {
-        record(load.out.as_deref(), s)
-    })
+    serve::run(
+        target,
+        tag,
+        &prompts(load)?,
+        first_round,
+        rounds,
+        load.concurrency,
+        load.warmup,
+        &mut |s| record(load.out.as_deref(), s),
+    )
 }
 
 /// A started server; stopped when dropped.
@@ -143,8 +152,30 @@ struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
+        // Child::kill ends only this process. taskkill /T also ends any process
+        // it started, in case one of them holds the port. Neither waits for the
+        // port to close; `start` checks that before the next server starts.
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &self.0.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = self.0.wait();
     }
+}
+
+/// Whether something still serves HTTP at `target`. Any response counts, a 401
+/// or 503 too: an old server with another password is still running. Only a
+/// failed connection means the port is free.
+fn port_answers(client: &reqwest::blocking::Client, target: &Target) -> bool {
+    client
+        .get(format!("{}/v1/models", target.url))
+        .bearer_auth(&target.key)
+        .send()
+        .is_ok()
 }
 
 /// Start `server` with `config` and wait until it answers.
@@ -162,18 +193,40 @@ fn start(server: &Path, config: &Path, timeout: Duration) -> Result<(Server, Tar
         key,
         max_tokens: 0,
     };
-    let child = Command::new(server)
-        .arg("--config")
-        .arg(config)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{}: {e}", server.display()))?;
-    let mut server = Server(child);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
+    // A previous server can still be answering on this port. Starting now would
+    // time that process and report a fresh start.
+    let down_by = Instant::now() + Duration::from_secs(20);
+    while port_answers(&client, &target) {
+        if Instant::now() > down_by {
+            return Err(format!(
+                "{}: port {} is still serving, so this would not be a fresh start",
+                config.display(),
+                cfg.http.port
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // A null stdout crashes the HIP server on Windows (exit 0xffffffff) before
+    // it listens. Keep the log beside the config so a failed start is readable.
+    let log_path = config.with_extension("server.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let err = log.try_clone().map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let child = Command::new(server)
+        .arg("--config")
+        .arg(config)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .map_err(|e| format!("{}: {e}", server.display()))?;
+    let mut server = Server(child);
     let started = Instant::now();
     loop {
         if let Ok(Some(status)) = server.0.try_wait() {
@@ -212,7 +265,7 @@ fn ab(configs: &[PathBuf], server: &Path, load_timeout: u64, load: &Load) -> Res
             drop(running);
         }
     }
-    println!("\n{}", serve::table(&serve::summarize(&samples)));
+    println!("\n{}", serve::report_text(&samples));
     Ok(())
 }
 
@@ -226,7 +279,7 @@ fn report(file: &Path, tags: &[String]) -> Result<(), String> {
     if samples.is_empty() {
         return Err(format!("{} has no samples", file.display()));
     }
-    print!("{}", serve::table(&serve::summarize(&samples)));
+    print!("{}", serve::report_text(&samples));
     Ok(())
 }
 
@@ -265,7 +318,7 @@ fn main() {
             let key = key.or_else(|| std::env::var("ALLPACA_BENCH_KEY").ok()).unwrap_or_default();
             let target = Target { url, key, max_tokens: load.tokens };
             run(&target, &tag, &load, 1, load.rounds)
-                .map(|samples| println!("\n{}", serve::table(&serve::summarize(&samples))))
+                .map(|samples| println!("\n{}", serve::report_text(&samples)))
         }
         Cmd::Ab { configs, server, load_timeout, load } => ab(&configs, &server, load_timeout, &load),
         Cmd::Report { file, tag } => report(&file, &tag),
@@ -277,5 +330,48 @@ fn main() {
     if let Err(e) = result {
         eprintln!("allpaca-bench: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A server on a free local port that answers every request with `status`.
+    fn answering(status: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        url
+    }
+
+    fn client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap()
+    }
+
+    fn target(url: String) -> Target {
+        Target { url, key: "wrong".into(), max_tokens: 0 }
+    }
+
+    #[test]
+    fn an_old_server_refusing_the_key_still_counts_as_serving() {
+        assert!(port_answers(&client(), &target(answering("401 Unauthorized"))));
+        assert!(port_answers(&client(), &target(answering("503 Service Unavailable"))));
+        assert!(port_answers(&client(), &target(answering("200 OK"))));
+    }
+
+    #[test]
+    fn a_closed_port_is_gone() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert!(!port_answers(&client(), &target(format!("http://127.0.0.1:{port}"))));
     }
 }
