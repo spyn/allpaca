@@ -23,6 +23,25 @@
 #define ALLPACA_HAS_HIP 0
 #endif
 
+/* Register slots per attention-row lane in the fixed-size kernel (the flash
+ * kernel, and the DPT = ATTN_MAX_DPT template instantiation). */
+constexpr int ATTN_MAX_DPT = 16;
+
+/* Attention-kernel template bucket for a head_dim: ceil(head_dim/32) rounded
+ * up to a compiled instantiation. 0 is the per-row flash kernel (head_dim
+ * outside 1..=32 * ATTN_MAX_DPT). Pure arithmetic, defined outside the HIP
+ * gate so stub builds export the same value; it both picks the kernel and
+ * sizes the chunk-partial scratch of a call. */
+static constexpr int attn_dpt_bucket(int head_dim) {
+    if (head_dim <= 0 || head_dim > 32 * ATTN_MAX_DPT) {
+        return 0;
+    }
+    const int dpt = (head_dim + 31) / 32;
+    return dpt <= 4 ? 4 : dpt <= 8 ? 8 : 16;
+}
+
+extern "C" int32_t allpaca_attn_dpt(int32_t head_dim) { return attn_dpt_bucket(head_dim); }
+
 #if ALLPACA_HAS_HIP
 
 #include <atomic>
@@ -1456,19 +1475,29 @@ __device__ float warp_sum32(float v) {
  * arithmetic so the split and Q-tiled kernels run the same instructions on
  * the same values: a row's result does not depend on which kernel, or how
  * many rows, computed it. */
-constexpr int ATTN_MAX_DPT = 16;
+/* Per-lane register slots for one (query, head) row at template DPT (the
+ * head_dim/32 bucket): the float4 path holds 4 dims per slot, so round the
+ * array up to a multiple of 4; the scalar path never touches past DPT. Fewer
+ * live registers is the point of the templating, so the arrays must be
+ * exactly this size, not ATTN_MAX_DPT. */
+template <int DPT>
+constexpr int attn_row_dims() {
+    return ((DPT + 3) / 4) * 4;
+}
 
+template <int DPT>
 struct AttnRow {
-    float qreg[ATTN_MAX_DPT];
-    float acc[ATTN_MAX_DPT];
+    float qreg[attn_row_dims<DPT>()];
+    float acc[attn_row_dims<DPT>()];
     float m;
     float l;
 };
 
-__device__ __forceinline__ void attn_row_init(AttnRow &r, const float *qh, int lane, int head_dim,
+template <int DPT>
+__device__ __forceinline__ void attn_row_init(AttnRow<DPT> &r, const float *qh, int lane, int head_dim,
                                               int nvec, bool vec4, const float *sinks, int h) {
 #pragma unroll
-    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
         r.qreg[i] = 0.0f;
         r.acc[i] = 0.0f;
     }
@@ -1477,7 +1506,7 @@ __device__ __forceinline__ void attn_row_init(AttnRow &r, const float *qh, int l
      * scratch memory. Same operations in the same order either way. */
     if (vec4) {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+        for (int j = 0; j < attn_row_dims<DPT>() / 4; ++j) {
             const int v = lane + 32 * j;
             if (v < nvec) {
                 const float4 qv = *reinterpret_cast<const float4 *>(qh + v * 4);
@@ -1489,7 +1518,7 @@ __device__ __forceinline__ void attn_row_init(AttnRow &r, const float *qh, int l
         }
     } else {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+        for (int j = 0; j < DPT; ++j) {
             const int d = lane + 32 * j;
             if (d < head_dim) {
                 r.qreg[j] = qh[d];
@@ -1508,14 +1537,15 @@ __device__ __forceinline__ void attn_row_init(AttnRow &r, const float *qh, int l
  * Contraction is off and every fused multiply-add is written out (here and in
  * attn_tile_step): left to the compiler, kernels fused differently once their
  * loops were unrolled, and their rows stopped matching. */
-__device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const float *vh,
+template <int DPT>
+__device__ __forceinline__ void attn_row_step(AttnRow<DPT> &r, const float *kh, const float *vh,
                                               bool valid, int lane, int head_dim, int nvec,
                                               bool vec4, float scale) {
 #pragma clang fp contract(off)
     float partial = 0.0f;
     if (vec4) {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+        for (int j = 0; j < attn_row_dims<DPT>() / 4; ++j) {
             const int vec = lane + 32 * j;
             if (vec >= nvec) {
                 continue;
@@ -1538,7 +1568,7 @@ __device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const
         }
     } else {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+        for (int j = 0; j < DPT; ++j) {
             const int d = lane + 32 * j;
             if (d < head_dim) {
                 partial = fmaf(r.qreg[j], valid ? kh[d] : 0.0f, partial);
@@ -1555,7 +1585,7 @@ __device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const
     r.l = fmaf(r.l, alpha, p);
     if (vec4) {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+        for (int j = 0; j < attn_row_dims<DPT>() / 4; ++j) {
             const int vec = lane + 32 * j;
             if (vec >= nvec) {
                 continue;
@@ -1577,7 +1607,7 @@ __device__ __forceinline__ void attn_row_step(AttnRow &r, const float *kh, const
         }
     } else {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+        for (int j = 0; j < DPT; ++j) {
             const int d = lane + 32 * j;
             if (d < head_dim) {
                 r.acc[j] = fmaf(r.acc[j], alpha, p * (valid ? vh[d] : 0.0f));
@@ -1611,7 +1641,8 @@ __device__ __forceinline__ void attn_keys_stage(float (&p)[ATTN_KT], int lane, i
  * pair of expf and one sum serve all the keys, and the values accumulate in
  * key order. `valid` is for key lane/2. Key/value rows of keys whose weight
  * is exactly zero are not read into the accumulators. */
-__device__ __forceinline__ void attn_tile_step(AttnRow &r, const float *kt, const float *vt, bool valid,
+template <int DPT>
+__device__ __forceinline__ void attn_tile_step(AttnRow<DPT> &r, const float *kt, const float *vt, bool valid,
                                                int lane, int head_dim, int nvec, bool vec4, float scale) {
 #pragma clang fp contract(off)
     float part[ATTN_KT];
@@ -1621,7 +1652,7 @@ __device__ __forceinline__ void attn_tile_step(AttnRow &r, const float *kt, cons
         float partial = 0.0f;
         if (vec4) {
 #pragma unroll
-            for (int g = 0; g < ATTN_MAX_DPT / 4; ++g) {
+            for (int g = 0; g < attn_row_dims<DPT>() / 4; ++g) {
                 const int vec = lane + 32 * g;
                 if (vec < nvec) {
                     const float4 kv = *reinterpret_cast<const float4 *>(kh + vec * 4);
@@ -1634,7 +1665,7 @@ __device__ __forceinline__ void attn_tile_step(AttnRow &r, const float *kt, cons
             }
         } else {
 #pragma unroll
-            for (int g = 0; g < ATTN_MAX_DPT; ++g) {
+            for (int g = 0; g < DPT; ++g) {
                 const int d = lane + 32 * g;
                 if (d < head_dim) {
                     partial = fmaf(r.qreg[g], kh[d], partial);
@@ -1666,7 +1697,7 @@ __device__ __forceinline__ void attn_tile_step(AttnRow &r, const float *kt, cons
     }
     r.l = fmaf(r.l, alpha, sum);
 #pragma unroll
-    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
         r.acc[i] = r.acc[i] * alpha;
     }
 #pragma unroll
@@ -1678,7 +1709,7 @@ __device__ __forceinline__ void attn_tile_step(AttnRow &r, const float *kt, cons
         const float *vh = vt + static_cast<size_t>(j) * head_dim;
         if (vec4) {
 #pragma unroll
-            for (int g = 0; g < ATTN_MAX_DPT / 4; ++g) {
+            for (int g = 0; g < attn_row_dims<DPT>() / 4; ++g) {
                 const int vec = lane + 32 * g;
                 if (vec < nvec) {
                     const float4 vv = *reinterpret_cast<const float4 *>(vh + vec * 4);
@@ -1690,7 +1721,7 @@ __device__ __forceinline__ void attn_tile_step(AttnRow &r, const float *kt, cons
             }
         } else {
 #pragma unroll
-            for (int g = 0; g < ATTN_MAX_DPT; ++g) {
+            for (int g = 0; g < DPT; ++g) {
                 const int d = lane + 32 * g;
                 if (d < head_dim) {
                     r.acc[g] = fmaf(pj, vh[d], r.acc[g]);
@@ -1701,12 +1732,13 @@ __device__ __forceinline__ void attn_tile_step(AttnRow &r, const float *kt, cons
     r.m = m_new;
 }
 
-__device__ __forceinline__ void attn_row_store(const AttnRow &r, float *oh, int lane, int head_dim,
+template <int DPT>
+__device__ __forceinline__ void attn_row_store(const AttnRow<DPT> &r, float *oh, int lane, int head_dim,
                                                int nvec, bool vec4) {
     const float inv = (r.l == 0.0f) ? 0.0f : 1.0f / r.l;
     if (vec4) {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT / 4; ++j) {
+        for (int j = 0; j < attn_row_dims<DPT>() / 4; ++j) {
             const int vec = lane + 32 * j;
             if (vec >= nvec) {
                 continue;
@@ -1736,7 +1768,7 @@ __device__ __forceinline__ void attn_row_store(const AttnRow &r, float *oh, int 
         }
     } else {
 #pragma unroll
-        for (int j = 0; j < ATTN_MAX_DPT; ++j) {
+        for (int j = 0; j < DPT; ++j) {
             const int d = lane + 32 * j;
             if (d < head_dim) {
                 oh[d] = r.acc[j] * inv;
@@ -1760,35 +1792,44 @@ __device__ __forceinline__ int attn_row_tmax(int qi, int n_q, int n_kv, int caus
  * 256 took a 2051-key MI50 decode row from 217 to 141 us. */
 constexpr int ATTN_CHUNK = 128;
 static_assert(ATTN_CHUNK % ATTN_KT == 0, "chunks are whole key tiles");
-/* Floats per (row, head, chunk) partial: every lane's accumulators, m, l. */
-constexpr int ATTN_PART = 32 * ATTN_MAX_DPT + 2;
+/* Floats per (row, head, chunk) partial: every lane's accumulators, m, l.
+ * Sized by the head_dim bucket so the scratch holds only what the launched
+ * kernels write; the host launcher uses the same value for one call. */
+template <int DPT>
+constexpr int attn_part() {
+    return 32 * attn_row_dims<DPT>() + 2;
+}
 
-__device__ __forceinline__ void attn_row_reset(AttnRow &r) {
+template <int DPT>
+__device__ __forceinline__ void attn_row_reset(AttnRow<DPT> &r) {
 #pragma unroll
-    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
         r.acc[i] = 0.0f;
     }
     r.m = -1.0e30f;
     r.l = 0.0f;
 }
 
-/* into (+)= (m_b, l_b, acc_b), rounding spelled out. */
-__device__ __forceinline__ void attn_fold(float &m, float &l, float (&acc)[ATTN_MAX_DPT], float m_b,
-                                          float l_b, const float (&acc_b)[ATTN_MAX_DPT]) {
+/* into (+)= (m_b, l_b, acc_b), rounding spelled out. DPT is named at the
+ * call sites: it sits inside the array bound, a non-deduced context. */
+template <int DPT>
+__device__ __forceinline__ void attn_fold(float &m, float &l, float *acc, float m_b, float l_b,
+                                          const float *acc_b) {
 #pragma clang fp contract(off)
     const float mm = fmaxf(m, m_b);
     const float a = expf(m - mm);
     const float b = expf(m_b - mm);
     l = fmaf(l, a, __fmul_rn(l_b, b));
 #pragma unroll
-    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
         acc[i] = fmaf(acc[i], a, __fmul_rn(acc_b[i], b));
     }
     m = mm;
 }
 
 /* One warp per (query, head), keys from global memory one at a time
- * (attn_row_step): head dims too wide for the tiled kernels' LDS. */
+ * (attn_row_step): head dims too wide for the tiled kernels' LDS. Untemplated:
+ * any head_dim, with the full ATTN_MAX_DPT slot count. */
 __global__ void __launch_bounds__(32) attention_flash_kernel(const float *q, const float *k, const float *v, float *out,
                                        int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
                                        int causal, const uint8_t *mask, const float *sinks) {
@@ -1807,7 +1848,7 @@ __global__ void __launch_bounds__(32) attention_flash_kernel(const float *q, con
     const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
                       (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
     const int nvec = vec4 ? head_dim / 4 : head_dim;
-    AttnRow r;
+    AttnRow<ATTN_MAX_DPT> r;
     attn_row_init(r, qh, lane, head_dim, nvec, vec4, sinks, h);
     /* Causal rows stop at their last visible key: a masked step adds exactly
      * nothing (p = 0, alpha = 1). */
@@ -1859,7 +1900,7 @@ __device__ __forceinline__ void attn_stage_tile(float *k_lds, float *v_lds, cons
  * attention_split_gqa_kernel. `tile` is a multiple of ATTN_KT. */
 constexpr int ATTN_QTILE = 8;
 
-template <bool VEC4>
+template <int DPT, bool VEC4>
 __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const float *q, const float *k, const float *v, float *out,
                                        int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
                                        int causal, const uint8_t *mask, const float *sinks,
@@ -1888,10 +1929,10 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
     /* Keys the block needs: up to the last row's end. */
     const int q_last = min(n_q, q0 + ATTN_QTILE) - 1;
     const int block_end = mask ? n_kv : min(n_kv, attn_row_tmax(q_last, n_q, n_kv, causal) + 1);
-    AttnRow r;
+    AttnRow<DPT> r;
     attn_row_init(r, qh, lane, head_dim, nvec, vec4, sinks, h);
     /* Folded chunks before the current one. */
-    float m_acc[ATTN_MAX_DPT];
+    float m_acc[attn_row_dims<DPT>()];
     float m_m = -1.0e30f, m_l = 0.0f;
     bool folded = false;
     int next_fold = ATTN_CHUNK;
@@ -1904,10 +1945,10 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
             if (s == next_fold) {
                 next_fold += ATTN_CHUNK;
                 if (folded) {
-                    attn_fold(m_m, m_l, m_acc, r.m, r.l, r.acc);
+                    attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
                 } else {
 #pragma unroll
-                    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+                    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
                         m_acc[i] = r.acc[i];
                     }
                     m_m = r.m;
@@ -1925,9 +1966,9 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
     }
     if (active) {
         if (folded) {
-            attn_fold(m_m, m_l, m_acc, r.m, r.l, r.acc);
+            attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
 #pragma unroll
-            for (int i = 0; i < ATTN_MAX_DPT; ++i) {
+            for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
                 r.acc[i] = m_acc[i];
             }
             r.m = m_m;
@@ -1947,7 +1988,7 @@ constexpr int ATTN_GQA_HEADS = 8;
  * head. With several chunks the chunk's online softmax goes to `part` (see
  * ATTN_PART) for attention_merge_kernel; with one, the row goes to `out`,
  * as the merge would write it. `tile` is a multiple of ATTN_KT. */
-template <bool VEC4>
+template <int DPT, bool VEC4>
 __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kernel(
     const float *q, const float *k, const float *v, float *part, float *out, int n_kv, int n_heads,
     int n_kv_heads, int head_dim, int causal, const uint8_t *mask, const float *sinks, int n_chunks, int tile) {
@@ -1973,7 +2014,7 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
      * offset is a multiple of head_dim floats. */
     constexpr bool vec4 = VEC4;
     const int nvec = vec4 ? head_dim / 4 : head_dim;
-    AttnRow r;
+    AttnRow<DPT> r;
     attn_row_init(r, qh, lane, head_dim, nvec, vec4, c == 0 ? sinks : nullptr, active ? h : h0);
     const int t_end = mask ? n_kv : min(n_kv, t_max + 1);
     const int t1 = min(t_end, (c + 1) * ATTN_CHUNK);
@@ -1996,18 +2037,19 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
         attn_row_store(r, out + static_cast<size_t>(h) * head_dim, lane, head_dim, nvec, vec4);
         return;
     }
-    float *dst = part + (static_cast<size_t>(h) * n_chunks + c) * ATTN_PART;
+    float *dst = part + (static_cast<size_t>(h) * n_chunks + c) * attn_part<DPT>();
 #pragma unroll
-    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
-        dst[lane * ATTN_MAX_DPT + i] = r.acc[i];
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
+        dst[lane * attn_row_dims<DPT>() + i] = r.acc[i];
     }
     if (lane == 0) {
-        dst[32 * ATTN_MAX_DPT] = r.m;
-        dst[32 * ATTN_MAX_DPT + 1] = r.l;
+        dst[32 * attn_row_dims<DPT>()] = r.m;
+        dst[32 * attn_row_dims<DPT>() + 1] = r.l;
     }
 }
 
 /* Folds a row's chunk partials in ascending order and writes the row. */
+template <int DPT>
 __global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, const float *part, float *out, int n_heads,
                                        int head_dim, int n_chunks) {
     const int qi = static_cast<int>(blockIdx.x);
@@ -2018,22 +2060,22 @@ __global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, con
     const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
                       (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
     const int nvec = vec4 ? head_dim / 4 : head_dim;
-    const float *src = part + (static_cast<size_t>(qi) * n_heads + h) * n_chunks * ATTN_PART;
-    AttnRow r;
+    const float *src = part + (static_cast<size_t>(qi) * n_heads + h) * n_chunks * attn_part<DPT>();
+    AttnRow<DPT> r;
 #pragma unroll
-    for (int i = 0; i < ATTN_MAX_DPT; ++i) {
-        r.acc[i] = src[lane * ATTN_MAX_DPT + i];
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
+        r.acc[i] = src[lane * attn_row_dims<DPT>() + i];
     }
-    r.m = src[32 * ATTN_MAX_DPT];
-    r.l = src[32 * ATTN_MAX_DPT + 1];
+    r.m = src[32 * attn_row_dims<DPT>()];
+    r.l = src[32 * attn_row_dims<DPT>() + 1];
     for (int c = 1; c < n_chunks; ++c) {
-        const float *pc = src + static_cast<size_t>(c) * ATTN_PART;
-        float acc_b[ATTN_MAX_DPT];
+        const float *pc = src + static_cast<size_t>(c) * attn_part<DPT>();
+        float acc_b[attn_row_dims<DPT>()];
 #pragma unroll
-        for (int i = 0; i < ATTN_MAX_DPT; ++i) {
-            acc_b[i] = pc[lane * ATTN_MAX_DPT + i];
+        for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
+            acc_b[i] = pc[lane * attn_row_dims<DPT>() + i];
         }
-        attn_fold(r.m, r.l, r.acc, pc[32 * ATTN_MAX_DPT], pc[32 * ATTN_MAX_DPT + 1], acc_b);
+        attn_fold<DPT>(r.m, r.l, r.acc, pc[32 * attn_row_dims<DPT>()], pc[32 * attn_row_dims<DPT>() + 1], acc_b);
     }
     attn_row_store(r, oh, lane, head_dim, nvec, vec4);
 }
@@ -2055,10 +2097,12 @@ static AttnPartScratch g_attn_part[ATTN_PART_DEVICES];
  * f32 accumulation; the online softmax is the attn_row_step recurrence (max,
  * exp, rescale) per 16-key tile. Q, K, P and V are rounded to f16, so a row's
  * bits differ from the decode kernels (relative error ~1e-3): the engine runs
- * this kernel only in prefill with the option on. Overflow is not possible:
- * each Q row (over head_dim), each K row (one token, over head_dim) and each
- * V column of a 16-token tile is scaled by a power of two into [2^13, 2^14)
- * before rounding, and the scale is taken out exactly in f32.
+ * this kernel only in prefill with the option on. Each Q row and each K row
+ * (one token, over head_dim) is scaled by a power of two into [2^13, 2^14)
+ * before rounding and the scale is taken out exactly in f32; each V row (one
+ * token) is scaled down only, with the inverse folded into P. Every scale
+ * depends on one row or token alone, so a row's bits do not depend on keys
+ * past its causal limit.
  *
  * Q fragments stay in registers for the whole key loop. The loop stops at the
  * causal limit of the block's last row. K and V are only read. head_dim must
@@ -2206,6 +2250,36 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
             p_lane[g] = p;
         }
 
+        /* V scale, per token so a row never depends on keys past its causal
+         * limit (a scale shared over a 16-key tile did): lane L takes token
+         * k0 + L%16's largest |v| over head_dim (lane L^16 the other half) and
+         * scales that token's V down by a power of two when it would not fit
+         * f16 (never up, at most 2^15). The inverse goes into P, which stays
+         * <= 2^15. V past 2^29 still overflows f16. */
+        float v_tmax = 0.0f;
+        if (k_tok < n_kv) {
+            const float *vr = v + static_cast<size_t>(k_tok) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+            for (int dt = 0; dt < n_dtiles; ++dt) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    v_tmax = fmaxf(v_tmax, fabsf(vr[dt * 16 + half + e]));
+                }
+            }
+        }
+        v_tmax = fmaxf(v_tmax, __shfl_xor(v_tmax, 16, 32));
+        int v_sh = wmma_f16_shift(v_tmax);
+        v_sh = v_sh > 0 ? 0 : (v_sh < -15 ? -15 : v_sh);
+        /* This lane's P and V operands cover tokens k0 + half + e; token
+         * k0 + j's shift lives in lane j. */
+        float tok_vs[8];
+        float tok_pinv[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int sh = __shfl(v_sh, half + e, 32);
+            tok_vs[e] = ldexpf(1.0f, sh);
+            tok_pinv[e] = ldexpf(1.0f, -sh);
+        }
+
         /* P as the A operand: lane L needs row L%16 at tokens half + 0..7. */
         f16x8 p_frag;
 #pragma unroll
@@ -2221,7 +2295,7 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
                 const int src = (r / 8) * 16 + half + e;
                 const float got = __shfl(vreg, src, 32);
                 if ((r % 8) == gsrc) {
-                    p_frag[e] = static_cast<_Float16>(got);
+                    p_frag[e] = static_cast<_Float16>(got * tok_pinv[e]);
                 }
             }
         }
@@ -2230,38 +2304,24 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
             if (dt >= n_dtiles) {
                 continue;
             }
-            /* V: this lane's B column is dim dt*16 + lane%16, tokens k0 + half + 0..7;
-             * lane L^16 holds the other 8 tokens of the column. */
+            /* V: this lane's B column is dim dt*16 + lane%16, tokens k0 + half + 0..7
+             * (lane L^16 holds the other 8 tokens of the column), each scaled
+             * by its own token's power of two. */
             const int d = dt * 16 + (lane % 16);
-            float vv[8];
-            float vmax = 0.0f;
-#pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int token = k0 + half + e;
-                vv[e] = token < n_kv
-                            ? v[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + d]
-                            : 0.0f;
-                vmax = fmaxf(vmax, fabsf(vv[e]));
-            }
-            vmax = fmaxf(vmax, __shfl_xor(vmax, 16, 32));
-            const int v_sh = wmma_f16_shift(vmax);
-            const float vs = ldexpf(1.0f, v_sh);
             f16x8 b_frag;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                b_frag[e] = static_cast<_Float16>(vv[e] * vs);
+                const int token = k0 + half + e;
+                const float vv = token < n_kv
+                                     ? v[static_cast<size_t>(token) * kv_stride + static_cast<size_t>(kv_h) * head_dim + d]
+                                     : 0.0f;
+                b_frag[e] = static_cast<_Float16>(vv * tok_vs[e]);
             }
-            f32x8 pv;
 #pragma unroll
             for (int g = 0; g < 8; ++g) {
-                pv[g] = 0.0f;
+                acc[dt][g] *= alpha[g];
             }
-            pv = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_frag, b_frag, pv);
-            const float v_unscale = ldexpf(1.0f, -v_sh);
-#pragma unroll
-            for (int g = 0; g < 8; ++g) {
-                acc[dt][g] = acc[dt][g] * alpha[g] + pv[g] * v_unscale;
-            }
+            acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_frag, b_frag, acc[dt]);
         }
     }
 #pragma unroll
@@ -2294,19 +2354,19 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
 #endif
 }
 
-/* One query: attention_split_gqa_kernel, its chunks in parallel plus a merge
+/* One query, a head_dim in the DPT bucket: the tiled kernels, sized on DPT.
+ * n_q == 1: attention_split_gqa_kernel, its chunks in parallel plus a merge
  * when the row is longer than one chunk. Several rows: the Q-tiled kernel.
- * Both give a row the same bits. Head dims past 32 * ATTN_MAX_DPT take the
- * per-row kernel, whichever the row count. */
-static void launch_attention(const float *q, const float *k, const float *v, float *out, int n_q,
-                             int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
-                             const uint8_t *mask, const float *sinks, hipStream_t stream) {
+ * Both give a row the same bits. */
+template <int DPT>
+static void launch_attention_tiled(const float *q, const float *k, const float *v, float *out, int n_q,
+                                   int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
+                                   const uint8_t *mask, const float *sinks, hipStream_t stream) {
     /* About 2048 floats of K (and of V) per tile, at least one key tile: 16
      * keys at head_dim 128 or 256. On an MI50 (3199-token prompt, 14 layers)
      * 4096 lost occupancy and 1024 paid more barriers; for a 2051-key decode
      * row at head_dim 256, 32 keys were slower than 16. */
-    const bool fits = head_dim > 0 && head_dim <= 32 * ATTN_MAX_DPT;
-    const int tile = fits ? max(ATTN_KT, 2048 / head_dim / ATTN_KT * ATTN_KT) : 0;
+    const int tile = max(ATTN_KT, 2048 / head_dim / ATTN_KT * ATTN_KT);
     const size_t lds = 2 * static_cast<size_t>(tile) * head_dim * sizeof(float);
     const int n_chunks = n_kv > ATTN_CHUNK ? (n_kv + ATTN_CHUNK - 1) / ATTN_CHUNK : 1;
     /* Heads that share a key/value head read each key once. */
@@ -2316,14 +2376,14 @@ static void launch_attention(const float *q, const float *k, const float *v, flo
     /* float4 rows; the same for every row of the call (see the kernels). */
     const bool vec4 = (head_dim % 4) == 0 && (reinterpret_cast<uintptr_t>(q) % 16u) == 0;
     const dim3 split_grid(static_cast<unsigned>(n_kv_heads * groups), static_cast<unsigned>(n_chunks));
-    if (n_q == 1 && n_chunks == 1 && fits) {
-        hipLaunchKernelGGL(vec4 ? attention_split_gqa_kernel<true> : attention_split_gqa_kernel<false>, split_grid,
-                           dim3(32 * per_block), lds, stream, q, k, v,
+    if (n_q == 1 && n_chunks == 1) {
+        hipLaunchKernelGGL((vec4 ? attention_split_gqa_kernel<DPT, true> : attention_split_gqa_kernel<DPT, false>),
+                           split_grid, dim3(32 * per_block), lds, stream, q, k, v,
                            static_cast<float *>(nullptr), out, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
                            sinks, n_chunks, tile);
         return;
     }
-    if (n_q == 1 && fits) {
+    if (n_q == 1) {
         int dev = 0;
         if (hipGetDevice(&dev) == hipSuccess && dev >= 0 && dev < ATTN_PART_DEVICES) {
             AttnPartScratch &s = g_attn_part[dev];
@@ -2332,7 +2392,7 @@ static void launch_attention(const float *q, const float *k, const float *v, flo
             if (s.p && s.stream != stream && hipDeviceSynchronize() != hipSuccess) {
                 ok = false;
             }
-            const size_t need = static_cast<size_t>(n_heads) * n_chunks * ATTN_PART;
+            const size_t need = static_cast<size_t>(n_heads) * n_chunks * attn_part<DPT>();
             if (ok && s.cap < need) {
                 if (s.p) {
                     (void)hipDeviceSynchronize();
@@ -2350,24 +2410,47 @@ static void launch_attention(const float *q, const float *k, const float *v, flo
             }
             if (ok) {
                 s.stream = stream;
-                hipLaunchKernelGGL(vec4 ? attention_split_gqa_kernel<true> : attention_split_gqa_kernel<false>,
+                hipLaunchKernelGGL((vec4 ? attention_split_gqa_kernel<DPT, true> : attention_split_gqa_kernel<DPT, false>),
                                    split_grid, dim3(32 * per_block), lds, stream, q, k,
                                    v, s.p, static_cast<float *>(nullptr), n_kv, n_heads, n_kv_heads, head_dim, causal,
                                    mask, sinks, n_chunks, tile);
-                hipLaunchKernelGGL(attention_merge_kernel, dim3(1, static_cast<unsigned>(n_heads)),
+                hipLaunchKernelGGL(attention_merge_kernel<DPT>, dim3(1, static_cast<unsigned>(n_heads)),
                                    dim3(32), 0, stream, q, s.p, out, n_heads, head_dim, n_chunks);
                 return;
             }
         }
         /* No scratch: the Q-tiled kernel computes the same chunked row. */
     }
-    if (fits) {
-        dim3 block(32 * ATTN_QTILE);
-        dim3 grid(static_cast<unsigned>((n_q + ATTN_QTILE - 1) / ATTN_QTILE),
-                  static_cast<unsigned>(n_heads));
-        hipLaunchKernelGGL(vec4 ? attention_qtile_kernel<true> : attention_qtile_kernel<false>, grid, block, lds, stream, q, k, v, out, n_q, n_kv,
-                           n_heads, n_kv_heads, head_dim, causal, mask, sinks, tile);
+    dim3 block(32 * ATTN_QTILE);
+    dim3 grid(static_cast<unsigned>((n_q + ATTN_QTILE - 1) / ATTN_QTILE),
+              static_cast<unsigned>(n_heads));
+    hipLaunchKernelGGL((vec4 ? attention_qtile_kernel<DPT, true> : attention_qtile_kernel<DPT, false>),
+                       grid, block, lds, stream, q, k, v, out, n_q, n_kv,
+                       n_heads, n_kv_heads, head_dim, causal, mask, sinks, tile);
+}
+
+/* One query: attention_split_gqa_kernel, its chunks in parallel plus a merge
+ * when the row is longer than one chunk. Several rows: the Q-tiled kernel.
+ * Both give a row the same bits. Head dims past 32 * ATTN_MAX_DPT (or
+ * non-positive) take the per-row kernel, whichever the row count. */
+static void launch_attention(const float *q, const float *k, const float *v, float *out, int n_q,
+                             int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
+                             const uint8_t *mask, const float *sinks, hipStream_t stream) {
+    switch (attn_dpt_bucket(head_dim)) {
+    case 4:
+        launch_attention_tiled<4>(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
+                                  sinks, stream);
         return;
+    case 8:
+        launch_attention_tiled<8>(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
+                                  sinks, stream);
+        return;
+    case 16:
+        launch_attention_tiled<16>(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
+                                   sinks, stream);
+        return;
+    default:
+        break;
     }
     dim3 block(32);
     dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));

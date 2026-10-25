@@ -313,6 +313,19 @@ fn make_swiglu_lanes(
     }
 }
 
+/// `ALLPACA_SWIGLU_SINGLE_STREAM=1` forces the m > 1 MXFP4 SwiGLU onto the
+/// default stream, skipping the two side-stream fork (A/B switch for the
+/// `GPU_MAX_HW_QUEUES` experiments; see board task Q3).
+fn swiglu_single_stream_env() -> bool {
+    std::env::var("ALLPACA_SWIGLU_SINGLE_STREAM").is_ok_and(|v| v == "1")
+}
+
+/// Whether the m > 1 MXFP4 SwiGLU may fork its gate/up GEMMs onto the two
+/// side streams: it needs rows, healthy lanes, and no single-stream force.
+fn swiglu_use_two_streams(m: i32, lanes_ready: bool, force_single_stream: bool) -> bool {
+    m > 1 && lanes_ready && !force_single_stream
+}
+
 fn destroy_swiglu_pair(
     streams: [*mut std::ffi::c_void; SWIGLU_STREAMS],
     events: [*mut std::ffi::c_void; SWIGLU_EVENTS],
@@ -377,6 +390,7 @@ mod ffi {
             l2_bytes: *mut i32,
         ) -> i32;
         pub fn allpaca_hip_device_multiprocessors(id: i32, count: *mut i32) -> i32;
+        pub fn allpaca_attn_dpt(head_dim: i32) -> i32;
         pub fn allpaca_hip_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
         pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
@@ -1680,6 +1694,23 @@ pub fn device_multiprocessors(id: i32) -> Option<u32> {
     {
         let _ = id;
         None
+    }
+}
+
+/// Attention-kernel template bucket for a head_dim: ceil(head_dim/32) rounded
+/// up to a compiled instantiation (4, 8 or 16 register slots per lane). 0 is
+/// the per-row flash kernel (head_dim outside 1..=32 * the slot cap). Pure
+/// arithmetic: the same value sizes `ATTN_PART` and picks the kernel, so the
+/// split, merge and Q-tiled launches of one call always agree.
+pub fn attn_dpt(head_dim: i32) -> i32 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_attn_dpt(head_dim) }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = head_dim;
+        0
     }
 }
 
@@ -8069,13 +8100,12 @@ impl HipWorkspace {
             let ev_u = self.swiglu_ev[2];
             // M=1 decode grids underfill gfx906 (~32 blocks for ff=2048). Dual
             // launch helps prefill (M>1) but the event join shows up on `"hi"`.
-            if m > 1
-                && !s0.is_null()
+            let lanes_ready = !s0.is_null()
                 && !s1.is_null()
                 && !ev_h2d.is_null()
                 && !ev_g.is_null()
-                && !ev_u.is_null()
-            {
+                && !ev_u.is_null();
+            if swiglu_use_two_streams(m, lanes_ready, swiglu_single_stream_env()) {
                 event_record_on(ev_h2d, std::ptr::null_mut())?;
                 stream_wait_event(s0, ev_h2d)?;
                 stream_wait_event(s1, ev_h2d)?;
@@ -13779,6 +13809,34 @@ mod tests {
         }
     }
 
+    /// `launch_attention` templates on DPT = ceil(head_dim/32), rounded up to a
+    /// compiled instantiation; head_dims outside 1..=512 take the per-row flash
+    /// kernel (bucket 0). Every head_dim below must reach exactly one kernel
+    /// family, and the split/merge/Q-tiled launches of one call share a bucket.
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn attention_dpt_dispatch_buckets() {
+        assert_eq!(attn_dpt(0), 0);
+        assert_eq!(attn_dpt(-8), 0);
+        assert_eq!(attn_dpt(513), 0);
+        assert_eq!(attn_dpt(4096), 0);
+        for hd in 1..=128 {
+            assert_eq!(attn_dpt(hd), 4, "head_dim {hd}");
+        }
+        for hd in 129..=256 {
+            assert_eq!(attn_dpt(hd), 8, "head_dim {hd}");
+        }
+        for hd in 257..=512 {
+            assert_eq!(attn_dpt(hd), 16, "head_dim {hd}");
+        }
+        // The dims the exactness tests exercise land where intended.
+        assert_eq!(attn_dpt(6), 4);
+        assert_eq!(attn_dpt(96), 4);
+        assert_eq!(attn_dpt(128), 4);
+        assert_eq!(attn_dpt(256), 8);
+        assert_eq!(attn_dpt(512), 16);
+    }
+
     #[test]
     fn kernel_launches_counts_a_launch() {
         if device_count() == 0 {
@@ -14319,7 +14377,7 @@ mod tests {
             let q = device_malloc(nh * hd * 4, dev).unwrap();
             let out = device_malloc(nh * hd * 4, dev).unwrap();
             memcpy(q, vec![0.01f32; nh * hd].as_ptr().cast(), nh * hd * 4, MEMCPY_H2D).unwrap();
-            for n_kv in [512usize, 4096, 32768] {
+            for n_kv in [512usize, 4096, 32768, 131072] {
                 let kv_bytes = n_kv * nkv * hd * 4;
                 let kvs: Vec<(*mut u8, *mut u8)> = (0..copies_for(2 * kv_bytes))
                     .map(|_| {
@@ -16246,6 +16304,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The m > 1 SwiGLU forks onto the two side streams only when rows,
+    /// lanes and the `ALLPACA_SWIGLU_SINGLE_STREAM` switch all allow it.
+    #[test]
+    fn swiglu_two_stream_gate_respects_the_single_stream_switch() {
+        // Healthy lanes fork at m > 1...
+        assert!(swiglu_use_two_streams(2, true, false));
+        assert!(swiglu_use_two_streams(8, true, false));
+        // ...but not when the switch forces one stream.
+        assert!(!swiglu_use_two_streams(2, true, true));
+        assert!(!swiglu_use_two_streams(8, true, true));
+        // m = 1 decode never forks, with or without the switch.
+        assert!(!swiglu_use_two_streams(1, true, false));
+        assert!(!swiglu_use_two_streams(1, true, true));
+        // Missing lanes never fork.
+        assert!(!swiglu_use_two_streams(2, false, false));
+        assert!(!swiglu_use_two_streams(2, false, true));
+    }
+
+    #[test]
+    fn swiglu_single_stream_env_reads_the_allpaca_var() {
+        std::env::remove_var("ALLPACA_SWIGLU_SINGLE_STREAM");
+        assert!(!swiglu_single_stream_env());
+        std::env::set_var("ALLPACA_SWIGLU_SINGLE_STREAM", "1");
+        assert!(swiglu_single_stream_env());
+        std::env::set_var("ALLPACA_SWIGLU_SINGLE_STREAM", "0");
+        assert!(!swiglu_single_stream_env());
+        std::env::set_var("ALLPACA_SWIGLU_SINGLE_STREAM", "true");
+        assert!(!swiglu_single_stream_env());
+        std::env::remove_var("ALLPACA_SWIGLU_SINGLE_STREAM");
     }
 
     #[cfg(feature = "hip")]
@@ -19447,6 +19536,61 @@ mod tests {
         }
     }
 
+    /// A row's WMMA attention output must not depend on keys past its causal
+    /// limit: the same rows over the same visible keys give the same bits
+    /// whether or not the call also carries later tokens (larger, in the same
+    /// 16-key tile and beyond). Otherwise a prompt-cache hit, or a prompt that
+    /// shares a prefix, would get prefix KV other than a cold prefill's.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gfx12_wmma_prefill_attention_row_ignores_later_tokens() {
+        if device_count() == 0 || !device_is_gfx12_by_name(0) {
+            return;
+        }
+        // (n_q, n_kv, extra trailing tokens, heads, kv heads, head_dim)
+        for (ci, (n_q, n_kv, extra, nh, nkv, hd)) in
+            [(21usize, 40usize, 11usize, 4usize, 1usize, 64usize), (16, 16, 5, 8, 2, 128), (9, 300, 20, 2, 1, 64)]
+                .into_iter()
+                .enumerate()
+        {
+            let (q2n, kv2n) = (n_q + extra, n_kv + extra);
+            let q = wmma_test_values(q2n * nh * hd, 31 + ci as u64);
+            let mut k = wmma_test_values(kv2n * nkv * hd, 37 + ci as u64);
+            let mut v = wmma_test_values(kv2n * nkv * hd, 41 + ci as u64);
+            // Later tokens are far larger (V by 2^30), so a scale shared with
+            // them would push the visible V into f16 subnormals.
+            for t in n_kv..kv2n {
+                for x in &mut k[t * nkv * hd..(t + 1) * nkv * hd] {
+                    *x *= 40.0;
+                }
+                for x in &mut v[t * nkv * hd..(t + 1) * nkv * hd] {
+                    *x *= (1u64 << 30) as f32; // pushes a shared scale into f16 subnormals
+                }
+            }
+            let row = nh * hd;
+            let mut short = vec![0.0f32; n_q * row];
+            attention_wmma_prefill(
+                &q[..n_q * row], &k[..n_kv * nkv * hd], &v[..n_kv * nkv * hd], &mut short,
+                n_q as i32, n_kv as i32, nh as i32, nkv as i32, hd as i32, true,
+            )
+            .unwrap();
+            let mut long = vec![0.0f32; q2n * row];
+            attention_wmma_prefill(&q, &k, &v, &mut long, q2n as i32, kv2n as i32, nh as i32, nkv as i32, hd as i32, true)
+                .unwrap();
+            for i in 0..n_q * row {
+                assert_eq!(
+                    short[i].to_bits(),
+                    long[i].to_bits(),
+                    "case {ci}: row {} col {} changed with later tokens: {} vs {}",
+                    i / row,
+                    i % row,
+                    short[i],
+                    long[i]
+                );
+            }
+        }
+    }
+
     /// Dispatch: `HipWorkspace::attention_device` and `gemm_nt_f16_dev` launch
     /// the WMMA kernels only inside a [`PrefillWmma`] scope, only on gfx12,
     /// never for one query row or under [`ExactRows`], and the scope restores
@@ -20272,6 +20416,16 @@ mod tests {
             (3, 600, 20, 2, 256, true),
             // A head dim the float4 path cannot take.
             (7, 300, 4, 2, 6, true),
+            // Every DPT template bucket, float4 and scalar rows, chunked folds:
+            // hd 32/40/100 -> 4 slots, hd 130/160 -> 8, hd 512 -> 16 (Q4).
+            (4, 1000, 4, 2, 32, true),
+            (3, 300, 4, 2, 40, true),
+            (2, 600, 4, 2, 100, true),
+            (4, 300, 4, 2, 34, true),
+            (4, 300, 4, 2, 130, true),
+            (5, 700, 4, 2, 160, true),
+            (3, 513, 4, 2, 512, true),
+            (2, 1000, 8, 2, 256, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()

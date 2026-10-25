@@ -53,6 +53,12 @@ int allpaca_hip_device_arch(int32_t id, char *arch, int32_t arch_len, int32_t *l
 /* multiProcessorCount: compute units on GCN/CDNA, work-group processors on RDNA. */
 int allpaca_hip_device_multiprocessors(int32_t id, int32_t *count);
 
+/* Attention-kernel template bucket for a head_dim (ceil(head_dim/32) rounded up
+ * to 4, 8 or 16 register slots; 0 is the flash kernel, head_dim <= 0 or
+ * > 512). Pure arithmetic; the same value sizes ATTN_PART and picks the
+ * kernel, so a call's split/merge/Q-tiled launches always agree. */
+int32_t allpaca_attn_dpt(int32_t head_dim);
+
 int allpaca_hip_can_p2p(int32_t src, int32_t dst, int32_t *can);
 
 int allpaca_hip_enable_peer_access(int32_t src, int32_t dst);
