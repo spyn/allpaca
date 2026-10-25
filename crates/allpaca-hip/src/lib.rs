@@ -310,6 +310,19 @@ fn make_swiglu_lanes(
     }
 }
 
+/// `ALLPACA_SWIGLU_SINGLE_STREAM=1` forces the m > 1 MXFP4 SwiGLU onto the
+/// default stream, skipping the two side-stream fork (A/B switch for the
+/// `GPU_MAX_HW_QUEUES` experiments; see board task Q3).
+fn swiglu_single_stream_env() -> bool {
+    std::env::var("ALLPACA_SWIGLU_SINGLE_STREAM").is_ok_and(|v| v == "1")
+}
+
+/// Whether the m > 1 MXFP4 SwiGLU may fork its gate/up GEMMs onto the two
+/// side streams: it needs rows, healthy lanes, and no single-stream force.
+fn swiglu_use_two_streams(m: i32, lanes_ready: bool, force_single_stream: bool) -> bool {
+    m > 1 && lanes_ready && !force_single_stream
+}
+
 fn destroy_swiglu_pair(
     streams: [*mut std::ffi::c_void; SWIGLU_STREAMS],
     events: [*mut std::ffi::c_void; SWIGLU_EVENTS],
@@ -8003,13 +8016,12 @@ impl HipWorkspace {
             let ev_u = self.swiglu_ev[2];
             // M=1 decode grids underfill gfx906 (~32 blocks for ff=2048). Dual
             // launch helps prefill (M>1) but the event join shows up on `"hi"`.
-            if m > 1
-                && !s0.is_null()
+            let lanes_ready = !s0.is_null()
                 && !s1.is_null()
                 && !ev_h2d.is_null()
                 && !ev_g.is_null()
-                && !ev_u.is_null()
-            {
+                && !ev_u.is_null();
+            if swiglu_use_two_streams(m, lanes_ready, swiglu_single_stream_env()) {
                 event_record_on(ev_h2d, std::ptr::null_mut())?;
                 stream_wait_event(s0, ev_h2d)?;
                 stream_wait_event(s1, ev_h2d)?;
@@ -16198,6 +16210,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The m > 1 SwiGLU forks onto the two side streams only when rows,
+    /// lanes and the `ALLPACA_SWIGLU_SINGLE_STREAM` switch all allow it.
+    #[test]
+    fn swiglu_two_stream_gate_respects_the_single_stream_switch() {
+        // Healthy lanes fork at m > 1...
+        assert!(swiglu_use_two_streams(2, true, false));
+        assert!(swiglu_use_two_streams(8, true, false));
+        // ...but not when the switch forces one stream.
+        assert!(!swiglu_use_two_streams(2, true, true));
+        assert!(!swiglu_use_two_streams(8, true, true));
+        // m = 1 decode never forks, with or without the switch.
+        assert!(!swiglu_use_two_streams(1, true, false));
+        assert!(!swiglu_use_two_streams(1, true, true));
+        // Missing lanes never fork.
+        assert!(!swiglu_use_two_streams(2, false, false));
+        assert!(!swiglu_use_two_streams(2, false, true));
+    }
+
+    #[test]
+    fn swiglu_single_stream_env_reads_the_allpaca_var() {
+        std::env::remove_var("ALLPACA_SWIGLU_SINGLE_STREAM");
+        assert!(!swiglu_single_stream_env());
+        std::env::set_var("ALLPACA_SWIGLU_SINGLE_STREAM", "1");
+        assert!(swiglu_single_stream_env());
+        std::env::set_var("ALLPACA_SWIGLU_SINGLE_STREAM", "0");
+        assert!(!swiglu_single_stream_env());
+        std::env::set_var("ALLPACA_SWIGLU_SINGLE_STREAM", "true");
+        assert!(!swiglu_single_stream_env());
+        std::env::remove_var("ALLPACA_SWIGLU_SINGLE_STREAM");
     }
 
     #[cfg(feature = "hip")]
