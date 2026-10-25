@@ -11,6 +11,11 @@
 //! Each draft layer wraps attention and FFN in two-tap dynamic convolutions
 //! along the block: `out[t] = w0[t] * h[t] + w1[t] * h[t-1]`, with per-group
 //! weights projected from the layer's normed input plus a static base.
+//!
+//! Plain DFlash (llama.cpp `draft-dflash`, e.g. the Nemotron-3.5-Bolt
+//! drafter) is the same pass without the convolutions and the selector:
+//! the block's tokens embedded times `dflash.embedding_scale`, Qwen3-style
+//! layers, and the target head's top-1 at each position.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,11 +52,35 @@ pub struct Dflash2Spec {
     /// Target layers whose *input* feeds the draft, in feature order.
     pub target_layers: Vec<usize>,
     pub mask_token: u32,
+    /// Plain DFlash: no dynamic convolutions, no selector.
+    pub plain: bool,
+    /// Scale on the block's token embeddings (`dflash.embedding_scale`).
+    pub embedding_scale: f32,
+    /// Tokens in the draft's own vocabulary, when it carries one.
+    pub vocab: Option<usize>,
 }
 
 impl Dflash2Spec {
     pub fn from_gguf(file: &GgufFile) -> Option<Self> {
-        if file.tensor("selector_hidden.weight").is_none() {
+        let plain = file.tensor("selector_hidden.weight").is_none();
+        // A plain DFlash draft has none of DSpark's Markov or hyper-connection
+        // tensors and none of DFlash2's convolutions.
+        let has_markov = [
+            "markov_w1.weight",
+            "dspark.markov_w1.weight",
+            "markov_w1",
+            "dspark.markov_w1",
+        ]
+        .into_iter()
+        .any(|name| file.tensor(name).is_some());
+        if plain
+            && (file.architecture() != Some("dflash")
+                || file.tensor("fc.weight").is_none()
+                || has_markov
+                || file.tensor("hc_head_fn.weight").is_some()
+                || file.tensor("blk.0.attn_conv_proj.weight").is_some()
+                || file.tensor("blk.0.attn_q.weight").is_none())
+        {
             return None;
         }
         let u = |k: &str| file.meta_u32(&format!("dflash.{k}")).map(|v| v as usize);
@@ -80,12 +109,18 @@ impl Dflash2Spec {
             conv_kernel: u("conv_kernel_size").unwrap_or(2),
             conv_group: u("conv_group_size").unwrap_or(16),
             selector_rank: u("selector_rank").unwrap_or(256),
-            top_k: u("selector_top_k").unwrap_or(16),
+            top_k: if plain { 1 } else { u("selector_top_k").unwrap_or(16) },
             window: u("attention.sliding_window").unwrap_or(2048),
             target_layers,
             mask_token: file.meta_u32("tokenizer.ggml.mask_token_id")?,
+            plain,
+            embedding_scale: file.meta_f32("dflash.embedding_scale").unwrap_or(1.0),
+            vocab: match file.metadata.get("tokenizer.ggml.tokens") {
+                Some(allpaca_gguf::GgufValue::Array(items)) => Some(items.len()),
+                _ => None,
+            },
         };
-        (spec.dim % spec.conv_group == 0
+        ((plain || spec.dim % spec.conv_group == 0)
             && spec.block_size >= 2
             && !spec.target_layers.is_empty()
             && spec.top_k > 0)
@@ -111,6 +146,60 @@ impl Dflash2Spec {
     pub fn ring_slots(&self) -> usize {
         self.window + RING_SLACK
     }
+}
+
+/// What a file nominated as a DSpark sidecar turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarKind {
+    /// A DSpark sidecar for this target.
+    Dspark,
+    /// A block draft (plain DFlash or DFlash2): attaches only through
+    /// `providers = ["dflash1"]` / `["dflash2"]`.
+    BlockDraft { plain: bool },
+    /// Built for another model (width or vocabulary differ).
+    Mismatch,
+}
+
+/// Classify a nominated sidecar by its content, for a target of hidden
+/// width `dim` and `vocab` tokens.
+pub(crate) fn classify_sidecar(file: &GgufFile, dim: usize, vocab: usize) -> SidecarKind {
+    if let Some(spec) = Dflash2Spec::from_gguf(file) {
+        return SidecarKind::BlockDraft { plain: spec.plain };
+    }
+    if allpaca_gguf::sidecar_matches_target(file, dim, vocab) {
+        SidecarKind::Dspark
+    } else {
+        SidecarKind::Mismatch
+    }
+}
+
+/// Whether a block draft fits the configured providers and the target
+/// (hidden width `dim`, `vocab` tokens).
+pub(crate) fn check_block_draft(
+    spec: &Dflash2Spec,
+    providers: &[allpaca_types::DraftProviderKind],
+    dim: usize,
+    vocab: usize,
+) -> Result<(), AllpacaError> {
+    use allpaca_types::DraftProviderKind as K;
+    let (kind, provider) = if spec.plain { ("plain DFlash", K::Dflash1) } else { ("DFlash2", K::Dflash2) };
+    let bad = |msg: String| Err(AllpacaError::Fatal(FatalError::InvalidConfig(msg)));
+    if !providers.contains(&provider) {
+        return bad(format!(
+            "the draft is a {kind} draft; use providers = [\"{}\"]",
+            if spec.plain { "dflash1" } else { "dflash2" }
+        ));
+    }
+    if spec.dim != dim {
+        return bad(format!("{kind} draft width {} != target {dim}", spec.dim));
+    }
+    if spec.vocab.is_some_and(|v| v != vocab) {
+        return bad(format!("{kind} draft vocabulary {} != target {vocab}", spec.vocab.unwrap_or(0)));
+    }
+    if spec.mask_token as usize >= vocab {
+        return bad(format!("{kind} draft mask token {} is outside the target's {vocab} tokens", spec.mask_token));
+    }
+    Ok(())
 }
 
 /// One target row's features: the residual entering each captured layer.
@@ -253,9 +342,9 @@ pub trait TargetHead: Send {
 }
 
 /// Logits per GPU top-k chunk; each chunk returns its own top `k`.
-const TOPK_CHUNK: usize = 2048;
+pub(crate) const TOPK_CHUNK: usize = 2048;
 /// Largest `k` the head's candidate buffers hold.
-const TOPK_MAX: usize = 32;
+pub(crate) const TOPK_MAX: usize = 32;
 
 /// [`TargetHead`] over the target's resident weights on its own GPU.
 pub struct ResidentHead {
@@ -698,8 +787,8 @@ pub struct Dflash2Provider {
     out_norm: usize,
     sel_hidden: usize,
     layers: Vec<LayerOff>,
-    sel_prev: SelectorTable,
-    sel_next: SelectorTable,
+    /// The selector's tables (DFlash2 only).
+    sel: Option<(SelectorTable, SelectorTable)>,
     ring_k: Vec<DeviceWeights>,
     ring_v: Vec<DeviceWeights>,
     ring: RingIndex,
@@ -765,14 +854,21 @@ impl Dflash2Provider {
         let fc = push(q8("fc.weight")?);
         let enc_norm = push(f32b("enc.output_norm.weight")?);
         let out_norm = push(f32b("output_norm.weight")?);
-        let sel_hidden = push(q8("selector_hidden.weight")?);
+        let plain = spec.plain;
+        let sel_hidden = if plain { 0 } else { push(q8("selector_hidden.weight")?) };
         let mut layers = Vec::with_capacity(spec.n_layers);
         for i in 0..spec.n_layers {
             let t = |s: &str| format!("blk.{i}.{s}");
+            let attn_norm = push(f32b(&t("attn_norm.weight"))?);
+            let (attn_conv_base, attn_conv_proj) = if plain {
+                (0, 0)
+            } else {
+                (push(f32b(&t("attn_conv_base"))?), push(q8(&t("attn_conv_proj.weight"))?))
+            };
             layers.push(LayerOff {
-                attn_norm: push(f32b(&t("attn_norm.weight"))?),
-                attn_conv_base: push(f32b(&t("attn_conv_base"))?),
-                attn_conv_proj: push(q8(&t("attn_conv_proj.weight"))?),
+                attn_norm,
+                attn_conv_base,
+                attn_conv_proj,
                 wq: push(q8(&t("attn_q.weight"))?),
                 wk: push(q8(&t("attn_k.weight"))?),
                 wv: push(q8(&t("attn_v.weight"))?),
@@ -780,8 +876,8 @@ impl Dflash2Provider {
                 k_norm: push(f32b(&t("attn_k_norm.weight"))?),
                 wo: push(q8(&t("attn_output.weight"))?),
                 ffn_norm: push(f32b(&t("ffn_norm.weight"))?),
-                ffn_conv_base: push(f32b(&t("ffn_conv_base"))?),
-                ffn_conv_proj: push(q8(&t("ffn_conv_proj.weight"))?),
+                ffn_conv_base: if plain { 0 } else { push(f32b(&t("ffn_conv_base"))?) },
+                ffn_conv_proj: if plain { 0 } else { push(q8(&t("ffn_conv_proj.weight"))?) },
                 w_gate: push(q8(&t("ffn_gate.weight"))?),
                 w_up: push(q8(&t("ffn_up.weight"))?),
                 w_down: push(q8(&t("ffn_down.weight"))?),
@@ -791,8 +887,14 @@ impl Dflash2Provider {
         let weights = DeviceWeights::upload_bytes(device, &refs)?;
         drop(parts);
         let rank = spec.selector_rank;
-        let sel_prev = SelectorTable::load(file, "selector_predecessor.weight", rank)?;
-        let sel_next = SelectorTable::load(file, "selector_successor.weight", rank)?;
+        let sel = if plain {
+            None
+        } else {
+            Some((
+                SelectorTable::load(file, "selector_predecessor.weight", rank)?,
+                SelectorTable::load(file, "selector_successor.weight", rank)?,
+            ))
+        };
         let slots = spec.ring_slots();
         let ring_bytes = (slots + spec.block_size) * spec.kv_dim() * 4;
         let mut ring_k = Vec::with_capacity(spec.n_layers);
@@ -811,8 +913,9 @@ impl Dflash2Provider {
             layers = spec.n_layers,
             block = spec.block_size,
             window = spec.window,
+            plain = spec.plain,
             target_layers = ?spec.target_layers,
-            "DFlash2 draft loaded"
+            "DFlash draft loaded"
         );
         Ok(Self {
             ring: RingIndex::new(slots),
@@ -824,8 +927,7 @@ impl Dflash2Provider {
             out_norm,
             sel_hidden,
             layers,
-            sel_prev,
-            sel_next,
+            sel,
             ring_k,
             ring_v,
             scratch,
@@ -975,7 +1077,10 @@ impl Dflash2Provider {
         let mut block_tokens = vec![sp.mask_token; b];
         block_tokens[0] = anchor;
         let t0 = std::time::Instant::now();
-        let x0 = self.head.embed_rows(&block_tokens)?;
+        let mut x0 = self.head.embed_rows(&block_tokens)?;
+        if sp.embedding_scale != 1.0 {
+            x0.iter_mut().for_each(|v| *v *= sp.embedding_scale);
+        }
         let t_embed = t0.elapsed();
         hip.bind()?;
         let s = &self.scratch;
@@ -987,13 +1092,15 @@ impl Dflash2Provider {
         let (m, d) = (b as i32, dim as i32);
         for (l, lo) in self.layers.iter().enumerate() {
             hip.rmsnorm_device_rows(s.x, self.w(lo.attn_norm), s.nn, m, d, sp.eps)?;
-            hip.gemm_nt_q8_dev(s.nn, self.wb(lo.attn_conv_proj), s.dynamic, m, proj as i32, d)?;
-            if l == 0 {
-                self.probe("dyn", s.dynamic, b * proj);
-            }
-            self.conv(s.nn, lo.attn_conv_base, 0)?;
-            if l == 0 {
-                self.probe("conv_in", s.nn, b * dim);
+            if !sp.plain {
+                hip.gemm_nt_q8_dev(s.nn, self.wb(lo.attn_conv_proj), s.dynamic, m, proj as i32, d)?;
+                if l == 0 {
+                    self.probe("dyn", s.dynamic, b * proj);
+                }
+                self.conv(s.nn, lo.attn_conv_base, 0)?;
+                if l == 0 {
+                    self.probe("conv_in", s.nn, b * dim);
+                }
             }
             let kb = Self::ring_row(&self.ring_k[l], 0, kv);
             let vb = Self::ring_row(&self.ring_v[l], 0, kv);
@@ -1036,21 +1143,34 @@ impl Dflash2Provider {
                 self.probe("attn", s.attn, b * sp.q_dim());
             }
             hip.gemm_nt_q8_dev(s.attn, self.wb(lo.wo), s.o, m, d, sp.q_dim() as i32)?;
-            self.conv(s.o, lo.attn_conv_base, 1)?;
+            if !sp.plain {
+                self.conv(s.o, lo.attn_conv_base, 1)?;
+            }
             hip.residual_add(s.x, s.o, (b * dim) as i32)?;
 
             hip.rmsnorm_device_rows(s.x, self.w(lo.ffn_norm), s.nn, m, d, sp.eps)?;
-            hip.gemm_nt_q8_dev(s.nn, self.wb(lo.ffn_conv_proj), s.dynamic, m, proj as i32, d)?;
-            self.conv(s.nn, lo.ffn_conv_base, 0)?;
+            if !sp.plain {
+                hip.gemm_nt_q8_dev(s.nn, self.wb(lo.ffn_conv_proj), s.dynamic, m, proj as i32, d)?;
+                self.conv(s.nn, lo.ffn_conv_base, 0)?;
+            }
             hip.gemm_nt_q8_dev(s.nn, self.wb(lo.w_gate), s.gate, m, sp.ff as i32, d)?;
             hip.gemm_nt_q8_dev(s.nn, self.wb(lo.w_up), s.up, m, sp.ff as i32, d)?;
             hip.silu_mul_device(s.gate, s.up, (b * sp.ff) as i32)?;
             hip.gemm_nt_q8_dev(s.gate, self.wb(lo.w_down), s.o, m, d, sp.ff as i32)?;
-            self.conv(s.o, lo.ffn_conv_base, 1)?;
+            if !sp.plain {
+                self.conv(s.o, lo.ffn_conv_base, 1)?;
+            }
             hip.residual_add(s.x, s.o, (b * dim) as i32)?;
             self.probe("layer_out", s.x, b * dim);
         }
         hip.rmsnorm_device_rows(s.x, self.w(self.out_norm), s.nn, m, d, sp.eps)?;
+        let Some((sel_prev, sel_next)) = self.sel.as_ref() else {
+            // Plain DFlash: the head's top-1 at positions 1.. (greedy).
+            let mut hidden = vec![0.0f32; b * dim];
+            hip.copy_d2h_f32(s.nn, &mut hidden)?;
+            let top = self.head.topk_rows(&hidden[dim..], b - 1, 1)?;
+            return Ok(top.into_iter().filter_map(|row| row.first().map(|&(id, _)| id as u32)).collect());
+        };
         let rank = sp.selector_rank;
         hip.gemm_nt_q8_dev(s.nn, self.wb(self.sel_hidden), s.sel, m, rank as i32, d)?;
         let mut hidden = vec![0.0f32; b * dim];
@@ -1088,8 +1208,8 @@ impl Dflash2Provider {
             &cands,
             &unary,
             &gates,
-            &self.sel_prev,
-            &self.sel_next,
+            sel_prev,
+            sel_next,
             rank,
         ))
     }
@@ -1097,7 +1217,11 @@ impl Dflash2Provider {
 
 impl DraftProvider for Dflash2Provider {
     fn name(&self) -> &'static str {
-        "dflash2"
+        if self.spec.plain {
+            "dflash"
+        } else {
+            "dflash2"
+        }
     }
 
     fn observe(&mut self, _tokens: &[u32]) {}
@@ -1264,6 +1388,73 @@ mod tests {
                 .collect();
             assert_eq!(got, top_k_desc(&x[r * n..(r + 1) * n], k), "row {r}");
         }
+    }
+
+    /// A metadata-only draft GGUF: `tensors` named (shape [1]), dim 64.
+    fn sidecar_file(tag: &str, tensors: &[&str], vocab: usize, dim: u32) -> GgufFile {
+        use allpaca_gguf::{write_gguf, GgufValue, GgufWriteTensor};
+        let path = std::env::temp_dir().join(format!("allpaca_sidecar_{tag}_{}.gguf", std::process::id()));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("general.architecture".into(), GgufValue::String("dflash".into()));
+        let u = |v: u32| GgufValue::Uint32(v);
+        for (k, v) in [
+            ("block_count", u(1)),
+            ("embedding_length", u(dim)),
+            ("feed_forward_length", u(128)),
+            ("attention.head_count", u(4)),
+            ("attention.head_count_kv", u(2)),
+            ("block_size", u(8)),
+        ] {
+            meta.insert(format!("dflash.{k}"), v);
+        }
+        meta.insert("dflash.target_layers".into(), GgufValue::Array(vec![u(1), u(2)]));
+        meta.insert("tokenizer.ggml.mask_token_id".into(), u(4));
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array((0..vocab).map(|i| GgufValue::String(format!("t{i}"))).collect()),
+        );
+        let one = [0.0f32];
+        let ts: Vec<GgufWriteTensor<'_>> = tensors
+            .iter()
+            .map(|n| GgufWriteTensor { name: (*n).into(), dims: vec![1], data: &one })
+            .collect();
+        write_gguf(&path, &meta, &ts).unwrap();
+        GgufFile::open(&path).unwrap()
+    }
+
+    #[test]
+    fn nominated_sidecars_are_classified_by_content() {
+        let plain = sidecar_file("plain", &["fc.weight", "blk.0.attn_q.weight"], 32, 64);
+        let dflash2 = sidecar_file("d2", &["fc.weight", "selector_hidden.weight", "blk.0.attn_q.weight"], 32, 64);
+        let dspark = sidecar_file("dspark", &["fc.weight", "markov_w1.weight", "blk.0.attn_q.weight"], 32, 64);
+        let dspark_alias = sidecar_file("dspark_alias", &["fc.weight", "dspark.markov_w1", "blk.0.attn_q.weight"], 32, 64);
+        // A DeepSeek DSpark (hyper-connections) named like a DFlash file.
+        let dsv4 = sidecar_file("dsv4_named_dflash", &["fc.weight", "hc_head_fn.weight", "blk.0.attn_q.weight"], 32, 64);
+        assert_eq!(classify_sidecar(&plain, 64, 32), SidecarKind::BlockDraft { plain: true });
+        assert_eq!(classify_sidecar(&dflash2, 64, 32), SidecarKind::BlockDraft { plain: false });
+        assert_eq!(classify_sidecar(&dspark, 64, 32), SidecarKind::Dspark);
+        assert_eq!(classify_sidecar(&dspark_alias, 64, 32), SidecarKind::Dspark);
+        assert_eq!(classify_sidecar(&dsv4, 64, 32), SidecarKind::Dspark);
+        assert_eq!(classify_sidecar(&dspark, 128, 32), SidecarKind::Mismatch);
+        assert_eq!(classify_sidecar(&dsv4, 64, 33), SidecarKind::Mismatch);
+    }
+
+    #[test]
+    fn block_draft_attach_checks_provider_shape_and_vocab() {
+        use allpaca_types::DraftProviderKind as K;
+        let plain = Dflash2Spec::from_gguf(&sidecar_file("chk_plain", &["fc.weight", "blk.0.attn_q.weight"], 32, 64)).unwrap();
+        let d2 = Dflash2Spec::from_gguf(&sidecar_file("chk_d2", &["fc.weight", "selector_hidden.weight", "blk.0.attn_q.weight"], 32, 64)).unwrap();
+        assert!(check_block_draft(&plain, &[K::Dflash1], 64, 32).is_ok());
+        assert!(check_block_draft(&plain, &[K::Dflash2], 64, 32).is_err(), "a plain draft needs dflash1");
+        assert!(check_block_draft(&d2, &[K::Dflash1], 64, 32).is_err(), "a DFlash2 draft needs dflash2");
+        // Listing both accepts either kind.
+        assert!(check_block_draft(&d2, &[K::Dflash1, K::Dflash2], 64, 32).is_ok());
+        assert!(check_block_draft(&plain, &[K::Dflash1, K::Dflash2], 64, 32).is_ok());
+        assert!(check_block_draft(&plain, &[K::Dflash1], 128, 32).is_err(), "width");
+        assert!(check_block_draft(&plain, &[K::Dflash1], 64, 40).is_err(), "vocabulary");
+        let mut tiny = plain.clone();
+        tiny.vocab = None;
+        assert!(check_block_draft(&tiny, &[K::Dflash1], 64, 4).is_err(), "mask token 4 outside 4 tokens");
     }
 
     #[test]

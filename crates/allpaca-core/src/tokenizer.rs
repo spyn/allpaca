@@ -102,6 +102,11 @@ impl EngineTokenizer {
             && self.token_id("<|role_end|>").is_some()
     }
 
+    /// Vocab has Gemma 4's turn specials.
+    pub fn uses_gemma4_chat(&self) -> bool {
+        self.token_id("<|turn>").is_some() && self.token_id("<turn|>").is_some()
+    }
+
     /// Vocab has DeepSeek's turn specials.
     pub fn uses_deepseek_chat(&self) -> bool {
         self.token_id("<｜User｜>").is_some() && self.token_id("<｜Assistant｜>").is_some()
@@ -119,6 +124,8 @@ impl EngineTokenizer {
             format_ling_chat(messages, add_generation_prompt)
         } else if self.uses_llama3_chat() {
             format_llama3_chat(messages, add_generation_prompt)
+        } else if self.uses_gemma4_chat() {
+            format_gemma4_chat(messages, add_generation_prompt)
         } else if self.uses_deepseek_chat() {
             // DeepSeek-V4 (its vocab has the DSML tool marker) closes the
             // reasoning block right after the assistant marker when
@@ -423,6 +430,7 @@ const CHAT_EOG_PIECES: &[&str] = &[
     "<|end_of_turn|>",
     "<|endoftext|>",
     "<|end_of_text|>",
+    "<turn|>",
 ];
 
 fn push_unique(out: &mut Vec<u32>, id: u32) {
@@ -460,6 +468,49 @@ pub fn format_llama3_chat(messages: &[(&str, &str)], add_generation_prompt: bool
     }
     if add_generation_prompt {
         out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+    out
+}
+
+/// Gemma 4 turns, as the GGUF's template renders them with
+/// `enable_thinking` and `conversational_mode` off and no tools: a leading
+/// system message becomes the system turn, assistant turns are `model`
+/// turns with any `<|channel>...<channel|>` reasoning stripped. The BOS
+/// comes from the tokenizer.
+pub fn format_gemma4_chat(messages: &[(&str, &str)], add_generation_prompt: bool) -> String {
+    let mut out = String::new();
+    let mut rest = messages;
+    if let Some(((role, content), tail)) = messages.split_first() {
+        if *role == "system" || *role == "developer" {
+            out.push_str("<|turn>system\n");
+            out.push_str(content.trim());
+            out.push_str("<turn|>\n");
+            rest = tail;
+        }
+    }
+    for (role, content) in rest {
+        let model = *role == "assistant";
+        out.push_str("<|turn>");
+        out.push_str(if model { "model" } else { role });
+        out.push('\n');
+        if model {
+            out.push_str(strip_gemma4_thinking(content).trim());
+        } else {
+            out.push_str(content.trim());
+        }
+        out.push_str("<turn|>\n");
+    }
+    if add_generation_prompt {
+        out.push_str("<|turn>model\n");
+    }
+    out
+}
+
+/// The template's `strip_thinking`: drops each `<|channel>...<channel|>` block.
+fn strip_gemma4_thinking(text: &str) -> String {
+    let mut out = String::new();
+    for part in text.split("<channel|>") {
+        out.push_str(part.split("<|channel>").next().unwrap_or(""));
     }
     out
 }
@@ -998,6 +1049,47 @@ mod tests {
             tok.format_chat(&[("user", "hello")], true),
             "user: hello\nassistant:"
         );
+    }
+
+    /// Nemotron-3.5-Bolt-E4B (gemma4): `ALLPACA_GEMMA4_GGUF`, else the main
+    /// checkout's models folder.
+    fn gated_gemma4_gguf_path() -> Option<std::path::PathBuf> {
+        let path = std::env::var("ALLPACA_GEMMA4_GGUF").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+            std::path::PathBuf::from(
+                "D:/code/inference/allpaca/models/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF/NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q4_K_XL.gguf",
+            )
+        });
+        path.is_file().then_some(path)
+    }
+
+    /// llama.cpp's ids (build 10190, `/tokenize` with parse_special) from
+    /// `allpaca-research/p16/ref_hip.json`.
+    #[test]
+    fn gemma4_encode_matches_llamacpp_ids() {
+        let (Some(path), Ok(refs)) = (
+            gated_gemma4_gguf_path(),
+            std::fs::read_to_string("D:/code/inference/allpaca-research/p16/ref_hip.json"),
+        ) else {
+            eprintln!("skip gemma4 tokenizer parity: no model or reference");
+            return;
+        };
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        let file = allpaca_gguf::GgufFile::open(&path).unwrap();
+        let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
+        for (text, ids) in refs["probes"].as_object().unwrap() {
+            let want: Vec<u32> = ids.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            assert_eq!(tok.encode_plain(text).unwrap(), want, "{text:?}");
+            if !text.contains("<|turn>") {
+                assert_eq!(tok.decode(&want).unwrap(), *text, "decode {text:?}");
+            }
+        }
+        let report = std::fs::read_to_string(
+            "D:/code/inference/allpaca-research/reports/Allpaca October inference advancements.md",
+        )
+        .unwrap();
+        let ids = tok.encode(&report).unwrap();
+        let want: Vec<u32> = refs["p4k"]["prompt"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        assert_eq!(ids[..want.len()], want[..], "the 4400-token prompt (BOS + report)");
     }
 
     fn gated_qwen_gguf_path() -> Option<std::path::PathBuf> {

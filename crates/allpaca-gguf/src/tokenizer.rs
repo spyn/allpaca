@@ -143,6 +143,7 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
             }
         }
         "llama" => build_unigram_or_wordlevel(&tokens, scores.as_deref(), unk_id)?,
+        "gemma4" => gemma4_bpe(&tokens, merges.as_deref(), unk_id)?,
         _ => build_wordlevel(&tokens, unk_id)?,
     };
     // llama.cpp partitions CONTROL / USER_DEFINED / UNKNOWN before BPE.
@@ -380,6 +381,46 @@ fn regex_bpe(model: BPE, pattern: &str) -> Tokenizer {
     ])));
     tokenizer.with_decoder(Some(ByteLevel::new(false, true, true)));
     tokenizer
+}
+
+/// llama.cpp's `gemma4` tokenizer: SentencePiece-style BPE on raw UTF-8.
+/// Spaces become U+2581 and the text is cut only into runs of newlines and
+/// runs of other characters. Characters outside the vocabulary fall back to
+/// `<0xXX>` byte tokens.
+fn gemma4_bpe(tokens: &[String], merges: Option<&[String]>, unk_id: Option<u32>) -> Result<Tokenizer, AllpacaError> {
+    use tokenizers::decoders::byte_fallback::ByteFallback;
+    use tokenizers::decoders::fuse::Fuse;
+    use tokenizers::decoders::sequence::Sequence as DecoderSequence;
+    use tokenizers::decoders::DecoderWrapper;
+    use tokenizers::normalizers::replace::Replace;
+    let err = |e: tokenizers::Error| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string()));
+    let vocab: AHashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+    // Merges are "a b" split at the first ASCII space after the first
+    // character (U+2581 is not whitespace, but a merge may start with a space).
+    let merge_pairs: Vec<(String, String)> = merges
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|line| {
+            let pos = line.char_indices().skip(1).find(|&(_, c)| c == ' ').map(|(i, _)| i)?;
+            Some((line[..pos].to_string(), line[pos + 1..].to_string()))
+        })
+        .collect();
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, merge_pairs)
+        .unk_token(unk_token(tokens, unk_id))
+        .byte_fallback(true)
+        .build()
+        .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))?;
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_normalizer(Some(Replace::new(" ", "\u{2581}").map_err(err)?));
+    let split = Split::new(SplitPattern::Regex(r"[^\n]+|[\n]+".into()), SplitDelimiterBehavior::Isolated, false).map_err(err)?;
+    tokenizer.with_pre_tokenizer(Some(split));
+    tokenizer.with_decoder(Some(DecoderSequence::new(vec![
+        DecoderWrapper::Replace(Replace::new("\u{2581}", " ").map_err(err)?),
+        DecoderWrapper::ByteFallback(ByteFallback::new()),
+        DecoderWrapper::Fuse(Fuse::new()),
+    ])));
+    Ok(tokenizer)
 }
 
 /// Spark2_5 (XHToken) BPE pre-tokenizer: byte-level plus documented pre type.

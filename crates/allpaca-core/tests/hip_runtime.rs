@@ -37,6 +37,34 @@ fn greedy(max_tokens: usize) -> GenerationParams {
     }
 }
 
+/// gemma4 keeps its K/V in its sequence state, which the prompt cache does
+/// not store: on the CPU path (where prefill captures checkpoints) a repeat
+/// prompt must never hit, and must give the same tokens.
+#[test]
+fn gemma4_never_hits_the_prompt_cache() {
+    let path = std::env::temp_dir().join(format!("allpaca_g4_cpu_cache_{}.gguf", std::process::id()));
+    allpaca_core::write_tiny_gemma4_gguf(&path, 2);
+    let mut cfg = Config::compiled_defaults();
+    cfg.model.path = Some(path);
+    cfg.model.synthetic = false;
+    cfg.engine.cpu_only = true;
+    cfg.engine.determinism_seed = Some(7);
+    cfg.speculative.enabled = false;
+    let engine = Engine::new(cfg).expect("tiny gemma4 must load on the CPU");
+    let prompt = "t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12";
+    let first = engine.generate(prompt, greedy(8)).unwrap().token_ids;
+    let again = engine.generate(prompt, greedy(8)).unwrap().token_ids;
+    let longer = engine.generate(&format!("{prompt} t13 t14"), greedy(8)).unwrap().token_ids;
+    // A one-token prompt takes the per-token prefill, which captures checkpoints.
+    let short = engine.generate("t3", greedy(4)).unwrap().token_ids;
+    let after = engine.generate("t3 t4 t5", greedy(4)).unwrap().token_ids;
+    assert_eq!((short.len(), after.len()), (4, 4));
+    assert_eq!(first, again);
+    assert_eq!(longer.len(), 8);
+    let stats = engine.stats();
+    assert_eq!((stats.radix_hits, stats.anchor_hits), (0, 0), "gemma4 must not resume from the prompt cache: {stats:?}");
+}
+
 #[test]
 fn cpu_only_generate_reports_cpu_backend() {
     let engine = Engine::new(cpu_only_synthetic()).unwrap();
@@ -7584,6 +7612,54 @@ fn poll_concurrently(engine: &Engine, prompts: &[&str], params: &GenerationParam
     }
     assert!(done.iter().all(|&d| d), "every request must finish; got {out:?}");
     out
+}
+
+/// gemma4 (tiny, on the GPU): n-gram speculation equals plain greedy, and
+/// requests run together (batched and not) equal their solo runs.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gemma4_spec_and_concurrent_match_solo_greedy() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_gemma4_spec_and_concurrent: no HIP");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("allpaca_g4_engine_{}.gguf", std::process::id()));
+    allpaca_core::write_tiny_gemma4_gguf(&path, 2);
+    let prompts = [
+        "t1 t2 t3 t4 t1 t2 t3 t4 t1 t2 t3",
+        "t5 t6 t7 t5 t6 t7 t5 t6",
+        "t9 t8 t9 t8 t9 t8 t9",
+    ];
+    let params = greedy(40);
+    let engine_for = |ngram: bool, batch_decode: bool| {
+        let mut cfg = hip_7b_config(path.clone());
+        cfg.engine.max_active_requests = 3;
+        cfg.engine.batch_decode = batch_decode;
+        cfg.prompt_cache.ram_bytes = 1;
+        if ngram {
+            cfg.speculative.enabled = true;
+            cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Ngram];
+        }
+        Engine::new(cfg).expect("tiny gemma4 must load")
+    };
+    let plain = engine_for(false, false);
+    let solo: Vec<Vec<u32>> = prompts.iter().map(|p| poll_concurrently(&plain, &[p], &params).remove(0)).collect();
+    for (ngram, batch_decode) in [(true, false), (false, true), (true, true)] {
+        let engine = engine_for(ngram, batch_decode);
+        for (i, p) in prompts.iter().enumerate() {
+            let one = poll_concurrently(&engine, &[p], &params).remove(0);
+            assert_eq!(one, solo[i], "request {i} solo (ngram={ngram} batch={batch_decode})");
+        }
+        let together = poll_concurrently(&engine, &prompts, &params);
+        assert_eq!(together, solo, "requests together (ngram={ngram} batch={batch_decode})");
+        let stats = engine.stats();
+        if ngram {
+            assert!(stats.linear_packed_verifies > 0, "n-gram spans must be verified: {stats:?}");
+        }
+        if batch_decode {
+            assert!(stats.batched_decode_steps > 0, "batched decode must run: {stats:?}");
+        }
+    }
 }
 
 /// Requests decoded side by side must produce exactly what each produces

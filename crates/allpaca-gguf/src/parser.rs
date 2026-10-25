@@ -788,6 +788,7 @@ impl GgufFile {
                 | "spark2_5"
                 | "gemma2"
                 | "gemma3"
+                | "gemma4"
                 | "deepseek2"
                 | "deepseek4"
                 | "deepseek_v4"
@@ -1276,6 +1277,20 @@ pub fn is_dflash2_filename(name: &str) -> bool {
     l.contains("dflash2") || l.contains("dflash-2")
 }
 
+/// Whether a sidecar found by name next to a target was built for it: any
+/// declared hidden width equals the target's `dim` and any declared vocabulary
+/// has the target's `vocab` tokens. Older DSpark files without this metadata
+/// remain eligible; a file that declares another model's shape is rejected.
+pub fn sidecar_matches_target(sidecar: &GgufFile, dim: usize, vocab: usize) -> bool {
+    let arch = sidecar.architecture().unwrap_or("dflash");
+    let width = sidecar.meta_u32(&format!("{arch}.embedding_length")).map(|v| v as usize);
+    let tokens = match sidecar.metadata.get("tokenizer.ggml.tokens") {
+        Some(GgufValue::Array(items)) => Some(items.len()),
+        _ => None,
+    };
+    width.is_none_or(|n| n == dim) && tokens.is_none_or(|n| n == vocab)
+}
+
 pub fn is_split_gguf_name(name: &str) -> bool {
     parse_split_filename(name).is_some()
 }
@@ -1355,12 +1370,23 @@ fn collect_split_shards(dir: &Path, nested: u32, found: &mut Vec<std::path::Path
 /// level below a shared models directory, that directory's other folders hold
 /// other models, and their sidecars must not attach to this one.
 pub fn discover_dspark_sidecar(target: &Path) -> Option<std::path::PathBuf> {
+    discover_dspark_candidates(target).into_iter().next()
+}
+
+/// Every file [`discover_dspark_sidecar`] could pick, best first. The name
+/// only nominates a file: the caller reads each and takes the first that is
+/// a DSpark sidecar for this target (a plain DFlash draft is also named
+/// `dflash-*`, and a DSpark may be named `*DFlash*`).
+pub fn discover_dspark_candidates(target: &Path) -> Vec<std::path::PathBuf> {
     let own = if target.is_file() {
-        target.parent()?
+        let Some(dir) = target.parent() else {
+            return Vec::new();
+        };
+        dir
     } else if target.is_dir() {
         target
     } else {
-        return None;
+        return Vec::new();
     };
     let mut hits = Vec::new();
     collect_dspark_files(own, 1, &mut hits);
@@ -1370,7 +1396,7 @@ pub fn discover_dspark_sidecar(target: &Path) -> Option<std::path::PathBuf> {
     }
     hits.sort_by(|a, b| dspark_hit_rank(a).cmp(&dspark_hit_rank(b)));
     hits.dedup();
-    hits.into_iter().next()
+    hits
 }
 
 fn dspark_hit_rank(path: &Path) -> (u8, String) {
@@ -2724,6 +2750,53 @@ mod tests {
         assert_eq!(discover_dspark_sidecar(&target), None);
         assert_eq!(discover_dspark_sidecar(&model_dir), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dspark_candidates_include_every_dflash_and_dspark_name_best_first() {
+        let root = std::env::temp_dir().join(format!("allpaca_dspark_cands_{}", std::process::id()));
+        let model_dir = root.join("NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let target = model_dir.join("NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q4_K_XL.gguf");
+        std::fs::write(&target, b"x").unwrap();
+        let plain = model_dir.join("dflash-NVIDIA-Nemotron-3.5-Bolt-E4B-Q8_0.gguf");
+        let named = model_dir.join("DeepSeek-V4-Flash-DFlash-BF16.gguf");
+        std::fs::write(&plain, b"x").unwrap();
+        std::fs::write(&named, b"x").unwrap();
+        std::fs::write(model_dir.join("Qwen3.8-27B-DFlash2-Q8_0.gguf"), b"x").unwrap();
+        // Names only nominate: both are candidates (Q8_0 first), DFlash2 never.
+        assert_eq!(discover_dspark_candidates(&target), vec![plain.clone(), named]);
+        assert_eq!(discover_dspark_sidecar(&target), Some(plain));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sidecar_must_match_the_targets_width_and_vocab() {
+        let dir = std::env::temp_dir().join(format!("allpaca_sidecar_match_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, arch: &str, dim: u32, vocab: usize| {
+            let mut meta = HashMap::new();
+            meta.insert("general.architecture".into(), GgufValue::String(arch.into()));
+            meta.insert(format!("{arch}.embedding_length"), GgufValue::Uint32(dim));
+            meta.insert(
+                "tokenizer.ggml.tokens".into(),
+                GgufValue::Array((0..vocab).map(|i| GgufValue::String(format!("t{i}"))).collect()),
+            );
+            let path = dir.join(name);
+            crate::writer::write_gguf(&path, &meta, &[]).unwrap();
+            GgufFile::open(&path).unwrap()
+        };
+        let dspark = write("dspark-x.gguf", "dflash", 4096, 16);
+        assert!(sidecar_matches_target(&dspark, 4096, 16));
+        assert!(!sidecar_matches_target(&dspark, 3072, 32), "a DeepSeek DSpark must not attach to Llama");
+        assert!(!sidecar_matches_target(&dspark, 4096, 20), "vocab differs");
+        let legacy_path = dir.join("dspark-legacy.gguf");
+        let mut legacy_meta = HashMap::new();
+        legacy_meta.insert("general.architecture".into(), GgufValue::String("dflash".into()));
+        crate::writer::write_gguf(&legacy_path, &legacy_meta, &[]).unwrap();
+        let legacy = GgufFile::open(&legacy_path).unwrap();
+        assert!(sidecar_matches_target(&legacy, 4096, 16), "legacy DSpark metadata is optional");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
