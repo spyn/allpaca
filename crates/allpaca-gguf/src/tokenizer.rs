@@ -558,10 +558,7 @@ mod tests {
         ] {
             let path = std::env::temp_dir().join(format!("allpaca_{pre}_tok.gguf"));
             let mut meta = gpt2_hello_world_meta();
-            meta.insert(
-                "tokenizer.ggml.pre".into(),
-                GgufValue::String(pre.into()),
-            );
+            meta.insert("tokenizer.ggml.pre".into(), GgufValue::String(pre.into()));
             write_gguf(&path, &meta, &[]).unwrap();
             let file = GgufFile::open(&path).unwrap();
             let tok = extract_tokenizer(&file).unwrap();

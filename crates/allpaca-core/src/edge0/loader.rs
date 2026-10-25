@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use allpaca_gguf::HybridLayerKind;
-use allpaca_safetensors::{load_hf_config, load_vocab_sidecar, resolve_sidecar, HfConfig, SafetensorsFile};
+use allpaca_safetensors::{
+    load_hf_config, load_vocab_sidecar, resolve_sidecar, HfConfig, SafetensorsFile,
+};
 use allpaca_types::{AllpacaError, FatalError};
 
 use super::lora::RecoverLora;
@@ -166,9 +168,7 @@ fn load_weight_index(dir: &Path) -> Result<WeightIndex, AllpacaError> {
             )))
         })?;
         let v: serde_json::Value = serde_json::from_str(&src).map_err(|e| {
-            AllpacaError::Fatal(FatalError::ModelLoad(format!(
-                "Edge0 index JSON: {e}"
-            )))
+            AllpacaError::Fatal(FatalError::ModelLoad(format!("Edge0 index JSON: {e}")))
         })?;
         if let Some(obj) = v.get("weight_map").and_then(|x| x.as_object()) {
             for (k, file) in obj {
@@ -459,20 +459,19 @@ fn load_qwen35_layer(
         }
     }
 
-    let shared_expert = if let Some(w_gate) =
-        get_f32(&format!("{prefix}.mlp.shared_expert.gate_proj.weight"))?
-    {
-        LayerFfn {
-            ffn_norm: Vec::new(),
-            w_gate,
-            w_up: get_f32(&format!("{prefix}.mlp.shared_expert.up_proj.weight"))?
-                .unwrap_or_default(),
-            w_down: get_f32(&format!("{prefix}.mlp.shared_expert.down_proj.weight"))?
-                .unwrap_or_default(),
-        }
-    } else {
-        LayerFfn::default()
-    };
+    let shared_expert =
+        if let Some(w_gate) = get_f32(&format!("{prefix}.mlp.shared_expert.gate_proj.weight"))? {
+            LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate,
+                w_up: get_f32(&format!("{prefix}.mlp.shared_expert.up_proj.weight"))?
+                    .unwrap_or_default(),
+                w_down: get_f32(&format!("{prefix}.mlp.shared_expert.down_proj.weight"))?
+                    .unwrap_or_default(),
+            }
+        } else {
+            LayerFfn::default()
+        };
 
     Ok(LayerWeights {
         block,
@@ -508,8 +507,8 @@ fn load_ling8_layer(
     get_f32: &mut dyn FnMut(&str) -> Result<Option<Vec<f32>>, AllpacaError>,
 ) -> Result<LayerWeights, AllpacaError> {
     let prefix = format!("model.layers.{i}");
-    let attn_norm = get_f32(&format!("{prefix}.input_layernorm.weight"))?
-        .unwrap_or_else(|| vec![1.0; cfg.dim]);
+    let attn_norm =
+        get_f32(&format!("{prefix}.input_layernorm.weight"))?.unwrap_or_else(|| vec![1.0; cfg.dim]);
     let ffn_norm = get_f32(&format!("{prefix}.post_attention_layernorm.weight"))?
         .unwrap_or_else(|| vec![1.0; cfg.dim]);
 
@@ -567,20 +566,19 @@ fn load_ling8_layer(
                 .unwrap_or_default(),
         });
     }
-    let shared_expert = if let Some(w_gate) =
-        get_f32(&format!("{prefix}.mlp.shared_experts.gate_proj.weight"))?
-    {
-        LayerFfn {
-            ffn_norm: Vec::new(),
-            w_gate,
-            w_up: get_f32(&format!("{prefix}.mlp.shared_experts.up_proj.weight"))?
-                .unwrap_or_default(),
-            w_down: get_f32(&format!("{prefix}.mlp.shared_experts.down_proj.weight"))?
-                .unwrap_or_default(),
-        }
-    } else {
-        LayerFfn::default()
-    };
+    let shared_expert =
+        if let Some(w_gate) = get_f32(&format!("{prefix}.mlp.shared_experts.gate_proj.weight"))? {
+            LayerFfn {
+                ffn_norm: Vec::new(),
+                w_gate,
+                w_up: get_f32(&format!("{prefix}.mlp.shared_experts.up_proj.weight"))?
+                    .unwrap_or_default(),
+                w_down: get_f32(&format!("{prefix}.mlp.shared_experts.down_proj.weight"))?
+                    .unwrap_or_default(),
+            }
+        } else {
+            LayerFfn::default()
+        };
 
     Ok(LayerWeights {
         block: HybridLayerKind::Moe,
@@ -634,7 +632,10 @@ pub fn materialize_affine4_expert(
 }
 
 /// Pack a dense expert into affine-4 (tests / spill).
-pub fn pack_expert_affine4(ffn: &LayerFfn, group_size: usize) -> (Affine4Tensor, Affine4Tensor, Affine4Tensor) {
+pub fn pack_expert_affine4(
+    ffn: &LayerFfn,
+    group_size: usize,
+) -> (Affine4Tensor, Affine4Tensor, Affine4Tensor) {
     (
         quant_affine4(&ffn.w_gate, group_size),
         quant_affine4(&ffn.w_up, group_size),

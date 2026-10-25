@@ -161,7 +161,9 @@ mod tests {
             SidecarTokenizer::HuggingFace { tokenizer_json, .. } => {
                 assert!(tokenizer_json.ends_with("tokenizer.json"));
             }
-            SidecarTokenizer::Vocab(_) => panic!("HF tokenizer.json must not parse as vocab sidecar"),
+            SidecarTokenizer::Vocab(_) => {
+                panic!("HF tokenizer.json must not parse as vocab sidecar")
+            }
         }
         let _ = std::fs::remove_dir_all(dir);
     }

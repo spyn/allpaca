@@ -70,13 +70,16 @@ impl RecoverLora {
             ))));
         }
         let file = SafetensorsFile::open(path)?;
-        let scale = if rank == 0 {
-            0.0
-        } else {
-            alpha / rank as f32
-        };
-        let mut bases: HashMap<String, (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<usize>>, Option<Vec<usize>>)> =
-            HashMap::new();
+        let scale = if rank == 0 { 0.0 } else { alpha / rank as f32 };
+        let mut bases: HashMap<
+            String,
+            (
+                Option<Vec<f32>>,
+                Option<Vec<f32>>,
+                Option<Vec<usize>>,
+                Option<Vec<usize>>,
+            ),
+        > = HashMap::new();
         for (name, info) in &file.tensors {
             let (base, which) = if let Some(b) = name.strip_suffix(".lora_A.weight") {
                 (b.to_string(), 'A')
@@ -142,11 +145,7 @@ impl RecoverLora {
                 },
             );
         }
-        Ok(Self {
-            pairs,
-            rank,
-            alpha,
-        })
+        Ok(Self { pairs, rank, alpha })
     }
 
     pub fn apply_named(&self, name: &str, x: &[f32], y: &mut [f32]) {

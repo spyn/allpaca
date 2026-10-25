@@ -1054,7 +1054,8 @@ impl GgufFile {
         let mut out = vec![0i32; n];
         for (i, slot) in out.iter_mut().enumerate() {
             let off = i * 4;
-            *slot = i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+            *slot =
+                i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         }
         Ok(out)
     }
@@ -2335,10 +2336,7 @@ mod tests {
         );
         meta.insert("spark2_5.block_count".into(), GgufValue::Uint32(4));
         meta.insert("spark2_5.embedding_length".into(), GgufValue::Uint32(32));
-        meta.insert(
-            "spark2_5.attention.head_count".into(),
-            GgufValue::Uint32(4),
-        );
+        meta.insert("spark2_5.attention.head_count".into(), GgufValue::Uint32(4));
         write_gguf(&path, &meta, &[]).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let report = file.compat_report();
@@ -2363,10 +2361,7 @@ mod tests {
             );
             meta.insert(format!("{arch}.block_count"), GgufValue::Uint32(4));
             meta.insert(format!("{arch}.embedding_length"), GgufValue::Uint32(32));
-            meta.insert(
-                format!("{arch}.attention.head_count"),
-                GgufValue::Uint32(4),
-            );
+            meta.insert(format!("{arch}.attention.head_count"), GgufValue::Uint32(4));
             write_gguf(&path, &meta, &[]).unwrap();
             let file = GgufFile::open(&path).unwrap();
             let report = file.compat_report();
@@ -2392,10 +2387,7 @@ mod tests {
             );
             meta.insert(format!("{arch}.block_count"), GgufValue::Uint32(4));
             meta.insert(format!("{arch}.embedding_length"), GgufValue::Uint32(32));
-            meta.insert(
-                format!("{arch}.attention.head_count"),
-                GgufValue::Uint32(4),
-            );
+            meta.insert(format!("{arch}.attention.head_count"), GgufValue::Uint32(4));
             write_gguf(&path, &meta, &[]).unwrap();
             let file = GgufFile::open(&path).unwrap();
             let report = file.compat_report();
@@ -2412,14 +2404,15 @@ mod tests {
 
     #[test]
     fn parse_split_filename_five_digit() {
-        let (stem, idx, total) = parse_split_filename(
-            "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf",
-        )
-        .expect("split name");
+        let (stem, idx, total) =
+            parse_split_filename("DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf")
+                .expect("split name");
         assert_eq!(stem, "DeepSeek-V4-Flash-0731-UD-Q8_K_XL");
         assert_eq!(idx, 3);
         assert_eq!(total, 5);
-        assert!(is_dspark_filename("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"));
+        assert!(is_dspark_filename(
+            "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"
+        ));
         assert!(!is_dspark_filename(
             "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf"
         ));
@@ -2559,7 +2552,10 @@ mod tests {
         write_gguf(&bf, &meta, &tensor).unwrap();
         write_gguf(&target, &meta, &tensor).unwrap();
         let hit = discover_dspark_sidecar(&target).expect("sidecar");
-        assert_eq!(hit.file_name().and_then(|s| s.to_str()), Some("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"));
+        assert_eq!(
+            hit.file_name().and_then(|s| s.to_str()),
+            Some("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

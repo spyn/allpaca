@@ -16,5 +16,9 @@ tracing.workspace = true
 [dev-dependencies]
 allpaca-cpu.workspace = true
 
+[[test]]
+name = "sidecar_gemm"
+required-features = ["hip"]
+
 [target.'cfg(windows)'.build-dependencies]
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

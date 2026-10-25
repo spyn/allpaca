@@ -13,8 +13,8 @@ use crate::weight_set::ExpertId;
 #[derive(Debug, Clone)]
 pub struct PrerouterHead {
     pub owner_layer: usize,
-    pub fc1: Vec<f32>, // [hidden, feat_dim]
-    pub fc2: Vec<f32>, // [n_experts, hidden]
+    pub fc1: Vec<f32>,    // [hidden, feat_dim]
+    pub fc2: Vec<f32>,    // [n_experts, hidden]
     pub linear: Vec<f32>, // [n_experts, feat_dim] residual init path
     pub feat_dim: usize,
     pub hidden: usize,
@@ -339,15 +339,8 @@ mod tests {
     fn stager_stages_next_layer() {
         let spec = PrerouterSpec::qwen35();
         let heads = PrerouterHeads::zeros(&spec, 8, 4);
-        let mut stager = CrossTokenStager::new(
-            spec,
-            heads,
-            RouterKind::SoftmaxTopk,
-            40,
-            None,
-            None,
-            None,
-        );
+        let mut stager =
+            CrossTokenStager::new(spec, heads, RouterKind::SoftmaxTopk, 40, None, None, None);
         let hidden = vec![0.1f32; 4];
         let pred = stager.note_executed(6, &hidden, &[0, 1, 2, 3]);
         assert!(pred.is_some());

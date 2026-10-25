@@ -2653,7 +2653,9 @@ impl CudaWorkspace {
         }
         #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
         {
-            let _ = (q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal);
+            let _ = (
+                q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+            );
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "CUDA attention unavailable".into(),
             )))
@@ -3390,7 +3392,16 @@ impl CudaWorkspace {
         let d_out = device_malloc(q_n * 4, self.device)?;
         let result = (|| {
             self.attention_dev(
-                d_q, d_k, d_v, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+                d_q,
+                d_k,
+                d_v,
+                d_out.cast(),
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
             )?;
             memcpy_on(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H, self.stream)?;
             self.synchronize()?;
@@ -3851,7 +3862,16 @@ impl CudaWorkspace {
         let d_out = device_malloc(q_n * 4, self.device)?;
         let result = (|| {
             self.attention_dev(
-                d_q, k_dev, v_dev, d_out.cast(), n_q, n_kv, n_heads, n_kv_heads, head_dim, causal,
+                d_q,
+                k_dev,
+                v_dev,
+                d_out.cast(),
+                n_q,
+                n_kv,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
             )?;
             memcpy_on(out.as_mut_ptr().cast(), d_out, q_n * 4, MEMCPY_D2H, self.stream)?;
             self.synchronize()?;
@@ -4229,13 +4249,7 @@ mod tests {
         assert_eq!(w.bytes(), 24);
         let p0 = w.ptr_f32(0).expect("ptr");
         let mut back = [0.0f32; 4];
-        memcpy(
-            back.as_mut_ptr().cast(),
-            p0.cast(),
-            16,
-            MEMCPY_D2H,
-        )
-        .expect("d2h");
+        memcpy(back.as_mut_ptr().cast(), p0.cast(), 16, MEMCPY_D2H).expect("d2h");
         assert_eq!(back, a);
     }
 
@@ -4247,7 +4261,14 @@ mod tests {
         if !runtime_linked() || device_count() == 0 {
             assert!(enumerate_devices().is_empty());
             let mut c = [0.0f32; 4];
-            let err = gemm_nt(&[1.0, 0.0, 0.0, 1.0], &[1.0, 0.0, 0.0, 1.0], &mut c, 2, 2, 2);
+            let err = gemm_nt(
+                &[1.0, 0.0, 0.0, 1.0],
+                &[1.0, 0.0, 0.0, 1.0],
+                &mut c,
+                2,
+                2,
+                2,
+            );
             assert!(err.is_err());
             assert!(CudaWorkspace::new(0, 4096).is_err());
         }
@@ -4269,13 +4290,7 @@ mod tests {
         let d = device_malloc(src.len() * 4, 0).expect("malloc");
         ws.copy_h2d_f32(d.cast(), &src).expect("h2d");
         let mut back = vec![0.0f32; src.len()];
-        memcpy(
-            back.as_mut_ptr().cast(),
-            d,
-            src.len() * 4,
-            MEMCPY_D2H,
-        )
-        .expect("d2h");
+        memcpy(back.as_mut_ptr().cast(), d, src.len() * 4, MEMCPY_D2H).expect("d2h");
         device_free(d);
         assert_eq!(back, src);
         assert!(ws.activation_h2d_bytes() >= (src.len() * 4) as u64);
@@ -4798,8 +4813,12 @@ mod tests {
             .expect("cuda rope");
         for h in 0..n_heads as usize {
             let off = h * head_dim as usize;
-            allpaca_cpu::rope(&mut cpu_x[off..off + head_dim as usize], pos as usize, theta)
-                .expect("cpu rope");
+            allpaca_cpu::rope(
+                &mut cpu_x[off..off + head_dim as usize],
+                pos as usize,
+                theta,
+            )
+            .expect("cpu rope");
         }
         for i in 0..n {
             assert!(

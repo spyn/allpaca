@@ -1092,9 +1092,7 @@ mod tests {
         let w_gate: Vec<f32> = (0..ff * dim)
             .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
             .collect();
-        let w_up: Vec<f32> = (0..ff * dim)
-            .map(|i| ((i % 5) as f32) * 0.05)
-            .collect();
+        let w_up: Vec<f32> = (0..ff * dim).map(|i| ((i % 5) as f32) * 0.05).collect();
         let w_down: Vec<f32> = (0..dim * ff)
             .map(|i| ((i % 3) as f32) * 0.2 - 0.1)
             .collect();

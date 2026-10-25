@@ -207,10 +207,7 @@ pub fn discover_gguf_path(dir: &Path, preferred: Option<&str>) -> Result<PathBuf
     }
     let mut found = collect_gguf_files(dir, 1);
     found.retain(|p| {
-        let name = p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let l = name.to_ascii_lowercase();
         !l.contains("dspark") && !l.contains("dflash")
     });
@@ -296,10 +293,11 @@ pub fn discover_checkpoint(
         let kind = match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => CheckpointKind::Safetensors,
             Some("onnx") => CheckpointKind::Onnx,
-            Some("json") if path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|n| n.ends_with(".index.json")) =>
+            Some("json")
+                if path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.ends_with(".index.json")) =>
             {
                 CheckpointKind::Safetensors
             }
@@ -322,7 +320,8 @@ pub fn discover_checkpoint(
             return discover_checkpoint(&explicit, None);
         }
     }
-    if path.join("model.safetensors.index.json").is_file() || path.join("model.safetensors").is_file()
+    if path.join("model.safetensors.index.json").is_file()
+        || path.join("model.safetensors").is_file()
     {
         return Ok(DiscoveredCheckpoint {
             kind: CheckpointKind::Safetensors,

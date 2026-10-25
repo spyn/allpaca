@@ -281,9 +281,7 @@ impl HfConfig {
             num_experts_per_tok: t
                 .and_then(|x| x.num_experts_per_tok)
                 .or(self.num_experts_per_tok),
-            rms_norm_eps: t
-                .and_then(|x| x.rms_norm_eps)
-                .unwrap_or(self.rms_norm_eps),
+            rms_norm_eps: t.and_then(|x| x.rms_norm_eps).unwrap_or(self.rms_norm_eps),
             rope_theta: t
                 .and_then(|x| x.rope_parameters.as_ref().and_then(|r| r.rope_theta))
                 .or(t.and_then(|x| x.rope_theta))
@@ -303,12 +301,8 @@ impl HfConfig {
                 .or_else(|| self.rope_parameters.clone()),
             q_lora_rank: t.and_then(|x| x.q_lora_rank).or(self.q_lora_rank),
             kv_lora_rank: t.and_then(|x| x.kv_lora_rank).or(self.kv_lora_rank),
-            qk_nope_head_dim: t
-                .and_then(|x| x.qk_nope_head_dim)
-                .or(self.qk_nope_head_dim),
-            qk_rope_head_dim: t
-                .and_then(|x| x.qk_rope_head_dim)
-                .or(self.qk_rope_head_dim),
+            qk_nope_head_dim: t.and_then(|x| x.qk_nope_head_dim).or(self.qk_nope_head_dim),
+            qk_rope_head_dim: t.and_then(|x| x.qk_rope_head_dim).or(self.qk_rope_head_dim),
             v_head_dim: t.and_then(|x| x.v_head_dim).or(self.v_head_dim),
             n_group: t.and_then(|x| x.n_group).or(self.n_group),
             topk_group: t.and_then(|x| x.topk_group).or(self.topk_group),
@@ -319,9 +313,7 @@ impl HfConfig {
                 .and_then(|x| x.norm_topk_prob)
                 .or(self.norm_topk_prob)
                 .unwrap_or(true),
-            n_shared_experts: t
-                .and_then(|x| x.n_shared_experts)
-                .or(self.n_shared_experts),
+            n_shared_experts: t.and_then(|x| x.n_shared_experts).or(self.n_shared_experts),
         }
     }
 }
@@ -374,12 +366,12 @@ pub fn load_hf_config(path: &Path) -> Result<HfConfig, AllpacaError> {
 pub fn load_vocab_sidecar(path: &Path) -> Result<VocabSidecar, AllpacaError> {
     match load_tokenizer_sidecar(path)? {
         SidecarTokenizer::Vocab(v) => Ok(v),
-        SidecarTokenizer::HuggingFace { .. } => Err(AllpacaError::Fatal(FatalError::Tokenizer(
-            format!(
+        SidecarTokenizer::HuggingFace { .. } => {
+            Err(AllpacaError::Fatal(FatalError::Tokenizer(format!(
                 "{} is a HuggingFace tokenizer.json (use load_tokenizer_sidecar)",
                 path.display()
-            ),
-        ))),
+            ))))
+        }
     }
 }
 
