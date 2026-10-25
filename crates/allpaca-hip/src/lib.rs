@@ -387,6 +387,7 @@ mod ffi {
             l2_bytes: *mut i32,
         ) -> i32;
         pub fn allpaca_hip_device_multiprocessors(id: i32, count: *mut i32) -> i32;
+        pub fn allpaca_attn_dpt(head_dim: i32) -> i32;
         pub fn allpaca_hip_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
         pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
@@ -1678,6 +1679,23 @@ pub fn device_multiprocessors(id: i32) -> Option<u32> {
     {
         let _ = id;
         None
+    }
+}
+
+/// Attention-kernel template bucket for a head_dim: ceil(head_dim/32) rounded
+/// up to a compiled instantiation (4, 8 or 16 register slots per lane). 0 is
+/// the per-row flash kernel (head_dim outside 1..=32 * the slot cap). Pure
+/// arithmetic: the same value sizes `ATTN_PART` and picks the kernel, so the
+/// split, merge and Q-tiled launches of one call always agree.
+pub fn attn_dpt(head_dim: i32) -> i32 {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        unsafe { ffi::allpaca_attn_dpt(head_dim) }
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = head_dim;
+        0
     }
 }
 
@@ -13707,6 +13725,34 @@ mod tests {
         }
     }
 
+    /// `launch_attention` templates on DPT = ceil(head_dim/32), rounded up to a
+    /// compiled instantiation; head_dims outside 1..=512 take the per-row flash
+    /// kernel (bucket 0). Every head_dim below must reach exactly one kernel
+    /// family, and the split/merge/Q-tiled launches of one call share a bucket.
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn attention_dpt_dispatch_buckets() {
+        assert_eq!(attn_dpt(0), 0);
+        assert_eq!(attn_dpt(-8), 0);
+        assert_eq!(attn_dpt(513), 0);
+        assert_eq!(attn_dpt(4096), 0);
+        for hd in 1..=128 {
+            assert_eq!(attn_dpt(hd), 4, "head_dim {hd}");
+        }
+        for hd in 129..=256 {
+            assert_eq!(attn_dpt(hd), 8, "head_dim {hd}");
+        }
+        for hd in 257..=512 {
+            assert_eq!(attn_dpt(hd), 16, "head_dim {hd}");
+        }
+        // The dims the exactness tests exercise land where intended.
+        assert_eq!(attn_dpt(6), 4);
+        assert_eq!(attn_dpt(96), 4);
+        assert_eq!(attn_dpt(128), 4);
+        assert_eq!(attn_dpt(256), 8);
+        assert_eq!(attn_dpt(512), 16);
+    }
+
     #[test]
     fn kernel_launches_counts_a_launch() {
         if device_count() == 0 {
@@ -14247,7 +14293,7 @@ mod tests {
             let q = device_malloc(nh * hd * 4, dev).unwrap();
             let out = device_malloc(nh * hd * 4, dev).unwrap();
             memcpy(q, vec![0.01f32; nh * hd].as_ptr().cast(), nh * hd * 4, MEMCPY_H2D).unwrap();
-            for n_kv in [512usize, 4096, 32768] {
+            for n_kv in [512usize, 4096, 32768, 131072] {
                 let kv_bytes = n_kv * nkv * hd * 4;
                 let kvs: Vec<(*mut u8, *mut u8)> = (0..copies_for(2 * kv_bytes))
                     .map(|_| {
@@ -20276,6 +20322,16 @@ mod tests {
             (3, 600, 20, 2, 256, true),
             // A head dim the float4 path cannot take.
             (7, 300, 4, 2, 6, true),
+            // Every DPT template bucket, float4 and scalar rows, chunked folds:
+            // hd 32/40/100 -> 4 slots, hd 130/160 -> 8, hd 512 -> 16 (Q4).
+            (4, 1000, 4, 2, 32, true),
+            (3, 300, 4, 2, 40, true),
+            (2, 600, 4, 2, 100, true),
+            (4, 300, 4, 2, 34, true),
+            (4, 300, 4, 2, 130, true),
+            (5, 700, 4, 2, 160, true),
+            (3, 513, 4, 2, 512, true),
+            (2, 1000, 8, 2, 256, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()
