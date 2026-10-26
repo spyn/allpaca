@@ -222,6 +222,62 @@ impl ExpertRam {
         self.slots.len()
     }
 
+    pub(crate) fn heat_snapshot(&self) -> crate::dsv4_heat::TierHeat {
+        crate::dsv4_heat::TierHeat::from_map(&self.heat, self.requests)
+    }
+
+    pub(crate) fn restore_heat(&mut self, heat: &crate::dsv4_heat::TierHeat) {
+        self.heat = heat.to_map();
+        self.requests = heat.routes;
+    }
+
+    /// Fill free slots from saved heat without counting new routes.
+    pub(crate) fn preload(
+        &mut self,
+        layer: usize,
+        wanted: &[(usize, Vec<FileSpan>)],
+    ) -> Result<usize, AllpacaError> {
+        let mut reads: Vec<(Dst, &FileSpan)> = Vec::new();
+        let mut inserted = Vec::new();
+        for (expert, spans) in wanted {
+            let key = (layer, *expert);
+            if self.index.contains_key(&key) {
+                continue;
+            }
+            let Some(slot) = self.slots.iter().position(Option::is_none) else {
+                break;
+            };
+            if spans.iter().map(|s| s.len).sum::<usize>() != self.slot_bytes {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                    "expert slices do not fill a RAM slot".into(),
+                )));
+            }
+            self.slots[slot] = Some(key);
+            self.index.insert(key, slot);
+            inserted.push(key);
+            // SAFETY: slot `slot` lies inside the arena.
+            let base = unsafe { self.arena.ptr.add(slot * self.slot_bytes) };
+            let mut at = 0usize;
+            for span in spans {
+                // SAFETY: the slices sum to `slot_bytes`.
+                reads.push((Dst(unsafe { base.add(at) }), span));
+                at += span.len;
+            }
+        }
+        if reads.is_empty() {
+            return Ok(0);
+        }
+        if let Err(e) = read_all(&mut self.readers, &self.paths, &reads) {
+            for key in inserted {
+                if let Some(slot) = self.index.remove(&key) {
+                    self.slots[slot] = None;
+                }
+            }
+            return Err(e);
+        }
+        Ok(inserted.len())
+    }
+
     /// The packed bytes of a fetched expert. Valid until the next `fetch`.
     pub(crate) fn bytes(&self, loc: Loc) -> &[u8] {
         match loc {
@@ -802,5 +858,48 @@ mod tests {
         let locs = ram.fetch(8, &want(&[3]), &metrics).unwrap();
         check(&ram, locs[0], 3);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saved_heat_preloads_ram_without_changing_route_accounting() {
+        let part = 5008usize;
+        let (path, spans) = fixture(&std::env::temp_dir(), 4, part);
+        let heat = crate::dsv4_heat::TierHeat::from_map(
+            &HashMap::from([((7, 0), 8.0), ((7, 1), 1.0), ((7, 2), 5.0), ((7, 3), 2.0)]),
+            16,
+        );
+        let mut ram = ExpertRam::new(vec![path.clone()], 3 * part, part, (2 * 3 * part) as u64)
+            .unwrap()
+            .unwrap();
+        ram.restore_heat(&heat);
+        let wanted: Vec<_> = heat
+            .ranked(ram.slots())
+            .into_iter()
+            .map(|(_, expert)| (expert, spans[expert].clone()))
+            .collect();
+        ram.preload(7, &wanted).unwrap();
+        assert_eq!(ram.heat_snapshot(), heat);
+
+        let metrics = Metrics::default();
+        let want = |ids: &[usize]| -> Vec<(usize, Vec<FileSpan>)> {
+            ids.iter().map(|&e| (e, spans[e].clone())).collect()
+        };
+        let locs = ram.fetch(7, &want(&[0, 2]), &metrics).unwrap();
+        assert_eq!(metrics.expert_ram_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.nvme_reads.load(Ordering::Relaxed), 0);
+        for (loc, expert) in locs.iter().zip([0, 2]) {
+            let bytes = ram.bytes(*loc);
+            for p in 0..3 {
+                assert!(bytes[p * part..(p + 1) * part]
+                    .iter()
+                    .all(|v| *v == (expert * 3 + p) as u8));
+            }
+        }
+
+        let locs = ram.fetch(7, &want(&[1]), &metrics).unwrap();
+        assert!(matches!(locs[0], Loc::Temp(_)));
+        assert_eq!(metrics.nvme_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(ram.heat_snapshot().routes, 19);
+        std::fs::remove_file(path).unwrap();
     }
 }
