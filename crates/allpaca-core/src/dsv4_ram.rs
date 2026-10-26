@@ -157,6 +157,47 @@ struct Dst(*mut u8);
 unsafe impl Send for Dst {}
 unsafe impl Sync for Dst {}
 
+struct ReadAheadGate {
+    enabled: bool,
+    reads: u64,
+    hits: u64,
+}
+
+impl ReadAheadGate {
+    fn new(ram_slots: usize, total_experts: usize) -> Self {
+        let enabled = total_experts > 0 && (ram_slots as u128) * 5 >= (total_experts as u128) * 3;
+        Self {
+            enabled,
+            reads: 0,
+            hits: 0,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn record_read(&mut self) {
+        if self.enabled {
+            self.reads += 1;
+        }
+    }
+
+    fn record_fetch(&mut self, hits: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.hits += hits;
+        if self.reads >= 128 {
+            if self.hits * 10 < self.reads {
+                self.enabled = false;
+            }
+            self.reads = 0;
+            self.hits = 0;
+        }
+    }
+}
+
 pub(crate) struct ExpertRam {
     paths: Vec<PathBuf>,
     /// Packed bytes of one expert: its tensor slices back to back.
@@ -177,6 +218,7 @@ pub(crate) struct ExpertRam {
     spare: Vec<Vec<u8>>,
     staged_total: u64,
     staged_reported: u64,
+    read_ahead: ReadAheadGate,
 }
 
 impl ExpertRam {
@@ -215,11 +257,17 @@ impl ExpertRam {
             spare: Vec::new(),
             staged_total: 0,
             staged_reported: 0,
+            read_ahead: ReadAheadGate::new(0, 0),
         }))
     }
 
     pub(crate) fn slots(&self) -> usize {
         self.slots.len()
+    }
+
+    pub(crate) fn configure_read_ahead(&mut self, total_experts: usize) -> bool {
+        self.read_ahead = ReadAheadGate::new(self.slots(), total_experts);
+        self.read_ahead.enabled()
     }
 
     /// The packed bytes of a fetched expert. Valid until the next `fetch`.
@@ -236,6 +284,9 @@ impl ExpertRam {
     /// The experts of `layer` among `experts` that are neither cached nor
     /// already read ahead.
     pub(crate) fn missing(&self, layer: usize, experts: &[usize]) -> Vec<usize> {
+        if !self.read_ahead.enabled() {
+            return Vec::new();
+        }
         experts
             .iter()
             .copied()
@@ -254,6 +305,10 @@ impl ExpertRam {
     /// Keep the packed bytes of `key`, read ahead of use, for the next
     /// [`Self::fetch`] that asks for it.
     pub(crate) fn stage(&mut self, key: (usize, usize), buf: Vec<u8>) {
+        if !self.read_ahead.enabled() {
+            self.spare.push(buf);
+            return;
+        }
         if self.staged.len() >= STAGE_MAX {
             if let Some((_, old)) = self.staged.pop_front() {
                 self.spare.push(old);
@@ -261,6 +316,7 @@ impl ExpertRam {
         }
         self.staged.push_back((key, buf));
         self.staged_total += 1;
+        self.read_ahead.record_read();
     }
 
     /// The cached bytes of `key`, held in place until [`Self::release`]:
@@ -362,6 +418,7 @@ impl ExpertRam {
             }
             locs.push(loc);
         }
+        self.read_ahead.record_fetch(ahead_hits);
         metrics.expert_ram_hits.fetch_add(hits, Ordering::Relaxed);
         metrics.expert_prefetch_hits.fetch_add(ahead_hits, Ordering::Relaxed);
         metrics
@@ -737,6 +794,82 @@ mod tests {
         }
         std::fs::write(&path, &data).unwrap();
         (path, spans)
+    }
+
+    #[test]
+    fn read_ahead_requires_sixty_percent_ram_coverage() {
+        assert!(!ReadAheadGate::new(59, 100).enabled());
+        assert!(ReadAheadGate::new(60, 100).enabled());
+        assert!(!ReadAheadGate::new(1, 0).enabled());
+    }
+
+    #[test]
+    fn read_ahead_stops_after_a_window_below_ten_percent_hits() {
+        let mut gate = ReadAheadGate::new(60, 100);
+        for _ in 0..128 {
+            gate.record_read();
+        }
+        gate.record_fetch(0);
+        assert!(!gate.enabled());
+    }
+
+    #[test]
+    fn read_ahead_survives_a_useful_window_and_stops_a_later_useless_one() {
+        let mut gate = ReadAheadGate::new(60, 100);
+        for _ in 0..128 {
+            gate.record_read();
+        }
+        gate.record_fetch(13);
+        assert!(gate.enabled());
+        for _ in 0..128 {
+            gate.record_read();
+        }
+        gate.record_fetch(0);
+        assert!(!gate.enabled());
+    }
+
+    #[test]
+    fn ram_coverage_controls_whether_staged_experts_are_used() {
+        let part = 5100usize;
+        let (path, spans) = fixture(&std::env::temp_dir(), 4, part);
+        let want = || vec![(0, spans[0].clone())];
+        let staged = || (0..3 * part).map(|i| (i / part) as u8).collect::<Vec<u8>>();
+
+        let metrics = Metrics::default();
+        let mut small = ExpertRam::new(vec![path.clone()], 3 * part, part, (2 * 3 * part) as u64)
+            .unwrap()
+            .unwrap();
+        assert!(!small.configure_read_ahead(4));
+        small.stage((7, 0), staged());
+        let loc = small.fetch(7, &want(), &metrics).unwrap()[0];
+        for p in 0..3 {
+            assert!(
+                small.bytes(loc)[p * part..(p + 1) * part]
+                    .iter()
+                    .all(|v| *v == p as u8)
+            );
+        }
+        assert_eq!(metrics.nvme_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.expert_prefetch_reads.load(Ordering::Relaxed), 0);
+
+        let metrics = Metrics::default();
+        let mut large = ExpertRam::new(vec![path.clone()], 3 * part, part, (2 * 3 * part) as u64)
+            .unwrap()
+            .unwrap();
+        assert!(large.configure_read_ahead(3));
+        large.stage((7, 0), staged());
+        let loc = large.fetch(7, &want(), &metrics).unwrap()[0];
+        for p in 0..3 {
+            assert!(
+                large.bytes(loc)[p * part..(p + 1) * part]
+                    .iter()
+                    .all(|v| *v == p as u8)
+            );
+        }
+        assert_eq!(metrics.nvme_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.expert_prefetch_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.expert_prefetch_hits.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
