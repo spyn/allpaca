@@ -15,6 +15,7 @@ mod direct_storage;
 mod draft;
 mod dspark;
 mod dsv4_gpu;
+mod dsv4_heat;
 pub mod prompt_store;
 mod qsa;
 mod qwen4_gpu;

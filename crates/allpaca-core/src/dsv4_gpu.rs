@@ -363,6 +363,8 @@ pub struct Dsv4Gpu {
     /// Decayed routing count per (layer, expert): what earns a cache slot.
     heat: HashMap<(usize, usize), f32>,
     heat_routes: u64,
+    heat_file: Option<std::path::PathBuf>,
+    heat_profile: Option<crate::dsv4_heat::ExpertHeat>,
     /// Cache misses run on the CPU from the mapped file, and an expert
     /// takes a slot only when it is routed clearly more often than the
     /// coldest resident one. Off: every miss is copied in (plain LRU).
@@ -479,6 +481,15 @@ impl Dsv4Gpu {
         };
         let stream = DeviceWeights::alloc(hip.device, STREAM_SLOT_BYTES * 2).ok();
         let expert_slot = packed_expert_bytes(cfg.dim, cfg.ff_dim.max(1));
+        let heat_file = crate::dsv4_heat::sidecar_path(file);
+        let mut heat_profile = crate::dsv4_heat::ExpertHeat::for_model(file, cfg, expert_slot);
+        if let Some(path) = &heat_file {
+            if let Some(loaded) = crate::dsv4_heat::ExpertHeat::load_for_model(path, file, cfg, expert_slot) {
+                heat_profile = Some(loaded);
+            }
+        }
+        let gpu_heat = heat_profile.as_ref().map(|profile| profile.gpu.to_map()).unwrap_or_default();
+        let gpu_heat_routes = heat_profile.as_ref().map_or(0, |profile| profile.gpu.routes);
         let gpu1_device = draft.as_ref().map(|d| d.device).unwrap_or(-1);
         let prefill_device = draft.as_ref().map(|d| d.device).unwrap_or(hip.device);
         let mut gpu = Self {
@@ -529,8 +540,10 @@ impl Dsv4Gpu {
             warmup_miss: Vec::new(),
             used: AtomicBool::new(false),
             keep_set: HashSet::new(),
-            heat: HashMap::new(),
-            heat_routes: 0,
+            heat: gpu_heat,
+            heat_routes: gpu_heat_routes,
+            heat_file,
+            heat_profile,
             cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").map_or(true, |v| v != "0")
                 && cpu_expert_kernel_fits(file, cfg),
             ram: None,
@@ -557,7 +570,70 @@ impl Dsv4Gpu {
             }
         }
         gpu.alloc_expert_pools(cfg)?;
+        gpu.warm_saved_experts(file, cfg);
         Ok(gpu)
+    }
+
+    fn warm_saved_experts(&mut self, file: &GgufFile, cfg: &ModelConfig) {
+        let Some(profile) = self.heat_profile.clone() else {
+            return;
+        };
+        if let Some(ram) = self.ram.as_ref() {
+            let mut ram = ram.lock().unwrap_or_else(|e| e.into_inner());
+            ram.restore_heat(&profile.ram);
+            let mut by_layer: std::collections::BTreeMap<usize, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (layer, expert) in profile.ram.ranked(ram.slots()) {
+                by_layer.entry(layer).or_default().push(expert);
+            }
+            let mut preloaded = 0usize;
+            for (layer, experts) in by_layer {
+                let wanted: Vec<_> = experts
+                    .into_iter()
+                    .filter_map(|expert| {
+                        expert_mxfp4_spans(file, layer, expert, cfg).map(|spans| (expert, spans))
+                    })
+                    .collect();
+                match ram.preload(layer, &wanted) {
+                    Ok(n) => preloaded += n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, layer, "DeepSeek-V4 saved RAM heat preload failed");
+                        break;
+                    }
+                }
+            }
+            if preloaded > 0 {
+                tracing::info!(experts = preloaded, "DeepSeek-V4 RAM experts warmed from saved heat");
+            }
+        }
+
+        let capacity = self.slots.len() + self.gpu1_slots.len();
+        let mut by_layer: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (layer, expert) in profile.gpu.ranked(capacity) {
+            by_layer.entry(layer).or_default().push(expert);
+        }
+        for (layer, experts) in by_layer {
+            match self.warmup_experts(file, layer, &experts, cfg, None) {
+                Ok(plan) => {
+                    let (inflight0, inflight1) = self.submit_copy_plan(&plan, None);
+                    self.mark_expert_h2d(inflight0, inflight1);
+                    self.join_expert_h2d();
+                    self.finish_h2d_keep();
+                    self.unpin_layer(layer);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, layer, "DeepSeek-V4 saved GPU heat warmup failed");
+                    self.unpin_layer(layer);
+                    break;
+                }
+            }
+        }
+        self.warmup_miss.clear();
+        let warmed = self.slots.iter().chain(&self.gpu1_slots).filter(|slot| slot.key.is_some()).count();
+        if warmed > 0 {
+            tracing::info!(experts = warmed, "DeepSeek-V4 GPU experts warmed from saved heat");
+        }
     }
 
     /// Misses are computed on the CPU instead of being copied into the cache.
@@ -694,7 +770,7 @@ impl Dsv4Gpu {
             let free1 = device_free_bytes(dhip.device);
             if let Some((blob, n1)) = try_alloc_expert_lru(
                 dhip.device,
-                expert_lru_slots(free1, self.expert_slot),
+                expert_lru_slots(free1, self.expert_slot).min(cfg.n_layers * cfg.n_experts),
                 self.expert_slot,
             ) {
                 tracing::info!(
@@ -733,7 +809,7 @@ impl Dsv4Gpu {
         let free0 = device_free_bytes(hip.device);
         if let Some((blob, n0)) = try_alloc_expert_lru(
             hip.device,
-            expert_lru_slots(free0, self.expert_slot),
+            expert_lru_slots(free0, self.expert_slot).min(cfg.n_layers * cfg.n_experts),
             self.expert_slot,
         ) {
             tracing::info!(
@@ -3207,6 +3283,25 @@ impl Dsv4Gpu {
     }
 }
 
+impl Drop for Dsv4Gpu {
+    fn drop(&mut self) {
+        self.read_ahead = None;
+        let (Some(path), Some(profile)) = (&self.heat_file, &self.heat_profile) else {
+            return;
+        };
+        let mut profile = profile.clone();
+        profile.gpu = crate::dsv4_heat::TierHeat::from_map(&self.heat, self.heat_routes);
+        profile.ram = self
+            .ram
+            .as_ref()
+            .map(|ram| ram.lock().unwrap_or_else(|e| e.into_inner()).heat_snapshot())
+            .unwrap_or_default();
+        if let Err(e) = profile.save(path) {
+            tracing::warn!(path = %path.display(), error = %e, "DeepSeek-V4 expert heat save failed");
+        }
+    }
+}
+
 #[cfg(all(test, feature = "hip"))]
 impl Dsv4Gpu {
     fn for_hc_test(hip: std::sync::Arc<HipWorkspace>) -> Self {
@@ -3236,6 +3331,8 @@ impl Dsv4Gpu {
             keep_set: HashSet::new(),
             heat: HashMap::new(),
             heat_routes: 0,
+            heat_file: None,
+            heat_profile: None,
             cpu_miss: false,
             ram: None,
             mapped_used: Vec::new(),
@@ -5583,5 +5680,99 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(got_a, a);
         assert_eq!(got_b, b);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn saved_heat_restores_the_maps_and_warms_the_gpu_without_permanent_pins() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-dsv4-gpu-heat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("tiny.gguf");
+        crate::deepseek4::write_tiny_deepseek4_packed_gguf(&model_path);
+        let file = allpaca_gguf::GgufFile::open(&model_path).unwrap();
+        let cfg = ModelConfig::from_gguf(&file).unwrap();
+        let slot = super::packed_expert_bytes(cfg.dim, cfg.ff_dim.max(1));
+        let mut saved = crate::dsv4_heat::ExpertHeat::for_model(&file, &cfg, slot).unwrap();
+        saved.gpu = crate::dsv4_heat::TierHeat::from_map(
+            &std::collections::HashMap::from([((0, 1), 8.0), ((0, 0), 4.0)]),
+            12,
+        );
+        saved.ram = crate::dsv4_heat::TierHeat::from_map(
+            &std::collections::HashMap::from([((0, 1), 7.0)]),
+            7,
+        );
+        saved.save(&crate::dsv4_heat::sidecar_path(&file).unwrap()).unwrap();
+
+        let hip = std::sync::Arc::new(
+            allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace"),
+        );
+        let gpu = super::Dsv4Gpu::build(&file, &cfg, hip, None, (4 * slot) as u64).unwrap();
+
+        assert_eq!(gpu.heat_routes, 12);
+        assert_eq!(gpu.heat.get(&(0, 1)), Some(&8.0));
+        assert!(gpu.resident_expert(0, 0).is_some());
+        assert!(gpu.resident_expert(0, 1).is_some());
+        assert!(gpu.resident_expert(0, 2).is_none());
+        assert!(gpu.slots.iter().chain(&gpu.gpu1_slots).all(|slot| !slot.pinned));
+        assert!(!gpu.expert_copy_pending(0, 0));
+        assert!(!gpu.expert_copy_pending(0, 1));
+        let ram = gpu.ram.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ram.heat_snapshot().routes, 7);
+        drop(ram);
+        drop(gpu);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn dropping_the_engine_saves_heat_and_the_next_build_restores_it() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-dsv4-drop-heat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("tiny.gguf");
+        crate::deepseek4::write_tiny_deepseek4_packed_gguf(&model_path);
+        let file = allpaca_gguf::GgufFile::open(&model_path).unwrap();
+        let cfg = ModelConfig::from_gguf(&file).unwrap();
+        let slot = super::packed_expert_bytes(cfg.dim, cfg.ff_dim.max(1));
+        let heat_path = crate::dsv4_heat::sidecar_path(&file).unwrap();
+        assert!(
+            super::cpu_expert_kernel_fits(&file, &cfg),
+            "tiny fixture needs CPU experts: dim={} ff={} gate={:?}",
+            cfg.dim,
+            cfg.ff_dim,
+            file.tensor("blk.0.ffn_gate_exps.weight").map(|t| t.ggml_type)
+        );
+        let hip = std::sync::Arc::new(
+            allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 64).expect("hip workspace"),
+        );
+
+        {
+            let mut gpu = super::Dsv4Gpu::build(&file, &cfg, hip.clone(), None, (4 * slot) as u64).unwrap();
+            gpu.note_route(0, 2);
+            gpu.note_route(0, 2);
+            gpu.note_route(0, 0);
+            let mut ram = gpu.ram.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+            let spans = super::expert_mxfp4_spans(&file, 0, 1, &cfg).unwrap();
+            ram.fetch(0, &[(1, spans)], &crate::telemetry::Metrics::default()).unwrap();
+        }
+
+        let saved = crate::dsv4_heat::ExpertHeat::load_for_model(&heat_path, &file, &cfg, slot)
+            .expect("drop wrote a valid sidecar");
+        assert_eq!(saved.gpu.ranked(2), vec![(0, 2), (0, 0)]);
+        assert_eq!(saved.gpu.routes, 3);
+        assert_eq!(saved.ram.ranked(1), vec![(0, 1)]);
+        assert_eq!(saved.ram.routes, 1);
+
+        let rebuilt = super::Dsv4Gpu::build(&file, &cfg, hip, None, (4 * slot) as u64).unwrap();
+        assert_eq!(rebuilt.heat_routes, 3);
+        assert_eq!(rebuilt.heat.get(&(0, 2)), Some(&2.0));
+        assert!(rebuilt.resident_expert(0, 2).is_some());
+        drop(rebuilt);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
