@@ -646,14 +646,28 @@ impl Dsv4Gpu {
         self.ram.clone()
     }
 
-    /// Start the read-ahead worker when `ALLPACA_DSV4_READAHEAD=1`. Off by
-    /// default: on DeepSeek-V4-Flash about a quarter of its reads were used,
-    /// SSD traffic nearly doubled and throughput did not improve.
+    /// Start read-ahead when the RAM tier covers at least 60% of experts.
+    /// `ALLPACA_DSV4_READAHEAD=0` disables it; a low useful-read rate stops it.
     fn start_read_ahead(&mut self, file: &Arc<GgufFile>, cfg: &ModelConfig) {
         let Some(ram) = self.ram.clone() else {
             return;
         };
-        if !std::env::var("ALLPACA_DSV4_READAHEAD").is_ok_and(|v| v == "1") {
+        if std::env::var("ALLPACA_DSV4_READAHEAD").is_ok_and(|v| v == "0") {
+            return;
+        }
+        let total = cfg.n_layers * cfg.n_experts;
+        let lock = || ram.lock().unwrap_or_else(|e| e.into_inner());
+        let (slots, enabled) = {
+            let mut ram = lock();
+            (ram.slots(), ram.configure_read_ahead(total))
+        };
+        tracing::info!(
+            ram_slots = slots,
+            total_experts = total,
+            enabled,
+            "DeepSeek-V4 expert read-ahead gate"
+        );
+        if !enabled {
             return;
         }
         let ff = cfg.ff_dim.max(1);
