@@ -140,6 +140,9 @@ Sampling (temperature, top-k, top-p, grammar masking, RNG) happens on **CPU**. O
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/chat/completions` | Chat generation (streaming and non-streaming) |
+| `POST /v1/tools/calls` | Structured host-supplied tool call, inspected before an injected `ToolExecutor` runs it |
+| `GET /v1/tools/guardrails/{id}` | Guardrail-case status, detection, intent verdict, and explanation |
+| `POST /v1/tools/guardrails/{id}/confirm` | Single-use, expiring allow/deny decision; denial returns 403 `security_rejected` |
 | `POST /v1/systemone` | Decision models (`<arch>.decision.type` = `openjev` or `kev`): typed questions about a `state`, answered with probabilities in one forward pass each; same schema as llama.cpp |
 | `GET /v1/models` | List loaded model info |
 | `GET /stats` | Internal metrics JSON (non-OpenAI) |
@@ -151,3 +154,5 @@ Sampling (temperature, top-k, top-p, grammar masking, RNG) happens on **CPU**. O
 | `GET /v1/status` | Dashboard JSON: stats + devices + host CPU/RAM |
 | `GET /v1/logs` | Recent tracing lines |
 | `GET /v1/logs/stream` | SSE tail of tracing lines |
+
+Tool guardrails are enabled by default (`[security] enable_guardrails = true`; `--skip-tool-guardrails` is the server-wide bypass). The detector handles execution-style structured calls, not ordinary generated prose. Suspicious calls move through `pending_verification -> pending_confirmation -> allowed | denied | blocked`; intent verification uses a fresh public `Engine::generate` call after the original request has returned, so it cannot nest inside an active request slot. Alignment never auto-approves execution. Audit events use structured `tracing`, cap and redact command payloads, and never include caller credentials. Production shell execution is deliberately absent: hosts inject `ToolExecutor`, and tests use an in-memory double.

@@ -27,6 +27,8 @@ pub struct Config {
     pub structured_output: StructuredOutputSection,
     pub model: ModelSection,
     pub http: HttpSection,
+    #[serde(default)]
+    pub security: SecuritySection,
     pub multimodal: MultimodalSection,
     pub features: FeatureFlagOverlay,
     #[serde(default)]
@@ -66,6 +68,7 @@ impl Config {
             structured_output: StructuredOutputSection::default(),
             model: ModelSection::default(),
             http: HttpSection::default(),
+            security: SecuritySection::default(),
             multimodal: MultimodalSection::default(),
             features: FeatureFlagOverlay::default(),
             rpc: RpcSection::default(),
@@ -149,6 +152,9 @@ impl Config {
         }
         if let Some(json) = cli.json_mode {
             self.structured_output.json_mode = json;
+        }
+        if cli.skip_tool_guardrails {
+            self.security.enable_guardrails = false;
         }
         if let Some(endpoints) = &cli.rpc_endpoints {
             self.rpc.endpoints = endpoints.clone();
@@ -255,9 +261,7 @@ impl Config {
             .entry("tunes".to_string())
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
         let tunes = tunes.as_table_mut().ok_or_else(|| {
-            AllpacaError::Fatal(FatalError::InvalidConfig(
-                "[tunes] must be a table".into(),
-            ))
+            AllpacaError::Fatal(FatalError::InvalidConfig("[tunes] must be a table".into()))
         })?;
         let value = toml::Value::try_from(entry).map_err(|e| {
             AllpacaError::Fatal(FatalError::InvalidConfig(format!(
@@ -921,6 +925,20 @@ impl Default for ModelSection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct SecuritySection {
+    pub enable_guardrails: bool,
+}
+
+impl Default for SecuritySection {
+    fn default() -> Self {
+        Self {
+            enable_guardrails: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HttpSection {
     pub host: String,
     pub port: u16,
@@ -1021,6 +1039,7 @@ pub struct CliOverrides {
     pub ui_password: Option<String>,
     pub synthetic: bool,
     pub json_mode: Option<bool>,
+    pub skip_tool_guardrails: bool,
     /// Comma-separated `host:port` RPC workers.
     pub rpc_endpoints: Option<Vec<String>>,
     /// Shared RPC HELLO token (`--rpc-token`).
@@ -1034,6 +1053,20 @@ pub struct CliOverrides {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_guardrails_default_on_and_cli_can_skip_them() {
+        let defaults = Config::compiled_defaults();
+        assert!(defaults.security.enable_guardrails);
+
+        let mut cfg = Config::from_toml_str("[security]\nenable_guardrails = true\n").unwrap();
+        assert!(cfg.security.enable_guardrails);
+        cfg.merge_cli(&CliOverrides {
+            skip_tool_guardrails: true,
+            ..CliOverrides::default()
+        });
+        assert!(!cfg.security.enable_guardrails);
+    }
 
     #[test]
     fn experimental_defaults_are_off_and_exact() {
@@ -1177,9 +1210,15 @@ mod tests {
         assert_eq!(ds, vec![DraftProviderKind::Dspark]);
         // "dflash" stays the DSpark alias; DFlash2 is its own provider.
         let d2 = DraftProviderKind::parse_list("dflash2,dflash-2").unwrap();
-        assert_eq!(d2, vec![DraftProviderKind::Dflash2, DraftProviderKind::Dflash2]);
+        assert_eq!(
+            d2,
+            vec![DraftProviderKind::Dflash2, DraftProviderKind::Dflash2]
+        );
         let d1 = DraftProviderKind::parse_list("dflash1,draft-dflash").unwrap();
-        assert_eq!(d1, vec![DraftProviderKind::Dflash1, DraftProviderKind::Dflash1]);
+        assert_eq!(
+            d1,
+            vec![DraftProviderKind::Dflash1, DraftProviderKind::Dflash1]
+        );
         let aliases = DraftProviderKind::parse_list("dflash,draft-dspark").unwrap();
         assert_eq!(
             aliases,
@@ -1204,10 +1243,12 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.multimodal.vision_device, Some(DeviceSelector::Hip(1)));
         assert_eq!(cfg.multimodal.vision_n_blocks, 1);
-        assert!(Config::compiled_defaults()
-            .multimodal
-            .vision_device
-            .is_none());
+        assert!(
+            Config::compiled_defaults()
+                .multimodal
+                .vision_device
+                .is_none()
+        );
         assert_eq!(Config::compiled_defaults().multimodal.vision_n_blocks, 0);
     }
 
@@ -1459,17 +1500,17 @@ mod tests {
         let dumped = cfg.to_toml_string().unwrap();
         let reparsed = Config::from_toml_str(&dumped).unwrap();
         assert_eq!(
-            reparsed.tune_for_spec("models/other.gguf").unwrap().cache_bytes,
+            reparsed
+                .tune_for_spec("models/other.gguf")
+                .unwrap()
+                .cache_bytes,
             1024
         );
     }
 
     #[test]
     fn write_tune_file_patches_existing_toml() {
-        let dir = std::env::temp_dir().join(format!(
-            "allpaca_tune_write_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("allpaca_tune_write_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("allpaca.toml");
         std::fs::write(&path, "[http]\nport = 9090\n").unwrap();
@@ -1517,7 +1558,10 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.prompt_cache.codec, KvCodec::Q4);
         assert_eq!(cfg.prompt_cache.ram_bytes, 1 << 20);
-        assert_eq!(cfg.prompt_cache.disk_dir.as_deref(), Some(Path::new("cache/prompts")));
+        assert_eq!(
+            cfg.prompt_cache.disk_dir.as_deref(),
+            Some(Path::new("cache/prompts"))
+        );
         assert_eq!(cfg.prompt_cache.disk_bytes, 2048);
         assert_eq!(defaults.prompt_cache.disk_dir, None);
         assert_eq!(defaults.prompt_cache.boundary_tokens, 2048);
