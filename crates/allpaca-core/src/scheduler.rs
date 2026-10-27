@@ -2,7 +2,76 @@ use allpaca_types::{
     DeviceInfo, DeviceKind, FeatureFlags, KvTierKind, PipelineMode, Placement, PollSchedule,
     SpeculativeSection, TaskCost,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SpecCosts {
+    verify_us: Vec<f64>,
+    verify_n: Vec<u32>,
+    verify_seed: Vec<f64>,
+    draft_us: Vec<f64>,
+    draft_n: Vec<u32>,
+    draft_seed: Vec<f64>,
+    want_deeper: u32,
+    want_shallower: u32,
+    depth: Option<usize>,
+}
+
+fn observe_cost(us: &mut f64, n: &mut u32, seed: &mut f64, sample: f64) {
+    if *n < STEP_MIN_SAMPLES {
+        *us = if *n == 0 { sample } else { us.min(sample) };
+        *seed = *us;
+    } else {
+        *us = 0.8 * *us + 0.2 * sample.min(2.0 * *seed);
+    }
+    *n = n.saturating_add(1);
+}
+
+fn valid_calibration_costs(costs: &BTreeMap<usize, SpecCosts>) -> bool {
+    costs.len() <= 4096
+        && costs.values().all(|c| {
+            c.depth.is_none_or(|d| d > 0)
+                && c.verify_us.len() == c.verify_n.len()
+                && c.verify_us.len() == c.verify_seed.len()
+                && c.draft_us.len() == c.draft_n.len()
+                && c.draft_us.len() == c.draft_seed.len()
+                && c.verify_us.len() <= 4096
+                && c.draft_us.len() <= 4096
+                && c.verify_us
+                    .iter()
+                    .chain(&c.verify_seed)
+                    .chain(&c.draft_us)
+                    .chain(&c.draft_seed)
+                    .all(|v| v.is_finite() && *v >= 0.0)
+        })
+}
+
+const CALIBRATION_VERSION: u32 = 2;
+const CALIBRATION_SAVE_EVERY: u32 = 32;
+
+#[derive(Serialize, Deserialize)]
+struct CalibrationFile {
+    version: u32,
+    model: String,
+    build: String,
+    target_gpu: String,
+    draft_gpu: String,
+    draft_provider: String,
+    costs: BTreeMap<usize, SpecCosts>,
+}
+
+struct CalibrationStore {
+    path: PathBuf,
+    model: String,
+    build: String,
+    target_gpu: String,
+    draft_gpu: String,
+    draft_provider: String,
+    dirty: u32,
+}
 
 /// Heuristic scheduler. Modes only seed [`FeatureFlags`]; flags stay composable.
 pub struct Scheduler {
@@ -20,10 +89,12 @@ pub struct Scheduler {
     /// Consecutive verifies whose estimate asked for a deeper / shallower span.
     want_deeper: u32,
     want_shallower: u32,
-    /// Wall time of a speculative step (drafting + verify) by rows verified
-    /// (index rows - 1): EMA in microseconds and sample count.
+    /// Legacy whole-step costs, retained for callers without split timings.
     step_us: Vec<f64>,
     step_n: Vec<u32>,
+    spec_costs: BTreeMap<usize, SpecCosts>,
+    cost_context: usize,
+    calibration: Option<CalibrationStore>,
     /// Steps handed out by [`Self::step_depth`] (probe cadence).
     step_calls: u64,
 }
@@ -44,7 +115,97 @@ impl Scheduler {
             want_shallower: 0,
             step_us: Vec::new(),
             step_n: Vec::new(),
+            spec_costs: BTreeMap::new(),
+            cost_context: 0,
+            calibration: None,
             step_calls: 0,
+        }
+    }
+
+    pub fn configure_calibration(
+        &mut self,
+        path: &Path,
+        model: &str,
+        build: &str,
+        target_gpu: &str,
+        draft_gpu: &str,
+        draft_provider: &str,
+    ) {
+        if self
+            .calibration
+            .as_ref()
+            .is_some_and(|store| store.dirty > 0)
+        {
+            self.save_calibration();
+        }
+        let mut costs = BTreeMap::new();
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<CalibrationFile>(&text) {
+                Ok(file)
+                    if file.version == CALIBRATION_VERSION
+                        && file.model == model
+                        && file.build == build
+                        && file.target_gpu == target_gpu
+                        && file.draft_gpu == draft_gpu
+                        && file.draft_provider == draft_provider
+                        && valid_calibration_costs(&file.costs) =>
+                {
+                    costs = file.costs;
+                }
+                Ok(_) => {
+                    tracing::warn!(path = %path.display(), "speculative-depth calibration incompatible; cold start")
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "speculative-depth calibration invalid; cold start")
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "speculative-depth calibration unreadable; cold start")
+            }
+        }
+        self.spec_costs = costs;
+        self.calibration = Some(CalibrationStore {
+            path: path.to_path_buf(),
+            model: model.to_string(),
+            build: build.to_string(),
+            target_gpu: target_gpu.to_string(),
+            draft_gpu: draft_gpu.to_string(),
+            draft_provider: draft_provider.to_string(),
+            dirty: 0,
+        });
+    }
+
+    pub fn save_calibration(&mut self) {
+        let Some(store) = &self.calibration else {
+            return;
+        };
+        let file = CalibrationFile {
+            version: CALIBRATION_VERSION,
+            model: store.model.clone(),
+            build: store.build.clone(),
+            target_gpu: store.target_gpu.clone(),
+            draft_gpu: store.draft_gpu.clone(),
+            draft_provider: store.draft_provider.clone(),
+            costs: self.spec_costs.clone(),
+        };
+        let path = store.path.clone();
+        let result = serde_json::to_vec_pretty(&file)
+            .map_err(std::io::Error::other)
+            .and_then(|json| {
+                let tmp = path.with_extension(format!("spec-depth.{}.tmp", std::process::id()));
+                std::fs::write(&tmp, json)?;
+                std::fs::rename(&tmp, &path)
+            });
+        match result {
+            Ok(()) => {
+                if let Some(store) = &mut self.calibration {
+                    store.dirty = 0;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "speculative-depth calibration not saved")
+            }
         }
     }
 
@@ -52,15 +213,37 @@ impl Scheduler {
     /// every [`PROBE_EVERY`]th step tries a neighbouring depth whose cost has
     /// not been measured, so [`Self::record_acceptance`] can weigh it.
     pub fn step_depth(&mut self) -> usize {
+        self.step_depth_at(self.cost_context * 1024)
+    }
+
+    pub fn step_depth_at(&mut self, context_tokens: usize) -> usize {
+        self.cost_context = context_tokens / 1024;
+        if let Some(depth) = self
+            .spec_costs
+            .get(&self.cost_context)
+            .and_then(|c| c.depth)
+        {
+            self.draft_depth = depth.clamp(self.min_depth, self.max_depth);
+        }
         self.step_calls = self.step_calls.wrapping_add(1);
         let depth = self.draft_depth;
         if !self.flags.adaptive_draft_depth || self.step_calls % PROBE_EVERY != 0 {
             return depth;
         }
-        let unmeasured = |d: usize| self.step_n.get(d).copied().unwrap_or(0) < STEP_MIN_SAMPLES;
+        let legacy_unmeasured =
+            |d: usize| self.step_n.get(d).copied().unwrap_or(0) < STEP_MIN_SAMPLES;
+        let split_unmeasured = |d: usize| {
+            self.spec_costs
+                .get(&self.cost_context)
+                .is_none_or(|c| c.verify_n.get(d).copied().unwrap_or(0) < STEP_MIN_SAMPLES)
+        };
         [depth + 1, depth.wrapping_sub(1)]
             .into_iter()
-            .find(|&d| (self.min_depth..=self.max_depth).contains(&d) && unmeasured(d))
+            .find(|&d| {
+                (self.min_depth..=self.max_depth).contains(&d)
+                    && legacy_unmeasured(d)
+                    && split_unmeasured(d)
+            })
             .unwrap_or(depth)
     }
 
@@ -75,8 +258,78 @@ impl Scheduler {
             self.step_n.resize(rows, 0);
         }
         let i = rows - 1;
-        self.step_us[i] = if self.step_n[i] == 0 { us } else { 0.8 * self.step_us[i] + 0.2 * us };
+        self.step_us[i] = if self.step_n[i] == 0 {
+            us
+        } else {
+            0.8 * self.step_us[i] + 0.2 * us
+        };
         self.step_n[i] = self.step_n[i].saturating_add(1);
+    }
+
+    pub fn record_speculative_step(
+        &mut self,
+        context_tokens: usize,
+        rows: usize,
+        draft_us: f64,
+        verify_us: f64,
+    ) {
+        self.record_speculative_step_with_basis(
+            context_tokens,
+            rows,
+            draft_us,
+            verify_us,
+            rows.saturating_sub(1),
+        );
+    }
+
+    pub fn record_speculative_step_with_basis(
+        &mut self,
+        context_tokens: usize,
+        rows: usize,
+        draft_us: f64,
+        verify_us: f64,
+        draft_basis: usize,
+    ) {
+        if rows == 0 || !verify_us.is_finite() || verify_us <= 0.0 {
+            return;
+        }
+        self.cost_context = context_tokens / 1024;
+        let costs = self.spec_costs.entry(self.cost_context).or_default();
+        if costs.verify_us.len() < rows {
+            costs.verify_us.resize(rows, 0.0);
+            costs.verify_n.resize(rows, 0);
+            costs.verify_seed.resize(rows, 0.0);
+        }
+        let i = rows - 1;
+        observe_cost(
+            &mut costs.verify_us[i],
+            &mut costs.verify_n[i],
+            &mut costs.verify_seed[i],
+            verify_us,
+        );
+        let depth = rows - 1;
+        if depth == 0 || !draft_us.is_finite() || draft_us <= 0.0 {
+            return;
+        }
+        if costs.draft_us.len() < depth {
+            costs.draft_us.resize(depth, 0.0);
+            costs.draft_n.resize(depth, 0);
+            costs.draft_seed.resize(depth, 0.0);
+        }
+        let per_draft = draft_us / draft_basis.max(1) as f64;
+        observe_cost(
+            &mut costs.draft_us[i - 1],
+            &mut costs.draft_n[i - 1],
+            &mut costs.draft_seed[i - 1],
+            per_draft,
+        );
+        let save = self.calibration.as_mut().is_some_and(|store| {
+            store.dirty = store.dirty.saturating_add(1);
+            store.dirty >= CALIBRATION_SAVE_EVERY
+        });
+        if save {
+            self.save_calibration();
+        }
     }
 
     /// Measured (or linearly interpolated) step time for `rows` rows.
@@ -95,15 +348,29 @@ impl Scheduler {
         if known.len() < 2 {
             return None;
         }
-        // Least-squares line through the measured row counts.
         let n = known.len() as f64;
-        let (sx, sy) = known.iter().fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
-        let (mx, my) = (sx / n, sy / n);
-        let (sxy, sxx) = known
+        let (sx, sy) = known
             .iter()
-            .fold((0.0, 0.0), |(a, b), (x, y)| (a + (x - mx) * (y - my), b + (x - mx) * (x - mx)));
+            .fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
+        let (mx, my) = (sx / n, sy / n);
+        let (sxy, sxx) = known.iter().fold((0.0, 0.0), |(a, b), (x, y)| {
+            (a + (x - mx) * (y - my), b + (x - mx) * (x - mx))
+        });
         let slope = if sxx > 0.0 { (sxy / sxx).max(0.0) } else { 0.0 };
         Some((my + slope * (rows as f64 - mx)).max(1.0))
+    }
+
+    fn split_step_cost(&self, rows: usize) -> Option<f64> {
+        let i = rows.checked_sub(1)?;
+        let costs = self.spec_costs.get(&self.cost_context)?;
+        let verify = *costs.verify_us.get(i)?;
+        let draft = *costs.draft_us.get(i - 1)?;
+        if costs.verify_n.get(i).copied().unwrap_or(0) < STEP_MIN_SAMPLES
+            || costs.draft_n.get(i - 1).copied().unwrap_or(0) < STEP_MIN_SAMPLES
+        {
+            return None;
+        }
+        Some(verify + i as f64 * draft)
     }
 
     /// DSpark / MiMo-style depth: of the current depth and its neighbours,
@@ -112,12 +379,19 @@ impl Scheduler {
     /// measured step time for d + 1 rows. `None` while those costs are
     /// unknown.
     fn throughput_depth(&self, q: &[f64]) -> Option<usize> {
-        let tokens = |d: usize| 1.0 + (1..=d).map(|k| q.iter().take(k).product::<f64>()).sum::<f64>();
+        let tokens = |d: usize| {
+            1.0 + (1..=d)
+                .map(|k| q.iter().take(k).product::<f64>())
+                .sum::<f64>()
+        };
         let lo = self.draft_depth.saturating_sub(1).max(self.min_depth);
         let hi = (self.draft_depth + 1).min(self.max_depth);
         let mut best = (self.draft_depth, f64::MIN);
         for d in lo..=hi {
-            let rate = tokens(d) / self.step_cost(d + 1)?;
+            let cost = self
+                .split_step_cost(d + 1)
+                .or_else(|| self.step_cost(d + 1))?;
+            let rate = tokens(d) / cost;
             // Ties keep the current depth.
             if rate > best.1 * (1.0 + 1e-9) || (d == self.draft_depth && rate >= best.1) {
                 best = (d, rate);
@@ -189,24 +463,53 @@ impl Scheduler {
                 prior
             })
             .collect();
-        let want = self
-            .throughput_depth(&q)
-            .unwrap_or_else(|| next_draft_depth(&q, self.draft_depth, self.min_depth, self.max_depth));
+        let want = self.throughput_depth(&q).unwrap_or_else(|| {
+            next_draft_depth(&q, self.draft_depth, self.min_depth, self.max_depth)
+        });
         // Act only when the estimate has asked for the same move several
         // verifies in a row, so sampling noise does not move depth.
         let (deeper, shallower) = (want > self.draft_depth, want < self.draft_depth);
-        self.want_deeper = if deeper { self.want_deeper + 1 } else { 0 };
-        self.want_shallower = if shallower { self.want_shallower + 1 } else { 0 };
-        if self.want_deeper >= DEPTH_PATIENCE || self.want_shallower >= DEPTH_PATIENCE {
+        let split = self
+            .spec_costs
+            .get(&self.cost_context)
+            .is_some_and(|c| c.verify_n.iter().any(|&n| n > 0));
+        let (want_deeper, want_shallower) = if split {
+            let costs = self.spec_costs.entry(self.cost_context).or_default();
+            costs.want_deeper = if deeper { costs.want_deeper + 1 } else { 0 };
+            costs.want_shallower = if shallower {
+                costs.want_shallower + 1
+            } else {
+                0
+            };
+            (costs.want_deeper, costs.want_shallower)
+        } else {
+            self.want_deeper = if deeper { self.want_deeper + 1 } else { 0 };
+            self.want_shallower = if shallower {
+                self.want_shallower + 1
+            } else {
+                0
+            };
+            (self.want_deeper, self.want_shallower)
+        };
+        if want_deeper >= DEPTH_PATIENCE || want_shallower >= DEPTH_PATIENCE {
             self.draft_depth = want;
-            self.want_deeper = 0;
-            self.want_shallower = 0;
+            if split {
+                let costs = self.spec_costs.entry(self.cost_context).or_default();
+                costs.want_deeper = 0;
+                costs.want_shallower = 0;
+            } else {
+                self.want_deeper = 0;
+                self.want_shallower = 0;
+            }
         }
         if active_requests > 1 {
             self.draft_depth = self
                 .draft_depth
                 .saturating_sub(active_requests.saturating_sub(1))
                 .max(self.min_depth);
+        }
+        if split {
+            self.spec_costs.entry(self.cost_context).or_default().depth = Some(self.draft_depth);
         }
     }
 
@@ -255,6 +558,18 @@ impl Scheduler {
             consecutive_prefill,
             max_consecutive_prefill,
         )
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if self
+            .calibration
+            .as_ref()
+            .is_some_and(|store| store.dirty > 0)
+        {
+            self.save_calibration();
+        }
     }
 }
 
@@ -387,7 +702,9 @@ mod tests {
         let depth = s.draft_depth as u64;
         let mut accepted = 0;
         while accepted < depth {
-            *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let pk = p[(accepted as usize).min(p.len() - 1)];
             if ((*rng >> 11) as f64 / (1u64 << 53) as f64) >= pk {
                 break;
@@ -416,7 +733,10 @@ mod tests {
         let at3 = depths.iter().filter(|&&d| d == 3).count();
         let changes = depths.windows(2).filter(|w| w[0] != w[1]).count();
         assert!(at3 >= 130, "depth 3 on {at3}/200 steps: {depths:?}");
-        assert!(changes <= 6, "{changes} depth changes in 200 steps: {depths:?}");
+        assert!(
+            changes <= 6,
+            "{changes} depth changes in 200 steps: {depths:?}"
+        );
     }
 
     #[test]
@@ -435,7 +755,11 @@ mod tests {
         for _ in 0..15 {
             verify_step_by_position(&mut s, &profile, &mut rng);
         }
-        assert!(s.draft_depth <= 4, "depth {} 15 spans after the easy start (was {easy})", s.draft_depth);
+        assert!(
+            s.draft_depth <= 4,
+            "depth {} 15 spans after the easy start (was {easy})",
+            s.draft_depth
+        );
     }
 
     #[test]
@@ -453,8 +777,14 @@ mod tests {
         }
         let changes = depths.windows(2).filter(|w| w[0] != w[1]).count();
         let mean = depths.iter().sum::<usize>() as f64 / depths.len() as f64;
-        assert!((2.5..=3.5).contains(&mean), "mean depth {mean}, depths {depths:?}");
-        assert!(changes <= 20, "{changes} depth changes in 200 steps: {depths:?}");
+        assert!(
+            (2.5..=3.5).contains(&mean),
+            "mean depth {mean}, depths {depths:?}"
+        );
+        assert!(
+            changes <= 20,
+            "{changes} depth changes in 200 steps: {depths:?}"
+        );
     }
 
     #[test]
@@ -466,7 +796,10 @@ mod tests {
         }
         let settled = s.draft_depth;
         s.record_acceptance(0, settled as u64);
-        assert_eq!(s.draft_depth, settled, "one rejected span must not move depth");
+        assert_eq!(
+            s.draft_depth, settled,
+            "one rejected span must not move depth"
+        );
     }
 
     #[test]
@@ -489,7 +822,9 @@ mod tests {
         let depth = s.step_depth() as u64;
         let mut accepted = 0;
         while accepted < depth {
-            *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             if ((*rng >> 11) as f64 / (1u64 << 53) as f64) >= p {
                 break;
             }
@@ -547,6 +882,122 @@ mod tests {
         assert!(probes >= 1, "never probed: {depths:?}");
         assert!(probes <= 8, "probed {probes} of 64 steps: {depths:?}");
         assert!(depths.iter().all(|&d| (3..=5).contains(&d)));
+    }
+
+    #[test]
+    fn split_cost_model_prices_drafting_separately_from_verify() {
+        fn settled(draft_us: f64) -> usize {
+            let mut s = adaptive(2, 8);
+            for _ in 0..40 {
+                for rows in 2..=9 {
+                    s.record_speculative_step(0, rows, draft_us * (rows - 1) as f64, 100.0);
+                }
+                let proposed = s.draft_depth as u64;
+                s.record_acceptance(proposed, proposed);
+            }
+            s.draft_depth
+        }
+
+        assert_eq!(settled(10_000.0), 2, "expensive drafts must stay shallow");
+        assert!(
+            settled(1.0) >= 6,
+            "cheap drafts must exploit the verify batch"
+        );
+    }
+
+    #[test]
+    fn cost_buckets_keep_short_and_long_depth_decisions_independent() {
+        let mut s = adaptive(2, 8);
+        for _ in 0..40 {
+            for rows in 2..=9 {
+                s.record_speculative_step(100, rows, (rows - 1) as f64, 100.0);
+                s.record_speculative_step(8_192, rows, 10_000.0 * (rows - 1) as f64, 100.0);
+            }
+            s.step_depth_at(100);
+            let proposed = s.draft_depth as u64;
+            s.record_acceptance(proposed, proposed);
+            s.step_depth_at(8_192);
+            s.record_acceptance(proposed, proposed);
+        }
+        s.step_depth_at(100);
+        s.record_acceptance(s.draft_depth as u64, s.draft_depth as u64);
+        let short = s.step_depth_at(100);
+        s.step_depth_at(8_192);
+        s.record_acceptance(2, 2);
+        assert!(short >= 6, "short context should stay deep: {short}");
+        assert_eq!(
+            s.step_depth_at(8_192),
+            2,
+            "8K context has its own expensive drafts"
+        );
+    }
+
+    #[test]
+    fn cost_model_seeds_fast_clips_outliers_and_ignores_invalid_timings() {
+        let mut s = adaptive(2, 8);
+        for cycle in 0..40 {
+            let (draft, verify) = if cycle == 0 || cycle > 5 {
+                (1e9, 1e9)
+            } else {
+                (1.0, 100.0)
+            };
+            for rows in 2..=9 {
+                s.record_speculative_step(0, rows, draft * (rows - 1) as f64, verify);
+            }
+            s.step_depth_at(0);
+            let proposed = s.draft_depth as u64;
+            s.record_acceptance(proposed, proposed);
+        }
+        let settled = s.step_depth_at(0);
+        assert!(
+            settled >= 6,
+            "one desktop stall must not dominate cost: {settled}"
+        );
+        for rows in 2..=9 {
+            s.record_speculative_step(0, rows, f64::NAN, -1.0);
+        }
+        assert_eq!(s.step_depth_at(0), settled);
+    }
+
+    #[test]
+    fn calibration_round_trips_only_for_the_same_model_gpu_and_build() {
+        let dir =
+            std::env::temp_dir().join(format!("allpaca-q5-calibration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf.allpaca.spec-depth.json");
+        let mut saved = adaptive(2, 8);
+        saved.configure_calibration(&path, "model-a", "build-a", "target-a", "draft-a", "mtp");
+        for _ in 0..40 {
+            for rows in 2..=9 {
+                saved.record_speculative_step(0, rows, (rows - 1) as f64, 100.0);
+            }
+            saved.step_depth_at(0);
+            let proposed = saved.draft_depth as u64;
+            saved.record_acceptance(proposed, proposed);
+        }
+        let expected = saved.step_depth_at(0);
+        assert!(expected >= 6);
+        saved.save_calibration();
+
+        let mut loaded = adaptive(2, 8);
+        loaded.configure_calibration(&path, "model-a", "build-a", "target-a", "draft-a", "mtp");
+        assert_eq!(loaded.step_depth_at(0), expected);
+        let mut other_build = adaptive(2, 8);
+        other_build
+            .configure_calibration(&path, "model-a", "build-b", "target-a", "draft-a", "mtp");
+        assert_eq!(other_build.step_depth_at(0), 2);
+        let mut other_provider = adaptive(2, 8);
+        other_provider.configure_calibration(
+            &path, "model-a", "build-a", "target-a", "draft-a", "dflash2",
+        );
+        assert_eq!(other_provider.step_depth_at(0), 2);
+
+        std::fs::write(&path, "not json").unwrap();
+        let mut corrupt = adaptive(2, 8);
+        corrupt.configure_calibration(&path, "model-a", "build-a", "target-a", "draft-a", "mtp");
+        assert_eq!(corrupt.step_depth_at(0), 2);
+        drop(saved);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

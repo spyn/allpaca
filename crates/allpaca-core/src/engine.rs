@@ -1835,6 +1835,47 @@ impl Engine {
         self.load_model_path_discovered(&resolved, preferred.as_deref())
     }
 
+    fn configure_spec_calibration(&self, path: &std::path::Path) {
+        let Some(build) = engine_build_id() else {
+            return;
+        };
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        let provider = self
+            .config
+            .speculative
+            .providers
+            .iter()
+            .map(|kind| format!("{kind:?}"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let provider_tag = provider
+            .to_lowercase()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+        let sidecar = path.with_file_name(format!(
+            "{}.allpaca.spec-depth.{}.json",
+            name.to_string_lossy(),
+            provider_tag
+        ));
+        let device = |id| {
+            self.inventory
+                .devices
+                .iter()
+                .find(|device| device.id == id)
+                .map(|device| format!("{:?}:{}:{}", device.kind, device.id, device.name))
+                .unwrap_or_else(|| format!("unknown:{id}"))
+        };
+        let model = format!("{}:{}", self.config.model.id, path.display());
+        let target = device(self.inventory.target_device);
+        let draft = device(self.inventory.draft_device);
+        if let Ok(mut inner) = self.lock() {
+            inner.scheduler.configure_calibration(
+                &sidecar, &model, build, &target, &draft, &provider,
+            );
+        }
+    }
+
     fn load_model_path_discovered(
         &self,
         path: &std::path::Path,
@@ -1844,6 +1885,7 @@ impl Engine {
             return self.load_edge0(path);
         }
         let discovered = discover_checkpoint(path, preferred)?;
+        self.configure_spec_calibration(&discovered.weights);
         match discovered.kind {
             CheckpointKind::Safetensors => self.load_safetensors(&discovered.weights),
             CheckpointKind::Onnx => self.load_onnx(&discovered.weights),
@@ -3998,12 +4040,19 @@ impl Engine {
                 || inner.dflash2.is_some())
             && !suppress_draft
             && !crowded;
-        // One DFlash2 pass drafts the whole block at the same cost, so it
-        // always proposes the full block; verify then takes what matches.
-        let step_depth = match (speculate, inner.dflash2.as_ref()) {
+        let context_tokens = request(&inner, id)?.tokens.len();
+        let dflash_depth = inner.dflash2.as_ref().map(|p| p.spec().block_size - 1);
+        let step_depth = match (speculate, dflash_depth) {
             (false, _) => 0,
-            (true, Some(p)) => (p.spec().block_size - 1).min(self.config.speculative.max_depth),
-            (true, None) => inner.scheduler.step_depth(),
+            (true, Some(full)) if !inner.flags.adaptive_draft_depth => {
+                full.min(self.config.speculative.max_depth)
+            }
+            (true, Some(full)) => inner
+                .scheduler
+                .step_depth_at(context_tokens)
+                .min(full)
+                .min(self.config.speculative.max_depth),
+            (true, None) => inner.scheduler.step_depth_at(context_tokens),
         };
         let (json_mode, json_prefix, temperature, remaining, depth, has_grammar) = {
             let active = request(&inner, id)?;
@@ -4082,7 +4131,8 @@ impl Engine {
             #[cfg(feature = "vulkan")]
             vulkan: self.vulkan.as_deref(),
         };
-        let step_started = Instant::now();
+        let mut draft_us = 0.0;
+        let mut verify_us = 0.0;
         let produced = if use_tree {
             let max_nodes = self.config.speculative.tree.max_nodes.max(1);
             let draft = if inner.flags.draft_model_speculation {
@@ -4111,6 +4161,7 @@ impl Engine {
                 &hooks,
             )?
         } else {
+            let draft_started = Instant::now();
             let drafts = if speculate && depth > 0 {
                 propose_drafts(
                     &mut inner,
@@ -4123,7 +4174,9 @@ impl Engine {
             } else {
                 Vec::new()
             };
-            verify_and_sample(
+            draft_us = draft_started.elapsed().as_secs_f64() * 1e6;
+            let verify_started = Instant::now();
+            let produced = verify_and_sample(
                 &mut inner,
                 id,
                 drafts,
@@ -4136,14 +4189,23 @@ impl Engine {
                 temperature,
                 micro_batch,
                 &hooks,
-            )?
+            )?;
+            verify_us = verify_started.elapsed().as_secs_f64() * 1e6;
+            produced
         };
-        // Cost of this step by rows verified, for the throughput-aware depth
-        // (a staged batched span finishes elsewhere and is not a solo step).
+        // A staged batched span has no tokens yet and finishes elsewhere.
         if speculate && !use_tree && !produced.tokens.is_empty() {
-            inner.scheduler.record_step_time(
+            let draft_basis = inner
+                .dflash2
+                .as_ref()
+                .map(|p| p.spec().block_size - 1)
+                .unwrap_or(produced.proposed as usize);
+            inner.scheduler.record_speculative_step_with_basis(
+                context_tokens,
                 produced.proposed as usize + 1,
-                step_started.elapsed().as_secs_f64() * 1e6,
+                draft_us,
+                verify_us,
+                draft_basis,
             );
         }
         if produced.tokens.is_empty()
