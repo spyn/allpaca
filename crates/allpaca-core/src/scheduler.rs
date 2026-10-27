@@ -227,24 +227,39 @@ impl Scheduler {
         }
         self.step_calls = self.step_calls.wrapping_add(1);
         let depth = self.draft_depth;
-        if !self.flags.adaptive_draft_depth || self.step_calls % PROBE_EVERY != 0 {
-            return depth;
-        }
-        let legacy_unmeasured =
-            |d: usize| self.step_n.get(d).copied().unwrap_or(0) < STEP_MIN_SAMPLES;
-        let split_unmeasured = |d: usize| {
-            self.spec_costs
-                .get(&self.cost_context)
-                .is_none_or(|c| c.verify_n.get(d).copied().unwrap_or(0) < STEP_MIN_SAMPLES)
+        let selected = if !self.flags.adaptive_draft_depth
+            || self.use_legacy_long_mtp()
+            || self.step_calls % PROBE_EVERY != 0
+        {
+            depth
+        } else {
+            let legacy_unmeasured =
+                |d: usize| self.step_n.get(d).copied().unwrap_or(0) < STEP_MIN_SAMPLES;
+            let split_unmeasured = |d: usize| {
+                self.spec_costs
+                    .get(&self.cost_context)
+                    .is_none_or(|c| c.verify_n.get(d).copied().unwrap_or(0) < STEP_MIN_SAMPLES)
+            };
+            [depth + 1, depth.wrapping_sub(1)]
+                .into_iter()
+                .find(|&d| {
+                    (self.min_depth..=self.max_depth).contains(&d)
+                        && legacy_unmeasured(d)
+                        && split_unmeasured(d)
+                })
+                .unwrap_or(depth)
         };
-        [depth + 1, depth.wrapping_sub(1)]
-            .into_iter()
-            .find(|&d| {
-                (self.min_depth..=self.max_depth).contains(&d)
-                    && legacy_unmeasured(d)
-                    && split_unmeasured(d)
-            })
-            .unwrap_or(depth)
+        if depth_debug_enabled() {
+            let costs = self.spec_costs.get(&self.cost_context);
+            tracing::info!(
+                bucket = self.cost_context,
+                depth,
+                selected,
+                costs = ?costs,
+                "speculative depth decision"
+            );
+        }
+        selected
     }
 
     /// Wall time of one speculative step that verified `rows` rows (drafts
@@ -360,6 +375,14 @@ impl Scheduler {
         Some((my + slope * (rows as f64 - mx)).max(1.0))
     }
 
+    fn use_legacy_long_mtp(&self) -> bool {
+        self.cost_context >= 8
+            && self
+                .calibration
+                .as_ref()
+                .is_some_and(|store| store.draft_provider.eq_ignore_ascii_case("mtp"))
+    }
+
     fn split_step_cost(&self, rows: usize) -> Option<f64> {
         let i = rows.checked_sub(1)?;
         let costs = self.spec_costs.get(&self.cost_context)?;
@@ -463,9 +486,12 @@ impl Scheduler {
                 prior
             })
             .collect();
-        let want = self.throughput_depth(&q).unwrap_or_else(|| {
-            next_draft_depth(&q, self.draft_depth, self.min_depth, self.max_depth)
-        });
+        let legacy = next_draft_depth(&q, self.draft_depth, self.min_depth, self.max_depth);
+        let want = if self.use_legacy_long_mtp() {
+            legacy
+        } else {
+            self.throughput_depth(&q).unwrap_or(legacy)
+        };
         // Act only when the estimate has asked for the same move several
         // verifies in a row, so sampling noise does not move depth.
         let (deeper, shallower) = (want > self.draft_depth, want < self.draft_depth);
@@ -635,6 +661,11 @@ pub fn pick_runnable(candidates: &[(u64, Instant)], after_id: Option<u64>) -> Op
         }
     }
     tied.first().copied()
+}
+
+fn depth_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ALLPACA_SPEC_DEPTH_DEBUG").is_some())
 }
 
 /// Acceptance-aware adaptive speculation (CODE_EXAMPLES example 6).
@@ -903,6 +934,35 @@ mod tests {
             settled(1.0) >= 6,
             "cheap drafts must exploit the verify batch"
         );
+    }
+
+    #[test]
+    fn split_cost_cannot_undercut_legacy_acceptance_depth() {
+        let dir = std::env::temp_dir().join(format!("allpaca-q5-long-mtp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf.allpaca.spec-depth.mtp.json");
+        let mut s = adaptive(2, 8);
+        s.configure_calibration(&path, "model-a", "build-a", "target-a", "draft-a", "mtp");
+        s.draft_depth = 3;
+        for _ in 0..40 {
+            for rows in 2..=9 {
+                s.record_speculative_step(8_192, rows, 10_000.0 * (rows - 1) as f64, 100.0);
+            }
+            s.step_depth_at(8_192);
+            s.record_acceptance(2, 3);
+        }
+        assert_eq!(s.step_depth_at(8_192), 3);
+        for _ in 0..40 {
+            for rows in 2..=9 {
+                s.record_speculative_step(8_192, rows, (rows - 1) as f64, 100.0);
+            }
+            s.step_depth_at(8_192);
+            s.record_acceptance(2, 3);
+        }
+        assert_eq!(s.step_depth_at(8_192), 3);
+        assert!((0..64).map(|_| s.step_depth_at(8_192)).all(|d| d == 3));
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
