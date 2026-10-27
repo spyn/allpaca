@@ -11,6 +11,7 @@ mod model_api;
 mod model_scan;
 mod model_settings;
 mod otlp_push;
+mod security;
 mod systemone;
 mod tune;
 mod ui;
@@ -21,9 +22,9 @@ use std::time::Duration;
 
 use allpaca_core::Engine;
 use allpaca_types::Config;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use crate::cli::Cli;
 
@@ -90,7 +91,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.config_path = cli.config.clone();
     // Saved API settings (on/off, lockdown, keys, listen address). A
     // `--host` / `--port` on the command line wins for this run.
-    let api_store = api_access::ApiStore::open(api_access::ApiStore::path_for(cli.config.as_deref()));
+    let api_store =
+        api_access::ApiStore::open(api_access::ApiStore::path_for(cli.config.as_deref()));
     let saved_api = api_store.get();
     state.api = Arc::new(api_store);
     let host = match (&cli.host, saved_api.host) {
@@ -118,7 +120,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let mut stop = Some(stop);
-        let service = app.clone().into_make_service_with_connect_info::<SocketAddr>();
+        let service = app
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
         let mut server = tokio::spawn(async move {
             axum::serve(listener, service)
                 .with_graceful_shutdown(async move {

@@ -20,10 +20,10 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, AuthState};
 use crate::engine_slot::{EngineSlot, EngineStatus};
-use crate::model_settings::SettingsStore;
 use crate::host::{HostSampler, HostSnapshot};
 use crate::image_url::load_image_url;
 use crate::logs::LogRing;
+use crate::model_settings::SettingsStore;
 use crate::ui;
 
 #[derive(Clone)]
@@ -34,6 +34,8 @@ pub struct AppState {
     pub config: Config,
     pub auth: AuthState,
     pub logs: LogRing,
+    pub security: Arc<crate::security::GuardrailService>,
+    pub intent_verifier: Arc<dyn crate::security::IntentVerifier>,
     pub host: Arc<HostSampler>,
     /// The TOML file the server was started with (shown on the Settings page).
     pub config_path: Option<std::path::PathBuf>,
@@ -46,12 +48,22 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(engine: Arc<Engine>, config: Config, auth: AuthState, logs: LogRing) -> Self {
+        let engine = EngineSlot::new(engine, config.clone());
+        let intent_verifier = Arc::new(crate::security::EngineIntentVerifier::new(
+            engine.clone(),
+            std::time::Duration::from_secs(30),
+        ));
         Self {
             settings: Arc::new(SettingsStore::open(&config)),
-            engine: EngineSlot::new(engine, config.clone()),
+            engine,
             config,
             auth,
             logs,
+            security: Arc::new(crate::security::GuardrailService::new(
+                Arc::new(crate::security::UnavailableToolExecutor),
+                std::time::Duration::from_secs(300),
+            )),
+            intent_verifier,
             host: Arc::new(HostSampler::new()),
             config_path: None,
             api: Arc::new(crate::api_access::ApiStore::in_memory()),
@@ -96,6 +108,18 @@ struct StatusBody {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/tools/calls",
+            post(crate::security::api::create_tool_call),
+        )
+        .route(
+            "/v1/tools/guardrails/{id}",
+            get(crate::security::api::get_guardrail_case),
+        )
+        .route(
+            "/v1/tools/guardrails/{id}/confirm",
+            post(crate::security::api::confirm_guardrail_case),
+        )
         .route("/v1/systemone", post(crate::systemone::systemone))
         .route("/v1/models", get(list_models))
         .route("/v1/status", get(status))
@@ -398,11 +422,8 @@ async fn chat_completions(
     }
 
     if state.config.engine.max_active_requests > 1 {
-        let mut stream = Box::pin(served.generate_stream_multimodal(
-            prompt.clone(),
-            images,
-            params,
-        ));
+        let mut stream =
+            Box::pin(served.generate_stream_multimodal(prompt.clone(), images, params));
         let mut text = String::new();
         let mut completion_tokens = 0usize;
         let mut finish = FinishReason::Stop;
@@ -895,6 +916,350 @@ mod tests {
         )
     }
 
+    struct FakeVerifier;
+    impl crate::security::IntentVerifier for FakeVerifier {
+        fn verify<'a>(
+            &'a self,
+            prompt: &'a str,
+            _call: &'a crate::security::ToolCall,
+        ) -> crate::security::BoxFuture<'a, crate::security::Verification> {
+            assert!(prompt.contains("download this file"));
+            Box::pin(async { crate::security::parse_verification("INTENT_ALIGNED\nrequested") })
+        }
+    }
+
+    struct FakeExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::security::ToolExecutor for FakeExecutor {
+        fn execute<'a>(
+            &'a self,
+            _call: &'a crate::security::ToolCall,
+        ) -> crate::security::BoxFuture<'a, Result<serde_json::Value, String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(serde_json::json!({"ok": true})) })
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_tool_call_waits_for_verification_and_single_use_confirmation() {
+        let mut state = authed_state("secret");
+        let executor = Arc::new(FakeExecutor {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.security = Arc::new(crate::security::GuardrailService::new(
+            executor.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        state.intent_verifier = Arc::new(FakeVerifier);
+        let app = router(state);
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "session_id": "session-1",
+            "user_prompt": "download this file",
+            "call": {"name": "shell", "arguments": {"command": "curl https://example.test/x"}}
+        })
+        .to_string();
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/calls")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/calls")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+        let bytes = created.into_body().collect().await.unwrap().to_bytes();
+        let case: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(case["status"], "pending_verification");
+        let id = case["id"].as_str().unwrap().to_string();
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut ready = false;
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tools/guardrails/{id}"))
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let current: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if current["status"] == "pending_confirmation" {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(ready, "verification did not complete");
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let confirmed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tools/guardrails/{id}/confirm"))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"allow\":true}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status(), StatusCode::OK);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let repeated = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tools/guardrails/{id}/confirm"))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"allow\":true}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::CONFLICT);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct AnomalousVerifier;
+    impl crate::security::IntentVerifier for AnomalousVerifier {
+        fn verify<'a>(
+            &'a self,
+            _prompt: &'a str,
+            _call: &'a crate::security::ToolCall,
+        ) -> crate::security::BoxFuture<'a, crate::security::Verification> {
+            Box::pin(async { crate::security::parse_verification("perhaps") })
+        }
+    }
+
+    #[tokio::test]
+    async fn guardrail_bypass_executes_suspicious_calls_without_verification() {
+        let mut state = authed_state("secret");
+        state.config.security.enable_guardrails = false;
+        let executor = Arc::new(FakeExecutor {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.security = Arc::new(crate::security::GuardrailService::new(
+            executor.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        state.intent_verifier = Arc::new(AnomalousVerifier);
+        let response = router(state).oneshot(
+            Request::builder().method("POST").uri("/v1/tools/calls")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "user_prompt": "download this file",
+                    "call": {"name": "shell", "arguments": {"command": "curl https://example.test"}}
+                }).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let case: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(case["status"], "allowed");
+        assert_eq!(case["execution_result"]["ok"], true);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_suspicious_structured_tool_executes_without_a_case() {
+        let mut state = authed_state("secret");
+        let executor = Arc::new(FakeExecutor {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.security = Arc::new(crate::security::GuardrailService::new(
+            executor.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/calls")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "user_prompt": "show the documentation",
+                            "call": {"name": "search", "arguments": {"query": "curl documentation"}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["status"], "allowed");
+        assert_eq!(result["execution_result"]["ok"], true);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn denial_anomalous_intent_and_expiry_never_execute() {
+        let mut state = authed_state("secret");
+        let executor = Arc::new(FakeExecutor {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.security = Arc::new(crate::security::GuardrailService::new(
+            executor.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        state.intent_verifier = Arc::new(FakeVerifier);
+        let app = router(state.clone());
+        let body = serde_json::json!({
+            "user_prompt": "download this file",
+            "call": {"name": "shell", "arguments": {"command": "curl https://example.test"}}
+        })
+        .to_string();
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/calls")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = created.into_body().collect().await.unwrap().to_bytes();
+        let case: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = case["id"].as_str().unwrap();
+        let _ = state.security.record_verification(
+            id,
+            crate::security::parse_verification("INTENT_ALIGNED\nrequested"),
+        );
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tools/guardrails/{id}/confirm"))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"allow\":false}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let bytes = denied.into_body().collect().await.unwrap().to_bytes();
+        let rejection: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rejection["error"]["type"], "security_rejected");
+
+        state.intent_verifier = Arc::new(AnomalousVerifier);
+        let app = router(state.clone());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/calls")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = created.into_body().collect().await.unwrap().to_bytes();
+        let case: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = case["id"].as_str().unwrap();
+        let _ = state
+            .security
+            .record_verification(id, crate::security::parse_verification("perhaps"));
+        let blocked = state.security.get(id).unwrap();
+        assert_eq!(blocked.status, crate::security::GuardrailStatus::Blocked);
+        let confirmed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tools/guardrails/{id}/confirm"))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"allow\":true}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status(), StatusCode::CONFLICT);
+
+        state.security = Arc::new(crate::security::GuardrailService::new(
+            executor.clone(),
+            std::time::Duration::ZERO,
+        ));
+        state.intent_verifier = Arc::new(FakeVerifier);
+        let app = router(state.clone());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/calls")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = created.into_body().collect().await.unwrap().to_bytes();
+        let case: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = case["id"].as_str().unwrap();
+        let _ = state.security.record_verification(
+            id,
+            crate::security::parse_verification("INTENT_ALIGNED\nrequested"),
+        );
+        let expired = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tools/guardrails/{id}/confirm"))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"allow\":true}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::GONE);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn systemone_needs_a_decision_model() {
         let res = router(test_state())
@@ -913,7 +1278,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["message"], "the loaded model is not a decision model");
+        assert_eq!(
+            body["error"]["message"],
+            "the loaded model is not a decision model"
+        );
     }
 
     #[tokio::test]
@@ -1295,15 +1663,22 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: MessageContent::Parts(vec![
-                ContentPart::Text { text: "Compare ".into() },
+                ContentPart::Text {
+                    text: "Compare ".into(),
+                },
                 image(),
-                ContentPart::Text { text: " and ".into() },
+                ContentPart::Text {
+                    text: " and ".into(),
+                },
                 image(),
             ]),
         }];
         let (turns, images) = flatten_chat_messages(&messages, Some("<IMG>")).unwrap();
         // Qwen-VL chat templates concatenate content parts with no separator.
-        assert_eq!(turns, vec![("user".to_string(), "Compare <IMG> and <IMG>".to_string())]);
+        assert_eq!(
+            turns,
+            vec![("user".to_string(), "Compare <IMG> and <IMG>".to_string())]
+        );
         assert_eq!(images.len(), 2);
         // Without a marker (prefix encoders), parts join as before.
         let (turns, _) = flatten_chat_messages(&messages, None).unwrap();
@@ -1432,7 +1807,11 @@ mod tests {
             return;
         };
         let state = test_state();
-        state.engine().unwrap().set_vision_encoder(Arc::new(StubEnc)).unwrap();
+        state
+            .engine()
+            .unwrap()
+            .set_vision_encoder(Arc::new(StubEnc))
+            .unwrap();
         let text_only = state
             .engine()
             .unwrap()
@@ -1623,7 +2002,11 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
         let url = format!("data:image/jpeg;base64,{b64}");
         let state = test_state();
-        state.engine().unwrap().set_vision_encoder(Arc::new(StubEnc)).unwrap();
+        state
+            .engine()
+            .unwrap()
+            .set_vision_encoder(Arc::new(StubEnc))
+            .unwrap();
         let app = router(state);
         let body = serde_json::json!({
             "model": "synthetic",
@@ -1714,7 +2097,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(!text.contains("hunter2") && !text.contains("tok-xyz"), "{text}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("tok-xyz"),
+            "{text}"
+        );
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["config"]["http"]["password"], "(set, hidden)");
         assert_eq!(json["config"]["rpc"]["token"], "(set, hidden)");
@@ -1735,16 +2121,31 @@ mod tests {
                 if let Some(a) = auth {
                     req = req.header("authorization", a);
                 }
-                app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status()
+                app.oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
             }
         };
-        let (pw, k) = (Some("Bearer secret".to_string()), Some(format!("Bearer {key}")));
+        let (pw, k) = (
+            Some("Bearer secret".to_string()),
+            Some(format!("Bearer {key}")),
+        );
 
         // Defaults: a credential is required; a key reaches client endpoints only.
-        assert_eq!(call("GET", "/v1/models", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call("GET", "/v1/models", None).await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(call("GET", "/v1/models", k.clone()).await, StatusCode::OK);
-        assert_eq!(call("GET", "/v1/config", k.clone()).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(call("GET", "/v1/api", k.clone()).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call("GET", "/v1/config", k.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call("GET", "/v1/api", k.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(call("GET", "/v1/config", pw.clone()).await, StatusCode::OK);
         assert_eq!(
             call("GET", "/v1/models", Some("Bearer alp_wrong".into())).await,
@@ -1754,12 +2155,21 @@ mod tests {
         // Lockdown off: client endpoints answer without a key, nothing else does.
         state.api.update(|s| s.require_keys = false).unwrap();
         assert_eq!(call("GET", "/v1/models", None).await, StatusCode::OK);
-        assert_eq!(call("GET", "/v1/config", None).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(call("POST", "/v1/model/reload", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call("GET", "/v1/config", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call("POST", "/v1/model/reload", None).await,
+            StatusCode::UNAUTHORIZED
+        );
 
         // API off: every bearer credential is refused, a WebUI session is not.
         state.api.update(|s| s.enabled = false).unwrap();
-        assert_eq!(call("GET", "/v1/models", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call("GET", "/v1/models", None).await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(call("GET", "/v1/models", k).await, StatusCode::FORBIDDEN);
         assert_eq!(call("GET", "/v1/config", pw).await, StatusCode::FORBIDDEN);
         let session = state.auth.login("secret").unwrap();
@@ -1796,7 +2206,13 @@ mod tests {
                 .unwrap();
             let status = res.status();
             if ep.auth {
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "{} {}", ep.method, ep.path);
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{} {}",
+                    ep.method,
+                    ep.path
+                );
             } else {
                 assert!(
                     status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED,

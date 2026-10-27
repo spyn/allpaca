@@ -62,6 +62,9 @@ pub struct Cli {
     /// Edge0: disable prerouter (reactive expert fill).
     #[arg(long)]
     pub no_prerouter: bool,
+    /// Skip inspection and approval for structured tool calls.
+    #[arg(long)]
+    pub skip_tool_guardrails: bool,
     /// Open the MoE keep-set TUI (does not start the HTTP server).
     #[arg(long)]
     pub tune: bool,
@@ -98,6 +101,7 @@ impl Cli {
             ui_password: self.ui_password.clone(),
             synthetic: self.synthetic,
             json_mode: self.json_mode,
+            skip_tool_guardrails: self.skip_tool_guardrails,
             rpc_endpoints: self.rpc.as_deref().and_then(parse_csv_nonempty),
             rpc_token: self.rpc_token.clone(),
             tensor_split: self.tensor_split.as_deref().and_then(parse_csv_nonempty),
@@ -122,9 +126,18 @@ fn parse_csv_nonempty(raw: &str) -> Option<Vec<String>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts)
+    if parts.is_empty() { None } else { Some(parts) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_tool_guardrails_flag_overrides_the_default() {
+        let cli = Cli::try_parse_from(["allpaca-server", "--skip-tool-guardrails"]).unwrap();
+        assert!(cli.to_overrides().skip_tool_guardrails);
+        let cli = Cli::try_parse_from(["allpaca-server"]).unwrap();
+        assert!(!cli.to_overrides().skip_tool_guardrails);
     }
 }
