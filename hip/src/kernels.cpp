@@ -2354,6 +2354,14 @@ __global__ void __launch_bounds__(32) attention_wmma_prefill_kernel(const float 
 #endif
 }
 
+static void warn_attn_no_scratch_once() {
+    static std::atomic<int> printed{0};
+    if (printed.exchange(1, std::memory_order_relaxed) == 0) {
+        std::fprintf(stderr,
+                     "allpaca: attention decode fell back to the Q-tiled kernel because scratch was unavailable\n");
+    }
+}
+
 /* One query, a head_dim in the DPT bucket: the tiled kernels, sized on DPT.
  * n_q == 1: attention_split_gqa_kernel, its chunks in parallel plus a merge
  * when the row is longer than one chunk. Several rows: the Q-tiled kernel.
@@ -2420,6 +2428,7 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
             }
         }
         /* No scratch: the Q-tiled kernel computes the same chunked row. */
+        warn_attn_no_scratch_once();
     }
     dim3 block(32 * ATTN_QTILE);
     dim3 grid(static_cast<unsigned>((n_q + ATTN_QTILE - 1) / ATTN_QTILE),
@@ -5057,7 +5066,14 @@ struct Q2MoePicks {
 };
 
 /* c + the dot of four signed bytes of a with four bytes of b (b's bytes are 0..127 or signed;
- * here they are the 2-bit codes 0..3). */
+ * here they are the 2-bit codes 0..3). The scalar branch matches
+ * `fallback::dot4_i8_scalar` and warns once; gfx900 is the build target that
+ * takes it. */
+#if !defined(__gfx906__) && !defined(__gfx908__) && !defined(__gfx90a__) && !defined(__gfx942__) && \
+    !defined(__gfx1100__) && !defined(__gfx1101__) && !defined(__gfx1102__) &&                       \
+    !defined(__gfx1200__) && !defined(__gfx1201__)
+__device__ int g_allpaca_dot4_scalar_warned = 0;
+#endif
 __device__ inline int allpaca_dot4_i8(int a, int b, int c) {
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__)
     return __builtin_amdgcn_sdot4(a, b, c, false);
@@ -5065,6 +5081,9 @@ __device__ inline int allpaca_dot4_i8(int a, int b, int c) {
     defined(__gfx1200__) || defined(__gfx1201__)
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
+    if (atomicCAS(&g_allpaca_dot4_scalar_warned, 0, 1) == 0) {
+        printf("allpaca: dot4 i8 using the scalar fallback\n");
+    }
     const int8_t *x = reinterpret_cast<const int8_t *>(&a);
     const int8_t *y = reinterpret_cast<const int8_t *>(&b);
     return c + x[0] * y[0] + x[1] * y[1] + x[2] * y[2] + x[3] * y[3];

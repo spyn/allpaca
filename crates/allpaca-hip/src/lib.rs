@@ -4,6 +4,7 @@
 //! (`HIP_PATH` / `ROCM_PATH` / common install locations). Without an SDK the
 //! crate still compiles; [`device_count`] returns 0 and GPU tests skip.
 
+mod fallback;
 mod gemv_tile;
 
 pub use gemv_tile::{
@@ -6847,6 +6848,9 @@ impl HipWorkspace {
     pub fn new(device: i32, scratch_bytes: usize, vocab: usize) -> Result<Self, AllpacaError> {
         let scratch_bytes = scratch_bytes.max(4096);
         let scratch = device_malloc(scratch_bytes, device)?;
+        if let Some((arch, _)) = device_gcn_arch(device) {
+            fallback::log_kernel_families(device, &arch);
+        }
         let (swiglu_s, swiglu_ev) = make_swiglu_lanes(device);
         let pinned_bytes = vocab.max(1) * 4;
         let pinned_ptr = match host_malloc(pinned_bytes) {
@@ -8073,23 +8077,25 @@ impl HipWorkspace {
         silu_n: i32,
     ) -> Result<(), AllpacaError> {
         let limit = self.mxfp4_limit();
-        match self.timed_gpu(DecodeOp::Q8Gemm, || {
-            mxfp4_swiglu_gate_up_device_on(
-                dx.cast(),
-                gate_w,
-                up_w,
-                dg.cast(),
-                m,
-                ff,
-                dim,
-                limit,
-                std::ptr::null_mut(),
-            )
-        }) {
-            Ok(()) => return self.gemm_nt_mxfp4_dev(dg.cast(), down_w, dy.cast(), m, dim, ff),
-            // Only the fused kernel clamps; the split path below does not.
-            Err(e) if limit > 0.0 => return Err(e),
-            Err(_) => {}
+        match fallback::fused_mxfp4_swiglu_held(
+            self.timed_gpu(DecodeOp::Q8Gemm, || {
+                mxfp4_swiglu_gate_up_device_on(
+                    dx.cast(),
+                    gate_w,
+                    up_w,
+                    dg.cast(),
+                    m,
+                    ff,
+                    dim,
+                    limit,
+                    std::ptr::null_mut(),
+                )
+            }),
+            limit,
+        ) {
+            Ok(true) => return self.gemm_nt_mxfp4_dev(dg.cast(), down_w, dy.cast(), m, dim, ff),
+            Ok(false) => {}
+            Err(err) => return Err(err),
         }
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -8720,23 +8726,25 @@ impl HipWorkspace {
     ) -> Result<(), AllpacaError> {
         let silu_n = m.saturating_mul(ff);
         let limit = self.mxfp4_limit();
-        match mxfp4_swiglu_gate_up_device_on(
-            dx.cast(),
-            gate_w,
-            up_w,
-            dg.cast(),
-            m,
-            ff,
-            dim,
+        match fallback::fused_mxfp4_swiglu_held(
+            mxfp4_swiglu_gate_up_device_on(
+                dx.cast(),
+                gate_w,
+                up_w,
+                dg.cast(),
+                m,
+                ff,
+                dim,
+                limit,
+                stream,
+            ),
             limit,
-            stream,
         ) {
-            Ok(()) => {
+            Ok(true) => {
                 return gemm_nt_mxfp4_device_on(dg.cast(), down_w, dy.cast(), m, dim, ff, stream)
             }
-            // Only the fused kernel clamps; the split path below does not.
-            Err(e) if limit > 0.0 => return Err(e),
-            Err(_) => {}
+            Ok(false) => {}
+            Err(err) => return Err(err),
         }
         gemm_nt_mxfp4_device_on(dx.cast(), gate_w, dg.cast(), m, ff, dim, stream)?;
         gemm_nt_mxfp4_device_on(dx.cast(), up_w, du.cast(), m, ff, dim, stream)?;
