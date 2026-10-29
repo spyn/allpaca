@@ -218,6 +218,8 @@ pub struct ImageUrlSpec {
 
 #[derive(Debug, Deserialize)]
 pub struct JsonSchemaSpec {
+    /// OpenAI `json_schema.name`. Accepted so the object parses; the grammar uses `schema` only.
+    #[allow(dead_code)]
     #[serde(default)]
     pub name: Option<String>,
     pub schema: serde_json::Value,
@@ -333,6 +335,7 @@ fn flatten_chat_messages(
     Ok((turns, images))
 }
 
+#[cfg(test)]
 fn messages_to_prompt_and_images(
     messages: &[ChatMessage],
 ) -> Result<(String, Vec<ImageInput>), AllpacaError> {

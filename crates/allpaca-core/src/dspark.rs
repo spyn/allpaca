@@ -130,6 +130,7 @@ impl DsparkProvider {
         })
     }
 
+    #[cfg(test)]
     pub fn spec(&self) -> &DsparkSpec {
         &self.spec
     }

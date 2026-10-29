@@ -263,6 +263,7 @@ pub enum ExpertPin {
 /// Split layers across local GPUs in proportion to their budgets, so each
 /// GPU keeps room for experts next to its own layer bodies, then keep experts
 /// local in layer order while they fit.
+#[cfg(test)]
 pub fn plan_expert_parallel(body: &[u64], experts: &[u64], budgets: &[u64]) -> ExpertPlan {
     plan_expert_parallel_pinned(body, experts, budgets, &[])
 }

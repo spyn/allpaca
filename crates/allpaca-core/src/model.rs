@@ -690,6 +690,7 @@ impl WeightRef {
         }
     }
 
+    #[cfg(feature = "vulkan")]
     fn f16(off: usize, n: usize) -> Self {
         Self {
             off,
@@ -698,10 +699,12 @@ impl WeightRef {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn q8(off: usize, n: usize) -> Self {
         Self::q8_0(off, n)
     }
 
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
     fn q8_0(off: usize, n: usize) -> Self {
         Self {
             off,

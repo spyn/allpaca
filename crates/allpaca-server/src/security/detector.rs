@@ -9,6 +9,7 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
+    #[cfg(test)]
     pub fn new(name: impl Into<String>, arguments: serde_json::Value) -> Self {
         Self {
             name: name.into(),

@@ -393,10 +393,12 @@ impl Default for KvRadixForest {
 }
 
 impl KvRadixForest {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn with_max_nodes(max_nodes: usize) -> Self {
         Self::with_limits(max_nodes, 0)
     }
@@ -426,18 +428,21 @@ impl KvRadixForest {
     }
 
     /// Keep checkpoints in `dir` too; see [`Self::open_disk`].
+    #[cfg(test)]
     pub fn with_disk(mut self, dir: &Path, max_bytes: usize) -> Result<Self, AllpacaError> {
         self.open_disk(dir, max_bytes)?;
         Ok(self)
     }
 
     /// Keep checkpoints in `store` too; see [`Self::open_store`].
+    #[cfg(test)]
     pub(crate) fn with_store(mut self, store: Box<dyn CheckpointStore>, max_bytes: usize) -> Result<Self, AllpacaError> {
         self.open_store(store, max_bytes)?;
         Ok(self)
     }
 
     /// [`Self::open_store`] on the folder `dir`.
+    #[cfg(test)]
     pub fn open_disk(&mut self, dir: &Path, max_bytes: usize) -> Result<(), AllpacaError> {
         self.open_store(Box::new(LocalDir::open(dir)?), max_bytes)
     }
@@ -516,6 +521,7 @@ impl KvRadixForest {
     }
 
     /// Bytes of checkpoint files in the disk tier.
+    #[cfg(test)]
     pub fn disk_bytes(&self) -> usize {
         self.disk.as_ref().map_or(0, |d| d.bytes)
     }
@@ -777,6 +783,7 @@ impl KvRadixForest {
 
     /// Longest restorable prefix: deepest node on the walk that has a checkpoint
     /// with `depth <= max_depth` (use `max_depth = tokens.len()-1` to leave logits work).
+    #[cfg(test)]
     pub fn lookup_checkpoint(&mut self, tokens: &[u32]) -> Option<(usize, RadixCheckpoint)> {
         self.lookup_checkpoint_capped(tokens, usize::MAX)
     }

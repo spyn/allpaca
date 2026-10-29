@@ -102,6 +102,7 @@ fn profile() -> Option<&'static Mutex<BTreeMap<String, (u64, f64)>>> {
 
 /// The matrix products of the passes so far, slowest kind first:
 /// `(kind, calls, seconds)`. Empty unless `ALLPACA_Q4X_PROFILE` is set.
+#[cfg(test)]
 pub fn profile_report() -> Vec<(String, u64, f64)> {
     let mut kinds: Vec<_> = profile()
         .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (k.clone(), v.0, v.1)).collect())
@@ -879,7 +880,6 @@ impl Qwen4Gpu {
     }
 
     fn upload_experts(&mut self, file: &GgufFile, cfg: &ModelConfig, slot: usize) -> Result<u64, AllpacaError> {
-        let matrix = slot / 3;
         let with_experts = self.placement.expert_blocks[0] + self.placement.expert_blocks[1];
         let mut total = 0u64;
         for layer in 0..with_experts.min(cfg.n_layers) {

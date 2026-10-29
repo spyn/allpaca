@@ -5946,6 +5946,7 @@ fn prompt_cache_fingerprint(
 /// Names the prompt cache's disk folder: a hash of
 /// [`prompt_cache_fingerprint`], so checkpoints only resume the model, mask
 /// and settings that wrote them.
+#[cfg(test)]
 fn prompt_cache_key(
     model: &ModelConfig,
     file: Option<&std::path::Path>,

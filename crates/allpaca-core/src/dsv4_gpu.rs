@@ -2430,6 +2430,7 @@ impl Dsv4Gpu {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn mla_o_rows_with_ptrs(
         &mut self,
@@ -2466,6 +2467,7 @@ impl Dsv4Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn mla_o_rows_with_ptrs_from_device(
         &mut self,
         dattn: *const f32,
@@ -2829,6 +2831,7 @@ impl Dsv4Gpu {
         Ok(())
     }
 
+    #[allow(dead_code)] // Q* GPU fill count; no caller reads it yet.
     pub fn qstar_gpu_count(&self, misses: usize) -> usize {
         if self.slots.is_empty() && self.gpu1_slots.is_empty() {
             return 0;
