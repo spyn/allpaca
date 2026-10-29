@@ -859,17 +859,25 @@ fn json_u32_second(value: Option<&Value>) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn unigram_file(nfc: Option<bool>) -> EngineTokenizer {
-        let path = std::env::temp_dir().join(format!(
-            "allpaca-q12-{}-{}.gguf",
-            nfc.map(|v| v.to_string())
-                .unwrap_or_else(|| "absent".into()),
+    /// A temp GGUF path no other test thread uses: tests that build the same
+    /// tokenizer run in parallel and each deletes its file.
+    fn q12_temp_path(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "allpaca-q12-{label}-{}-{n}.gguf",
             std::process::id()
-        ));
+        ))
+    }
+
+    /// `model` is `tokenizer.ggml.model`: `t5` is llama.cpp's Unigram (UGM)
+    /// vocab, `llama` its SentencePiece BPE (SPM) vocab.
+    fn unigram_file(model: &str, nfc: Option<bool>) -> EngineTokenizer {
+        let path = q12_temp_path(&format!("{model}-{nfc:?}"));
         let mut meta = std::collections::HashMap::new();
         meta.insert(
             "tokenizer.ggml.model".into(),
-            allpaca_gguf::GgufValue::String("llama".into()),
+            allpaca_gguf::GgufValue::String(model.into()),
         );
         meta.insert(
             "tokenizer.ggml.tokens".into(),
@@ -912,7 +920,7 @@ mod tests {
 
     #[test]
     fn unigram_nfc_encodes_a_decomposed_e_acute_as_the_composed_piece() {
-        let tok = unigram_file(Some(true));
+        let tok = unigram_file("t5", Some(true));
         let composed = tok.encode("é").unwrap();
         let decomposed = tok.encode("e\u{0301}").unwrap();
         assert_eq!(decomposed, composed);
@@ -920,13 +928,7 @@ mod tests {
     }
 
     fn pieces_file(clean_spaces: Option<bool>) -> EngineTokenizer {
-        let path = std::env::temp_dir().join(format!(
-            "allpaca-q12-clean-{}-{}.gguf",
-            clean_spaces
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "absent".into()),
-            std::process::id()
-        ));
+        let path = q12_temp_path(&format!("clean-{clean_spaces:?}"));
         let pieces = [
             "<unk>", "Hello", " ", "?", "it", "'s", "'t", "'re", "'ve", "'ll", "'", "!", ".", ",",
             "'m", "'d",
@@ -1008,11 +1010,21 @@ mod tests {
     #[test]
     fn unigram_without_nfc_keeps_a_decomposed_e_acute_split() {
         for flag in [Some(false), None] {
-            let tok = unigram_file(flag);
+            let tok = unigram_file("t5", flag);
             assert_eq!(tok.encode("é").unwrap(), vec![1]);
             assert_eq!(tok.encode("e\u{0301}").unwrap(), vec![2, 3]);
             assert_eq!(tok.encode_plain("e\u{0301}").unwrap(), vec![2, 3]);
         }
+    }
+
+    /// llama.cpp reads `normalizer.nfc` only in its UGM session; the SPM
+    /// session never normalises. A Qwen-style converter writes the key for
+    /// any NFC `tokenizer.json`, so an SPM file can carry it.
+    #[test]
+    fn sentencepiece_bpe_ignores_the_nfc_key_like_llamacpp() {
+        let tok = unigram_file("llama", Some(true));
+        assert_eq!(tok.encode("é").unwrap(), vec![1]);
+        assert_eq!(tok.encode("e\u{0301}").unwrap(), vec![2, 3]);
     }
 
     #[test]
