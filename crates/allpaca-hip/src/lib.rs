@@ -25,6 +25,9 @@ pub const Q8_PACKED_BLOCK: usize = 34;
 /// Device-staged Q8_0: f32 scale at 0, qs at 4, 36-byte stride (4-byte aligned).
 pub const Q8_STAGED_BLOCK: usize = 36;
 pub const Q8_STAGED_QS: usize = 4;
+/// GGUF Q4_0 block (f16 scale + 32 packed nibbles).
+pub const Q4_0_BLOCK_ELEMS: usize = 32;
+pub const Q4_0_BLOCK_BYTES: usize = 18;
 /// GGUF Q4_K super-block (f16 d + f16 dmin + 12 scale bytes + 128 qs).
 pub const Q4_K_BLOCK_ELEMS: usize = 256;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
@@ -513,6 +516,15 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_q8_0_gemv_rounds_activations(m: i32, n: i32, k: i32) -> i32;
         pub fn allpaca_gemm_nt_q8_0_intdot(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_q4_0(
             a: *const f32,
             b: *const u8,
             c: *mut f32,
@@ -2976,6 +2988,29 @@ pub fn gemm_nt_bf16_untiled_device(
     }
 }
 
+/// Device-pointer NT GEMM with native GGUF Q4_0 `b` (`C = A * dequant(B)^T`).
+pub fn gemm_nt_q4_0_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_q4_0(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_q4_0")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q4_0 unavailable".into(),
+        )))
+    }
+}
+
 /// Device-pointer NT GEMM with native GGUF Q4_K `b` (`C = A * dequant(B)^T`).
 pub fn gemm_nt_q4_k_device(
     a: *const f32,
@@ -5202,6 +5237,54 @@ pub fn gemm_nt_q2_0(
     }
 }
 
+/// Host-pointer Q4_0 NT GEMM: copies native GGUF blocks, runs the kernel, copies back.
+pub fn gemm_nt_q4_0(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let packed_bytes = (n as usize) * (k as usize).div_ceil(Q4_0_BLOCK_ELEMS) * Q4_0_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "Q4_0 GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            gemm_nt_q4_0_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_q4_0 unavailable".into(),
+        )))
+    }
+}
+
 /// Host-pointer Q3_K NT GEMM: copies native GGUF blocks, runs the fused kernel, copies back.
 pub fn gemm_nt_q3_k(
     a: &[f32],
@@ -7172,6 +7255,23 @@ impl HipWorkspace {
             DecodeOp::Q8Gemm
         };
         self.timed_gpu(op, || gemm_nt_q8_0_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_q4_0_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::OtherGpu
+        };
+        self.timed_gpu(op, || gemm_nt_q4_0_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q4_k_dev(
@@ -14291,6 +14391,32 @@ mod tests {
             for w in w8 {
                 device_free(w, staged.len());
             }
+            // Q4_0, native 18-byte blocks (P1 MTP draft head).
+            let p40: Vec<u8> = (0..n * k / 32 * 18)
+                .map(|i| match i % 18 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w40: Vec<*mut u8> = (0..copies_for(p40.len()))
+                .map(|_| {
+                    let w = device_malloc(p40.len(), dev).unwrap();
+                    memcpy(w, p40.as_ptr(), p40.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_q4_0_device(x.cast(), w40[i % w40.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("q4_0 gemv", format!("n={n} k={k} m={m}"), p40.len(), us);
+            }
+            for w in w40 {
+                device_free(w, p40.len());
+            }
             // Q4_K, 144-byte super-blocks.
             let p4: Vec<u8> = (0..n * k / 256 * 144)
                 .map(|i| match i % 144 {
@@ -15337,6 +15463,50 @@ mod tests {
                 assert!(
                     gemm_close(hip[i], cpu[i]),
                     "gemm_nt_q4_k mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_q4_0_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(1usize, 4usize, 32usize), (3, 5, 64)].into_iter().enumerate() {
+            let mut a = vec![0.0f32; m * k];
+            let mut b_f = vec![0.0f32; n * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            for (i, v) in b_f.iter_mut().enumerate() {
+                *v = ((i * 13 + si * 7) % 50) as f32 * 0.02 - 0.5;
+            }
+            let mut b_q = Vec::new();
+            let mut b_deq = Vec::with_capacity(n * k);
+            for row in b_f.chunks_exact(k) {
+                b_q.extend(allpaca_cpu::quantize_q4_0(row));
+                let mut deq = vec![0.0f32; k];
+                allpaca_cpu::dequant_q4_0(
+                    &b_q[b_q.len() - k / 32 * allpaca_cpu::Q4_0_BLOCK_BYTES..],
+                    k,
+                    &mut deq,
+                )
+                .unwrap();
+                b_deq.extend(deq);
+            }
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+            gemm_nt_q4_0(&a, &b_q, &mut hip, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_q4_0 must run when a device is present");
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_q4_0 mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
                     hip[i],
                     cpu[i]
                 );

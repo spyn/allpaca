@@ -272,6 +272,89 @@ impl DraftModelProvider {
     }
 }
 
+pub struct Qwen4MtpProvider {
+    model: TinyModel,
+    memory: crate::qwen4exp::Qwen4Memory,
+}
+
+impl Qwen4MtpProvider {
+    pub fn new(model: TinyModel) -> Self {
+        Self {
+            model,
+            memory: crate::qwen4exp::Qwen4Memory::default(),
+        }
+    }
+
+    pub fn process(&mut self, token: u32, pos: usize, hidden: &[f32], metrics: &Metrics) -> Result<(), AllpacaError> {
+        if pos == 0 && self.memory.tokens() != 0 {
+            self.memory = crate::qwen4exp::Qwen4Memory::default();
+        }
+        if self.memory.tokens() != pos {
+            return Ok(());
+        }
+        let dim = self.model.config.dim;
+        let hidden_width = self.model.q4x.as_ref().map_or(dim, |q4| q4.spec.hc * dim);
+        self.memory.nextn_seed = Some(if pos == 0 && hidden.len() == dim && hidden_width != dim {
+            vec![0.0; hidden_width]
+        } else {
+            hidden.to_vec()
+        });
+        let mut logits = vec![0.0f32; self.model.config.vocab_size];
+        crate::qwen4exp::forward_qwen4_token(&self.model, token, pos, &mut logits, &mut self.memory)?;
+        metrics.draft_gpu_forwards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn propose_on(&mut self, ctx: &[u32], max_tokens: usize, temperature: f32, metrics: &Metrics) -> Result<Vec<u32>, AllpacaError> {
+        self.propose_inner(ctx, None, max_tokens, temperature, metrics)
+    }
+
+    pub fn propose_after(&mut self, ctx: &[u32], forced: u32, max_tokens: usize, temperature: f32, metrics: &Metrics) -> Result<Vec<u32>, AllpacaError> {
+        self.propose_inner(ctx, Some(forced), max_tokens, temperature, metrics)
+    }
+
+    fn propose_inner(&mut self, ctx: &[u32], forced: Option<u32>, max_tokens: usize, temperature: f32, metrics: &Metrics) -> Result<Vec<u32>, AllpacaError> {
+        if ctx.is_empty() || self.memory.tokens() != ctx.len() {
+            return Ok(Vec::new());
+        }
+        let mut memory = self.memory.clone();
+        let mut out = Vec::with_capacity(max_tokens);
+        let mut window = ctx.to_vec();
+        let params = GenerationParams {
+            temperature,
+            top_k: 1,
+            top_p: 1.0,
+            seed: Some(1),
+            ..GenerationParams::default()
+        };
+        let mut rng = rng_from_params(&params, Some(1));
+        for i in 0..max_tokens {
+            let token = match (i, forced) {
+                (0, Some(tok)) => tok,
+                (0, None) => ctx[ctx.len() - 1],
+                _ => out[out.len() - 1],
+            };
+            let mut logits = vec![0.0f32; self.model.config.vocab_size];
+            crate::qwen4exp::forward_qwen4_token(&self.model, token, window.len(), &mut logits, &mut memory)?;
+            metrics.draft_gpu_forwards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let next = if let (0, Some(tok)) = (i, forced) {
+                tok
+            } else if temperature <= 1e-5 {
+                argmax(&logits)
+            } else {
+                sample(&mut logits, None, &params, &mut rng)
+            };
+            out.push(next);
+            window.push(next);
+        }
+        metrics.draft_tokens_drafted.fetch_add(
+            (out.len() - usize::from(forced.is_some())) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(out)
+    }
+}
+
 impl DraftProvider for DraftModelProvider {
     fn name(&self) -> &'static str {
         "draft_model"

@@ -660,6 +660,7 @@ enum WeightKind {
     F32,
     F16,
     Q8_0,
+    Q4_0,
     Q3_K,
     Q4_K,
     Q5_K,
@@ -2147,11 +2148,11 @@ impl ResidentModel {
         let lm_head = if !globals {
             none
         } else if file.tensor("output.weight").is_some() {
-            append_gguf_tensor(file, "output.weight", &mut parts, &mut off)?
-        } else if host_embed.is_some() {
+            append_gguf_lm_head(file, cfg, "output.weight", &mut parts, &mut off)?
+        } else if host_embed.is_some() || use_q4_0_draft_head(cfg) {
             // Tied weights, host gather: lm_head still needs the table on
             // device, packed in GEMV layout rather than an F32 expand.
-            append_gguf_tensor_as(file, "token_embd.weight", &mut parts, &mut off, false)?
+            append_gguf_lm_head(file, cfg, "token_embd.weight", &mut parts, &mut off)?
         } else {
             embed
         };
@@ -2408,6 +2409,7 @@ impl ResidentModel {
                 Ok(out as *const f32)
             }
             WeightKind::F16
+            | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
@@ -2417,7 +2419,7 @@ impl ResidentModel {
             | WeightKind::RocmFp4
             | WeightKind::RocmFp4Fast
             | WeightKind::P48Fp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "F16/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
+                "F16/Q4_0/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
         }
     }
@@ -2438,6 +2440,9 @@ impl ResidentModel {
                 hip.gemm_nt_f16_dev(a, self.weights.byte_ptr_at(w.off) as *const u16, c, m, n, k)
             }
             WeightKind::Q8_0 => hip.gemm_nt_q8_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k),
+            WeightKind::Q4_0 => {
+                hip.gemm_nt_q4_0_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
             WeightKind::Q3_K => {
                 hip.gemm_nt_q3_k_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
@@ -2501,13 +2506,14 @@ impl ResidentModel {
                 dim,
             ),
             WeightKind::P48Fp4
+            | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+                "Q4_0/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
             ))),
         }
     }
@@ -2551,13 +2557,14 @@ impl ResidentModel {
                 dim,
             ),
             WeightKind::P48Fp4
+            | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
             | WeightKind::Q5_K
             | WeightKind::Q6_K
             | WeightKind::TQ1_0
             | WeightKind::TQ2_0 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
+                "Q4_0/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0 embed must be F32 at load".into(),
             ))),
         }
     }
@@ -3881,6 +3888,32 @@ fn append_gguf_tensor<'a>(
     append_gguf_tensor_as(file, name, parts, off, name == "token_embd.weight")
 }
 
+fn append_gguf_lm_head<'a>(
+    file: &'a GgufFile,
+    cfg: &ModelConfig,
+    name: &str,
+    parts: &mut Vec<UploadPart<'a>>,
+    off: &mut usize,
+) -> Result<WeightRef, AllpacaError> {
+    if !use_q4_0_draft_head(cfg) {
+        return append_gguf_tensor_as(file, name, parts, off, false);
+    }
+    let info = file.tensor(name).ok_or_else(|| {
+        AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
+    })?;
+    let n = info.n_elements() as usize;
+    let part = UploadPart::Owned(stage_draft_head_q4_0(info, file.tensor_bytes(name)?)?);
+    let w = WeightRef {
+        off: *off,
+        n,
+        kind: WeightKind::Q4_0,
+    };
+    *off += part.len();
+    tracing::info!(tensor = name, bytes = part.len(), "MTP draft LM head staged as Q4_0");
+    parts.push(part);
+    Ok(w)
+}
+
 /// Low-bit ggml types with no fused HIP GEMV. Large GEMM weights of these
 /// types re-pack to Q8_0 at load: every value lands on (or within half a step
 /// of) the Q8_0 grid, at ~1.1 B/elem instead of a 4 B/elem F32 expand.
@@ -3899,6 +3932,46 @@ fn q3_k_native(info: &allpaca_gguf::TensorInfo) -> bool {
     k > 0 && k % 256 == 0 && info.n_elements() > 65_536
 }
 
+fn use_q4_0_draft_head(cfg: &ModelConfig) -> bool {
+    cfg.gguf_layer_base > 0 && std::env::var("ALLPACA_DRAFT_HEAD_Q4_0").ok().as_deref() != Some("0")
+}
+
+pub(crate) fn stage_draft_head_q4_0(
+    info: &allpaca_gguf::TensorInfo,
+    bytes: &[u8],
+) -> Result<Vec<u8>, AllpacaError> {
+    let k = info.dims.first().copied().unwrap_or(0) as usize;
+    let n = info.n_elements() as usize;
+    if k == 0 || k % allpaca_cpu::Q4_0_BLOCK_ELEMS != 0 || n % k != 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "Q4_0 draft head dims {:?} do not tile n={n}",
+            info.dims
+        ))));
+    }
+    let rows = n / k;
+    if rows == 0 || bytes.len() != info.nbytes() || bytes.len() % rows != 0 {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "Q4_0 draft head {} has invalid packed bytes",
+            info.name
+        ))));
+    }
+    let row_bytes = bytes.len() / rows;
+    let mut row = vec![0.0f32; k];
+    let mut out = Vec::with_capacity(
+        n.div_ceil(allpaca_cpu::Q4_0_BLOCK_ELEMS) * allpaca_cpu::Q4_0_BLOCK_BYTES,
+    );
+    for r in 0..rows {
+        allpaca_gguf::dequant_packed(
+            info.ggml_type,
+            &bytes[r * row_bytes..(r + 1) * row_bytes],
+            k,
+            &mut row,
+        )?;
+        out.extend_from_slice(&allpaca_cpu::quantize_q4_0(&row));
+    }
+    Ok(out)
+}
+
 /// VRAM bytes [`append_gguf_tensor_as`] stages for one tensor (not `gather`).
 fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
     use allpaca_gguf::GgmlType as T;
@@ -3915,6 +3988,15 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         T::Q8_0 => q8_staged,
         ty if requant_q8_0_on_load(ty) => q8_staged,
         _ => n * 4,
+    }
+}
+
+fn staged_lm_head_bytes(info: &allpaca_gguf::TensorInfo, cfg: &ModelConfig) -> u64 {
+    if use_q4_0_draft_head(cfg) {
+        info.n_elements().div_ceil(allpaca_cpu::Q4_0_BLOCK_ELEMS as u64)
+            * allpaca_cpu::Q4_0_BLOCK_BYTES as u64
+    } else {
+        staged_device_bytes(info)
     }
 }
 
@@ -3950,10 +4032,19 @@ pub fn gguf_device_bytes_split(file: &GgufFile, cfg: &ModelConfig) -> (Vec<u64>,
             } else {
                 layers[l] += staged_device_bytes(t);
             }
-        } else if t.name == "output.weight" || t.name == "output_norm.weight" {
+        } else if t.name == "output.weight" {
+            globals += staged_lm_head_bytes(t, cfg);
+        } else if t.name == "output_norm.weight" {
             globals += staged_device_bytes(t);
         } else if t.name == "token_embd.weight" && (tied || !HostEmbed::wanted(t.ggml_type)) {
-            globals += staged_device_bytes(t);
+            globals += if tied {
+                staged_lm_head_bytes(t, cfg)
+            } else {
+                staged_device_bytes(t)
+            };
+            if tied && use_q4_0_draft_head(cfg) && !HostEmbed::wanted(t.ggml_type) {
+                globals += staged_device_bytes(t);
+            }
         }
     }
     (layers, experts, globals)
@@ -4304,6 +4395,15 @@ fn split_packed_experts(
                 ))));
             }
             (n_per / allpaca_cpu::P48FP4_BLOCK_ELEMS).saturating_mul(allpaca_cpu::P48FP4_BLOCK_BYTES)
+        }
+        WeightKind::Q4_0 => {
+            if n_per % allpaca_cpu::Q4_0_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} Q4_0 expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::Q4_0_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::Q4_0_BLOCK_ELEMS).saturating_mul(allpaca_cpu::Q4_0_BLOCK_BYTES)
         }
         WeightKind::Q3_K => {
             if n_per % allpaca_cpu::Q3_K_BLOCK_ELEMS != 0 {
@@ -6646,14 +6746,34 @@ impl TinyModel {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(reason)));
         }
         let trunk = ModelConfig::from_gguf(file)?;
-        if trunk.nextn_predict_layers == 0 {
-            return Err(AllpacaError::Fatal(FatalError::ModelLoad(
-                "GGUF has no nextn_predict_layers for MTP draft".into(),
-            )));
-        }
+        let (base, count) = if trunk.nextn_predict_layers > 0 {
+            (trunk.n_layers, trunk.nextn_predict_layers)
+        } else {
+            let mut blocks: Vec<usize> = file
+                .tensors
+                .iter()
+                .filter_map(|t| {
+                    let rest = t.name.strip_prefix("blk.")?;
+                    let (block, suffix) = rest.split_once('.')?;
+                    (suffix == "nextn.eh_proj.weight")
+                        .then(|| block.parse::<usize>().ok())
+                        .flatten()
+                })
+                .collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            match (blocks.first(), blocks.last()) {
+                (Some(first), Some(last)) => (*first, last - first + 1),
+                _ => {
+                    return Err(AllpacaError::Fatal(FatalError::ModelLoad(
+                        "GGUF has no nextn_predict_layers or NextN tensors for MTP draft".into(),
+                    )))
+                }
+            }
+        };
         let mut cfg = trunk.clone();
-        cfg.gguf_layer_base = trunk.n_layers;
-        cfg.n_layers = trunk.nextn_predict_layers;
+        cfg.gguf_layer_base = base;
+        cfg.n_layers = count;
         cfg.nextn_predict_layers = 0;
         cfg.recurrent = false;
         let base = cfg.gguf_layer_base;
@@ -6665,6 +6785,18 @@ impl TinyModel {
             return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
                 "MTP blk.{base} missing attn_q / nextn.eh_proj"
             ))));
+        }
+        if crate::qwen4exp::file_is_qwen4exp(file) {
+            let mut model = Self::from_gguf(file)?;
+            model.config.gguf_layer_base = cfg.gguf_layer_base;
+            model.config.n_layers = cfg.n_layers;
+            model.config.nextn_predict_layers = 0;
+            model.config.recurrent = false;
+            if let Some(q4) = model.q4x.as_mut().and_then(Arc::get_mut) {
+                q4.spec.full_attention_interval = 1;
+            }
+            model.name = format!("{}-mtp", model.name);
+            return Ok(model);
         }
         let mut model = Self::from_gguf_cfg(file, cfg, &report, false)?;
         // Dense MTP heads (Qwen3.5/3.8) ship `ffn_gate/up/down`, not MoE exps.
@@ -7664,7 +7796,13 @@ impl TinyModel {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
             })?;
-            return crate::qwen4exp::forward_qwen4_token(self, token, pos, logits, &mut memory.q4x);
+            crate::qwen4exp::forward_qwen4_token(self, token, pos, logits, &mut memory.q4x)?;
+            if let Some(last_hidden) = side.and_then(|s| s.last_hidden.as_deref_mut()) {
+                if let Some(captured) = memory.q4x.row_hiddens.take() {
+                    *last_hidden = captured;
+                }
+            }
+            return Ok(());
         }
         if self.g4.is_some() {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
@@ -8341,12 +8479,13 @@ impl TinyModel {
             let memory = recurrent.as_deref_mut().ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::ModelLoad("qwen4exp needs the sequence's state".into()))
             })?;
-            return crate::qwen4exp::forward_qwen4_tokens(
+            return crate::qwen4exp::forward_qwen4_tokens_with_hiddens(
                 self,
                 tokens,
                 start_pos,
                 logits,
                 row_logits.as_deref_mut(),
+                out_row_hiddens.unwrap_or(&mut Vec::new()),
                 &mut memory.q4x,
             );
         }
@@ -12950,6 +13089,73 @@ mod lightning_moe_tests {
         let ragged = info(5120 + 32);
         let q8 = ragged.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
         assert_eq!(staged_device_bytes(&ragged), q8);
+    }
+
+    #[test]
+    fn only_the_mtp_draft_head_uses_a_q4_0_copy() {
+        let target = ModelConfig::tiny();
+        let mut draft = target.clone();
+        draft.gguf_layer_base = 64;
+        assert!(!use_q4_0_draft_head(&target));
+        assert!(use_q4_0_draft_head(&draft));
+
+        let info = allpaca_gguf::TensorInfo {
+            name: "output.weight".into(),
+            dims: vec![32, 2],
+            ggml_type: allpaca_gguf::GgmlType::F32,
+            ggml_type_id: 0,
+            offset: 0,
+            shard: 0,
+        };
+        let source: Vec<f32> = (0..64)
+            .map(|i| ((i * 17 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+        let bytes: Vec<u8> = source.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let packed = stage_draft_head_q4_0(&info, &bytes).unwrap();
+        assert_eq!(packed.len(), 2 * allpaca_cpu::Q4_0_BLOCK_BYTES);
+
+        let mut roundtrip = vec![0.0; source.len()];
+        allpaca_cpu::dequant_q4_0(&packed, source.len(), &mut roundtrip).unwrap();
+        for (original, actual) in source.iter().zip(roundtrip) {
+            assert!((original - actual).abs() < 0.125, "{original} vs {actual}");
+        }
+    }
+
+    #[test]
+    fn lm_head_upload_quantises_only_the_mtp_draft() {
+        let dir = std::env::temp_dir().join(format!("allpaca-p1-head-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("head.gguf");
+        let source: Vec<f32> = (0..64).map(|i| (i % 17) as f32 / 32.0).collect();
+        allpaca_gguf::write_gguf(
+            &path,
+            &std::collections::HashMap::new(),
+            &[allpaca_gguf::GgufWriteTensor {
+                name: "output.weight".into(),
+                dims: vec![32, 2],
+                data: &source,
+            }],
+        )
+        .unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let target = ModelConfig::tiny();
+        let mut draft = target.clone();
+        draft.gguf_layer_base = 64;
+
+        let mut target_parts = Vec::new();
+        let mut draft_parts = Vec::new();
+        let target_ref = append_gguf_lm_head(&file, &target, "output.weight", &mut target_parts, &mut 0).unwrap();
+        let draft_ref = append_gguf_lm_head(&file, &draft, "output.weight", &mut draft_parts, &mut 0).unwrap();
+        assert!(matches!(target_ref.kind, WeightKind::F32));
+        assert!(matches!(draft_ref.kind, WeightKind::Q4_0));
+        assert_eq!(target_parts[0].len(), source.len() * 4);
+        assert_eq!(draft_parts[0].len(), source.len() / 32 * allpaca_cpu::Q4_0_BLOCK_BYTES);
+        let info = file.tensor("output.weight").unwrap();
+        assert_eq!(staged_lm_head_bytes(info, &target), (source.len() * 4) as u64);
+        assert_eq!(staged_lm_head_bytes(info, &draft), draft_parts[0].len() as u64);
+
+        drop(file);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
