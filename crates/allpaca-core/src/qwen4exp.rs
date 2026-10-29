@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use allpaca_cpu::{attention, matmul_nt, rope_imrope_neox};
+use allpaca_cpu::{attention, matmul_nt, rmsnorm, rope_imrope_neox};
 use allpaca_gguf::{dequant_packed, GgufFile, GgufValue};
 use allpaca_types::{AllpacaError, FatalError};
 
@@ -268,6 +268,7 @@ const DECODE_THREADED: usize = if cfg!(test) { 0 } else { 1 << 20 };
 pub struct Qwen4Weights {
     pub spec: Qwen4Spec,
     file: Option<Arc<GgufFile>>,
+    shared: Mutex<Option<Arc<GgufFile>>>,
     /// Dense tensors decoded to F32 on first use.
     dense: Mutex<HashMap<String, Arc<Vec<f32>>>>,
     /// Whether [`Self::w`] keeps what it decodes (off: decoded on every use,
@@ -295,6 +296,7 @@ impl Qwen4Weights {
         Ok(Self {
             spec,
             file: None,
+            shared: Mutex::new(None),
             dense: Mutex::new(HashMap::new()),
             keep_dense: std::sync::atomic::AtomicBool::new(true),
             swapped: Mutex::new(HashMap::new()),
@@ -317,7 +319,7 @@ impl Qwen4Weights {
     pub(crate) fn current(&self, name: &str) -> Result<Arc<Vec<f32>>, AllpacaError> {
         match self.swapped_now(name)? {
             Some(w) => Ok(w),
-            None => Ok(Arc::new(self.file()?.tensor_f32(name)?)),
+            None => Ok(Arc::new(self.tensor_source(name)?.tensor_f32(name)?)),
         }
     }
 
@@ -330,8 +332,27 @@ impl Qwen4Weights {
         self.file = Some(file);
     }
 
+    pub fn attach_shared_gguf(&self, file: Arc<GgufFile>) {
+        if let Ok(mut shared) = self.shared.lock() {
+            *shared = Some(file);
+        }
+    }
+
     fn file(&self) -> Result<&GgufFile, AllpacaError> {
         self.file.as_deref().ok_or_else(|| load_err("qwen4exp weights have no GGUF handle".into()))
+    }
+
+    fn tensor_source(&self, name: &str) -> Result<Arc<GgufFile>, AllpacaError> {
+        let file = self.file.as_ref().ok_or_else(|| load_err("qwen4exp weights have no GGUF handle".into()))?;
+        if file.tensor(name).is_some() {
+            return Ok(file.clone());
+        }
+        if let Ok(shared) = self.shared.lock() {
+            if let Some(shared) = shared.as_ref().filter(|f| f.tensor(name).is_some()) {
+                return Ok(shared.clone());
+            }
+        }
+        Ok(file.clone())
     }
 
     pub(crate) fn gguf(&self) -> Result<&GgufFile, AllpacaError> {
@@ -340,6 +361,7 @@ impl Qwen4Weights {
 
     fn has(&self, name: &str) -> bool {
         self.file.as_ref().is_some_and(|f| f.tensor(name).is_some())
+            || self.shared.lock().is_ok_and(|f| f.as_ref().is_some_and(|f| f.tensor(name).is_some()))
     }
 
     /// Whether dense tensors stay decoded once read (the default). Off, the
@@ -365,7 +387,7 @@ impl Qwen4Weights {
         if let Some(w) = cache.get(name) {
             return Ok(w.clone());
         }
-        let w = Arc::new(self.file()?.tensor_f32(name)?);
+        let w = Arc::new(self.tensor_source(name)?.tensor_f32(name)?);
         cache.insert(name.to_string(), w.clone());
         Ok(w)
     }
@@ -373,13 +395,14 @@ impl Qwen4Weights {
     /// Tensor `name` from the file in F32, its rows split over the cores
     /// (the same values as [`GgufFile::tensor_f32`]).
     fn decode_threaded(&self, name: &str) -> Result<Vec<f32>, AllpacaError> {
-        let info = self.file()?.tensor(name).ok_or_else(|| load_err(format!("missing tensor {name}")))?;
+        let file = self.tensor_source(name)?;
+        let info = file.tensor(name).ok_or_else(|| load_err(format!("missing tensor {name}")))?;
         let n = info.n_elements() as usize;
         let row_len = info.dims.first().copied().unwrap_or(1).max(1) as usize;
         let n_rows = n / row_len;
         let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).min(n_rows);
         if threads < 2 || n < DECODE_THREADED {
-            return self.file()?.tensor_f32(name);
+            return file.tensor_f32(name);
         }
         let mut out = vec![0.0f32; n];
         let per = n_rows.div_ceil(threads);
@@ -411,7 +434,7 @@ impl Qwen4Weights {
     /// The file's rows from `first` decoded into `out` (whole rows of `row_len`).
     fn rows_into(&self, name: &str, first: usize, out: &mut [f32], row_len: usize) -> Result<(), AllpacaError> {
         let n_rows = out.len() / row_len.max(1);
-        let file = self.file()?;
+        let file = self.tensor_source(name)?;
         let info = file.tensor(name).ok_or_else(|| load_err(format!("missing tensor {name}")))?;
         let total = info.n_elements() as usize;
         let (lo, n) = (first * row_len, n_rows * row_len);
@@ -486,6 +509,8 @@ pub struct Qwen4Memory {
     tokens: Vec<i64>,
     layers: Vec<LayerState>,
     ple_history: Vec<f32>,
+    pub(crate) nextn_seed: Option<Vec<f32>>,
+    pub(crate) row_hiddens: Option<Vec<f32>>,
     /// When set, every routed (layer, expert) pair is appended, in order.
     pub routes: Option<Vec<(u16, u16)>>,
     /// When set, experts marked `true` (index `blk * n_experts + expert`)
@@ -586,6 +611,8 @@ impl Qwen4Memory {
             tokens: self.tokens.clone(),
             layers: self.layers.clone(),
             ple_history,
+            nextn_seed: None,
+            row_hiddens: None,
             routes: None,
             expert_mask: None,
             saliency: None,
@@ -1213,6 +1240,29 @@ fn ple_embedding(q4: &Qwen4Weights, ple: &PleSpec, token: u32, earlier: &[i64]) 
     Ok(emb)
 }
 
+fn nextn_seed(q4: &Qwen4Weights, cfg: &ModelConfig, token: u32, hidden: &[f32]) -> Result<Vec<f32>, AllpacaError> {
+    let dim = cfg.dim;
+    let blk = cfg.gguf_blk(0);
+    let hnorm = q4.w(&format!("blk.{blk}.nextn.hnorm.weight"))?;
+    if hidden.len() != hnorm.len() {
+        return Err(load_err("NextN hidden state has the wrong width".into()));
+    }
+    let tok = q4.rows("token_embd.weight", token as usize, 1, dim)?;
+    let mut e_norm = vec![0.0f32; dim];
+    let mut h_norm = vec![0.0f32; hidden.len()];
+    rmsnorm(&tok, &q4.w(&format!("blk.{blk}.nextn.enorm.weight"))?, cfg.eps, &mut e_norm)?;
+    rmsnorm(hidden, &hnorm, cfg.eps, &mut h_norm)?;
+    if h_norm.len() != dim {
+        h_norm = mix(q4, &format!("blk.{blk}.nextn.hc_head"), false, &h_norm, dim, cfg.eps)?.0;
+    }
+    let mut concat = Vec::with_capacity(2 * dim);
+    concat.extend_from_slice(&e_norm);
+    concat.extend_from_slice(&h_norm);
+    let mut seed = vec![0.0f32; dim];
+    matmul_nt(&concat, &q4.w(&format!("blk.{blk}.nextn.eh_proj.weight"))?, &mut seed, 1, dim, 2 * dim)?;
+    Ok(seed)
+}
+
 /// Forward one token at `pos`; `logits` gets the next-token logits.
 pub(crate) fn forward_qwen4_token(
     model: &TinyModel,
@@ -1228,12 +1278,13 @@ pub(crate) fn forward_qwen4_token(
 /// host one at a time. `logits` ends with the last token's; `row_logits`,
 /// when given, gets every token's logits, one row of the vocabulary size
 /// each (a draft verify reads them all).
-pub(crate) fn forward_qwen4_tokens(
+fn forward_qwen4_tokens_impl(
     model: &TinyModel,
     tokens: &[u32],
     start_pos: usize,
     logits: &mut [f32],
     mut row_logits: Option<&mut [f32]>,
+    mut out_row_hiddens: Option<&mut Vec<f32>>,
     mem: &mut Qwen4Memory,
 ) -> Result<(), AllpacaError> {
     let q4 = model.q4x.as_ref().ok_or_else(|| load_err("missing qwen4exp weights".into()))?;
@@ -1264,6 +1315,11 @@ pub(crate) fn forward_qwen4_tokens(
             let first = pass * crate::qwen4_gpu::MAX_ROWS;
             let rows = row_logits.as_deref_mut().map(|rows| &mut rows[first * vocab..(first + chunk.len()) * vocab]);
             forward_device(q4, gpu, rpc, cfg, chunk, start_pos + first, &mut logits[..vocab], rows, mem, None)?;
+            if let Some(out) = out_row_hiddens.as_deref_mut() {
+                if let Some(captured) = mem.row_hiddens.take() {
+                    out.extend(captured);
+                }
+            }
         }
         return Ok(());
     }
@@ -1273,8 +1329,36 @@ pub(crate) fn forward_qwen4_tokens(
         if let Some(rows) = row_logits.as_deref_mut() {
             rows[i * vocab..(i + 1) * vocab].copy_from_slice(&logits[..vocab]);
         }
+        if let Some(out) = out_row_hiddens.as_deref_mut() {
+            if let Some(captured) = mem.row_hiddens.take() {
+                out.extend(captured);
+            }
+        }
     }
     Ok(())
+}
+
+pub(crate) fn forward_qwen4_tokens(
+    model: &TinyModel,
+    tokens: &[u32],
+    start_pos: usize,
+    logits: &mut [f32],
+    row_logits: Option<&mut [f32]>,
+    mem: &mut Qwen4Memory,
+) -> Result<(), AllpacaError> {
+    forward_qwen4_tokens_impl(model, tokens, start_pos, logits, row_logits, None, mem)
+}
+
+pub(crate) fn forward_qwen4_tokens_with_hiddens(
+    model: &TinyModel,
+    tokens: &[u32],
+    start_pos: usize,
+    logits: &mut [f32],
+    row_logits: Option<&mut [f32]>,
+    out_row_hiddens: &mut Vec<f32>,
+    mem: &mut Qwen4Memory,
+) -> Result<(), AllpacaError> {
+    forward_qwen4_tokens_impl(model, tokens, start_pos, logits, row_logits, Some(out_row_hiddens), mem)
 }
 
 /// A prompt through a worker that hosts blocks, in passes that overlap:
@@ -1434,7 +1518,10 @@ fn forward_host(
         *slot += clock.elapsed().as_secs_f32();
         clock = std::time::Instant::now();
     };
-    let embed = q4.rows("token_embd.weight", token as usize, 1, dim)?;
+    let embed = match mem.nextn_seed.as_deref() {
+        Some(hidden) => nextn_seed(q4, cfg, token, hidden)?,
+        None => q4.rows("token_embd.weight", token as usize, 1, dim)?,
+    };
     let mut streams = embed.repeat(hc);
     for layer in 0..cfg.n_layers {
         if mem.trace.as_mut().is_some_and(|t| t.enter(pos, layer, cfg.n_layers, &mut streams)) {
@@ -1461,7 +1548,7 @@ fn forward_host(
         lap(&mut times.embed_ple);
         let (x, inject) = mix(q4, &format!("blk.{blk}.hc_attn"), true, &streams, dim, eps)?;
         lap(&mut times.mix);
-        let out = if q4.spec.is_recurrent(blk) {
+        let out = if q4.spec.is_recurrent(layer) {
             let out = gdn_layer(q4, cfg, blk, &x, &mut mem.layers[layer])?;
             lap(&mut times.gdn);
             out
@@ -1483,7 +1570,16 @@ fn forward_host(
         return Ok(());
     }
     // The output mixer stands in for the final norm.
-    let (x, _) = mix(q4, "output_hc", false, &streams, dim, eps)?;
+    mem.row_hiddens = Some(streams.clone());
+    if mem.nextn_seed.is_some() {
+        mem.nextn_seed = mem.row_hiddens.clone();
+    }
+    let mixer = if mem.nextn_seed.is_some() {
+        format!("blk.{}.nextn.hc_head", cfg.gguf_blk(0))
+    } else {
+        "output_hc".into()
+    };
+    let (x, _) = mix(q4, &mixer, false, &streams, dim, eps)?;
     let head = if q4.has("output.weight") { "output.weight" } else { "token_embd.weight" };
     matmul_nt(&x, &q4.w(head)?, logits, 1, cfg.vocab_size, dim)?;
     lap(&mut times.head);
@@ -1830,7 +1926,7 @@ pub(crate) fn forward_qwen4_host_rows(
             }
         }
         let (x, inject) = mix_rows(q4, &format!("blk.{blk}.hc_attn"), true, &s, n, dim, eps)?;
-        let out = match q4.spec.is_recurrent(blk) {
+        let out = match q4.spec.is_recurrent(layer) {
             true => gdn_rows(q4, cfg, blk, layer, &x, &act, mems, &model.calib)?,
             false => attn_rows(q4, cfg, blk, layer, &x, &act, mems, &model.calib)?,
         };
@@ -1917,7 +2013,10 @@ fn forward_device(
         None => {
             let mut streams = Vec::with_capacity(rows * hc * dim);
             for &token in tokens {
-                let embed = q4.rows("token_embd.weight", token as usize, 1, dim)?;
+                let embed = match mem.nextn_seed.as_deref() {
+                    Some(hidden) => nextn_seed(q4, cfg, token, hidden)?,
+                    None => q4.rows("token_embd.weight", token as usize, 1, dim)?,
+                };
                 for _ in 0..hc {
                     streams.extend_from_slice(&embed);
                 }
@@ -2007,7 +2106,7 @@ fn forward_device(
         if wait {
             lap(card, &mut times.mix)?;
         }
-        let recurrent = q4.spec.is_recurrent(blk);
+        let recurrent = q4.spec.is_recurrent(layer);
         if recurrent {
             gpu.gdn(blk, &dims, device, rows)?;
         } else {
@@ -2062,13 +2161,28 @@ fn forward_device(
         gpu.set_streams(0, &streams)?;
     }
     // The output mixer stands in for the final norm.
-    gpu.mix(0, "output_hc", false, rows)?;
+    mem.row_hiddens = Some(gpu.hidden_rows(rows)?);
+    if mem.nextn_seed.is_some() {
+        mem.nextn_seed = mem.row_hiddens.clone();
+    }
+    let mixer = if mem.nextn_seed.is_some() {
+        format!("blk.{}.nextn.hc_head", cfg.gguf_blk(0))
+    } else {
+        "output_hc".into()
+    };
+    gpu.mix(0, &mixer, false, rows)?;
     let head = if q4.has("output.weight") { "output.weight" } else { "token_embd.weight" };
+    let q4_draft = mem.nextn_seed.is_some() && gpu.has_q4_0_draft_head();
     match row_logits {
         Some(all) => {
-            gpu.head(head, rows, &mut all[..rows * vocab])?;
+            if q4_draft {
+                gpu.head_q4_0(rows, &mut all[..rows * vocab])?;
+            } else {
+                gpu.head(head, rows, &mut all[..rows * vocab])?;
+            }
             logits[..vocab].copy_from_slice(&all[(rows - 1) * vocab..rows * vocab]);
         }
+        None if q4_draft => gpu.head_q4_0(rows, &mut logits[..vocab])?,
         None => gpu.head(head, rows, &mut logits[..vocab])?,
     }
     lap(0, &mut times.head)?;
@@ -2232,6 +2346,12 @@ fn write_tiny_ple(path: &std::path::Path, dim: usize, ff: usize, packed: bool, i
     add("output_hc_norm.weight".into(), &[hc_dim], vec![1.0; hc_dim]);
     add("output_hc_down.weight".into(), &[lr, hc_dim], noise(lr * hc_dim, 0.3));
     add("output_hc_up.weight".into(), &[hc_dim, lr], noise(hc_dim * lr, 0.3));
+    add("blk.0.nextn.enorm.weight".into(), &[dim], vec![1.0; dim]);
+    add("blk.0.nextn.hnorm.weight".into(), &[hc_dim], vec![1.0; hc_dim]);
+    add("blk.0.nextn.eh_proj.weight".into(), &[dim, 2 * dim], noise(dim * 2 * dim, 0.3));
+    add("blk.0.nextn.hc_head_norm.weight".into(), &[hc_dim], vec![1.0; hc_dim]);
+    add("blk.0.nextn.hc_head_down.weight".into(), &[lr, hc_dim], noise(lr * hc_dim, 0.3));
+    add("blk.0.nextn.hc_head_up.weight".into(), &[hc_dim, lr], noise(hc_dim * lr, 0.3));
     for blk in 0..n_layers {
         let mut t = |name: &str, dims: &[usize], data: Vec<f32>| add(format!("blk.{blk}.{name}"), dims, data);
         for kind in ["attn", "ffn"] {
@@ -2494,7 +2614,7 @@ mod tests {
         type Build = fn() -> TinyModel;
         for (what, build, expert_layers) in [("f32", tiny_model as Build, 0usize), ("packed", tiny_packed_model as Build, 4)] {
             let (host, gpu) = (build(), build());
-            crate::qwen4_gpu::attach(&gpu, &hip, None, None).expect("attach");
+            crate::qwen4_gpu::attach(&gpu, &hip, None, None, None).expect("attach");
             {
                 let attached = gpu.q4x.as_ref().unwrap().gpu.lock().unwrap();
                 let attached = attached.as_ref().expect("gpu attached");
@@ -2526,7 +2646,7 @@ mod tests {
         let hip = Arc::new(hip);
         let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
         let model = tiny_packed_model();
-        crate::qwen4_gpu::attach(&model, &hip, None, None).expect("attach");
+        crate::qwen4_gpu::attach(&model, &hip, None, None, None).expect("attach");
         let single = run(&model, &tokens);
         let vocab = model.config.vocab_size;
         let mut mem = Qwen4Memory::default();
@@ -2546,7 +2666,7 @@ mod tests {
         // activations): passes of several still match single tokens, and
         // the whole stays near the all-on-card logits.
         let mixed = tiny_packed_model();
-        crate::qwen4_gpu::attach(&mixed, &hip, None, Some(&[2])).expect("attach");
+        crate::qwen4_gpu::attach(&mixed, &hip, None, Some(&[2]), None).expect("attach");
         assert_eq!(mixed.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().expert_layers()[0], [0, 1]);
         let mixed_single = run(&mixed, &tokens);
         let mut mem = Qwen4Memory::default();
@@ -2574,8 +2694,8 @@ mod tests {
         type Build = fn(usize) -> TinyModel;
         for (what, build) in [("f32", tiny_sparse_model as Build), ("packed", tiny_packed_sparse_model as Build)] {
             let (host, gpu, dense) = (build(8), build(8), build(64));
-            crate::qwen4_gpu::attach(&gpu, &hip, None, None).expect("attach");
-            crate::qwen4_gpu::attach(&dense, &hip, None, None).expect("attach");
+            crate::qwen4_gpu::attach(&gpu, &hip, None, None, None).expect("attach");
+            crate::qwen4_gpu::attach(&dense, &hip, None, None, None).expect("attach");
             let (want, got, all) = (run(&host, &tokens), run(&gpu, &tokens), run(&dense, &tokens));
             assert_eq!(got[..9], all[..9], "{what}: every cell is kept up to rank 8");
             for (pos, (want, got)) in want.iter().zip(&got).enumerate() {
@@ -2628,13 +2748,13 @@ mod tests {
         });
         let tokens = long_tokens(40);
         let local = tiny_packed_sparse_model(8);
-        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        crate::qwen4_gpu::attach(&local, &hip, None, None, None).expect("attach");
         let on_card = run(&local, &tokens);
 
         let mut remote = tiny_packed_sparse_model(8);
         let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
         remote.rpc = Some(rt.clone());
-        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2]), None).expect("attach");
         assert_eq!(remote.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().hosted_blocks(), [2, 3]);
         let vocab = remote.config.vocab_size;
         let (mut mem, mut logits) = (Qwen4Memory::default(), vec![0.0f32; vocab]);
@@ -2667,13 +2787,13 @@ mod tests {
         });
         let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
         let local = tiny_packed_model();
-        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        crate::qwen4_gpu::attach(&local, &hip, None, None, None).expect("attach");
         let on_card = run(&local, &tokens);
 
         let mut remote = tiny_packed_model();
         let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
         remote.rpc = Some(rt.clone());
-        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2]), None).expect("attach");
         {
             let gpu = remote.q4x.as_ref().unwrap().gpu.lock().unwrap();
             let gpu = gpu.as_ref().unwrap();
@@ -2719,13 +2839,13 @@ mod tests {
         });
         let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
         let local = tiny_packed_model();
-        crate::qwen4_gpu::attach(&local, &hip, None, None).expect("attach");
+        crate::qwen4_gpu::attach(&local, &hip, None, None, None).expect("attach");
         let on_card = run(&local, &tokens);
 
         let mut remote = tiny_packed_model();
         let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
         remote.rpc = Some(rt.clone());
-        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2]), None).expect("attach");
         {
             let gpu = remote.q4x.as_ref().unwrap().gpu.lock().unwrap();
             let gpu = gpu.as_ref().unwrap();
@@ -2787,7 +2907,7 @@ mod tests {
         let mut remote = tiny_packed_model();
         let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
         remote.rpc = Some(rt.clone());
-        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2])).expect("attach");
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2]), None).expect("attach");
         let single = run(&remote, &tokens);
         let trips = || rt.roundtrips.load(std::sync::atomic::Ordering::Relaxed);
         let before = trips();
@@ -2829,7 +2949,7 @@ mod tests {
         let mut model = tiny_packed_model();
         let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
         model.rpc = Some(rt.clone());
-        crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+        crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2]), None).expect("attach");
         assert!(model.supports_forward_batch(&hip), "hosted blocks make the batched forward worth it");
         let vocab = model.config.vocab_size;
         let seqs: [Vec<u32>; 3] = [
@@ -2905,7 +3025,7 @@ mod tests {
             let mut model = tiny_packed_model();
             let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr.clone()], None).expect("connect"));
             model.rpc = Some(rt.clone());
-            crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+            crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2]), None).expect("attach");
             let cached = {
                 let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
                 gpu.as_ref().unwrap().hosted().expect("hosted blocks").cache_bytes.load(Ordering::Relaxed)
@@ -2991,7 +3111,7 @@ mod tests {
         };
         let hip = Arc::new(hip);
         for (what, model) in [("packed", tiny_packed_model()), ("packed, sparse", tiny_packed_sparse_model(2))] {
-            crate::qwen4_gpu::attach(&model, &hip, None, None).expect("attach");
+            crate::qwen4_gpu::attach(&model, &hip, None, None, None).expect("attach");
             carries_on_from_the_cache_copy(&model, what);
         }
     }
@@ -3022,7 +3142,7 @@ mod tests {
             let mut model = tiny_packed_model();
             let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
             model.rpc = Some(rt);
-            crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2])).expect("attach");
+            crate::qwen4_gpu::attach(&model, &hip, None, Some(&[2]), None).expect("attach");
             assert_eq!(model.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().hosted_blocks(), [2, 3]);
             (model, worker)
         };
@@ -3106,6 +3226,40 @@ mod tests {
         let c = run(&model, &[3, 4, 5, 6, 7, 4]);
         assert!(max_diff(&a[5], &c[5]) > 1e-4);
         assert_eq!(a[..5], c[..5]);
+    }
+
+    #[test]
+    fn tiny_qwen4exp_nextn_seed_uses_every_hidden_stream() {
+        let model = tiny_model();
+        let dim = model.config.dim;
+        let hidden: Vec<f32> = (0..model.q4x.as_ref().unwrap().spec.hc * dim)
+            .map(|i| (i + 1) as f32 / dim as f32)
+            .collect();
+        let seeded = |streams: &[f32]| {
+            let mut mem = Qwen4Memory { nextn_seed: Some(streams.to_vec()), ..Default::default() };
+            let mut logits = vec![0.0f32; model.config.vocab_size];
+            forward_qwen4_token(&model, 3, 0, &mut logits, &mut mem).expect("NextN forward");
+            assert_eq!(mem.tokens(), 1);
+            logits
+        };
+        let first = seeded(&hidden);
+        let mut swapped = hidden.clone();
+        swapped.copy_within(dim.., 0);
+        swapped[dim..].copy_from_slice(&hidden[..hidden.len() - dim]);
+        let second = seeded(&swapped);
+        assert!(first.iter().all(|v| v.is_finite()));
+        assert!(max_diff(&first, &second) > 1e-5, "the NextN seed must mix all hidden streams");
+    }
+
+    #[test]
+    fn tiny_qwen4exp_mtp_sidecar_loads_its_full_attention_block() {
+        let path = std::env::temp_dir().join(format!("allpaca_tiny_qwen4exp_mtp-{}.gguf", std::process::id()));
+        write_tiny_qwen4exp_gguf(&path);
+        let file = GgufFile::open(&path).expect("open tiny qwen4exp");
+        let model = TinyModel::from_gguf_mtp(&file).expect("MTP sidecar");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(model.config.n_layers, 1);
+        assert!(!model.q4x.as_ref().unwrap().spec.is_recurrent(0));
     }
 
     /// A run of tokens leaves each token's logits in its row: a draft
@@ -3354,7 +3508,7 @@ mod tests {
                 let rt = crate::rpc_runtime::RpcRuntime::connect(&[endpoint], token.as_deref()).expect("rpc worker");
                 model.rpc = Some(Arc::new(rt));
             }
-            crate::qwen4_gpu::attach(model, &first, second.as_ref(), None).expect("attach");
+            crate::qwen4_gpu::attach(model, &first, second.as_ref(), None, None).expect("attach");
             let gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
             eprintln!(
                 "Q4X gpu attached in {:.1}s, expert layers per card {:?}",

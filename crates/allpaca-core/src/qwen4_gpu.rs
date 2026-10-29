@@ -27,7 +27,7 @@ use crate::model::{ModelConfig, TinyModel};
 use crate::qsa::{QsaKeys, QsaShape};
 
 /// Matrices of a block that run on the GPU, by tensor name after `blk.N.`.
-const BLOCK_MATRICES: [&str; 24] = [
+const BLOCK_MATRICES: [&str; 26] = [
     "indexer.q_proj.weight",
     "indexer.k_proj.weight",
     "attn_qkv.weight",
@@ -39,6 +39,8 @@ const BLOCK_MATRICES: [&str; 24] = [
     "attn_k.weight",
     "attn_v.weight",
     "attn_output.weight",
+    "nextn.hc_head_down.weight",
+    "nextn.hc_head_up.weight",
     "hc_attn_down.weight",
     "hc_attn_up.weight",
     "hc_attn_inject.weight",
@@ -54,7 +56,8 @@ const BLOCK_MATRICES: [&str; 24] = [
     "ple_value.weight",
 ];
 /// F32 vectors of a block the kernels read.
-const BLOCK_VECTORS: [&str; 14] = [
+const BLOCK_VECTORS: [&str; 15] = [
+    "nextn.hc_head_norm.weight",
     "hc_attn_norm.weight",
     "hc_ffn_norm.weight",
     "attn_q_norm.weight",
@@ -646,6 +649,7 @@ pub struct Qwen4Gpu {
     placement: Placement,
     matrices: HashMap<String, Matrix>,
     vectors: HashMap<String, DeviceWeights>,
+    draft_head: Option<DeviceWeights>,
     act: Act,
     hc: usize,
     dim: usize,
@@ -690,6 +694,7 @@ impl Qwen4Gpu {
         second: Option<Arc<HipWorkspace>>,
         expert_blocks: Option<&[usize]>,
         worker: Option<(&[u64], usize)>,
+        globals: Option<&GgufFile>,
     ) -> Result<Self, AllpacaError> {
         let (dim, ff, n_experts) = (cfg.dim, cfg.ff_dim.max(1), cfg.n_experts);
         let hips: Vec<Arc<HipWorkspace>> = std::iter::once(hip).chain(second).collect();
@@ -795,6 +800,19 @@ impl Qwen4Gpu {
             dense_bytes += weights.bytes();
             matrices.insert(info.name.clone(), Matrix { weights, encoding, n, k });
         }
+        if let Some(global) = globals {
+            for info in global.tensors.iter().filter(|t| GLOBAL_MATRICES.contains(&t.name.as_str())) {
+                if matrices.contains_key(&info.name) {
+                    continue;
+                }
+                let (k, n) = shape(info);
+                let device = cards[card_of(&info.name)].hip.device;
+                let (encoding, bytes) = encode(global, info)?;
+                let weights = DeviceWeights::upload_bytes(device, &[&bytes])?;
+                dense_bytes += weights.bytes();
+                matrices.insert(info.name.clone(), Matrix { weights, encoding, n, k });
+            }
+        }
         let mut vectors = HashMap::new();
         for info in &file.tensors {
             let wanted = match block_of(&info.name) {
@@ -807,11 +825,22 @@ impl Qwen4Gpu {
                 vectors.insert(info.name.clone(), DeviceWeights::upload(device, &[&values])?);
             }
         }
+        if let Some(global) = globals {
+            for info in global.tensors.iter().filter(|t| GLOBAL_VECTORS.contains(&t.name.as_str())) {
+                if vectors.contains_key(&info.name) {
+                    continue;
+                }
+                let values = global.tensor_f32(&info.name)?;
+                let device = cards[card_of(&info.name)].hip.device;
+                vectors.insert(info.name.clone(), DeviceWeights::upload(device, &[&values])?);
+            }
+        }
         let mut gpu = Self {
             cards,
             placement,
             matrices,
             vectors,
+            draft_head: None,
             act,
             hc,
             dim,
@@ -1016,6 +1045,7 @@ impl Qwen4Gpu {
             },
             matrices: HashMap::new(),
             vectors: HashMap::new(),
+            draft_head: None,
             act,
             hc: spec.hc,
             dim: spec.dim,
@@ -1871,6 +1901,58 @@ impl Qwen4Gpu {
         self.launch(card, m, x, card.at(act.io_out), out_rows)?;
         card.hip.copy_d2h_f32(card.at(act.io_out), &mut logits[..out_rows * m.n])
     }
+
+    pub fn hidden_rows(&self, rows: usize) -> Result<Vec<f32>, AllpacaError> {
+        let (card, act) = (&self.cards[0], &self.act);
+        let mut out = vec![0.0f32; rows * self.hc * self.dim];
+        card.hip.copy_d2h_f32(card.at(act.streams), &mut out)?;
+        Ok(out)
+    }
+
+    pub fn enable_q4_0_draft_head(&mut self, file: &GgufFile) -> Result<(), AllpacaError> {
+        if std::env::var("ALLPACA_DRAFT_HEAD_Q4_0").ok().as_deref() == Some("0") {
+            return Ok(());
+        }
+        let name = if file.tensor("output.weight").is_some() {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        let info = file.tensor(name).ok_or_else(|| gpu_err(format!("missing {name}")))?;
+        let packed = crate::model::stage_draft_head_q4_0(info, file.tensor_bytes(name)?)?;
+        tracing::info!(tensor = name, bytes = packed.len(), "qwen4exp MTP draft LM head staged as Q4_0");
+        self.draft_head = Some(DeviceWeights::upload_bytes(self.cards[0].hip.device, &[&packed])?);
+        Ok(())
+    }
+
+    pub fn has_q4_0_draft_head(&self) -> bool {
+        self.draft_head.is_some()
+    }
+
+    pub fn head_q4_0(&self, rows: usize, logits: &mut [f32]) -> Result<(), AllpacaError> {
+        let Some(weights) = &self.draft_head else {
+            return Err(gpu_err("qwen4exp: Q4_0 draft head is not enabled".into()));
+        };
+        let (card, act) = (&self.cards[0], &self.act);
+        let m = self.matrix("output.weight", self.dim)?;
+        self.check_rows(rows)?;
+        let out_rows = if logits.len() >= rows * m.n { rows } else { 1 };
+        if out_rows * m.n > act.io_out_floats || logits.len() < m.n {
+            return Err(gpu_err(format!("qwen4exp: {} logits do not fit", out_rows * m.n)));
+        }
+        // SAFETY: the input part holds `rows` rows of `dim` floats.
+        let x = unsafe { card.at(act.x).add((rows - out_rows) * self.dim) };
+        let _lm = card.hip.lm_head_scope();
+        allpaca_hip::gemm_nt_q4_0_device(
+            x,
+            weights.byte_ptr_at(0),
+            card.at(act.io_out),
+            out_rows as i32,
+            m.n as i32,
+            self.dim as i32,
+        )?;
+        card.hip.copy_d2h_f32(card.at(act.io_out), &mut logits[..out_rows * m.n])
+    }
 }
 
 /// Build the GPU working set of a loaded `qwen4exp` model.
@@ -1879,6 +1961,7 @@ pub fn attach(
     hip: &Arc<HipWorkspace>,
     second: Option<&Arc<HipWorkspace>>,
     expert_blocks: Option<&[usize]>,
+    globals: Option<&GgufFile>,
 ) -> Result<(), AllpacaError> {
     let q4 = model.q4x.as_ref().ok_or_else(|| gpu_err("missing qwen4exp weights".into()))?;
     // A worker that hosts whole blocks takes those after the last n-gram
@@ -1899,9 +1982,10 @@ pub fn attach(
         second.cloned(),
         expert_blocks,
         worker.as_ref().map(|(_, _, free)| (free.as_slice(), first_free)),
+        globals,
     )?;
     if let Some((rt, session, _)) = worker {
-        let recurrent = |blk: usize| q4.spec.is_recurrent(blk);
+        let recurrent = |blk: usize| q4.spec.is_recurrent(blk.saturating_sub(model.config.gguf_layer_base));
         // One indexer shape serves every block that has one.
         let mut qsa = None;
         for layer in 0..model.config.n_layers {

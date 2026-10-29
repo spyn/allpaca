@@ -27,7 +27,7 @@ use crate::device_manager::DeviceInventory;
 use crate::direct_storage::{
     probe_direct_storage, DirectStorageBridge, DirectStorageProbe, DirectStorageQueue,
 };
-use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider};
+use crate::draft::{DraftModelProvider, DraftProvider, NGramProvider, Qwen4MtpProvider};
 use crate::early_exit::gate_unsupported;
 #[cfg(test)]
 use crate::early_exit::EarlyExitSpec;
@@ -199,6 +199,7 @@ struct EngineInner {
     decision: Option<Arc<crate::decision::DecisionModel>>,
     target: Option<Arc<TinyModel>>,
     draft_model: Option<Arc<TinyModel>>,
+    qwen4_mtp: Option<Qwen4MtpProvider>,
     ngram: NGramProvider,
     dspark: Option<crate::dspark::DsparkProvider>,
     dflash2: Option<crate::dflash2::Dflash2Provider>,
@@ -667,6 +668,7 @@ impl Engine {
             decision: None,
             target: None,
             draft_model: None,
+            qwen4_mtp: None,
             ngram: NGramProvider::new(config.speculative.ngram_n),
             dspark: None,
             dflash2: None,
@@ -2042,7 +2044,11 @@ impl Engine {
                         });
                 match opened {
                     Ok(f) => match load_draft_gguf(&f) {
-                        Ok(draft) => {
+                        Ok(mut draft) => {
+                            let f = Arc::new(f);
+                            if draft.q4x.is_some() {
+                                draft.bind_gguf(f.clone());
+                            }
                             if draft.config.gguf_layer_base > 0 {
                                 tracing::info!(
                                     layers = draft.config.n_layers,
@@ -2168,7 +2174,7 @@ impl Engine {
             let draft_gguf = if draft_reuses_target_gguf {
                 Some(file.as_ref())
             } else {
-                draft_file.as_ref()
+                draft_file.as_ref().map(|f| f.as_ref())
             };
             draft_gguf.map_or(0, |f| {
                 let (layers, globals) = crate::model::gguf_device_bytes(f, &draft.config);
@@ -2196,13 +2202,39 @@ impl Engine {
                         }
                     }
                 } else if let Some(target) = target.as_ref().filter(|t| t.q4x.is_some()) {
-                    match crate::qwen4_gpu::attach(target, hip, self.draft_hip.as_ref(), None) {
+                    match crate::qwen4_gpu::attach(target, hip, self.draft_hip.as_ref(), None, None) {
                         Ok(()) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "qwen4exp HIP working set failed; CPU forward");
                             self.metrics
                                 .degraded_events
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    let mut draft_inner = self.lock()?;
+                    if let (Some(draft_hip), Some(draft)) =
+                        (self.draft_hip.as_ref(), draft_inner.draft_model.clone())
+                    {
+                        match crate::qwen4_gpu::attach(&draft, draft_hip, None, None, Some(file.as_ref())) {
+                            Ok(()) => {
+                                if let Some(q4) = draft.q4x.as_ref() {
+                                    q4.attach_shared_gguf(file.clone());
+                                    if let Ok(mut guard) = q4.gpu.lock() {
+                                        if let Some(gpu) = guard.as_mut() {
+                                            if let Err(e) = gpu.enable_q4_0_draft_head(file.as_ref()) {
+                                                tracing::warn!(error = %e, "qwen4exp Q4_0 draft head staging failed");
+                                            }
+                                        }
+                                    }
+                                }
+                                draft_inner.qwen4_mtp = Some(Qwen4MtpProvider::new((*draft).clone()));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "qwen4exp MTP draft upload failed");
+                                self.metrics
+                                    .degraded_events
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                 } else if let Some(target) = target {
@@ -2261,7 +2293,7 @@ impl Engine {
         let draft_ref = if draft_reuses_target_gguf {
             Some(file.as_ref())
         } else {
-            draft_file.as_ref()
+            draft_file.as_ref().map(|f| f.as_ref())
         };
         self.upload_resident_from_gguf(Some(file.as_ref()), draft_ref)?;
         self.attach_dflash2();
@@ -4453,13 +4485,16 @@ impl Engine {
                     probed_rows.extend_from_slice(&row_hiddens[(pos - start) * dim..][..dim]);
                 }
             }
-            if mtp && row_hiddens.len() == toks.len() * dim {
+            let hidden_width = inner.target.as_ref().map_or(dim, |t| {
+                t.q4x.as_ref().map_or(dim, |q4| q4.spec.hc * dim)
+            });
+            if mtp && row_hiddens.len() == toks.len() * hidden_width {
                 // Same pairing as per-token prefill: token `pos` with h_{pos-1}.
                 for (i, tok) in toks.iter().enumerate() {
                     let h_prev = if i == 0 {
                         std::mem::take(&mut last_hidden)
                     } else {
-                        row_hiddens[(i - 1) * dim..i * dim].to_vec()
+                        row_hiddens[(i - 1) * hidden_width..i * hidden_width].to_vec()
                     };
                     mtp_process_token(
                         inner,
@@ -4470,7 +4505,7 @@ impl Engine {
                         &self.metrics,
                     )?;
                 }
-                last_hidden = row_hiddens[(toks.len() - 1) * dim..].to_vec();
+                last_hidden = row_hiddens[(toks.len() - 1) * hidden_width..].to_vec();
             }
             // Device KV stays on-GPU. Host radix/anchor snapshots would D2H every
             // page (growing with seq) and break logits-only decode accounting.
@@ -6115,6 +6150,9 @@ fn load_draft_gguf(file: &GgufFile) -> Result<TinyModel, AllpacaError> {
 }
 
 fn mtp_draft_active(inner: &EngineInner) -> bool {
+    if inner.qwen4_mtp.is_some() {
+        return true;
+    }
     let Some(model) = inner.draft_model.as_ref() else {
         return false;
     };
@@ -6144,6 +6182,9 @@ fn mtp_process_token(
         .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
     let dim = model.config.dim;
     let kv_dim = model.config.n_kv_heads * model.config.head_dim();
+    if let Some(provider) = inner.qwen4_mtp.as_mut() {
+        return provider.process(token, pos, h_prev, metrics);
+    }
     if h_prev.len() != dim {
         return Ok(());
     }
@@ -6254,6 +6295,13 @@ fn propose_after_deferred(
             Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
         }
     }
+    if let Some(provider) = inner.qwen4_mtp.as_mut() {
+        let draft = provider.propose_after(ctx, tok, depth + 1, temperature, metrics)?;
+        if draft.len() >= 2 {
+            host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
+        }
+        return Ok(draft);
+    }
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
             let mtp = mtp_draft_active(inner);
@@ -6323,6 +6371,13 @@ fn propose_drafts(
             host_stage_draft_tokens(&ahead.tokens, draft_hip, metrics);
             return Ok(ahead.tokens);
         }
+    }
+    if let Some(provider) = inner.qwen4_mtp.as_mut() {
+        let draft = provider.propose_on(&ctx, depth, temperature, metrics)?;
+        if !draft.is_empty() {
+            host_stage_draft_tokens(&draft, draft_hip, metrics);
+        }
+        return Ok(draft);
     }
     if let Some(provider) = inner.dflash2.as_mut() {
         match provider.propose(&ctx, depth, temperature) {
@@ -6742,7 +6797,7 @@ fn packed_linear_verify(
         ctx.extend_from_slice(&span);
         ctx
     };
-    let can_ahead = depth > 0 && inner.flags.draft_model_speculation && inner.draft_model.is_some();
+    let can_ahead = depth > 0 && inner.qwen4_mtp.is_none() && inner.flags.draft_model_speculation && inner.draft_model.is_some();
     if !can_ahead {
         return packed_linear_verify_span(
             inner, id, span, first, mask, remaining, metrics, hip, draft_hip, hooks, None, None,
@@ -6982,7 +7037,7 @@ fn store_draft_ahead_from_ctx(
 ) -> Result<(), AllpacaError> {
     // A deferred correction occupies the next slot; a span drafted from `ctx`
     // would predict that slot and is never used (`propose_after_deferred`).
-    if depth == 0 || ctx.is_empty() || request(inner, id)?.deferred.is_some() {
+    if depth == 0 || ctx.is_empty() || inner.qwen4_mtp.is_some() || request(inner, id)?.deferred.is_some() {
         return Ok(());
     }
     let Some(model) = inner.draft_model.clone() else {
@@ -7418,7 +7473,8 @@ fn finish_linear_span(
         join();
     }
     // Rebuild MTP draft KV for accepted prefix with target hiddens (llama process).
-    if mtp_draft_active(inner) && dim > 0 && row_hiddens.len() >= keep * dim {
+    let hidden_width = target.q4x.as_ref().map_or(dim, |q4| q4.spec.hc * dim);
+    if mtp_draft_active(inner) && dim > 0 && row_hiddens.len() >= keep * hidden_width {
         let kv_dim = inner
             .draft_model
             .as_ref()
@@ -7431,8 +7487,8 @@ fn finish_linear_span(
             let h_prev = if i == 0 {
                 pending_h.as_slice()
             } else {
-                let off = (i - 1) * dim;
-                &row_hiddens[off..off + dim]
+                let off = (i - 1) * hidden_width;
+                &row_hiddens[off..off + hidden_width]
             };
             mtp_process_token(inner, span[i], start_pos + i, h_prev, draft_hip, metrics)?;
         }
@@ -7442,9 +7498,9 @@ fn finish_linear_span(
         active.tokens.extend_from_slice(&span[..keep]);
         active.pages = pages;
         // MTP handoff: last accepted row's output_norm hidden (not the rejected suffix).
-        if dim > 0 && row_hiddens.len() >= keep * dim {
-            let start = (keep - 1) * dim;
-            active.last_hidden = row_hiddens[start..start + dim].to_vec();
+        if dim > 0 && row_hiddens.len() >= keep * hidden_width {
+            let start = (keep - 1) * hidden_width;
+            active.last_hidden = row_hiddens[start..start + hidden_width].to_vec();
         }
     }
     if inner.flags.ngram_speculation {
