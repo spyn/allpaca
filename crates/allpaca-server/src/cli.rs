@@ -9,7 +9,9 @@ use clap::Parser;
     about = "Allpaca OpenAI-compatible inference server"
 )]
 pub struct Cli {
-    /// TOML config file. CLI flags override file values; file overrides compiled defaults.
+    /// TOML config file. When omitted, `allpaca.toml` in the working directory
+    /// is loaded if it exists. CLI flags override the file; the file overrides
+    /// compiled defaults.
     #[arg(long)]
     pub config: Option<PathBuf>,
     /// Local GGUF / SafeTensors / ONNX path, HuggingFace snapshot dir, or Hub `org/name`.

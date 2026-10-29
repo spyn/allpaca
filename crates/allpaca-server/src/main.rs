@@ -12,6 +12,7 @@ mod model_scan;
 mod model_settings;
 mod otlp_push;
 mod security;
+mod startup;
 mod systemone;
 mod tune;
 mod ui;
@@ -21,7 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use allpaca_core::Engine;
-use allpaca_types::Config;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -45,16 +45,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse_args();
-    let mut config = if let Some(path) = &cli.config {
-        Config::from_toml_file(path)?
-    } else {
-        Config::compiled_defaults()
-    };
+    let loaded = startup::load_startup_config(cli.config.as_deref(), &std::env::current_dir()?)?;
+    let mut config = loaded.config;
     config.merge_cli(&cli.to_overrides());
     config.validate()?;
 
     if cli.tune {
-        let config_path = cli.config.clone();
+        let config_path = loaded.path.clone();
         return crate::tune::run(cli.model.clone(), config, config_path);
     }
 
@@ -88,11 +85,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth::AuthState::from_password(Some(password)),
         log_ring,
     );
-    state.config_path = cli.config.clone();
+    state.config_path = loaded.path.clone();
     // Saved API settings (on/off, lockdown, keys, listen address). A
     // `--host` / `--port` on the command line wins for this run.
     let api_store =
-        api_access::ApiStore::open(api_access::ApiStore::path_for(cli.config.as_deref()));
+        api_access::ApiStore::open(api_access::ApiStore::path_for(loaded.path.as_deref()));
     let saved_api = api_store.get();
     state.api = Arc::new(api_store);
     let host = match (&cli.host, saved_api.host) {
