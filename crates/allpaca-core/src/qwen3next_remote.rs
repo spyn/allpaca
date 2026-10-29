@@ -335,7 +335,10 @@ fn weight_key_file(path: &std::path::Path) -> Result<(u64, u64), AllpacaError> {
 
     const M: u64 = 0x9e37_79b9_7f4a_7c15;
     let len = std::fs::metadata(path).map_err(FatalError::from)?.len();
-    let mut file = std::fs::File::open(path).map_err(FatalError::from)?;
+    let mut file = std::io::BufReader::with_capacity(
+        16 * 1024 * 1024,
+        std::fs::File::open(path).map_err(FatalError::from)?,
+    );
     let mut h = len.wrapping_mul(M);
     let mut word = [0u8; 8];
     loop {
