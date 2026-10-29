@@ -36,6 +36,10 @@ pub struct GgufTokenizer {
     pub fim_sep_id: Option<u32>,
     pub add_bos: bool,
     pub model_kind: String,
+    /// `tokenizer.ggml.normalizer.nfc`. Honour it only for Unigram (`llama`).
+    pub normalizer_nfc: bool,
+    /// `tokenizer.ggml.clean_spaces`. Detokenize only, and only when the key is set.
+    pub clean_spaces: bool,
 }
 
 impl GgufTokenizer {
@@ -115,6 +119,11 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
             _ => None,
         })
         .unwrap_or(kind.as_str() == "llama");
+    // Absent keys stay off. llama.cpp's BPE default of clean_spaces=true would
+    // change detokenized text for GGUFs that never wrote the key.
+    let normalizer_nfc =
+        kind.as_str() == "llama" && file.meta_bool("tokenizer.ggml.normalizer.nfc") == Some(true);
+    let clean_spaces = file.meta_bool("tokenizer.ggml.clean_spaces") == Some(true);
 
     let mut inner = match kind.as_str() {
         "gpt2" => {
@@ -168,6 +177,8 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
         fim_sep_id,
         add_bos,
         model_kind: kind,
+        normalizer_nfc,
+        clean_spaces,
     })
 }
 
