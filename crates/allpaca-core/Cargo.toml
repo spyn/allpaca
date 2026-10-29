@@ -29,6 +29,7 @@ rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
+unicode-normalization.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde_json.workspace = true

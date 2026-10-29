@@ -36,6 +36,10 @@ pub struct GgufTokenizer {
     pub fim_sep_id: Option<u32>,
     pub add_bos: bool,
     pub model_kind: String,
+    /// `tokenizer.ggml.normalizer.nfc`. Honoured only for UGM (`t5`), as in llama.cpp.
+    pub normalizer_nfc: bool,
+    /// `tokenizer.ggml.clean_spaces`. Detokenize only, and only when the key is set.
+    pub clean_spaces: bool,
 }
 
 impl GgufTokenizer {
@@ -115,6 +119,14 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
             _ => None,
         })
         .unwrap_or(kind.as_str() == "llama");
+    // Absent keys stay off. llama.cpp's BPE default of clean_spaces=true would
+    // change detokenized text for GGUFs that never wrote the key.
+    // llama.cpp reads the NFC key only in its UGM (`t5`) session. Converters
+    // write it for any NFC `tokenizer.json` (Qwen's BPE has one), so SPM and
+    // BPE files that carry it must not be normalised.
+    let normalizer_nfc =
+        kind.as_str() == "t5" && file.meta_bool("tokenizer.ggml.normalizer.nfc") == Some(true);
+    let clean_spaces = file.meta_bool("tokenizer.ggml.clean_spaces") == Some(true);
 
     let mut inner = match kind.as_str() {
         "gpt2" => {
@@ -142,7 +154,8 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
                 }
             }
         }
-        "llama" => build_unigram_or_wordlevel(&tokens, scores.as_deref(), unk_id)?,
+        // `t5` is llama.cpp's UGM vocab: pieces and scores, like HF Unigram.
+        "llama" | "t5" => build_unigram_or_wordlevel(&tokens, scores.as_deref(), unk_id)?,
         "gemma4" => gemma4_bpe(&tokens, merges.as_deref(), unk_id)?,
         _ => build_wordlevel(&tokens, unk_id)?,
     };
@@ -168,6 +181,8 @@ pub fn extract_tokenizer(file: &GgufFile) -> Result<GgufTokenizer, AllpacaError>
         fim_sep_id,
         add_bos,
         model_kind: kind,
+        normalizer_nfc,
+        clean_spaces,
     })
 }
 

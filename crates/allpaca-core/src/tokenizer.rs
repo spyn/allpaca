@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ahash::AHashMap;
 use allpaca_gguf::GgufTokenizer;
 use allpaca_safetensors::SidecarTokenizer;
@@ -6,6 +8,7 @@ use serde_json::Value;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
 use tokenizers::tokenizer::Tokenizer;
+use unicode_normalization::UnicodeNormalization;
 
 pub struct EngineTokenizer {
     inner: Tokenizer,
@@ -30,6 +33,10 @@ pub struct EngineTokenizer {
     /// GGUF `gpt2` vocab: pieces are GPT-2 byte-level strings (`Ġ` space,
     /// `Ċ` newline, UTF-8 split across pieces), not text.
     byte_level: bool,
+    /// GGUF `tokenizer.ggml.normalizer.nfc` on a Unigram model.
+    normalizer_nfc: bool,
+    /// GGUF `tokenizer.ggml.clean_spaces`, applied to a full detokenize only.
+    clean_spaces: bool,
 }
 
 impl EngineTokenizer {
@@ -54,6 +61,8 @@ impl EngineTokenizer {
             add_bos: tok.add_bos,
             hf_native_decode: false,
             byte_level: tok.model_kind == "gpt2",
+            normalizer_nfc: tok.normalizer_nfc,
+            clean_spaces: tok.clean_spaces,
         }
     }
 
@@ -183,6 +192,8 @@ impl EngineTokenizer {
             add_bos: bos_id.is_some(),
             hf_native_decode: false,
             byte_level: false,
+            normalizer_nfc: false,
+            clean_spaces: false,
         })
     }
 
@@ -192,17 +203,19 @@ impl EngineTokenizer {
 
     /// Token ids of `text` alone, never with a BOS token in front.
     pub fn encode_plain(&self, text: &str) -> Result<Vec<u32>, AllpacaError> {
+        let text = self.prepare_encode(text);
         let encoding = self
             .inner
-            .encode(text, false)
+            .encode(text.as_ref(), false)
             .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))?;
         Ok(encoding.get_ids().to_vec())
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, AllpacaError> {
+        let text = self.prepare_encode(text);
         let encoding = self
             .inner
-            .encode(text, false)
+            .encode(text.as_ref(), false)
             .map_err(|e| AllpacaError::Fatal(FatalError::Tokenizer(e.to_string())))?;
         let mut ids = encoding.get_ids().to_vec();
         if self.add_bos {
@@ -303,10 +316,30 @@ impl EngineTokenizer {
             add_bos,
             hf_native_decode: true,
             byte_level: false,
+            normalizer_nfc: false,
+            clean_spaces: false,
         })
     }
 
+    /// NFC the text when the GGUF flag asks for it. Already-composed text is borrowed.
+    fn prepare_encode<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if self.normalizer_nfc && !unicode_normalization::is_nfc(text) {
+            Cow::Owned(text.nfc().collect())
+        } else {
+            Cow::Borrowed(text)
+        }
+    }
+
     pub fn decode(&self, ids: &[u32]) -> Result<String, AllpacaError> {
+        let text = self.decode_uncleaned(ids)?;
+        if self.clean_spaces {
+            Ok(clean_tokenization_spaces(&text))
+        } else {
+            Ok(text)
+        }
+    }
+
+    fn decode_uncleaned(&self, ids: &[u32]) -> Result<String, AllpacaError> {
         if self.hf_native_decode {
             return self
                 .inner
@@ -372,6 +405,74 @@ impl EngineTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
     }
+}
+
+/// llama.cpp `llama_detokenize` when `clean_spaces` is set. Three in-place
+/// byte passes: drop a space before `?!.,`, drop a space-apostrophe-space,
+/// and drop the space before `'s` `'m` `'re` `'ve`. `'t` `'d` `'ll` keep it.
+fn clean_tokenization_spaces(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut buf = text.as_bytes().to_vec();
+    let n = clean_spaces_bytes(&mut buf);
+    String::from_utf8(buf[..n].to_vec()).unwrap_or_else(|_| text.to_string())
+}
+
+fn clean_spaces_bytes(text: &mut [u8]) -> usize {
+    let total1 = text.len();
+    let mut total = 1usize;
+    let mut i = 1usize;
+    while i < total1 {
+        let x = text[i];
+        if text[i - 1] == b' ' && matches!(x, b'?' | b'!' | b'.' | b',') {
+            total -= 1;
+        }
+        text[total] = x;
+        total += 1;
+        i += 1;
+    }
+
+    let total2 = total;
+    total = 1;
+    i = 1;
+    while i < total2 {
+        let x = text[i];
+        if x == b'\'' && i + 1 < total2 && text[i - 1] == b' ' && text[i + 1] == b' ' {
+            total -= 1;
+            i += 1;
+            text[i] = 0;
+        }
+        text[total] = x;
+        total += 1;
+        i += 1;
+    }
+
+    let total3 = total;
+    total = 1;
+    i = 1;
+    while i < total3 {
+        let x = text[i];
+        if text[i - 1] == b' ' && x == b'\'' && i + 1 < total3 {
+            let x1 = text[i + 1];
+            if x1 == b't' || x1 == b'd' {
+                // llama.cpp keeps the space before 't and 'd.
+            } else if x1 == b's' || x1 == b'm' {
+                total -= 1;
+            } else if i + 2 < total3 {
+                let x2 = text[i + 2];
+                if x1 == b'l' && x2 == b'l' {
+                    // llama.cpp keeps the space before 'll.
+                } else if (x1 == b'r' && x2 == b'e') || (x1 == b'v' && x2 == b'e') {
+                    total -= 1;
+                }
+            }
+        }
+        text[total] = x;
+        total += 1;
+        i += 1;
+    }
+    total
 }
 
 /// Turns a stream of token bytes into text without splitting a character:
@@ -757,6 +858,174 @@ fn json_u32_second(value: Option<&Value>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A temp GGUF path no other test thread uses: tests that build the same
+    /// tokenizer run in parallel and each deletes its file.
+    fn q12_temp_path(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "allpaca-q12-{label}-{}-{n}.gguf",
+            std::process::id()
+        ))
+    }
+
+    /// `model` is `tokenizer.ggml.model`: `t5` is llama.cpp's Unigram (UGM)
+    /// vocab, `llama` its SentencePiece BPE (SPM) vocab.
+    fn unigram_file(model: &str, nfc: Option<bool>) -> EngineTokenizer {
+        let path = q12_temp_path(&format!("{model}-{nfc:?}"));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            allpaca_gguf::GgufValue::String(model.into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            allpaca_gguf::GgufValue::Array(vec![
+                allpaca_gguf::GgufValue::String("<unk>".into()),
+                allpaca_gguf::GgufValue::String("é".into()),
+                allpaca_gguf::GgufValue::String("e".into()),
+                allpaca_gguf::GgufValue::String("\u{0301}".into()),
+            ]),
+        );
+        meta.insert(
+            "tokenizer.ggml.scores".into(),
+            allpaca_gguf::GgufValue::Array(vec![
+                allpaca_gguf::GgufValue::Float32(-20.0),
+                allpaca_gguf::GgufValue::Float32(0.0),
+                allpaca_gguf::GgufValue::Float32(-1.0),
+                allpaca_gguf::GgufValue::Float32(-1.0),
+            ]),
+        );
+        meta.insert(
+            "tokenizer.ggml.unknown_token_id".into(),
+            allpaca_gguf::GgufValue::Uint32(0),
+        );
+        meta.insert(
+            "tokenizer.ggml.add_bos_token".into(),
+            allpaca_gguf::GgufValue::Bool(false),
+        );
+        if let Some(nfc) = nfc {
+            meta.insert(
+                "tokenizer.ggml.normalizer.nfc".into(),
+                allpaca_gguf::GgufValue::Bool(nfc),
+            );
+        }
+        allpaca_gguf::write_gguf(&path, &meta, &[]).unwrap();
+        let file = allpaca_gguf::GgufFile::open(&path).unwrap();
+        let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
+        let _ = std::fs::remove_file(path);
+        tok
+    }
+
+    #[test]
+    fn unigram_nfc_encodes_a_decomposed_e_acute_as_the_composed_piece() {
+        let tok = unigram_file("t5", Some(true));
+        let composed = tok.encode("é").unwrap();
+        let decomposed = tok.encode("e\u{0301}").unwrap();
+        assert_eq!(decomposed, composed);
+        assert_eq!(composed, vec![1]);
+    }
+
+    fn pieces_file(clean_spaces: Option<bool>) -> EngineTokenizer {
+        let path = q12_temp_path(&format!("clean-{clean_spaces:?}"));
+        let pieces = [
+            "<unk>", "Hello", " ", "?", "it", "'s", "'t", "'re", "'ve", "'ll", "'", "!", ".", ",",
+            "'m", "'d",
+        ];
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "tokenizer.ggml.model".into(),
+            allpaca_gguf::GgufValue::String("llama".into()),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".into(),
+            allpaca_gguf::GgufValue::Array(
+                pieces
+                    .iter()
+                    .map(|p| allpaca_gguf::GgufValue::String((*p).into()))
+                    .collect(),
+            ),
+        );
+        meta.insert(
+            "tokenizer.ggml.scores".into(),
+            allpaca_gguf::GgufValue::Array(
+                pieces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        allpaca_gguf::GgufValue::Float32(if i == 0 { -20.0 } else { 0.0 })
+                    })
+                    .collect(),
+            ),
+        );
+        meta.insert(
+            "tokenizer.ggml.add_bos_token".into(),
+            allpaca_gguf::GgufValue::Bool(false),
+        );
+        if let Some(clean_spaces) = clean_spaces {
+            meta.insert(
+                "tokenizer.ggml.clean_spaces".into(),
+                allpaca_gguf::GgufValue::Bool(clean_spaces),
+            );
+        }
+        allpaca_gguf::write_gguf(&path, &meta, &[]).unwrap();
+        let file = allpaca_gguf::GgufFile::open(&path).unwrap();
+        let tok = EngineTokenizer::from_gguf(allpaca_gguf::extract_tokenizer(&file).unwrap());
+        let _ = std::fs::remove_file(path);
+        tok
+    }
+
+    #[test]
+    fn clean_spaces_drops_the_space_before_punctuation() {
+        let tok = pieces_file(Some(true));
+        assert_eq!(tok.decode(&[1, 2, 3]).unwrap(), "Hello?");
+    }
+
+    #[test]
+    fn clean_spaces_matches_llamacpp_contractions_and_stays_off_when_unset() {
+        let tok = pieces_file(Some(true));
+        assert_eq!(tok.decode(&[4, 2, 5]).unwrap(), "it's");
+        assert_eq!(tok.decode(&[4, 2, 14]).unwrap(), "it'm");
+        assert_eq!(tok.decode(&[4, 2, 7]).unwrap(), "it're");
+        assert_eq!(tok.decode(&[4, 2, 8]).unwrap(), "it've");
+        assert_eq!(tok.decode(&[4, 2, 6]).unwrap(), "it 't");
+        assert_eq!(tok.decode(&[4, 2, 15]).unwrap(), "it 'd");
+        assert_eq!(tok.decode(&[4, 2, 9]).unwrap(), "it 'll");
+        assert_eq!(tok.decode(&[2, 10, 2]).unwrap(), "'");
+        assert_eq!(tok.decode(&[1, 2, 11]).unwrap(), "Hello!");
+        assert_eq!(tok.decode(&[1, 2, 12]).unwrap(), "Hello.");
+        assert_eq!(tok.decode(&[1, 2, 13]).unwrap(), "Hello,");
+        assert_eq!(tok.decode_one(2), " ");
+        assert_eq!(tok.decode_one(3), "?");
+
+        let off = pieces_file(Some(false));
+        assert_eq!(off.decode(&[1, 2, 3]).unwrap(), "Hello ?");
+        assert_eq!(off.decode(&[4, 2, 5]).unwrap(), "it 's");
+
+        let absent = pieces_file(None);
+        assert_eq!(absent.decode(&[1, 2, 3]).unwrap(), "Hello ?");
+    }
+
+    #[test]
+    fn unigram_without_nfc_keeps_a_decomposed_e_acute_split() {
+        for flag in [Some(false), None] {
+            let tok = unigram_file("t5", flag);
+            assert_eq!(tok.encode("é").unwrap(), vec![1]);
+            assert_eq!(tok.encode("e\u{0301}").unwrap(), vec![2, 3]);
+            assert_eq!(tok.encode_plain("e\u{0301}").unwrap(), vec![2, 3]);
+        }
+    }
+
+    /// llama.cpp reads `normalizer.nfc` only in its UGM session; the SPM
+    /// session never normalises. A Qwen-style converter writes the key for
+    /// any NFC `tokenizer.json`, so an SPM file can carry it.
+    #[test]
+    fn sentencepiece_bpe_ignores_the_nfc_key_like_llamacpp() {
+        let tok = unigram_file("llama", Some(true));
+        assert_eq!(tok.encode("é").unwrap(), vec![1]);
+        assert_eq!(tok.encode("e\u{0301}").unwrap(), vec![2, 3]);
+    }
 
     #[test]
     fn deepseek_chat_uses_the_models_turn_tokens() {
