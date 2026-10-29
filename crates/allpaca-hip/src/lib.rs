@@ -416,12 +416,15 @@ mod ffi {
         pub fn allpaca_hip_host_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_hip_host_register(ptr: *mut c_void, bytes: usize, flags: u32) -> i32;
         pub fn allpaca_hip_host_unregister(ptr: *mut c_void) -> i32;
+        // Windows DirectStorage bridge only; the call sites are cfg(windows).
+        #[allow(dead_code)]
         pub fn allpaca_dstorage_alloc(
             handle: *mut *mut c_void,
             hip_ptr: *mut *mut c_void,
             bytes: usize,
             device: i32,
         ) -> i32;
+        #[allow(dead_code)] // Windows DirectStorage bridge only.
         pub fn allpaca_dstorage_read(
             handle: *mut c_void,
             path: *const u16,
@@ -429,6 +432,7 @@ mod ffi {
             buffer_offset: u64,
             bytes: usize,
         ) -> i32;
+        #[allow(dead_code)] // Windows DirectStorage bridge only.
         pub fn allpaca_dstorage_free(handle: *mut c_void) -> i32;
         pub fn allpaca_hip_memcpy(
             dst: *mut c_void,
@@ -651,6 +655,8 @@ mod ffi {
             limit: f32,
             stream: *mut c_void,
         ) -> i32;
+        // Superseded by `allpaca_gemm_nt_q6_k_cols`; kept so the C ABI stays declared.
+        #[allow(dead_code)]
         pub fn allpaca_gemm_nt_q6_k(
             a: *const f32,
             b: *const u8,
@@ -881,6 +887,8 @@ mod ffi {
             out: *mut f32,
             stream: *mut c_void,
         ) -> i32;
+        // Superseded by `allpaca_gemm_nt_q5_k_cols`; kept so the C ABI stays declared.
+        #[allow(dead_code)]
         pub fn allpaca_gemm_nt_q5_k(
             a: *const f32,
             b: *const u8,

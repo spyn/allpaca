@@ -71,6 +71,8 @@ pub struct ModelEntry {
     pub error: Option<String>,
 }
 
+/// Directory scan as one value. `scan` still returns the entries; this shape is unused.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanResult {
     pub models_dir: Option<String>,

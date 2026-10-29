@@ -289,7 +289,7 @@ impl InputStats {
         if &magic != STATS_MAGIC {
             return Err(bad("not calibration statistics"));
         }
-        let mut u64_of = |input: &mut std::io::BufReader<std::fs::File>| -> Result<u64, AllpacaError> {
+        let u64_of = |input: &mut std::io::BufReader<std::fs::File>| -> Result<u64, AllpacaError> {
             let mut b = [0u8; 8];
             input.read_exact(&mut b).map_err(io)?;
             Ok(u64::from_le_bytes(b))

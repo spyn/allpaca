@@ -2198,12 +2198,14 @@ fn forward_device(
 /// Tiny `qwen4exp` GGUF for tests: four layers (three Gated DeltaNet, one
 /// full attention), two residual streams, n-gram embeddings at layer 1,
 /// routed and shared experts. Weights are seeded noise, all F32.
+#[cfg(test)]
 pub fn write_tiny_qwen4exp_gguf(path: &std::path::Path) {
     write_tiny(path, 16, 8, false, None);
 }
 
 /// The tiny model with an indexer on its full-attention layer: pools of
 /// two cells, of which the attention keeps `top_k / 2` and the tail.
+#[cfg(test)]
 pub fn write_tiny_qwen4exp_sparse_gguf(path: &std::path::Path, top_k: usize) {
     write_tiny(path, 16, 8, false, Some(top_k));
 }
@@ -2222,6 +2224,7 @@ pub fn write_tiny_qwen4exp_packed_sparse_gguf(path: &std::path::Path, top_k: usi
 }
 
 /// The encoding a tensor of the packed fixture is stored in.
+#[cfg(test)]
 fn packed_type(name: &str) -> Option<allpaca_gguf::GgmlType> {
     use allpaca_gguf::GgmlType;
     let ends = |suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
@@ -2236,15 +2239,18 @@ fn packed_type(name: &str) -> Option<allpaca_gguf::GgmlType> {
     }
 }
 
+#[cfg(test)]
 fn write_tiny(path: &std::path::Path, dim: usize, ff: usize, packed: bool, indexer: Option<usize>) {
     write_tiny_ple(path, dim, ff, packed, indexer, 4);
 }
 
 /// The tiny model with n-gram table rows `ple_dim` wide (32 fits IQ4_NL blocks).
+#[cfg(test)]
 pub fn write_tiny_qwen4exp_wide_ple_gguf(path: &std::path::Path) {
     write_tiny_ple(path, 16, 8, false, None, 32);
 }
 
+#[cfg(test)]
 fn write_tiny_ple(path: &std::path::Path, dim: usize, ff: usize, packed: bool, indexer: Option<usize>, ple_dim: usize) {
     use allpaca_gguf::{write_gguf_quant, GgmlType, GgufWriteQuantTensor, GgufWriteTensor};
 
@@ -3421,7 +3427,7 @@ mod tests {
         // conv taps per channel: [two back, current].
         let conv_w = [10.0f32, 0.0, 10.0, 0.0];
         let mut history = Vec::new();
-        let mut step = |emb: f32, history: &mut Vec<f32>| {
+        let step = |emb: f32, history: &mut Vec<f32>| {
             let mut streams = [1.0f32, 0.0];
             ple_update(&mut streams, &[emb], &key_w, &value_w, [&ones, &ones, &ones], &conv_w, history, &ple, 2, 0.0).unwrap();
             streams
