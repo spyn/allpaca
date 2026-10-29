@@ -1780,8 +1780,9 @@ impl ResidentModel {
             }
             let reported = report
                 .layers
-                .get(i)
-                .map(|l| l.block)
+                .iter()
+                .find(|layer| layer.index == i)
+                .map(|layer| layer.block)
                 .unwrap_or(HybridLayerKind::Attention);
             // NextN/MTP is dense attn+FFN even when the trunk is hybrid SSM.
             let block = if file.tensor(&format!("blk.{i}.attn_q.weight")).is_some() {
@@ -6857,11 +6858,16 @@ impl TinyModel {
         let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
         for i in 0..cfg.n_layers {
             let i = cfg.gguf_blk(i);
-            let info = report.layers.get(i).cloned().unwrap_or(HybridLayerInfo {
-                index: i,
-                block: HybridLayerKind::Attention,
-                moe: cfg.n_experts > 0,
-            });
+            let info = report
+                .layers
+                .iter()
+                .find(|layer| layer.index == i)
+                .cloned()
+                .unwrap_or(HybridLayerInfo {
+                    index: i,
+                    block: HybridLayerKind::Attention,
+                    moe: cfg.n_experts > 0,
+                });
             match info.block {
                 HybridLayerKind::Ssm => {
                     if file.tensor(&format!("blk.{i}.ssm_in.weight")).is_none()
@@ -7012,11 +7018,16 @@ impl TinyModel {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let i = cfg.gguf_blk(i);
-            let info = report.layers.get(i).cloned().unwrap_or(HybridLayerInfo {
-                index: i,
-                block: HybridLayerKind::Attention,
-                moe: cfg.n_experts > 0,
-            });
+            let info = report
+                .layers
+                .iter()
+                .find(|layer| layer.index == i)
+                .cloned()
+                .unwrap_or(HybridLayerInfo {
+                    index: i,
+                    block: HybridLayerKind::Attention,
+                    moe: cfg.n_experts > 0,
+                });
             // Compat may mark MTP blocks as Ssm if neighboring heuristics misfire; prefer Attention
             // when Q projections exist (Qwen3.5 NextN is dense attn + FFN).
             let block = if file.tensor(&format!("blk.{i}.attn_q.weight")).is_some()
@@ -7343,7 +7354,7 @@ impl TinyModel {
         let layers = (0..cfg.n_layers)
             .map(|local| {
                 let i = cfg.gguf_blk(local);
-                let info = report.layers.get(i);
+                let info = report.layers.iter().find(|layer| layer.index == i);
                 let reported = info.map(|l| l.block).unwrap_or(HybridLayerKind::Attention);
                 let block = if file
                     .map(|f| {
