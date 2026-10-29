@@ -15020,6 +15020,85 @@ mod tests {
         assert_eq!(back, vec![0x22u8; 64], "destination missed the source write");
     }
 
+    /// Queue `rounds` fills of `buf` on the current device's null stream, so
+    /// later work on that device starts tens of milliseconds from now.
+    #[cfg(feature = "hip")]
+    fn queue_null_stream_backlog(buf: *mut u8, bytes: usize, value: u8, rounds: usize) {
+        for _ in 0..rounds {
+            memset_async(buf, value, bytes, std::ptr::null_mut()).expect("backlog fill");
+        }
+    }
+
+    /// The hop used to run on the destination null stream, behind the work
+    /// already queued there. Work that still writes `dst` must not land after
+    /// the copy.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn peer_copy_lands_after_queued_destination_writes() {
+        if device_count() < 2 {
+            return;
+        }
+        let big = 64 * 1024 * 1024;
+        let src = device_malloc(4096, 1).expect("src");
+        let dst = device_malloc(big, 0).expect("dst");
+        set_device(1).expect("src device");
+        memset_async(src, 0x22, 4096, std::ptr::null_mut()).expect("src fill");
+        stream_synchronize().expect("src sync");
+
+        set_device(0).expect("dst device");
+        queue_null_stream_backlog(dst, big, 0x33, 128);
+        memcpy_peer(dst, 0, src, 1, 4096).expect("peer copy");
+        set_device(0).expect("dst device");
+        stream_synchronize().expect("dst sync");
+        let mut back = vec![0u8; 64];
+        memcpy(back.as_mut_ptr(), dst, 64, MEMCPY_D2H).expect("d2h");
+        device_free(src, 4096);
+        device_free(dst, big);
+        assert_eq!(
+            back,
+            vec![0x22u8; 64],
+            "a queued destination fill overwrote the copy"
+        );
+    }
+
+    /// `memcpy_peer` used to return only after the copy finished, so a caller
+    /// could reuse `src` at once. A source write queued after the call must
+    /// not reach the destination, even when the copy is held up behind
+    /// destination work.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn peer_copy_reads_the_source_before_later_source_writes() {
+        if device_count() < 2 {
+            return;
+        }
+        let big = 64 * 1024 * 1024;
+        let src = device_malloc(4096, 1).expect("src");
+        let dst = device_malloc(4096, 0).expect("dst");
+        let busy = device_malloc(big, 0).expect("dst backlog");
+        set_device(1).expect("src device");
+        memset_async(src, 0x22, 4096, std::ptr::null_mut()).expect("src fill");
+        stream_synchronize().expect("src sync");
+
+        set_device(0).expect("dst device");
+        queue_null_stream_backlog(busy, big, 0x55, 128);
+        memcpy_peer(dst, 0, src, 1, 4096).expect("peer copy");
+        set_device(1).expect("src device");
+        memset_async(src, 0x44, 4096, std::ptr::null_mut()).expect("src rewrite");
+        stream_synchronize().expect("src sync");
+        set_device(0).expect("dst device");
+        stream_synchronize().expect("dst sync");
+        let mut back = vec![0u8; 64];
+        memcpy(back.as_mut_ptr(), dst, 64, MEMCPY_D2H).expect("d2h");
+        device_free(src, 4096);
+        device_free(dst, 4096);
+        device_free(busy, big);
+        assert_eq!(
+            back,
+            vec![0x22u8; 64],
+            "the copy read a source write queued after it"
+        );
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn memcpy_peer_is_capable_even_when_access_api_denies() {

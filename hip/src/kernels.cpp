@@ -8202,6 +8202,8 @@ struct PeerSrcEvents {
 };
 
 static std::mutex g_peer_mu;
+/* Indexed by the device an event is recorded on: the source for `ready`,
+   the destination for `copied` (peer_hold_source). */
 static PeerSrcEvents g_peer_src[kPeerDevs]{};
 /* Process lifetime. Destroying a join stream waits for the hop queued on it. */
 static hipStream_t g_peer_join[kPeerDevs]{};
@@ -8247,6 +8249,31 @@ static hipStream_t peer_join_stream(int32_t dst_dev) {
         clear_last_error();
     }
     return join;
+}
+
+/* The hop used to return only after the copy, so callers reuse `src` at once.
+   The source device's join stream waits for the copy and its null stream
+   joins that stream, so a later source write cannot reach the copy. Called
+   with `dst_dev` current; leaves `src_dev` current. */
+static hipError_t peer_hold_source(hipStream_t copy_stream, int32_t dst_dev, int32_t src_dev) {
+    PeerSrcEvents &pool = g_peer_src[dst_dev];
+    hipEvent_t copied = peer_take_event(pool);
+    if (!copied) {
+        return hipErrorOutOfMemory;
+    }
+    hipError_t err = hipEventRecord(copied, copy_stream);
+    if (err == hipSuccess) {
+        err = hipSetDevice(src_dev);
+    }
+    hipStream_t hold = err == hipSuccess ? peer_join_stream(src_dev) : nullptr;
+    if (err == hipSuccess && !hold) {
+        err = hipErrorOutOfMemory;
+    }
+    if (err == hipSuccess) {
+        err = hipStreamWaitEvent(hold, copied, 0);
+    }
+    peer_stash_event(pool, copied);
+    return err;
 }
 
 extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
@@ -8301,6 +8328,9 @@ extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *s
         err = hipMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
     }
     peer_stash_event(pool, ready);
+    if (err == hipSuccess) {
+        err = peer_hold_source(s, dst_dev, src_dev);
+    }
     (void)hipSetDevice(prev);
     return hip_status(err);
 }
