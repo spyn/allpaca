@@ -8,6 +8,7 @@
 //! versa) as long as HELLO majors match.
 
 mod gpu_sysfs;
+pub mod link;
 mod protocol;
 mod session;
 mod worker;
