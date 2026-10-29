@@ -400,6 +400,12 @@ mod ffi {
             bytes: usize,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_hip_memset_async(
+            ptr: *mut c_void,
+            value: i32,
+            bytes: usize,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_hip_free(ptr: *mut c_void) -> i32;
         pub fn allpaca_hip_free_async(ptr: *mut c_void, stream: *mut c_void) -> i32;
         pub fn allpaca_hip_host_malloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
@@ -1858,7 +1864,6 @@ pub fn copy_dev_f32(
         return memcpy(dst.cast(), src.cast(), bytes, MEMCPY_D2D);
     }
     set_device(src_dev)?;
-    stream_synchronize()?;
     if memcpy_peer(dst.cast(), dst_dev, src.cast(), src_dev, bytes).is_ok() {
         set_device(dst_dev)?;
         return Ok(());
@@ -1923,8 +1928,14 @@ pub fn benchmark_transfer(
         let _ = probe_peer(src, dst);
         let _ = probe_peer(dst, src);
         let _ = memcpy_peer(d_dst, dst, d_src, src, n);
+        let _ = set_device(dst);
+        let _ = stream_synchronize();
         let t = Instant::now();
-        let copy_ok = memcpy_peer(d_dst, dst, d_src, src, n).is_ok();
+        // memcpy_peer enqueues. The dest null stream joins that work, so the
+        // sync below is the transfer, not a stall inside the hop.
+        let copy_ok = memcpy_peer(d_dst, dst, d_src, src, n).is_ok()
+            && set_device(dst).is_ok()
+            && stream_synchronize().is_ok();
         let p2p_elapsed_us = t.elapsed().as_secs_f64() * 1.0e6;
         let (p2p_gbps, p2p_us, p2p_copy_ok) = if copy_ok && p2p_elapsed_us > 0.0 {
             let gbps = (bytes as f64 * 8.0 / 1.0e9) / (p2p_elapsed_us / 1.0e6);
@@ -2168,6 +2179,32 @@ pub fn memset_on(
     {
         let rc = unsafe { ffi::allpaca_hip_memset(dst.cast(), i32::from(value), bytes, stream) };
         status(rc, "memset")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (dst, value, bytes, stream);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP memset unavailable".into(),
+        )))
+    }
+}
+
+/// Queue a fill and return. Unlike [`memset_on`] with a null stream, this
+/// does not wait, so later work on that stream stays behind the fill.
+pub fn memset_async(
+    dst: *mut u8,
+    value: u8,
+    bytes: usize,
+    stream: *mut std::ffi::c_void,
+) -> Result<(), AllpacaError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc =
+            unsafe { ffi::allpaca_hip_memset_async(dst.cast(), i32::from(value), bytes, stream) };
+        status(rc, "memset_async")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
@@ -14922,6 +14959,65 @@ mod tests {
         memcpy(back.as_mut_ptr(), d, n, MEMCPY_D2H).expect("d2h");
         device_free(d, n);
         assert_eq!(back, vec![0x3C; n]);
+    }
+
+    /// A peer hop must not sit in `hipStreamSynchronize` for the source
+    /// device's queued work. The destination still has to observe that work:
+    /// the old sync existed so a ping-pong split did not copy a stale activation.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn peer_copy_returns_while_the_source_stream_is_still_busy() {
+        if device_count() < 2 {
+            return;
+        }
+        let bytes = 64 * 1024 * 1024;
+        let src = device_malloc(bytes, 1).expect("src");
+        let dst = device_malloc(4096, 0).expect("dst");
+        set_device(1).expect("src device");
+        // First touch of a fresh allocation is not the steady copy cost.
+        memset_async(src, 0x11, bytes, std::ptr::null_mut()).expect("warmup");
+        stream_synchronize().expect("warmup sync");
+        // The join stream is created on the first hop. Time the next one.
+        memcpy_peer(dst, 0, src, 1, 4096).expect("warmup peer");
+        set_device(0).expect("warmup dst");
+        stream_synchronize().expect("warmup peer sync");
+        set_device(1).expect("src device");
+        let mut rounds = 8usize;
+        let mut kernel_us = 0.0;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                memset_async(src, 0x11, bytes, std::ptr::null_mut()).expect("calibrate");
+            }
+            stream_synchronize().expect("calibrate sync");
+            kernel_us = t.elapsed().as_secs_f64() * 1.0e6;
+            if kernel_us >= 20_000.0 {
+                break;
+            }
+            rounds = rounds.saturating_mul(2);
+        }
+        assert!(
+            kernel_us >= 20_000.0,
+            "could not queue a source-stream backlog ({kernel_us:.0} us, {rounds} fills)"
+        );
+
+        for _ in 0..rounds {
+            memset_async(src, 0x22, bytes, std::ptr::null_mut()).expect("source write");
+        }
+        let t = std::time::Instant::now();
+        memcpy_peer(dst, 0, src, 1, 4096).expect("peer copy");
+        let peer_us = t.elapsed().as_secs_f64() * 1.0e6;
+        set_device(0).expect("dst device");
+        stream_synchronize().expect("dst sync");
+        let mut back = vec![0u8; 64];
+        memcpy(back.as_mut_ptr(), dst, 64, MEMCPY_D2H).expect("d2h");
+        device_free(src, bytes);
+        device_free(dst, 4096);
+        assert!(
+            peer_us * 4.0 < kernel_us,
+            "peer copy waited on the source stream: {peer_us:.0} us vs {kernel_us:.0} us queued"
+        );
+        assert_eq!(back, vec![0x22u8; 64], "destination missed the source write");
     }
 
     #[cfg(feature = "hip")]

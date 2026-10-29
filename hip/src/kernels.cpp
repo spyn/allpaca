@@ -8137,6 +8137,20 @@ extern "C" int allpaca_hip_memset(void *dst, int32_t value, size_t bytes, allpac
     return hip_status(hipMemset(dst, fill, bytes));
 }
 
+// Queue a fill on `stream`, including the null stream. `allpaca_hip_memset`
+// uses the synchronous call for the null stream, which finishes the work
+// before it returns and cannot stand in for queued source compute.
+extern "C" int allpaca_hip_memset_async(void *dst, int32_t value, size_t bytes,
+                                        allpaca_stream_t stream) {
+    if (!dst && bytes) {
+        return ALLPACA_ERR_INVALID;
+    }
+    if (bytes == 0) {
+        return ALLPACA_OK;
+    }
+    return hip_status(hipMemsetAsync(dst, value & 0xff, bytes, as_stream(stream)));
+}
+
 __device__ unsigned int g_touch_sink;
 
 __global__ void touch_resident_kernel(const uint8_t *p, size_t bytes) {
@@ -8173,32 +8187,120 @@ extern "C" int allpaca_hip_touch_resident(void *ptr, size_t bytes, int32_t devic
     return hip_status(hipGetLastError());
 }
 
+/* SDK 7.1 `hipStreamWaitEvent` on the null stream drains that event on the
+   CPU (measured ~13 ms against a full source backlog). A blocking stream's
+   wait returns immediately, and the destination null stream joins every
+   blocking stream on that device, so later null-stream work still happens
+   after the copy. Events stay in a pool: destroying one that is still
+   recorded can sync, which is the stall this hop exists to avoid. */
+static constexpr int kPeerDevs = 16;
+static constexpr int kPeerEvents = 32;
+
+struct PeerSrcEvents {
+    hipEvent_t events[kPeerEvents]{};
+    int n = 0;
+};
+
+static std::mutex g_peer_mu;
+static PeerSrcEvents g_peer_src[kPeerDevs]{};
+/* Process lifetime. Destroying a join stream waits for the hop queued on it. */
+static hipStream_t g_peer_join[kPeerDevs]{};
+
+static hipEvent_t peer_take_event(PeerSrcEvents &pool) {
+    for (int i = 0; i < pool.n;) {
+        if (hipEventQuery(pool.events[i]) == hipSuccess) {
+            hipEvent_t ready = pool.events[i];
+            pool.events[i] = pool.events[pool.n - 1];
+            pool.n--;
+            return ready;
+        }
+        clear_last_error();
+        ++i;
+    }
+    hipEvent_t ready = nullptr;
+    if (hipEventCreateWithFlags(&ready, hipEventDisableTiming) != hipSuccess) {
+        clear_last_error();
+        return nullptr;
+    }
+    return ready;
+}
+
+static void peer_stash_event(PeerSrcEvents &pool, hipEvent_t ready) {
+    if (!ready) {
+        return;
+    }
+    if (pool.n < kPeerEvents) {
+        pool.events[pool.n++] = ready;
+        return;
+    }
+    /* More than 32 hops from one device are still queued. Waiting for the
+       oldest is the overflow path; the steady hop never fills the pool. */
+    (void)hipEventSynchronize(pool.events[0]);
+    (void)hipEventDestroy(pool.events[0]);
+    pool.events[0] = ready;
+}
+
+static hipStream_t peer_join_stream(int32_t dst_dev) {
+    hipStream_t &join = g_peer_join[dst_dev];
+    if (!join && hipStreamCreate(&join) != hipSuccess) {
+        join = nullptr;
+        clear_last_error();
+    }
+    return join;
+}
+
 extern "C" int allpaca_hip_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
                                       size_t bytes, allpaca_stream_t stream) {
     if (!dst || !src) {
         return ALLPACA_ERR_INVALID;
     }
+    if (src_dev < 0 || dst_dev < 0 || src_dev >= kPeerDevs || dst_dev >= kPeerDevs) {
+        return ALLPACA_ERR_DEVICE;
+    }
     int prev = 0;
     if (hipGetDevice(&prev) != hipSuccess) {
         return ALLPACA_ERR_DEVICE;
     }
-    /* Drain src compute. hipMemcpyPeerAsync on the dst stream does not wait
-       for kernels on the src device; ping-pong layer splits copied a stale x. */
+    /* The source null stream holds the compute that produced `src`.
+       hipMemcpyPeerAsync does not wait for that stream, and the HIP SDK 7.1
+       host-staged peer path does not drain it either (ROCm #10553), so a
+       ping-pong split used to copy a stale activation. */
+    std::lock_guard<std::mutex> lock(g_peer_mu);
     if (hipSetDevice(src_dev) != hipSuccess) {
+        (void)hipSetDevice(prev);
         return ALLPACA_ERR_DEVICE;
     }
-    hipError_t err = hipStreamSynchronize(nullptr);
+    PeerSrcEvents &pool = g_peer_src[src_dev];
+    hipEvent_t ready = peer_take_event(pool);
+    if (!ready) {
+        (void)hipSetDevice(prev);
+        return ALLPACA_ERR_DEVICE;
+    }
+    hipError_t err = hipEventRecord(ready, nullptr);
     if (err != hipSuccess) {
+        peer_stash_event(pool, ready);
+        (void)hipSetDevice(prev);
+        return ALLPACA_ERR_DEVICE;
+    }
+    if (hipSetDevice(dst_dev) != hipSuccess) {
+        peer_stash_event(pool, ready);
         (void)hipSetDevice(prev);
         return ALLPACA_ERR_DEVICE;
     }
     hipStream_t s = as_stream(stream);
-    err = hipMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
-    if (err != hipSuccess) {
+    if (!s) {
+        s = peer_join_stream(dst_dev);
+    }
+    if (!s) {
+        peer_stash_event(pool, ready);
         (void)hipSetDevice(prev);
         return ALLPACA_ERR_DEVICE;
     }
-    err = hipStreamSynchronize(s);
+    err = hipStreamWaitEvent(s, ready, 0);
+    if (err == hipSuccess) {
+        err = hipMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
+    }
+    peer_stash_event(pool, ready);
     (void)hipSetDevice(prev);
     return hip_status(err);
 }
@@ -11740,6 +11842,10 @@ extern "C" int allpaca_hip_memcpy_batch(void **, void **, size_t *, size_t, int3
 }
 
 extern "C" int allpaca_hip_memset(void *, int32_t, size_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_hip_memset_async(void *, int32_t, size_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
