@@ -474,7 +474,7 @@ impl ModelConfig {
                 .iter()
                 .any(|t| t.name.contains(".ssm_") || t.name.contains(".attn_compressor_kv.")),
             nextn_predict_layers: nextn,
-            gguf_layer_base: 0,
+            gguf_layer_base: file.meta_u32("allpaca.gguf_layer_base").unwrap_or(0) as usize,
             router_kind: if arch == "deepseek2"
                 && file
                     .meta_u32(&format!("{arch}.expert_gating_func"))
@@ -7848,6 +7848,7 @@ impl TinyModel {
                     side.as_deref_mut(),
                     recurrent.as_deref_mut(),
                     soft_x,
+                    None,
                 ) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
@@ -7891,7 +7892,11 @@ impl TinyModel {
             if let Some(rpc) = &self.rpc {
                 if rpc.is_remote(layer_idx) {
                     if rpc.is_span_start(layer_idx) {
-                        rpc.run_layer(layer_idx, pos, &mut x)?;
+                        if rpc.is_hosted(layer_idx) {
+                            rpc.run_hosted(layer_idx, pos, recurrent.as_deref_mut(), &mut x)?;
+                        } else {
+                            rpc.run_layer(layer_idx, pos, &mut x)?;
+                        }
                     }
                     continue;
                 }
@@ -8507,7 +8512,10 @@ impl TinyModel {
         // Layers on RPC workers: the batched device path below sends each
         // remote span `rpc.prefill_rows` rows per round trip. Without a local
         // GPU workspace the prompt runs one token at a time.
-        let batched_remote = hip.is_some() && resident.is_some() && self.supports_hip_batched_prefill();
+        let batched_remote = hip.is_some()
+            && resident.is_some()
+            && self.supports_hip_batched_prefill()
+            && self.rpc.as_ref().is_none_or(|rpc| !rpc.has_hosted());
         if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) && !batched_remote {
             for (i, tok) in tokens.iter().enumerate() {
                 let last = i + 1 == tokens.len();
@@ -9586,6 +9594,51 @@ impl TinyModel {
         Ok(true)
     }
 
+    /// Run the model's layers on an already-computed residual row and return
+    /// that row after the last layer, without the final norm or LM head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_hidden_token_device(
+        &self,
+        pos: usize,
+        x: &mut [f32],
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        recurrent: &mut RecurrentState,
+        request_id: u64,
+    ) -> Result<(), AllpacaError> {
+        if x.len() != self.config.dim {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "hidden input has {} floats, expected {}",
+                x.len(),
+                self.config.dim
+            ))));
+        }
+        let mut out = Vec::new();
+        let mut side = DeviceDecodeSide::new(request_id);
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.forward_token_device(
+            0,
+            pos,
+            page_ids,
+            kv,
+            metrics,
+            &mut logits,
+            hip,
+            resident,
+            false,
+            None,
+            Some(&mut side),
+            Some(recurrent),
+            Some(x),
+            Some(&mut out),
+        )?;
+        x.copy_from_slice(&out);
+        Ok(())
+    }
+
     fn forward_token_device(
         &self,
         token: u32,
@@ -9601,6 +9654,7 @@ impl TinyModel {
         mut side: Option<&mut DeviceDecodeSide<'_>>,
         mut recurrent: Option<&mut RecurrentState>,
         soft_x: Option<&[f32]>,
+        mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -9686,7 +9740,11 @@ impl TinyModel {
                         if rpc.is_span_start(layer_idx) {
                             let mut host_x = vec![0.0f32; dim];
                             hip.copy_d2h_f32(buf.x, &mut host_x)?;
-                            rpc.run_layer(layer_idx, pos, &mut host_x)?;
+                            if rpc.is_hosted(layer_idx) {
+                                rpc.run_hosted(layer_idx, pos, recurrent.as_deref_mut(), &mut host_x)?;
+                            } else {
+                                rpc.run_layer(layer_idx, pos, &mut host_x)?;
+                            }
                             hip.copy_h2d_f32(buf.x, &host_x)?;
                         }
                         normed_ready = false;
@@ -10112,6 +10170,11 @@ impl TinyModel {
                 record_elementwise(Some(metrics));
             }
 
+            if let Some(out) = hidden_out.as_deref_mut() {
+                out.resize(dim, 0.0);
+                hip.copy_d2h_f32(buf.x, out)?;
+                return Ok(());
+            }
             Self::switch_local_gpu(
                 primary_hip.device,
                 &mut hip,

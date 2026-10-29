@@ -25,6 +25,8 @@ pub struct RpcRuntime {
     counters: Vec<(Arc<allpaca_rpc::CallCounters>, Arc<allpaca_rpc::CallCounters>)>,
     plan: Mutex<LayerPlan>,
     remote: Mutex<Vec<Option<RemoteLayer>>>,
+    /// Whole hybrid layers hosted as one contiguous worker span.
+    hosted: Mutex<Vec<Option<HostedSpan>>>,
     /// Expert-parallel MoE: layers whose routed experts live on a worker.
     experts: Mutex<Vec<Option<RemoteExperts>>>,
     /// HIP device for each local layer. `-1` means the layer was placed on RPC.
@@ -123,6 +125,14 @@ struct RemoteExperts {
     /// Send rows as int8 blocks: the worker's fused K-quant kernels quantize
     /// to exactly that, so it is lossless and a quarter of the bytes.
     q8: bool,
+}
+
+#[derive(Clone)]
+struct HostedSpan {
+    session: usize,
+    device: u32,
+    start: usize,
+    span: std::sync::Arc<crate::qwen3next_remote::RemoteSpan>,
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +323,7 @@ impl RpcRuntime {
             counters,
             plan: Mutex::new(LayerPlan::all_local(0)),
             remote: Mutex::new(Vec::new()),
+            hosted: Mutex::new(Vec::new()),
             experts: Mutex::new(Vec::new()),
             layer_device: Mutex::new(Vec::new()),
             local_budget_mib: Mutex::new(Vec::new()),
@@ -402,6 +413,25 @@ impl RpcRuntime {
             .lock()
             .map(|layers| layers.iter().any(|layer| layer.is_some()))
             .unwrap_or(false)
+            || self
+                .hosted
+                .lock()
+                .map(|layers| layers.iter().any(|layer| layer.is_some()))
+                .unwrap_or(false)
+    }
+
+    pub fn has_hosted(&self) -> bool {
+        self.hosted
+            .lock()
+            .map(|layers| layers.iter().any(|layer| layer.is_some()))
+            .unwrap_or(false)
+    }
+
+    pub fn is_hosted(&self, layer_idx: usize) -> bool {
+        self.hosted
+            .lock()
+            .ok()
+            .is_some_and(|layers| layers.get(layer_idx).is_some_and(Option::is_some))
     }
 
     pub fn session_count(&self) -> usize {
@@ -543,7 +573,7 @@ impl RpcRuntime {
     /// second local GPU, where the draft model is uploaded.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
-        &self,
+        self: &Arc<Self>,
         model: &TinyModel,
         local_devices: &[(i32, u64)],
         tensor_split: Option<&[f64]>,
@@ -732,7 +762,7 @@ impl RpcRuntime {
     /// then fill with routed experts to ~92% of VRAM; the remaining layers'
     /// experts go to worker GPUs by free memory and run there as `MoeFfn`.
     fn prepare_expert_parallel(
-        &self,
+        self: &Arc<Self>,
         model: &TinyModel,
         file: &GgufFile,
         local_ids: &[i32],
@@ -854,28 +884,69 @@ impl RpcRuntime {
                 }
             }
         }
+        for l in 0..n {
+            if !remote(l) || picks[l].is_some() {
+                continue;
+            }
+            let o = (0..owners.len())
+                .find(|&o| worker_free[o] >= experts[l])
+                .ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                        "expert-parallel: layer {l} experts ({} MiB) fit no local or RPC GPU",
+                        experts[l] >> 20
+                    )))
+                })?;
+            worker_free[o] -= experts[l];
+            picks[l] = Some(o);
+        }
+        let hosted_start = self.extension_host(crate::qwen3next_remote::EXT).and_then(|(session, _)| {
+            if std::env::var("ALLPACA_Q3N_NO_HOST").ok().as_deref() == Some("1") {
+                return None;
+            }
+            let mut start = n;
+            let device = (n > 0 && remote(n - 1)).then(|| owners[picks[n - 1].expect("last remote layer")].1);
+            while start > 0 {
+                let l = start - 1;
+                if remote(l)
+                    && device.is_some_and(|device| {
+                        picks[l].is_some_and(|o| owners[o].0 == session && owners[o].1 == device)
+                    })
+                {
+                    start = l;
+                } else {
+                    break;
+                }
+            }
+            (n - start >= 2).then_some((session, start))
+        });
+        let mut hosted = vec![None; n];
+        if let Some((session, start)) = hosted_start {
+            let device = owners[picks[start].expect("hosted layer placement")].1;
+            let path = std::env::temp_dir().join(format!(
+                "allpaca-q3n-span-{}-{start}-{n}.gguf",
+                std::process::id()
+            ));
+            crate::qwen3next_remote::write_span_gguf(&path, file, start, n)?;
+            let span = crate::qwen3next_remote::RemoteSpan::from_gguf(self, session, device as i32, &path)?;
+            for l in start..n {
+                hosted[l] = Some(HostedSpan {
+                    session,
+                    device,
+                    start,
+                    span: span.clone(),
+                });
+                layer_device[l] = -1;
+            }
+            let _ = std::fs::remove_file(path);
+            tracing::info!(session, device, start, end = n, "expert-parallel: whole layer span on rpc");
+        }
         let mut remote_experts = vec![None; n];
         let mut remote_bytes = 0u64;
         for l in 0..n {
-            if !remote(l) {
+            if !remote(l) || hosted[l].is_some() {
                 continue;
             }
-            let pick = match picks[l] {
-                Some(o) => o,
-                None => {
-                    let o = (0..owners.len())
-                        .find(|&o| worker_free[o] >= experts[l])
-                        .ok_or_else(|| {
-                            AllpacaError::Fatal(FatalError::InvalidConfig(format!(
-                                "expert-parallel: layer {l} experts ({} MiB) fit no local or RPC GPU",
-                                experts[l] >> 20
-                            )))
-                        })?;
-                    worker_free[o] -= experts[l];
-                    o
-                }
-            };
-            let (session, device) = owners[pick];
+            let (session, device) = owners[picks[l].expect("expert placement")];
             remote_experts[l] = Some(self.upload_experts(file, cfg, l, session, device)?);
             remote_bytes += experts[l];
             tracing::info!(
@@ -912,6 +983,7 @@ impl RpcRuntime {
         let lock = |e| AllpacaError::Fatal(FatalError::InvalidConfig(e));
         *self.plan.lock().map_err(|_| lock("rpc plan lock".into()))? = plan.layers;
         *self.remote.lock().map_err(|_| lock("rpc remote lock".into()))? = vec![None; n];
+        *self.hosted.lock().map_err(|_| lock("rpc hosted lock".into()))? = hosted;
         *self.experts.lock().map_err(|_| lock("rpc experts lock".into()))? = remote_experts;
         *self.expert_layout.lock().map_err(|_| lock("rpc expert layout lock".into()))? =
             (experts, targets);
@@ -1099,12 +1171,17 @@ impl RpcRuntime {
 
     /// Where `layer_idx` runs: a worker GPU, or the local HIP device.
     pub fn layer_home(&self, layer_idx: usize) -> LayerHome {
+        let hosted = self
+            .hosted
+            .lock()
+            .ok()
+            .and_then(|layers| layers.get(layer_idx).and_then(|x| x.as_ref()).map(|h| (h.session, h.device)));
         let remote = self
             .remote
             .lock()
             .ok()
             .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|l| (l.session, l.device)));
-        match remote {
+        match hosted.or(remote) {
             Some((session, device)) => LayerHome::Remote {
                 endpoint: self.endpoints.get(session).cloned().unwrap_or_default(),
                 device,
@@ -1564,10 +1641,16 @@ impl RpcRuntime {
     }
 
     fn remote_session(&self, layer_idx: usize) -> Option<usize> {
-        self.remote
+        self.hosted
             .lock()
             .ok()
-            .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|l| l.session))
+            .and_then(|layers| layers.get(layer_idx).and_then(|x| x.as_ref()).map(|h| h.session))
+            .or_else(|| {
+                self.remote
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.get(layer_idx).and_then(|x| x.as_ref()).map(|l| l.session))
+            })
     }
 
     /// Rows per batched span call (`rpc.prefill_rows`, 0 = one token per call).
@@ -1721,6 +1804,35 @@ impl RpcRuntime {
         tracing::info!(session = session_idx, device, rows, "rpc prefill row scratch allocated");
         map.insert((session_idx, device), s);
         Ok(s)
+    }
+
+    /// Run a whole hybrid span on its worker, using the request's worker-side state.
+    pub fn run_hosted(
+        &self,
+        layer_idx: usize,
+        pos: usize,
+        recurrent: Option<&mut crate::anchors::RecurrentState>,
+        x: &mut [f32],
+    ) -> Result<(), AllpacaError> {
+        let hosted = self
+            .hosted
+            .lock()
+            .map_err(|_| AllpacaError::Fatal(FatalError::InvalidConfig("rpc hosted lock".into())))?
+            .get(layer_idx)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig("rpc hosted span missing".into())))?;
+        if hosted.start != layer_idx {
+            return Ok(());
+        }
+        let recurrent = recurrent.ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::InvalidConfig("hosted span needs recurrent state".into()))
+        })?;
+        if recurrent.remote.is_none() {
+            recurrent.remote = Some(hosted.span.new_seq());
+        }
+        let seq = recurrent.remote.as_ref().expect("hosted remote sequence");
+        hosted.span.run(seq, pos, x)
     }
 
     /// Run one remote layer. A call on the first layer of a contiguous same-worker

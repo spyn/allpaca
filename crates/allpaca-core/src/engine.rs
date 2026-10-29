@@ -2462,7 +2462,10 @@ impl Engine {
         let draft = inner.draft_model.clone();
         inner.target_resident = if let (Some(hip), Some(target)) = (&self.hip, target) {
             let host_ready = target.host_weights_ready();
-            let uploaded = if target.config.n_experts > 0 && host_ready {
+            let uploaded = if target.config.n_experts > 0
+                && host_ready
+                && !target.layers.iter().any(|layer| layer.gdn.is_some())
+            {
                 ResidentModel::upload(&target, hip.device)
             } else if let Some(file) = target_gguf {
                 let skip: Vec<bool> = (0..target.config.n_layers)
@@ -4776,7 +4779,7 @@ impl Engine {
         inner.kv_radix.reset();
         let pc = &self.config.prompt_cache;
         // Its state is not part of a checkpoint file.
-        if target.dsv4.is_some() {
+        if target.dsv4.is_some() || target.rpc.as_ref().is_some_and(|rpc| rpc.has_hosted()) {
             return;
         }
         if settings.is_none() && (pc.worker || pc.disk_dir.is_some()) {
@@ -8729,6 +8732,98 @@ mod tests {
             "two contiguous remote layers must be one RunSpan per forward"
         );
         assert_eq!(stats.rpc_activation_bytes, 1536);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rpc_qwen3next_whole_span_matches_local_and_cuts_roundtrips() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        use allpaca_gguf::{write_gguf_quant, GgufWriteQuantTensor};
+        use allpaca_rpc::{serve_connection_ext, WorkerBackend};
+
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-r3-engine-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_with(&source, 4, true);
+        let file = allpaca_gguf::GgufFile::open(&source).unwrap();
+        let three = dir.join("three.gguf");
+        let mut metadata = file.metadata.clone();
+        metadata.insert("qwen35moe.block_count".into(), allpaca_gguf::GgufValue::Uint32(3));
+        let mut tensors = Vec::new();
+        for info in &file.tensors {
+            tensors.push(GgufWriteQuantTensor {
+                name: info.name.clone(),
+                dims: info.dims.clone(),
+                ggml_type: info.ggml_type,
+                bytes: file.tensor_bytes(&info.name).unwrap(),
+            });
+            if let Some(suffix) = info.name.strip_prefix("blk.1.") {
+                tensors.push(GgufWriteQuantTensor {
+                    name: format!("blk.2.{suffix}"),
+                    dims: info.dims.clone(),
+                    ggml_type: info.ggml_type,
+                    bytes: file.tensor_bytes(&info.name).unwrap(),
+                });
+            }
+        }
+        write_gguf_quant(&three, &metadata, &[], &tensors).unwrap();
+
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let mut local_cfg = test_config();
+        local_cfg.model.synthetic = false;
+        local_cfg.model.path = Some(three.clone());
+        local_cfg.speculative.enabled = false;
+        local_cfg.engine.cpu_only = false;
+        local_cfg.engine.gpu_backend = "hip".into();
+        let local = Engine::new(local_cfg).unwrap();
+        let expected = local.generate("hello", params.clone()).unwrap().token_ids;
+
+        let run = |hosted: bool| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let worker = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let backend = WorkerBackend::Hip(allpaca_rpc::HipWorker::new(0).unwrap());
+                if hosted {
+                    serve_connection_ext(stream, backend, None, vec![crate::qwen3next_remote::worker_extension(None)]).unwrap();
+                } else {
+                    allpaca_rpc::serve_connection(stream, backend).unwrap();
+                }
+            });
+            let mut cfg = test_config();
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(three.clone());
+            cfg.speculative.enabled = false;
+            cfg.engine.cpu_only = false;
+            cfg.engine.gpu_backend = "hip".into();
+            cfg.rpc.endpoints = vec![addr.to_string()];
+            cfg.rpc.expert_homes = ["1".into(), "2".into()]
+                .into_iter()
+                .map(|layer| (layer, format!("rpc:{addr}/0")))
+                .collect();
+            let engine = Engine::new(cfg).unwrap();
+            let output = engine.generate("hello", params.clone()).unwrap().token_ids;
+            let trips = engine.stats().rpc_roundtrips;
+            drop(engine);
+            worker.join().unwrap();
+            (output, trips)
+        };
+        let (separate, separate_trips) = run(false);
+        let (hosted, hosted_trips) = run(true);
+        assert_eq!(separate, expected);
+        assert_eq!(hosted, expected);
+        assert!(hosted_trips < separate_trips, "hosted={hosted_trips} separate={separate_trips}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
