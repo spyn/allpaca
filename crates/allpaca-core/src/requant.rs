@@ -247,6 +247,28 @@ pub const QWEN4EXP_KEEP: [&str; 7] =
 /// source holds it wider (a Q8_0 model's n-gram table is 54 GB).
 pub const QWEN4EXP_4BIT: [&str; 1] = ["per_layer_token_embd"];
 
+/// MTP / nextn weights stay at Q8_0. A tensor whose name contains `nextn`
+/// is one, and so is every tensor of the last `{arch}.nextn_predict_layers`
+/// blocks (`block_count` includes those blocks).
+fn keeps_q8_floor(file: &GgufFile, name: &str) -> bool {
+    if name.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"nextn")) {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return false;
+    };
+    let Some((index, _)) = rest.split_once('.') else {
+        return false;
+    };
+    let Ok(blk) = index.parse::<usize>() else {
+        return false;
+    };
+    let arch = file.architecture().unwrap_or("llama");
+    let blocks = file.meta_u32(&format!("{arch}.block_count")).unwrap_or(0) as usize;
+    let nextn = file.meta_u32(&format!("{arch}.nextn_predict_layers")).unwrap_or(0) as usize;
+    nextn > 0 && blocks >= nextn && blk + nextn >= blocks
+}
+
 /// Weights encoded at a time when a kept table is narrowed to IQ4_NL.
 const NARROW_CHUNK: usize = 1 << 24;
 
@@ -419,15 +441,30 @@ pub fn requantise_each(
             && n > 0
             && t.nbytes() * 8 > n * 9 / 2
     };
+    // Nextn tensors are not in the knapsack: a type below Q8_0 is never
+    // an option for them, and a cost that far above the budget does not
+    // fit the solver. They are written as Q8_0 when that type was offered
+    // and the rows fit it, and copied otherwise.
+    let mut pinned_q8: Vec<(usize, usize, usize)> = Vec::new();
     let candidates: Vec<(usize, usize, usize)> = file
         .tensors
         .iter()
         .enumerate()
         .filter(|(_, t)| t.name.ends_with(".weight") && !matches!(t.ggml_type, GgmlType::I32 | GgmlType::Other))
         .filter(|(_, t)| !keep.iter().any(|k| t.name.contains(k.as_str())))
-        .filter_map(|(i, t)| matrix_shape(&t.dims, opts.min_weights, targets).map(|(rows, cols)| (i, rows, cols)))
+        .filter_map(|(i, t)| {
+            let (rows, cols) = matrix_shape(&t.dims, opts.min_weights, targets)?;
+            if keeps_q8_floor(&file, &t.name) {
+                let q8_fits = targets.iter().any(|target| target.bits() >= Target::Q8_0.bits() && target.fits(cols));
+                if q8_fits {
+                    pinned_q8.push((i, rows, cols));
+                }
+                return None;
+            }
+            Some((i, rows, cols))
+        })
         .collect();
-    if candidates.is_empty() {
+    if candidates.is_empty() && pinned_q8.is_empty() {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "requantise: the file has no weight matrix whose rows are whole blocks of the types asked for".into(),
         )));
@@ -552,7 +589,11 @@ pub fn requantise_each(
     let weights: Vec<f64> = candidates.iter().map(|&(_, rows, cols)| (rows * cols) as f64).collect();
     // The loss of a matrix's option: how far it moved the model's predictions
     // when probed, otherwise its error weighted by its size.
-    let mean_weight = weights.iter().sum::<f64>() / candidates.len() as f64;
+    let mean_weight = if candidates.is_empty() {
+        1.0
+    } else {
+        weights.iter().sum::<f64>() / candidates.len() as f64
+    };
     let loss: Vec<f64> = if probed {
         divergence.iter().flatten().copied().collect()
     } else {
@@ -572,22 +613,31 @@ pub fn requantise_each(
             budget: avg_bits,
         };
         // The loss is one term per matrix and option, so the knapsack optimum is exact.
-        let assignment = knapsack(&problem, &gain, opts.resolution)?;
+        let assignment = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            knapsack(&problem, &gain, opts.resolution)?
+        };
 
         let chosen = |i: usize| candidates.iter().position(|c| c.0 == i).map(|at| targets[assignment[at]]);
+        let pinned = |i: usize| pinned_q8.iter().find(|p| p.0 == i).copied();
         let declared: Vec<GgufStreamTensor> = file
             .tensors
             .iter()
             .enumerate()
             .map(|(i, t)| {
                 let n = t.n_elements() as usize;
-                let (ggml_type_id, nbytes) = match chosen(i) {
-                    Some(target) => (target.ggml() as u32, n / target.block().0 * target.block().1),
-                    None if narrowed(t) => (
+                let (ggml_type_id, nbytes) = match (chosen(i), pinned(i)) {
+                    (Some(target), _) => (target.ggml() as u32, n / target.block().0 * target.block().1),
+                    (None, Some(_)) => {
+                        let (weights_per_block, bytes) = Target::Q8_0.block();
+                        (Target::Q8_0.ggml() as u32, n / weights_per_block * bytes)
+                    }
+                    (None, None) if narrowed(t) => (
                         GgmlType::IQ4_NL as u32,
                         n / allpaca_cpu::IQ4_NL_BLOCK_ELEMS * allpaca_cpu::IQ4_NL_BLOCK_BYTES,
                     ),
-                    None => (t.ggml_type_id, t.nbytes()),
+                    (None, None) => (t.ggml_type_id, t.nbytes()),
                 };
                 GgufStreamTensor {
                     name: t.name.clone(),
@@ -628,17 +678,21 @@ pub fn requantise_each(
                 writer.write_tensor(bytes)?;
                 continue;
             }
-            match chosen(i) {
-                Some(Target::Q2_0) => {
+            match (chosen(i), pinned(i)) {
+                (Some(Target::Q2_0), _) => {
                     let at = candidates.iter().position(|c| c.0 == i).expect("chosen");
                     writer.write_tensor(&two_bit.get(at)?)?;
                 }
-                Some(target) => {
+                (Some(target), _) => {
                     let (_, rows, cols) = candidates[candidates.iter().position(|c| c.0 == i).expect("chosen")];
                     let w = file.tensor_f32(&t.name)?;
                     writer.write_tensor(&target.quantise(&w, rows, cols, &Gram::Identity, &opts.gsq)?)?;
                 }
-                None if narrowed(t) => {
+                (None, Some((_, rows, cols))) => {
+                    let w = file.tensor_f32(&t.name)?;
+                    writer.write_tensor(&Target::Q8_0.quantise(&w, rows, cols, &Gram::Identity, &opts.gsq)?)?;
+                }
+                (None, None) if narrowed(t) => {
                     let (n, bytes) = (t.n_elements() as usize, file.tensor_bytes(&t.name)?);
                     writer.write_tensor_parts((0..n).step_by(NARROW_CHUNK).map(|start| {
                         let len = NARROW_CHUNK.min(n - start);
@@ -649,28 +703,37 @@ pub fn requantise_each(
                         Ok(encode_iq4_nl_threaded(&w))
                     }))?;
                 }
-                None => writer.write_tensor(file.tensor_bytes(&t.name)?)?,
+                (None, None) => writer.write_tensor(file.tensor_bytes(&t.name)?)?,
             }
         }
         writer.finish()?;
+        let mut choices: Vec<Choice> = candidates
+            .iter()
+            .zip(&assignment)
+            .zip(&errors)
+            .zip(&calibrated)
+            .zip(&divergence)
+            .map(|((((&(i, rows, cols), &o), row), &calibrated), moved)| Choice {
+                name: file.tensors[i].name.clone(),
+                weights: rows * cols,
+                target: targets[o],
+                relative_error: row.clone(),
+                calibrated,
+                divergence: probed.then(|| moved.clone()),
+            })
+            .collect();
+        choices.extend(pinned_q8.iter().map(|&(i, rows, cols)| Choice {
+            name: file.tensors[i].name.clone(),
+            weights: rows * cols,
+            target: Target::Q8_0,
+            relative_error: vec![f64::NAN; targets.len()],
+            calibrated: false,
+            divergence: None,
+        }));
         reports.push(Report {
-            choices: candidates
-                .iter()
-                .zip(&assignment)
-                .zip(&errors)
-                .zip(&calibrated)
-                .zip(&divergence)
-                .map(|((((&(i, rows, cols), &o), row), &calibrated), moved)| Choice {
-                    name: file.tensors[i].name.clone(),
-                    weights: rows * cols,
-                    target: targets[o],
-                    relative_error: row.clone(),
-                    calibrated,
-                    divergence: probed.then(|| moved.clone()),
-                })
-                .collect(),
+            choices,
             targets: targets.clone(),
-            copied: file.tensors.len() - candidates.len(),
+            copied: file.tensors.len() - candidates.len() - pinned_q8.len(),
             calibrated: calibrated.iter().filter(|c| **c).count(),
             propagated: in_order.len(),
         });
@@ -895,6 +958,71 @@ mod tests {
         assert!(err / energy < 0.02, "{}", err / energy);
         let _ = std::fs::remove_file(src);
         let _ = std::fs::remove_file(dst);
+    }
+
+    /// A tight budget would put every matrix at 2 bits. An MTP head
+    /// (`nextn` in the name, or a block in the trailing
+    /// `nextn_predict_layers`) stays at Q8_0. With Q8_0 not on offer, that
+    /// tensor is copied rather than pushed to the cheaper type.
+    #[test]
+    fn nextn_and_trailing_mtp_blocks_stay_at_q8_0() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let (src, dst, dst_q4) = (
+            dir.join(format!("allpaca_requant_nextn_in-{pid}.gguf")),
+            dir.join(format!("allpaca_requant_nextn_out-{pid}.gguf")),
+            dir.join(format!("allpaca_requant_nextn_q4-{pid}.gguf")),
+        );
+        let n = 64 * 64;
+        let tensors = vec![
+            ("blk.0.ffn_down.weight", vec![64, 64], noise(n, 1, 1.0)),
+            ("blk.0.nextn.eh_proj.weight", vec![64, 64], noise(n, 2, 1.0)),
+            ("blk.1.attn_q.weight", vec![64, 64], noise(n, 3, 1.0)),
+        ];
+        let views: Vec<GgufWriteTensor<'_>> = tensors
+            .iter()
+            .map(|(name, dims, data)| GgufWriteTensor {
+                name: (*name).into(),
+                dims: dims.clone(),
+                data,
+            })
+            .collect();
+        let mut meta = HashMap::new();
+        meta.insert("general.architecture".into(), GgufValue::String("llama".into()));
+        meta.insert("llama.block_count".into(), GgufValue::Uint32(2));
+        meta.insert("llama.nextn_predict_layers".into(), GgufValue::Uint32(1));
+        write_gguf(&src, &meta, &views).unwrap();
+
+        let opts = Options {
+            avg_bits: Target::Q2_0.bits(),
+            targets: vec![Target::Q2_0, Target::Q8_0],
+            gsq: GsqConfig { steps: 1, ..GsqConfig::default() },
+            ..Options::default()
+        };
+        let report = requantise(&src, &dst, &opts).unwrap();
+        let chosen = |name: &str| report.choices.iter().find(|c| c.name == name).map(|c| c.target);
+        assert_eq!(chosen("blk.0.ffn_down.weight"), Some(Target::Q2_0));
+        assert_eq!(chosen("blk.0.nextn.eh_proj.weight"), Some(Target::Q8_0));
+        assert_eq!(chosen("blk.1.attn_q.weight"), Some(Target::Q8_0));
+        let out = GgufFile::open(&dst).unwrap();
+        assert_eq!(out.tensor("blk.0.ffn_down.weight").unwrap().ggml_type, GgmlType::Q2_0);
+        assert_eq!(out.tensor("blk.0.nextn.eh_proj.weight").unwrap().ggml_type, GgmlType::Q8_0);
+        assert_eq!(out.tensor("blk.1.attn_q.weight").unwrap().ggml_type, GgmlType::Q8_0);
+
+        let q4 = Options {
+            avg_bits: Target::Q4_0.bits(),
+            targets: vec![Target::Q4_0],
+            ..opts
+        };
+        let without_q8 = requantise(&src, &dst_q4, &q4).unwrap();
+        assert!(without_q8.choices.iter().all(|c| c.name == "blk.0.ffn_down.weight"));
+        let copied = GgufFile::open(&dst_q4).unwrap();
+        assert_eq!(copied.tensor("blk.0.ffn_down.weight").unwrap().ggml_type, GgmlType::Q4_0);
+        assert_eq!(copied.tensor("blk.0.nextn.eh_proj.weight").unwrap().ggml_type, GgmlType::F32);
+        assert_eq!(copied.tensor("blk.1.attn_q.weight").unwrap().ggml_type, GgmlType::F32);
+        for path in [src, dst, dst_q4] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn write_matrices(path: &Path, tensors: &[(&str, Vec<u64>, Vec<f32>)]) {
