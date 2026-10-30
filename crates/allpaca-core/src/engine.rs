@@ -4996,7 +4996,7 @@ impl Engine {
         // DSpark and tree speculation run their own forwards.
         let live = inner.active.values().filter(|r| !r.finished).count();
         let own_forward_spec = cfg.speculative.enabled
-            && (inner.flags.draft_model_speculation
+            && (inner.draft_model.is_some()
                 || inner.dspark.is_some()
                 || (inner.dflash2.is_some() && live <= 1)
                 || inner.flags.tree_speculation);
@@ -10790,6 +10790,28 @@ mod tests {
             stats.poll_decode_picks > 0,
             "fair generate must record decode picks; stats={stats:?}"
         );
+    }
+
+    #[test]
+    fn missing_draft_model_does_not_block_ngram_batching() {
+        let mut cfg = test_config();
+        cfg.engine.max_active_requests = 2;
+        let engine = Engine::new(cfg).unwrap();
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let _a = engine.begin_request("hello world", params.clone()).unwrap();
+        let _b = engine.begin_request("hello world", params).unwrap();
+        let mut inner = engine.lock().unwrap();
+        inner.draft_model = None;
+        inner.flags.draft_model_speculation = true;
+        for request in inner.active.values_mut() {
+            request.prefill_pos = request.prompt_len;
+        }
+        assert_eq!(engine.batch_decode_ids(&inner).len(), 2);
     }
 
     /// Two Requests decoded together: speculation stops while more Requests
