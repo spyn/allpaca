@@ -14,12 +14,10 @@ mod session;
 mod worker;
 
 pub use protocol::{
-    f32_to_f16_rne, quantize_q8_rows, MoeFfnRequest, MoeX,
-    check_rpc_bind, encode_hello_reply, fnv1a64, is_loopback_bind_host, write_reply, BufId, Cmd,
-    DeviceStat,
-    HelloReply, HelloRequest, KernelOp, LaunchItem, LaunchList, RpcBackendKind, BUILD_ID, KERNEL_ABI_REV,
-    SOCKET_BUFFER,
-    PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
+    check_rpc_bind, encode_hello_reply, f32_to_f16_rne, fnv1a64, is_loopback_bind_host,
+    quantize_q8_rows, write_reply, BufId, Cmd, DeviceStat, HelloReply, HelloRequest, KernelOp,
+    LaunchItem, LaunchList, MoeFfnRequest, MoeX, RpcBackendKind, BUILD_ID, KERNEL_ABI_REV,
+    PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, SOCKET_BUFFER, STATUS_ERR, STATUS_OK,
 };
 pub use session::{CallCounters, RpcSession};
 pub use worker::{
@@ -114,7 +112,10 @@ mod tests {
         let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(load(&calls.calls), 3);
         assert!(load(&calls.bytes_out) >= 1000, "the upload counts as sent");
-        assert!(load(&calls.bytes_in) >= 1000, "the download counts as received");
+        assert!(
+            load(&calls.bytes_in) >= 1000,
+            "the download counts as received"
+        );
         assert_eq!(load(&ext.calls), 0);
         drop(client);
         worker.join().unwrap();
@@ -182,9 +183,7 @@ mod tests {
         let m = 1i32;
         let n = 32i32;
         let k = 32i32;
-        let weight: Vec<f32> = (0..n * k)
-            .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
-            .collect();
+        let weight: Vec<f32> = (0..n * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
         let packed = allpaca_cpu::quantize_q8_0(&weight);
         let a_f: Vec<f32> = (0..k).map(|i| (i as f32) * 0.05).collect();
         let a = client.alloc((k as usize * 4) as u64).unwrap();
@@ -235,7 +234,10 @@ mod tests {
         if allpaca_hip::device_count() == 0 {
             return;
         }
-        check_moe_ffn(WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker")), MOE_Q8);
+        check_moe_ffn(
+            WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker")),
+            MOE_Q8,
+        );
     }
 
     /// Q5_K gate/up with Q6_K down (Qwen3-Next) take the fused MoE kernels.
@@ -245,7 +247,10 @@ mod tests {
         if allpaca_hip::device_count() == 0 {
             return;
         }
-        check_moe_ffn(WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker")), MOE_KQUANT_FUSED);
+        check_moe_ffn(
+            WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker")),
+            MOE_KQUANT_FUSED,
+        );
     }
 
     /// Rows that share experts run as expert groups (each expert's weights
@@ -284,7 +289,13 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let worker = thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
-                serve_connection_ext(stream, WorkerBackend::Cpu(CpuWorker::new(1 << 20)), None, exts).unwrap();
+                serve_connection_ext(
+                    stream,
+                    WorkerBackend::Cpu(CpuWorker::new(1 << 20)),
+                    None,
+                    exts,
+                )
+                .unwrap();
             });
             (RpcSession::connect_addr(&addr.to_string()).unwrap(), worker)
         };
@@ -293,7 +304,10 @@ mod tests {
         assert_eq!(client.build_id(), Some(BUILD_ID), "a worker of this build");
         assert!(client.same_build() && BUILD_ID.len() == 16);
         let big = vec![7u8; 200_000];
-        assert_eq!(client.ext("echo", b"abc", &big).unwrap(), [&[1u8][..], b"cba", &200_000u32.to_le_bytes()].concat());
+        assert_eq!(
+            client.ext("echo", b"abc", &big).unwrap(),
+            [&[1u8][..], b"cba", &200_000u32.to_le_bytes()].concat()
+        );
         assert_eq!(client.ext("echo", b"", &[]).unwrap(), [2, 0, 0, 0, 0]);
         let err = client.ext("echo", b"fail", &[]).unwrap_err().to_string();
         assert!(err.contains("asked to fail"), "{err}");
@@ -312,10 +326,16 @@ mod tests {
 
         let (client, worker) = serve(Vec::new());
         assert!(!client.has_extension("echo"));
-        assert!(client.same_build(), "the build id does not need an extension");
+        assert!(
+            client.same_build(),
+            "the build id does not need an extension"
+        );
         // A reply that ends at the device list is from a worker without either.
         let old = encode_hello_reply(client.hello());
-        assert_eq!(crate::protocol::decode_hello_tail(&old).unwrap(), (Vec::new(), None));
+        assert_eq!(
+            crate::protocol::decode_hello_tail(&old).unwrap(),
+            (Vec::new(), None)
+        );
         drop(client);
         worker.join().unwrap();
     }
@@ -338,14 +358,29 @@ mod tests {
         let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
         let (n_exp, dim, ff, rows) = (4usize, 128usize, 192usize, 3usize);
         let mat = |seed: usize, n: usize| -> Vec<f32> {
-            (0..n).map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2).collect()
+            (0..n)
+                .map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2)
+                .collect()
         };
-        let parts = |e: usize| [mat(1 + e, ff * dim), mat(5 + e, ff * dim), mat(9 + e, dim * ff)];
+        let parts = |e: usize| {
+            [
+                mat(1 + e, ff * dim),
+                mat(5 + e, ff * dim),
+                mat(9 + e, dim * ff),
+            ]
+        };
         let bytes: Vec<u8> = (0..n_exp)
-            .flat_map(|e| parts(e).into_iter().flat_map(|m| allpaca_cpu::quantize_q2_0(&m)).collect::<Vec<u8>>())
+            .flat_map(|e| {
+                parts(e)
+                    .into_iter()
+                    .flat_map(|m| allpaca_cpu::quantize_q2_0(&m))
+                    .collect::<Vec<u8>>()
+            })
             .collect();
         let slot = bytes.len() / n_exp;
-        let pool = client.put_tensor(42, &[slot as u32, n_exp as u32], &bytes, None).unwrap();
+        let pool = client
+            .put_tensor(42, &[slot as u32, n_exp as u32], &bytes, None)
+            .unwrap();
         let req = MoeFfnRequest {
             gate: pool,
             up: pool,
@@ -355,7 +390,9 @@ mod tests {
             ff: ff as u32,
             f16_out: false,
         };
-        let x: Vec<f32> = (0..rows * dim).map(|i| ((i % 61) as f32) * 0.03 - 0.9).collect();
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i % 61) as f32) * 0.03 - 0.9)
+            .collect();
         // Row 2 routes to no expert.
         let pairs = [(1u32, 3u32, 1.0f32), (0, 0, 0.7), (1, 1, 0.5), (0, 2, 0.3)];
         let got = client.moe_ffn(req, &x, false, &pairs).unwrap();
@@ -373,15 +410,28 @@ mod tests {
             let (mut g, mut u, mut o) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; dim]);
             allpaca_cpu::matmul_nt(xr, &held(&gate), &mut g, 1, ff, dim).unwrap();
             allpaca_cpu::matmul_nt(xr, &held(&up), &mut u, 1, ff, dim).unwrap();
-            let h: Vec<f32> = g.iter().zip(&u).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+            let h: Vec<f32> = g
+                .iter()
+                .zip(&u)
+                .map(|(a, b)| a / (1.0 + (-a).exp()) * b)
+                .collect();
             allpaca_cpu::matmul_nt(&h, &held(&down), &mut o, 1, dim, ff).unwrap();
             let input = allpaca_cpu::Q2_0Input::new(xr).unwrap();
             let q = |m: &[f32]| allpaca_cpu::quantize_q2_0(m);
             allpaca_cpu::gemv_q2_0_i8(&q(&gate), &input, &mut g).unwrap();
             allpaca_cpu::gemv_q2_0_i8(&q(&up), &input, &mut u).unwrap();
-            let h: Vec<f32> = g.iter().zip(&u).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+            let h: Vec<f32> = g
+                .iter()
+                .zip(&u)
+                .map(|(a, b)| a / (1.0 + (-a).exp()) * b)
+                .collect();
             let mut o8 = vec![0.0f32; dim];
-            allpaca_cpu::gemv_q2_0_i8(&q(&down), &allpaca_cpu::Q2_0Input::new(&h).unwrap(), &mut o8).unwrap();
+            allpaca_cpu::gemv_q2_0_i8(
+                &q(&down),
+                &allpaca_cpu::Q2_0Input::new(&h).unwrap(),
+                &mut o8,
+            )
+            .unwrap();
             for i in 0..dim {
                 want[r * dim + i] += wgt * o[i];
                 want8[r * dim + i] += wgt * o8[i];
@@ -393,10 +443,20 @@ mod tests {
             assert!((g - w8).abs() <= 1e-4 * scale, "out[{i}] {g} vs 8-bit {w8}");
             assert!((g - w).abs() <= 0.03 * scale, "out[{i}] {g} vs {w}");
         }
-        assert!(got[2 * dim..].iter().all(|v| *v == 0.0), "unrouted row must be zero");
+        assert!(
+            got[2 * dim..].iter().all(|v| *v == 0.0),
+            "unrouted row must be zero"
+        );
         // A row alone gives the bits it gives among others.
-        let one = client.moe_ffn(req, &x[dim..2 * dim], false, &[(0, 3, 1.0), (0, 1, 0.5)]).unwrap();
-        assert!(one.iter().zip(&got[dim..2 * dim]).all(|(a, b)| a.to_bits() == b.to_bits()), "row 1 alone differs");
+        let one = client
+            .moe_ffn(req, &x[dim..2 * dim], false, &[(0, 3, 1.0), (0, 1, 0.5)])
+            .unwrap();
+        assert!(
+            one.iter()
+                .zip(&got[dim..2 * dim])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "row 1 alone differs"
+        );
         // Int8 rows are the same rows rounded to 8 bits (on the wire, then again per block).
         let q8 = client.moe_ffn(req, &x, true, &pairs).unwrap();
         for (i, (g, w)) in q8.iter().zip(&want8).enumerate() {
@@ -414,8 +474,14 @@ mod tests {
         if allpaca_cuda::device_count() <= 0 {
             return;
         }
-        check_moe_ffn(WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")), MOE_KQUANT_FUSED);
-        check_moe_ffn(WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")), MOE_Q4K_FUSED);
+        check_moe_ffn(
+            WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")),
+            MOE_KQUANT_FUSED,
+        );
+        check_moe_ffn(
+            WorkerBackend::Cuda(CudaWorker::new(0).expect("CudaWorker")),
+            MOE_Q4K_FUSED,
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -438,16 +504,36 @@ mod tests {
         let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
         let (n_exp, dim, ff) = (3usize, 256usize, 256usize);
         let mat = |seed: usize, n: usize| -> Vec<f32> {
-            (0..n).map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2).collect()
+            (0..n)
+                .map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2)
+                .collect()
         };
         let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
-            let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
-            client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+            let bytes: Vec<u8> = (0..n_exp)
+                .flat_map(|e| quantize(ty, &mat(seed + e, rows * cols)))
+                .collect();
+            client
+                .put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None)
+                .unwrap()
         };
-        let (gate, up, down) = (put(13, 1, ff, dim), put(13, 5, ff, dim), put(14, 9, dim, ff));
-        let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: false };
+        let (gate, up, down) = (
+            put(13, 1, ff, dim),
+            put(13, 5, ff, dim),
+            put(14, 9, dim, ff),
+        );
+        let req = MoeFfnRequest {
+            gate,
+            up,
+            down,
+            n_experts: n_exp as u32,
+            dim: dim as u32,
+            ff: ff as u32,
+            f16_out: false,
+        };
         let rows = 4usize;
-        let x: Vec<f32> = (0..rows * dim).map(|i| ((i % 61) as f32) * 0.03 - 0.9).collect();
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i % 61) as f32) * 0.03 - 0.9)
+            .collect();
         let routes: [&[(u32, f32)]; 4] = [
             &[(1, 0.6), (0, 0.4)],
             &[(1, 0.5), (2, 0.5)],
@@ -463,9 +549,14 @@ mod tests {
             let all = client.moe_ffn(req, &x, q8, &pairs).unwrap();
             for (r, rt) in routes.iter().enumerate() {
                 let one: Vec<(u32, u32, f32)> = rt.iter().map(|&(e, w)| (0, e, w)).collect();
-                let single = client.moe_ffn(req, &x[r * dim..(r + 1) * dim], q8, &one).unwrap();
+                let single = client
+                    .moe_ffn(req, &x[r * dim..(r + 1) * dim], q8, &one)
+                    .unwrap();
                 assert!(
-                    single.iter().zip(&all[r * dim..(r + 1) * dim]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    single
+                        .iter()
+                        .zip(&all[r * dim..(r + 1) * dim])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                     "row {r} (q8 {q8}) differs between grouped and single-row runs"
                 );
             }
@@ -496,7 +587,8 @@ mod tests {
                 let addr = listener.local_addr().unwrap();
                 worker = Some(thread::spawn(move || {
                     let (stream, _) = listener.accept().unwrap();
-                    serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+                    serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap()))
+                        .unwrap();
                 }));
                 RpcSession::connect_addr(&addr.to_string()).unwrap()
             }
@@ -504,17 +596,54 @@ mod tests {
         let (n_exp, dim, ff) = (512usize, 2048usize, 512usize);
         // Weights do not change the cost: one quantized expert, repeated.
         let one = |ty: u32, rows: usize, cols: usize| -> Vec<u8> {
-            let m: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 1000) as f32 - 500.0) * 1e-4).collect();
+            let m: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i * 7919 % 1000) as f32 - 500.0) * 1e-4)
+                .collect();
             let q = quantize(ty, &m);
             (0..n_exp).flat_map(|_| q.iter().copied()).collect()
         };
         let t = std::time::Instant::now();
-        let gate = client.put_tensor(13, &[dim as u32, ff as u32, n_exp as u32], &one(13, ff, dim), None).unwrap();
-        let up = client.put_tensor(13, &[dim as u32, ff as u32, n_exp as u32], &one(13, ff, dim), None).unwrap();
-        let down = client.put_tensor(14, &[ff as u32, dim as u32, n_exp as u32], &one(14, dim, ff), None).unwrap();
-        eprintln!("upload {:.1} s to {}", t.elapsed().as_secs_f64(), remote.as_deref().unwrap_or("loopback hip"));
-        let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: true };
-        let x: Vec<f32> = (0..8 * dim).map(|i| ((i % 97) as f32 - 48.0) * 0.02).collect();
+        let gate = client
+            .put_tensor(
+                13,
+                &[dim as u32, ff as u32, n_exp as u32],
+                &one(13, ff, dim),
+                None,
+            )
+            .unwrap();
+        let up = client
+            .put_tensor(
+                13,
+                &[dim as u32, ff as u32, n_exp as u32],
+                &one(13, ff, dim),
+                None,
+            )
+            .unwrap();
+        let down = client
+            .put_tensor(
+                14,
+                &[ff as u32, dim as u32, n_exp as u32],
+                &one(14, dim, ff),
+                None,
+            )
+            .unwrap();
+        eprintln!(
+            "upload {:.1} s to {}",
+            t.elapsed().as_secs_f64(),
+            remote.as_deref().unwrap_or("loopback hip")
+        );
+        let req = MoeFfnRequest {
+            gate,
+            up,
+            down,
+            n_experts: n_exp as u32,
+            dim: dim as u32,
+            ff: ff as u32,
+            f16_out: true,
+        };
+        let x: Vec<f32> = (0..8 * dim)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.02)
+            .collect();
         for rows in [1usize, 4] {
             for k in [1usize, 2, 4, 6, 8, 10] {
                 let pairs: Vec<(u32, u32, f32)> = (0..rows as u32)
@@ -529,7 +658,10 @@ mod tests {
                     client.moe_ffn(req, &x[..rows * dim], true, &pairs).unwrap();
                 }
                 let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
-                eprintln!("COST rows={rows} experts_per_row={k} pairs={} us={us:.0}", pairs.len());
+                eprintln!(
+                    "COST rows={rows} experts_per_row={k} pairs={} us={us:.0}",
+                    pairs.len()
+                );
             }
         }
         drop(client);
@@ -560,28 +692,48 @@ mod tests {
                 let addr = listener.local_addr().unwrap();
                 worker = Some(thread::spawn(move || {
                     let (stream, _) = listener.accept().unwrap();
-                    serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+                    serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap()))
+                        .unwrap();
                 }));
                 RpcSession::connect_addr(&addr.to_string()).unwrap()
             }
         };
         let (n_exp, dim, ff) = (64usize, 2560usize, 640usize);
-        let m: Vec<f32> = (0..3 * ff * dim).map(|i| ((i * 7919 % 1000) as f32 - 500.0) * 1e-4).collect();
+        let m: Vec<f32> = (0..3 * ff * dim)
+            .map(|i| ((i * 7919 % 1000) as f32 - 500.0) * 1e-4)
+            .collect();
         let slot = allpaca_cpu::quantize_q2_0(&m);
         let bytes: Vec<u8> = (0..n_exp).flat_map(|_| slot.iter().copied()).collect();
-        let pool = client.put_tensor(42, &[slot.len() as u32, n_exp as u32], &bytes, None).unwrap();
-        let req = MoeFfnRequest { gate: pool, up: pool, down: pool, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: true };
-        let x: Vec<f32> = (0..16 * dim).map(|i| ((i % 97) as f32 - 48.0) * 0.02).collect();
+        let pool = client
+            .put_tensor(42, &[slot.len() as u32, n_exp as u32], &bytes, None)
+            .unwrap();
+        let req = MoeFfnRequest {
+            gate: pool,
+            up: pool,
+            down: pool,
+            n_experts: n_exp as u32,
+            dim: dim as u32,
+            ff: ff as u32,
+            f16_out: true,
+        };
+        let x: Vec<f32> = (0..16 * dim)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.02)
+            .collect();
         for q8 in [true, false] {
             for (rows, k) in [(1usize, 1usize), (1, 10), (4, 10), (16, 10)] {
                 let pairs: Vec<(u32, u32, f32)> = (0..rows as u32)
-                    .flat_map(|r| (0..k as u32).map(move |j| (r, (r * 37 + j * 51) % n_exp as u32, 0.1)))
+                    .flat_map(|r| {
+                        (0..k as u32).map(move |j| (r, (r * 37 + j * 51) % n_exp as u32, 0.1))
+                    })
                     .collect();
                 for _ in 0..5 {
                     client.moe_ffn(req, &x[..rows * dim], q8, &pairs).unwrap();
                 }
                 // `ALLPACA_BENCH_GAP_US`: idle between calls, as a forward leaves.
-                let gap = std::env::var("ALLPACA_BENCH_GAP_US").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                let gap = std::env::var("ALLPACA_BENCH_GAP_US")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
                 let (n, mut busy) = (40, std::time::Duration::ZERO);
                 for _ in 0..n {
                     std::thread::sleep(std::time::Duration::from_micros(gap));
@@ -617,37 +769,98 @@ mod tests {
             serve_connection(stream, backend).unwrap();
         });
         let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
-        let digest = |v: &[f32]| v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
-            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
-        });
+        let digest = |v: &[f32]| {
+            v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+                (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+            })
+        };
         // Qwen3-Next's expert shape; 1-row calls (decode) and grouped rows.
         let (dim, ff, n_exp) = (2048usize, 512usize, 4usize);
         let mat = |seed: usize, n: usize| -> Vec<f32> {
-            (0..n).map(|i| ((((i * 2654435761usize) ^ (seed * 40503)) % 1000) as f32 - 500.0) * 0.0007).collect()
+            (0..n)
+                .map(|i| {
+                    ((((i * 2654435761usize) ^ (seed * 40503)) % 1000) as f32 - 500.0) * 0.0007
+                })
+                .collect()
         };
         let x: Vec<f32> = mat(77, 4 * dim).iter().map(|v| v * 9.0).collect();
         for (gu, dn) in [(12u32, 12u32), (13, 14)] {
             let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
-                let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
-                client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+                let bytes: Vec<u8> = (0..n_exp)
+                    .flat_map(|e| quantize(ty, &mat(seed + e, rows * cols)))
+                    .collect();
+                client
+                    .put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None)
+                    .unwrap()
             };
-            let (gate, up, down) = (put(gu, 1, ff, dim), put(gu, 5, ff, dim), put(dn, 9, dim, ff));
-            let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: false };
-            let pairs = [(0u32, 1u32, 0.6f32), (0, 3, 0.4), (1, 1, 0.5), (1, 2, 0.5), (2, 0, 1.0), (3, 1, 0.3), (3, 3, 0.7)];
+            let (gate, up, down) = (
+                put(gu, 1, ff, dim),
+                put(gu, 5, ff, dim),
+                put(dn, 9, dim, ff),
+            );
+            let req = MoeFfnRequest {
+                gate,
+                up,
+                down,
+                n_experts: n_exp as u32,
+                dim: dim as u32,
+                ff: ff as u32,
+                f16_out: false,
+            };
+            let pairs = [
+                (0u32, 1u32, 0.6f32),
+                (0, 3, 0.4),
+                (1, 1, 0.5),
+                (1, 2, 0.5),
+                (2, 0, 1.0),
+                (3, 1, 0.3),
+                (3, 3, 0.7),
+            ];
             for q8 in [false, true] {
                 let y = client.moe_ffn(req, &x, q8, &pairs).unwrap();
-                eprintln!("DIGEST moe gate_up={gu} down={dn} q8={q8}: {:016x} first={:?}", digest(&y), &y[..3]);
+                eprintln!(
+                    "DIGEST moe gate_up={gu} down={dn} q8={q8}: {:016x} first={:?}",
+                    digest(&y),
+                    &y[..3]
+                );
                 let one: Vec<(u32, u32, f32)> = (0..n_exp as u32).map(|e| (0, e, 0.25)).collect();
                 let y1 = client.moe_ffn(req, &x[..dim], q8, &one).unwrap();
-                let half = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &x[..dim], q8, &one).unwrap();
-                eprintln!("DIGEST moe1 gate_up={gu} down={dn} q8={q8}: {:016x} f16 {:016x}", digest(&y1), digest(&half));
+                let half = client
+                    .moe_ffn(
+                        MoeFfnRequest {
+                            f16_out: true,
+                            ..req
+                        },
+                        &x[..dim],
+                        q8,
+                        &one,
+                    )
+                    .unwrap();
+                eprintln!(
+                    "DIGEST moe1 gate_up={gu} down={dn} q8={q8}: {:016x} f16 {:016x}",
+                    digest(&y1),
+                    digest(&half)
+                );
                 // Prefill-sized: 20 rows, 2 experts each, groups of up to 8 rows.
                 let xs: Vec<f32> = mat(91, 20 * dim).iter().map(|v| v * 7.0).collect();
                 let many: Vec<(u32, u32, f32)> = (0..20u32)
                     .flat_map(|r| [(r, r % 4, 0.7f32), (r, (r * 3 + 1) % 4, 0.3)])
                     .collect();
-                let yp = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &xs, q8, &many).unwrap();
-                eprintln!("DIGEST moe20 gate_up={gu} down={dn} q8={q8}: {:016x}", digest(&yp));
+                let yp = client
+                    .moe_ffn(
+                        MoeFfnRequest {
+                            f16_out: true,
+                            ..req
+                        },
+                        &xs,
+                        q8,
+                        &many,
+                    )
+                    .unwrap();
+                eprintln!(
+                    "DIGEST moe20 gate_up={gu} down={dn} q8={q8}: {:016x}",
+                    digest(&yp)
+                );
             }
         }
         // Real routing shape: 21 rows x 10 distinct experts of 64 (groups of
@@ -655,11 +868,27 @@ mod tests {
         let n_exp = 64usize;
         for (gu, dn) in [(13u32, 14u32)] {
             let mut put = |ty: u32, seed: usize, rows: usize, cols: usize| {
-                let bytes: Vec<u8> = (0..n_exp).flat_map(|e| quantize(ty, &mat(seed + e, rows * cols))).collect();
-                client.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+                let bytes: Vec<u8> = (0..n_exp)
+                    .flat_map(|e| quantize(ty, &mat(seed + e, rows * cols)))
+                    .collect();
+                client
+                    .put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None)
+                    .unwrap()
             };
-            let (gate, up, down) = (put(gu, 1, ff, dim), put(gu, 5, ff, dim), put(dn, 9, dim, ff));
-            let req = MoeFfnRequest { gate, up, down, n_experts: n_exp as u32, dim: dim as u32, ff: ff as u32, f16_out: true };
+            let (gate, up, down) = (
+                put(gu, 1, ff, dim),
+                put(gu, 5, ff, dim),
+                put(dn, 9, dim, ff),
+            );
+            let req = MoeFfnRequest {
+                gate,
+                up,
+                down,
+                n_experts: n_exp as u32,
+                dim: dim as u32,
+                ff: ff as u32,
+                f16_out: true,
+            };
             let xs: Vec<f32> = mat(93, 21 * dim).iter().map(|v| v * 7.0).collect();
             let many: Vec<(u32, u32, f32)> = (0..21u32)
                 .flat_map(|r| (0..10u32).map(move |j| (r, (r * 7 + j * 13 + j * j) % 64, 0.1)))
@@ -684,13 +913,32 @@ mod tests {
         /// Also send int8 rows and require the identical result (fused path).
         q8_exact: bool,
     }
-    const MOE_Q8: MoeCase =
-        MoeCase { gate_up: 8, down: 8, dim: 32, ff: 64, tol: 2e-3, q8_exact: false };
-    const MOE_KQUANT: MoeCase =
-        MoeCase { gate_up: 13, down: 14, dim: 256, ff: 256, tol: 3e-2, q8_exact: false };
-    const MOE_KQUANT_FUSED: MoeCase = MoeCase { q8_exact: true, ..MOE_KQUANT };
+    const MOE_Q8: MoeCase = MoeCase {
+        gate_up: 8,
+        down: 8,
+        dim: 32,
+        ff: 64,
+        tol: 2e-3,
+        q8_exact: false,
+    };
+    const MOE_KQUANT: MoeCase = MoeCase {
+        gate_up: 13,
+        down: 14,
+        dim: 256,
+        ff: 256,
+        tol: 3e-2,
+        q8_exact: false,
+    };
+    const MOE_KQUANT_FUSED: MoeCase = MoeCase {
+        q8_exact: true,
+        ..MOE_KQUANT
+    };
     #[cfg(feature = "cuda")]
-    const MOE_Q4K_FUSED: MoeCase = MoeCase { gate_up: 12, down: 12, ..MOE_KQUANT_FUSED };
+    const MOE_Q4K_FUSED: MoeCase = MoeCase {
+        gate_up: 12,
+        down: 12,
+        ..MOE_KQUANT_FUSED
+    };
 
     /// A coordinator connects, sets up (stats, allocations, packed weights)
     /// and only then launches. No setup call may leave a CUDA error pending
@@ -706,7 +954,10 @@ mod tests {
         let setups: [(&str, Setup); 11] = [
             ("put_tensor q6_k", |c| {
                 let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
-                drop(c.put_tensor(14, &[256, 4], &quantize(14, &m), None).unwrap());
+                drop(
+                    c.put_tensor(14, &[256, 4], &quantize(14, &m), None)
+                        .unwrap(),
+                );
             }),
             ("put_tensor q8_0", |c| {
                 let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
@@ -727,7 +978,10 @@ mod tests {
             }),
             ("put_tensor q4_k", |c| {
                 let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
-                drop(c.put_tensor(12, &[256, 4], &quantize(12, &m), None).unwrap());
+                drop(
+                    c.put_tensor(12, &[256, 4], &quantize(12, &m), None)
+                        .unwrap(),
+                );
             }),
             ("sync", |c| c.sync().unwrap()),
         ];
@@ -794,7 +1048,9 @@ mod tests {
         for coordinator in 0..2 {
             let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
             let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
-            client.put_tensor(12, &[256, 4], &quantize(12, &m), None).unwrap();
+            client
+                .put_tensor(12, &[256, 4], &quantize(12, &m), None)
+                .unwrap();
             let (x, w, out) = (
                 client.alloc(n as u64 * 4).unwrap(),
                 client.alloc(n as u64 * 4).unwrap(),
@@ -815,7 +1071,10 @@ mod tests {
             drop(client);
         }
         worker.join().unwrap();
-        assert!(results.iter().all(|r| r.ends_with("Ok(())")), "{results:#?}");
+        assert!(
+            results.iter().all(|r| r.ends_with("Ok(())")),
+            "{results:#?}"
+        );
     }
 
     fn quantize(ty: u32, m: &[f32]) -> Vec<u8> {
@@ -852,7 +1111,9 @@ mod tests {
         let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
         let (n_exp, dim, ff, rows) = (3usize, case.dim, case.ff, 3usize);
         let mat = |seed: usize, rows: usize, cols: usize| -> Vec<f32> {
-            (0..rows * cols).map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2).collect()
+            (0..rows * cols)
+                .map(|i| (((i * 7 + seed * 13) % 23) as f32) * 0.02 - 0.2)
+                .collect()
         };
         // Stacked like GGUF `ffn_*_exps`: expert e's matrix follows expert e-1's.
         let stack = |seed: usize, rows: usize, cols: usize| -> Vec<Vec<f32>> {
@@ -861,12 +1122,15 @@ mod tests {
         let (gates, ups, downs) = (stack(1, ff, dim), stack(5, ff, dim), stack(9, dim, ff));
         let put = |c: &mut RpcSession, ty: u32, m: &[Vec<f32>], rows: usize, cols: usize| {
             let bytes: Vec<u8> = m.iter().flat_map(|w| quantize(ty, w)).collect();
-            c.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None).unwrap()
+            c.put_tensor(ty, &[cols as u32, rows as u32, n_exp as u32], &bytes, None)
+                .unwrap()
         };
         let gb = put(&mut client, case.gate_up, &gates, ff, dim);
         let ub = put(&mut client, case.gate_up, &ups, ff, dim);
         let db = put(&mut client, case.down, &downs, dim, ff);
-        let x: Vec<f32> = (0..rows * dim).map(|i| ((i % 61) as f32) * 0.03 - 0.9).collect();
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i % 61) as f32) * 0.03 - 0.9)
+            .collect();
         // Unsorted, and row 2 routes to no expert.
         let pairs = [(1u32, 1u32, 1.0f32), (0, 0, 0.7), (0, 2, 0.3)];
         let req = MoeFfnRequest {
@@ -880,9 +1144,23 @@ mod tests {
         };
         let got = client.moe_ffn(req, &x, false, &pairs).unwrap();
         // F16 replies: the same values, rounded to nearest-even F16.
-        let half = client.moe_ffn(MoeFfnRequest { f16_out: true, ..req }, &x, false, &pairs).unwrap();
+        let half = client
+            .moe_ffn(
+                MoeFfnRequest {
+                    f16_out: true,
+                    ..req
+                },
+                &x,
+                false,
+                &pairs,
+            )
+            .unwrap();
         for (h, g) in half.iter().zip(&got) {
-            assert_eq!(*h, allpaca_cpu::f16_to_f32(f32_to_f16_rne(*g)), "f16 reply of {g}");
+            assert_eq!(
+                *h,
+                allpaca_cpu::f16_to_f32(f32_to_f16_rne(*g)),
+                "f16 reply of {g}"
+            );
         }
         if case.q8_exact {
             // Pre-quantized rows are what the fused kernels compute anyway.
@@ -901,7 +1179,11 @@ mod tests {
                 .unwrap();
             allpaca_cpu::matmul_nt(xr, &dequantize(case.gate_up, &ups[e]), &mut u, 1, ff, dim)
                 .unwrap();
-            let h: Vec<f32> = g.iter().zip(&u).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+            let h: Vec<f32> = g
+                .iter()
+                .zip(&u)
+                .map(|(a, b)| a / (1.0 + (-a).exp()) * b)
+                .collect();
             allpaca_cpu::matmul_nt(&h, &dequantize(case.down, &downs[e]), &mut o, 1, dim, ff)
                 .unwrap();
             for i in 0..dim {
@@ -910,23 +1192,35 @@ mod tests {
         }
         assert_eq!(got.len(), want.len());
         let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
-        let tol = if case.tol < 1e-2 { case.tol } else { case.tol * scale };
+        let tol = if case.tol < 1e-2 {
+            case.tol
+        } else {
+            case.tol * scale
+        };
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             assert!((g - w).abs() < tol, "out[{i}] {g} vs {w} (tol {tol})");
         }
-        assert!(got[2 * dim..].iter().all(|v| *v == 0.0), "unrouted row must be zero");
+        assert!(
+            got[2 * dim..].iter().all(|v| *v == 0.0),
+            "unrouted row must be zero"
+        );
         drop(client);
         worker.join().unwrap();
     }
 
     #[test]
     fn f16_rne_rounds_to_nearest_even() {
-        for v in [0.0f32, -0.0, 1.0, -2.5, 65504.0, 1.0e-5, -6.0e-8, 0.333_333, 1234.567] {
+        for v in [
+            0.0f32, -0.0, 1.0, -2.5, 65504.0, 1.0e-5, -6.0e-8, 0.333_333, 1234.567,
+        ] {
             let h = f32_to_f16_rne(v);
             let back = allpaca_cpu::f16_to_f32(h);
             // Spacing: 2^-10 relative for normals, a fixed 2^-24 below 2^-14.
             let ulp = (back.abs() / 1024.0).max(1.0 / 16_777_216.0);
-            assert!((back - v).abs() <= ulp * 0.5 + f32::EPSILON * v.abs(), "{v} -> {back}");
+            assert!(
+                (back - v).abs() <= ulp * 0.5 + f32::EPSILON * v.abs(),
+                "{v} -> {back}"
+            );
         }
         // Ties go to even: 1 + 2^-11 sits halfway between 1 and 1 + 2^-10.
         assert_eq!(f32_to_f16_rne(1.0 + 1.0 / 2048.0), 0x3c00);
@@ -1000,7 +1294,10 @@ mod tests {
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].name, "cpu");
         assert_eq!((before[0].mem_used, before[0].mem_total), (0, 8 << 20));
-        assert_eq!((before[0].util_pct, before[0].temp_c, before[0].power_w), (-1, -1, -1));
+        assert_eq!(
+            (before[0].util_pct, before[0].temp_c, before[0].power_w),
+            (-1, -1, -1)
+        );
         let _buf = client.alloc(4096).unwrap();
         assert_eq!(client.device_stats().unwrap()[0].mem_used, 4096);
         drop(client);
