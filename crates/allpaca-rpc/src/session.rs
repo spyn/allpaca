@@ -24,8 +24,7 @@ impl CallCounters {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.wall_us
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.bytes_out
-            .fetch_add(bytes_out as u64, Ordering::Relaxed);
+        self.bytes_out.fetch_add(bytes_out as u64, Ordering::Relaxed);
         self.bytes_in.fetch_add(bytes_in as u64, Ordering::Relaxed);
     }
 }
@@ -146,9 +145,7 @@ impl RpcSession {
     /// buffers ([`SOCKET_BUFFER`]).
     pub fn ext_send(&mut self, name: &str, head: &[u8], data: &[u8]) -> Result<(), RpcError> {
         if !self.has_extension(name) {
-            return Err(RpcError::Protocol(format!(
-                "extension {name} is not served"
-            )));
+            return Err(RpcError::Protocol(format!("extension {name} is not served")));
         }
         self.ext_calls
             .bytes_out
@@ -162,9 +159,7 @@ impl RpcSession {
         let (status, body) = read_reply(&mut self.stream)?;
         self.ext_calls.add(started, 0, body.len());
         if status != STATUS_OK {
-            return Err(RpcError::Worker(
-                String::from_utf8_lossy(&body).into_owned(),
-            ));
+            return Err(RpcError::Worker(String::from_utf8_lossy(&body).into_owned()));
         }
         Ok(body)
     }
@@ -315,10 +310,7 @@ impl RpcSession {
         q8: bool,
         pairs: &[(u32, u32, f32)],
     ) -> Result<Vec<f32>, RpcError> {
-        let body = self.rpc(
-            Cmd::MoeFfn,
-            &crate::protocol::encode_moe_ffn(&req, x, q8, pairs),
-        )?;
+        let body = self.rpc(Cmd::MoeFfn, &crate::protocol::encode_moe_ffn(&req, x, q8, pairs))?;
         crate::protocol::decode_moe_reply(&body, x.len(), req.f16_out)
             .ok_or_else(|| RpcError::Protocol("moe ffn reply size".into()))
     }
@@ -352,9 +344,7 @@ impl RpcSession {
 impl Read for RpcSession {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.stream.read(buf)?;
-        self.ext_calls
-            .bytes_in
-            .fetch_add(n as u64, Ordering::Relaxed);
+        self.ext_calls.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 }
@@ -362,9 +352,7 @@ impl Read for RpcSession {
 impl Write for RpcSession {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.stream.write(buf)?;
-        self.ext_calls
-            .bytes_out
-            .fetch_add(n as u64, Ordering::Relaxed);
+        self.ext_calls.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 

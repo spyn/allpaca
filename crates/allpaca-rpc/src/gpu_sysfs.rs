@@ -25,13 +25,8 @@ impl AmdCard {
     /// First `hwmon/hwmon*/<file>` that parses.
     fn hwmon(&self, file: &str) -> Option<u64> {
         let rd = std::fs::read_dir(self.dir.join("hwmon")).ok()?;
-        rd.flatten().find_map(|e| {
-            std::fs::read_to_string(e.path().join(file))
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
-        })
+        rd.flatten()
+            .find_map(|e| std::fs::read_to_string(e.path().join(file)).ok()?.trim().parse().ok())
     }
 
     /// Overwrite the fields sysfs reports; leave the rest.
@@ -39,10 +34,9 @@ impl AmdCard {
         if let Some(name) = self.read("product_name").filter(|n| !n.is_empty()) {
             stat.name = name;
         }
-        if let (Some(used), Some(total)) = (
-            self.num("mem_info_vram_used"),
-            self.num("mem_info_vram_total"),
-        ) {
+        if let (Some(used), Some(total)) =
+            (self.num("mem_info_vram_used"), self.num("mem_info_vram_total"))
+        {
             stat.mem_used = used;
             stat.mem_total = total;
         }
@@ -53,10 +47,7 @@ impl AmdCard {
         if let Some(t) = self.hwmon("temp1_input") {
             stat.temp_c = (t / 1000) as i32;
         }
-        if let Some(p) = self
-            .hwmon("power1_average")
-            .or_else(|| self.hwmon("power1_input"))
-        {
+        if let Some(p) = self.hwmon("power1_average").or_else(|| self.hwmon("power1_input")) {
             stat.power_w = (p / 1_000_000) as i32;
         }
     }
@@ -162,19 +153,9 @@ mod tests {
         card(&root, "card2", &[("vendor", "0x1002\n")]);
         let cards = amd_cards_in(&root);
         assert_eq!(cards.len(), 2);
-        let mut bare = DeviceStat {
-            name: "hip:1".into(),
-            mem_used: 5,
-            mem_total: 9,
-            util_pct: -1,
-            temp_c: -1,
-            power_w: -1,
-        };
+        let mut bare = DeviceStat { name: "hip:1".into(), mem_used: 5, mem_total: 9, util_pct: -1, temp_c: -1, power_w: -1 };
         cards[1].fill(&mut bare);
-        assert_eq!(
-            (bare.name.as_str(), bare.mem_used, bare.util_pct),
-            ("hip:1", 5, -1)
-        );
+        assert_eq!((bare.name.as_str(), bare.mem_used, bare.util_pct), ("hip:1", 5, -1));
         let _ = std::fs::remove_dir_all(root);
     }
 }

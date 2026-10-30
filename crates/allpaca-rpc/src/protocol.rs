@@ -372,9 +372,7 @@ pub fn f32_to_f16_rne(v: f32) -> u16 {
 /// `MoeFfn` reply payload: `out` as F32 or F16 little-endian values.
 pub fn encode_moe_reply(out: &[f32], f16_out: bool) -> Vec<u8> {
     if f16_out {
-        out.iter()
-            .flat_map(|&v| f32_to_f16_rne(v).to_le_bytes())
-            .collect()
+        out.iter().flat_map(|&v| f32_to_f16_rne(v).to_le_bytes()).collect()
     } else {
         out.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
@@ -407,10 +405,7 @@ pub fn quantize_q8_rows(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
         let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
         let inv = if scale == 0.0 { 0.0 } else { 1.0 / scale };
-        q.extend(
-            blk.iter()
-                .map(|v| (v * inv).round().clamp(-127.0, 127.0) as i8),
-        );
+        q.extend(blk.iter().map(|v| (v * inv).round().clamp(-127.0, 127.0) as i8));
         d.push(scale);
     }
     (q, d)
@@ -463,16 +458,8 @@ pub fn encode_moe_ffn(
     for id in [req.gate, req.up, req.down] {
         write_buf_id(&mut w, id);
     }
-    let flags =
-        if q8 { MOE_FLAG_Q8_IN } else { 0 } | if req.f16_out { MOE_FLAG_F16_OUT } else { 0 };
-    for v in [
-        req.n_experts,
-        req.dim,
-        req.ff,
-        x.len() as u32,
-        pairs.len() as u32,
-        flags,
-    ] {
+    let flags = if q8 { MOE_FLAG_Q8_IN } else { 0 } | if req.f16_out { MOE_FLAG_F16_OUT } else { 0 };
+    for v in [req.n_experts, req.dim, req.ff, x.len() as u32, pairs.len() as u32, flags] {
         w.extend_from_slice(&v.to_le_bytes());
     }
     if q8 {
@@ -495,9 +482,7 @@ pub fn encode_moe_ffn(
 }
 
 #[allow(clippy::type_complexity)]
-pub fn decode_moe_ffn(
-    data: &[u8],
-) -> Result<(MoeFfnRequest, MoeX, Vec<(u32, u32, f32)>), RpcError> {
+pub fn decode_moe_ffn(data: &[u8]) -> Result<(MoeFfnRequest, MoeX, Vec<(u32, u32, f32)>), RpcError> {
     let mut c = Cursor::new(data);
     let (gate, up, down) = (c.buf_id()?, c.buf_id()?, c.buf_id()?);
     let (n_experts, dim, ff, n_x, n_pairs) = (c.u32()?, c.u32()?, c.u32()?, c.u32()?, c.u32()?);
@@ -508,12 +493,8 @@ pub fn decode_moe_ffn(
     }
     let rows = n_x / dim;
     let x = if q8 {
-        let q = (0..n_x)
-            .map(|_| c.u8().map(|b| b as i8))
-            .collect::<Result<Vec<_>, _>>()?;
-        let d = (0..n_x / 32)
-            .map(|_| c.f32())
-            .collect::<Result<Vec<_>, _>>()?;
+        let q = (0..n_x).map(|_| c.u8().map(|b| b as i8)).collect::<Result<Vec<_>, _>>()?;
+        let d = (0..n_x / 32).map(|_| c.f32()).collect::<Result<Vec<_>, _>>()?;
         MoeX::Q8 { q, d }
     } else {
         MoeX::F32((0..n_x).map(|_| c.f32()).collect::<Result<Vec<_>, _>>()?)
@@ -526,15 +507,7 @@ pub fn decode_moe_ffn(
         }
         pairs.push((row, expert, weight));
     }
-    let req = MoeFfnRequest {
-        gate,
-        up,
-        down,
-        n_experts,
-        dim,
-        ff,
-        f16_out,
-    };
+    let req = MoeFfnRequest { gate, up, down, n_experts, dim, ff, f16_out };
     Ok((req, x, pairs))
 }
 
@@ -758,11 +731,7 @@ pub fn decode_hello_tail(data: &[u8]) -> Result<(Vec<String>, Option<String>), R
         return Err(RpcError::Protocol("too many rpc extensions".into()));
     }
     let names = (0..n).map(|_| c.str()).collect::<Result<Vec<_>, _>>()?;
-    let build = if c.has_remaining() {
-        Some(c.str()?)
-    } else {
-        None
-    };
+    let build = if c.has_remaining() { Some(c.str()?) } else { None };
     Ok((names, build))
 }
 
@@ -785,17 +754,9 @@ pub fn widen_socket_buffers(stream: &std::net::TcpStream) {
 }
 
 /// Send an extension call without copying its bulk `data`.
-pub fn write_ext_request<W: Write>(
-    w: &mut W,
-    name: &str,
-    head: &[u8],
-    data: &[u8],
-) -> Result<(), RpcError> {
+pub fn write_ext_request<W: Write>(w: &mut W, name: &str, head: &[u8], data: &[u8]) -> Result<(), RpcError> {
     let mut front = vec![Cmd::Ext as u8];
-    write_u64(
-        &mut front,
-        (16 + name.len() + head.len() + data.len()) as u64,
-    );
+    write_u64(&mut front, (16 + name.len() + head.len() + data.len()) as u64);
     write_str(&mut front, name);
     write_bytes(&mut front, head);
     if data.len() <= ONE_WRITE_FRAME {
