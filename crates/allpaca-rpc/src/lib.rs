@@ -706,7 +706,10 @@ mod tests {
         let setups: [(&str, Setup); 11] = [
             ("put_tensor q6_k", |c| {
                 let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
-                drop(c.put_tensor(14, &[256, 4], &quantize(14, &m), None).unwrap());
+                drop(
+                    c.put_tensor(14, &[256, 4], &quantize(14, &m), None)
+                        .unwrap(),
+                );
             }),
             ("put_tensor q8_0", |c| {
                 let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
@@ -727,7 +730,10 @@ mod tests {
             }),
             ("put_tensor q4_k", |c| {
                 let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
-                drop(c.put_tensor(12, &[256, 4], &quantize(12, &m), None).unwrap());
+                drop(
+                    c.put_tensor(12, &[256, 4], &quantize(12, &m), None)
+                        .unwrap(),
+                );
             }),
             ("sync", |c| c.sync().unwrap()),
         ];
@@ -794,7 +800,9 @@ mod tests {
         for coordinator in 0..2 {
             let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
             let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
-            client.put_tensor(12, &[256, 4], &quantize(12, &m), None).unwrap();
+            client
+                .put_tensor(12, &[256, 4], &quantize(12, &m), None)
+                .unwrap();
             let (x, w, out) = (
                 client.alloc(n as u64 * 4).unwrap(),
                 client.alloc(n as u64 * 4).unwrap(),
@@ -815,7 +823,10 @@ mod tests {
             drop(client);
         }
         worker.join().unwrap();
-        assert!(results.iter().all(|r| r.ends_with("Ok(())")), "{results:#?}");
+        assert!(
+            results.iter().all(|r| r.ends_with("Ok(())")),
+            "{results:#?}"
+        );
     }
 
     fn quantize(ty: u32, m: &[f32]) -> Vec<u8> {
