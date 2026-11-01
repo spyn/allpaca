@@ -8,6 +8,7 @@
 //! versa) as long as HELLO majors match.
 
 mod gpu_sysfs;
+pub mod link;
 mod protocol;
 mod session;
 mod worker;
@@ -690,6 +691,143 @@ mod tests {
     const MOE_KQUANT_FUSED: MoeCase = MoeCase { q8_exact: true, ..MOE_KQUANT };
     #[cfg(feature = "cuda")]
     const MOE_Q4K_FUSED: MoeCase = MoeCase { gate_up: 12, down: 12, ..MOE_KQUANT_FUSED };
+
+    /// A coordinator connects, sets up (stats, allocations, packed weights)
+    /// and only then launches. No setup call may leave a CUDA error pending
+    /// for the first kernel to pick up: on a K80 (sm_37) worker the first
+    /// request after connect failed with "CUDA rmsnorm failed rc=3" (S1).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_cuda_workers_first_kernel_runs_after_each_setup_call() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        type Setup = fn(&mut RpcSession);
+        let setups: [(&str, Setup); 11] = [
+            ("put_tensor q6_k", |c| {
+                let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
+                drop(
+                    c.put_tensor(14, &[256, 4], &quantize(14, &m), None)
+                        .unwrap(),
+                );
+            }),
+            ("put_tensor q8_0", |c| {
+                let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
+                drop(c.put_tensor(8, &[256, 4], &quantize(8, &m), None).unwrap());
+            }),
+            ("put_tensor f32", |c| {
+                let m: Vec<u8> = (0..256).flat_map(|i| (i as f32).to_le_bytes()).collect();
+                drop(c.put_tensor(0, &[256], &m, None).unwrap());
+            }),
+            ("alloc 2 GiB", |c| drop(c.alloc(2 << 30).unwrap())),
+            ("none", |_| {}),
+            ("mem_info", |c| drop(c.mem_info().unwrap())),
+            ("device_count", |c| drop(c.device_count().unwrap())),
+            ("device_stats", |c| drop(c.device_stats().unwrap())),
+            ("alloc+clear", |c| {
+                let b = c.alloc(4096).unwrap();
+                c.clear(b, 0).unwrap();
+            }),
+            ("put_tensor q4_k", |c| {
+                let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
+                drop(
+                    c.put_tensor(12, &[256, 4], &quantize(12, &m), None)
+                        .unwrap(),
+                );
+            }),
+            ("sync", |c| c.sync().unwrap()),
+        ];
+        let mut failed = Vec::new();
+        for (name, setup) in setups {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let worker = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let backend = WorkerBackend::Cuda(CudaWorker::new(0).unwrap());
+                serve_connection(stream, backend).unwrap();
+            });
+            let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+            setup(&mut client);
+            let n = 64usize;
+            let ones: Vec<u8> = (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+            let (x, w, out) = (
+                client.alloc(n as u64 * 4).unwrap(),
+                client.alloc(n as u64 * 4).unwrap(),
+                client.alloc(n as u64 * 4).unwrap(),
+            );
+            client.h2d(x, 0, &ones).unwrap();
+            client.h2d(w, 0, &ones).unwrap();
+            let first = client.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::RmsNorm,
+                    bufs: vec![x, w, out],
+                    i32s: vec![],
+                    f32s: vec![1e-5],
+                }],
+            });
+            if let Err(e) = first {
+                failed.push(format!("{name}: {e}"));
+            }
+            drop(client);
+            worker.join().unwrap();
+        }
+        assert!(failed.is_empty(), "first kernel failed after: {failed:#?}");
+    }
+
+    /// `allpaca-rpc-server` serves coordinators one after another on one
+    /// thread, opening a new backend for each and dropping the old one. The
+    /// teardown of the last coordinator's buffers must not leave a CUDA error
+    /// for the next coordinator's first kernel (K80 symptom: HTTP 500, "CUDA
+    /// rmsnorm failed rc=3", on the first request after every restart).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_second_coordinator_on_the_same_cuda_worker_thread_runs_its_first_kernel() {
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let backend = WorkerBackend::Cuda(CudaWorker::new(0).unwrap());
+                serve_connection(stream, backend).unwrap();
+            }
+        });
+        let n = 64usize;
+        let ones: Vec<u8> = (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        let mut results = Vec::new();
+        for coordinator in 0..2 {
+            let mut client = RpcSession::connect_addr(&addr.to_string()).unwrap();
+            let m: Vec<f32> = (0..256 * 4).map(|i| (i % 17) as f32 * 0.01).collect();
+            client
+                .put_tensor(12, &[256, 4], &quantize(12, &m), None)
+                .unwrap();
+            let (x, w, out) = (
+                client.alloc(n as u64 * 4).unwrap(),
+                client.alloc(n as u64 * 4).unwrap(),
+                client.alloc(n as u64 * 4).unwrap(),
+            );
+            client.h2d(x, 0, &ones).unwrap();
+            client.h2d(w, 0, &ones).unwrap();
+            let first = client.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::RmsNorm,
+                    bufs: vec![x, w, out],
+                    i32s: vec![],
+                    f32s: vec![1e-5],
+                }],
+            });
+            results.push(format!("coordinator {coordinator}: {first:?}"));
+            // Hang up without freeing, as a killed coordinator does.
+            drop(client);
+        }
+        worker.join().unwrap();
+        assert!(
+            results.iter().all(|r| r.ends_with("Ok(())")),
+            "{results:#?}"
+        );
+    }
 
     fn quantize(ty: u32, m: &[f32]) -> Vec<u8> {
         match ty {

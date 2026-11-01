@@ -215,7 +215,7 @@ extern "C" int allpaca_cuda_memcpy_batch(void **dsts, void **srcs, size_t *sizes
     for (size_t i = 0; i < count; ++i) {
         cudaError_t err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], ck, s);
         if (err != cudaSuccess) {
-            return ALLPACA_ERR_DEVICE;
+            return cuda_status(err);
         }
     }
     if (kind == ALLPACA_MEMCPY_D2H) {
@@ -255,7 +255,7 @@ extern "C" int allpaca_cuda_can_p2p(int32_t src, int32_t dst, int32_t *can) {
     cudaError_t err = cudaDeviceCanAccessPeer(&yes, src, dst);
     if (err != cudaSuccess) {
         *can = 0;
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     *can = yes;
     return ALLPACA_OK;
@@ -264,13 +264,15 @@ extern "C" int allpaca_cuda_can_p2p(int32_t src, int32_t dst, int32_t *can) {
 extern "C" int allpaca_cuda_enable_peer_access(int32_t src, int32_t dst) {
     cudaError_t err = cudaSetDevice(src);
     if (err != cudaSuccess) {
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     err = cudaDeviceEnablePeerAccess(dst, 0);
-    if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
-        return ALLPACA_ERR_DEVICE;
+    if (err == cudaErrorPeerAccessAlreadyEnabled) {
+        /* Success, but the runtime still records it as the last error. */
+        (void)cudaGetLastError();
+        return ALLPACA_OK;
     }
-    return ALLPACA_OK;
+    return cuda_status(err);
 }
 
 extern "C" int allpaca_cuda_memcpy_peer(void *dst, int32_t dst_dev, const void *src, int32_t src_dev,
@@ -281,7 +283,7 @@ extern "C" int allpaca_cuda_memcpy_peer(void *dst, int32_t dst_dev, const void *
     cudaStream_t s = as_stream(stream);
     cudaError_t err = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, bytes, s);
     if (err != cudaSuccess) {
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     if (s) {
         return cuda_status(cudaStreamSynchronize(s));
@@ -296,13 +298,13 @@ extern "C" int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint6
     int prev = 0;
     cudaError_t err = cudaGetDevice(&prev);
     if (err != cudaSuccess) {
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     const bool rebind = prev != device;
     if (rebind) {
         err = cudaSetDevice(device);
         if (err != cudaSuccess) {
-            return ALLPACA_ERR_DEVICE;
+            return cuda_status(err);
         }
     }
     size_t free_b = 0;
@@ -312,7 +314,7 @@ extern "C" int allpaca_cuda_mem_info(int32_t device, uint64_t *free_bytes, uint6
         (void)cudaSetDevice(prev);
     }
     if (err != cudaSuccess) {
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     *free_bytes = static_cast<uint64_t>(free_b);
     *total_bytes = static_cast<uint64_t>(total_b);
@@ -349,7 +351,7 @@ extern "C" int allpaca_cuda_stream_create(allpaca_cuda_stream_t *stream) {
     cudaError_t err = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         *stream = nullptr;
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     *stream = s;
     return ALLPACA_OK;
@@ -370,7 +372,7 @@ extern "C" int allpaca_cuda_event_create(void **event) {
     cudaError_t err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
     if (err != cudaSuccess) {
         *event = nullptr;
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     *event = ev;
     return ALLPACA_OK;
@@ -384,7 +386,7 @@ extern "C" int allpaca_cuda_event_create_timing(void **event) {
     cudaError_t err = cudaEventCreateWithFlags(&ev, cudaEventDefault);
     if (err != cudaSuccess) {
         *event = nullptr;
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     *event = ev;
     return ALLPACA_OK;
@@ -412,7 +414,7 @@ extern "C" int allpaca_cuda_event_elapsed_us(void *start, void *stop, double *us
     cudaError_t err = cudaEventElapsedTime(
         &ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(stop));
     if (err != cudaSuccess) {
-        return ALLPACA_ERR_DEVICE;
+        return cuda_status(err);
     }
     *us = static_cast<double>(ms) * 1000.0;
     return ALLPACA_OK;
