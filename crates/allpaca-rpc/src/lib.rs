@@ -753,6 +753,124 @@ mod tests {
                 .collect();
             eprintln!("DIGEST rope rows={rows} start={start}: {:016x} first={:?}", digest(&y), &y[..3]);
         }
+        // The rest of a dense layer: norm, SiLU, residual.
+        for rows in [1usize, 2, 21] {
+            let (x, w, o) = (
+                c.alloc((rows * dim * 4) as u64).unwrap(),
+                c.alloc((dim * 4) as u64).unwrap(),
+                c.alloc((rows * dim * 4) as u64).unwrap(),
+            );
+            c.h2d(x, 0, &bytes(&mat(7, rows * dim))).unwrap();
+            c.h2d(w, 0, &bytes(&mat(8, dim))).unwrap();
+            let read = |c: &mut RpcSession, id, n: usize| -> Vec<f32> {
+                c.sync().unwrap();
+                c.d2h(id, 0, (n * 4) as u64)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect()
+            };
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::RmsNormRows,
+                    bufs: vec![x, w, o],
+                    i32s: vec![rows as i32, dim as i32],
+                    f32s: vec![1e-5],
+                }],
+            })
+            .unwrap();
+            let y = read(&mut c, o, rows * dim);
+            eprintln!("DIGEST rms rows={rows}: {:016x} first={:?}", digest(&y), &y[..3]);
+            c.h2d(o, 0, &bytes(&mat(9, rows * dim))).unwrap();
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::SiluMul,
+                    bufs: vec![o, x],
+                    i32s: vec![(rows * dim) as i32],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+            let y = read(&mut c, o, rows * dim);
+            eprintln!("DIGEST silu rows={rows}: {:016x} first={:?}", digest(&y), &y[..3]);
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::ResidualAdd,
+                    bufs: vec![o, x],
+                    i32s: vec![(rows * dim) as i32],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+            let y = read(&mut c, o, rows * dim);
+            eprintln!("DIGEST residual rows={rows}: {:016x}", digest(&y));
+        }
+        // Dense K-quant GEMV: `rows` of each width, row digests comparable
+        // with the same row run alone.
+        let (n, k) = (3072usize, 3072usize);
+        for ty in [12u32, 13, 14] {
+            let w = quantize(ty, &mat(10 + ty as usize, n * k));
+            let w = c.put_tensor(ty, &[k as u32, n as u32], &w, None).unwrap();
+            for rows in [1usize, 2, 3, 4, 5, 8, 9, 21] {
+                let (a, y) = (c.alloc((rows * k * 4) as u64).unwrap(), c.alloc((rows * n * 4) as u64).unwrap());
+                c.h2d(a, 0, &bytes(&mat(6, rows * k))).unwrap();
+                c.launch(&LaunchList {
+                    items: vec![LaunchItem {
+                        op: KernelOp::GemmNtQuant,
+                        bufs: vec![a, w, y],
+                        i32s: vec![rows as i32, n as i32, k as i32],
+                        f32s: vec![],
+                    }],
+                })
+                .unwrap();
+                c.sync().unwrap();
+                let v: Vec<f32> = c
+                    .d2h(y, 0, (rows * n * 4) as u64)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                let per_row: Vec<String> = v.chunks(n).take(3).map(|r| format!("{:016x}", digest(r))).collect();
+                eprintln!("DIGEST gemv ty={ty} rows={rows}: {:016x} rows {per_row:?} first={:?}", digest(&v), &v[..2]);
+            }
+        }
+        // How far a last-bit input change travels through the int8 activations:
+        // one row, every value moved by one ulp in turn is too slow, so nudge all.
+        let w = quantize(12, &mat(22, n * k));
+        let w = c.put_tensor(12, &[k as u32, n as u32], &w, None).unwrap();
+        let (a, y) = (c.alloc((k * 4) as u64).unwrap(), c.alloc((n * 4) as u64).unwrap());
+        let base = mat(6, k);
+        let gemv = |c: &mut RpcSession, input: &[f32]| -> Vec<f32> {
+            c.h2d(a, 0, &bytes(input)).unwrap();
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::GemmNtQuant,
+                    bufs: vec![a, w, y],
+                    i32s: vec![1, n as i32, k as i32],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+            c.sync().unwrap();
+            c.d2h(y, 0, (n * 4) as u64)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
+        let clean = gemv(&mut c, &base);
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for ulps in [1u32, 4, 16] {
+            let nudged: Vec<f32> = base.iter().map(|x| f32::from_bits(x.to_bits() + ulps)).collect();
+            let input_err: Vec<f32> = base.iter().zip(&nudged).map(|(p, q)| p - q).collect();
+            let out = gemv(&mut c, &nudged);
+            let out_err: Vec<f32> = clean.iter().zip(&out).map(|(p, q)| p - q).collect();
+            eprintln!(
+                "AMPLIFY ulps={ulps}: input rel err {:.2e}, output rel err {:.2e}",
+                norm(&input_err) / norm(&base),
+                norm(&out_err) / norm(&clean)
+            );
+        }
         drop(c);
         worker.join().unwrap();
     }
