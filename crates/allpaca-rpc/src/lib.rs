@@ -673,6 +673,90 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Prints digests of the dense-layer ops for fixed inputs at Llama 3.2 3B's
+    /// shape (24 heads of 128), to compare workers bit for bit like
+    /// `kquant_digest`:
+    /// `cargo test --release -p allpaca-rpc --features <hip|cuda> --lib dense_digest -- --ignored --nocapture`
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn dense_digest() {
+        #[cfg(feature = "hip")]
+        let backend = WorkerBackend::Hip(HipWorker::new(0).unwrap());
+        #[cfg(all(feature = "cuda", not(feature = "hip")))]
+        let backend = WorkerBackend::Cuda(CudaWorker::new(0).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, backend).unwrap();
+        });
+        let mut c = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let digest = |v: &[f32]| v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+        });
+        let mat = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((((i * 2654435761usize) ^ (seed * 40503)) % 1000) as f32 - 500.0) * 0.002).collect()
+        };
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (heads, hd) = (24usize, 128usize);
+        let dim = heads * hd;
+        for &(rows, n_kv, causal) in &[(1usize, 1usize, 1i32), (1, 2, 1), (1, 8, 1), (1, 21, 1), (1, 300, 1), (2, 2, 1), (21, 21, 1), (21, 300, 1)] {
+            let (q, k, v, out) = (
+                c.alloc((rows * dim * 4) as u64).unwrap(),
+                c.alloc((n_kv * dim * 4) as u64).unwrap(),
+                c.alloc((n_kv * dim * 4) as u64).unwrap(),
+                c.alloc((rows * dim * 4) as u64).unwrap(),
+            );
+            c.h2d(q, 0, &bytes(&mat(1, rows * dim))).unwrap();
+            c.h2d(k, 0, &bytes(&mat(2, n_kv * dim))).unwrap();
+            c.h2d(v, 0, &bytes(&mat(3, n_kv * dim))).unwrap();
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::Attention,
+                    bufs: vec![q, k, v, out],
+                    i32s: vec![rows as i32, n_kv as i32, heads as i32, heads as i32, hd as i32, causal],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+            c.sync().unwrap();
+            let y: Vec<f32> = c
+                .d2h(out, 0, (rows * dim * 4) as u64)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let per_row: Vec<String> = y.chunks(dim).take(4).map(|r| format!("{:016x}", digest(r))).collect();
+            eprintln!("DIGEST attn rows={rows} n_kv={n_kv}: {:016x} rows {per_row:?} first={:?}", digest(&y), &y[..3]);
+        }
+        for &(rows, start) in &[(1usize, 0usize), (1, 1), (1, 5), (21, 0), (21, 100), (128, 128)] {
+            let (q, k) = (c.alloc((rows * dim * 4) as u64).unwrap(), c.alloc((rows * dim * 4) as u64).unwrap());
+            let (mq, mk) = (mat(4, rows * dim), mat(5, rows * dim));
+            c.h2d(q, 0, &bytes(&mq)).unwrap();
+            c.h2d(k, 0, &bytes(&mk)).unwrap();
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::RopeRows,
+                    bufs: vec![q, k],
+                    i32s: vec![rows as i32, heads as i32, heads as i32, hd as i32, start as i32],
+                    f32s: vec![10_000.0],
+                }],
+            })
+            .unwrap();
+            c.sync().unwrap();
+            let y: Vec<f32> = c
+                .d2h(q, 0, (rows * dim * 4) as u64)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            eprintln!("DIGEST rope rows={rows} start={start}: {:016x} first={:?}", digest(&y), &y[..3]);
+        }
+        drop(c);
+        worker.join().unwrap();
+    }
+
     /// Expert tensor types, sizes, and the allowed error relative to the
     /// largest output (the fused kernels quantize activations to int8).
     struct MoeCase {
