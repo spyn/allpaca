@@ -397,6 +397,9 @@ impl Drop for RequestHandle {
             if let Err(e) = capture_qwen4_reply(&mut guard, self.id) {
                 tracing::warn!(error = %e, "prompt cache: a reply's end state was not kept");
             }
+            if let Err(e) = capture_reply(&mut guard, self.id) {
+                tracing::warn!(error = %e, "prompt cache: a reply's drafter state was not kept");
+            }
             if let Some(active) = guard.active.remove(&self.id) {
                 for layer in active.pages {
                     for page in layer {
@@ -416,6 +419,44 @@ impl Drop for RequestHandle {
     }
 }
 
+/// When a Request ends, keep the warmed drafter with the whole sequence so
+/// the next turn resumes it. qwen4exp stores its own state in
+/// [`capture_qwen4_reply`].
+fn capture_reply(inner: &mut EngineInner, id: u64) -> Result<(), AllpacaError> {
+    let Some(target) = inner
+        .target
+        .clone()
+        .filter(|t| t.q4x.is_none() && t.g4.is_none() && t.dsv4.is_none())
+    else {
+        return Ok(());
+    };
+    let prepared = {
+        let Some(active) = inner.active.get(&id) else {
+            return Ok(());
+        };
+        if !active.vision.is_empty() || active.probe.is_some() || active.tokens.is_empty() {
+            return Ok(());
+        }
+        Some((
+            active.tokens.clone(),
+            active.pages.clone(),
+            active.recurrent.clone().unwrap_or_else(|| {
+                RecurrentState::zeros(target.config.n_layers, target.config.dim)
+            }),
+        ))
+    };
+    let Some((tokens, pages, state)) = prepared else {
+        return Ok(());
+    };
+    let draft = drafter_snapshot(inner);
+    if draft.is_none() {
+        return Ok(());
+    }
+    inner
+        .kv_radix
+        .capture(&tokens, &state, &inner.kv, &pages, &target.config, draft)
+}
+
 /// When a qwen4exp Request ends, keep its state after every token it has read
 /// (the prompt and all of the reply but the token it ended on): the
 /// conversation's next turn starts with them, so it resumes there instead of
@@ -424,32 +465,91 @@ fn capture_qwen4_reply(inner: &mut EngineInner, id: u64) -> Result<(), AllpacaEr
     let Some(target) = inner.target.clone().filter(|t| t.q4x.is_some()) else {
         return Ok(());
     };
-    let Some(active) = inner.active.get(&id) else {
+    let prepared = {
+        let Some(active) = inner.active.get(&id) else {
+            return Ok(());
+        };
+        if !active.vision.is_empty() || active.probe.is_some() {
+            return Ok(());
+        }
+        let Some(state) = active.recurrent.as_ref() else {
+            return Ok(());
+        };
+        let read = state.q4x.token_ids();
+        let n = read.len();
+        if n <= active.prompt_len
+            || n > active.tokens.len()
+            || !read.iter().zip(&active.tokens).all(|(&a, &b)| a == i64::from(b))
+        {
+            return Ok(());
+        }
+        let Some(q4x) = state.q4x.for_cache(&target)? else {
+            return Ok(());
+        };
+        let tokens = active.tokens[..n].to_vec();
+        let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
+        recurrent.q4x = q4x;
+        Some((tokens, recurrent))
+    };
+    let Some((tokens, recurrent)) = prepared else {
         return Ok(());
     };
-    if !active.vision.is_empty() || active.probe.is_some() {
-        return Ok(());
-    }
-    let Some(state) = active.recurrent.as_ref() else {
-        return Ok(());
-    };
-    let read = state.q4x.token_ids();
-    let n = read.len();
-    if n <= active.prompt_len
-        || n > active.tokens.len()
-        || !read.iter().zip(&active.tokens).all(|(&a, &b)| a == i64::from(b))
-    {
-        return Ok(());
-    }
-    let Some(q4x) = state.q4x.for_cache(&target)? else {
-        return Ok(());
-    };
-    let tokens = active.tokens[..n].to_vec();
-    let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
-    recurrent.q4x = q4x;
-    let cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
+    let mut cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
+    cp.draft = drafter_snapshot(inner);
     inner.kv_radix.insert_checkpoint(&tokens, cp);
     Ok(())
+}
+
+/// Drafter state to store beside the checkpoint being written.
+fn drafter_snapshot(inner: &mut EngineInner) -> Option<crate::kv_radix::DraftCache> {
+    if let Some(p) = inner.dflash2.as_mut() {
+        match p.export_ring() {
+            Ok(bytes) if !bytes.is_empty() => {
+                return Some(crate::kv_radix::DraftCache {
+                    kind: crate::kv_radix::DRAFT_DFLASH2,
+                    bytes,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "prompt cache: dflash2 ring was not saved"),
+        }
+    }
+    if inner.draft_kv.seq_len() > 0 {
+        return Some(crate::kv_radix::DraftCache {
+            kind: crate::kv_radix::DRAFT_MTP,
+            bytes: inner.draft_kv.to_cache_bytes(),
+        });
+    }
+    if let Some(bytes) = inner.qwen4_mtp.as_ref().and_then(|m| m.cache_bytes()) {
+        return Some(crate::kv_radix::DraftCache {
+            kind: crate::kv_radix::DRAFT_QWEN4_MTP,
+            bytes,
+        });
+    }
+    None
+}
+
+/// Put a checkpoint's drafter state back. A kind this process is not running is skipped.
+fn restore_drafter(inner: &mut EngineInner, draft: &crate::kv_radix::DraftCache) {
+    match draft.kind {
+        crate::kv_radix::DRAFT_MTP => match DenseKv::from_cache_bytes(&draft.bytes) {
+            Some(kv) => inner.draft_kv = kv,
+            None => tracing::warn!("prompt cache: mtp draft state was not readable"),
+        },
+        crate::kv_radix::DRAFT_DFLASH2 => {
+            if let Some(p) = inner.dflash2.as_mut() {
+                if let Err(e) = p.import_ring(&draft.bytes) {
+                    tracing::warn!(error = %e, "prompt cache: dflash2 ring was not restored");
+                }
+            }
+        }
+        crate::kv_radix::DRAFT_QWEN4_MTP => {
+            if inner.qwen4_mtp.as_mut().is_some_and(|m| !m.restore_cache(&draft.bytes)) {
+                tracing::warn!("prompt cache: qwen4 mtp state was not readable");
+            }
+        }
+        _ => {}
+    }
 }
 
 fn rpc_hello_token(config: &Config) -> String {
@@ -3102,6 +3202,7 @@ impl Engine {
         self.sync_prompt_cache(&mut inner, &target);
         let probe = read.map(|read| DecisionProbe::new(read, &tokens));
         let mut prefill_pos = 0;
+        let mut resumed_draft = None;
         // Soft vision tokens are not text anchors / radix keys yet. A
         // decision request that reads hidden states forwards every token.
         // gemma4's K/V is in its sequence state, which checkpoints do not hold.
@@ -3141,6 +3242,7 @@ impl Engine {
             };
             if let Some((n, cp)) = found {
                 if n > prefill_pos {
+                    resumed_draft = cp.draft.clone();
                     restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
                     if let Some(dst) = recurrent.as_mut() {
                         *dst = cp.recurrent;
@@ -3178,6 +3280,9 @@ impl Engine {
         inner.next_request_id += 1;
         inner.draft_ahead = None;
         inner.draft_kv.reset();
+        if let Some(draft) = resumed_draft {
+            restore_drafter(&mut inner, &draft);
+        }
         let prompt_len = tokens.len();
         inner.active.insert(
             id,
@@ -4683,12 +4788,14 @@ impl Engine {
                     let state_ref = recurrent.clone().unwrap_or_else(|| {
                         RecurrentState::zeros(target.config.n_layers, target.config.dim)
                     });
+                    let draft = drafter_snapshot(inner);
                     inner.kv_radix.capture(
                         &prefix,
                         &state_ref,
                         &inner.kv,
                         &pages_now,
                         &target.config,
+                        draft,
                     )?;
                     if is_anchor {
                         if let Some(state) = recurrent.as_ref() {
@@ -4888,20 +4995,26 @@ impl Engine {
         target: &TinyModel,
         end: usize,
     ) -> Result<(), AllpacaError> {
-        let active = request(inner, id)?;
-        if !active.vision.is_empty() || active.probe.is_some() {
-            return Ok(());
-        }
-        let Some(state) = active.recurrent.as_ref() else {
+        let prepared = {
+            let active = request(inner, id)?;
+            if !active.vision.is_empty() || active.probe.is_some() {
+                return Ok(());
+            }
+            let Some(state) = active.recurrent.as_ref() else {
+                return Ok(());
+            };
+            let Some(q4x) = state.q4x.for_cache(target)? else {
+                return Ok(());
+            };
+            let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
+            recurrent.q4x = q4x;
+            Some((active.tokens[..end].to_vec(), recurrent))
+        };
+        let Some((tokens, recurrent)) = prepared else {
             return Ok(());
         };
-        let Some(q4x) = state.q4x.for_cache(target)? else {
-            return Ok(());
-        };
-        let mut recurrent = RecurrentState::zeros(target.config.n_layers, target.config.dim);
-        recurrent.q4x = q4x;
-        let tokens = active.tokens[..end].to_vec();
-        let cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
+        let mut cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
+        cp.draft = drafter_snapshot(inner);
         inner.kv_radix.insert_checkpoint(&tokens, cp);
         Ok(())
     }
@@ -4958,16 +5071,20 @@ impl Engine {
         if !self.prompt_cache_reads_back(inner, id, target)? {
             return Ok(());
         }
-        let active = request(inner, id)?;
-        let tokens = active.tokens[..active.prompt_len].to_vec();
-        let pages = active.pages.clone();
-        let state = active
-            .recurrent
-            .clone()
-            .unwrap_or_else(|| RecurrentState::zeros(target.config.n_layers, target.config.dim));
+        let (tokens, pages, state) = {
+            let active = request(inner, id)?;
+            (
+                active.tokens[..active.prompt_len].to_vec(),
+                active.pages.clone(),
+                active.recurrent.clone().unwrap_or_else(|| {
+                    RecurrentState::zeros(target.config.n_layers, target.config.dim)
+                }),
+            )
+        };
+        let draft = drafter_snapshot(inner);
         inner
             .kv_radix
-            .capture(&tokens, &state, &inner.kv, &pages, &target.config)
+            .capture(&tokens, &state, &inner.kv, &pages, &target.config, draft)
     }
 
     /// Whether this Engine can batch decode at all: enabled, several Request

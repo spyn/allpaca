@@ -11942,6 +11942,67 @@ impl DenseKv {
         self.h_nextn_host_dirty = true;
     }
 
+    /// Host MTP KV for a prompt-cache checkpoint. Device copies are rebuilt
+    /// on the next draft step.
+    pub(crate) fn to_cache_bytes(&self) -> Vec<u8> {
+        let len = |n: usize| u32::try_from(n).expect("draft cache length fits in u32");
+        let mut out = Vec::new();
+        out.extend_from_slice(&len(self.tokens).to_le_bytes());
+        out.extend_from_slice(&len(self.kv_dim).to_le_bytes());
+        out.extend_from_slice(&len(self.seq.len()).to_le_bytes());
+        for t in &self.seq {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out.extend_from_slice(&len(self.layers.len()).to_le_bytes());
+        for layer in &self.layers {
+            crate::kv_codec::write_f32s(&mut out, &layer.k);
+            crate::kv_codec::write_f32s(&mut out, &layer.v);
+        }
+        out.extend_from_slice(&self.forwards.to_le_bytes());
+        out.push(u8::from(self.h_nextn_host_dirty));
+        crate::kv_codec::write_f32s(&mut out, &self.h_nextn);
+        out
+    }
+
+    /// What [`Self::to_cache_bytes`] wrote.
+    pub(crate) fn from_cache_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = crate::kv_codec::Reader(bytes);
+        let tokens = r.u32()? as usize;
+        let kv_dim = r.u32()? as usize;
+        let n_seq = r.u32()? as usize;
+        let seq = (0..n_seq).map(|_| r.u32()).collect::<Option<Vec<_>>>()?;
+        let n_layers = r.u32()? as usize;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            layers.push(DenseLayerKv { k: r.f32s()?, v: r.f32s()? });
+        }
+        let forwards = r.u64()?;
+        let h_nextn_host_dirty = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let h_nextn = r.f32s()?;
+        if !r.0.is_empty() {
+            return None;
+        }
+        Some(Self {
+            layers,
+            device: None,
+            device_layers: Vec::new(),
+            tokens,
+            capacity: 0,
+            kv_dim,
+            seq,
+            forwards,
+            h_nextn,
+            h_nextn_dev: std::ptr::null_mut(),
+            h_nextn_bytes: 0,
+            h_nextn_dev_device: None,
+            h_nextn_host_dirty,
+        })
+    }
+
     /// Independent copy of process KV (host seq/h_nextn/layers + D2D device K/V).
     /// Pointers are never aliased; the original cache stays usable for process().
     pub(crate) fn snapshot(&self) -> Result<DenseKv, AllpacaError> {
