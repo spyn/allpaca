@@ -673,6 +673,264 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// One line per dense-layer case, fixed inputs: Llama 3.2 3B's shape and
+    /// the shapes the attention kernels treat differently. Compares workers
+    /// across machines bit for bit, like `kquant_digest`.
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn dense_digests() -> Vec<String> {
+        #[cfg(feature = "hip")]
+        let backend = WorkerBackend::Hip(HipWorker::new(0).unwrap());
+        #[cfg(all(feature = "cuda", not(feature = "hip")))]
+        let backend = WorkerBackend::Cuda(CudaWorker::new(0).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, backend).unwrap();
+        });
+        let mut c = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let mut lines = Vec::new();
+        let digest = |v: &[f32]| v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+        });
+        let mat = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((((i * 2654435761usize) ^ (seed * 40503)) % 1000) as f32 - 500.0) * 0.002).collect()
+        };
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (heads, hd) = (24usize, 128usize);
+        let dim = heads * hd;
+        // Attention: decode (one row), prefill (many rows), both sides of a
+        // chunk, GQA, and head dims off the float4 path and past shared memory.
+        let shapes = [(24usize, 24usize, 128usize), (8, 2, 64), (12, 12, 32), (6, 6, 256), (4, 4, 30), (2, 2, 512)];
+        let lengths = [(1usize, 1usize), (1, 2), (1, 8), (1, 15), (1, 16), (1, 17), (1, 21), (1, 127), (1, 128), (1, 129), (1, 257), (1, 300), (2, 2), (9, 9), (21, 21), (21, 300), (130, 130)];
+        for (a_heads, a_kv, hd_a) in shapes {
+            let (q_row, k_row) = (a_heads * hd_a, a_kv * hd_a);
+            for (rows, n_kv) in lengths {
+                let (q, k, v, out) = (
+                    c.alloc((rows * q_row * 4) as u64).unwrap(),
+                    c.alloc((n_kv * k_row * 4) as u64).unwrap(),
+                    c.alloc((n_kv * k_row * 4) as u64).unwrap(),
+                    c.alloc((rows * q_row * 4) as u64).unwrap(),
+                );
+                c.h2d(q, 0, &bytes(&mat(1, rows * q_row))).unwrap();
+                c.h2d(k, 0, &bytes(&mat(2, n_kv * k_row))).unwrap();
+                c.h2d(v, 0, &bytes(&mat(3, n_kv * k_row))).unwrap();
+                c.launch(&LaunchList {
+                    items: vec![LaunchItem {
+                        op: KernelOp::Attention,
+                        bufs: vec![q, k, v, out],
+                        i32s: vec![rows as i32, n_kv as i32, a_heads as i32, a_kv as i32, hd_a as i32, 1],
+                        f32s: vec![],
+                    }],
+                })
+                .unwrap();
+                c.sync().unwrap();
+                let y: Vec<f32> = c
+                    .d2h(out, 0, (rows * q_row * 4) as u64)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                lines.push(format!("attn heads={a_heads}/{a_kv}x{hd_a} rows={rows} n_kv={n_kv}: {:016x} first={:?}", digest(&y), &y[..2]));
+                for id in [q, k, v, out] {
+                    c.free(id).unwrap();
+                }
+            }
+        }
+        for &(rows, start) in &[(1usize, 0usize), (1, 1), (1, 5), (21, 0), (21, 100), (128, 128)] {
+            let (q, k) = (c.alloc((rows * dim * 4) as u64).unwrap(), c.alloc((rows * dim * 4) as u64).unwrap());
+            let (mq, mk) = (mat(4, rows * dim), mat(5, rows * dim));
+            c.h2d(q, 0, &bytes(&mq)).unwrap();
+            c.h2d(k, 0, &bytes(&mk)).unwrap();
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::RopeRows,
+                    bufs: vec![q, k],
+                    i32s: vec![rows as i32, heads as i32, heads as i32, hd as i32, start as i32],
+                    f32s: vec![10_000.0],
+                }],
+            })
+            .unwrap();
+            c.sync().unwrap();
+            let y: Vec<f32> = c
+                .d2h(q, 0, (rows * dim * 4) as u64)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            lines.push(format!("rope rows={rows} start={start}: {:016x} first={:?}", digest(&y), &y[..3]));
+        }
+        // The rest of a dense layer: norm, SiLU, residual.
+        for rows in [1usize, 2, 21] {
+            let (x, w, o) = (
+                c.alloc((rows * dim * 4) as u64).unwrap(),
+                c.alloc((dim * 4) as u64).unwrap(),
+                c.alloc((rows * dim * 4) as u64).unwrap(),
+            );
+            c.h2d(x, 0, &bytes(&mat(7, rows * dim))).unwrap();
+            c.h2d(w, 0, &bytes(&mat(8, dim))).unwrap();
+            let read = |c: &mut RpcSession, id, n: usize| -> Vec<f32> {
+                c.sync().unwrap();
+                c.d2h(id, 0, (n * 4) as u64)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect()
+            };
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::RmsNormRows,
+                    bufs: vec![x, w, o],
+                    i32s: vec![rows as i32, dim as i32],
+                    f32s: vec![1e-5],
+                }],
+            })
+            .unwrap();
+            let y = read(&mut c, o, rows * dim);
+            lines.push(format!("rms rows={rows}: {:016x} first={:?}", digest(&y), &y[..3]));
+            c.h2d(o, 0, &bytes(&mat(9, rows * dim))).unwrap();
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::SiluMul,
+                    bufs: vec![o, x],
+                    i32s: vec![(rows * dim) as i32],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+            let y = read(&mut c, o, rows * dim);
+            lines.push(format!("silu rows={rows}: {:016x} first={:?}", digest(&y), &y[..3]));
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::ResidualAdd,
+                    bufs: vec![o, x],
+                    i32s: vec![(rows * dim) as i32],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+            let y = read(&mut c, o, rows * dim);
+            lines.push(format!("residual rows={rows}: {:016x}", digest(&y)));
+        }
+        // Gated layers: per-head norm and sigmoid.
+        {
+            let (x, w, g) = (
+                c.alloc((dim * 4) as u64).unwrap(),
+                c.alloc((hd * 4) as u64).unwrap(),
+                c.alloc((dim * 4) as u64).unwrap(),
+            );
+            c.h2d(x, 0, &bytes(&mat(11, dim))).unwrap();
+            c.h2d(w, 0, &bytes(&mat(12, hd))).unwrap();
+            c.h2d(g, 0, &bytes(&mat(13, dim))).unwrap();
+            c.launch(&LaunchList {
+                items: vec![
+                    LaunchItem {
+                        op: KernelOp::RmsNormHeads,
+                        bufs: vec![x, w],
+                        i32s: vec![heads as i32, hd as i32],
+                        f32s: vec![1e-5],
+                    },
+                    LaunchItem {
+                        op: KernelOp::SigmoidMul,
+                        bufs: vec![x, g],
+                        i32s: vec![dim as i32],
+                        f32s: vec![],
+                    },
+                ],
+            })
+            .unwrap();
+            c.sync().unwrap();
+            let y: Vec<f32> = c
+                .d2h(x, 0, (dim * 4) as u64)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            lines.push(format!("gated: {:016x} first={:?}", digest(&y), &y[..2]));
+        }
+        // Dense GEMV: `rows` of each width, row digests comparable with the
+        // same row run alone. Type 0 is F32, 8 is Q8_0, 12..14 the K-quants;
+        // narrow outputs and wide rows take other paths on some cards.
+        for (ty, n, k) in [
+            (12u32, 3072usize, 3072usize),
+            (13, 3072, 3072),
+            (14, 3072, 3072),
+            (12, 1024, 3072),
+            (14, 1024, 3072),
+            (14, 8192, 3072),
+            (8, 3072, 3072),
+            (8, 1024, 5120),
+            (0, 3072, 3072),
+        ] {
+            let m = mat(10 + ty as usize, n * k);
+            let packed = if ty == 0 { bytes(&m) } else { quantize(ty, &m) };
+            let w = c.put_tensor(ty, &[k as u32, n as u32], &packed, None).unwrap();
+            for rows in [1usize, 2, 3, 4, 5, 8, 9, 12, 21] {
+                let (a, y) = (c.alloc((rows * k * 4) as u64).unwrap(), c.alloc((rows * n * 4) as u64).unwrap());
+                c.h2d(a, 0, &bytes(&mat(6, rows * k))).unwrap();
+                c.launch(&LaunchList {
+                    items: vec![LaunchItem {
+                        op: KernelOp::GemmNtQuant,
+                        bufs: vec![a, w, y],
+                        i32s: vec![rows as i32, n as i32, k as i32],
+                        f32s: vec![],
+                    }],
+                })
+                .unwrap();
+                c.sync().unwrap();
+                let v: Vec<f32> = c
+                    .d2h(y, 0, (rows * n * 4) as u64)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                lines.push(format!("gemv ty={ty} {n}x{k} rows={rows}: {:016x} first={:?}", digest(&v), &v[..2]));
+                c.free(a).unwrap();
+                c.free(y).unwrap();
+            }
+            c.free(w).unwrap();
+        }
+        drop(c);
+        worker.join().unwrap();
+        lines
+    }
+
+    /// Prints [`dense_digests`], to find which case differs on a new card:
+    /// `cargo test --release -p allpaca-rpc --features <hip|cuda> --lib dense_digest -- --ignored --nocapture`
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn dense_digest() {
+        for line in dense_digests() {
+            eprintln!("DIGEST {line}");
+        }
+    }
+
+    /// Every dense-layer op gives these bits on every backend: RX 9070, RX
+    /// 9060 XT, MI50 and a K80 (sm_37). A last-bit difference is not harmless:
+    /// the int8 activations in the K-quant GEMV turn it into a 1% difference
+    /// within a few layers (S1). A change that moves this number has to move
+    /// it on HIP and CUDA alike; re-pin it after checking both agree.
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    #[test]
+    fn dense_ops_give_the_same_bits_on_every_backend() {
+        #[cfg(feature = "cuda")]
+        if allpaca_cuda::device_count() <= 0 {
+            return;
+        }
+        // F32 and Q8_0 GEMV still differ by card, and no pinned model's layer
+        // weights use them: they stay in `dense_digest` to see, out of the pin.
+        let digests: String = dense_digests()
+            .iter()
+            .filter(|l| !l.starts_with("gemv ty=0 ") && !l.starts_with("gemv ty=8 "))
+            .map(|l| l.split(": ").nth(1).and_then(|d| d.split_whitespace().next()).unwrap_or(""))
+            .collect();
+        let all = digests.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+        assert_eq!(all, 0x1bb6_909a_8b8e_f82b, "dense-layer bits changed: {all:#018x}");
+    }
+
     /// Expert tensor types, sizes, and the allowed error relative to the
     /// largest output (the fused kernels quantize activations to int8).
     struct MoeCase {

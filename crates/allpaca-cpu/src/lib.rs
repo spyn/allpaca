@@ -19,7 +19,7 @@ pub use p48fp4::{
     P48FP4_BLOCK_ELEMS,
 };
 pub use kernels::{
-    det_expf, det_silu_mul, dot,
+    det_expf, det_logf, det_powf, det_rsqrtf, det_silu_mul, det_sincosf, dot,
     attention, attention_softcap, attention_with_mask, attention_with_mask_softcap, bf16_to_f32,
     copy_async, dequant_iq4_nl, dequant_iq4_xs, dequant_mxfp4, dequant_q2_k, dequant_q3_k,
     dequant_q4_0, dequant_q4_1, dequant_q4_k, dequant_q5_0, dequant_q5_1, dequant_q5_k,
