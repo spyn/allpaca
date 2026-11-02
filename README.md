@@ -163,17 +163,18 @@ Needs the CUDA toolkit (`nvcc`). Probes `CUDA_PATH` / `CUDA_HOME`, PATH `nvcc`,
 `device_count()` is 0 — you can still compile and link on a toolkit-only machine.
 
 **GPU arches (dual toolchain):** `ALLPACA_CUDA_ARCH` / `CUDA_ARCHES` /
-`CUDAARCHS` / `TORCH_CUDA_ARCH_LIST`, else live `nvidia-smi` (product-name map
-covers **Tesla K80 → sm_37** when `compute_cap` is missing on driver 470), else
-a toolkit-aware fat default: **CUDA ≤11.4** includes `sm_37`; **CUDA 12+**
-defaults to **sm_86** / **sm_89** / **sm_120** and filters Kepler out.
+`CUDAARCHS` / `TORCH_CUDA_ARCH_LIST`, else live `nvidia-smi` (driver 470 rejects
+the `compute_cap` query, so those boxes skip this step), else a toolkit-aware
+fat default: **CUDA ≤11.4** includes `sm_35` and `sm_37`; **CUDA 12+** defaults
+to **sm_86** / **sm_89** / **sm_120** and filters Kepler out.
 Attention uses all-lane `__shfl_xor` (pre-Volta) on `sm < 70`.
 
 Example (modern): `ALLPACA_CUDA_ARCH=sm_86,sm_89,sm_120 cargo test -p allpaca-cuda --features cuda`.
 
 #### Tesla K80 / driver 470 (Kepler)
 
-K80 is **sm_37**. Driver 470 advertises CUDA **11.4** max; CUDA **12** removed
+K80 is **sm_37** and Quadro K6000 is **sm_35**; a `sm_37` binary fails on the
+K6000 with `rc=3`. Driver 470 advertises CUDA **11.4** max; CUDA **12** removed
 Kepler. Stage a matching toolkit without root:
 
 ```bash
@@ -195,7 +196,7 @@ Kernels live in `cuda/`. Symbols are `allpaca_cuda_*` so HIP and CUDA can coexis
 TinyModel F32 decode (KV pages + device attention, tiny F32/Q4_K/F16 GGUF)
 runs on CUDA when a device is present. 7B packed-quant still HIP.
 
-Kepler/K80 (`sm_37`) needs CUDA ≤11.4 (`scripts/fetch-cuda-toolkit.sh`); it is in the fat default only on CUDA ≤11.x toolkits.
+Kepler (K6000 `sm_35`, K80 `sm_37`) needs CUDA ≤11.4 (`scripts/fetch-cuda-toolkit.sh`); both are in the fat default only on CUDA ≤11.x toolkits.
 
 Dual K80 (two compute devices in one board) shows up as two ordinals; prefer `cpu_only` coordinator + `cuda:0` worker (or CUDA coordinator + CPU worker) to avoid two concurrent CUDA contexts.
 
