@@ -91,6 +91,7 @@ struct ActiveRequest {
     tokens: Vec<u32>,
     prompt_len: usize,
     prefill_pos: usize,
+    prompt_checkpoints: Vec<usize>,
     generated: usize,
     params: GenerationParams,
     pages: Vec<Vec<u64>>,
@@ -262,6 +263,15 @@ struct DecodePollHooks<'a> {
     cuda: Option<&'a allpaca_cuda::CudaWorkspace>,
     #[cfg(feature = "vulkan")]
     vulkan: Option<&'a allpaca_vulkan::VulkanWorkspace>,
+}
+
+/// Rendered chat text and the token offsets of its complete-message boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatPrompt {
+    /// Prompt text, including the assistant generation marker.
+    pub text: String,
+    /// Sorted token offsets at which prompt-cache checkpoints should be kept.
+    pub checkpoint_offsets: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -909,6 +919,31 @@ impl Engine {
         images: &[crate::ImageInput],
         params: GenerationParams,
     ) -> Result<RequestHandle, AllpacaError> {
+        self.begin_request_multimodal_inner(prompt, images, params, Vec::new())
+    }
+
+    /// Start a Request that saves prompt state at the chat's message boundaries.
+    pub fn begin_request_multimodal_with_checkpoints(
+        &self,
+        prompt: &ChatPrompt,
+        images: &[crate::ImageInput],
+        params: GenerationParams,
+    ) -> Result<RequestHandle, AllpacaError> {
+        self.begin_request_multimodal_inner(
+            &prompt.text,
+            images,
+            params,
+            prompt.checkpoint_offsets.clone(),
+        )
+    }
+
+    fn begin_request_multimodal_inner(
+        &self,
+        prompt: &str,
+        images: &[crate::ImageInput],
+        params: GenerationParams,
+        checkpoint_offsets: Vec<usize>,
+    ) -> Result<RequestHandle, AllpacaError> {
         let vision = if images.is_empty() {
             None
         } else {
@@ -925,7 +960,7 @@ impl Engine {
                 }
             }
         };
-        self.begin_request_with_vision(prompt, vision, params)
+        self.begin_request_with_vision(prompt, vision, params, checkpoint_offsets)
     }
 
     /// Refresh driver VRAM and GPU busy into [`Metrics`], at most once per
@@ -2722,6 +2757,30 @@ impl Engine {
         self.generate_multimodal(prompt, &[], params)
     }
 
+    /// Render a chat prompt and the token offset after every complete message.
+    pub fn format_chat_with_checkpoints(
+        &self,
+        messages: &[(&str, &str)],
+    ) -> Result<ChatPrompt, AllpacaError> {
+        let inner = self.lock()?;
+        let tokenizer = inner
+            .tokenizer
+            .as_ref()
+            .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
+        let text = tokenizer.format_chat(messages, true);
+        let mut checkpoint_offsets = Vec::with_capacity(messages.len());
+        for end in 1..=messages.len() {
+            let prefix = tokenizer.format_chat(&messages[..end], false);
+            checkpoint_offsets.push(tokenizer.encode(&prefix)?.len());
+        }
+        checkpoint_offsets.sort_unstable();
+        checkpoint_offsets.dedup();
+        Ok(ChatPrompt {
+            text,
+            checkpoint_offsets,
+        })
+    }
+
     /// ChatML when the loaded vocab has `<|im_start|>` / `<|im_end|>`; else `role:`.
     pub fn format_chat(&self, messages: &[(&str, &str)]) -> String {
         self.lock()
@@ -2741,7 +2800,32 @@ impl Engine {
         images: &[crate::ImageInput],
         params: GenerationParams,
     ) -> Result<GenerationOutput, AllpacaError> {
-        let mut handle = self.begin_request_multimodal(prompt, images, params)?;
+        self.generate_multimodal_inner(prompt, images, params, Vec::new())
+    }
+
+    /// Generate with prompt-cache checkpoints at the chat's message boundaries.
+    pub fn generate_multimodal_with_checkpoints(
+        &self,
+        prompt: &ChatPrompt,
+        images: &[crate::ImageInput],
+        params: GenerationParams,
+    ) -> Result<GenerationOutput, AllpacaError> {
+        self.generate_multimodal_inner(
+            &prompt.text,
+            images,
+            params,
+            prompt.checkpoint_offsets.clone(),
+        )
+    }
+
+    fn generate_multimodal_inner(
+        &self,
+        prompt: &str,
+        images: &[crate::ImageInput],
+        params: GenerationParams,
+        checkpoint_offsets: Vec<usize>,
+    ) -> Result<GenerationOutput, AllpacaError> {
+        let mut handle = self.begin_request_multimodal_inner(prompt, images, params, checkpoint_offsets)?;
         let mut token_ids = Vec::new();
         // The reply text is the stream's text, so a blocking reply and a
         // streamed one are the same string: special tokens the model emits
@@ -2784,10 +2868,35 @@ impl Engine {
         images: Vec<crate::ImageInput>,
         params: GenerationParams,
     ) -> impl Stream<Item = Result<TokenEvent, AllpacaError>> + Send {
+        self.generate_stream_multimodal_inner(prompt, images, params, Vec::new())
+    }
+
+    /// Stream a reply while saving prompt state at the chat's message boundaries.
+    pub fn generate_stream_multimodal_with_checkpoints(
+        &self,
+        prompt: ChatPrompt,
+        images: Vec<crate::ImageInput>,
+        params: GenerationParams,
+    ) -> impl Stream<Item = Result<TokenEvent, AllpacaError>> + Send {
+        self.generate_stream_multimodal_inner(
+            prompt.text,
+            images,
+            params,
+            prompt.checkpoint_offsets,
+        )
+    }
+
+    fn generate_stream_multimodal_inner(
+        &self,
+        prompt: String,
+        images: Vec<crate::ImageInput>,
+        params: GenerationParams,
+        checkpoint_offsets: Vec<usize>,
+    ) -> impl Stream<Item = Result<TokenEvent, AllpacaError>> + Send {
         let engine = self.clone();
         let use_fair = engine.config.engine.max_active_requests > 1;
         async_stream::stream! {
-            let mut handle = match engine.begin_request_multimodal(&prompt, &images, params) {
+            let mut handle = match engine.begin_request_multimodal_inner(&prompt, &images, params, checkpoint_offsets) {
                 Ok(h) => h,
                 Err(e) => {
                     yield Err(e);
@@ -2915,7 +3024,7 @@ impl Engine {
         prompt: &str,
         params: GenerationParams,
     ) -> Result<RequestHandle, AllpacaError> {
-        self.begin_request_with_vision(prompt, None, params)
+        self.begin_request_with_vision(prompt, None, params, Vec::new())
     }
 
     fn begin_request_with_vision(
@@ -2923,8 +3032,9 @@ impl Engine {
         prompt: &str,
         vision: Option<crate::VisionTokens>,
         params: GenerationParams,
+        checkpoint_offsets: Vec<usize>,
     ) -> Result<RequestHandle, AllpacaError> {
-        self.begin_request_probed(prompt, vision, params, None)
+        self.begin_request_probed(prompt, vision, params, None, checkpoint_offsets)
     }
 
     /// `read`: start a decision request, which ends with its prompt.
@@ -2934,6 +3044,7 @@ impl Engine {
         vision: Option<crate::VisionTokens>,
         mut params: GenerationParams,
         read: Option<&crate::decision::DecisionRead>,
+        checkpoint_offsets: Vec<usize>,
     ) -> Result<RequestHandle, AllpacaError> {
         if params.max_tokens == 0 {
             params.max_tokens = 1;
@@ -3179,12 +3290,20 @@ impl Engine {
         inner.draft_ahead = None;
         inner.draft_kv.reset();
         let prompt_len = tokens.len();
+        let mut prompt_checkpoints = checkpoint_offsets;
+        prompt_checkpoints.sort_unstable();
+        prompt_checkpoints.dedup();
+        prompt_checkpoints.retain(|&n| n > 0 && n < prompt_len);
+        if !vision_seq.is_empty() || read.is_some() {
+            prompt_checkpoints.clear();
+        }
         inner.active.insert(
             id,
             ActiveRequest {
                 id,
                 prompt_len,
                 prefill_pos,
+                prompt_checkpoints,
                 tokens,
                 generated: 0,
                 params,
@@ -3284,7 +3403,7 @@ impl Engine {
             max_tokens: 1,
             ..GenerationParams::default()
         };
-        let handle = self.begin_request_probed(prompt, None, params, Some(read))?;
+        let handle = self.begin_request_probed(prompt, None, params, Some(read), Vec::new())?;
         let id = handle.id;
         loop {
             let mut inner = self.lock()?;
@@ -4388,7 +4507,13 @@ impl Engine {
                 return Ok((start, total));
             }
             let stop = if q4x && start + 1 < total { total - 1 } else { total };
-            let end = (start + chunk).min(stop);
+            let next_checkpoint = active
+                .prompt_checkpoints
+                .iter()
+                .copied()
+                .find(|&n| n > start)
+                .unwrap_or(stop);
+            let end = (start + chunk).min(stop).min(next_checkpoint);
             (
                 start,
                 total,
@@ -4729,7 +4854,10 @@ impl Engine {
         self.metrics
             .prefill_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if q4x {
+        let message_boundary = request(inner, id)?.prompt_checkpoints.contains(&end);
+        if message_boundary {
+            self.capture_prompt_at(inner, id, &target, end)?;
+        } else if q4x {
             if end + 1 == total {
                 self.capture_qwen4_prompt(inner, id, &target, end)?;
             }
@@ -4946,8 +5074,18 @@ impl Engine {
         id: u64,
         target: &TinyModel,
     ) -> Result<(), AllpacaError> {
+        let end = request(inner, id)?.prompt_len;
+        self.capture_prompt_at(inner, id, target, end)
+    }
+
+    fn capture_prompt_at(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+        end: usize,
+    ) -> Result<(), AllpacaError> {
         if target.q4x.is_some() {
-            let end = request(inner, id)?.prompt_len;
             return self.capture_qwen4_prompt(inner, id, target, end);
         }
         if target.g4.is_some() {
@@ -4959,7 +5097,7 @@ impl Engine {
             return Ok(());
         }
         let active = request(inner, id)?;
-        let tokens = active.tokens[..active.prompt_len].to_vec();
+        let tokens = active.tokens[..end].to_vec();
         let pages = active.pages.clone();
         let state = active
             .recurrent
@@ -9984,6 +10122,32 @@ mod tests {
             stats.anchor_skip_tokens >= 2,
             "bos+hello must be skipped; stats={stats:?}"
         );
+    }
+
+    #[test]
+    fn chat_checkpoints_land_at_every_message_end() {
+        let engine = test_engine();
+        let messages = [
+            ("system", "rules"),
+            ("user", "question"),
+            ("tool", "result"),
+            ("assistant", "answer"),
+        ];
+        let formatted = engine.format_chat_with_checkpoints(&messages).unwrap();
+        assert_eq!(formatted.text, engine.format_chat(&messages));
+        assert_eq!(formatted.checkpoint_offsets.len(), messages.len());
+
+        let inner = engine.lock().unwrap();
+        let tokenizer = inner.tokenizer.as_ref().unwrap();
+        let full_tokens = tokenizer.encode(&formatted.text).unwrap().len();
+        let mut previous = 0;
+        for (i, &offset) in formatted.checkpoint_offsets.iter().enumerate() {
+            let prefix = tokenizer.format_chat(&messages[..=i], false);
+            assert_eq!(offset, tokenizer.encode(&prefix).unwrap().len(), "message {i}");
+            assert!(offset > previous, "offsets must increase");
+            previous = offset;
+        }
+        assert!(previous < full_tokens, "the generation prompt follows every checkpoint");
     }
 
     #[test]

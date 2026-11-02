@@ -92,8 +92,8 @@ pub use edge0::{
     RecoverLora, RouterKind,
 };
 pub use engine::{
-    mtp_text_is_garbled, DevicePlacement, Engine, ExpertLayerHome, ExpertPlacement, KvEstimate,
-    RequestHandle,
+    mtp_text_is_garbled, ChatPrompt, DevicePlacement, Engine, ExpertLayerHome, ExpertPlacement,
+    KvEstimate, RequestHandle,
 };
 pub use rpc_runtime::RemoteGpu;
 pub use kv_tier::KvTierManager;
