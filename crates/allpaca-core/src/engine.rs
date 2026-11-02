@@ -265,6 +265,9 @@ struct DecodePollHooks<'a> {
     vulkan: Option<&'a allpaca_vulkan::VulkanWorkspace>,
 }
 
+/// Prompt-cache checkpoints kept per chat, at its last complete messages.
+const MESSAGE_CHECKPOINTS: usize = 4;
+
 /// Rendered chat text and the token offsets of its complete-message boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatPrompt {
@@ -2757,7 +2760,8 @@ impl Engine {
         self.generate_multimodal(prompt, &[], params)
     }
 
-    /// Render a chat prompt and the token offset after every complete message.
+    /// Render a chat prompt and the token offsets after its last complete
+    /// messages ([`MESSAGE_CHECKPOINTS`]).
     pub fn format_chat_with_checkpoints(
         &self,
         messages: &[(&str, &str)],
@@ -2768,8 +2772,9 @@ impl Engine {
             .as_ref()
             .ok_or(AllpacaError::Fatal(FatalError::NoModel))?;
         let text = tokenizer.format_chat(messages, true);
-        let mut checkpoint_offsets = Vec::with_capacity(messages.len());
-        for end in 1..=messages.len() {
+        let first = messages.len().saturating_sub(MESSAGE_CHECKPOINTS - 1).max(1);
+        let mut checkpoint_offsets = Vec::with_capacity(MESSAGE_CHECKPOINTS);
+        for end in first..=messages.len() {
             let prefix = tokenizer.format_chat(&messages[..end], false);
             checkpoint_offsets.push(tokenizer.encode(&prefix)?.len());
         }
@@ -3294,9 +3299,11 @@ impl Engine {
         prompt_checkpoints.sort_unstable();
         prompt_checkpoints.dedup();
         prompt_checkpoints.retain(|&n| n > 0 && n < prompt_len);
-        if !vision_seq.is_empty() || read.is_some() {
+        if !vision_seq.is_empty() || read.is_some() || !self.message_checkpoints_help(&target) {
             prompt_checkpoints.clear();
         }
+        let older = prompt_checkpoints.len().saturating_sub(MESSAGE_CHECKPOINTS);
+        prompt_checkpoints.drain(..older);
         inner.active.insert(
             id,
             ActiveRequest {
@@ -4855,17 +4862,16 @@ impl Engine {
             .prefill_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let message_boundary = request(inner, id)?.prompt_checkpoints.contains(&end);
-        if message_boundary {
-            self.capture_prompt_at(inner, id, &target, end)?;
-        } else if q4x {
-            if end + 1 == total {
+        if q4x {
+            if message_boundary || end + 1 == total {
                 self.capture_qwen4_prompt(inner, id, &target, end)?;
             }
         } else if end >= total {
             self.capture_prompt(inner, id, &target)?;
         } else {
             let every = self.config.prompt_cache.boundary_tokens;
-            if target.config.recurrent && every > 0 && end / every > start / every {
+            let at_boundary = every > 0 && end / every > start / every;
+            if target.config.recurrent && (message_boundary || at_boundary) {
                 self.capture_state(inner, id, &target, end)?;
             }
         }
@@ -5034,6 +5040,24 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether stopping prefill at a chat message saves anything. A dense
+    /// checkpoint at the end of the prompt already serves every shared prefix,
+    /// so only qwen4exp (exact capture points) and hybrids (their recurrent
+    /// state cannot be cut) need one there.
+    fn message_checkpoints_help(&self, target: &TinyModel) -> bool {
+        target.q4x.is_some()
+            || (target.config.recurrent
+                && self.hip.is_some()
+                && Self::prompt_cache_holds_layers(target))
+    }
+
+    /// Whether the host can read this model's layer state back for the
+    /// prompt cache.
+    fn prompt_cache_holds_layers(target: &TinyModel) -> bool {
+        let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
+        !(target.dsv4.is_some() || target.q4x.is_some() || target.g4.is_some() || layers_remote)
+    }
+
     /// Whether the prompt cache can take this Request's state on HIP, after
     /// reading its GDN/Mamba state back to the host. Left out: models whose
     /// state the host cannot read back yet (DeepSeek-V4, qwen4exp, layers on
@@ -5044,13 +5068,9 @@ impl Engine {
         id: u64,
         target: &TinyModel,
     ) -> Result<bool, AllpacaError> {
-        let Some(hip) = self.hip.as_deref() else {
+        let Some(hip) = self.hip.as_deref().filter(|_| Self::prompt_cache_holds_layers(target)) else {
             return Ok(false);
         };
-        let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
-        if target.dsv4.is_some() || target.q4x.is_some() || target.g4.is_some() || layers_remote {
-            return Ok(false);
-        }
         let active = request_mut(inner, id)?;
         if !active.vision.is_empty() || active.probe.is_some() {
             return Ok(false);
@@ -5074,18 +5094,8 @@ impl Engine {
         id: u64,
         target: &TinyModel,
     ) -> Result<(), AllpacaError> {
-        let end = request(inner, id)?.prompt_len;
-        self.capture_prompt_at(inner, id, target, end)
-    }
-
-    fn capture_prompt_at(
-        &self,
-        inner: &mut EngineInner,
-        id: u64,
-        target: &TinyModel,
-        end: usize,
-    ) -> Result<(), AllpacaError> {
         if target.q4x.is_some() {
+            let end = request(inner, id)?.prompt_len;
             return self.capture_qwen4_prompt(inner, id, target, end);
         }
         if target.g4.is_some() {
@@ -5097,7 +5107,7 @@ impl Engine {
             return Ok(());
         }
         let active = request(inner, id)?;
-        let tokens = active.tokens[..end].to_vec();
+        let tokens = active.tokens[..active.prompt_len].to_vec();
         let pages = active.pages.clone();
         let state = active
             .recurrent
@@ -10125,29 +10135,60 @@ mod tests {
     }
 
     #[test]
-    fn chat_checkpoints_land_at_every_message_end() {
+    fn chat_checkpoints_land_at_the_last_message_ends() {
         let engine = test_engine();
         let messages = [
             ("system", "rules"),
             ("user", "question"),
             ("tool", "result"),
             ("assistant", "answer"),
+            ("user", "again"),
+            ("tool", "more"),
         ];
         let formatted = engine.format_chat_with_checkpoints(&messages).unwrap();
         assert_eq!(formatted.text, engine.format_chat(&messages));
-        assert_eq!(formatted.checkpoint_offsets.len(), messages.len());
+        assert_eq!(formatted.checkpoint_offsets.len(), MESSAGE_CHECKPOINTS);
 
         let inner = engine.lock().unwrap();
         let tokenizer = inner.tokenizer.as_ref().unwrap();
         let full_tokens = tokenizer.encode(&formatted.text).unwrap().len();
+        let first = messages.len() - MESSAGE_CHECKPOINTS;
         let mut previous = 0;
         for (i, &offset) in formatted.checkpoint_offsets.iter().enumerate() {
-            let prefix = tokenizer.format_chat(&messages[..=i], false);
+            let prefix = tokenizer.format_chat(&messages[..=first + i], false);
             assert_eq!(offset, tokenizer.encode(&prefix).unwrap().len(), "message {i}");
             assert!(offset > previous, "offsets must increase");
             previous = offset;
         }
         assert!(previous < full_tokens, "the generation prompt follows every checkpoint");
+    }
+
+    #[test]
+    fn a_dense_chat_prefills_in_one_chunk() {
+        let mut cfg = test_config();
+        cfg.speculative.enabled = false;
+        let engine = Engine::new(cfg).unwrap();
+        let prompt = engine
+            .format_chat_with_checkpoints(&[
+                ("user", "hello"),
+                ("assistant", "world"),
+                ("user", "there"),
+            ])
+            .unwrap();
+        let params = GenerationParams {
+            max_tokens: 1,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        engine
+            .generate_multimodal_with_checkpoints(&prompt, &[], params)
+            .unwrap();
+        assert_eq!(
+            engine.stats().prefill_chunks,
+            1,
+            "the prompt-end checkpoint serves every shared prefix"
+        );
     }
 
     #[test]
