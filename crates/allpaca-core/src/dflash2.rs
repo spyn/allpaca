@@ -778,75 +778,6 @@ impl Scratch {
     }
 }
 
-/// Host copy of a DFlash2 context ring, the part a later turn has to resume.
-pub(crate) struct Dflash2RingCache {
-    block: usize,
-    kv_dim: usize,
-    slot_pos: Vec<Option<usize>>,
-    tokens: Vec<u32>,
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
-}
-
-impl Dflash2RingCache {
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let len = |n: usize| u32::try_from(n).expect("dflash2 ring cache length fits in u32");
-        let mut out = Vec::new();
-        out.extend_from_slice(&len(self.block).to_le_bytes());
-        out.extend_from_slice(&len(self.kv_dim).to_le_bytes());
-        out.extend_from_slice(&len(self.slot_pos.len()).to_le_bytes());
-        for slot in &self.slot_pos {
-            let pos = slot.map(|p| p as u64).unwrap_or(u64::MAX);
-            out.extend_from_slice(&pos.to_le_bytes());
-        }
-        out.extend_from_slice(&len(self.tokens.len()).to_le_bytes());
-        for t in &self.tokens {
-            out.extend_from_slice(&t.to_le_bytes());
-        }
-        out.extend_from_slice(&len(self.k.len()).to_le_bytes());
-        for (k, v) in self.k.iter().zip(&self.v) {
-            crate::kv_codec::write_f32s(&mut out, k);
-            crate::kv_codec::write_f32s(&mut out, v);
-        }
-        out
-    }
-
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut r = crate::kv_codec::Reader(bytes);
-        let block = r.u32()? as usize;
-        let kv_dim = r.u32()? as usize;
-        let n_slots = r.u32()? as usize;
-        let mut slot_pos = Vec::with_capacity(n_slots);
-        for _ in 0..n_slots {
-            let pos = r.u64()?;
-            slot_pos.push(if pos == u64::MAX {
-                None
-            } else {
-                Some(usize::try_from(pos).ok()?)
-            });
-        }
-        let n_tokens = r.u32()? as usize;
-        let tokens = (0..n_tokens).map(|_| r.u32()).collect::<Option<Vec<_>>>()?;
-        let n_layers = r.u32()? as usize;
-        let row = n_slots.checked_mul(kv_dim)?;
-        let mut k = Vec::with_capacity(n_layers);
-        let mut v = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            let ks = r.f32s()?;
-            let vs = r.f32s()?;
-            if ks.len() != row || vs.len() != row {
-                return None;
-            }
-            k.push(ks);
-            v.push(vs);
-        }
-        if !r.0.is_empty() || k.len() != v.len() {
-            return None;
-        }
-        Some(Self { block, kv_dim, slot_pos, tokens, k, v })
-    }
-}
-
 pub struct Dflash2Provider {
     spec: Dflash2Spec,
     hip: Arc<HipWorkspace>,
@@ -1013,62 +944,6 @@ impl Dflash2Provider {
     /// HIP device the draft runs on.
     pub fn device(&self) -> i32 {
         self.hip.device
-    }
-
-    /// Context ring for a prompt-cache checkpoint. Empty when the ring holds nothing.
-    pub(crate) fn export_ring(&self) -> Result<Vec<u8>, AllpacaError> {
-        if self.ring.tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-        let kv = self.spec.kv_dim();
-        let block = self.spec.block_size;
-        let slots = self.ring.slot_pos.len();
-        let nbytes = slots.saturating_mul(kv).saturating_mul(4);
-        let off = block.saturating_mul(kv).saturating_mul(4);
-        let mut k = Vec::with_capacity(self.ring_k.len());
-        let mut v = Vec::with_capacity(self.ring_v.len());
-        for layer in 0..self.ring_k.len() {
-            let mut raw = vec![0u8; nbytes];
-            self.ring_k[layer].copy_d2h(off, &mut raw)?;
-            k.push(floats_from_le(&raw));
-            self.ring_v[layer].copy_d2h(off, &mut raw)?;
-            v.push(floats_from_le(&raw));
-        }
-        Ok(Dflash2RingCache {
-            block,
-            kv_dim: kv,
-            slot_pos: self.ring.slot_pos.clone(),
-            tokens: self.ring.tokens.clone(),
-            k,
-            v,
-        }
-        .to_bytes())
-    }
-
-    /// Put a ring saved by [`Self::export_ring`] back. A ring for another
-    /// window or model is left untouched.
-    pub(crate) fn import_ring(&mut self, bytes: &[u8]) -> Result<(), AllpacaError> {
-        let cache = Dflash2RingCache::from_bytes(bytes).ok_or_else(|| {
-            AllpacaError::Fatal(FatalError::InvalidConfig("dflash2 ring cache is not readable".into()))
-        })?;
-        if cache.block != self.spec.block_size
-            || cache.kv_dim != self.spec.kv_dim()
-            || cache.slot_pos.len() != self.ring.slot_pos.len()
-            || cache.k.len() != self.ring_k.len()
-        {
-            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
-                "dflash2 ring cache does not match this drafter".into(),
-            )));
-        }
-        let kv = cache.kv_dim;
-        let off = cache.block.saturating_mul(kv).saturating_mul(4);
-        for (layer, (k, v)) in cache.k.iter().zip(&cache.v).enumerate() {
-            self.ring_k[layer].copy_h2d(off, &le_bytes(k))?;
-            self.ring_v[layer].copy_h2d(off, &le_bytes(v))?;
-        }
-        self.ring.slot_pos = cache.slot_pos;
-        self.ring.tokens = cache.tokens;
-        Ok(())
     }
 
     fn w(&self, off: usize) -> *const f32 {
@@ -1402,42 +1277,9 @@ impl DraftProvider for Dflash2Provider {
     }
 }
 
-fn floats_from_le(raw: &[u8]) -> Vec<f32> {
-    raw.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-fn le_bytes(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 4);
-    for v in values {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_dflash2_ring_round_trips_and_rejects_a_short_file() {
-        let saved = Dflash2RingCache {
-            block: 4,
-            kv_dim: 2,
-            slot_pos: vec![Some(0), None, Some(2)],
-            tokens: vec![7, 8, 9],
-            k: vec![vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]],
-            v: vec![vec![5.0, 6.0, 0.0, 0.0, 7.0, 8.0]],
-        };
-        let back = Dflash2RingCache::from_bytes(&saved.to_bytes()).expect("ring");
-        assert_eq!(back.slot_pos, saved.slot_pos);
-        assert_eq!(back.tokens, saved.tokens);
-        assert_eq!(back.k, saved.k);
-        assert_eq!(back.v, saved.v);
-        assert_eq!(back.block, 4);
-        assert!(Dflash2RingCache::from_bytes(&[1, 2, 3]).is_none());
-    }
 
     #[test]
     fn dynamic_conv_mixes_the_previous_row_within_a_block_only() {
