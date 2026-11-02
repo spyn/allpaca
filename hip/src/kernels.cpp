@@ -1461,6 +1461,114 @@ __global__ void gemm_nt_i8_wmma_kernel(const int8_t *a, const int8_t *b, float *
 #endif
 }
 
+/* Deterministic math: every rounding spelled out, so HIP, CUDA and the CPU
+ * reference (`allpaca_cpu::det_*`) give the same bits. The vendors' expf, sinf,
+ * cosf, powf and rsqrtf differ in the last bits, and the int8 activations of
+ * the K-quant GEMV turn a last-bit difference into a step of 1/127 of a block's
+ * largest value (3e-7 in, 3e-4 out, measured), so layers on an NVIDIA worker
+ * changed the text against an AMD one. `/` and sqrtf are correctly rounded on
+ * both.
+ * exp(x) = 2^n * exp(r), n = rint(x / ln 2), |r| <= ln 2 / 2, a degree-7
+ * Taylor polynomial in Horner form (error < 1e-8 relative), then 2^n applied
+ * as two exact power-of-two products. */
+__device__ inline float det_pow2i(int k) {
+    return __int_as_float((k + 127) << 23);
+}
+
+__device__ inline float det_expf(float x) {
+    x = fminf(fmaxf(x, -103.0f), 88.5f);
+    const float n = rintf(__fmul_rn(x, 1.44269504088896341f));
+    float r = fmaf(n, -0.693145751953125f, x);
+    r = fmaf(n, -1.42860682030941723212e-6f, r);
+    float p = 1.98412698412698413e-4f;
+    p = fmaf(p, r, 1.38888888888888889e-3f);
+    p = fmaf(p, r, 8.33333333333333333e-3f);
+    p = fmaf(p, r, 4.16666666666666667e-2f);
+    p = fmaf(p, r, 1.66666666666666667e-1f);
+    p = fmaf(p, r, 0.5f);
+    p = fmaf(p, r, 1.0f);
+    p = fmaf(p, r, 1.0f);
+    const int ni = static_cast<int>(n);
+    const int a = ni / 2;
+    return __fmul_rn(__fmul_rn(p, det_pow2i(a)), det_pow2i(ni - a));
+}
+
+/* ln(x), positive normal x: x = m * 2^e, m in [sqrt(1/2), sqrt(2)], then
+ * 2 * atanh(s), s = (m - 1) / (m + 1). */
+__device__ inline float det_logf(float x) {
+    const int bits = __float_as_int(x);
+    int e = ((bits >> 23) & 255) - 127;
+    float m = __int_as_float((bits & 0x007fffff) | 0x3f800000);
+    if (m > 1.41421356f) {
+        m = __fmul_rn(m, 0.5f);
+        e += 1;
+    }
+    const float f = __fadd_rn(m, -1.0f);
+    const float s = __fdiv_rn(f, __fadd_rn(2.0f, f));
+    const float z = __fmul_rn(s, s);
+    float p = 2.2222222e-1f;
+    p = fmaf(p, z, 2.8571428e-1f);
+    p = fmaf(p, z, 0.4f);
+    p = fmaf(p, z, 6.6666666e-1f);
+    p = fmaf(p, z, 2.0f);
+    return fmaf(static_cast<float>(e), 0.69314718f, __fmul_rn(s, p));
+}
+
+/* base^y, positive base: single precision throughout, about 1e-6 relative at
+ * worst, which for RoPE is the slowest pairs (2e-6 rad at position 10k). */
+__device__ inline float det_powf(float base, float y) {
+    return det_expf(__fmul_rn(y, det_logf(base)));
+}
+
+/* sin and cos of x >= 0: reduction by pi / 2 in two fused steps, then Taylor
+ * polynomials on |r| <= pi / 4. */
+__device__ inline void det_sincosf(float x, float &s, float &c) {
+    const float n = rintf(__fmul_rn(x, 6.3661977e-1f));
+    float r = fmaf(n, -1.5707964f, x);
+    r = fmaf(n, 4.371139e-8f, r);
+    const float z = __fmul_rn(r, r);
+    float p = 2.7557319e-6f;
+    p = fmaf(p, z, -1.984127e-4f);
+    p = fmaf(p, z, 8.333334e-3f);
+    p = fmaf(p, z, -1.6666667e-1f);
+    const float sin_r = fmaf(__fmul_rn(r, z), p, r);
+    float q = -2.755732e-7f;
+    q = fmaf(q, z, 2.4801588e-5f);
+    q = fmaf(q, z, -1.3888889e-3f);
+    q = fmaf(q, z, 4.1666668e-2f);
+    q = fmaf(q, z, -0.5f);
+    q = fmaf(q, z, 1.0f);
+    const int k = static_cast<int>(n) & 3;
+    s = k == 0 ? sin_r : (k == 1 ? q : (k == 2 ? -sin_r : -q));
+    c = k == 0 ? q : (k == 1 ? -sin_r : (k == 2 ? -q : sin_r));
+}
+
+/* 1 / sqrt(x). The hardware reciprocal roots are not the same across vendors. */
+__device__ inline float det_rsqrtf(float x) {
+    return __fdiv_rn(1.0f, sqrtf(x));
+}
+
+/* silu(g) * u, bit-identical across backends. */
+__device__ inline float det_silu_mul(float g, float u) {
+    return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, det_expf(-g))), u);
+}
+
+/* x * sigmoid(g). */
+__device__ inline float det_sigmoid_mul(float x, float g) {
+    return __fmul_rn(x, __fdiv_rn(1.0f, __fadd_rn(1.0f, det_expf(-g))));
+}
+
+/* Turns the pair (a, b) by `angle`, or back by it when `forward` is 0. */
+__device__ inline void det_rotate(float &a, float &b, float angle, int forward) {
+    float s, c;
+    det_sincosf(angle, s, c);
+    s = forward ? s : -s;
+    const float x = fmaf(a, c, -__fmul_rn(b, s));
+    const float y = fmaf(a, s, __fmul_rn(b, c));
+    a = x;
+    b = y;
+}
+
 __device__ float warp_sum32(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1580,8 +1688,8 @@ __device__ __forceinline__ void attn_row_step(AttnRow<DPT> &r, const float *kh, 
         s = -1.0e30f;
     }
     const float m_new = fmaxf(r.m, s);
-    const float alpha = expf(r.m - m_new);
-    const float p = expf(s - m_new);
+    const float alpha = det_expf(r.m - m_new);
+    const float p = det_expf(s - m_new);
     r.l = fmaf(r.l, alpha, p);
     if (vec4) {
 #pragma unroll
@@ -1688,8 +1796,8 @@ __device__ __forceinline__ void attn_tile_step(AttnRow<DPT> &r, const float *kt,
         top = fmaxf(top, __shfl_xor(top, m, 32));
     }
     const float m_new = fmaxf(r.m, top);
-    const float alpha = expf(r.m - m_new);
-    const float p = valid ? expf(s - m_new) : 0.0f;
+    const float alpha = det_expf(r.m - m_new);
+    const float p = valid ? det_expf(s - m_new) : 0.0f;
     float sum = p;
 #pragma unroll
     for (int m = 2; m < 32; m <<= 1) {
@@ -1817,8 +1925,8 @@ __device__ __forceinline__ void attn_fold(float &m, float &l, float *acc, float 
                                           const float *acc_b) {
 #pragma clang fp contract(off)
     const float mm = fmaxf(m, m_b);
-    const float a = expf(m - mm);
-    const float b = expf(m_b - mm);
+    const float a = det_expf(m - mm);
+    const float b = det_expf(m_b - mm);
     l = fmaf(l, a, __fmul_rn(l_b, b));
 #pragma unroll
     for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
@@ -1840,7 +1948,7 @@ __global__ void __launch_bounds__(32) attention_flash_kernel(const float *q, con
     }
     const int lane = static_cast<int>(threadIdx.x);
     const int kv_h = h / (n_heads / n_kv_heads);
-    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const float scale = det_rsqrtf(static_cast<float>(head_dim));
     const int t_max = attn_row_tmax(qi, n_q, n_kv, causal);
     const float *qh = q + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
     float *oh = out + (static_cast<size_t>(qi) * n_heads + h) * head_dim;
@@ -1915,7 +2023,7 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
     const int h = static_cast<int>(blockIdx.y);
     const bool active = qi < n_q;
     const int kv_h = h / (n_heads / n_kv_heads);
-    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const float scale = det_rsqrtf(static_cast<float>(head_dim));
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
     const int qrow = active ? qi : q0;
     const float *qh = q + (static_cast<size_t>(qrow) * n_heads + h) * head_dim;
@@ -2006,7 +2114,7 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
     const int h = h0 + warp;
     const bool active = h < h_end;
     const int c = static_cast<int>(blockIdx.y);
-    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const float scale = det_rsqrtf(static_cast<float>(head_dim));
     const int t_max = attn_row_tmax(0, 1, n_kv, causal);
     const float *qh = q + static_cast<size_t>(active ? h : h0) * head_dim;
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
@@ -5209,7 +5317,7 @@ __device__ inline void q2_0_moe_gate_up_body(const Q2Act &x, const uint8_t *pool
         const float gs = (pg[tid] + pg[tid + 1]) + (pg[tid + 2] + pg[tid + 3]);
         const float us = (pu[tid] + pu[tid + 1]) + (pu[tid + 2] + pu[tid + 3]);
         h[static_cast<size_t>(p) * static_cast<size_t>(ff) + static_cast<size_t>(r)] =
-            gs / (1.f + expf(-gs)) * us;
+            det_silu_mul(gs, us);
     }
 }
 
@@ -5412,7 +5520,7 @@ __global__ void q2_0_moe_gate_up_pairs_kernel(Q2Act x, const uint8_t *pool, cons
     u = q2_lane_sum<L>(u);
     if (lane == 0 && r < ff) {
         h[(row * gridDim.y + static_cast<size_t>(p)) * static_cast<size_t>(ff) + static_cast<size_t>(r)] =
-            g / (1.f + expf(-g)) * u;
+            det_silu_mul(g, u);
     }
 }
 
@@ -5525,7 +5633,7 @@ __global__ __launch_bounds__(256) void q2_0_moe_gate_up_lds_kernel(Q2Act x, cons
     u = q2_lane_sum<L>(u);
     if (lane == 0 && gi < nr) {
         h[(row * gridDim.y + static_cast<size_t>(p)) * static_cast<size_t>(ff) +
-          static_cast<size_t>(r0 + gi)] = g / (1.f + expf(-g)) * u;
+          static_cast<size_t>(r0 + gi)] = det_silu_mul(g, u);
     }
 }
 
@@ -8800,12 +8908,12 @@ __global__ void rmsnorm_kernel(const float *x, const float *weight, float *out, 
     float local = 0.0f;
     for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
         const float v = x[i];
-        local += v * v;
+        local = fmaf(v, v, local);
     }
     const float ss = block_reduce_sum(local, red);
-    const float inv = rsqrtf(ss / static_cast<float>(n) + eps);
+    const float inv = det_rsqrtf(__fadd_rn(__fdiv_rn(ss, static_cast<float>(n)), eps));
     for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
-        out[i] = x[i] * inv * weight[i];
+        out[i] = __fmul_rn(__fmul_rn(x[i], inv), weight[i]);
     }
 }
 
@@ -8840,12 +8948,12 @@ __global__ void residual_rmsnorm_kernel(float *x, const float *residual, const f
     for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
         const float v = x[i] + residual[i];
         x[i] = v;
-        local += v * v;
+        local = fmaf(v, v, local);
     }
     const float ss = block_reduce_sum(local, red);
-    const float inv = rsqrtf(ss / static_cast<float>(n) + eps);
+    const float inv = det_rsqrtf(__fadd_rn(__fdiv_rn(ss, static_cast<float>(n)), eps));
     for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
-        out[i] = x[i] * inv * weight[i];
+        out[i] = __fmul_rn(__fmul_rn(x[i], inv), weight[i]);
     }
 }
 
@@ -9069,25 +9177,13 @@ __global__ void gated_delta_step_kernel(float *q, float *k, const float *v, cons
 }
 
 __device__ void rope_pair(float *hvec, int i, int half, int pos, float theta) {
-    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
-    const float angle = static_cast<float>(pos) * freq;
-    const float s = sinf(angle);
-    const float c = cosf(angle);
-    const float a = hvec[2 * i];
-    const float b = hvec[2 * i + 1];
-    hvec[2 * i] = a * c - b * s;
-    hvec[2 * i + 1] = a * s + b * c;
+    const float freq = det_powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    det_rotate(hvec[2 * i], hvec[2 * i + 1], __fmul_rn(static_cast<float>(pos), freq), 1);
 }
 
 __device__ void rope_back_pair(float *hvec, int i, int half, int pos, float theta) {
-    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
-    const float angle = static_cast<float>(pos) * freq;
-    const float s = sinf(angle);
-    const float c = cosf(angle);
-    const float a = hvec[2 * i];
-    const float b = hvec[2 * i + 1];
-    hvec[2 * i] = a * c + b * s;
-    hvec[2 * i + 1] = -a * s + b * c;
+    const float freq = det_powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    det_rotate(hvec[2 * i], hvec[2 * i + 1], __fmul_rn(static_cast<float>(pos), freq), 0);
 }
 
 __global__ void rope_offset_rows_kernel(float *x, int n_tok, int n_heads, int head_dim, int n_rot,
@@ -9132,15 +9228,9 @@ __global__ void rope_yarn_rows_kernel(float *x, int n_tok, int n_heads, int head
                   static_cast<size_t>(offset);
     const float y = (static_cast<float>(i) - low) / fmaxf(0.001f, high - low);
     const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
-    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half)) *
-                       (scale * (1.0f - ramp) + ramp);
-    const float angle = static_cast<float>(start_pos + tok) * freq;
-    const float s = back ? -sinf(angle) : sinf(angle);
-    const float c = cosf(angle);
-    const float a = hvec[2 * i];
-    const float b = hvec[2 * i + 1];
-    hvec[2 * i] = a * c - b * s;
-    hvec[2 * i + 1] = a * s + b * c;
+    const float freq = __fmul_rn(det_powf(theta, -static_cast<float>(i) / static_cast<float>(half)),
+                                 fmaf(scale, 1.0f - ramp, ramp));
+    det_rotate(hvec[2 * i], hvec[2 * i + 1], __fmul_rn(static_cast<float>(start_pos + tok), freq), !back);
 }
 
 __global__ void rope_kernel(float *x, int n_heads, int head_dim, int pos, float theta) {
@@ -9179,8 +9269,7 @@ __global__ void silu_mul_kernel(float *gate, const float *up, int n) {
     if (idx >= n) {
         return;
     }
-    const float g = gate[idx];
-    gate[idx] = (g / (1.0f + expf(-g))) * up[idx];
+    gate[idx] = det_silu_mul(gate[idx], up[idx]);
 }
 
 __global__ void gelu_mul_kernel(float *gate, const float *up, int n) {
@@ -9215,7 +9304,7 @@ __global__ void scale_heads_sigmoid_kernel(float *attn, const float *scores, int
     const int within = idx % head_elems;
     const int h = within / head_dim;
     const float s = scores[tok * n_heads + h];
-    attn[idx] *= 1.0f / (1.0f + expf(-s));
+    attn[idx] = det_sigmoid_mul(attn[idx], s);
 }
 
 __global__ void deinterleave_q_gate_kernel(const float *q_full, float *q, float *gate, int n_heads,
@@ -9248,7 +9337,7 @@ __global__ void sigmoid_mul_kernel(float *x, const float *gate, int n) {
         return;
     }
     const float g = gate[idx];
-    x[idx] *= 1.0f / (1.0f + expf(-g));
+    x[idx] = det_sigmoid_mul(x[idx], g);
 }
 
 __global__ void rmsnorm_heads_kernel(float *x, const float *weight, int head_dim, float eps) {
@@ -9258,7 +9347,7 @@ __global__ void rmsnorm_heads_kernel(float *x, const float *weight, int head_dim
     float sum = 0.0f;
     for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
         const float v = row[i];
-        sum += v * v;
+        sum = fmaf(v, v, sum);
     }
     shared[threadIdx.x] = sum;
     __syncthreads();
@@ -9268,9 +9357,9 @@ __global__ void rmsnorm_heads_kernel(float *x, const float *weight, int head_dim
         }
         __syncthreads();
     }
-    const float inv = rsqrtf(shared[0] / static_cast<float>(head_dim) + eps);
+    const float inv = det_rsqrtf(__fadd_rn(__fdiv_rn(shared[0], static_cast<float>(head_dim)), eps));
     for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
-        row[i] = row[i] * inv * weight[i];
+        row[i] = __fmul_rn(__fmul_rn(row[i], inv), weight[i]);
     }
 }
 
@@ -9940,7 +10029,7 @@ __device__ void rope_imrope_pair(float *hvec, int i, int half, int n_rot, int po
                                 int pos_w, float theta, int s0, int s1, int s2, int s3) {
     const int sect_dims = s0 + s1 + s2 + s3;
     const bool use_imrope = sect_dims > 0 && s0 > 0 && s1 > 0;
-    const float theta_scale = powf(theta, -2.0f / static_cast<float>(n_rot));
+    const float theta_scale = det_powf(theta, -2.0f / static_cast<float>(n_rot));
     float theta_t = static_cast<float>(pos_t);
     float theta_h = static_cast<float>(pos_h);
     float theta_w = static_cast<float>(pos_w);
@@ -9967,12 +10056,7 @@ __device__ void rope_imrope_pair(float *hvec, int i, int half, int n_rot, int po
             theta_t *= theta_scale;
         }
     }
-    const float s = sinf(angle);
-    const float c = cosf(angle);
-    const float a = hvec[i];
-    const float b = hvec[i + half];
-    hvec[i] = a * c - b * s;
-    hvec[i + half] = a * s + b * c;
+    det_rotate(hvec[i], hvec[i + half], angle, 1);
 }
 
 __global__ void rope_imrope_qk_kernel(float *q, float *k, int n_q_heads, int n_k_heads, int head_dim,
@@ -10110,7 +10194,7 @@ __device__ void qsa_norm_rope(float *v, const float *gain, int dim, int n_rot, i
     const int tid = static_cast<int>(threadIdx.x);
     float sum = 0.0f;
     for (int i = tid; i < dim; i += 256) {
-        sum += v[i] * v[i];
+        sum = fmaf(v[i], v[i], sum);
     }
     red[tid] = sum;
     __syncthreads();
@@ -10120,9 +10204,9 @@ __device__ void qsa_norm_rope(float *v, const float *gain, int dim, int n_rot, i
         }
         __syncthreads();
     }
-    const float inv = rsqrtf(red[0] / static_cast<float>(dim) + eps);
+    const float inv = det_rsqrtf(__fadd_rn(__fdiv_rn(red[0], static_cast<float>(dim)), eps));
     for (int i = tid; i < dim; i += 256) {
-        v[i] = v[i] * inv * gain[i];
+        v[i] = __fmul_rn(__fmul_rn(v[i], inv), gain[i]);
     }
     __syncthreads();
     const int half = n_rot / 2;
@@ -10419,7 +10503,7 @@ __global__ void gdn_norm_gate_kernel(const float *y, const float *z, const float
     float sum = 0.0f;
     for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
         const float v = row[i];
-        sum += v * v;
+        sum = fmaf(v, v, sum);
     }
     shared[threadIdx.x] = sum;
     __syncthreads();
@@ -10429,11 +10513,10 @@ __global__ void gdn_norm_gate_kernel(const float *y, const float *z, const float
         }
         __syncthreads();
     }
-    const float inv = rsqrtf(shared[0] / static_cast<float>(head_dim) + eps);
+    const float inv = det_rsqrtf(__fadd_rn(__fdiv_rn(shared[0], static_cast<float>(head_dim)), eps));
     for (int i = static_cast<int>(threadIdx.x); i < head_dim; i += static_cast<int>(blockDim.x)) {
-        const float normed = row[i] * inv * weight[i];
-        const float g = z[base + i];
-        out[base + i] = (g / (1.0f + expf(-g))) * normed;
+        const float normed = __fmul_rn(__fmul_rn(row[i], inv), weight[i]);
+        out[base + i] = det_silu_mul(z[base + i], normed);
     }
 }
 
@@ -11329,14 +11412,8 @@ __global__ void rope_neox_rows_kernel(float *x, int n_tok, int n_heads, int head
     const int h = idx / half;
     const int i = idx % half;
     float *hvec = x + (static_cast<size_t>(tok) * n_heads + h) * static_cast<size_t>(head_dim);
-    const float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
-    const float angle = static_cast<float>(start_pos + tok) * freq;
-    const float sn = sinf(angle);
-    const float cs = cosf(angle);
-    const float a = hvec[i];
-    const float b = hvec[i + half];
-    hvec[i] = a * cs - b * sn;
-    hvec[i + half] = a * sn + b * cs;
+    const float freq = det_powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    det_rotate(hvec[i], hvec[i + half], __fmul_rn(static_cast<float>(start_pos + tok), freq), 1);
 }
 
 extern "C" int allpaca_rope_neox_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
@@ -11367,17 +11444,11 @@ __global__ void rope_neox_ff_rows_kernel(float *x, int n_tok, int n_heads, int h
     const int h = idx / half;
     const int i = idx % half;
     float *hvec = x + (static_cast<size_t>(tok) * n_heads + h) * static_cast<size_t>(head_dim);
-    float freq = powf(theta, -static_cast<float>(i) / static_cast<float>(half));
+    float freq = det_powf(theta, -static_cast<float>(i) / static_cast<float>(half));
     if (ff) {
-        freq = freq / ff[i];
+        freq = __fdiv_rn(freq, ff[i]);
     }
-    const float angle = static_cast<float>(start_pos + tok) * freq;
-    const float sn = sinf(angle);
-    const float cs = cosf(angle);
-    const float a = hvec[i];
-    const float b = hvec[i + half];
-    hvec[i] = a * cs - b * sn;
-    hvec[i + half] = a * sn + b * cs;
+    det_rotate(hvec[i], hvec[i + half], __fmul_rn(static_cast<float>(start_pos + tok), freq), 1);
 }
 
 extern "C" int allpaca_rope_neox_ff_rows(float *x, int32_t n_tok, int32_t n_heads, int32_t head_dim,
@@ -11537,40 +11608,6 @@ __device__ inline void moe_quantize_lds(const float *v, int k, int8_t *aq, float
         }
     }
     __syncthreads();
-}
-
-/* exp(x) with every rounding spelled out, so HIP, CUDA and the CPU
- * reference (`allpaca_cpu::det_expf`) give the same bits: the vendors' expf
- * differ in the last bit for some inputs, and the MoE SiLU used it, so expert
- * layers on an NVIDIA worker changed the text against an AMD one.
- * exp(x) = 2^n * exp(r), n = rint(x / ln 2), |r| <= ln 2 / 2, a degree-7
- * Taylor polynomial in Horner form (error < 1e-8 relative), then 2^n applied
- * as two exact power-of-two products. */
-__device__ inline float det_pow2i(int k) {
-    return __int_as_float((k + 127) << 23);
-}
-
-__device__ inline float det_expf(float x) {
-    x = fminf(fmaxf(x, -103.0f), 88.5f);
-    const float n = rintf(__fmul_rn(x, 1.44269504088896341f));
-    float r = fmaf(n, -0.693145751953125f, x);
-    r = fmaf(n, -1.42860682030941723212e-6f, r);
-    float p = 1.98412698412698413e-4f;
-    p = fmaf(p, r, 1.38888888888888889e-3f);
-    p = fmaf(p, r, 8.33333333333333333e-3f);
-    p = fmaf(p, r, 4.16666666666666667e-2f);
-    p = fmaf(p, r, 1.66666666666666667e-1f);
-    p = fmaf(p, r, 0.5f);
-    p = fmaf(p, r, 1.0f);
-    p = fmaf(p, r, 1.0f);
-    const int ni = static_cast<int>(n);
-    const int a = ni / 2;
-    return __fmul_rn(__fmul_rn(p, det_pow2i(a)), det_pow2i(ni - a));
-}
-
-/* silu(g) * u for the MoE expert FFN, bit-identical across backends. */
-__device__ inline float det_silu_mul(float g, float u) {
-    return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, det_expf(-g))), u);
 }
 
 /* Test hook: det_silu_mul over n values. */

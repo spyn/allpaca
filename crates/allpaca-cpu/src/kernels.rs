@@ -729,6 +729,63 @@ pub fn det_expf(x: f32) -> f32 {
     p * pow2(a) * pow2(ni - a)
 }
 
+/// `ln(x)` for positive normal `x`, every rounding fixed: `x = m * 2^e`, `m`
+/// in `[sqrt(1/2), sqrt(2)]`, then `2 * atanh(s)` with `s = (m - 1) / (m + 1)`.
+pub fn det_logf(x: f32) -> f32 {
+    let bits = x.to_bits() as i32;
+    let mut e = ((bits >> 23) & 255) - 127;
+    let mut m = f32::from_bits(((bits & 0x007f_ffff) | 0x3f80_0000) as u32);
+    if m > 1.414_213_56 {
+        m *= 0.5;
+        e += 1;
+    }
+    let f = m - 1.0;
+    let s = f / (2.0 + f);
+    let z = s * s;
+    let mut p = 2.222_222_2e-1_f32;
+    for c in [2.857_142_8e-1_f32, 0.4, 6.666_666_6e-1, 2.0] {
+        p = p.mul_add(z, c);
+    }
+    (e as f32).mul_add(0.693_147_18_f32, s * p)
+}
+
+/// `base^y` for positive `base`: [`det_expf`] of `y * det_logf(base)`.
+/// Single precision throughout, so about 1e-6 relative at worst: for RoPE that
+/// is the slowest pairs, a 2e-6 rad error at position 10k.
+pub fn det_powf(base: f32, y: f32) -> f32 {
+    det_expf(y * det_logf(base))
+}
+
+/// `(sin x, cos x)` for `x >= 0`, every rounding fixed: reduction by `pi / 2`
+/// in two fused steps, then Taylor polynomials on `|r| <= pi / 4`.
+pub fn det_sincosf(x: f32) -> (f32, f32) {
+    let n = (x * 6.366_197_7e-1_f32).round_ties_even();
+    let mut r = n.mul_add(-1.570_796_4_f32, x);
+    r = n.mul_add(4.371_139e-8_f32, r);
+    let z = r * r;
+    let mut p = 2.755_731_9e-6_f32;
+    for c in [-1.984_127e-4_f32, 8.333_334e-3, -1.666_666_7e-1] {
+        p = p.mul_add(z, c);
+    }
+    let sin_r = (r * z).mul_add(p, r);
+    let mut q = -2.755_732e-7_f32;
+    for c in [2.480_158_8e-5_f32, -1.388_888_9e-3, 4.166_666_8e-2, -0.5, 1.0] {
+        q = q.mul_add(z, c);
+    }
+    match (n as i32) & 3 {
+        0 => (sin_r, q),
+        1 => (q, -sin_r),
+        2 => (-sin_r, -q),
+        _ => (-q, sin_r),
+    }
+}
+
+/// `1 / sqrt(x)` from a correctly rounded root and division, which every
+/// backend has, instead of the hardware reciprocal root, which they don't share.
+pub fn det_rsqrtf(x: f32) -> f32 {
+    1.0 / x.sqrt()
+}
+
 /// `silu(g) * u` as the GPU MoE expert FFN computes it ([`det_expf`]).
 pub fn det_silu_mul(g: f32, u: f32) -> f32 {
     g / (1.0 + det_expf(-g)) * u
@@ -2282,6 +2339,52 @@ pub fn dequant_q8_0(blocks: &[u8], n: usize, out: &mut [f32]) -> Result<(), Allp
 
 #[cfg(test)]
 mod tests {
+    fn ulps(a: f32, b: f64) -> f64 {
+        let b32 = b as f32;
+        ((f64::from(a) - b) / f64::from(f32::from_bits(b32.abs().to_bits() + 1) - b32.abs())).abs()
+    }
+
+    #[test]
+    fn det_logf_is_within_two_ulps_of_the_log() {
+        for x in [1.0f32, 1.5, 2.0, 2.718_281_8, 10.0, 500.0, 10_000.0, 1_000_000.0] {
+            assert!(ulps(det_logf(x), f64::from(x).ln()) <= 2.0 || x == 1.0, "log {x}: {}", det_logf(x));
+        }
+        assert_eq!(det_logf(1.0), 0.0);
+    }
+
+    #[test]
+    fn det_powf_gives_every_rope_frequency_within_16_ulps() {
+        for half in [32, 64, 128] {
+            for i in 0..half {
+                let y = -(i as f32) / half as f32;
+                let got = det_powf(10_000.0, y);
+                let want = 10_000f64.powf(f64::from(y));
+                assert!(ulps(got, want) <= 16.0, "i={i} half={half}: {got} vs {want}");
+            }
+        }
+        assert_eq!(det_powf(10_000.0, -0.0), 1.0);
+    }
+
+    #[test]
+    fn det_sincosf_tracks_the_true_angle_at_every_context_position() {
+        let mut angle = 0.0f32;
+        for k in 0..400_000 {
+            angle += 0.1 + (k % 7) as f32 * 0.31;
+            let (s, c) = det_sincosf(angle);
+            let (ts, tc) = f64::from(angle).sin_cos();
+            assert!((f64::from(s) - ts).abs() < 1.2e-7, "sin {angle}: {s} vs {ts}");
+            assert!((f64::from(c) - tc).abs() < 1.2e-7, "cos {angle}: {c} vs {tc}");
+        }
+        assert_eq!(det_sincosf(0.0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn det_rsqrtf_is_correctly_rounded_division_of_a_correctly_rounded_root() {
+        for x in [1.0f32, 2.0, 128.0, 256.0, 3.3e-5, 7.0e4] {
+            assert_eq!(det_rsqrtf(x).to_bits(), (1.0 / x.sqrt()).to_bits());
+        }
+    }
+
     #[test]
     fn iq4_nl_round_trips_and_beats_q4_0() {
         let data: Vec<f32> = (0..4096).map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * (1.0 + (i % 5) as f32)).collect();
