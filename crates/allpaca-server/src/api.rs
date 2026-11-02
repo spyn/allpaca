@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use allpaca_core::{Engine, ImageInput};
+use allpaca_core::{ChatPrompt, Engine, ImageInput};
 use allpaca_types::{
     AllpacaError, Config, DeviceInfo, FinishReason, GenerationParams, StatsSnapshot,
 };
@@ -399,7 +399,7 @@ async fn chat_completions(
             .iter()
             .map(|(r, c)| (r.as_str(), c.as_str()))
             .collect();
-        Ok::<_, AllpacaError>((engine.format_chat(&pairs), images))
+        Ok::<_, AllpacaError>((engine.format_chat_with_checkpoints(&pairs)?, images))
     })
     .await
     {
@@ -425,8 +425,11 @@ async fn chat_completions(
     }
 
     if state.config.engine.max_active_requests > 1 {
-        let mut stream =
-            Box::pin(served.generate_stream_multimodal(prompt.clone(), images, params));
+        let mut stream = Box::pin(served.generate_stream_multimodal_with_checkpoints(
+            prompt.clone(),
+            images,
+            params,
+        ));
         let mut text = String::new();
         let mut completion_tokens = 0usize;
         let mut finish = FinishReason::Stop;
@@ -466,8 +469,10 @@ async fn chat_completions(
     }
 
     let engine = Arc::clone(&served);
-    match tokio::task::spawn_blocking(move || engine.generate_multimodal(&prompt, &images, params))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        engine.generate_multimodal_with_checkpoints(&prompt, &images, params)
+    })
+    .await
     {
         Ok(Ok(out)) => Json(ChatCompletionResponse {
             id,
@@ -550,7 +555,7 @@ impl Drop for DoneLog {
 fn stream_completion(
     state: AppState,
     engine: Arc<Engine>,
-    prompt: String,
+    prompt: ChatPrompt,
     images: Vec<ImageInput>,
     params: GenerationParams,
     model: String,
@@ -561,7 +566,9 @@ fn stream_completion(
     let use_async_poll = state.config.engine.max_active_requests > 1;
     if use_async_poll {
         tokio::spawn(async move {
-            let mut stream = Box::pin(engine.generate_stream_multimodal(prompt, images, params));
+            let mut stream = Box::pin(
+                engine.generate_stream_multimodal_with_checkpoints(prompt, images, params),
+            );
             let mut done = DoneLog::new(&id);
             let first = serde_json::json!({
                 "id": id,
@@ -609,7 +616,9 @@ fn stream_completion(
         let rt = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let _ = &state;
-            let mut stream = Box::pin(engine.generate_stream_multimodal(prompt, images, params));
+            let mut stream = Box::pin(
+                engine.generate_stream_multimodal_with_checkpoints(prompt, images, params),
+            );
             let mut done = DoneLog::new(&id);
             rt.block_on(async {
                 let first = serde_json::json!({
@@ -1967,6 +1976,86 @@ mod tests {
             text.contains("\"content\"") || text.contains("assistant"),
             "stream must carry token or role deltas: {text}"
         );
+    }
+
+    #[cfg(feature = "hip")]
+    #[tokio::test]
+    async fn chat_completions_use_message_checkpoints() {
+        for stream in [false, true] {
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                synthetic: true,
+                cpu_only: false,
+                seed: Some(1),
+                speculative: Some(false),
+                ..CliOverrides::default()
+            });
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            let engine = Arc::new(Engine::new(cfg.clone()).unwrap());
+            if engine.stats().backend != "hip" {
+                eprintln!("skip chat_completions_use_message_checkpoints: no HIP device");
+                return;
+            }
+            engine
+                .load_synthetic(allpaca_core::ModelConfig::tiny_hybrid())
+                .unwrap();
+            let app = router(AppState::new(
+                engine.clone(),
+                cfg,
+                AuthState::from_password(None),
+                LogRing::new(64),
+            ));
+            let call = |app: axum::Router, messages: serde_json::Value| async move {
+                let body = serde_json::json!({
+                    "model": "synthetic",
+                    "messages": messages,
+                    "stream": stream,
+                    "max_tokens": 4,
+                    "temperature": 0.0,
+                    "seed": 1
+                });
+                let res = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = res.status();
+                let bytes = res.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            };
+            call(
+                app.clone(),
+                serde_json::json!([
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world"},
+                    {"role": "user", "content": "there"}
+                ]),
+            )
+            .await;
+            call(
+                app,
+                serde_json::json!([
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world"},
+                    {"role": "user", "content": "true"}
+                ]),
+            )
+            .await;
+            let stats = engine.stats();
+            assert_eq!(stats.radix_hits, 1, "stream={stream}; {stats:?}");
+            assert!(stats.radix_skip_tokens > 0, "stream={stream}; {stats:?}");
+        }
     }
 
     #[tokio::test]

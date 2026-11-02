@@ -8031,6 +8031,51 @@ fn hip_prompt_cache_hit_decodes_like_a_full_prefill() {
     }
 }
 
+#[cfg(feature = "hip")]
+#[test]
+fn hip_message_checkpoint_restores_after_mid_edit() {
+    let model = ModelConfig::tiny_hybrid();
+    let fresh = Engine::new(hip_auto_synthetic()).unwrap();
+    fresh.load_synthetic(model.clone()).unwrap();
+    if hip_gpus(&fresh).is_empty() {
+        eprintln!("skip hip_message_checkpoint_restores_after_mid_edit: no HIP device");
+        return;
+    }
+    let edited = fresh
+        .format_chat_with_checkpoints(&[
+            ("user", "hello"),
+            ("assistant", "world"),
+            ("user", "true"),
+        ])
+        .unwrap();
+    let cold = fresh.generate(&edited.text, greedy(12)).unwrap();
+
+    let mut cfg = hip_auto_synthetic();
+    cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+    let warm = Engine::new(cfg).unwrap();
+    warm.load_synthetic(model).unwrap();
+    let cached = warm
+        .format_chat_with_checkpoints(&[
+            ("user", "hello"),
+            ("assistant", "world"),
+            ("user", "there"),
+        ])
+        .unwrap();
+    warm.generate_multimodal_with_checkpoints(&cached, &[], greedy(4))
+        .unwrap();
+    let hit = warm
+        .generate_multimodal_with_checkpoints(&edited, &[], greedy(12))
+        .unwrap();
+
+    let stats = warm.stats();
+    assert_eq!(stats.radix_hits, 1, "the second-message checkpoint must hit; {stats:?}");
+    assert!(
+        stats.radix_skip_tokens >= edited.checkpoint_offsets[1] as u64,
+        "the whole second message must be skipped; {stats:?}"
+    );
+    assert_eq!(hit.token_ids, cold.token_ids);
+}
+
 /// Real model: a prompt that extends a cached one decodes exactly as a full
 /// prefill. `ALLPACA_CACHE_GGUF` = model path (a hybrid such as Qwen3.5
 /// checks the recurrent state too).
