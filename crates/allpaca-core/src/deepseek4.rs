@@ -287,6 +287,7 @@ pub fn file_is_deepseek4(file: &GgufFile) -> bool {
     }
 }
 
+#[cfg(test)]
 fn sqrt_softplus(x: f32) -> f32 {
     let sp = if x > 20.0 {
         x
@@ -381,6 +382,7 @@ impl HcBatch {
     }
 }
 
+#[cfg(test)]
 fn pack_hc_states(states: &[Vec<Vec<f32>>], hc: usize, dim: usize) -> Vec<f32> {
     let n_tok = states.len();
     let mut packed = vec![0.0f32; n_tok.saturating_mul(hc).saturating_mul(dim)];
@@ -459,6 +461,7 @@ fn hc_pre(
 }
 
 /// Token-parallel [`hc_pre`]: one mix GEMM at `M=n_tok`, per-token Sinkhorn.
+#[cfg(test)]
 fn hc_pre_rows(
     states: &[Vec<Vec<f32>>],
     mix: &HcMix,
@@ -869,6 +872,7 @@ fn hc_post(
 }
 
 /// Packed [`hc_post`]: one scratch buffer, swapped into `states` (no per-token alloc).
+#[cfg(test)]
 fn hc_post_rows(
     xs: &[f32],
     states: &mut [Vec<Vec<f32>>],
@@ -885,6 +889,7 @@ fn hc_post_rows(
     });
 }
 
+#[cfg(test)]
 fn hc_post_rows_with<'p>(
     xs: &[f32],
     states: &mut [Vec<Vec<f32>>],

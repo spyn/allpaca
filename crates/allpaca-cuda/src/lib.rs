@@ -10,7 +10,9 @@
 
 mod cuda_arch;
 
-use allpaca_types::{AllpacaError, DegradedError, DeviceInfo, DeviceKind};
+use allpaca_types::{AllpacaError, DegradedError, DeviceInfo};
+#[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
+use allpaca_types::DeviceKind;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -494,6 +496,7 @@ mod ffi {
     }
 }
 
+#[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
 fn status(rc: i32, op: &str) -> Result<(), AllpacaError> {
     if rc == ALLPACA_OK {
         Ok(())
@@ -1676,17 +1679,20 @@ impl CudaWorkspace {
             .take()
             .map(|t| t.elapsed().as_secs_f64() * 1_000_000.0)
             .unwrap_or(0.0);
-        let mut gpu_us = 0.0f64;
+        let gpu_us;
         #[cfg(all(feature = "cuda", allpaca_cuda_runtime))]
         {
+            let mut elapsed = 0.0f64;
             unsafe {
                 let _ = ffi::allpaca_cuda_event_record(self.t1, self.stream);
             }
             let _ = self.synchronize();
-            let rc = unsafe { ffi::allpaca_cuda_event_elapsed_us(self.t0, self.t1, &mut gpu_us) };
-            if rc != ALLPACA_OK {
-                gpu_us = 0.0;
-            }
+            let rc = unsafe { ffi::allpaca_cuda_event_elapsed_us(self.t0, self.t1, &mut elapsed) };
+            gpu_us = if rc == ALLPACA_OK { elapsed } else { 0.0 };
+        }
+        #[cfg(not(all(feature = "cuda", allpaca_cuda_runtime)))]
+        {
+            gpu_us = 0.0;
         }
         let host_us = (wall - gpu_us).max(0.0);
         // EMA: 7/8 previous + 1/8 sample, stored as microsecond integers.

@@ -83,6 +83,7 @@ impl QsaKeys {
     }
 
     /// Tokens whose raw key is held.
+    #[cfg(test)]
     pub fn tokens(&self, shape: &QsaShape) -> usize {
         self.raw.len() / shape.dim
     }

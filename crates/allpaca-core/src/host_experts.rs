@@ -106,6 +106,7 @@ impl PackedExperts {
     }
 
     /// Stacks held replaced by F32 weights.
+    #[cfg(test)]
     pub(crate) fn swapped(&self) -> usize {
         self.swapped.len()
     }

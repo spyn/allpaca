@@ -395,6 +395,7 @@ impl Gemma4Memory {
         self.tokens = n;
     }
 
+    #[allow(dead_code)] // Host KV size; no caller reads it yet.
     pub(crate) fn host_bytes(&self) -> usize {
         self.kv.iter().map(|(k, v)| (k.len() + v.len()) * 4).sum()
     }

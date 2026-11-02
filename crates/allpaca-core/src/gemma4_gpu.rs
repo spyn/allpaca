@@ -352,10 +352,12 @@ impl Gemma4DeviceKv {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn device_bytes(&self) -> u64 {
         self.k.iter().chain(&self.v).chain(&self.tmp).map(|w| w.0.bytes()).sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn swa_base(&self) -> usize {
         self.swa_base
     }
@@ -374,7 +376,6 @@ pub struct Gemma4Gpu {
     /// Rows of a new sequence's SWA buffers ([`Gemma4DeviceKv::swa_rows_for`]).
     swa_rows: usize,
     scratch: Scratch,
-    weight_bytes: u64,
 }
 
 impl Gemma4Gpu {
@@ -445,7 +446,6 @@ impl Gemma4Gpu {
             ones,
             swa_rows: Gemma4DeviceKv::swa_rows_for(spec),
             scratch,
-            weight_bytes,
         })
     }
 
@@ -503,10 +503,6 @@ impl Gemma4Gpu {
     #[cfg(test)]
     pub(crate) fn set_swa_rows(&mut self, rows: usize) {
         self.swa_rows = rows;
-    }
-
-    pub(crate) fn weight_bytes(&self) -> u64 {
-        self.weight_bytes
     }
 
     /// Forward `tokens` from `start_pos`; row-logit passes are capped at
