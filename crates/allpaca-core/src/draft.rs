@@ -285,6 +285,29 @@ impl Qwen4MtpProvider {
         }
     }
 
+    /// Warmed MTP memory for a prompt-cache checkpoint.
+    pub(crate) fn cache_bytes(&self) -> Option<Vec<u8>> {
+        if self.memory.tokens() == 0 || !self.memory.persistable() {
+            return None;
+        }
+        let mut out = Vec::new();
+        self.memory.write_to(&mut out);
+        Some(out)
+    }
+
+    /// Replace this drafter's memory with what [`Self::cache_bytes`] wrote.
+    pub(crate) fn restore_cache(&mut self, bytes: &[u8]) -> bool {
+        let mut r = crate::kv_codec::Reader(bytes);
+        let Some(memory) = crate::qwen4exp::Qwen4Memory::read_from(&mut r) else {
+            return false;
+        };
+        if !r.0.is_empty() {
+            return false;
+        }
+        self.memory = memory;
+        true
+    }
+
     pub fn process(&mut self, token: u32, pos: usize, hidden: &[f32], metrics: &Metrics) -> Result<(), AllpacaError> {
         if pos == 0 && self.memory.tokens() != 0 {
             self.memory = crate::qwen4exp::Qwen4Memory::default();
@@ -421,5 +444,30 @@ mod tests {
             "prefix hit refreshes the last ctx token then runs 3 drafts; replay would be {}; added={added}",
             ctx2.len() + 3
         );
+    }
+
+    /// A prompt-cache restore of the draft KV continues the same drafts a
+    /// cache that never left memory would, and does not prefill the prefix again.
+    #[test]
+    fn restored_draft_cache_continues_without_replaying_the_prefix() {
+        let cfg = ModelConfig::draft_tiny();
+        let mut live = DraftModelProvider::new(TinyModel::synthetic(cfg.clone(), 1, "draft"));
+        let mut cache = DenseKv::default();
+        let first = live.propose_on(&[1, 2], 3, 0.0, &mut cache, None, None, None).unwrap();
+        let bytes = cache.to_cache_bytes();
+        let mut restored = DenseKv::from_cache_bytes(&bytes).expect("draft cache");
+
+        let ctx2 = vec![1, 2, first[0]];
+        let live_before = cache.forwards;
+        let from_live = live
+            .propose_on(&ctx2, 3, 0.0, &mut cache, None, None, None)
+            .unwrap();
+        let mut resumed = DraftModelProvider::new(TinyModel::synthetic(cfg, 1, "draft"));
+        let restored_before = restored.forwards;
+        let from_restored = resumed
+            .propose_on(&ctx2, 3, 0.0, &mut restored, None, None, None)
+            .unwrap();
+        assert_eq!(from_restored, from_live);
+        assert_eq!(restored.forwards - restored_before, cache.forwards - live_before);
     }
 }
