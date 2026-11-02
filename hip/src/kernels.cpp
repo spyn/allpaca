@@ -4605,19 +4605,14 @@ static bool kq_wave64() {
     return known == 2;
 }
 
-/* Lanes per output column of the int8 K-quant GEMV. On the MI50 narrow
- * outputs left most CUs idle at 8 (Q3_K 640x2560 15 -> 8.5 us at 32) and
- * Q6_K ran at half speed (2560x6144 69 -> 34 us at 32; 16 rows 243 -> 289 us).
- * Q4_K/Q5_K stay at 8: 16 lanes saved 3-4 us a token but cost 16-row passes
- * ~1.8x. The choice depends on the weight and the card only, so every row
- * count sums a column in the same order. */
+/* Lanes per output column of the int8 K-quant GEMV: 8 on every card. Lanes set
+ * the order a column sums in, so they decide its bits, and the MI50 must give
+ * the bits every other worker gives. 32 lanes ran Q6_K 2560x6144 in 34 us
+ * against 69 and 16 rows in 84 against 231, but moved Q6_K and narrow outputs
+ * by the last bits, which the next int8 GEMV turns into 1% (S1). */
 static int kq_i8_lanes(int qt, int n) {
-    if ((qt < 3 || qt > 6) || !kq_wave64()) {
-        return 8;
-    }
-    if (n < 2048 || (qt == 6 && n < 7680)) {
-        return 32;
-    }
+    (void)qt;
+    (void)n;
     return 8;
 }
 
@@ -4662,7 +4657,7 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
     KqActCopy act(scratch, a, aq, ad, m, k, stream, c, n);
     // 8 lanes x 32 weights per column: at 32 lanes x 8 weights the per-row
     // A loads and scale math dominated on RDNA (Q5_K m=4 cost 1.7x m=1; now
-    // ~1.05x). The MI50 takes more lanes on some weights (kq_i8_lanes).
+    // ~1.05x).
     const int lpc = kq_i8_lanes(QT, n);
     dim3 block(256);
     const int cols = 256 / lpc;
@@ -4673,24 +4668,10 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
         // MI50, 16 rows: Q3_K 6144x2560 232 -> 91 us, Q6_K 7680x2560
         // 231 -> 84, Q4_K/Q5_K 2560x6144 ~163 -> ~106. At 9 rows Q4_K lost
         // (92 -> 106 us), so Q4_K/Q5_K start at 12.
-        if (kq_wave64() && (lpc == 8 || lpc == 32) &&
-            m >= ((QT == 4 || QT == 5) ? 12 : 9)) {
+        if (kq_wave64() && m >= ((QT == 4 || QT == 5) ? 12 : 9)) {
             const dim3 tgrid(gx, static_cast<unsigned>((m + KQ_TILE_ROWS - 1) / KQ_TILE_ROWS));
-            if (lpc == 32) {
-                hipLaunchKernelGGL((gemv_nt_kquant_i8_tile_kernel<QT, 32>), tgrid, block, 0,
-                                   stream, aq, ad, b, c, m, n, k);
-            } else {
-                hipLaunchKernelGGL((gemv_nt_kquant_i8_tile_kernel<QT, 8>), tgrid, block, 0,
-                                   stream, aq, ad, b, c, m, n, k);
-            }
-            return hip_status(hipGetLastError());
-        }
-        if (lpc == 32) {
-            kq_i8_dispatch<QT, 32>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
-            return hip_status(hipGetLastError());
-        }
-        if (lpc == 16) {
-            kq_i8_dispatch<QT, 16>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
+            hipLaunchKernelGGL((gemv_nt_kquant_i8_tile_kernel<QT, 8>), tgrid, block, 0, stream, aq,
+                               ad, b, c, m, n, k);
             return hip_status(hipGetLastError());
         }
     }

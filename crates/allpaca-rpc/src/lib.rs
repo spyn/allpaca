@@ -848,13 +848,24 @@ mod tests {
                 .collect();
             lines.push(format!("gated: {:016x} first={:?}", digest(&y), &y[..2]));
         }
-        // Dense K-quant GEMV: `rows` of each width, row digests comparable
-        // with the same row run alone.
-        let (n, k) = (3072usize, 3072usize);
-        for ty in [12u32, 13, 14] {
-            let w = quantize(ty, &mat(10 + ty as usize, n * k));
-            let w = c.put_tensor(ty, &[k as u32, n as u32], &w, None).unwrap();
-            for rows in [1usize, 2, 3, 4, 5, 8, 9, 21] {
+        // Dense GEMV: `rows` of each width, row digests comparable with the
+        // same row run alone. Type 0 is F32, 8 is Q8_0, 12..14 the K-quants;
+        // narrow outputs and wide rows take other paths on some cards.
+        for (ty, n, k) in [
+            (12u32, 3072usize, 3072usize),
+            (13, 3072, 3072),
+            (14, 3072, 3072),
+            (12, 1024, 3072),
+            (14, 1024, 3072),
+            (14, 8192, 3072),
+            (8, 3072, 3072),
+            (8, 1024, 5120),
+            (0, 3072, 3072),
+        ] {
+            let m = mat(10 + ty as usize, n * k);
+            let packed = if ty == 0 { bytes(&m) } else { quantize(ty, &m) };
+            let w = c.put_tensor(ty, &[k as u32, n as u32], &packed, None).unwrap();
+            for rows in [1usize, 2, 3, 4, 5, 8, 9, 12, 21] {
                 let (a, y) = (c.alloc((rows * k * 4) as u64).unwrap(), c.alloc((rows * n * 4) as u64).unwrap());
                 c.h2d(a, 0, &bytes(&mat(6, rows * k))).unwrap();
                 c.launch(&LaunchList {
@@ -873,9 +884,11 @@ mod tests {
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();
-                let per_row: Vec<String> = v.chunks(n).take(3).map(|r| format!("{:016x}", digest(r))).collect();
-                lines.push(format!("gemv ty={ty} rows={rows}: {:016x} rows {per_row:?} first={:?}", digest(&v), &v[..2]));
+                lines.push(format!("gemv ty={ty} {n}x{k} rows={rows}: {:016x} first={:?}", digest(&v), &v[..2]));
+                c.free(a).unwrap();
+                c.free(y).unwrap();
             }
+            c.free(w).unwrap();
         }
         drop(c);
         worker.join().unwrap();
@@ -905,14 +918,17 @@ mod tests {
         if allpaca_cuda::device_count() <= 0 {
             return;
         }
+        // F32 and Q8_0 GEMV still differ by card, and no pinned model's layer
+        // weights use them: they stay in `dense_digest` to see, out of the pin.
         let digests: String = dense_digests()
             .iter()
+            .filter(|l| !l.starts_with("gemv ty=0 ") && !l.starts_with("gemv ty=8 "))
             .map(|l| l.split(": ").nth(1).and_then(|d| d.split_whitespace().next()).unwrap_or(""))
             .collect();
         let all = digests.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
         });
-        assert_eq!(all, 0xa0cf_4763_ea3a_0b80, "dense-layer bits changed: {all:#018x}");
+        assert_eq!(all, 0x1bb6_909a_8b8e_f82b, "dense-layer bits changed: {all:#018x}");
     }
 
     /// Expert tensor types, sizes, and the allowed error relative to the

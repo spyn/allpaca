@@ -18233,8 +18233,8 @@ mod tests {
     }
 
     /// Q3_K GEMV must keep the bits of the lane sum the kernel really launches
-    /// (`kquant_i8_lanes` asks the device), on every arch: 8 lanes on RDNA, 32 on
-    /// the MI50 below n = 2048. A packed-byte subtract that changes a product or
+    /// (`kquant_i8_lanes` asks the device), on every arch: 8 lanes on every card.
+    /// A packed-byte subtract that changes a product or
     /// the add order fails here.
     #[cfg(feature = "hip")]
     #[test]
