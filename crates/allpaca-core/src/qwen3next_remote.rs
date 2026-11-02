@@ -209,7 +209,9 @@ impl SpanHost {
         };
         let path = Self::upload_path(key);
         std::fs::write(&path, data).map_err(FatalError::from)?;
-        self.model = Some(HostedModel::load(&path, self.device)?);
+        let loaded = HostedModel::load(&path, self.device);
+        let _ = std::fs::remove_file(&path);
+        self.model = Some(loaded?);
         Ok(true)
     }
 
@@ -230,12 +232,17 @@ impl SpanHost {
                 Ok(vec![0])
             }
             Call::Chunk { offset } => {
-                let Some((path, _, _, received)) = self.upload.as_mut() else {
+                let Some((path, _, len, received)) = self.upload.as_mut() else {
                     return Err(err("q3n chunk before Begin".into()));
                 };
                 if offset != *received {
                     return Err(err(format!(
                         "q3n chunk offset {offset}, expected {received}"
+                    )));
+                }
+                if *received > *len || data.len() as u64 > *len - *received {
+                    return Err(err(format!(
+                        "q3n chunk exceeds the declared upload length of {len} bytes"
                     )));
                 }
                 let mut file = std::fs::OpenOptions::new()
@@ -256,10 +263,15 @@ impl SpanHost {
                         "q3n upload has {received} bytes, expected {len}"
                     )));
                 }
-                self.model = Some(HostedModel::load(&path, self.device)?);
-                if let Some(cache) = &self.cache {
-                    cache.put(key, &std::fs::read(path).map_err(FatalError::from)?);
-                }
+                let loaded: Result<HostedModel, AllpacaError> = (|| {
+                    let model = HostedModel::load(&path, self.device)?;
+                    if let Some(cache) = &self.cache {
+                        cache.put(key, &std::fs::read(&path).map_err(FatalError::from)?);
+                    }
+                    Ok(model)
+                })();
+                let _ = std::fs::remove_file(&path);
+                self.model = Some(loaded?);
                 Ok(Vec::new())
             }
             Call::Run { seq, pos } => {
@@ -465,6 +477,59 @@ impl Drop for RemoteSeq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_upload_cannot_pass_declared_length() {
+        let mut host = SpanHost::default();
+        let begin = serde_json::to_vec(&Call::Begin {
+            key: 17,
+            len: 4,
+            device: 0,
+        })
+        .unwrap();
+        host.serve(&begin, &[]).unwrap();
+        let chunk = serde_json::to_vec(&Call::Chunk { offset: 0 }).unwrap();
+        assert!(host.serve(&chunk, &[1, 2, 3, 4, 5]).is_err());
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn load_paths_remove_uploaded_gguf() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-r3-upload-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_with(&source, 2, true);
+        let source_file = GgufFile::open(&source).unwrap();
+        let span = dir.join("span.gguf");
+        write_span_gguf(&span, &source_file, 0, 1).unwrap();
+        let bytes = std::fs::read(&span).unwrap();
+        let key = 23u64;
+        let len = bytes.len() as u64;
+
+        let mut host = SpanHost::default();
+        let begin = serde_json::to_vec(&Call::Begin { key, len, device: 0 }).unwrap();
+        host.serve(&begin, &[]).unwrap();
+        let chunk = serde_json::to_vec(&Call::Chunk { offset: 0 }).unwrap();
+        host.serve(&chunk, &bytes).unwrap();
+        assert!(SpanHost::upload_path(key).exists());
+        let load = serde_json::to_vec(&Call::Load).unwrap();
+        host.serve(&load, &[]).unwrap();
+        assert!(!SpanHost::upload_path(key).exists());
+
+        let cache = crate::qwen4_remote::WeightCache::new(&dir, 1 << 30);
+        cache.put(key, &bytes);
+        let mut host = SpanHost {
+            cache: Some(cache),
+            ..SpanHost::default()
+        };
+        host.load_cached(key, len).unwrap();
+        assert!(!SpanHost::upload_path(key).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn span_gguf_keeps_only_the_requested_layers_and_uses_tiny_globals() {

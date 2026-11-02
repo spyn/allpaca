@@ -8938,6 +8938,11 @@ mod tests {
         let expected = local.generate("hello", params.clone()).unwrap().token_ids;
 
         let run = |hosted: bool| {
+            if hosted {
+                unsafe { std::env::set_var("ALLPACA_Q3N_HOST", "1") };
+            } else {
+                unsafe { std::env::remove_var("ALLPACA_Q3N_HOST") };
+            }
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let worker = thread::spawn(move || {

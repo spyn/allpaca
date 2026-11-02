@@ -900,7 +900,9 @@ impl RpcRuntime {
             picks[l] = Some(o);
         }
         let hosted_start = self.extension_host(crate::qwen3next_remote::EXT).and_then(|(session, _)| {
-            if std::env::var("ALLPACA_Q3N_NO_HOST").ok().as_deref() == Some("1") {
+            if std::env::var("ALLPACA_Q3N_NO_HOST").ok().as_deref() == Some("1")
+                || std::env::var("ALLPACA_Q3N_HOST").ok().as_deref() != Some("1")
+            {
                 return None;
             }
             let mut start = n;
